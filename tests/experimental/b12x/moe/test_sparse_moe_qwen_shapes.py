@@ -21,7 +21,16 @@ from benchmarks.experimental.b12x.benchmark_moe import (
     load_gate_weight,
     make_input_activations,
 )
-from b12x.moe.fused_moe._impl import B12XFP4ExpertWeights, build_tp_moe_route_binding, build_tp_moe_sparse_fp4_binding, clear_tp_moe_caches, plan_b12x_fp4_moe_weights, prepare_b12x_fp4_moe_weights, b12x_route_experts_fast, b12x_sparse_moe_fp4
+from b12x.moe.fused_moe._impl import (
+    B12XFP4ExpertWeights,
+    build_tp_moe_route_binding,
+    build_tp_moe_sparse_fp4_binding,
+    clear_tp_moe_caches,
+    plan_b12x_fp4_moe_weights,
+    prepare_b12x_fp4_moe_weights,
+    b12x_route_experts_fast,
+    b12x_sparse_moe_fp4,
+)
 import b12x.moe.fused_moe._impl as tp_moe_impl
 from b12x.testing.reference.helpers import run_tp_moe_fp4
 
@@ -47,7 +56,11 @@ def _make_spec() -> ModelSpec:
 @functools.lru_cache(maxsize=1)
 def _load_qwen_case() -> tuple[ModelSpec, object, torch.Tensor]:
     spec = _make_spec()
-    return spec, load_expert_weights(MODEL_PATH, spec), load_gate_weight(MODEL_PATH, spec)
+    return (
+        spec,
+        load_expert_weights(MODEL_PATH, spec),
+        load_gate_weight(MODEL_PATH, spec),
+    )
 
 
 def _pack_experts(weights) -> B12XFP4ExpertWeights:
@@ -64,12 +77,10 @@ def _pack_experts(weights) -> B12XFP4ExpertWeights:
     prepared = prepare_b12x_fp4_moe_weights(
         plan=plan,
         w1_global_scale=(
-            weights.g1_alphas_per_expert
-            * weights.w13_input_scale_quant_per_expert
+            weights.g1_alphas_per_expert * weights.w13_input_scale_quant_per_expert
         ),
         w2_global_scale=(
-            weights.g2_alphas_per_expert
-            * weights.w2_input_scale_quant_per_expert
+            weights.g2_alphas_per_expert * weights.w2_input_scale_quant_per_expert
         ),
         w1_fp4=weights.w13_weight,
         w1_blockscale=weights.w13_blockscale_swizzled,
@@ -97,7 +108,9 @@ def _manual_route(
     return router_logits, topk_ids, topk_weights
 
 
-def _selected_logits(router_logits: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+def _selected_logits(
+    router_logits: torch.Tensor, topk_ids: torch.Tensor
+) -> torch.Tensor:
     return torch.gather(router_logits, 1, topk_ids.to(torch.int64))
 
 
@@ -110,7 +123,9 @@ def test_route_experts_fast_matches_manual_qwen_gate_path(m: int) -> None:
     spec, weights, gate_weight = _load_qwen_case()
     hidden_states = make_input_activations(spec, m, seed=9_000 + m, device=device)
 
-    router_logits, topk_ids, topk_weights = _manual_route(hidden_states, gate_weight, spec.top_k)
+    router_logits, topk_ids, topk_weights = _manual_route(
+        hidden_states, gate_weight, spec.top_k
+    )
     del weights
 
     routing = b12x_route_experts_fast(
@@ -183,7 +198,9 @@ def test_sparse_moe_fp4_matches_manual_qwen_gate_path(m: int) -> None:
     experts = _pack_experts(weights)
     hidden_states = make_input_activations(spec, m, seed=10_000 + m, device=device)
 
-    router_logits, topk_ids, topk_weights = _manual_route(hidden_states, gate_weight, spec.top_k)
+    router_logits, topk_ids, topk_weights = _manual_route(
+        hidden_states, gate_weight, spec.top_k
+    )
     sparse_output, routing = b12x_sparse_moe_fp4(
         binding=build_tp_moe_sparse_fp4_binding(
             scratch=_make_scratch(),
@@ -211,7 +228,9 @@ def test_sparse_moe_fp4_matches_manual_qwen_gate_path(m: int) -> None:
         input_scales_static=True,
     )
     torch.cuda.synchronize()
-    torch.testing.assert_close(sparse_output, routed_manual_output, atol=5e-4, rtol=1e-2)
+    torch.testing.assert_close(
+        sparse_output, routed_manual_output, atol=5e-4, rtol=1e-2
+    )
 
 
 @pytest.mark.parametrize("m", [1, 80])
@@ -224,7 +243,9 @@ def test_sparse_moe_fp4_matches_manual_qwen_router_logits(m: int) -> None:
     experts = _pack_experts(weights)
     hidden_states = make_input_activations(spec, m, seed=20_000 + m, device=device)
 
-    router_logits, topk_ids, topk_weights = _manual_route(hidden_states, gate_weight, spec.top_k)
+    router_logits, topk_ids, topk_weights = _manual_route(
+        hidden_states, gate_weight, spec.top_k
+    )
     output = torch.empty_like(hidden_states)
     sparse_output, routing = b12x_sparse_moe_fp4(
         binding=build_tp_moe_sparse_fp4_binding(
@@ -254,4 +275,6 @@ def test_sparse_moe_fp4_matches_manual_qwen_router_logits(m: int) -> None:
         input_scales_static=True,
     )
     torch.cuda.synchronize()
-    torch.testing.assert_close(sparse_output, routed_manual_output, atol=5e-4, rtol=1e-2)
+    torch.testing.assert_close(
+        sparse_output, routed_manual_output, atol=5e-4, rtol=1e-2
+    )

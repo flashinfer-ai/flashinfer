@@ -361,15 +361,15 @@ class _EPMoELayout:
             expert_offsets=views["expert_offsets"],
             expert_counts=views["expert_counts"],
             fused_launch=_launch,
-            route_ids_i32=(
-                views["route_ids_i32"] if _route_ids_workspace else None
-            ),
+            route_ids_i32=(views["route_ids_i32"] if _route_ids_workspace else None),
             plan=_plan,
         )
 
 
 def _materialize_layout(
-    caps: EPMoEScratchCaps, *, route_ids_workspace: bool = False,
+    caps: EPMoEScratchCaps,
+    *,
+    route_ids_workspace: bool = False,
 ) -> _EPMoELayout:
     """Materialize native scratch views from immutable capacity metadata."""
     routed_rows = int(caps.max_tokens) * int(caps.num_topk)
@@ -441,7 +441,8 @@ def _materialize_layout(
             ("expert_counts", caps.global_num_experts, torch.int32),
             *(
                 (("route_ids_i32", caps.max_tokens * caps.num_topk, torch.int32),)
-                if route_ids_workspace else ()
+                if route_ids_workspace
+                else ()
             ),
         )
     )
@@ -504,9 +505,12 @@ def _run_bound_ep_moe(binding: EPMoEFP4Binding) -> torch.Tensor:
         raise RuntimeError("EP binding requires a session-prepared W4A16 execution")
     binding.expert_map.validate_static()
     prepared = _prepared_payload_for_runtime(
-        binding.experts, quant_mode="w4a16",
-        source_format=binding.experts.source_format, activation=binding.experts.activation,
-        w13_layout=binding.experts.w13_layout, dtype=binding.a.dtype,
+        binding.experts,
+        quant_mode="w4a16",
+        source_format=binding.experts.source_format,
+        activation=binding.experts.activation,
+        w13_layout=binding.experts.w13_layout,
+        dtype=binding.a.dtype,
         hidden_size=int(binding.a.shape[1]),
     )
     if prepared is None:
@@ -517,30 +521,45 @@ def _run_bound_ep_moe(binding: EPMoEFP4Binding) -> torch.Tensor:
             raise RuntimeError("prepared EP route-id workspace requires int64 topk_ids")
         route_count = topk_ids.numel()
         if binding.route_ids_i32.numel() < route_count:
-            raise RuntimeError("prepared EP route-id workspace is smaller than live routes")
+            raise RuntimeError(
+                "prepared EP route-id workspace is smaller than live routes"
+            )
         topk_ids = binding.route_ids_i32[:route_count].view_as(topk_ids)
         topk_ids.copy_(binding.topk_ids)
     from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+
     return run_w4a16_moe(
-        binding.a, prepared, binding.topk_weights, topk_ids,
+        binding.a,
+        prepared,
+        binding.topk_weights,
+        topk_ids,
         activation=binding.experts.activation,
         intermediate_cache13=binding.intermediate_cache13,
-        intermediate_cache2=binding.intermediate_cache2, output=binding.output,
-        fc1_c_tmp=binding.fc1_c_tmp, fc2_c_tmp=binding.fc2_c_tmp,
+        intermediate_cache2=binding.intermediate_cache2,
+        output=binding.output,
+        fc1_c_tmp=binding.fc1_c_tmp,
+        fc2_c_tmp=binding.fc2_c_tmp,
         packed_route_indices=binding.packed_route_indices,
         block_expert_ids=binding.block_expert_ids,
         packed_route_count=binding.packed_route_count,
-        expert_offsets=binding.expert_offsets, expert_counts=binding.expert_counts,
+        expert_offsets=binding.expert_offsets,
+        expert_counts=binding.expert_counts,
         expert_map=binding.expert_map.tensor,
         apply_router_weight_on_input=binding.apply_router_weight_on_input,
-        fast_math=binding.fast_math, swiglu_limit=binding.swiglu_limit,
-        swiglu_alpha=binding.swiglu_alpha, swiglu_beta=binding.swiglu_beta,
+        fast_math=binding.fast_math,
+        swiglu_limit=binding.swiglu_limit,
+        swiglu_alpha=binding.swiglu_alpha,
+        swiglu_beta=binding.swiglu_beta,
         fused_launch=binding.fused_launch,
     )
 
 
 __all__ = [
-    "EPExpertMap", "EPMoEFP4Binding", "EPMoEScratchCaps",
-    "_EPMoELayout", "_materialize_layout", "_run_bound_ep_moe",
+    "EPExpertMap",
+    "EPMoEFP4Binding",
+    "EPMoEScratchCaps",
+    "_EPMoELayout",
+    "_materialize_layout",
+    "_run_bound_ep_moe",
     "prepare_ep_expert_map",
 ]

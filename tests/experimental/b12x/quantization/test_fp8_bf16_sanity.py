@@ -62,14 +62,18 @@ class TinyFp8Bf16DequantKernel:
         lane = cute.arch.lane_idx()
         smem = cutlass_utils.SmemAllocator()
         s_layout = cute.make_layout((self.tile_m, self.tile_n))
-        sB = smem.allocate_tensor(element_type=self.dtype, layout=s_layout, byte_alignment=128)
+        sB = smem.allocate_tensor(
+            element_type=self.dtype, layout=s_layout, byte_alignment=128
+        )
         mBu8 = cute.recast_tensor(mB, cutlass.Uint8)
         descale_bf2 = broadcast_f32_to_bfloat2(mDescale[0])
         one = Float32(1.0)
         total_elems = self.tile_m * self.tile_n
         total_vec4 = total_elems // 4
 
-        for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_vec4, cute.arch.WARP_SIZE)):
+        for idx_iter in cutlass.range_constexpr(
+            cute.ceil_div(total_vec4, cute.arch.WARP_SIZE)
+        ):
             vec_idx = lane + idx_iter * cute.arch.WARP_SIZE
             if vec_idx < total_vec4:
                 linear_idx = vec_idx * 4
@@ -92,7 +96,9 @@ class TinyFp8Bf16DequantKernel:
                 sB[row, col + 3] = value3.to(self.dtype)
         cute.arch.sync_threads()
 
-        for idx_iter in cutlass.range_constexpr(cute.ceil_div(total_elems, self.num_threads)):
+        for idx_iter in cutlass.range_constexpr(
+            cute.ceil_div(total_elems, self.num_threads)
+        ):
             linear_idx = tidx + idx_iter * self.num_threads
             if linear_idx < total_elems:
                 row = linear_idx // self.tile_n
@@ -114,10 +120,14 @@ def test_tiny_fp8_bf16_dequant_matches_reference() -> None:
 
     b_src = torch.randn(16, 16, device=device, dtype=torch.float32) / 4
     descale = torch.tensor([0.5], device=device, dtype=torch.float32)
-    b_fp8 = (b_src / descale).clamp(
-        min=-torch.finfo(torch.float8_e4m3fn).max,
-        max=torch.finfo(torch.float8_e4m3fn).max,
-    ).to(torch.float8_e4m3fn)
+    b_fp8 = (
+        (b_src / descale)
+        .clamp(
+            min=-torch.finfo(torch.float8_e4m3fn).max,
+            max=torch.finfo(torch.float8_e4m3fn).max,
+        )
+        .to(torch.float8_e4m3fn)
+    )
     out = torch.empty_like(b_src, dtype=torch.bfloat16)
 
     kernel = TinyFp8Bf16DequantKernel()

@@ -81,8 +81,10 @@ def runtime():
         peer_hosts=tuple(f"rank-{rank}" for rank in range(rt.world_size)),
     )
     declaration = roce.plan(query, runtime=rt)
-    seeds = [torch.zeros(16 // dtype.itemsize, dtype=dtype, device=device)
-             for dtype in (torch.float16, torch.bfloat16, torch.float32)]
+    seeds = [
+        torch.zeros(16 // dtype.itemsize, dtype=dtype, device=device)
+        for dtype in (torch.float16, torch.bfloat16, torch.float32)
+    ]
 
     def prepare(state):
         calls = [_preparation.prepared_call(state, inp=seed) for seed in seeds]
@@ -93,7 +95,9 @@ def runtime():
         name="roce",
         prepare_call=prepare,
     )
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
         session.prepare((request,))
         yield _PreparedRuntime(rt, declaration)
     rt.close()
@@ -476,11 +480,15 @@ def _fresh_runtime(spin_limit: int):
     from b12x.comm.roce import _preparation
 
     query = roce.query_from_runtime(
-        rt, surface="AllReduce.all_reduce", call={"dtypes": ("bfloat16",)},
-        topology="roce_rdma", peer_hosts=tuple(f"rank-{r}" for r in range(rt.world_size)),
+        rt,
+        surface="AllReduce.all_reduce",
+        call={"dtypes": ("bfloat16",)},
+        topology="roce_rdma",
+        peer_hosts=tuple(f"rank-{r}" for r in range(rt.world_size)),
     )
     declaration = roce.plan(query, runtime=rt)
     seed = torch.zeros(8, dtype=torch.bfloat16, device=rt.device)
+
     def prepare(state):
         call = _preparation.prepared_call(state, inp=seed)
 

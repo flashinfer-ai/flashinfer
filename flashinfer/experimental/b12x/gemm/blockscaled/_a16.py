@@ -84,9 +84,15 @@ def pack_nvfp4_weight(
     storage = scale_storage(scale, n, k, 16)
     _check_tensor("scale", storage, weight.device, torch.uint8)
     _check_tensor("global_scale", global_scale, weight.device, torch.float32)
-    if global_scale.numel() != 1 or global_scale_kind not in ("multiplier", "reciprocal"):
-        raise ValueError("global_scale must be scalar, with kind 'multiplier' or 'reciprocal'")
+    if global_scale.numel() != 1 or global_scale_kind not in (
+        "multiplier",
+        "reciprocal",
+    ):
+        raise ValueError(
+            "global_scale must be scalar, with kind 'multiplier' or 'reciprocal'"
+        )
     from b12x._lib.intrinsics import as_grouped_scale_view
+
     mma = as_grouped_scale_view(storage.view(1, -1), n, k)
     return NVFP4LinearWeight(weight, mma, global_scale, global_scale_kind, k, n)
 
@@ -96,6 +102,7 @@ def _stream_context(stream, device):
         return nullcontext()
     if not isinstance(stream, torch.cuda.Stream):
         from b12x._lib.utils import cuda_stream_to_int
+
         stream = torch.cuda.ExternalStream(cuda_stream_to_int(stream), device=device)
     if stream.device != device:
         raise ValueError("stream must be on the operand device")
@@ -105,8 +112,10 @@ def _stream_context(stream, device):
 def _overlap(a, b):
     if not a.numel() or not b.numel():
         return False
-    return (a.data_ptr() < b.data_ptr() + b.numel() * b.element_size()
-            and b.data_ptr() < a.data_ptr() + a.numel() * a.element_size())
+    return (
+        a.data_ptr() < b.data_ptr() + b.numel() * b.element_size()
+        and b.data_ptr() < a.data_ptr() + a.numel() * a.element_size()
+    )
 
 
 def _validate_output(source, out, n):
@@ -119,17 +128,18 @@ def _validate_output(source, out, n):
     return out
 
 
-
-
-
 def _config(config):
     config = (64, 64, 1) if config is None else tuple(config)
-    if len(config) != 3 or config[0] not in (64, 128) or config[1] not in (64, 128) or config[2] not in (1, 2, 4, 8):
-        raise ValueError("A16 config must be (N tile 64/128, K tile 64/128, split-K 1/2/4/8)")
+    if (
+        len(config) != 3
+        or config[0] not in (64, 128)
+        or config[1] not in (64, 128)
+        or config[2] not in (1, 2, 4, 8)
+    ):
+        raise ValueError(
+            "A16 config must be (N tile 64/128, K tile 64/128, split-K 1/2/4/8)"
+        )
     return config
-
-
-
 
 
 def w4a16(
@@ -155,9 +165,18 @@ def w4a16(
     if block_scale.dtype not in (torch.uint8, torch.float8_e4m3fn):
         raise ValueError("NVFP4 requires E4M3 block scales")
     from ._ops import linear
+
     return linear(
-        source, weight, block_scale, global_scale, out=out, workspace=workspace,
-        plan=plan, global_scale_kind=global_scale_kind, required_mode="a16", stream=stream,
+        source,
+        weight,
+        block_scale,
+        global_scale,
+        out=out,
+        workspace=workspace,
+        plan=plan,
+        global_scale_kind=global_scale_kind,
+        required_mode="a16",
+        stream=stream,
     )
 
 
@@ -175,15 +194,25 @@ def w8a16(
     if block_scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
         raise ValueError("MXFP8 requires UE8M0 block scales")
     from ._ops import linear
+
     return linear(
-        source, weight, block_scale, None, out=out, workspace=workspace,
-        plan=plan, global_scale_kind="none", required_mode="a16", stream=stream,
+        source,
+        weight,
+        block_scale,
+        None,
+        out=out,
+        workspace=workspace,
+        plan=plan,
+        global_scale_kind="none",
+        required_mode="a16",
+        stream=stream,
     )
 
 
 def _weight_parts(weight):
     from ._linear import MXFP8LinearWeight
     from ._iq2_xs import IQ2XSLinearWeight
+
     if isinstance(weight, IQ2XSLinearWeight):
         return weight.values, weight.metadata, None, False
     if isinstance(weight, NVFP4LinearWeight):

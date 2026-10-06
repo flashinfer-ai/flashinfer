@@ -39,7 +39,9 @@ WIDE_N = 4096  # n > 1536 -> the MXFP8 wide-N regime that the hint tunes
 @pytest.mark.parametrize("sm_count", (LOW_SM, HIGH_SM))
 @pytest.mark.parametrize("c_dtype", (cutlass.BFloat16, cutlass.Float16))
 def test_expected_m_bounds_the_complete_scheduling_specialization(
-    expected_m: int, sm_count: int, c_dtype,
+    expected_m: int,
+    sm_count: int,
+    c_dtype,
 ) -> None:
     n = k = 4096
     plan = _select_default_dense_gemm_plan(
@@ -87,9 +89,7 @@ def test_qwen38_tp_fp4_decode_follows_bk256_cutoff(
     k: int,
     expected_tile_k: int,
 ) -> None:
-    assert (
-        _select_fp4_tile_k(m, n, k, None, 48, (64, 128)) == expected_tile_k
-    )
+    assert _select_fp4_tile_k(m, n, k, None, 48, (64, 128)) == expected_tile_k
 
 
 def test_fp4_bk256_uses_tile_and_half_sm_wave_cutoffs() -> None:
@@ -175,18 +175,12 @@ def test_high_sm_fp4_small_batch_uses_square_bk256_plan(
 
     assert plan.mma_tiler_mn == (64, 64)
     assert not plan.swap_ab
-    assert _select_fp4_tile_k(
-        plan_m, n, k, plan_m, HIGH_SM, plan.mma_tiler_mn
-    ) == 256
+    assert _select_fp4_tile_k(plan_m, n, k, plan_m, HIGH_SM, plan.mma_tiler_mn) == 256
 
 
 def test_high_sm_fp4_wide_output_uses_grid_cutoff_for_bk256() -> None:
-    assert _select_fp4_tile_k(
-        128, 8704, 5120, 128, HIGH_SM, (64, 128)
-    ) == 256
-    assert _select_fp4_tile_k(
-        128, 7936, 5120, 128, HIGH_SM, (64, 128)
-    ) == 128
+    assert _select_fp4_tile_k(128, 8704, 5120, 128, HIGH_SM, (64, 128)) == 256
+    assert _select_fp4_tile_k(128, 7936, 5120, 128, HIGH_SM, (64, 128)) == 128
 
 
 def test_high_sm_fp4_underfilled_prefill_uses_64x128() -> None:
@@ -301,9 +295,7 @@ def test_low_sm_mxfp8_decode_split_preserves_unqualified_boundaries(
     n: int,
     k: int,
 ) -> None:
-    plan = _select_default_dense_gemm_plan(
-        m, n, k, 48, is_mxfp8=True, expected_m=m
-    )
+    plan = _select_default_dense_gemm_plan(m, n, k, 48, is_mxfp8=True, expected_m=m)
 
     assert plan.mma_tiler_mn != (32, 64)
 
@@ -318,9 +310,7 @@ def test_low_sm_mxfp8_medium_prefill_uses_bk64_plan(expected_m: int) -> None:
         is_mxfp8=True,
         expected_m=expected_m,
     )
-    tile_k = _select_mxfp8_tile_k(
-        expected_m, 4096, 4096, expected_m, 48
-    )
+    tile_k = _select_mxfp8_tile_k(expected_m, 4096, 4096, expected_m, 48)
     policy = _dense_gemm_policy_for(
         m=expected_m,
         n=4096,
@@ -509,9 +499,7 @@ def test_high_sm_mxfp8_prefill_plan_covers_tp_and_common_shapes(
     )
 
     assert plan.mma_tiler_mn == expected_tile
-    assert _select_mxfp8_tile_k(
-        1, n, k, expected_m, HIGH_SM
-    ) == expected_tile_k
+    assert _select_mxfp8_tile_k(1, n, k, expected_m, HIGH_SM) == expected_tile_k
 
 
 def test_non_mxfp8_split_k_policy_is_unchanged() -> None:
@@ -588,10 +576,7 @@ def test_high_sm_block_fp8_decode_uses_bounded_two_way_split(
     k: int,
     expected_slices: int,
 ) -> None:
-    assert (
-        _select_block_fp8_decode_slices(m, 4096, k, HIGH_SM)
-        == expected_slices
-    )
+    assert _select_block_fp8_decode_slices(m, 4096, k, HIGH_SM) == expected_slices
     plan = _select_default_dense_gemm_plan(
         m,
         4096,
@@ -1599,8 +1584,12 @@ def test_expected_m_prefill_hint_for_narrow_n():
     # decode winner, while declared prefill still moves to the prefill tile.
     narrow = 1024
     base = _select_default_mma_tiler_mn(64, narrow, HIGH_SM, is_mxfp8=True)
-    decode = _select_default_mma_tiler_mn(64, narrow, HIGH_SM, is_mxfp8=True, expected_m=1)
-    small = _select_default_mma_tiler_mn(64, narrow, HIGH_SM, is_mxfp8=True, expected_m=64)
+    decode = _select_default_mma_tiler_mn(
+        64, narrow, HIGH_SM, is_mxfp8=True, expected_m=1
+    )
+    small = _select_default_mma_tiler_mn(
+        64, narrow, HIGH_SM, is_mxfp8=True, expected_m=64
+    )
     prefill = _select_default_mma_tiler_mn(
         64, narrow, HIGH_SM, is_mxfp8=True, expected_m=512
     )

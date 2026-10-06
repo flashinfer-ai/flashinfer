@@ -30,7 +30,9 @@ from b12x.attention._shared.mla.compressed_reference import (
     unpack_deepseek_v41_cache_reference,
 )
 from b12x.attention import compressed_sparse_mla
-from b12x.attention.compressed_sparse_mla._scratch import B12XCompressedSparseMLAScratchCaps
+from b12x.attention.compressed_sparse_mla._scratch import (
+    B12XCompressedSparseMLAScratchCaps,
+)
 from b12x.attention._shared.mla.api import clear_mla_caches
 
 from ..conftest import require_b12x as require_sm120
@@ -74,7 +76,9 @@ def test_compressed_sparse_mla_layout_rejects_short_page() -> None:
         )
 
 
-@pytest.mark.parametrize(("cache_kind", "record_bytes"), [("swa", 528), ("indexed", 288)])
+@pytest.mark.parametrize(
+    ("cache_kind", "record_bytes"), [("swa", 528), ("indexed", 288)]
+)
 def test_deepseek_v41_reference_page_records_are_distinct(
     cache_kind: str, record_bytes: int
 ) -> None:
@@ -91,6 +95,7 @@ def test_deepseek_v41_reference_page_records_are_distinct(
     )
     assert unpacked.shape == (16, 512)
     assert torch.isfinite(unpacked).all()
+
 
 @pytest.mark.parametrize(
     "stride_fn,kwargs",
@@ -165,13 +170,15 @@ def _make_split_merge_tensors(
     attn_sink = torch.zeros((heads,), dtype=torch.float32, device=device)
     return tmp_output, tmp_lse, num_chunks_ptr, attn_sink, output
 
+
 def _page_size_from_cache(cache: torch.Tensor) -> int:
     """Recover the V4 page geometry from the supplied physical page metadata."""
     page_nbytes = int(cache.shape[1])
     matches = [
         page_size
         for page_size in (1, 2, 4, 16, 64, 256)
-        if page_nbytes in (
+        if page_nbytes
+        in (
             page_size * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
             compressed_sparse_mla_page_nbytes(page_size),
         )
@@ -181,7 +188,6 @@ def _page_size_from_cache(cache: torch.Tensor) -> int:
             f"cache page width {page_nbytes} does not identify one DSV4 page size"
         )
     return matches[0]
-
 
 
 def _prepare_compressed_binding(
@@ -207,9 +213,7 @@ def _prepare_compressed_binding(
     indexed_width = 0 if indexed_indices is None else int(indexed_indices.shape[1])
     swa_page_size = _page_size_from_cache(swa_k_cache)
     indexed_page_size = (
-        0
-        if indexed_k_cache is None
-        else _page_size_from_cache(indexed_k_cache)
+        0 if indexed_k_cache is None else _page_size_from_cache(indexed_k_cache)
     )
     caps = B12XCompressedSparseMLAScratchCaps(
         device=device,
@@ -263,12 +267,14 @@ def _prepare_compressed_binding(
             )
         )
 
-    result = PreparationSession(device=device, autotune=False).prepare((
-        declaration.request(
-            name="compressed-sparse-mla-test",
-            prepare_call=prepare_call,
-        ),
-    ))
+    result = PreparationSession(device=device, autotune=False).prepare(
+        (
+            declaration.request(
+                name="compressed-sparse-mla-test",
+                prepare_call=prepare_call,
+            ),
+        )
+    )
     plan = declaration
     return (
         result,
@@ -469,7 +475,6 @@ def test_compressed_sparse_mla_shared_core_replays_under_cuda_graph() -> None:
     )
     captured_out: torch.Tensor | None = None
 
-
     def run() -> torch.Tensor:
         nonlocal captured_out
         captured_out = compressed_sparse_mla.run(
@@ -648,8 +653,12 @@ def test_compressed_sparse_mla_out_param_writes_directly_and_matches() -> None:
     )
     with pytest.raises(ValueError, match="out must have shape"):
         compressed_sparse_mla.run(
-            plan=plan, binding=binding, swa_k_cache=swa_cache,
-            attn_sink=attn_sink, sm_scale=_SM_SCALE, out=bad_shape,
+            plan=plan,
+            binding=binding,
+            swa_k_cache=swa_cache,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+            out=bad_shape,
         )
     bad_dtype = torch.empty(
         (rows, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM),
@@ -658,8 +667,12 @@ def test_compressed_sparse_mla_out_param_writes_directly_and_matches() -> None:
     )
     with pytest.raises(TypeError, match="out must be bfloat16"):
         compressed_sparse_mla.run(
-            plan=plan, binding=binding, swa_k_cache=swa_cache,
-            attn_sink=attn_sink, sm_scale=_SM_SCALE, out=bad_dtype,
+            plan=plan,
+            binding=binding,
+            swa_k_cache=swa_cache,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+            out=bad_dtype,
         )
     non_contiguous = torch.empty(
         (rows, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM * 2),
@@ -668,6 +681,10 @@ def test_compressed_sparse_mla_out_param_writes_directly_and_matches() -> None:
     )[..., ::2]
     with pytest.raises(ValueError, match="out must be contiguous"):
         compressed_sparse_mla.run(
-            plan=plan, binding=binding, swa_k_cache=swa_cache,
-            attn_sink=attn_sink, sm_scale=_SM_SCALE, out=non_contiguous,
+            plan=plan,
+            binding=binding,
+            swa_k_cache=swa_cache,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+            out=non_contiguous,
         )

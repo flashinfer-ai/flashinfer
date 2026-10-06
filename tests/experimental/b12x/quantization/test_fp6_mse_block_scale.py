@@ -1,4 +1,5 @@
 """Phase 1.2: MSE-optimal per-block UE8M0 exponent (offline weights)."""
+
 from __future__ import annotations
 
 import pytest
@@ -35,11 +36,15 @@ def test_mse_never_worse_than_ceil_rmse() -> None:
         w, source_format="mxfp6_w6a8", use_gpu=False, block_scale_rule="mse"
     )
     hat_ceil = dequantize_linear_from_fp6(
-        qt_ceil.weight, qt_ceil.weight_scale, fmt=qt_ceil.fmt,
+        qt_ceil.weight,
+        qt_ceil.weight_scale,
+        fmt=qt_ceil.fmt,
         weight_scale_2=qt_ceil.weight_scale_2,
     )
     hat_mse = dequantize_linear_from_fp6(
-        qt_mse.weight, qt_mse.weight_scale, fmt=qt_mse.fmt,
+        qt_mse.weight,
+        qt_mse.weight_scale,
+        fmt=qt_mse.fmt,
         weight_scale_2=qt_mse.weight_scale_2,
     )
     rmse_ceil = _rel_frobenius_rmse(w, hat_ceil)

@@ -10,7 +10,11 @@ from benchmarks.experimental.b12x.common import require_sm120
 from b12x.norm import mhc
 
 from .test_mhc_lagged import _lagged_reference
-from b12x.testing.mhc import make_inputs as _make_inputs, pre_reference as _mhc_pre_reference, post_reference as _mhc_post_reference
+from b12x.testing.mhc import (
+    make_inputs as _make_inputs,
+    pre_reference as _mhc_pre_reference,
+    post_reference as _mhc_post_reference,
+)
 from ._mhc import declaration, prepare, bind, mhc_session
 
 
@@ -93,7 +97,6 @@ def test_mhc_lagged_parallel_rejects_y_output_alias(mhc_session) -> None:
         )
 
 
-
 def test_mhc_lagged_pre_unbound_frozen_capacity_mode(
     mhc_session,
 ) -> None:
@@ -114,8 +117,14 @@ def test_mhc_lagged_pre_unbound_frozen_capacity_mode(
     post_out = torch.empty((capacity, 4), dtype=torch.float32, device=device)
     comb_out = torch.empty((capacity, 4, 4), dtype=torch.float32, device=device)
 
-    options = dict(pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
-                   rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
+    options = dict(
+        pre_mix=incoming,
+        norm_weight=weight,
+        norm_eps=1e-20,
+        rms_eps=1e-20,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
     plan = prepare(mhc_session, "pre", (residual, fn, scale, bias), options)
 
     def run(live: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -124,7 +133,8 @@ def test_mhc_lagged_pre_unbound_frozen_capacity_mode(
             fn,
             scale,
             bias,
-            plan=plan, residual_out=residual_out[:live],
+            plan=plan,
+            residual_out=residual_out[:live],
             y_out=y_out[:live],
             post_out=post_out[:live],
             comb_out=comb_out[:live],
@@ -186,24 +196,59 @@ def test_mhc_lagged_parallel_decode_frozen_live_graph(
     del prev_y
     prev_post, prev_comb = prev_post.contiguous(), prev_comb.contiguous()
 
-    options = dict(pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
-                   rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
-    args = (residual, fn, scale, bias) if phase == "pre" else (x, residual, prev_post, prev_comb, fn, scale, bias)
-    plan = prepare(mhc_session, phase, args, options,
-                   lagged_prepare=True, partials_per_cta=partials_per_cta)
+    options = dict(
+        pre_mix=incoming,
+        norm_weight=weight,
+        norm_eps=1e-20,
+        rms_eps=1e-20,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
+    args = (
+        (residual, fn, scale, bias)
+        if phase == "pre"
+        else (x, residual, prev_post, prev_comb, fn, scale, bias)
+    )
+    plan = prepare(
+        mhc_session,
+        phase,
+        args,
+        options,
+        lagged_prepare=True,
+        partials_per_cta=partials_per_cta,
+    )
     binding = bind(plan, pre_out=pre_out)
 
     def run(live: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if phase == "pre":
             return mhc.run_pre(
-                residual[:live], fn, scale, bias, binding=binding,
-                pre_mix=incoming[:live], norm_weight=weight, norm_eps=1e-20,
-                rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
+                residual[:live],
+                fn,
+                scale,
+                bias,
+                binding=binding,
+                pre_mix=incoming[:live],
+                norm_weight=weight,
+                norm_eps=1e-20,
+                rms_eps=1e-20,
+                hc_eps=1e-6,
+                sinkhorn_iters=20,
             )
         return mhc.run_post_pre(
-            x[:live], residual[:live], prev_post[:live], prev_comb[:live], fn, scale, bias,
-            binding=binding, pre_mix=incoming[:live], norm_weight=weight, norm_eps=1e-20,
-            rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
+            x[:live],
+            residual[:live],
+            prev_post[:live],
+            prev_comb[:live],
+            fn,
+            scale,
+            bias,
+            binding=binding,
+            pre_mix=incoming[:live],
+            norm_weight=weight,
+            norm_eps=1e-20,
+            rms_eps=1e-20,
+            hc_eps=1e-6,
+            sinkhorn_iters=20,
         )
 
     # One prepared capacity accepts every live decode count.
@@ -227,7 +272,9 @@ def test_mhc_lagged_parallel_decode_frozen_live_graph(
         # Replay changes every producer input, including a non-uniform mix; a
         # stale rounded y or partial RMS statistic therefore cannot pass.
         incoming[:live].copy_(_nonuniform_mix(live, device).roll(1, dims=1))
-        residual[:live, 2].add_(torch.arange(live, device=device).view(-1, 1).bfloat16() / 32)
+        residual[:live, 2].add_(
+            torch.arange(live, device=device).view(-1, 1).bfloat16() / 32
+        )
         if phase == "post_pre":
             x[:live].add_(torch.arange(live, device=device).view(-1, 1).bfloat16() / 16)
         replay_incoming = incoming[:live].clone()
@@ -248,12 +295,20 @@ def test_mhc_lagged_parallel_decode_frozen_live_graph(
             residual[:live]
             if phase == "pre"
             else _source_reference(
-                lambda: _mhc_post_reference(x[:live], residual[:live], prev_post[:live], prev_comb[:live])
+                lambda: _mhc_post_reference(
+                    x[:live], residual[:live], prev_post[:live], prev_comb[:live]
+                )
             )
         )
         _assert_lagged_outputs(
-            actual, binding.pre_out[:live], current, fn, scale, bias,
-            incoming[:live], weight,
+            actual,
+            binding.pre_out[:live],
+            current,
+            fn,
+            scale,
+            bias,
+            incoming[:live],
+            weight,
         )
 
         graph.reset()
@@ -280,15 +335,23 @@ def test_mhc_lagged_post_pre_static_split_reuses_frozen_capacity(
     )
     prev_post, prev_comb = prev_post.contiguous(), prev_comb.contiguous()
 
-    options = dict(pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
-                   rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
+    options = dict(
+        pre_mix=incoming,
+        norm_weight=weight,
+        norm_eps=1e-20,
+        rms_eps=1e-20,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
     args = (x, residual, prev_post, prev_comb, fn, scale, bias)
     with monkeypatch.context() as controls:
         controls.setenv("B12X_MHC_DECODE_SPLITS", "4")
         controls.setenv("B12X_MHC_DECODE_TILE_N", "6")
         plan = declaration("post_pre", args, options, lagged_prepare=False)
     plan = prepare(mhc_session, "post_pre", args, options, plan=plan)
-    native = _lower_native(plan.query, plan.prepared.selection.config, plan.prepared.device)
+    native = _lower_native(
+        plan.query, plan.prepared.selection.config, plan.prepared.device
+    )
     assert native.source_splits == 4 and native.decode_tile_n == 6
     binding = bind(plan, pre_out=pre_out)
 

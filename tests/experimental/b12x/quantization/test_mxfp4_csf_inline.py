@@ -161,7 +161,9 @@ class _WordProbe:
         cute.arch.sync_threads()
         warp, quad = tid // Int32(32), (tid & Int32(31)) >> Int32(2)
         slot = warp * Int32(32) + quad * Int32(4)
-        tiles_bytes = Int64(self.experts * self.blocks * self.k_tiles * inline.TILE_BYTES)
+        tiles_bytes = Int64(
+            self.experts * self.blocks * self.k_tiles * inline.TILE_BYTES
+        )
         raw = tiles_bytes + Int64(self.experts * self.blocks * inline.BASE_BYTES)
         bases = inline.inline_row_bases(
             base, tiles_bytes, Int64(Int32(tile) // Int32(self.k_tiles)), slot
@@ -199,9 +201,15 @@ def test_device_words_match_native_stages(rows, columns, group, rotation, first)
     )
 
     def ptr(tensor, dtype):
-        return make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+        return make_ptr(
+            dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        )
 
-    args = (ptr(plane.storage, cutlass.Uint8), ptr(out, cutlass.Int32), current_cuda_stream())
+    args = (
+        ptr(plane.storage, cutlass.Uint8),
+        ptr(out, cutlass.Int32),
+        current_cuda_stream(),
+    )
     cute.compile(probe, *args)(*args)
     torch.cuda.synchronize()
     assert torch.equal(out, staged_words(native, rows, columns, group))

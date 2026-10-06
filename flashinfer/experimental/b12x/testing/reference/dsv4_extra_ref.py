@@ -309,15 +309,25 @@ def make_dsv4_extra_decode_case(
 
     main_bf16 = (
         torch.randn(
-            num_blocks, page_block_size, 1, d_qk,
-            device=device, dtype=torch.bfloat16, generator=gen,
+            num_blocks,
+            page_block_size,
+            1,
+            d_qk,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=gen,
         )
         / 10.0
     ).clamp(-1, 1)
     extra_bf16 = (
         torch.randn(
-            extra_num_blocks, pbs_extra, 1, d_qk,
-            device=device, dtype=torch.bfloat16, generator=gen,
+            extra_num_blocks,
+            pbs_extra,
+            1,
+            d_qk,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=gen,
         )
         / 10.0
     ).clamp(-1, 1)
@@ -328,18 +338,31 @@ def make_dsv4_extra_decode_case(
 
     q = (
         torch.randn(
-            num_tokens, num_heads, d_qk,
-            device=device, dtype=dtype, generator=gen,
+            num_tokens,
+            num_heads,
+            d_qk,
+            device=device,
+            dtype=dtype,
+            generator=gen,
         )
         / 10.0
     ).clamp(-1, 1)
 
     main_idx = torch.randint(
-        0, main_s_kv, (num_tokens, topk), device=device, dtype=torch.int32, generator=gen
+        0,
+        main_s_kv,
+        (num_tokens, topk),
+        device=device,
+        dtype=torch.int32,
+        generator=gen,
     )
     extra_idx = torch.randint(
-        0, extra_s_kv, (num_tokens, extra_topk),
-        device=device, dtype=torch.int32, generator=gen,
+        0,
+        extra_s_kv,
+        (num_tokens, extra_topk),
+        device=device,
+        dtype=torch.int32,
+        generator=gen,
     )
     if invalidate_half:
         if topk >= 2:
@@ -409,8 +432,14 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     #     (the dual oracle's concat/shift is a no-op when there is no extra
     #     section -> the const_expr(has_extra_cache=False) elision invariant.)
     single = dsv4_ref.make_dsv4_decode_case(
-        num_heads=8, topk=64, num_tokens=2, num_blocks=4,
-        invalidate_half=True, with_sink=False, device=device, seed=3,
+        num_heads=8,
+        topk=64,
+        num_tokens=2,
+        num_blocks=4,
+        invalidate_half=True,
+        with_sink=False,
+        device=device,
+        seed=3,
     )
     O_dual, lse_dual = dsv4_extra_decode_reference(
         single["q"],
@@ -431,9 +460,17 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     # (2) Brute-force dense cross-check on a TINY dual case (no online softmax,
     #     plain float matmul over the dequantized UNION of main+extra rows).
     case = make_dsv4_extra_decode_case(
-        num_heads=4, topk=8, extra_topk=6, num_tokens=2,
-        num_blocks=2, page_block_size=64, pbs_extra=2,
-        invalidate_half=False, with_sink=False, device=device, seed=4,
+        num_heads=4,
+        topk=8,
+        extra_topk=6,
+        num_tokens=2,
+        num_blocks=2,
+        page_block_size=64,
+        pbs_extra=2,
+        invalidate_half=False,
+        with_sink=False,
+        device=device,
+        seed=4,
     )
     q = case["q"].float()
     main_pool = case["kv_dequant"].reshape(-1, DSV4_D_QK).float()  # [main_s_kv, 512]
@@ -465,8 +502,14 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     # (3) num_splits spans BOTH sections.
     assert case["num_splits"] == dsv4_num_splits_dual(case["topk"], case["extra_topk"])
     big = make_dsv4_extra_decode_case(
-        num_heads=16, topk=128, extra_topk=2176, num_blocks=16,
-        page_block_size=64, pbs_extra=2, device=device, seed=5,
+        num_heads=16,
+        topk=128,
+        extra_topk=2176,
+        num_blocks=16,
+        page_block_size=64,
+        pbs_extra=2,
+        device=device,
+        seed=5,
     )
     # 128/64 + 2176/64 = 2 + 34 = 36 (>32, the old merge bound).
     assert big["num_splits"] == 36, big["num_splits"]
@@ -477,10 +520,18 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     #     result, and past-length entries are masked even though they point at
     #     valid slots.  Cross-check the truncated case against a brute force.
     case_l = make_dsv4_extra_decode_case(
-        num_heads=4, topk=8, extra_topk=8, num_tokens=2,
-        num_blocks=2, page_block_size=64, pbs_extra=2,
-        invalidate_half=False, with_extra_topk_length=True,
-        with_sink=False, device=device, seed=6,
+        num_heads=4,
+        topk=8,
+        extra_topk=8,
+        num_tokens=2,
+        num_blocks=2,
+        page_block_size=64,
+        pbs_extra=2,
+        invalidate_half=False,
+        with_extra_topk_length=True,
+        with_sink=False,
+        device=device,
+        seed=6,
     )
     assert case_l["extra_topk_length"] is not None
     q = case_l["q"].float()
@@ -504,17 +555,29 @@ def _self_test(device: str | torch.device = "cuda") -> None:
         valid = union_idx[t] >= 0
         rows = union_pool.index_select(0, union_idx[t].clamp(min=0))
         for h in range(nh):
-            logits = ((q[t, h] @ rows.t()) * sm_scale).masked_fill(~valid, float("-inf"))
+            logits = ((q[t, h] @ rows.t()) * sm_scale).masked_fill(
+                ~valid, float("-inf")
+            )
             w = torch.exp(logits - logits.max())
             bruteO[t, h] = (w @ rows[:, :DSV4_D_V]) / w.sum()
-    torch.testing.assert_close(case_l["expected_O"].float(), bruteO, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        case_l["expected_O"].float(), bruteO, atol=2e-2, rtol=2e-2
+    )
 
     # (5) sink path over the UNION runs and stays finite (single softmax folds
     #     the sink mass once across both sections).
     case_s = make_dsv4_extra_decode_case(
-        num_heads=4, topk=8, extra_topk=6, num_tokens=2,
-        num_blocks=2, page_block_size=64, pbs_extra=2,
-        invalidate_half=False, with_sink=True, device=device, seed=7,
+        num_heads=4,
+        topk=8,
+        extra_topk=6,
+        num_tokens=2,
+        num_blocks=2,
+        page_block_size=64,
+        pbs_extra=2,
+        invalidate_half=False,
+        with_sink=True,
+        device=device,
+        seed=7,
     )
     assert case_s["attn_sink"] is not None
     assert torch.isfinite(case_s["expected_O"].float()).all()
@@ -522,7 +585,11 @@ def _self_test(device: str | torch.device = "cuda") -> None:
 
     # (6) full-size dispatch shapes (num_heads=128) with pbs_extra=2.
     full = make_dsv4_extra_decode_case(
-        num_heads=128, topk=64, extra_topk=128, device=device, seed=8,
+        num_heads=128,
+        topk=64,
+        extra_topk=128,
+        device=device,
+        seed=8,
     )
     assert full["q"].shape == (1, 128, DSV4_D_QK)
     assert full["expected_O"].shape == (1, 128, DSV4_D_V)

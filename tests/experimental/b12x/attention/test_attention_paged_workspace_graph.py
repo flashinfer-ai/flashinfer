@@ -42,9 +42,7 @@ def _make_cpu_decode_graph_workspace(
         total_num_rows_ptr=torch.empty(1, dtype=torch.int32),
         block_valid_mask=torch.empty(work_items, dtype=torch.int32),
         cache_seqlens=torch.full((batch,), 4096, dtype=torch.int32),
-        tmp_output=torch.empty(
-            (partial_rows, q_heads, head_dim), dtype=torch.bfloat16
-        ),
+        tmp_output=torch.empty((partial_rows, q_heads, head_dim), dtype=torch.bfloat16),
         tmp_lse=torch.empty((partial_rows, q_heads), dtype=torch.float32),
         _plan=SimpleNamespace(
             split_kv=True,

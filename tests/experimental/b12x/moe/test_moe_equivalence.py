@@ -74,7 +74,8 @@ def _make_layer_chain_bindings(
     fast_math: bool,
 ):
     if not (
-        len(experts_stack) == len(topk_ids_per_layer)
+        len(experts_stack)
+        == len(topk_ids_per_layer)
         == len(topk_weights_per_layer)
         == len(output_buffers)
     ):
@@ -90,16 +91,20 @@ def _make_layer_chain_bindings(
             output_buffers,
             strict=True,
         ):
-            bindings.append(stack.enter_context(make_tp_moe_fp4_binding(
-                a=current,
-                experts=experts,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                fast_math=fast_math,
-                output=output,
-                input_scales_static=True,
-                quant_mode="nvfp4",
-            )))
+            bindings.append(
+                stack.enter_context(
+                    make_tp_moe_fp4_binding(
+                        a=current,
+                        experts=experts,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        fast_math=fast_math,
+                        output=output,
+                        input_scales_static=True,
+                        quant_mode="nvfp4",
+                    )
+                )
+            )
             current = output
         yield bindings
 
@@ -196,7 +201,9 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
             b12x_moe_fp4(binding=graph_binding)
 
         for seed in (123, 456):
-            x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=seed, device=device)
+            x, topk_ids, topk_weights = make_routed_inputs(
+                spec, m, seed=seed, device=device
+            )
             x_buf.copy_(x)
             topk_ids_buf.copy_(topk_ids)
             topk_weights_buf.copy_(topk_weights)
@@ -235,7 +242,9 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
     device = torch.device("cuda")
     spec = _make_spec()
     weights_stack = list(_load_multilayer_weights())
-    params_stack = [get_scale_contract_params(weights, "shared") for weights in weights_stack]
+    params_stack = [
+        get_scale_contract_params(weights, "shared") for weights in weights_stack
+    ]
     num_layers = len(weights_stack)
 
     x_buf = make_input_activations(spec, m, seed=10_000 + m, device=device)
@@ -270,12 +279,20 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
     eager_output_bufs = [torch.empty_like(x_buf) for _ in range(num_layers)]
     with (
         _make_layer_chain_bindings(
-            experts_stack, x_buf, topk_ids_bufs, topk_weights_bufs,
-            fast_math=True, output_buffers=graph_output_bufs,
+            experts_stack,
+            x_buf,
+            topk_ids_bufs,
+            topk_weights_bufs,
+            fast_math=True,
+            output_buffers=graph_output_bufs,
         ) as graph_bindings,
         _make_layer_chain_bindings(
-            experts_stack, x_buf, topk_ids_bufs, topk_weights_bufs,
-            fast_math=True, output_buffers=eager_output_bufs,
+            experts_stack,
+            x_buf,
+            topk_ids_bufs,
+            topk_weights_bufs,
+            fast_math=True,
+            output_buffers=eager_output_bufs,
         ) as eager_bindings,
     ):
         _run_layer_chain_bindings(graph_bindings)
@@ -295,10 +312,18 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
 
         for scenario_name, pattern, seed in scenario_specs:
             x_case = make_input_activations(
-                spec, m, seed=30_000 + m + seed, device=device,
+                spec,
+                m,
+                seed=30_000 + m + seed,
+                device=device,
             )
             routing_case = make_multilayer_routing_case(
-                spec, m, num_layers, device, pattern=pattern, seed=40_000 + m + seed,
+                spec,
+                m,
+                num_layers,
+                device,
+                pattern=pattern,
+                seed=40_000 + m + seed,
             )
 
             x_buf.copy_(x_case)
@@ -317,10 +342,10 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
                 metrics = compare_graph_replay_outputs(replay_out, eager_out)
                 max_abs = metrics.max_abs
                 cos = metrics.cos
-                assert (
-                    max_abs < max_abs_tol
-                ), f"m={m} scenario={scenario_name} layer={layer_idx}: max_abs={max_abs:.6f}"
-                assert (
-                    cos > cos_tol
-                ), f"m={m} scenario={scenario_name} layer={layer_idx}: cos={cos:.6f}"
+                assert max_abs < max_abs_tol, (
+                    f"m={m} scenario={scenario_name} layer={layer_idx}: max_abs={max_abs:.6f}"
+                )
+                assert cos > cos_tol, (
+                    f"m={m} scenario={scenario_name} layer={layer_idx}: cos={cos:.6f}"
+                )
         del graph

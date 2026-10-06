@@ -46,8 +46,15 @@ def compress_fixture(swizzled, rows, columns, raw=False):
 @pytest.mark.parametrize("activation_mode", ["a4", "a16"])
 @pytest.mark.parametrize("n", [64, 128, 192, 320])
 def test_native_expert_output_and_shared_scratch_poisoned_replay(
-    tokens, activation_mode, raw, n, inline_scales=None, autotune=False,
-    deterministic=True, tile_m=16, after_plan=None,
+    tokens,
+    activation_mode,
+    raw,
+    n,
+    inline_scales=None,
+    autotune=False,
+    deterministic=True,
+    tile_m=16,
+    after_plan=None,
 ):
     device = require_b12x()
     e, h, topk = 8, 256, 2
@@ -78,8 +85,13 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
     )
     buffers = (torch.empty_like(s13), torch.empty_like(s2))
     compressed = moe.Nvfp4CsfWeights(
-        packed=replace(packed, w13=packed.w13.clone(), w2=packed.w2.clone(),
-                       w13_block_scales=buffers[0], w2_block_scales=buffers[1]),
+        packed=replace(
+            packed,
+            w13=packed.w13.clone(),
+            w2=packed.w2.clone(),
+            w13_block_scales=buffers[0],
+            w2_block_scales=buffers[1],
+        ),
         w13_scales=compress_fixture(s13, 2 * n, h // 16, raw=raw),
         w2_scales=compress_fixture(s2, h, n // 16, raw=raw),
     )
@@ -96,10 +108,17 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
         assert experts[1]._impl.w4a16_expanded is not None
     from b12x.moe.fused_moe._tuning import MoeDecodeConfig
 
-    override = None if inline_scales is None else MoeDecodeConfig(
-        backend="dynamic", route_planner="internal", max_active_clusters=None,
-        dynamic_tile_m=tile_m, dynamic_route_mode="grouped",
-        nvfp4_inline_scales=inline_scales,
+    override = (
+        None
+        if inline_scales is None
+        else MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="internal",
+            max_active_clusters=None,
+            dynamic_tile_m=tile_m,
+            dynamic_route_mode="grouped",
+            nvfp4_inline_scales=inline_scales,
+        )
     )
     plans = [
         moe.plan_execution(
@@ -107,9 +126,9 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
             capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
             invocation={"fast_math": False},
             routing=moe.RoutingSpec(deterministic_output=deterministic),
-            override=override if i == 1 else (
-                replace(override, nvfp4_inline_scales=False) if override else None
-            ),
+            override=override
+            if i == 1
+            else (replace(override, nvfp4_inline_scales=False) if override else None),
         )
         for i, owner in enumerate(experts)
     ]
@@ -216,7 +235,12 @@ def test_split_gate_scale_operands_preserve_native_output_for_consumer_counts(ti
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_indexed_scale_programs_are_declared_for_preparation(deterministic):
     test_native_expert_output_and_shared_scratch_poisoned_replay(
-        1, "a4", True, 128, inline_scales=False, autotune=True,
+        1,
+        "a4",
+        True,
+        128,
+        inline_scales=False,
+        autotune=True,
         deterministic=deterministic,
     )
 
@@ -245,16 +269,26 @@ def test_a16_stage_scales_reuse_the_planned_launch_for_live_counts():
     s2 = domain["w2_sfb"].view(torch.float8_e4m3fn).view(e, h, n // 16)
     one = torch.ones(e, device=device)
     packed = moe.PackedWeights(
-        w13=domain["w13_packed"], w2=domain["w2_packed"],
-        w13_block_scales=s13, w2_block_scales=s2,
-        w13_global_scales=one, w2_global_scales=one,
-        input_scale=one, intermediate_scale=one, immutable_input_scales=True,
+        w13=domain["w13_packed"],
+        w2=domain["w2_packed"],
+        w13_block_scales=s13,
+        w2_block_scales=s2,
+        w13_global_scales=one,
+        w2_global_scales=one,
+        input_scale=one,
+        intermediate_scale=one,
+        immutable_input_scales=True,
     )
     buffers = (torch.empty_like(s13), torch.empty_like(s2))
     # Native preparation repacks its package in place: compress the source first.
     compressed = moe.Nvfp4CsfWeights(
-        packed=replace(packed, w13=packed.w13.clone(), w2=packed.w2.clone(),
-                       w13_block_scales=buffers[0], w2_block_scales=buffers[1]),
+        packed=replace(
+            packed,
+            w13=packed.w13.clone(),
+            w2=packed.w2.clone(),
+            w13_block_scales=buffers[0],
+            w2_block_scales=buffers[1],
+        ),
         w13_scales=compress_fixture(s13, 2 * n, h // 16),
         w2_scales=compress_fixture(s2, h, n // 16),
     )
@@ -275,11 +309,19 @@ def test_a16_stage_scales_reuse_the_planned_launch_for_live_counts():
 
     def bind(plan, rows):
         scratch = tuple(
-            torch.empty(s.shape, dtype=s.dtype, device=device) for s in plan.scratch_specs()
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in plan.scratch_specs()
         )
         output = torch.empty_like(x[:rows])
-        binding = moe.bind(plan, a=x[:rows], topk_ids=ids[:rows], topk_weights=weights[:rows],
-                           output=output, scratch=scratch, input_scales_static=True)
+        binding = moe.bind(
+            plan,
+            a=x[:rows],
+            topk_ids=ids[:rows],
+            topk_weights=weights[:rows],
+            output=output,
+            scratch=scratch,
+            input_scales_static=True,
+        )
         return binding, output, scratch
 
     def prepare(state):
@@ -288,14 +330,27 @@ def test_a16_stage_scales_reuse_the_planned_launch_for_live_counts():
             for s in state.scratch.scratch_specs()
         )
         output = torch.empty_like(x)
-        binding = state.bind(a=x, topk_ids=ids, topk_weights=weights, output=output,
-                             scratch=scratch, input_scales_static=True)
-        return PreparedCall(run=lambda: state.run(binding), output=output, owners=(scratch, binding))
+        binding = state.bind(
+            a=x,
+            topk_ids=ids,
+            topk_weights=weights,
+            output=output,
+            scratch=scratch,
+            input_scales_static=True,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding), output=output, owners=(scratch, binding)
+        )
 
-    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
-        session.prepare(tuple(
-            p.request(name=f"csf-live-{i}", prepare_call=prepare) for i, p in enumerate(plans)
-        ))
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            tuple(
+                p.request(name=f"csf-live-{i}", prepare_call=prepare)
+                for i, p in enumerate(plans)
+            )
+        )
         session.freeze()
         for rows in (1, 7, 33, capacity):
             native, compressed = (bind(plan, rows) for plan in plans)
@@ -310,7 +365,9 @@ def test_a16_stage_scales_reuse_the_planned_launch_for_live_counts():
             assert all(torch.all(buf.view(torch.uint8) == 0x7F) for buf in buffers)
 
 
-@pytest.mark.parametrize("activation_mode,backend", [("a16", None), ("a4", None), ("a4", "dynamic")])
+@pytest.mark.parametrize(
+    "activation_mode,backend", [("a16", None), ("a4", None), ("a4", "dynamic")]
+)
 def test_prefetched_scales_replace_the_per_call_expansion(activation_mode, backend):
     """expand_scales() fills the shared scratch for a later scales_expanded call."""
     from b12x.moe.fused_moe._impl import W4A16_CSF_STAGE_MAX_TOKENS
@@ -323,7 +380,9 @@ def test_prefetched_scales_replace_the_per_call_expansion(activation_mode, backe
     weight_plan = moe.plan_weights(
         source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
         activation=moe.ActivationSpec(
-            mode=activation_mode, nonlinearity="silu", io_dtype=torch.bfloat16,
+            mode=activation_mode,
+            nonlinearity="silu",
+            io_dtype=torch.bfloat16,
             swiglu_limit=10.0,
         ),
         geometry=moe.MoEGeometry(num_experts=e, hidden_size=h, intermediate_size=n),
@@ -332,15 +391,25 @@ def test_prefetched_scales_replace_the_per_call_expansion(activation_mode, backe
     s2 = domain["w2_sfb"].view(torch.float8_e4m3fn).view(e, h, n // 16)
     one = torch.ones(e, device=device)
     packed = moe.PackedWeights(
-        w13=domain["w13_packed"], w2=domain["w2_packed"],
-        w13_block_scales=s13, w2_block_scales=s2,
-        w13_global_scales=one, w2_global_scales=one,
-        input_scale=one, intermediate_scale=one, immutable_input_scales=True,
+        w13=domain["w13_packed"],
+        w2=domain["w2_packed"],
+        w13_block_scales=s13,
+        w2_block_scales=s2,
+        w13_global_scales=one,
+        w2_global_scales=one,
+        input_scale=one,
+        intermediate_scale=one,
+        immutable_input_scales=True,
     )
     buffers = (torch.empty_like(s13), torch.empty_like(s2))
     compressed = moe.Nvfp4CsfWeights(
-        packed=replace(packed, w13=packed.w13.clone(), w2=packed.w2.clone(),
-                       w13_block_scales=buffers[0], w2_block_scales=buffers[1]),
+        packed=replace(
+            packed,
+            w13=packed.w13.clone(),
+            w2=packed.w2.clone(),
+            w13_block_scales=buffers[0],
+            w2_block_scales=buffers[1],
+        ),
         w13_scales=compress_fixture(s13, 2 * n, h // 16),
         w2_scales=compress_fixture(s2, h, n // 16),
     )
@@ -350,30 +419,48 @@ def test_prefetched_scales_replace_the_per_call_expansion(activation_mode, backe
     assert not moe.expand_scales(experts[0])
     from b12x.moe.fused_moe._tuning import MoeDecodeConfig
 
-    override = None if backend is None else MoeDecodeConfig(
-        backend="dynamic", route_planner="internal", max_active_clusters=None,
-        dynamic_tile_m=16, dynamic_route_mode="grouped", nvfp4_inline_scales=False,
+    override = (
+        None
+        if backend is None
+        else MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="internal",
+            max_active_clusters=None,
+            dynamic_tile_m=16,
+            dynamic_route_mode="grouped",
+            nvfp4_inline_scales=False,
+        )
     )
     plans = [
         moe.plan_execution(
             experts=owner,
             capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
-            invocation={"fast_math": False}, override=override,
+            invocation={"fast_math": False},
+            override=override,
             routing=moe.RoutingSpec(deterministic_output=True),
         )
         for owner in experts
     ]
     source, ids, probabilities = domain["x"], domain["topk_ids"], domain["topk_weights"]
     scratches = [
-        tuple(torch.empty(s.shape, dtype=s.dtype, device=device) for s in p.scratch_specs())
+        tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in p.scratch_specs()
+        )
         for p in plans
     ]
 
     def call(index, **kwargs):
         output = torch.full_like(source, float("nan"))
         binding = moe.bind(
-            plans[index], a=source, topk_ids=ids, topk_weights=probabilities,
-            output=output, scratch=scratches[index], input_scales_static=True, **kwargs,
+            plans[index],
+            a=source,
+            topk_ids=ids,
+            topk_weights=probabilities,
+            output=output,
+            scratch=scratches[index],
+            input_scales_static=True,
+            **kwargs,
         )
         moe.run(binding=binding)
         torch.cuda.synchronize()
@@ -386,14 +473,20 @@ def test_prefetched_scales_replace_the_per_call_expansion(activation_mode, backe
         )
         output = torch.empty_like(source)
         binding = state.bind(
-            a=source, topk_ids=ids, topk_weights=probabilities, output=output,
-            scratch=scratch, input_scales_static=True,
+            a=source,
+            topk_ids=ids,
+            topk_weights=probabilities,
+            output=output,
+            scratch=scratch,
+            input_scales_static=True,
         )
         return PreparedCall(
             run=lambda: state.run(binding), output=output, owners=(scratch, binding)
         )
 
-    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
         session.prepare(
             tuple(
                 p.request(name=f"nvfp4-scale-prefetch-{i}", prepare_call=prepare)
@@ -418,7 +511,9 @@ def test_prefetched_scales_replace_the_per_call_expansion(activation_mode, backe
         with torch.cuda.stream(side):
             assert moe.expand_scales(experts[1])
         torch.cuda.current_stream(device).wait_stream(side)
-        torch.testing.assert_close(call(1, scales_expanded=True), reference, rtol=0, atol=0)
+        torch.testing.assert_close(
+            call(1, scales_expanded=True), reference, rtol=0, atol=0
+        )
         # Without the flag the call still expands its own routed experts.
         poison()
         torch.testing.assert_close(call(1), reference, rtol=0, atol=0)
@@ -430,12 +525,19 @@ def test_prefetched_scales_replace_the_per_call_expansion(activation_mode, backe
                 assert moe.expand_scales(experts[1])
                 assert torch.cuda.current_device() == 1
             torch.cuda.synchronize(device)
-            torch.testing.assert_close(call(1, scales_expanded=True), reference, rtol=0, atol=0)
+            torch.testing.assert_close(
+                call(1, scales_expanded=True), reference, rtol=0, atol=0
+            )
 
         output = torch.empty_like(source)
         binding = moe.bind(
-            plans[1], a=source, topk_ids=ids, topk_weights=probabilities,
-            output=output, scratch=scratches[1], input_scales_static=True,
+            plans[1],
+            a=source,
+            topk_ids=ids,
+            topk_weights=probabilities,
+            output=output,
+            scratch=scratches[1],
+            input_scales_static=True,
             scales_expanded=True,
         )
         session.freeze()
@@ -449,17 +551,26 @@ def test_prefetched_scales_replace_the_per_call_expansion(activation_mode, backe
             allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
             graph.replay()
             torch.cuda.synchronize()
-            assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+            assert (
+                torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+            )
             torch.testing.assert_close(output, reference, rtol=0, atol=0)
         graph.reset()
 
 
 @pytest.mark.parametrize("declared,changed,tokens", [(64, 1536, 300), (1536, 0, 33)])
-def test_stage_scale_capacity_control_is_retained(declared, changed, tokens, monkeypatch):
+def test_stage_scale_capacity_control_is_retained(
+    declared, changed, tokens, monkeypatch
+):
     from b12x.moe.fused_moe import _impl
 
     monkeypatch.setattr(_impl, "W4A16_CSF_STAGE_MAX_TOKENS", declared)
     test_native_expert_output_and_shared_scratch_poisoned_replay(
-        tokens, "a16", False, 128,
-        after_plan=lambda: monkeypatch.setattr(_impl, "W4A16_CSF_STAGE_MAX_TOKENS", changed),
+        tokens,
+        "a16",
+        False,
+        128,
+        after_plan=lambda: monkeypatch.setattr(
+            _impl, "W4A16_CSF_STAGE_MAX_TOKENS", changed
+        ),
     )

@@ -55,15 +55,23 @@ _NATIVE_JITS = weakref.WeakSet()
 
 def retained_program_keys():
     return frozenset(
-        program for retained in tuple(_LIVE_RETAINED_PROGRAMS)
-        for owner in retained.owners.values() for program in program_keys(owner)
+        program
+        for retained in tuple(_LIVE_RETAINED_PROGRAMS)
+        for owner in retained.owners.values()
+        for program in program_keys(owner)
     )
 
 
-def _planning_artifacts(value: Any, seen: set[int] | None = None) -> Iterator[ProgramKey]:
+def _planning_artifacts(
+    value: Any, seen: set[int] | None = None
+) -> Iterator[ProgramKey]:
     """The programs of every deferred kernel inside a memoized value that was never compiled."""
     seen = set() if seen is None else seen
-    if id(value) in seen or value is None or isinstance(value, (str, bytes, int, float, bool)):
+    if (
+        id(value) in seen
+        or value is None
+        or isinstance(value, (str, bytes, int, float, bool))
+    ):
         return
     seen.add(id(value))
     if isinstance(value, (DeferredCuTeKernel, DeferredTritonKernel)):
@@ -90,10 +98,14 @@ def evict_planning_artifacts(programs: Iterable[ProgramKey] | None = None) -> in
     program set, every uncompiled deferred program is dropped.
     """
     from .program_cache import _CACHES, _MAPPING_CACHES
+
     targets = None if programs is None else frozenset(programs)
 
     def stale(value) -> bool:
-        return any(targets is None or program in targets for program in _planning_artifacts(value))
+        return any(
+            targets is None or program in targets
+            for program in _planning_artifacts(value)
+        )
 
     removed = 0
     caches = [(cache._values, (), cache._lock) for cache in tuple(_CACHES)]
@@ -121,8 +133,11 @@ def evict_unretained_triton(keep):
     removed = 0
     for jit in tuple(_NATIVE_JITS):
         for kernel_cache, key_cache, *_ in jit.device_caches.values():
-            obsolete = {key for key, kernel in kernel_cache.items()
-                        if not frozenset(program_keys(kernel)) <= keep}
+            obsolete = {
+                key
+                for key, kernel in kernel_cache.items()
+                if not frozenset(program_keys(kernel)) <= keep
+            }
             for key in obsolete:
                 del kernel_cache[key]
             for key, value in tuple(key_cache.items()):
@@ -138,9 +153,11 @@ def compiled_program_available(program: ProgramKey) -> bool:
         return True
     if program.dialect == "cute":
         from .compiler import _valid_cute_compile_cache
+
         return _valid_cute_compile_cache(program.key)
     if program.dialect == "triton":
         from triton.compiler.compiler import get_cache_manager
+
         if not program.name:
             raise ValueError("Triton availability requires its current descriptor name")
         group = get_cache_manager(program.key).get_group(f"{program.name[:150]}.json")
@@ -180,7 +197,9 @@ def _load_triton_only(source, target=None, options=None, _env_vars=None):
     program = _triton_program(source, target, options, _env_vars)
     group = get_cache_manager(program.key).get_group(f"{source.name[:150]}.json")
     if not group:
-        raise RuntimeError(f"no-compilation phase encountered an uncached Triton program: {program.name} {program.key}")
+        raise RuntimeError(
+            f"no-compilation phase encountered an uncached Triton program: {program.name} {program.key}"
+        )
     record_program(program)
     return CompiledKernel(source, group, program.key)
 
@@ -193,7 +212,8 @@ def launch_triton(kernel, grid, *args, **kwargs):
         args = tuple(
             MockTensor(arg.dtype, tuple(arg.shape))
             if getattr(getattr(arg, "device", None), "type", None) == "meta"
-            or getattr(arg, "fake_mode", None) is not None else arg
+            or getattr(arg, "fake_mode", None) is not None
+            else arg
             for arg in args
         )
         compiled = kernel.warmup(*args, grid=grid, **kwargs)
@@ -223,7 +243,11 @@ def record_program(program: ProgramKey, owner: Any = None) -> None:
 
 def program_keys(value: Any) -> tuple[ProgramKey, ...]:
     """Return compiler program identities retained by ``value``."""
-    if value is None or isinstance(value, (str, int, float, bool)) or type(value).__module__ == "torch":
+    if (
+        value is None
+        or isinstance(value, (str, int, float, bool))
+        or type(value).__module__ == "torch"
+    ):
         return ()
     if isinstance(value, Mapping):
         value = tuple(value.values())
@@ -238,6 +262,7 @@ def program_keys(value: Any) -> tuple[ProgramKey, ...]:
         # unrelated sweep.
         return ()
     from triton.compiler.compiler import CompiledKernel
+
     if isinstance(value, CompiledKernel):
         return (ProgramKey("triton", value.hash, value.name),)
     raise TypeError(f"compile factory returned an unannotated {type(value).__name__}")
@@ -245,7 +270,9 @@ def program_keys(value: Any) -> tuple[ProgramKey, ...]:
 
 def attach_programs(value: Any, *dependencies: Any) -> Any:
     """Retain exact compiler keys on a host launch closure or compile plan."""
-    keys = tuple(dict.fromkeys(key for item in dependencies for key in program_keys(item)))
+    keys = tuple(
+        dict.fromkeys(key for item in dependencies for key in program_keys(item))
+    )
     object.__setattr__(value, "__b12x_programs__", keys)
     object.__setattr__(value, "__b12x_dependencies__", tuple(dependencies))
     return value
@@ -312,18 +339,25 @@ class DeferredCuTeKernel:
 
     def _load(self):
         if planning():
-            raise RuntimeError("compile planning attempted kernel execution or resource inspection")
+            raise RuntimeError(
+                "compile planning attempted kernel execution or resource inspection"
+            )
         record_program(self.__b12x_programs__[0])
         if self._resolved is None:
             from . import compiler
             from .runtime_control import raise_if_kernel_resolution_frozen
+
             program = self.__b12x_programs__[0]
             value = compiler._memory_cache_get(self._memory_key)
             if value is None:
-                raise_if_kernel_resolution_frozen("planned CuTe object load", cache_key=program.key)
+                raise_if_kernel_resolution_frozen(
+                    "planned CuTe object load", cache_key=program.key
+                )
                 value = compiler._load_cute_compile_from_disk(program.key)
                 if value is None:
-                    raise RuntimeError(f"planned CuTe program has not been compiled: {program.name} {program.key}")
+                    raise RuntimeError(
+                        f"planned CuTe program has not been compiled: {program.name} {program.key}"
+                    )
                 value = tag_compiled(value, program)
                 compiler._memory_cache_put(self._memory_key, value)
             self._resolved = value
@@ -345,15 +379,24 @@ class DeferredTritonKernel:
 
     def _load(self):
         if planning():
-            raise RuntimeError("compile planning attempted Triton execution or resource inspection")
+            raise RuntimeError(
+                "compile planning attempted Triton execution or resource inspection"
+            )
         if self._resolved is None:
             from triton.compiler.compiler import CompiledKernel, get_cache_manager
             from .runtime_control import raise_if_kernel_resolution_frozen
+
             program = self.__b12x_programs__[0]
-            raise_if_kernel_resolution_frozen("planned Triton object load", cache_key=program.key)
-            group = get_cache_manager(program.key).get_group(f"{self._source.name[:150]}.json")
+            raise_if_kernel_resolution_frozen(
+                "planned Triton object load", cache_key=program.key
+            )
+            group = get_cache_manager(program.key).get_group(
+                f"{self._source.name[:150]}.json"
+            )
             if not group:
-                raise RuntimeError(f"planned Triton program has not been compiled: {program.name} {program.key}")
+                raise RuntimeError(
+                    f"planned Triton program has not been compiled: {program.name} {program.key}"
+                )
             self._resolved = CompiledKernel(self._source, group, program.key)
             _RESIDENT_PROGRAMS[program] = self._resolved
         record_program(self.__b12x_programs__[0], self._resolved)
@@ -398,14 +441,18 @@ def load_programs(value: Any) -> Any:
             record_program(item.__b12x_programs__[0], item)
         elif isinstance(item, CompiledKernel):
             if item.module is None:
-                raise_if_kernel_resolution_frozen("prepared Triton module load", cache_key=item.hash)
+                raise_if_kernel_resolution_frozen(
+                    "prepared Triton module load", cache_key=item.hash
+                )
                 item._init_handles()
             for program in program_keys(item):
                 record_program(program, item)
         else:
             dependencies = getattr(item, "__b12x_dependencies__", None)
             if dependencies is None:
-                raise TypeError(f"executable carrier has no explicit dependencies: {type(item).__name__}")
+                raise TypeError(
+                    f"executable carrier has no explicit dependencies: {type(item).__name__}"
+                )
             for child in dependencies:
                 load(child)
 
@@ -418,8 +465,13 @@ def _triton_program(source, target=None, options=None, _env_vars=None):
     # source/options/environment key and optional instrumentation contribution.
     from triton import knobs
     from triton.compiler.compiler import (
-        ASTSource, driver, get_cache_invalidating_env_vars, get_cache_key, make_backend,
+        ASTSource,
+        driver,
+        get_cache_invalidating_env_vars,
+        get_cache_key,
+        make_backend,
     )
+
     if not isinstance(source, ASTSource):
         raise TypeError("startup planning requires a Triton AST compilation request")
     target = driver.active.get_current_target() if target is None else target
@@ -450,7 +502,9 @@ def serialized_compilations():
         _SERIALIZE_TRITON.reset(token)
 
 
-def _locked_triton_compile(compile_fn, source, target=None, options=None, _env_vars=None):
+def _locked_triton_compile(
+    compile_fn, source, target=None, options=None, _env_vars=None
+):
     import fcntl
     from pathlib import Path
     from triton.compiler.compiler import get_cache_manager
@@ -459,12 +513,16 @@ def _locked_triton_compile(compile_fn, source, target=None, options=None, _env_v
     cache = get_cache_manager(program.key)
     directory = getattr(cache, "cache_dir", None)
     if directory is None:
-        raise RuntimeError("parallel Triton compilation requires its local persistent cache")
+        raise RuntimeError(
+            "parallel Triton compilation requires its local persistent cache"
+        )
     Path(directory).mkdir(parents=True, exist_ok=True)
     with (Path(directory) / ".b12x-compile.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            result = compile_fn(source, target=target, options=options, _env_vars=_env_vars)
+            result = compile_fn(
+                source, target=target, options=options, _env_vars=_env_vars
+            )
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     record_program(program)
@@ -477,6 +535,7 @@ def _ensure_triton_hook():
         return
     from triton.runtime.jit import JITFunction
     from triton.compiler.compiler import CompiledKernel
+
     original = JITFunction._do_compile
     original_run = JITFunction.run
     original_init = CompiledKernel._init_handles
@@ -488,7 +547,10 @@ def _ensure_triton_hook():
         native = module == "b12x" or module.startswith("b12x.")
         if native and self.module is None:
             from .runtime_control import raise_if_kernel_resolution_frozen
-            raise_if_kernel_resolution_frozen("Triton compiled module load", target=fn, cache_key=self.hash)
+
+            raise_if_kernel_resolution_frozen(
+                "Triton compiled module load", target=fn, cache_key=self.hash
+            )
         original_init(self)
         if native:
             if not hasattr(self, "__b12x_programs__"):
@@ -509,20 +571,35 @@ def _ensure_triton_hook():
         module = getattr(self.fn, "__module__", "")
         if module == "b12x" or module.startswith("b12x."):
             _NATIVE_JITS.add(self)
-        if result is not None and (_OBSERVERS.get() or planning() or _RETAINED_PROGRAMS.get() is not None):
+        if result is not None and (
+            _OBSERVERS.get() or planning() or _RETAINED_PROGRAMS.get() is not None
+        ):
             for program in program_keys(result):
                 record_program(program, result)
         return result
 
-    def compile_or_plan(self, key, signature, device, constexprs, options, attrs, warmup):
+    def compile_or_plan(
+        self, key, signature, device, constexprs, options, attrs, warmup
+    ):
         module = getattr(self.fn, "__module__", "")
         if module == "b12x" or module.startswith("b12x."):
             from .runtime_control import raise_if_kernel_resolution_frozen
-            raise_if_kernel_resolution_frozen("Triton JIT miss", target=self.fn, cache_key=key)
-        if not planning() and not _SERIALIZE_TRITON.get() and not _FORBID_LOWERING.get():
-            return original(self, key, signature, device, constexprs, options, attrs, warmup)
+
+            raise_if_kernel_resolution_frozen(
+                "Triton JIT miss", target=self.fn, cache_key=key
+            )
+        if (
+            not planning()
+            and not _SERIALIZE_TRITON.get()
+            and not _FORBID_LOWERING.get()
+        ):
+            return original(
+                self, key, signature, device, constexprs, options, attrs, warmup
+            )
         if planning() and not warmup:
-            raise RuntimeError("compile-plan factories must use Triton warmup, never launch")
+            raise RuntimeError(
+                "compile-plan factories must use Triton warmup, never launch"
+            )
         previous = self.compile
         if planning():
             self.compile = _plan_triton
@@ -530,9 +607,12 @@ def _ensure_triton_hook():
             self.compile = _load_triton_only
         else:
             from functools import partial
+
             self.compile = partial(_locked_triton_compile, previous)
         try:
-            return original(self, key, signature, device, constexprs, options, attrs, warmup)
+            return original(
+                self, key, signature, device, constexprs, options, attrs, warmup
+            )
         finally:
             self.compile = previous
 
@@ -555,7 +635,20 @@ def plan_compilations():
         _PLANNING.reset(token)
 
 
-__all__ = ["DeferredCuTeKernel", "ProgramKey", "ProgramBundle", "attach_programs",
-           "compile_only_launches", "compile_only_launches_enabled", "observe_programs",
-           "launch_triton", "plan_compilations", "planning", "program_keys", "record_program",
-           "retain_compiled_programs", "serialized_compilations", "tag_compiled"]
+__all__ = [
+    "DeferredCuTeKernel",
+    "ProgramKey",
+    "ProgramBundle",
+    "attach_programs",
+    "compile_only_launches",
+    "compile_only_launches_enabled",
+    "observe_programs",
+    "launch_triton",
+    "plan_compilations",
+    "planning",
+    "program_keys",
+    "record_program",
+    "retain_compiled_programs",
+    "serialized_compilations",
+    "tag_compiled",
+]

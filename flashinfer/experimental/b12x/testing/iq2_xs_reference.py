@@ -549,9 +549,11 @@ def dequantize_blocks(blocks: torch.Tensor) -> torch.Tensor:
     """Decode source [..., K/256, 74] blocks to FP32 [..., K] on CPU."""
     if blocks.shape[-1] == 34:
         from .q8_0_reference import dequantize_blocks as decode_q8
+
         return decode_q8(blocks)
     if blocks.shape[-1] == 66:
         from .iq2_xxs_reference import dequantize_blocks as decode_xxs
+
         return decode_xxs(blocks)
     if blocks.dtype != torch.uint8 or blocks.shape[-1] != 74:
         raise ValueError("expected uint8 IQ2_XS blocks ending in 74 bytes")

@@ -16,7 +16,8 @@ class _Decode:
     @cute.jit
     def __call__(self, source, decoded, reciprocal, count: Int32, stream):
         self.kernel(source, decoded, reciprocal, count).launch(
-            grid=[cute.ceil_div(count, 128), 1, 1], block=[128, 1, 1], stream=stream)
+            grid=[cute.ceil_div(count, 128), 1, 1], block=[128, 1, 1], stream=stream
+        )
 
     @cute.kernel
     def kernel(self, source, decoded, reciprocal, count: Int32):
@@ -34,11 +35,19 @@ def test_e4m3_decode_and_reciprocal_all_codes():
     source = torch.arange(256, device=device).to(torch.uint8)
     decoded = torch.empty(256, dtype=torch.float32, device=device)
     reciprocal = torch.empty_like(decoded)
-    arrays = tuple(from_dlpack(t, assumed_align=16) for t in (source, decoded, reciprocal))
+    arrays = tuple(
+        from_dlpack(t, assumed_align=16) for t in (source, decoded, reciprocal)
+    )
     stream = current_cuda_stream()
-    kernel = compile_kernel(_Decode(), *arrays, Int32(256), stream,
-        compile_spec=KernelCompileSpec.from_fields('test.e4m3-scalar-decode', 1,
-                                                  ('capacity', 256)))
+    kernel = compile_kernel(
+        _Decode(),
+        *arrays,
+        Int32(256),
+        stream,
+        compile_spec=KernelCompileSpec.from_fields(
+            "test.e4m3-scalar-decode", 1, ("capacity", 256)
+        ),
+    )
     kernel(*arrays, Int32(256), stream)
     torch.cuda.synchronize()
     reference = source.view(torch.float8_e4m3fn).float()
@@ -46,6 +55,7 @@ def test_e4m3_decode_and_reciprocal_all_codes():
     # NaN conversion may canonicalize its sign; finite values retain it.
     finite = reference.isfinite()
     assert torch.equal(torch.signbit(decoded[finite]), torch.signbit(reference[finite]))
-    expected_reciprocal = torch.where(reference == 0, 0., reference.reciprocal())
-    torch.testing.assert_close(reciprocal, expected_reciprocal,
-                               rtol=2e-7, atol=0, equal_nan=True)
+    expected_reciprocal = torch.where(reference == 0, 0.0, reference.reciprocal())
+    torch.testing.assert_close(
+        reciprocal, expected_reciprocal, rtol=2e-7, atol=0, equal_nan=True
+    )

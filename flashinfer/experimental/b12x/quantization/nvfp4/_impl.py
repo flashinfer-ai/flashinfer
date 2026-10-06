@@ -148,8 +148,7 @@ def compile_bf16_to_fp4_tma(
     mac = min(get_max_active_clusters(1), get_num_sm(torch.device("cuda")))
     if liveness_strategy not in {"retain", "packed"}:
         raise ValueError(
-            "liveness_strategy must be 'retain' or 'packed', got "
-            f"{liveness_strategy!r}"
+            f"liveness_strategy must be 'retain' or 'packed', got {liveness_strategy!r}"
         )
     cache_key = (M, K, liveness_strategy, mac)
     cached = _KERNEL_CACHE.get(cache_key)

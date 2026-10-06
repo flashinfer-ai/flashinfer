@@ -1,4 +1,5 @@
 """A stop drops only undispatched optional work, never promoted requirements."""
+
 import os
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -43,8 +44,12 @@ def test_stop_preserves_promoted_shared_required_programs(monkeypatch):
         pool_arguments.append(kwargs)
         return workers
 
-    context = SimpleNamespace(Array=lambda kind, values: Activity(values), Pool=create_pool)
-    monkeypatch.setattr(compile_pool.multiprocessing, "get_context", lambda kind: context)
+    context = SimpleNamespace(
+        Array=lambda kind, values: Activity(values), Pool=create_pool
+    )
+    monkeypatch.setattr(
+        compile_pool.multiprocessing, "get_context", lambda kind: context
+    )
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6")
     pool = CompilePool(
         device_ordinal=0,
@@ -59,9 +64,13 @@ def test_stop_preserves_promoted_shared_required_programs(monkeypatch):
     assert inherited_visibility == [""]
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "6"
     assert pool_arguments[0]["initargs"][5:7] == (1024, 2048)
-    plans = tuple(CompilationPlan(
-        CompileJob.create("integration.producer:compile", index), (ProgramKey("cute", str(index)),),
-    ) for index in range(10))
+    plans = tuple(
+        CompilationPlan(
+            CompileJob.create("integration.producer:compile", index),
+            (ProgramKey("cute", str(index)),),
+        )
+        for index in range(10)
+    )
     pool.submit_plans(plans, required=False)
     assert len(workers.calls) == 2
     required = pool.submit_plans((plans[7],), required=True)
@@ -83,10 +92,16 @@ def test_stop_preserves_promoted_shared_required_programs(monkeypatch):
     pool.close()
 
 
-def test_summary_counts_unique_dispatched_programs_across_overlapping_plans(monkeypatch):
+def test_summary_counts_unique_dispatched_programs_across_overlapping_plans(
+    monkeypatch,
+):
     workers = Workers()
-    context = SimpleNamespace(Array=lambda kind, values: Activity(values), Pool=lambda **kwargs: workers)
-    monkeypatch.setattr(compile_pool.multiprocessing, "get_context", lambda kind: context)
+    context = SimpleNamespace(
+        Array=lambda kind, values: Activity(values), Pool=lambda **kwargs: workers
+    )
+    monkeypatch.setattr(
+        compile_pool.multiprocessing, "get_context", lambda kind: context
+    )
     pool = CompilePool(
         device_ordinal=0,
         compute_capability=(12, 0),
@@ -100,8 +115,12 @@ def test_summary_counts_unique_dispatched_programs_across_overlapping_plans(monk
     cute = ProgramKey("cute", "shared")
     triton = ProgramKey("triton", "shared")
     another = ProgramKey("cute", "another")
-    first = CompilationPlan(CompileJob.create("integration.producer:compile", 1), (cute, triton))
-    second = CompilationPlan(CompileJob.create("integration.producer:compile", 2), (cute, another))
+    first = CompilationPlan(
+        CompileJob.create("integration.producer:compile", 1), (cute, triton)
+    )
+    second = CompilationPlan(
+        CompileJob.create("integration.producer:compile", 2), (cute, another)
+    )
     pool.submit_plans((first, second, first))
     summary = pool.summary()
     assert (summary.jobs, summary.requested_jobs) == (1, 3)
@@ -125,8 +144,12 @@ def test_summary_counts_unique_dispatched_programs_across_overlapping_plans(monk
 
 def test_failed_job_cannot_become_ready(monkeypatch):
     workers = Workers()
-    context = SimpleNamespace(Array=lambda kind, values: Activity(values), Pool=lambda **kwargs: workers)
-    monkeypatch.setattr(compile_pool.multiprocessing, "get_context", lambda kind: context)
+    context = SimpleNamespace(
+        Array=lambda kind, values: Activity(values), Pool=lambda **kwargs: workers
+    )
+    monkeypatch.setattr(
+        compile_pool.multiprocessing, "get_context", lambda kind: context
+    )
     pool = CompilePool(
         device_ordinal=0,
         compute_capability=(12, 0),
@@ -137,7 +160,10 @@ def test_failed_job_cannot_become_ready(monkeypatch):
         max_shared_memory_per_multiprocessor=2048,
         workers=1,
     )
-    plan = CompilationPlan(CompileJob.create("integration.producer:compile"), (ProgramKey("cute", "failed"),))
+    plan = CompilationPlan(
+        CompileJob.create("integration.producer:compile"),
+        (ProgramKey("cute", "failed"),),
+    )
     required = pool.submit_plans((plan,))
     workers.calls[0][2](ValueError("compiler rejected specialization"))
     with pytest.raises(ValueError, match="rejected specialization"):
@@ -166,7 +192,10 @@ def test_offline_cutlass_device_attributes_are_explicit_and_fail_closed():
 def test_loading_explicit_dependencies_keeps_capture_free_of_loader_access(monkeypatch):
     from b12x._lib import compiler
     from b12x._lib.compile_plan import (
-        CompiledCuTeProgram, DeferredCuTeKernel, attach_programs, load_programs,
+        CompiledCuTeProgram,
+        DeferredCuTeKernel,
+        attach_programs,
+        load_programs,
     )
     from b12x._lib.runtime_control import kernel_resolution_guard
 

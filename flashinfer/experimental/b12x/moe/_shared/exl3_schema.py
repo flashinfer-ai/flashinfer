@@ -96,9 +96,7 @@ def matrix_slot_bytes(hidden_size: int, low_bits: int, high_bits: int) -> int:
     return (int(hidden_size) // 16) * 32 * (int(low_bits) + int(high_bits))
 
 
-def bundle_bytes(
-    hidden_size: int, fc1_code: int, fc2_code: int
-) -> int:
+def bundle_bytes(hidden_size: int, fc1_code: int, fc2_code: int) -> int:
     """Per-(expert, slot) bundle size: gate ‖ up ‖ down trellis words."""
 
     fc1_low, fc1_high = rate_code_bits(fc1_code)
@@ -197,8 +195,7 @@ class Exl3Manifest:
         )
         _require(
             data["kind"] == EXL3_MANIFEST_KIND,
-            f"EXL3 manifest kind must be {EXL3_MANIFEST_KIND!r}, "
-            f"got {data['kind']!r}",
+            f"EXL3 manifest kind must be {EXL3_MANIFEST_KIND!r}, got {data['kind']!r}",
         )
         _require(
             data["schema"] == EXL3_SCHEMA,
@@ -362,9 +359,7 @@ def _parse_rates(data: dict, *, codebook: str) -> Exl3Rates:
         for kind in kinds:
             for bits in rate_code_bits(PAIR_KIND_RATE_CODES[kind]):
                 validate_codebook_bits(codebook, bits)
-        return Exl3Rates(
-            structure=structure, bits=None, pair_kinds=frozenset(kinds)
-        )
+        return Exl3Rates(structure=structure, bits=None, pair_kinds=frozenset(kinds))
     raise ValueError(
         "EXL3 rates structure must be 'uniform' or 'per_expert_pair', "
         f"got {structure!r}"
@@ -380,7 +375,8 @@ def _parse_hadamard(data: dict, *, geometry: Exl3Geometry) -> Exl3Hadamard:
     )
     intermediate_hadamard = data["intermediate_hadamard"]
     _require(
-        isinstance(intermediate_hadamard, bool), "EXL3 hadamard intermediate_hadamard must be a boolean"
+        isinstance(intermediate_hadamard, bool),
+        "EXL3 hadamard intermediate_hadamard must be a boolean",
     )
     per_expert = data["per_expert_input_rotations"]
     _require(
@@ -406,8 +402,7 @@ def _parse_hadamard(data: dict, *, geometry: Exl3Geometry) -> Exl3Hadamard:
     for name, value in (("pre_block", pre_block), ("post_block", post_block)):
         _require(
             isinstance(value, int) and value > 0 and value % SLOT_CHANNELS == 0,
-            f"EXL3 hadamard {name} must be a positive multiple of "
-            f"{SLOT_CHANNELS}",
+            f"EXL3 hadamard {name} must be a positive multiple of {SLOT_CHANNELS}",
         )
     _require(
         geometry.intermediate_size % post_block == 0,
@@ -447,10 +442,7 @@ def _parse_layout(data: dict, *, geometry: Exl3Geometry) -> Exl3Layout:
     barriers = data.get("extent_barriers", [])
     _require(
         isinstance(barriers, list)
-        and all(
-            isinstance(b, int) and 0 < b < geometry.num_slots
-            for b in barriers
-        )
+        and all(isinstance(b, int) and 0 < b < geometry.num_slots for b in barriers)
         and len(set(barriers)) == len(barriers),
         "EXL3 extent_barriers must be distinct interior slot indices",
     )

@@ -1,4 +1,5 @@
 """Serialized block-FP8 activations and weights use the dense MXFP8 contract."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -22,27 +23,44 @@ class BlockFp8LinearQuery:
     codegen: FrozenMapping | None = None
 
     def __post_init__(self):
-        object.__setattr__(self, "codegen", dense._codegen_snapshot()
-                           if self.codegen is None else FrozenMapping(self.codegen))
+        object.__setattr__(
+            self,
+            "codegen",
+            dense._codegen_snapshot()
+            if self.codegen is None
+            else FrozenMapping(self.codegen),
+        )
 
 
 def dense_query(query):
     from .._shared.block_fp8 import _physical_mxfp8_k
 
     return dense.DenseGemmQuery(
-        recipe="mxfp8", entry_point="gemm.mm", weight_storage="native",
-        output_dtype=query.output_dtype, batch=1, max_rows=query.max_tokens,
+        recipe="mxfp8",
+        entry_point="gemm.mm",
+        weight_storage="native",
+        output_dtype=query.output_dtype,
+        batch=1,
+        max_rows=query.max_tokens,
         in_features=_physical_mxfp8_k(query.in_features),
-        out_features=query.out_features, output_mode="provided", alpha_mode="unit",
-        expected_m=query.max_tokens, sfb_k_replicated=query.weight_block_size == 128,
-        codegen=query.codegen, exhaustive=query.exhaustive,
+        out_features=query.out_features,
+        output_mode="provided",
+        alpha_mode="unit",
+        expected_m=query.max_tokens,
+        sfb_k_replicated=query.weight_block_size == 128,
+        codegen=query.codegen,
+        exhaustive=query.exhaustive,
     )
 
 
 def _validate_query(query, device):
     if not isinstance(query, BlockFp8LinearQuery):
         raise TypeError("query must be BlockFp8LinearQuery")
-    if type(query.in_features) is not int or query.in_features <= 0 or query.in_features % 32:
+    if (
+        type(query.in_features) is not int
+        or query.in_features <= 0
+        or query.in_features % 32
+    ):
         raise ValueError("block-FP8 input features must be a positive multiple of 32")
     if query.source_dtype not in ("bfloat16", "float16"):
         raise ValueError(f"unsupported source dtype {query.source_dtype!r}")
@@ -71,7 +89,9 @@ TUNING = TuningContract(
     config_schema_version=4,
     query_fields=frozenset(BlockFp8LinearQuery.__dataclass_fields__),
     config_fields=dense.TUNING.config_fields,
-    encode_query=lambda query: {name: getattr(query, name) for name in query.__dataclass_fields__},
+    encode_query=lambda query: {
+        name: getattr(query, name) for name in query.__dataclass_fields__
+    },
     encode_config=dense.TUNING.encode_config,
     decode_config=dense.TUNING.decode_config,
     validate_query=_validate_query,

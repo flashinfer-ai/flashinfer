@@ -114,7 +114,6 @@ class _Layout:
         return live_tokens
 
 
-
 @dataclass(frozen=True)
 class Binding:
     """Caller-owned MTP feedback inputs, output, and scratch views.
@@ -181,9 +180,15 @@ def _materialize_layout(caps: Caps, config: MtpFeedbackConfig) -> _Layout:
     return result
 
 
-def plan(caps: Caps, *, invocation: FrozenMapping = FrozenMapping(), override: MtpFeedbackConfig | None = None) -> Plan:
+def plan(
+    caps: Caps,
+    *,
+    invocation: FrozenMapping = FrozenMapping(),
+    override: MtpFeedbackConfig | None = None,
+) -> Plan:
     """Declare the exact MTP capacity without compiling projections."""
     from ._preparation import make_plan
+
     if not isinstance(caps, Caps):
         raise TypeError("plan requires MTP Caps")
     return make_plan(caps, invocation=invocation, override=override)

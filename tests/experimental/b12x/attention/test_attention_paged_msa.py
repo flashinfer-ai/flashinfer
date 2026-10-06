@@ -11,7 +11,10 @@ from b12x.attention.paged.reference import (
 )
 from b12x.attention._shared.contiguous.api import clear_attention_caches
 from b12x.attention.paged._forward import paged_attention_forward
-from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention.paged._scratch import (
+    B12XPagedAttentionScratchCaps,
+    plan_paged_attention_scratch,
+)
 from b12x.attention.paged.planner import create_paged_plan
 
 from b12x.testing.reference.helpers import require_b12x
@@ -39,7 +42,7 @@ def _msa_dense_mask_reference(
     )
     lse = torch.empty((total_q, q_heads), dtype=torch.float32, device=q.device)
     q_offsets = [int(v) for v in cu_seqlens_q.detach().cpu().tolist()]
-    scale = head_dim ** -0.5
+    scale = head_dim**-0.5
 
     for request_idx, (q_start, q_end) in enumerate(
         zip(q_offsets[:-1], q_offsets[1:], strict=False)
@@ -77,13 +80,17 @@ def _msa_dense_mask_reference(
                 scores = scores.masked_fill(mask, float("-inf"))
                 probs = torch.softmax(scores, dim=0)
                 out[q_row, q_head].copy_(
-                    torch.matmul(probs, v_full[:, kv_head].to(torch.float32)).to(q.dtype)
+                    torch.matmul(probs, v_full[:, kv_head].to(torch.float32)).to(
+                        q.dtype
+                    )
                 )
                 lse[q_row, q_head] = torch.logsumexp(scores, dim=0)
     return out, lse
 
 
-def _assert_close(out: torch.Tensor, ref: torch.Tensor, lse: torch.Tensor, ref_lse: torch.Tensor) -> None:
+def _assert_close(
+    out: torch.Tensor, ref: torch.Tensor, lse: torch.Tensor, ref_lse: torch.Tensor
+) -> None:
     torch.testing.assert_close(lse, ref_lse, rtol=0, atol=1e-5)
     cosine = torch.nn.functional.cosine_similarity(
         out.to(torch.float32).reshape(-1),
@@ -241,7 +248,9 @@ def _run_msa_extend(
 
 
 @pytest.mark.parametrize("page_size", [64, 128])
-def test_msa_attention_reference_matches_dense_mask_small_decode(page_size: int) -> None:
+def test_msa_attention_reference_matches_dense_mask_small_decode(
+    page_size: int,
+) -> None:
     require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1, 1],
@@ -307,7 +316,9 @@ def test_msa_attention_reference_ignores_poisoned_padding(page_size: int) -> Non
 
 
 @pytest.mark.parametrize("page_size", [64, 128])
-def test_msa_attention_reference_handles_varlen_extend_causality(page_size: int) -> None:
+def test_msa_attention_reference_handles_varlen_extend_causality(
+    page_size: int,
+) -> None:
     require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[5, 3],
@@ -918,7 +929,16 @@ def test_msa_decode_cuda_graph_replays_with_mutating_metadata_and_q2k(
             assert not k_q.is_contiguous()
         return q_c, k_q, v_q, table_c, seqlens_c, cu_c, k_ds, v_ds
 
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q, k_descale, v_descale = make_case(
+    (
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale,
+        v_descale,
+    ) = make_case(
         [2048, 5000],
         seed=1401,
     )
@@ -1562,9 +1582,7 @@ def test_msa_decode_cuda_graph_replays_minimax_padded_bucket_after_prefill(
         k_q = combined[:, 0]
         v_q = combined[:, 1]
         assert not k_q.is_contiguous()
-        k_ds_c = torch.ones(
-            (bucket, k_q.shape[2]), dtype=torch.float32, device=device
-        )
+        k_ds_c = torch.ones((bucket, k_q.shape[2]), dtype=torch.float32, device=device)
         v_ds_c = torch.ones_like(k_ds_c)
         k_ds_c[0].copy_(k_ds[0])
         v_ds_c[0].copy_(v_ds[0])
@@ -1589,9 +1607,7 @@ def test_msa_decode_cuda_graph_replays_minimax_padded_bucket_after_prefill(
         force_block0=True,
     )
     q2k_source = q2k_indices.clone()
-    live_cu_seqlens_q = torch.tensor(
-        [0, 1], dtype=torch.int32, device=q.device
-    )
+    live_cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=q.device)
 
     scratch_plan = plan_paged_attention_scratch(
         B12XPagedAttentionScratchCaps(

@@ -17,7 +17,18 @@ from b12x.testing.iq2_xs_reference import dequantize_blocks, descriptor_vectors
 def blocks(e=2, n=544, k=768, codec="iq2_xs"):
     block_size = 32 if codec == "q8_0" else 256
     g = torch.Generator().manual_seed(712)
-    raw = torch.randint(0, 256, (e, n, k // block_size, 34 if codec == "q8_0" else 66 if codec == "iq2_xxs" else 74), dtype=torch.uint8, generator=g)
+    raw = torch.randint(
+        0,
+        256,
+        (
+            e,
+            n,
+            k // block_size,
+            34 if codec == "q8_0" else 66 if codec == "iq2_xxs" else 74,
+        ),
+        dtype=torch.uint8,
+        generator=g,
+    )
     bases = (torch.randn(e, n, k // block_size, generator=g) * 0.01).half()
     raw[..., :2] = bases[..., None].view(torch.uint8)
     return raw
@@ -30,17 +41,24 @@ def test_relu2_direct_route_workspace_covers_capacity():
     )
 
     prepared = SimpleNamespace(
-        num_experts=8, intermediate_size=1280, hidden_size=1024,
-        is_gated=False, weight_layout="iq2_xs",
+        num_experts=8,
+        intermediate_size=1280,
+        hidden_size=1024,
+        is_gated=False,
+        weight_layout="iq2_xs",
     )
     plan = plan_w4a16_buffers(prepared, m=8, topk=2, sms=48, block_size_m=8)
     for rows in (1, 2, 4, 8):
         for size_n, allocated in (
-            (1280, plan.fc1_c_tmp_elements), (1024, plan.fc2_c_tmp_elements),
+            (1280, plan.fc1_c_tmp_elements),
+            (1024, plan.fc2_c_tmp_elements),
         ):
             assert allocated >= packed_gemm_scratch_elements(
-                size_n=size_n, route_slots=rows * 2 * 8, moe_block_size=8,
-                sms=48, weight_layout="iq2_xs",
+                size_n=size_n,
+                route_slots=rows * 2 * 8,
+                moe_block_size=8,
+                sms=48,
+                weight_layout="iq2_xs",
             )
 
 
@@ -48,9 +66,15 @@ def test_iq2_xs_rejects_eight_way_warp_reduction():
     from b12x.moe._shared.kernels.w4a16.kernel import _candidate_tile_fits
 
     assert not _candidate_tile_fits(
-        problem_n=1280, problem_k=1024, cta_m_blocks=1, tile_n=64,
-        tile_k=256, cta_threads=256, max_shared_mem=101376,
-        scale_format="iq2_xs", weight_layout="iq2_xs",
+        problem_n=1280,
+        problem_k=1024,
+        cta_m_blocks=1,
+        tile_n=64,
+        tile_k=256,
+        cta_threads=256,
+        max_shared_mem=101376,
+        scale_format="iq2_xs",
+        weight_layout="iq2_xs",
     )
 
 
@@ -76,18 +100,27 @@ def unpack_planes(words, metadata, shape):
     payload_bytes = 32 if q8 else 64
     q = (
         words.reshape(e, k16, n // 16, 8, 2, row_words)
-        .transpose(3, 4).reshape(e, k16, n, row_words).view(torch.uint8)
+        .transpose(3, 4)
+        .reshape(e, k16, n, row_words)
+        .view(torch.uint8)
     )
-    raw[..., 2:2 + payload_bytes] = q.permute(0, 2, 1, 3).reshape(e, n, kb, payload_bytes)
+    raw[..., 2 : 2 + payload_bytes] = q.permute(0, 2, 1, 3).reshape(
+        e, n, kb, payload_bytes
+    )
     raw[..., :2] = (
-        metadata[: e * kb * n * 2].view(torch.int16)
-        .reshape(e, kb, n // 16, 8, 2).transpose(-2, -1)
-        .reshape(e, kb, n, 1).view(torch.uint8).permute(0, 2, 1, 3)
+        metadata[: e * kb * n * 2]
+        .view(torch.int16)
+        .reshape(e, kb, n // 16, 8, 2)
+        .transpose(-2, -1)
+        .reshape(e, kb, n, 1)
+        .view(torch.uint8)
+        .permute(0, 2, 1, 3)
     )
     if shape[-1] == 74:
         raw[..., 66:] = (
             metadata[e * kb * n * 2 :]
-            .reshape(e, kb, n // 16, 8, 8, 2).transpose(-2, -1)
+            .reshape(e, kb, n // 16, 8, 8, 2)
+            .transpose(-2, -1)
             .reshape(e, kb, n // 16, 8, 16)
             .permute(0, 2, 4, 1, 3)
             .reshape(e, n, kb, 8)
@@ -129,27 +162,43 @@ def test_tiled_descriptors_preserve_compact_bytes(swap, n, k, tile_scales, codec
     source = blocks(e=2, n=n, k=k, codec=codec)
     original = source.clone()
     words, metadata = pack_iq2_xs_matrix(
-        source, codec=codec, swap_halves=swap, tile_descriptors=True, tile_scales=tile_scales
+        source,
+        codec=codec,
+        swap_halves=swap,
+        tile_descriptors=True,
+        tile_scales=tile_scales,
     )
-    canonical_words, canonical_metadata = pack_iq2_xs_matrix(source, codec=codec, swap_halves=swap)
+    canonical_words, canonical_metadata = pack_iq2_xs_matrix(
+        source, codec=codec, swap_halves=swap
+    )
     untiled = (
         words.reshape(2, n // 64, k // 128, 8, 4, 8, 2, 4 if codec == "q8_0" else 1)
-        .permute(0, 2, 3, 1, 4, 5, 6, 7).contiguous().reshape(-1)
+        .permute(0, 2, 3, 1, 4, 5, 6, 7)
+        .contiguous()
+        .reshape(-1)
     )
     assert torch.equal(untiled, canonical_words)
     base_bytes = 2 * (k // 256) * n * 2
     if tile_scales and codec == "iq2_xs":
         untiled_scales = (
-            metadata[base_bytes:].reshape(2, n // 64, k // 256, 2, 4, 4, 8, 2)
-            .permute(0, 2, 1, 5, 3, 4, 6, 7).contiguous().reshape(-1)
+            metadata[base_bytes:]
+            .reshape(2, n // 64, k // 256, 2, 4, 4, 8, 2)
+            .permute(0, 2, 1, 5, 3, 4, 6, 7)
+            .contiguous()
+            .reshape(-1)
         )
         restored_metadata = torch.cat((metadata[:base_bytes], untiled_scales))
     else:
         restored_metadata = metadata
     assert torch.equal(restored_metadata, canonical_metadata)
     expected = torch.cat(source.chunk(2, 1)[::-1], 1) if swap else source
-    assert torch.equal(unpack_planes(untiled, restored_metadata, source.shape), expected)
-    assert words.untyped_storage().nbytes() + metadata.untyped_storage().nbytes() == source.numel()
+    assert torch.equal(
+        unpack_planes(untiled, restored_metadata, source.shape), expected
+    )
+    assert (
+        words.untyped_storage().nbytes() + metadata.untyped_storage().nbytes()
+        == source.numel()
+    )
     assert torch.equal(source, original)
 
 
@@ -179,12 +228,17 @@ def test_nonfinite_bases_rejected(bits):
 
 
 def weight_plan(
-    *, mode="a16", activation="silu", dtype=torch.bfloat16, h=2048, i=512, packing=None, codec="iq2_xs"
+    *,
+    mode="a16",
+    activation="silu",
+    dtype=torch.bfloat16,
+    h=2048,
+    i=512,
+    packing=None,
+    codec="iq2_xs",
 ):
     return moe.plan_weights(
-        source=moe.PackedSource(
-            format=codec, w13_layout=moe.W13Layout.W31
-        ),
+        source=moe.PackedSource(format=codec, w13_layout=moe.W13Layout.W31),
         activation=moe.ActivationSpec(
             mode=mode, nonlinearity=activation, io_dtype=dtype
         ),
@@ -245,8 +299,18 @@ def test_invalid_payload_rejected(source):
         ({"activation": "relu2", "num_tokens": 7}, True),
         ({"activation": "relu2", "num_tokens": 9}, False),
         ({"activation": "relu2", "num_tokens": 6, "deterministic_output": True}, False),
-        ({"activation": "relu2", "num_tokens": 6, "collect_activation_amax": True}, False),
-        ({"activation": "relu2", "num_tokens": 6, "apply_router_weight_on_input": True}, False),
+        (
+            {"activation": "relu2", "num_tokens": 6, "collect_activation_amax": True},
+            False,
+        ),
+        (
+            {
+                "activation": "relu2",
+                "num_tokens": 6,
+                "apply_router_weight_on_input": True,
+            },
+            False,
+        ),
         ({"deterministic_output": True}, False),
         ({"collect_activation_amax": True}, False),
         ({"apply_router_weight_on_input": True}, False),
@@ -280,16 +344,32 @@ def test_relu2_tuning_races_supported_route_modes(capacity):
     from b12x.preparation import DeviceIdentity, FrozenMapping
 
     query = MoeDecodeQuery(
-        quant_mode="w4a16", quant_modes=("w4a16",), source_format="iq2_xs",
-        activation="relu2", io_dtype="bfloat16", num_experts=512,
-        hidden_size=1024, intermediate_size=1280, top_k=4,
-        num_tokens=capacity, routed_rows=capacity * 4, route_num_experts=512,
-        route_logits_dtype=None, apply_router_weight_on_input=False,
-        collect_activation_amax=False, deterministic_output=False,
-        swiglu_limit=None, swiglu_alpha=1.0, swiglu_beta=0.0,
-        w13_layout="w31", weight_layouts=("iq2_xs",),
-        w4a16_weight_layout="iq2_xs", w4a16_scale_format="iq2_xs",
-        w4a16_block_size_m=None, fast_math=True, numerical_recipe=None,
+        quant_mode="w4a16",
+        quant_modes=("w4a16",),
+        source_format="iq2_xs",
+        activation="relu2",
+        io_dtype="bfloat16",
+        num_experts=512,
+        hidden_size=1024,
+        intermediate_size=1280,
+        top_k=4,
+        num_tokens=capacity,
+        routed_rows=capacity * 4,
+        route_num_experts=512,
+        route_logits_dtype=None,
+        apply_router_weight_on_input=False,
+        collect_activation_amax=False,
+        deterministic_output=False,
+        swiglu_limit=None,
+        swiglu_alpha=1.0,
+        swiglu_beta=0.0,
+        w13_layout="w31",
+        weight_layouts=("iq2_xs",),
+        w4a16_weight_layout="iq2_xs",
+        w4a16_scale_format="iq2_xs",
+        w4a16_block_size_m=None,
+        fast_math=True,
+        numerical_recipe=None,
         controls=FrozenMapping(),
     )
     device = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
@@ -304,8 +384,11 @@ def test_relu2_tuning_races_supported_route_modes(capacity):
 def test_weight_codec_must_match_plan(codec):
     other = "iq2_xxs" if codec == "iq2_xs" else "iq2_xs"
     plan = weight_plan(codec=codec)
-    weights = moe.BlockQuantWeights(blocks(e=1, n=16, k=256, codec=other),
-                                   blocks(e=1, n=16, k=256, codec=other), codec=other)
+    weights = moe.BlockQuantWeights(
+        blocks(e=1, n=16, k=256, codec=other),
+        blocks(e=1, n=16, k=256, codec=other),
+        codec=other,
+    )
     with pytest.raises(TypeError, match="matching"):
         moe.prepare_weights(plan=plan, weights=weights)
 
@@ -313,9 +396,14 @@ def test_weight_codec_must_match_plan(codec):
 def test_codec_table_identity_and_sizes():
     from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
     from b12x._lib.quant.block_codec import block_codec
+
     for selectors in (False, True):
         xs = iq2_xs_execution_lut("cpu", prepare=True, selectors=selectors)
-        xxs = iq2_xs_execution_lut("cpu", prepare=True, selectors=selectors, codec="iq2_xxs")
+        xxs = iq2_xs_execution_lut(
+            "cpu", prepare=True, selectors=selectors, codec="iq2_xxs"
+        )
         assert xs.data_ptr() != xxs.data_ptr()
-        assert xxs.numel() * xxs.element_size() == block_codec("iq2_xxs").lut_bytes(selectors=selectors)
+        assert xxs.numel() * xxs.element_size() == block_codec("iq2_xxs").lut_bytes(
+            selectors=selectors
+        )
         assert iq2_xs_execution_lut("cpu", selectors=selectors, codec="iq2_xxs") is xxs

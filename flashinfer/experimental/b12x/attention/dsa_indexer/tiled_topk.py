@@ -493,8 +493,7 @@ def _to_kernel_tensor(tensor, dtype, *, assumed_align=16):
         )
         shape = tuple(cute.sym_int(32) for _ in tensor.shape)
         strides = tuple(
-            1 if idx == leading_dim else cute.sym_int(64)
-            for idx in range(tensor.ndim)
+            1 if idx == leading_dim else cute.sym_int(64) for idx in range(tensor.ndim)
         )
         return make_fake_tensor(
             dtype,
@@ -1676,8 +1675,11 @@ def run_tiled_topk(
         ),
     )
     launcher_key = (
-        "tiled", bool(is_first), bool(output_physical_slots),
-        int(extent_splits), bool(write_values),
+        "tiled",
+        bool(is_first),
+        bool(output_physical_slots),
+        int(extent_splits),
+        bool(write_values),
     )
     if isinstance(launcher, Mapping):
         launcher = launcher[launcher_key]

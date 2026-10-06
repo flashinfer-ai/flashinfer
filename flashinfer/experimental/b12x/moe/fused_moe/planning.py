@@ -125,9 +125,7 @@ def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
     source_format = source.format.value
     if mode is ActivationMode.A16:
         if source_format in ("mxfp6_e2m3", "mxfp8_e8m0_k32"):
-            raise ValueError(
-                f"{source_format} weights require A8 activations"
-            )
+            raise ValueError(f"{source_format} weights require A8 activations")
         return "w4a16"
     if mode is ActivationMode.A4:
         if source_format != "modelopt_nvfp4":
@@ -565,7 +563,12 @@ def prepare_weights(
             # Both execution paths own views of one fixed stream. Only the
             # exception index differs between whole-plane and tile reads.
             planes = tuple(
-                replace(plane, fixed=value.storage[1024: 1024 + plane.fixed.numel()].view_as(plane.fixed))
+                replace(
+                    plane,
+                    fixed=value.storage[1024 : 1024 + plane.fixed.numel()].view_as(
+                        plane.fixed
+                    ),
+                )
                 for plane, value in zip(planes, inline, strict=True)
             )
             plan = replace(plan, _impl=replace(plan._impl, nvfp4_inline_scales=True))
@@ -578,7 +581,8 @@ def prepare_weights(
         return PreparedExperts(
             plan=plan,
             _impl=replace(
-                prepared._impl, plan=plan._impl,
+                prepared._impl,
+                plan=plan._impl,
                 nvfp4_csf=replace(decoder, inline_scales=inline),
             ),
         )

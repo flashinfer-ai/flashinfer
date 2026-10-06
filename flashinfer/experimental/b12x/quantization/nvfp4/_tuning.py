@@ -67,7 +67,9 @@ def _validate_query(
         raise TypeError("query must be Nvfp4QuantizationQuery")
     if query.dtype != "bfloat16":
         raise ValueError("NVFP4 quantization requires bfloat16 input")
-    if any(type(value) is not int or value <= 0 for value in (query.rows, query.columns)):
+    if any(
+        type(value) is not int or value <= 0 for value in (query.rows, query.columns)
+    ):
         raise ValueError("NVFP4 quantization dimensions must be positive")
     if query.rows % 128 or query.columns % 128:
         raise ValueError("NVFP4 quantization dimensions must be multiples of 128")
@@ -100,7 +102,11 @@ TUNING = TuningContract(
     default_config=_default_config,
     knobs=(
         Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),
-        Knob(name="liveness_strategy", values=("retain", "packed"), binding=ParameterBinding.COMPILE),
+        Knob(
+            name="liveness_strategy",
+            values=("retain", "packed"),
+            binding=ParameterBinding.COMPILE,
+        ),
     ),
 )
 

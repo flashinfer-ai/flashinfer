@@ -41,7 +41,14 @@ from .planning import (
     plan_weights as _plan_weights,
     prepare_weights as _prepare_weights,
 )
-from .source import PackedSource, PackedSourceFormat, TrellisExtent, TrellisSource, W13Layout, WeightSource
+from .source import (
+    PackedSource,
+    PackedSourceFormat,
+    TrellisExtent,
+    TrellisSource,
+    W13Layout,
+    WeightSource,
+)
 from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
@@ -66,6 +73,7 @@ def plan_weights(**kwargs):
         if "source" in kwargs or "geometry" in kwargs:
             raise TypeError("quant_modes cannot be combined with source or geometry")
         from ._impl import plan_b12x_fp4_moe_weights
+
         return plan_b12x_fp4_moe_weights(**kwargs)
     return _canonical_plan_weights(**kwargs)
 
@@ -75,6 +83,7 @@ def prepare_weights(**kwargs):
     if isinstance(kwargs.get("plan"), WeightPlan):
         return _canonical_prepare_weights(**kwargs)
     from ._impl import prepare_b12x_fp4_moe_weights
+
     return prepare_b12x_fp4_moe_weights(**kwargs)
 
 
@@ -84,6 +93,7 @@ def plan_execution(**kwargs):
         if "experts" in kwargs or "capacity" in kwargs:
             raise TypeError("weight_plan cannot be combined with experts or capacity")
         from ._compat import plan_execution as legacy_plan_execution
+
         return legacy_plan_execution(**kwargs)
     return _canonical_plan_execution(**kwargs)
 
@@ -138,7 +148,9 @@ def _canonical_plan_execution(
 
 
 def plan_route_topk(
-    invocation: RouteTopKInvocation, *, invocation_metadata: FrozenMapping = FrozenMapping(),
+    invocation: RouteTopKInvocation,
+    *,
+    invocation_metadata: FrozenMapping = FrozenMapping(),
     override=None,
 ):
     """Declare a standalone native top-k route operation."""
@@ -148,12 +160,18 @@ def plan_route_topk(
 
 
 def plan_fc2(
-    *, experts: PreparedExperts, invocation: FC2Invocation,
-    invocation_metadata: FrozenMapping = FrozenMapping(), override=None,
+    *,
+    experts: PreparedExperts,
+    invocation: FC2Invocation,
+    invocation_metadata: FrozenMapping = FrozenMapping(),
+    override=None,
 ):
     """Declare standalone route-major W4A16 FC2 without a full MoE plan."""
     return _plan_fc2(
-        experts, invocation, declaration_invocation=invocation_metadata, override=override
+        experts,
+        invocation,
+        declaration_invocation=invocation_metadata,
+        override=override,
     )
 
 
@@ -204,21 +222,32 @@ def _state_for(plan: Plan, hidden_states: torch.Tensor):
 
 
 def route_topk(
-    plan: Plan, router_logits: torch.Tensor, topk_logits: torch.Tensor,
-    topk_ids: torch.Tensor, topk_weights: torch.Tensor, **kwargs: Any,
+    plan: Plan,
+    router_logits: torch.Tensor,
+    topk_logits: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    **kwargs: Any,
 ) -> None:
     """Run caller-owned top-k buffers through their retained route launcher."""
     state = require_prepared(plan, "moe.route_topk", router_logits.device)
     state.run(router_logits, topk_logits, topk_ids, topk_weights, **kwargs)
 
 
-def bind_route(plan: Plan, *, hidden_states: torch.Tensor, **kwargs: Any) -> RouteBinding:
+def bind_route(
+    plan: Plan, *, hidden_states: torch.Tensor, **kwargs: Any
+) -> RouteBinding:
     """Bind native routing to an exact prepared MoE plan."""
     _state_for(plan, hidden_states)
     scratch = kwargs.pop("scratch")
-    return replace(build_tp_moe_route_binding(
-        scratch=scratch, hidden_states=hidden_states, **kwargs,
-    ), plan=plan)
+    return replace(
+        build_tp_moe_route_binding(
+            scratch=scratch,
+            hidden_states=hidden_states,
+            **kwargs,
+        ),
+        plan=plan,
+    )
 
 
 def route(plan: Plan, *, binding: RouteBinding) -> object:
@@ -228,13 +257,21 @@ def route(plan: Plan, *, binding: RouteBinding) -> object:
     return _state_for(plan, binding.hidden_states).route(binding)
 
 
-def bind_sparse(plan: Plan, *, hidden_states: torch.Tensor, **kwargs: Any) -> SparseBinding:
+def bind_sparse(
+    plan: Plan, *, hidden_states: torch.Tensor, **kwargs: Any
+) -> SparseBinding:
     """Bind sparse MoE math to an exact prepared native plan."""
     state = _state_for(plan, hidden_states)
     scratch = kwargs.pop("scratch")
-    return replace(build_tp_moe_sparse_fp4_binding(
-        scratch=scratch, hidden_states=hidden_states, experts=state.experts._impl, **kwargs,
-    ), plan=plan)
+    return replace(
+        build_tp_moe_sparse_fp4_binding(
+            scratch=scratch,
+            hidden_states=hidden_states,
+            experts=state.experts._impl,
+            **kwargs,
+        ),
+        plan=plan,
+    )
 
 
 def run_sparse(plan: Plan, *, binding: SparseBinding):
@@ -245,8 +282,11 @@ def run_sparse(plan: Plan, *, binding: SparseBinding):
 
 
 def run_fc2(
-    plan: Plan, intermediate: torch.Tensor,
-    route_expert_ids: torch.Tensor, route_weights: torch.Tensor, *,
+    plan: Plan,
+    intermediate: torch.Tensor,
+    route_expert_ids: torch.Tensor,
+    route_weights: torch.Tensor,
+    *,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run standalone FC2 through its retained prepared native launcher."""

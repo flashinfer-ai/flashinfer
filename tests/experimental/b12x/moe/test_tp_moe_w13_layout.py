@@ -116,12 +116,17 @@ def _run(
     seed: int = 1234,
 ) -> torch.Tensor:
     from b12x.moe.fused_moe._impl import clear_tp_moe_caches
-    from b12x.testing.reference.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
+    from b12x.testing.reference.helpers import (
+        prepare_tp_moe_fp4_experts,
+        run_tp_moe_fp4,
+    )
 
     clear_tp_moe_caches()
     device = torch.device("cuda")
     weights = _sub_weights()
-    x, topk_ids, topk_weights = make_routed_inputs(_make_spec(), m, seed=seed, device=device)
+    x, topk_ids, topk_weights = make_routed_inputs(
+        _make_spec(), m, seed=seed, device=device
+    )
     mode = quant_mode or "nvfp4"
     experts = prepare_tp_moe_fp4_experts(
         a=x,

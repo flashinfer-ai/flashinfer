@@ -76,8 +76,7 @@ def sfb_byte_offset(r: int, c: int, *, rows: int, k_tiles: int, rot: int) -> int
         # gated half-aligned tail layout (the serving w13 path)
         (704, 4096, 352, 352),
     ],
-    ids=["w13_rotated", "w2", "w13_n_tail", "w2_k_tail", "both_tails",
-         "w13_half_tail"],
+    ids=["w13_rotated", "w2", "w13_n_tail", "w2_k_tail", "both_tails", "w13_half_tail"],
 )
 def test_rp_weight_inverse(rows: int, kdim: int, rot: int, half: int) -> None:
     torch.manual_seed(0)

@@ -156,12 +156,18 @@ def quantize_kv_dsv4(kv_bf16: torch.Tensor) -> torch.Tensor:
         tile = kv[..., ti * tile_size : (ti + 1) * tile_size].float()
         amax = tile.abs().amax(dim=-1).clamp(min=1e-4)
         scale = _cast_scale_inv_to_ue8m0(amax / FP8_MAX)
-        fp8 = (tile / scale.unsqueeze(-1)).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+        fp8 = (
+            (tile / scale.unsqueeze(-1))
+            .clamp(-FP8_MAX, FP8_MAX)
+            .to(torch.float8_e4m3fn)
+        )
         ue8m0 = _fp32_to_ue8m0_bytes(scale)
 
         for tok in range(bs):
             data_off = tok * data_stride + ti * tile_size
-            result_flat[:, data_off : data_off + tile_size] = fp8[:, tok].view(torch.uint8)
+            result_flat[:, data_off : data_off + tile_size] = fp8[:, tok].view(
+                torch.uint8
+            )
             scale_off = bs * data_stride + tok * scale_bytes + ti
             result_flat[:, scale_off] = ue8m0[:, tok]
 
@@ -331,8 +337,13 @@ def make_dsv4_decode_case(
 
     kv_bf16 = (
         torch.randn(
-            num_blocks, page_block_size, 1, d_qk,
-            device=device, dtype=torch.bfloat16, generator=gen,
+            num_blocks,
+            page_block_size,
+            1,
+            d_qk,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=gen,
         )
         / 10.0
     ).clamp(-1, 1)
@@ -341,8 +352,12 @@ def make_dsv4_decode_case(
 
     q = (
         torch.randn(
-            num_tokens, num_heads, d_qk,
-            device=device, dtype=dtype, generator=gen,
+            num_tokens,
+            num_heads,
+            d_qk,
+            device=device,
+            dtype=dtype,
+            generator=gen,
         )
         / 10.0
     ).clamp(-1, 1)
@@ -420,10 +435,9 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     # rope tail is bf16-exact (no quant); nope is e4m3 with per-64 pow2 scale.
     rope_err = (got[..., DSV4_D_NOPE:] - orig[..., DSV4_D_NOPE:]).abs().max().item()
     assert rope_err < 1e-2, f"rope round-trip error too large: {rope_err}"
-    nope_rel = (
-        (got[..., : DSV4_D_NOPE] - orig[..., : DSV4_D_NOPE]).abs()
-        / orig[..., : DSV4_D_NOPE].abs().clamp(min=1e-3)
-    )
+    nope_rel = (got[..., :DSV4_D_NOPE] - orig[..., :DSV4_D_NOPE]).abs() / orig[
+        ..., :DSV4_D_NOPE
+    ].abs().clamp(min=1e-3)
     # e4m3 has ~2 mantissa bits at this scale; per-element rel error < ~0.1.
     assert nope_rel.median().item() < 0.1, (
         f"nope round-trip median rel error too large: {nope_rel.median().item()}"
@@ -432,8 +446,13 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     # (3) Reference matches an INDEPENDENT brute-force dense attention on a tiny
     #     case (no online softmax, plain float matmul) over the dequantized KV.
     case = make_dsv4_decode_case(
-        num_heads=4, topk=8, num_tokens=2, num_blocks=2,
-        invalidate_half=False, with_sink=False, device=device,
+        num_heads=4,
+        topk=8,
+        num_tokens=2,
+        num_blocks=2,
+        invalidate_half=False,
+        with_sink=False,
+        device=device,
     )
     q = case["q"].float()
     deq = case["kv_dequant"].view(-1, DSV4_D_QK).float()
@@ -451,17 +470,21 @@ def _self_test(device: str | torch.device = "cuda") -> None:
             denom = w.sum()
             bruteO[t, h] = (w @ rows[:, :DSV4_D_V]) / denom
             bruteLSE[t, h] = (m + torch.log(denom)) / math.log(2.0)
-    torch.testing.assert_close(
-        case["expected_O"].float(), bruteO, atol=2e-2, rtol=2e-2
-    )
+    torch.testing.assert_close(case["expected_O"].float(), bruteO, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(case["expected_lse"], bruteLSE, atol=1e-3, rtol=1e-3)
 
     # (4) sink path: with a sink, output is scaled by sigmoid(lse_e - sink) and
     #     lse folds in the sink mass — sanity check it runs and the sink lowers
     #     the output magnitude (sigmoid factor < 1 when sink is comparable).
     case_s = make_dsv4_decode_case(
-        num_heads=4, topk=8, num_tokens=2, num_blocks=2,
-        invalidate_half=False, with_sink=True, device=device, seed=1,
+        num_heads=4,
+        topk=8,
+        num_tokens=2,
+        num_blocks=2,
+        invalidate_half=False,
+        with_sink=True,
+        device=device,
+        seed=1,
     )
     assert case_s["expected_O"].shape == (2, 4, DSV4_D_V)
     assert torch.isfinite(case_s["expected_O"].float()).all()
@@ -470,12 +493,21 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     # (5) all-invalid token: lse must be -inf, output 0 (no sink) — matches the
     #     kernel's empty-block mid_lse=-inf / acc=0 epilogue.
     case_e = make_dsv4_decode_case(
-        num_heads=4, topk=4, num_tokens=1, num_blocks=2,
-        invalidate_half=False, with_sink=False, device=device, seed=2,
+        num_heads=4,
+        topk=4,
+        num_tokens=1,
+        num_blocks=2,
+        invalidate_half=False,
+        with_sink=False,
+        device=device,
+        seed=2,
     )
     case_e["topk_indices"][:] = -1
     O_e, lse_e = dsv4_decode_reference(
-        case_e["q"], case_e["kv_cache"], case_e["topk_indices"], case_e["sm_scale"],
+        case_e["q"],
+        case_e["kv_cache"],
+        case_e["topk_indices"],
+        case_e["sm_scale"],
         kv_dequant=case_e["kv_dequant"],
     )
     assert torch.all(lse_e == float("-inf")), "all-invalid LSE must be -inf"
@@ -493,7 +525,9 @@ def _self_test(device: str | torch.device = "cuda") -> None:
         # so lse is finite.
         assert torch.isfinite(c["expected_lse"]).all()
 
-    print("dsv4_ref self-tests PASSED (pow2/round-trip/brute-force/sink/empty/topk-sweep)")
+    print(
+        "dsv4_ref self-tests PASSED (pow2/round-trip/brute-force/sink/empty/topk-sweep)"
+    )
 
 
 if __name__ == "__main__":

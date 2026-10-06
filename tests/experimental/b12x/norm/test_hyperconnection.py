@@ -803,7 +803,9 @@ def test_cute_reference_helpers_reuse_binaries_across_live_counts(
     monkeypatch.setattr(_cute, "_compile", traced_compile)
     try:
         launch(1)
-        with kernel_resolution_guard('HyperConnection live counts must reuse warmed CuTe binaries'):
+        with kernel_resolution_guard(
+            "HyperConnection live counts must reuse warmed CuTe binaries"
+        ):
             launch(17)
     finally:
         _cute.clear_caches()
@@ -1409,17 +1411,23 @@ def test_torch_compile_rejects_dynamic_input_aliasing_bound_output() -> None:
 def test_stateless_swiglu_asymmetric_clamp_and_vision_rounding():
     device = require_sm120()
     gate = torch.tensor(
-        [-20.0, -2.0, -0.5, 0.5, 1.5, 20.0], device=device, dtype=torch.bfloat16,
+        [-20.0, -2.0, -0.5, 0.5, 1.5, 20.0],
+        device=device,
+        dtype=torch.bfloat16,
     )
     up = torch.tensor(
-        [20.0, -20.0, 1.75, 1.75, -1.75, 20.0], device=device, dtype=torch.bfloat16,
+        [20.0, -20.0, 1.75, 1.75, -1.75, 20.0],
+        device=device,
+        dtype=torch.bfloat16,
     )
     gate_up = torch.cat((gate, up)).reshape(1, -1)
     out = torch.empty(1, gate.numel(), device=device, dtype=torch.bfloat16)
     hc.run_swiglu(gate_up, limit=2.0, out=out)
     expected = (
-        F.silu(gate.float().clamp(max=2.0)) * up.float().clamp(-2.0, 2.0)
-    ).bfloat16().reshape_as(out)
+        (F.silu(gate.float().clamp(max=2.0)) * up.float().clamp(-2.0, 2.0))
+        .bfloat16()
+        .reshape_as(out)
+    )
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
     # The negative gate remains -20, rather than being symmetrically clamped.
     assert out[0, 0].abs() < 1e-6
@@ -1447,7 +1455,9 @@ def test_stateless_add_retains_fp32_before_cancellation(output_dtype):
     out = torch.empty_like(left, dtype=output_dtype)
     result = hc.run_add(left, right, out=out)
     assert result.data_ptr() == out.data_ptr()
-    torch.testing.assert_close(out, (left + right.float()).to(output_dtype), rtol=0, atol=0)
+    torch.testing.assert_close(
+        out, (left + right.float()).to(output_dtype), rtol=0, atol=0
+    )
     assert out[0, 0] == 0.5 and out[0, 1] == -0.5
 
 
@@ -1468,7 +1478,10 @@ def test_stateless_tails_frozen_live_counts_and_graph_mutation(request):
     def launch(rows):
         hc.run_swiglu(gate_up[:rows], limit=2.0, out=shared[:rows])
         hc.run_swiglu(
-            gate_up[:rows], limit=float("inf"), out=vision[:rows], round_silu=True,
+            gate_up[:rows],
+            limit=float("inf"),
+            out=vision[:rows],
+            round_silu=True,
         )
         hc.run_add(routed[:rows], shared[:rows], out=added[:rows])
         hc.run_add(residual[:rows], vision[:rows], out=vision_added[:rows])
@@ -1492,7 +1505,9 @@ def test_stateless_tails_frozen_live_counts_and_graph_mutation(request):
         allocations = torch.cuda.memory_stats(device)["allocation.all.allocated"]
         graph.replay()
         torch.cuda.synchronize(device)
-        assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocations
+        assert (
+            torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocations
+        )
         assert tuple(t.data_ptr() for t in outputs) == pointers
         gate, up = gate_up[:rows].chunk(2, dim=1)
         shared_ref = (
@@ -1518,22 +1533,37 @@ def test_ordinary_rmsnorm_preserves_fp32_weights_and_pointer_abi(request):
     capacity, streams, hidden = 7, 4, 256
     width = streams * hidden
     binding = _allocate_binding(
-        device=device, tokens=capacity, hidden_size=hidden, streams=streams, lowrank=16,
+        device=device,
+        tokens=capacity,
+        hidden_size=hidden,
+        streams=streams,
+        lowrank=16,
     )
-    state = torch.linspace(-2.0, 3.0, capacity * width, device=device).reshape(
-        capacity, width,
-    ).bfloat16()
+    state = (
+        torch.linspace(-2.0, 3.0, capacity * width, device=device)
+        .reshape(
+            capacity,
+            width,
+        )
+        .bfloat16()
+    )
     weights = torch.linspace(0.9931, 1.0137, width, device=device)
     rounded = weights.bfloat16()
     assert bool((weights != rounded.float()).any())
 
     def launch(rows, weight):
         live = binding.plan.bind(
-            tokens=rows, normalized=binding.normalized_capacity,
-            bottleneck=binding.bottleneck_capacity, block_input=binding.block_input_capacity,
+            tokens=rows,
+            normalized=binding.normalized_capacity,
+            bottleneck=binding.bottleneck_capacity,
+            block_input=binding.block_input_capacity,
         )
         return hc.run_grouped_rmsnorm(
-            state[:rows], weight, eps=1e-6, binding=live, zero_centered=False,
+            state[:rows],
+            weight,
+            eps=1e-6,
+            binding=live,
+            zero_centered=False,
         )
 
     # Warming both dtypes must produce distinct pointer-ABI specializations.
@@ -1561,5 +1591,9 @@ def test_ordinary_rmsnorm_preserves_fp32_weights_and_pointer_abi(request):
                 assert bool((output != rounded_expected).any())
     with pytest.raises(ValueError, match="dtype"):
         hc.run_grouped_rmsnorm(
-            state, weights, eps=1e-6, binding=binding, zero_centered=True,
+            state,
+            weights,
+            eps=1e-6,
+            binding=binding,
+            zero_centered=True,
         )

@@ -32,7 +32,6 @@ def kernel_resolution_frozen() -> bool:
         return bool(_GUARDS)
 
 
-
 def raise_if_kernel_resolution_frozen(
     kind: str,
     *,

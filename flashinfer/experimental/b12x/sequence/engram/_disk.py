@@ -1,9 +1,15 @@
 """Bounded immutable-file row staging for prepared Engram lookup."""
+
 from __future__ import annotations
 
 import operator
 import os
 import torch
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ._impl import LookupBinding, _State
+
 
 def _require_disk_eager(device: torch.device) -> None:
     if torch.compiler.is_compiling():
@@ -13,7 +19,6 @@ def _require_disk_eager(device: torch.device) -> None:
             raise RuntimeError(
                 "disk Engram preparation must run outside CUDA graph capture"
             )
-
 
 
 class DiskTable:
@@ -43,6 +48,7 @@ class DiskTable:
         from .._shared.disk_table import DiskRowCache, MappedHostAllocation
 
         from ._impl import _State
+
         if not isinstance(state, _State):
             raise TypeError("state must be prepared Engram state")
         if state.caps.device.type != "cuda":
@@ -53,7 +59,9 @@ class DiskTable:
         self.state = state
         self._closed = False
         if not state.compact_rows or state.resident_scales != resident_scales:
-            raise ValueError("disk row and scale layouts differ from Engram preparation")
+            raise ValueError(
+                "disk row and scale layouts differ from Engram preparation"
+            )
         self.resident_scales = resident_scales
         self._scale_sources: set[int] = set()
         self._scale_owner = None
@@ -138,7 +146,10 @@ class DiskTable:
                 raise ValueError("checkpoint scale shard is already registered")
             start = index * self._cache.shard_rows
             end = min(start + self._cache.shard_rows, self.state.table_rows)
-            first, last = max(start, self.state.shard_start), min(end, self.state.shard_end)
+            first, last = (
+                max(start, self.state.shard_start),
+                min(end, self.state.shard_end),
+            )
             if first >= last:
                 return
             view = self._scale_owner.host_view[
@@ -162,7 +173,9 @@ class DiskTable:
         self._cache.require_complete()
         if self.resident_scales:
             first = self._cache.shard_start // self._cache.shard_rows
-            last = (self._cache.shard_end + self._cache.shard_rows - 1) // self._cache.shard_rows
+            last = (
+                self._cache.shard_end + self._cache.shard_rows - 1
+            ) // self._cache.shard_rows
             for shard in range(first, last):
                 if shard not in self._scale_sources:
                     raise ValueError(f"missing resident scale shard {shard}")
@@ -171,6 +184,10 @@ class DiskTable:
         """Return shared reader counters and batch-bounded staging sizes."""
         self._require_open()
         result = self._cache.stats()
-        result["resident_scale_bytes"] = self._scale_owner.nbytes if self._scale_owner else 0
-        result["owned_host_bytes"] = result["owned_host_bytes"] + result["resident_scale_bytes"]
+        result["resident_scale_bytes"] = (
+            self._scale_owner.nbytes if self._scale_owner else 0
+        )
+        result["owned_host_bytes"] = (
+            result["owned_host_bytes"] + result["resident_scale_bytes"]
+        )
         return result

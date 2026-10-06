@@ -109,45 +109,99 @@ def test_decode_wo_b_column_tiles_match_independent_quantized_oracle(rows, block
 
 @pytest.fixture
 def wo_session():
-    with PreparationSession(device=require_b12x(), autotune=False, compile_workers=2) as session:
+    with PreparationSession(
+        device=require_b12x(), autotune=False, compile_workers=2
+    ) as session:
         yield session
 
 
 def _make_wo_projection_binding(source_tgd, weights, *, session, config=None):
     tokens, groups, group_width = source_tgd.shape
-    plan = wo.plan(wo.Caps(device=source_tgd.device, max_tokens=tokens, groups=groups,
-                           group_width=group_width, rank=weights.rank, hidden=weights.hidden,
-                           dtype=source_tgd.dtype), override=config)
+    plan = wo.plan(
+        wo.Caps(
+            device=source_tgd.device,
+            max_tokens=tokens,
+            groups=groups,
+            group_width=group_width,
+            rank=weights.rank,
+            hidden=weights.hidden,
+            dtype=source_tgd.dtype,
+        ),
+        override=config,
+    )
     kwargs = dict(source_tgd=source_tgd, weights=weights)
+
     def prepare(state):
-        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=source_tgd.device)
-                        for spec in state._scratch_state.scratch_specs())
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=source_tgd.device)
+            for spec in state._scratch_state.scratch_specs()
+        )
         binding = state.bind(scratch=scratch, **kwargs)
         return PreparedCall(run=lambda: state.run(binding), owners=(scratch, binding))
+
     session.prepare((plan.request(name="wo", prepare_call=prepare),))
-    scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=source_tgd.device)
-                    for spec in plan.scratch_specs())
+    scratch = tuple(
+        torch.empty(spec.shape, dtype=spec.dtype, device=source_tgd.device)
+        for spec in plan.scratch_specs()
+    )
     return wo.bind(plan, scratch=scratch, **kwargs)
 
 
-def _make_inv_rope_binding(o, positions, cos_sin_cache, weights, *, session,
-                           heads_per_group, nope_dim, rope_dim):
-    plan = wo.plan(wo.Caps(device=o.device, max_tokens=o.shape[0], groups=weights.groups,
-                           group_width=weights.group_width, rank=weights.rank, hidden=weights.hidden,
-                           dtype=o.dtype), invocation=dict(operation="inv_rope",
-        heads_per_group=heads_per_group, nope_dim=nope_dim, rope_dim=rope_dim,
-        positions_dtype=str(positions.dtype).removeprefix("torch."),
-        cos_sin_dtype=str(cos_sin_cache.dtype).removeprefix("torch.")))
-    kwargs = dict(o=o, positions=positions, cos_sin_cache=cos_sin_cache, weights=weights,
-                  heads_per_group=heads_per_group, nope_dim=nope_dim, rope_dim=rope_dim)
+def _make_inv_rope_binding(
+    o,
+    positions,
+    cos_sin_cache,
+    weights,
+    *,
+    session,
+    heads_per_group,
+    nope_dim,
+    rope_dim,
+):
+    plan = wo.plan(
+        wo.Caps(
+            device=o.device,
+            max_tokens=o.shape[0],
+            groups=weights.groups,
+            group_width=weights.group_width,
+            rank=weights.rank,
+            hidden=weights.hidden,
+            dtype=o.dtype,
+        ),
+        invocation=dict(
+            operation="inv_rope",
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            positions_dtype=str(positions.dtype).removeprefix("torch."),
+            cos_sin_dtype=str(cos_sin_cache.dtype).removeprefix("torch."),
+        ),
+    )
+    kwargs = dict(
+        o=o,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        weights=weights,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+    )
+
     def prepare(state):
-        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=o.device)
-                        for spec in state._scratch_state.scratch_specs())
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=o.device)
+            for spec in state._scratch_state.scratch_specs()
+        )
         binding = state.bind_inv_rope(scratch=scratch, **kwargs)
-        return PreparedCall(run=lambda: state.run_inv_rope(binding), owners=(scratch, binding))
+        return PreparedCall(
+            run=lambda: state.run_inv_rope(binding), owners=(scratch, binding)
+        )
+
     session.prepare((plan.request(name="wo-inv-rope", prepare_call=prepare),))
-    scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=o.device)
-                    for spec in plan.scratch_specs())
+    scratch = tuple(
+        torch.empty(spec.shape, dtype=spec.dtype, device=o.device)
+        for spec in plan.scratch_specs()
+    )
     return wo.bind_inv_rope(plan, scratch=scratch, **kwargs)
 
 
@@ -665,7 +719,9 @@ def test_two_gemm_wo_projection_group_major_path_matches_quantized_reference() -
     _assert_close_bf16(actual[:, :, 0], expected)
 
 
-def test_two_gemm_wo_projection_singleton_group_matches_quantized_reference(wo_session) -> None:
+def test_two_gemm_wo_projection_singleton_group_matches_quantized_reference(
+    wo_session,
+) -> None:
     """TP8 collapses DSV4's eight output groups to one local WO group."""
 
     require_b12x()
@@ -750,7 +806,9 @@ def test_two_gemm_wo_projection_replays_under_graph(wo_session) -> None:
     graph.reset()
 
 
-def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding(wo_session):
+def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding(
+    wo_session,
+):
     require_b12x()
     torch.manual_seed(31007)
 
@@ -783,9 +841,18 @@ def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding(
     )
     weights = quantize_wo_projection_weights_mxfp8_torch(wo_a, wo_b)
 
-    binding = _make_inv_rope_binding(o, positions, cos_sin_cache, weights,
-        session=wo_session, heads_per_group=heads_per_group, nope_dim=nope_dim, rope_dim=rope_dim)
+    binding = _make_inv_rope_binding(
+        o,
+        positions,
+        cos_sin_cache,
+        weights,
+        session=wo_session,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+    )
     wo_session.freeze()
+
     def run_once():
         return wo.run_inv_rope(binding=binding, plan=binding.plan)
 
@@ -820,13 +887,27 @@ def test_wo_prepared_decode_tiles_and_prefill(tokens, wo_session):
     require_b12x()
     torch.manual_seed(31008)
     groups, width, rank, hidden = 2, 4096, 1024, 5120
-    source = torch.randn(tokens, groups, width, device="cuda", dtype=torch.bfloat16).mul_(0.25)
-    a = torch.randn(groups, rank, width, device="cuda", dtype=torch.bfloat16) / width**0.5
-    b = torch.randn(hidden, groups * rank, device="cuda", dtype=torch.bfloat16) / (groups * rank)**0.5
+    source = torch.randn(
+        tokens, groups, width, device="cuda", dtype=torch.bfloat16
+    ).mul_(0.25)
+    a = (
+        torch.randn(groups, rank, width, device="cuda", dtype=torch.bfloat16)
+        / width**0.5
+    )
+    b = (
+        torch.randn(hidden, groups * rank, device="cuda", dtype=torch.bfloat16)
+        / (groups * rank) ** 0.5
+    )
     weights = quantize_wo_projection_weights_mxfp8_torch(a, b)
-    bindings = [_make_wo_projection_binding(source, weights, session=wo_session,
-                 config=wo.WoProjectionConfig(decode_tile_n=tile))
-                for tile in ((64, 128) if tokens <= 8 else (0,))]
+    bindings = [
+        _make_wo_projection_binding(
+            source,
+            weights,
+            session=wo_session,
+            config=wo.WoProjectionConfig(decode_tile_n=tile),
+        )
+        for tile in ((64, 128) if tokens <= 8 else (0,))
+    ]
     x_q = quantize_wo_a_input_mxfp8(source)
     tmp = wo_a_dense_gemm_mxfp8(x_q, weights.wo_a)
     tmp_q = quantize_wo_b_input_mxfp8(tmp)
@@ -947,7 +1028,9 @@ def test_wo_projection_block32_pack_preserves_k_scale_bytes(wo_session) -> None:
     )
     assert not weights.sfb_k_replicated
 
-    actual = _run_binding(binding=_make_wo_projection_binding(x_tgd, weights, session=wo_session))
+    actual = _run_binding(
+        binding=_make_wo_projection_binding(x_tgd, weights, session=wo_session)
+    )
     x_q = quantize_wo_a_input_mxfp8(x_tgd)
     x_deq = dequantize_mxfp8_rows_torch(x_q.values, x_q.scale_rows)
     wo_a_deq = dequantize_mxfp8_rows_torch(weights.wo_a.values, weights.wo_a.scale_rows)
@@ -1197,9 +1280,18 @@ def test_wo_inv_rope_route_fused_small_m_matches_reference_shapes(wo_session) ->
     )
     weights = quantize_wo_projection_weights_mxfp8_torch(wo_a_grd, wo_b_hgr)
 
-    binding = _make_inv_rope_binding(o, positions, cos_sin, weights,
-        session=wo_session, heads_per_group=heads_per_group, nope_dim=nope_dim, rope_dim=rope_dim)
+    binding = _make_inv_rope_binding(
+        o,
+        positions,
+        cos_sin,
+        weights,
+        session=wo_session,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+    )
     wo_session.freeze()
+
     def run():
         return wo.run_inv_rope(binding=binding, plan=binding.plan)
 

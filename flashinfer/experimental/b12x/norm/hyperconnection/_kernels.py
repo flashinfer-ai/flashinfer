@@ -214,51 +214,78 @@ def _combine_launch(
 
 @torch.library.custom_op("b12x::hyperconnection_grouped_rmsnorm", mutates_args=("out",))
 def _grouped_rmsnorm_op(
-    state: torch.Tensor, weight: torch.Tensor, out: torch.Tensor,
-    eps: float, plan_handle: int, zero_centered: bool = True,
+    state: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    plan_handle: int,
+    zero_centered: bool = True,
 ) -> None:
     from ._impl import run_grouped_rmsnorm_impl
-    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", state.device)
-    run_grouped_rmsnorm_impl(state, weight, eps=eps, plan=prepared, out=out, zero_centered=zero_centered)
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", state.device
+    )
+    run_grouped_rmsnorm_impl(
+        state, weight, eps=eps, plan=prepared, out=out, zero_centered=zero_centered
+    )
 
 
 @_grouped_rmsnorm_op.register_fake
 def _grouped_rmsnorm_fake(
-    state: torch.Tensor, weight: torch.Tensor, out: torch.Tensor,
-    eps: float, plan_handle: int, zero_centered: bool = True,
+    state: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    plan_handle: int,
+    zero_centered: bool = True,
 ) -> None:
     del state, weight, out, eps, plan_handle
 
 
 @torch.library.custom_op("b12x::hyperconnection_scaled_silu", mutates_args=("out",))
 def _scaled_silu_op(
-    projected_down: torch.Tensor, out: torch.Tensor, plan_handle: int,
+    projected_down: torch.Tensor,
+    out: torch.Tensor,
+    plan_handle: int,
 ) -> None:
     from ._impl import run_scaled_silu_impl
-    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", projected_down.device)
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", projected_down.device
+    )
     run_scaled_silu_impl(projected_down, plan=prepared, out=out)
 
 
 @_scaled_silu_op.register_fake
 def _scaled_silu_fake(
-    projected_down: torch.Tensor, out: torch.Tensor, plan_handle: int,
+    projected_down: torch.Tensor,
+    out: torch.Tensor,
+    plan_handle: int,
 ) -> None:
     del projected_down, out, plan_handle
 
 
 @torch.library.custom_op("b12x::hyperconnection_gate_mean", mutates_args=("out",))
 def _gate_mean_op(
-    normalized: torch.Tensor, gate_logits: torch.Tensor, out: torch.Tensor,
+    normalized: torch.Tensor,
+    gate_logits: torch.Tensor,
+    out: torch.Tensor,
     plan_handle: int,
 ) -> None:
     from ._impl import run_gate_mean_impl
-    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", normalized.device)
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", normalized.device
+    )
     run_gate_mean_impl(normalized, gate_logits, plan=prepared, out=out)
 
 
 @_gate_mean_op.register_fake
 def _gate_mean_fake(
-    normalized: torch.Tensor, gate_logits: torch.Tensor, out: torch.Tensor,
+    normalized: torch.Tensor,
+    gate_logits: torch.Tensor,
+    out: torch.Tensor,
     plan_handle: int,
 ) -> None:
     del normalized, gate_logits, out, plan_handle
@@ -266,17 +293,24 @@ def _gate_mean_fake(
 
 @torch.library.custom_op("b12x::hyperconnection_combine", mutates_args=())
 def _combine_op(
-    state: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
+    state: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
     plan_handle: int,
 ) -> torch.Tensor:
     from ._impl import run_combine_impl
-    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", state.device)
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", state.device
+    )
     return run_combine_impl(state, block_output, injection_logits, plan=prepared)
 
 
 @_combine_op.register_fake
 def _combine_fake(
-    state: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
+    state: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
     plan_handle: int,
 ) -> torch.Tensor:
     del block_output, injection_logits, plan_handle
@@ -285,20 +319,36 @@ def _combine_fake(
 
 @torch.library.custom_op("b12x::hyperconnection_combine_norm", mutates_args=())
 def _combine_norm_op(
-    state: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
-    next_norm_weight: torch.Tensor, eps: float, plan_handle: int,
+    state: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
+    next_norm_weight: torch.Tensor,
+    eps: float,
+    plan_handle: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from ._impl import run_combine_norm_impl
-    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", state.device)
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", state.device
+    )
     return run_combine_norm_impl(
-        state, block_output, injection_logits, next_norm_weight, eps=eps, plan=prepared,
+        state,
+        block_output,
+        injection_logits,
+        next_norm_weight,
+        eps=eps,
+        plan=prepared,
     )
 
 
 @_combine_norm_op.register_fake
 def _combine_norm_fake(
-    state: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
-    next_norm_weight: torch.Tensor, eps: float, plan_handle: int,
+    state: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
+    next_norm_weight: torch.Tensor,
+    eps: float,
+    plan_handle: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del block_output, injection_logits, next_norm_weight, eps, plan_handle
     return torch.empty_like(state), torch.empty_like(state)
@@ -306,20 +356,38 @@ def _combine_norm_fake(
 
 @torch.library.custom_op("b12x::hyperconnection_engram_mix", mutates_args=("out",))
 def _engram_mix_op(
-    state: torch.Tensor, projected_kv: torch.Tensor, norm_weights: torch.Tensor,
-    token_mask: torch.Tensor | None, out: torch.Tensor, eps: float,
+    state: torch.Tensor,
+    projected_kv: torch.Tensor,
+    norm_weights: torch.Tensor,
+    token_mask: torch.Tensor | None,
+    out: torch.Tensor,
+    eps: float,
     plan_handle: int,
 ) -> None:
     from ._impl import run_engram_mix_impl
-    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", state.device)
-    run_engram_mix_impl(state, projected_kv, norm_weights, eps=eps, plan=prepared,
-                        out=out, token_mask=token_mask)
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", state.device
+    )
+    run_engram_mix_impl(
+        state,
+        projected_kv,
+        norm_weights,
+        eps=eps,
+        plan=prepared,
+        out=out,
+        token_mask=token_mask,
+    )
 
 
 @_engram_mix_op.register_fake
 def _engram_mix_fake(
-    state: torch.Tensor, projected_kv: torch.Tensor, norm_weights: torch.Tensor,
-    token_mask: torch.Tensor | None, out: torch.Tensor, eps: float,
+    state: torch.Tensor,
+    projected_kv: torch.Tensor,
+    norm_weights: torch.Tensor,
+    token_mask: torch.Tensor | None,
+    out: torch.Tensor,
+    eps: float,
     plan_handle: int,
 ) -> None:
     del state, projected_kv, norm_weights, token_mask, out, eps, plan_handle
@@ -327,17 +395,26 @@ def _engram_mix_fake(
 
 @torch.library.custom_op("b12x::hyperconnection_swiglu", mutates_args=("out",))
 def _swiglu_op(
-    gate_up: torch.Tensor, out: torch.Tensor, limit: float, round_silu: bool,
+    gate_up: torch.Tensor,
+    out: torch.Tensor,
+    limit: float,
+    round_silu: bool,
     plan_handle: int,
 ) -> None:
     from ._impl import run_swiglu_impl
-    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", gate_up.device)
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", gate_up.device
+    )
     run_swiglu_impl(gate_up, out=out, limit=limit, round_silu=round_silu, plan=prepared)
 
 
 @_swiglu_op.register_fake
 def _swiglu_fake(
-    gate_up: torch.Tensor, out: torch.Tensor, limit: float, round_silu: bool,
+    gate_up: torch.Tensor,
+    out: torch.Tensor,
+    limit: float,
+    round_silu: bool,
     plan_handle: int,
 ) -> None:
     del gate_up, out, limit, round_silu, plan_handle
@@ -345,17 +422,24 @@ def _swiglu_fake(
 
 @torch.library.custom_op("b12x::hyperconnection_add", mutates_args=("out",))
 def _add_op(
-    left: torch.Tensor, right: torch.Tensor, out: torch.Tensor,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    out: torch.Tensor,
     plan_handle: int,
 ) -> None:
     from ._impl import run_add_impl
-    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", left.device)
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", left.device
+    )
     run_add_impl(left, right, out=out, plan=prepared)
 
 
 @_add_op.register_fake
 def _add_fake(
-    left: torch.Tensor, right: torch.Tensor, out: torch.Tensor,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    out: torch.Tensor,
     plan_handle: int,
 ) -> None:
     del left, right, out, plan_handle
@@ -364,7 +448,10 @@ def _add_fake(
 @torch.library.custom_op("b12x::hyperconnection_sigmoid", mutates_args=("out",))
 def _sigmoid_op(source: torch.Tensor, out: torch.Tensor, plan_handle: int) -> None:
     from ._impl import run_sigmoid_impl
-    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", source.device)
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", source.device
+    )
     run_sigmoid_impl(source, out=out, plan=prepared)
 
 

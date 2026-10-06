@@ -35,7 +35,11 @@ _COLLAPSE_SUPPORTED_HIDDEN_SIZES = (4096, 5120, 7168)
 
 
 def _run_collapse_impl(
-    state: torch.Tensor, pre_mix: torch.Tensor | None, *, out: torch.Tensor, _state: "_MhcState",
+    state: torch.Tensor,
+    pre_mix: torch.Tensor | None,
+    *,
+    out: torch.Tensor,
+    _state: "_MhcState",
 ) -> torch.Tensor:
     """Contract BF16 ``[T,4,H]`` using FP32 weights, or a uniform stream mean.
 
@@ -60,12 +64,19 @@ def _run_collapse_impl(
         ("out", out, (tokens, hidden), torch.bfloat16),
     ):
         _validate_optional_view(
-            tensor, shape=shape, dtype=dtype, device=state.device, name=name,
+            tensor,
+            shape=shape,
+            dtype=dtype,
+            device=state.device,
+            name=name,
         )
     if pre_mix is not None:
         _validate_optional_view(
-            pre_mix, shape=(tokens, MHC_MULT), dtype=torch.float32,
-            device=state.device, name="pre_mix",
+            pre_mix,
+            shape=(tokens, MHC_MULT),
+            dtype=torch.float32,
+            device=state.device,
+            name="pre_mix",
         )
     _state.launchers["collapse"](state=state, pre_mix=pre_mix, out=out)
     return out
@@ -134,9 +145,18 @@ class B12XMHCBinding:
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return b12x_mhc_pre(
-            residual, fn, hc_scale, hc_base, rms_eps=rms_eps, hc_eps=hc_eps,
-            sinkhorn_iters=sinkhorn_iters, pre_mix=pre_mix, pre_out=pre_out,
-            norm_weight=norm_weight, norm_eps=norm_eps, binding=self,
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            pre_mix=pre_mix,
+            pre_out=pre_out,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            binding=self,
         )
 
     def post_pre(
@@ -159,10 +179,22 @@ class B12XMHCBinding:
         fn_bf16: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return b12x_mhc_post_pre(
-            x, residual, prev_post, prev_comb, fn, hc_scale, hc_base,
-            rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters,
-            pre_mix=pre_mix, pre_out=pre_out, norm_weight=norm_weight,
-            norm_eps=norm_eps, fn_bf16=fn_bf16, binding=self,
+            x,
+            residual,
+            prev_post,
+            prev_comb,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            pre_mix=pre_mix,
+            pre_out=pre_out,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            fn_bf16=fn_bf16,
+            binding=self,
         )
 
 
@@ -180,7 +212,11 @@ class B12XMHCScratchCaps:
             device = torch.device("cuda", torch.cuda.current_device())
         object.__setattr__(self, "device", device)
         if self.split_k is None:
-            object.__setattr__(self, "split_k", _required_mhc_split_k(self.hidden_size, MHC_DEFAULT_BLOCK_K))
+            object.__setattr__(
+                self,
+                "split_k",
+                _required_mhc_split_k(self.hidden_size, MHC_DEFAULT_BLOCK_K),
+            )
         for name in ("max_tokens", "hidden_size", "split_k"):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -206,28 +242,53 @@ class _MhcState:
     query: MhcQuery
     launchers: Mapping[str, Callable]
 
-    def require(self, operation, tensor, *, norm_weight=None, fn_bf16=None,
-                rms_eps=None, hc_eps=None, sinkhorn_iters=None, norm_eps=None):
+    def require(
+        self,
+        operation,
+        tensor,
+        *,
+        norm_weight=None,
+        fn_bf16=None,
+        rms_eps=None,
+        hc_eps=None,
+        sinkhorn_iters=None,
+        norm_eps=None,
+    ):
         query = self.query
         if operation != query.operation:
             raise ValueError(f"execution prepares {query.operation}, not {operation}")
         if tensor.device != self.caps.device:
             raise ValueError("MHC tensor and prepared device differ")
-        if not 0 <= tensor.shape[0] <= query.max_tokens or tensor.shape[-1] != query.hidden_size:
-            raise ValueError("MHC tensor exceeds its planned token capacity or differs in hidden size")
+        if (
+            not 0 <= tensor.shape[0] <= query.max_tokens
+            or tensor.shape[-1] != query.hidden_size
+        ):
+            raise ValueError(
+                "MHC tensor exceeds its planned token capacity or differs in hidden size"
+            )
         if operation == "pre" and (tensor.ndim == 3) != query.expanded_residual:
             raise ValueError("MHC residual layout differs from its prepared invocation")
         if operation in ("pre", "post_pre"):
             if (norm_weight is not None) != query.has_norm_weight:
                 raise ValueError("MHC normalization operand presence changed")
-            if norm_weight is not None and str(norm_weight.dtype).removeprefix("torch.") != query.norm_weight_dtype:
+            if (
+                norm_weight is not None
+                and str(norm_weight.dtype).removeprefix("torch.")
+                != query.norm_weight_dtype
+            ):
                 raise ValueError("MHC normalization dtype changed")
             if operation == "post_pre" and (fn_bf16 is not None) != query.has_fn_bf16:
                 raise ValueError("MHC BF16 projection operand presence changed")
             if (rms_eps, hc_eps, sinkhorn_iters, norm_eps) != (
-                query.rms_eps, query.hc_eps, query.sinkhorn_iters, query.norm_eps,
+                query.rms_eps,
+                query.hc_eps,
+                query.sinkhorn_iters,
+                query.norm_eps,
             ):
-                raise ValueError("MHC numerical recipe differs from prepared invocation")
+                raise ValueError(
+                    "MHC numerical recipe differs from prepared invocation"
+                )
+
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
@@ -350,8 +411,6 @@ def _canonicalize_mhc_expected_m(
     return expected
 
 
-
-
 def _validate_mhc_binding_views(
     *,
     partials: torch.Tensor | None,
@@ -458,8 +517,6 @@ def _layout_mhc_scratch(caps: B12XMHCScratchCaps) -> _MHCScratchLayout:
     )
 
 
-
-
 def _require_contiguous(tensor: torch.Tensor, *, name: str) -> None:
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
@@ -477,7 +534,9 @@ def _validate_pre_inputs(
         raise ValueError("residual must be a CUDA tensor")
     if residual.dtype != torch.bfloat16:
         raise ValueError(f"residual must be torch.bfloat16, got {residual.dtype}")
-    if residual.ndim != (3 if expanded else 2) or (expanded and residual.shape[1] != MHC_MULT):
+    if residual.ndim != (3 if expanded else 2) or (
+        expanded and residual.shape[1] != MHC_MULT
+    ):
         raise ValueError(
             f"residual must match its declared broadcast or four-stream layout, got {tuple(residual.shape)}"
         )
@@ -617,12 +676,19 @@ def _lagged_mix_views(
     if pre_mix is None:
         return None, None
     _validate_optional_view(
-        pre_mix, shape=(tokens, MHC_MULT), dtype=torch.float32,
-        device=device, name="pre_mix",
+        pre_mix,
+        shape=(tokens, MHC_MULT),
+        dtype=torch.float32,
+        device=device,
+        name="pre_mix",
     )
     pre_out = _slice_capacity_view(
-        pre_out, tokens=tokens, tail_shape=(MHC_MULT,), dtype=torch.float32,
-        device=device, name="pre_out",
+        pre_out,
+        tokens=tokens,
+        tail_shape=(MHC_MULT,),
+        dtype=torch.float32,
+        device=device,
+        name="pre_out",
     )
     assert pre_out is not None
     if torch._C._overlaps(pre_mix, pre_out):
@@ -631,11 +697,17 @@ def _lagged_mix_views(
         if tensor is not None and (
             torch._C._overlaps(pre_mix, tensor) or torch._C._overlaps(pre_out, tensor)
         ):
-            raise ValueError("lagged MHC coefficient buffers must not alias inputs, outputs, or scratch")
+            raise ValueError(
+                "lagged MHC coefficient buffers must not alias inputs, outputs, or scratch"
+            )
     return pre_mix, pre_out
+
+
 def _validate_lagged_y_output(y, tensors):
     if any(tensor is not None and torch._C._overlaps(y, tensor) for tensor in tensors):
-        raise ValueError("lagged mHC y output must not alias inputs, residual output, or scratch")
+        raise ValueError(
+            "lagged mHC y output must not alias inputs, residual output, or scratch"
+        )
 
 
 def _b12x_mhc_pre_impl(
@@ -658,28 +730,55 @@ def _b12x_mhc_pre_impl(
     pre_out: torch.Tensor | None = None,
     _state: _MhcState,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    _state.require("pre", residual, norm_weight=norm_weight,
-                   rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps)
-    split_k, block_k, block_h = _state.query.split_k, _state.query.block_k, _state.query.block_h
+    _state.require(
+        "pre",
+        residual,
+        norm_weight=norm_weight,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        norm_eps=norm_eps,
+    )
+    split_k, block_k, block_h = (
+        _state.query.split_k,
+        _state.query.block_k,
+        _state.query.block_h,
+    )
     partials = None
     if binding is not None:
         if binding.state is not _state:
             raise ValueError("binding and plan have different prepared states")
         extras = [
-            name for name, value in (
-                ("residual_out", residual_out), ("y_out", y_out),
-                ("post_out", post_out), ("comb_out", comb_out), ("pre_out", pre_out),
-            ) if value is not None
+            name
+            for name, value in (
+                ("residual_out", residual_out),
+                ("y_out", y_out),
+                ("post_out", post_out),
+                ("comb_out", comb_out),
+                ("pre_out", pre_out),
+            )
+            if value is not None
         ]
         if extras:
-            raise ValueError("mHC binding owns scratch and output buffers; do not also pass " + ", ".join(extras))
+            raise ValueError(
+                "mHC binding owns scratch and output buffers; do not also pass "
+                + ", ".join(extras)
+            )
         partials = binding.partials
         residual_out, y_out = binding.out, binding.y
-        post_out, comb_out, pre_out = binding.post_buffer, binding.comb_buffer, binding.pre_out
+        post_out, comb_out, pre_out = (
+            binding.post_buffer,
+            binding.comb_buffer,
+            binding.pre_out,
+        )
         split_k = int(binding.state.query.split_k)
 
     tokens, hidden_size, _ = _validate_pre_inputs(
-        residual, fn, hc_scale, hc_base, expanded=_state.query.expanded_residual,
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        expanded=_state.query.expanded_residual,
     )
     if (residual.ndim == 3) != _state.query.expanded_residual:
         raise ValueError("MHC pre residual layout differs from preparation")
@@ -696,12 +795,17 @@ def _b12x_mhc_pre_impl(
     if block_h <= 0:
         raise ValueError(f"block_h must be positive, got {block_h}")
     pre_mix, pre_out = _lagged_mix_views(
-        pre_mix, pre_out, tokens=tokens, device=residual.device,
+        pre_mix,
+        pre_out,
+        tokens=tokens,
+        device=residual.device,
         outputs=(partials, residual_out, y_out, post_out, comb_out),
         inputs=(residual, fn, hc_scale, hc_base, norm_weight),
     )
     if (pre_mix is not None) != _state.query.lagged_mix:
-        raise ValueError("MHC lagged coefficient presence differs from prepared invocation")
+        raise ValueError(
+            "MHC lagged coefficient presence differs from prepared invocation"
+        )
 
     if partials is None:
         partials = torch.empty(
@@ -818,15 +922,29 @@ def _b12x_mhc_pre_impl(
     if _state.query.lagged_mix:
         assert pre_mix is not None and pre_out is not None
         if _state.config.lagged_prepare:
-            _validate_lagged_y_output(y_out, (residual, fn, hc_scale, hc_base, norm_weight, residual_out, partials))
+            _validate_lagged_y_output(
+                y_out,
+                (residual, fn, hc_scale, hc_base, norm_weight, residual_out, partials),
+            )
         _state.launchers["partial"](
-            residual=residual, fn=fn, partials=partials, out=residual_out,
-            pre_mix=pre_mix, y=y_out,
+            residual=residual,
+            fn=fn,
+            partials=partials,
+            out=residual_out,
+            pre_mix=pre_mix,
+            y=y_out,
         )
         _state.launchers["finalize"](
-            residual=residual_out, partials=partials, scale=hc_scale, bias=hc_base,
-            y=y_out, post=post_out, comb=comb_out, norm_weight=norm_weight,
-            pre_mix=pre_mix, pre_out=pre_out,
+            residual=residual_out,
+            partials=partials,
+            scale=hc_scale,
+            bias=hc_base,
+            y=y_out,
+            post=post_out,
+            comb=comb_out,
+            norm_weight=norm_weight,
+            pre_mix=pre_mix,
+            pre_out=pre_out,
         )
         return residual_out, post_out, comb_out, y_out
     if (
@@ -842,11 +960,20 @@ def _b12x_mhc_pre_impl(
         and sinkhorn_iters == 20
     ):
         _state.launchers["partial"](
-            residual=residual, fn=fn, partials=partials, out=residual_out,
+            residual=residual,
+            fn=fn,
+            partials=partials,
+            out=residual_out,
         )
         _state.launchers["finalize"](
-            residual=residual_out, partials=partials, scale=hc_scale, bias=hc_base,
-            y=y_out, post=post_out, comb=comb_out, norm_weight=norm_weight,
+            residual=residual_out,
+            partials=partials,
+            scale=hc_scale,
+            bias=hc_base,
+            y=y_out,
+            post=post_out,
+            comb=comb_out,
+            norm_weight=norm_weight,
         )
         return residual_out, post_out, comb_out, y_out
 
@@ -889,10 +1016,20 @@ def _b12x_mhc_post_pre_impl(
     _state: _MhcState,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _state.require(
-        "post_pre", residual, norm_weight=norm_weight, fn_bf16=fn_bf16,
-        rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps,
+        "post_pre",
+        residual,
+        norm_weight=norm_weight,
+        fn_bf16=fn_bf16,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        norm_eps=norm_eps,
     )
-    split_k, block_k, block_h = _state.query.split_k, _state.query.block_k, _state.query.block_h
+    split_k, block_k, block_h = (
+        _state.query.split_k,
+        _state.query.block_k,
+        _state.query.block_h,
+    )
     expected_m = _state.query.max_tokens
     partials = None
     if binding is not None:
@@ -936,12 +1073,17 @@ def _b12x_mhc_post_pre_impl(
     expected_m = _canonicalize_mhc_expected_m(expected_m, min_tokens=tokens)
     _validate_norm_weight(norm_weight, hidden_size=hidden_size, device=residual.device)
     pre_mix, pre_out = _lagged_mix_views(
-        pre_mix, pre_out, tokens=tokens, device=residual.device,
+        pre_mix,
+        pre_out,
+        tokens=tokens,
+        device=residual.device,
         outputs=(partials, residual_out, y_out, post_out, comb_out),
         inputs=(x, residual, prev_post, prev_comb, fn, hc_scale, hc_base, norm_weight),
     )
     if (pre_mix is not None) != _state.query.lagged_mix:
-        raise ValueError("MHC lagged coefficient presence differs from prepared invocation")
+        raise ValueError(
+            "MHC lagged coefficient presence differs from prepared invocation"
+        )
     if x.dtype != residual.dtype or x.dtype != torch.bfloat16:
         raise ValueError(
             f"x and residual must both be torch.bfloat16, got {x.dtype} and {residual.dtype}"
@@ -1100,33 +1242,77 @@ def _b12x_mhc_post_pre_impl(
     if _state.query.lagged_mix:
         assert pre_mix is not None and pre_out is not None
         if _state.config.lagged_prepare:
-            _validate_lagged_y_output(y_out, (x, residual, prev_post, prev_comb, fn, hc_scale, hc_base, norm_weight, residual_out, partials))
+            _validate_lagged_y_output(
+                y_out,
+                (
+                    x,
+                    residual,
+                    prev_post,
+                    prev_comb,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    norm_weight,
+                    residual_out,
+                    partials,
+                ),
+            )
         _state.launchers["partial"](
-            x=x, residual=residual, prev_post=prev_post, prev_comb=prev_comb,
-            fn=fn, fn_bf16=fn_bf16, partials=partials, out=residual_out, pre_mix=pre_mix, y=y_out,
+            x=x,
+            residual=residual,
+            prev_post=prev_post,
+            prev_comb=prev_comb,
+            fn=fn,
+            fn_bf16=fn_bf16,
+            partials=partials,
+            out=residual_out,
+            pre_mix=pre_mix,
+            y=y_out,
         )
         _state.launchers["finalize"](
-            residual=residual_out, partials=partials, scale=hc_scale, bias=hc_base,
-            y=y_out, post=post_out, comb=comb_out, norm_weight=norm_weight,
-            pre_mix=pre_mix, pre_out=pre_out,
+            residual=residual_out,
+            partials=partials,
+            scale=hc_scale,
+            bias=hc_base,
+            y=y_out,
+            post=post_out,
+            comb=comb_out,
+            norm_weight=norm_weight,
+            pre_mix=pre_mix,
+            pre_out=pre_out,
         )
         return residual_out, post_out, comb_out, y_out
     if (
         partials is not None
         and _supports_fused_mhc_gram(
-            hidden_size=hidden_size, split_k=split_k, block_k=block_k, block_h=block_h,
+            hidden_size=hidden_size,
+            split_k=split_k,
+            block_k=block_k,
+            block_h=block_h,
         )
         and float(rms_eps) in MHC_SUPPORTED_RMS_EPS
         and float(hc_eps) == 1.0e-6
         and sinkhorn_iters == 20
     ):
         _state.launchers["partial"](
-            x=x, residual=residual, prev_post=prev_post, prev_comb=prev_comb,
-            fn=fn, fn_bf16=fn_bf16, partials=partials, out=residual_out,
+            x=x,
+            residual=residual,
+            prev_post=prev_post,
+            prev_comb=prev_comb,
+            fn=fn,
+            fn_bf16=fn_bf16,
+            partials=partials,
+            out=residual_out,
         )
         _state.launchers["finalize"](
-            residual=residual_out, partials=partials, scale=hc_scale, bias=hc_base,
-            y=y_out, post=post_out, comb=comb_out, norm_weight=norm_weight,
+            residual=residual_out,
+            partials=partials,
+            scale=hc_scale,
+            bias=hc_base,
+            y=y_out,
+            post=post_out,
+            comb=comb_out,
+            norm_weight=norm_weight,
         )
         return residual_out, post_out, comb_out, y_out
 
@@ -1212,7 +1398,11 @@ def _b12x_mhc_post_impl(
         return out
     if _supports_mhc_post_hidden(hidden_size):
         _state.launchers["post"](
-            x=x, residual=residual, prev_post=prev_post, prev_comb=prev_comb, out=out,
+            x=x,
+            residual=residual,
+            prev_post=prev_post,
+            prev_comb=prev_comb,
+            out=out,
         )
         return out
 
@@ -1233,150 +1423,277 @@ def _prepared_state(plan, *, output_mode):
 def _functional_output_metadata(residual):
     tokens, hidden = residual.shape[0], residual.shape[-1]
     return (
-        torch.empty((tokens, MHC_MULT, hidden), dtype=residual.dtype, device=residual.device),
+        torch.empty(
+            (tokens, MHC_MULT, hidden), dtype=residual.dtype, device=residual.device
+        ),
         torch.empty((tokens, MHC_MULT), dtype=torch.float32, device=residual.device),
-        torch.empty((tokens, MHC_MULT, MHC_MULT), dtype=torch.float32, device=residual.device),
+        torch.empty(
+            (tokens, MHC_MULT, MHC_MULT), dtype=torch.float32, device=residual.device
+        ),
         torch.empty((tokens, hidden), dtype=residual.dtype, device=residual.device),
     )
 
 
 @torch.library.custom_op("b12x::mhc_pre_planned_functional", mutates_args=())
 def _mhc_pre_planned_functional_op(
-    residual: torch.Tensor, fn: torch.Tensor, hc_scale: torch.Tensor,
-    hc_base: torch.Tensor, norm_weight: torch.Tensor | None,
-    rms_eps: float, hc_eps: float, sinkhorn_iters: int, norm_eps: float,
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
     plan_handle: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _b12x_mhc_pre_impl(
-        residual, fn, hc_scale, hc_base, norm_weight=norm_weight,
-        rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps,
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight=norm_weight,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        norm_eps=norm_eps,
         _state=_prepared_state(plan_from_handle(plan_handle), output_mode="functional"),
     )
 
 
 @_mhc_pre_planned_functional_op.register_fake
 def _mhc_pre_planned_functional_fake(
-    residual: torch.Tensor, fn: torch.Tensor, hc_scale: torch.Tensor,
-    hc_base: torch.Tensor, norm_weight: torch.Tensor | None,
-    rms_eps: float, hc_eps: float, sinkhorn_iters: int, norm_eps: float,
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
     plan_handle: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _functional_output_metadata(residual)
+
+
 @torch.library.custom_op(
     "b12x::mhc_pre_lagged_planned_functional", mutates_args=("pre_out",)
 )
 def _mhc_pre_lagged_planned_functional_op(
-    residual: torch.Tensor, fn: torch.Tensor, hc_scale: torch.Tensor,
-    hc_base: torch.Tensor, pre_mix: torch.Tensor, pre_out: torch.Tensor,
-    norm_weight: torch.Tensor | None, rms_eps: float, hc_eps: float,
-    sinkhorn_iters: int, norm_eps: float, plan_handle: int,
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    pre_mix: torch.Tensor,
+    pre_out: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    plan_handle: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _b12x_mhc_pre_impl(
-        residual, fn, hc_scale, hc_base, pre_mix=pre_mix, pre_out=pre_out,
-        norm_weight=norm_weight, rms_eps=rms_eps, hc_eps=hc_eps,
-        sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps,
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        pre_mix=pre_mix,
+        pre_out=pre_out,
+        norm_weight=norm_weight,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        norm_eps=norm_eps,
         _state=_prepared_state(plan_from_handle(plan_handle), output_mode="functional"),
     )
 
 
 @_mhc_pre_lagged_planned_functional_op.register_fake
 def _mhc_pre_lagged_planned_functional_fake(
-    residual: torch.Tensor, fn: torch.Tensor, hc_scale: torch.Tensor,
-    hc_base: torch.Tensor, pre_mix: torch.Tensor, pre_out: torch.Tensor,
-    norm_weight: torch.Tensor | None, rms_eps: float, hc_eps: float,
-    sinkhorn_iters: int, norm_eps: float, plan_handle: int,
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    pre_mix: torch.Tensor,
+    pre_out: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    plan_handle: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _functional_output_metadata(residual)
 
 
 @torch.library.custom_op("b12x::mhc_post_pre_planned_functional", mutates_args=())
 def _mhc_post_pre_planned_functional_op(
-    x: torch.Tensor, residual: torch.Tensor, prev_post: torch.Tensor,
-    prev_comb: torch.Tensor, fn: torch.Tensor, hc_scale: torch.Tensor,
-    hc_base: torch.Tensor, fn_bf16: torch.Tensor | None, norm_weight: torch.Tensor | None,
-    rms_eps: float, hc_eps: float, sinkhorn_iters: int, norm_eps: float,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    fn_bf16: torch.Tensor | None,
+    norm_weight: torch.Tensor | None,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
     plan_handle: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _b12x_mhc_post_pre_impl(
-        x, residual, prev_post, prev_comb, fn, hc_scale, hc_base,
-        norm_weight=norm_weight, fn_bf16=fn_bf16,
-        rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps,
+        x,
+        residual,
+        prev_post,
+        prev_comb,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight=norm_weight,
+        fn_bf16=fn_bf16,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        norm_eps=norm_eps,
         _state=_prepared_state(plan_from_handle(plan_handle), output_mode="functional"),
     )
 
 
 @_mhc_post_pre_planned_functional_op.register_fake
 def _mhc_post_pre_planned_functional_fake(
-    x: torch.Tensor, residual: torch.Tensor, prev_post: torch.Tensor,
-    prev_comb: torch.Tensor, fn: torch.Tensor, hc_scale: torch.Tensor,
-    hc_base: torch.Tensor, fn_bf16: torch.Tensor | None, norm_weight: torch.Tensor | None,
-    rms_eps: float, hc_eps: float, sinkhorn_iters: int, norm_eps: float,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    fn_bf16: torch.Tensor | None,
+    norm_weight: torch.Tensor | None,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
     plan_handle: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _functional_output_metadata(residual)
+
 
 @torch.library.custom_op(
     "b12x::mhc_post_pre_lagged_planned_functional", mutates_args=("pre_out",)
 )
 def _mhc_post_pre_lagged_planned_functional_op(
-    x: torch.Tensor, residual: torch.Tensor, prev_post: torch.Tensor,
-    prev_comb: torch.Tensor, fn: torch.Tensor, hc_scale: torch.Tensor,
-    hc_base: torch.Tensor, fn_bf16: torch.Tensor | None, pre_mix: torch.Tensor,
-    pre_out: torch.Tensor, norm_weight: torch.Tensor | None, rms_eps: float,
-    hc_eps: float, sinkhorn_iters: int, norm_eps: float, plan_handle: int,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    fn_bf16: torch.Tensor | None,
+    pre_mix: torch.Tensor,
+    pre_out: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    plan_handle: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _b12x_mhc_post_pre_impl(
-        x, residual, prev_post, prev_comb, fn, hc_scale, hc_base,
-        fn_bf16=fn_bf16, pre_mix=pre_mix, pre_out=pre_out,
-        norm_weight=norm_weight, rms_eps=rms_eps, hc_eps=hc_eps,
-        sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps,
+        x,
+        residual,
+        prev_post,
+        prev_comb,
+        fn,
+        hc_scale,
+        hc_base,
+        fn_bf16=fn_bf16,
+        pre_mix=pre_mix,
+        pre_out=pre_out,
+        norm_weight=norm_weight,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        norm_eps=norm_eps,
         _state=_prepared_state(plan_from_handle(plan_handle), output_mode="functional"),
     )
 
 
 @_mhc_post_pre_lagged_planned_functional_op.register_fake
 def _mhc_post_pre_lagged_planned_functional_fake(
-    x: torch.Tensor, residual: torch.Tensor, prev_post: torch.Tensor,
-    prev_comb: torch.Tensor, fn: torch.Tensor, hc_scale: torch.Tensor,
-    hc_base: torch.Tensor, fn_bf16: torch.Tensor | None, pre_mix: torch.Tensor,
-    pre_out: torch.Tensor, norm_weight: torch.Tensor | None, rms_eps: float,
-    hc_eps: float, sinkhorn_iters: int, norm_eps: float, plan_handle: int,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    fn_bf16: torch.Tensor | None,
+    pre_mix: torch.Tensor,
+    pre_out: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    plan_handle: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _functional_output_metadata(residual)
 
 
 @torch.library.custom_op("b12x::mhc_post_planned_functional", mutates_args=())
 def _mhc_post_planned_functional_op(
-    x: torch.Tensor, residual: torch.Tensor, prev_post: torch.Tensor,
-    prev_comb: torch.Tensor, plan_handle: int,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    plan_handle: int,
 ) -> torch.Tensor:
     return _b12x_mhc_post_impl(
-        x, residual, prev_post, prev_comb,
+        x,
+        residual,
+        prev_post,
+        prev_comb,
         _state=_prepared_state(plan_from_handle(plan_handle), output_mode="functional"),
     )
 
 
 @_mhc_post_planned_functional_op.register_fake
 def _mhc_post_planned_functional_fake(
-    x: torch.Tensor, residual: torch.Tensor, prev_post: torch.Tensor,
-    prev_comb: torch.Tensor, plan_handle: int,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    prev_comb: torch.Tensor,
+    plan_handle: int,
 ) -> torch.Tensor:
     return torch.empty_like(residual)
 
 
 @torch.library.custom_op("b12x::mhc_collapse", mutates_args=("out",))
 def _mhc_collapse_op(
-    state: torch.Tensor, pre_mix: torch.Tensor | None, out: torch.Tensor,
+    state: torch.Tensor,
+    pre_mix: torch.Tensor | None,
+    out: torch.Tensor,
     plan_handle: int,
 ) -> None:
     _run_collapse_impl(
-        state, pre_mix, out=out, _state=_prepared_state(plan_from_handle(plan_handle), output_mode="provided"),
+        state,
+        pre_mix,
+        out=out,
+        _state=_prepared_state(plan_from_handle(plan_handle), output_mode="provided"),
     )
 
 
 @_mhc_collapse_op.register_fake
 def _mhc_collapse_fake(
-    state: torch.Tensor, pre_mix: torch.Tensor | None, out: torch.Tensor,
+    state: torch.Tensor,
+    pre_mix: torch.Tensor | None,
+    out: torch.Tensor,
     plan_handle: int,
 ) -> None:
     del state, pre_mix, out, plan_handle
@@ -1393,10 +1710,24 @@ def _plan_from_binding(plan, binding):
 
 
 def b12x_mhc_pre(
-    residual, fn, hc_scale, hc_base, *, rms_eps, hc_eps, sinkhorn_iters,
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    *,
+    rms_eps,
+    hc_eps,
+    sinkhorn_iters,
     plan: Plan | None = None,
-    residual_out=None, y_out=None, post_out=None, comb_out=None, pre_mix=None, pre_out=None,
-    norm_weight=None, norm_eps=0.0, binding: B12XMHCBinding | None = None,
+    residual_out=None,
+    y_out=None,
+    post_out=None,
+    comb_out=None,
+    pre_mix=None,
+    pre_out=None,
+    norm_weight=None,
+    norm_eps=0.0,
+    binding: B12XMHCBinding | None = None,
 ):
     plan = _plan_from_binding(plan, binding)
     functional = binding is None and all(
@@ -1406,30 +1737,78 @@ def b12x_mhc_pre(
         raise ValueError("pre_mix and caller-owned pre_out must be supplied together")
     if functional and pre_mix is not None:
         return torch.ops.b12x.mhc_pre_lagged_planned_functional(
-            residual, fn, hc_scale, hc_base, pre_mix, pre_out, norm_weight,
-            float(rms_eps), float(hc_eps), int(sinkhorn_iters), float(norm_eps), plan.handle,
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            pre_mix,
+            pre_out,
+            norm_weight,
+            float(rms_eps),
+            float(hc_eps),
+            int(sinkhorn_iters),
+            float(norm_eps),
+            plan.handle,
         )
     if functional:
         return torch.ops.b12x.mhc_pre_planned_functional(
-            residual, fn, hc_scale, hc_base, norm_weight,
-            float(rms_eps), float(hc_eps), int(sinkhorn_iters), float(norm_eps), plan.handle,
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            float(rms_eps),
+            float(hc_eps),
+            int(sinkhorn_iters),
+            float(norm_eps),
+            plan.handle,
         )
     if torch.compiler.is_compiling():
         raise RuntimeError("caller-owned MHC buffers are not supported inside Dynamo")
     return _b12x_mhc_pre_impl(
-        residual, fn, hc_scale, hc_base, rms_eps=rms_eps, hc_eps=hc_eps,
-        sinkhorn_iters=sinkhorn_iters, pre_mix=pre_mix, pre_out=pre_out,
-        norm_weight=norm_weight, norm_eps=norm_eps,
-        residual_out=residual_out, y_out=y_out, post_out=post_out, comb_out=comb_out,
-        binding=binding, _state=_prepared_state(plan, output_mode="provided"),
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        pre_mix=pre_mix,
+        pre_out=pre_out,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        residual_out=residual_out,
+        y_out=y_out,
+        post_out=post_out,
+        comb_out=comb_out,
+        binding=binding,
+        _state=_prepared_state(plan, output_mode="provided"),
     )
 
 
 def b12x_mhc_post_pre(
-    x, residual, prev_post, prev_comb, fn, hc_scale, hc_base, *,
-    rms_eps, hc_eps, sinkhorn_iters, plan: Plan | None = None,
-    residual_out=None, y_out=None, post_out=None, comb_out=None, pre_mix=None, pre_out=None,
-    fn_bf16=None, norm_weight=None, norm_eps=0.0, binding: B12XMHCBinding | None = None,
+    x,
+    residual,
+    prev_post,
+    prev_comb,
+    fn,
+    hc_scale,
+    hc_base,
+    *,
+    rms_eps,
+    hc_eps,
+    sinkhorn_iters,
+    plan: Plan | None = None,
+    residual_out=None,
+    y_out=None,
+    post_out=None,
+    comb_out=None,
+    pre_mix=None,
+    pre_out=None,
+    fn_bf16=None,
+    norm_weight=None,
+    norm_eps=0.0,
+    binding: B12XMHCBinding | None = None,
 ):
     plan = _plan_from_binding(plan, binding)
     functional = binding is None and all(
@@ -1439,34 +1818,80 @@ def b12x_mhc_post_pre(
         raise ValueError("pre_mix and caller-owned pre_out must be supplied together")
     if functional and pre_mix is not None:
         return torch.ops.b12x.mhc_post_pre_lagged_planned_functional(
-            x, residual, prev_post, prev_comb, fn, hc_scale, hc_base, fn_bf16,
-            pre_mix, pre_out, norm_weight, float(rms_eps), float(hc_eps),
-            int(sinkhorn_iters), float(norm_eps), plan.handle,
+            x,
+            residual,
+            prev_post,
+            prev_comb,
+            fn,
+            hc_scale,
+            hc_base,
+            fn_bf16,
+            pre_mix,
+            pre_out,
+            norm_weight,
+            float(rms_eps),
+            float(hc_eps),
+            int(sinkhorn_iters),
+            float(norm_eps),
+            plan.handle,
         )
     if functional:
         return torch.ops.b12x.mhc_post_pre_planned_functional(
-            x, residual, prev_post, prev_comb, fn, hc_scale, hc_base, fn_bf16, norm_weight,
-            float(rms_eps), float(hc_eps), int(sinkhorn_iters), float(norm_eps), plan.handle,
+            x,
+            residual,
+            prev_post,
+            prev_comb,
+            fn,
+            hc_scale,
+            hc_base,
+            fn_bf16,
+            norm_weight,
+            float(rms_eps),
+            float(hc_eps),
+            int(sinkhorn_iters),
+            float(norm_eps),
+            plan.handle,
         )
     if torch.compiler.is_compiling():
         raise RuntimeError("caller-owned MHC buffers are not supported inside Dynamo")
     return _b12x_mhc_post_pre_impl(
-        x, residual, prev_post, prev_comb, fn, hc_scale, hc_base,
-        rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters,
-        residual_out=residual_out, y_out=y_out, post_out=post_out, comb_out=comb_out,
-        pre_mix=pre_mix, pre_out=pre_out, fn_bf16=fn_bf16,
-        norm_weight=norm_weight, norm_eps=norm_eps, binding=binding,
+        x,
+        residual,
+        prev_post,
+        prev_comb,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        residual_out=residual_out,
+        y_out=y_out,
+        post_out=post_out,
+        comb_out=comb_out,
+        pre_mix=pre_mix,
+        pre_out=pre_out,
+        fn_bf16=fn_bf16,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        binding=binding,
         _state=_prepared_state(plan, output_mode="provided"),
     )
 
 
 def b12x_mhc_post(x, residual, prev_post, prev_comb, *, plan: Plan, out=None):
     if out is None:
-        return torch.ops.b12x.mhc_post_planned_functional(x, residual, prev_post, prev_comb, plan.handle)
+        return torch.ops.b12x.mhc_post_planned_functional(
+            x, residual, prev_post, prev_comb, plan.handle
+        )
     if torch.compiler.is_compiling():
         raise RuntimeError("caller-owned MHC outputs are not supported inside Dynamo")
     return _b12x_mhc_post_impl(
-        x, residual, prev_post, prev_comb, out=out,
+        x,
+        residual,
+        prev_post,
+        prev_comb,
+        out=out,
         _state=_prepared_state(plan, output_mode="provided"),
     )
 
@@ -1477,9 +1902,19 @@ def run_collapse(state, pre_mix, *, out, plan: Plan):
 
 
 __all__ = [
-    "B12XMHCBinding", "B12XMHCScratchCaps", "MHC_DEFAULT_BLOCK_H",
-    "MHC_DEFAULT_BLOCK_K", "MHC_DEFAULT_SPLIT_K", "MHC_GRAM_BLOCK_H",
-    "MHC_MULT", "MHC_MIXES", "MHC_PARTIALS", "MHC_SOURCE_TILE_H",
-    "MHC_SUPPORTED_HIDDEN_SIZES", "b12x_mhc_post", "b12x_mhc_pre",
-    "b12x_mhc_post_pre", "run_collapse",
+    "B12XMHCBinding",
+    "B12XMHCScratchCaps",
+    "MHC_DEFAULT_BLOCK_H",
+    "MHC_DEFAULT_BLOCK_K",
+    "MHC_DEFAULT_SPLIT_K",
+    "MHC_GRAM_BLOCK_H",
+    "MHC_MULT",
+    "MHC_MIXES",
+    "MHC_PARTIALS",
+    "MHC_SOURCE_TILE_H",
+    "MHC_SUPPORTED_HIDDEN_SIZES",
+    "b12x_mhc_post",
+    "b12x_mhc_pre",
+    "b12x_mhc_post_pre",
+    "run_collapse",
 ]

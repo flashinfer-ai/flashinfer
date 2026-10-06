@@ -16,7 +16,12 @@ import torch
 from cutlass import Float32, Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from b12x._lib.intrinsics import cvt_e8m0_to_f32, fabs_f32, fmax_f32, swizzle_block_scale
+from b12x._lib.intrinsics import (
+    cvt_e8m0_to_f32,
+    fabs_f32,
+    fmax_f32,
+    swizzle_block_scale,
+)
 from b12x._lib.fp6 import (
     _decode_fp6_e2m3,
     _decode_fp6_e3m2,
@@ -152,7 +157,9 @@ def test_mxfp6_micro_shapes_predicate_rejects_invalid() -> None:
     assert _mxfp6_micro_shapes_ok(1, 2048, 512, 33, 256) is False  # topk > 32
     assert _mxfp6_micro_shapes_ok(1, 2048, 512, 8, 0) is False  # weight_E == 0
     too_large_k = (_MAX_DIRECT_K_SEGMENTS + 1) * 32 * MXFP6_BLOCK_SIZE
-    assert _mxfp6_micro_shapes_ok(1, too_large_k, 512, 8, 256) is False  # too many segments
+    assert (
+        _mxfp6_micro_shapes_ok(1, too_large_k, 512, 8, 256) is False
+    )  # too many segments
 
 
 def test_is_supported_mxfp6_default_off(monkeypatch) -> None:
@@ -294,7 +301,9 @@ class _Fp6SwizzledScaleKernel:
         r = cute.arch.thread_idx()[0]
         if r < self.rows:
             for blk in cutlass.range_constexpr(self.num_blocks):
-                off = mxfp6_swizzled_scale_offset(Int32(r), Int32(blk), Int32(self.cpd4))
+                off = mxfp6_swizzled_scale_offset(
+                    Int32(r), Int32(blk), Int32(self.cpd4)
+                )
                 mOut[r, blk] = cvt_e8m0_to_f32(Uint32(mSwz[off]))
 
 
@@ -537,7 +546,9 @@ class _Fp6Fc1Kernel:
         if r < self.rows:
             acc = Float32(0.0)
             for blk in cutlass.range_constexpr(self.k_blocks):
-                off = mxfp6_swizzled_scale_offset(Int32(r), Int32(blk), Int32(self.cpd4))
+                off = mxfp6_swizzled_scale_offset(
+                    Int32(r), Int32(blk), Int32(self.cpd4)
+                )
                 wscale = cvt_e8m0_to_f32(Uint32(mScaleW[off]))
                 for gg in cutlass.range_constexpr(8):
                     g = blk * 8 + gg
@@ -546,10 +557,18 @@ class _Fp6Fc1Kernel:
                     b2 = Uint32(mPackedW[r, g * 3 + 2])
                     c0, c1, c2, c3 = fp6_unpack4_codes(b0, b1, b2)
                     base_k = blk * 32 + gg * 4
-                    acc = acc + fp6_decode_code(mLutW, c0) * wscale * Float32(mAdq[base_k + 0])
-                    acc = acc + fp6_decode_code(mLutW, c1) * wscale * Float32(mAdq[base_k + 1])
-                    acc = acc + fp6_decode_code(mLutW, c2) * wscale * Float32(mAdq[base_k + 2])
-                    acc = acc + fp6_decode_code(mLutW, c3) * wscale * Float32(mAdq[base_k + 3])
+                    acc = acc + fp6_decode_code(mLutW, c0) * wscale * Float32(
+                        mAdq[base_k + 0]
+                    )
+                    acc = acc + fp6_decode_code(mLutW, c1) * wscale * Float32(
+                        mAdq[base_k + 1]
+                    )
+                    acc = acc + fp6_decode_code(mLutW, c2) * wscale * Float32(
+                        mAdq[base_k + 2]
+                    )
+                    acc = acc + fp6_decode_code(mLutW, c3) * wscale * Float32(
+                        mAdq[base_k + 3]
+                    )
             mOut[r] = acc
 
 
@@ -576,12 +595,19 @@ def test_fp6_fc1_gemv_on_production_storage() -> None:
     x = (torch.randn(k, device=device) / 2).to(torch.bfloat16)
     gs = torch.ones(1, dtype=torch.float32, device=device)
     packed_a, scales_a = quantize_grouped_mxfp6_torch(
-        x.float().reshape(1, 1, k), torch.tensor([1], dtype=torch.int32, device=device),
-        gs, fmt=act_fmt, bf16_round=True,
+        x.float().reshape(1, 1, k),
+        torch.tensor([1], dtype=torch.int32, device=device),
+        gs,
+        fmt=act_fmt,
+        bf16_round=True,
     )
-    a_dq = dequant_mxfp6_torch(
-        packed_a[..., 0], scales_a, num_fp6=k, fmt=act_fmt, scales_swizzled=True
-    ).reshape(k).contiguous()
+    a_dq = (
+        dequant_mxfp6_torch(
+            packed_a[..., 0], scales_a, num_fp6=k, fmt=act_fmt, scales_swizzled=True
+        )
+        .reshape(k)
+        .contiguous()
+    )
 
     expert = 0
     w1_packed = weights.w1_fp6[expert].contiguous()  # (2N, 3K/4)
@@ -605,7 +631,10 @@ def test_fp6_fc1_gemv_on_production_storage() -> None:
 
     # Reference: dequant production weights and matmul with the same FP6 activation.
     w1_dq = dequant_mxfp6_torch(
-        w1_packed, weights.w1_blockscale[expert], num_fp6=k, fmt=weight_fmt,
+        w1_packed,
+        weights.w1_blockscale[expert],
+        num_fp6=k,
+        fmt=weight_fmt,
         scales_swizzled=True,
     ).reshape(two_n, k)
     ref = (w1_dq.double() @ a_dq.double()).float()  # f64 to avoid TF32 noise
@@ -658,12 +687,16 @@ class _Fp6Fc1GateKernel:
         r = cute.arch.thread_idx()[0]
         smem = cutlass_utils.SmemAllocator()
         sh = smem.allocate_tensor(
-            element_type=Float32, layout=cute.make_layout(self.two_n), byte_alignment=128
+            element_type=Float32,
+            layout=cute.make_layout(self.two_n),
+            byte_alignment=128,
         )
         if r < self.two_n:
             acc = Float32(0.0)
             for blk in cutlass.range_constexpr(self.k_blocks):
-                off = mxfp6_swizzled_scale_offset(Int32(r), Int32(blk), Int32(self.cpd4))
+                off = mxfp6_swizzled_scale_offset(
+                    Int32(r), Int32(blk), Int32(self.cpd4)
+                )
                 wscale = cvt_e8m0_to_f32(Uint32(mScaleW[off]))
                 for gg in cutlass.range_constexpr(8):
                     g = blk * 8 + gg
@@ -672,16 +705,26 @@ class _Fp6Fc1GateKernel:
                     b2 = Uint32(mPackedW[r, g * 3 + 2])
                     c0, c1, c2, c3 = fp6_unpack4_codes(b0, b1, b2)
                     base_k = blk * 32 + gg * 4
-                    acc = acc + fp6_decode_code(mLutW, c0) * wscale * Float32(mAdq[base_k + 0])
-                    acc = acc + fp6_decode_code(mLutW, c1) * wscale * Float32(mAdq[base_k + 1])
-                    acc = acc + fp6_decode_code(mLutW, c2) * wscale * Float32(mAdq[base_k + 2])
-                    acc = acc + fp6_decode_code(mLutW, c3) * wscale * Float32(mAdq[base_k + 3])
+                    acc = acc + fp6_decode_code(mLutW, c0) * wscale * Float32(
+                        mAdq[base_k + 0]
+                    )
+                    acc = acc + fp6_decode_code(mLutW, c1) * wscale * Float32(
+                        mAdq[base_k + 1]
+                    )
+                    acc = acc + fp6_decode_code(mLutW, c2) * wscale * Float32(
+                        mAdq[base_k + 2]
+                    )
+                    acc = acc + fp6_decode_code(mLutW, c3) * wscale * Float32(
+                        mAdq[base_k + 3]
+                    )
             sh[r] = acc
         cute.arch.sync_threads()
         if r < self.n:
             up = sh[r]
             gate = sh[self.n + r]
-            sigmoid_g = cute.arch.rcp_approx(Float32(1.0) + cute.math.exp(-gate, fastmath=False))
+            sigmoid_g = cute.arch.rcp_approx(
+                Float32(1.0) + cute.math.exp(-gate, fastmath=False)
+            )
             mOut[r] = sigmoid_g * gate * up
 
 
@@ -707,12 +750,19 @@ def test_fp6_fc1_gate_intermediate() -> None:
     x = (torch.randn(k, device=device) / 2).to(torch.bfloat16)
     gs = torch.ones(1, dtype=torch.float32, device=device)
     packed_a, scales_a = quantize_grouped_mxfp6_torch(
-        x.float().reshape(1, 1, k), torch.tensor([1], dtype=torch.int32, device=device),
-        gs, fmt=act_fmt, bf16_round=True,
+        x.float().reshape(1, 1, k),
+        torch.tensor([1], dtype=torch.int32, device=device),
+        gs,
+        fmt=act_fmt,
+        bf16_round=True,
     )
-    a_dq = dequant_mxfp6_torch(
-        packed_a[..., 0], scales_a, num_fp6=k, fmt=act_fmt, scales_swizzled=True
-    ).reshape(k).contiguous()
+    a_dq = (
+        dequant_mxfp6_torch(
+            packed_a[..., 0], scales_a, num_fp6=k, fmt=act_fmt, scales_swizzled=True
+        )
+        .reshape(k)
+        .contiguous()
+    )
 
     expert = 0
     w1_packed = weights.w1_fp6[expert].contiguous()
@@ -735,10 +785,13 @@ def test_fp6_fc1_gate_intermediate() -> None:
     torch.cuda.synchronize()
 
     w1_dq = dequant_mxfp6_torch(
-        w1_packed, weights.w1_blockscale[expert], num_fp6=k, fmt=weight_fmt,
+        w1_packed,
+        weights.w1_blockscale[expert],
+        num_fp6=k,
+        fmt=weight_fmt,
         scales_swizzled=True,
     ).reshape(two_n, k)
-    h = (w1_dq.double() @ a_dq.double())  # [2N]
+    h = w1_dq.double() @ a_dq.double()  # [2N]
     up_ref, gate_ref = h[:n], h[n:]
     inter_ref = (torch.sigmoid(gate_ref) * gate_ref * up_ref).float()
 
@@ -759,8 +812,9 @@ class _Fp6MoeBs1Kernel:
     static path's math with the proven decode/scale/quant primitives.
     """
 
-    def __init__(self, n: int, k: int, topk: int, act_fmt: str,
-                 cpd4_w1: int, cpd4_w2: int):
+    def __init__(
+        self, n: int, k: int, topk: int, act_fmt: str, cpd4_w1: int, cpd4_w2: int
+    ):
         self.n = int(n)
         self.two_n = 2 * int(n)
         self.k = int(k)
@@ -775,27 +829,46 @@ class _Fp6MoeBs1Kernel:
     @cute.jit
     def __call__(
         self,
-        mLutW: cute.Tensor, mLutA: cute.Tensor, mAdq: cute.Tensor,
-        mW1p: cute.Tensor, mW1s: cute.Tensor, mW2p: cute.Tensor, mW2s: cute.Tensor,
-        mIds: cute.Tensor, mTw: cute.Tensor, mGs: cute.Tensor, mOut: cute.Tensor,
-        m: Int32, stream: cuda.CUstream,
+        mLutW: cute.Tensor,
+        mLutA: cute.Tensor,
+        mAdq: cute.Tensor,
+        mW1p: cute.Tensor,
+        mW1s: cute.Tensor,
+        mW2p: cute.Tensor,
+        mW2s: cute.Tensor,
+        mIds: cute.Tensor,
+        mTw: cute.Tensor,
+        mGs: cute.Tensor,
+        mOut: cute.Tensor,
+        m: Int32,
+        stream: cuda.CUstream,
     ):
-        self.kernel(mLutW, mLutA, mAdq, mW1p, mW1s, mW2p, mW2s, mIds, mTw, mGs, mOut).launch(
-            grid=(m, 1, 1), block=[self.blk_dim, 1, 1], stream=stream
-        )
+        self.kernel(
+            mLutW, mLutA, mAdq, mW1p, mW1s, mW2p, mW2s, mIds, mTw, mGs, mOut
+        ).launch(grid=(m, 1, 1), block=[self.blk_dim, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(
         self,
-        mLutW: cute.Tensor, mLutA: cute.Tensor, mAdq: cute.Tensor,
-        mW1p: cute.Tensor, mW1s: cute.Tensor, mW2p: cute.Tensor, mW2s: cute.Tensor,
-        mIds: cute.Tensor, mTw: cute.Tensor, mGs: cute.Tensor, mOut: cute.Tensor,
+        mLutW: cute.Tensor,
+        mLutA: cute.Tensor,
+        mAdq: cute.Tensor,
+        mW1p: cute.Tensor,
+        mW1s: cute.Tensor,
+        mW2p: cute.Tensor,
+        mW2s: cute.Tensor,
+        mIds: cute.Tensor,
+        mTw: cute.Tensor,
+        mGs: cute.Tensor,
+        mOut: cute.Tensor,
     ):
         t = cute.arch.block_idx()[0]
         r = cute.arch.thread_idx()[0]
         smem = cutlass_utils.SmemAllocator()
         sh = smem.allocate_tensor(
-            element_type=Float32, layout=cute.make_layout(self.two_n), byte_alignment=128
+            element_type=Float32,
+            layout=cute.make_layout(self.two_n),
+            byte_alignment=128,
         )
         sinter = smem.allocate_tensor(
             element_type=Float32, layout=cute.make_layout(self.n), byte_alignment=128
@@ -818,7 +891,9 @@ class _Fp6MoeBs1Kernel:
             if r < self.two_n:
                 acc = Float32(0.0)
                 for blk in cutlass.range_constexpr(self.k_blocks):
-                    off = mxfp6_swizzled_scale_offset(Int32(r), Int32(blk), Int32(self.cpd4_w1))
+                    off = mxfp6_swizzled_scale_offset(
+                        Int32(r), Int32(blk), Int32(self.cpd4_w1)
+                    )
                     wsc = cvt_e8m0_to_f32(Uint32(mW1s[e, off]))
                     for gg in cutlass.range_constexpr(8):
                         g = blk * 8 + gg
@@ -828,17 +903,27 @@ class _Fp6MoeBs1Kernel:
                             Uint32(mW1p[e, r, g * 3 + 2]),
                         )
                         bk = blk * 32 + gg * 4
-                        acc = acc + fp6_decode_code(mLutW, c0) * wsc * Float32(mAdq[t, bk + 0])
-                        acc = acc + fp6_decode_code(mLutW, c1) * wsc * Float32(mAdq[t, bk + 1])
-                        acc = acc + fp6_decode_code(mLutW, c2) * wsc * Float32(mAdq[t, bk + 2])
-                        acc = acc + fp6_decode_code(mLutW, c3) * wsc * Float32(mAdq[t, bk + 3])
+                        acc = acc + fp6_decode_code(mLutW, c0) * wsc * Float32(
+                            mAdq[t, bk + 0]
+                        )
+                        acc = acc + fp6_decode_code(mLutW, c1) * wsc * Float32(
+                            mAdq[t, bk + 1]
+                        )
+                        acc = acc + fp6_decode_code(mLutW, c2) * wsc * Float32(
+                            mAdq[t, bk + 2]
+                        )
+                        acc = acc + fp6_decode_code(mLutW, c3) * wsc * Float32(
+                            mAdq[t, bk + 3]
+                        )
                 sh[r] = acc
             cute.arch.sync_threads()
             # ---- gate: inter[n] = silu(gate)*up (up=rows[:N], gate=rows[N:]) ----
             if r < self.n:
                 up = sh[r]
                 gate = sh[self.n + r]
-                sig = cute.arch.rcp_approx(Float32(1.0) + cute.math.exp(-gate, fastmath=False))
+                sig = cute.arch.rcp_approx(
+                    Float32(1.0) + cute.math.exp(-gate, fastmath=False)
+                )
                 sinter[r] = sig * gate * up
             cute.arch.sync_threads()
             # ---- re-quant intermediate to FP6 (one thread per 32-elem block) ----
@@ -854,13 +939,17 @@ class _Fp6MoeBs1Kernel:
                 )
                 bsc = cvt_e8m0_to_f32(Uint32(sb))
                 for j in cutlass.range_constexpr(32):
-                    sinter_dq[r * 32 + j] = fp6_decode_code(mLutA, Uint32(containers[j])) * bsc / gs
+                    sinter_dq[r * 32 + j] = (
+                        fp6_decode_code(mLutA, Uint32(containers[j])) * bsc / gs
+                    )
             cute.arch.sync_threads()
             # ---- FC2: y[r] = sum_n decode(W2[e,r,n]) * wscale * inter_dq[n] ----
             if r < self.k:
                 acc2 = Float32(0.0)
                 for blk in cutlass.range_constexpr(self.n_blocks):
-                    off = mxfp6_swizzled_scale_offset(Int32(r), Int32(blk), Int32(self.cpd4_w2))
+                    off = mxfp6_swizzled_scale_offset(
+                        Int32(r), Int32(blk), Int32(self.cpd4_w2)
+                    )
                     wsc = cvt_e8m0_to_f32(Uint32(mW2s[e, off]))
                     for gg in cutlass.range_constexpr(8):
                         g = blk * 8 + gg
@@ -870,10 +959,18 @@ class _Fp6MoeBs1Kernel:
                             Uint32(mW2p[e, r, g * 3 + 2]),
                         )
                         bn = blk * 32 + gg * 4
-                        acc2 = acc2 + fp6_decode_code(mLutW, c0) * wsc * sinter_dq[bn + 0]
-                        acc2 = acc2 + fp6_decode_code(mLutW, c1) * wsc * sinter_dq[bn + 1]
-                        acc2 = acc2 + fp6_decode_code(mLutW, c2) * wsc * sinter_dq[bn + 2]
-                        acc2 = acc2 + fp6_decode_code(mLutW, c3) * wsc * sinter_dq[bn + 3]
+                        acc2 = (
+                            acc2 + fp6_decode_code(mLutW, c0) * wsc * sinter_dq[bn + 0]
+                        )
+                        acc2 = (
+                            acc2 + fp6_decode_code(mLutW, c1) * wsc * sinter_dq[bn + 1]
+                        )
+                        acc2 = (
+                            acc2 + fp6_decode_code(mLutW, c2) * wsc * sinter_dq[bn + 2]
+                        )
+                        acc2 = (
+                            acc2 + fp6_decode_code(mLutW, c3) * wsc * sinter_dq[bn + 3]
+                        )
                 sout[r] = sout[r] + Float32(mTw[t, slot]) * acc2
             cute.arch.sync_threads()
 
@@ -912,13 +1009,29 @@ def test_fp6_moe_bs1_micro_matches_static(m: int) -> None:
 
     # Ground truth: the validated static fused FP6 path.
     workspace = allocate_tp_moe_workspace(
-        x, weights.a1_gscale, weights.w1_fp6, weights.a2_gscale, weights.w2_fp6,
-        topk_ids, quant_mode="w6a6", input_scales_static=True,
+        x,
+        weights.a1_gscale,
+        weights.w1_fp6,
+        weights.a2_gscale,
+        weights.w2_fp6,
+        topk_ids,
+        quant_mode="w6a6",
+        input_scales_static=True,
     )
     static_out = b12x_moe_fp6(
-        x, weights.a1_gscale, weights.w1_fp6, weights.w1_blockscale, weights.w1_alphas,
-        weights.a2_gscale, weights.w2_fp6, weights.w2_blockscale, weights.w2_alphas,
-        topk_weights, topk_ids, workspace=workspace, input_scales_static=True,
+        x,
+        weights.a1_gscale,
+        weights.w1_fp6,
+        weights.w1_blockscale,
+        weights.w1_alphas,
+        weights.a2_gscale,
+        weights.w2_fp6,
+        weights.w2_blockscale,
+        weights.w2_alphas,
+        topk_weights,
+        topk_ids,
+        workspace=workspace,
+        input_scales_static=True,
         source_format="mxfp6_default",
     )
     torch.cuda.synchronize()
@@ -930,7 +1043,9 @@ def test_fp6_moe_bs1_micro_matches_static(m: int) -> None:
         packed_a, scales_a = quantize_grouped_mxfp6_torch(
             x[t].float().reshape(1, 1, k),
             torch.tensor([1], dtype=torch.int32, device=device),
-            gs1, fmt=act_fmt, bf16_round=True,
+            gs1,
+            fmt=act_fmt,
+            bf16_round=True,
         )
         a_dq[t] = dequant_mxfp6_torch(
             packed_a[..., 0], scales_a, num_fp6=k, fmt=act_fmt, scales_swizzled=True
@@ -940,8 +1055,8 @@ def test_fp6_moe_bs1_micro_matches_static(m: int) -> None:
     lut_a = build_fp6_decode_lut(act_fmt, device=device)
     w1s = weights.w1_blockscale.reshape(experts, -1).contiguous()
     w2s = weights.w2_blockscale.reshape(experts, -1).contiguous()
-    cpd4_w1 = (((k // 32) + 3) // 4)
-    cpd4_w2 = (((n // 32) + 3) // 4)
+    cpd4_w1 = ((k // 32) + 3) // 4
+    cpd4_w2 = ((n // 32) + 3) // 4
     micro_out = torch.empty(m, k, dtype=torch.float32, device=device)
 
     kernel = _Fp6MoeBs1Kernel(n, k, topk, act_fmt, cpd4_w1, cpd4_w2)
@@ -976,7 +1091,9 @@ def test_fp6_moe_bs1_micro_matches_static(m: int) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("m", [1, 4])
-def test_fp6_micro_dispatch_matches_static_via_b12x_moe_fp6(monkeypatch, m: int) -> None:
+def test_fp6_micro_dispatch_matches_static_via_b12x_moe_fp6(
+    monkeypatch, m: int
+) -> None:
     pytest.skip("pending: fused_moe-based rewrite")
     require_b12x()
     from b12x.integration.tp_moe import (  # retired pre-facade API (module TODO)
@@ -1003,13 +1120,29 @@ def test_fp6_micro_dispatch_matches_static_via_b12x_moe_fp6(monkeypatch, m: int)
     def _run() -> torch.Tensor:
         clear_tp_moe_caches()
         ws = allocate_tp_moe_workspace(
-            x, weights.a1_gscale, weights.w1_fp6, weights.a2_gscale, weights.w2_fp6,
-            topk_ids, quant_mode="w6a6", input_scales_static=True,
+            x,
+            weights.a1_gscale,
+            weights.w1_fp6,
+            weights.a2_gscale,
+            weights.w2_fp6,
+            topk_ids,
+            quant_mode="w6a6",
+            input_scales_static=True,
         )
         out = b12x_moe_fp6(
-            x, weights.a1_gscale, weights.w1_fp6, weights.w1_blockscale, weights.w1_alphas,
-            weights.a2_gscale, weights.w2_fp6, weights.w2_blockscale, weights.w2_alphas,
-            topk_weights, topk_ids, workspace=ws, input_scales_static=True,
+            x,
+            weights.a1_gscale,
+            weights.w1_fp6,
+            weights.w1_blockscale,
+            weights.w1_alphas,
+            weights.a2_gscale,
+            weights.w2_fp6,
+            weights.w2_blockscale,
+            weights.w2_alphas,
+            topk_weights,
+            topk_ids,
+            workspace=ws,
+            input_scales_static=True,
             source_format="mxfp6_default",
         )
         torch.cuda.synchronize()
@@ -1060,13 +1193,29 @@ def test_fp6_micro_dispatch_larger_shapes(monkeypatch, m: int, k: int, n: int) -
     def _run() -> torch.Tensor:
         clear_tp_moe_caches()
         ws = allocate_tp_moe_workspace(
-            x, weights.a1_gscale, weights.w1_fp6, weights.a2_gscale, weights.w2_fp6,
-            topk_ids, quant_mode="w6a6", input_scales_static=True,
+            x,
+            weights.a1_gscale,
+            weights.w1_fp6,
+            weights.a2_gscale,
+            weights.w2_fp6,
+            topk_ids,
+            quant_mode="w6a6",
+            input_scales_static=True,
         )
         out = b12x_moe_fp6(
-            x, weights.a1_gscale, weights.w1_fp6, weights.w1_blockscale, weights.w1_alphas,
-            weights.a2_gscale, weights.w2_fp6, weights.w2_blockscale, weights.w2_alphas,
-            topk_weights, topk_ids, workspace=ws, input_scales_static=True,
+            x,
+            weights.a1_gscale,
+            weights.w1_fp6,
+            weights.w1_blockscale,
+            weights.w1_alphas,
+            weights.a2_gscale,
+            weights.w2_fp6,
+            weights.w2_blockscale,
+            weights.w2_alphas,
+            topk_weights,
+            topk_ids,
+            workspace=ws,
+            input_scales_static=True,
             source_format="mxfp6_default",
         )
         torch.cuda.synchronize()
@@ -1080,4 +1229,6 @@ def test_fp6_micro_dispatch_larger_shapes(monkeypatch, m: int, k: int, n: int) -
     cos = torch.nn.functional.cosine_similarity(
         micro_out.reshape(-1).float(), static_out.reshape(-1).float(), dim=0
     )
-    assert cos.item() > 0.99, f"larger-shape micro vs static cosine too low: {cos.item()}"
+    assert cos.item() > 0.99, (
+        f"larger-shape micro vs static cosine too low: {cos.item()}"
+    )

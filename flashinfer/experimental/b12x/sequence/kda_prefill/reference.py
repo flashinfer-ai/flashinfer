@@ -24,7 +24,12 @@ import torch
 from .._shared.kda_math import KDA_HEAD_DIM, kda_beta, kda_log_decay, l2_normalize
 
 from .._shared.delta_prefill.reference import (
-    MirrorPolicy, _bf16, _neumann_inverse, _recur_tile, _scalar, _validate_packed,
+    MirrorPolicy,
+    _bf16,
+    _neumann_inverse,
+    _recur_tile,
+    _scalar,
+    _validate_packed,
 )
 
 LOG2E = 1.4426950408889634
@@ -152,7 +157,9 @@ def prefill_kda(
         offset = int(checkpoint_offsets[request])
         if is_null(initial):
             state = torch.zeros(
-                (heads, KDA_HEAD_DIM, KDA_HEAD_DIM), dtype=torch.float32, device=q.device
+                (heads, KDA_HEAD_DIM, KDA_HEAD_DIM),
+                dtype=torch.float32,
+                device=q.device,
             )
         else:
             state = recurrent_state[initial].float()
@@ -223,7 +230,9 @@ def _prepare_tile(
     kn = l2_normalize(k, eps) if qk_l2norm else k.float()
     qn = torch.where(mask, qn, torch.zeros_like(qn))
     kn = torch.where(mask, kn, torch.zeros_like(kn))
-    scale_value = _bf16(torch.tensor(scale)).item() if policy.scale_dtype == "bf16" else scale
+    scale_value = (
+        _bf16(torch.tensor(scale)).item() if policy.scale_dtype == "bf16" else scale
+    )
     if policy.operands == "fp32":
         q_tilde = qn * lam * scale_value
         k_tilde = kn * lam
@@ -245,11 +254,15 @@ def _prepare_tile(
     # [heads, chunk, 128] operands for the per-head GEMMs.
     q_h, k_h, kinv_h = (x.transpose(0, 1) for x in (q_tilde, k_tilde, k_inv))
     beta_h = beta.transpose(0, 1)
-    causal = torch.tril(torch.ones((chunk, chunk), dtype=torch.bool, device=q.device), -1)
+    causal = torch.tril(
+        torch.ones((chunk, chunk), dtype=torch.bool, device=q.device), -1
+    )
     lower = beta_h[:, :, None] * (k_h @ kinv_h.transpose(-1, -2))
     lower = torch.where(causal, lower, torch.zeros_like(lower))
     inverse = _neumann_inverse(lower, chunk)
-    inclusive = torch.tril(torch.ones((chunk, chunk), dtype=torch.bool, device=q.device))
+    inclusive = torch.tril(
+        torch.ones((chunk, chunk), dtype=torch.bool, device=q.device)
+    )
     mqk = q_h @ kinv_h.transpose(-1, -2)
     mqk = torch.where(inclusive, mqk, torch.zeros_like(mqk))
     return {
@@ -391,7 +404,9 @@ def prefill_kda_chunk_mirror(
                     if trace:
                         record.checkpoints[request] = state.clone()
                     if not is_null(checkpoint_slot):
-                        recurrent_state[checkpoint_slot].copy_(state.to(recurrent_state.dtype))
+                        recurrent_state[checkpoint_slot].copy_(
+                            state.to(recurrent_state.dtype)
+                        )
             if not is_null(final):
                 recurrent_state[final].copy_(state.to(recurrent_state.dtype))
     finally:

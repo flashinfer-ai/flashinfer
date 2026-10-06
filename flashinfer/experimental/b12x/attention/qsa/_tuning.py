@@ -84,6 +84,7 @@ class QsaQuery:
             "abi": self.abi,
         }
 
+
 @dataclass(frozen=True, kw_only=True)
 class QsaConfig:
     backend: str
@@ -184,19 +185,31 @@ def _validate_query(
         raise ValueError("scalar-position QSA cannot use interleaved M-RoPE")
     if query.mrope_sections is not None and (
         len(query.mrope_sections) != 3
-        or any(type(section) is not int or section <= 0 for section in query.mrope_sections)
+        or any(
+            type(section) is not int or section <= 0 for section in query.mrope_sections
+        )
     ):
         raise ValueError("QSA M-RoPE sections must contain three positive integers")
     operands = query.abi.get("operands")
     expected_ranks = {
-        "request_ids": 1, "rope_positions": 2, "index_query": 3,
-        "raw_index_key": 2, "main_k_cache": 4, "main_v_cache": 4,
-        "main_block_table": 2, "compressed_k_cache": 3,
+        "request_ids": 1,
+        "rope_positions": 2,
+        "index_query": 3,
+        "raw_index_key": 2,
+        "main_k_cache": 4,
+        "main_v_cache": 4,
+        "main_block_table": 2,
+        "compressed_k_cache": 3,
         "compressed_block_table": 2,
-        "raw_k_ring": 3, "raw_logical_positions": 2, "raw_rope_positions": 3,
-        "raw_interval_start_positions": 1, "raw_state_slot_ids": 1,
-        "index_q_norm_weight": 1, "index_k_norm_weight": 1,
-        "rope_cos": 2, "rope_sin": 2,
+        "raw_k_ring": 3,
+        "raw_logical_positions": 2,
+        "raw_rope_positions": 3,
+        "raw_interval_start_positions": 1,
+        "raw_state_slot_ids": 1,
+        "index_q_norm_weight": 1,
+        "index_k_norm_weight": 1,
+        "rope_cos": 2,
+        "rope_sin": 2,
     }
     if not isinstance(operands, FrozenMapping) or set(operands) != set(expected_ranks):
         raise ValueError("QSA query requires complete normalized ABI metadata")
@@ -207,7 +220,10 @@ def _validate_query(
             or set(descriptor) != {"dtype", "strides"}
             or not isinstance(descriptor["dtype"], str)
             or len(tuple(descriptor["strides"])) != rank
-            or any(type(stride) is not int or stride <= 0 for stride in descriptor["strides"])
+            or any(
+                type(stride) is not int or stride <= 0
+                for stride in descriptor["strides"]
+            )
         ):
             raise ValueError(f"QSA {name} ABI metadata is invalid")
     expected_dtypes = {
@@ -255,12 +271,15 @@ def _validate_config(
 # The cache page counts size the caller's pools; they do not change which
 # configuration is fastest, so they stay out of the selection key.
 _KEY_FIELDS = frozenset(QsaQuery.__dataclass_fields__) - {
-    "num_main_cache_pages", "num_compressed_cache_pages",
+    "num_main_cache_pages",
+    "num_compressed_cache_pages",
 }
 
 
 def _encode_query(query: QsaQuery) -> dict[str, object]:
-    return {name: value for name, value in query.to_dict().items() if name in _KEY_FIELDS}
+    return {
+        name: value for name, value in query.to_dict().items() if name in _KEY_FIELDS
+    }
 
 
 TUNING = TuningContract(

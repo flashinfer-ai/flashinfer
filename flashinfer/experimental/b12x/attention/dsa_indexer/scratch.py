@@ -2428,7 +2428,10 @@ def plan_indexer_scratch(
     if caps.cache_format == "mxfp4":
         from .mxfp4 import plan_mxfp4
 
-        if caps.source_layout != INDEXER_SOURCE_LAYOUT_PAGED or caps.score_mode != "dsa":
+        if (
+            caps.source_layout != INDEXER_SOURCE_LAYOUT_PAGED
+            or caps.score_mode != "dsa"
+        ):
             raise ValueError("MXFP4 requires the paged DSA source layout")
         inner = plan_mxfp4(caps)
     elif caps.source_layout == INDEXER_SOURCE_LAYOUT_PAGED:
@@ -2477,6 +2480,8 @@ def plan_indexer_scratch(
     else:
         raise ValueError(f"unsupported indexer source_layout {caps.source_layout!r}")
     return B12XIndexerScratchPlan(caps=caps, inner=inner)
+
+
 __all__ = [
     "B12XIndexerPagedBinding",
     "B12XIndexerPagedScratch",

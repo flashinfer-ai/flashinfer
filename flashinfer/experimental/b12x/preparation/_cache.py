@@ -1,4 +1,5 @@
 """Versioned tuning decisions, independent of executable artifact caches."""
+
 from __future__ import annotations
 
 import fcntl
@@ -29,7 +30,9 @@ def cache_identity(namespace: Mapping[str, object], device_ordinal: int):
     try:
         version = int(raw_version)
     except ValueError:
-        raise ValueError("B12X_TUNING_CACHE_VERSION must be a positive integer") from None
+        raise ValueError(
+            "B12X_TUNING_CACHE_VERSION must be a positive integer"
+        ) from None
     if version <= 0:
         raise ValueError("B12X_TUNING_CACHE_VERSION must be a positive integer")
     with torch.cuda.device(device_ordinal):
@@ -46,7 +49,8 @@ def cache_identity(namespace: Mapping[str, object], device_ordinal: int):
         # several MiB apart. The name is still read above so an unusable device
         # fails closed.
         return {
-            "schema_version": 6, "tuning_cache_version": version,
+            "schema_version": 6,
+            "tuning_cache_version": version,
             "measurement": "stream_gated_events_v1",
             "namespace": dict(namespace),
             "compute_capability": [int(properties.major), int(properties.minor)],
@@ -79,23 +83,37 @@ class SelectionCache:
             FrozenMapping(record["assignment"])
             FrozenMapping(record["config"])
             coverage = record["coverage"]
-            fields = {"cartesian_count", "legal_count", "effective_count", "measured_count"}
+            fields = {
+                "cartesian_count",
+                "legal_count",
+                "effective_count",
+                "measured_count",
+            }
             if not isinstance(coverage, dict) or set(coverage) != fields:
                 raise ValueError("selection coverage fields differ from schema")
             if any(type(value) is not int or value < 0 for value in coverage.values()):
                 raise ValueError("selection counts must be nonnegative integers")
             if not (
-                coverage["cartesian_count"] >= coverage["legal_count"]
-                >= coverage["effective_count"] == coverage["measured_count"] > 1
+                coverage["cartesian_count"]
+                >= coverage["legal_count"]
+                >= coverage["effective_count"]
+                == coverage["measured_count"]
+                > 1
             ):
-                raise ValueError("only completed exhaustive multi-candidate races are cacheable")
+                raise ValueError(
+                    "only completed exhaustive multi-candidate races are cacheable"
+                )
             programs = record["programs"]
             if not isinstance(programs, list):
                 raise ValueError("selection program dependencies must be a list")
             for program in programs:
-                if (not isinstance(program, list) or len(program) != 2
-                        or program[0] not in ("cute", "triton")
-                        or not isinstance(program[1], str) or not program[1]):
+                if (
+                    not isinstance(program, list)
+                    or len(program) != 2
+                    or program[0] not in ("cute", "triton")
+                    or not isinstance(program[1], str)
+                    or not program[1]
+                ):
                     raise ValueError("invalid selected program identity")
         return records
 
@@ -135,9 +153,12 @@ class SelectionCache:
                 "assignment": FrozenMapping(assignment).to_dict(),
                 "config": FrozenMapping(config).to_dict(),
                 "coverage": dict(coverage),
-                "programs": [list(item) for item in sorted({
-                    (program.dialect, program.key) for program in programs
-                })],
+                "programs": [
+                    list(item)
+                    for item in sorted(
+                        {(program.dialect, program.key) for program in programs}
+                    )
+                ],
             }
         }
         self._validate(update)
@@ -149,7 +170,10 @@ class SelectionCache:
             temporary = None
             try:
                 with tempfile.NamedTemporaryFile(
-                    mode="w", dir=self.path.parent, suffix=".tmp", delete=False,
+                    mode="w",
+                    dir=self.path.parent,
+                    suffix=".tmp",
+                    delete=False,
                 ) as stream:
                     temporary = stream.name
                     stream.write(_json({"identity": self.identity, "records": records}))

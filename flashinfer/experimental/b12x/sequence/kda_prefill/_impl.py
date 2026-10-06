@@ -14,7 +14,10 @@ from b12x.preparation.types import require_prepared
 from .._shared.kda_math import KDA_HEAD_DIM
 from .._shared.tensors import canonical_device, positive
 from .._shared.delta_prefill.contract import (
-    Binding as _SharedBinding, Layout as _SharedLayout, bind_tensors, materialize_layout,
+    Binding as _SharedBinding,
+    Layout as _SharedLayout,
+    bind_tensors,
+    materialize_layout,
 )
 from ._tuning import CHUNK_TOKENS, KdaPrefillConfig, KdaPrefillQuery, tiles_capacity
 
@@ -88,7 +91,6 @@ class _Layout(_SharedLayout):
     _scratch_specs: tuple[ScratchBufferSpec, ...]
 
 
-
 @dataclass(frozen=True)
 class Binding(_SharedBinding):
     """Caller-owned tensors for lower-bounded KDA prefill."""
@@ -112,21 +114,32 @@ def _query(caps: Caps, invocation: FrozenMapping) -> KdaPrefillQuery:
         checkpoint_export=caps.checkpoint_export,
         max_tokens=caps.max_tokens,
         max_seqs=caps.max_seqs,
-        max_state_slots=caps.max_state_slots, null_state_index=caps.null_state_index,
+        max_state_slots=caps.max_state_slots,
+        null_state_index=caps.null_state_index,
         **dict(invocation),
     )
 
 
 def _materialize_layout(caps: Caps, config: KdaPrefillConfig) -> _Layout:
     return materialize_layout(
-        caps, layout_type=_Layout, v_split=config.v_split, k_split=config.k_split,
-        stages=config.stages, window_tiles=config.window_tiles,
+        caps,
+        layout_type=_Layout,
+        v_split=config.v_split,
+        k_split=config.k_split,
+        stages=config.stages,
+        window_tiles=config.window_tiles,
     )
 
 
-def plan(caps: Caps, *, invocation: FrozenMapping = FrozenMapping(), override: KdaPrefillConfig | None = None) -> Plan:
+def plan(
+    caps: Caps,
+    *,
+    invocation: FrozenMapping = FrozenMapping(),
+    override: KdaPrefillConfig | None = None,
+) -> Plan:
     """Declare KDA prefill without compiling or allocating resources."""
     from ._preparation import make_plan
+
     if not isinstance(caps, Caps):
         raise TypeError("caps must be kda_prefill.Caps")
     return make_plan(caps, invocation=invocation, override=override)
@@ -167,16 +180,32 @@ def _bind(
     if not isinstance(plan, _Layout):
         raise TypeError("binding requires a KDA prefill layout")
     return bind_tensors(
-        plan, binding_type=Binding, _plan=_plan, scratch=scratch, q=q, k=k, v=v,
-        raw_g=raw_g, raw_beta=raw_beta, A_log=A_log, dt_bias=dt_bias,
-        recurrent_state=recurrent_state, cu_seqlens=cu_seqlens,
-        initial_state_indices=initial_state_indices, final_state_indices=final_state_indices,
-        checkpoint_state_indices=checkpoint_state_indices, checkpoint_offsets=checkpoint_offsets,
-        num_seqs=num_seqs, num_tokens=num_tokens, output=output,
+        plan,
+        binding_type=Binding,
+        _plan=_plan,
+        scratch=scratch,
+        q=q,
+        k=k,
+        v=v,
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        recurrent_state=recurrent_state,
+        cu_seqlens=cu_seqlens,
+        initial_state_indices=initial_state_indices,
+        final_state_indices=final_state_indices,
+        checkpoint_state_indices=checkpoint_state_indices,
+        checkpoint_offsets=checkpoint_offsets,
+        num_seqs=num_seqs,
+        num_tokens=num_tokens,
+        output=output,
     )
 
 
-def _check_run_scalars(lower_bound: float, scale: float | None, eps: float) -> tuple[float, float, float]:
+def _check_run_scalars(
+    lower_bound: float, scale: float | None, eps: float
+) -> tuple[float, float, float]:
     lower_bound_value = float(lower_bound)
     if not math.isfinite(lower_bound_value) or not -5.0 <= lower_bound_value < 0.0:
         raise ValueError(f"lower_bound must be in [-5, 0), got {lower_bound_value}")
@@ -212,11 +241,17 @@ def run(
     """
     if not isinstance(binding, Binding):
         raise TypeError("binding must be kda_prefill.Binding")
-    state = require_prepared(binding.plan, "sequence.kda_prefill", binding.output.device)
-    return state.run(binding, lower_bound=lower_bound, scale=scale, eps=eps,
-                     max_live_tokens=max_live_tokens, max_live_seqs=max_live_seqs)
-
-
+    state = require_prepared(
+        binding.plan, "sequence.kda_prefill", binding.output.device
+    )
+    return state.run(
+        binding,
+        lower_bound=lower_bound,
+        scale=scale,
+        eps=eps,
+        max_live_tokens=max_live_tokens,
+        max_live_seqs=max_live_seqs,
+    )
 
 
 __all__ = [

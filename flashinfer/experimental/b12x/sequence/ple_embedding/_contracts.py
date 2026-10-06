@@ -19,7 +19,10 @@ from b12x.preparation import FrozenMapping, Plan
 from b12x.preparation.types import require_prepared
 from b12x.sequence import ple_hash
 
-from b12x.sequence.ple_hash._contracts import _HashLayout, _materialize_layout as _hash_layout
+from b12x.sequence.ple_hash._contracts import (
+    _HashLayout,
+    _materialize_layout as _hash_layout,
+)
 from b12x.sequence.ple_hash._tuning import PleHashConfig
 from b12x.sequence.ple_hash.geometry import Geometry, compute_geometry
 from ._tuning import PleEmbeddingConfig
@@ -356,8 +359,13 @@ def plan(
     if not isinstance(caps, Caps):
         raise TypeError("caps must be Caps")
     return make_plan(
-        caps, geometry=geometry, prime_sizes=prime_sizes, table_offsets=table_offsets,
-        multipliers=multipliers, invocation=invocation, override=override,
+        caps,
+        geometry=geometry,
+        prime_sizes=prime_sizes,
+        table_offsets=table_offsets,
+        multipliers=multipliers,
+        invocation=invocation,
+        override=override,
     )
 
 
@@ -369,16 +377,23 @@ def storage_layout(caps: Caps, *, geometry: Geometry | None = None) -> TableLayo
     if not isinstance(geometry, Geometry):
         raise TypeError("geometry must be host Geometry")
     validated = compute_geometry(
-        caps, prime_sizes=geometry.prime_sizes, table_offsets=geometry.table_offsets,
+        caps,
+        prime_sizes=geometry.prime_sizes,
+        table_offsets=geometry.table_offsets,
         multipliers=geometry.multipliers,
     )
     if geometry != validated:
         raise ValueError("inconsistent PLE table geometry")
     hash_caps = ple_hash.Caps(
-        device=caps.device, max_tokens=caps.max_tokens, max_seqs=caps.max_seqs,
-        vocab_size=caps.vocab_size, eos_token_id=caps.eos_token_id,
-        max_order=caps.max_order, heads_per_order=caps.heads_per_order,
-        dense_layer_ordinal=caps.dense_layer_ordinal, base_table_size=caps.base_table_size,
+        device=caps.device,
+        max_tokens=caps.max_tokens,
+        max_seqs=caps.max_seqs,
+        vocab_size=caps.vocab_size,
+        eos_token_id=caps.eos_token_id,
+        max_order=caps.max_order,
+        heads_per_order=caps.heads_per_order,
+        dense_layer_ordinal=caps.dense_layer_ordinal,
+        base_table_size=caps.base_table_size,
         table_alignment=caps.table_alignment,
     )
     hash_layout = _hash_layout(hash_caps, geometry, PleHashConfig(backend="triton"))

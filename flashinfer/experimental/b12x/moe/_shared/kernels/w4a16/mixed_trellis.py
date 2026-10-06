@@ -823,9 +823,7 @@ class W4A16MixedTrellisKernel:
                 tid,
             )
             cute.arch.sync_threads()
-            phase_lut_addr = Int64(
-                smem_base + Int32(self.driver.lut_e4m3_smem_off)
-            )
+            phase_lut_addr = Int64(smem_base + Int32(self.driver.lut_e4m3_smem_off))
         fc1_emit = partial(
             self._emit_tier_tile,
             True,
@@ -1018,9 +1016,7 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
         self.sms = driver.sms
         self.blocks_per_sm = min(tier.blocks_per_sm for tier in kernels)
         self.shared_words = max(tier.shared_words for tier in kernels)
-        self.lut_e4m3_smem_off = max(
-            tier.lut_e4m3_smem_off for tier in kernels
-        )
+        self.lut_e4m3_smem_off = max(tier.lut_e4m3_smem_off for tier in kernels)
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -2531,9 +2527,10 @@ def _check_descriptor_projection_counts(
 def _require_capture_safe_descriptor_metadata(
     descriptor_map: torch.Tensor,
 ) -> None:
-    if torch.cuda.is_current_stream_capturing() and getattr(
-        descriptor_map, "_mt_projection_counts", None
-    ) is None:
+    if (
+        torch.cuda.is_current_stream_capturing()
+        and getattr(descriptor_map, "_mt_projection_counts", None) is None
+    ):
         raise RuntimeError(
             "mixed Trellis capture-time binding requires descriptor projection "
             "counts prepared on the host"

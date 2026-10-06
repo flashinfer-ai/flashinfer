@@ -185,14 +185,11 @@ class _MXFP8RowsQuantLaunch:
                         r = Int32(0)
                         tile = Int32(0)
                         if lane4 < Int32(4):
-                            r = ((lane4 & Int32(1)) << Int32(1)) | (
-                                lane4 >> Int32(1)
-                            )
+                            r = ((lane4 & Int32(1)) << Int32(1)) | (lane4 >> Int32(1))
                         else:
                             q = lane4 - Int32(4)
-                            r = (
-                                ((Int32(1) - (q & Int32(1))) << Int32(1))
-                                | (q >> Int32(1))
+                            r = ((Int32(1) - (q & Int32(1))) << Int32(1)) | (
+                                q >> Int32(1)
                             )
                             tile = Int32(16)
                         base = k0 + tile + (r << Int32(1))
@@ -309,8 +306,14 @@ def _get_compiled_mxfp8_rows_quant(
     sm_count: int | None = None,
 ) -> Callable:
     k = int(k)
-    device_ordinal = torch.cuda.current_device() if device_ordinal is None else device_ordinal
-    sm_count = torch.cuda.get_device_properties(device_ordinal).multi_processor_count if sm_count is None else sm_count
+    device_ordinal = (
+        torch.cuda.current_device() if device_ordinal is None else device_ordinal
+    )
+    sm_count = (
+        torch.cuda.get_device_properties(device_ordinal).multi_processor_count
+        if sm_count is None
+        else sm_count
+    )
     if k <= 0 or k % 32 != 0:
         raise ValueError(f"MXFP8 CuTe quantizer requires K divisible by 32, got {k}")
     if source_dtype == torch.bfloat16:
@@ -337,9 +340,7 @@ def _get_compiled_mxfp8_rows_quant(
             f"'trellis_native_mma', got {value_order!r}"
         )
     if value_order == "trellis_native_mma" and subgroup_width != 8:
-        raise ValueError(
-            "trellis_native_mma MXFP8 ordering requires subgroup_width=8"
-        )
+        raise ValueError("trellis_native_mma MXFP8 ordering requires subgroup_width=8")
     if min_amax not in (0.0, 1e-4):
         raise ValueError("MXFP8 min_amax must be 0.0 or 1e-4")
     launch = _MXFP8RowsQuantLaunch(

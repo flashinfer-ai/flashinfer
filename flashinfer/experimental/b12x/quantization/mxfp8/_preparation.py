@@ -1,4 +1,5 @@
 """Prepared plan for the fixed CuTe MXFP8 row quantizer."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from b12x.preparation import (
 )
 from b12x.preparation.types import plan_from_handle, require_prepared
 from ._tuning import Mxfp8Config, Mxfp8Query, TUNING
+
 
 def _dtype_name(dtype: torch.dtype) -> str:
     if dtype is torch.bfloat16:
@@ -46,9 +48,8 @@ def _scale_rows_layout(scale_rows: torch.Tensor, rows: int, columns: int) -> str
         return "row_major"
     if scale_rows.ndim == 3 and tuple(scale_rows.shape) == (1, rows, groups):
         return "grouped"
-    raise ValueError(
-        "scale_rows must have shape [M,K/32] or [1,M,K/32] for MXFP8 rows"
-    )
+    raise ValueError("scale_rows must have shape [M,K/32] or [1,M,K/32] for MXFP8 rows")
+
 
 def _scale_mma_layout(scale_mma: torch.Tensor, rows: int, columns: int) -> str:
     groups = columns // 32
@@ -63,7 +64,10 @@ def _scale_mma_layout(scale_mma: torch.Tensor, rows: int, columns: int) -> str:
         return "linear_storage"
     expected_shape = (32, 4, m_tiles, 4, k_tiles, 1)
     expected_stride = (16, 4, k_tiles * 512, 1, 512, m_tiles * k_tiles * 512)
-    if tuple(scale_mma.shape) == expected_shape and scale_mma.stride() == expected_stride:
+    if (
+        tuple(scale_mma.shape) == expected_shape
+        and scale_mma.stride() == expected_stride
+    ):
         return "dense_gemm_swizzled"
     raise ValueError(
         "scale_mma must be contiguous linear physical storage or the canonical "
@@ -142,7 +146,9 @@ class _Mxfp8RowsExecutionState:
 
     def _check(self, source, values, scale_rows, scale_mma):
         query = self.query
-        if source.device != self.device or source.dtype is not getattr(torch, query.dtype):
+        if source.device != self.device or source.dtype is not getattr(
+            torch, query.dtype
+        ):
             raise ValueError("MXFP8 source device/dtype differs from preparation")
         if source.ndim != 2 or not source.is_contiguous():
             raise ValueError("CuTe MXFP8 quantizer requires contiguous [M,K] input")
@@ -190,7 +196,10 @@ class _Mxfp8RowsExecutionState:
         else:
             expected_mma = (32, 4, m_tiles, 4, k_tiles, 1)
             expected_stride = (16, 4, k_tiles * 512, 1, 512, m_tiles * k_tiles * 512)
-            if tuple(scale_mma.shape) != expected_mma or scale_mma.stride() != expected_stride:
+            if (
+                tuple(scale_mma.shape) != expected_mma
+                or scale_mma.stride() != expected_stride
+            ):
                 raise ValueError("scale_mma swizzled layout differs from preparation")
 
     def run(self, source, values, scale_rows, scale_mma):
@@ -250,7 +259,9 @@ def _quantize_rows_prepared(
     scale_mma: torch.Tensor,
     plan_handle: int,
 ) -> None:
-    state = require_prepared(plan_from_handle(plan_handle), "quantization.mxfp8", source.device)
+    state = require_prepared(
+        plan_from_handle(plan_handle), "quantization.mxfp8", source.device
+    )
     state.run(source, values, scale_rows, scale_mma)
 
 

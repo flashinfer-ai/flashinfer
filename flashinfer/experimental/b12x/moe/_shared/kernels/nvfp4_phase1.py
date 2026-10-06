@@ -103,8 +103,7 @@ class Nvfp4MaterializedPhase1Kernel:
             )
         if activation != "silu":
             raise ValueError(
-                "materialized NVFP4 phase 1 requires silu, "
-                f"got {activation!r}"
+                f"materialized NVFP4 phase 1 requires silu, got {activation!r}"
             )
         self.fast_math = bool(fast_math)
         self.source_tile_m = int(source_tile_m)
@@ -277,9 +276,7 @@ class Nvfp4MaterializedPhase1Kernel:
                 n_local = output_tile * Int32(self.tile_n) + tid
             else:
                 sfb_base = gate_sfb_base
-                n_local = (
-                    output_tile + intermediate_tiles
-                ) * Int32(self.tile_n) + tid
+                n_local = (output_tile + intermediate_tiles) * Int32(self.tile_n) + tid
             if tid < Int32(self.tile_n):
                 sf_src = (
                     Int64(expert_idx) * sfb_expert_stride
@@ -444,18 +441,14 @@ class Nvfp4MaterializedPhase1Kernel:
             gate_sfb_w = cute.make_rmem_tensor((4,), Uint32)
             up_sfb_w = cute.make_rmem_tensor((4,), Uint32)
             for g in cutlass.range_constexpr(4):
-                b_row = Int32(8) * (warp_idx * Int32(4) + Int32(g)) + (
-                    lane >> Int32(2)
-                )
+                b_row = Int32(8) * (warp_idx * Int32(4) + Int32(g)) + (lane >> Int32(2))
                 gate_b_lo[g] = ld_shared_u32(
                     gate_b_base + b_row * Int32(32) + Int32(4) * c
                 )
                 gate_b_hi[g] = ld_shared_u32(
                     gate_b_base + b_row * Int32(32) + Int32(4) * c + Int32(16)
                 )
-                up_b_lo[g] = ld_shared_u32(
-                    up_b_base + b_row * Int32(32) + Int32(4) * c
-                )
+                up_b_lo[g] = ld_shared_u32(up_b_base + b_row * Int32(32) + Int32(4) * c)
                 up_b_hi[g] = ld_shared_u32(
                     up_b_base + b_row * Int32(32) + Int32(4) * c + Int32(16)
                 )
@@ -484,9 +477,11 @@ class Nvfp4MaterializedPhase1Kernel:
                 # lanes with c in {1, 3}; the c in {2, 3} lanes re-read the
                 # c in {0, 1} words (clamped to a live row) which the
                 # hardware ignores for this atom.
-                sf_row = Int32(16) * Int32(blk) + (lane >> Int32(2)) + Int32(
-                    8
-                ) * (lane & Int32(1))
+                sf_row = (
+                    Int32(16) * Int32(blk)
+                    + (lane >> Int32(2))
+                    + Int32(8) * (lane & Int32(1))
+                )
                 sfa_w = ld_shared_u32(sfa_base + (sf_row << Int32(2)))
 
                 for g in cutlass.range_constexpr(4):
@@ -597,12 +592,9 @@ class Nvfp4MaterializedPhase1Kernel:
                     abs_value = fabs_f32(value)
                     if abs_value > block_max:
                         block_max = abs_value
-                payload, scale_byte = quantize_block_fp4(
-                    values, block_max, quant_gs
-                )
-                dst_word = (
-                    Int64(phys_row) * Int64(words_per_row)
-                    + Int64(output_tile * Int32(16) + Int32(block * 2))
+                payload, scale_byte = quantize_block_fp4(values, block_max, quant_gs)
+                dst_word = Int64(phys_row) * Int64(words_per_row) + Int64(
+                    output_tile * Int32(16) + Int32(block * 2)
                 )
                 st_global_u64(get_ptr_as_int64(intermediate_u32, dst_word), payload)
                 if cutlass.const_expr(block < 4):
@@ -620,9 +612,7 @@ class Nvfp4MaterializedPhase1Kernel:
                 + Int64(output_tile) * Int64(rows_capacity) * Int64(2)
                 + Int64(phys_row) * Int64(2)
             )
-            st_global_u32(
-                get_ptr_as_int64(intermediate_u32, sf_word), scale_word_lo
-            )
+            st_global_u32(get_ptr_as_int64(intermediate_u32, sf_word), scale_word_lo)
             st_global_u32(
                 get_ptr_as_int64(intermediate_u32, sf_word + Int64(1)),
                 scale_word_hi,

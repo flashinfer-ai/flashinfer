@@ -1,4 +1,5 @@
 """Prepared dense-MLA declaration and retained native launchers."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -8,15 +9,32 @@ import torch
 
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
-from b12x.preparation.types import FrozenMapping, MemoryRequirements, Plan, require_prepared
+from b12x.preparation.types import (
+    FrozenMapping,
+    MemoryRequirements,
+    Plan,
+    require_prepared,
+)
 
-from ._scratch import Binding, Caps, _dense_mla_scratch_layout, _materialize, plan_dense_mla_scratch
+from ._scratch import (
+    Binding,
+    Caps,
+    _dense_mla_scratch_layout,
+    _materialize,
+    plan_dense_mla_scratch,
+)
 from ._tuning import DenseMlaConfig, DenseMlaQuery, TUNING
 
 
 _OPERANDS = (
-    "q", "kv_cache", "output", "page_table", "cache_seqlens", "cu_seqlens_q",
-    "kv_scale", "q_scale",
+    "q",
+    "kv_cache",
+    "output",
+    "page_table",
+    "cache_seqlens",
+    "cu_seqlens_q",
+    "kv_scale",
+    "q_scale",
 )
 
 
@@ -33,12 +51,15 @@ def _alignment(tensor: torch.Tensor) -> int:
 
 
 def _descriptor(tensor: torch.Tensor) -> FrozenMapping:
-    return FrozenMapping({
-        "shape": tuple(int(value) for value in tensor.shape),
-        "strides": tuple(int(value) for value in tensor.stride()),
-        "dtype": str(tensor.dtype).removeprefix("torch."),
-        "alignment": _alignment(tensor),
-    })
+    return FrozenMapping(
+        {
+            "shape": tuple(int(value) for value in tensor.shape),
+            "strides": tuple(int(value) for value in tensor.stride()),
+            "dtype": str(tensor.dtype).removeprefix("torch."),
+            "alignment": _alignment(tensor),
+        }
+    )
+
 
 def _is_scalar_shape(shape: tuple[object, ...], strides: tuple[object, ...]) -> bool:
     return (shape == () and strides == ()) or (
@@ -50,8 +71,6 @@ def _is_scalar_shape(shape: tuple[object, ...], strides: tuple[object, ...]) -> 
     )
 
 
-
-
 def _cache_view(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.ndim == 4:
         if int(tensor.shape[2]) != 1:
@@ -61,7 +80,9 @@ def _cache_view(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def invocation_from_descriptors(
-    caps: Caps, *, operands: Mapping[str, Mapping[str, object] | None],
+    caps: Caps,
+    *,
+    operands: Mapping[str, Mapping[str, object] | None],
 ) -> FrozenMapping:
     """Describe the exact immutable tensor ABI without allocating device storage."""
     if not isinstance(caps, Caps):
@@ -74,15 +95,15 @@ def invocation_from_descriptors(
             continue
         fields = FrozenMapping(descriptor)
         if set(fields) != {"shape", "strides", "dtype", "alignment"}:
-            raise ValueError(f"dense MLA {name} ABI descriptor fields do not match schema")
+            raise ValueError(
+                f"dense MLA {name} ABI descriptor fields do not match schema"
+            )
         shape = tuple(fields["shape"])
         strides = tuple(fields["strides"])
         if (
             len(shape) != len(strides)
             or any(
-                not isinstance(value, int)
-                or isinstance(value, bool)
-                or value <= 0
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
                 for value in (*shape, *strides)
             )
             or not isinstance(fields["dtype"], str)
@@ -101,28 +122,31 @@ def invocation_from_descriptors(
         if name == "kv_cache" and len(shape) == 4:
             if shape[2] != 1:
                 raise ValueError("rank-4 dense MLA cache must have one KV head")
-            fields = FrozenMapping({
-                "shape": (shape[0], shape[1], shape[3]),
-                "strides": (strides[0], strides[1], strides[3]),
-                "dtype": fields["dtype"],
-                "alignment": fields["alignment"],
-            })
+            fields = FrozenMapping(
+                {
+                    "shape": (shape[0], shape[1], shape[3]),
+                    "strides": (strides[0], strides[1], strides[3]),
+                    "dtype": fields["dtype"],
+                    "alignment": fields["alignment"],
+                }
+            )
         normalized[name] = fields
     return FrozenMapping({"operands": FrozenMapping(normalized)})
 
 
-def invocation_from_tensors(caps: Caps, **tensors: torch.Tensor | None) -> FrozenMapping:
+def invocation_from_tensors(
+    caps: Caps, **tensors: torch.Tensor | None
+) -> FrozenMapping:
     """Capture the actual ABI of caller-owned tensors for one declaration."""
     return invocation_from_descriptors(
         caps,
         operands={
-            name: None if (tensor := tensors.get(name)) is None else _descriptor(
-                _cache_view(tensor) if name == "kv_cache" else tensor
-            )
+            name: None
+            if (tensor := tensors.get(name)) is None
+            else _descriptor(_cache_view(tensor) if name == "kv_cache" else tensor)
             for name in _OPERANDS
         },
     )
-
 
 
 def _canonical_invocation(caps: Caps) -> FrozenMapping:
@@ -140,28 +164,35 @@ def _canonical_invocation(caps: Caps) -> FrozenMapping:
         }
 
     fp8 = caps.kv_dtype == torch.float8_e4m3fn
-    return invocation_from_descriptors(caps, operands={
-        "q": descriptor(
-            (caps.max_total_q, caps.num_q_heads, caps.head_dim), caps.q_dtype
-        ),
-        "kv_cache": descriptor(
-            (caps.num_cache_pages, caps.page_size, caps.physical_record_width),
-            caps.kv_dtype,
-        ),
-        "output": descriptor(
-            (caps.max_total_q, caps.num_q_heads, caps.v_head_dim), torch.bfloat16
-        ),
-        "page_table": descriptor(
-            (caps.max_batch, caps.max_page_table_width), torch.int32
-        ),
-        "cache_seqlens": descriptor((caps.max_batch,), torch.int32),
-        "cu_seqlens_q": descriptor((caps.max_batch + 1,), torch.int32),
-        "kv_scale": descriptor((1,), torch.float32) if fp8 else None,
-        "q_scale": descriptor((1,), torch.float32) if fp8 else None,
-    })
+    return invocation_from_descriptors(
+        caps,
+        operands={
+            "q": descriptor(
+                (caps.max_total_q, caps.num_q_heads, caps.head_dim), caps.q_dtype
+            ),
+            "kv_cache": descriptor(
+                (caps.num_cache_pages, caps.page_size, caps.physical_record_width),
+                caps.kv_dtype,
+            ),
+            "output": descriptor(
+                (caps.max_total_q, caps.num_q_heads, caps.v_head_dim), torch.bfloat16
+            ),
+            "page_table": descriptor(
+                (caps.max_batch, caps.max_page_table_width), torch.int32
+            ),
+            "cache_seqlens": descriptor((caps.max_batch,), torch.int32),
+            "cu_seqlens_q": descriptor((caps.max_batch + 1,), torch.int32),
+            "kv_scale": descriptor((1,), torch.float32) if fp8 else None,
+            "q_scale": descriptor((1,), torch.float32) if fp8 else None,
+        },
+    )
+
+
 def _abi(invocation: FrozenMapping) -> FrozenMapping:
     if set(invocation) != {"operands"}:
-        raise ValueError("dense MLA declarations require invocation_from_tensors metadata")
+        raise ValueError(
+            "dense MLA declarations require invocation_from_tensors metadata"
+        )
     operands = invocation["operands"]
     if not isinstance(operands, FrozenMapping) or set(operands) != set(_OPERANDS):
         raise ValueError("dense MLA invocation operands must be complete")
@@ -173,6 +204,7 @@ def _abi(invocation: FrozenMapping) -> FrozenMapping:
         elif not isinstance(value, FrozenMapping):
             raise TypeError(f"dense MLA {name} ABI metadata is required")
     return operands
+
 
 def _matches_abi(expected: FrozenMapping, actual: FrozenMapping) -> bool:
     """Check retained-launch compatibility after each side passed ABI validation.
@@ -200,6 +232,7 @@ def _matches_abi(expected: FrozenMapping, actual: FrozenMapping) -> bool:
             return False
     return True
 
+
 def _validate_abi(caps: Caps, abi: FrozenMapping) -> None:
     def metadata(name: str) -> FrozenMapping | None:
         value = abi[name]
@@ -211,7 +244,9 @@ def _validate_abi(caps: Caps, abi: FrozenMapping) -> None:
     page_table = metadata("page_table")
     lengths = metadata("cache_seqlens")
     cu = metadata("cu_seqlens_q")
-    assert all(value is not None for value in (q, cache, output, page_table, lengths, cu))
+    assert all(
+        value is not None for value in (q, cache, output, page_table, lengths, cu)
+    )
     if (
         q["dtype"] != str(caps.q_dtype).removeprefix("torch.")
         or tuple(q["shape"][1:]) != (caps.num_q_heads, caps.head_dim)
@@ -236,8 +271,11 @@ def _validate_abi(caps: Caps, abi: FrozenMapping) -> None:
         raise ValueError("dense MLA cache ABI is not a legal declared page layout")
     if (
         output["dtype"] != "bfloat16"
-        or tuple(output["shape"]) != (
-            int(q["shape"][0]), caps.num_q_heads, caps.v_head_dim,
+        or tuple(output["shape"])
+        != (
+            int(q["shape"][0]),
+            caps.num_q_heads,
+            caps.v_head_dim,
         )
         or int(output["strides"][2]) != 1
         or int(output["strides"][1]) != caps.v_head_dim
@@ -259,53 +297,68 @@ def _validate_abi(caps: Caps, abi: FrozenMapping) -> None:
         or not 1 <= int(page_table["shape"][1]) <= caps.max_page_table_width
         or tuple(page_table["strides"]) != (int(page_table["shape"][1]), 1)
     ):
-        raise ValueError("dense MLA sequence metadata ABI differs from declared capacity")
+        raise ValueError(
+            "dense MLA sequence metadata ABI differs from declared capacity"
+        )
     fp8 = caps.kv_dtype == torch.float8_e4m3fn
     for name, required in (("kv_scale", fp8), ("q_scale", fp8)):
         scale = metadata(name)
         if (scale is None) != (not required):
-            raise ValueError(f"dense MLA {name} ABI presence differs from cache precision")
+            raise ValueError(
+                f"dense MLA {name} ABI presence differs from cache precision"
+            )
         if scale is not None and (
             scale["dtype"] != "float32"
-            or not _is_scalar_shape(
-                tuple(scale["shape"]), tuple(scale["strides"])
-            )
+            or not _is_scalar_shape(tuple(scale["shape"]), tuple(scale["strides"]))
             or int(scale["alignment"]) < 4
         ):
-            raise ValueError(
-                f"dense MLA {name} ABI must be an aligned float32 scalar"
-            )
+            raise ValueError(f"dense MLA {name} ABI must be an aligned float32 scalar")
 
 
 def _query(caps: Caps, abi: FrozenMapping) -> DenseMlaQuery:
     return DenseMlaQuery(
-        mode=caps.mode, q_dtype=str(caps.q_dtype).removeprefix("torch."),
+        mode=caps.mode,
+        q_dtype=str(caps.q_dtype).removeprefix("torch."),
         kv_dtype=str(caps.kv_dtype).removeprefix("torch."),
-        num_q_heads=caps.num_q_heads, qk_head_dim=caps.head_dim,
-        v_head_dim=caps.v_head_dim, page_size=caps.page_size,
-        query_rows=caps.max_total_q, max_batch=caps.max_batch,
+        num_q_heads=caps.num_q_heads,
+        qk_head_dim=caps.head_dim,
+        v_head_dim=caps.v_head_dim,
+        page_size=caps.page_size,
+        query_rows=caps.max_total_q,
+        max_batch=caps.max_batch,
         cache_tokens=caps.max_cache_tokens,
         physical_record_width=caps.physical_record_width,
-        window_size=caps.window_size, use_cuda_graph=caps.use_cuda_graph,
+        window_size=caps.window_size,
+        use_cuda_graph=caps.use_cuda_graph,
         max_page_table_width=caps.max_page_table_width,
-        num_cache_pages=caps.num_cache_pages, abi=abi,
+        num_cache_pages=caps.num_cache_pages,
+        abi=abi,
         partial_dtype=str(caps.partial_dtype).removeprefix("torch."),
     )
 
 
 def _caps(query: DenseMlaQuery, config: DenseMlaConfig, device: torch.device) -> Caps:
     return Caps(
-        device=device, mode=query.mode, q_dtype=_dtype(query.q_dtype),
-        kv_dtype=_dtype(query.kv_dtype), num_q_heads=query.num_q_heads,
-        page_size=query.page_size, max_total_q=query.query_rows,
-        max_batch=query.max_batch, max_cache_tokens=query.cache_tokens,
+        device=device,
+        mode=query.mode,
+        q_dtype=_dtype(query.q_dtype),
+        kv_dtype=_dtype(query.kv_dtype),
+        num_q_heads=query.num_q_heads,
+        page_size=query.page_size,
+        max_total_q=query.query_rows,
+        max_batch=query.max_batch,
+        max_cache_tokens=query.cache_tokens,
         max_page_table_width=query.max_page_table_width,
         num_cache_pages=query.num_cache_pages,
-        head_dim=query.qk_head_dim, v_head_dim=query.v_head_dim,
+        head_dim=query.qk_head_dim,
+        v_head_dim=query.v_head_dim,
         physical_record_width=query.physical_record_width,
-        window_size=query.window_size, use_cuda_graph=query.use_cuda_graph,
+        window_size=query.window_size,
+        use_cuda_graph=query.use_cuda_graph,
         partial_dtype=_dtype(query.partial_dtype),
-        budget=__import__("b12x.attention.dense_mla.planner", fromlist=["Budget"]).Budget(max_splits=config.max_splits),
+        budget=__import__(
+            "b12x.attention.dense_mla.planner", fromlist=["Budget"]
+        ).Budget(max_splits=config.max_splits),
     )
 
 
@@ -323,6 +376,7 @@ def compile_dense_mla(query_payload, config_payload, ordinal):
     layout = _dense_mla_scratch_layout(caps)
     abi = query.abi
     with FakeTensorMode(), compile_only_launches():
+
         def empty(shape, dtype):
             return torch.empty(shape, dtype=dtype, device=caps.device)
 
@@ -348,18 +402,34 @@ def compile_dense_mla(query_payload, config_payload, ordinal):
         cu = operand("cu_seqlens_q")
         kv_scale = operand("kv_scale")
         q_scale = operand("q_scale")
-        assert all(value is not None for value in (
-            source_q, cache, output, page_table, lengths, cu,
-        ))
+        assert all(
+            value is not None
+            for value in (
+                source_q,
+                cache,
+                output,
+                page_table,
+                lengths,
+                cu,
+            )
+        )
         native_q = source_q
         if caps.q_dtype != caps.kv_dtype:
             assert scratch.quantized_q is not None
             native_q = scratch.quantized_q[: int(source_q.shape[0])]
         binding = Binding(
-            scratch=scratch, q=native_q, kv_cache=cache, output=output,
-            page_table=page_table, cache_seqlens=lengths, cu_seqlens_q=cu,
-            kv_scale=kv_scale, q_scale=q_scale, sm_scale=1.0,
-            active_splits=layout.num_splits, query_quant=None,
+            scratch=scratch,
+            q=native_q,
+            kv_cache=cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=lengths,
+            cu_seqlens_q=cu,
+            kv_scale=kv_scale,
+            q_scale=q_scale,
+            sm_scale=1.0,
+            active_splits=layout.num_splits,
+            query_quant=None,
         )
         forward, merge = _kernel._compile_entries(binding)
         programs = {"forward": forward}
@@ -411,12 +481,19 @@ class _DenseMlaState:
         launchers = resolve_dense_mla_launchers(binding=binding)
         quantizer = (
             resolve_static_fp8_quant_launcher(binding=binding.query_quant)
-            if binding.query_quant is not None else None
+            if binding.query_quant is not None
+            else None
         )
-        object.__setattr__(self, "launchers", MappingProxyType({
-            "dense": launchers,
-            "quantizer": quantizer,
-        }))
+        object.__setattr__(
+            self,
+            "launchers",
+            MappingProxyType(
+                {
+                    "dense": launchers,
+                    "quantizer": quantizer,
+                }
+            ),
+        )
 
     def run(self, binding: Binding):
         if self.launchers is None:
@@ -428,7 +505,9 @@ class _DenseMlaState:
 
 
 def plan(
-    caps: Caps, *, invocation: FrozenMapping = FrozenMapping(),
+    caps: Caps,
+    *,
+    invocation: FrozenMapping = FrozenMapping(),
     override: DenseMlaConfig | None = None,
 ) -> Plan:
     if not isinstance(caps, Caps):
@@ -452,12 +531,21 @@ def plan(
         return _DenseMlaState(lowered(selection.config), native, query.abi)
 
     return Plan(
-        contract=TUNING, query=query, invocation=invocation, override=override,
-        _compile_jobs=lambda config, device: (CompileJob.create(
-            "b12x.attention.dense_mla._preparation:compile_dense_mla",
-            TUNING.encode_query(replace(query, exhaustive=False)), TUNING.encode_config(config), device.ordinal,
-        ),),
-        _memory_requirements=memory, _materialize=materialize, _device=caps.device,
+        contract=TUNING,
+        query=query,
+        invocation=invocation,
+        override=override,
+        _compile_jobs=lambda config, device: (
+            CompileJob.create(
+                "b12x.attention.dense_mla._preparation:compile_dense_mla",
+                TUNING.encode_query(replace(query, exhaustive=False)),
+                TUNING.encode_config(config),
+                device.ordinal,
+            ),
+        ),
+        _memory_requirements=memory,
+        _materialize=materialize,
+        _device=caps.device,
     )
 
 
@@ -466,6 +554,9 @@ def state(plan, *, device=None) -> _DenseMlaState:
 
 
 __all__ = [
-    "compile_dense_mla", "invocation_from_descriptors", "invocation_from_tensors",
-    "plan", "state",
+    "compile_dense_mla",
+    "invocation_from_descriptors",
+    "invocation_from_tensors",
+    "plan",
+    "state",
 ]

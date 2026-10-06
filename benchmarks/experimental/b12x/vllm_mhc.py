@@ -72,7 +72,9 @@ def _validated_model_config(model_config: dict[str, Any]) -> SimpleNamespace:
 
     missing = [field for field in _REQUIRED_MODEL_FIELDS if field not in values]
     if missing:
-        raise ValueError(f"model_config is missing required mHC fields: {', '.join(missing)}")
+        raise ValueError(
+            f"model_config is missing required mHC fields: {', '.join(missing)}"
+        )
 
     try:
         normalized = {
@@ -137,7 +139,9 @@ class VllmMHCRunner:
         return {
             "checkout": str(self.vllm_path),
             "commit": subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=self.vllm_path, text=True,
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.vllm_path,
+                text=True,
             ).strip(),
             "adapter": f"{type(self.adapter).__module__}.{type(self.adapter).__name__}",
             "capture_sizes": self.capture_sizes,
@@ -164,9 +168,12 @@ class VllmMHCRunner:
         layer = torch.nn.Module()
         layer._b12x_mhc = self.adapter
         for target, source in (
-            ("hc_attn_fn", "prev_fn"), ("hc_attn_scale", "prev_scale"),
-            ("hc_attn_base", "prev_bias"), ("hc_ffn_fn", "fn"),
-            ("hc_ffn_scale", "scale"), ("hc_ffn_base", "bias"),
+            ("hc_attn_fn", "prev_fn"),
+            ("hc_attn_scale", "prev_scale"),
+            ("hc_attn_base", "prev_bias"),
+            ("hc_ffn_fn", "fn"),
+            ("hc_ffn_scale", "scale"),
+            ("hc_ffn_base", "bias"),
         ):
             setattr(layer, target, tensors[source])
         layer.hc_attn_fn_broadcast = None
@@ -179,19 +186,30 @@ class VllmMHCRunner:
         self.adapter.bind_layer_name(prefix)
         self._layer = layer
         workload = B12xWorkload(
-            stage="weights", token_counts=self.capture_sizes,
+            stage="weights",
+            token_counts=self.capture_sizes,
             fixed_token_counts=self.capture_sizes[:-1],
-            output_dtype=torch.bfloat16, max_tokens=max(self.capture_sizes),
-            max_seqs=1, max_model_len=max(self.capture_sizes),
+            output_dtype=torch.bfloat16,
+            max_tokens=max(self.capture_sizes),
+            max_seqs=1,
+            max_model_len=max(self.capture_sizes),
         )
         units = self.adapter.get_b12x_preparation_units(layer, workload)
-        requests = tuple(request for unit in units for request in unit.requests
-                         if ".post_pre." in request.name)
+        requests = tuple(
+            request
+            for unit in units
+            for request in unit.requests
+            if ".post_pre." in request.name
+        )
         if not requests:
             raise RuntimeError("mHC provider did not declare the benchmark operation")
-        session = self._preparation_stack.enter_context(PreparationSession(
-            device=tensors["fn"].device, autotune=True, compile_workers=2,
-        ))
+        session = self._preparation_stack.enter_context(
+            PreparationSession(
+                device=tensors["fn"].device,
+                autotune=True,
+                compile_workers=2,
+            )
+        )
         self._preparation_stack.enter_context(session.prepare(requests))
         self._preparation_session = session
 
@@ -258,8 +276,12 @@ def vllm_mhc_runner(
             f"Unsupported mHC profile {profile_name!r}; expected one of "
             f"{sorted(_SUPPORTED_PROFILES)}."
         )
-    if not capture_sizes or any(not isinstance(size, int) or size <= 0 for size in capture_sizes):
-        raise ValueError("capture_sizes must be a non-empty tuple of positive integers.")
+    if not capture_sizes or any(
+        not isinstance(size, int) or size <= 0 for size in capture_sizes
+    ):
+        raise ValueError(
+            "capture_sizes must be a non-empty tuple of positive integers."
+        )
     if tuple(sorted(set(capture_sizes))) != capture_sizes:
         raise ValueError("capture_sizes must be sorted and unique.")
 
@@ -268,7 +290,12 @@ def vllm_mhc_runner(
     vllm = _import_vllm(checkout)
 
     import torch
-    from vllm.config import CompilationConfig, SchedulerConfig, VllmConfig, set_current_vllm_config
+    from vllm.config import (
+        CompilationConfig,
+        SchedulerConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
     from vllm.v1.worker import workspace as workspace_module
     from vllm.v1.worker.workspace import (
         collect_cuda_graph_capture_resources,
@@ -308,9 +335,15 @@ def vllm_mhc_runner(
     reset_workspace_manager()
     init_workspace_manager(device)
     try:
-        with set_current_vllm_config(vllm_config), collect_cuda_graph_capture_resources() as resources, ExitStack() as preparation_stack:
+        with (
+            set_current_vllm_config(vllm_config),
+            collect_cuda_graph_capture_resources() as resources,
+            ExitStack() as preparation_stack,
+        ):
             if profile_name == _V4_PROFILE:
-                adapter_module = importlib.import_module("vllm.models.deepseek_v4.nvidia.b12x")
+                adapter_module = importlib.import_module(
+                    "vllm.models.deepseek_v4.nvidia.b12x"
+                )
                 adapter = adapter_module.B12xMHCResidual(
                     hidden_size=hf_config.hidden_size,
                     hc_mult=hf_config.hc_mult,
@@ -319,7 +352,9 @@ def vllm_mhc_runner(
                     sinkhorn_iters=hf_config.hc_sinkhorn_iters,
                 )
             else:
-                adapter_module = importlib.import_module("vllm.models.deepseek_v4_1.b12x_layers")
+                adapter_module = importlib.import_module(
+                    "vllm.models.deepseek_v4_1.b12x_layers"
+                )
                 adapter = adapter_module.B12xMHC(hf_config)
 
             runner = VllmMHCRunner(

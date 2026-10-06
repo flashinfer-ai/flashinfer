@@ -21,6 +21,7 @@ The two-kernel formulation matches the host arithmetic bit-for-bit:
 * ``alpha`` uses div.rn.f32, bit-identical to ``torch.reciprocal`` (both
   correctly rounded) of ``1.0 * w_gs``.
 """
+
 from __future__ import annotations
 
 from typing import Dict, Tuple

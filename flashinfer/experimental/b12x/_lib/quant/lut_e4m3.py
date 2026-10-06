@@ -228,10 +228,7 @@ def lut_e4m3_direct_table_cpu() -> torch.Tensor:
     codewords = torch.arange(1 << 16, dtype=torch.int64)
     values = lut_e4m3_value_table_cpu()
     return torch.cat(
-        [
-            values[_lut_e4m3_permutation(codewords, bits) >> 4]
-            for bits in (2, 3, 4)
-        ]
+        [values[_lut_e4m3_permutation(codewords, bits) >> 4] for bits in (2, 3, 4)]
     ).contiguous()
 
 

@@ -30,7 +30,9 @@ class _DecodeProbe:
         self.count = 32768 if codec == "iq2_xxs" else 65536
         self.shared_lut = shared_lut
         self.selector_lut = selector_lut
-        self.table_bytes = (IQ2_XS_SELECTOR_LUT_BYTES if selector_lut else IQ2_XS_MAGNITUDE_LUT_BYTES) // (2 if codec == "iq2_xxs" else 1)
+        self.table_bytes = (
+            IQ2_XS_SELECTOR_LUT_BYTES if selector_lut else IQ2_XS_MAGNITUDE_LUT_BYTES
+        ) // (2 if codec == "iq2_xxs" else 1)
 
     @property
     def __cache_key__(self):
@@ -59,7 +61,9 @@ class _DecodeProbe:
                 cutlass.Uint32, self.table_bytes // 4, byte_alignment=16
             )
             table_shared = shared_ptr_to_u32(storage)
-            for i in cutlass.range_constexpr((self.table_bytes + 256 * 16 - 1) // (256 * 16)):
+            for i in cutlass.range_constexpr(
+                (self.table_bytes + 256 * 16 - 1) // (256 * 16)
+            ):
                 if (i * 256 + tid) * 16 < self.table_bytes:
                     cp_async4_shared_global(
                         table_shared + (i * 256 + tid) * 16,
@@ -75,7 +79,9 @@ class _DecodeProbe:
         nibble = cutlass.Uint32((row // 4) % 16)
         if cutlass.const_expr(self.codec == "iq2_xxs"):
             descriptor = (descriptor & 255) | ((descriptor >> 8) << 9)
-        other = descriptor ^ cutlass.Uint32(0xFEFF if self.codec == "iq2_xxs" else 0xFFFF)
+        other = descriptor ^ cutlass.Uint32(
+            0xFEFF if self.codec == "iq2_xxs" else 0xFFFF
+        )
         q0 = descriptor | (other << 16)
         q1 = other | (descriptor << 16)
         base_pair = cutlass.Uint32(base) | (
@@ -95,8 +101,14 @@ class _DecodeProbe:
             q1 = iq2_xxs_descriptor_pair(grids1, signs1, cutlass.Int32(row % 2))
             subscale_pair = (signs0 >> 28) | ((signs1 >> 28) << 8)
         a, b, c, d = packed_decode_iq2_xs_to_bfloat2x4(
-            q0, q1, base_pair, subscale_pair, table_addr, pair,
-            shared_lut=self.shared_lut, selector_lut=self.selector_lut,
+            q0,
+            q1,
+            base_pair,
+            subscale_pair,
+            table_addr,
+            pair,
+            shared_lut=self.shared_lut,
+            selector_lut=self.selector_lut,
         )
         out[row, 0], out[row, 1] = cutlass.Int32(a), cutlass.Int32(b)
         out[row, 2], out[row, 3] = cutlass.Int32(c), cutlass.Int32(d)
@@ -108,9 +120,13 @@ class _DecodeProbe:
 @pytest.mark.parametrize("shared_lut", [False, True])
 @pytest.mark.parametrize("selector_lut", [False, True])
 @pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs"])
-def test_all_descriptors_subscales_and_rounding(base_bits, shared_lut, selector_lut, codec):
+def test_all_descriptors_subscales_and_rounding(
+    base_bits, shared_lut, selector_lut, codec
+):
     device = require_b12x()
-    table = iq2_xs_execution_lut(device, prepare=True, selectors=selector_lut, codec=codec)
+    table = iq2_xs_execution_lut(
+        device, prepare=True, selectors=selector_lut, codec=codec
+    )
     count = 32768 if codec == "iq2_xxs" else 65536
     output = torch.empty((count * 64, 4), dtype=torch.int32, device=device)
     lut_arg, out_arg = (
@@ -129,12 +145,17 @@ def test_all_descriptors_subscales_and_rounding(base_bits, shared_lut, selector_
     if codec == "iq2_xxs":
         import struct
         from b12x.testing.iq2_xxs_reference import _GRID_WORDS
-        grid = torch.tensor(list(b"".join(struct.pack("<Q", w) for w in _GRID_WORDS))).reshape(256, 8)
+
+        grid = torch.tensor(
+            list(b"".join(struct.pack("<Q", w) for w in _GRID_WORDS))
+        ).reshape(256, 8)
         indices = torch.arange(count)
         signs = indices // 256
         parity = sum((signs >> bit) & 1 for bit in range(7)) % 2
         masks = signs | (parity << 7)
-        vectors = (grid[indices % 256] * (1 - 2 * ((masks[:, None] >> torch.arange(8)) & 1))).float()
+        vectors = (
+            grid[indices % 256] * (1 - 2 * ((masks[:, None] >> torch.arange(8)) & 1))
+        ).float()
     else:
         vectors = descriptor_vectors().float()
     base = torch.tensor([base_bits], dtype=torch.uint16).view(torch.float16).float()[0]

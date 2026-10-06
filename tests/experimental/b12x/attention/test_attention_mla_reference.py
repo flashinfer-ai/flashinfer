@@ -16,8 +16,17 @@ from b12x.attention._shared.mla.reference import (
     sparse_mla_reference,
     unpack_mla_kv_cache_reference,
 )
-from b12x.attention._shared.mla.api import MLASparseDecodeMetadata, MLASparseExtendMetadata, clear_mla_caches, sparse_mla_decode_forward, sparse_mla_extend_forward
-from b12x.attention.sparse_mla._scratch import B12XSparseMLAScratchCaps, plan_sparse_mla_scratch
+from b12x.attention._shared.mla.api import (
+    MLASparseDecodeMetadata,
+    MLASparseExtendMetadata,
+    clear_mla_caches,
+    sparse_mla_decode_forward,
+    sparse_mla_extend_forward,
+)
+from b12x.attention.sparse_mla._scratch import (
+    B12XSparseMLAScratchCaps,
+    plan_sparse_mla_scratch,
+)
 
 from b12x.testing.reference.helpers import require_b12x
 
@@ -100,7 +109,9 @@ def _load_glm_layer0_cpu() -> GLMMLAWeights:
 
     return GLMMLAWeights(
         q_a_proj=tensors["model.layers.0.self_attn.q_a_proj.weight"],
-        kv_a_proj_with_mqa=tensors["model.layers.0.self_attn.kv_a_proj_with_mqa.weight"],
+        kv_a_proj_with_mqa=tensors[
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
+        ],
         q_b_proj=tensors["model.layers.0.self_attn.q_b_proj.weight"],
         q_a_layernorm=tensors["model.layers.0.self_attn.q_a_layernorm.weight"],
         kv_a_layernorm=tensors["model.layers.0.self_attn.kv_a_layernorm.weight"],
@@ -129,14 +140,12 @@ def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor
     return (x_f * inv_rms).to(x.dtype) * weight
 
 
-def _rope_interleaved(x: torch.Tensor, positions: torch.Tensor, theta: float) -> torch.Tensor:
+def _rope_interleaved(
+    x: torch.Tensor, positions: torch.Tensor, theta: float
+) -> torch.Tensor:
     half = x.shape[-1] // 2
     inv_freq = 1.0 / (
-        theta
-        ** (
-            torch.arange(half, device=x.device, dtype=torch.float32)
-            / half
-        )
+        theta ** (torch.arange(half, device=x.device, dtype=torch.float32) / half)
     )
     freqs = positions.to(torch.float32).unsqueeze(-1) * inv_freq.unsqueeze(0)
     cos = freqs.cos().view(x.shape[0], 1, half)
@@ -343,7 +352,9 @@ def _embed_mla_cache_in_pool(
 
 
 @pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
-def test_glm51_layer0_mla_pack_roundtrip_matches_unquantized_cache(cache_len: int) -> None:
+def test_glm51_layer0_mla_pack_roundtrip_matches_unquantized_cache(
+    cache_len: int,
+) -> None:
     device = require_b12x()
     _require_glm_weights()
 
@@ -366,7 +377,9 @@ def test_glm51_layer0_mla_pack_roundtrip_matches_unquantized_cache(cache_len: in
 
 
 @pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
-def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_decode(cache_len: int) -> None:
+def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_decode(
+    cache_len: int,
+) -> None:
     device = require_b12x()
     _require_glm_weights()
 
@@ -377,7 +390,9 @@ def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_decode(cache
         device=device,
     )
     packed = pack_mla_kv_cache_reference(k_nope, k_rope)
-    page_table_1 = torch.arange(cache_len, dtype=torch.int32, device=device).unsqueeze(0)
+    page_table_1 = torch.arange(cache_len, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
 
     actual = sparse_mla_reference(
         q_all=q_all,
@@ -403,7 +418,9 @@ def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_decode(cache
 
 
 @pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
-def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_extend(cache_len: int) -> None:
+def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_extend(
+    cache_len: int,
+) -> None:
     device = require_b12x()
     _require_glm_weights()
 
@@ -414,7 +431,9 @@ def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_extend(cache
         device=device,
     )
     packed = pack_mla_kv_cache_reference(k_nope, k_rope)
-    page_table_1 = torch.arange(cache_len, dtype=torch.int32, device=device).repeat(5, 1)
+    page_table_1 = torch.arange(cache_len, dtype=torch.int32, device=device).repeat(
+        5, 1
+    )
 
     actual = sparse_mla_reference(
         q_all=q_all,
@@ -459,7 +478,9 @@ def test_glm51_layer0_sparse_mla_reference_handles_sparse_indices_and_padding() 
     gen.manual_seed(40129)
     rows = []
     for _ in range(q_len):
-        valid = torch.randperm(cache_len, generator=gen, dtype=torch.int64)[:valid_per_row]
+        valid = torch.randperm(cache_len, generator=gen, dtype=torch.int64)[
+            :valid_per_row
+        ]
         valid = valid.to(torch.int32)
         padded = torch.full((width,), -1, dtype=torch.int32)
         padded[:valid_per_row] = valid
@@ -506,7 +527,9 @@ def test_glm51_layer0_decode_api_handles_sparse_indices_and_padding() -> None:
 
     gen = torch.Generator(device="cpu")
     gen.manual_seed(45129)
-    valid = torch.randperm(cache_len, generator=gen, dtype=torch.int64)[:valid_per_row].to(torch.int32)
+    valid = torch.randperm(cache_len, generator=gen, dtype=torch.int64)[
+        :valid_per_row
+    ].to(torch.int32)
     page_table_1 = torch.full((1, width), -1, dtype=torch.int32, device=device)
     page_table_1[0, :valid_per_row] = valid.to(device=device)
     cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
@@ -568,7 +591,9 @@ def test_glm51_layer0_extend_api_handles_sparse_indices_and_padding() -> None:
     gen.manual_seed(46129)
     rows = []
     for _ in range(q_len):
-        valid = torch.randperm(cache_len, generator=gen, dtype=torch.int64)[:valid_per_row]
+        valid = torch.randperm(cache_len, generator=gen, dtype=torch.int64)[
+            :valid_per_row
+        ]
         valid = valid.to(torch.int32)
         padded = torch.full((width,), -1, dtype=torch.int32)
         padded[:valid_per_row] = valid
@@ -619,7 +644,9 @@ def test_glm51_layer0_extend_api_handles_sparse_indices_and_padding() -> None:
 
 
 @pytest.mark.parametrize("width", [129, 511, 1024, 2048])
-def test_glm51_layer0_decode_api_matches_dense_oracle_for_split_widths(width: int) -> None:
+def test_glm51_layer0_decode_api_matches_dense_oracle_for_split_widths(
+    width: int,
+) -> None:
     device = require_b12x()
     _require_glm_weights()
 
@@ -688,7 +715,9 @@ def test_glm51_layer0_decode_api_split_handles_sparse_padding(width: int) -> Non
 
     gen = torch.Generator(device="cpu")
     gen.manual_seed(48_000 + width)
-    valid = torch.randperm(cache_len, generator=gen, dtype=torch.int64)[:valid_per_row].to(torch.int32)
+    valid = torch.randperm(cache_len, generator=gen, dtype=torch.int64)[
+        :valid_per_row
+    ].to(torch.int32)
     page_table_1 = torch.full((1, width), -1, dtype=torch.int32, device=device)
     page_table_1[0, :valid_per_row] = valid.to(device=device)
     cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
@@ -731,7 +760,9 @@ def test_glm51_layer0_decode_api_split_handles_sparse_padding(width: int) -> Non
 
 
 @pytest.mark.parametrize("width", [129, 2048])
-def test_glm51_layer0_decode_api_matches_dense_oracle_for_boundary_widths(width: int) -> None:
+def test_glm51_layer0_decode_api_matches_dense_oracle_for_boundary_widths(
+    width: int,
+) -> None:
     device = require_b12x()
     _require_glm_weights()
 
@@ -783,7 +814,9 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_boundary_widths(width:
     assert cos >= 0.9995, f"width={width}: cos={cos:.6f}"
 
 
-def test_glm51_layer0_decode_split_graph_replay_handles_runtime_padding_changes() -> None:
+def test_glm51_layer0_decode_split_graph_replay_handles_runtime_padding_changes() -> (
+    None
+):
     device = require_b12x()
     _require_glm_weights()
 
@@ -924,7 +957,9 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads() -> No
     assert cos >= 0.9995, f"cos={cos:.6f}"
 
 
-def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads_fp8_view_cache() -> None:
+def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads_fp8_view_cache() -> (
+    None
+):
     device = require_b12x()
     _require_glm_weights()
 
@@ -1005,7 +1040,9 @@ def test_glm51_layer0_decode_api_matches_dense_oracle(cache_len: int) -> None:
         device=device,
     )
     packed = pack_mla_kv_cache_reference(k_nope, k_rope)
-    page_table_1 = torch.arange(cache_len, dtype=torch.int32, device=device).unsqueeze(0)
+    page_table_1 = torch.arange(cache_len, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
     cache_seqlens = torch.tensor([cache_len], dtype=torch.int32, device=device)
     metadata = MLASparseDecodeMetadata(
         page_table_1=page_table_1,
@@ -1058,7 +1095,9 @@ def test_glm51_layer0_extend_api_matches_dense_oracle(cache_len: int) -> None:
         device=device,
     )
     packed = pack_mla_kv_cache_reference(k_nope, k_rope)
-    page_table_1 = torch.arange(cache_len, dtype=torch.int32, device=device).repeat(q_len, 1)
+    page_table_1 = torch.arange(cache_len, dtype=torch.int32, device=device).repeat(
+        q_len, 1
+    )
     cache_seqlens = torch.full((q_len,), cache_len, dtype=torch.int32, device=device)
     cu_seqlens = torch.arange(0, q_len + 1, dtype=torch.int32, device=device)
     metadata = MLASparseExtendMetadata(
@@ -1118,9 +1157,13 @@ def test_glm51_layer0_extend_api_respects_active_token_counts() -> None:
     )
     packed = pack_mla_kv_cache_reference(k_nope, k_rope)
 
-    active_counts = torch.tensor([257, 193, 129, 65, 0], dtype=torch.int32, device=device)
+    active_counts = torch.tensor(
+        [257, 193, 129, 65, 0], dtype=torch.int32, device=device
+    )
     page_table_actual = torch.empty((q_len, width), dtype=torch.int32, device=device)
-    page_table_expected = torch.full((q_len, width), -1, dtype=torch.int32, device=device)
+    page_table_expected = torch.full(
+        (q_len, width), -1, dtype=torch.int32, device=device
+    )
     base = torch.arange(width, dtype=torch.int32, device=device)
     for row in range(q_len):
         row_tokens = (base + row * 37) % cache_len

@@ -190,7 +190,9 @@ def _csf_planes(rows, columns, *, experts, seed):
         )
         position = np.flatnonzero(outside).astype(np.uint32)
         exceptions.append(
-            torch.from_numpy(position | (grid.reshape(-1)[position].astype(np.uint32) << 24))
+            torch.from_numpy(
+                position | (grid.reshape(-1)[position].astype(np.uint32) << 24)
+            )
         )
         grids.append(grid)
     batch = make_x4t_scale_batch(
@@ -328,7 +330,9 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
             run=lambda: state.run(binding), output=output, owners=(buffers, binding)
         )
 
-    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
         session.prepare(
             tuple(
                 p.request(name=f"mxfp4-csf-inline-{i}", prepare_call=prepare)
@@ -442,7 +446,9 @@ def test_inline_capacity_plan_reuses_its_launches_for_live_counts(
             run=lambda: state.run(binding), output=output, owners=(buffers, binding)
         )
 
-    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
         session.prepare(
             tuple(
                 p.request(name=f"csf-inline-live-{i}", prepare_call=prepare)
@@ -513,7 +519,9 @@ def test_inline_plans_above_the_limit_expand_the_inline_storage(tokens, monkeypa
             owners=(buffers, binding),
         )
 
-    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
         session.prepare(
             tuple(
                 p.request(
@@ -575,6 +583,11 @@ def test_inline_capacity_control_is_retained_after_declaration(monkeypatch):
 
     monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 1536)
     test_inline_scales_match_native_and_expansion_under_poisoned_replay(
-        1024, 320, 17, "w31", torch.int32, monkeypatch,
+        1024,
+        320,
+        17,
+        "w31",
+        torch.int32,
+        monkeypatch,
         after_plan=lambda: monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 0),
     )

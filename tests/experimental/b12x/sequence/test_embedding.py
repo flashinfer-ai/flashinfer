@@ -1,4 +1,5 @@
 """Unquantized row identity, frozen dynamic counts, and Int64 pool addressing."""
+
 from contextlib import contextmanager
 
 import subprocess
@@ -14,15 +15,24 @@ from b12x.preparation import PreparationSession, PreparedCall
 @contextmanager
 def _prepared(weight, ids, out, *, num_rows=None):
     from b12x.sequence import embedding
+
     declaration = embedding.plan(
-        embedding.query_from_call(weight, ids, out=out, num_rows=num_rows), device=weight.device,
+        embedding.query_from_call(weight, ids, out=out, num_rows=num_rows),
+        device=weight.device,
     )
-    with PreparationSession(device=weight.device, autotune=False, compile_workers=2) as session:
-        session.prepare((declaration.request(
-            name="embedding", prepare_call=lambda state: PreparedCall(
-                run=lambda: state.run(weight, ids, out=out, num_rows=num_rows),
-            ),
-        ),))
+    with PreparationSession(
+        device=weight.device, autotune=False, compile_workers=2
+    ) as session:
+        session.prepare(
+            (
+                declaration.request(
+                    name="embedding",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.run(weight, ids, out=out, num_rows=num_rows),
+                    ),
+                ),
+            )
+        )
         session.freeze()
         yield declaration
 
@@ -56,21 +66,36 @@ def test_exact_rows_preserve_shape_dtype_and_strided_table(dtype, id_dtype):
 def test_frozen_lookup_changes_counts_and_replays_mutated_ids(dtype, id_dtype):
     from b12x.sequence import embedding
 
-    weight = torch.arange(23 * 129, device="cuda", dtype=torch.float32).reshape(23, 129).to(dtype)
+    weight = (
+        torch.arange(23 * 129, device="cuda", dtype=torch.float32)
+        .reshape(23, 129)
+        .to(dtype)
+    )
     ids = torch.zeros(11, device="cuda", dtype=id_dtype)
     out = torch.full((11, 129), -7, device="cuda", dtype=dtype)
     count = torch.zeros((), device="cuda", dtype=torch.int32)
     torch.cuda.synchronize()
-    with _prepared(weight, ids, out) as host_plan, _prepared(weight, ids, out, num_rows=count) as device_plan:
+    with (
+        _prepared(weight, ids, out) as host_plan,
+        _prepared(weight, ids, out, num_rows=count) as device_plan,
+    ):
         for table_rows, rows in [(3, 1), (23, 11), (7, 0), (11, 5)]:
             ids.fill_(table_rows - 1)
             out.fill_(-7)
-            embedding.run(weight[:table_rows], ids[:rows], out=out[:rows], plan=host_plan)
-            torch.testing.assert_close(out[:rows], weight[ids[:rows].long()], rtol=0, atol=0)
-            torch.testing.assert_close(out[rows:], torch.full_like(out[rows:], -7), rtol=0, atol=0)
+            embedding.run(
+                weight[:table_rows], ids[:rows], out=out[:rows], plan=host_plan
+            )
+            torch.testing.assert_close(
+                out[:rows], weight[ids[:rows].long()], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                out[rows:], torch.full_like(out[rows:], -7), rtol=0, atol=0
+            )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            captured = embedding.run(weight, ids, out=out, num_rows=count, plan=device_plan)
+            captured = embedding.run(
+                weight, ids, out=out, num_rows=count, plan=device_plan
+            )
         address = out.data_ptr()
         for rows in (11, 2, 0, 7):
             # Invalid inactive IDs must not be read even after a larger batch.
@@ -81,8 +106,12 @@ def test_frozen_lookup_changes_counts_and_replays_mutated_ids(dtype, id_dtype):
             graph.replay()
             torch.cuda.synchronize()
             assert captured.data_ptr() == address
-            torch.testing.assert_close(out[:rows], weight[ids[:rows].long()], rtol=0, atol=0)
-            torch.testing.assert_close(out[rows:], torch.full_like(out[rows:], -7), rtol=0, atol=0)
+            torch.testing.assert_close(
+                out[:rows], weight[ids[:rows].long()], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                out[rows:], torch.full_like(out[rows:], -7), rtol=0, atol=0
+            )
         graph.reset()
 
 
@@ -140,7 +169,9 @@ def test_invalid_ids_raise_device_error_instead_of_zero_or_oob(bad_id):
         else:
             raise AssertionError('invalid embedding ID did not raise a CUDA error')
     """)
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=180)
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=180
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -150,9 +181,15 @@ def test_q8_blocks_decode_exactly_with_frozen_counts_and_graph_replay(id_dtype):
     from b12x.sequence import embedding
     from b12x.testing.q8_0_reference import dequantize_blocks
 
-    raw = torch.arange(19 * 3 * 34, dtype=torch.int32).to(torch.uint8).reshape(19, 3, 34)
-    bases = torch.tensor([0., -0., 2**-24, -2**-14, 0.125, -0.25, 65504.], dtype=torch.float16)
-    raw[..., :2] = bases[torch.arange(19 * 3).reshape(19, 3) % len(bases)][..., None].view(torch.uint8)
+    raw = (
+        torch.arange(19 * 3 * 34, dtype=torch.int32).to(torch.uint8).reshape(19, 3, 34)
+    )
+    bases = torch.tensor(
+        [0.0, -0.0, 2**-24, -(2**-14), 0.125, -0.25, 65504.0], dtype=torch.float16
+    )
+    raw[..., :2] = bases[torch.arange(19 * 3).reshape(19, 3) % len(bases)][
+        ..., None
+    ].view(torch.uint8)
     expected = dequantize_blocks(raw).bfloat16().cuda()
     weight = raw.cuda()
     ids = torch.zeros(11, device="cuda", dtype=id_dtype)
@@ -168,7 +205,12 @@ def test_q8_blocks_decode_exactly_with_frozen_counts_and_graph_replay(id_dtype):
             graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_allocated() == allocated
-            torch.testing.assert_close(out[:rows].view(torch.int16), expected[ids[:rows].long()].view(torch.int16), rtol=0, atol=0)
+            torch.testing.assert_close(
+                out[:rows].view(torch.int16),
+                expected[ids[:rows].long()].view(torch.int16),
+                rtol=0,
+                atol=0,
+            )
             assert torch.isnan(out[rows:]).all()
 
 
@@ -182,12 +224,20 @@ def test_q8_high_row_uses_64_bit_byte_addressing(id_dtype):
     required = (high_row + 1) * stride
     if torch.cuda.mem_get_info()[0] < required + 512 * 1024**2:
         pytest.skip("requires just over 2 GiB for high Q8 row offsets")
-    weight = torch.empty((high_row + 1, width // 32, 34), device="cuda", dtype=torch.uint8)
-    tail = torch.arange(width // 32 * 34, dtype=torch.int32).to(torch.uint8).reshape(width // 32, 34)
+    weight = torch.empty(
+        (high_row + 1, width // 32, 34), device="cuda", dtype=torch.uint8
+    )
+    tail = (
+        torch.arange(width // 32 * 34, dtype=torch.int32)
+        .to(torch.uint8)
+        .reshape(width // 32, 34)
+    )
     tail[:, :2] = torch.tensor([0.125], dtype=torch.float16).view(torch.uint8)
     weight[high_row].copy_(tail)
     ids = torch.full((1,), high_row, device="cuda", dtype=id_dtype)
     out = torch.empty((1, width), device="cuda", dtype=torch.bfloat16)
     with _prepared(weight, ids, out) as plan:
         embedding.run(weight, ids, out=out, plan=plan)
-    torch.testing.assert_close(out[0], dequantize_blocks(tail).bfloat16().cuda(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        out[0], dequantize_blocks(tail).bfloat16().cuda(), rtol=0, atol=0
+    )

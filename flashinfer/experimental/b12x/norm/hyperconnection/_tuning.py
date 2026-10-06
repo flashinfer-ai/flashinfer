@@ -29,8 +29,6 @@ class HyperConnectionQuery:
     weight_dtype: str = "bfloat16"
 
 
-
-
 @dataclass(frozen=True, kw_only=True)
 class HyperConnectionConfig:
     backend: str
@@ -108,28 +106,53 @@ def _validate_query(query, device):
     if not isinstance(query, HyperConnectionQuery):
         raise TypeError("query must be HyperConnectionQuery")
     if query.operation not in (
-        "grouped_rmsnorm", "scaled_silu", "gate_mean", "combine", "combine_norm",
-        "engram_mix", "swiglu", "add", "sigmoid",
+        "grouped_rmsnorm",
+        "scaled_silu",
+        "gate_mean",
+        "combine",
+        "combine_norm",
+        "engram_mix",
+        "swiglu",
+        "add",
+        "sigmoid",
     ):
         raise ValueError("unknown HyperConnection operation")
-    if any(type(value) is not int or value <= 0 for value in (
-        query.max_tokens, query.hidden_size, query.streams, query.lowrank,
-    )):
+    if any(
+        type(value) is not int or value <= 0
+        for value in (
+            query.max_tokens,
+            query.hidden_size,
+            query.streams,
+            query.lowrank,
+        )
+    ):
         raise ValueError("HyperConnection dimensions must be positive integers")
     if query.output_mode not in ("provided", "functional"):
         raise ValueError("unknown HyperConnection output form")
-    expected_mode = "functional" if query.operation in ("combine", "combine_norm") else "provided"
+    expected_mode = (
+        "functional" if query.operation in ("combine", "combine_norm") else "provided"
+    )
     if query.output_mode != expected_mode:
         raise ValueError("output form is not supported by this operation")
     if query.dtype != "bfloat16":
         raise ValueError("HyperConnection state dtype must be bfloat16")
-    if query.operation not in ("add", "sigmoid") and any(value != "bfloat16" for value in (
-        query.left_dtype, query.right_dtype, query.output_dtype,
-    )):
+    if query.operation not in ("add", "sigmoid") and any(
+        value != "bfloat16"
+        for value in (
+            query.left_dtype,
+            query.right_dtype,
+            query.output_dtype,
+        )
+    ):
         raise ValueError("this HyperConnection operation requires BF16 operands")
-    if any(value not in ("bfloat16", "float32") for value in (
-        query.left_dtype, query.right_dtype, query.output_dtype,
-    )):
+    if any(
+        value not in ("bfloat16", "float32")
+        for value in (
+            query.left_dtype,
+            query.right_dtype,
+            query.output_dtype,
+        )
+    ):
         raise ValueError("pointwise operands must be BF16 or FP32")
     if type(query.zero_centered) is not bool:
         raise TypeError("normalization centering must be a boolean")
@@ -149,7 +172,9 @@ def _validate_query(query, device):
         raise ValueError("activation limit must be positive or infinity")
     if type(query.token_mask) is not bool or type(query.round_silu) is not bool:
         raise TypeError("operand and rounding flags must be boolean")
-    if query.operation != "swiglu" and (query.round_silu or query.limit != float("inf")):
+    if query.operation != "swiglu" and (
+        query.round_silu or query.limit != float("inf")
+    ):
         raise ValueError("activation controls apply only to SwiGLU")
     if query.operation != "engram_mix" and query.token_mask:
         raise ValueError("token masks apply only to Engram mixing")
@@ -168,15 +193,18 @@ def _tuning_parameters(query, device):
     # every partition below 32 lanes trailed the best in-range partition by 1.7x
     # or more, reaching 40x at a single lane.
     blocks = tuple(
-        block for block in (1 << exponent for exponent in range(covering.bit_length()))
+        block
+        for block in (1 << exponent for exponent in range(covering.bit_length()))
         if block >= min(32, covering)
     )
     return {
         "reduction_block_h": (covering, 2 * covering)
-        if operation == "grouped_rmsnorm" and query.zero_centered else (covering,),
+        if operation == "grouped_rmsnorm" and query.zero_centered
+        else (covering,),
         "pointwise_block": blocks if operation == "gate_mean" else (256,),
         "reduction_num_warps": (1, 2, 4, 8)
-        if operation == "grouped_rmsnorm" and query.zero_centered else (4,),
+        if operation == "grouped_rmsnorm" and query.zero_centered
+        else (4,),
     }
 
 
@@ -209,7 +237,11 @@ TUNING = TuningContract(
     knobs=(
         Knob(name="reduction_block_h", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="pointwise_block", values=None, binding=ParameterBinding.COMPILE),
-        Knob(name="reduction_num_warps", values=(1, 2, 4, 8), binding=ParameterBinding.COMPILE),
+        Knob(
+            name="reduction_num_warps",
+            values=(1, 2, 4, 8),
+            binding=ParameterBinding.COMPILE,
+        ),
     ),
     materialize=_materialize_tuning,
     parameters=_tuning_parameters,

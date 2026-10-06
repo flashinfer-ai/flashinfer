@@ -125,7 +125,13 @@ def load() -> ctypes.CDLL:
         lib.roce_local_blob.restype = ctypes.c_int
         lib.roce_local_blob.argtypes = [p, p, u64]
         lib.roce_connect.restype = ctypes.c_int
-        lib.roce_connect.argtypes = [p, p, u64, ctypes.POINTER(ctypes.c_int32), ctypes.c_int]
+        lib.roce_connect.argtypes = [
+            p,
+            p,
+            u64,
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.c_int,
+        ]
         lib.roce_start.restype = ctypes.c_int
         lib.roce_start.argtypes = [p]
         lib.roce_stop.restype = None
@@ -241,7 +247,9 @@ class Proxy:
         flat = []
         for peer, rail_links in enumerate(routes):
             if peer != self.rank and len(rail_links) != rails:
-                raise RuntimeError(f"RoCE routes to rank {peer} have {len(rail_links)} rails, expected {rails}")
+                raise RuntimeError(
+                    f"RoCE routes to rank {peer} have {len(rail_links)} rails, expected {rails}"
+                )
             for k in range(rails):
                 flat.extend(rail_links[k] if peer != self.rank else (0, 0))
         table = (ctypes.c_int32 * len(flat))(*flat)

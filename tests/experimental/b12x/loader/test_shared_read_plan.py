@@ -13,8 +13,15 @@ def _writes(copies):
     for copy in copies:
         for row in range(copy.rows):
             for column in range(copy.width):
-                destination = copy.destination + row * copy.destination_stride + column * (1 + copy.expand)
-                result[destination] = (copy.file, copy.offset + row * copy.source_stride + column)
+                destination = (
+                    copy.destination
+                    + row * copy.destination_stride
+                    + column * (1 + copy.expand)
+                )
+                result[destination] = (
+                    copy.file,
+                    copy.offset + row * copy.source_stride + column,
+                )
     return result
 
 
@@ -24,24 +31,46 @@ def test_random_rows_preserve_exact_routing_and_read_each_block_once(seed):
     copies = []
     for index in range(16):
         width, rows = rng.randrange(1, 400), rng.randrange(1, 13)
-        copies.append(Copy(rng.randrange(2), rng.randrange(0, 20000), width,
-                           (1 << 34) + index * 65536, 0, rows,
-                           rng.choice([0, rng.randrange(1, 500)]), width + 17))
+        copies.append(
+            Copy(
+                rng.randrange(2),
+                rng.randrange(0, 20000),
+                width,
+                (1 << 34) + index * 65536,
+                0,
+                rows,
+                rng.choice([0, rng.randrange(1, 500)]),
+                width + 17,
+            )
+        )
     expected = _writes(copies)
     actual, reads = {}, Counter()
     for rank in range(4):
-        chunks, fragments = plan_reads(copies, rank=rank, world_size=4, chunk_bytes=4096)
+        chunks, fragments = plan_reads(
+            copies, rank=rank, world_size=4, chunk_bytes=4096
+        )
         for index in range(0, len(chunks), 5):
-            file, offset, size, first, count = chunks[index:index + 5]
+            file, offset, size, first, count = chunks[index : index + 5]
             reads.update((file, block) for block in range(offset, offset + size, 4096))
             for fragment in range(first, first + count):
-                source, destination, width, rows, source_stride, destination_stride, expand = fragments[fragment * 7:fragment * 7 + 7]
+                (
+                    source,
+                    destination,
+                    width,
+                    rows,
+                    source_stride,
+                    destination_stride,
+                    expand,
+                ) = fragments[fragment * 7 : fragment * 7 + 7]
                 assert expand == 0
                 for row in range(rows):
                     for column in range(width):
                         pointer = destination + row * destination_stride + column
                         assert pointer not in actual
-                        actual[pointer] = (file, offset + source + row * source_stride + column)
+                        actual[pointer] = (
+                            file,
+                            offset + source + row * source_stride + column,
+                        )
     assert actual == expected
     assert set(reads.values()) == {1}
 
@@ -51,15 +80,28 @@ def test_bf16_fragment_offsets_and_repeated_source_rows():
     expected = _writes(copies)
     actual = {}
     for rank in range(4):
-        chunks, fragments = plan_reads(copies, rank=rank, world_size=4, chunk_bytes=4096)
+        chunks, fragments = plan_reads(
+            copies, rank=rank, world_size=4, chunk_bytes=4096
+        )
         for index in range(0, len(chunks), 5):
-            file, offset, _, first, count = chunks[index:index + 5]
+            file, offset, _, first, count = chunks[index : index + 5]
             for fragment in range(first, first + count):
-                source, destination, width, rows, source_stride, destination_stride, expand = fragments[fragment * 7:fragment * 7 + 7]
+                (
+                    source,
+                    destination,
+                    width,
+                    rows,
+                    source_stride,
+                    destination_stride,
+                    expand,
+                ) = fragments[fragment * 7 : fragment * 7 + 7]
                 assert expand == 1 and width % 2 == 0
                 for row in range(rows):
                     for column in range(width):
-                        actual[destination + row * destination_stride + column * 2] = (file, offset + source + row * source_stride + column)
+                        actual[destination + row * destination_stride + column * 2] = (
+                            file,
+                            offset + source + row * source_stride + column,
+                        )
     assert actual == expected
 
 

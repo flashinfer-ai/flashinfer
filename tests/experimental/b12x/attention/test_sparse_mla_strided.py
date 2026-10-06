@@ -31,11 +31,9 @@ def _prepared_binding(declaration, *, name: str, device, make_binding):
         )
 
     session = PreparationSession(device=device, autotune=False)
-    result = session.prepare((
-        declaration.request(
-            name=name, prepare_call=prepare_call
-        ),
-    ))
+    result = session.prepare(
+        (declaration.request(name=name, prepare_call=prepare_call),)
+    )
     return result, replace(prepared_binding, plan=declaration)
 
 
@@ -78,11 +76,20 @@ def test_fp8_physical_slots_ignore_padding_and_mask_invalid_tail() -> None:
     block_table = torch.arange(blocks, dtype=torch.int32, device=device).repeat(rows, 1)
     request_ids = torch.arange(rows, dtype=torch.int32, device=device)
     result, binding = _prepared_binding(
-        plan, name="physical-slots", device=device,
+        plan,
+        name="physical-slots",
+        device=device,
         make_binding=lambda state, scratch: state.bind_indexed(
-            scratch=scratch, q=q, kv_cache=cache, output=output,
-            logical_indices=selected, request_ids=request_ids, block_table=block_table,
-            cu_seqlens_q=cu_seqlens_q, kv_scale=kv_scale, q_scale=q_scale,
+            scratch=scratch,
+            q=q,
+            kv_cache=cache,
+            output=output,
+            logical_indices=selected,
+            request_ids=request_ids,
+            block_table=block_table,
+            cu_seqlens_q=cu_seqlens_q,
+            kv_scale=kv_scale,
+            q_scale=q_scale,
         ),
     )
     actual, actual_lse = sparse_mla_strided.run_decode(binding=binding)
@@ -145,12 +152,20 @@ def test_request_relative_indices_are_stably_compacted_and_remapped() -> None:
     expected_counts = torch.tensor([5, 5], dtype=torch.int32, device=device)
     output = torch.empty(rows, 16, 512, dtype=torch.bfloat16, device=device)
     result, binding = _prepared_binding(
-        plan, name="request-relative", device=device,
+        plan,
+        name="request-relative",
+        device=device,
         make_binding=lambda state, scratch: state.bind_indexed(
-            scratch=scratch, q=q, kv_cache=cache, output=output,
-            logical_indices=logical, request_ids=request_ids, block_table=block_table,
+            scratch=scratch,
+            q=q,
+            kv_cache=cache,
+            output=output,
+            logical_indices=logical,
+            request_ids=request_ids,
+            block_table=block_table,
             cu_seqlens_q=torch.arange(rows + 1, dtype=torch.int32, device=device),
-            kv_scale=kv_scale, q_scale=q_scale,
+            kv_scale=kv_scale,
+            q_scale=q_scale,
         ),
     )
     actual, actual_lse = sparse_mla_strided.run_extend(binding=binding)
@@ -203,14 +218,20 @@ def test_request_relative_indices_address_layer_interleaved_records() -> None:
     counts = torch.tensor([selected.numel()], dtype=torch.int32, device=device)
     output = torch.empty(rows, 16, 512, dtype=torch.bfloat16, device=device)
     result, binding = _prepared_binding(
-        plan, name="interleaved", device=device,
+        plan,
+        name="interleaved",
+        device=device,
         make_binding=lambda state, scratch: state.bind_indexed(
-            scratch=scratch, q=q, kv_cache=cache, output=output,
+            scratch=scratch,
+            q=q,
+            kv_cache=cache,
+            output=output,
             logical_indices=logical,
             request_ids=torch.zeros(rows, dtype=torch.int32, device=device),
             block_table=torch.arange(blocks, dtype=torch.int32, device=device)[None],
             cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=device),
-            kv_scale=kv_scale, q_scale=q_scale,
+            kv_scale=kv_scale,
+            q_scale=q_scale,
         ),
     )
     actual, actual_lse = sparse_mla_strided.run_decode(binding=binding)
@@ -266,11 +287,20 @@ def test_fp8_sparse_replays_on_non_default_stream_without_allocation() -> None:
     block_table = torch.arange(blocks, dtype=torch.int32, device=device).repeat(rows, 1)
     request_ids = torch.arange(rows, dtype=torch.int32, device=device)
     result, binding = _prepared_binding(
-        plan, name="replay", device=device,
+        plan,
+        name="replay",
+        device=device,
         make_binding=lambda state, scratch: state.bind_indexed(
-            scratch=scratch, q=q, kv_cache=cache, output=output,
-            logical_indices=selected, request_ids=request_ids, block_table=block_table,
-            cu_seqlens_q=cu_seqlens_q, kv_scale=kv_scale, q_scale=q_scale,
+            scratch=scratch,
+            q=q,
+            kv_cache=cache,
+            output=output,
+            logical_indices=selected,
+            request_ids=request_ids,
+            block_table=block_table,
+            cu_seqlens_q=cu_seqlens_q,
+            kv_scale=kv_scale,
+            q_scale=q_scale,
         ),
     )
     stream = torch.cuda.Stream(device=device)
@@ -338,11 +368,19 @@ def test_fp8_physical_slot_offset_exceeds_signed_int32() -> None:
     kv_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
     output = torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device)
     result, binding = _prepared_binding(
-        plan, name="high-pid", device=device,
+        plan,
+        name="high-pid",
+        device=device,
         make_binding=lambda state, scratch: state.bind(
-            scratch=scratch, q=q, kv_cache=cache, output=output,
-            selected_indices=selected, selected_counts=counts,
-            cu_seqlens_q=cu_seqlens_q, kv_scale=kv_scale, q_scale=q_scale,
+            scratch=scratch,
+            q=q,
+            kv_cache=cache,
+            output=output,
+            selected_indices=selected,
+            selected_counts=counts,
+            cu_seqlens_q=cu_seqlens_q,
+            kv_scale=kv_scale,
+            q_scale=q_scale,
         ),
     )
     actual, actual_lse = sparse_mla_strided.run_decode(binding=binding)

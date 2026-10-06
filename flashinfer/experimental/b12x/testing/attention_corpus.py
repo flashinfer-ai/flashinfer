@@ -830,7 +830,9 @@ def sparse_mla_cases() -> tuple[WorkloadCase, ...]:
                 "cache_format": geometry.cache_format,
                 "mode": "decode" if rows <= 256 else "extend",
                 "q_dtype": "bfloat16",
-                "kv_dtype": "uint8" if geometry.cache_format == "deepseek_v41" else "float8_e4m3fn",
+                "kv_dtype": "uint8"
+                if geometry.cache_format == "deepseek_v41"
+                else "float8_e4m3fn",
                 "num_q_heads": geometry.num_q_heads,
                 "qk_head_dim": geometry.qk_head_dim,
                 "v_head_dim": geometry.v_head_dim,

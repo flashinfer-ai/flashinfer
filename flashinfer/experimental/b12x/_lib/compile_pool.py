@@ -16,7 +16,11 @@ from threading import Condition, Lock
 from typing import Any, Iterable
 
 from .compile_plan import (
-    ProgramKey, observe_programs, plan_compilations, program_keys, record_program,
+    ProgramKey,
+    observe_programs,
+    plan_compilations,
+    program_keys,
+    record_program,
     serialized_compilations,
 )
 
@@ -41,9 +45,11 @@ def _validate_metadata(value):
             _validate_metadata(item)
         return
     import torch
+
     if isinstance(value, (torch.dtype, torch.device)):
         return
     raise TypeError(f"compile jobs accept metadata only, not {type(value).__name__}")
+
 
 @dataclass(frozen=True, kw_only=True)
 class CompileJob:
@@ -55,8 +61,16 @@ class CompileJob:
 
     def __post_init__(self):
         module, separator, name = self.factory.partition(":")
-        if (not separator or not module or not name or "<locals>" in name
-                or any(not part.isidentifier() for part in (*module.split("."), *name.split(".")))):
+        if (
+            not separator
+            or not module
+            or not name
+            or "<locals>" in name
+            or any(
+                not part.isidentifier()
+                for part in (*module.split("."), *name.split("."))
+            )
+        ):
             raise ValueError("compile factories require an importable module:attribute")
         _validate_metadata(self.args)
         _validate_metadata(self.kwargs)
@@ -66,7 +80,9 @@ class CompileJob:
     @classmethod
     def create(cls, factory: str, *args: object, **kwargs: object):
         # __post_init__ also validates direct construction and rejects tensors.
-        return cls(factory=factory, args=tuple(args), kwargs=tuple(sorted(kwargs.items())))
+        return cls(
+            factory=factory, args=tuple(args), kwargs=tuple(sorted(kwargs.items()))
+        )
 
 
 def _factory(reference):
@@ -91,10 +107,14 @@ def describe_compilation(job: CompileJob) -> CompilationPlan:
         value = _factory(job.factory)(*job.args, **dict(job.kwargs))
         returned = program_keys(value)
     if not returned:
-        raise ValueError(f"compile factory must return its program carriers: {job.factory}")
+        raise ValueError(
+            f"compile factory must return its program carriers: {job.factory}"
+        )
     if not observed <= set(returned):
         raise ValueError(f"compile factory discarded required programs: {job.factory}")
-    return CompilationPlan(job, tuple(sorted(set(returned), key=lambda p: (p.dialect, p.key))))
+    return CompilationPlan(
+        job, tuple(sorted(set(returned), key=lambda p: (p.dialect, p.key)))
+    )
 
 
 def compile_in_process(plans: Iterable[CompilationPlan]) -> None:
@@ -107,6 +127,7 @@ def compile_in_process(plans: Iterable[CompilationPlan]) -> None:
     artifact availability afterwards as it does for pool jobs.
     """
     from .compile_plan import evict_planning_artifacts
+
     plans = tuple(plans)
     evict_planning_artifacts(program for plan in plans for program in plan.programs)
     for plan in plans:
@@ -178,7 +199,9 @@ def _initialize_worker(
     if torch.cuda.is_initialized():
         raise RuntimeError("compiler worker inherited an initialized CUDA runtime")
     compiler._configure_offline_compile_target(
-        device_ordinal, compute_capability, sm_count,
+        device_ordinal,
+        compute_capability,
+        sm_count,
     )
 
     def target_ordinal(device=None):
@@ -209,16 +232,20 @@ def _initialize_worker(
         def synchronize(self):
             raise RuntimeError("compiler workers cannot synchronize CUDA")
 
-    properties = type("OfflineCudaDeviceProperties", (), {
-        "major": compute_capability[0],
-        "minor": compute_capability[1],
-        "multi_processor_count": sm_count,
-        "shared_memory_per_block": max_shared_memory_per_block,
-        "shared_memory_per_block_optin": max_shared_memory_per_block,
-        "shared_memory_per_multiprocessor": max_shared_memory_per_multiprocessor,
-        "name": product_name,
-        "uuid": device_uuid,
-    })()
+    properties = type(
+        "OfflineCudaDeviceProperties",
+        (),
+        {
+            "major": compute_capability[0],
+            "minor": compute_capability[1],
+            "multi_processor_count": sm_count,
+            "shared_memory_per_block": max_shared_memory_per_block,
+            "shared_memory_per_block_optin": max_shared_memory_per_block,
+            "shared_memory_per_multiprocessor": max_shared_memory_per_multiprocessor,
+            "name": product_name,
+            "uuid": device_uuid,
+        },
+    )()
     offline_stream = OfflineStream()
 
     def get_device_properties(device=None):
@@ -268,8 +295,10 @@ def _initialize_worker(
     def meta_index(value):
         if isinstance(value, FakeTensor):
             return torch.empty_strided(
-                tuple(value.shape), tuple(value.stride()),
-                dtype=value.dtype, device="meta",
+                tuple(value.shape),
+                tuple(value.stride()),
+                dtype=value.dtype,
+                device="meta",
             ).as_strided(
                 tuple(value.shape), tuple(value.stride()), value.storage_offset()
             )
@@ -292,11 +321,14 @@ def _initialize_worker(
         geometry = fake_geometry(tensor, index)
         if has_advanced_index(index):
             return torch.empty_strided(
-                tuple(geometry.shape), tuple(geometry.stride()),
-                dtype=tensor.dtype, device=tensor.device,
+                tuple(geometry.shape),
+                tuple(geometry.stride()),
+                dtype=tensor.dtype,
+                device=tensor.device,
             )
         return tensor.as_strided(
-            tuple(geometry.shape), tuple(geometry.stride()),
+            tuple(geometry.shape),
+            tuple(geometry.stride()),
             geometry.storage_offset(),
         )
 
@@ -331,15 +363,18 @@ def _initialize_worker(
     major, minor = compute_capability
     arch_suffix = "a" if major >= 9 else ""
     from cutlass.cutlass_dsl import CuTeDSL
+
     CuTeDSL._get_dsl().envar.arch = f"sm_{major}{minor}{arch_suffix}"
 
     from cutlass.base_dsl.runtime import cuda as cuda_helpers
+
     _configure_offline_cutlass_device_attributes(
         cuda_helpers, max_shared_memory_per_multiprocessor
     )
 
     from triton.backends.compiler import GPUTarget
     from triton.runtime import driver
+
     triton_target = GPUTarget("cuda", major * 10 + minor, 32)
 
     class OfflineTritonDriver:
@@ -399,8 +434,10 @@ def _run_job(payload: bytes, expected: tuple[ProgramKey, ...]):
             result = _factory(job.factory)(*job.args, **dict(job.kwargs))
             actual = set(program_keys(result))
         if not observed <= actual or actual != set(expected):
+
             def descriptions(keys):
                 return sorted(f"{key.dialect}:{key.name} ({key.key})" for key in keys)
+
             raise RuntimeError(
                 f"factory program keys changed between planning and compilation: {job.factory}; "
                 f"planned-only {descriptions(set(expected) - actual)}, "
@@ -408,12 +445,18 @@ def _run_job(payload: bytes, expected: tuple[ProgramKey, ...]):
                 f"observed {descriptions(observed - actual)} outside the carriers; args {job.args!r:.600}"
             )
         if torch.cuda.is_initialized():
-            raise RuntimeError("compiler worker initialized CUDA while compiling artifacts")
+            raise RuntimeError(
+                "compiler worker initialized CUDA while compiling artifacts"
+            )
     except Exception as error:
         # Many compiler-specific exception constructors are not pickle-safe.
         raise RuntimeError(f"{job.factory}: {type(error).__name__}: {error}") from error
-    return (os.getpid(), int(compile_cache_info()["compile_misses"]) - before_cute,
-            _WORKER_TRITON_COMPILES - before_triton, expected)
+    return (
+        os.getpid(),
+        int(compile_cache_info()["compile_misses"]) - before_cute,
+        _WORKER_TRITON_COMPILES - before_triton,
+        expected,
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -449,9 +492,8 @@ class CompilePool:
         if type(workers) is not int or workers <= 0:
             raise ValueError("compiler worker count must be positive")
         compute_capability = tuple(compute_capability)
-        if (
-            len(compute_capability) != 2
-            or any(type(value) is not int or value < 0 for value in compute_capability)
+        if len(compute_capability) != 2 or any(
+            type(value) is not int or value < 0 for value in compute_capability
         ):
             raise ValueError("compiler pool needs a two-part compute capability")
         device_uuid = str(device_uuid).strip()
@@ -492,7 +534,8 @@ class CompilePool:
         self._activity = context.Array("q", (0, 0))
         with _offline_compiler_spawn_environment():
             self._pool: Pool | None = context.Pool(
-                processes=workers, initializer=_initialize_worker,
+                processes=workers,
+                initializer=_initialize_worker,
                 initargs=(
                     device_ordinal,
                     compute_capability,
@@ -535,7 +578,9 @@ class CompilePool:
     def _dispatch(self):
         # Called under the Condition. Pool.apply_async's queue is bounded here,
         # not merely by the number of worker processes consuming that queue.
-        while self._pool is not None and self._inflight < self._limit and not self._errors:
+        while (
+            self._pool is not None and self._inflight < self._limit and not self._errors
+        ):
             queue = self._required if self._required else self._optional
             if not queue:
                 break
@@ -549,11 +594,15 @@ class CompilePool:
             self._jobs += 1
             self._inflight += 1
             self._pool.apply_async(
-                _run_job, (pickle.dumps(plan.job, protocol=5), plan.programs),
-                callback=self._finish, error_callback=self._fail,
+                _run_job,
+                (pickle.dumps(plan.job, protocol=5), plan.programs),
+                callback=self._finish,
+                error_callback=self._fail,
             )
 
-    def submit_plans(self, plans: Iterable[CompilationPlan], *, required=True) -> tuple[ProgramKey, ...]:
+    def submit_plans(
+        self, plans: Iterable[CompilationPlan], *, required=True
+    ) -> tuple[ProgramKey, ...]:
         programs = set()
         with self._condition:
             if self._pool is None:
@@ -568,11 +617,18 @@ class CompilePool:
                 if not missing:
                     continue
                 if required:
-                    promoted = [queued for queued in self._optional if missing.intersection(queued.programs)]
-                    self._optional = [queued for queued in self._optional if queued not in promoted]
+                    promoted = [
+                        queued
+                        for queued in self._optional
+                        if missing.intersection(queued.programs)
+                    ]
+                    self._optional = [
+                        queued for queued in self._optional if queued not in promoted
+                    ]
                     self._required.extend(promoted)
                 queued_programs = {
-                    program for queued in (*self._required, *self._optional)
+                    program
+                    for queued in (*self._required, *self._optional)
                     for program in queued.programs
                 }
                 if missing - queued_programs:
@@ -580,7 +636,9 @@ class CompilePool:
             self._dispatch()
         return tuple(sorted(programs, key=lambda p: (p.dialect, p.key)))
 
-    def submit(self, jobs: Iterable[CompileJob], *, required=True) -> tuple[ProgramKey, ...]:
+    def submit(
+        self, jobs: Iterable[CompileJob], *, required=True
+    ) -> tuple[ProgramKey, ...]:
         return self.submit_plans(self.plan(jobs), required=required)
 
     def cancel_optional(self):
@@ -596,7 +654,11 @@ class CompilePool:
     def _raise_errors(self):
         if self._errors:
             raise self._errors[0]
-        exited = [(worker.pid, worker.exitcode) for worker in self._workers if worker.exitcode is not None]
+        exited = [
+            (worker.pid, worker.exitcode)
+            for worker in self._workers
+            if worker.exitcode is not None
+        ]
         if exited:
             raise RuntimeError(f"preparation compiler worker exited: {exited}")
 
@@ -622,17 +684,26 @@ class CompilePool:
         batches = tuple(batches)
         with self._condition:
             while True:
-                exited = [(worker.pid, worker.exitcode) for worker in self._workers if worker.exitcode is not None]
+                exited = [
+                    (worker.pid, worker.exitcode)
+                    for worker in self._workers
+                    if worker.exitcode is not None
+                ]
                 if exited:
                     raise RuntimeError(f"startup compiler worker exited: {exited}")
                 if self._errors:
                     raise self._errors[0]
-                if any(all(program in self._completed for program in batch) for batch in batches):
+                if any(
+                    all(program in self._completed for program in batch)
+                    for batch in batches
+                ):
                     return
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError("explicit compilation deadline exceeded")
-                self._condition.wait(timeout=.1 if remaining is None else min(.1, remaining))
+                self._condition.wait(
+                    timeout=0.1 if remaining is None else min(0.1, remaining)
+                )
 
     def wait(self, batch, *, deadline=None):
         self.wait_any((batch,), deadline=deadline)
@@ -649,10 +720,12 @@ class CompilePool:
     def summary(self):
         with self._condition:
             return CompilationSummary(
-                jobs=self._jobs, requested_jobs=self._requested_jobs,
+                jobs=self._jobs,
+                requested_jobs=self._requested_jobs,
                 cute_programs=self._cute_programs,
                 triton_programs=self._triton_programs,
-                workers_used=len(self._pids), cute_compilations=self._cute_count,
+                workers_used=len(self._pids),
+                cute_compilations=self._cute_count,
                 triton_compilations=self._triton_count,
                 peak_parallel_cute_compilations=int(self._activity[1]),
                 elapsed_seconds=time.monotonic() - self._started,
@@ -686,4 +759,10 @@ class CompilePool:
         self.close(terminate=kind is not None)
 
 
-__all__ = ["CompilationPlan", "CompilationSummary", "CompileJob", "CompilePool", "describe_compilation"]
+__all__ = [
+    "CompilationPlan",
+    "CompilationSummary",
+    "CompileJob",
+    "CompilePool",
+    "describe_compilation",
+]

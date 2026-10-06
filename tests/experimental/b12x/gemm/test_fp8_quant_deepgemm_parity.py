@@ -50,7 +50,12 @@ def _per_token_cast_to_fp8(x: torch.Tensor, gran_k: int):
     xv = xp.view(m, padded_n // gran_k, gran_k)
     amax = xv.abs().float().amax(dim=2).view(m, padded_n // gran_k).clamp(1e-4)
     sf = _ceil_to_ue8m0(amax / 448.0)
-    fp8 = (xv * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, padded_n)[:, :n].contiguous()
+    fp8 = (
+        (xv * (1.0 / sf.unsqueeze(2)))
+        .to(torch.float8_e4m3fn)
+        .view(m, padded_n)[:, :n]
+        .contiguous()
+    )
     return fp8, sf  # sf: fp32 power-of-two, [m, n//gran_k]
 
 
@@ -67,7 +72,7 @@ def test_activation_quant_byte_exact_with_deepgemm() -> None:
     require_b12x()
     torch.manual_seed(0)
     M, K = 64, 5376  # Nemotron down-proj K (= 42 * 128)
-    x = (torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 3.0)
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 3.0
 
     rows = quantize_block_fp8_linear_input_mxfp8(x)
     b_vals = rows.values.view(torch.uint8)
@@ -98,7 +103,9 @@ def test_ue8m0_rounding_matches_bit_exact_ceil() -> None:
 
     be_exp = torch.log2(bit_exact).round().clamp(-127, 127)
     fm_exp = torch.log2(formula).round().clamp(-127, 127)
-    assert (be_exp == fm_exp).all(), "UE8M0 rounding diverges from bit-exact ceil_to_ue8m0"
+    assert (be_exp == fm_exp).all(), (
+        "UE8M0 rounding diverges from bit-exact ceil_to_ue8m0"
+    )
 
 
 def _deepseek_checkpoint(N: int, K: int, dev: str):
@@ -132,7 +139,9 @@ def test_weight_pack_requantizes_arbitrary_fp32_scales_to_parity() -> None:
 
     err_new = _relfro(deq, w_orig)
     err_old = _relfro(deq_old, w_orig)
-    assert err_new < 0.05, f"weight quant error {err_new:.4f} not at parity (expected < 0.05)"
+    assert err_new < 0.05, (
+        f"weight quant error {err_new:.4f} not at parity (expected < 0.05)"
+    )
     assert err_new < err_old * 0.6, (
         f"re-quant ({err_new:.4f}) must be much better than round-keep ({err_old:.4f})"
     )
@@ -148,7 +157,9 @@ def test_weight_pack_keeps_ue8m0_values_verbatim() -> None:
     amax = wv.abs().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
     exp = torch.ceil(torch.log2(amax / 448.0)).clamp(-127, 127)
     w_fp8 = (wv / torch.exp2(exp)).to(torch.float8_e4m3fn).view(N, K)
-    s_e8m0 = (exp.view(N // 128, K // 128) + 127).to(torch.uint8).view(torch.float8_e8m0fnu)
+    s_e8m0 = (
+        (exp.view(N // 128, K // 128) + 127).to(torch.uint8).view(torch.float8_e8m0fnu)
+    )
 
     packed = pack_block_fp8_linear_weight_mxfp8(w_fp8, s_e8m0)
     torch.testing.assert_close(
@@ -163,22 +174,28 @@ def test_v41_activation_floor_matches_reference(tokens, dtype) -> None:
     require_b12x()
     peaks = torch.tensor(
         [0.0, 1e-8, 5e-5, 1e-4, 2e-4, 0.875, 1.75, 3.5],
-        device="cuda", dtype=dtype,
+        device="cuda",
+        dtype=dtype,
     )
     pattern = torch.linspace(-1, 1, 32, device="cuda", dtype=torch.float32)
     source = (peaks.float()[:, None] * pattern).to(dtype).reshape(1, 256)
     source = source.repeat(tokens, 1)
     expected_values, expected_scales = _per_token_cast_to_fp8(source, 32)
     actual = quantize_block_fp8_linear_input_mxfp8(
-        source, block_size=(32, 32),
+        source,
+        block_size=(32, 32),
     )
     torch.testing.assert_close(
-        actual.values.view(torch.uint8), expected_values.view(torch.uint8),
-        rtol=0, atol=0,
+        actual.values.view(torch.uint8),
+        expected_values.view(torch.uint8),
+        rtol=0,
+        atol=0,
     )
     torch.testing.assert_close(
         actual.scale_rows.view(torch.uint8)[0],
-        _sf_fp32_to_e8m0_u8(expected_scales), rtol=0, atol=0,
+        _sf_fp32_to_e8m0_u8(expected_scales),
+        rtol=0,
+        atol=0,
     )
     # The older recipe deliberately retains its unit scale for a zero group.
     legacy = quantize_block_fp8_linear_input_mxfp8(source)

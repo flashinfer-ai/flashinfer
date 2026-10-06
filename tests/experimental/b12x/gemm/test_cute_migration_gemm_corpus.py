@@ -32,11 +32,14 @@ def _quantize_nvfp4_operand(
         (groups,), rows, dtype=torch.int32, device=source_gmk.device
     )
     amax = source_gmk.abs().amax().to(torch.float32)
-    global_scale = torch.tensor(
-        [torch.finfo(torch.float8_e4m3fn).max * 6.0],
-        dtype=torch.float32,
-        device=source_gmk.device,
-    ) / amax
+    global_scale = (
+        torch.tensor(
+            [torch.finfo(torch.float8_e4m3fn).max * 6.0],
+            dtype=torch.float32,
+            device=source_gmk.device,
+        )
+        / amax
+    )
     return quantize_grouped_nvfp4_torch(
         source_gmk, row_counts, global_scale
     ), global_scale
@@ -64,15 +67,11 @@ def _mxfp8_gemm_reference(
     b_scale_rows: torch.Tensor,
 ) -> torch.Tensor:
     a_quant = quantize_mxfp8_rows_torch(source_mkl)
-    a_dequant = dequantize_mxfp8_rows_torch(
-        a_quant.values, a_quant.scale_rows
-    ).to(torch.bfloat16)
-    b_dequant = dequantize_mxfp8_rows_torch(
-        b_values, b_scale_rows
-    ).to(torch.bfloat16)
-    return torch.einsum("mkl,nkl->mnl", a_dequant, b_dequant).to(
+    a_dequant = dequantize_mxfp8_rows_torch(a_quant.values, a_quant.scale_rows).to(
         torch.bfloat16
     )
+    b_dequant = dequantize_mxfp8_rows_torch(b_values, b_scale_rows).to(torch.bfloat16)
+    return torch.einsum("mkl,nkl->mnl", a_dequant, b_dequant).to(torch.bfloat16)
 
 
 def test_cute_migration_dense_nvfp4_gpu_oracle_and_graph() -> None:
@@ -119,15 +118,9 @@ def test_cute_migration_dense_nvfp4_gpu_oracle_and_graph() -> None:
 
     run()
     torch.cuda.synchronize()
-    a_dequant = _dequantize_nvfp4_dense_operand(
-        a, k=k, global_scale=a_global_scale
-    )
-    b_dequant = _dequantize_nvfp4_dense_operand(
-        b, k=k, global_scale=b_global_scale
-    )
-    expected = torch.einsum("gmk,gnk->mng", a_dequant, b_dequant).to(
-        torch.bfloat16
-    )
+    a_dequant = _dequantize_nvfp4_dense_operand(a, k=k, global_scale=a_global_scale)
+    b_dequant = _dequantize_nvfp4_dense_operand(b, k=k, global_scale=b_global_scale)
+    expected = torch.einsum("gmk,gnk->mng", a_dequant, b_dequant).to(torch.bfloat16)
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     graph = torch.cuda.CUDAGraph()
@@ -143,7 +136,9 @@ def test_cute_migration_dense_nvfp4_gpu_oracle_and_graph() -> None:
     "m,expected_m,a_inner_span", ((2, None, 0), (8, 8, 32), (1, 8, 32), (1, 1, 32))
 )
 def test_cute_migration_dense_fused_quant_gpu_oracle_and_graph(
-    m: int, expected_m: int | None, a_inner_span: int,
+    m: int,
+    expected_m: int | None,
+    a_inner_span: int,
 ) -> None:
     require_b12x()
     generator = torch.Generator(device="cuda").manual_seed(46_002)
@@ -159,7 +154,9 @@ def test_cute_migration_dense_fused_quant_gpu_oracle_and_graph(
     ).contiguous()
     if a_inner_span:
         physical = torch.empty(
-            (k // a_inner_span, m, a_inner_span), dtype=source.dtype, device=source.device
+            (k // a_inner_span, m, a_inner_span),
+            dtype=source.dtype,
+            device=source.device,
         )
         physical.copy_(source.view(m, k // a_inner_span, a_inner_span).permute(1, 0, 2))
         source = physical.permute(1, 2, 0)
@@ -219,7 +216,8 @@ def test_cute_migration_dense_fused_quant_gpu_oracle_and_graph(
 
 @pytest.mark.parametrize("m,expected_m", ((2, None), (1, 1), (8, 8), (1, 8)))
 def test_cute_migration_dense_grouped_fused_quant_gpu_oracle_and_graph(
-    m: int, expected_m: int | None,
+    m: int,
+    expected_m: int | None,
 ) -> None:
     require_b12x()
     generator = torch.Generator(device="cuda").manual_seed(46_003)
@@ -245,9 +243,9 @@ def test_cute_migration_dense_grouped_fused_quant_gpu_oracle_and_graph(
     b_quant = quantize_mxfp8_rows_torch(b_source)
     # The dense kernel writes C as physical [L,M,N]; retain that storage
     # contract while exposing the public logical [M,N,L] view.
-    out = torch.empty(
-        (groups, m, n), dtype=torch.bfloat16, device="cuda"
-    ).as_strided((m, n, groups), (n, 1, m * n))
+    out = torch.empty((groups, m, n), dtype=torch.bfloat16, device="cuda").as_strided(
+        (m, n, groups), (n, 1, m * n)
+    )
 
     def run() -> torch.Tensor:
         return dense_gemm_fused_quant_a_grouped(
@@ -366,7 +364,9 @@ def test_cute_migration_mxfp8_quant_gpu_oracle_and_graph(m: int, k: int) -> None
 
 @pytest.mark.parametrize("capacity", [8, 16])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_mxfp8_quant_planned_capacity_reuses_callable(capacity, dtype, monkeypatch) -> None:
+def test_mxfp8_quant_planned_capacity_reuses_callable(
+    capacity, dtype, monkeypatch
+) -> None:
     import b12x._lib.quant.mxfp8_rows as quant_module
     from b12x._lib.runtime_control import kernel_resolution_guard
 
@@ -385,15 +385,21 @@ def test_mxfp8_quant_planned_capacity_reuses_callable(capacity, dtype, monkeypat
 
     def run(rows):
         quantize_mxfp8_rows_cute(
-            source[:rows], actual.values, actual.scale_rows, actual.scale_mma,
+            source[:rows],
+            actual.values,
+            actual.scale_rows,
+            actual.scale_mma,
             expected_m=capacity,
         )
 
     run(capacity)
     warmed = calls[-1]
     scalar = resolve(640, dtype, 0, 256, "linear")
-    pointers = tuple(t.data_ptr() for t in (source, actual.values, actual.scale_rows, actual.scale_mma))
-    with kernel_resolution_guard('MXFP8 quantization within one planned row capacity'):
+    pointers = tuple(
+        t.data_ptr()
+        for t in (source, actual.values, actual.scale_rows, actual.scale_mma)
+    )
+    with kernel_resolution_guard("MXFP8 quantization within one planned row capacity"):
         for rows in (1, 8, 9, 16):
             if rows > capacity:
                 continue
@@ -406,7 +412,9 @@ def test_mxfp8_quant_planned_capacity_reuses_callable(capacity, dtype, monkeypat
             for storage in (actual, expected):
                 for tensor in (storage.values, storage.scale_rows, storage.scale_mma):
                     tensor.view(torch.uint8).fill_(0xA5)
-            scalar(source[:rows], expected.values, expected.scale_rows, expected.scale_mma)
+            scalar(
+                source[:rows], expected.values, expected.scale_rows, expected.scale_mma
+            )
             torch.cuda.synchronize()
             before = torch.cuda.memory_stats()
             graph.replay()
@@ -414,11 +422,16 @@ def test_mxfp8_quant_planned_capacity_reuses_callable(capacity, dtype, monkeypat
             after = torch.cuda.memory_stats()
             for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
                 assert before[key] == after[key]
-            assert pointers == tuple(t.data_ptr() for t in (source, actual.values, actual.scale_rows, actual.scale_mma))
+            assert pointers == tuple(
+                t.data_ptr()
+                for t in (source, actual.values, actual.scale_rows, actual.scale_mma)
+            )
             for name in ("values", "scale_rows", "scale_mma"):
                 torch.testing.assert_close(
                     getattr(actual, name).view(torch.uint8),
-                    getattr(expected, name).view(torch.uint8), rtol=0, atol=0,
+                    getattr(expected, name).view(torch.uint8),
+                    rtol=0,
+                    atol=0,
                 )
 
 
@@ -436,9 +449,7 @@ def test_mxfp8_decode_quant_finite_bit_patterns_match_scalar(dtype) -> None:
             tensor.view(torch.uint8).fill_(0xA5)
     scalar = _get_compiled_mxfp8_rows_quant(8192, dtype, 0, 256, "linear")
     scalar(source, reference.values, reference.scale_rows, reference.scale_mma)
-    quantize_mxfp8_rows_cute(
-        source, actual.values, actual.scale_rows, actual.scale_mma
-    )
+    quantize_mxfp8_rows_cute(source, actual.values, actual.scale_rows, actual.scale_mma)
     for name in ("values", "scale_rows", "scale_mma"):
         torch.testing.assert_close(
             getattr(actual, name).view(torch.uint8),
@@ -478,10 +489,38 @@ def test_cute_migration_mxfp8_quant_trellis_native_mma_order() -> None:
     torch.cuda.synchronize()
     perm = torch.tensor(
         (
-            0, 1, 8, 9, 4, 5, 12, 13,
-            2, 3, 10, 11, 6, 7, 14, 15,
-            20, 21, 28, 29, 16, 17, 24, 25,
-            22, 23, 30, 31, 18, 19, 26, 27,
+            0,
+            1,
+            8,
+            9,
+            4,
+            5,
+            12,
+            13,
+            2,
+            3,
+            10,
+            11,
+            6,
+            7,
+            14,
+            15,
+            20,
+            21,
+            28,
+            29,
+            16,
+            17,
+            24,
+            25,
+            22,
+            23,
+            30,
+            31,
+            18,
+            19,
+            26,
+            27,
         ),
         device="cuda",
     )

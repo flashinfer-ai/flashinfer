@@ -35,7 +35,9 @@ class MoERouteTrace:
     routed_out: torch.Tensor
 
 
-def compare_to_reference(actual: torch.Tensor, reference: torch.Tensor) -> OracleMetrics:
+def compare_to_reference(
+    actual: torch.Tensor, reference: torch.Tensor
+) -> OracleMetrics:
     actual_fp32 = actual.float()
     reference_fp32 = reference.float()
     diff = actual_fp32 - reference_fp32
@@ -60,11 +62,17 @@ def compare_to_reference(actual: torch.Tensor, reference: torch.Tensor) -> Oracl
     )
 
 
-def unswizzle_block_scale(swizzled_scale: torch.Tensor, rows: int, cols_blocks: int) -> torch.Tensor:
+def unswizzle_block_scale(
+    swizzled_scale: torch.Tensor, rows: int, cols_blocks: int
+) -> torch.Tensor:
     cols_padded = ((cols_blocks + 3) // 4) * 4
     rows_padded = ((rows + 127) // 128) * 128
     unswizzled = swizzled_scale.view(torch.float8_e4m3fn).reshape(
-        rows_padded // 128, cols_padded // 4, 32, 4, 4,
+        rows_padded // 128,
+        cols_padded // 4,
+        32,
+        4,
+        4,
     )
     unswizzled = unswizzled.permute(0, 3, 2, 1, 4).contiguous()
     unswizzled = unswizzled.reshape(rows_padded, cols_padded)
@@ -103,8 +111,22 @@ def _apply_gated_activation(
 def _make_fp4_lut(device: torch.device) -> torch.Tensor:
     return torch.tensor(
         [
-            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
         ],
         dtype=torch.float32,
         device=device,
@@ -150,7 +172,9 @@ def _quantize_vec_to_fp4_dequant(
     raw_scale = (block_max * global_scale / 6.0).clamp(max=fp8_e4m3_max)
     sf_e4m3 = raw_scale.to(torch.float8_e4m3fn).to(torch.float32)
 
-    sf_times_gs = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) / global_scale
+    sf_times_gs = (
+        sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) / global_scale
+    )
     scaled = vals_f32 / sf_times_gs.clamp(min=1e-30)
     quant = fp4_quantize_values_torch(scaled)
     sf_only = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols)
@@ -210,11 +234,15 @@ def _trace_nvfp4_route(
         )
         gate_out = (gate_dequant @ x_dequant) * alpha_fc1
         up_out = (up_dequant @ x_dequant) * alpha_fc1
-        intermediate = _apply_gated_activation(
-            gate_out,
-            up_out,
-            activation,
-        ).to(torch.bfloat16).float()
+        intermediate = (
+            _apply_gated_activation(
+                gate_out,
+                up_out,
+                activation,
+            )
+            .to(torch.bfloat16)
+            .float()
+        )
     else:
         w1_sf = unswizzle_block_scale(w1_blockscale_eid, I_tp, K // block_size)
         fc1_dequant = _apply_block_scales(
@@ -293,49 +321,69 @@ def _trace_w4a16_route(
     up_out = None
     if is_gated:
         w13_sf = unswizzle_block_scale(w1_blockscale_eid, 2 * I_tp, K // block_size)
-        up_dequant = _apply_block_scales(
-            _dequant_fp4(w1_fp4_eid[:I_tp], I_tp, K, fp4_lut),
-            w13_sf[:I_tp],
-            I_tp,
-            K,
-            block_size=block_size,
-        ).to(torch.bfloat16).float()
-        gate_dequant = _apply_block_scales(
-            _dequant_fp4(w1_fp4_eid[I_tp:], I_tp, K, fp4_lut),
-            w13_sf[I_tp:],
-            I_tp,
-            K,
-            block_size=block_size,
-        ).to(torch.bfloat16).float()
+        up_dequant = (
+            _apply_block_scales(
+                _dequant_fp4(w1_fp4_eid[:I_tp], I_tp, K, fp4_lut),
+                w13_sf[:I_tp],
+                I_tp,
+                K,
+                block_size=block_size,
+            )
+            .to(torch.bfloat16)
+            .float()
+        )
+        gate_dequant = (
+            _apply_block_scales(
+                _dequant_fp4(w1_fp4_eid[I_tp:], I_tp, K, fp4_lut),
+                w13_sf[I_tp:],
+                I_tp,
+                K,
+                block_size=block_size,
+            )
+            .to(torch.bfloat16)
+            .float()
+        )
         gate_out = (gate_dequant @ x_bf16) * alpha_fc1
         up_out = (up_dequant @ x_bf16) * alpha_fc1
         if swiglu_limit is not None:
             gate_out = torch.clamp(gate_out, max=swiglu_limit)
             up_out = torch.clamp(up_out, min=-swiglu_limit, max=swiglu_limit)
-        intermediate = _apply_gated_activation(
-            gate_out,
-            up_out,
-            activation,
-        ).to(torch.bfloat16).float()
+        intermediate = (
+            _apply_gated_activation(
+                gate_out,
+                up_out,
+                activation,
+            )
+            .to(torch.bfloat16)
+            .float()
+        )
     else:
         w1_sf = unswizzle_block_scale(w1_blockscale_eid, I_tp, K // block_size)
-        fc1_dequant = _apply_block_scales(
-            _dequant_fp4(w1_fp4_eid[:I_tp], I_tp, K, fp4_lut),
-            w1_sf[:I_tp],
-            I_tp,
-            K,
-            block_size=block_size,
-        ).to(torch.bfloat16).float()
+        fc1_dequant = (
+            _apply_block_scales(
+                _dequant_fp4(w1_fp4_eid[:I_tp], I_tp, K, fp4_lut),
+                w1_sf[:I_tp],
+                I_tp,
+                K,
+                block_size=block_size,
+            )
+            .to(torch.bfloat16)
+            .float()
+        )
         fc1_out = (fc1_dequant @ x_bf16) * alpha_fc1
         intermediate = torch.square(torch.relu(fc1_out)).to(torch.bfloat16).float()
 
-    down_dequant = _apply_block_scales(
-        _dequant_fp4(w2_fp4_eid, K, I_tp, fp4_lut),
-        w2_sf,
-        K,
-        I_tp,
-        block_size=block_size,
-    ).to(torch.bfloat16).float()
+    down_dequant = (
+        _apply_block_scales(
+            _dequant_fp4(w2_fp4_eid, K, I_tp, fp4_lut),
+            w2_sf,
+            K,
+            I_tp,
+            block_size=block_size,
+        )
+        .to(torch.bfloat16)
+        .float()
+    )
     down_out = ((down_dequant @ intermediate) * alpha_fc2).to(torch.bfloat16)
     routed_out = (router_weight * down_out.float()).to(torch.bfloat16)
     return MoERouteTrace(
@@ -382,17 +430,29 @@ def trace_moe_reference_nvfp4_route(
     del E
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     if token_idx < 0 or token_idx >= x.shape[0]:
-        raise IndexError(f"token_idx {token_idx} is out of range for batch {x.shape[0]}")
+        raise IndexError(
+            f"token_idx {token_idx} is out of range for batch {x.shape[0]}"
+        )
     if route_idx < 0 or route_idx >= topk_ids.shape[1]:
-        raise IndexError(f"route_idx {route_idx} is out of range for top_k {topk_ids.shape[1]}")
+        raise IndexError(
+            f"route_idx {route_idx} is out of range for top_k {topk_ids.shape[1]}"
+        )
 
     x_f32 = x[token_idx].float()
     expert_idx = int(topk_ids[token_idx, route_idx].item())
     router_weight = float(topk_weights[token_idx, route_idx].item())
     alpha_fc1 = float(w1_alphas[expert_idx].item())
     alpha_fc2 = float(w2_alphas[expert_idx].item())
-    gs_fc1 = float(a1_gscale[expert_idx].item()) if a1_gscale.numel() > 1 else float(a1_gscale.item())
-    gs_fc2 = float(a2_gscale[expert_idx].item()) if a2_gscale.numel() > 1 else float(a2_gscale.item())
+    gs_fc1 = (
+        float(a1_gscale[expert_idx].item())
+        if a1_gscale.numel() > 1
+        else float(a1_gscale.item())
+    )
+    gs_fc2 = (
+        float(a2_gscale[expert_idx].item())
+        if a2_gscale.numel() > 1
+        else float(a2_gscale.item())
+    )
     return _trace_nvfp4_route(
         x_f32=x_f32,
         w1_fp4_eid=w1_fp4[expert_idx],
@@ -435,9 +495,13 @@ def trace_moe_reference_w4a16_route(
     del E
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     if token_idx < 0 or token_idx >= x.shape[0]:
-        raise IndexError(f"token_idx {token_idx} is out of range for batch {x.shape[0]}")
+        raise IndexError(
+            f"token_idx {token_idx} is out of range for batch {x.shape[0]}"
+        )
     if route_idx < 0 or route_idx >= topk_ids.shape[1]:
-        raise IndexError(f"route_idx {route_idx} is out of range for top_k {topk_ids.shape[1]}")
+        raise IndexError(
+            f"route_idx {route_idx} is out of range for top_k {topk_ids.shape[1]}"
+        )
 
     expert_idx = int(topk_ids[token_idx, route_idx].item())
     return _trace_w4a16_route(
@@ -485,23 +549,44 @@ def moe_reference_f32(
 
     fp4_lut = torch.tensor(
         [
-            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
         ],
         dtype=torch.float32,
         device=x.device,
     )
+
     def dequant_fp4(packed_u8: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
         lo = (packed_u8 & 0x0F).to(torch.int64)
         hi = ((packed_u8 >> 4) & 0x0F).to(torch.int64)
         return torch.stack([fp4_lut[lo], fp4_lut[hi]], dim=-1).reshape(rows, cols)
 
-    def apply_block_scales(raw: torch.Tensor, sf_f32: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    def apply_block_scales(
+        raw: torch.Tensor, sf_f32: torch.Tensor, rows: int, cols: int
+    ) -> torch.Tensor:
         n_blocks = cols // block_size
         sf = sf_f32[:rows, :n_blocks]
-        return raw * sf.unsqueeze(-1).expand(rows, n_blocks, block_size).reshape(rows, cols)
+        return raw * sf.unsqueeze(-1).expand(rows, n_blocks, block_size).reshape(
+            rows, cols
+        )
 
-    def quantize_vec_to_fp4_dequant(vals_f32: torch.Tensor, global_scale: float) -> torch.Tensor:
+    def quantize_vec_to_fp4_dequant(
+        vals_f32: torch.Tensor, global_scale: float
+    ) -> torch.Tensor:
         cols = vals_f32.shape[0]
         n_blocks = cols // block_size
         blocked = vals_f32.reshape(n_blocks, block_size)
@@ -510,7 +595,10 @@ def moe_reference_f32(
         raw_scale = (block_max * global_scale / 6.0).clamp(max=fp8_e4m3_max)
         sf_e4m3 = raw_scale.to(torch.float8_e4m3fn).to(torch.float32)
 
-        sf_times_gs = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols) / global_scale
+        sf_times_gs = (
+            sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols)
+            / global_scale
+        )
         scaled = vals_f32 / sf_times_gs.clamp(min=1e-30)
         quant = fp4_quantize_values_torch(scaled)
         sf_only = sf_e4m3.unsqueeze(-1).expand(n_blocks, block_size).reshape(cols)
@@ -529,20 +617,36 @@ def moe_reference_f32(
             alpha_fc1 = float(w1_alphas[eid].item())
             alpha_fc2 = float(w2_alphas[eid].item())
 
-            gs_fc1 = float(a1_gscale[eid].item()) if a1_gscale.numel() > 1 else float(a1_gscale.item())
-            gs_fc2 = float(a2_gscale[eid].item()) if a2_gscale.numel() > 1 else float(a2_gscale.item())
+            gs_fc1 = (
+                float(a1_gscale[eid].item())
+                if a1_gscale.numel() > 1
+                else float(a1_gscale.item())
+            )
+            gs_fc2 = (
+                float(a2_gscale[eid].item())
+                if a2_gscale.numel() > 1
+                else float(a2_gscale.item())
+            )
 
             x_dequant = quantize_vec_to_fp4_dequant(x_f32, gs_fc1)
 
             w2_sf = unswizzle_block_scale(w2_blockscale[eid], K, I_tp // block_size)
 
             if is_gated:
-                w13_sf = unswizzle_block_scale(w1_blockscale[eid], 2 * I_tp, K // block_size)
+                w13_sf = unswizzle_block_scale(
+                    w1_blockscale[eid], 2 * I_tp, K // block_size
+                )
                 up_dequant = apply_block_scales(
-                    dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K), w13_sf[:I_tp], I_tp, K,
+                    dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K),
+                    w13_sf[:I_tp],
+                    I_tp,
+                    K,
                 )
                 gate_dequant = apply_block_scales(
-                    dequant_fp4(w1_fp4[eid, I_tp:], I_tp, K), w13_sf[I_tp:], I_tp, K,
+                    dequant_fp4(w1_fp4[eid, I_tp:], I_tp, K),
+                    w13_sf[I_tp:],
+                    I_tp,
+                    K,
                 )
                 gate_out = (gate_dequant @ x_dequant) * alpha_fc1
                 up_out = (up_dequant @ x_dequant) * alpha_fc1
@@ -554,14 +658,20 @@ def moe_reference_f32(
             else:
                 w1_sf = unswizzle_block_scale(w1_blockscale[eid], I_tp, K // block_size)
                 fc1_dequant = apply_block_scales(
-                    dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K), w1_sf[:I_tp], I_tp, K,
+                    dequant_fp4(w1_fp4[eid, :I_tp], I_tp, K),
+                    w1_sf[:I_tp],
+                    I_tp,
+                    K,
                 )
                 fc1_out = (fc1_dequant @ x_dequant) * alpha_fc1
                 intermediate = torch.square(torch.relu(fc1_out))
 
             int_dequant = quantize_vec_to_fp4_dequant(intermediate, gs_fc2)
             down_dequant = apply_block_scales(
-                dequant_fp4(w2_fp4[eid], K, I_tp), w2_sf, K, I_tp,
+                dequant_fp4(w2_fp4[eid], K, I_tp),
+                w2_sf,
+                K,
+                I_tp,
             )
             down_out = (down_dequant @ int_dequant) * alpha_fc2
             output[t] += router_w * down_out

@@ -75,12 +75,14 @@ def _run_public_decode(q_all, kv_cache, selected, cache_seqlens, active, *, widt
         return PreparedCall(run=lambda: state.run(runtime, kv_cache=kv_cache))
 
     session = PreparationSession(device=q_all.device)
-    result = session.prepare((
-        declaration.request(
-            name="sparse-mla-test",
-            prepare_call=prepare_call,
-        ),
-    ))
+    result = session.prepare(
+        (
+            declaration.request(
+                name="sparse-mla-test",
+                prepare_call=prepare_call,
+            ),
+        )
+    )
     plan = result.plans["sparse-mla-test"]
     binding = sparse_mla.bind(
         plan,

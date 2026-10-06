@@ -130,11 +130,19 @@ def _w4a8_oracle(m: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
 
     out = moe_reference_w4a8_mx(
         x.float(),
-        weights.w13_weight.view(torch.uint8), w13_mx,
-        w13_res.view(torch.float8_e4m3fn), alpha1,
-        weights.w2_weight.view(torch.uint8), w2_mx,
-        w2_res.view(torch.float8_e4m3fn), alpha2,
-        topk_ids, topk_weights.float(), E, k, n,
+        weights.w13_weight.view(torch.uint8),
+        w13_mx,
+        w13_res.view(torch.float8_e4m3fn),
+        alpha1,
+        weights.w2_weight.view(torch.uint8),
+        w2_mx,
+        w2_res.view(torch.float8_e4m3fn),
+        alpha2,
+        topk_ids,
+        topk_weights.float(),
+        E,
+        k,
+        n,
         activation="silu",
     )
     return out, x
@@ -182,7 +190,9 @@ def test_nvfp4_fused_micro_graph_replay_with_prequeued_aux_work() -> None:
     if not torch.cuda.is_available():
         pytest.skip("No CUDA")
 
-    from benchmarks.experimental.b12x.benchmark_moe import make_shape_only_expert_weights
+    from benchmarks.experimental.b12x.benchmark_moe import (
+        make_shape_only_expert_weights,
+    )
     from b12x.moe.fused_moe._impl import (
         allocate_tp_moe_workspace_pool,
         build_tp_moe_fp4_binding,

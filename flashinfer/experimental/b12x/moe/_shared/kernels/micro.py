@@ -422,7 +422,9 @@ class MoEMicroKernelBackend:
                 f"unsupported micro e8m0_scale_layout {e8m0_scale_layout!r}"
             )
         if e4m3_scale_layout not in {"packed", "modelopt"}:
-            raise ValueError(f"unsupported micro e4m3_scale_layout {e4m3_scale_layout!r}")
+            raise ValueError(
+                f"unsupported micro e4m3_scale_layout {e4m3_scale_layout!r}"
+            )
         swiglu_limit = normalize_swiglu_limit_for_activation(activation, swiglu_limit)
         swiglu_alpha = normalize_swiglu_alpha_for_activation(activation, swiglu_alpha)
         swiglu_beta = normalize_swiglu_beta_for_activation(activation, swiglu_beta)
@@ -5977,7 +5979,11 @@ class MoEMicroKernelBackend:
                 cute.make_tensor(
                     trellis_rot_ptr,
                     cute.make_layout(
-                        Int32(cfg.weight_E * (6 if self.trellis_intermediate_hadamard else 3) * cfg.n)
+                        Int32(
+                            cfg.weight_E
+                            * (6 if self.trellis_intermediate_hadamard else 3)
+                            * cfg.n
+                        )
                     ),
                 )
                 if cutlass.const_expr(trellis_rot_ptr is not None)

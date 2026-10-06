@@ -201,8 +201,13 @@ def make_dsv4_prefill_case(
 
     kv_bf16 = (
         torch.randn(
-            num_blocks, page_block_size, 1, d_qk,
-            device=device, dtype=torch.bfloat16, generator=gen,
+            num_blocks,
+            page_block_size,
+            1,
+            d_qk,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=gen,
         )
         / 10.0
     ).clamp(-1, 1)
@@ -211,8 +216,12 @@ def make_dsv4_prefill_case(
 
     q = (
         torch.randn(
-            num_tokens, num_heads, d_qk,
-            device=device, dtype=dtype, generator=gen,
+            num_tokens,
+            num_heads,
+            d_qk,
+            device=device,
+            dtype=dtype,
+            generator=gen,
         )
         / 10.0
     ).clamp(-1, 1)
@@ -233,7 +242,9 @@ def make_dsv4_prefill_case(
         span = topk - lo
         # Spread deterministically across tokens, then perturb so none lands on a
         # multiple of 64 (offsets 13/27/41/55 cycle through the 4 lane-pair cases).
-        base = lo + (torch.arange(num_tokens, device=device, dtype=torch.int64) * 37) % max(span, 1)
+        base = lo + (
+            torch.arange(num_tokens, device=device, dtype=torch.int64) * 37
+        ) % max(span, 1)
         perturb = torch.tensor([13, 27, 41, 55], device=device, dtype=torch.int64)
         lengths = base + perturb[torch.arange(num_tokens, device=device) % 4]
         lengths = lengths.clamp(max=topk, min=1)
@@ -304,12 +315,8 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     idx[:, 64:] = -1
     sm_scale = DSV4_D_QK**-0.5
 
-    o_dec, l_dec = dsv4_decode_reference(
-        q, packed, idx, sm_scale, kv_dequant=deq
-    )
-    o_pre, l_pre = dsv4_prefill_reference(
-        q, packed, idx, sm_scale, kv_dequant=deq
-    )
+    o_dec, l_dec = dsv4_decode_reference(q, packed, idx, sm_scale, kv_dequant=deq)
+    o_pre, l_pre = dsv4_prefill_reference(q, packed, idx, sm_scale, kv_dequant=deq)
     assert torch.equal(o_dec, o_pre), "T=1 prefill O != decode O (no length)"
     assert torch.equal(l_dec, l_pre), "T=1 prefill LSE != decode LSE (no length)"
 
@@ -328,8 +335,14 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     #     softmax over each token's masked valid rows (no online softmax, no
     #     vectorized einsum) must match the reference.
     case = make_dsv4_prefill_case(
-        num_tokens=5, num_heads=3, topk=128, num_blocks=3,
-        invalidate_half=True, with_sink=False, device=device, seed=7,
+        num_tokens=5,
+        num_heads=3,
+        topk=128,
+        num_blocks=3,
+        invalidate_half=True,
+        with_sink=False,
+        device=device,
+        seed=7,
     )
     qf = case["q"].float()
     deqf = case["kv_dequant"].view(-1, DSV4_D_QK).float()
@@ -347,9 +360,7 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     for t in range(T):
         L = int(lengths[t].item())
         cols = idx[t]
-        valid_cols = [
-            k for k in range(topk) if k < L and int(cols[k].item()) >= 0
-        ]
+        valid_cols = [k for k in range(topk) if k < L and int(cols[k].item()) >= 0]
         if not valid_cols:
             bruteLSE[t] = float("-inf")
             continue
@@ -369,8 +380,13 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     # (3) PREFILL regime sanity: T > 64 tokens, full head count, finite outputs,
     #     correct shapes, and the harness emits per-token non-mult-of-64 lengths.
     big = make_dsv4_prefill_case(
-        num_tokens=128, num_heads=128, topk=512, num_blocks=64,
-        with_sink=False, device=device, seed=0,
+        num_tokens=128,
+        num_heads=128,
+        topk=512,
+        num_blocks=64,
+        with_sink=False,
+        device=device,
+        seed=0,
     )
     assert big["q"].shape == (128, 128, DSV4_D_QK)
     assert big["expected_O"].shape == (128, 128, DSV4_D_V)
@@ -390,8 +406,14 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     #           and lse = (l>0) ? log2(l)+m : -1e30, then +log2(1+exp2(sink-lse)).
     #     (a) and (b) are algebraically equal; verifying both pins the formula.
     case_s = make_dsv4_prefill_case(
-        num_tokens=6, num_heads=4, topk=128, num_blocks=4,
-        invalidate_half=True, with_sink=True, device=device, seed=3,
+        num_tokens=6,
+        num_heads=4,
+        topk=128,
+        num_blocks=4,
+        invalidate_half=True,
+        with_sink=True,
+        device=device,
+        seed=3,
     )
     qf = case_s["q"].float()
     deqf = case_s["kv_dequant"].view(-1, DSV4_D_QK).float()
@@ -435,36 +457,50 @@ def _self_test(device: str | torch.device = "cuda") -> None:
             s2 = logits * LOG2E
             l2 = torch.exp2(s2 - m2).sum()
             il_kernel = 1.0 / (l2 + math.pow(2.0, sink_log2 - m2))
-            out_kernel = (
-                (torch.exp2(s2 - m2) @ rows[:, :DSV4_D_V]) * il_kernel
-            )
+            out_kernel = (torch.exp2(s2 - m2) @ rows[:, :DSV4_D_V]) * il_kernel
             torch.testing.assert_close(
                 base_out * factor, out_kernel, atol=1e-4, rtol=1e-4
             )
             # base-2 LSE with fold
             lse2 = float((torch.log2(l2) + m2).item())
             directLSE[t, h] = lse2 + math.log2(1.0 + math.pow(2.0, sink_log2 - lse2))
-    torch.testing.assert_close(case_s["expected_O"].float(), directO, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        case_s["expected_O"].float(), directO, atol=2e-2, rtol=2e-2
+    )
     torch.testing.assert_close(case_s["expected_lse"], directLSE, atol=1e-2, rtol=1e-2)
 
     # (5) all-invalid token: with NO sink, lse = -inf and output 0; WITH sink,
     #     lse = sink_log2 (per the kernel's empty-row branch) and output 0.
     case_e = make_dsv4_prefill_case(
-        num_tokens=3, num_heads=4, topk=128, num_blocks=4,
-        invalidate_half=True, with_sink=False, device=device, seed=2,
+        num_tokens=3,
+        num_heads=4,
+        topk=128,
+        num_blocks=4,
+        invalidate_half=True,
+        with_sink=False,
+        device=device,
+        seed=2,
     )
     case_e["topk_indices"][:] = -1
     O_e, lse_e = dsv4_prefill_reference(
-        case_e["q"], case_e["kv_cache"], case_e["topk_indices"], case_e["sm_scale"],
-        topk_length=case_e["topk_lengths"], kv_dequant=case_e["kv_dequant"],
+        case_e["q"],
+        case_e["kv_cache"],
+        case_e["topk_indices"],
+        case_e["sm_scale"],
+        topk_length=case_e["topk_lengths"],
+        kv_dequant=case_e["kv_dequant"],
     )
     assert torch.all(lse_e == float("-inf")), "all-invalid LSE must be -inf (no sink)"
     assert torch.all(O_e.float() == 0.0), "all-invalid output must be 0"
 
     sink_vec = torch.randn(4, device=device) * 2.0
     O_es, lse_es = dsv4_prefill_reference(
-        case_e["q"], case_e["kv_cache"], case_e["topk_indices"], case_e["sm_scale"],
-        attn_sink=sink_vec, topk_length=case_e["topk_lengths"],
+        case_e["q"],
+        case_e["kv_cache"],
+        case_e["topk_indices"],
+        case_e["sm_scale"],
+        attn_sink=sink_vec,
+        topk_length=case_e["topk_lengths"],
         kv_dequant=case_e["kv_dequant"],
     )
     assert torch.all(O_es.float() == 0.0), "all-invalid sink output must be 0"
@@ -476,8 +512,13 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     for nh, tk in ((16, 128), (32, 512), (64, 1024)):
         for T in (128, 256):
             c = make_dsv4_prefill_case(
-                num_tokens=T, num_heads=nh, topk=tk, num_blocks=64,
-                with_sink=(T == 256), device=device, seed=1,
+                num_tokens=T,
+                num_heads=nh,
+                topk=tk,
+                num_blocks=64,
+                with_sink=(T == 256),
+                device=device,
+                seed=1,
             )
             assert c["q"].shape == (T, nh, DSV4_D_QK)
             assert c["expected_O"].shape == (T, nh, DSV4_D_V)

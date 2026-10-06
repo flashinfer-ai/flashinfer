@@ -21,10 +21,19 @@ def _scale_offset(row, group, GROUPS: tl.constexpr):
 
 @triton.jit(do_not_specialize=["M"], do_not_specialize_on_alignment=["M"])
 def _quantize(
-    X, Q, S, AG, WG, ALPHA, M,
-    INPUT_K: tl.constexpr, K: tl.constexpr,
-    FP4: tl.constexpr, RECIPROCAL: tl.constexpr,
-    GROUP: tl.constexpr, CHUNKS: tl.constexpr,
+    X,
+    Q,
+    S,
+    AG,
+    WG,
+    ALPHA,
+    M,
+    INPUT_K: tl.constexpr,
+    K: tl.constexpr,
+    FP4: tl.constexpr,
+    RECIPROCAL: tl.constexpr,
+    GROUP: tl.constexpr,
+    CHUNKS: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1) * CHUNKS + tl.arange(0, CHUNKS)
@@ -68,14 +77,16 @@ def _quantize(
         tl.store(Q + row * K + k, values, (row < M) & (k < K))
         if (row == 0) & (tl.program_id(1) == 0):
             tl.store(ALPHA, 1.0)
-    tl.store(S + _scale_offset(row, group, K // GROUP), sf_byte,
-             group < K // GROUP)
+    tl.store(S + _scale_offset(row, group, K // GROUP), sf_byte, group < K // GROUP)
     if row == 0:
         pad = (M // 128).to(tl.int64) * 128 + tl.arange(0, 128)
-        tl.store(S + _scale_offset(pad[:, None], group[None, :], K // GROUP),
-                 0 if FP4 else 127,
-                 (pad[:, None] >= M) & (pad[:, None] < ((M + 127) // 128) * 128)
-                 & (group[None, :] < K // GROUP))
+        tl.store(
+            S + _scale_offset(pad[:, None], group[None, :], K // GROUP),
+            0 if FP4 else 127,
+            (pad[:, None] >= M)
+            & (pad[:, None] < ((M + 127) // 128) * 128)
+            & (group[None, :] < K // GROUP),
+        )
 
 
 _COMPILED: dict[tuple, object] = {}
@@ -83,19 +94,39 @@ _COMPILED: dict[tuple, object] = {}
 
 def launch(kernel, args, constants, grid, *, device, num_warps=4, num_stages=3):
     """Resolve by static geometry, then launch the exact compiled callable."""
-    key = (kernel.__name__, device.index, tuple(
-        arg.dtype if isinstance(arg, torch.Tensor) else type(arg) for arg in args
-    ), tuple(constants.items()), num_warps, num_stages)
+    key = (
+        kernel.__name__,
+        device.index,
+        tuple(
+            arg.dtype if isinstance(arg, torch.Tensor) else type(arg) for arg in args
+        ),
+        tuple(constants.items()),
+        num_warps,
+        num_stages,
+    )
     compiled = _COMPILED.get(key)
     all_args = (*args, *constants.values())
     if compiled is None:
-        raise_if_kernel_resolution_frozen("triton.compile", target=kernel, cache_key=key)
+        raise_if_kernel_resolution_frozen(
+            "triton.compile", target=kernel, cache_key=key
+        )
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("blockscaled kernel must be prewarmed before CUDA graph capture")
-        compiled = kernel[grid](*all_args, num_warps=num_warps, num_stages=num_stages,
-                                enable_fp_fusion=False)
-        if compiled.metadata.global_scratch_size or compiled.metadata.profile_scratch_size:
-            raise RuntimeError("blockscaled kernels require zero implicit Triton launch scratch")
+            raise RuntimeError(
+                "blockscaled kernel must be prewarmed before CUDA graph capture"
+            )
+        compiled = kernel[grid](
+            *all_args,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            enable_fp_fusion=False,
+        )
+        if (
+            compiled.metadata.global_scratch_size
+            or compiled.metadata.profile_scratch_size
+        ):
+            raise RuntimeError(
+                "blockscaled kernels require zero implicit Triton launch scratch"
+            )
         _COMPILED[key] = compiled
     else:
         compiled[grid](*all_args)

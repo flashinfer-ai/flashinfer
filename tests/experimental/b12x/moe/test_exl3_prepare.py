@@ -80,22 +80,16 @@ def test_exl3_uniform_mcg_matches_direct_binder(tmp_path) -> None:
         seed=5,
     )
     manifest = write_exl3_checkpoint(tmp_path, config)
-    layer = read_exl3_layer(
-        tmp_path, manifest, 0, first_slot=0, slot_count=slots
-    )
+    layer = read_exl3_layer(tmp_path, manifest, 0, first_slot=0, slot_count=slots)
     device = _device()
-    exl3_prepared = prepare_exl3_moe_weights(
-        layer, activation="silu", device=device
-    )
+    exl3_prepared = prepare_exl3_moe_weights(layer, activation="silu", device=device)
 
     payloads = synth_layer_payloads(config, 0)
     hidden_tiles = hidden // 16
     w13 = torch.empty(
         (2, experts, hidden_tiles, 2 * slots, 16 * bits), dtype=torch.int16
     )
-    w2 = torch.empty(
-        (experts, 2 * slots, hidden_tiles, 16 * bits), dtype=torch.int16
-    )
+    w2 = torch.empty((experts, 2 * slots, hidden_tiles, 16 * bits), dtype=torch.int16)
     for expert in range(experts):
         for slot in range(slots):
             for matrix in range(2):
@@ -177,9 +171,7 @@ def test_exl3_per_expert_pair_matches_naive_assembly(
     manifest = write_exl3_checkpoint(tmp_path, config)
     layer = read_exl3_layer(tmp_path, manifest, 0, first_slot=0, slot_count=8)
     device = _device()
-    prepared = prepare_exl3_moe_weights(
-        layer, activation="situ", device=device
-    )
+    prepared = prepare_exl3_moe_weights(layer, activation="situ", device=device)
     assert prepared.fc1_trellis_pair_kind == expected_kind
     assert prepared.fc2_trellis_pair_kind == expected_kind
 
@@ -194,15 +186,9 @@ def test_exl3_per_expert_pair_matches_naive_assembly(
             highs.append(high)
         return lows, highs
 
-    expected_gate = [
-        _naive_fc1_words(*_matrix_planes(e, 0)) for e in range(experts)
-    ]
-    expected_up = [
-        _naive_fc1_words(*_matrix_planes(e, 1)) for e in range(experts)
-    ]
-    expected_down = [
-        _naive_fc2_words(*_matrix_planes(e, 2)) for e in range(experts)
-    ]
+    expected_gate = [_naive_fc1_words(*_matrix_planes(e, 0)) for e in range(experts)]
+    expected_up = [_naive_fc1_words(*_matrix_planes(e, 1)) for e in range(experts)]
+    expected_down = [_naive_fc2_words(*_matrix_planes(e, 2)) for e in range(experts)]
     expected_w13 = torch.cat(expected_gate + expected_up).to(device)
     expected_w2 = torch.cat(expected_down).to(device)
     assert torch.equal(prepared.w13.view(torch.int16), expected_w13)
@@ -322,22 +308,44 @@ def _uniform_reference(layer, *, activation, device):
     geometry = layer.manifest.geometry
     experts, local = geometry.num_experts, layer.local_intermediate_size
     w13, w2 = _independent_planes(layer)
-    rotations = torch.stack([
-        torch.cat([layer.rotations[s, e] for s in range(layer.slot_count)], dim=1)
-        for e in range(experts)
-    ]).reshape(experts, 3 * local).to(device)
+    rotations = (
+        torch.stack(
+            [
+                torch.cat(
+                    [layer.rotations[s, e] for s in range(layer.slot_count)], dim=1
+                )
+                for e in range(experts)
+            ]
+        )
+        .reshape(experts, 3 * local)
+        .to(device)
+    )
     gate, up = layer.gate_suh.to(device), layer.up_suh.to(device)
     hadamard = layer.manifest.hadamard.intermediate_hadamard
     if hadamard:
         gate = up = gate if layer.first_slot < geometry.num_slots // 2 else up
-    tiles = (128, 128, 128, 128) if hadamard and layer.manifest.rates.bits == 2 else (64, 256, 64, 256)
+    tiles = (
+        (128, 128, 128, 128)
+        if hadamard and layer.manifest.rates.bits == 2
+        else (64, 256, 64, 256)
+    )
     result = prepare_trellis256_moe_weights(
-        w13.to(device), w2.to(device), hidden_size=geometry.hidden_size,
-        intermediate_size=local, num_experts=experts, activation=activation,
-        fc1_tile_n=tiles[1], fc2_tile_n=tiles[3], params_dtype=torch.float16,
-        w13_layout="trellis_t256_proj", trellis_bits=layer.manifest.rates.bits,
-        codebook=layer.manifest.codebook, gate_suh=gate, up_suh=up,
-        intermediate_rotations=rotations, down_svh=layer.down_svh.to(device),
+        w13.to(device),
+        w2.to(device),
+        hidden_size=geometry.hidden_size,
+        intermediate_size=local,
+        num_experts=experts,
+        activation=activation,
+        fc1_tile_n=tiles[1],
+        fc2_tile_n=tiles[3],
+        params_dtype=torch.float16,
+        w13_layout="trellis_t256_proj",
+        trellis_bits=layer.manifest.rates.bits,
+        codebook=layer.manifest.codebook,
+        gate_suh=gate,
+        up_suh=up,
+        intermediate_rotations=rotations,
+        down_svh=layer.down_svh.to(device),
         tile_config=tiles,
     )
     if not hadamard:
@@ -355,12 +363,18 @@ def _uniform_reference(layer, *, activation, device):
                     (0x6A09E667F3BCC909 * pattern + 0xBB67AE8584CAA73B * axis) % (2**63)
                 )
                 full = torch.randint(2, (length,), generator=gen) * 2 - 1
-            parts.append(full[begin:begin + multiplier * local])
+            parts.append(full[begin : begin + multiplier * local])
         signs.append(torch.cat(parts))
-    return replace(result, trellis=replace(
-        result.trellis, intermediate_hadamard=True,
-        intermediate_rotations=torch.cat((rotations, torch.stack(signs).half().to(device)), dim=1),
-    ))
+    return replace(
+        result,
+        trellis=replace(
+            result.trellis,
+            intermediate_hadamard=True,
+            intermediate_rotations=torch.cat(
+                (rotations, torch.stack(signs).half().to(device)), dim=1
+            ),
+        ),
+    )
 
 
 @requires_cuda
@@ -405,7 +419,9 @@ def test_canonical_exl3_preparation_preserves_source_extent(
     plan = fused_moe.plan_weights(
         source=source_metadata,
         activation=fused_moe.ActivationSpec(
-            mode="a16", nonlinearity=activation, io_dtype=torch.bfloat16,
+            mode="a16",
+            nonlinearity=activation,
+            io_dtype=torch.bfloat16,
             rotation_dtype=torch.float16,
         ),
         geometry=fused_moe.MoEGeometry(
@@ -413,7 +429,9 @@ def test_canonical_exl3_preparation_preserves_source_extent(
         ),
     )
     prepared = fused_moe.prepare_weights(
-        plan=plan, weights=source_weights, device=_device(),
+        plan=plan,
+        weights=source_weights,
+        device=_device(),
     )
     actual = prepared._impl.representation.value
     assert actual.params_dtype == expected.params_dtype == torch.float16
@@ -447,13 +465,18 @@ def test_canonical_exl3_preparation_preserves_source_extent(
     )
 
     def allocate(state):
-        return tuple(torch.empty(s.shape, dtype=s.dtype, device=s.device)
-                     for s in state.scratch.scratch_specs())
+        return tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=s.device)
+            for s in state.scratch.scratch_specs()
+        )
 
     def bind(state, scratch, rows):
         return state.bind(
-            scratch=scratch, a=source[:rows], experts=prepared,
-            topk_weights=route_weights[:rows], topk_ids=route_ids[:rows],
+            scratch=scratch,
+            a=source[:rows],
+            experts=prepared,
+            topk_weights=route_weights[:rows],
+            topk_ids=route_ids[:rows],
             output=output[:rows],
         )
 
@@ -464,8 +487,13 @@ def test_canonical_exl3_preparation_preserves_source_extent(
 
     def oracle(rows):
         return _serial_tier(
-            source[:rows], expected, route_weights[:rows], route_ids[:rows],
-            expert_map, block_size_m=8, activation=activation,
+            source[:rows],
+            expected,
+            route_weights[:rows],
+            route_ids[:rows],
+            expert_map,
+            block_size_m=8,
+            activation=activation,
         ).to(output.dtype)
 
     with PreparationSession(device=source.device, autotune=False) as session:

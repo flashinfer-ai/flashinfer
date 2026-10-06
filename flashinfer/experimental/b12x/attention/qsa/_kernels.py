@@ -194,9 +194,7 @@ def _compress_completed_groups_kernel(
         group_interleave = CP_INTERLEAVE // COMPRESS_RATIO
         dcp_round = DCP_SIZE * group_interleave
         owner = (group_id // group_interleave) % DCP_SIZE
-        complete = (((position + 1) % COMPRESS_RATIO) == 0) & (
-            owner == DCP_RANK
-        )
+        complete = (((position + 1) % COMPRESS_RATIO) == 0) & (owner == DCP_RANK)
     if real_request & complete & (state_slot >= 0):
         request_start = tl.load(query_start_loc + request).to(tl.int64)
         current_first = tl.load(query_positions + request_start).to(tl.int64)
@@ -323,9 +321,8 @@ def _compress_completed_groups_kernel(
             local_group = group_id
         else:
             local_group = (
-                (group_id // dcp_round) * group_interleave
-                + group_id % group_interleave
-            )
+                group_id // dcp_round
+            ) * group_interleave + group_id % group_interleave
         logical_page = local_group // COMPRESSED_PAGE_SIZE
         page_offset = local_group % COMPRESSED_PAGE_SIZE
         table_offset = (request * compressed_table_stride + logical_page).to(tl.int64)
@@ -683,9 +680,8 @@ def _expand_selected_groups_kernel(
         dcp_round = DCP_SIZE * group_interleave
         tail_owner = (global_tail_group // group_interleave) % DCP_SIZE
         local_tail_group = (
-            (global_tail_group // dcp_round) * group_interleave
-            + global_tail_group % group_interleave
-        )
+            global_tail_group // dcp_round
+        ) * group_interleave + global_tail_group % group_interleave
         local_tail_start = local_tail_group * COMPRESS_RATIO
         tail_length = tl.where(
             tail_owner == DCP_RANK,
@@ -735,9 +731,8 @@ def _expand_global_selected_groups_kernel(
     safe_group = tl.maximum(global_group, 0)
     owner = (safe_group // group_interleave) % DCP_SIZE
     local_group = (
-        (safe_group // dcp_round) * group_interleave
-        + safe_group % group_interleave
-    )
+        safe_group // dcp_round
+    ) * group_interleave + safe_group % group_interleave
     expanded = local_group * COMPRESS_RATIO + columns % COMPRESS_RATIO
     selected = tl.where(
         (columns < GROUP_BUDGET * COMPRESS_RATIO)
@@ -752,15 +747,12 @@ def _expand_global_selected_groups_kernel(
     global_tail_group = global_tail_start // COMPRESS_RATIO
     tail_owner = (global_tail_group // group_interleave) % DCP_SIZE
     local_tail_group = (
-        (global_tail_group // dcp_round) * group_interleave
-        + global_tail_group % group_interleave
-    )
+        global_tail_group // dcp_round
+    ) * group_interleave + global_tail_group % group_interleave
     tail_column = columns - GROUP_BUDGET * COMPRESS_RATIO
     tail_length = position + 1 - global_tail_start
     in_tail = (
-        (tail_owner == DCP_RANK)
-        & (tail_column >= 0)
-        & (tail_column < tail_length)
+        (tail_owner == DCP_RANK) & (tail_column >= 0) & (tail_column < tail_length)
     )
     selected = tl.where(
         in_tail,
@@ -801,7 +793,9 @@ def _support_kernel_key(kernel: object, constexprs: Mapping[str, object]) -> str
     return key
 
 
-def _launch_triton(kernel: object, grid: tuple[int, ...], *args: object, **constexprs: object) -> object:
+def _launch_triton(
+    kernel: object, grid: tuple[int, ...], *args: object, **constexprs: object
+) -> object:
     """Launch a declared QSA support program without resolving JIT at runtime."""
     context = _support_launch_context.get()
     if context is None:
@@ -817,7 +811,9 @@ def _launch_triton(kernel: object, grid: tuple[int, ...], *args: object, **const
     try:
         program = programs[key]
     except KeyError:
-        raise RuntimeError(f"prepared QSA support programs are missing {key!r}") from None
+        raise RuntimeError(
+            f"prepared QSA support programs are missing {key!r}"
+        ) from None
     # Native Triton launchers retain their static ABI; only runtime pointers and
     # scalars cross this boundary, on Triton's required three-dimensional grid.
     return program[tuple((*grid, 1, 1)[:3])](*args)
@@ -827,8 +823,11 @@ def _launch_triton(kernel: object, grid: tuple[int, ...], *args: object, **const
 def _support_context(programs: Mapping[str, object], *, compiling: bool):
     if compiling:
         from b12x._lib.compile_plan import compile_only_launches_enabled
+
         if not compile_only_launches_enabled():
-            raise RuntimeError("QSA support extraction requires compile-only preparation")
+            raise RuntimeError(
+                "QSA support extraction requires compile-only preparation"
+            )
     token = _support_launch_context.set((programs, compiling))
     try:
         yield
@@ -882,30 +881,34 @@ def launch_prepare_index_query(
 ) -> None:
     rows = int(index_query.shape[0])
     section0, section1 = _mrope_sections(caps)
-    _launch_triton(_prepare_index_query_kernel, (rows * int(caps.index_heads),), index_query,
-    request_ids,
-    norm_weight,
-    rope_positions,
-    rope_cos,
-    rope_sin,
-    prepared_query,
-    int(rope_cos.shape[0]),
-    float(caps.rms_norm_eps),
-    int(rope_positions.stride(0)),
-    int(rope_positions.stride(1)),
-    int(rope_cos.stride(0)),
-    int(rope_sin.stride(0)),
-    int(index_query.stride(0)),
-    INDEX_HEADS=int(caps.index_heads),
-    HEAD_DIM=int(caps.index_head_dim),
-    ROTARY_DIM=int(caps.index_rotary_dim),
-    POSITION_AXES=int(caps.position_axes),
-    MROPE_INTERLEAVED=bool(caps.mrope_interleaved),
-    MROPE_SECTION_0=section0,
-    MROPE_SECTION_1=section1,
-    ROPE_IS_BF16=rope_cos.dtype == torch.bfloat16,
-    BLOCK_D=triton.next_power_of_2(int(caps.index_head_dim)),
-    num_warps=4,)
+    _launch_triton(
+        _prepare_index_query_kernel,
+        (rows * int(caps.index_heads),),
+        index_query,
+        request_ids,
+        norm_weight,
+        rope_positions,
+        rope_cos,
+        rope_sin,
+        prepared_query,
+        int(rope_cos.shape[0]),
+        float(caps.rms_norm_eps),
+        int(rope_positions.stride(0)),
+        int(rope_positions.stride(1)),
+        int(rope_cos.stride(0)),
+        int(rope_sin.stride(0)),
+        int(index_query.stride(0)),
+        INDEX_HEADS=int(caps.index_heads),
+        HEAD_DIM=int(caps.index_head_dim),
+        ROTARY_DIM=int(caps.index_rotary_dim),
+        POSITION_AXES=int(caps.position_axes),
+        MROPE_INTERLEAVED=bool(caps.mrope_interleaved),
+        MROPE_SECTION_0=section0,
+        MROPE_SECTION_1=section1,
+        ROPE_IS_BF16=rope_cos.dtype == torch.bfloat16,
+        BLOCK_D=triton.next_power_of_2(int(caps.index_head_dim)),
+        num_warps=4,
+    )
 
 
 def launch_compress_completed_groups(
@@ -928,51 +931,55 @@ def launch_compress_completed_groups(
 ) -> None:
     rows = int(raw_index_key.shape[0])
     section0, section1 = _mrope_sections(caps)
-    _launch_triton(_compress_completed_groups_kernel, (rows,), raw_index_key,
-    query_positions,
-    rope_positions,
-    request_ids,
-    query_start_loc,
-    raw_state_slot_ids,
-    raw_k_ring,
-    raw_logical_positions,
-    raw_rope_positions,
-    key_norm_weight,
-    rope_cos,
-    rope_sin,
-    compressed_cache,
-    compressed_block_table,
-    int(rope_cos.shape[0]),
-    int(rope_positions.stride(0)),
-    int(rope_positions.stride(1)),
-    int(rope_cos.stride(0)),
-    int(rope_sin.stride(0)),
-    int(raw_state_slot_ids.stride(0)),
-    int(raw_k_ring.stride(0)),
-    int(raw_k_ring.stride(1)),
-    int(raw_logical_positions.stride(0)),
-    int(raw_rope_positions.stride(0)),
-    int(raw_rope_positions.stride(1)),
-    int(compressed_cache.stride(0)),
-    int(compressed_cache.stride(1)),
-    int(compressed_block_table.stride(0)),
-    float(caps.rms_norm_eps),
-    int(raw_index_key.stride(0)),
-    INDEX_HEAD_DIM=int(caps.index_head_dim),
-    ROTARY_DIM=int(caps.index_rotary_dim),
-    COMPRESS_RATIO=int(caps.compress_ratio),
-    RING_CAPACITY=int(caps.raw_ring_capacity),
-    COMPRESSED_PAGE_SIZE=int(caps.compressed_page_size),
-    DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
-    DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
-    CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
-    POSITION_AXES=int(caps.position_axes),
-    MROPE_INTERLEAVED=bool(caps.mrope_interleaved),
-    MROPE_SECTION_0=section0,
-    MROPE_SECTION_1=section1,
-    ROPE_IS_BF16=rope_cos.dtype == torch.bfloat16,
-    BLOCK_D=triton.next_power_of_2(int(caps.index_head_dim)),
-    num_warps=4,)
+    _launch_triton(
+        _compress_completed_groups_kernel,
+        (rows,),
+        raw_index_key,
+        query_positions,
+        rope_positions,
+        request_ids,
+        query_start_loc,
+        raw_state_slot_ids,
+        raw_k_ring,
+        raw_logical_positions,
+        raw_rope_positions,
+        key_norm_weight,
+        rope_cos,
+        rope_sin,
+        compressed_cache,
+        compressed_block_table,
+        int(rope_cos.shape[0]),
+        int(rope_positions.stride(0)),
+        int(rope_positions.stride(1)),
+        int(rope_cos.stride(0)),
+        int(rope_sin.stride(0)),
+        int(raw_state_slot_ids.stride(0)),
+        int(raw_k_ring.stride(0)),
+        int(raw_k_ring.stride(1)),
+        int(raw_logical_positions.stride(0)),
+        int(raw_rope_positions.stride(0)),
+        int(raw_rope_positions.stride(1)),
+        int(compressed_cache.stride(0)),
+        int(compressed_cache.stride(1)),
+        int(compressed_block_table.stride(0)),
+        float(caps.rms_norm_eps),
+        int(raw_index_key.stride(0)),
+        INDEX_HEAD_DIM=int(caps.index_head_dim),
+        ROTARY_DIM=int(caps.index_rotary_dim),
+        COMPRESS_RATIO=int(caps.compress_ratio),
+        RING_CAPACITY=int(caps.raw_ring_capacity),
+        COMPRESSED_PAGE_SIZE=int(caps.compressed_page_size),
+        DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+        DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+        CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
+        POSITION_AXES=int(caps.position_axes),
+        MROPE_INTERLEAVED=bool(caps.mrope_interleaved),
+        MROPE_SECTION_0=section0,
+        MROPE_SECTION_1=section1,
+        ROPE_IS_BF16=rope_cos.dtype == torch.bfloat16,
+        BLOCK_D=triton.next_power_of_2(int(caps.index_head_dim)),
+        num_warps=4,
+    )
 
 
 def launch_commit_raw_ring(
@@ -991,33 +998,37 @@ def launch_commit_raw_ring(
     raw_interval_start_positions: torch.Tensor,
     caps,
 ) -> None:
-    _launch_triton(_commit_raw_ring_kernel, (int(caps.max_batch), int(caps.raw_ring_capacity)), raw_index_key,
-    query_positions,
-    rope_positions,
-    request_ids,
-    query_start_loc,
-    sequence_lengths,
-    is_prefilling,
-    raw_state_slot_ids,
-    raw_k_ring,
-    raw_logical_positions,
-    raw_rope_positions,
-    raw_interval_start_positions,
-    int(rope_positions.stride(0)),
-    int(rope_positions.stride(1)),
-    int(raw_state_slot_ids.stride(0)),
-    int(raw_k_ring.stride(0)),
-    int(raw_k_ring.stride(1)),
-    int(raw_logical_positions.stride(0)),
-    int(raw_rope_positions.stride(0)),
-    int(raw_rope_positions.stride(1)),
-    int(raw_interval_start_positions.stride(0)),
-    int(raw_index_key.stride(0)),
-    INDEX_HEAD_DIM=int(caps.index_head_dim),
-    POSITION_AXES=int(caps.position_axes),
-    RING_CAPACITY=int(caps.raw_ring_capacity),
-    BLOCK_D=triton.next_power_of_2(int(caps.index_head_dim)),
-    num_warps=4,)
+    _launch_triton(
+        _commit_raw_ring_kernel,
+        (int(caps.max_batch), int(caps.raw_ring_capacity)),
+        raw_index_key,
+        query_positions,
+        rope_positions,
+        request_ids,
+        query_start_loc,
+        sequence_lengths,
+        is_prefilling,
+        raw_state_slot_ids,
+        raw_k_ring,
+        raw_logical_positions,
+        raw_rope_positions,
+        raw_interval_start_positions,
+        int(rope_positions.stride(0)),
+        int(rope_positions.stride(1)),
+        int(raw_state_slot_ids.stride(0)),
+        int(raw_k_ring.stride(0)),
+        int(raw_k_ring.stride(1)),
+        int(raw_logical_positions.stride(0)),
+        int(raw_rope_positions.stride(0)),
+        int(raw_rope_positions.stride(1)),
+        int(raw_interval_start_positions.stride(0)),
+        int(raw_index_key.stride(0)),
+        INDEX_HEAD_DIM=int(caps.index_head_dim),
+        POSITION_AXES=int(caps.position_axes),
+        RING_CAPACITY=int(caps.raw_ring_capacity),
+        BLOCK_D=triton.next_power_of_2(int(caps.index_head_dim)),
+        num_warps=4,
+    )
 
 
 def launch_score_representatives(
@@ -1037,33 +1048,37 @@ def launch_score_representatives(
 ) -> None:
     rows = int(prepared_query.shape[0])
     block_g = 32
-    _launch_triton(_score_representatives_kernel, (rows, triton.cdiv(int(group_count), block_g)), prepared_query,
-    query_positions,
-    request_ids,
-    sequence_lengths,
-    compressed_cache,
-    compressed_block_table,
-    scores,
-    eligible_counts,
-    merge_lengths,
-    int(compressed_cache.stride(0)),
-    int(compressed_cache.stride(1)),
-    int(compressed_block_table.stride(0)),
-    int(scores.stride(0)),
-    MAX_GROUPS=int(caps.max_groups),
-    GROUP_OFFSET=int(group_offset),
-    GROUP_COUNT=int(group_count),
-    GROUP_BUDGET=int(caps.group_budget),
-    INDEX_HEADS=int(caps.index_heads),
-    INDEX_HEAD_DIM=int(caps.index_head_dim),
-    COMPRESS_RATIO=int(caps.compress_ratio),
-    COMPRESSED_PAGE_SIZE=int(caps.compressed_page_size),
-    DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
-    DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
-    CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
-    BLOCK_G=block_g,
-    BLOCK_D=triton.next_power_of_2(int(caps.index_head_dim)),
-    num_warps=4,)
+    _launch_triton(
+        _score_representatives_kernel,
+        (rows, triton.cdiv(int(group_count), block_g)),
+        prepared_query,
+        query_positions,
+        request_ids,
+        sequence_lengths,
+        compressed_cache,
+        compressed_block_table,
+        scores,
+        eligible_counts,
+        merge_lengths,
+        int(compressed_cache.stride(0)),
+        int(compressed_cache.stride(1)),
+        int(compressed_block_table.stride(0)),
+        int(scores.stride(0)),
+        MAX_GROUPS=int(caps.max_groups),
+        GROUP_OFFSET=int(group_offset),
+        GROUP_COUNT=int(group_count),
+        GROUP_BUDGET=int(caps.group_budget),
+        INDEX_HEADS=int(caps.index_heads),
+        INDEX_HEAD_DIM=int(caps.index_head_dim),
+        COMPRESS_RATIO=int(caps.compress_ratio),
+        COMPRESSED_PAGE_SIZE=int(caps.compressed_page_size),
+        DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+        DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+        CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
+        BLOCK_G=block_g,
+        BLOCK_D=triton.next_power_of_2(int(caps.index_head_dim)),
+        num_warps=4,
+    )
 
 
 def launch_stage_topk_carry(
@@ -1075,14 +1090,18 @@ def launch_stage_topk_carry(
     group_budget: int,
 ) -> None:
     rows = int(scores.shape[0])
-    _launch_triton(_stage_topk_carry_kernel, (rows,), prior_values,
-    eligible_counts,
-    scores,
-    int(scores.stride(0)),
-    GROUP_OFFSET=int(group_offset),
-    GROUP_BUDGET=int(group_budget),
-    BLOCK_K=triton.next_power_of_2(int(group_budget)),
-    num_warps=8,)
+    _launch_triton(
+        _stage_topk_carry_kernel,
+        (rows,),
+        prior_values,
+        eligible_counts,
+        scores,
+        int(scores.stride(0)),
+        GROUP_OFFSET=int(group_offset),
+        GROUP_BUDGET=int(group_budget),
+        BLOCK_K=triton.next_power_of_2(int(group_budget)),
+        num_warps=8,
+    )
 
 
 def launch_topk_groups(
@@ -1127,14 +1146,18 @@ def launch_remap_topk_group_ids(
     group_budget: int,
 ) -> None:
     rows = int(local_ids.shape[0])
-    _launch_triton(_remap_topk_group_ids_kernel, (rows,), local_ids,
-    prior_ids,
-    eligible_counts,
-    merge_lengths,
-    GROUP_OFFSET=int(group_offset),
-    GROUP_BUDGET=int(group_budget),
-    BLOCK_K=triton.next_power_of_2(int(group_budget)),
-    num_warps=8,)
+    _launch_triton(
+        _remap_topk_group_ids_kernel,
+        (rows,),
+        local_ids,
+        prior_ids,
+        eligible_counts,
+        merge_lengths,
+        GROUP_OFFSET=int(group_offset),
+        GROUP_BUDGET=int(group_budget),
+        BLOCK_K=triton.next_power_of_2(int(group_budget)),
+        num_warps=8,
+    )
 
 
 def launch_stabilize_topk(
@@ -1164,20 +1187,30 @@ def launch_stabilize_topk(
     if context is not None and not context[1]:
         prepared = context[0]["stable_selection"]
     raw = launch_stable_selection(
-        scores=scores, merge_lengths=merge_lengths, prior_ids=prior_ids,
-        eligible_counts=eligible_counts, topk_values=topk_values,
-        stable_values=stable_values, stable_ids=stable_ids,
-        group_offset=group_offset, group_budget=group_budget, prepared=prepared,
+        scores=scores,
+        merge_lengths=merge_lengths,
+        prior_ids=prior_ids,
+        eligible_counts=eligible_counts,
+        topk_values=topk_values,
+        stable_values=stable_values,
+        stable_ids=stable_ids,
+        group_offset=group_offset,
+        group_budget=group_budget,
+        prepared=prepared,
     )
     if context is not None and context[1]:
         context[0]["stable_selection"] = raw
-    _launch_triton(_copy_stable_topk_kernel, (rows,), stable_values,
-    stable_ids,
-    topk_values,
-    topk_group_ids,
-    GROUP_BUDGET=int(group_budget),
-    BLOCK_K=block_k,
-    num_warps=8,)
+    _launch_triton(
+        _copy_stable_topk_kernel,
+        (rows,),
+        stable_values,
+        stable_ids,
+        topk_values,
+        topk_group_ids,
+        GROUP_BUDGET=int(group_budget),
+        BLOCK_K=block_k,
+        num_warps=8,
+    )
 
 
 def launch_expand_selected_groups(
@@ -1189,20 +1222,24 @@ def launch_expand_selected_groups(
     caps,
 ) -> None:
     rows = int(query_positions.shape[0])
-    _launch_triton(_expand_selected_groups_kernel, (rows,), topk_group_ids,
-    eligible_counts,
-    query_positions,
-    selected_positions,
-    int(topk_group_ids.stride(0)),
-    int(selected_positions.stride(0)),
-    GROUP_BUDGET=int(caps.group_budget),
-    COMPRESS_RATIO=int(caps.compress_ratio),
-    SELECTION_WIDTH=int(caps.selection_width),
-    DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
-    DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
-    CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
-    BLOCK_W=triton.next_power_of_2(int(caps.selection_width)),
-    num_warps=8,)
+    _launch_triton(
+        _expand_selected_groups_kernel,
+        (rows,),
+        topk_group_ids,
+        eligible_counts,
+        query_positions,
+        selected_positions,
+        int(topk_group_ids.stride(0)),
+        int(selected_positions.stride(0)),
+        GROUP_BUDGET=int(caps.group_budget),
+        COMPRESS_RATIO=int(caps.compress_ratio),
+        SELECTION_WIDTH=int(caps.selection_width),
+        DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+        DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+        CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
+        BLOCK_W=triton.next_power_of_2(int(caps.selection_width)),
+        num_warps=8,
+    )
 
 
 def launch_expand_global_selected_groups(
@@ -1213,19 +1250,23 @@ def launch_expand_global_selected_groups(
     caps,
 ) -> None:
     rows = int(query_positions.shape[0])
-    _launch_triton(_expand_global_selected_groups_kernel, (rows,), topk_group_ids,
-    query_positions,
-    selected_positions,
-    int(topk_group_ids.stride(0)),
-    int(selected_positions.stride(0)),
-    GROUP_BUDGET=int(caps.group_budget),
-    COMPRESS_RATIO=int(caps.compress_ratio),
-    SELECTION_WIDTH=int(caps.selection_width),
-    DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
-    DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
-    CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
-    BLOCK_W=triton.next_power_of_2(int(caps.selection_width)),
-    num_warps=8,)
+    _launch_triton(
+        _expand_global_selected_groups_kernel,
+        (rows,),
+        topk_group_ids,
+        query_positions,
+        selected_positions,
+        int(topk_group_ids.stride(0)),
+        int(selected_positions.stride(0)),
+        GROUP_BUDGET=int(caps.group_budget),
+        COMPRESS_RATIO=int(caps.compress_ratio),
+        SELECTION_WIDTH=int(caps.selection_width),
+        DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+        DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+        CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
+        BLOCK_W=triton.next_power_of_2(int(caps.selection_width)),
+        num_warps=8,
+    )
 
 
 _SUPPORT_WRAPPER_NAMES = (

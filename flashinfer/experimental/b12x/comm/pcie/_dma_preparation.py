@@ -1,4 +1,5 @@
 """Prepared launch ownership for the fixed PCIe DMA all-reduce channel."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -49,20 +50,27 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
         raise ValueError("DMA preparation max_bytes differs from its runtime channel")
     if str(values["wire_mode"]) != runtime._fp8:
         raise ValueError("DMA preparation wire mode differs from its runtime channel")
-    if int(values["pieces_override"]) != runtime._pieces_override or int(
-        values["a2a_chunks_override"]
-    ) != runtime._a2a_chunks_override:
-        raise ValueError("DMA preparation crossover metadata differs from its runtime channel")
-    setup = FrozenMapping({
-        "shard_capacity": int(runtime.shard_capacity),
-        "flag_slots": 256,
-        "flag_stride": 128,
-        "steps": 2 * (int(runtime.world_size) - 1),
-        "slab_nbytes": 256 * 128
-        + 2 * (int(runtime.world_size) - 1) * int(runtime.shard_capacity),
-        "stage_nbytes": 0 if runtime._fp8_stage is None else int(runtime._fp8_stage.numel()),
-        "stage_stride": int(runtime._fp8_stage_stride),
-    })
+    if (
+        int(values["pieces_override"]) != runtime._pieces_override
+        or int(values["a2a_chunks_override"]) != runtime._a2a_chunks_override
+    ):
+        raise ValueError(
+            "DMA preparation crossover metadata differs from its runtime channel"
+        )
+    setup = FrozenMapping(
+        {
+            "shard_capacity": int(runtime.shard_capacity),
+            "flag_slots": 256,
+            "flag_stride": 128,
+            "steps": 2 * (int(runtime.world_size) - 1),
+            "slab_nbytes": 256 * 128
+            + 2 * (int(runtime.world_size) - 1) * int(runtime.shard_capacity),
+            "stage_nbytes": 0
+            if runtime._fp8_stage is None
+            else int(runtime._fp8_stage.numel()),
+            "stage_stride": int(runtime._fp8_stage_stride),
+        }
+    )
     return PcieQuery(
         surface=surface,
         world_size=int(runtime.world_size),
@@ -74,8 +82,12 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
 
 
 def query_from_metadata(
-    runtime, *, shape: tuple[int, ...], dtype: torch.dtype,
-    strides: tuple[int, ...] | None = None, alignment: int = 16,
+    runtime,
+    *,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    strides: tuple[int, ...] | None = None,
+    alignment: int = 16,
 ) -> PcieQuery:
     """Snapshot a concrete DMA invocation without allocating an activation."""
     if not shape or any(type(extent) is not int or extent <= 0 for extent in shape):
@@ -102,10 +114,14 @@ def query_from_metadata(
     return query_from_runtime(
         runtime,
         surface=_SURFACE,
-        call=FrozenMapping({
-            "shape": tuple(shape), "dtype": str(dtype).removeprefix("torch."),
-            "strides": tuple(strides), "alignment": alignment,
-        }),
+        call=FrozenMapping(
+            {
+                "shape": tuple(shape),
+                "dtype": str(dtype).removeprefix("torch."),
+                "strides": tuple(strides),
+                "alignment": alignment,
+            }
+        ),
     )
 
 
@@ -132,7 +148,10 @@ class _DmaExecutionState:
     def require_runtime(self, runtime) -> None:
         if runtime is not self.runtime:
             raise ValueError("DMA plan belongs to a different native runtime channel")
-        if (runtime.rank, runtime.world_size) != (self.query.rank, self.query.world_size):
+        if (runtime.rank, runtime.world_size) != (
+            self.query.rank,
+            self.query.world_size,
+        ):
             raise ValueError("DMA runtime rank or world size differs from preparation")
 
     def run(self, inp, *, out=None):
@@ -150,6 +169,7 @@ class _DmaExecutionState:
             )
         self.runtime._prime_prepared(self)
         self.run(inp, out=out)
+
 
 def prepared_call(state: object, *, inp, out) -> PreparedCall:
     """Build a priming call from actual channel input/output buffers."""
@@ -211,6 +231,7 @@ def plan(
 
     def materialize(selection, device):
         from b12x._lib.compile_plan import load_programs
+
         del selection
         launchers = load_programs(compile_dma_surface(payload, device.ordinal))
         runtime._kernels.install(launchers)

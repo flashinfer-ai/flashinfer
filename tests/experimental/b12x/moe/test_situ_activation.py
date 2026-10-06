@@ -53,13 +53,9 @@ def test_situ_reference_matches_kimi_k3_beta_scaled_contract() -> None:
         swiglu_beta=0.0,
     )
     situ_gate = (
-        SITU_DEFAULT_BETA
-        * torch.tanh(gate / SITU_DEFAULT_BETA)
-        * torch.sigmoid(gate)
+        SITU_DEFAULT_BETA * torch.tanh(gate / SITU_DEFAULT_BETA) * torch.sigmoid(gate)
     )
-    situ_up = SITU_DEFAULT_LINEAR_BETA * torch.tanh(
-        up / SITU_DEFAULT_LINEAR_BETA
-    )
+    situ_up = SITU_DEFAULT_LINEAR_BETA * torch.tanh(up / SITU_DEFAULT_LINEAR_BETA)
     expected = situ_gate * situ_up
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
     assert torch.isfinite(actual).all()

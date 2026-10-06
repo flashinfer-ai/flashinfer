@@ -1,8 +1,10 @@
 """FP6 operand construction shared by numerical tests and benchmarks."""
+
 from __future__ import annotations
 
 import torch
 from b12x._lib.fp6 import quantize_grouped_mxfp6_torch
+
 
 def _bf16_global_scale(amax: float) -> torch.Tensor:
     return torch.tensor(
@@ -11,7 +13,10 @@ def _bf16_global_scale(amax: float) -> torch.Tensor:
         device="cuda",
     )
 
-def _quantize_bf16_matrix(bf16: torch.Tensor, fmt: str = "e3m2") -> tuple[torch.Tensor, torch.Tensor]:
+
+def _quantize_bf16_matrix(
+    bf16: torch.Tensor, fmt: str = "e3m2"
+) -> tuple[torch.Tensor, torch.Tensor]:
     m, k = bf16.shape
     row_counts = torch.tensor([m], dtype=torch.int32, device=bf16.device)
     gs = _bf16_global_scale(float(bf16.abs().max().item()))

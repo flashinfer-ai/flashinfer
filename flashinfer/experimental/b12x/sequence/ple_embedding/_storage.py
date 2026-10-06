@@ -113,7 +113,9 @@ def allocate_storage(
         raise TypeError(f"layout must be TableLayout, got {type(layout)!r}")
     caps = layout.caps
     if caps.table_memory == "io_uring":
-        raise ValueError("disk tables must be loaded with DiskTable(layout, shard_rows)")
+        raise ValueError(
+            "disk tables must be loaded with DiskTable(layout, shard_rows)"
+        )
     if host_allocator is not None and caps.table_memory != "mapped_host":
         raise ValueError(
             "host_allocator requires table_memory='mapped_host', "

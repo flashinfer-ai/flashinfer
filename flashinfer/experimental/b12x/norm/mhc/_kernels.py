@@ -44,16 +44,30 @@ from b12x._lib.intrinsics import (
 )
 from b12x._lib.utils import current_cuda_stream
 
+_PREFILL_TF32_TMA_LONG_4096_K_SPLITS = (
+    None  # placeholder: undefined in the b12x migration; set the real value
+)
+_PREFILL_TF32_TMA_CHUNK_4096_K_SPLITS = (
+    None  # placeholder: undefined in the b12x migration; set the real value
+)
+
 
 def _compile_mhc_entry(*args, **kwargs):
     if not compile_only_launches_enabled():
         raise RuntimeError("MHC launchers must be resolved by preparation")
     return b12x_launch(*args, **kwargs)
 
+
 @cute.jit
 def _contract_four(
-    p0: Float32, p1: Float32, p2: Float32, p3: Float32,
-    r0: Float32, r1: Float32, r2: Float32, r3: Float32,
+    p0: Float32,
+    p1: Float32,
+    p2: Float32,
+    p3: Float32,
+    r0: Float32,
+    r1: Float32,
+    r2: Float32,
+    r3: Float32,
 ) -> Float32:
     return p0 * r0 + p1 * r1 + p2 * r2 + p3 * r3
 
@@ -67,12 +81,17 @@ class _MhcCollapse:
 
     @cute.jit
     def __call__(
-        self, state: cute.Tensor, pre_mix: cute.Tensor, out: cute.Tensor,
-        tokens: Int32, stream: cuda.CUstream,
+        self,
+        state: cute.Tensor,
+        pre_mix: cute.Tensor,
+        out: cute.Tensor,
+        tokens: Int32,
+        stream: cuda.CUstream,
     ) -> None:
         self.kernel(state, pre_mix, out).launch(
             grid=((self.hidden_size + 255) // 256, tokens, 1),
-            block=(256, 1, 1), stream=stream,
+            block=(256, 1, 1),
+            stream=stream,
         )
 
     @cute.kernel
@@ -92,9 +111,14 @@ class _MhcCollapse:
                 p2 = Float32(pre_mix[token, 2])
                 p3 = Float32(pre_mix[token, 3])
             out[token, h] = _contract_four(
-                p0, p1, p2, p3,
-                Float32(state[token, 0, h]), Float32(state[token, 1, h]),
-                Float32(state[token, 2, h]), Float32(state[token, 3, h]),
+                p0,
+                p1,
+                p2,
+                p3,
+                Float32(state[token, 0, h]),
+                Float32(state[token, 1, h]),
+                Float32(state[token, 2, h]),
+                Float32(state[token, 3, h]),
             ).to(cutlass.BFloat16)
 
 
@@ -104,8 +128,11 @@ def _collapse_kernel(hidden_size: int, weighted: bool) -> _MhcCollapse:
 
 
 def _run_mhc_collapse_launch(
-    state: torch.Tensor, pre_mix: torch.Tensor | None, out: torch.Tensor,
-    *, _prepared=None,
+    state: torch.Tensor,
+    pre_mix: torch.Tensor | None,
+    out: torch.Tensor,
+    *,
+    _prepared=None,
 ):
     if torch._C._overlaps(state, out) or (
         pre_mix is not None and torch._C._overlaps(pre_mix, out)
@@ -116,21 +143,27 @@ def _run_mhc_collapse_launch(
         return
     weighted = pre_mix is not None
     args = (
-        _to_kernel_tensor(state, cutlass.BFloat16, assumed_align=2, dynamic_layout=True),
+        _to_kernel_tensor(
+            state, cutlass.BFloat16, assumed_align=2, dynamic_layout=True
+        ),
         _to_kernel_tensor(
             pre_mix if weighted else state,
             cutlass.Float32 if weighted else cutlass.BFloat16,
-            assumed_align=4 if weighted else 2, dynamic_layout=True,
+            assumed_align=4 if weighted else 2,
+            dynamic_layout=True,
         ),
         _to_kernel_tensor(out, cutlass.BFloat16, assumed_align=2, dynamic_layout=True),
-        Int32(tokens), current_cuda_stream(),
+        Int32(tokens),
+        current_cuda_stream(),
     )
     if _prepared is not None:
         return run_compiled(_prepared, args)
     key = (
-        hidden, weighted,
+        hidden,
+        weighted,
         tensor_key(
-            "state", state,
+            "state",
+            state,
             dims=(DimKey.dynamic(), DimKey.exact(4), DimKey.exact(hidden)),
         ),
         tensor_key("out", out, dims=(DimKey.dynamic(), DimKey.exact(hidden))),
@@ -138,10 +171,9 @@ def _run_mhc_collapse_launch(
     return _compile_mhc_entry(
         _collapse_kernel(hidden, weighted),
         compile_spec=KernelCompileSpec.from_key("norm.mhc.collapse", 1, key),
-        compile_args=args, runtime_args=args,
+        compile_args=args,
+        runtime_args=args,
     )
-
-
 
 
 _MHC_MULT = 4
@@ -174,19 +206,11 @@ _PREFILL_MMA_THREADS = 32
 _PREFILL_MMA_TILE_M = 16
 _PREFILL_MMA_TILE_N = 8
 _PREFILL_MMA_TILE_K = 16
-_PREFILL_TMA_COMPUTE_WARPS = int(
-    os.getenv("B12X_MHC_PREFILL_TMA_WARPS", "8")
-)
+_PREFILL_TMA_COMPUTE_WARPS = int(os.getenv("B12X_MHC_PREFILL_TMA_WARPS", "8"))
 _PREFILL_TMA_THREADS = (_PREFILL_TMA_COMPUTE_WARPS + 1) * 32
-_PREFILL_TMA_TILE_M = int(
-    os.getenv("B12X_MHC_PREFILL_TMA_TILE_M", "128")
-)
-_PREFILL_TMA_TILE_N = int(
-    os.getenv("B12X_MHC_PREFILL_TMA_TILE_N", "16")
-)
-_PREFILL_TMA_TILE_K = int(
-    os.getenv("B12X_MHC_PREFILL_TMA_TILE_K", "64")
-)
+_PREFILL_TMA_TILE_M = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_M", "128"))
+_PREFILL_TMA_TILE_N = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_N", "16"))
+_PREFILL_TMA_TILE_K = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_K", "64"))
 _PREFILL_TMA_STAGES = int(os.getenv("B12X_MHC_PREFILL_TMA_STAGES", "3"))
 _PREFILL_TF32_TMA_M_WARPS = int(
     os.getenv(
@@ -197,9 +221,7 @@ _PREFILL_TF32_TMA_M_WARPS = int(
         ),
     )
 )
-_PREFILL_TF32_TMA_N_WARPS = int(
-    os.getenv("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1")
-)
+_PREFILL_TF32_TMA_N_WARPS = int(os.getenv("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"))
 _PREFILL_TF32_TMA_COMPUTE_WARPS = _PREFILL_TF32_TMA_M_WARPS * _PREFILL_TF32_TMA_N_WARPS
 _PREFILL_TF32_TMA_THREADS = (_PREFILL_TF32_TMA_COMPUTE_WARPS + 1) * 32
 _PREFILL_TF32_TMA_TILE_M = int(
@@ -208,9 +230,7 @@ _PREFILL_TF32_TMA_TILE_M = int(
         os.getenv("B12X_MHC_PREFILL_TMA_TILE_M", "16"),
     )
 )
-_PREFILL_TF32_TMA_TILE_N = int(
-    os.getenv("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8")
-)
+_PREFILL_TF32_TMA_TILE_N = int(os.getenv("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8"))
 _PREFILL_TF32_TMA_TILE_K = int(
     os.getenv(
         "B12X_MHC_PREFILL_TF32_TMA_TILE_K",
@@ -301,9 +321,7 @@ _PREFILL_TF32_TMA_LONG_4096_TILE_K = int(
 _PREFILL_TF32_TMA_LONG_4096_STAGES = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_STAGES", "2")
 )
-_PREFILL_FINALIZE_THREADS = int(
-    os.getenv("B12X_MHC_PREFILL_FINALIZE_THREADS", "256")
-)
+_PREFILL_FINALIZE_THREADS = int(os.getenv("B12X_MHC_PREFILL_FINALIZE_THREADS", "256"))
 _POST_PRE_CHUNK = 12
 
 # --- Gram-trick split finalize (multi-CTA fuse_norm, no per-h norm reduction) -
@@ -425,10 +443,15 @@ def _to_kernel_tensor(
 ) -> cutlass.cute.Tensor:
     if compile_only_launches_enabled() and hasattr(tensor, "fake_mode"):
         from cutlass.cute.runtime import make_fake_tensor
-        leading_dim = next((i for i, stride in enumerate(tensor.stride()) if stride == 1), None)
+
+        leading_dim = next(
+            (i for i, stride in enumerate(tensor.stride()) if stride == 1), None
+        )
         if dynamic_layout and tensor.ndim >= 1 and leading_dim is not None:
             shape = tuple(cute.sym_int(32) for _ in tensor.shape)
-            strides = tuple(1 if i == leading_dim else cute.sym_int(64) for i in range(tensor.ndim))
+            strides = tuple(
+                1 if i == leading_dim else cute.sym_int(64) for i in range(tensor.ndim)
+            )
         else:
             shape, strides = tuple(tensor.shape), tuple(tensor.stride())
         return make_fake_tensor(dtype, shape, strides, assumed_align=assumed_align)
@@ -534,15 +557,6 @@ def _validate_post_pre_partials_per_cta(partials_per_cta: int) -> int:
             f"[1, {_PARTIALS}], got {partials_per_cta}"
         )
     return partials_per_cta
-
-
-
-
-
-
-
-
-
 
 
 @lru_cache(maxsize=32)
@@ -951,9 +965,7 @@ class MHCPostPrePartialKernel:
                     cutlass.BFloat16
                 )
                 y[token, h] = y_bf16
-                lagged_sum = _warp_allreduce_sum(
-                    Float32(y_bf16) * Float32(y_bf16)
-                )
+                lagged_sum = _warp_allreduce_sum(Float32(y_bf16) * Float32(y_bf16))
                 if lane == Int32(0):
                     lagged_sums[warp] = lagged_sum
 
@@ -2657,7 +2669,9 @@ class MHCPrefillTf32ProjectTmaKernel:
         if self.tile_k % 8 != 0:
             raise ValueError(f"TF32 TMA tile_k={self.tile_k} must be divisible by 8")
         if self.tile_k < 32:
-            raise ValueError("TF32 TMA projection requires at least 32 FP32 weights per row")
+            raise ValueError(
+                "TF32 TMA projection requires at least 32 FP32 weights per row"
+            )
         if self.tile_n <= 0 or self.tile_n % 8 != 0:
             raise ValueError(
                 f"TF32 TMA tile_n={self.tile_n} must be a positive multiple of 8 "
@@ -2950,7 +2964,10 @@ class MHCPrefillTf32ProjectTmaKernel:
                                 acc_low[warp_mma_n, 1],
                                 acc_low[warp_mma_n, 2],
                                 acc_low[warp_mma_n, 3],
-                                a0_tf32, a1_tf32, a2_tf32, a3_tf32,
+                                a0_tf32,
+                                a1_tf32,
+                                a2_tf32,
+                                a3_tf32,
                                 _tf32_residual_bits(b0_f, b0_tf32),
                                 _tf32_residual_bits(b1_f, b1_tf32),
                             )
@@ -3224,9 +3241,14 @@ class MHCFinalizeGramKernel:
     ):
         self.lagged_prepared = bool(lagged_prepared)
         if self.lagged_prepared and (
-            not lagged_mix or compact_partials or single_cta or active_source_splits not in (0, _source_tiles_for_hidden(hidden_size))
+            not lagged_mix
+            or compact_partials
+            or single_cta
+            or active_source_splits not in (0, _source_tiles_for_hidden(hidden_size))
         ):
-            raise ValueError("prepared lagged finalize requires standard full-source partials")
+            raise ValueError(
+                "prepared lagged finalize requires standard full-source partials"
+            )
         self.hidden_size = int(hidden_size)
         self.single_cta = bool(single_cta)
         self.single_cta_threads = int(single_cta_threads)
@@ -3353,7 +3375,18 @@ class MHCFinalizeGramKernel:
             and norm_weight.element_type != cutlass.Float32
         ):
             raise TypeError("norm_weight must be BFloat16 or Float32")
-        self.kernel(residual, partials, scale, bias, y, post, comb, norm_weight, pre_mix, pre_out).launch(
+        self.kernel(
+            residual,
+            partials,
+            scale,
+            bias,
+            y,
+            post,
+            comb,
+            norm_weight,
+            pre_mix,
+            pre_out,
+        ).launch(
             grid=(self.hidden_tiles // self.tiles_per_cta, num_tokens, 1),
             block=[self.num_threads, 1, 1],
             stream=stream,
@@ -3545,7 +3578,9 @@ class MHCFinalizeGramKernel:
             lagged_norm_value = Float32(0.0)
             if tidx < Int32(self.source_warps * 32):
                 if tidx < Int32(self.source_tiles):
-                    lagged_norm_value = Float32(partials[token, Int32(self.gram_row0) + tidx, 0])
+                    lagged_norm_value = Float32(
+                        partials[token, Int32(self.gram_row0) + tidx, 0]
+                    )
                 lagged_norm_value = _warp_allreduce_sum(lagged_norm_value)
                 if tidx % Int32(32) == Int32(0):
                     norm_partials[norm_base + tidx // Int32(32)] = lagged_norm_value
@@ -3553,7 +3588,9 @@ class MHCFinalizeGramKernel:
             lagged_norm_total = Float32(0.0)
             if tidx == Int32(0):
                 for warp_idx in cutlass.range_constexpr(self.source_warps):
-                    lagged_norm_total += Float32(norm_partials[norm_base + Int32(warp_idx)])
+                    lagged_norm_total += Float32(
+                        norm_partials[norm_base + Int32(warp_idx)]
+                    )
                 gram[0] = lagged_norm_total
 
         if const_expr(self.single_cta):
@@ -3950,7 +3987,8 @@ class MHCFinalizeGramKernel:
                 )
             elif const_expr(self.lagged_prepared and self.lagged_norm):
                 s_post[0] = cute.math.rsqrt(
-                    Float32(gram[0]) / Float32(self.hidden_size) + Float32(self.norm_eps),
+                    Float32(gram[0]) / Float32(self.hidden_size)
+                    + Float32(self.norm_eps),
                     fastmath=True,
                 )
 
@@ -3982,9 +4020,14 @@ class MHCFinalizeGramKernel:
                 for tile in cutlass.range_constexpr(self.hidden_tiles):
                     h = Int32(tile * self.num_threads) + tidx
                     value = _contract_four(
-                        p0, p1, p2, p3,
-                        Float32(residual[token, 0, h]), Float32(residual[token, 1, h]),
-                        Float32(residual[token, 2, h]), Float32(residual[token, 3, h]),
+                        p0,
+                        p1,
+                        p2,
+                        p3,
+                        Float32(residual[token, 0, h]),
+                        Float32(residual[token, 1, h]),
+                        Float32(residual[token, 2, h]),
+                        Float32(residual[token, 3, h]),
                     ).to(cutlass.BFloat16)
                     values[tile] = Float32(value)
                     square_sum += Float32(value) * Float32(value)
@@ -4313,9 +4356,13 @@ def _run_mhc_post_pre_partial_launch(
             raise ValueError("pre_mix and y must be contiguous")
     pre_mix_arg = pre_mix if lagged_mix else prev_post
     y_arg = y if lagged_mix else out
-    decode_bf16x2 = (not lagged_mix) and decode_bf16x2 and all(
-        tensor.is_contiguous() and tensor.data_ptr() % 4 == 0
-        for tensor in (x, residual, out)
+    decode_bf16x2 = (
+        (not lagged_mix)
+        and decode_bf16x2
+        and all(
+            tensor.is_contiguous() and tensor.data_ptr() % 4 == 0
+            for tensor in (x, residual, out)
+        )
     )
     compute_gram = bool(compute_gram)
     split_n_abi = decode_source_splits > 0 and not lagged_mix
@@ -4483,15 +4530,6 @@ def _run_mhc_post_pre_partial_launch(
     )
 
 
-
-
-
-
-
-
-
-
-
 def _run_mhc_post_pre_prefill_partial_launch(
     *,
     x: torch.Tensor,
@@ -4615,15 +4653,6 @@ def _run_mhc_post_pre_prefill_partial_launch(
         compile_args=args,
         runtime_args=args,
     )
-
-
-
-
-
-
-
-
-
 
 
 def _run_mhc_post_pre_prefill_block_m_partial_launch(
@@ -4754,20 +4783,13 @@ def _run_mhc_post_pre_prefill_block_m_partial_launch(
         cache_key,
     )
     return _compile_mhc_entry(
-        _post_pre_prefill_block_m_partial_kernel(hidden_size, split_k, block_m, tile_n, compute_gram),
+        _post_pre_prefill_block_m_partial_kernel(
+            hidden_size, split_k, block_m, tile_n, compute_gram
+        ),
         compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
         compile_args=args,
         runtime_args=args,
     )
-
-
-
-
-
-
-
-
-
 
 
 def _run_mhc_post_pre_prefill_gram_launch(
@@ -4884,15 +4906,6 @@ def _run_mhc_post_pre_prefill_gram_launch(
         compile_args=args,
         runtime_args=args,
     )
-
-
-
-
-
-
-
-
-
 
 
 def _run_mhc_prefill_bf16_project_launch(
@@ -5040,15 +5053,6 @@ def _run_mhc_prefill_bf16_project_launch(
     )
 
 
-
-
-
-
-
-
-
-
-
 def _run_mhc_prefill_tf32_project_launch(
     *,
     out: torch.Tensor,
@@ -5161,30 +5165,6 @@ def _run_mhc_prefill_tf32_project_launch(
         compile_args=args,
         runtime_args=args,
     )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _run_mhc_post_launch(
@@ -5313,15 +5293,6 @@ def _run_mhc_post_launch(
     )
 
 
-
-
-
-
-
-
-
-
-
 def _run_mhc_pre_partial_launch(
     *,
     residual: torch.Tensor,
@@ -5344,7 +5315,9 @@ def _run_mhc_pre_partial_launch(
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
     expanded = residual.ndim == 3
-    residual_shape = (tokens, _MHC_MULT, hidden_size) if expanded else (tokens, hidden_size)
+    residual_shape = (
+        (tokens, _MHC_MULT, hidden_size) if expanded else (tokens, hidden_size)
+    )
     fn_width = _MHC_MULT * hidden_size if expanded else hidden_size
     _validate_tensor_shape("residual", residual, residual_shape)
     _validate_tensor_shape("fn", fn, (_MIXES, fn_width))
@@ -5475,15 +5448,6 @@ def _run_mhc_pre_partial_launch(
     )
 
 
-
-
-
-
-
-
-
-
-
 def _run_mhc_finalize_gram_launch(
     *,
     residual: torch.Tensor,
@@ -5562,8 +5526,18 @@ def _run_mhc_finalize_gram_launch(
             dynamic_layout=True,
         ),
         norm_weight_tensor,
-        _to_kernel_tensor(pre_mix if lagged_mix else scale, cutlass.Float32, assumed_align=4, dynamic_layout=True),
-        _to_kernel_tensor(pre_out if lagged_mix else bias, cutlass.Float32, assumed_align=4, dynamic_layout=True),
+        _to_kernel_tensor(
+            pre_mix if lagged_mix else scale,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
+        _to_kernel_tensor(
+            pre_out if lagged_mix else bias,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
         Int32(tokens),
         current_cuda_stream(),
     )
@@ -5579,10 +5553,21 @@ def _run_mhc_finalize_gram_launch(
         else ("norm_weight", None)
     )
     kernel = _finalize_gram_kernel(
-        hidden_size, split_k, rms_eps, hc_eps, sinkhorn_iters, norm_eps,
-        fuse_norm, compact_partials, compact_projection_splits, single_cta,
+        hidden_size,
+        split_k,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_eps,
+        fuse_norm,
+        compact_partials,
+        compact_projection_splits,
+        single_cta,
         single_cta_threads if single_cta else _PREFILL_FINALIZE_THREADS,
-        single_cta_groups, active_source_splits, lagged_mix, bool(lagged_prepared),
+        single_cta_groups,
+        active_source_splits,
+        lagged_mix,
+        bool(lagged_prepared),
     )
     common_key_tail = (
         (
@@ -5686,51 +5671,16 @@ def _run_mhc_finalize_gram_launch(
     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @dsl_user_op
 def _tf32_residual_bits(value: Float32, high: Uint32, *, loc=None, ip=None) -> Uint32:
     """Round the FP32 remainder after the first TF32 term."""
     return Uint32(
         llvm.inline_asm(
             T.i32(),
-            [Float32(value).ir_value(loc=loc, ip=ip), Uint32(high).ir_value(loc=loc, ip=ip)],
+            [
+                Float32(value).ir_value(loc=loc, ip=ip),
+                Uint32(high).ir_value(loc=loc, ip=ip),
+            ],
             "{ .reg .f32 hi, lo; mov.b32 hi, $2; sub.rn.f32 lo, $1, hi; cvt.rna.tf32.f32 $0, lo; }",
             "=r,f,r",
             has_side_effects=False,

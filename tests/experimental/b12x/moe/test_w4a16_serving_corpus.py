@@ -274,9 +274,7 @@ def _run_nano35_serving_case(m: int, weights: _Nano35Weights) -> None:
     free_before_buffers, device_total = torch.cuda.mem_get_info(device)
     torch.cuda.reset_peak_memory_stats(device)
     x, topk_ids, topk_weights, prototype = _make_repeated_inputs(m)
-    live_prototype = (
-        prototype.float() * -0.75 + 0.015625
-    ).to(torch.bfloat16)
+    live_prototype = (prototype.float() * -0.75 + 0.015625).to(torch.bfloat16)
     live_topk_ids = (topk_ids + 1) % _NANO35_EXPERTS
     assert not torch.equal(live_prototype, prototype)
     assert not torch.equal(live_topk_ids, topk_ids)

@@ -36,9 +36,17 @@ def _prepared_dispatch(manager, inp, **call):
     from b12x.comm.pcie import _preparation
 
     with (
-        patch.object(_preparation, "query_from_runtime", side_effect=lambda runtime, **_: runtime),
-        patch.object(_preparation, "plan", side_effect=lambda query, **_: SimpleNamespace(runtime=query)),
-        patch.object(pcie_allreduce, "require_prepared", side_effect=lambda plan, *_: plan),
+        patch.object(
+            _preparation, "query_from_runtime", side_effect=lambda runtime, **_: runtime
+        ),
+        patch.object(
+            _preparation,
+            "plan",
+            side_effect=lambda query, **_: SimpleNamespace(runtime=query),
+        ),
+        patch.object(
+            pcie_allreduce, "require_prepared", side_effect=lambda plan, *_: plan
+        ),
     ):
         plan = manager.plan(inp, **call)
         manager.all_reduce(inp, plan=plan, **call)
@@ -51,10 +59,17 @@ def test_hierarchical_query_preserves_tensor_metadata(strided: bool) -> None:
     from b12x.preparation import FrozenMapping
 
     runtime = SimpleNamespace(
-        rank=0, world_size=16, threads=256, wait_nanosleep_cycles=0,
-        double_buffered=True, deferred_consumption=False,
-        vectorized_bf16x2=True, vectorized_bf16x2_max_elements=7168,
-        max_elements=8192, blocks=None, slab_bytes=65536,
+        rank=0,
+        world_size=16,
+        threads=256,
+        wait_nanosleep_cycles=0,
+        double_buffered=True,
+        deferred_consumption=False,
+        vectorized_bf16x2=True,
+        vectorized_bf16x2_max_elements=7168,
+        max_elements=8192,
+        blocks=None,
+        slab_bytes=65536,
         mapped_peers=(1, 2, 3, 4, 8, 12),
     )
     inp = torch.empty((2, 64), dtype=torch.bfloat16)
@@ -62,7 +77,8 @@ def test_hierarchical_query_preserves_tensor_metadata(strided: bool) -> None:
         inp = inp[:, ::2]
     out = torch.empty_like(inp)
     query = _owner_preparation.query_from_runtime(
-        runtime, surface="PCIeHierarchicalAllReduce.all_reduce",
+        runtime,
+        surface="PCIeHierarchicalAllReduce.all_reduce",
         call={"inp": inp, "out": out},
     )
     encoded = query.call["inp"]
@@ -551,7 +567,9 @@ def test_allreduce_oneshot_forwards_named_channel_contract() -> None:
 
     allreduce.prepare_channels(("target", "draft"))
     allreduce.for_stream(stream, channel_id="target")
-    plan = _prepared_dispatch(allreduce, inp, out=out, stream=stream, channel_id="target")
+    plan = _prepared_dispatch(
+        allreduce, inp, out=out, stream=stream, channel_id="target"
+    )
     with allreduce.capture(stream, channel_id="target"):
         pass
 
@@ -590,7 +608,9 @@ def test_allreduce_hierarchy_accepts_named_channel_contract() -> None:
 
     allreduce.prepare_channels(("target", "draft"))
     allreduce.for_stream(stream, channel_id="target")
-    plan = _prepared_dispatch(allreduce, inp, out=out, stream=stream, channel_id="target")
+    plan = _prepared_dispatch(
+        allreduce, inp, out=out, stream=stream, channel_id="target"
+    )
     with allreduce.capture(stream, channel_id="target"):
         pass
 

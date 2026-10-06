@@ -178,8 +178,12 @@ def test_packed_weight_preparation_shapes_and_dtypes(
         intermediate_size=intermediate_size,
         activation=activation,
     )
-    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
-    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
 
     prepared = prepare_w4a16_weights(
         w13,
@@ -230,8 +234,12 @@ def test_modelopt_nvfp4_preparation_packs_runtime_weights(
         intermediate_size=intermediate_size,
         activation=activation,
     )
-    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
-    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
 
     actual = prepare_w4a16_weights(
         w13,
@@ -326,8 +334,12 @@ def test_legacy_modelopt_source_format_is_not_accepted() -> None:
         experts=experts,
         activation="relu2",
     )
-    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
-    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
 
     with pytest.raises(ValueError, match="modelopt_nvfp4"):
         prepare_w4a16_packed_weights(
@@ -391,7 +403,9 @@ def test_compressed_tensors_source_matches_reciprocal_modelopt_nvfp4_contract(
         "w2_scale",
         "w2_global_scale",
     ):
-        assert torch.equal(getattr(modelopt, name), getattr(compressed_tensors, name)), name
+        assert torch.equal(
+            getattr(modelopt, name), getattr(compressed_tensors, name)
+        ), name
 
 
 def test_mxfp4_native_source_format_is_removed() -> None:
@@ -438,8 +452,12 @@ def test_fp4_e8m0_k32_scales_clamp_high_bytes_and_keep_scale_count(
     w2_source_scale_bytes = w2_scale_bytes.clone()
     w13_clamped_scale_bytes = w13_source_scale_bytes.clamp(max=247)
     w2_clamped_scale_bytes = w2_source_scale_bytes.clamp(max=247)
-    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
-    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
 
     actual = prepare_w4a16_fp4_e8m0_k32_weights(
         w13.clone() if reuse_input_storage else w13,
@@ -528,8 +546,12 @@ def test_packed_weight_preparation_can_reuse_input_storage(activation: str) -> N
         intermediate_size=intermediate_size,
         activation=activation,
     )
-    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
-    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+    w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
+    w2_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
+        torch.float32
+    )
 
     expected = prepare_w4a16_weights(
         w13.clone(),
@@ -644,12 +666,8 @@ def test_integration_modelopt_nvfp4_preparation_uses_raw_weight_global_scales(
         intermediate_size=intermediate_size,
         activation=activation,
     )
-    w13_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
-        torch.float32
-    )
-    w2_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
-        torch.float32
-    )
+    w13_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+    w2_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
     a1_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
     a2_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
 
@@ -753,12 +771,8 @@ def test_integration_modelopt_nvfp4_preparation_can_reuse_input_storage(
         intermediate_size=intermediate_size,
         activation=activation,
     )
-    w13_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
-        torch.float32
-    )
-    w2_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
-        torch.float32
-    )
+    w13_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
+    w2_alphas = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(torch.float32)
     a1_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
     a2_gscale = (torch.rand(experts, device="cuda") * 0.5 + 0.75).to(torch.float32)
 

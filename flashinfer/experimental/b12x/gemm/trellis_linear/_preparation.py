@@ -1,4 +1,5 @@
 """Prepared native Trellis dense declarations and dispatch."""
+
 from __future__ import annotations
 
 import weakref
@@ -9,7 +10,10 @@ from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x._lib.scratch import scratch_buffer_spec
 from b12x.preparation import (
-    FrozenMapping, MemoryRequirements, PersistentMemory, Plan,
+    FrozenMapping,
+    MemoryRequirements,
+    PersistentMemory,
+    Plan,
     current_plan,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import PreparedTrellis256DenseWeight
@@ -110,7 +114,9 @@ def _compile_trellis(query_payload, config_payload, ordinal, sm_count):
 def _c_tmp_elements(query: TrellisQuery, config: TrellisConfig, sm_count: int) -> int:
     from b12x.moe._shared.kernels.w4a16.kernel import packed_gemm_scratch_elements
 
-    route_slots = ((query.max_rows + config.block_rows - 1) // config.block_rows) * config.block_rows
+    route_slots = (
+        (query.max_rows + config.block_rows - 1) // config.block_rows
+    ) * config.block_rows
     return packed_gemm_scratch_elements(
         size_n=query.out_features,
         route_slots=route_slots,
@@ -155,36 +161,70 @@ class _TrellisExecutionState:
     grid_cap: int
     c_tmp_owner: tuple[object, ...] | None
 
-    def run(self, x, *, output=None, gemm_output=None, input_f16=None,
-            rotated_f16=None, rotated_compute=None, gemm_output_f16=None,
-            output_f16=None):
+    def run(
+        self,
+        x,
+        *,
+        output=None,
+        gemm_output=None,
+        input_f16=None,
+        rotated_f16=None,
+        rotated_compute=None,
+        gemm_output_f16=None,
+        output_f16=None,
+    ):
         from b12x.moe._shared.kernels.w4a16.kernel import run_trellis256_dense
 
         if not isinstance(x, torch.Tensor) or x.device != self.device:
             raise ValueError("Trellis source device differs from prepared plan")
         if _dtype_name(x.dtype) != self.query.input_dtype:
             raise ValueError("Trellis source dtype differs from preparation")
-        if x.ndim != 2 or int(x.shape[0]) != self.query.max_rows or int(x.shape[1]) != self.query.in_features:
+        if (
+            x.ndim != 2
+            or int(x.shape[0]) != self.query.max_rows
+            or int(x.shape[1]) != self.query.in_features
+        ):
             raise ValueError("Trellis plan requires its exact planned [M, K] input")
         if (output is None) != (self.query.output_mode == "functional"):
             raise ValueError("Trellis output mode differs from preparation")
         for name in (
-            "gemm_output", "input_f16", "rotated_f16", "rotated_compute",
-            "gemm_output_f16", "output_f16",
+            "gemm_output",
+            "input_f16",
+            "rotated_f16",
+            "rotated_compute",
+            "gemm_output_f16",
+            "output_f16",
         ):
             if (locals()[name] is not None) != getattr(self.query, f"{name}_provided"):
-                raise ValueError(f"Trellis {name} workspace form differs from preparation")
+                raise ValueError(
+                    f"Trellis {name} workspace form differs from preparation"
+                )
         return run_trellis256_dense(
-            x, self.weight, launch=self.launch, execution_lut=self.execution_lut,
-            grid_cap=self.grid_cap, output=output, gemm_output=gemm_output,
-            input_f16=input_f16, rotated_f16=rotated_f16,
-            rotated_compute=rotated_compute, gemm_output_f16=gemm_output_f16,
-            output_f16=output_f16, hadamard_128=self.hadamard_128,
+            x,
+            self.weight,
+            launch=self.launch,
+            execution_lut=self.execution_lut,
+            grid_cap=self.grid_cap,
+            output=output,
+            gemm_output=gemm_output,
+            input_f16=input_f16,
+            rotated_f16=rotated_f16,
+            rotated_compute=rotated_compute,
+            gemm_output_f16=gemm_output_f16,
+            output_f16=output_f16,
+            hadamard_128=self.hadamard_128,
         )
 
 
-def plan(query: TrellisQuery, *, weight: PreparedTrellis256DenseWeight,
-         invocation=FrozenMapping(), override=None, c_tmp=None, hadamard_128=None) -> Plan:
+def plan(
+    query: TrellisQuery,
+    *,
+    weight: PreparedTrellis256DenseWeight,
+    invocation=FrozenMapping(),
+    override=None,
+    c_tmp=None,
+    hadamard_128=None,
+) -> Plan:
     """Declare an exact-M Trellis plan; all code is loaded by the session."""
     if not isinstance(query, TrellisQuery):
         raise TypeError("Trellis plan requires TrellisQuery")
@@ -194,29 +234,50 @@ def plan(query: TrellisQuery, *, weight: PreparedTrellis256DenseWeight,
     if invocation:
         raise ValueError("Trellis invocation semantics belong in TrellisQuery")
     if hadamard_128 is not None:
-        supplied = hadamard_128 if callable(hadamard_128) else getattr(
-            hadamard_128, "had_r_128", None
+        supplied = (
+            hadamard_128
+            if callable(hadamard_128)
+            else getattr(hadamard_128, "had_r_128", None)
         )
         if not callable(supplied):
             raise TypeError("hadamard_128 must be callable or expose had_r_128")
-    if query.transform_mode != ("supplied" if hadamard_128 is not None else "extension"):
-        raise ValueError("Trellis transform metadata differs from the supplied transform")
+    if query.transform_mode != (
+        "supplied" if hadamard_128 is not None else "extension"
+    ):
+        raise ValueError(
+            "Trellis transform metadata differs from the supplied transform"
+        )
     if query.c_tmp_mode != ("provided" if c_tmp is not None else "internal"):
         raise ValueError("Trellis c_tmp metadata differs from the supplied workspace")
-    if (query.in_features, query.out_features, query.compute_dtype, query.codebook, query.bits,
-            query.pair_kind, query.rate_axis) != (
-        weight.in_features, weight.out_features, _dtype_name(weight.params_dtype),
-        weight.trellis_codebook, weight.trellis_bits, weight.trellis_pair_kind,
+    if (
+        query.in_features,
+        query.out_features,
+        query.compute_dtype,
+        query.codebook,
+        query.bits,
+        query.pair_kind,
+        query.rate_axis,
+    ) != (
+        weight.in_features,
+        weight.out_features,
+        _dtype_name(weight.params_dtype),
+        weight.trellis_codebook,
+        weight.trellis_bits,
+        weight.trellis_pair_kind,
         weight.trellis_rate_axis,
     ):
         raise ValueError("Trellis declaration metadata differs from prepared weight")
 
     def compile_jobs(config, device):
-        return (CompileJob.create(
-            "b12x.gemm.trellis_linear._preparation:_compile_trellis",
-            TUNING.encode_query(query), TUNING.encode_config(config), device.ordinal,
-            device.identity.sm_count,
-        ),)
+        return (
+            CompileJob.create(
+                "b12x.gemm.trellis_linear._preparation:_compile_trellis",
+                TUNING.encode_query(query),
+                TUNING.encode_config(config),
+                device.ordinal,
+                device.identity.sm_count,
+            ),
+        )
 
     def memory(config, device):
         elements = _c_tmp_elements(query, config, device.identity.sm_count)
@@ -230,14 +291,21 @@ def plan(query: TrellisQuery, *, weight: PreparedTrellis256DenseWeight,
                 or int(c_tmp.data_ptr()) % 16
                 or c_tmp.numel() < elements
             ):
-                raise ValueError("provided Trellis c_tmp cannot cover the selected launch")
-            specs.append(scratch_buffer_spec("trellis_linear.c_tmp", nbytes=elements * 4, device=c_tmp.device))
+                raise ValueError(
+                    "provided Trellis c_tmp cannot cover the selected launch"
+                )
+            specs.append(
+                scratch_buffer_spec(
+                    "trellis_linear.c_tmp", nbytes=elements * 4, device=c_tmp.device
+                )
+            )
         else:
             owner = ("gemm.trellis_linear.c_tmp", current_plan(), device.ordinal)
             resident = _INTERNAL_C_TMPS.get(owner)
             resident_nbytes = (
                 resident.numel() * resident.element_size()
-                if resident is not None else 0
+                if resident is not None
+                else 0
             )
             persistent.append(PersistentMemory(owner, elements * 4, resident_nbytes))
         lut_memory = _lut_memory(query, device)
@@ -253,41 +321,70 @@ def plan(query: TrellisQuery, *, weight: PreparedTrellis256DenseWeight,
         }
         for name, nbytes in sizes.items():
             if getattr(query, f"{name}_provided"):
-                specs.append(scratch_buffer_spec(f"trellis_linear.{name}", nbytes=nbytes, device=torch.device("cuda", device.ordinal)))
+                specs.append(
+                    scratch_buffer_spec(
+                        f"trellis_linear.{name}",
+                        nbytes=nbytes,
+                        device=torch.device("cuda", device.ordinal),
+                    )
+                )
         return MemoryRequirements(tuple(specs), tuple(persistent))
 
     def materialize(selection, device):
-        from b12x.moe._shared.kernels.w4a16.kernel import _W4A16GemmLaunch, _resolve_exl3_hadamard_128, _trellis256_execution_lut
+        from b12x.moe._shared.kernels.w4a16.kernel import (
+            _W4A16GemmLaunch,
+            _resolve_exl3_hadamard_128,
+            _trellis256_execution_lut,
+        )
 
         config = selection.config
         programs = _compile_trellis(
-            TUNING.encode_query(query), TUNING.encode_config(config),
-            device.ordinal, device.identity.sm_count,
+            TUNING.encode_query(query),
+            TUNING.encode_config(config),
+            device.ordinal,
+            device.identity.sm_count,
         )
         elements = _c_tmp_elements(query, config, device.identity.sm_count)
         resolved_device = torch.device("cuda", device.ordinal)
         c_tmp_owner = None
         if c_tmp is None:
             c_tmp_owner = (
-                "gemm.trellis_linear.c_tmp", current_plan(), device.ordinal,
+                "gemm.trellis_linear.c_tmp",
+                current_plan(),
+                device.ordinal,
             )
             scratch = _INTERNAL_C_TMPS.get(c_tmp_owner)
             if scratch is None or scratch.numel() < elements:
-                scratch = torch.empty(elements, dtype=torch.float32, device=resolved_device)
+                scratch = torch.empty(
+                    elements, dtype=torch.float32, device=resolved_device
+                )
                 _INTERNAL_C_TMPS[c_tmp_owner] = scratch
         else:
             scratch = c_tmp
         launch = _W4A16GemmLaunch(kernel=programs["gemm"], c_tmp=scratch)
         lut = (
-            None if query.codebook == "mcg"
+            None
+            if query.codebook == "mcg"
             else _trellis256_execution_lut(resolved_device, query.codebook)
         )
         return _TrellisExecutionState(
-            query=query, weight=weight, device=resolved_device, launch=launch,
-            execution_lut=lut, hadamard_128=_resolve_exl3_hadamard_128(hadamard_128),
+            query=query,
+            weight=weight,
+            device=resolved_device,
+            launch=launch,
+            execution_lut=lut,
+            hadamard_128=_resolve_exl3_hadamard_128(hadamard_128),
             grid_cap=device.identity.sm_count * int(programs["gemm"].blocks_per_sm),
             c_tmp_owner=c_tmp_owner,
         )
-    return Plan(contract=TUNING, query=query, invocation=invocation, override=override,
-                _compile_jobs=compile_jobs, _memory_requirements=memory, _materialize=materialize,
-                _device=weight.trellis.device)
+
+    return Plan(
+        contract=TUNING,
+        query=query,
+        invocation=invocation,
+        override=override,
+        _compile_jobs=compile_jobs,
+        _memory_requirements=memory,
+        _materialize=materialize,
+        _device=weight.trellis.device,
+    )

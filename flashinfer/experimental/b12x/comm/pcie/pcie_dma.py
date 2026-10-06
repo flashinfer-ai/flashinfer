@@ -380,6 +380,7 @@ class PCIeDmaAllReduce:
         if out is None:
             out = torch.empty_like(inp)
         return state.run(inp, out=out)
+
     def _run_prepared(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor], state
     ) -> torch.Tensor:
@@ -391,7 +392,9 @@ class PCIeDmaAllReduce:
                 f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
             )
         if out is None:
-            raise ValueError("prepared DMA all_reduce requires a caller-owned output tensor")
+            raise ValueError(
+                "prepared DMA all_reduce requires a caller-owned output tensor"
+            )
         if (
             out.shape != inp.shape
             or out.dtype != inp.dtype
@@ -677,35 +680,64 @@ class PCIeDmaAllReduce:
             # The final slot is beyond both transport layouts for supported worlds.
             slot = FLAG_SLOTS - 1
             flag = self._flag_ptr(self.rank, slot)
-            self._kernels.dma_set_flag(flag, self._counter_ptr(self._send_counters, slot))
-            self._kernels.dma_wait_flag(flag, self._counter_ptr(self._wait_counters, slot))
+            self._kernels.dma_set_flag(
+                flag, self._counter_ptr(self._send_counters, slot)
+            )
+            self._kernels.dma_wait_flag(
+                flag, self._counter_ptr(self._wait_counters, slot)
+            )
             scratch = flag + 16
             self._kernels.dma_copy(scratch, scratch, 16)
             for dtype_code, elems in ((0, 8), (1, 8), (2, 4)):
                 self._kernels.dma_add(scratch, scratch, scratch, elems, dtype_code)
             if self._fp8:
                 if self._fp8_stage is None or self._fp8_stage.numel() < 512:
-                    raise RuntimeError("compressed DMA stage buffer is too small to prime")
+                    raise RuntimeError(
+                        "compressed DMA stage buffer is too small to prime"
+                    )
                 codec = (
-                    "i8" if self._fp8.startswith("i8")
-                    else "mx" if self._fp8.startswith("mx") else "e4m3"
+                    "i8"
+                    if self._fp8.startswith("i8")
+                    else "mx"
+                    if self._fp8.startswith("mx")
+                    else "e4m3"
                 )
                 stage = self._fp8_stage.data_ptr()
                 source, payload, scales = stage, stage + 256, stage + 384
                 self._kernels._quant(codec, source, payload, scales, FP8_QUANT_BLOCK)
-                self._kernels._dequant_store(codec, source, payload, scales, FP8_QUANT_BLOCK)
-                self._kernels._dequant_add_quant(
-                    codec, source, source, payload, scales, payload, scales,
-                    FP8_QUANT_BLOCK, False,
+                self._kernels._dequant_store(
+                    codec, source, payload, scales, FP8_QUANT_BLOCK
                 )
                 self._kernels._dequant_add_quant(
-                    codec, source, source, payload, scales, payload, scales,
-                    FP8_QUANT_BLOCK, True,
+                    codec,
+                    source,
+                    source,
+                    payload,
+                    scales,
+                    payload,
+                    scales,
+                    FP8_QUANT_BLOCK,
+                    False,
+                )
+                self._kernels._dequant_add_quant(
+                    codec,
+                    source,
+                    source,
+                    payload,
+                    scales,
+                    payload,
+                    scales,
+                    FP8_QUANT_BLOCK,
+                    True,
                 )
                 if self._fp8 == "a2a" or self._fp8.endswith("a2a"):
                     sources = [payload] * (self.world_size - 1)
                     self._kernels._dequant_accum(
-                        codec, source, source, sources, [scales] * len(sources),
+                        codec,
+                        source,
+                        source,
+                        sources,
+                        [scales] * len(sources),
                         FP8_QUANT_BLOCK,
                     )
             torch.cuda.current_stream(self.device).synchronize()
@@ -923,5 +955,6 @@ class PCIeDmaAllReduce:
         # Distributed barriers are unsafe during asymmetric interpreter
         # teardown. Explicit/context-manager close owns coordinated release.
         return None
+
 
 __all__ = ["PCIeDmaAllReduce"]

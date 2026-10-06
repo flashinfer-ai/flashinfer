@@ -29,6 +29,7 @@ from b12x.comm.pcie._dma_preparation import (
     query_from_runtime,
 )
 from b12x.preparation import PreparationSession
+import torch.multiprocessing as mp
 
 
 def free_port() -> int:
@@ -83,7 +84,10 @@ def worker(rank: int, world: int, port: int, mode: str) -> None:
     from b12x.comm.pcie.pcie_dma import PCIeDmaAllReduce
 
     ring = PCIeDmaAllReduce(
-        exchange_group=dist.group.WORLD, device=device, max_bytes=512 * 6144 * 2, fp8=mode
+        exchange_group=dist.group.WORLD,
+        device=device,
+        max_bytes=512 * 6144 * 2,
+        fp8=mode,
     )
     session = PreparationSession(device=device, autotune=False)
     result = None
@@ -106,7 +110,9 @@ def worker(rank: int, world: int, port: int, mode: str) -> None:
         output = torch.empty_like(inp)
         ring.all_reduce(inp, plan=plan, out=output)
         torch.cuda.synchronize(device)
-        assert_output(output, reference, rank=rank, world=world, mode=mode, label="eager")
+        assert_output(
+            output, reference, rank=rank, world=world, mode=mode, label="eager"
+        )
 
         graph_input = make_input(rank, device, 1)
         graph_output = torch.empty_like(graph_input)
@@ -120,7 +126,11 @@ def worker(rank: int, world: int, port: int, mode: str) -> None:
             graph.replay()
             torch.cuda.synchronize(device)
             assert_output(
-                graph_output, graph_reference, rank=rank, world=world, mode=mode,
+                graph_output,
+                graph_reference,
+                rank=rank,
+                world=world,
+                mode=mode,
                 label=f"graph-replay-{iteration}",
             )
         dist.barrier()

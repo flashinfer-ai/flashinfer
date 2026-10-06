@@ -37,7 +37,9 @@ class BlockInfo:
     per_segment_tiles: cutlass.Constexpr[bool] = False
 
     @cute.jit
-    def n_block_list(self, seqlen_info: SeqlenInfoQK, m_block: Int32) -> Tuple[Int32, Int32]:
+    def n_block_list(
+        self, seqlen_info: SeqlenInfoQK, m_block: Int32
+    ) -> Tuple[Int32, Int32]:
         """(offset, count) of this q tile's K blocks in the CSR list.
 
         With per_segment_tiles the CSR holds one list per packed segment and is indexed by

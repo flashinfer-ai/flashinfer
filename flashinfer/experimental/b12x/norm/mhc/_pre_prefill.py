@@ -74,7 +74,11 @@ def _kernel(hidden):
 
 
 def prepare_lagged_prefill(
-    residual: torch.Tensor, output: torch.Tensor, partials: torch.Tensor, *, _prepared=None,
+    residual: torch.Tensor,
+    output: torch.Tensor,
+    partials: torch.Tensor,
+    *,
+    _prepared=None,
 ):
     if (
         residual.ndim != 3

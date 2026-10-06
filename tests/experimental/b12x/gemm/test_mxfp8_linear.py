@@ -57,12 +57,19 @@ def _quantize_source(source):
     packed = mxfp8_rows_from_bases(*bases, rows, width, num_groups=1)
     args = (source, packed.values, packed.scale_rows, packed.scale_mma)
     plan = mxfp8_quant.plan(mxfp8_quant.query_from_call(*args))
-    with PreparationSession(device=source.device, autotune=False, compile_workers=2) as session:
-        session.prepare((plan.request(
-            name="reference_quantization", prepare_call=lambda state: PreparedCall(
-                run=lambda: state.run(*args),
-            ),
-        ),))
+    with PreparationSession(
+        device=source.device, autotune=False, compile_workers=2
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="reference_quantization",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.run(*args),
+                    ),
+                ),
+            )
+        )
         session.freeze()
         mxfp8_quant.quantize_rows(*args, plan=plan)
     return packed
@@ -137,9 +144,7 @@ def test_mm_persistent_ctas_complete_single_stage_epilogue_stores() -> None:
 
     with prepared((source_values, source_scale), packed, expected_m=tokens) as plan:
         for _ in range(4):
-            actual = mxfp8_linear.mm(
-                (source_values, source_scale), packed, plan=plan
-            )
+            actual = mxfp8_linear.mm((source_values, source_scale), packed, plan=plan)
             torch.cuda.synchronize()
             assert torch.all(actual == in_features)
 
@@ -166,19 +171,22 @@ def test_mm_prefill_swizzle_bounds_weight_scales(
         (out_features, in_features), dtype=torch.float8_e4m3fn, device="cuda"
     )
     exponents = torch.arange(out_features, device="cuda") % 4 - 2
-    scales = (exponents + 127).to(torch.uint8)[:, None].expand(
-        out_features, in_features // 32
-    ).contiguous()
+    scales = (
+        (exponents + 127)
+        .to(torch.uint8)[:, None]
+        .expand(out_features, in_features // 32)
+        .contiguous()
+    )
     packed = blockscaled.pack_weight(weight, scales)
-    expected = (in_features * 2.0 ** exponents).to(torch.bfloat16)
+    expected = (in_features * 2.0**exponents).to(torch.bfloat16)
 
-    with prepared(
-        source, packed, activation_mode="quantized"
-    ) as plan:
+    with prepared(source, packed, activation_mode="quantized") as plan:
         for tokens in (137, 2048, capacity):
             actual = blockscaled.mm(source[:tokens], packed, plan=plan)
             torch.cuda.synchronize()
-            torch.testing.assert_close(actual, expected.expand(tokens, -1), rtol=0, atol=0)
+            torch.testing.assert_close(
+                actual, expected.expand(tokens, -1), rtol=0, atol=0
+            )
 
         if not capture:
             return
@@ -201,7 +209,10 @@ def test_mm_prefill_swizzle_bounds_weight_scales(
                         == allocations
                     )
                     torch.testing.assert_close(
-                        actual, (expected * multiplier).expand(tokens, -1), rtol=0, atol=0
+                        actual,
+                        (expected * multiplier).expand(tokens, -1),
+                        rtol=0,
+                        atol=0,
                     )
             finally:
                 graph.reset()
@@ -216,7 +227,9 @@ def test_mm_writes_all_rows_for_unaligned_output_width(tokens: int) -> None:
 
     source, _, packed = _make_inputs(tokens, 7168, 132)
     expected = _reference_from_packed(source, packed)
-    with prepared(source, packed, activation_mode="quantized", expected_m=tokens) as plan:
+    with prepared(
+        source, packed, activation_mode="quantized", expected_m=tokens
+    ) as plan:
         actual = mxfp8_linear.mm(source, packed, plan=plan)
         torch.cuda.synchronize()
 
@@ -310,9 +323,13 @@ def test_mm_default_fused_path_captures_with_k_padding() -> None:
         graph.reset()
 
 
-@pytest.mark.parametrize("tokens,in_features", [(1, 160), (8, 256), (9, 256), (17, 160)])
+@pytest.mark.parametrize(
+    "tokens,in_features", [(1, 160), (8, 256), (9, 256), (17, 160)]
+)
 def test_mm_uses_quantizer_without_scale_padding_initialization(
-    monkeypatch, tokens: int, in_features: int,
+    monkeypatch,
+    tokens: int,
+    in_features: int,
 ) -> None:
     require_b12x()
     require_mxf8_mma()
@@ -390,13 +407,18 @@ def test_blockscaled_mm_accepts_prequantized_mxfp8_and_replays() -> None:
     for scales in (source_q.scale_mma, source_scale_storage):
         operands = (source_q.values, scales)
         with prepared(operands, packed) as plan:
-            actual = blockscaled.mm(operands, packed, plan=plan, out_dtype=torch.bfloat16)
+            actual = blockscaled.mm(
+                operands, packed, plan=plan, out_dtype=torch.bfloat16
+            )
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             graph = torch.cuda.CUDAGraph()
             try:
                 with torch.cuda.graph(graph):
                     graph_output = blockscaled.mm(
-                        operands, packed, plan=plan, out_dtype=torch.bfloat16,
+                        operands,
+                        packed,
+                        plan=plan,
+                        out_dtype=torch.bfloat16,
                     )
                 output_ptr = graph_output.data_ptr()
                 allocated = torch.cuda.memory_allocated()

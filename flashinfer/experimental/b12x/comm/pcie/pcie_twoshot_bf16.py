@@ -339,7 +339,9 @@ class PCIeTwoShotBF16:
         state = require_prepared(plan, "comm.pcie", self.device)
         state.require_runtime(self)
         if self._capture_context_depth:
-            raise RuntimeError("overlapping PCIe twoshot-bf16 capture contexts are not allowed")
+            raise RuntimeError(
+                "overlapping PCIe twoshot-bf16 capture contexts are not allowed"
+            )
         self._capture_context_depth = 1
         try:
             yield self
@@ -354,9 +356,13 @@ class PCIeTwoShotBF16:
         rows = payload.numel() // self.row_elems
         rows_per_rank = (
             rows // self.world_size
-            if operation in ("reduce_scatter", "all_reduce") else rows
+            if operation in ("reduce_scatter", "all_reduce")
+            else rows
         )
-        if int(threads) != state.query.call["threads"] or int(block_limit) != state.query.call["block_limit"]:
+        if (
+            int(threads) != state.query.call["threads"]
+            or int(block_limit) != state.query.call["block_limit"]
+        ):
             raise ValueError("two-shot launch controls differ from the prepared plan")
         shard_packs = rows_per_rank * (self.row_elems // _PACK_ELEMS)
         if shard_packs > self._pack_stride:
@@ -364,7 +370,9 @@ class PCIeTwoShotBF16:
         blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
         capturing = _is_current_stream_capturing(self.device)
         if capturing and self._capture_context_depth <= 0:
-            raise RuntimeError("PCIe twoshot-bf16 capture requires runtime.capture(plan=...)")
+            raise RuntimeError(
+                "PCIe twoshot-bf16 capture requires runtime.capture(plan=...)"
+            )
         if capturing and not self._device_slot_selection:
             self._device_slot_bias = self._slot & 1
             self._device_slot_selection = True
@@ -375,19 +383,40 @@ class PCIeTwoShotBF16:
             self._slot += 1
         launcher = state.launcher(self._device_slot_selection, self._device_slot_bias)
         if operation == "all_reduce":
-            launcher(payload.data_ptr(), self._staging_ptrs[slot], self._signal_ptrs,
-                     out.data_ptr(), self.rank, self._reduced_offset, self._slot_bytes,
-                     rows_per_rank, blocks)
+            launcher(
+                payload.data_ptr(),
+                self._staging_ptrs[slot],
+                self._signal_ptrs,
+                out.data_ptr(),
+                self.rank,
+                self._reduced_offset,
+                self._slot_bytes,
+                rows_per_rank,
+                blocks,
+            )
         else:
-            launcher(payload.data_ptr(), self._staging_ptrs[slot], self._signal_ptrs,
-                     out.data_ptr(), self.rank, self._pack_stride, self._slot_bytes,
-                     rows_per_rank, blocks)
+            launcher(
+                payload.data_ptr(),
+                self._staging_ptrs[slot],
+                self._signal_ptrs,
+                out.data_ptr(),
+                self.rank,
+                self._pack_stride,
+                self._slot_bytes,
+                rows_per_rank,
+                blocks,
+            )
 
     # ---- public collectives ---------------------------------------------
 
     def reduce_scatter(
-        self, payload: torch.Tensor, out: Optional[torch.Tensor] = None, *,
-        plan: Plan, threads: int = 512, block_limit: int = 64,
+        self,
+        payload: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        *,
+        plan: Plan,
+        threads: int = 512,
+        block_limit: int = 64,
     ) -> torch.Tensor:
         state = require_prepared(plan, "comm.pcie", self.device)
         state.require_runtime(self)
@@ -400,16 +429,37 @@ class PCIeTwoShotBF16:
                 raise ValueError("rows must be divisible by world size")
             if out is None:
                 if _is_current_stream_capturing(self.device):
-                    raise RuntimeError("PCIeTwoShotBF16.reduce_scatter capture requires caller-owned output")
-                out = torch.empty(rows // self.world_size, self.row_elems, dtype=torch.bfloat16, device=self.device)
-            self._check_tensor(out, shape=(rows // self.world_size, self.row_elems), name="output")
+                    raise RuntimeError(
+                        "PCIeTwoShotBF16.reduce_scatter capture requires caller-owned output"
+                    )
+                out = torch.empty(
+                    rows // self.world_size,
+                    self.row_elems,
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+            self._check_tensor(
+                out, shape=(rows // self.world_size, self.row_elems), name="output"
+            )
             _require_disjoint(out, payload, source_name="payload")
-            self._launch_prepared(payload, None, out, state=state, threads=threads, block_limit=block_limit)
+            self._launch_prepared(
+                payload,
+                None,
+                out,
+                state=state,
+                threads=threads,
+                block_limit=block_limit,
+            )
             return out
 
     def all_gather(
-        self, payload: torch.Tensor, out: Optional[torch.Tensor] = None, *,
-        plan: Plan, threads: int = 512, block_limit: int = 64,
+        self,
+        payload: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        *,
+        plan: Plan,
+        threads: int = 512,
+        block_limit: int = 64,
     ) -> torch.Tensor:
         state = require_prepared(plan, "comm.pcie", self.device)
         state.require_runtime(self)
@@ -420,16 +470,37 @@ class PCIeTwoShotBF16:
             self._check(payload, rows)
             if out is None:
                 if _is_current_stream_capturing(self.device):
-                    raise RuntimeError("PCIeTwoShotBF16.all_gather capture requires caller-owned output")
-                out = torch.empty(rows * self.world_size, self.row_elems, dtype=torch.bfloat16, device=self.device)
-            self._check_tensor(out, shape=(rows * self.world_size, self.row_elems), name="output")
+                    raise RuntimeError(
+                        "PCIeTwoShotBF16.all_gather capture requires caller-owned output"
+                    )
+                out = torch.empty(
+                    rows * self.world_size,
+                    self.row_elems,
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+            self._check_tensor(
+                out, shape=(rows * self.world_size, self.row_elems), name="output"
+            )
             _require_disjoint(out, payload, source_name="payload")
-            self._launch_prepared(payload, None, out, state=state, threads=threads, block_limit=block_limit)
+            self._launch_prepared(
+                payload,
+                None,
+                out,
+                state=state,
+                threads=threads,
+                block_limit=block_limit,
+            )
             return out
 
     def all_reduce(
-        self, inp: torch.Tensor, out: Optional[torch.Tensor] = None, *,
-        plan: Plan, threads: int = 512, block_limit: int = 64,
+        self,
+        inp: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        *,
+        plan: Plan,
+        threads: int = 512,
+        block_limit: int = 64,
     ) -> torch.Tensor:
         """FP32-accumulating BF16 all-reduce with one BF16 rounding."""
         state = require_prepared(plan, "comm.pcie", self.device)
@@ -442,12 +513,20 @@ class PCIeTwoShotBF16:
         with _device_guard(self.device):
             if out is None:
                 if _is_current_stream_capturing(self.device):
-                    raise RuntimeError("PCIeTwoShotBF16.all_reduce capture requires caller-owned output")
+                    raise RuntimeError(
+                        "PCIeTwoShotBF16.all_reduce capture requires caller-owned output"
+                    )
                 out = torch.empty_like(inp)
             self._check_tensor(out, shape=tuple(inp.shape), name="output")
             _require_disjoint(out, inp, source_name="input")
-            self._launch_prepared(inp.view(rows, self.row_elems), None, out.view(rows, self.row_elems),
-                                  state=state, threads=threads, block_limit=block_limit)
+            self._launch_prepared(
+                inp.view(rows, self.row_elems),
+                None,
+                out.view(rows, self.row_elems),
+                state=state,
+                threads=threads,
+                block_limit=block_limit,
+            )
         return out
 
     # ---- teardown (mirrors pcie_twoshot) -----------------------------------

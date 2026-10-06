@@ -127,7 +127,11 @@ def prepare_experts(layer: IQ2XSLayer, device, *, activation="silu"):
             intermediate_size=layer.intermediate_size,
         ),
     )
-    source = moe.BlockQuantWeights(layer.weights.w13.to(device), layer.weights.w2.to(device), codec=layer.weights.codec)
+    source = moe.BlockQuantWeights(
+        layer.weights.w13.to(device),
+        layer.weights.w2.to(device),
+        codec=layer.weights.codec,
+    )
     experts = moe.prepare_weights(plan=plan, weights=source)
     prepared = experts._impl.representation.value
     payload = sum(
@@ -169,7 +173,10 @@ def qualify_capacity(
             route_num_experts=layer.route_num_experts,
         ),
         routing=moe.RoutingSpec(deterministic_output=deterministic),
-        override=None if autotune else config or moe.MoeDecodeConfig(
+        override=None
+        if autotune
+        else config
+        or moe.MoeDecodeConfig(
             backend="w4a16",
             route_planner="internal",
             max_active_clusters=None,
@@ -177,7 +184,9 @@ def qualify_capacity(
         ),
     )
     warmup = make_inputs(layer, capacity, experts.device, mapped=mapped)
-    expected_warmup = reference(layer, warmup, activation=activation) if autotune else None
+    expected_warmup = (
+        reference(layer, warmup, activation=activation) if autotune else None
+    )
     activation_source = warmup.x.clone() if autotune else None
 
     def factory(state):
@@ -201,7 +210,8 @@ def qualify_capacity(
             bound.run()
             check(warmup.output, expected_warmup)
         return PreparedCall(
-            run=bound.run, output=warmup.output,
+            run=bound.run,
+            output=warmup.output,
             produce=(lambda: warmup.x.copy_(activation_source)) if autotune else None,
             owners=(scratch, bound, warmup, activation_source),
         )
@@ -346,7 +356,11 @@ def main():
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--launches", type=int, default=50)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--tune", action="store_true", help="Race production MoE candidates, then qualify the selected plans")
+    parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="Race production MoE candidates, then qualify the selected plans",
+    )
     args = parser.parse_args()
     if min(*args.counts, args.repeats, args.launches) <= 0:
         parser.error("counts, repeats and launches must be positive")
@@ -404,7 +418,9 @@ def main():
                         if args.expert_ids is None
                         else tuple(args.expert_ids),
                     )
-                    experts, payload = prepare_experts(loaded, device, activation=loaded.activation)
+                    experts, payload = prepare_experts(
+                        loaded, device, activation=loaded.activation
+                    )
                     source_digest = hashlib.sha256(
                         loaded.weights.w13.numpy().tobytes()
                         + loaded.weights.w2.numpy().tobytes()
@@ -420,8 +436,20 @@ def main():
                             (m, (m,), "direct", False) for m in args.counts if m <= 8
                         ]
                         if args.tune:
-                            cases = [(m, tuple(n for n in args.counts if n <= m), "auto", False)
-                                     for m in sorted({max(args.counts), *(m for m in args.counts if m <= 8)})]
+                            cases = [
+                                (
+                                    m,
+                                    tuple(n for n in args.counts if n <= m),
+                                    "auto",
+                                    False,
+                                )
+                                for m in sorted(
+                                    {
+                                        max(args.counts),
+                                        *(m for m in args.counts if m <= 8),
+                                    }
+                                )
+                            ]
                         for capacity, counts, route_mode, deterministic in cases:
                             results = qualify_capacity(
                                 loaded,

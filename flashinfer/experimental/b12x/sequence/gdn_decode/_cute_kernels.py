@@ -73,9 +73,7 @@ def _fake_pointer(dtype: type[cutlass.Numeric]) -> cute.Pointer:
     )
 
 
-def _pointer(
-    tensor: torch.Tensor, dtype: type[cutlass.Numeric]
-) -> cute.Pointer:
+def _pointer(tensor: torch.Tensor, dtype: type[cutlass.Numeric]) -> cute.Pointer:
     return make_ptr(
         dtype,
         tensor.data_ptr(),
@@ -100,9 +98,7 @@ class _GatedRmsNormKernel:
         self.norm_weight_type = norm_weight_type
         self.norm_fp32 = bool(norm_fp32)
         total_rows = self.max_tokens * self.value_heads
-        natural_grid = (
-            total_rows + _NORM_WARPS_PER_CTA - 1
-        ) // _NORM_WARPS_PER_CTA
+        natural_grid = (total_rows + _NORM_WARPS_PER_CTA - 1) // _NORM_WARPS_PER_CTA
         self.grid_ctas = min(_NORM_MAX_CTAS, natural_grid)
 
     @cute.jit
@@ -141,9 +137,7 @@ class _GatedRmsNormKernel:
         grid, _, _ = cute.arch.grid_dim()
         warp = Int32(thread) // Int32(32)
         lane = Int32(thread) % Int32(32)
-        token_value_head = (
-            Int32(block) * Int32(_NORM_WARPS_PER_CTA) + warp
-        )
+        token_value_head = Int32(block) * Int32(_NORM_WARPS_PER_CTA) + warp
         row_stride = Int32(grid) * Int32(_NORM_WARPS_PER_CTA)
         total_rows = Int32(self.max_tokens * self.value_heads)
         live_tokens = num_tokens[Int32(0)].to(Int32)
@@ -153,24 +147,17 @@ class _GatedRmsNormKernel:
         while token_value_head < total_rows:
             token = token_value_head // Int32(self.value_heads)
             value_head = token_value_head % Int32(self.value_heads)
-            base = (
-                token.to(Int64) * Int64(self.value_heads * _VALUE_DIM)
-                + value_head.to(Int64) * Int64(_VALUE_DIM)
-            )
+            base = token.to(Int64) * Int64(
+                self.value_heads * _VALUE_DIM
+            ) + value_head.to(Int64) * Int64(_VALUE_DIM)
             if token >= bounded_tokens:
-                for lane_element in cutlass.range_constexpr(
-                    _VALUE_DIM // 32
-                ):
+                for lane_element in cutlass.range_constexpr(_VALUE_DIM // 32):
                     column = lane + Int32(lane_element * 32)
                     output[base + column.to(Int64)] = BFloat16(0.0)
             else:
-                values = cute.make_rmem_tensor(
-                    (_VALUE_DIM // 32,), Float32
-                )
+                values = cute.make_rmem_tensor((_VALUE_DIM // 32,), Float32)
                 square_sum = Float32(0.0)
-                for lane_element in cutlass.range_constexpr(
-                    _VALUE_DIM // 32
-                ):
+                for lane_element in cutlass.range_constexpr(_VALUE_DIM // 32):
                     column = lane + Int32(lane_element * 32)
                     value = Float32(output[base + column.to(Int64)])
                     values[lane_element] = value
@@ -180,9 +167,7 @@ class _GatedRmsNormKernel:
                     square_sum / Float32(_VALUE_DIM) + eps,
                     fastmath=False,
                 )
-                for lane_element in cutlass.range_constexpr(
-                    _VALUE_DIM // 32
-                ):
+                for lane_element in cutlass.range_constexpr(_VALUE_DIM // 32):
                     column = lane + Int32(lane_element * 32)
                     normalized = values[lane_element] * inv_rms
                     weighted = Float32(0.0)
@@ -190,29 +175,23 @@ class _GatedRmsNormKernel:
                         weighted = normalized * Float32(norm_weight[column])
                     else:
                         normalized_bf16 = BFloat16(normalized)
-                        if cutlass.const_expr(
-                            self.norm_weight_type is Float32
-                        ):
+                        if cutlass.const_expr(self.norm_weight_type is Float32):
                             weighted = Float32(normalized_bf16) * Float32(
                                 norm_weight[column]
                             )
                         else:
                             weighted = Float32(
                                 BFloat16(
-                                    normalized_bf16
-                                    * BFloat16(norm_weight[column])
+                                    normalized_bf16 * BFloat16(norm_weight[column])
                                 )
                             )
                     gate_input = Float32(z[base + column.to(Int64)])
                     gate = cute.arch.rcp_approx(
-                        Float32(1.0)
-                        + cute.math.exp(-gate_input, fastmath=False)
+                        Float32(1.0) + cute.math.exp(-gate_input, fastmath=False)
                     )
                     if cutlass.const_expr(not self.sigmoid_gate):
                         gate *= gate_input
-                    output[base + column.to(Int64)] = BFloat16(
-                        weighted * gate
-                    )
+                    output[base + column.to(Int64)] = BFloat16(weighted * gate)
             token_value_head += row_stride
 
 
@@ -843,9 +822,9 @@ class _PackedRecurrentQwenKernel:
             value_head = request_value_head % Int32(self.value_heads)
             request = request_value_head // Int32(self.value_heads)
             key_head = value_head // Int32(self.head_ratio)
-            value_row = value_tile * Int32(_VALUE_ROWS_PER_CTA) + Int32(
-                lane
-            ) // Int32(_KEY_LANES_PER_ROW)
+            value_row = value_tile * Int32(_VALUE_ROWS_PER_CTA) + Int32(lane) // Int32(
+                _KEY_LANES_PER_ROW
+            )
             start = query_start_loc[request].to(Int32)
             end = query_start_loc[request + Int32(1)].to(Int32)
             if end > start:
@@ -864,9 +843,7 @@ class _PackedRecurrentQwenKernel:
                         if Int32(lane) % Int32(_KEY_LANES_PER_ROW) == Int32(0):
                             if grouped_heads:
                                 if group_leader:
-                                    for (
-                                        value_head_offset
-                                    ) in cutlass.range_constexpr(
+                                    for value_head_offset in cutlass.range_constexpr(
                                         _GROUPED_VALUE_HEADS
                                     ):
                                         self._zero_request(
@@ -1154,9 +1131,18 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[..., None]]
         )
 
     def launch(
-        mixed_qkv, a, b, A_log, dt_bias, recurrent_state,
-        query_start_loc, num_accepted_tokens, state_indices, num_seqs,
-        output, scale,
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        recurrent_state,
+        query_start_loc,
+        num_accepted_tokens,
+        state_indices,
+        num_seqs,
+        output,
+        scale,
     ) -> None:
         raw(
             pointer(mixed_qkv, BFloat16),
@@ -1190,9 +1176,7 @@ def precompile_packed_recurrent_qwen(binding: Binding) -> None:
     """Compile the binding specialization without mutating runtime tensors."""
     with torch.cuda.device(binding.output.device):
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "CuTe GDN compilation is forbidden during CUDA capture"
-            )
+            raise RuntimeError("CuTe GDN compilation is forbidden during CUDA capture")
         _compile(binding)
 
 
@@ -1222,17 +1206,24 @@ def run_packed_recurrent_qwen(
         if launch is None:
             key, launch = _compile(binding)
         launch(
-            binding.mixed_qkv, binding.a, binding.b, binding.A_log, binding.dt_bias,
-            binding.recurrent_state, binding.query_start_loc, binding.num_accepted_tokens,
-            binding.state_indices, binding.num_seqs, binding.output, scale_value,
+            binding.mixed_qkv,
+            binding.a,
+            binding.b,
+            binding.A_log,
+            binding.dt_bias,
+            binding.recurrent_state,
+            binding.query_start_loc,
+            binding.num_accepted_tokens,
+            binding.state_indices,
+            binding.num_seqs,
+            binding.output,
+            scale_value,
         )
         if not capturing:
             _WARMED.add(key)
 
 
-def _norm_key(
-    binding: Binding, *, norm_fp32: bool
-) -> tuple[object, ...]:
+def _norm_key(binding: Binding, *, norm_fp32: bool) -> tuple[object, ...]:
     caps = binding._state.caps
     return (
         binding.output.device.index,
@@ -1260,9 +1251,7 @@ def _compile_norm(
         norm_weight_type=norm_weight_type,
         norm_fp32=norm_fp32,
     )
-    raise_if_kernel_resolution_frozen(
-        "cute.compile", target=kernel, cache_key=key
-    )
+    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
     raw = b12x_compile(
         kernel,
         _fake_pointer(BFloat16),
@@ -1278,9 +1267,7 @@ def _compile_norm(
 
     def launch(active_binding: Binding, eps: float) -> None:
         if _norm_key(active_binding, norm_fp32=norm_fp32) != key:
-            raise ValueError(
-                "compiled CuTe GDN RMSNorm does not match the binding"
-            )
+            raise ValueError("compiled CuTe GDN RMSNorm does not match the binding")
         raw(
             _pointer(active_binding.output, BFloat16),
             _pointer(active_binding.z, BFloat16),
@@ -1295,9 +1282,7 @@ def _compile_norm(
     return key, launch
 
 
-def run_gated_rmsnorm(
-    binding: Binding, *, eps: float, norm_fp32: bool = False
-) -> None:
+def run_gated_rmsnorm(binding: Binding, *, eps: float, norm_fp32: bool = False) -> None:
     """Apply the graph-safe gated RMSNorm to the bound output rows."""
     with torch.cuda.device(binding.output.device):
         key = _norm_key(binding, norm_fp32=norm_fp32)

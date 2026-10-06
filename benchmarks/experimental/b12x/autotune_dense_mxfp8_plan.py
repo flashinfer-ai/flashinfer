@@ -150,7 +150,9 @@ def _parse_unroll_list(raw: str) -> list[bool | None]:
         "true": True,
     }
     try:
-        values = [aliases[item.strip().lower()] for item in raw.split(",") if item.strip()]
+        values = [
+            aliases[item.strip().lower()] for item in raw.split(",") if item.strip()
+        ]
     except KeyError as exc:
         raise argparse.ArgumentTypeError(
             "large-M unroll values must be auto, 0/false, or 1/true"
@@ -381,9 +383,8 @@ def main() -> None:
                 runnable: list[Candidate] = []
                 for candidate in candidates:
                     work_tiles = (
-                        ((m + candidate.tile_mn[0] - 1) // candidate.tile_mn[0])
-                        * ((shape.n + candidate.tile_mn[1] - 1) // candidate.tile_mn[1])
-                    )
+                        (m + candidate.tile_mn[0] - 1) // candidate.tile_mn[0]
+                    ) * ((shape.n + candidate.tile_mn[1] - 1) // candidate.tile_mn[1])
                     prefix = (
                         f"{shape.name}\t{m}\t{shape.n}\t{shape.k}\t"
                         f"{candidate.tile_mn[0]}\t{candidate.tile_mn[1]}\t"

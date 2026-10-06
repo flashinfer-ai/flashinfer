@@ -35,40 +35,66 @@ def _fake_moe(path: pathlib.Path, *, e: int, layers: int, k: int, n: int) -> Non
     for L in range(layers):
         base = pre.format(L=L)
         for ei in range(e):
-            t[f"{base}.experts.{ei}.gate_proj.weight"] = torch.randn(n, k, dtype=torch.bfloat16) * 0.1
-            t[f"{base}.experts.{ei}.up_proj.weight"] = torch.randn(n, k, dtype=torch.bfloat16) * 0.1
-            t[f"{base}.experts.{ei}.down_proj.weight"] = torch.randn(k, n, dtype=torch.bfloat16) * 0.1
+            t[f"{base}.experts.{ei}.gate_proj.weight"] = (
+                torch.randn(n, k, dtype=torch.bfloat16) * 0.1
+            )
+            t[f"{base}.experts.{ei}.up_proj.weight"] = (
+                torch.randn(n, k, dtype=torch.bfloat16) * 0.1
+            )
+            t[f"{base}.experts.{ei}.down_proj.weight"] = (
+                torch.randn(k, n, dtype=torch.bfloat16) * 0.1
+            )
         # decoys discovery must ignore:
         t[f"{base}.gate.weight"] = torch.randn(e, k, dtype=torch.bfloat16)
-        t[f"model.language_model.layers.{L}.linear_attn.in_proj.weight"] = torch.randn(k, k, dtype=torch.bfloat16)
+        t[f"model.language_model.layers.{L}.linear_attn.in_proj.weight"] = torch.randn(
+            k, k, dtype=torch.bfloat16
+        )
     t["visual.blocks.0.mlp.fc1.weight"] = torch.randn(8, 8, dtype=torch.bfloat16)
     _write_ckpt(path, t)
 
 
-def _fake_moe_packed(path: pathlib.Path, *, e: int, layers: int, k: int, n: int) -> None:
+def _fake_moe_packed(
+    path: pathlib.Path, *, e: int, layers: int, k: int, n: int
+) -> None:
     """Experts stacked in one 3-D tensor: experts.gate_up_proj / experts.down_proj."""
     t: dict[str, torch.Tensor] = {}
     pre = "model.language_model.layers.{L}.mlp"
     for L in range(layers):
         base = pre.format(L=L)
-        t[f"{base}.experts.gate_up_proj"] = torch.randn(e, 2 * n, k, dtype=torch.bfloat16) * 0.1
-        t[f"{base}.experts.down_proj"] = torch.randn(e, k, n, dtype=torch.bfloat16) * 0.1
+        t[f"{base}.experts.gate_up_proj"] = (
+            torch.randn(e, 2 * n, k, dtype=torch.bfloat16) * 0.1
+        )
+        t[f"{base}.experts.down_proj"] = (
+            torch.randn(e, k, n, dtype=torch.bfloat16) * 0.1
+        )
         t[f"{base}.gate.weight"] = torch.randn(e, k, dtype=torch.bfloat16)
-        t[f"model.language_model.layers.{L}.input_layernorm.weight"] = torch.randn(k, dtype=torch.bfloat16)
-    t["model.language_model.embed_tokens.weight"] = torch.randn(16, k, dtype=torch.bfloat16)
+        t[f"model.language_model.layers.{L}.input_layernorm.weight"] = torch.randn(
+            k, dtype=torch.bfloat16
+        )
+    t["model.language_model.embed_tokens.weight"] = torch.randn(
+        16, k, dtype=torch.bfloat16
+    )
     _write_ckpt(path, t)
 
 
-def _fake_dense(path: pathlib.Path, *, layers: int, k: int, n: int, attn_on: set[int]) -> None:
+def _fake_dense(
+    path: pathlib.Path, *, layers: int, k: int, n: int, attn_on: set[int]
+) -> None:
     t: dict[str, torch.Tensor] = {}
     for L in range(layers):
         base = f"model.language_model.layers.{L}"
-        t[f"{base}.mlp.gate_proj.weight"] = torch.randn(n, k, dtype=torch.bfloat16) * 0.1
+        t[f"{base}.mlp.gate_proj.weight"] = (
+            torch.randn(n, k, dtype=torch.bfloat16) * 0.1
+        )
         t[f"{base}.mlp.up_proj.weight"] = torch.randn(n, k, dtype=torch.bfloat16) * 0.1
-        t[f"{base}.mlp.down_proj.weight"] = torch.randn(k, n, dtype=torch.bfloat16) * 0.1
+        t[f"{base}.mlp.down_proj.weight"] = (
+            torch.randn(k, n, dtype=torch.bfloat16) * 0.1
+        )
         if L in attn_on:
             for p in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                t[f"{base}.self_attn.{p}.weight"] = torch.randn(k, k, dtype=torch.bfloat16) * 0.1
+                t[f"{base}.self_attn.{p}.weight"] = (
+                    torch.randn(k, k, dtype=torch.bfloat16) * 0.1
+                )
     _write_ckpt(path, t)
 
 
@@ -129,7 +155,12 @@ def test_discover_dense_and_dryrun(tmp_path) -> None:
     assert scheme.layers == [0, 1]
     assert scheme.mlp_gate == "mlp.gate_proj" and scheme.mlp_down == "mlp.down_proj"
     assert scheme.mlp_fused_gate_up is None
-    assert scheme.attn_projs == ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"]
+    assert scheme.attn_projs == [
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+    ]
 
     report = convert_dense_model_to_fp6(
         tmp_path / "d", tmp_path / "out_d", dry_run=True, device="cpu", verbose=False
@@ -161,7 +192,11 @@ def test_export_moe_per_expert_safetensors(tmp_path) -> None:
     state, index, config = _read_ckpt(out)
 
     base = "model.language_model.layers.0.mlp.experts"
-    for proj, (o, i) in {"gate_proj": (32, 64), "up_proj": (32, 64), "down_proj": (64, 32)}.items():
+    for proj, (o, i) in {
+        "gate_proj": (32, 64),
+        "up_proj": (32, 64),
+        "down_proj": (64, 32),
+    }.items():
         w = state[f"{base}.0.{proj}.weight"]
         sc = state[f"{base}.0.{proj}.weight_scale"]
         assert w.dtype == torch.uint8 and tuple(w.shape) == (o, i * 3 // 4)

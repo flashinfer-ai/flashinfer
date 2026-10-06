@@ -32,7 +32,8 @@ from b12x.gemm import block_fp8_linear
 from b12x.preparation import PreparationSession, PreparedCall
 from b12x.testing.reference.helpers import dequantize_grouped_nvfp4
 from b12x.gemm._shared.wo_mxfp8 import (
-    quantize_mxfp8_rows_torch, dequantize_mxfp8_rows_torch,
+    quantize_mxfp8_rows_torch,
+    dequantize_mxfp8_rows_torch,
 )
 from b12x.gemm._shared.block_fp8 import quantize_block_fp8_linear_input_mxfp8
 from b12x._lib.dense_gemm import dense_gemm
@@ -90,10 +91,18 @@ FP8_BLOCK_GEMM_SPECS = QWEN38_27B_GEMM_SPECS
 
 SUPER3_MAMBA_GEMM_SPECS = [
     # Each shape occurs in all 40 Mamba blocks of NVIDIA_Super3_5_VL_IQ2XXS-Packed.
-    ("Super3.5 Mamba in_proj", 4096, 18560,
-     "NVFP4 mixer.in_proj: BF16 activations, hidden=4096"),
-    ("Super3.5 Mamba out_proj", 8192, 4096,
-     "NVFP4 mixer.out_proj: BF16 activations, expanded hidden=8192"),
+    (
+        "Super3.5 Mamba in_proj",
+        4096,
+        18560,
+        "NVFP4 mixer.in_proj: BF16 activations, hidden=4096",
+    ),
+    (
+        "Super3.5 Mamba out_proj",
+        8192,
+        4096,
+        "NVFP4 mixer.out_proj: BF16 activations, expanded hidden=8192",
+    ),
 ]
 
 DEFAULT_PROFILE = "default"
@@ -121,6 +130,7 @@ def gemm_specs_for_mode(mode: str, profile: str = DEFAULT_PROFILE):
         return FP8_BLOCK_GEMM_SPECS
     return FP8_GEMM_SPECS
 
+
 FP4_BATCH_SIZES = [2, 4, 8]
 FP8_BATCH_SIZES = [1, 2, 4, 8, 4096]
 FP8_BLOCK_BATCH_SIZES = [1, 2, 4, 8, 16, 128, 512, 4096]
@@ -138,6 +148,7 @@ class CorrectnessError(BenchmarkAbort):
 
 def bench_events(fn, *, warmup, iters, l2_flush=None):
     from b12x.testing.benchmark import samples_ms
+
     return samples_ms(fn, warmup=warmup, iters=iters, l2_flush=l2_flush)
 
 
@@ -219,13 +230,9 @@ def quantize_mxfp8_source(source: torch.Tensor):
     return quantized.values, quantized.scale_rows, quantized.scale_mma
 
 
-
-
 def make_mxfp8_operand(M: int, K: int):
     source = (torch.randn(M, K, device="cuda", dtype=torch.bfloat16) / 4).contiguous()
     return (*quantize_mxfp8_source(source), source)
-
-
 
 
 def bench_one_fp4(
@@ -274,10 +281,17 @@ def bench_one_fp4(
         b_ref = dequantize_grouped_nvfp4(b_packed.permute(2, 0, 1), b_sf, K, b_gs)[0]
         reference = a_ref @ b_ref.T
         torch.cuda.synchronize()
-        check_outputs(results["b12x_out"][:, :, 0], reference,
-                      label="b12x dequantized reference", cosine_threshold=COSINE_THRESHOLD)
+        check_outputs(
+            results["b12x_out"][:, :, 0],
+            reference,
+            label="b12x dequantized reference",
+            cosine_threshold=COSINE_THRESHOLD,
+        )
     results["b12x"] = bench_events(
-        b12x_replay, warmup=warmup, iters=iters, l2_flush=l2_flush,
+        b12x_replay,
+        warmup=warmup,
+        iters=iters,
+        l2_flush=l2_flush,
     )
     return results
 
@@ -319,19 +333,34 @@ def bench_one_fp8(
                     K,
                     device=a_source.device,
                 )
-                quant_plan = block_fp8_linear.plan(block_fp8_linear.Caps(
-                    device=a_source.device, max_tokens=M, in_features=K,
-                    out_features=N, output_dtype=torch.bfloat16,
-                ))
-                session = scopes.enter_context(PreparationSession(
-                    device=a_source.device, autotune=False, compile_workers=2,
-                ))
-                session.prepare((quant_plan.request(
-                    name="activation-quantization",
-                    prepare_call=lambda state: PreparedCall(
-                        run=lambda: state.quantize_input(a_source, out=a_quantized_b12x),
-                    ),
-                ),))
+                quant_plan = block_fp8_linear.plan(
+                    block_fp8_linear.Caps(
+                        device=a_source.device,
+                        max_tokens=M,
+                        in_features=K,
+                        out_features=N,
+                        output_dtype=torch.bfloat16,
+                    )
+                )
+                session = scopes.enter_context(
+                    PreparationSession(
+                        device=a_source.device,
+                        autotune=False,
+                        compile_workers=2,
+                    )
+                )
+                session.prepare(
+                    (
+                        quant_plan.request(
+                            name="activation-quantization",
+                            prepare_call=lambda state: PreparedCall(
+                                run=lambda: state.quantize_input(
+                                    a_source, out=a_quantized_b12x
+                                ),
+                            ),
+                        ),
+                    )
+                )
 
             def b12x_launch():
                 if a_quantized_b12x is not None:
@@ -374,10 +403,17 @@ def bench_one_fp8(
             b_ref = dequantize_mxfp8_rows_torch(b_quantized, b_scale)
             reference = a_ref @ b_ref.T
             torch.cuda.synchronize()
-            check_outputs(results["b12x_out"][:, :, 0], reference,
-                          label="b12x dequantized reference", cosine_threshold=COSINE_THRESHOLD)
+            check_outputs(
+                results["b12x_out"][:, :, 0],
+                reference,
+                label="b12x dequantized reference",
+                cosine_threshold=COSINE_THRESHOLD,
+            )
         results["b12x"] = bench_events(
-            b12x_replay, warmup=warmup, iters=iters, l2_flush=l2_flush,
+            b12x_replay,
+            warmup=warmup,
+            iters=iters,
+            l2_flush=l2_flush,
         )
         return results
 
@@ -429,9 +465,7 @@ def bench_one_fp8_block(
     b_scale = (
         torch.rand(N // 128, K // 128, device="cuda") * 0.01 + 0.005
     ).contiguous()
-    b12x_out = torch.empty(
-        (M, N, 1), device="cuda", dtype=torch.bfloat16
-    )
+    b12x_out = torch.empty((M, N, 1), device="cuda", dtype=torch.bfloat16)
 
     def b12x_launch():
         dense_gemm(
@@ -457,13 +491,22 @@ def bench_one_fp8_block(
     if check:
         results["b12x_replay"]()
         a_ref = a.float() * a_scale.repeat_interleave(128, dim=1)
-        b_ref = b.float() * b_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+        b_ref = b.float() * b_scale.repeat_interleave(128, dim=0).repeat_interleave(
+            128, dim=1
+        )
         reference = a_ref @ b_ref.T
         torch.cuda.synchronize()
-        check_outputs(results["b12x_out"][:, :, 0], reference,
-                      label="b12x dequantized reference", cosine_threshold=COSINE_THRESHOLD)
+        check_outputs(
+            results["b12x_out"][:, :, 0],
+            reference,
+            label="b12x dequantized reference",
+            cosine_threshold=COSINE_THRESHOLD,
+        )
     results["b12x"] = bench_events(
-        b12x_replay, warmup=warmup, iters=iters, l2_flush=l2_flush,
+        b12x_replay,
+        warmup=warmup,
+        iters=iters,
+        l2_flush=l2_flush,
     )
     return results
 
@@ -483,16 +526,37 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
-    parser.add_argument("--evidence", type=pathlib.Path, help="JSONL evidence output for A16 comparisons.")
-    parser.add_argument("--model-path", type=pathlib.Path, help="Safetensors checkpoint for checkpoint-a16.")
-    parser.add_argument("--checkpoint-recipe", choices=("iq2_xs", "iq2_xxs", "q8_0", "nvfp4"),
-                        help="Restrict checkpoint-a16 to one stored weight recipe.")
-    parser.add_argument("--profile-graphs", action="store_true",
-                        help="Expose one cold-L2 replay per checkpoint case to CUDA profiling.")
+    parser.add_argument(
+        "--evidence",
+        type=pathlib.Path,
+        help="JSONL evidence output for A16 comparisons.",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=pathlib.Path,
+        help="Safetensors checkpoint for checkpoint-a16.",
+    )
+    parser.add_argument(
+        "--checkpoint-recipe",
+        choices=("iq2_xs", "iq2_xxs", "q8_0", "nvfp4"),
+        help="Restrict checkpoint-a16 to one stored weight recipe.",
+    )
+    parser.add_argument(
+        "--profile-graphs",
+        action="store_true",
+        help="Expose one cold-L2 replay per checkpoint case to CUDA profiling.",
+    )
     a16_config = parser.add_mutually_exclusive_group()
-    a16_config.add_argument("--tune-a16", action="store_true", help="Race the 16 A16 tile/split configurations.")
     a16_config.add_argument(
-        "--a16-config", type=int, nargs=3, metavar=("TILE_N", "TILE_K", "SPLIT_K"),
+        "--tune-a16",
+        action="store_true",
+        help="Race the 16 A16 tile/split configurations.",
+    )
+    a16_config.add_argument(
+        "--a16-config",
+        type=int,
+        nargs=3,
+        metavar=("TILE_N", "TILE_K", "SPLIT_K"),
         help="Pin the fp4-a16/fp8-a16 launch configuration instead of tuning.",
     )
     parser.add_argument(
@@ -507,7 +571,9 @@ def main():
         ),
     )
     parser.add_argument("--n", type=int, default=None, help="Override output width N.")
-    parser.add_argument("--k", type=int, default=None, help="Override reduction width K.")
+    parser.add_argument(
+        "--k", type=int, default=None, help="Override reduction width K."
+    )
     parser.add_argument(
         "--shape-name",
         default="custom",
@@ -515,7 +581,16 @@ def main():
     )
     parser.add_argument(
         "--dtype",
-        choices=("fp4", "fp8", "fp8-block", "fp8-e2e", "fp4-a16", "fp8-a16", "checkpoint-a16", "all"),
+        choices=(
+            "fp4",
+            "fp8",
+            "fp8-block",
+            "fp8-e2e",
+            "fp4-a16",
+            "fp8-a16",
+            "checkpoint-a16",
+            "all",
+        ),
         default="fp4",
         help=(
             "Benchmark NVFP4, prequantized MXFP8, regular K128 block FP8, "
@@ -554,6 +629,7 @@ def main():
         parser.error("--a16-config requires --dtype fp4-a16 or fp8-a16")
     if args.dtype == "checkpoint-a16":
         from benchmarks.experimental.b12x.checkpoint_dense import run
+
         run(args)
         return
     if args.model_path is not None:
@@ -569,17 +645,18 @@ def main():
 
     if args.dtype in ("fp4-a16", "fp8-a16"):
         from benchmarks.experimental.b12x.benchmark_blockscaled_precision import run
-        specs = ([(args.shape_name, args.k, args.n, "explicit CLI shape")]
-                 if args.n is not None else
-                 gemm_specs_for_mode(args.dtype, args.profile))
+
+        specs = (
+            [(args.shape_name, args.k, args.n, "explicit CLI shape")]
+            if args.n is not None
+            else gemm_specs_for_mode(args.dtype, args.profile)
+        )
         run(args, specs)
         return
 
     custom_specs = None
     if args.n is not None:
-        custom_specs = (
-            (args.shape_name, args.k, args.n, "explicit CLI shape"),
-        )
+        custom_specs = ((args.shape_name, args.k, args.n, "explicit CLI shape"),)
 
     def selected_specs(mode: str):
         return (
@@ -604,9 +681,7 @@ def main():
     elif args.dtype == "fp8":
         benchmark_modes = (("fp8", bench_one_fp8),)
     elif args.dtype == "fp8-block":
-        benchmark_modes = (
-            ("fp8-block", bench_one_fp8_block),
-        )
+        benchmark_modes = (("fp8-block", bench_one_fp8_block),)
     else:
         benchmark_modes = (("fp8-e2e", bench_one_fp8_e2e),)
     if args.batch_sizes is not None:
@@ -641,7 +716,9 @@ def main():
         print(f"L2 flush: on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)")
     else:
         print("L2 flush: off")
-    print(f"b12x reference check: {'on' if args.check else 'off'} (cos >= {COSINE_THRESHOLD:.6f})")
+    print(
+        f"b12x reference check: {'on' if args.check else 'off'} (cos >= {COSINE_THRESHOLD:.6f})"
+    )
     print(f"warmup={args.warmup}, iters={args.iters}")
     print(f"M values: {batch_sizes}")
     print()

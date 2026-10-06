@@ -62,9 +62,7 @@ class PreparedW6A8MXFP6Weights:
     def __post_init__(self) -> None:
         object.__setattr__(self, "num_experts", int(self.num_experts))
         object.__setattr__(self, "hidden_size", int(self.hidden_size))
-        object.__setattr__(
-            self, "intermediate_size", int(self.intermediate_size)
-        )
+        object.__setattr__(self, "intermediate_size", int(self.intermediate_size))
 
     # Canonical-storage aliases consumed by the generic prepared-weight
     # plumbing in b12x.moe.fused_moe._impl (mirrors w13/w2 attribute
@@ -105,9 +103,7 @@ def _validate_packed_codes(
     if not isinstance(packed, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
     if packed.dtype != torch.uint8:
-        raise TypeError(
-            f"{name} must be packed MX-FP6 uint8 codes, got {packed.dtype}"
-        )
+        raise TypeError(f"{name} must be packed MX-FP6 uint8 codes, got {packed.dtype}")
     expected = (num_experts, rows, _packed_k_bytes(k))
     if packed.dim() != 3 or tuple(packed.shape) != expected:
         raise ValueError(
@@ -281,8 +277,7 @@ def prepare_w6a8_mxfp6_weights(
     )
     if tuple(w2_sf_swizzled.shape) != expected_w2_sf:
         raise AssertionError(
-            f"swizzled w2 scale shape {tuple(w2_sf_swizzled.shape)} != "
-            f"{expected_w2_sf}"
+            f"swizzled w2 scale shape {tuple(w2_sf_swizzled.shape)} != {expected_w2_sf}"
         )
 
     return PreparedW6A8MXFP6Weights(

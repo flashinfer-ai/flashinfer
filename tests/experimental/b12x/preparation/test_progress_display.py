@@ -1,4 +1,5 @@
 """Rendering and accounting checks for the rank-zero preparation dashboard."""
+
 import io
 from collections import Counter
 import time
@@ -14,17 +15,33 @@ from rich.console import Console  # noqa: E402
 
 def _progress(**overrides):
     base = dict(
-        running=False, pending_compilation=False, ready_collectives=(), done=False,
-        phase="planning", component_id="", request_name="", completed_requests=0,
-        total_requests=6, candidate_count=0, candidates_prepared=0, measured_candidates=0,
-        completed_rounds=0, total_rounds=0, latest_round_us=(), cache_hits=0,
-        compilations=0, active_compilations=0, elapsed_seconds=0.0, tuning_stopped=False,
+        running=False,
+        pending_compilation=False,
+        ready_collectives=(),
+        done=False,
+        phase="planning",
+        component_id="",
+        request_name="",
+        completed_requests=0,
+        total_requests=6,
+        candidate_count=0,
+        candidates_prepared=0,
+        measured_candidates=0,
+        completed_rounds=0,
+        total_rounds=0,
+        latest_round_us=(),
+        cache_hits=0,
+        compilations=0,
+        active_compilations=0,
+        elapsed_seconds=0.0,
+        tuning_stopped=False,
     )
     base.update(overrides)
     sources = ("cached", "fixed", "tuned", "cached", "default", "fixed")
-    base.setdefault("selection_counts", tuple(sorted(
-        Counter(sources[:base["completed_requests"]]).items()
-    )))
+    base.setdefault(
+        "selection_counts",
+        tuple(sorted(Counter(sources[: base["completed_requests"]]).items())),
+    )
     return PreparationProgress(**base)
 
 
@@ -34,57 +51,205 @@ def _timeline():
     yield _progress(phase="planning", cache_hits=2)
     common = dict(cache_hits=2)
     # Request 0: cached lookup from planning (zero candidates).
-    yield _progress(phase="selecting", component_id="gemm.mm", request_name="mm_a", **common)
-    yield _progress(phase="priming", component_id="gemm.mm", request_name="mm_a", running=True, **common)
-    yield _progress(phase="priming", component_id="gemm.mm", request_name="mm_a", completed_requests=1, **common)
+    yield _progress(
+        phase="selecting", component_id="gemm.mm", request_name="mm_a", **common
+    )
+    yield _progress(
+        phase="priming",
+        component_id="gemm.mm",
+        request_name="mm_a",
+        running=True,
+        **common,
+    )
+    yield _progress(
+        phase="priming",
+        component_id="gemm.mm",
+        request_name="mm_a",
+        completed_requests=1,
+        **common,
+    )
     # Request 1: single-candidate space compiled in the pool.
-    yield _progress(phase="selecting", component_id="norm.mhc", request_name="mhc", candidate_count=1, completed_requests=1, **common)
-    yield _progress(phase="compiling", component_id="norm.mhc", request_name="mhc", candidate_count=1, completed_requests=1,
-                    pending_compilation=True, compilations=3, active_compilations=2, **common)
-    yield _progress(phase="priming", component_id="norm.mhc", request_name="mhc", candidate_count=1, completed_requests=2,
-                    compilations=3, **common)
+    yield _progress(
+        phase="selecting",
+        component_id="norm.mhc",
+        request_name="mhc",
+        candidate_count=1,
+        completed_requests=1,
+        **common,
+    )
+    yield _progress(
+        phase="compiling",
+        component_id="norm.mhc",
+        request_name="mhc",
+        candidate_count=1,
+        completed_requests=1,
+        pending_compilation=True,
+        compilations=3,
+        active_compilations=2,
+        **common,
+    )
+    yield _progress(
+        phase="priming",
+        component_id="norm.mhc",
+        request_name="mhc",
+        candidate_count=1,
+        completed_requests=2,
+        compilations=3,
+        **common,
+    )
     # Request 2: a four-candidate race over three rounds.
-    race = dict(component_id="attention.dense_mla", request_name="mla_q1", candidate_count=4, compilations=7, **common)
+    race = dict(
+        component_id="attention.dense_mla",
+        request_name="mla_q1",
+        candidate_count=4,
+        compilations=7,
+        **common,
+    )
     yield _progress(phase="selecting", completed_requests=2, **race)
-    yield _progress(phase="preparing candidates", completed_requests=2, candidates_prepared=2, **race)
-    yield _progress(phase="calibrating", completed_requests=2, candidates_prepared=4, **race)
-    rounds = ((50.0, 41.0, 66.0, 45.0), (52.0, 40.0, 64.0, 44.0), (51.0, 42.0, 65.0, 46.0))
+    yield _progress(
+        phase="preparing candidates",
+        completed_requests=2,
+        candidates_prepared=2,
+        **race,
+    )
+    yield _progress(
+        phase="calibrating", completed_requests=2, candidates_prepared=4, **race
+    )
+    rounds = (
+        (50.0, 41.0, 66.0, 45.0),
+        (52.0, 40.0, 64.0, 44.0),
+        (51.0, 42.0, 65.0, 46.0),
+    )
     for turn, latest in enumerate(rounds, start=1):
-        yield _progress(phase="autotuning", completed_requests=2, candidates_prepared=4, completed_rounds=turn,
-                        total_rounds=3, latest_round_us=latest, **race)
-    yield _progress(phase="priming", completed_requests=2, candidates_prepared=4, completed_rounds=3, total_rounds=3,
-                    latest_round_us=rounds[-1], measured_candidates=4, **race)
-    yield _progress(phase="priming", completed_requests=3, candidates_prepared=4, measured_candidates=4, **race)
+        yield _progress(
+            phase="autotuning",
+            completed_requests=2,
+            candidates_prepared=4,
+            completed_rounds=turn,
+            total_rounds=3,
+            latest_round_us=latest,
+            **race,
+        )
+    yield _progress(
+        phase="priming",
+        completed_requests=2,
+        candidates_prepared=4,
+        completed_rounds=3,
+        total_rounds=3,
+        latest_round_us=rounds[-1],
+        measured_candidates=4,
+        **race,
+    )
+    yield _progress(
+        phase="priming",
+        completed_requests=3,
+        candidates_prepared=4,
+        measured_candidates=4,
+        **race,
+    )
     # Request 3: a lookup hit during selection (cache hits grow while the request is active).
-    yield _progress(phase="selecting", component_id="moe.fused_moe", request_name="moe", candidate_count=6,
-                    completed_requests=3, measured_candidates=4, cache_hits=3, compilations=7)
-    yield _progress(phase="priming", component_id="moe.fused_moe", request_name="moe", candidate_count=6,
-                    completed_requests=4, measured_candidates=4, cache_hits=3, compilations=7)
+    yield _progress(
+        phase="selecting",
+        component_id="moe.fused_moe",
+        request_name="moe",
+        candidate_count=6,
+        completed_requests=3,
+        measured_candidates=4,
+        cache_hits=3,
+        compilations=7,
+    )
+    yield _progress(
+        phase="priming",
+        component_id="moe.fused_moe",
+        request_name="moe",
+        candidate_count=6,
+        completed_requests=4,
+        measured_candidates=4,
+        cache_hits=3,
+        compilations=7,
+    )
     # Request 4: tuning stopped before the race, defaults chosen.
-    yield _progress(phase="selecting", component_id="sequence.ple", request_name="ple", candidate_count=8,
-                    completed_requests=4, measured_candidates=4, cache_hits=3, compilations=7, tuning_stopped=True)
-    yield _progress(phase="priming", component_id="sequence.ple", request_name="ple", candidate_count=8,
-                    completed_requests=5, measured_candidates=4, cache_hits=3, compilations=7, tuning_stopped=True)
+    yield _progress(
+        phase="selecting",
+        component_id="sequence.ple",
+        request_name="ple",
+        candidate_count=8,
+        completed_requests=4,
+        measured_candidates=4,
+        cache_hits=3,
+        compilations=7,
+        tuning_stopped=True,
+    )
+    yield _progress(
+        phase="priming",
+        component_id="sequence.ple",
+        request_name="ple",
+        candidate_count=8,
+        completed_requests=5,
+        measured_candidates=4,
+        cache_hits=3,
+        compilations=7,
+        tuning_stopped=True,
+    )
+
     # Request 5: waits for other ranks, then completes as a fixed selection.
     class Requirement:
         key = ("allreduce", 8)
-    yield _progress(phase="waiting for ranks", component_id="comm.pcie", request_name="pcie", candidate_count=1,
-                    completed_requests=5, measured_candidates=4, cache_hits=3, compilations=7,
-                    ready_collectives=(Requirement(),), tuning_stopped=True)
-    yield _progress(phase="priming", component_id="comm.pcie", request_name="pcie", candidate_count=1,
-                    completed_requests=6, measured_candidates=4, cache_hits=3, compilations=7, tuning_stopped=True)
-    yield _progress(phase="finishing", completed_requests=6, measured_candidates=4, cache_hits=3, compilations=7,
-                    tuning_stopped=True)
-    yield _progress(phase="ready", done=True, completed_requests=6, measured_candidates=4, cache_hits=3,
-                    compilations=7, tuning_stopped=True)
+
+    yield _progress(
+        phase="waiting for ranks",
+        component_id="comm.pcie",
+        request_name="pcie",
+        candidate_count=1,
+        completed_requests=5,
+        measured_candidates=4,
+        cache_hits=3,
+        compilations=7,
+        ready_collectives=(Requirement(),),
+        tuning_stopped=True,
+    )
+    yield _progress(
+        phase="priming",
+        component_id="comm.pcie",
+        request_name="pcie",
+        candidate_count=1,
+        completed_requests=6,
+        measured_candidates=4,
+        cache_hits=3,
+        compilations=7,
+        tuning_stopped=True,
+    )
+    yield _progress(
+        phase="finishing",
+        completed_requests=6,
+        measured_candidates=4,
+        cache_hits=3,
+        compilations=7,
+        tuning_stopped=True,
+    )
+    yield _progress(
+        phase="ready",
+        done=True,
+        completed_requests=6,
+        measured_candidates=4,
+        cache_hits=3,
+        compilations=7,
+        tuning_stopped=True,
+    )
 
 
 def _attach(width, height):
     display = PreparationDisplay(global_rank=0, stream=io.StringIO())
     display._started = time.monotonic()
     display._request_started = display._started
-    console = Console(file=io.StringIO(), force_terminal=True, color_system="truecolor",
-                      width=width, height=height, record=True)
+    console = Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        color_system="truecolor",
+        width=width,
+        height=height,
+        record=True,
+    )
     display._console = console
     return display, console
 
@@ -94,14 +259,19 @@ def _render_text(display, console):
     return console.export_text(clear=True)
 
 
-@pytest.mark.parametrize("width,height", [(140, 40), (100, 16), (84, 12), (80, 24), (60, 24), (40, 8)])
+@pytest.mark.parametrize(
+    "width,height", [(140, 40), (100, 16), (84, 12), (80, 24), (60, 24), (40, 8)]
+)
 def test_every_phase_renders_within_console_width(width, height):
     display, console = _attach(width, height)
     for progress in _timeline():
         display.update(progress)
         text = _render_text(display, console)
         assert text.strip(), progress.phase
-        assert max(len(line) for line in text.splitlines()) <= width, (progress.phase, text)
+        assert max(len(line) for line in text.splitlines()) <= width, (
+            progress.phase,
+            text,
+        )
     display.close(failed=True)
     text = _render_text(display, console)
     assert "FAILED" in text or "failed" in text
@@ -121,7 +291,10 @@ def test_reported_outcomes_and_measured_lanes_render_from_snapshots():
     assert seen_lanes[0].history == (41.0, 40.0, 42.0)
     frame = display._frame
     assert dict(frame.progress.selection_counts) == {
-        "cached": 2, "fixed": 2, "tuned": 1, "default": 1,
+        "cached": 2,
+        "fixed": 2,
+        "tuned": 1,
+        "default": 1,
     }
     assert frame.widest is not None and frame.widest[1] == "attention.dense_mla"
     assert frame.widest[0] == pytest.approx(65.0 / 41.0)
@@ -133,16 +306,57 @@ def test_reported_outcomes_and_measured_lanes_render_from_snapshots():
 
 def test_race_history_resets_between_requests():
     display, _ = _attach(140, 40)
-    race = dict(component_id="attention.paged", request_name="paged", candidate_count=2, total_requests=2)
-    display.update(_progress(phase="autotuning", completed_rounds=1, total_rounds=2, latest_round_us=(10.0, 20.0), **race))
-    display.update(_progress(phase="autotuning", completed_rounds=2, total_rounds=2, latest_round_us=(12.0, 18.0), **race))
+    race = dict(
+        component_id="attention.paged",
+        request_name="paged",
+        candidate_count=2,
+        total_requests=2,
+    )
+    display.update(
+        _progress(
+            phase="autotuning",
+            completed_rounds=1,
+            total_rounds=2,
+            latest_round_us=(10.0, 20.0),
+            **race,
+        )
+    )
+    display.update(
+        _progress(
+            phase="autotuning",
+            completed_rounds=2,
+            total_rounds=2,
+            latest_round_us=(12.0, 18.0),
+            **race,
+        )
+    )
     assert display._frame.lanes[0].history == (10.0, 12.0)
-    display.update(_progress(phase="selecting", component_id="attention.qsa", request_name="qsa", candidate_count=3,
-                             completed_requests=1, total_requests=2, measured_candidates=2))
+    display.update(
+        _progress(
+            phase="selecting",
+            component_id="attention.qsa",
+            request_name="qsa",
+            candidate_count=3,
+            completed_requests=1,
+            total_requests=2,
+            measured_candidates=2,
+        )
+    )
     assert display._frame.lanes == ()
-    display.update(_progress(phase="autotuning", component_id="attention.qsa", request_name="qsa", candidate_count=3,
-                             completed_requests=1, total_requests=2, measured_candidates=2, completed_rounds=1,
-                             total_rounds=2, latest_round_us=(5.0, 7.0, 6.0)))
+    display.update(
+        _progress(
+            phase="autotuning",
+            component_id="attention.qsa",
+            request_name="qsa",
+            candidate_count=3,
+            completed_requests=1,
+            total_requests=2,
+            measured_candidates=2,
+            completed_rounds=1,
+            total_rounds=2,
+            latest_round_us=(5.0, 7.0, 6.0),
+        )
+    )
     assert [lane.index for lane in display._frame.lanes] == [0, 2, 1]
 
 
@@ -182,14 +396,21 @@ def test_bar_and_number_helpers():
     assert _bar(0.5, 10).cell_len == 10
     assert _bar(1.0, 7).plain == "█" * 7
     assert _bar(0.0, 4).plain == "━━━━"
-    assert _us(41.26) == "41.3 µs" and _us(512.0) == "512 µs" and _us(2500.0) == "2.50 ms"
+    assert (
+        _us(41.26) == "41.3 µs" and _us(512.0) == "512 µs" and _us(2500.0) == "2.50 ms"
+    )
 
 
 def test_batch_change_resets_measurements_when_intermediate_rounds_are_not_reported():
     display, console = _attach(160, 40)
     common = dict(
-        phase="autotuning", component_id="norm.mhc", request_name="mhc.post_pre.m24",
-        candidate_count=272, batch_candidates=33, completed_rounds=2, total_rounds=3,
+        phase="autotuning",
+        component_id="norm.mhc",
+        request_name="mhc.post_pre.m24",
+        candidate_count=272,
+        batch_candidates=33,
+        completed_rounds=2,
+        total_rounds=3,
         tuning_rank=2,
     )
     display.update(_progress(batch_index=2, latest_round_us=(10.0, 20.0), **common))
@@ -201,12 +422,24 @@ def test_batch_change_resets_measurements_when_intermediate_rounds_are_not_repor
 
 def test_progress_bar_measures_candidate_work_independently_of_request_count():
     display, console = _attach(180, 40)
-    display.update(_progress(
-        phase="autotuning", component_id="norm.mhc", request_name="mhc.post_pre.m4096",
-        completed_requests=1, total_requests=100, measured_candidates=900, total_candidates=1000,
-        candidate_count=43, global_candidate_count=172, candidate_sharded=True,
-        batch_candidates=20, batch_index=2, completed_rounds=1, total_rounds=3,
-    ))
+    display.update(
+        _progress(
+            phase="autotuning",
+            component_id="norm.mhc",
+            request_name="mhc.post_pre.m4096",
+            completed_requests=1,
+            total_requests=100,
+            measured_candidates=900,
+            total_candidates=1000,
+            candidate_count=43,
+            global_candidate_count=172,
+            candidate_sharded=True,
+            batch_candidates=20,
+            batch_index=2,
+            completed_rounds=1,
+            total_rounds=3,
+        )
+    )
     text = _render_text(display, console)
     assert "900 / 1000 candidates measured" in text
     assert "90%" in text
@@ -229,7 +462,9 @@ def test_escape_hint_and_cancellation_status(width):
     stream = io.StringIO()
     display = PreparationDisplay(global_rank=0, stream=stream, cancel_available=True)
     with display:
-        display._console = Console(file=stream, width=width, height=24, color_system=None)
+        display._console = Console(
+            file=stream, width=width, height=24, color_system=None
+        )
         display.update(_progress(phase="autotuning"))
         display._console.print(display._render())
         assert "Press ESC to use default tuning" in stream.getvalue()
@@ -244,11 +479,21 @@ def test_escape_hint_and_cancellation_status(width):
 def test_results_use_selections_when_completion_snapshots_are_skipped():
     display, console = _attach(160, 40)
     display.update(_progress(phase="autotuning", candidate_count=64))
-    display.update(_progress(
-        phase="ready", done=True, completed_requests=298, total_requests=298,
-        measured_candidates=64000,
-        selection_counts=(("tuned", 279), ("fixed", 1), ("default", 17), ("override", 1)),
-    ))
+    display.update(
+        _progress(
+            phase="ready",
+            done=True,
+            completed_requests=298,
+            total_requests=298,
+            measured_candidates=64000,
+            selection_counts=(
+                ("tuned", 279),
+                ("fixed", 1),
+                ("default", 17),
+                ("override", 1),
+            ),
+        )
+    )
     text = _render_text(display, console)
     assert "279 tuned" in text and "1 fixed" in text
     assert "17 default" in text and "1 override" in text

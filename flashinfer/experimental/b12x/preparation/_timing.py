@@ -1,4 +1,5 @@
 """Opt-in wall timing for preparation work and its external driver."""
+
 from __future__ import annotations
 
 import json
@@ -47,9 +48,13 @@ class PreparationTiming:
             return
         self.last_report = now
         payload = dict(
-            event=event, wall_time=time.time(), elapsed_s=now - self.started,
-            seconds=dict(self.seconds), counts=dict(self.counts),
-            **self.context, **fields,
+            event=event,
+            wall_time=time.time(),
+            elapsed_s=now - self.started,
+            seconds=dict(self.seconds),
+            counts=dict(self.counts),
+            **self.context,
+            **fields,
         )
         with self.path.open("a") as stream:
             stream.write(json.dumps(payload, allow_nan=False) + "\n")

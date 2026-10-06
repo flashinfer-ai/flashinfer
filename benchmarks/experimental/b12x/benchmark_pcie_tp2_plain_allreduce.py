@@ -133,8 +133,6 @@ def _correct(output: torch.Tensor, expected: float, device: torch.device) -> boo
     return bool(local.item())
 
 
-
-
 def _benchmark_b12x(
     pool: object,
     rows: int,
@@ -210,8 +208,6 @@ def _benchmark_b12x(
     }
 
 
-
-
 def main() -> None:
     args = _parse_args()
     rank = int(os.environ["RANK"])
@@ -253,7 +249,13 @@ def main() -> None:
     try:
         for rows in row_counts:
             b12x = _benchmark_b12x(
-                pool, rows, args.hidden_size, dtype, rank, args, device,
+                pool,
+                rows,
+                args.hidden_size,
+                dtype,
+                rank,
+                args,
+                device,
             )
             if not b12x["correct"]:
                 raise RuntimeError(f"all-reduce oracle failed for rows={rows}")
@@ -263,7 +265,6 @@ def main() -> None:
                     "hidden_size": args.hidden_size,
                     "bytes": rows * args.hidden_size * dtype.itemsize,
                     "b12x": b12x,
-
                 }
             )
     finally:
@@ -317,10 +318,7 @@ def main() -> None:
         args.output.write_text(json.dumps(report, indent=2) + "\n")
         print(f"wrote {args.output}")
         for result in results:
-            print(
-                f"M={result['rows']:>3}: "
-                f"B12X={result['b12x']['median_us']:.2f} us "
-            )
+            print(f"M={result['rows']:>3}: B12X={result['b12x']['median_us']:.2f} us ")
 
     dist.barrier()
     dist.destroy_process_group()

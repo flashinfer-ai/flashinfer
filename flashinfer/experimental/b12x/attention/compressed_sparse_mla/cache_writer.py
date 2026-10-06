@@ -41,7 +41,9 @@ def _validate_query(query: CacheWriterQuery, _device) -> None:
     if query.cache_kind not in ("swa", "indexed"):
         raise ValueError("cache_kind must be 'swa' or 'indexed'")
     if query.cache_format != "deepseek_v41":
-        raise ValueError("prepared compressed writer requires cache_format='deepseek_v41'")
+        raise ValueError(
+            "prepared compressed writer requires cache_format='deepseek_v41'"
+        )
     if query.slot_dtype not in ("int32", "int64"):
         raise ValueError("slot_dtype must be 'int32' or 'int64'")
 
@@ -65,9 +67,7 @@ def page_nbytes(
 ) -> int:
     from b12x.attention._shared.mla.kv_cache import page_nbytes as _page_nbytes
 
-    return _page_nbytes(
-        page_size, cache_kind=cache_kind, cache_format=cache_format
-    )
+    return _page_nbytes(page_size, cache_kind=cache_kind, cache_format=cache_format)
 
 
 def _slot_dtype(name: str) -> torch.dtype:
@@ -82,8 +82,12 @@ def _representative(query: CacheWriterQuery, ordinal: int):
     return (
         writer,
         torch.empty((query.max_rows, 512), dtype=torch.bfloat16, device=device),
-        torch.empty((1, query.page_size * record_bytes), dtype=torch.uint8, device=device),
-        torch.empty((query.max_rows,), dtype=_slot_dtype(query.slot_dtype), device=device),
+        torch.empty(
+            (1, query.page_size * record_bytes), dtype=torch.uint8, device=device
+        ),
+        torch.empty(
+            (query.max_rows,), dtype=_slot_dtype(query.slot_dtype), device=device
+        ),
     )
 
 
@@ -148,7 +152,9 @@ class _CacheWriterState:
             self.query.cache_format,
         )
         if str(slot_mapping.dtype).removeprefix("torch.") != self.query.slot_dtype:
-            raise ValueError("slot_mapping dtype contradicts prepared cache-writer query")
+            raise ValueError(
+                "slot_mapping dtype contradicts prepared cache-writer query"
+            )
         if int(slot_mapping.shape[0]) > self.query.max_rows:
             raise ValueError("cache-writer rows exceed prepared capacity")
         if int(slot_mapping.shape[0]) == 0:
@@ -174,10 +180,13 @@ def plan(
     device = torch.device(device)
 
     def jobs(_config, detected):
-        return (CompileJob.create(
-            "b12x.attention.compressed_sparse_mla.cache_writer:compile_cache_writer",
-            query.to_dict(), detected.ordinal,
-        ),)
+        return (
+            CompileJob.create(
+                "b12x.attention.compressed_sparse_mla.cache_writer:compile_cache_writer",
+                query.to_dict(),
+                detected.ordinal,
+            ),
+        )
 
     def materialize(_selection, detected):
         compiled = compile_cache_writer(query.to_dict(), detected.ordinal)
@@ -210,7 +219,9 @@ def write_cache(
         plan, "attention.compressed_sparse_mla.cache_writer", kv.device
     )
     state.write(
-        kv, cache, slot_mapping,
+        kv,
+        cache,
+        slot_mapping,
         page_size=page_size,
         cache_kind=cache_kind,
         cache_format=cache_format,

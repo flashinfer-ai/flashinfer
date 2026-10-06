@@ -14,13 +14,30 @@ from b12x.preparation import (
 
 
 _OPERANDS = (
-    "mixed_qkv", "a", "b", "z", "A_log", "dt_bias", "norm_weight",
-    "recurrent_state", "query_start_loc", "num_accepted_tokens", "state_indices",
-    "num_seqs", "num_tokens", "output",
+    "mixed_qkv",
+    "a",
+    "b",
+    "z",
+    "A_log",
+    "dt_bias",
+    "norm_weight",
+    "recurrent_state",
+    "query_start_loc",
+    "num_accepted_tokens",
+    "state_indices",
+    "num_seqs",
+    "num_tokens",
+    "output",
 )
-_QWEN_ALIGNED_OPERANDS = frozenset((
-    "query_start_loc", "num_accepted_tokens", "num_seqs", "num_tokens", "norm_weight",
-))
+_QWEN_ALIGNED_OPERANDS = frozenset(
+    (
+        "query_start_loc",
+        "num_accepted_tokens",
+        "num_seqs",
+        "num_tokens",
+        "norm_weight",
+    )
+)
 _KDA_ALIGNED_OPERANDS = frozenset(_OPERANDS) - {"z", "state_indices"}
 
 
@@ -30,9 +47,17 @@ def aligned_operands(kda):
 
 def _default_kda_strides(key_heads, value_heads):
     return (
-        (2 * key_heads + value_heads) * 128, value_heads * 128, 128,
-        value_heads, 1, 128, value_heads * 128 * 128, 128 * 128, 128,
-        value_heads * 128, 128,
+        (2 * key_heads + value_heads) * 128,
+        value_heads * 128,
+        128,
+        value_heads,
+        1,
+        128,
+        value_heads * 128 * 128,
+        128 * 128,
+        128,
+        value_heads * 128,
+        128,
     )
 
 
@@ -62,12 +87,19 @@ class GdnQuery:
             object.__setattr__(self, "dt_bias_dtype", "float32" if kda else "bfloat16")
         strides = self.kda_strides
         if kda:
-            strides = _default_kda_strides(self.key_heads, self.value_heads) if strides is None else tuple(strides)
+            strides = (
+                _default_kda_strides(self.key_heads, self.value_heads)
+                if strides is None
+                else tuple(strides)
+            )
         object.__setattr__(self, "kda_strides", strides)
         alignments = {name: 16 for name in _OPERANDS}
         if self.pointer_alignments is not None:
             alignments.update(self.pointer_alignments)
-        if any(type(value) is not int or value not in (1, 2, 4, 8, 16) for value in alignments.values()):
+        if any(
+            type(value) is not int or value not in (1, 2, 4, 8, 16)
+            for value in alignments.values()
+        ):
             raise ValueError("invalid GDN pointer alignment")
         # CuTe recurrence pointers and explicitly nonspecialized Triton pointers
         # retain their existing dynamic-alignment contract.
@@ -121,40 +153,62 @@ def _default_config(
 def _validate_query(query: GdnQuery, _device: DeviceIdentity | None) -> None:
     if not isinstance(query, GdnQuery):
         raise TypeError("query must be GdnQuery")
-    if any(type(value) is not int or value <= 0 for value in (
-        query.key_heads, query.value_heads, query.max_seqs, query.max_tokens,
-        query.state_index_columns, query.max_state_slots,
-    )):
+    if any(
+        type(value) is not int or value <= 0
+        for value in (
+            query.key_heads,
+            query.value_heads,
+            query.max_seqs,
+            query.max_tokens,
+            query.state_index_columns,
+            query.max_state_slots,
+        )
+    ):
         raise ValueError("GDN dimensions must be positive integers")
-    if query.state_index_columns > 8 or query.max_tokens > query.max_seqs * query.state_index_columns:
-        raise ValueError("GDN token capacity must fit at most eight state columns per sequence")
+    if (
+        query.state_index_columns > 8
+        or query.max_tokens > query.max_seqs * query.state_index_columns
+    ):
+        raise ValueError(
+            "GDN token capacity must fit at most eight state columns per sequence"
+        )
     kda = query.key_heads == query.value_heads
     if type(query.recover_speculative_state) is not bool:
         raise TypeError("recover_speculative_state must be boolean")
     if query.recover_speculative_state and (
         not kda or query.state_dtype != "float32" or not query.qk_l2norm
     ):
-        raise ValueError("KDA recovery requires equal heads, FP32 state and Q/K normalization")
+        raise ValueError(
+            "KDA recovery requires equal heads, FP32 state and Q/K normalization"
+        )
     if not kda and query.value_heads != 3 * query.key_heads:
         raise ValueError("Qwen GDN requires three value heads per key head")
-    if query.gate_activation not in ("silu", "sigmoid") or (kda and query.gate_activation != "sigmoid"):
+    if query.gate_activation not in ("silu", "sigmoid") or (
+        kda and query.gate_activation != "sigmoid"
+    ):
         raise ValueError("KDA requires sigmoid gating; Qwen supports silu or sigmoid")
     if type(query.qk_l2norm) is not bool:
         raise TypeError("qk_l2norm must be boolean")
     if query.state_dtype not in ("bfloat16", "float32") or any(
-        value not in ("bfloat16", "float32") for value in (
-            query.a_log_dtype, query.dt_bias_dtype, query.norm_weight_dtype,
+        value not in ("bfloat16", "float32")
+        for value in (
+            query.a_log_dtype,
+            query.dt_bias_dtype,
+            query.norm_weight_dtype,
         )
     ):
         raise ValueError("unsupported GDN state or parameter dtype")
     if query.state_indices_dtype not in ("int32", "int64"):
         raise ValueError("GDN state indices require int32 or int64")
     if query.null_state_index is not None and (
-        type(query.null_state_index) is not int or not -(1 << 63) <= query.null_state_index < (1 << 63)
+        type(query.null_state_index) is not int
+        or not -(1 << 63) <= query.null_state_index < (1 << 63)
     ):
         raise ValueError("null state index must fit int64")
     if kda:
-        if len(query.kda_strides) != 11 or any(type(value) is not int or value < 0 for value in query.kda_strides):
+        if len(query.kda_strides) != 11 or any(
+            type(value) is not int or value < 0 for value in query.kda_strides
+        ):
             raise ValueError("KDA requires eleven nonnegative compile-time strides")
     elif query.kda_strides is not None:
         raise ValueError("Qwen recurrent strides remain dynamic")
@@ -188,7 +242,11 @@ def _validate_config(
 
 
 def _backend(query: GdnQuery) -> str:
-    return "triton" if query.key_heads == query.value_heads and not query.recover_speculative_state else "cutedsl"
+    return (
+        "triton"
+        if query.key_heads == query.value_heads and not query.recover_speculative_state
+        else "cutedsl"
+    )
 
 
 def _tuning_parameters(query: GdnQuery, device):
@@ -203,7 +261,9 @@ _KEY_FIELDS = frozenset(GdnQuery.__dataclass_fields__) - {"max_state_slots"}
 
 
 def _encode_query(query: GdnQuery) -> dict[str, object]:
-    return {name: value for name, value in query.to_dict().items() if name in _KEY_FIELDS}
+    return {
+        name: value for name, value in query.to_dict().items() if name in _KEY_FIELDS
+    }
 
 
 TUNING = TuningContract(
@@ -220,7 +280,9 @@ TUNING = TuningContract(
     default_config=_default_config,
     knobs=(
         Knob(name="backend", values=None, binding=ParameterBinding.COMPILE),
-        Knob(name="recurrent_block_v", values=(16, 32), binding=ParameterBinding.COMPILE),
+        Knob(
+            name="recurrent_block_v", values=(16, 32), binding=ParameterBinding.COMPILE
+        ),
     ),
     candidate_contract_version=4,
     parameters=_tuning_parameters,

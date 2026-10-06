@@ -166,9 +166,7 @@ class _TopKOwnerStageLaunch:
             # Retain their smaller proven specializations while keeping the
             # remaining path below faithful to CUDA's ``#pragma unroll 1``.
             for unrolled_step in cutlass.range_constexpr(self._world_size):
-                unrolled_destination = (
-                    self._rank + unrolled_step
-                ) % self._world_size
+                unrolled_destination = (self._rank + unrolled_step) % self._world_size
                 unrolled_destination_indices = candidates[unrolled_destination]
                 unrolled_destination_scores = (
                     unrolled_destination_indices + candidate_plane_words
@@ -194,8 +192,7 @@ class _TopKOwnerStageLaunch:
                     _copy_16b(
                         local_scores
                         + (unrolled_input_offset + unrolled_pack) * Int64(4),
-                        unrolled_destination_scores
-                        + unrolled_output_offset * Int64(4),
+                        unrolled_destination_scores + unrolled_output_offset * Int64(4),
                     )
                     unrolled_pack += Int64(self._threads)
         else:
@@ -204,9 +201,9 @@ class _TopKOwnerStageLaunch:
             # loop.
             runtime_step = Int32(0)
             while runtime_step < Int32(self._world_size):
-                runtime_destination = (
-                    Int32(self._rank) + runtime_step
-                ) % Int32(self._world_size)
+                runtime_destination = (Int32(self._rank) + runtime_step) % Int32(
+                    self._world_size
+                )
                 runtime_destination_address = Int64(candidate0.toint())
                 for runtime_peer in cutlass.range_constexpr(1, self._world_size):
                     if runtime_destination == Int32(runtime_peer):
@@ -237,14 +234,11 @@ class _TopKOwnerStageLaunch:
                     _copy_16b(
                         local_indices
                         + (runtime_input_offset + runtime_pack) * Int64(4),
-                        runtime_destination_indices
-                        + runtime_output_offset * Int64(4),
+                        runtime_destination_indices + runtime_output_offset * Int64(4),
                     )
                     _copy_16b(
-                        local_scores
-                        + (runtime_input_offset + runtime_pack) * Int64(4),
-                        runtime_destination_scores
-                        + runtime_output_offset * Int64(4),
+                        local_scores + (runtime_input_offset + runtime_pack) * Int64(4),
+                        runtime_destination_scores + runtime_output_offset * Int64(4),
                     )
                     runtime_pack += Int64(self._threads)
                 runtime_step += Int32(1)

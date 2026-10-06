@@ -41,9 +41,7 @@ def _wait_nanosleep_cycles_from_env() -> int:
             "B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES must be an integer"
         ) from exc
     if not 0 <= cycles <= 1024:
-        raise ValueError(
-            "B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES must be in [0, 1024]"
-        )
+        raise ValueError("B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES must be in [0, 1024]")
     return cycles
 
 
@@ -52,13 +50,10 @@ def _threads_from_env() -> int:
     try:
         threads = int(raw)
     except ValueError as exc:
-        raise ValueError(
-            "B12X_PCIE_HIERARCHICAL_THREADS must be an integer"
-        ) from exc
+        raise ValueError("B12X_PCIE_HIERARCHICAL_THREADS must be an integer") from exc
     if not 32 <= threads <= 1024 or threads % 32 != 0:
         raise ValueError(
-            "B12X_PCIE_HIERARCHICAL_THREADS must be a multiple of 32 "
-            "in [32, 1024]"
+            "B12X_PCIE_HIERARCHICAL_THREADS must be a multiple of 32 in [32, 1024]"
         )
     return threads
 
@@ -151,9 +146,7 @@ def _pick_blocks(elements: int) -> int:
 def _buffer_modes_from_env() -> tuple[bool, bool]:
     """Return mutually exclusive experimental synchronization modes."""
 
-    double_buffered = (
-        os.getenv("B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER", "0") == "1"
-    )
+    double_buffered = os.getenv("B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER", "0") == "1"
     deferred_consumption = (
         os.getenv(
             "B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION",
@@ -208,9 +201,7 @@ class PCIeHierarchicalAllReduce:
         self.wait_nanosleep_cycles = _wait_nanosleep_cycles_from_env()
         self.threads = _threads_from_env()
         self.vectorized_bf16x2 = _vectorized_bf16x2_from_env()
-        self.vectorized_bf16x2_max_elements = (
-            _vectorized_bf16x2_max_elements_from_env()
-        )
+        self.vectorized_bf16x2_max_elements = _vectorized_bf16x2_max_elements_from_env()
         self._layout = _make_layout(self.max_elements)
         self._ipc = CudaRTLibrary()
         self._ipc.cudaSetDevice(self.device.index or 0)

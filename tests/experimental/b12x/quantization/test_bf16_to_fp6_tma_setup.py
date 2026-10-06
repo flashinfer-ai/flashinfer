@@ -9,6 +9,7 @@ from b12x.quantization.mxfp6 import (
     allocate_bf16_to_fp6_tma_outputs,
     compile_bf16_to_fp6_tma,
 )
+
 # Underscore alias: pytest tries to collect any module-level class named
 # Test* (PytestCollectionWarning — TestKernel has an __init__).
 from b12x.quantization.mxfp6.bf16_to_fp6_tma import TestKernel as _TestKernel
@@ -34,7 +35,9 @@ def test_allocate_bf16_to_fp6_tma_outputs_shapes() -> None:
 
 def test_allocate_bf16_to_fp6_tma_outputs_bytes_shapes() -> None:
     m, k = 128, 256
-    out = allocate_bf16_to_fp6_tma_outputs(m, k, device=torch.device("cpu"), emit="bytes")
+    out = allocate_bf16_to_fp6_tma_outputs(
+        m, k, device=torch.device("cpu"), emit="bytes"
+    )
     assert out.packed_a_storage.shape == (1, m, k)
     assert out.packed_a_storage.dtype == torch.uint8
 

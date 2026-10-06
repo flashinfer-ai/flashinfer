@@ -5,6 +5,7 @@ component callbacks that compile, size, and materialize one configuration.
 A ``PreparationSession`` fills the plan's prepared slot in place. Families
 bind and run from the plan; nothing else carries executable state.
 """
+
 from __future__ import annotations
 
 import itertools
@@ -50,7 +51,9 @@ def current_plan():
     try:
         return _CURRENT_PLAN.get()
     except LookupError:
-        raise RuntimeError("the current plan is available only inside preparation callbacks") from None
+        raise RuntimeError(
+            "the current plan is available only inside preparation callbacks"
+        ) from None
 
 
 def current_prepared_state():
@@ -213,7 +216,9 @@ class MemoryRequirements:
                 scratch, size = requirement.scratch, candidate_size
             persistent.extend(requirement.persistent)
         combined = cls(scratch=scratch, persistent=tuple(persistent))
-        return cls(scratch=scratch, persistent=tuple(combined._persistent_by_key().values()))
+        return cls(
+            scratch=scratch, persistent=tuple(combined._persistent_by_key().values())
+        )
 
 
 @dataclass(frozen=True)
@@ -232,7 +237,11 @@ class CollectiveRequirement:
 
     def __post_init__(self):
         ranks = tuple(self.ranks)
-        if not self.key or not ranks or any(type(rank) is not int or rank < 0 for rank in ranks):
+        if (
+            not self.key
+            or not ranks
+            or any(type(rank) is not int or rank < 0 for rank in ranks)
+        ):
             raise ValueError("collectives require a key and nonnegative global ranks")
         if ranks != tuple(sorted(set(ranks))):
             raise ValueError("collective ranks must be sorted and unique")
@@ -272,8 +281,10 @@ class TuningRequirement:
 
     def __post_init__(self):
         ranks = tuple(self.ranks)
-        if not self.key or not ranks or any(
-            type(rank) is not int or rank < 0 for rank in ranks
+        if (
+            not self.key
+            or not ranks
+            or any(type(rank) is not int or rank < 0 for rank in ranks)
         ):
             raise ValueError("tuning requirements need a key and nonnegative ranks")
         if ranks != tuple(sorted(set(ranks))):
@@ -283,13 +294,16 @@ class TuningRequirement:
         empty = self.assignment is None
         programs = tuple(self.cute_programs)
         if (empty and programs) or any(
-            not isinstance(key, str) or len(key) != 64
+            not isinstance(key, str)
+            or len(key) != 64
             or any(char not in "0123456789abcdef" for char in key)
             for key in programs
         ):
             raise ValueError("winner programs must be CuTe cache keys")
         object.__setattr__(self, "cute_programs", tuple(sorted(set(programs))))
-        if empty != (self.latency_us is None) or empty != (self.candidate_index is None):
+        if empty != (self.latency_us is None) or empty != (
+            self.candidate_index is None
+        ):
             raise ValueError("a tuning contribution must be either complete or empty")
         if not empty:
             object.__setattr__(self, "assignment", FrozenMapping(self.assignment))
@@ -373,6 +387,7 @@ def call_scope():
     them run inside it, as serving does.
     """
     import torch
+
     return torch.inference_mode()
 
 
@@ -513,7 +528,9 @@ class Plan(_PreparedSlot, Generic[ConfigT]):
     dependencies: tuple[str, ...] = ()
     _device: object | None = None
     shared: bool = False
-    _prepared: _Prepared | None = field(default=None, init=False, repr=False, compare=False)
+    _prepared: _Prepared | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
     _handle: int = field(default=0, init=False, repr=False, compare=False)
 
     def __post_init__(self):
@@ -528,14 +545,23 @@ class Plan(_PreparedSlot, Generic[ConfigT]):
         return self.contract.component_id
 
     def request(
-        self, *, name, prepare_call, benchmark_call=None,
-        dependencies=(), collective=None, retain_benchmark_call=False,
+        self,
+        *,
+        name,
+        prepare_call,
+        benchmark_call=None,
+        dependencies=(),
+        collective=None,
+        retain_benchmark_call=False,
     ):
         return PreparationRequest(
-            name=name, plan=self,
-            prepare_call=prepare_call, benchmark_call=benchmark_call,
+            name=name,
+            plan=self,
+            prepare_call=prepare_call,
+            benchmark_call=benchmark_call,
             dependencies=tuple(dict.fromkeys((*self.dependencies, *dependencies))),
-            collective=collective, retain_benchmark_call=retain_benchmark_call,
+            collective=collective,
+            retain_benchmark_call=retain_benchmark_call,
         )
 
     def memory_requirements(self):
@@ -546,9 +572,19 @@ class Plan(_PreparedSlot, Generic[ConfigT]):
         if prepared is not None:
             config, device = prepared.selection.config, prepared.device
         else:
-            device = detect_device(self._device if self._device is not None else getattr(self.query, "device", None))
-            configuration = self.contract.configure(self.query, device=device.identity, override=self.override)
-            config = configuration.default if configuration.pinned is None else configuration.pinned
+            device = detect_device(
+                self._device
+                if self._device is not None
+                else getattr(self.query, "device", None)
+            )
+            configuration = self.contract.configure(
+                self.query, device=device.identity, override=self.override
+            )
+            config = (
+                configuration.default
+                if configuration.pinned is None
+                else configuration.pinned
+            )
         with _plan_scope(self):
             return self._memory_requirements(config, device)
 
@@ -564,7 +600,9 @@ class _CompositePlan(_PreparedSlot):
     composite_semantic_version: int = 1
     dependencies: tuple[str, ...] = ()
     shared: bool = False
-    _prepared: _Prepared | None = field(default=None, init=False, repr=False, compare=False)
+    _prepared: _Prepared | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
     _handle: int = field(default=0, init=False, repr=False, compare=False)
 
     def __post_init__(self):
@@ -576,13 +614,18 @@ class _CompositePlan(_PreparedSlot):
             raise ValueError("composite counts must be sorted and unique")
         if any(not isinstance(child, Plan) for child in variants.values()):
             raise TypeError("composite variants must be scalar plans")
-        if type(self.composite_semantic_version) is not int or self.composite_semantic_version <= 0:
+        if (
+            type(self.composite_semantic_version) is not int
+            or self.composite_semantic_version <= 0
+        ):
             raise ValueError("composite semantic version must be positive")
         if type(self.shared) is not bool:
             raise TypeError("shared must be boolean")
         object.__setattr__(self, "variants", MappingProxyType(variants))
         object.__setattr__(self, "dependencies", tuple(self.dependencies))
-        object.__setattr__(self, "capacity_metadata", FrozenMapping(self.capacity_metadata))
+        object.__setattr__(
+            self, "capacity_metadata", FrozenMapping(self.capacity_metadata)
+        )
         _register_handle(self)
 
     @property
@@ -590,19 +633,35 @@ class _CompositePlan(_PreparedSlot):
         return tuple(self.variants)
 
     def request(
-        self, *, name, prepare_calls, benchmark_calls=None,
-        dependencies=(), collective=None, retain_benchmark_call=False,
+        self,
+        *,
+        name,
+        prepare_calls,
+        benchmark_calls=None,
+        dependencies=(),
+        collective=None,
+        retain_benchmark_call=False,
     ):
         if set(prepare_calls) != set(self.token_counts):
-            raise ValueError("composite preparation calls must cover exact planned counts")
-        if benchmark_calls is not None and set(benchmark_calls) != set(self.token_counts):
-            raise ValueError("composite benchmark calls must cover exact planned counts")
+            raise ValueError(
+                "composite preparation calls must cover exact planned counts"
+            )
+        if benchmark_calls is not None and set(benchmark_calls) != set(
+            self.token_counts
+        ):
+            raise ValueError(
+                "composite benchmark calls must cover exact planned counts"
+            )
         return PreparationRequest(
-            name=name, plan=self,
+            name=name,
+            plan=self,
             prepare_call=MappingProxyType(dict(prepare_calls)),
-            benchmark_call=None if benchmark_calls is None else MappingProxyType(dict(benchmark_calls)),
+            benchmark_call=None
+            if benchmark_calls is None
+            else MappingProxyType(dict(benchmark_calls)),
             dependencies=tuple(dict.fromkeys((*self.dependencies, *dependencies))),
-            collective=collective, retain_benchmark_call=retain_benchmark_call,
+            collective=collective,
+            retain_benchmark_call=retain_benchmark_call,
         )
 
     def memory_requirements(self):
@@ -615,8 +674,15 @@ class _CompositePlan(_PreparedSlot):
 class PreparationRequest:
     name: str
     plan: Plan | _CompositePlan
-    prepare_call: Callable[[object], PreparedCall] | Mapping[int, Callable[[object], PreparedCall]]
-    benchmark_call: Callable[[object], PreparedCall] | Mapping[int, Callable[[object], PreparedCall]] | None = None
+    prepare_call: (
+        Callable[[object], PreparedCall]
+        | Mapping[int, Callable[[object], PreparedCall]]
+    )
+    benchmark_call: (
+        Callable[[object], PreparedCall]
+        | Mapping[int, Callable[[object], PreparedCall]]
+        | None
+    ) = None
     dependencies: tuple[str, ...] = ()
     collective: CollectiveRequirement | None = None
     retain_benchmark_call: bool = False
@@ -666,6 +732,7 @@ def require_prepared(plan, component_id, device=None):
         raise RuntimeError(f"{component_id} plan resources have been released")
     if device is not None:
         import torch
+
         actual = torch.device(device)
         if actual.type != "cuda" or actual.index != prepared.device.ordinal:
             raise ValueError("plan and tensor device differ")
@@ -676,19 +743,35 @@ class PreparationResult:
     """Report of one preparation batch; the prepared state lives on the plans."""
 
     def __init__(
-        self, *, plans, coverage=None, benchmark_calls=None, benchmark_closers=(),
-        cache_hits=0, benchmarked_candidates=0, elapsed_seconds=0.0, compilation=None,
-        parent_cute_compilations=0, parent_triton_compilations=0,
-        overlapped_benchmark_samples=0, program_counts=None,
+        self,
+        *,
+        plans,
+        coverage=None,
+        benchmark_calls=None,
+        benchmark_closers=(),
+        cache_hits=0,
+        benchmarked_candidates=0,
+        elapsed_seconds=0.0,
+        compilation=None,
+        parent_cute_compilations=0,
+        parent_triton_compilations=0,
+        overlapped_benchmark_samples=0,
+        program_counts=None,
     ):
         self.plans = MappingProxyType(dict(plans))
-        self.selections = MappingProxyType({
-            name: plan.selection for name, plan in self.plans.items()
-            if plan.selection is not None
-        })
-        self.coverage = MappingProxyType({
-            name: MappingProxyType(dict(value)) for name, value in (coverage or {}).items()
-        })
+        self.selections = MappingProxyType(
+            {
+                name: plan.selection
+                for name, plan in self.plans.items()
+                if plan.selection is not None
+            }
+        )
+        self.coverage = MappingProxyType(
+            {
+                name: MappingProxyType(dict(value))
+                for name, value in (coverage or {}).items()
+            }
+        )
         self.benchmark_calls = MappingProxyType(dict(benchmark_calls or {}))
         self.cache_hits = cache_hits
         self.benchmarked_candidates = benchmarked_candidates

@@ -56,6 +56,8 @@ _OFFLINE_COMPILE_DEVICE_ORDINAL: int | None = None
 _OFFLINE_CUTE_NO_JIT = False
 
 _LAUNCHER_OBSERVERS = ContextVar("b12x_launcher_observers", default=())
+
+
 @dataclass(frozen=True)
 class DimKey:
     kind: str
@@ -391,7 +393,8 @@ def tensor_compile_fact(
         dynamic_dim_set = set(dynamic_dims)
         dim_facts = tuple(
             ("dim", "dynamic", None)
-            if idx in dynamic_dim_set else ("dim", "exact", dim)
+            if idx in dynamic_dim_set
+            else ("dim", "exact", dim)
             for idx, dim in enumerate(shape)
         )
     else:
@@ -407,7 +410,8 @@ def tensor_compile_fact(
         dynamic_stride_set = set(dynamic_strides)
         stride_facts = tuple(
             ("dim", "dynamic", None)
-            if idx in dynamic_stride_set else ("dim", "exact", stride)
+            if idx in dynamic_stride_set
+            else ("dim", "exact", stride)
             for idx, stride in enumerate(raw_strides)
         )
     else:
@@ -1209,7 +1213,8 @@ def _is_explicit_spec_payload(payload: tuple[object, ...] | None) -> bool:
     return (
         payload is not None
         and len(payload) == 11
-        and payload[0] in {
+        and payload[0]
+        in {
             "b12x_cute_compile_cache_v6_explicit_spec",
             "b12x_cute_compile_cache_v7_explicit_spec",
         }
@@ -1492,7 +1497,8 @@ def _current_device_ordinal() -> int | None:
 
 
 def _compile_arch_key(
-    compute_capability: tuple[int, int], sm_count: int,
+    compute_capability: tuple[int, int],
+    sm_count: int,
 ) -> tuple[str, tuple[int, int], int]:
     capability = tuple(compute_capability)
     if (
@@ -1506,7 +1512,9 @@ def _compile_arch_key(
 
 
 def _configure_offline_compile_target(
-    device_ordinal: int, compute_capability: tuple[int, int], sm_count: int,
+    device_ordinal: int,
+    compute_capability: tuple[int, int],
+    sm_count: int,
 ) -> None:
     """Bind portable cache identity without initializing CUDA in a child."""
     global _OFFLINE_COMPILE_DEVICE_ORDINAL
@@ -2159,9 +2167,13 @@ def _semantic_compile_manifest_payload(
         "target": _semantic_target_key(cache_payload[1]),
     }
     target_field = (
-        "device_arch" if cache_format in {
-            "b12x_cute_compile_cache_v4", "b12x_cute_compile_cache_v7_explicit_spec",
-        } else "device_uuid"
+        "device_arch"
+        if cache_format
+        in {
+            "b12x_cute_compile_cache_v4",
+            "b12x_cute_compile_cache_v7_explicit_spec",
+        }
+        else "device_uuid"
     )
     semantic[target_field] = _manifest_json_value(cache_payload[4])
     if _is_explicit_spec_payload(cache_payload):
@@ -2488,16 +2500,24 @@ def _write_compile_manifest(
     manifest = _build_compile_manifest(
         cache_key, cache_payload, func, object_bytes, compiled=compiled
     )
-    data = json.dumps(
-        manifest, sort_keys=True, separators=(",", ":"),
-        ensure_ascii=True, allow_nan=False,
-    ) + "\n"
+    data = (
+        json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    )
     atomic_write_bytes(_cache_manifest_path(cache_key), data.encode("utf-8"))
 
 
 def _valid_cute_compile_cache(cache_key: str) -> bool:
     return valid_object(
-        _cache_object_path(cache_key), _cache_manifest_path(cache_key), cache_key,
+        _cache_object_path(cache_key),
+        _cache_manifest_path(cache_key),
+        cache_key,
     )
 
 
@@ -2541,14 +2561,14 @@ def _load_cute_compile_from_disk(cache_key: str):
         # CUTLASS may finalize or patch the ELF while loading it.  The cache
         # object is content-addressed and its digest is recorded in the compile
         # manifest, so never expose that canonical object to the loader.
-        with tempfile.TemporaryDirectory(
-            prefix="b12x-cute-cache-load-"
-        ) as raw_stage:
+        with tempfile.TemporaryDirectory(prefix="b12x-cute-cache-load-") as raw_stage:
             staged_object = Path(raw_stage) / object_path.name
             shutil.copy2(object_path, staged_object)
             # Validate the bytes actually handed to CUTLASS. Its loader can
             # modify this private copy; it must never modify the cached object.
-            if not valid_object(staged_object, _cache_manifest_path(cache_key), cache_key):
+            if not valid_object(
+                staged_object, _cache_manifest_path(cache_key), cache_key
+            ):
                 return None
             module = ExternalBinaryModule(str(staged_object))
             return getattr(module, _cache_prefix(cache_key))
@@ -2710,11 +2730,16 @@ def compile(
             compile_callable, func, args, kwargs, compile_spec
         )
         if not _cute_compile_disk_cache_enabled_for_payload(payload):
-            raise RuntimeError("compilation planning requires the normal device-bound object cache")
+            raise RuntimeError(
+                "compilation planning requires the normal device-bound object cache"
+            )
         cache_key = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
         program = ProgramKey(
-            "cute", cache_key,
-            compile_spec.kernel_id if compile_spec is not None else _compile_target_name(func),
+            "cute",
+            cache_key,
+            compile_spec.kernel_id
+            if compile_spec is not None
+            else _compile_target_name(func),
         )
         record_program(program)
         return DeferredCuTeKernel(program, memory_cache_key)
@@ -2739,8 +2764,11 @@ def compile(
     )
     cache_key = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
     program = ProgramKey(
-        "cute", cache_key,
-        compile_spec.kernel_id if compile_spec is not None else _compile_target_name(func),
+        "cute",
+        cache_key,
+        compile_spec.kernel_id
+        if compile_spec is not None
+        else _compile_target_name(func),
     )
     disk_cache_enabled = _cute_compile_disk_cache_enabled_for_payload(payload)
 
@@ -2823,7 +2851,9 @@ def compile(
                 compile_spec=compile_spec,
                 cache_key=cache_key,
             )
-            store_context = nullcontext() if _OFFLINE_CUTE_NO_JIT else suppress(Exception)
+            store_context = (
+                nullcontext() if _OFFLINE_CUTE_NO_JIT else suppress(Exception)
+            )
             with store_context:
                 _store_cute_compile_to_disk(
                     cache_key,
@@ -2904,7 +2934,12 @@ def _cached_default_executor(compiled: Any) -> Any | None:
 
 
 def run_compiled(compiled: Any, args: tuple[Any, ...]) -> Any:
-    from .compile_plan import compile_only_launches_enabled, program_keys, record_program
+    from .compile_plan import (
+        compile_only_launches_enabled,
+        program_keys,
+        record_program,
+    )
+
     if compile_only_launches_enabled():
         for program in program_keys(compiled):
             record_program(program, compiled)
@@ -2919,19 +2954,22 @@ def run_compiled(compiled: Any, args: tuple[Any, ...]) -> Any:
         return compiled.run_compiled_program(execution_args)
     return compiled(*args)
 
+
 @contextmanager
 def observe_launchers():
     """Collect concrete launchers resolved by one metadata-only host factory."""
     from .compile_plan import compile_only_launches_enabled
+
     if not compile_only_launches_enabled():
-        raise RuntimeError("launcher extraction requires a compile-only preparation scope")
+        raise RuntimeError(
+            "launcher extraction requires a compile-only preparation scope"
+        )
     observed = []
     token = _LAUNCHER_OBSERVERS.set((*_LAUNCHER_OBSERVERS.get(), observed))
     try:
         yield observed
     finally:
         _LAUNCHER_OBSERVERS.reset(token)
-
 
 
 def launch(
@@ -2951,6 +2989,7 @@ def launch(
     for observed in _LAUNCHER_OBSERVERS.get():
         observed.append(compiled)
     from .compile_plan import compile_only_launches_enabled
+
     if compile_only_launches_enabled():
         return compiled
     return run_compiled(compiled, runtime_args)

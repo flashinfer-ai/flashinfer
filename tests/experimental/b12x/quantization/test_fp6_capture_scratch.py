@@ -1,4 +1,5 @@
 """Decode quantization workspace tests for CUDA-graph capture."""
+
 from __future__ import annotations
 
 import pytest
@@ -60,9 +61,7 @@ def test_capture_claims_eager_bucket_per_stream(monkeypatch):
     assert len(fdw._QUANT_SCRATCH) == 2
 
     # "Capture" on the same stream: must claim the eager bucket, not allocate.
-    monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", lambda: True
-    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     claimed = fdw._small_m_quant_scratch(m_pad, k, device)
     assert claimed is eager_entry
     assert len(fdw._QUANT_SCRATCH) == 2
@@ -78,9 +77,7 @@ def test_capture_claims_eager_bucket_per_stream(monkeypatch):
 
     # Claimed graph storage is reserved. Later eager work gets a replacement
     # instead of racing a replay that retains the old pointer.
-    monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", lambda: False
-    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     eager_replacement = fdw._small_m_quant_scratch(m_pad, k, device)
     assert eager_replacement is not eager_entry
     assert fdw._CAPTURE_ASSIGNED
@@ -129,9 +126,7 @@ def test_decode_graph_replay_reuses_bucket_and_is_bit_exact():
     assert fdw._CAPTURE_ASSIGNED, "capture did not claim a bucket"
     assert len(fdw._QUANT_SCRATCH) == buckets_before
     assigned = next(iter(fdw._CAPTURE_ASSIGNED.values()))
-    eager_ptrs = {
-        e[0].packed_a_storage.data_ptr() for e in fdw._QUANT_SCRATCH.values()
-    }
+    eager_ptrs = {e[0].packed_a_storage.data_ptr() for e in fdw._QUANT_SCRATCH.values()}
     assert assigned[0].packed_a_storage.data_ptr() in eager_ptrs
 
     graph.replay()
@@ -140,9 +135,7 @@ def test_decode_graph_replay_reuses_bucket_and_is_bit_exact():
 
     # Replay tracks new contents in the static input. The eager comparison uses
     # separate scratch because graph-claimed storage remains reserved.
-    x_static.copy_(
-        (torch.randn(1, k, device="cuda") * 0.2).to(torch.bfloat16)
-    )
+    x_static.copy_((torch.randn(1, k, device="cuda") * 0.2).to(torch.bfloat16))
     graph.replay()
     torch.cuda.synchronize()
     y_replay = y_static.clone()

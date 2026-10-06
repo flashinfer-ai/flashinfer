@@ -1,4 +1,5 @@
 """Partial summation for BF16-activation weight-only GEMM."""
+
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -17,11 +18,17 @@ class WeightOnlySplitKReduce:
         self.slices = slices
 
     @cute.jit
-    def __call__(self, partials: cute.Pointer, output: cute.Pointer,
-                 m: Int32, stream: cuda.CUstream):
+    def __call__(
+        self,
+        partials: cute.Pointer,
+        output: cute.Pointer,
+        m: Int32,
+        stream: cuda.CUstream,
+    ):
         self.kernel(partials, output, m).launch(
             grid=((Int64(m) * self.n + 255) // 256, 1, 1),
-            block=(256, 1, 1), stream=stream,
+            block=(256, 1, 1),
+            stream=stream,
         )
 
     @cute.kernel
@@ -38,7 +45,9 @@ class WeightOnlySplitKReduce:
 @program_cache
 def compile_reduce(n: int, slices: int, device: int):
     if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("A16 split-K reduction must be prewarmed before CUDA graph capture")
+        raise RuntimeError(
+            "A16 split-K reduction must be prewarmed before CUDA graph capture"
+        )
     launch = WeightOnlySplitKReduce(n, slices)
     key = (n, slices, device)
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
@@ -46,6 +55,7 @@ def compile_reduce(n: int, slices: int, device: int):
         launch,
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
-        1, current_cuda_stream(),
+        1,
+        current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key("gemm.dense.split_k_reduce", 1, key),
     )

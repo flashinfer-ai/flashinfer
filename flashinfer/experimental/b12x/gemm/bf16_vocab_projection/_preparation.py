@@ -1,4 +1,5 @@
 """Prepared BF16 vocabulary projection declaration and prepared state."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -26,13 +27,22 @@ def compile_vocab_projection(query_payload, config_payload, ordinal):
     TUNING.validate_config(query, config, None)
     if config.backend == "torch":
         return {}
-    kernel = _kernel._row_kernel if config.algorithm == "row" else _kernel._row_loop_kernel
+    kernel = (
+        _kernel._row_kernel if config.algorithm == "row" else _kernel._row_loop_kernel
+    )
     with torch.cuda.device(ordinal):
-        return {"projection": kernel.warmup(
-            torch.bfloat16, torch.bfloat16, torch.bfloat16,
-            K=query.in_features, BLOCK_K=config.block_k, N=query.out_features,
-            num_warps=config.num_warps, grid=(query.out_features, 1, 1),
-        )}
+        return {
+            "projection": kernel.warmup(
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.bfloat16,
+                K=query.in_features,
+                BLOCK_K=config.block_k,
+                N=query.out_features,
+                num_warps=config.num_warps,
+                grid=(query.out_features, 1, 1),
+            )
+        }
 
 
 @dataclass(frozen=True)
@@ -56,17 +66,23 @@ def make_plan(caps: Caps, *, invocation=FrozenMapping(), override=None) -> Plan:
     if invocation:
         raise ValueError("BF16 vocabulary projection has no invocation metadata")
     query = Bf16VocabProjectionQuery(
-        dtype="bfloat16", max_tokens=caps.max_tokens,
-        in_features=caps.in_features, out_features=caps.out_features,
+        dtype="bfloat16",
+        max_tokens=caps.max_tokens,
+        in_features=caps.in_features,
+        out_features=caps.out_features,
     )
 
     def compile_jobs(config, device):
         if config.backend == "torch":
             return ()
-        return (CompileJob.create(
-            "b12x.gemm.bf16_vocab_projection._preparation:compile_vocab_projection",
-            TUNING.encode_query(query), config.to_dict(), device.ordinal,
-        ),)
+        return (
+            CompileJob.create(
+                "b12x.gemm.bf16_vocab_projection._preparation:compile_vocab_projection",
+                TUNING.encode_query(query),
+                config.to_dict(),
+                device.ordinal,
+            ),
+        )
 
     def materialize(selection, device):
         config = selection.config
@@ -74,7 +90,9 @@ def make_plan(caps: Caps, *, invocation=FrozenMapping(), override=None) -> Plan:
             runner = torch.nn.functional.linear
         else:
             programs = compile_vocab_projection(
-                TUNING.encode_query(query), config.to_dict(), device.ordinal,
+                TUNING.encode_query(query),
+                config.to_dict(),
+                device.ordinal,
             )
             launcher = programs["projection"]
 
@@ -85,11 +103,16 @@ def make_plan(caps: Caps, *, invocation=FrozenMapping(), override=None) -> Plan:
                         "vocabulary projection source rows differ from preparation"
                     )
                 output = torch.empty(
-                    (rows, query.out_features), dtype=torch.bfloat16,
+                    (rows, query.out_features),
+                    dtype=torch.bfloat16,
                     device=source.device,
                 )
                 launcher[(query.out_features, rows, 1)](
-                    source, weight, output, query.in_features, config.block_k,
+                    source,
+                    weight,
+                    output,
+                    query.in_features,
+                    config.block_k,
                     query.out_features,
                 )
                 return output
@@ -97,10 +120,14 @@ def make_plan(caps: Caps, *, invocation=FrozenMapping(), override=None) -> Plan:
         return _PreparedVocabProjection(caps, query, config, runner)
 
     return Plan(
-        contract=TUNING, query=query, invocation=invocation, override=override,
+        contract=TUNING,
+        query=query,
+        invocation=invocation,
+        override=override,
         _compile_jobs=compile_jobs,
         _memory_requirements=lambda config, device: MemoryRequirements(),
-        _materialize=materialize, _device=caps.device,
+        _materialize=materialize,
+        _device=caps.device,
     )
 
 

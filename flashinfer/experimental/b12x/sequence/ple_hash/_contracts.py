@@ -21,7 +21,6 @@ from ._tuning import PleHashConfig
 from .geometry import Geometry, GeometryTensors
 
 
-
 def _canonical_device(device: torch.device | str) -> torch.device:
     result = torch.device(device)
     if result.type == "cuda" and result.index is None:
@@ -191,11 +190,9 @@ class _HashLayout:
         return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
 
 
-
-
-
-def _materialize_layout(caps: Caps, geometry: Geometry, config: PleHashConfig) -> _HashLayout:
-
+def _materialize_layout(
+    caps: Caps, geometry: Geometry, config: PleHashConfig
+) -> _HashLayout:
     request_ids_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)
     cursor = request_ids_offset_bytes + caps.max_tokens * dtype_nbytes(torch.int32)
     layout = _ScratchLayout(
@@ -213,18 +210,28 @@ def _materialize_layout(caps: Caps, geometry: Geometry, config: PleHashConfig) -
 
 
 def plan(
-    caps: Caps, *, geometry: Geometry | None = None,
-    prime_sizes: torch.Tensor | None = None, table_offsets: torch.Tensor | None = None,
-    multipliers: torch.Tensor | None = None, invocation: FrozenMapping = FrozenMapping(),
+    caps: Caps,
+    *,
+    geometry: Geometry | None = None,
+    prime_sizes: torch.Tensor | None = None,
+    table_offsets: torch.Tensor | None = None,
+    multipliers: torch.Tensor | None = None,
+    invocation: FrozenMapping = FrozenMapping(),
     override: PleHashConfig | None = None,
 ) -> Plan:
     """Declare hashing while retaining the caller's checkpoint tensor references."""
     from ._preparation import make_plan
+
     if not isinstance(caps, Caps):
         raise TypeError("caps must be Caps")
     return make_plan(
-        caps, geometry=geometry, prime_sizes=prime_sizes, table_offsets=table_offsets,
-        multipliers=multipliers, invocation=invocation, override=override,
+        caps,
+        geometry=geometry,
+        prime_sizes=prime_sizes,
+        table_offsets=table_offsets,
+        multipliers=multipliers,
+        invocation=invocation,
+        override=override,
     )
 
 

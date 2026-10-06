@@ -107,9 +107,7 @@ def _make_batch(
 def test_x4t_scale_batch_rejects_mismatched_component_counts() -> None:
     fixed = torch.empty((1,), dtype=torch.uint8)
     with pytest.raises(ValueError, match="nonempty and equally sized"):
-        make_x4t_scale_batch(
-            [fixed], [], rows=16, columns=8, device="cuda"
-        )
+        make_x4t_scale_batch([fixed], [], rows=16, columns=8, device="cuda")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -128,9 +126,7 @@ def test_x4t_scale_batch_accepts_target_device_components() -> None:
     expected_device = torch.device("cuda", torch.cuda.current_device())
     assert batch.fixed.device == expected_device
     assert batch.exceptions.device == expected_device
-    assert torch.equal(
-        batch.fixed.cpu(), torch.stack([item[0] for item in components])
-    )
+    assert torch.equal(batch.fixed.cpu(), torch.stack([item[0] for item in components]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -215,17 +211,11 @@ def test_x4t_tp12_single_launch_matches_both_w4a16_scale_planes() -> None:
     w13, logical_w13 = _make_batch(
         rows=512, columns=112, experts=experts, device=device
     )
-    w2, logical_w2 = _make_batch(
-        rows=3584, columns=8, experts=experts, device=device
-    )
+    w2, logical_w2 = _make_batch(rows=3584, columns=8, experts=experts, device=device)
     expert_ids = torch.tensor([0, 2, 0, -1], dtype=torch.int32, device=device)
     expert_map = torch.tensor([2, -1, 0, 1], dtype=torch.int32, device=device)
-    output_w13 = torch.full(
-        (experts, 112, 512), 0xD6, dtype=torch.uint8, device=device
-    )
-    output_w2 = torch.full(
-        (experts, 8, 3584), 0xD6, dtype=torch.uint8, device=device
-    )
+    output_w13 = torch.full((experts, 112, 512), 0xD6, dtype=torch.uint8, device=device)
+    output_w2 = torch.full((experts, 8, 3584), 0xD6, dtype=torch.uint8, device=device)
 
     decode_x4t_tp12_w4a16_scales(
         w13,
@@ -268,9 +258,7 @@ def test_x4t_tp12_single_launch_matches_both_w4a16_scale_planes() -> None:
         )
     output_w13.fill_(0xD6)
     output_w2.fill_(0xD6)
-    expert_ids.copy_(
-        torch.tensor([3, 1, 3, -1], dtype=torch.int32, device=device)
-    )
+    expert_ids.copy_(torch.tensor([3, 1, 3, -1], dtype=torch.int32, device=device))
     graph.replay()
     torch.cuda.synchronize()
 
@@ -425,6 +413,4 @@ def test_x4t_tp12_w4a16_moe_matches_dense_scales_and_graph_replay() -> None:
     compressed_buffers.output.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize(device)
-    torch.testing.assert_close(
-        compressed_buffers.output, dense_output, rtol=0, atol=0
-    )
+    torch.testing.assert_close(compressed_buffers.output, dense_output, rtol=0, atol=0)

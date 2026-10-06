@@ -139,9 +139,7 @@ def make_smem_layout_mg(
     # that small scratch cooperatively between tiles instead of keeping the
     # ldmatrix fragments live (and spilled) across the full kernel.
     alias_qrope = bf16_qk or is_glm
-    dsv41_fp8_pv = (
-        traits.model_type == ModelType.DSV41 and traits.fp8_internal
-    )
+    dsv41_fp8_pv = traits.model_type == ModelType.DSV41 and traits.fp8_internal
     # Keep the model-native padded KV row in both compute modes.  DSV4's 464-B
     # stride (448-B payload + 16-B pad) is part of the shared-memory bank layout,
     # not merely copy padding; FlashInfer retains it for BF16 QK as well.  The
@@ -373,8 +371,10 @@ def get_prefill_mg_shared_storage_cls(
     # reads rope from global/L2, so it allocates NEITHER kv_sc nor kv_rope. Each
     # model is its own compiled specialization, so the GLM struct cannot perturb
     # the DSV4 struct.
-    if is_glm and not traits.latent_scale_per_token and not (
-        traits.model_type == ModelType.DSV41 and traits.fp8_internal
+    if (
+        is_glm
+        and not traits.latent_scale_per_token
+        and not (traits.model_type == ModelType.DSV41 and traits.fp8_internal)
     ):
         kv_scale_field = {}
     else:
@@ -463,8 +463,10 @@ def get_prefill_mg_shared_storage_cls(
             "q_sc": layout.q_sc_off,
         }
     expected_offsets["kv_fp8"] = layout.kv_fp8_off
-    if not is_glm or traits.latent_scale_per_token or (
-        traits.model_type == ModelType.DSV41 and traits.fp8_internal
+    if (
+        not is_glm
+        or traits.latent_scale_per_token
+        or (traits.model_type == ModelType.DSV41 and traits.fp8_internal)
     ):
         expected_offsets["kv_sc"] = layout.kv_sc_off
     if layout.kv_ratio_buf_bytes:
@@ -521,9 +523,7 @@ def _run_module_asserts() -> None:
         f"{SM120_SMEM_CARVEOUT_BYTES}B"
     )
     v41_fp8 = replace(
-        make_unified_traits(
-            ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3
-        ),
+        make_unified_traits(ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3),
         fp8_internal=True,
     )
     v41_layout = make_smem_layout_mg(v41_fp8, mg_n_hg=1)

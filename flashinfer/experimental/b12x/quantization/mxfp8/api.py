@@ -12,7 +12,6 @@ def is_supported(device=None) -> bool:
     return default_is_supported(device, requires=META.requires)
 
 
-
 __all__ = [
     "Mxfp8Config",
     "Mxfp8Query",

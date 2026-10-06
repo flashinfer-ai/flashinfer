@@ -13,7 +13,11 @@ import math
 
 import torch
 
-from b12x._lib.compile_plan import compile_only_launches_enabled, program_keys, record_program
+from b12x._lib.compile_plan import (
+    compile_only_launches_enabled,
+    program_keys,
+    record_program,
+)
 
 from ._sparse_gqa_cute_config import (
     MAX_SPLIT_ROWS as _MAX_SPLIT_ROWS,
@@ -218,8 +222,11 @@ def compile_sparse_paged_gqa(
     result: dict[str, object] = {}
     for direct in (False, True):
         _, result["direct" if direct else "split"] = _compile(
-            query=query, key_cache=key_cache, value_cache=value_cache,
-            request_ids=request_ids, direct_output=direct,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            request_ids=request_ids,
+            direct_output=direct,
             return_lse=return_lse if direct else True,
             kv_warps=int(direct_kv_warps) if direct else 2,
             selection_width=int(selected_positions.shape[1]),
@@ -227,11 +234,13 @@ def compile_sparse_paged_gqa(
     # Split merge is a distinct CuTe ABI; compile-only returns its carrier.
     partial_output = torch.empty(
         (int(query.shape[0]), 1, int(query.shape[1]), int(query.shape[2])),
-        dtype=torch.float32, device=query.device,
+        dtype=torch.float32,
+        device=query.device,
     )
     partial_lse = torch.empty(
         (int(query.shape[0]), 1, int(query.shape[1])),
-        dtype=torch.float32, device=query.device,
+        dtype=torch.float32,
+        device=query.device,
     )
     output = torch.empty_like(query)
     output_lse = (
@@ -244,9 +253,12 @@ def compile_sparse_paged_gqa(
         else None
     )
     result["merge"] = launch_sparse_gqa_merge(
-        partial_output=partial_output, partial_lse=partial_lse, output=output,
+        partial_output=partial_output,
+        partial_lse=partial_lse,
+        output=output,
         output_lse=output_lse,
-        rows=int(query.shape[0]), splits=1,
+        rows=int(query.shape[0]),
+        splits=1,
     )
     return result
 
@@ -334,45 +346,77 @@ def launch_sparse_paged_gqa(
         )
     if _prepared is not None:
         from ..paged._selected_forward import (
-            BFloat16, Float8E4M3FN, Float32, Int32, Int64, _fake_pointer,
-            _pointer, current_cuda_stream, run_compiled,
+            BFloat16,
+            Float8E4M3FN,
+            Float32,
+            Int32,
+            Int64,
+            _fake_pointer,
+            _pointer,
+            current_cuda_stream,
+            run_compiled,
         )
+
         direct = rows > _MAX_SPLIT_ROWS
         raw = _prepared["direct" if direct else "split"]
         request_id_type = Int32 if request_ids.dtype == torch.int32 else Int64
         kv_type = Float8E4M3FN if key_cache.dtype == torch.float8_e4m3fn else BFloat16
-        run_compiled(raw, (
-            _pointer(query, BFloat16), _pointer(key_cache, kv_type),
-            _pointer(value_cache, kv_type),
-            _pointer(k_descale, Float32) if k_descale is not None else _fake_pointer(Float32),
-            _pointer(v_descale, Float32) if v_descale is not None else _fake_pointer(Float32),
-            _pointer(block_table, Int32), _pointer(request_ids, request_id_type),
-            _pointer(selected_positions, Int32), _pointer(query_positions, Int64),
-            _fake_pointer(Float32) if direct else _pointer(partial_output, Float32),
+        run_compiled(
+            raw,
             (
-                _pointer(output_lse, Float32)
-                if output_lse is not None
-                else _fake_pointer(Float32)
-            ) if direct else _pointer(partial_lse, Float32),
-            _pointer(output, BFloat16), int(key_cache.shape[0]),
-            int(block_table.shape[0]), int(block_table.shape[1]), float(softmax_scale),
-            int(rows), 1 if direct else int(splits), current_cuda_stream(),
-        ))
+                _pointer(query, BFloat16),
+                _pointer(key_cache, kv_type),
+                _pointer(value_cache, kv_type),
+                _pointer(k_descale, Float32)
+                if k_descale is not None
+                else _fake_pointer(Float32),
+                _pointer(v_descale, Float32)
+                if v_descale is not None
+                else _fake_pointer(Float32),
+                _pointer(block_table, Int32),
+                _pointer(request_ids, request_id_type),
+                _pointer(selected_positions, Int32),
+                _pointer(query_positions, Int64),
+                _fake_pointer(Float32) if direct else _pointer(partial_output, Float32),
+                (
+                    _pointer(output_lse, Float32)
+                    if output_lse is not None
+                    else _fake_pointer(Float32)
+                )
+                if direct
+                else _pointer(partial_lse, Float32),
+                _pointer(output, BFloat16),
+                int(key_cache.shape[0]),
+                int(block_table.shape[0]),
+                int(block_table.shape[1]),
+                float(softmax_scale),
+                int(rows),
+                1 if direct else int(splits),
+                current_cuda_stream(),
+            ),
+        )
         if not direct:
             from ..paged._selected_forward import launch_sparse_gqa_merge
+
             # The merge helper has no runtime resolver here: its exact carrier
             # was retained in the QSA program map during preparation.
             merge = _prepared["merge"]
             from ..paged._selected_forward import run_compiled as run_merge
-            run_merge(merge, (
-                _pointer(partial_output, Float32), _pointer(partial_lse, Float32),
-                _pointer(output, BFloat16),
-                _pointer(output_lse, Float32)
-                if output_lse is not None
-                else _fake_pointer(Float32),
-                int(rows), int(splits),
-                current_cuda_stream(),
-            ))
+
+            run_merge(
+                merge,
+                (
+                    _pointer(partial_output, Float32),
+                    _pointer(partial_lse, Float32),
+                    _pointer(output, BFloat16),
+                    _pointer(output_lse, Float32)
+                    if output_lse is not None
+                    else _fake_pointer(Float32),
+                    int(rows),
+                    int(splits),
+                    current_cuda_stream(),
+                ),
+            )
         return output[:rows]
     if rows > _MAX_SPLIT_ROWS:
         from ..paged._selected_forward import launch_selected_paged_gqa_direct

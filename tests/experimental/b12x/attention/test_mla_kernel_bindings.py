@@ -77,32 +77,32 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
         # in prefill.py); the only prefill op is the MG dual-cache op below.
         # DUAL-CACHE MG prefill op (the new op DSV4 has_extra routes through).
         torch.ops.b12x.sparse_mla_sm120_prefill_mg_dual(
-            q_all,        # q
-            cache,        # kv_flat (MAIN)
-            indices,      # topk_indices
-            lengths,      # topk_length
-            attn_sink,    # attn_sink_t
-            output,       # output
+            q_all,  # q
+            cache,  # kv_flat (MAIN)
+            indices,  # topk_indices
+            lengths,  # topk_length
+            attn_sink,  # attn_sink_t
+            output,  # output
             prefill_lse,  # lse_out
-            cache,        # extra_kv_flat
-            indices,      # extra_indices_t
-            lengths,      # extra_len_t
-            0.1,          # sm_scale
-            1.0,          # latent_scale
-            64,           # page_block_size
-            4,            # topk
-            2,            # num_tiles
-            1024,         # stride_kv_block
-            True,         # has_sink
-            1,            # compute_mode (BF16)
-            2,            # mg_n_hg
-            0,            # model_type (DSV4)
-            0,            # scale_format
-            4,            # extra_topk
-            1,            # num_main_tiles
-            2,            # pbs_extra
-            1024,         # stride_extra_kv_block
-            True,         # row_xor
+            cache,  # extra_kv_flat
+            indices,  # extra_indices_t
+            lengths,  # extra_len_t
+            0.1,  # sm_scale
+            1.0,  # latent_scale
+            64,  # page_block_size
+            4,  # topk
+            2,  # num_tiles
+            1024,  # stride_kv_block
+            True,  # has_sink
+            1,  # compute_mode (BF16)
+            2,  # mg_n_hg
+            0,  # model_type (DSV4)
+            0,  # scale_format
+            4,  # extra_topk
+            1,  # num_main_tiles
+            2,  # pbs_extra
+            1024,  # stride_extra_kv_block
+            True,  # row_xor
         )
 
 
@@ -120,7 +120,9 @@ def test_sm120_prefill_dual_odd_multiple_heads_splits_to_mg(monkeypatch) -> None
         calls.append(kwargs)
         return kwargs["output"], kwargs["lse_out"]
 
-    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg)
+    monkeypatch.setattr(
+        prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg
+    )
 
     topk = 128
     q = torch.empty((2, 80, 512), dtype=torch.bfloat16)
@@ -168,7 +170,9 @@ def test_glm_prefill_partitions_120_heads_as_32_16_8(monkeypatch) -> None:
         calls.append(kwargs)
         return kwargs["output"], kwargs["lse_out"]
 
-    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg)
+    monkeypatch.setattr(
+        prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg
+    )
 
     topk = 2048
     q = torch.empty((2, 120, 576), dtype=torch.bfloat16)
@@ -206,7 +210,9 @@ def test_dsv4_bf16_prefill_partitions_24_heads(monkeypatch) -> None:
         calls.append(kwargs)
         return kwargs["output"], kwargs["lse_out"]
 
-    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg)
+    monkeypatch.setattr(
+        prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg
+    )
 
     topk = 128
     q = torch.empty((2, 24, 512), dtype=torch.bfloat16)
@@ -229,6 +235,7 @@ def test_dsv4_bf16_prefill_partitions_24_heads(monkeypatch) -> None:
     assert {call["model_type"] for call in calls} == {ModelType.DSV4}
     assert {call["scale_format"] for call in calls} == {ScaleFormat.UE8M0_BYTE}
 
+
 @pytest.mark.parametrize(
     ("heads", "expected_active", "expected_offsets"),
     [(24, [16, 8], [0, 16]), (32, [32], [0])],
@@ -246,7 +253,9 @@ def test_dsv41_prefill_partitions_tp_shards(
         calls.append(kwargs)
         return kwargs["output"], kwargs["lse_out"]
 
-    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg)
+    monkeypatch.setattr(
+        prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg
+    )
 
     q = torch.empty((2, heads, 512), dtype=torch.bfloat16)
     kv_cache = torch.empty((4, 432), dtype=torch.uint8)
@@ -279,7 +288,9 @@ def test_sm120_prefill_dual_partitions_40_heads_with_8_tail(monkeypatch) -> None
         calls.append(kwargs)
         return kwargs["output"], kwargs["lse_out"]
 
-    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg)
+    monkeypatch.setattr(
+        prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg
+    )
 
     topk = 128
     q = torch.empty((2, 40, 512), dtype=torch.bfloat16)
@@ -319,7 +330,9 @@ def test_glm_tp8_prefill_routes_to_single_group_mg(monkeypatch) -> None:
         calls.append(kwargs)
         return kwargs["output"], kwargs["lse_out"]
 
-    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg)
+    monkeypatch.setattr(
+        prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg
+    )
 
     topk = 2048
     q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
@@ -356,7 +369,9 @@ def test_prefill_mg_heads8_uses_flat_valid_hpb_launcher(monkeypatch) -> None:
         del args
         calls.append(kwargs)
 
-    monkeypatch.setattr(prefill_mg, "_sparse_mla_prefill_mg_flat_launch", fake_flat_launch)
+    monkeypatch.setattr(
+        prefill_mg, "_sparse_mla_prefill_mg_flat_launch", fake_flat_launch
+    )
 
     topk = 2048
     q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
@@ -414,11 +429,21 @@ def test_sm120_prefill_dual_non_eligible_raises() -> None:
 
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
 @pytest.mark.parametrize("dynamic", [False, True])
-@pytest.mark.parametrize("shape,stride", [
-    ((3, 8), (8, 1)), ((1, 8), (1, 1)), ((3, 8), (24, 3)), ((0,), (1,)),
-])
+@pytest.mark.parametrize(
+    "shape,stride",
+    [
+        ((3, 8), (8, 1)),
+        ((1, 8), (1, 1)),
+        ((3, 8), (24, 3)),
+        ((0,), (1,)),
+    ],
+)
 def test_prefill_compile_descriptors_never_export_fake_storage(
-    monkeypatch, device, dynamic, shape, stride,
+    monkeypatch,
+    device,
+    dynamic,
+    shape,
+    stride,
 ):
     """Compilation preserves native layouts without exporting FakeTensor storage."""
     import cutlass
@@ -426,7 +451,9 @@ def test_prefill_compile_descriptors_never_export_fake_storage(
     from b12x.attention._shared.mla import prefill_mg
 
     real = torch.empty_strided(shape, stride, dtype=torch.float32)
-    expected = prefill_mg._to_cute(real, cutlass.Float32, align=4, dynamic_layout=dynamic)
+    expected = prefill_mg._to_cute(
+        real, cutlass.Float32, align=4, dynamic_layout=dynamic
+    )
 
     from_dlpack = prefill_mg.from_dlpack
 
@@ -438,7 +465,9 @@ def test_prefill_compile_descriptors_never_export_fake_storage(
     monkeypatch.setattr(prefill_mg, "from_dlpack", reject_fake_dlpack)
     with FakeTensorMode(), compile_only_launches():
         fake = torch.empty_strided(shape, stride, dtype=torch.float32, device=device)
-        actual = prefill_mg._to_cute(fake, cutlass.Float32, align=4, dynamic_layout=dynamic)
+        actual = prefill_mg._to_cute(
+            fake, cutlass.Float32, align=4, dynamic_layout=dynamic
+        )
     from cutlass._mlir import ir
 
     assert actual.element_type == expected.element_type

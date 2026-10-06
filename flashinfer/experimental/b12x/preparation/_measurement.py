@@ -1,4 +1,5 @@
 """Representative activation-producing races owned by preparation."""
+
 from __future__ import annotations
 
 import ctypes
@@ -10,7 +11,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from b12x._lib.compile_plan import (
-    ProgramKey, forbid_lowering, observe_programs, record_program,
+    ProgramKey,
+    forbid_lowering,
+    observe_programs,
+    record_program,
 )
 from .types import _prime, _close_all
 
@@ -31,6 +35,7 @@ class _ParentCompilations:
     def __enter__(self):
         from triton import knobs
         from b12x._lib import compiler
+
         self.compiler, self.knobs = compiler, knobs
         self.before = int(compiler.compile_cache_info()["compile_misses"])
         self.original_compile = compiler._call_cute_compile
@@ -40,7 +45,9 @@ class _ParentCompilations:
 
         def listener(*args, **kwargs):
             metadata = kwargs.get("metadata", args[1] if len(args) > 1 else {})
-            record_program(ProgramKey("triton", metadata["hash"], metadata.get("name", "")))
+            record_program(
+                ProgramKey("triton", metadata["hash"], metadata.get("name", ""))
+            )
             if not kwargs.get("cache_hit", args[4] if len(args) > 4 else False):
                 self.triton += 1
             if self.previous_listener is not None:
@@ -58,12 +65,18 @@ class _ParentCompilations:
         return self
 
     def check(self):
-        self.cute = int(self.compiler.compile_cache_info()["compile_misses"]) - self.before
+        self.cute = (
+            int(self.compiler.compile_cache_info()["compile_misses"]) - self.before
+        )
         if self.cache_only and (self.cute or self.triton):
-            raise RuntimeError(f"no-compilation phase compiled CuTe={self.cute}, Triton={self.triton}")
+            raise RuntimeError(
+                f"no-compilation phase compiled CuTe={self.cute}, Triton={self.triton}"
+            )
 
     def __exit__(self, kind, value, traceback):
-        self.cute = int(self.compiler.compile_cache_info()["compile_misses"]) - self.before
+        self.cute = (
+            int(self.compiler.compile_cache_info()["compile_misses"]) - self.before
+        )
         self.knobs.compilation.listener = self.previous_listener
         if self.cache_only:
             self.compiler._call_cute_compile = self.original_compile
@@ -83,13 +96,19 @@ class _StreamGate:
 
     def __init__(self):
         if os.environ.get("CUDA_LAUNCH_BLOCKING") == "1":
-            raise RuntimeError("stream-gated autotuning requires CUDA_LAUNCH_BLOCKING to be disabled")
+            raise RuntimeError(
+                "stream-gated autotuning requires CUDA_LAUNCH_BLOCKING to be disabled"
+            )
         from cuda.bindings import driver
 
         self.driver = driver
-        self.pointer = self._check(driver.cuMemHostAlloc(4, driver.CU_MEMHOSTALLOC_DEVICEMAP))
+        self.pointer = self._check(
+            driver.cuMemHostAlloc(4, driver.CU_MEMHOSTALLOC_DEVICEMAP)
+        )
         try:
-            self.device_pointer = self._check(driver.cuMemHostGetDevicePointer(self.pointer, 0))
+            self.device_pointer = self._check(
+                driver.cuMemHostGetDevicePointer(self.pointer, 0)
+            )
             self.flag = ctypes.c_uint32.from_address(int(self.pointer))
             self.flag.value = 0
         except BaseException:
@@ -109,10 +128,14 @@ class _StreamGate:
         self.streams[stream.cuda_stream] = stream
         self.sequence = (self.sequence + 1) & 0xFFFFFFFF
         target = self.sequence
-        self._check(self.driver.cuStreamWaitValue32(
-            stream.cuda_stream, self.device_pointer, target,
-            int(self.driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ),
-        ))
+        self._check(
+            self.driver.cuStreamWaitValue32(
+                stream.cuda_stream,
+                self.device_pointer,
+                target,
+                int(self.driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ),
+            )
+        )
         try:
             yield
         finally:
@@ -150,12 +173,14 @@ def _collection_paused():
 class _TimedCall:
     def __init__(self, call, eviction, samples, gate):
         import torch
+
         self.call, self.eviction = call, eviction
         self.gate = gate
         self.producers = call.benchmark_producers or (call.produce,)
-        self.events = tuple((torch.cuda.Event(enable_timing=True),
-                             torch.cuda.Event(enable_timing=True))
-                            for _ in range(samples * len(self.producers)))
+        self.events = tuple(
+            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            for _ in range(samples * len(self.producers))
+        )
         for pair in self.events:
             for event in pair:
                 event.record()
@@ -212,7 +237,6 @@ class RaceMeasurements:
     overlapped_samples: int
 
 
-
 def _l2_flush_fn(device: object, *, enabled: bool):
     if not enabled:
         return None
@@ -234,17 +258,25 @@ def _l2_flush_fn(device: object, *, enabled: bool):
 
 
 def prepare_race_steps(
-    calls, *, device_ordinal, samples=DEFAULT_SAMPLES, primed=False, eviction=None,
+    calls,
+    *,
+    device_ordinal,
+    samples=DEFAULT_SAMPLES,
+    primed=False,
+    eviction=None,
 ):
     """Prepare event pairs for asynchronous calls on the current CUDA stream."""
     import torch
+
     if not calls or type(samples) is not int or samples <= 0:
         raise ValueError("a race requires candidates and positive samples")
     if any(call.produce is None for call in calls):
         raise ValueError("candidate races require an activation-producing context")
     workload_counts = {len(call.benchmark_producers) or 1 for call in calls}
     if len(workload_counts) != 1:
-        raise ValueError("candidate races require the same workload count for every candidate")
+        raise ValueError(
+            "candidate races require the same workload count for every candidate"
+        )
     sample_count = samples * workload_counts.pop()
     timers = []
     gate = None
@@ -252,7 +284,9 @@ def prepare_race_steps(
     try:
         with torch.cuda.device(device_ordinal), no_compilation():
             if eviction is None:
-                eviction = _l2_flush_fn(torch.device("cuda", device_ordinal), enabled=True)
+                eviction = _l2_flush_fn(
+                    torch.device("cuda", device_ordinal), enabled=True
+                )
             try:
                 eviction()
                 if not primed:
@@ -289,8 +323,15 @@ def _replay_timers(timers, *, device_ordinal, sample_count=0, compilation_active
 
 
 def measure_race_steps(
-    prepared, *, device_ordinal, rounds=7, compilation_active=None,
-    eliminate=False, champion=False, sample_observer=None, adaptive_repeats=True,
+    prepared,
+    *,
+    device_ordinal,
+    rounds=7,
+    compilation_active=None,
+    eliminate=False,
+    champion=False,
+    sample_observer=None,
+    adaptive_repeats=True,
 ):
     """Balanced comparison; cancellation discards this generator's result.
 
@@ -320,12 +361,14 @@ def measure_race_steps(
         repetition = 0
         while repetition < max(repeats[index] for index in order):
             indices = tuple(
-                index for index in (order if repetition % 2 == 0 else reversed(order))
+                index
+                for index in (order if repetition % 2 == 0 else reversed(order))
                 if repetition < repeats[index]
             )
             overlaps += _replay_timers(
                 tuple(prepared.timers[index] for index in indices),
-                device_ordinal=device_ordinal, sample_count=prepared.sample_count,
+                device_ordinal=device_ordinal,
+                sample_count=prepared.sample_count,
                 compilation_active=compilation_active,
             )
             for index in indices:
@@ -338,7 +381,10 @@ def measure_race_steps(
                 totals[index] += latency
                 if adaptive_repeats and turn == 0 and repetition == 0:
                     # The first scored replay also sizes the remaining work.
-                    repeats[index] = max(1, math.ceil(ROUND_BUDGET_US / (prepared.sample_count * latency)))
+                    repeats[index] = max(
+                        1,
+                        math.ceil(ROUND_BUDGET_US / (prepared.sample_count * latency)),
+                    )
             repetition += 1
             yield
         for index in order:
@@ -358,8 +404,10 @@ def measure_race_steps(
             # the median of the rounds it completed; the champion at position 0
             # is re-timed against every batch.
             active = [
-                index for index in active
-                if best[index] <= ELIMINATION_MARGIN * leader or (champion and index == 0)
+                index
+                for index in active
+                if best[index] <= ELIMINATION_MARGIN * leader
+                or (champion and index == 0)
             ]
             prepared.active_count = len(active)
     latencies = tuple(statistics.median(series) for series in values)
@@ -377,13 +425,22 @@ def _consume(steps):
 
 
 def _prepare_race(calls, *, device_ordinal, samples=DEFAULT_SAMPLES, primed=False):
-    return _consume(prepare_race_steps(
-        calls, device_ordinal=device_ordinal, samples=samples, primed=primed,
-    ))
+    return _consume(
+        prepare_race_steps(
+            calls,
+            device_ordinal=device_ordinal,
+            samples=samples,
+            primed=primed,
+        )
+    )
 
 
 def _measure_race(prepared, *, device_ordinal, rounds=7, compilation_active=None):
-    return _consume(measure_race_steps(
-        prepared, device_ordinal=device_ordinal, rounds=rounds,
-        compilation_active=compilation_active,
-    ))
+    return _consume(
+        measure_race_steps(
+            prepared,
+            device_ordinal=device_ordinal,
+            rounds=rounds,
+            compilation_active=compilation_active,
+        )
+    )

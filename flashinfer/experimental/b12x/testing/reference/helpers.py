@@ -181,9 +181,7 @@ def make_tp_moe_fp4_binding(
             fused_moe.PackedSourceFormat.MXFP4_E8M0_K32: "w4a8_mx",
             fused_moe.PackedSourceFormat.MXFP6_E8M0_K32: "w6a8_mx",
             fused_moe.PackedSourceFormat.MXFP8_E8M0_K32: "w8a8_mx",
-        }.get(
-            experts.plan.source.format, "w4a8_nvfp4"
-        ),
+        }.get(experts.plan.source.format, "w4a8_nvfp4"),
     }.get(activation.mode)
     if requested_mode is not None and requested_mode != expected_mode:
         raise ValueError(
@@ -201,15 +199,18 @@ def make_tp_moe_fp4_binding(
     declaration = fused_moe.plan_execution(
         experts=experts,
         capacity=fused_moe.ExecutionCapacity(
-            max_tokens=int(a.shape[0]), top_k=int(topk_ids.shape[1]),
+            max_tokens=int(a.shape[0]),
+            top_k=int(topk_ids.shape[1]),
         ),
         routing=fused_moe.RoutingSpec(
             apply_router_weight_on_input=apply_router_weight_on_input,
             deterministic_output=deterministic_output,
         ),
-        invocation=FrozenMapping({
-            "fast_math": True if fast_math is None else bool(fast_math),
-        }),
+        invocation=FrozenMapping(
+            {
+                "fast_math": True if fast_math is None else bool(fast_math),
+            }
+        ),
     )
 
     def bind_with_state(state, scratch):
@@ -465,8 +466,13 @@ def require_b12x(*, allow_module_level=False) -> torch.device:
     import pytest
 
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for b12x tests", allow_module_level=allow_module_level)
+        pytest.skip(
+            "CUDA is required for b12x tests", allow_module_level=allow_module_level
+        )
     major, minor = torch.cuda.get_device_capability()
     if major != 12 or minor not in (0, 1):
-        pytest.skip(f"SM12x (SM120/SM121) GPU required, found sm_{major}{minor}", allow_module_level=allow_module_level)
+        pytest.skip(
+            f"SM12x (SM120/SM121) GPU required, found sm_{major}{minor}",
+            allow_module_level=allow_module_level,
+        )
     return torch.device("cuda")

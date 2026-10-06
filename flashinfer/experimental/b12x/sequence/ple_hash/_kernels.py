@@ -154,24 +154,48 @@ def _hash_ids_kernel(
     mutates_args=("out", "request_ids"),
 )
 def _hash_pipeline_op(
-    token_ids: torch.Tensor, query_start_loc: torch.Tensor, committed_history: torch.Tensor,
-    num_seqs: torch.Tensor, num_tokens: torch.Tensor, multipliers: torch.Tensor,
-    prime_sizes: torch.Tensor, table_offsets: torch.Tensor, out: torch.Tensor,
-    request_ids: torch.Tensor, plan_handle: int,
+    token_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    committed_history: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    multipliers: torch.Tensor,
+    prime_sizes: torch.Tensor,
+    table_offsets: torch.Tensor,
+    out: torch.Tensor,
+    request_ids: torch.Tensor,
+    plan_handle: int,
 ) -> None:
-    state = require_prepared(plan_from_handle(plan_handle), "sequence.ple_hash", token_ids.device)
+    state = require_prepared(
+        plan_from_handle(plan_handle), "sequence.ple_hash", token_ids.device
+    )
     state.run_tensors(
-        token_ids, query_start_loc, committed_history, num_seqs, num_tokens,
-        multipliers, prime_sizes, table_offsets, out, request_ids,
+        token_ids,
+        query_start_loc,
+        committed_history,
+        num_seqs,
+        num_tokens,
+        multipliers,
+        prime_sizes,
+        table_offsets,
+        out,
+        request_ids,
     )
 
 
 @_hash_pipeline_op.register_fake
 def _hash_pipeline_fake(
-    token_ids: torch.Tensor, query_start_loc: torch.Tensor, committed_history: torch.Tensor,
-    num_seqs: torch.Tensor, num_tokens: torch.Tensor, multipliers: torch.Tensor,
-    prime_sizes: torch.Tensor, table_offsets: torch.Tensor, out: torch.Tensor,
-    request_ids: torch.Tensor, plan_handle: int,
+    token_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    committed_history: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    multipliers: torch.Tensor,
+    prime_sizes: torch.Tensor,
+    table_offsets: torch.Tensor,
+    out: torch.Tensor,
+    request_ids: torch.Tensor,
+    plan_handle: int,
 ) -> None:
     del token_ids, query_start_loc, committed_history, num_seqs, num_tokens
     del multipliers, prime_sizes, table_offsets, out, request_ids, plan_handle

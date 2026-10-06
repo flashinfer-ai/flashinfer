@@ -26,6 +26,7 @@ CODEBOOKS: tuple[str, ...] = (MCG, LUT_E4M3, LUT_FP16)
 MCG_MULTIPLIER = 0xCBAC1FED
 CODEBOOK_SENTINELS: dict[int, str] = {MCG_MULTIPLIER: MCG}
 
+
 def normalize_codebook(codebook: str | int) -> str:
     """Return the canonical codebook id for ``codebook``.
 

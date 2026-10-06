@@ -467,8 +467,6 @@ def _bf16_process_key(
     )
 
 
-
-
 @functools.cache
 def get_twoshot_bf16_launcher(
     operation: str,
@@ -1005,8 +1003,8 @@ def get_twoshot_bf16_allreduce_launcher(
             current_cuda_stream(),
         )
         raw(*raw_args)
-    return attach_programs(run, raw)
 
+    return attach_programs(run, raw)
 
 
 __all__ = ["get_twoshot_bf16_launcher", "get_twoshot_bf16_allreduce_launcher"]

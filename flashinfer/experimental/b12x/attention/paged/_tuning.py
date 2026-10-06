@@ -7,7 +7,12 @@ from dataclasses import dataclass, field, replace
 from b12x.preparation._efficiency import capture_exhaustive_search, powers_of_two
 
 from b12x.preparation import DeviceIdentity, FrozenMapping
-from b12x.preparation.tuning import Knob, ParameterBinding, ParameterSpace, TuningContract
+from b12x.preparation.tuning import (
+    Knob,
+    ParameterBinding,
+    ParameterSpace,
+    TuningContract,
+)
 
 
 def _compress_lut(values: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
@@ -232,7 +237,8 @@ def _heuristic(
             head_dim_vo=query.head_dim_vo,
             page_size=query.page_size,
             batch=query.batch_size,
-            max_cache_page_count=(query.cache_tokens + query.page_size - 1) // query.page_size,
+            max_cache_page_count=(query.cache_tokens + query.page_size - 1)
+            // query.page_size,
             window_left=query.window_left,
             graph_ctas_per_sm=query.requested_graph_ctas_per_sm,
             max_work_items=query.requested_max_work_items,
@@ -339,12 +345,16 @@ def _tuning_parameters(
         if min(query.batch_size, query.q_heads, query.kv_heads, query.page_size) <= 0:
             raise ValueError("GQA tuning geometry must be positive")
         if query.q_heads % query.kv_heads or query.cache_tokens <= 0:
-            raise ValueError("GQA tuning requires divisible heads and positive cache capacity")
+            raise ValueError(
+                "GQA tuning requires divisible heads and positive cache capacity"
+            )
         pages = (query.cache_tokens + query.page_size - 1) // query.page_size
         if query.window_left >= 0:
             pages = min(
                 pages,
-                max(1, (query.window_left + 2 * query.page_size - 1) // query.page_size),
+                max(
+                    1, (query.window_left + 2 * query.page_size - 1) // query.page_size
+                ),
             )
         query_tiles = (query.q_heads // query.kv_heads + 15) // 16
         # Decode is M16. Ordinary schedules cannot split below one page;
@@ -368,20 +378,25 @@ def _tuning_parameters(
 
         with paged_controls(query.controls):
             default_residency = resolve_decode_graph_ctas_per_sm(
-                kv_dtype=getattr(torch, query.kv_dtype), batch=query.batch_size,
-                page_size=query.page_size, head_dim_qk=query.head_dim_qk,
+                kv_dtype=getattr(torch, query.kv_dtype),
+                batch=query.batch_size,
+                page_size=query.page_size,
+                head_dim_qk=query.head_dim_qk,
                 head_dim_vo=query.head_dim_vo,
                 gqa_group_size=query.q_heads // query.kv_heads,
             )
         residencies = powers_of_two(maximum) | {3, 6, maximum, default_residency}
-    return ParameterSpace.create(TUNING.knobs, values={
-        "graph_ctas_per_sm": graph_options,
-        "force_split_kv": (
-            (query.force_split_kv,)
-            if query.force_split_kv is not None
-            else (False, True)
-        ),
-    }, exhaustive=query.exhaustive,
+    return ParameterSpace.create(
+        TUNING.knobs,
+        values={
+            "graph_ctas_per_sm": graph_options,
+            "force_split_kv": (
+                (query.force_split_kv,)
+                if query.force_split_kv is not None
+                else (False, True)
+            ),
+        },
+        exhaustive=query.exhaustive,
         efficiency_predicates=(lambda p: p["graph_ctas_per_sm"] in residencies,),
     )
 

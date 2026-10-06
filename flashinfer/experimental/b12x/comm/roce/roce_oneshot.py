@@ -516,7 +516,6 @@ class RoceOneshotAllReduce:
             if padded_gather:
                 self._gather_scratch(PACK_BYTES)
 
-
     # -- execution ----------------------------------------------------------------
 
     def all_reduce(
@@ -536,7 +535,9 @@ class RoceOneshotAllReduce:
         prepared = require_prepared(plan, "comm.roce", self.device)
         if prepared.runtime is not self:
             raise ValueError("RoCE plan belongs to another runtime")
-        return self._run_prepared_all_reduce(inp, prepared=prepared, out=out, stream=stream)
+        return self._run_prepared_all_reduce(
+            inp, prepared=prepared, out=out, stream=stream
+        )
 
     def _run_prepared_all_reduce(
         self,
@@ -577,7 +578,9 @@ class RoceOneshotAllReduce:
                 try:
                     launcher = prepared.reduce_launchers[inp.dtype]
                 except KeyError as exc:
-                    raise ValueError("RoCE all-reduce dtype differs from preparation") from exc
+                    raise ValueError(
+                        "RoCE all-reduce dtype differs from preparation"
+                    ) from exc
                 if out is None:
                     out = torch.empty_like(inp)
                 src = inp
@@ -803,8 +806,11 @@ class RoceOneshotAllReduce:
                     )
                     self._order_stream(capturing)
                     self._launch_gather(
-                        prepared.gather_launcher, inp.data_ptr(), out.data_ptr(),
-                        nbytes, row_packs,
+                        prepared.gather_launcher,
+                        inp.data_ptr(),
+                        out.data_ptr(),
+                        nbytes,
+                        row_packs,
                     )
                     self._mark_stream(capturing)
                     return out
@@ -817,8 +823,11 @@ class RoceOneshotAllReduce:
                 staged[:nbytes].copy_(inp.reshape(-1).view(torch.uint8))
                 self._order_stream(capturing)
                 self._launch_gather(
-                    prepared.gather_launcher, staged.data_ptr(), gathered.data_ptr(),
-                    padded, padded // PACK_BYTES,
+                    prepared.gather_launcher,
+                    staged.data_ptr(),
+                    gathered.data_ptr(),
+                    padded,
+                    padded // PACK_BYTES,
                 )
                 self._mark_stream(capturing)
                 stacked = (
@@ -858,7 +867,11 @@ class RoceOneshotAllReduce:
         return staged[:padded], gathered[: self.world_size * padded]
 
     def _launch_gather(
-        self, launcher, input_address: int, output_address: int, nbytes: int,
+        self,
+        launcher,
+        input_address: int,
+        output_address: int,
+        nbytes: int,
         row_packs: int,
     ) -> None:
         """Launch an already prepared all-gather kernel."""

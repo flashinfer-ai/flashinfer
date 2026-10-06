@@ -93,8 +93,6 @@ def moe_flops(m: int, k: int, n: int, topk: int) -> float:
     return float(rows) * (2.0 * k * 2 * n + 2.0 * n * k)
 
 
-
-
 def _bench_b12x(
     mode: str,
     experts,
@@ -212,10 +210,7 @@ def main() -> None:
     modes = [s.strip() for s in args.modes.split(",") if s.strip()]
     if not modes or set(modes) - {"w4a8_mx", "w4a16"}:
         parser.error("--modes must select w4a8_mx and/or w4a16")
-    experts_by_mode = {
-        mode: _prepare_b12x_experts(mode, weights)
-        for mode in modes
-    }
+    experts_by_mode = {mode: _prepare_b12x_experts(mode, weights) for mode in modes}
     ms_list = [int(s) for s in args.m.split(",") if s.strip()]
     print(f"{'m':>7} | " + " | ".join(f"{mode:>22}" for mode in modes))
     for m in ms_list:

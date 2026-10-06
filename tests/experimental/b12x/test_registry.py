@@ -125,9 +125,7 @@ def test_list_ops_and_find_op():
 def test_every_op_meta_contract():
     b12x = _b12x()
     for meta in b12x.list_ops():
-        module = importlib.import_module(
-            f"b12x.{b12x._op_module_path(meta.qualname)}"
-        )
+        module = importlib.import_module(f"b12x.{b12x._op_module_path(meta.qualname)}")
         assert isinstance(module.META, b12x.OpMeta)
         assert set(module.__all__) == set(meta.entry_points) | {"META"}, meta.qualname
         assert any(
@@ -156,8 +154,6 @@ def test_every_op_api_resolves():
     pytest.importorskip("cutlass")
     b12x = _b12x()
     for meta in b12x.list_ops():
-        module = importlib.import_module(
-            f"b12x.{b12x._op_module_path(meta.qualname)}"
-        )
+        module = importlib.import_module(f"b12x.{b12x._op_module_path(meta.qualname)}")
         for name in meta.entry_points:
             assert getattr(module, name) is not None, f"{meta.qualname}.{name}"

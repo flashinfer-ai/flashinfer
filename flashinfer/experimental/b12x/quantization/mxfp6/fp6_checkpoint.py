@@ -27,6 +27,7 @@ exponent bytes kept as ``uint8`` (safetensors does not portably serialize
 and ``quant_algo="W6A6"`` so a framework can route FP6 weights to the b12x
 kernel.
 """
+
 from __future__ import annotations
 
 import fnmatch
@@ -72,6 +73,7 @@ def _validate_block_scale_rule(rule: str) -> str:
             f"{rule!r}"
         )
     return normalized
+
 
 _TILE = 128
 
@@ -309,7 +311,10 @@ def _pack_codes(mat_bf16: torch.Tensor, fmt: str, *, use_gpu: bool) -> torch.Ten
     row_counts = torch.full((1,), m, dtype=torch.int32, device=mat_bf16.device)
     gs = torch.ones(1, dtype=torch.float32, device=mat_bf16.device)
     packed_grp, _ = quantize_grouped_mxfp6_torch(
-        mat_bf16.unsqueeze(0), row_counts, gs, fmt=fmt  # type: ignore[arg-type]
+        mat_bf16.unsqueeze(0),
+        row_counts,
+        gs,
+        fmt=fmt,  # type: ignore[arg-type]
     )
     return packed_grp.permute(2, 0, 1).contiguous()[0]
 
@@ -330,7 +335,9 @@ def _unswizzled_block_scales(mat_bf16: torch.Tensor, fmt: str) -> torch.Tensor:
 
 
 # Cache: (fmt, device_str) -> (sorted unique values, bucketize bounds, codes)
-_FP6_ROUND_CACHE: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_FP6_ROUND_CACHE: dict[
+    tuple[str, str], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
 
 
 def _fp6_round_tables(
@@ -353,7 +360,9 @@ def _fp6_round_tables(
             best[val] = code
     vals_sorted = sorted(best.keys())
     lut = torch.tensor(vals_sorted, dtype=torch.float32, device=device)
-    codes = torch.tensor([best[v] for v in vals_sorted], dtype=torch.uint8, device=device)
+    codes = torch.tensor(
+        [best[v] for v in vals_sorted], dtype=torch.uint8, device=device
+    )
     bounds = (lut[1:] + lut[:-1]) * 0.5
     _FP6_ROUND_CACHE[key] = (lut, bounds, codes)
     return lut, bounds, codes

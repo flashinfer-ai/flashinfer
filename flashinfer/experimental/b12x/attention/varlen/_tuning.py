@@ -63,12 +63,12 @@ def _default_config(
     _device: DeviceIdentity | None,
 ) -> VarlenAttentionConfig:
     if query.block_sparse and query.block_tile_m:
-        return VarlenAttentionConfig(tile_m=query.block_tile_m, tile_n=query.block_tile_n)
+        return VarlenAttentionConfig(
+            tile_m=query.block_tile_m, tile_n=query.block_tile_n
+        )
     if query.q_head_dim <= 64:
         return VarlenAttentionConfig(tile_m=128, tile_n=128)
-    if query.q_head_dim <= 128 or (
-        query.q_head_dim == 192 and query.v_head_dim <= 128
-    ):
+    if query.q_head_dim <= 128 or (query.q_head_dim == 192 and query.v_head_dim <= 128):
         return VarlenAttentionConfig(tile_m=128, tile_n=64)
     if query.q_head_dim == 256:
         return VarlenAttentionConfig(
@@ -100,9 +100,12 @@ def _validate_config(
     _device: DeviceIdentity | None,
 ) -> None:
     if _query.block_sparse and (config.tile_m, config.tile_n) != (
-        _query.block_tile_m, _query.block_tile_n
+        _query.block_tile_m,
+        _query.block_tile_n,
     ):
-        raise ValueError("Sparse attention tiles must match the declared CSR block geometry")
+        raise ValueError(
+            "Sparse attention tiles must match the declared CSR block geometry"
+        )
     if config.tile_m <= 0 or config.tile_n <= 0:
         raise ValueError("attention tile dimensions must be positive")
     if config.tile_m % 16 or config.tile_n % 16:

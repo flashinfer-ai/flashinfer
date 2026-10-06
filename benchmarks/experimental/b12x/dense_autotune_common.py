@@ -13,6 +13,7 @@ from b12x._lib.utils import convert_sf_to_mma_layout
 
 def bench_events(fn, *, warmup, iters, l2_flush=None):
     from b12x.testing.benchmark import samples_ms
+
     return samples_ms(fn, warmup=warmup, iters=iters, l2_flush=l2_flush)
 
 
@@ -47,17 +48,15 @@ def make_nvfp4_operand(rows: int, k: int) -> tuple[torch.Tensor, ...]:
         dtype=torch.float32,
         device="cuda",
     )
-    packed, scales = quantize_grouped_nvfp4_torch(
-        source, row_counts, global_scale
-    )
+    packed, scales = quantize_grouped_nvfp4_torch(source, row_counts, global_scale)
     return packed, scales, global_scale
 
 
 def make_mxfp8_operand(rows: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Build valid prequantized MXFP8 values/scales without a reference backend."""
-    values = (
-        torch.randn(rows, k, device="cuda", dtype=torch.bfloat16) / 4
-    ).to(torch.float8_e4m3fn)
+    values = (torch.randn(rows, k, device="cuda", dtype=torch.bfloat16) / 4).to(
+        torch.float8_e4m3fn
+    )
     m_tiles = (rows + 127) // 128
     k_tiles = ((k + 31) // 32 + 3) // 4
     scale_storage = torch.full(

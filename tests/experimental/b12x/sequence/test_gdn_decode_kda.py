@@ -62,49 +62,78 @@ def _make_case(
     token_capacity = max_tokens if tensor_tokens is None else tensor_tokens
     column_capacity = columns if tensor_columns is None else tensor_columns
     caps = gdn.Caps(
-        device=device, max_tokens=max_tokens, max_seqs=max_seqs,
-        max_state_slots=max_seqs * columns + 1, key_heads=heads, value_heads=heads,
-        state_index_columns=columns, state_dtype=state_dtype, gate_activation="sigmoid",
+        device=device,
+        max_tokens=max_tokens,
+        max_seqs=max_seqs,
+        max_state_slots=max_seqs * columns + 1,
+        key_heads=heads,
+        value_heads=heads,
+        state_index_columns=columns,
+        state_dtype=state_dtype,
+        gate_activation="sigmoid",
         null_state_index=null_state_index,
     )
     query_start_loc = torch.tensor(
-        [0, *torch.tensor(query_lengths).cumsum(0).tolist()], dtype=torch.int32, device=device,
+        [0, *torch.tensor(query_lengths).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
     )
     raw_beta = _randn((token_capacity, heads), device=device)
     if noncontiguous_beta:
-        storage = torch.empty((token_capacity, heads + 3), dtype=raw_beta.dtype, device=device)
+        storage = torch.empty(
+            (token_capacity, heads + 3), dtype=raw_beta.dtype, device=device
+        )
         storage[:, :heads].copy_(raw_beta)
         raw_beta = storage[:, :heads]
     args = {
         "mixed_qkv": _randn((token_capacity, caps.packed_qkv_width), device=device),
         "raw_g": _randn((token_capacity, heads, 128), device=device),
-        "raw_beta": raw_beta, "z": _randn((token_capacity, heads, 128), device=device),
+        "raw_beta": raw_beta,
+        "z": _randn((token_capacity, heads, 128), device=device),
         "A_log": _randn((heads,), device=device, dtype=torch.float32, scale=0.1),
         "dt_bias": _randn((heads, 128), device=device, dtype=torch.float32, scale=0.1),
-        "norm_weight": (1.0 + _randn((128,), device=device, dtype=torch.float32, scale=0.05)).contiguous(),
+        "norm_weight": (
+            1.0 + _randn((128,), device=device, dtype=torch.float32, scale=0.05)
+        ).contiguous(),
         "recurrent_state": _randn(
-            (max_seqs * columns + 1, heads, 128, 128), device=device, dtype=state_dtype, scale=0.1,
+            (max_seqs * columns + 1, heads, 128, 128),
+            device=device,
+            dtype=state_dtype,
+            scale=0.1,
         ),
         "query_start_loc": query_start_loc,
         "num_accepted_tokens": torch.tensor(
-            [min(2, length, column_capacity) for length in query_lengths], dtype=torch.int32, device=device,
+            [min(2, length, column_capacity) for length in query_lengths],
+            dtype=torch.int32,
+            device=device,
         ),
         "state_indices": torch.arange(
             max_seqs * column_capacity, dtype=state_indices_dtype, device=device
         ).view(max_seqs, column_capacity),
         "num_seqs": torch.tensor([max_seqs], dtype=torch.int32, device=device),
         "num_tokens": torch.tensor([live_tokens], dtype=torch.int32, device=device),
-        "output": torch.empty((token_capacity, heads, 128), dtype=torch.bfloat16, device=device),
+        "output": torch.empty(
+            (token_capacity, heads, 128), dtype=torch.bfloat16, device=device
+        ),
     }
-    override = gdn.GdnConfig(backend="triton", recurrent_block_v=recurrent_block_v) if recurrent_block_v else None
-    plan = gdn.plan(caps, invocation=gdn.invocation_from_tensors(caps, **args), override=override)
+    override = (
+        gdn.GdnConfig(backend="triton", recurrent_block_v=recurrent_block_v)
+        if recurrent_block_v
+        else None
+    )
+    plan = gdn.plan(
+        caps, invocation=gdn.invocation_from_tensors(caps, **args), override=override
+    )
 
     def prepare_call(state):
         (spec,) = state.layout.scratch_specs()
         binding = state.bind_kda(
             scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device), **args
         )
-        original_state, original_output = binding.recurrent_state.clone(), binding.output.clone()
+        original_state, original_output = (
+            binding.recurrent_state.clone(),
+            binding.output.clone(),
+        )
 
         def reset():
             binding.recurrent_state.copy_(original_state)
@@ -112,11 +141,14 @@ def _make_case(
 
         return PreparedCall(
             run=lambda: state.run(binding, lower_bound=-5.0),
-            output=binding.output, reset=reset, restore=reset,
+            output=binding.output,
+            reset=reset,
+            restore=reset,
         )
 
     request = plan.request(
-        name=f"kda-{id(args)}", prepare_call=prepare_call,
+        name=f"kda-{id(args)}",
+        prepare_call=prepare_call,
     )
     session = PreparationSession(device=device, autotune=False)
     result = session.prepare((request,))
@@ -129,17 +161,25 @@ def _make_case(
 
 
 def _prepare_binding(
-    caps: gdn.Caps, args: dict[str, torch.Tensor], *, override: gdn.GdnConfig | None = None
+    caps: gdn.Caps,
+    args: dict[str, torch.Tensor],
+    *,
+    override: gdn.GdnConfig | None = None,
 ) -> gdn.KdaBinding:
     device = caps.device
-    plan = gdn.plan(caps, invocation=gdn.invocation_from_tensors(caps, **args), override=override)
+    plan = gdn.plan(
+        caps, invocation=gdn.invocation_from_tensors(caps, **args), override=override
+    )
 
     def prepare_call(state):
         (spec,) = state.layout.scratch_specs()
         binding = state.bind_kda(
             scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device), **args
         )
-        original_state, original_output = binding.recurrent_state.clone(), binding.output.clone()
+        original_state, original_output = (
+            binding.recurrent_state.clone(),
+            binding.output.clone(),
+        )
 
         def reset():
             binding.recurrent_state.copy_(original_state)
@@ -147,11 +187,14 @@ def _prepare_binding(
 
         return PreparedCall(
             run=lambda: state.run(binding, lower_bound=-5.0),
-            output=binding.output, reset=reset, restore=reset,
+            output=binding.output,
+            reset=reset,
+            restore=reset,
         )
 
     request = plan.request(
-        name=f"kda-{id(args)}", prepare_call=prepare_call,
+        name=f"kda-{id(args)}",
+        prepare_call=prepare_call,
     )
     session = PreparationSession(device=device, autotune=False)
     result = session.prepare((request,))
@@ -165,12 +208,21 @@ def _prepare_binding(
 
 def _rebind(binding: gdn.KdaBinding, **overrides: torch.Tensor) -> gdn.KdaBinding:
     arguments = {
-        "scratch": binding.scratch, "mixed_qkv": binding.mixed_qkv, "raw_g": binding.raw_g,
-        "raw_beta": binding.raw_beta, "z": binding.z, "A_log": binding.A_log,
-        "dt_bias": binding.dt_bias, "norm_weight": binding.norm_weight,
-        "recurrent_state": binding.recurrent_state, "query_start_loc": binding.query_start_loc,
-        "num_accepted_tokens": binding.num_accepted_tokens, "state_indices": binding.state_indices,
-        "num_seqs": binding.num_seqs, "num_tokens": binding.num_tokens, "output": binding.output,
+        "scratch": binding.scratch,
+        "mixed_qkv": binding.mixed_qkv,
+        "raw_g": binding.raw_g,
+        "raw_beta": binding.raw_beta,
+        "z": binding.z,
+        "A_log": binding.A_log,
+        "dt_bias": binding.dt_bias,
+        "norm_weight": binding.norm_weight,
+        "recurrent_state": binding.recurrent_state,
+        "query_start_loc": binding.query_start_loc,
+        "num_accepted_tokens": binding.num_accepted_tokens,
+        "state_indices": binding.state_indices,
+        "num_seqs": binding.num_seqs,
+        "num_tokens": binding.num_tokens,
+        "output": binding.output,
     }
     arguments.update(overrides)
     return gdn.bind_kda(binding.plan, **arguments)
@@ -178,7 +230,9 @@ def _rebind(binding: gdn.KdaBinding, **overrides: torch.Tensor) -> gdn.KdaBindin
 
 def _row_padded(tensor: torch.Tensor, padding: int = 3) -> torch.Tensor:
     rows, row_elements = tensor.shape[0], tensor[0].numel()
-    storage = torch.empty((rows, row_elements + padding), dtype=tensor.dtype, device=tensor.device)
+    storage = torch.empty(
+        (rows, row_elements + padding), dtype=tensor.dtype, device=tensor.device
+    )
     result = storage[:, :row_elements].view(tensor.shape)
     result.copy_(tensor)
     return result
@@ -187,53 +241,106 @@ def _row_padded(tensor: torch.Tensor, padding: int = 3) -> torch.Tensor:
 def _reference(binding: gdn.KdaBinding, state: torch.Tensor) -> torch.Tensor:
     caps = binding._state.caps
     return gdn.reference.decode_kda(
-        binding.mixed_qkv, binding.raw_g, binding.raw_beta, binding.z, binding.A_log,
-        binding.dt_bias, binding.norm_weight, state, binding.query_start_loc,
-        binding.num_accepted_tokens, binding.state_indices, binding.num_seqs, binding.num_tokens,
-        heads=caps.value_heads, qk_l2norm=caps.qk_l2norm, null_state_index=caps.null_state_index,
+        binding.mixed_qkv,
+        binding.raw_g,
+        binding.raw_beta,
+        binding.z,
+        binding.A_log,
+        binding.dt_bias,
+        binding.norm_weight,
+        state,
+        binding.query_start_loc,
+        binding.num_accepted_tokens,
+        binding.state_indices,
+        binding.num_seqs,
+        binding.num_tokens,
+        heads=caps.value_heads,
+        qk_l2norm=caps.qk_l2norm,
+        null_state_index=caps.null_state_index,
     )
 
 
 @pytest.mark.parametrize("columns", [1, 4, 8])
 @pytest.mark.parametrize("block_v", [16, 32])
-def test_recovery_preserves_outputs_and_accepted_fp32_checkpoints(columns, block_v, record_property, monkeypatch):
+def test_recovery_preserves_outputs_and_accepted_fp32_checkpoints(
+    columns, block_v, record_property, monkeypatch
+):
     """Record production must not mutate checkpoints or commit rejected tokens."""
     device = require_sm120()
     torch.manual_seed(591)
     baseline = _make_case(
-        device=device, heads=32, columns=columns, query_lengths=(columns, 1),
-        max_tokens=2 * columns, noncontiguous_beta=True, null_state_index=0,
+        device=device,
+        heads=32,
+        columns=columns,
+        query_lengths=(columns, 1),
+        max_tokens=2 * columns,
+        noncontiguous_beta=True,
+        null_state_index=0,
     )
-    baseline.state_indices.copy_(torch.arange(1, 2 * columns + 1, device=device).view(2, columns))
+    baseline.state_indices.copy_(
+        torch.arange(1, 2 * columns + 1, device=device).view(2, columns)
+    )
     baseline.num_accepted_tokens.fill_(1)
     before = baseline.recurrent_state.clone()
     expected_state = before.clone()
     expected = _reference(baseline, expected_state)
     caps = replace(baseline._state.caps, recover_speculative_state=True)
-    args = {name: getattr(baseline, name) for name in (
-        "mixed_qkv", "raw_g", "raw_beta", "z", "A_log", "dt_bias", "norm_weight",
-        "recurrent_state", "query_start_loc", "num_accepted_tokens", "num_seqs", "num_tokens", "output",
-    )}
+    args = {
+        name: getattr(baseline, name)
+        for name in (
+            "mixed_qkv",
+            "raw_g",
+            "raw_beta",
+            "z",
+            "A_log",
+            "dt_bias",
+            "norm_weight",
+            "recurrent_state",
+            "query_start_loc",
+            "num_accepted_tokens",
+            "num_seqs",
+            "num_tokens",
+            "output",
+        )
+    }
     args.update(
         state_indices=baseline.state_indices[:, :1],
-        correction_cache=torch.empty((caps.max_state_slots, 32, columns, 128), device=device),
-        kg_cache=torch.empty((caps.max_state_slots, 32, columns, 256), dtype=torch.bfloat16, device=device),
+        correction_cache=torch.empty(
+            (caps.max_state_slots, 32, columns, 128), device=device
+        ),
+        kg_cache=torch.empty(
+            (caps.max_state_slots, 32, columns, 256),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
     )
-    binding = _prepare_binding(caps, args, override=gdn.GdnConfig(backend="cutedsl", recurrent_block_v=block_v))
+    binding = _prepare_binding(
+        caps, args, override=gdn.GdnConfig(backend="cutedsl", recurrent_block_v=block_v)
+    )
     with pytest.raises(ValueError, match=rf"{2 * columns} > 1 \* {columns}"):
         gdn.bind_kda(
-            binding.plan, scratch=binding.scratch,
+            binding.plan,
+            scratch=binding.scratch,
             **{**args, "state_indices": binding.state_indices[:1]},
         )
+
     def unexpected_revalidation(*_args):
         raise AssertionError("Recovery run must use the already validated binding")
 
-    monkeypatch.setattr(type(require_prepared(binding.plan, "attention.gdn")), "_check", unexpected_revalidation)
+    monkeypatch.setattr(
+        type(require_prepared(binding.plan, "attention.gdn")),
+        "_check",
+        unexpected_revalidation,
+    )
     gdn.run_kda(binding)
     torch.testing.assert_close(binding.recurrent_state, before, rtol=0, atol=0)
-    actual = binding.output[:columns + 1].float()
-    torch.testing.assert_close(actual, expected[:columns + 1].float(), atol=0.016, rtol=0.012)
-    relative_output_error = (actual - expected[:columns + 1].float()).norm() / expected[:columns + 1].float().norm()
+    actual = binding.output[: columns + 1].float()
+    torch.testing.assert_close(
+        actual, expected[: columns + 1].float(), atol=0.016, rtol=0.012
+    )
+    relative_output_error = (
+        actual - expected[: columns + 1].float()
+    ).norm() / expected[: columns + 1].float().norm()
     assert relative_output_error < 0.003
     record_property("output_relative_l2", relative_output_error.item())
 
@@ -248,29 +355,47 @@ def test_recovery_preserves_outputs_and_accepted_fp32_checkpoints(columns, block
         boundary[0] = 2
         boundary_lens[0] = 2
     commit = gdn.bind_kda_commit(
-        binding.plan, scratch=binding.scratch,
+        binding.plan,
+        scratch=binding.scratch,
         state_base_addrs=table(binding.recurrent_state.data_ptr()),
         state_block_strides=table(binding.recurrent_state.stride(0)),
         correction_cache_base_addrs=table(binding.correction_cache.data_ptr()),
         correction_cache_block_strides=table(binding.correction_cache.stride(0)),
         kg_cache_base_addrs=table(binding.kg_cache.data_ptr()),
         kg_cache_block_strides=table(binding.kg_cache.stride(0)),
-        A_log=binding.A_log.unsqueeze(0), dt_bias=binding.dt_bias.unsqueeze(0),
-        state_indices=binding.state_indices[:, 0], commit_lens=lengths,
-        final_state_indices=final, boundary_state_indices=boundary,
+        A_log=binding.A_log.unsqueeze(0),
+        dt_bias=binding.dt_bias.unsqueeze(0),
+        state_indices=binding.state_indices[:, 0],
+        commit_lens=lengths,
+        final_state_indices=final,
+        boundary_state_indices=boundary,
         boundary_recovery_lens=boundary_lens,
     )
     gdn.run_kda_commit(commit)
-    record_property("accepted_state_max_abs", (binding.recurrent_state[1] - expected_state[columns]).abs().max().item())
-    torch.testing.assert_close(binding.recurrent_state[1], expected_state[columns], rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(binding.recurrent_state[columns + 1], expected_state[columns + 1], rtol=1e-5, atol=1e-6)
+    record_property(
+        "accepted_state_max_abs",
+        (binding.recurrent_state[1] - expected_state[columns]).abs().max().item(),
+    )
+    torch.testing.assert_close(
+        binding.recurrent_state[1], expected_state[columns], rtol=1e-5, atol=1e-6
+    )
+    torch.testing.assert_close(
+        binding.recurrent_state[columns + 1],
+        expected_state[columns + 1],
+        rtol=1e-5,
+        atol=1e-6,
+    )
     if columns > 1:
-        torch.testing.assert_close(binding.recurrent_state[2], expected_state[2], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            binding.recurrent_state[2], expected_state[2], rtol=1e-5, atol=1e-6
+        )
         binding.recurrent_state.copy_(before)
         boundary[0] = final[0]
         boundary_lens[0] = 1
         gdn.run_kda_commit(commit)
-        torch.testing.assert_close(binding.recurrent_state[1], expected_state[columns], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            binding.recurrent_state[1], expected_state[columns], rtol=1e-5, atol=1e-6
+        )
 
     binding.recurrent_state.copy_(before)
     graph = torch.cuda.CUDAGraph()
@@ -286,7 +411,9 @@ def test_recovery_preserves_outputs_and_accepted_fp32_checkpoints(columns, block
             graph.replay()
             assert torch.cuda.memory_allocated() == allocated
         reference = before[1] if accepted == 0 else expected_state[accepted]
-        torch.testing.assert_close(binding.recurrent_state[1], reference, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            binding.recurrent_state[1], reference, rtol=1e-5, atol=1e-6
+        )
 
     # Weak forgetting retains information across windows and exposes drift that
     # a single, strongly decayed random state can hide.
@@ -299,15 +426,29 @@ def test_recovery_preserves_outputs_and_accepted_fp32_checkpoints(columns, block
         recurrent_reference[1].copy_(recurrent_reference[columns])
         gdn.run_kda(binding)
         gdn.run_kda_commit(commit)
-    record_property("persistent_state_max_abs", (binding.recurrent_state[1] - recurrent_reference[1]).abs().max().item())
-    torch.testing.assert_close(binding.recurrent_state[1], recurrent_reference[1], rtol=1e-4, atol=1e-5)
+    record_property(
+        "persistent_state_max_abs",
+        (binding.recurrent_state[1] - recurrent_reference[1]).abs().max().item(),
+    )
+    torch.testing.assert_close(
+        binding.recurrent_state[1], recurrent_reference[1], rtol=1e-4, atol=1e-5
+    )
 
 
-@pytest.mark.parametrize("large_stride", [False, True], ids=["interleaved-pages", "int64-pool-offset"])
+@pytest.mark.parametrize(
+    "large_stride", [False, True], ids=["interleaved-pages", "int64-pool-offset"]
+)
 def test_recovery_reads_live_paged_fields_without_aliasing(large_stride):
     """Both kernels must handle interleaved fields and offsets exceeding 2^31."""
     device = require_sm120()
-    baseline = _make_case(device=device, heads=1, columns=1, query_lengths=(1,), max_tokens=1, null_state_index=0)
+    baseline = _make_case(
+        device=device,
+        heads=1,
+        columns=1,
+        query_lengths=(1,),
+        max_tokens=1,
+        null_state_index=0,
+    )
     baseline.state_indices.fill_(1)
     before = baseline.recurrent_state.clone()
     expected_state = before.clone()
@@ -318,33 +459,73 @@ def test_recovery_reads_live_paged_fields_without_aliasing(large_stride):
     storage = torch.empty((page_bytes + 67584,), dtype=torch.uint8, device=device)
     if not large_stride:
         storage.fill_(123)
-    checkpoint = storage.view(torch.float32).as_strided((2, 1, 128, 128), (page_bytes // 4, 16384, 128, 1))
-    correction = storage[65536:].view(torch.float32).as_strided((2, 1, 1, 128), (page_bytes // 4, 128, 128, 1))
-    kg = storage[66048:].view(torch.bfloat16).as_strided((2, 1, 1, 256), (page_bytes // 2, 256, 256, 1))
+    checkpoint = storage.view(torch.float32).as_strided(
+        (2, 1, 128, 128), (page_bytes // 4, 16384, 128, 1)
+    )
+    correction = (
+        storage[65536:]
+        .view(torch.float32)
+        .as_strided((2, 1, 1, 128), (page_bytes // 4, 128, 128, 1))
+    )
+    kg = (
+        storage[66048:]
+        .view(torch.bfloat16)
+        .as_strided((2, 1, 1, 256), (page_bytes // 2, 256, 256, 1))
+    )
     if large_stride:
-        assert all(tensor.stride(0) > 1 << 31 for tensor in (checkpoint, correction, kg))
+        assert all(
+            tensor.stride(0) > 1 << 31 for tensor in (checkpoint, correction, kg)
+        )
     checkpoint.copy_(before)
-    args = {name: getattr(baseline, name) for name in (
-        "mixed_qkv", "raw_g", "raw_beta", "z", "A_log", "dt_bias", "norm_weight",
-        "query_start_loc", "num_accepted_tokens", "state_indices", "num_seqs", "num_tokens", "output",
-    )}
+    args = {
+        name: getattr(baseline, name)
+        for name in (
+            "mixed_qkv",
+            "raw_g",
+            "raw_beta",
+            "z",
+            "A_log",
+            "dt_bias",
+            "norm_weight",
+            "query_start_loc",
+            "num_accepted_tokens",
+            "state_indices",
+            "num_seqs",
+            "num_tokens",
+            "output",
+        )
+    }
     args.update(recurrent_state=checkpoint, correction_cache=correction, kg_cache=kg)
-    binding = _prepare_binding(replace(baseline._state.caps, recover_speculative_state=True), args)
+    binding = _prepare_binding(
+        replace(baseline._state.caps, recover_speculative_state=True), args
+    )
     gdn.run_kda(binding)
     torch.testing.assert_close(checkpoint, before, rtol=0, atol=0)
-    torch.testing.assert_close(binding.output.float(), expected_output.float(), rtol=0.012, atol=0.016)
+    torch.testing.assert_close(
+        binding.output.float(), expected_output.float(), rtol=0.012, atol=0.016
+    )
+
     def table(value):
         return torch.tensor([value], dtype=torch.int64, device=device)
+
     one = torch.ones(1, dtype=torch.int32, device=device)
     zero = torch.zeros_like(one)
     commit = gdn.bind_kda_commit(
-        binding.plan, scratch=binding.scratch,
-        state_base_addrs=table(checkpoint.data_ptr()), state_block_strides=table(checkpoint.stride(0)),
-        correction_cache_base_addrs=table(correction.data_ptr()), correction_cache_block_strides=table(correction.stride(0)),
-        kg_cache_base_addrs=table(kg.data_ptr()), kg_cache_block_strides=table(kg.stride(0)),
-        A_log=binding.A_log.unsqueeze(0), dt_bias=binding.dt_bias.unsqueeze(0),
-        state_indices=binding.state_indices[:, 0], commit_lens=one,
-        final_state_indices=one, boundary_state_indices=zero, boundary_recovery_lens=zero,
+        binding.plan,
+        scratch=binding.scratch,
+        state_base_addrs=table(checkpoint.data_ptr()),
+        state_block_strides=table(checkpoint.stride(0)),
+        correction_cache_base_addrs=table(correction.data_ptr()),
+        correction_cache_block_strides=table(correction.stride(0)),
+        kg_cache_base_addrs=table(kg.data_ptr()),
+        kg_cache_block_strides=table(kg.stride(0)),
+        A_log=binding.A_log.unsqueeze(0),
+        dt_bias=binding.dt_bias.unsqueeze(0),
+        state_indices=binding.state_indices[:, 0],
+        commit_lens=one,
+        final_state_indices=one,
+        boundary_state_indices=zero,
+        boundary_recovery_lens=zero,
     )
     gdn.run_kda_commit(commit)
     torch.testing.assert_close(checkpoint, expected_state, atol=1e-6, rtol=1e-5)
@@ -620,9 +801,19 @@ def test_kda_binds_live_tensors_within_planned_capacity() -> None:
     args = {
         name: getattr(binding, name)
         for name in (
-            "mixed_qkv", "raw_g", "raw_beta", "z", "A_log", "dt_bias",
-            "norm_weight", "recurrent_state", "query_start_loc",
-            "num_accepted_tokens", "state_indices", "num_seqs", "num_tokens",
+            "mixed_qkv",
+            "raw_g",
+            "raw_beta",
+            "z",
+            "A_log",
+            "dt_bias",
+            "norm_weight",
+            "recurrent_state",
+            "query_start_loc",
+            "num_accepted_tokens",
+            "state_indices",
+            "num_seqs",
+            "num_tokens",
             "output",
         )
     }
@@ -671,7 +862,8 @@ def test_kda_binding_rejects_invalid_live_contract() -> None:
 @pytest.mark.parametrize("state_indices_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("index_offset", [0, 1, 2])
 def test_live_kda_cuda_graph_replays_bound_capacity(
-    state_indices_dtype: torch.dtype, index_offset: int,
+    state_indices_dtype: torch.dtype,
+    index_offset: int,
 ) -> None:
     """Sliced metadata must reuse the prepared kernel and remain graph-safe."""
     device = require_sm120()
@@ -686,7 +878,8 @@ def test_live_kda_cuda_graph_replays_bound_capacity(
     )
     storage = torch.empty(
         binding.state_indices.numel() + index_offset,
-        dtype=state_indices_dtype, device=device,
+        dtype=state_indices_dtype,
+        device=device,
     )
     indices = storage[index_offset:].view_as(binding.state_indices)
     indices.copy_(binding.state_indices)
@@ -863,7 +1056,11 @@ def test_kda_tiles_reuse_compiled_kernels_with_mutable_live_counts(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             gdn.run_kda(binding)
-        for starts, sequences, tokens in (([0, 3, 4], 2, 4), ([0, 2, 3], 2, 3), ([0, 1, 1], 1, 1)):
+        for starts, sequences, tokens in (
+            ([0, 3, 4], 2, 4),
+            ([0, 2, 3], 2, 3),
+            ([0, 1, 1], 1, 1),
+        ):
             binding.query_start_loc.copy_(
                 torch.tensor(starts, dtype=torch.int32, device=device)
             )
@@ -896,17 +1093,20 @@ def test_kda_tiles_reuse_compiled_kernels_with_mutable_live_counts(
                 rtol=1e-2 if state_dtype == torch.bfloat16 else 1e-5,
                 atol=8e-3 if state_dtype == torch.bfloat16 else 2e-5,
             )
-        assert tuple(
-            tensor.data_ptr()
-            for tensor in (
-                binding.scratch,
-                binding.mixed_qkv,
-                binding.raw_g,
-                binding.raw_beta,
-                binding.recurrent_state,
-                binding.output,
+        assert (
+            tuple(
+                tensor.data_ptr()
+                for tensor in (
+                    binding.scratch,
+                    binding.mixed_qkv,
+                    binding.raw_g,
+                    binding.raw_beta,
+                    binding.recurrent_state,
+                    binding.output,
+                )
             )
-        ) == addresses
+            == addresses
+        )
     graph.reset()
 
 
@@ -982,13 +1182,25 @@ def test_kda_padded_state_slot_past_int32_element_boundary() -> None:
     num_seqs = torch.ones(1, dtype=torch.int32, device=device)
     num_tokens = torch.ones(1, dtype=torch.int32, device=device)
     output = torch.empty((1, heads, 128), dtype=torch.bfloat16, device=device)
-    binding = _prepare_binding(caps, {
-        "mixed_qkv": mixed_qkv, "raw_g": raw_g, "raw_beta": raw_beta, "z": z,
-        "A_log": A_log, "dt_bias": dt_bias, "norm_weight": norm_weight,
-        "recurrent_state": recurrent_state, "query_start_loc": query_start_loc,
-        "num_accepted_tokens": accepted, "state_indices": state_indices,
-        "num_seqs": num_seqs, "num_tokens": num_tokens, "output": output,
-    })
+    binding = _prepare_binding(
+        caps,
+        {
+            "mixed_qkv": mixed_qkv,
+            "raw_g": raw_g,
+            "raw_beta": raw_beta,
+            "z": z,
+            "A_log": A_log,
+            "dt_bias": dt_bias,
+            "norm_weight": norm_weight,
+            "recurrent_state": recurrent_state,
+            "query_start_loc": query_start_loc,
+            "num_accepted_tokens": accepted,
+            "state_indices": state_indices,
+            "num_seqs": num_seqs,
+            "num_tokens": num_tokens,
+            "output": output,
+        },
+    )
     expected = gdn.reference.decode_kda(
         mixed_qkv,
         raw_g,

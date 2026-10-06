@@ -19,6 +19,7 @@ from b12x.moe.fused_moe._impl import (
     plan_tp_moe_scratch,
     prepare_b12x_fp4_moe_weights,
 )
+
 E, M, K, N_TP, TOPK = 32, 64, 6144, 512, 8
 
 
@@ -28,12 +29,8 @@ def main() -> None:
     device = torch.device("cuda", 0)
 
     w1_n = 2 * N_TP  # gated [up, gate]
-    w1_fp4 = torch.randint(
-        0, 256, (E, w1_n, K // 2), dtype=torch.uint8, device=device
-    )
-    w2_fp4 = torch.randint(
-        0, 256, (E, K, N_TP // 2), dtype=torch.uint8, device=device
-    )
+    w1_fp4 = torch.randint(0, 256, (E, w1_n, K // 2), dtype=torch.uint8, device=device)
+    w2_fp4 = torch.randint(0, 256, (E, K, N_TP // 2), dtype=torch.uint8, device=device)
     w1_bs = torch.randint(
         110, 126, (E, w1_n, K // 16), dtype=torch.uint8, device=device
     ).view(torch.float8_e4m3fn)
@@ -107,8 +104,12 @@ def main() -> None:
 
     baseline = run()
     baseline2 = run()
-    print("baseline finite:", bool(baseline.isfinite().all().item()),
-          "amax:", baseline.float().abs().amax().item())
+    print(
+        "baseline finite:",
+        bool(baseline.isfinite().all().item()),
+        "amax:",
+        baseline.float().abs().amax().item(),
+    )
     print("baseline deterministic:", torch.equal(baseline, baseline2))
     self_delta = (baseline.float() - baseline2.float()).abs()
     self_denom = baseline.float().abs().amax().clamp(min=1e-6)
@@ -122,10 +123,19 @@ def main() -> None:
     packed, sf = ops.scaled_fp4_quant(a, a1_gs, is_sf_swizzled_layout=False)
     sf_u8 = sf.view(torch.uint8).reshape(M, K // 16).contiguous()
     prequant = run(a_prequant=packed.contiguous(), a_prequant_scale=sf_u8)
-    print("prequant finite:", bool(prequant.isfinite().all().item()),
-          "amax:", prequant.float().abs().amax().item())
-    print("packed shape:", tuple(packed.shape), packed.dtype,
-          "sf shape:", tuple(sf_u8.shape))
+    print(
+        "prequant finite:",
+        bool(prequant.isfinite().all().item()),
+        "amax:",
+        prequant.float().abs().amax().item(),
+    )
+    print(
+        "packed shape:",
+        tuple(packed.shape),
+        packed.dtype,
+        "sf shape:",
+        tuple(sf_u8.shape),
+    )
 
     delta = (baseline.float() - prequant.float()).abs()
     denom = baseline.float().abs().amax().clamp(min=1e-6)

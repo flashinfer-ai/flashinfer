@@ -7,8 +7,14 @@ from b12x.comm.roce._proxy import _traffic_class
 
 @pytest.mark.parametrize(
     "override,nccl,expected",
-    [(None, None, 0), (None, "106", 106), ("194", "106", 194),
-     ("0", "106", 0), ("0x6a", None, 106), ("255", None, 255)],
+    [
+        (None, None, 0),
+        (None, "106", 106),
+        ("194", "106", 194),
+        ("0", "106", 0),
+        ("0x6a", None, 106),
+        ("255", None, 255),
+    ],
 )
 def test_traffic_class_precedence(monkeypatch, override, nccl, expected):
     for name, value in (("B12X_ROCE_TRAFFIC_CLASS", override), ("NCCL_IB_TC", nccl)):
@@ -48,7 +54,9 @@ def test_route_table_matches_native_peer_rail_pair_order():
     proxy._lib = Native()
     proxy.world_size, proxy.rank = 3, 0
     try:
-        proxy.connect([b"aaaa", b"bbbb", b"cccc"], [[], [(0, 1), (2, 3)], [(1, 0), (3, 2)]])
+        proxy.connect(
+            [b"aaaa", b"bbbb", b"cccc"], [[], [(0, 1), (2, 3)], [(1, 0), (3, 2)]]
+        )
         with pytest.raises(RuntimeError, match="rails"):
             proxy.connect([b"aaaa", b"bbbb", b"cccc"], [[], [(0, 1)], [(1, 0), (3, 2)]])
     finally:

@@ -1,4 +1,5 @@
 """Per-query defaults and exhaustive legal kernel parameter spaces."""
+
 from __future__ import annotations
 
 import json
@@ -12,6 +13,7 @@ from .types import DeviceIdentity, FrozenMapping
 
 QueryT = TypeVar("QueryT")
 ConfigT = TypeVar("ConfigT")
+
 
 class ParameterBinding(str, Enum):
     COMPILE = "compile"
@@ -79,7 +81,9 @@ class ParameterSpace:
     def __post_init__(self) -> None:
         object.__setattr__(self, "knobs", tuple(self.knobs))
         object.__setattr__(self, "predicates", tuple(self.predicates))
-        object.__setattr__(self, "efficiency_predicates", tuple(self.efficiency_predicates))
+        object.__setattr__(
+            self, "efficiency_predicates", tuple(self.efficiency_predicates)
+        )
         if type(self.exhaustive) is not bool:
             raise TypeError("exhaustive must be a boolean")
         names = set()
@@ -226,25 +230,36 @@ class TuningContract(Generic[QueryT, ConfigT]):
     knobs: tuple[Knob, ...]
     semantic_version: int = 1
     candidate_contract_version: int = 1
-    parameters: Callable[
-        [QueryT, DeviceIdentity | None],
-        Mapping[str, Iterable[object]] | ParameterSpace,
-    ] | None = None
-    materialize: Callable[[QueryT, DeviceIdentity | None, FrozenMapping], ConfigT] | None = None
-    equivalence_key: Callable[[QueryT, DeviceIdentity | None, ConfigT], object] | None = None
+    parameters: (
+        Callable[
+            [QueryT, DeviceIdentity | None],
+            Mapping[str, Iterable[object]] | ParameterSpace,
+        ]
+        | None
+    ) = None
+    materialize: (
+        Callable[[QueryT, DeviceIdentity | None, FrozenMapping], ConfigT] | None
+    ) = None
+    equivalence_key: (
+        Callable[[QueryT, DeviceIdentity | None, ConfigT], object] | None
+    ) = None
 
     def __post_init__(self):
         if not re.fullmatch(r"[a-z][a-z0-9_.-]*", self.component_id):
             raise ValueError(f"invalid component ID {self.component_id!r}")
         for version in (
-            self.query_schema_version, self.config_schema_version,
-            self.semantic_version, self.candidate_contract_version,
+            self.query_schema_version,
+            self.config_schema_version,
+            self.semantic_version,
+            self.candidate_contract_version,
         ):
             if type(version) is not int or version <= 0:
                 raise ValueError("contract versions must be positive integers")
         for name in ("query_fields", "config_fields"):
             value = frozenset(getattr(self, name))
-            if not value or any(not isinstance(item, str) or not item for item in value):
+            if not value or any(
+                not isinstance(item, str) or not item for item in value
+            ):
                 raise ValueError("contract fields must be nonempty strings")
             object.__setattr__(self, name, value)
         object.__setattr__(self, "knobs", tuple(self.knobs))
@@ -259,19 +274,27 @@ class TuningContract(Generic[QueryT, ConfigT]):
             return values
         return ParameterSpace.create(self.knobs, values=values)
 
-    def configure(self, query, *, device, override=None, search=True) -> TuningConfiguration:
+    def configure(
+        self, query, *, device, override=None, search=True
+    ) -> TuningConfiguration:
         self.validate_query(query, device)
         encoded = FrozenMapping(self.encode_query(query))
         if set(encoded) != self.query_fields:
             raise ValueError("query codec fields differ from the contract")
         # A complete pin is authoritative; an unused default may not reject it.
-        default = override if override is not None else self.default_config(query, device)
+        default = (
+            override if override is not None else self.default_config(query, device)
+        )
         self.validate_config(query, default, device)
         self.config_payload(default)
         return TuningConfiguration(
-            query=query, encoded_query=encoded, device=device,
-            space=self.parameter_space(query, device) if search else None, default=default,
-            pinned=override, contract=self,
+            query=query,
+            encoded_query=encoded,
+            device=device,
+            space=self.parameter_space(query, device) if search else None,
+            default=default,
+            pinned=override,
+            contract=self,
         )
 
     def config_payload(self, config) -> FrozenMapping:
@@ -283,7 +306,8 @@ class TuningContract(Generic[QueryT, ConfigT]):
     def _lower(self, query, device, assignment):
         payload = FrozenMapping(assignment)
         config = (
-            self.decode_config(payload) if self.materialize is None
+            self.decode_config(payload)
+            if self.materialize is None
             else self.materialize(query, device, payload)
         )
         self.validate_config(query, config, device)
@@ -306,13 +330,15 @@ class TuningContract(Generic[QueryT, ConfigT]):
         configuration = self.configure(query, device=device)
         iterator = self.iterate(configuration)
         candidates = tuple(
-            candidate for candidate in iterator
+            candidate
+            for candidate in iterator
             if eligible is None or eligible(*candidate)
         )
         if not candidates:
             raise ValueError(f"no eligible configurations for {self.component_id}")
         return EligiblePlan(
-            space=configuration.space, candidates=candidates,
+            space=configuration.space,
+            candidates=candidates,
             cartesian_count=iterator.cartesian_count,
             legal_count=iterator.legal_count,
         )
@@ -401,11 +427,18 @@ def make_fixed_contract(*, component_id, query_type, backend) -> TuningContract:
             raise ValueError(f"unsupported {component_id} backend {config.backend!r}")
 
     return TuningContract(
-        component_id=component_id, query_schema_version=1, config_schema_version=1,
-        query_fields=query_fields, config_fields=frozenset({"backend"}),
-        encode_query=lambda query: {name: getattr(query, name) for name in query_fields},
-        encode_config=BackendConfig.to_dict, decode_config=BackendConfig.from_config,
-        validate_query=validate_query, validate_config=validate_config,
+        component_id=component_id,
+        query_schema_version=1,
+        config_schema_version=1,
+        query_fields=query_fields,
+        config_fields=frozenset({"backend"}),
+        encode_query=lambda query: {
+            name: getattr(query, name) for name in query_fields
+        },
+        encode_config=BackendConfig.to_dict,
+        decode_config=BackendConfig.from_config,
+        validate_query=validate_query,
+        validate_config=validate_config,
         default_config=lambda query, device: BackendConfig(backend=backend),
         knobs=(Knob(name="backend", values=(backend,)),),
     )

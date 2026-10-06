@@ -408,8 +408,6 @@ def _update_state_kernel(
         )
 
 
-
-
 @torch.library.custom_op(
     "b12x::ple_layer_pipeline",
     mutates_args=(
@@ -421,37 +419,88 @@ def _update_state_kernel(
     ),
 )
 def _layer_pipeline_op(
-    residual: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-    k_norm_weight: torch.Tensor, q_norm_weight: torch.Tensor, u_norm_weight: torch.Tensor,
-    conv_weight: torch.Tensor, query_start_loc: torch.Tensor, state_slot_ids: torch.Tensor,
-    state_is_fresh: torch.Tensor, num_accepted_tokens: torch.Tensor,
-    num_seqs: torch.Tensor, num_tokens: torch.Tensor, conv_state: torch.Tensor,
-    out: torch.Tensor, normalized_u: torch.Tensor, gathered_state: torch.Tensor,
-    request_ids: torch.Tensor, eps: float, plan_handle: int,
+    residual: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    u_norm_weight: torch.Tensor,
+    conv_weight: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    state_slot_ids: torch.Tensor,
+    state_is_fresh: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    conv_state: torch.Tensor,
+    out: torch.Tensor,
+    normalized_u: torch.Tensor,
+    gathered_state: torch.Tensor,
+    request_ids: torch.Tensor,
+    eps: float,
+    plan_handle: int,
 ) -> None:
-    state = require_prepared(plan_from_handle(plan_handle), "sequence.ple", residual.device)
+    state = require_prepared(
+        plan_from_handle(plan_handle), "sequence.ple", residual.device
+    )
     if state.mixed:
         raise ValueError("mixed PLE plan requires the mixed operator")
     state.run_tensors(
-        residual, key, value, k_norm_weight, q_norm_weight, u_norm_weight,
-        conv_weight, query_start_loc, state_slot_ids, state_is_fresh, num_accepted_tokens,
-        state_is_fresh, num_seqs, num_tokens, conv_state, out, normalized_u, gathered_state,
-        request_ids, eps=eps,
+        residual,
+        key,
+        value,
+        k_norm_weight,
+        q_norm_weight,
+        u_norm_weight,
+        conv_weight,
+        query_start_loc,
+        state_slot_ids,
+        state_is_fresh,
+        num_accepted_tokens,
+        state_is_fresh,
+        num_seqs,
+        num_tokens,
+        conv_state,
+        out,
+        normalized_u,
+        gathered_state,
+        request_ids,
+        eps=eps,
     )
 
 
 @_layer_pipeline_op.register_fake
 def _layer_pipeline_fake(
-    residual: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-    k_norm_weight: torch.Tensor, q_norm_weight: torch.Tensor, u_norm_weight: torch.Tensor,
-    conv_weight: torch.Tensor, query_start_loc: torch.Tensor, state_slot_ids: torch.Tensor,
-    state_is_fresh: torch.Tensor, num_accepted_tokens: torch.Tensor,
-    num_seqs: torch.Tensor, num_tokens: torch.Tensor, conv_state: torch.Tensor,
-    out: torch.Tensor, normalized_u: torch.Tensor, gathered_state: torch.Tensor,
-    request_ids: torch.Tensor, eps: float, plan_handle: int,
+    residual: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    u_norm_weight: torch.Tensor,
+    conv_weight: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    state_slot_ids: torch.Tensor,
+    state_is_fresh: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    conv_state: torch.Tensor,
+    out: torch.Tensor,
+    normalized_u: torch.Tensor,
+    gathered_state: torch.Tensor,
+    request_ids: torch.Tensor,
+    eps: float,
+    plan_handle: int,
 ) -> None:
     del residual, key, value, k_norm_weight, q_norm_weight, u_norm_weight, conv_weight
-    del query_start_loc, state_slot_ids, state_is_fresh, num_accepted_tokens, num_seqs, num_tokens
+    del (
+        query_start_loc,
+        state_slot_ids,
+        state_is_fresh,
+        num_accepted_tokens,
+        num_seqs,
+        num_tokens,
+    )
     del conv_state, out, normalized_u, gathered_state, request_ids, eps, plan_handle
 
 
@@ -466,38 +515,100 @@ def _layer_pipeline_fake(
     ),
 )
 def _layer_mixed_pipeline_op(
-    residual: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-    k_norm_weight: torch.Tensor, q_norm_weight: torch.Tensor, u_norm_weight: torch.Tensor,
-    conv_weight: torch.Tensor, query_start_loc: torch.Tensor, state_slot_ids: torch.Tensor,
-    state_is_fresh: torch.Tensor, num_accepted_tokens: torch.Tensor, request_is_prefill: torch.Tensor,
-    num_seqs: torch.Tensor, num_tokens: torch.Tensor, conv_state: torch.Tensor,
-    out: torch.Tensor, normalized_u: torch.Tensor, gathered_state: torch.Tensor,
-    request_ids: torch.Tensor, eps: float, plan_handle: int,
+    residual: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    u_norm_weight: torch.Tensor,
+    conv_weight: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    state_slot_ids: torch.Tensor,
+    state_is_fresh: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    request_is_prefill: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    conv_state: torch.Tensor,
+    out: torch.Tensor,
+    normalized_u: torch.Tensor,
+    gathered_state: torch.Tensor,
+    request_ids: torch.Tensor,
+    eps: float,
+    plan_handle: int,
 ) -> None:
-    state = require_prepared(plan_from_handle(plan_handle), "sequence.ple", residual.device)
+    state = require_prepared(
+        plan_from_handle(plan_handle), "sequence.ple", residual.device
+    )
     if not state.mixed:
         raise ValueError("mixed PLE operator requires a mixed plan")
     state.run_tensors(
-        residual, key, value, k_norm_weight, q_norm_weight, u_norm_weight,
-        conv_weight, query_start_loc, state_slot_ids, state_is_fresh, num_accepted_tokens,
-        request_is_prefill, num_seqs, num_tokens, conv_state, out, normalized_u, gathered_state,
-        request_ids, eps=eps,
+        residual,
+        key,
+        value,
+        k_norm_weight,
+        q_norm_weight,
+        u_norm_weight,
+        conv_weight,
+        query_start_loc,
+        state_slot_ids,
+        state_is_fresh,
+        num_accepted_tokens,
+        request_is_prefill,
+        num_seqs,
+        num_tokens,
+        conv_state,
+        out,
+        normalized_u,
+        gathered_state,
+        request_ids,
+        eps=eps,
     )
 
 
 @_layer_mixed_pipeline_op.register_fake
 def _layer_mixed_pipeline_fake(
-    residual: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
-    k_norm_weight: torch.Tensor, q_norm_weight: torch.Tensor, u_norm_weight: torch.Tensor,
-    conv_weight: torch.Tensor, query_start_loc: torch.Tensor, state_slot_ids: torch.Tensor,
-    state_is_fresh: torch.Tensor, num_accepted_tokens: torch.Tensor, request_is_prefill: torch.Tensor,
-    num_seqs: torch.Tensor, num_tokens: torch.Tensor, conv_state: torch.Tensor,
-    out: torch.Tensor, normalized_u: torch.Tensor, gathered_state: torch.Tensor,
-    request_ids: torch.Tensor, eps: float, plan_handle: int,
+    residual: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    u_norm_weight: torch.Tensor,
+    conv_weight: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    state_slot_ids: torch.Tensor,
+    state_is_fresh: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    request_is_prefill: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    conv_state: torch.Tensor,
+    out: torch.Tensor,
+    normalized_u: torch.Tensor,
+    gathered_state: torch.Tensor,
+    request_ids: torch.Tensor,
+    eps: float,
+    plan_handle: int,
 ) -> None:
     del residual, key, value, k_norm_weight, q_norm_weight, u_norm_weight, conv_weight
-    del query_start_loc, state_slot_ids, state_is_fresh, num_accepted_tokens, request_is_prefill
-    del num_seqs, num_tokens, conv_state, out, normalized_u, gathered_state, request_ids, eps, plan_handle
+    del (
+        query_start_loc,
+        state_slot_ids,
+        state_is_fresh,
+        num_accepted_tokens,
+        request_is_prefill,
+    )
+    del (
+        num_seqs,
+        num_tokens,
+        conv_state,
+        out,
+        normalized_u,
+        gathered_state,
+        request_ids,
+        eps,
+        plan_handle,
+    )
 
 
 def run_layer_kernels(binding: LayerBinding, *, eps: float) -> None:

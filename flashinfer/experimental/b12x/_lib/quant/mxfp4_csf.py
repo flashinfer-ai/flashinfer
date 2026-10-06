@@ -345,7 +345,8 @@ class Mxfp4CsfDecoder:
             raise ValueError("MXFP4-CSF projections must be on one CUDA device")
         if (
             out13.data_ptr() < out2.data_ptr() + out2.numel() * out2.element_size()
-            and out2.data_ptr() < out13.data_ptr() + out13.numel() * out13.element_size()
+            and out2.data_ptr()
+            < out13.data_ptr() + out13.numel() * out13.element_size()
         ):
             raise ValueError("MXFP4-CSF output buffers must not overlap")
         for plane, output in ((first, out13), (second, out2)):
@@ -366,7 +367,9 @@ class Mxfp4CsfDecoder:
                 for ids64 in (False, True)
             ),
             tuple(compile_csf_active_experts(ids64) for ids64 in (False, True)),
-            torch.empty(first.num_experts, dtype=torch.int32, device=first.bases.device),
+            torch.empty(
+                first.num_experts, dtype=torch.int32, device=first.bases.device
+            ),
         )
 
     def decode(self, ids, out13, out2):

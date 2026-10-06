@@ -878,8 +878,10 @@ def _validate_layer(case: LayerCase) -> dict[str, object]:
 
 def _eager_samples(launch, *, prepare, warmup, samples, l2_flush):
     from b12x.testing.benchmark import transaction_samples
-    return transaction_samples(launch, samples=samples, warmup=warmup,
-                               prepare=prepare, l2_flush=l2_flush)
+
+    return transaction_samples(
+        launch, samples=samples, warmup=warmup, prepare=prepare, l2_flush=l2_flush
+    )
 
 
 def _percentile(samples: list[float], fraction: float) -> float:

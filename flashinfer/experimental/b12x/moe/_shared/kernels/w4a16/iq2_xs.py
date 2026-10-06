@@ -34,7 +34,9 @@ def pack_iq2_xs_matrix(
     if blocks.dtype != torch.uint8:
         raise TypeError("IQ2_XS blocks must be uint8")
     if blocks.ndim != 4 or blocks.shape[-1] != spec.block_bytes:
-        raise ValueError(f"{codec.upper()} blocks must have shape [E,N,K/{spec.block_weights},{spec.block_bytes}]")
+        raise ValueError(
+            f"{codec.upper()} blocks must have shape [E,N,K/{spec.block_weights},{spec.block_bytes}]"
+        )
     e, n, kb, _ = blocks.shape
     k16 = kb * spec.block_weights // 16
     words_per_row = 4 // spec.pack_factor
@@ -43,20 +45,26 @@ def pack_iq2_xs_matrix(
     if swap_halves and n % 32:
         raise ValueError("IQ2_XS projection halves must be divisible by 16")
     if (tile_descriptors or tile_scales) and (n % 64 or (swap_halves and n % 128)):
-        raise ValueError("tiled IQ2_XS requires N and projection halves divisible by 64")
+        raise ValueError(
+            "tiled IQ2_XS requires N and projection halves divisible by 64"
+        )
     words = torch.empty(
         (e, n // 64, k16 // 8, 8, 4, 8, 2, words_per_row)
-        if tile_descriptors else (e, k16, n // 16, 8, 2, words_per_row),
+        if tile_descriptors
+        else (e, k16, n // 16, 8, 2, words_per_row),
         dtype=torch.int32,
         device=blocks.device,
     )
-    metadata = torch.empty(e * kb * n * spec.metadata_bytes, dtype=torch.uint8, device=blocks.device)
+    metadata = torch.empty(
+        e * kb * n * spec.metadata_bytes, dtype=torch.uint8, device=blocks.device
+    )
     base_bytes = e * kb * n * 2
     bases = metadata[:base_bytes].view(torch.float16).reshape(e, kb, n // 16, 8, 2)
     if spec.subscale_bytes:
         scales = metadata[base_bytes:].reshape(
             (e, n // 64, kb, 2, 4, 4, 8, 2)
-            if tile_scales else (e, kb, n // 16, 8, 8, 2)
+            if tile_scales
+            else (e, kb, n // 16, 8, 8, 2)
         )
     for expert in range(e):
         boundaries = (0, n // 2, n) if swap_halves else (0, n)
@@ -73,15 +81,23 @@ def pack_iq2_xs_matrix(
                 )
                 if not bool(torch.isfinite(d).all()):
                     raise ValueError("IQ2_XS block bases must be finite")
-                q = chunk[..., 2:2 + spec.payload_bytes].contiguous().view(torch.int32)
-                descriptors = (q.reshape(stop - row, k16, words_per_row)
-                               .permute(1, 0, 2).contiguous()
-                               .reshape(k16, (stop - row) // 16, 2, 8, words_per_row)
-                               .transpose(2, 3))
+                q = (
+                    chunk[..., 2 : 2 + spec.payload_bytes]
+                    .contiguous()
+                    .view(torch.int32)
+                )
+                descriptors = (
+                    q.reshape(stop - row, k16, words_per_row)
+                    .permute(1, 0, 2)
+                    .contiguous()
+                    .reshape(k16, (stop - row) // 16, 2, 8, words_per_row)
+                    .transpose(2, 3)
+                )
                 if tile_descriptors:
                     words[expert, row // 64 : stop // 64].copy_(
-                        descriptors.reshape(k16 // 8, 8, (stop - row) // 64, 4, 8, 2, words_per_row)
-                        .permute(2, 0, 1, 3, 4, 5, 6)
+                        descriptors.reshape(
+                            k16 // 8, 8, (stop - row) // 64, 4, 8, 2, words_per_row
+                        ).permute(2, 0, 1, 3, 4, 5, 6)
                     )
                 else:
                     words[expert, :, row // 16 : stop // 16].copy_(descriptors)
@@ -137,14 +153,24 @@ def prepare_iq2_xs_moe_weights(
         hidden_size // spec.block_weights,
         spec.block_bytes,
     )
-    expected2 = (num_experts, hidden_size, intermediate_size // spec.block_weights, spec.block_bytes)
+    expected2 = (
+        num_experts,
+        hidden_size,
+        intermediate_size // spec.block_weights,
+        spec.block_bytes,
+    )
     if tuple(w13.shape) != expected13 or tuple(w2.shape) != expected2:
         raise ValueError(f"IQ2_XS blocks must have shapes {expected13} and {expected2}")
     q13, s13 = pack_iq2_xs_matrix(
-        w13, codec=codec, swap_halves=gated and w13_layout == "w13",
-        tile_descriptors=True, tile_scales=True,
+        w13,
+        codec=codec,
+        swap_halves=gated and w13_layout == "w13",
+        tile_descriptors=True,
+        tile_scales=True,
     )
-    q2, s2 = pack_iq2_xs_matrix(w2, codec=codec, tile_descriptors=True, tile_scales=True)
+    q2, s2 = pack_iq2_xs_matrix(
+        w2, codec=codec, tile_descriptors=True, tile_scales=True
+    )
     if codec in IQ2_CODECS:
         iq2_xs_execution_lut(w13.device, prepare=True, selectors=True, codec=codec)
     unit = torch.ones(num_experts, dtype=torch.float32, device=w13.device)

@@ -78,25 +78,35 @@ def prepare_exl3_moe_weights(
 
         source, weights = trellis_from_exl3(layer)
         return prepare_trellis_weights(
-            source, weights,
-            activation=activation, params_dtype=params_dtype,
+            source,
+            weights,
+            activation=activation,
+            params_dtype=params_dtype,
             num_experts=manifest.geometry.num_experts,
             hidden_size=manifest.geometry.hidden_size,
             intermediate_size=layer.local_intermediate_size,
             device=device,
-            tile_config=tile_config or (
+            tile_config=tile_config
+            or (
                 (128, 128, 128, 128)
                 if manifest.hadamard.intermediate_hadamard and manifest.rates.bits == 2
                 else (64, 256, 64, 256)
             ),
-            dummy_scale=dummy_scale, workspace=workspace,
+            dummy_scale=dummy_scale,
+            workspace=workspace,
         )
     gate, up, down, rotations = _extent_rotation_tables(layer, device)
     return _prepare_exl3_pair_extent(
-        layer, device=device, gate_suh=gate, up_suh=up, down_svh=down,
-        rotations=rotations, params_dtype=params_dtype,
+        layer,
+        device=device,
+        gate_suh=gate,
+        up_suh=up,
+        down_svh=down,
+        rotations=rotations,
+        params_dtype=params_dtype,
         tile_config=tile_config or (64, 256, 64, 256),
-        dummy_scale=dummy_scale, workspace=workspace,
+        dummy_scale=dummy_scale,
+        workspace=workspace,
     )
 
 
@@ -145,9 +155,7 @@ def _prepare_exl3_pair_extent(
     per_matrix = []
     values = layer.rotations.to(rotations.device)
     for matrix in range(3):
-        planes = values[:, :, matrix, :].reshape(
-            SLOTS_PER_PAIR, experts_count, 2, 16
-        )
+        planes = values[:, :, matrix, :].reshape(SLOTS_PER_PAIR, experts_count, 2, 16)
         low = planes[:, :, 0, :].permute(1, 0, 2).reshape(experts_count, -1)
         high = planes[:, :, 1, :].permute(1, 0, 2).reshape(experts_count, -1)
         per_matrix.append(torch.cat((low, high), dim=1))
@@ -185,9 +193,7 @@ def _prepare_exl3_pair_extent(
                 lo, hi = rate_code_bits(int(m_codes[expert]))
                 begin += matrix_slot_bytes(geometry.hidden_size, lo, hi)
             section = matrix_slot_bytes(geometry.hidden_size, low_bits, high_bits)
-            raw = layer.codes[:, _bundle_offset(layer, expert) + begin :][
-                :, :section
-            ]
+            raw = layer.codes[:, _bundle_offset(layer, expert) + begin :][:, :section]
             words = (
                 raw.contiguous()
                 .to(device=device)
@@ -211,9 +217,7 @@ def _prepare_exl3_pair_extent(
         gate = _restore(fc1_codes, 0, fc1=True)
         up = _restore(fc1_codes, 1, fc1=True)
         down = _restore(fc2_codes, 2, fc1=False)
-        w13 = torch.cat(
-            [torch.cat(gate, dim=0), torch.cat(up, dim=0)]
-        ).reshape(-1)
+        w13 = torch.cat([torch.cat(gate, dim=0), torch.cat(up, dim=0)]).reshape(-1)
         w2 = torch.cat(down, dim=0).reshape(-1)
         fc1_pair_modes: torch.Tensor = fc1_modes.contiguous()
         fc2_pair_modes: torch.Tensor = fc2_modes.contiguous()
@@ -236,9 +240,7 @@ def _prepare_exl3_pair_extent(
         down = _restore(fc2_codes, 2, fc1=False)
         _, fc1_descriptors = _compact(fc1_codes, gate)
         _, fc2_descriptors = _compact(fc2_codes, down)
-        w13 = torch.cat(
-            [torch.cat(gate, dim=1), torch.cat(up, dim=1)]
-        ).reshape(-1)
+        w13 = torch.cat([torch.cat(gate, dim=1), torch.cat(up, dim=1)]).reshape(-1)
         w2 = torch.cat(down, dim=1).reshape(-1)
         fc1_pair_modes = fc1_descriptors.contiguous()
         fc2_pair_modes = fc2_descriptors.contiguous()

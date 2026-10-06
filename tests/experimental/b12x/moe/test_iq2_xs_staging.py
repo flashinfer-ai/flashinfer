@@ -28,32 +28,63 @@ from tests.experimental.b12x.moe.test_iq2_xs import blocks
 def test_stage_records_with_alternate_tiles(tile_k, tile_n, codec):
     device = require_b12x()
     layer = IQ2XSLayer(
-        moe.BlockQuantWeights(blocks(e=8, n=1280, k=1024, codec=codec), blocks(e=8, n=1024, k=1280, codec=codec), codec=codec),
-        1024, 1280, 8, 2, tuple(range(8)), Path("synthetic-iq2-xs"), 0, 1, 0,
+        moe.BlockQuantWeights(
+            blocks(e=8, n=1280, k=1024, codec=codec),
+            blocks(e=8, n=1024, k=1280, codec=codec),
+            codec=codec,
+        ),
+        1024,
+        1280,
+        8,
+        2,
+        tuple(range(8)),
+        Path("synthetic-iq2-xs"),
+        0,
+        1,
+        0,
     )
     experts, _ = prepare_experts(layer, device, activation="relu2")
     prepared = experts._impl.representation.value
     buffers = make_w4a16_packed_buffers(
-        prepared, m=8, topk=2, dtype=torch.bfloat16, device=device, block_size_m=8,
+        prepared,
+        m=8,
+        topk=2,
+        dtype=torch.bfloat16,
+        device=device,
+        block_size_m=8,
     )
     workspace = (
-        buffers.intermediate_cache13, buffers.intermediate_cache2,
-        buffers.fc1_c_tmp, buffers.fc2_c_tmp,
+        buffers.intermediate_cache13,
+        buffers.intermediate_cache2,
+        buffers.fc1_c_tmp,
+        buffers.fc2_c_tmp,
     )
     pointers = tuple(t.data_ptr() for t in workspace)
     props = torch.cuda.get_device_properties(device)
     with (
         pytest.raises(ValueError, match="force_tile_config fc1 tile .* does not fit")
-        if tile_k > 128 else nullcontext()
+        if tile_k > 128
+        else nullcontext()
     ):
         fused = kernel.compile_w4a16_fused_moe(
-            size_m=8, hidden_size=1024, intermediate_size=1280, num_experts=8,
-            top_k=2, activation="relu2", apply_router_weight_on_input=False,
-            zero_fc2_output=False, moe_block_size=8, max_m_blocks=16,
-            element_dtype="bf16", sms=props.multi_processor_count,
+            size_m=8,
+            hidden_size=1024,
+            intermediate_size=1280,
+            num_experts=8,
+            top_k=2,
+            activation="relu2",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            moe_block_size=8,
+            max_m_blocks=16,
+            element_dtype="bf16",
+            sms=props.multi_processor_count,
             max_shared_mem=props.shared_memory_per_block_optin,
-            weight_layout=codec, scale_format=codec, w13_layout="packed",
-            direct_topk_routes=True, tc_decode_fused_sum=True,
+            weight_layout=codec,
+            scale_format=codec,
+            w13_layout="packed",
+            direct_topk_routes=True,
+            tc_decode_fused_sum=True,
             force_tile_config=(tile_k, tile_n, tile_k, tile_n),
         )
     if tile_k > 128:
@@ -73,12 +104,19 @@ def test_stage_records_with_alternate_tiles(tile_k, tile_n, codec):
 
             def run():
                 return kernel.run_w4a16_moe(
-                    inputs.x, prepared, inputs.probabilities, inputs.ids,
-                    activation="relu2", output=inputs.output,
+                    inputs.x,
+                    prepared,
+                    inputs.probabilities,
+                    inputs.ids,
+                    activation="relu2",
+                    output=inputs.output,
                     intermediate_cache13=buffers.intermediate_cache13,
                     intermediate_cache2=buffers.intermediate_cache2,
-                    fc1_c_tmp=buffers.fc1_c_tmp, fc2_c_tmp=buffers.fc2_c_tmp,
-                    route_mode="direct", route_block_size_m=8, fused_launch=fused,
+                    fc1_c_tmp=buffers.fc1_c_tmp,
+                    fc2_c_tmp=buffers.fc2_c_tmp,
+                    route_mode="direct",
+                    route_block_size_m=8,
+                    fused_launch=fused,
                 )
 
             inputs.output.fill_(float("nan"))

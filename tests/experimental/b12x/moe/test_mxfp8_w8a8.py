@@ -344,8 +344,12 @@ def test_prepare_w8a8_swizzles_non_128_fc1_halves_independently() -> None:
         prepared.w13_sf_swizzled,
         torch.stack(
             [
-                torch.stack([_expected_swizzled(w13_scale[e, :i]) for e in range(experts)]),
-                torch.stack([_expected_swizzled(w13_scale[e, i:]) for e in range(experts)]),
+                torch.stack(
+                    [_expected_swizzled(w13_scale[e, :i]) for e in range(experts)]
+                ),
+                torch.stack(
+                    [_expected_swizzled(w13_scale[e, i:]) for e in range(experts)]
+                ),
             ]
         ),
     )
@@ -926,10 +930,12 @@ def test_mxfp8_scaled_roundtrip_supports_per_row_globals(cols):
 
     x = torch.linspace(-4.0, 7.0, 3 * cols).reshape(3, cols)
     scales = torch.tensor([0.5, 2.0, 3.0])
-    expected = torch.cat([
-        quant_dequant_mxfp8_scaled_torch(row.unsqueeze(0), scale)
-        for row, scale in zip(x, scales)
-    ])
+    expected = torch.cat(
+        [
+            quant_dequant_mxfp8_scaled_torch(row.unsqueeze(0), scale)
+            for row, scale in zip(x, scales)
+        ]
+    )
     actual = quant_dequant_mxfp8_scaled_torch(x, scales)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
@@ -941,7 +947,11 @@ def test_w6a8_scale_validation_preserves_strided_input_support():
     scales = backing[:, :, ::2]
     assert not scales.is_contiguous()
     actual = _validate_e8m0_scale_grid(
-        scales, name="scales", num_experts=2, rows=4, k=128,
+        scales,
+        name="scales",
+        num_experts=2,
+        rows=4,
+        k=128,
     )
     assert actual.is_contiguous()
     torch.testing.assert_close(actual, scales, rtol=0, atol=0)
@@ -950,7 +960,10 @@ def test_w6a8_scale_validation_preserves_strided_input_support():
 def test_w8a8_prepared_capacity_reuses_launches_for_live_counts():
     require_b12x()
     from b12x.moe import fused_moe as moe
-    from b12x.moe._shared.kernels.reference import compare_to_reference, moe_reference_w8a8_mx
+    from b12x.moe._shared.kernels.reference import (
+        compare_to_reference,
+        moe_reference_w8a8_mx,
+    )
     from b12x.preparation import PreparationSession, PreparedCall
     from b12x._lib.runtime_control import kernel_resolution_guard
 
@@ -967,28 +980,56 @@ def test_w8a8_prepared_capacity_reuses_launches_for_live_counts():
     output = torch.empty_like(x)
 
     def primer(state):
-        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-                        for spec in state.scratch.scratch_specs())
-        binding = state.bind(a=x, experts=prepared, topk_ids=ids,
-                             topk_weights=weights, output=output, scratch=scratch)
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            for spec in state.scratch.scratch_specs()
+        )
+        binding = state.bind(
+            a=x,
+            experts=prepared,
+            topk_ids=ids,
+            topk_weights=weights,
+            output=output,
+            scratch=scratch,
+        )
         return PreparedCall(run=lambda: state.run(binding), owners=(scratch, binding))
 
-    with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
         session.prepare((plan.request(name="w8a8-live-counts", prepare_call=primer),))
         session.freeze()
-        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
-                        for spec in plan.scratch_specs())
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            for spec in plan.scratch_specs()
+        )
         for rows in (1, 17, 32):
             reference = moe_reference_w8a8_mx(
-                x[:rows].float(), native["w13"], native["w13_scale"], native["w1_alpha"],
-                native["w2"], native["w2_scale"], native["w2_alpha"], ids[:rows], weights[:rows],
-                experts, hidden, intermediate,
-                a1_gscale=native["a1_gscale"], a2_gscale=native["a2_gscale"],
+                x[:rows].float(),
+                native["w13"],
+                native["w13_scale"],
+                native["w1_alpha"],
+                native["w2"],
+                native["w2_scale"],
+                native["w2_alpha"],
+                ids[:rows],
+                weights[:rows],
+                experts,
+                hidden,
+                intermediate,
+                a1_gscale=native["a1_gscale"],
+                a2_gscale=native["a2_gscale"],
             )
             with kernel_resolution_guard():
-                binding = moe.bind(plan, a=x[:rows], experts=prepared,
-                                   topk_ids=ids[:rows], topk_weights=weights[:rows],
-                                   output=output[:rows], scratch=scratch)
+                binding = moe.bind(
+                    plan,
+                    a=x[:rows],
+                    experts=prepared,
+                    topk_ids=ids[:rows],
+                    topk_weights=weights[:rows],
+                    output=output[:rows],
+                    scratch=scratch,
+                )
                 actual = moe.run(binding=binding)
             metrics = compare_to_reference(actual.float(), reference)
             assert metrics.cos >= _MIN_COS, metrics

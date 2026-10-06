@@ -19,6 +19,7 @@ class ProjectionQuery:
     b_major: str
     sf_axis: str
 
+
 def validate_query(query):
     if query.b_major != "n" or query.sf_axis != "n":
         raise ValueError("MLA query projection requires N-major MXFP8 scales")
@@ -65,6 +66,12 @@ TUNING = TuningContract(
         backend=execution_backend(query)
     ),
     candidate_contract_version=2,
-    knobs=(Knob(name="backend", values=("triton", "cutedsl"), binding=ParameterBinding.COMPILE),),
+    knobs=(
+        Knob(
+            name="backend",
+            values=("triton", "cutedsl"),
+            binding=ParameterBinding.COMPILE,
+        ),
+    ),
     parameters=lambda query, device: {"backend": (execution_backend(query),)},
 )

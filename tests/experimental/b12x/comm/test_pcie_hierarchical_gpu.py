@@ -16,9 +16,7 @@ from b12x.preparation import PreparationSession
 
 pytestmark = pytest.mark.skipif(
     os.getenv("B12X_RUN_PCIE_HIERARCHICAL_TEST") != "1",
-    reason=(
-        "set B12X_RUN_PCIE_HIERARCHICAL_TEST=1 to run hierarchical GPU tests"
-    ),
+    reason=("set B12X_RUN_PCIE_HIERARCHICAL_TEST=1 to run hierarchical GPU tests"),
 )
 
 WORLD_SIZE = int(os.getenv("B12X_PCIE_HIERARCHICAL_TEST_WORLD_SIZE", "12"))
@@ -42,9 +40,7 @@ def _expected(elements: int, world_size: int, device: torch.device) -> torch.Ten
 def _worker(rank: int, world_size: int, port: int, mode: str) -> None:
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
-    os.environ["B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER"] = str(
-        int(mode == "double")
-    )
+    os.environ["B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER"] = str(int(mode == "double"))
     os.environ["B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION"] = str(
         int(mode == "deferred")
     )
@@ -72,18 +68,22 @@ def _worker(rank: int, world_size: int, port: int, mode: str) -> None:
     def prepare(inp, out):
         query = preparation.query_from_runtime(runtime, call={"inp": inp, "out": out})
         plan = preparation.plan(query, runtime=runtime)
-        session.prepare((plan.request(
-            name=f"hierarchical_{inp.numel()}",
-            prepare_call=lambda state: preparation.prepared_call(state, inp=inp, out=out),
-        ),))
+        session.prepare(
+            (
+                plan.request(
+                    name=f"hierarchical_{inp.numel()}",
+                    prepare_call=lambda state: preparation.prepared_call(
+                        state, inp=inp, out=out
+                    ),
+                ),
+            )
+        )
         return plan
 
     try:
         # Odd/even BF16x2 tails and the scalar path above the vector threshold.
         for elements in (1, 3583, 7168, 7169, 43008, 3583):
-            base = torch.arange(
-                elements, device=device, dtype=torch.float32
-            ) / 1024.0
+            base = torch.arange(elements, device=device, dtype=torch.float32) / 1024.0
             inp = (base + float(rank)).to(torch.bfloat16)
             out = torch.empty_like(inp)
             output_address = out.data_ptr()

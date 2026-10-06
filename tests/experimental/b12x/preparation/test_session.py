@@ -1,4 +1,5 @@
 """Host state-machine boundaries, without substituting a serving kernel."""
+
 import gc
 from dataclasses import replace
 import os
@@ -11,15 +12,27 @@ import pytest
 import torch
 
 from b12x.preparation import (
-    CollectiveBarrierTimeout, CollectiveRequirement, DetectedDevice, MemoryRequirements,
-    PersistentMemory, Plan, PreparationSession, PreparedCall, current_plan,
-    current_prepared_state, plan_from_handle, require_prepared,
+    CollectiveBarrierTimeout,
+    CollectiveRequirement,
+    DetectedDevice,
+    MemoryRequirements,
+    PersistentMemory,
+    Plan,
+    PreparationSession,
+    PreparedCall,
+    current_plan,
+    current_prepared_state,
+    plan_from_handle,
+    require_prepared,
 )
 from b12x.preparation.session import PreparationJob
 from b12x.preparation._cache import SelectionCache
 from b12x.preparation.types import DeviceIdentity, _CompositePlan
 from b12x._lib.scratch import ScratchBufferSpec
-from b12x._lib.runtime_control import KernelResolutionFrozenError, kernel_resolution_guard
+from b12x._lib.runtime_control import (
+    KernelResolutionFrozenError,
+    kernel_resolution_guard,
+)
 from .test_defaults import Config, Query, contract
 
 
@@ -87,7 +100,9 @@ def test_collective_barrier_dispatch_contract(tmp_path):
 def session(tmp_path, **kwargs):
     """Build a CPU preparation session with an isolated selection cache."""
     value = PreparationSession(device=DetectedDevice(None, None), **kwargs)
-    value._cache = SelectionCache(tmp_path, {"schema_version": 6, "tuning_cache_version": 1})
+    value._cache = SelectionCache(
+        tmp_path, {"schema_version": 6, "tuning_cache_version": 1}
+    )
     return value
 
 
@@ -103,13 +118,18 @@ def test_compiler_process_budget_can_be_limited_without_disabling_tuning(
         assert engine.compile_workers == 2
 
 
-@pytest.mark.parametrize("identity, workers", [
-    (DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10"), 4),
-    (DeviceIdentity("nvidia", (12, 1), 48, "GB10"), 4),
-    (DeviceIdentity("nvidia", (12, 0), 170, "NVIDIA GeForce RTX 5090"), 8),
-    (None, 8),
-])
-def test_compiler_default_limits_spark_memory_across_stages(monkeypatch, identity, workers):
+@pytest.mark.parametrize(
+    "identity, workers",
+    [
+        (DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10"), 4),
+        (DeviceIdentity("nvidia", (12, 1), 48, "GB10"), 4),
+        (DeviceIdentity("nvidia", (12, 0), 170, "NVIDIA GeForce RTX 5090"), 8),
+        (None, 8),
+    ],
+)
+def test_compiler_default_limits_spark_memory_across_stages(
+    monkeypatch, identity, workers
+):
     monkeypatch.delenv("B12X_COMPILE_WORKERS", raising=False)
     with PreparationSession(device=DetectedDevice(None, identity)) as engine:
         assert engine.compile_workers == workers
@@ -135,10 +155,15 @@ def declaration(*, tuning=None, pin=None, shared=False):
     """Build a minimal arithmetic plan for preparation state-machine tests."""
     tuning = contract(values=(2,)) if tuning is None else tuning
     return Plan(
-        contract=tuning, query=Query(3), override=pin, shared=shared,
+        contract=tuning,
+        query=Query(3),
+        override=pin,
+        shared=shared,
         _compile_jobs=lambda config, device: (),
         _memory_requirements=lambda config, device: MemoryRequirements(),
-        _materialize=lambda selection, device: SimpleNamespace(value=selection.config.width * 3),
+        _materialize=lambda selection, device: SimpleNamespace(
+            value=selection.config.width * 3
+        ),
     )
 
 
@@ -158,12 +183,27 @@ def test_compiler_budget_changes_between_jobs_preserve_prepared_plans(tmp_path):
         assert require_prepared(first.plan, "test.arithmetic").value == 6
 
 
-def request(*, name, tuning=None, pin=None, calls=None, close=None, benchmark=None, dependencies=(), collective=None, shared=False):
+def request(
+    *,
+    name,
+    tuning=None,
+    pin=None,
+    calls=None,
+    close=None,
+    benchmark=None,
+    dependencies=(),
+    collective=None,
+    shared=False,
+):
     calls = [] if calls is None else calls
     return declaration(tuning=tuning, pin=pin, shared=shared).request(
         name=name,
-        prepare_call=lambda state: PreparedCall(run=lambda: calls.append(state.value), close=close),
-        benchmark_call=benchmark, dependencies=dependencies, collective=collective,
+        prepare_call=lambda state: PreparedCall(
+            run=lambda: calls.append(state.value), close=close
+        ),
+        benchmark_call=benchmark,
+        dependencies=dependencies,
+        collective=collective,
     )
 
 
@@ -207,8 +247,12 @@ def test_job_bundle_memo_ends_at_completion_but_plan_programs_survive(tmp_path):
         return executable()
 
     def make(name):
-        plan = replace(declaration(), _materialize=lambda *_: compile_plan.load_programs(factory()))
-        return plan.request(name=name, prepare_call=lambda state: PreparedCall(run=state))
+        plan = replace(
+            declaration(), _materialize=lambda *_: compile_plan.load_programs(factory())
+        )
+        return plan.request(
+            name=name, prepare_call=lambda state: PreparedCall(run=state)
+        )
 
     with session(tmp_path, autotune=False) as engine:
         requests = (make("a"), make("b"))
@@ -238,10 +282,15 @@ def test_bulk_release_attempts_all_closers_and_reclaims_once(tmp_path, monkeypat
             raise RuntimeError("closer failed")
 
     with session(tmp_path) as engine:
-        requests = tuple(request(name=name, close=lambda name=name: close(name)) for name in ("a", "b"))
+        requests = tuple(
+            request(name=name, close=lambda name=name: close(name))
+            for name in ("a", "b")
+        )
         engine.prepare(requests)
         reclaim = engine._reclaim_programs
-        monkeypatch.setattr(engine, "_reclaim_programs", lambda: (reclaimed.append(1), reclaim()))
+        monkeypatch.setattr(
+            engine, "_reclaim_programs", lambda: (reclaimed.append(1), reclaim())
+        )
         with pytest.raises(RuntimeError, match="closer failed"):
             engine.release_many(item.plan for item in requests)
         assert closed == ["a", "b"]
@@ -256,13 +305,23 @@ def test_closing_one_session_preserves_another_sessions_executable(tmp_path):
 
     @program_cache.program_cache
     def executable():
-        return compile_plan.CompiledCuTeProgram(lambda: 41, compile_plan.ProgramKey("cute", "6" * 64))
+        return compile_plan.CompiledCuTeProgram(
+            lambda: 41, compile_plan.ProgramKey("cute", "6" * 64)
+        )
 
     def make(name):
-        plan = replace(declaration(), _materialize=lambda *_: compile_plan.load_programs(executable()))
-        return plan.request(name=name, prepare_call=lambda state: PreparedCall(run=state))
+        plan = replace(
+            declaration(),
+            _materialize=lambda *_: compile_plan.load_programs(executable()),
+        )
+        return plan.request(
+            name=name, prepare_call=lambda state: PreparedCall(run=state)
+        )
 
-    with session(tmp_path, autotune=False) as first, session(tmp_path, autotune=False) as second:
+    with (
+        session(tmp_path, autotune=False) as first,
+        session(tmp_path, autotune=False) as second,
+    ):
         a, b = make("a"), make("b")
         first.prepare((a,))
         second.prepare((b,))
@@ -305,10 +364,12 @@ def test_plan_scoped_persistent_owners_reserve_independent_buffers(tmp_path):
     buffers = {}
 
     def memory(config, device):
-        return MemoryRequirements(persistent=(
-            PersistentMemory(("scratch-owner", current_plan()), 16),
-            PersistentMemory("shared-readonly", 8, 8),
-        ))
+        return MemoryRequirements(
+            persistent=(
+                PersistentMemory(("scratch-owner", current_plan()), 16),
+                PersistentMemory("shared-readonly", 8, 8),
+            )
+        )
 
     def materialize(selection, device):
         buffers[current_plan()] = bytearray(16)
@@ -316,18 +377,24 @@ def test_plan_scoped_persistent_owners_reserve_independent_buffers(tmp_path):
 
     def make(name):
         plan = Plan(
-            contract=contract(values=(2,)), query=Query(3),
+            contract=contract(values=(2,)),
+            query=Query(3),
             _compile_jobs=lambda config, device: (),
-            _memory_requirements=memory, _materialize=materialize,
+            _memory_requirements=memory,
+            _materialize=materialize,
         )
         return plan.request(
             name=name,
-            prepare_call=lambda state: PreparedCall(run=lambda: state.buffer.__setitem__(0, 1)),
+            prepare_call=lambda state: PreparedCall(
+                run=lambda: state.buffer.__setitem__(0, 1)
+            ),
         )
 
     requests = (make("target"), make("draft"))
     with session(tmp_path) as engine:
-        assert engine.candidate_memory_envelope(requests).pending_persistent_nbytes == 32
+        assert (
+            engine.candidate_memory_envelope(requests).pending_persistent_nbytes == 32
+        )
         job = engine.begin(requests)
         while True:
             progress = job.advance()
@@ -344,6 +411,7 @@ def test_plan_scoped_persistent_owners_reserve_independent_buffers(tmp_path):
 
 def test_sticky_stop_before_enumeration_prepares_default_without_winner(tmp_path):
     """Stopped tuning installs defaults without enumerating optional candidates."""
+
     def no_optional(query, device, assignment):
         """Reject materialization if stopped tuning enumerates an optional choice."""
         raise AssertionError("stopped session enumerated an optional candidate")
@@ -360,14 +428,22 @@ def test_sticky_stop_before_enumeration_prepares_default_without_winner(tmp_path
     assert calls == [21, 21]
 
 
-def test_cache_only_effective_singleton_and_explicit_pin_need_no_selection_record(tmp_path):
+def test_cache_only_effective_singleton_and_explicit_pin_need_no_selection_record(
+    tmp_path,
+):
     """Cache-only mode permits fixed and explicit selections without cache records."""
-    tuning = replace(contract(), equivalence_key=lambda query, device, config: {"same": True})
+    tuning = replace(
+        contract(), equivalence_key=lambda query, device, config: {"same": True}
+    )
     calls = []
     with session(tmp_path, cache_only=True) as engine:
-        result = engine.prepare((request(name="singleton", tuning=tuning, calls=calls),))
+        result = engine.prepare(
+            (request(name="singleton", tuning=tuning, calls=calls),)
+        )
         assert result.selections["singleton"].source == "fixed"
-        result = engine.prepare((request(name="pinned", tuning=contract(), pin=Config(9), calls=calls),))
+        result = engine.prepare(
+            (request(name="pinned", tuning=contract(), pin=Config(9), calls=calls),)
+        )
         assert result.selections["pinned"].source == "override"
         with pytest.raises(LookupError):
             engine.prepare((request(name="missing", tuning=contract()),))
@@ -415,7 +491,8 @@ def test_collective_barrier_failure_closes_active_job(tmp_path):
 
 
 def test_collective_barrier_timeout_blocks_new_job_until_callback_returns(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     """A timed-out callback holds the collective gate until it returns."""
     started, release = threading.Event(), threading.Event()
@@ -461,7 +538,9 @@ def test_collective_barrier_start_failure_clears_pending_marker(tmp_path, monkey
     with session(tmp_path, collective_barrier=lambda key, ranks: None) as engine:
         job = engine.begin((request(name="collective", collective=requirement),))
         assert job.advance().ready_collectives == (requirement,)
-        with pytest.raises(RuntimeError, match="collective barrier.*thread start failed"):
+        with pytest.raises(
+            RuntimeError, match="collective barrier.*thread start failed"
+        ):
             job.advance(collective_key=requirement.key)
         assert job._closed and engine._job is None
         assert engine._pending_collective_barrier is None
@@ -470,7 +549,9 @@ def test_collective_barrier_start_failure_clears_pending_marker(tmp_path, monkey
 
 @pytest.mark.parametrize("value", ("0", "-1", "inf", "nan", "abc"))
 def test_collective_barrier_timeout_rejects_nonpositive_or_nonfinite_values(
-    tmp_path, monkeypatch, value,
+    tmp_path,
+    monkeypatch,
+    value,
 ):
     """Only sessions enabling a barrier must validate its environment setting."""
     monkeypatch.setenv("B12X_COLLECTIVE_BARRIER_TIMEOUT", value)
@@ -485,7 +566,8 @@ def test_preparation_import_ignores_unused_barrier_timeout():
     result = subprocess.run(
         [sys.executable, "-c", "import b12x.preparation"],
         env={**os.environ, "B12X_COLLECTIVE_BARRIER_TIMEOUT": "abc"},
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr
 
@@ -523,7 +605,9 @@ def test_failure_restores_and_closes_all_while_preserving_primary_error(tmp_path
             restored.append("restore")
             raise RuntimeError("cleanup failure")
 
-        return PreparedCall(run=fail, restore=restore, close=lambda: restored.append("close"))
+        return PreparedCall(
+            run=fail, restore=restore, close=lambda: restored.append("close")
+        )
 
     req = request(name="failed")
     req = replace(req, prepare_call=factory)
@@ -535,16 +619,28 @@ def test_failure_restores_and_closes_all_while_preserving_primary_error(tmp_path
 
 
 def test_persistent_memory_counts_shared_keys_once_and_rejects_conflicts():
-    requirements = MemoryRequirements(persistent=(
-        PersistentMemory("weights-side-state", 40, 10),
-        PersistentMemory("weights-side-state", 40, 10),
-    ))
+    requirements = MemoryRequirements(
+        persistent=(
+            PersistentMemory("weights-side-state", 40, 10),
+            PersistentMemory("weights-side-state", 40, 10),
+        )
+    )
     assert requirements.pending_persistent_nbytes == 30
-    assert MemoryRequirements(persistent=(PersistentMemory("state", 40, 40),)).pending_persistent_nbytes == 0
+    assert (
+        MemoryRequirements(
+            persistent=(PersistentMemory("state", 40, 40),)
+        ).pending_persistent_nbytes
+        == 0
+    )
     with pytest.raises(ValueError):
-        MemoryRequirements.sequential((requirements, MemoryRequirements(persistent=(
-            PersistentMemory("weights-side-state", 40, 20),
-        ))))
+        MemoryRequirements.sequential(
+            (
+                requirements,
+                MemoryRequirements(
+                    persistent=(PersistentMemory("weights-side-state", 40, 20),)
+                ),
+            )
+        )
 
 
 def _deterministic_timer(monkeypatch, *, stop=None, batches=None):
@@ -554,15 +650,22 @@ def _deterministic_timer(monkeypatch, *, stop=None, batches=None):
         if batches is not None:
             batches.append(tuple(call.output for call in calls))
         yield
-        return SimpleNamespace(calls=calls, close=lambda: None, completed_rounds=0,
-                               planned_rounds=0, active_count=len(calls), latest_round_us=())
+        return SimpleNamespace(
+            calls=calls,
+            close=lambda: None,
+            completed_rounds=0,
+            planned_rounds=0,
+            active_count=len(calls),
+            latest_round_us=(),
+        )
 
     def measure(race, **kwargs):
         if stop is not None:
             stop()
         yield
         return _measurement.RaceMeasurements(
-            tuple(abs(call.output - 6) + 1 for call in race.calls), 0,
+            tuple(abs(call.output - 6) + 1 for call in race.calls),
+            0,
         )
 
     monkeypatch.setattr(_measurement, "prepare_race_steps", prepare)
@@ -575,24 +678,37 @@ def test_complete_race_cached_restart_and_disabled_precedence(tmp_path, monkeypa
 
     def benchmark(state):
         return PreparedCall(
-            run=lambda: state.value, produce=lambda: None,
+            run=lambda: state.value,
+            produce=lambda: None,
             close=lambda: trial_closed.append(state.value),
         )
 
     with session(tmp_path) as engine:
-        result = engine.prepare((request(name="first", tuning=contract(), calls=calls, benchmark=benchmark),))
+        result = engine.prepare(
+            (
+                request(
+                    name="first", tuning=contract(), calls=calls, benchmark=benchmark
+                ),
+            )
+        )
         assert result.selections["first"].source == "tuned"
         assert result.selections["first"].config.width == 2
         assert result.benchmarked_candidates == 3
         assert sorted(trial_closed) == [3, 6, 12]
     with session(tmp_path) as engine:
-        result = engine.prepare((request(name="different-owner", tuning=contract(), calls=calls),))
+        result = engine.prepare(
+            (request(name="different-owner", tuning=contract(), calls=calls),)
+        )
         assert result.selections["different-owner"].source == "cached"
     with session(tmp_path, autotune=False) as engine:
-        result = engine.prepare((request(name="heuristic", tuning=contract(), calls=calls),))
+        result = engine.prepare(
+            (request(name="heuristic", tuning=contract(), calls=calls),)
+        )
         assert result.selections["heuristic"].source == "default"
         assert result.selections["heuristic"].config == Config(7)
-        result = engine.prepare((request(name="pin", tuning=contract(), pin=Config(9), calls=calls),))
+        result = engine.prepare(
+            (request(name="pin", tuning=contract(), pin=Config(9), calls=calls),)
+        )
         assert result.selections["pin"].source == "override"
     assert calls == [6, 6, 21, 27]
 
@@ -603,13 +719,16 @@ def test_race_batches_bound_residency_and_carry_the_champion(tmp_path, monkeypat
 
     def benchmark(state):
         return PreparedCall(
-            run=lambda: state.value, produce=lambda: None,
+            run=lambda: state.value,
+            produce=lambda: None,
             close=lambda: trial_closed.append(state.value),
         )
 
     tuning = contract(values=(1, 2, 4, 8))
     with session(tmp_path, race_batch=2) as engine:
-        result = engine.prepare((request(name="batched", tuning=tuning, benchmark=benchmark),))
+        result = engine.prepare(
+            (request(name="batched", tuning=tuning, benchmark=benchmark),)
+        )
         assert result.selections["batched"].config.width == 2
         assert result.benchmarked_candidates == 4
         assert result.coverage["batched"]["measured_count"] == 4
@@ -621,14 +740,20 @@ def _cuda_error(monkeypatch, code=720):
     from cutlass.base_dsl import common
 
     # Construct the actual DSL exception without querying a CUDA context.
-    monkeypatch.setattr(common, "_get_friendly_cuda_error_message",
-                        lambda code, name: (f"{name} ({code})", "", ""))
+    monkeypatch.setattr(
+        common,
+        "_get_friendly_cuda_error_message",
+        lambda code, name: (f"{name} ({code})", "", ""),
+    )
     return common.DSLCudaRuntimeError(code, "test CUDA launch error")
 
 
 @pytest.mark.parametrize("rejected", ((3,), (12,), (3, 6)))
 def test_unlaunchable_trials_release_scratch_and_race_survivors(
-    tmp_path, monkeypatch, caplog, rejected,
+    tmp_path,
+    monkeypatch,
+    caplog,
+    rejected,
 ):
     batches, events = [], []
     _deterministic_timer(monkeypatch, batches=batches)
@@ -642,14 +767,17 @@ def test_unlaunchable_trials_release_scratch_and_race_survivors(
             return state.value
 
         return PreparedCall(
-            run=run, produce=lambda: None,
+            run=run,
+            produce=lambda: None,
             restore=lambda: events.append(("restore", state.value)),
             close=lambda: events.append(("close", state.value)),
         )
 
     with session(tmp_path, race_batch=1) as engine:
         monkeypatch.setattr(engine, "_synchronize", lambda: events.append("sync"))
-        result = engine.prepare((request(name="race", tuning=contract(), benchmark=benchmark),))
+        result = engine.prepare(
+            (request(name="race", tuning=contract(), benchmark=benchmark),)
+        )
         survivors = {3, 6, 12} - set(rejected)
         assert result.selections["race"].config.width * 3 in survivors
         assert result.benchmarked_candidates == len(survivors)
@@ -659,7 +787,11 @@ def test_unlaunchable_trials_release_scratch_and_race_survivors(
         assert not engine._cache.records
     for value in rejected:
         start = events.index(("run", value))
-        assert events[start + 1:start + 4] == ["sync", ("restore", value), ("close", value)]
+        assert events[start + 1 : start + 4] == [
+            "sync",
+            ("restore", value),
+            ("close", value),
+        ]
         assert events.count(("close", value)) == 1
     assert caplog.text.count("Skipping race candidate") == len(rejected)
 
@@ -671,11 +803,14 @@ def test_all_trials_rejected_fail_without_installing_a_default(tmp_path, monkeyp
     def benchmark(state):
         def run():
             raise error
+
         return PreparedCall(run=run, close=lambda: closed.append(state.value))
 
     req = request(name="race", tuning=contract(), calls=prepared, benchmark=benchmark)
     with session(tmp_path) as engine:
-        with pytest.raises(RuntimeError, match="no launchable candidates for race: all 3"):
+        with pytest.raises(
+            RuntimeError, match="no launchable candidates for race: all 3"
+        ):
             engine.prepare((req,))
         assert req.plan.prepared is None
         assert not engine._cache.records
@@ -683,11 +818,16 @@ def test_all_trials_rejected_fail_without_installing_a_default(tmp_path, monkeyp
     assert not prepared
 
 
-@pytest.mark.parametrize("failure", ("cuda", "text", "factory", "restore", "sync", "selected"))
+@pytest.mark.parametrize(
+    "failure", ("cuda", "text", "factory", "restore", "sync", "selected")
+)
 def test_candidate_recovery_keeps_other_failures_fatal(tmp_path, monkeypatch, failure):
     _deterministic_timer(monkeypatch)
-    error = (_cuda_error(monkeypatch, 700 if failure == "cuda" else 720)
-             if failure != "text" else RuntimeError("CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE (720)"))
+    error = (
+        _cuda_error(monkeypatch, 700 if failure == "cuda" else 720)
+        if failure != "text"
+        else RuntimeError("CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE (720)")
+    )
     attempted = []
 
     def fail():
@@ -711,14 +851,20 @@ def test_candidate_recovery_keeps_other_failures_fatal(tmp_path, monkeypatch, fa
     with session(tmp_path) as engine:
         if failure == "sync":
             monkeypatch.setattr(engine, "_synchronize", cleanup_failure)
-        with pytest.raises(RuntimeError, match="cleanup failed" if failure in {"restore", "sync"} else "failed to prepare"):
+        with pytest.raises(
+            RuntimeError,
+            match="cleanup failed"
+            if failure in {"restore", "sync"}
+            else "failed to prepare",
+        ):
             engine.prepare((req,))
         assert req.plan.prepared is None
     assert attempted == ([3, 6, 12] if failure == "selected" else [3])
 
 
 def test_rejected_shard_accepts_a_peer_winner_without_claiming_full_measurement(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     from b12x.preparation import TuningRequirement
 
@@ -727,6 +873,7 @@ def test_rejected_shard_accepts_a_peer_winner_without_claiming_full_measurement(
     def benchmark(state):
         def run():
             raise error
+
         return PreparedCall(run=run)
 
     with session(tmp_path) as engine:
@@ -737,7 +884,7 @@ def test_rejected_shard_accepts_a_peer_winner_without_claiming_full_measurement(
         progress = job.advance(cache=(snapshot, snapshot))
         while not progress.ready_tuning:
             progress = job.advance()
-        contribution, = progress.ready_tuning
+        (contribution,) = progress.ready_tuning
         assert contribution.assignment is None and contribution.rejected_count == 1
         winner = TuningRequirement(contribution.key, (0, 1), {"width": 2}, 1.0, 1, 1)
         progress = job.advance(tuning=(winner,))
@@ -752,21 +899,35 @@ def test_rejected_shard_accepts_a_peer_winner_without_claiming_full_measurement(
 
 @pytest.mark.parametrize("cached_ranks", ((), (0,), (1,), (0, 1)))
 def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
-    tmp_path, monkeypatch, cached_ranks,
+    tmp_path,
+    monkeypatch,
+    cached_ranks,
 ):
     _deterministic_timer(monkeypatch)
     tuning = contract(values=(1, 2, 4, 8))
     for rank in cached_ranks:
         with session(tmp_path / f"rank-{rank}") as engine:
-            engine.prepare((request(
-                name="cached", tuning=tuning,
-                benchmark=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None),
-            ),))
+            engine.prepare(
+                (
+                    request(
+                        name="cached",
+                        tuning=tuning,
+                        benchmark=lambda state: PreparedCall(
+                            run=lambda: state.value, produce=lambda: None
+                        ),
+                    ),
+                )
+            )
             # Simulate another completed race choosing a different winner.
             if rank == 1 and len(cached_ranks) == 2:
                 key, record = next(iter(engine._cache.records.items()))
-                engine._cache.save(key, assignment={"width": 4}, config={"width": 4},
-                                   coverage=record["coverage"], programs=())
+                engine._cache.save(
+                    key,
+                    assignment={"width": 4},
+                    config={"width": 4},
+                    coverage=record["coverage"],
+                    programs=(),
+                )
     engines = [session(tmp_path / f"rank-{rank}") for rank in range(2)]
     requests = []
     jobs = []
@@ -780,8 +941,12 @@ def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
                 produce=lambda: None,
             ),
         )
-        fresh = replace(req, name="fresh", dependencies=("shared",),
-                        plan=replace(req.plan, query=Query(5)))
+        fresh = replace(
+            req,
+            name="fresh",
+            dependencies=("shared",),
+            plan=replace(req.plan, query=Query(5)),
+        )
         requests.append((req, fresh))
         jobs.append(engine.begin((req, fresh)))
 
@@ -791,7 +956,9 @@ def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
     for _ in range(100):
         progress = [
             job.advance(tuning=authorization, cache=cache)
-            for job, authorization, cache in zip(jobs, authorizations, caches, strict=True)
+            for job, authorization, cache in zip(
+                jobs, authorizations, caches, strict=True
+            )
         ]
         authorizations = [None, None]
         caches = [None, None]
@@ -799,11 +966,7 @@ def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
             snapshots = tuple(state.ready_cache for state in progress)
             assert all(snapshot is not None for snapshot in snapshots)
             caches = [snapshots, snapshots]
-        contributions = [
-            item
-            for state in progress
-            for item in state.ready_tuning
-        ]
+        contributions = [item for state in progress for item in state.ready_tuning]
         if contributions:
             assert len(contributions) == 2
             assert {item.candidate_index for item in contributions} == {0, 1}
@@ -819,11 +982,21 @@ def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
 
     results = [job.result() for job in jobs]
     try:
-        assert [result.benchmarked_candidates for result in results] == ([2, 2] if cached_ranks else [4, 4])
-        assert [result.selections["shared"].config.width for result in results] == [2, 2]
-        assert [result.selections["shared"].source for result in results] == (["cached"] * 2 if cached_ranks else ["tuned"] * 2)
+        assert [result.benchmarked_candidates for result in results] == (
+            [2, 2] if cached_ranks else [4, 4]
+        )
+        assert [result.selections["shared"].config.width for result in results] == [
+            2,
+            2,
+        ]
+        assert [result.selections["shared"].source for result in results] == (
+            ["cached"] * 2 if cached_ranks else ["tuned"] * 2
+        )
         assert all(result.selections["fresh"].source == "tuned" for result in results)
-        assert [result.coverage["shared"]["measured_count"] for result in results] == [4, 4]
+        assert [result.coverage["shared"]["measured_count"] for result in results] == [
+            4,
+            4,
+        ]
         assert [req[0].plan.selection.config.width for req in requests] == [2, 2]
         # Saving the fresh choice must not restore a conflicting local winner.
         for engine in engines:
@@ -898,35 +1071,53 @@ def test_candidate_memory_envelope_covers_every_legal_config(tmp_path):
     assert plan.scratch_specs()[0].shape == (1,)
 
 
-def test_prepared_scratch_reuses_selection_and_preserves_live_residency(tmp_path, monkeypatch):
+def test_prepared_scratch_reuses_selection_and_preserves_live_residency(
+    tmp_path, monkeypatch
+):
     _deterministic_timer(monkeypatch)
-    monkeypatch.setattr("b12x.preparation.device.detect_device", lambda device=None: DetectedDevice(None, None))
+    monkeypatch.setattr(
+        "b12x.preparation.device.detect_device",
+        lambda device=None: DetectedDevice(None, None),
+    )
     sized = []
 
     def memory(config, device):
         state = current_prepared_state()
         sized.append((current_plan(), state))
         return MemoryRequirements(
-            scratch=(ScratchBufferSpec(
-                name="workspace", shape=(config.width,),
-                dtype=torch.uint8, device=torch.device("cpu"),
-            ),),
-            persistent=(PersistentMemory(
-                current_plan(), 16, 0 if state is None else state.resident,
-            ),),
+            scratch=(
+                ScratchBufferSpec(
+                    name="workspace",
+                    shape=(config.width,),
+                    dtype=torch.uint8,
+                    device=torch.device("cpu"),
+                ),
+            ),
+            persistent=(
+                PersistentMemory(
+                    current_plan(),
+                    16,
+                    0 if state is None else state.resident,
+                ),
+            ),
         )
 
     plan = Plan(
-        contract=contract(), query=Query(3),
-        _compile_jobs=lambda config, device: (), _memory_requirements=memory,
+        contract=contract(),
+        query=Query(3),
+        _compile_jobs=lambda config, device: (),
+        _memory_requirements=memory,
         _materialize=lambda selection, device: SimpleNamespace(
-            value=selection.config.width * 3, resident=8,
+            value=selection.config.width * 3,
+            resident=8,
         ),
     )
     req = plan.request(
         name="workspace",
         prepare_call=lambda state: PreparedCall(run=lambda: state.value),
-        benchmark_call=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None),
+        benchmark_call=lambda state: PreparedCall(
+            run=lambda: state.value, produce=lambda: None
+        ),
     )
     assert plan.scratch_specs()[0].shape == (7,)
     with session(tmp_path) as engine:
@@ -955,35 +1146,59 @@ def test_prepared_scratch_reuses_selection_and_preserves_live_residency(tmp_path
         assert plan.scratch_specs() is not selected_specs
 
 
-def test_composite_scratch_retains_all_exact_variants_without_replanning(tmp_path, monkeypatch):
+def test_composite_scratch_retains_all_exact_variants_without_replanning(
+    tmp_path, monkeypatch
+):
     _deterministic_timer(monkeypatch)
-    monkeypatch.setattr("b12x.preparation.device.detect_device", lambda device=None: DetectedDevice(None, None))
+    monkeypatch.setattr(
+        "b12x.preparation.device.detect_device",
+        lambda device=None: DetectedDevice(None, None),
+    )
     sized = []
     counts = (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 4096)
 
     def child(rows):
         def memory(config, device):
             sized.append(rows)
-            return MemoryRequirements(scratch=(ScratchBufferSpec(
-                name="workspace", shape=(rows * config.width,),
-                dtype=torch.uint8, device=torch.device("cpu"),
-            ),))
+            return MemoryRequirements(
+                scratch=(
+                    ScratchBufferSpec(
+                        name="workspace",
+                        shape=(rows * config.width,),
+                        dtype=torch.uint8,
+                        device=torch.device("cpu"),
+                    ),
+                )
+            )
 
         return Plan(
-            contract=contract(), query=Query(rows),
-            _compile_jobs=lambda config, device: (), _memory_requirements=memory,
-            _materialize=lambda selection, device: SimpleNamespace(value=selection.config.width * 3),
+            contract=contract(),
+            query=Query(rows),
+            _compile_jobs=lambda config, device: (),
+            _memory_requirements=memory,
+            _materialize=lambda selection, device: SimpleNamespace(
+                value=selection.config.width * 3
+            ),
         )
 
     children = {rows: child(rows) for rows in counts}
     plan = _CompositePlan(
-        component_id="test.arithmetic", capacity_metadata={}, variants=children,
+        component_id="test.arithmetic",
+        capacity_metadata={},
+        variants=children,
         _assemble=lambda states, device: dict(states),
     )
     req = plan.request(
         name="workspace",
-        prepare_calls={rows: lambda state: PreparedCall(run=lambda: state.value) for rows in counts},
-        benchmark_calls={rows: lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None) for rows in counts},
+        prepare_calls={
+            rows: lambda state: PreparedCall(run=lambda: state.value) for rows in counts
+        },
+        benchmark_calls={
+            rows: lambda state: PreparedCall(
+                run=lambda: state.value, produce=lambda: None
+            )
+            for rows in counts
+        },
     )
     assert plan.scratch_specs()[0].shape == (4096 * 7,)
     with session(tmp_path) as engine:
@@ -1003,7 +1218,9 @@ def test_composite_scratch_retains_all_exact_variants_without_replanning(tmp_pat
     assert plan.scratch_specs()[0].shape == (4096 * 7,)
 
 
-def test_failed_prepared_scratch_snapshot_preserves_previous_payload(tmp_path, monkeypatch):
+def test_failed_prepared_scratch_snapshot_preserves_previous_payload(
+    tmp_path, monkeypatch
+):
     _deterministic_timer(monkeypatch)
     closed = []
 
@@ -1017,9 +1234,12 @@ def test_failed_prepared_scratch_snapshot_preserves_previous_payload(tmp_path, m
     req = plan.request(
         name="workspace",
         prepare_call=lambda state: PreparedCall(
-            run=lambda: state.value, close=lambda: closed.append(state.value),
+            run=lambda: state.value,
+            close=lambda: closed.append(state.value),
         ),
-        benchmark_call=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None),
+        benchmark_call=lambda state: PreparedCall(
+            run=lambda: state.value, produce=lambda: None
+        ),
     )
     with session(tmp_path) as engine:
         engine.prepare((req,), autotune=False)
@@ -1033,18 +1253,27 @@ def test_failed_prepared_scratch_snapshot_preserves_previous_payload(tmp_path, m
     assert closed == [6, 21]
 
 
-def test_stop_mid_race_discards_partial_winner_and_restores_trials(tmp_path, monkeypatch):
+def test_stop_mid_race_discards_partial_winner_and_restores_trials(
+    tmp_path, monkeypatch
+):
     calls, restored = [], []
     with session(tmp_path) as engine:
         _deterministic_timer(monkeypatch, stop=engine.cancel_tuning)
 
         def benchmark(state):
             return PreparedCall(
-                run=lambda: state.value, produce=lambda: None,
+                run=lambda: state.value,
+                produce=lambda: None,
                 restore=lambda: restored.append(state.value),
             )
 
-        result = engine.prepare((request(name="stopped", tuning=contract(), calls=calls, benchmark=benchmark),))
+        result = engine.prepare(
+            (
+                request(
+                    name="stopped", tuning=contract(), calls=calls, benchmark=benchmark
+                ),
+            )
+        )
         assert result.selections["stopped"].source == "default"
         assert result.benchmarked_candidates == 0
         assert engine._cache.records == {}
@@ -1071,27 +1300,37 @@ def test_equal_declarations_enumerate_their_candidates_once(tmp_path, monkeypatc
 
     def duplicate(name, rows):
         plan = Plan(
-            contract=tuning, query=Query(rows),
+            contract=tuning,
+            query=Query(rows),
             _compile_jobs=lambda config, device: (),
             _memory_requirements=lambda config, device: MemoryRequirements(),
-            _materialize=lambda selection, device: SimpleNamespace(value=selection.config.width),
+            _materialize=lambda selection, device: SimpleNamespace(
+                value=selection.config.width
+            ),
         )
         return plan.request(
-            name=name, prepare_call=lambda state: PreparedCall(run=lambda: None),
+            name=name,
+            prepare_call=lambda state: PreparedCall(run=lambda: None),
             benchmark_call=benchmark,
         )
 
     with session(tmp_path) as engine:
-        result = engine.prepare((
-            duplicate("first", 3), duplicate("second", 3), duplicate("wider", 5),
-        ))
+        result = engine.prepare(
+            (
+                duplicate("first", 3),
+                duplicate("second", 3),
+                duplicate("wider", 5),
+            )
+        )
     assert [query["rows"] for query in enumerated] == [3, 5]
     assert result.coverage["first"]["effective_count"] == 3
     assert result.coverage["second"]["effective_count"] == 3
     assert result.selections["second"].config == result.selections["first"].config
 
 
-def test_duplicate_choice_dependency_order_still_prepares_both_plans(tmp_path, monkeypatch):
+def test_duplicate_choice_dependency_order_still_prepares_both_plans(
+    tmp_path, monkeypatch
+):
     _deterministic_timer(monkeypatch)
     calls = []
     producer = request(name="producer", tuning=contract(), pin=Config(2))
@@ -1099,10 +1338,20 @@ def test_duplicate_choice_dependency_order_still_prepares_both_plans(tmp_path, m
     def benchmark(state):
         return PreparedCall(run=lambda: state.value, produce=lambda: None)
 
-    a = request(name="a", tuning=contract(), calls=calls,
-                benchmark=benchmark, dependencies=("producer",))
-    b = request(name="b", tuning=contract(), calls=calls,
-                benchmark=benchmark, dependencies=("producer",))
+    a = request(
+        name="a",
+        tuning=contract(),
+        calls=calls,
+        benchmark=benchmark,
+        dependencies=("producer",),
+    )
+    b = request(
+        name="b",
+        tuning=contract(),
+        calls=calls,
+        benchmark=benchmark,
+        dependencies=("producer",),
+    )
     with session(tmp_path) as engine:
         result = engine.prepare((b, a, producer))
         assert result.benchmarked_candidates == 3
@@ -1112,8 +1361,12 @@ def test_duplicate_choice_dependency_order_still_prepares_both_plans(tmp_path, m
 
 def test_shared_declarations_alias_one_prepared_state(tmp_path):
     calls, closed = [], []
-    a = request(name="a", calls=calls, shared=True, close=lambda: closed.append("closed"))
-    b = request(name="b", calls=calls, shared=True, close=lambda: closed.append("closed"))
+    a = request(
+        name="a", calls=calls, shared=True, close=lambda: closed.append("closed")
+    )
+    b = request(
+        name="b", calls=calls, shared=True, close=lambda: closed.append("closed")
+    )
     c = request(name="c", calls=calls, shared=True)
     with session(tmp_path) as engine:
         engine.prepare((a, b))
@@ -1131,7 +1384,9 @@ def test_shared_declarations_alias_one_prepared_state(tmp_path):
         assert closed == ["closed"]
     with pytest.raises(ValueError, match="shared plan"):
         with session(tmp_path) as engine:
-            engine.prepare((request(name="d", shared=True, dependencies=("e",)), request(name="e")))
+            engine.prepare(
+                (request(name="d", shared=True, dependencies=("e",)), request(name="e"))
+            )
 
 
 def test_composite_prepares_children_and_assembles_their_states(tmp_path):
@@ -1139,28 +1394,41 @@ def test_composite_prepares_children_and_assembles_their_states(tmp_path):
 
     def child(width):
         return Plan(
-            contract=contract(), query=Query(3), override=Config(width),
+            contract=contract(),
+            query=Query(3),
+            override=Config(width),
             _compile_jobs=lambda config, device: (),
             _memory_requirements=lambda config, device: MemoryRequirements(),
-            _materialize=lambda selection, device: SimpleNamespace(value=selection.config.width * 3),
+            _materialize=lambda selection, device: SimpleNamespace(
+                value=selection.config.width * 3
+            ),
         )
 
     children = {1: child(1), 2: child(2)}
     root = _CompositePlan(
-        component_id="test.arithmetic", capacity_metadata={}, variants=children,
-        _assemble=lambda states, device: assembled.append(dict(states)) or SimpleNamespace(states=dict(states)),
+        component_id="test.arithmetic",
+        capacity_metadata={},
+        variants=children,
+        _assemble=lambda states, device: assembled.append(dict(states))
+        or SimpleNamespace(states=dict(states)),
     )
     calls = []
     req = root.request(
         name="root",
-        prepare_calls={count: (lambda state: PreparedCall(run=lambda: calls.append(state.value))) for count in (1, 2)},
+        prepare_calls={
+            count: (lambda state: PreparedCall(run=lambda: calls.append(state.value)))
+            for count in (1, 2)
+        },
     )
     with session(tmp_path) as engine:
         result = engine.prepare((req,))
         assert result.plans["root"] is root
         assert sorted(calls) == [3, 6]
         state = require_prepared(root, "test.arithmetic")
-        assert state.states == {1: children[1].prepared.state, 2: children[2].prepared.state}
+        assert state.states == {
+            1: children[1].prepared.state,
+            2: children[2].prepared.state,
+        }
         assert root.prepared.variants[2] is children[2]
         assert root.token_counts == (1, 2)
         engine.prepare((req,))
@@ -1182,7 +1450,8 @@ def test_plan_handles_are_stable_and_resolve_only_live_plans():
 
 
 def test_unprepared_plan_materializes_its_default_with_a_warning_before_freeze_only(
-    tmp_path, caplog,
+    tmp_path,
+    caplog,
 ):
     from b12x.preparation.session import _warn_unprepared_declaration
 
@@ -1194,7 +1463,11 @@ def test_unprepared_plan_materializes_its_default_with_a_warning_before_freeze_o
     assert state.value == 21
     assert req.plan.selection.source == "default"
     assert calls == []
-    messages = [r.getMessage() for r in caplog.records if "not prepared before its first use" in r.getMessage()]
+    messages = [
+        r.getMessage()
+        for r in caplog.records
+        if "not prepared before its first use" in r.getMessage()
+    ]
     assert len(messages) == 1 and "test.arithmetic" in messages[0]
     with pytest.raises(ValueError, match="belongs to"):
         require_prepared(req.plan, "test.other")
@@ -1225,7 +1498,8 @@ def test_priming_closures_release_transients_and_restore_before_readiness(tmp_pa
             return output
 
         return PreparedCall(
-            run=run, restore=lambda: lifetime.append("restored"),
+            run=run,
+            restore=lambda: lifetime.append("restored"),
             close=lambda: lifetime.append("resources closed"),
         )
 
@@ -1324,7 +1598,6 @@ def test_frozen_reuse_rejects_changed_declared_device(tmp_path):
             engine.prepare((changed,))
 
 
-
 def test_plan_state_omits_the_prepared_payload(tmp_path):
     """Compiler caches serialize closed-over plans; only the declaration travels."""
     req = request(name="pickled")
@@ -1345,14 +1618,17 @@ def test_plan_state_omits_the_prepared_payload(tmp_path):
 
 
 def test_prepare_default_primes_with_the_request_call_and_refuses_after_freeze_or_under_capture(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     import torch
 
     from b12x.preparation import prepare_default
     from b12x.preparation import session as session_module
 
-    monkeypatch.setitem(session_module._LAZY_SESSIONS, None, session(tmp_path, autotune=False))
+    monkeypatch.setitem(
+        session_module._LAZY_SESSIONS, None, session(tmp_path, autotune=False)
+    )
     calls = []
     req = request(name="on-demand", tuning=contract(values=(1, 2, 4)), calls=calls)
     prepared = prepare_default(req)
@@ -1367,7 +1643,9 @@ def test_prepare_default_primes_with_the_request_call_and_refuses_after_freeze_o
         prepare_default(request(name="captured"))
 
 
-def test_gpu_steps_share_a_bounded_advance_without_changing_order(tmp_path, monkeypatch):
+def test_gpu_steps_share_a_bounded_advance_without_changing_order(
+    tmp_path, monkeypatch
+):
     from b12x.preparation import session as implementation
     from b12x.preparation.types import PreparationResult
 
@@ -1417,13 +1695,22 @@ def test_tuning_contribution_rejects_invalid_rejection_counts(count):
 
 @pytest.mark.parametrize("boundary", ("compile", "collective", "tuning", "cache"))
 def test_batched_gpu_steps_stop_before_unready_work(tmp_path, boundary):
-    from b12x.preparation.types import PreparationResult, TuningCacheRequirement, TuningRequirement
+    from b12x.preparation.types import (
+        PreparationResult,
+        TuningCacheRequirement,
+        TuningRequirement,
+    )
 
     seen = []
     collective = CollectiveRequirement("ready/collective", (0, 1))
     tuning = TuningRequirement("ready/tuning", (0, 1), {"width": 2}, 1.0, 0)
     cache = TuningCacheRequirement((0, 1), {}, {})
-    signals = {"compile": "compile", "collective": collective, "tuning": tuning, "cache": cache}
+    signals = {
+        "compile": "compile",
+        "collective": collective,
+        "tuning": tuning,
+        "cache": cache,
+    }
 
     def steps():
         for index in range(2):
@@ -1459,7 +1746,13 @@ def test_batched_gpu_steps_stop_before_unready_work(tmp_path, boundary):
             assert progress.pending_compilation
             progress = job.advance()
         assert progress.done
-        expected = tuning if boundary == "tuning" else (cache, cache) if boundary == "cache" else None
+        expected = (
+            tuning
+            if boundary == "tuning"
+            else (cache, cache)
+            if boundary == "cache"
+            else None
+        )
         assert seen == [0, 1, expected]
         job.result()
 
@@ -1498,7 +1791,9 @@ def test_closed_trials_release_storage_before_the_next_batch(tmp_path, monkeypat
     def benchmark(state):
         storage = TrialStorage()
         references.append(weakref.ref(storage))
-        allocation_peaks.append(sum(reference() is not None for reference in references))
+        allocation_peaks.append(
+            sum(reference() is not None for reference in references)
+        )
 
         def run():
             _ = storage
@@ -1508,10 +1803,15 @@ def test_closed_trials_release_storage_before_the_next_batch(tmp_path, monkeypat
 
     monkeypatch.setattr(_measurement, "prepare_race_steps", observe)
     with session(tmp_path, race_batch=2) as engine:
-        result = engine.prepare((request(
-            name="trial-lifetime", tuning=contract(values=(1, 2, 4, 8, 16, 32)),
-            benchmark=benchmark,
-        ),))
+        result = engine.prepare(
+            (
+                request(
+                    name="trial-lifetime",
+                    tuning=contract(values=(1, 2, 4, 8, 16, 32)),
+                    benchmark=benchmark,
+                ),
+            )
+        )
         assert result.benchmarked_candidates == 6
         assert result.selections["trial-lifetime"].config.width == 2
         assert alive == [2, 3, 3]
@@ -1520,7 +1820,9 @@ def test_closed_trials_release_storage_before_the_next_batch(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("shared", [False, True])
-def test_fifty_layer_bindings_are_one_preparation_request(tmp_path, monkeypatch, shared):
+def test_fifty_layer_bindings_are_one_preparation_request(
+    tmp_path, monkeypatch, shared
+):
     from b12x.preparation.tuning import TuningContract
 
     _deterministic_timer(monkeypatch)
@@ -1540,10 +1842,14 @@ def test_fifty_layer_bindings_are_one_preparation_request(tmp_path, monkeypatch,
             return ()
 
         plan = Plan(
-            contract=contract(), query=Query(3), shared=shared,
+            contract=contract(),
+            query=Query(3),
+            shared=shared,
             _compile_jobs=compile_jobs,
             _memory_requirements=lambda config, device: MemoryRequirements(),
-            _materialize=lambda selection, device: SimpleNamespace(value=3 * selection.config.width),
+            _materialize=lambda selection, device: SimpleNamespace(
+                value=3 * selection.config.width
+            ),
         )
         return plan.request(
             name=f"layer.{index}",
@@ -1551,7 +1857,9 @@ def test_fifty_layer_bindings_are_one_preparation_request(tmp_path, monkeypatch,
                 run=lambda: primed.append((index, state.value * weights[index])),
                 close=lambda: closed.append(index),
             ),
-            benchmark_call=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None),
+            benchmark_call=lambda state: PreparedCall(
+                run=lambda: state.value, produce=lambda: None
+            ),
         )
 
     requests = tuple(make(index) for index in range(50))
@@ -1564,11 +1872,18 @@ def test_fifty_layer_bindings_are_one_preparation_request(tmp_path, monkeypatch,
         assert progress[-1].completed_requests == progress[-1].total_requests == 1
         assert len(result.plans) == 50
         assert len(primed) == (1 if shared else 50)
-        assert len({id(item.plan.prepared) for item in requests}) == (1 if shared else 50)
+        assert len({id(item.plan.prepared) for item in requests}) == (
+            1 if shared else 50
+        )
         for index, item in enumerate(requests):
-            assert require_prepared(item.plan, "test.arithmetic").value * weights[index] == 6 * (index + 1)
+            assert require_prepared(item.plan, "test.arithmetic").value * weights[
+                index
+            ] == 6 * (index + 1)
         weights[27] = -3
-        assert require_prepared(requests[27].plan, "test.arithmetic").value * weights[27] == -18
+        assert (
+            require_prepared(requests[27].plan, "test.arithmetic").value * weights[27]
+            == -18
+        )
         engine.release(requests[0].plan)
         extra = make(0)
         if shared:
@@ -1584,9 +1899,14 @@ def test_fifty_layer_bindings_are_one_preparation_request(tmp_path, monkeypatch,
 
 def test_coalesced_collectives_authorize_each_resource_binding(tmp_path):
     calls, authorizations, progress = [], [], []
-    requests = tuple(request(
-        name=name, calls=calls, collective=CollectiveRequirement(name, (0, 1)),
-    ) for name in ("first-channel", "second-channel"))
+    requests = tuple(
+        request(
+            name=name,
+            calls=calls,
+            collective=CollectiveRequirement(name, (0, 1)),
+        )
+        for name in ("first-channel", "second-channel")
+    )
 
     def coordinate(state):
         if not state.ready_collectives:
@@ -1605,7 +1925,9 @@ def test_coalesced_collectives_authorize_each_resource_binding(tmp_path):
 
 @pytest.mark.parametrize("dependent", (False, True))
 def test_sharded_races_exchange_after_independent_work_and_release_trials(
-    tmp_path, monkeypatch, dependent,
+    tmp_path,
+    monkeypatch,
+    dependent,
 ):
     _deterministic_timer(monkeypatch)
     closed = []
@@ -1614,10 +1936,12 @@ def test_sharded_races_exchange_after_independent_work_and_release_trials(
         requests = []
         for i in range(2):
             req = request(
-                name=f"query-{i}", tuning=contract(values=(1, 2, 4, 8)),
+                name=f"query-{i}",
+                tuning=contract(values=(1, 2, 4, 8)),
                 dependencies=("query-0",) if dependent and i else (),
                 benchmark=lambda state: PreparedCall(
-                    run=lambda: state.value, produce=lambda: None,
+                    run=lambda: state.value,
+                    produce=lambda: None,
                     close=lambda: closed.append(state.value),
                 ),
             )
@@ -1648,15 +1972,23 @@ def test_sharded_races_exchange_after_independent_work_and_release_trials(
         job.result()
 
 
-def test_cancelled_pending_races_prepare_defaults_without_caching(tmp_path, monkeypatch):
+def test_cancelled_pending_races_prepare_defaults_without_caching(
+    tmp_path, monkeypatch
+):
     _deterministic_timer(monkeypatch)
     with session(tmp_path) as engine:
         engine.configure_tuning_shard(0, (0, 1))
         requests = tuple(
             replace(
-                req := request(name=f"query-{i}", tuning=contract(), benchmark=lambda state: PreparedCall(
-                    run=lambda: state.value, produce=lambda: None,
-                )), plan=replace(req.plan, query=Query(i + 3)),
+                req := request(
+                    name=f"query-{i}",
+                    tuning=contract(),
+                    benchmark=lambda state: PreparedCall(
+                        run=lambda: state.value,
+                        produce=lambda: None,
+                    ),
+                ),
+                plan=replace(req.plan, query=Query(i + 3)),
             )
             for i in range(2)
         )
@@ -1681,17 +2013,26 @@ def test_cancelled_pending_races_prepare_defaults_without_caching(tmp_path, monk
         job.result()
 
 
-def test_fixed_collective_without_dependents_does_not_split_race_results(tmp_path, monkeypatch):
+def test_fixed_collective_without_dependents_does_not_split_race_results(
+    tmp_path, monkeypatch
+):
     _deterministic_timer(monkeypatch)
     with session(tmp_path) as engine:
         engine.configure_tuning_shard(0, (0, 1))
         races = []
         for i in range(2):
-            req = request(name=f"race-{i}", tuning=contract(), benchmark=lambda state: PreparedCall(
-                run=lambda: state.value, produce=lambda: None,
-            ))
+            req = request(
+                name=f"race-{i}",
+                tuning=contract(),
+                benchmark=lambda state: PreparedCall(
+                    run=lambda: state.value,
+                    produce=lambda: None,
+                ),
+            )
             races.append(replace(req, plan=replace(req.plan, query=Query(i + 3))))
-        collective = request(name="comm", collective=CollectiveRequirement("comm", (0, 1)))
+        collective = request(
+            name="comm", collective=CollectiveRequirement("comm", (0, 1))
+        )
         collective = replace(collective, plan=replace(collective.plan, query=Query(99)))
         job = engine.begin((races[0], collective, races[1]))
         snapshot = job.advance().ready_cache
@@ -1714,13 +2055,20 @@ def test_fixed_collective_without_dependents_does_not_split_race_results(tmp_pat
         job.result()
 
 
-def test_candidate_progress_counts_races_and_excludes_fixed_or_cached_choices(tmp_path, monkeypatch):
+def test_candidate_progress_counts_races_and_excludes_fixed_or_cached_choices(
+    tmp_path, monkeypatch
+):
     _deterministic_timer(monkeypatch)
 
     def requests():
         return (
-            request(name="race", tuning=contract(values=(1, 2, 4, 8, 16)),
-                    benchmark=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None)),
+            request(
+                name="race",
+                tuning=contract(values=(1, 2, 4, 8, 16)),
+                benchmark=lambda state: PreparedCall(
+                    run=lambda: state.value, produce=lambda: None
+                ),
+            ),
             request(name="fixed", tuning=contract(values=(1,))),
         )
 
@@ -1731,10 +2079,16 @@ def test_candidate_progress_counts_races_and_excludes_fixed_or_cached_choices(tm
         assert snapshots[-1].total_candidates == expected
         assert snapshots[-1].measured_candidates == expected
         assert result.benchmarked_candidates == expected
-        assert all(p.measured_candidates <= p.total_candidates for p in snapshots if p.total_candidates is not None)
+        assert all(
+            p.measured_candidates <= p.total_candidates
+            for p in snapshots
+            if p.total_candidates is not None
+        )
 
 
-def test_first_use_warnings_group_equal_declarations_without_hiding_other_shapes(caplog):
+def test_first_use_warnings_group_equal_declarations_without_hiding_other_shapes(
+    caplog,
+):
     from b12x.preparation.session import _LAZY_SESSIONS, _warn_unprepared_declaration
 
     _warn_unprepared_declaration.cache_clear()
@@ -1749,11 +2103,16 @@ def test_first_use_warnings_group_equal_declarations_without_hiding_other_shapes
         messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
         assert len(messages) == 2
         assert "rows=3" in messages[0] and "rows=5" in messages[1]
-        details = [r.getMessage() for r in caplog.records if "unprepared plan Query#" in r.getMessage()]
+        details = [
+            r.getMessage()
+            for r in caplog.records
+            if "unprepared plan Query#" in r.getMessage()
+        ]
         assert len(details) == 21
     finally:
         # Lazy sessions are keyed by device ordinal: None without CUDA, else the GPU.
         from b12x.preparation.device import detect_device
+
         session = _LAZY_SESSIONS[detect_device(None).ordinal]
         for plan in plans:
             session.release(plan)
@@ -1772,7 +2131,10 @@ def test_progress_counts_prepared_selection_sources_once_per_shared_group(tmp_pa
                 progress = job.advance()
                 if progress.done:
                     break
-            assert sum(dict(progress.selection_counts).values()) == progress.completed_requests
+            assert (
+                sum(dict(progress.selection_counts).values())
+                == progress.completed_requests
+            )
             job.result().close()
             return dict(progress.selection_counts)
         finally:
@@ -1781,11 +2143,15 @@ def test_progress_counts_prepared_selection_sources_once_per_shared_group(tmp_pa
     with session(tmp_path) as engine:
         assert finish(engine, (fixed, alias, pinned)) == {"fixed": 1, "override": 1}
         engine.cancel_tuning()
-        default = replace(request(name="default"), plan=replace(declaration(), query=Query(5)))
+        default = replace(
+            request(name="default"), plan=replace(declaration(), query=Query(5))
+        )
         assert finish(engine, (fixed, default)) == {"fixed": 1, "default": 1}
         engine.freeze()
         assert finish(engine, (fixed, alias, pinned, default)) == {
-            "fixed": 1, "override": 1, "default": 1,
+            "fixed": 1,
+            "override": 1,
+            "default": 1,
         }
 
 
@@ -1797,22 +2163,41 @@ def test_missing_wo_warning_reports_shape_and_geometry_without_codegen_dump(capl
 
     plan = wo_projection.plan(
         wo_projection.Caps(
-            device="cuda:0", max_tokens=1797, groups=2,
-            group_width=4096, rank=1024, hidden=5120,
+            device="cuda:0",
+            max_tokens=1797,
+            groups=2,
+            group_width=4096,
+            rank=1024,
+            hidden=5120,
         ),
-        invocation=FrozenMapping({
-            "operation": "inv_rope", "heads_per_group": 8, "nope_dim": 448, "rope_dim": 64,
-            "positions_dtype": "int64", "cos_sin_dtype": "bfloat16",
-        }),
+        invocation=FrozenMapping(
+            {
+                "operation": "inv_rope",
+                "heads_per_group": 8,
+                "nope_dim": 448,
+                "rope_dim": 64,
+                "positions_dtype": "int64",
+                "cos_sin_dtype": "bfloat16",
+            }
+        ),
     )
     _warn_unprepared_declaration.cache_clear()
     try:
-        with patch("b12x.preparation.session.prepare_default"), caplog.at_level("WARNING"):
+        with (
+            patch("b12x.preparation.session.prepare_default"),
+            caplog.at_level("WARNING"),
+        ):
             _prepare_default(plan)
         (message,) = [record.getMessage() for record in caplog.records]
         for detail in (
-            "gemm.wo_projection", "max_tokens=1797", "operation=inv_rope",
-            "dtype=bfloat16", "groups=2", "group_width=4096", "rank=1024", "hidden=5120",
+            "gemm.wo_projection",
+            "max_tokens=1797",
+            "operation=inv_rope",
+            "dtype=bfloat16",
+            "groups=2",
+            "group_width=4096",
+            "rank=1024",
+            "hidden=5120",
         ):
             assert detail in message
         assert "codegen" not in message and "positions_dtype" not in message
@@ -1832,13 +2217,18 @@ def test_missing_plan_warning_uses_component_query_fields(caplog):
         max_rows: int
 
     tuning = replace(
-        contract(), component_id="test.image", query_fields=frozenset(ShapeQuery.__dataclass_fields__),
+        contract(),
+        component_id="test.image",
+        query_fields=frozenset(ShapeQuery.__dataclass_fields__),
         encode_query=lambda query: vars(query),
     )
     plan = replace(declaration(), contract=tuning, query=ShapeQuery((3, 16, 16), 7, 19))
     _warn_unprepared_declaration.cache_clear()
     try:
-        with patch("b12x.preparation.session.prepare_default"), caplog.at_level("WARNING"):
+        with (
+            patch("b12x.preparation.session.prepare_default"),
+            caplog.at_level("WARNING"),
+        ):
             _prepare_default(plan)
         (message,) = [record.getMessage() for record in caplog.records]
         assert "max_rows=19, image_shape=(3, 16, 16), window_width=7" in message

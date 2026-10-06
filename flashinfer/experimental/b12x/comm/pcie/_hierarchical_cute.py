@@ -75,9 +75,7 @@ def _load_acquire_sys_u32(address: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
-def _store_release_sys_u32(
-    address: Int64, value: Uint32, *, loc=None, ip=None
-) -> None:
+def _store_release_sys_u32(address: Int64, value: Uint32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
         [
@@ -138,10 +136,7 @@ def _flag_address(base: Int64, region: int, block: Int32, index: Int32) -> Int64
     return (
         base
         + Int64(region)
-        + (
-            Int64(block) * Int64(_ISLAND_SIZE) + Int64(index)
-        )
-        * Int64(128)
+        + (Int64(block) * Int64(_ISLAND_SIZE) + Int64(index)) * Int64(128)
     )
 
 
@@ -465,9 +460,7 @@ class _HierarchicalLaunch:
                 and Int32(bidx) == Int32(0)
                 and Int32(tidx) == Int32(0)
             ):
-                self_stage[elements - Int64(1)] = input_ptr[
-                    elements - Int64(1)
-                ]
+                self_stage[elements - Int64(1)] = input_ptr[elements - Int64(1)]
         else:
             index = Int64(bidx) * Int64(self._threads) + Int64(tidx)
             while index < elements:
@@ -492,9 +485,7 @@ class _HierarchicalLaunch:
         if cutlass.const_expr(self._local_rank != 0):
             if tidx == Int32(0):
                 _wait_for(
-                    self_base
-                    + Int64(_FINAL_READY)
-                    + Int64(bidx) * Int64(128),
+                    self_base + Int64(_FINAL_READY) + Int64(bidx) * Int64(128),
                     generation,
                     self._wait_nanosleep_cycles,
                 )
@@ -508,12 +499,8 @@ class _HierarchicalLaunch:
                 assumed_align=16,
             )
             if cutlass.const_expr(self._vectorized_bf16x2):
-                leader_words = cute.recast_ptr(
-                    leader_final.align(4), dtype=Uint32
-                )
-                output_words = cute.recast_ptr(
-                    output_ptr.align(4), dtype=Uint32
-                )
+                leader_words = cute.recast_ptr(leader_final.align(4), dtype=Uint32)
+                output_words = cute.recast_ptr(output_ptr.align(4), dtype=Uint32)
                 pairs = elements // Int64(2)
                 index = Int64(bidx) * Int64(self._threads) + Int64(tidx)
                 while index < pairs:
@@ -524,9 +511,7 @@ class _HierarchicalLaunch:
                     and Int32(bidx) == Int32(0)
                     and Int32(tidx) == Int32(0)
                 ):
-                    output_ptr[elements - Int64(1)] = leader_final[
-                        elements - Int64(1)
-                    ]
+                    output_ptr[elements - Int64(1)] = leader_final[elements - Int64(1)]
             else:
                 index = Int64(bidx) * Int64(self._threads) + Int64(tidx)
                 while index < elements:
@@ -659,12 +644,8 @@ class _HierarchicalLaunch:
                 assumed_align=16,
             )
             if cutlass.const_expr(self._vectorized_bf16x2):
-                final_words = cute.recast_ptr(
-                    self_final.align(4), dtype=Uint32
-                )
-                output_words = cute.recast_ptr(
-                    output_ptr.align(4), dtype=Uint32
-                )
+                final_words = cute.recast_ptr(self_final.align(4), dtype=Uint32)
+                output_words = cute.recast_ptr(output_ptr.align(4), dtype=Uint32)
                 pairs = elements // Int64(2)
                 index = Int64(bidx) * Int64(self._threads) + Int64(tidx)
                 while index < pairs:
@@ -675,14 +656,11 @@ class _HierarchicalLaunch:
                             peer_leader = peer_island * _ISLAND_SIZE
                             peer_partial = cute.make_ptr(
                                 cutlass.Float32,
-                                Int64(slabs[peer_leader].toint())
-                                + partial_offset,
+                                Int64(slabs[peer_leader].toint()) + partial_offset,
                                 cute.AddressSpace.gmem,
                                 assumed_align=16,
                             )
-                            total_lo += Float32(
-                                peer_partial[index * Int64(2)]
-                            )
+                            total_lo += Float32(peer_partial[index * Int64(2)])
                             total_hi += Float32(
                                 peer_partial[index * Int64(2) + Int64(1)]
                             )
@@ -702,8 +680,7 @@ class _HierarchicalLaunch:
                             peer_leader = peer_island * _ISLAND_SIZE
                             peer_partial = cute.make_ptr(
                                 cutlass.Float32,
-                                Int64(slabs[peer_leader].toint())
-                                + partial_offset,
+                                Int64(slabs[peer_leader].toint()) + partial_offset,
                                 cute.AddressSpace.gmem,
                                 assumed_align=16,
                             )
@@ -720,8 +697,7 @@ class _HierarchicalLaunch:
                             peer_leader = peer_island * _ISLAND_SIZE
                             peer_partial = cute.make_ptr(
                                 cutlass.Float32,
-                                Int64(slabs[peer_leader].toint())
-                                + partial_offset,
+                                Int64(slabs[peer_leader].toint()) + partial_offset,
                                 cute.AddressSpace.gmem,
                                 assumed_align=16,
                             )
@@ -735,8 +711,7 @@ class _HierarchicalLaunch:
             if tidx == Int32(0):
                 _fence_sc_sys()
                 if cutlass.const_expr(
-                    not self._double_buffered
-                    and not self._deferred_consumption
+                    not self._double_buffered and not self._deferred_consumption
                 ):
                     for peer_island in cutlass.range_constexpr(_MAX_ISLANDS):
                         if cutlass.const_expr(peer_island < self._num_islands):
@@ -761,8 +736,7 @@ class _HierarchicalLaunch:
                     )
 
                 if cutlass.const_expr(
-                    not self._double_buffered
-                    and not self._deferred_consumption
+                    not self._double_buffered and not self._deferred_consumption
                 ):
                     for peer_island in cutlass.range_constexpr(_MAX_ISLANDS):
                         if cutlass.const_expr(peer_island < self._num_islands):
@@ -884,9 +858,9 @@ def get_hierarchical_launcher(
             raise ValueError(
                 f"expected {world_size} slab addresses, got {len(slab_addresses)}"
             )
-        padded_slabs = tuple(int(address) for address in slab_addresses) + (
-            0,
-        ) * (_MAX_WORLD_SIZE - world_size)
+        padded_slabs = tuple(int(address) for address in slab_addresses) + (0,) * (
+            _MAX_WORLD_SIZE - world_size
+        )
         raw(
             *(
                 make_ptr(

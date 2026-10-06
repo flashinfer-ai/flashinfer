@@ -41,8 +41,9 @@ class DirectWeightSession:
     No checkpoint payload is mapped or read through the page cache.
     """
 
-    def __init__(self, device=0, io_threads=8, *,
-                 shared_read_group=None, read_mode="auto"):
+    def __init__(
+        self, device=0, io_threads=8, *, shared_read_group=None, read_mode="auto"
+    ):
         import torch
 
         if read_mode not in ("auto", "bounce", "gds"):
@@ -114,17 +115,27 @@ class DirectWeightSession:
     @staticmethod
     def _file_identity(fd):
         stat = os.fstat(fd)
-        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+        return (
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        )
 
     def _validate_source_identities(self):
         for fd, identity in self.file_identities.items():
             if self._file_identity(fd) != identity:
-                raise RuntimeError("checkpoint source changed after metadata was opened")
+                raise RuntimeError(
+                    "checkpoint source changed after metadata was opened"
+                )
 
     def flush(self):
         """Complete accepted destinations before a numerical consumer runs."""
         if self.shared_read_group is not None and self.shared_read_group.failed:
-            raise RuntimeError("shared checkpoint group failed; the load cannot continue")
+            raise RuntimeError(
+                "shared checkpoint group failed; the load cannot continue"
+            )
         if not self.records:
             return
         try:
@@ -430,9 +441,15 @@ class DirectWeightSession:
         if destination.device.type != "cuda" or destination.device.index != self.device:
             raise ValueError("destination must use the session CUDA device")
         storage = destination.untyped_storage()
-        extent = destination.element_size() * (1 + sum(
-            (size - 1) * stride for size, stride in zip(destination.shape, destination.stride(), strict=True)
-        ))
+        extent = destination.element_size() * (
+            1
+            + sum(
+                (size - 1) * stride
+                for size, stride in zip(
+                    destination.shape, destination.stride(), strict=True
+                )
+            )
+        )
         if destination.data_ptr() - storage.data_ptr() + extent > storage.nbytes():
             raise ValueError(f"destination exceeds tensor storage: {entry.name}")
         with torch.cuda.device(destination.device):
@@ -506,9 +523,7 @@ class DirectWeightSession:
                             "Q",
                             (
                                 entry.fd,
-                                entry.offset
-                                + offset
-                                + start * source.element_size(),
+                                entry.offset + offset + start * source.element_size(),
                                 count * source.element_size(),
                                 scratch.data_ptr(),
                                 0,
@@ -539,10 +554,16 @@ class DirectWeightSession:
                 io[name] = io.get(name, 0) + value
         if self.shared_read_group is not None:
             totals = self.shared_read_group.totals
-            io["physical_bytes"] = io.get("physical_bytes", 0) + totals.get("physical_bytes", 0)
-            io["gds_physical_bytes"] = io.get("gds_physical_bytes", 0) + totals.get("physical_bytes", 0)
+            io["physical_bytes"] = io.get("physical_bytes", 0) + totals.get(
+                "physical_bytes", 0
+            )
+            io["gds_physical_bytes"] = io.get("gds_physical_bytes", 0) + totals.get(
+                "physical_bytes", 0
+            )
             io["reads"] = io.get("reads", 0) + totals.get("reads", 0)
-            io["gpu_scratch_bytes"] = io.get("gpu_scratch_bytes", 0) + totals.get("staging_bytes", 0)
+            io["gpu_scratch_bytes"] = io.get("gpu_scratch_bytes", 0) + totals.get(
+                "staging_bytes", 0
+            )
             if totals.get("epochs", 0):
                 io["gds_enabled"] = 1
                 io["gds_version"] = totals["gds_version"]

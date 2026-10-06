@@ -167,9 +167,7 @@ def _apply_gated_activation(
             * torch.tanh(gate / SITU_DEFAULT_BETA)
             * torch.sigmoid(gate)
         )
-        situ_up = SITU_DEFAULT_LINEAR_BETA * torch.tanh(
-            up / SITU_DEFAULT_LINEAR_BETA
-        )
+        situ_up = SITU_DEFAULT_LINEAR_BETA * torch.tanh(up / SITU_DEFAULT_LINEAR_BETA)
         return situ_gate * situ_up
     return gate * torch.sigmoid(gate) * up
 
@@ -309,16 +307,22 @@ def _quantize_vec_to_fp4_dequant(
                 (3.5, 5.0, 4.0, True),
             ):
                 lower, upper = effective * lo, effective * hi
-                inside = ((mag >= lower) & (mag <= upper)) if closed else (
-                    (mag > lower) & (mag < upper)
+                inside = (
+                    ((mag >= lower) & (mag <= upper))
+                    if closed
+                    else ((mag > lower) & (mag < upper))
                 )
                 quant = torch.where(inside, value, quant)
             quant = torch.where(mag > effective * 5.0, 6.0, quant) * blocked.sign()
         elif scale_math == "micro":
             quant = fp4_quantize_values_torch(blocked * effective.reciprocal())
         else:
-            inverse_scale = torch.where(scale == 0, torch.zeros_like(scale), scale.reciprocal())
-            quant = fp4_quantize_values_torch(blocked * (inverse_scale * gs).unsqueeze(-1))
+            inverse_scale = torch.where(
+                scale == 0, torch.zeros_like(scale), scale.reciprocal()
+            )
+            quant = fp4_quantize_values_torch(
+                blocked * (inverse_scale * gs).unsqueeze(-1)
+            )
         return (quant * scale.unsqueeze(-1)).reshape(cols)
 
     raw_scale = (block_max * global_scale / 6.0).clamp(max=fp8_e4m3_max)
@@ -1365,9 +1369,7 @@ def moe_reference_w8a8_mx(
         )
     )
     if activation != "silu":
-        raise NotImplementedError(
-            "the W8A8-MXFP8 recipe is qualified for silu only"
-        )
+        raise NotImplementedError("the W8A8-MXFP8 recipe is qualified for silu only")
     _validate_reference_inputs(w1_e4m3, I_tp, activation)
     if K % 128 != 0 or I_tp % 32 != 0:
         raise ValueError("w8a8_mx requires K % 128 == 0 and I_tp % 32 == 0")
@@ -1388,13 +1390,9 @@ def moe_reference_w8a8_mx(
         w13_eff = _dequant_w8a8_weight_e8m0_k32(
             w1_e4m3[eid], w1_mx_scales[eid], 2 * I_tp, K
         )
-        w2_eff = _dequant_w8a8_weight_e8m0_k32(
-            w2_e4m3[eid], w2_mx_scales[eid], K, I_tp
-        )
+        w2_eff = _dequant_w8a8_weight_e8m0_k32(w2_e4m3[eid], w2_mx_scales[eid], K, I_tp)
         xs = quant_dequant_mxfp8_scaled_torch(x[token_mask].float(), gs_fc1)
-        gate_rows, up_rows = _gated_row_slices(
-            activation, I_tp, w13_layout=w13_layout
-        )
+        gate_rows, up_rows = _gated_row_slices(activation, I_tp, w13_layout=w13_layout)
         up_out = (xs @ w13_eff[up_rows].T) * alpha_fc1
         gate_out = (xs @ w13_eff[gate_rows].T) * alpha_fc1
         intermediate = _apply_gated_activation(

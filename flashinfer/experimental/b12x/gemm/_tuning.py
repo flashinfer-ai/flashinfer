@@ -5,7 +5,12 @@ from dataclasses import asdict, dataclass, field, fields
 from b12x.preparation._efficiency import capture_exhaustive_search
 
 from b12x.preparation import FrozenMapping
-from b12x.preparation.tuning import Knob, ParameterBinding, ParameterSpace, TuningContract
+from b12x.preparation.tuning import (
+    Knob,
+    ParameterBinding,
+    ParameterSpace,
+    TuningContract,
+)
 
 
 RECIPES = (
@@ -44,15 +49,24 @@ class DenseGemmQuery:
 
     def __post_init__(self):
         object.__setattr__(self, "overrides", FrozenMapping(self.overrides))
-        object.__setattr__(self, "codegen", _codegen_snapshot() if self.codegen is None else FrozenMapping(self.codegen))
+        object.__setattr__(
+            self,
+            "codegen",
+            _codegen_snapshot()
+            if self.codegen is None
+            else FrozenMapping(self.codegen),
+        )
 
 
 def _codegen_snapshot():
     from b12x._lib import dense_gemm as dense
-    return FrozenMapping({
-        "split_k_atomic": dense._B12X_DENSE_SPLITK_TURBO,
-        "fused_fp6_quant": dense._DENSE_FUSED_QUANT,
-    })
+
+    return FrozenMapping(
+        {
+            "split_k_atomic": dense._B12X_DENSE_SPLITK_TURBO,
+            "fused_fp6_quant": dense._DENSE_FUSED_QUANT,
+        }
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -90,26 +104,41 @@ def validate_query(query):
         raise ValueError("weight storage does not match the dense GEMM recipe")
     if query.recipe == "block_fp8" and (query.batch != 1 or query.out_features % 128):
         raise ValueError("block-FP8 requires one matrix and N divisible by 128")
-    if query.expected_m is not None and (type(query.expected_m) is not int or query.expected_m <= 0):
+    if query.expected_m is not None and (
+        type(query.expected_m) is not int or query.expected_m <= 0
+    ):
         raise ValueError("expected_m must be a positive integer or None")
-    if query.sm_count is not None and (type(query.sm_count) is not int or query.sm_count <= 0):
+    if query.sm_count is not None and (
+        type(query.sm_count) is not int or query.sm_count <= 0
+    ):
         raise ValueError("SM capacity must be a positive integer or None")
     if type(query.sfb_k_replicated) is not bool:
         raise TypeError("weight-scale replication must be a boolean")
     if query.sfb_k_replicated and query.recipe != "mxfp8":
         raise ValueError("weight-scale replication requires MXFP8")
     if query.codegen != _codegen_snapshot():
-        raise ValueError("dense declaration code-generation controls differ from the loaded kernels")
+        raise ValueError(
+            "dense declaration code-generation controls differ from the loaded kernels"
+        )
     allowed = {
-        "mma_tiler_mn", "load_path", "swap_ab", "_tile_k_override",
-        "_split_k_slices_override", "_large_m_unroll_override", "_target_occupancy_override",
+        "mma_tiler_mn",
+        "load_path",
+        "swap_ab",
+        "_tile_k_override",
+        "_split_k_slices_override",
+        "_large_m_unroll_override",
+        "_target_occupancy_override",
     }
     if set(query.overrides) - allowed:
         raise ValueError("unknown dense launch constraint")
     if query.workspace_nbytes is not None and (
-        type(query.workspace_nbytes) is not int or query.workspace_nbytes < 0 or query.workspace_nbytes % 4
+        type(query.workspace_nbytes) is not int
+        or query.workspace_nbytes < 0
+        or query.workspace_nbytes % 4
     ):
-        raise ValueError("dense workspace capacity must be a nonnegative FP32 byte count")
+        raise ValueError(
+            "dense workspace capacity must be a nonnegative FP32 byte count"
+        )
     if query.workspace_form not in ("owned", "provided"):
         raise ValueError("unknown dense workspace form")
     if query.workspace_form == "owned" and query.workspace_nbytes is not None:
@@ -180,7 +209,9 @@ def query_from_call(lhs, rhs, out=None, *, entry_point, options):
         if options.get(name) is not None
     )
     if unsupported:
-        raise ValueError(f"dense search does not model auxiliary operands: {unsupported}")
+        raise ValueError(
+            f"dense search does not model auxiliary operands: {unsupported}"
+        )
     ab, sf, vec = (
         options.get(name) for name in ("ab_dtype", "sf_dtype", "sf_vec_size")
     )
@@ -295,10 +326,14 @@ def query_from_call(lhs, rhs, out=None, *, entry_point, options):
         raise ValueError("dense search requires unit alpha or a scalar FP32 tensor")
     workspace = options.get("_split_k_workspace")
     if workspace is not None and (
-        workspace.dtype != torch.float32 or workspace.device != a.device
-        or not workspace.is_contiguous() or (workspace.numel() and workspace.data_ptr() % 16)
+        workspace.dtype != torch.float32
+        or workspace.device != a.device
+        or not workspace.is_contiguous()
+        or (workspace.numel() and workspace.data_ptr() % 16)
     ):
-        raise ValueError("dense workspace must be aligned contiguous FP32 storage on the operand device")
+        raise ValueError(
+            "dense workspace must be aligned contiguous FP32 storage on the operand device"
+        )
     query = DenseGemmQuery(
         recipe=recipe,
         entry_point=entry_point,
@@ -313,14 +348,25 @@ def query_from_call(lhs, rhs, out=None, *, entry_point, options):
         expected_m=expected_m,
         sm_count=options.get("sm_count"),
         sfb_k_replicated=options.get("sfb_k_replicated", False),
-        workspace_nbytes=None if workspace is None else workspace.numel() * workspace.element_size(),
+        workspace_nbytes=None
+        if workspace is None
+        else workspace.numel() * workspace.element_size(),
         workspace_form="owned" if workspace is None else "provided",
-        overrides=FrozenMapping({
-            name: options[name] for name in (
-                "mma_tiler_mn", "load_path", "swap_ab", "_tile_k_override",
-                "_split_k_slices_override", "_large_m_unroll_override", "_target_occupancy_override",
-            ) if options.get(name) is not None
-        }),
+        overrides=FrozenMapping(
+            {
+                name: options[name]
+                for name in (
+                    "mma_tiler_mn",
+                    "load_path",
+                    "swap_ab",
+                    "_tile_k_override",
+                    "_split_k_slices_override",
+                    "_large_m_unroll_override",
+                    "_target_occupancy_override",
+                )
+                if options.get(name) is not None
+            }
+        ),
     )
     validate_query(query)
     if out is not None and (
@@ -390,7 +436,9 @@ def validate_config(query, config, device):
     selected_options = launch_options(query, config)
     for name, value in query.overrides.items():
         if selected_options.get(name) != value:
-            raise ValueError(f"dense configuration conflicts with caller constraint {name}")
+            raise ValueError(
+                f"dense configuration conflicts with caller constraint {name}"
+            )
     options = operand_options(query)
     if not dense.DenseGemmKernel.can_implement(
         dense.get_cutlass_dtype(options["ab_dtype"]),
@@ -465,16 +513,24 @@ def validate_config(query, config, device):
         if query.output_dtype != "bfloat16" and dense._B12X_DENSE_SPLITK_TURBO:
             raise ValueError("atomic BF16 split-K requires BF16 output")
     from ._preparation import _configured_lowering
+
     p = _configured_lowering(query, config, device)
-    if query.workspace_nbytes is not None and p.policy.split_k_slices > 1 and not p.policy.split_k_atomic_bf16:
+    if (
+        query.workspace_nbytes is not None
+        and p.policy.split_k_slices > 1
+        and not p.policy.split_k_atomic_bf16
+    ):
         required = p.policy.split_k_slices * query.max_rows * query.out_features * 4
         if query.workspace_nbytes < required:
-            raise ValueError("dense caller workspace is smaller than this configuration requires")
+            raise ValueError(
+                "dense caller workspace is smaller than this configuration requires"
+            )
 
 
 def default_config(query, device):
     from b12x._lib import dense_gemm as dense
     from ._preparation import _default_lowering
+
     p = _default_lowering(query, device)
     fp4 = query.recipe in ("nvfp4", "mxfp4")
     fp8 = query.recipe in ("mxfp8", "tensor_fp8", "block_fp8")
@@ -483,16 +539,29 @@ def default_config(query, device):
         occupancy = p.target_occupancy_override
         if occupancy is None:
             occupancy = dense._dense_gemm_target_occupancy(
-                n=p.n, k=p.k, l=p.l, ab_dtype=dense.get_cutlass_dtype(p.ab_dtype),
-                c_dtype=dense.get_cutlass_dtype(p.c_dtype), tile_k=p.tile_k,
-                mma_tiler_mn=p.mma_tiler_mn, cluster_shape_mn=p.cluster_shape_mn,
-                sm_count=p.sm_count, load_path=p.load_path, swap_ab=p.swap_ab,
+                n=p.n,
+                k=p.k,
+                l=p.l,
+                ab_dtype=dense.get_cutlass_dtype(p.ab_dtype),
+                c_dtype=dense.get_cutlass_dtype(p.c_dtype),
+                tile_k=p.tile_k,
+                mma_tiler_mn=p.mma_tiler_mn,
+                cluster_shape_mn=p.cluster_shape_mn,
+                sm_count=p.sm_count,
+                load_path=p.load_path,
+                swap_ab=p.swap_ab,
                 b_tile_major=p.b_tile_major,
             )
     return DenseGemmConfig(
-        backend="cutedsl", tile_m=p.mma_tiler_mn[0], tile_n=p.mma_tiler_mn[1],
-        tile_k=p.tile_k, load_path=p.load_path, swap_ab=p.swap_ab,
-        split_k_slices=p.policy.split_k_slices if query.recipe in ("mxfp8", "block_fp8") else None,
+        backend="cutedsl",
+        tile_m=p.mma_tiler_mn[0],
+        tile_n=p.mma_tiler_mn[1],
+        tile_k=p.tile_k,
+        load_path=p.load_path,
+        swap_ab=p.swap_ab,
+        split_k_slices=p.policy.split_k_slices
+        if query.recipe in ("mxfp8", "block_fp8")
+        else None,
         large_m_unroll=p.policy.large_m_unroll if fp8 and query.batch == 1 else None,
         target_occupancy=occupancy,
     )
@@ -501,9 +570,12 @@ def default_config(query, device):
 def _parameters(query, device):
     values = knob_values(query)
     mapping = {
-        "load_path": "load_path", "swap_ab": "swap_ab",
-        "_tile_k_override": "tile_k", "_split_k_slices_override": "split_k_slices",
-        "_large_m_unroll_override": "large_m_unroll", "_target_occupancy_override": "target_occupancy",
+        "load_path": "load_path",
+        "swap_ab": "swap_ab",
+        "_tile_k_override": "tile_k",
+        "_split_k_slices_override": "split_k_slices",
+        "_large_m_unroll_override": "large_m_unroll",
+        "_target_occupancy_override": "target_occupancy",
     }
     for name, value in query.overrides.items():
         if name == "mma_tiler_mn":
@@ -512,8 +584,11 @@ def _parameters(query, device):
             values[mapping[name]] = (value,)
 
     def short_unswapped_async(p):
-        return (query.recipe != "nvfp4" or p["load_path"] != "cpasync"
-                or (not p["swap_ab"] and query.in_features <= 256))
+        return (
+            query.recipe != "nvfp4"
+            or p["load_path"] != "cpasync"
+            or (not p["swap_ab"] and query.in_features <= 256)
+        )
 
     def bounded_row_padding(p):
         row_tile = p["tile_n"] if p["swap_ab"] else p["tile_m"]
@@ -524,23 +599,38 @@ def _parameters(query, device):
         return True
 
     def narrow_output_swap(p):
-        return (query.recipe != "mxfp8" or not p["swap_ab"]
-                or query.max_rows > 16 or 2 * query.out_features <= query.in_features)
+        return (
+            query.recipe != "mxfp8"
+            or not p["swap_ab"]
+            or query.max_rows > 16
+            or 2 * query.out_features <= query.in_features
+        )
 
     def bounded_prefill_k_tile(p):
-        return (query.recipe != "nvfp4" or p["tile_k"] != 512
-                or query.max_rows <= 256 or query.in_features <= 1024
-                or (query.out_features <= 1024 and p["tile_m"] == 64))
+        return (
+            query.recipe != "nvfp4"
+            or p["tile_k"] != 512
+            or query.max_rows <= 256
+            or query.in_features <= 1024
+            or (query.out_features <= 1024 and p["tile_m"] == 64)
+        )
 
     def reuse_rows(p):
         row_tile = p["tile_n"] if p["swap_ab"] else p["tile_m"]
         return query.recipe != "mxfp8" or query.max_rows <= 128 or row_tile >= 32
 
     return ParameterSpace.create(
-        TUNING.knobs, values=values, exhaustive=query.exhaustive,
-        efficiency_predicates=() if query.overrides or query.batch != 1 else (
-            short_unswapped_async, bounded_row_padding, narrow_output_swap,
-            bounded_prefill_k_tile, reuse_rows,
+        TUNING.knobs,
+        values=values,
+        exhaustive=query.exhaustive,
+        efficiency_predicates=()
+        if query.overrides or query.batch != 1
+        else (
+            short_unswapped_async,
+            bounded_row_padding,
+            narrow_output_swap,
+            bounded_prefill_k_tile,
+            reuse_rows,
         ),
     )
 
@@ -557,7 +647,9 @@ TUNING = TuningContract(
     config_schema_version=2,
     query_fields=frozenset(field.name for field in fields(DenseGemmQuery)),
     config_fields=frozenset(field.name for field in fields(DenseGemmConfig)),
-    encode_query=lambda query: {field.name: getattr(query, field.name) for field in fields(query)},
+    encode_query=lambda query: {
+        field.name: getattr(query, field.name) for field in fields(query)
+    },
     encode_config=asdict,
     decode_config=lambda payload: DenseGemmConfig(**dict(payload)),
     default_config=default_config,
@@ -568,12 +660,30 @@ TUNING = TuningContract(
         Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),
         Knob(name="tile_m", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE),
         Knob(name="tile_n", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE),
-        Knob(name="tile_k", values=(64, 128, 256, 512), binding=ParameterBinding.COMPILE),
-        Knob(name="load_path", values=("tma", "cpasync"), binding=ParameterBinding.COMPILE),
+        Knob(
+            name="tile_k", values=(64, 128, 256, 512), binding=ParameterBinding.COMPILE
+        ),
+        Knob(
+            name="load_path",
+            values=("tma", "cpasync"),
+            binding=ParameterBinding.COMPILE,
+        ),
         Knob(name="swap_ab", values=(False, True), binding=ParameterBinding.COMPILE),
-        Knob(name="split_k_slices", values=(None, 1, 2, 4), binding=ParameterBinding.COMPILE),
-        Knob(name="large_m_unroll", values=(None, False, True), binding=ParameterBinding.COMPILE),
-        Knob(name="target_occupancy", values=(None, 1, 2, 3, 4), binding=ParameterBinding.COMPILE),
+        Knob(
+            name="split_k_slices",
+            values=(None, 1, 2, 4),
+            binding=ParameterBinding.COMPILE,
+        ),
+        Knob(
+            name="large_m_unroll",
+            values=(None, False, True),
+            binding=ParameterBinding.COMPILE,
+        ),
+        Knob(
+            name="target_occupancy",
+            values=(None, 1, 2, 3, 4),
+            binding=ParameterBinding.COMPILE,
+        ),
     ),
     parameters=_parameters,
 )

@@ -749,7 +749,9 @@ def test_dsa_indexer_config_and_merge_thresholds() -> None:
     assert TUNING.encode_config(config) == config.to_dict()
     common = dict(ctas_per_group=47, num_heads=32, topk=2048)
     assert resolve_fused_merge_threshold(FUSED_MERGE_COOPERATIVE, **common) == 0
-    assert resolve_fused_merge_threshold(FUSED_MERGE_SERIAL, **common) == _FORCE_LAST_CTA
+    assert (
+        resolve_fused_merge_threshold(FUSED_MERGE_SERIAL, **common) == _FORCE_LAST_CTA
+    )
     assert resolve_fused_merge_threshold(
         FUSED_MERGE_AUTO, **common
     ) == _resolve_default_merge_threshold(**common)
@@ -770,12 +772,27 @@ def test_tuning_keeps_the_live_length_merge_policy() -> None:
 
     device = DeviceIdentity("nvidia", (12, 0), 188, "RTX PRO 6000")
     query = DsaIndexerQuery(
-        source_layout="paged", mode="decode", dtype="bfloat16", kv_dtype="uint8",
-        num_q_heads=32, num_idx_heads=1, max_q_rows=4, max_k_rows=8192 * 64,
-        top_k=2048, page_size=64, score_mode="dsa", shared_page_table=False,
-        max_page_table_width=8192, route="auto", output_physical_slots=True,
-        supertile_k=0, prefill_block_k=256, reserve_paged_logits=False,
-        paged_logits_k_rows=0, operands=FrozenMapping({}), exhaustive=False,
+        source_layout="paged",
+        mode="decode",
+        dtype="bfloat16",
+        kv_dtype="uint8",
+        num_q_heads=32,
+        num_idx_heads=1,
+        max_q_rows=4,
+        max_k_rows=8192 * 64,
+        top_k=2048,
+        page_size=64,
+        score_mode="dsa",
+        shared_page_table=False,
+        max_page_table_width=8192,
+        route="auto",
+        output_physical_slots=True,
+        supertile_k=0,
+        prefill_block_k=256,
+        reserve_paged_logits=False,
+        paged_logits_k_rows=0,
+        operands=FrozenMapping({}),
+        exhaustive=False,
     )
     for exhaustive in (False, True):
         plan = TUNING.eligible_plan(replace(query, exhaustive=exhaustive), device)
@@ -803,17 +820,33 @@ def test_plan_indexer_scratch_applies_prepared_fused_merge() -> None:
     )
 
     caps = B12XIndexerScratchCaps(
-        device=torch.device("cuda"), source_layout="paged", num_q_heads=32,
-        max_q_rows=4, topk=2048, max_page_table_width=512,
+        device=torch.device("cuda"),
+        source_layout="paged",
+        num_q_heads=32,
+        max_q_rows=4,
+        topk=2048,
+        max_page_table_width=512,
         route=INDEXER_PAGED_ROUTE_FUSED,
     )
     thresholds = {
-        choice: int(plan_indexer_scratch(caps, fused_merge=choice).inner.layout.fused_merge_threshold)
+        choice: int(
+            plan_indexer_scratch(
+                caps, fused_merge=choice
+            ).inner.layout.fused_merge_threshold
+        )
         for choice in (FUSED_MERGE_COOPERATIVE, FUSED_MERGE_SERIAL)
     }
     assert thresholds[FUSED_MERGE_COOPERATIVE] == 0
     assert thresholds[FUSED_MERGE_SERIAL] == _FORCE_LAST_CTA
-    assert int(plan_indexer_scratch(caps, fused_merge=FUSED_MERGE_AUTO).inner.layout.fused_merge_threshold) == 0
+    assert (
+        int(
+            plan_indexer_scratch(
+                caps, fused_merge=FUSED_MERGE_AUTO
+            ).inner.layout.fused_merge_threshold
+        )
+        == 0
+    )
+
 
 # --- cooperative merge across repeated launches ------------------------------
 

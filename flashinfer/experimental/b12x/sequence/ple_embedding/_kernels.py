@@ -286,11 +286,24 @@ def _pipeline_op(
     token_count: int,
     plan_handle: int,
 ) -> None:
-    state = require_prepared(plan_from_handle(plan_handle), "sequence.ple_embedding", out.device)
+    state = require_prepared(
+        plan_from_handle(plan_handle), "sequence.ple_embedding", out.device
+    )
     state.run_tensors(
-        weight, weight_scale, weight_scale_2, token_ids, query_start_loc,
-        committed_history, num_seqs, num_tokens, multipliers, prime_sizes,
-        table_offsets, scratch, out, token_count=token_count,
+        weight,
+        weight_scale,
+        weight_scale_2,
+        token_ids,
+        query_start_loc,
+        committed_history,
+        num_seqs,
+        num_tokens,
+        multipliers,
+        prime_sizes,
+        table_offsets,
+        scratch,
+        out,
+        token_count=token_count,
     )
 
 
@@ -320,11 +333,21 @@ def _pipeline_fake(
 def run_pipeline(binding: Binding, *, token_count: int) -> None:
     geometry = binding._hash_binding.geometry
     torch.ops.b12x.ple_embedding_pipeline(
-        binding.weight, binding.weight_scale, binding.weight_scale_2,
-        binding.token_ids, binding.query_start_loc, binding.committed_history,
-        binding.num_seqs, binding.num_tokens, geometry.multipliers,
-        geometry.prime_sizes, geometry.table_offsets, binding.scratch,
-        binding.out, token_count, binding.plan.handle,
+        binding.weight,
+        binding.weight_scale,
+        binding.weight_scale_2,
+        binding.token_ids,
+        binding.query_start_loc,
+        binding.committed_history,
+        binding.num_seqs,
+        binding.num_tokens,
+        geometry.multipliers,
+        geometry.prime_sizes,
+        geometry.table_offsets,
+        binding.scratch,
+        binding.out,
+        token_count,
+        binding.plan.handle,
     )
 
 

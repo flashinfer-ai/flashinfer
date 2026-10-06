@@ -15,12 +15,11 @@ WINDOW_SIZE = 513
 SM_SCALE = 1.0 / (256**0.5)
 
 
-
-
 @pytest.fixture(autouse=True)
 def _prepared_dense_mla_window():
     with _prepared_scope():
         yield
+
 
 @pytest.mark.parametrize(
     "cache_lens,query_lens",

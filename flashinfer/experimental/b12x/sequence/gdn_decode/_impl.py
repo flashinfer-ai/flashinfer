@@ -90,7 +90,9 @@ class Caps:
             or self.state_dtype != torch.float32
             or not self.qk_l2norm
         ):
-            raise ValueError("KDA recovery requires equal heads, FP32 state and Q/K normalization")
+            raise ValueError(
+                "KDA recovery requires equal heads, FP32 state and Q/K normalization"
+            )
         if self.model_dtype != torch.bfloat16:
             raise TypeError(
                 f"model_dtype must be torch.bfloat16, got {self.model_dtype}"
@@ -160,7 +162,6 @@ class _GdnLayout:
                 f"tokens={live_tokens} exceeds capacity {self.caps.max_tokens}"
             )
         return (live_tokens, self.caps.value_heads, self.caps.value_head_dim)
-
 
 
 @dataclass(frozen=True)
@@ -352,7 +353,10 @@ def _paged_overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
     if not _overlaps(left, right):
         return False
     step = left.stride(0) * left.element_size()
-    if left.shape[0] != right.shape[0] or step != right.stride(0) * right.element_size():
+    if (
+        left.shape[0] != right.shape[0]
+        or step != right.stride(0) * right.element_size()
+    ):
         return True
     left_bytes = math.prod(left.shape[1:]) * left.element_size()
     right_bytes = math.prod(right.shape[1:]) * right.element_size()
@@ -651,7 +655,11 @@ def _bind_kda(
             f"state_indices column capacity {state_index_columns} exceeds "
             f"planned capacity {caps.state_index_columns}"
         )
-    query_columns = caps.state_index_columns if caps.recover_speculative_state else state_index_columns
+    query_columns = (
+        caps.state_index_columns
+        if caps.recover_speculative_state
+        else state_index_columns
+    )
     if token_capacity > sequence_capacity * query_columns:
         raise ValueError(
             "token capacity must fit the bound packed metadata geometry, got "
@@ -768,9 +776,17 @@ def _bind_kda(
             if tensor is None:
                 raise ValueError(f"KDA recovery requires {name}")
             _require_tensor(
-                name, tensor,
-                shape=(caps.max_state_slots, caps.value_heads, caps.state_index_columns, dim),
-                device=caps.device, dtypes=(dtype,), contiguous=False,
+                name,
+                tensor,
+                shape=(
+                    caps.max_state_slots,
+                    caps.value_heads,
+                    caps.state_index_columns,
+                    dim,
+                ),
+                device=caps.device,
+                dtypes=(dtype,),
+                contiguous=False,
             )
             if tensor.stride()[1:] != (caps.state_index_columns * dim, dim, 1):
                 raise ValueError(f"{name} requires contiguous per-slot records")
@@ -796,7 +812,9 @@ def _bind_kda(
     paged_names = {"recurrent_state", "correction_cache", "kg_cache"}
     for index, (left_name, left) in enumerate(mutable):
         for right_name, right in mutable[index + 1 :]:
-            overlap = _paged_overlaps if {left_name, right_name} <= paged_names else _overlaps
+            overlap = (
+                _paged_overlaps if {left_name, right_name} <= paged_names else _overlaps
+            )
             if overlap(left, right):
                 raise ValueError(
                     f"mutable buffers {left_name} and {right_name} must not overlap"
@@ -910,8 +928,13 @@ def run_kda(
         raise TypeError("KDA run requires a session-prepared binding")
     if binding._state.caps.recover_speculative_state:
         state = require_prepared(binding.plan, "attention.gdn")
-        return state.run(binding, eps=eps_value, scale=scale, lower_bound=lower_bound_value,
-                         apply_output_norm=apply_output_norm)
+        return state.run(
+            binding,
+            eps=eps_value,
+            scale=scale,
+            lower_bound=lower_bound_value,
+            apply_output_norm=apply_output_norm,
+        )
     if not apply_output_norm:
         raise ValueError("raw output is supported only by KDA state recovery")
     caps = binding._state.caps

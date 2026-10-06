@@ -127,8 +127,11 @@ def test_device_arch_key_is_memoized_per_ordinal(monkeypatch):
 
     def _properties(device):
         probes[device] += 1
-        return SimpleNamespace(major=boards[device][0], minor=boards[device][1],
-                               multi_processor_count=boards[device][2])
+        return SimpleNamespace(
+            major=boards[device][0],
+            minor=boards[device][1],
+            multi_processor_count=boards[device][2],
+        )
 
     monkeypatch.setattr(
         torch.cuda,
@@ -148,7 +151,9 @@ def test_device_arch_key_is_memoized_per_ordinal(monkeypatch):
     monkeypatch.setattr(
         torch.cuda,
         "is_available",
-        lambda: (_ for _ in ()).throw(AssertionError("cached architecture was re-probed")),
+        lambda: (_ for _ in ()).throw(
+            AssertionError("cached architecture was re-probed")
+        ),
     )
     assert compiler._device_arch_key(0) == ("cuda", (12, 0), 170)
 
@@ -339,13 +344,20 @@ def test_frozen_memory_miss_rejects_before_disk_cache_load(monkeypatch):
 @pytest.mark.parametrize("explicit", [False, True])
 def test_portable_manifest_records_architecture_without_uuid(monkeypatch, explicit):
     monkeypatch.setattr(compiler, "_current_device_ordinal", lambda: 0)
-    monkeypatch.setattr(compiler, "_device_arch_key", lambda ordinal: ("cuda", (12, 1), 48))
+    monkeypatch.setattr(
+        compiler, "_device_arch_key", lambda ordinal: ("cuda", (12, 1), 48)
+    )
     spec = (
         compiler.KernelCompileSpec.from_facts("test.portable", 1, ("rows", 8))
-        if explicit else None
+        if explicit
+        else None
     )
     payload = compiler._compile_disk_cache_payload(
-        object(), test_portable_manifest_records_architecture_without_uuid, (), {}, spec,
+        object(),
+        test_portable_manifest_records_architecture_without_uuid,
+        (),
+        {},
+        spec,
     )
     semantic = compiler._semantic_compile_manifest_payload(payload)
     assert semantic["device_arch"] == ["cuda", [12, 1], 48]
@@ -355,7 +367,8 @@ def test_portable_manifest_records_architecture_without_uuid(monkeypatch, explic
 
 @pytest.mark.parametrize("explicit", [False, True])
 def test_matching_silicon_shares_disk_artifacts_but_not_loaded_handles(
-    monkeypatch, explicit,
+    monkeypatch,
+    explicit,
 ):
     torch = pytest.importorskip("torch")
     current = {"ordinal": 0}
@@ -364,10 +377,22 @@ def test_matching_silicon_shares_disk_artifacts_but_not_loaded_handles(
     monkeypatch.setattr(compiler, "_current_device_ordinal", lambda: current["ordinal"])
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     boards = {
-        0: SimpleNamespace(major=12, minor=1, multi_processor_count=48,
-                           uuid="first", name="A", total_memory=1),
-        1: SimpleNamespace(major=12, minor=1, multi_processor_count=48,
-                           uuid="second", name="B", total_memory=2),
+        0: SimpleNamespace(
+            major=12,
+            minor=1,
+            multi_processor_count=48,
+            uuid="first",
+            name="A",
+            total_memory=1,
+        ),
+        1: SimpleNamespace(
+            major=12,
+            minor=1,
+            multi_processor_count=48,
+            uuid="second",
+            name="B",
+            total_memory=2,
+        ),
         2: SimpleNamespace(major=12, minor=0, multi_processor_count=48),
         3: SimpleNamespace(major=12, minor=1, multi_processor_count=40),
     }
@@ -375,7 +400,8 @@ def test_matching_silicon_shares_disk_artifacts_but_not_loaded_handles(
     callable_ = object()
     spec = (
         compiler.KernelCompileSpec.from_facts("test.portable", 1, ("rows", 8))
-        if explicit else None
+        if explicit
+        else None
     )
     disk, memory = [], []
     for ordinal in boards:
@@ -383,7 +409,9 @@ def test_matching_silicon_shares_disk_artifacts_but_not_loaded_handles(
         args = (
             callable_,
             test_matching_silicon_shares_disk_artifacts_but_not_loaded_handles,
-            (), {}, spec,
+            (),
+            {},
+            spec,
         )
         disk.append(compiler._build_compile_disk_cache_key(*args))
         memory.append(compiler._compile_memory_cache_key(*args))

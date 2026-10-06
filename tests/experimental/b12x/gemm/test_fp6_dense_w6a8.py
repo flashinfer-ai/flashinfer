@@ -1,4 +1,5 @@
 """Correctness tests for E4M3-activation/E2M3-weight dense W6A8."""
+
 from __future__ import annotations
 
 import pytest
@@ -175,7 +176,10 @@ def test_dense_fp6_linear_deterministic(m, n, k):
     for trial in range(9):
         y = dense_fp6_linear(x, fp6w)
         torch.testing.assert_close(
-            y, y_ref, rtol=0, atol=0,
+            y,
+            y_ref,
+            rtol=0,
+            atol=0,
             msg=f"trial {trial + 1}: output differs from reference",
         )
 

@@ -277,7 +277,6 @@ def _add_u64_opaque(
     )
 
 
-
 _KIMI_NEG_INF = float("-inf")
 
 
@@ -341,6 +340,7 @@ def _kimi_sort_desc(keys, count: int) -> None:
             stride //= 2
         width *= 2
 
+
 class _DCPA2ABase:
     def __init__(
         self,
@@ -366,6 +366,7 @@ class _DCPA2ABase:
         lse_offset: Int64,
     ) -> cute.Pointer:
         return cute.recast_ptr((pointer + lse_offset).align(4), dtype=Float32)
+
 
 class _LseReduceScatterLaunch(_DCPA2ABase):
     def __init__(
@@ -596,15 +597,10 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                 (signals[self._rank] + Int64(_GRAPH_EPOCH_INDEX)).toint()
             )
             slot = generation % Uint32(2)
-            slot_offset = (
-                Int64(slot)
-                * Int64(slot_delta_256b)
-                * Int64(_SLOT_ALIGNMENT)
-            )
+            slot_offset = Int64(slot) * Int64(slot_delta_256b) * Int64(_SLOT_ALIGNMENT)
         lane = Int32(tidx) % Int32(32)
-        warp_first = (
-            Int32(bidx) * Int32(self._warps_per_block)
-            + Int32(tidx) // Int32(32)
+        warp_first = Int32(bidx) * Int32(self._warps_per_block) + Int32(tidx) // Int32(
+            32
         )
         warp_stride = Int32(gdim) * Int32(self._warps_per_block)
         heads_per_rank = total_heads // Int32(self._world_size)
@@ -631,10 +627,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                 )
                 input_base = (
                     Int64(batch_index) * input_stride_batch
-                    + (
-                        Int64(destination) * Int64(heads_per_rank)
-                        + Int64(local_head)
-                    )
+                    + (Int64(destination) * Int64(heads_per_rank) + Int64(local_head))
                     * input_stride_head
                 )
                 staging_base = source_row * Int64(packs_per_head)
@@ -665,9 +658,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             batch_index = row // heads_per_rank
             local_head = row - batch_index * heads_per_rank
             global_head = Int32(self._rank) * heads_per_rank + local_head
-            source_row = (
-                Int64(batch_index) * Int64(total_heads) + Int64(global_head)
-            )
+            source_row = Int64(batch_index) * Int64(total_heads) + Int64(global_head)
 
             # Match the native lane-selected pointer shape: choose one source
             # address, then issue one runtime-guarded LSE load.  Spelling this
@@ -677,18 +668,14 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             for source_index in cutlass.range_constexpr(1, self._world_size):
                 source = (self._rank + source_index) % self._world_size
                 source_lse_base = (
-                    Int64(staging[source].toint())
-                    + slot_offset
-                    + lse_offset
+                    Int64(staging[source].toint()) + slot_offset + lse_offset
                 )
                 if lane == Int32(source_index):
                     lane_lse_base = source_lse_base
 
             lane_lse = Float32(float("-inf"))
             if lane < Int32(self._world_size):
-                lane_lse = ld_generic_f32(
-                    lane_lse_base + source_row * Int64(4)
-                )
+                lane_lse = ld_generic_f32(lane_lse_base + source_row * Int64(4))
                 if not cute.math.isfinite(lane_lse):
                     lane_lse = Float32(float("-inf"))
 
@@ -720,9 +707,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                         weight = cute.math.exp2(delta, approx=True)
                     weights[source_index] = weight
                     weight_sum += weight
-            inv_weight_sum = Float32(1.0) / fmax_f32(
-                weight_sum, Float32(1.0e-10)
-            )
+            inv_weight_sum = Float32(1.0) / fmax_f32(weight_sum, Float32(1.0e-10))
 
             staging_base = source_row * Int64(packs_per_head)
             local_base = (
@@ -733,15 +718,11 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                 Int64(batch_index) * output_stride_batch
                 + Int64(local_head) * output_stride_head
             )
-            payload_row_addresses = cute.make_rmem_tensor(
-                (self._world_size,), Int64
-            )
+            payload_row_addresses = cute.make_rmem_tensor((self._world_size,), Int64)
             for source_index in cutlass.range_constexpr(self._world_size):
                 source = (self._rank + source_index) % self._world_size
                 if cutlass.const_expr(source == self._rank):
-                    source_address = (
-                        local_output.toint() + local_base * Int64(16)
-                    )
+                    source_address = local_output.toint() + local_base * Int64(16)
                 else:
                     source_address = _add_u64_opaque(
                         staging[source].toint(),
@@ -755,22 +736,17 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                 unroll=1,
             ):
                 accum = cute.make_rmem_tensor((8,), Float32)
-                source_addresses = cute.make_rmem_tensor(
-                    (self._world_size,), Int64
-                )
+                source_addresses = cute.make_rmem_tensor((self._world_size,), Int64)
                 for element in cutlass.range_constexpr(8):
                     accum[element] = Float32(0.0)
                 for source_index in cutlass.range_constexpr(self._world_size):
-                    source_addresses[source_index] = (
-                        payload_row_addresses[source_index]
-                        + Int64(pack) * Int64(16)
-                    )
+                    source_addresses[source_index] = payload_row_addresses[
+                        source_index
+                    ] + Int64(pack) * Int64(16)
                 for source_index in cutlass.range_constexpr(self._world_size):
                     normalized_weight = weights[source_index] * inv_weight_sum
                     if normalized_weight != Float32(0.0):
-                        words = _ld_generic_v4_u32(
-                            source_addresses[source_index]
-                        )
+                        words = _ld_generic_v4_u32(source_addresses[source_index])
                         for pair in cutlass.range_constexpr(4):
                             lo, hi = self._unpack_pair(words[pair])
                             accum[pair * 2] = _fma_rn_f32(
@@ -784,11 +760,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                 result2 = self._pack_pair(accum[4], accum[5])
                 result3 = self._pack_pair(accum[6], accum[7])
                 st_global_v4_u32(
-                    (
-                        output
-                        + output_base * Int64(4)
-                        + Int64(pack) * Int64(4)
-                    ).toint(),
+                    (output + output_base * Int64(4) + Int64(pack) * Int64(4)).toint(),
                     result0,
                     result1,
                     result2,
@@ -983,11 +955,7 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                 (signals[self._rank] + Int64(_GRAPH_EPOCH_INDEX)).toint()
             )
             slot = generation % Uint32(2)
-            slot_offset = (
-                Int64(slot)
-                * Int64(slot_delta_256b)
-                * Int64(_SLOT_ALIGNMENT)
-            )
+            slot_offset = Int64(slot) * Int64(slot_delta_256b) * Int64(_SLOT_ALIGNMENT)
             staging = (
                 staging0 + slot_offset,
                 staging1 + slot_offset,
@@ -1007,9 +975,8 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                 staging15 + slot_offset,
             )
         lane = Int32(tidx) % Int32(32)
-        warp_first = (
-            Int32(bidx) * Int32(self._warps_per_block)
-            + Int32(tidx) // Int32(32)
+        warp_first = Int32(bidx) * Int32(self._warps_per_block) + Int32(tidx) // Int32(
+            32
         )
         warp_stride = Int32(gdim) * Int32(self._warps_per_block)
         total_heads = local_heads * Int32(self._world_size)
@@ -1024,9 +991,8 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             if source_rank == Int32(self._rank):
                 local_head = global_head - source_rank * local_heads
                 base = (
-                    (Int64(batch_index) * Int64(local_heads) + Int64(local_head))
-                    * Int64(packs_per_head)
-                )
+                    Int64(batch_index) * Int64(local_heads) + Int64(local_head)
+                ) * Int64(packs_per_head)
                 pack = lane
                 while pack < packs_per_head:
                     _copy_16b(
@@ -1051,16 +1017,13 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             source_rank = global_head // local_heads
             local_head = global_head - source_rank * local_heads
             source_base = (
-                (Int64(batch_index) * Int64(local_heads) + Int64(local_head))
-                * Int64(packs_per_head)
-            )
+                Int64(batch_index) * Int64(local_heads) + Int64(local_head)
+            ) * Int64(packs_per_head)
             output_base = Int64(row) * Int64(packs_per_head)
             # Resolve the peer's base address first and copy once. Cloning the
             # whole pack loop into all sixteen arms of the constexpr chain
             # bloats the kernel and pays the chain on every row.
-            source_address = Int64(
-                (local_input + source_base * Int64(4)).toint()
-            )
+            source_address = Int64((local_input + source_base * Int64(4)).toint())
             for source in cutlass.range_constexpr(self._world_size):
                 if source_rank == Int32(source):
                     if cutlass.const_expr(source == self._rank):
@@ -1070,9 +1033,7 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                     source_address = Int64(
                         (source_words + source_base * Int64(4)).toint()
                     )
-            output_address = Int64(
-                (output + output_base * Int64(4)).toint()
-            )
+            output_address = Int64((output + output_base * Int64(4)).toint())
             pack = lane
             while pack < packs_per_head:
                 _copy_16b_addr(
@@ -1292,15 +1253,9 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 (signals[self._rank] + Int64(_GRAPH_EPOCH_INDEX)).toint()
             )
             slot = generation % Uint32(2)
-            slot_offset = (
-                Int64(slot)
-                * Int64(slot_delta_256b)
-                * Int64(_SLOT_ALIGNMENT)
-            )
+            slot_offset = Int64(slot) * Int64(slot_delta_256b) * Int64(_SLOT_ALIGNMENT)
         combined_packs = first_packs + second_packs
-        local_stage = self._staging_words(
-            staging[self._rank] + slot_offset
-        )
+        local_stage = self._staging_words(staging[self._rank] + slot_offset)
 
         linear = Int32(tidx)
         while linear < batch * first_packs:
@@ -1309,11 +1264,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             _copy_16b(
                 local_first + Int64(linear) * Int64(4),
                 local_stage
-                + (
-                    Int64(batch_index) * Int64(combined_packs)
-                    + Int64(pack)
-                )
-                * Int64(4),
+                + (Int64(batch_index) * Int64(combined_packs) + Int64(pack)) * Int64(4),
             )
             linear += Int32(self._threads)
         linear = Int32(tidx)
@@ -1344,9 +1295,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
         linear = Int32(tidx)
         while linear < first_output_packs:
             batch_index = linear // (Int32(self._world_size) * first_packs)
-            row_pack = linear - (
-                batch_index * Int32(self._world_size) * first_packs
-            )
+            row_pack = linear - (batch_index * Int32(self._world_size) * first_packs)
             source_rank = row_pack // first_packs
             pack = row_pack - source_rank * first_packs
             # Default to this rank's own slice so the address is always
@@ -1355,11 +1304,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             source_address = Int64(
                 (
                     local_first
-                    + (
-                        Int64(batch_index) * Int64(first_packs)
-                        + Int64(pack)
-                    )
-                    * Int64(4)
+                    + (Int64(batch_index) * Int64(first_packs) + Int64(pack)) * Int64(4)
                 ).toint()
             )
             for source in cutlass.range_constexpr(self._world_size):
@@ -1371,14 +1316,9 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                         source_words = self._staging_words(
                             staging[source] + slot_offset
                         )
-                        source_base = (
-                            Int64(batch_index) * Int64(combined_packs)
-                        )
+                        source_base = Int64(batch_index) * Int64(combined_packs)
                     source_address = Int64(
-                        (
-                            source_words
-                            + (source_base + Int64(pack)) * Int64(4)
-                        ).toint()
+                        (source_words + (source_base + Int64(pack)) * Int64(4)).toint()
                     )
             _copy_16b_addr(
                 source_address,
@@ -1387,14 +1327,10 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             linear += Int32(self._threads)
 
         if cutlass.const_expr(not self._kimi_topk):
-            second_output_packs = (
-                batch * Int32(self._world_size) * second_packs
-            )
+            second_output_packs = batch * Int32(self._world_size) * second_packs
             linear = Int32(tidx)
             while linear < second_output_packs:
-                batch_index = linear // (
-                    Int32(self._world_size) * second_packs
-                )
+                batch_index = linear // (Int32(self._world_size) * second_packs)
                 row_pack = linear - (
                     batch_index * Int32(self._world_size) * second_packs
                 )
@@ -1403,10 +1339,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 source_address = Int64(
                     (
                         local_second
-                        + (
-                            Int64(batch_index) * Int64(second_packs)
-                            + Int64(pack)
-                        )
+                        + (Int64(batch_index) * Int64(second_packs) + Int64(pack))
                         * Int64(4)
                     ).toint()
                 )
@@ -1414,28 +1347,22 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                     if source_rank == Int32(source):
                         if cutlass.const_expr(source == self._rank):
                             source_words = local_second
-                            source_base = (
-                                Int64(batch_index) * Int64(second_packs)
-                            )
+                            source_base = Int64(batch_index) * Int64(second_packs)
                         else:
                             source_words = self._staging_words(
                                 staging[source] + slot_offset
                             )
-                            source_base = (
-                                Int64(batch_index) * Int64(combined_packs)
-                                + Int64(first_packs)
-                            )
+                            source_base = Int64(batch_index) * Int64(
+                                combined_packs
+                            ) + Int64(first_packs)
                         source_address = Int64(
                             (
-                                source_words
-                                + (source_base + Int64(pack)) * Int64(4)
+                                source_words + (source_base + Int64(pack)) * Int64(4)
                             ).toint()
                         )
                 _copy_16b_addr(
                     source_address,
-                    Int64(
-                        (output_second + Int64(linear) * Int64(4)).toint()
-                    ),
+                    Int64((output_second + Int64(linear) * Int64(4)).toint()),
                 )
                 linear += Int32(self._threads)
         else:
@@ -1473,9 +1400,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             while router_pack < router_packs_total:
                 source_rank = router_pack // second_packs
                 pack = router_pack - source_rank * second_packs
-                source_address = Int64(
-                    (local_second + Int64(pack) * Int64(4)).toint()
-                )
+                source_address = Int64((local_second + Int64(pack) * Int64(4)).toint())
                 for source in cutlass.range_constexpr(self._world_size):
                     if source_rank == Int32(source):
                         if cutlass.const_expr(source == self._rank):
@@ -1488,8 +1413,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                             source_base = Int64(first_packs)
                         source_address = Int64(
                             (
-                                source_words
-                                + (source_base + Int64(pack)) * Int64(4)
+                                source_words + (source_base + Int64(pack)) * Int64(4)
                             ).toint()
                         )
                 word0, word1, word2, word3 = ld_global_v4_u32(source_address)
@@ -1507,19 +1431,13 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             expert = Int32(tidx)
             while expert < Int32(896):
                 router_value = selection_scores[expert]
-                bias = cute.arch.load(
-                    correction_bias + Int64(expert), Float32
-                )
+                bias = cute.arch.load(correction_bias + Int64(expert), Float32)
                 unbiased = Float32(0.0)
                 selection = Float32(float("-inf"))
                 if cute.math.isfinite(router_value) and cute.math.isfinite(bias):
-                    unbiased = (
-                        Float32(0.5)
-                        * cute.math.tanh(
-                            Float32(0.5) * router_value, fastmath=False
-                        )
-                        + Float32(0.5)
-                    )
+                    unbiased = Float32(0.5) * cute.math.tanh(
+                        Float32(0.5) * router_value, fastmath=False
+                    ) + Float32(0.5)
                     selection = unbiased + bias
                     if selection == Float32(0.0):
                         selection = Float32(0.0)
@@ -1558,9 +1476,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                             keys[item] = _select_if_eq_u64(
                                 previous, head, keys[item + 1], keys[item]
                             )
-                        keys[7] = _select_if_eq_u64(
-                            previous, head, tail_key, keys[7]
-                        )
+                        keys[7] = _select_if_eq_u64(previous, head, tail_key, keys[7])
                     previous = _kimi_warp_max_key(keys[0])
                     lane_key = _select_if_eq_u64(
                         cutlass.Uint64(lane),
@@ -1675,18 +1591,10 @@ class _KimiTopK16Launch:
 
         @cute.struct
         class SharedStorage:
-            selection_scores: cute.struct.Align[
-                cute.struct.MemRange[Float32, 896], 16
-            ]
-            unbiased_scores: cute.struct.Align[
-                cute.struct.MemRange[Float32, 896], 16
-            ]
-            active_experts: cute.struct.Align[
-                cute.struct.MemRange[Int32, 896], 16
-            ]
-            warp_keys: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint64, 16], 16
-            ]
+            selection_scores: cute.struct.Align[cute.struct.MemRange[Float32, 896], 16]
+            unbiased_scores: cute.struct.Align[cute.struct.MemRange[Float32, 896], 16]
+            active_experts: cute.struct.Align[cute.struct.MemRange[Int32, 896], 16]
+            warp_keys: cute.struct.Align[cute.struct.MemRange[cutlass.Uint64, 16], 16]
 
         storage = smem_alloc.allocate(SharedStorage)
         selection_scores = storage.selection_scores.get_tensor(
@@ -1698,9 +1606,7 @@ class _KimiTopK16Launch:
         active_experts = storage.active_experts.get_tensor(
             cute.make_layout((896,), stride=(1,))
         )
-        warp_keys = storage.warp_keys.get_tensor(
-            cute.make_layout((16,), stride=(1,))
-        )
+        warp_keys = storage.warp_keys.get_tensor(cute.make_layout((16,), stride=(1,)))
 
         row_offset = Int64(bidx) * Int64(896)
         expert = Int32(tidx)
@@ -1708,9 +1614,7 @@ class _KimiTopK16Launch:
             router_value = cute.arch.load(
                 router_logits + row_offset + Int64(expert), Float32
             )
-            bias = cute.arch.load(
-                correction_bias + Int64(expert), Float32
-            )
+            bias = cute.arch.load(correction_bias + Int64(expert), Float32)
             unbiased = Float32(1.0) / (
                 Float32(1.0) + cute.math.exp(-router_value, fastmath=True)
             )
@@ -1756,12 +1660,8 @@ class _KimiTopK16Launch:
             cute.arch.sync_threads()
             if Int32(tidx) == Int32(0):
                 selected_key = warp_keys[0]
-                for source_warp in cutlass.range_constexpr(
-                    1, self._threads // 32
-                ):
-                    selected_key = cutlass.max(
-                        selected_key, warp_keys[source_warp]
-                    )
+                for source_warp in cutlass.range_constexpr(1, self._threads // 32):
+                    selected_key = cutlass.max(selected_key, warp_keys[source_warp])
                 final_expert = _kimi_key_expert(selected_key)
                 selected_ids[selected] = final_expert
                 selected_weights[selected] = unbiased_scores[final_expert]
@@ -1849,13 +1749,16 @@ def is_lse_reduce_scatter_prepared(
     threads: int,
     device_slot_selection: bool,
 ) -> bool:
-    return _lse_launcher_key(
-        world_size,
-        rank,
-        dtype_name,
-        threads,
-        device_slot_selection,
-    ) in _PREPARED_LSE_LAUNCHERS
+    return (
+        _lse_launcher_key(
+            world_size,
+            rank,
+            dtype_name,
+            threads,
+            device_slot_selection,
+        )
+        in _PREPARED_LSE_LAUNCHERS
+    )
 
 
 @program_cache
@@ -1984,12 +1887,15 @@ def is_all_gather_heads_prepared(
     threads: int,
     device_slot_selection: bool,
 ) -> bool:
-    return _gather_launcher_key(
-        world_size,
-        rank,
-        threads,
-        device_slot_selection,
-    ) in _PREPARED_GATHER_LAUNCHERS
+    return (
+        _gather_launcher_key(
+            world_size,
+            rank,
+            threads,
+            device_slot_selection,
+        )
+        in _PREPARED_GATHER_LAUNCHERS
+    )
 
 
 @program_cache
@@ -2100,13 +2006,16 @@ def is_all_gather_pair_prepared(
     device_slot_selection: bool,
     kimi_topk: bool = False,
 ) -> bool:
-    return _pair_launcher_key(
-        world_size,
-        rank,
-        threads,
-        device_slot_selection,
-        kimi_topk,
-    ) in _PREPARED_PAIR_LAUNCHERS
+    return (
+        _pair_launcher_key(
+            world_size,
+            rank,
+            threads,
+            device_slot_selection,
+            kimi_topk,
+        )
+        in _PREPARED_PAIR_LAUNCHERS
+    )
 
 
 @program_cache
@@ -2192,11 +2101,7 @@ def _get_compiled_all_gather_pair(
             _u32_ptr(local_second_ptr),
             _f32_ptr(correction_bias_ptr),
             _u32_ptr(output_first_ptr),
-            (
-                _f32_ptr(output_second_ptr)
-                if kimi_topk
-                else _u32_ptr(output_second_ptr)
-            ),
+            (_f32_ptr(output_second_ptr) if kimi_topk else _u32_ptr(output_second_ptr)),
             _i32_ptr(output_ids_ptr),
             *(_u8_ptr(ptr) for ptr in stages),
             *(_u32_ptr(ptr, align=4) for ptr in signals),
@@ -2450,9 +2355,7 @@ def all_gather_pair_kimi_topk(
             True,
         )
         if not device_slot_selection:
-            _get_compiled_all_gather_pair(
-                world_size, rank, 512, True, True
-            )
+            _get_compiled_all_gather_pair(world_size, rank, 512, True, True)
     launcher(
         local_down_ptr,
         local_router_ptr,

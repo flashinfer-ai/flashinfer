@@ -343,6 +343,7 @@ def _compile(*, binding: Binding) -> object:
             _CACHE[signature] = compiled
     return compiled
 
+
 @dataclass(frozen=True)
 class _PreparedRemapLauncher:
     signature: tuple[int, int, bool]
@@ -359,8 +360,6 @@ class _PreparedRemapLauncher:
 def _resolve_launcher(*, binding: Binding) -> _PreparedRemapLauncher:
     compiled = _compile(binding=binding)
     return _PreparedRemapLauncher(_signature(binding), compiled)
-
-
 
 
 def clear_caches() -> None:

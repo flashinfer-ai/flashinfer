@@ -405,7 +405,10 @@ def s0_quantize_q_to_smem(
                 q_sc_view[fused_slot] = rounded
                 if cutlass.const_expr(packed_q_scale_words):
                     st_shared_u8(
-                        q_fp8_base_addr + h * Int32(q_nope_stride) + Int32(d_nope) + blk,
+                        q_fp8_base_addr
+                        + h * Int32(q_nope_stride)
+                        + Int32(d_nope)
+                        + blk,
                         (_ue8m0 & Uint32(255)).to(cutlass.Uint8),
                     )
 
@@ -946,6 +949,7 @@ def s1_qk_nope_nvfp4_bf16(
                 b1,
             )
     return qk
+
 
 @cute.jit
 def s1_qk_nope_block_scaled_glm_h8_swap_ab(
@@ -1557,9 +1561,7 @@ def s0_normalize_dsv41_kv_to_fp8(
         if tag == Int32(1):
             for blk in cutlass.range_constexpr(8):
                 dim = Int32(blk * 64) + lane * Int32(2)
-                ratio = _ld_u16_zext(
-                    ratio_row, (dim // Int32(16)) * Int32(2)
-                )
+                ratio = _ld_u16_zext(ratio_row, (dim // Int32(16)) * Int32(2))
                 if ratio != Uint32(0x3C00):
                     native_h2 = _cvt_e4m3x2_to_f16x2(_ld_u16_zext(row, dim))
                     ratio_h2 = ratio | (ratio << Uint32(16))
@@ -1587,9 +1589,7 @@ def s0_normalize_dsv41_kv_to_fp8(
             for rev in cutlass.range_constexpr(8):
                 blk = 7 - rev
                 dim = Int32(blk * 64) + lane * Int32(2)
-                ratio = _ld_u16_zext(
-                    ratio_row, (dim // Int32(16)) * Int32(2)
-                )
+                ratio = _ld_u16_zext(ratio_row, (dim // Int32(16)) * Int32(2))
                 native_h2 = fp4_decode_2(_ld_u8_zext(row, dim // Int32(2)))
                 ratio_h2 = ratio | (ratio << Uint32(16))
                 scaled_h2 = half2_mul(native_h2, ratio_h2)
@@ -1617,6 +1617,7 @@ def s0_normalize_dsv41_kv_to_fp8(
             for blk in cutlass.range_constexpr(8):
                 _st_shared_u16(row + Int32(blk * 64) + lane * Int32(2), Uint32(0))
 
+
 @cute.jit
 def _nvfp4_scalar_bf16_u16(
     kv_fp4_base_addr: Int32,
@@ -1629,7 +1630,10 @@ def _nvfp4_scalar_bf16_u16(
     kv_sc_base_addr: Int32 = Int32(0),
 ) -> Uint32:
     pair = _nvfp4_pair_bfloat2(
-        kv_fp4_base_addr, entry, dim & ~Int32(1), latent_scale,
+        kv_fp4_base_addr,
+        entry,
+        dim & ~Int32(1),
+        latent_scale,
         kv_smem_stride=kv_smem_stride,
         latent_scale_per_token=latent_scale_per_token,
         kv_sc_base_addr=kv_sc_base_addr,
@@ -2469,8 +2473,11 @@ def s6_xv_nope_nvfp4_bf16(
                 a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
                 ent0 = k_base + tid * Int32(2)
                 pair0 = _nvfp4_pair_bfloat2(
-                    kv_fp4_base_addr, ent0 + entry_parity, col & ~Int32(1),
-                    latent_scale, kv_smem_stride=kv_smem_stride,
+                    kv_fp4_base_addr,
+                    ent0 + entry_parity,
+                    col & ~Int32(1),
+                    latent_scale,
+                    kv_smem_stride=kv_smem_stride,
                     latent_scale_per_token=latent_scale_per_token,
                     kv_sc_base_addr=kv_sc_base_addr,
                 )

@@ -6,6 +6,7 @@ tile. Codes and swizzled SFA scale bytes for those rows must be BIT-IDENTICAL
 to the validated TMA quantizer — same per-block math, only the padding work is
 skipped — so the GEMM result is unchanged.
 """
+
 from __future__ import annotations
 
 import pytest

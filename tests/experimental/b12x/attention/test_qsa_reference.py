@@ -195,8 +195,10 @@ def test_packed_prefill_commits_only_final_ring_suffix_and_final_anchor() -> Non
     dim = 8
     capacity = 8
     rows = 19
-    raw = torch.arange(rows * dim, dtype=torch.float32).reshape(rows, dim).to(
-        torch.bfloat16
+    raw = (
+        torch.arange(rows * dim, dtype=torch.float32)
+        .reshape(rows, dim)
+        .to(torch.bfloat16)
     )
     positions = torch.arange(rows, dtype=torch.int64)
     ring = torch.full((capacity, dim), -1, dtype=torch.bfloat16)
@@ -225,6 +227,8 @@ def test_packed_prefill_commits_only_final_ring_suffix_and_final_anchor() -> Non
         assert int(tags[slot]) == position
         assert torch.equal(ring[slot], raw[position])
         assert int(rope_tags[slot, 0]) == position
+
+
 def test_packed_speculative_compression_rejects_inconsistent_acceptance() -> None:
     with pytest.raises(ValueError, match="prior interval start"):
         packed_stream_compress_reference(

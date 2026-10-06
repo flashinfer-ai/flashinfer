@@ -248,7 +248,6 @@ class _LayerLayout:
         return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
 
 
-
 def _materialize_layout(caps: LayerCaps, config: PleConfig) -> _LayerLayout:
     normalized_u_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)
     cursor = normalized_u_offset_bytes
@@ -275,9 +274,15 @@ def _materialize_layout(caps: LayerCaps, config: PleConfig) -> _LayerLayout:
     )
 
 
-def plan_layer(caps: LayerCaps, *, invocation: FrozenMapping = FrozenMapping(), override: PleConfig | None = None) -> Plan:
+def plan_layer(
+    caps: LayerCaps,
+    *,
+    invocation: FrozenMapping = FrozenMapping(),
+    override: PleConfig | None = None,
+) -> Plan:
     """Declare PLE residual geometry without resolving or compiling kernels."""
     from ._preparation import make_plan
+
     if not isinstance(caps, LayerCaps):
         raise TypeError("caps must be LayerCaps")
     return make_plan(caps, invocation=invocation, override=override)

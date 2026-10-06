@@ -147,7 +147,9 @@ class BlockQuantWeights:
             if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.uint8:
                 raise TypeError(f"IQ2XSWeights.{name} must be a uint8 tensor")
             if tensor.ndim != 4 or tensor.shape[-1] != spec.block_bytes:
-                raise ValueError(f"{self.codec} {name} must have shape [E,N,K/{spec.block_weights},{spec.block_bytes}]")
+                raise ValueError(
+                    f"{self.codec} {name} must have shape [E,N,K/{spec.block_weights},{spec.block_bytes}]"
+                )
 
 
 IQ2XSWeights = BlockQuantWeights

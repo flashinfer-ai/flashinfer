@@ -53,8 +53,7 @@ def test_vocab_argmax_peer_graph_is_reciprocal_and_connected(
     world_size: int,
 ) -> None:
     peer_sets = {
-        rank: set(_selected_peers(rank, world_size))
-        for rank in range(world_size)
+        rank: set(_selected_peers(rank, world_size)) for rank in range(world_size)
     }
     for rank, peers in peer_sets.items():
         for peer in peers:
@@ -264,9 +263,7 @@ def test_vocab_argmax_close_reaches_all_barriers_after_ipc_close_failure(
 ) -> None:
     runtime = _fake_runtime()
     runtime.group = MagicMock()
-    runtime._ipc.cudaIpcCloseMemHandle.side_effect = RuntimeError(
-        "IPC close failed"
-    )
+    runtime._ipc.cudaIpcCloseMemHandle.side_effect = RuntimeError("IPC close failed")
     barrier = MagicMock()
     monkeypatch.setattr(torch.cuda, "synchronize", MagicMock())
     monkeypatch.setattr(torch.distributed, "barrier", barrier)

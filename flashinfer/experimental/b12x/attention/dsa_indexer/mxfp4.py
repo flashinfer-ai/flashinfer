@@ -493,7 +493,11 @@ class _TensorCorePagedScore(_PagedScore):
             pool_stride,
             pool_pages,
         ).launch(
-            grid=(cutlass.min((width - Int32(1)) // Int32(64) + Int32(1), Int32(256)), rows, 1),
+            grid=(
+                cutlass.min((width - Int32(1)) // Int32(64) + Int32(1), Int32(256)),
+                rows,
+                1,
+            ),
             block=(128, 1, 1),
             stream=stream,
         )
@@ -580,11 +584,7 @@ class _TensorCorePagedScore(_PagedScore):
         tx, _, _ = cute.arch.thread_idx()
         _, row, _ = cute.arch.block_idx()
         lane = Int32(tx) % Int32(32)
-        col = (
-            tile_start
-            + (Int32(tx) // Int32(32)) * Int32(16)
-            + lane // Int32(4)
-        )
+        col = tile_start + (Int32(tx) // Int32(32)) * Int32(16) + lane // Int32(4)
         kb = cute.make_rmem_tensor((2,), Int64)
         sb = cute.make_rmem_tensor((2,), Int64)
         valid_key = cute.make_rmem_tensor((2,), cutlass.Boolean)
@@ -969,6 +969,7 @@ class _CompiledLauncher:
     @property
     def __b12x_programs__(self):
         from b12x._lib.compile_plan import program_keys
+
         return program_keys(self.raw)
 
 
@@ -1027,7 +1028,10 @@ def _launch(kind, recipe, tensors, scalars, *, launcher=None):
         if launcher is None:
             launcher = _compile(kind, recipe, tensors[0].device.index)
         launcher.raw(
-            *(_ptr(t, dtype) for t, dtype in zip(tensors, launcher.dtypes, strict=True)),
+            *(
+                _ptr(t, dtype)
+                for t, dtype in zip(tensors, launcher.dtypes, strict=True)
+            ),
             *scalars,
             current_cuda_stream(),
         )
@@ -1043,7 +1047,10 @@ def _check(tensor, name, shape, dtype, device):
 
 
 def _quantize_q_mxfp4(
-    query: torch.Tensor, *, q_mxfp4: torch.Tensor, q_scales: torch.Tensor,
+    query: torch.Tensor,
+    *,
+    q_mxfp4: torch.Tensor,
+    q_scales: torch.Tensor,
     launcher,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the prepared query-quantizer launcher into caller-owned buffers."""
@@ -1055,8 +1062,11 @@ def _quantize_q_mxfp4(
     rows = query.numel() // 128
     if rows:
         _launch(
-            "quantize", (False, 64), (query, q_mxfp4, q_scales, query),
-            (rows, 0, 0), launcher=launcher,
+            "quantize",
+            (False, 64),
+            (query, q_mxfp4, q_scales, query),
+            (rows, 0, 0),
+            launcher=launcher,
         )
     return q_mxfp4, q_scales
 
@@ -1174,7 +1184,11 @@ def plan_mxfp4(caps, *, score_kind=None):
         views.append((name, shape, dtype, offset, nbytes))
         offset += nbytes
     if score_kind is None:
-        score_kind = "score_tensorcore" if caps.mode == "prefill" or caps.num_q_heads == 32 else "score"
+        score_kind = (
+            "score_tensorcore"
+            if caps.mode == "prefill" or caps.num_q_heads == 32
+            else "score"
+        )
     if score_kind not in ("score", "score_tensorcore"):
         raise ValueError("unsupported MXFP4 score kind")
     return MXFP4PagedPlan(caps, tuple(views), offset, score_kind)
@@ -1315,17 +1329,35 @@ def score_mxfp4(binding, *, launchers=None):
     rows = binding.q_mxfp4.shape[0]
     scores = rt.scratch["scores"][:rows]
     candidates = rt.candidate_indices if caps.max_candidates else rt.cache_lengths
-    candidate_lengths = rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
+    candidate_lengths = (
+        rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
+    )
     page_stride = 0 if rt.page_table.shape[0] == 1 else rt.page_table.stride(0)
     kind = binding.plan.inner.score_kind
     recipe = (caps.num_q_heads, bool(caps.max_candidates), caps.page_size)
     _launch(
-        kind, recipe,
-        (binding.q_mxfp4, binding.q_scales, binding.query_weights,
-         binding.index_k_cache, rt.page_table, rt.cache_lengths, rt.active_width,
-         candidates, candidate_lengths, scores),
-        (rows, scores.shape[1], rt.page_table.shape[1], page_stride,
-         binding.index_k_cache.stride(0), binding.index_k_cache.shape[0]),
+        kind,
+        recipe,
+        (
+            binding.q_mxfp4,
+            binding.q_scales,
+            binding.query_weights,
+            binding.index_k_cache,
+            rt.page_table,
+            rt.cache_lengths,
+            rt.active_width,
+            candidates,
+            candidate_lengths,
+            scores,
+        ),
+        (
+            rows,
+            scores.shape[1],
+            rt.page_table.shape[1],
+            page_stride,
+            binding.index_k_cache.stride(0),
+            binding.index_k_cache.shape[0],
+        ),
         launcher=None if launchers is None else launchers[(kind, recipe)],
     )
     return scores
@@ -1335,41 +1367,105 @@ def select_mxfp4(binding, *, launchers=None):
     caps, rt = binding.plan.caps, binding.runtime
     rows = binding.q_mxfp4.shape[0]
     s = {name: view[:rows] for name, view in rt.scratch.items()}
-    candidate_lengths = rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
+    candidate_lengths = (
+        rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
+    )
+
     def launch(kind, recipe, tensors, scalars):
-        _launch(kind, recipe, tensors, scalars,
-                launcher=None if launchers is None else launchers[(kind, recipe)])
-    launch("prepare", (bool(caps.max_candidates), False),
-           (s["scores"], s["logits"], rt.cache_lengths, rt.active_width,
-            candidate_lengths, s["lengths"]),
-           (rows, s["scores"].shape[1], s["logits"].shape[1]))
-    run_row_topk(row_logits=s["logits"], lengths=s["lengths"], topk=caps.topk,
-                 output_values=s["values"], output_indices=s["indices"],
-                 output_gather_table=rt.candidate_indices,
-                 launcher=None if launchers is None else launchers[("topk", caps.topk)][0])
-    out_values = binding.output_scores if binding.output_scores is not None else s["sorted_values"]
-    launch("sort", (caps.topk, False),
-           (s["indices"], s["values"], binding.output_indices, out_values,
-            rt.cache_lengths, rt.active_width, s["lengths"]), (rows,))
+        _launch(
+            kind,
+            recipe,
+            tensors,
+            scalars,
+            launcher=None if launchers is None else launchers[(kind, recipe)],
+        )
+
+    launch(
+        "prepare",
+        (bool(caps.max_candidates), False),
+        (
+            s["scores"],
+            s["logits"],
+            rt.cache_lengths,
+            rt.active_width,
+            candidate_lengths,
+            s["lengths"],
+        ),
+        (rows, s["scores"].shape[1], s["logits"].shape[1]),
+    )
+    run_row_topk(
+        row_logits=s["logits"],
+        lengths=s["lengths"],
+        topk=caps.topk,
+        output_values=s["values"],
+        output_indices=s["indices"],
+        output_gather_table=rt.candidate_indices,
+        launcher=None if launchers is None else launchers[("topk", caps.topk)][0],
+    )
+    out_values = (
+        binding.output_scores
+        if binding.output_scores is not None
+        else s["sorted_values"]
+    )
+    launch(
+        "sort",
+        (caps.topk, False),
+        (
+            s["indices"],
+            s["values"],
+            binding.output_indices,
+            out_values,
+            rt.cache_lengths,
+            rt.active_width,
+            s["lengths"],
+        ),
+        (rows,),
+    )
     if caps.candidate_topk_blocks:
-        launch("prepare", (False, True),
-               (s["scores"], s["block_logits"], rt.cache_lengths, rt.active_width,
-                rt.cache_lengths, s["block_lengths"]),
-               (rows, s["scores"].shape[1], s["block_logits"].shape[1]))
-        run_row_topk(row_logits=s["block_logits"], lengths=s["block_lengths"],
-                     topk=caps.candidate_topk_blocks,
-                     output_values=s["block_values"], output_indices=s["block_indices"],
-                     launcher=None if launchers is None else launchers[("topk", caps.candidate_topk_blocks)][0])
-        launch("sort", (caps.candidate_topk_blocks, True),
-               (s["block_indices"], s["block_values"], rt.candidate_output,
-                s["block_values"], rt.cache_lengths, rt.active_width,
-                rt.candidate_output_lengths), (rows,))
+        launch(
+            "prepare",
+            (False, True),
+            (
+                s["scores"],
+                s["block_logits"],
+                rt.cache_lengths,
+                rt.active_width,
+                rt.cache_lengths,
+                s["block_lengths"],
+            ),
+            (rows, s["scores"].shape[1], s["block_logits"].shape[1]),
+        )
+        run_row_topk(
+            row_logits=s["block_logits"],
+            lengths=s["block_lengths"],
+            topk=caps.candidate_topk_blocks,
+            output_values=s["block_values"],
+            output_indices=s["block_indices"],
+            launcher=None
+            if launchers is None
+            else launchers[("topk", caps.candidate_topk_blocks)][0],
+        )
+        launch(
+            "sort",
+            (caps.candidate_topk_blocks, True),
+            (
+                s["block_indices"],
+                s["block_values"],
+                rt.candidate_output,
+                s["block_values"],
+                rt.cache_lengths,
+                rt.active_width,
+                rt.candidate_output_lengths,
+            ),
+            (rows,),
+        )
     return binding.output_indices
 
 
 @dataclass(frozen=True, kw_only=True)
 class MXFP4Binding:
     """Private binding carrier; public callers receive dsa_indexer.Binding."""
+
     plan: object
     runtime: MXFP4Runtime
     q_mxfp4: torch.Tensor
@@ -1382,8 +1478,10 @@ class MXFP4Binding:
 
 class MXFP4PreparedState:
     """Materialized MXFP4 indexer retaining every callable used at runtime."""
+
     def __init__(self, layout, launchers):
         from types import MappingProxyType
+
         self.layout = layout
         self.caps = layout.caps
         self._launchers = MappingProxyType(dict(launchers))
@@ -1392,30 +1490,61 @@ class MXFP4PreparedState:
     def __b12x_programs__(self):
         """Expose the retained concrete carriers to compile-pool accounting."""
         from b12x._lib.compile_plan import program_keys
+
         return program_keys(self.__b12x_dependencies__)
 
     @property
     def __b12x_dependencies__(self):
         return tuple(self._launchers.values())
 
-    def bind(self, *, scratch, q_mxfp4, q_scales, query_weights, index_k_cache,
-             page_table, cache_lengths, active_width, output_indices,
-             output_scores=None, candidate_indices=None, candidate_lengths=None,
-             candidate_output=None, candidate_output_lengths=None, score_width=None,
-             **_ignored):
+    def bind(
+        self,
+        *,
+        scratch,
+        q_mxfp4,
+        q_scales,
+        query_weights,
+        index_k_cache,
+        page_table,
+        cache_lengths,
+        active_width,
+        output_indices,
+        output_scores=None,
+        candidate_indices=None,
+        candidate_lengths=None,
+        candidate_output=None,
+        candidate_output_lengths=None,
+        score_width=None,
+        **_ignored,
+    ):
         runtime = bind_mxfp4(
-            self, scratch=scratch, q_mxfp4=q_mxfp4, q_scales=q_scales,
-            query_weights=query_weights, index_k_cache=index_k_cache,
-            page_table=page_table, cache_lengths=cache_lengths,
-            active_width=active_width, output_indices=output_indices,
-            output_scores=output_scores, candidate_indices=candidate_indices,
-            candidate_lengths=candidate_lengths, candidate_output=candidate_output,
-            candidate_output_lengths=candidate_output_lengths, score_width=score_width,
+            self,
+            scratch=scratch,
+            q_mxfp4=q_mxfp4,
+            q_scales=q_scales,
+            query_weights=query_weights,
+            index_k_cache=index_k_cache,
+            page_table=page_table,
+            cache_lengths=cache_lengths,
+            active_width=active_width,
+            output_indices=output_indices,
+            output_scores=output_scores,
+            candidate_indices=candidate_indices,
+            candidate_lengths=candidate_lengths,
+            candidate_output=candidate_output,
+            candidate_output_lengths=candidate_output_lengths,
+            score_width=score_width,
         )
-        return MXFP4Binding(plan=self, runtime=runtime, q_mxfp4=q_mxfp4,
-                            q_scales=q_scales, query_weights=query_weights,
-                            index_k_cache=index_k_cache, output_indices=output_indices,
-                            output_scores=output_scores)
+        return MXFP4Binding(
+            plan=self,
+            runtime=runtime,
+            q_mxfp4=q_mxfp4,
+            q_scales=q_scales,
+            query_weights=query_weights,
+            index_k_cache=index_k_cache,
+            output_indices=output_indices,
+            output_scores=output_scores,
+        )
 
     @property
     def inner(self):
@@ -1423,13 +1552,17 @@ class MXFP4PreparedState:
 
     def quantize_query(self, query, *, q_mxfp4, q_scales):
         return _quantize_q_mxfp4(
-            query, q_mxfp4=q_mxfp4, q_scales=q_scales,
+            query,
+            q_mxfp4=q_mxfp4,
+            q_scales=q_scales,
             launcher=self._launchers[("quantize", (False, 64))],
         )
 
     def write_index_keys(self, keys, *, index_k_cache, slot_mapping):
         return _quantize_write_index_k_mxfp4(
-            keys, index_k_cache=index_k_cache, slot_mapping=slot_mapping,
+            keys,
+            index_k_cache=index_k_cache,
+            slot_mapping=slot_mapping,
             page_size=self.caps.page_size,
             launcher=self._launchers[("quantize", (True, self.caps.page_size))],
         )
@@ -1445,19 +1578,22 @@ def materialize_mxfp4(caps, *, device_index, score_kind=None):
     recipes = [
         ("quantize", (False, 64)),
         ("quantize", (True, caps.page_size)),
-        (layout.score_kind,
-         (caps.num_q_heads, bool(caps.max_candidates), caps.page_size)),
+        (
+            layout.score_kind,
+            (caps.num_q_heads, bool(caps.max_candidates), caps.page_size),
+        ),
         ("prepare", (bool(caps.max_candidates), False)),
         ("sort", (caps.topk, False)),
     ]
     if caps.candidate_topk_blocks:
-        recipes.extend((
-            ("prepare", (False, True)),
-            ("sort", (caps.candidate_topk_blocks, True)),
-        ))
+        recipes.extend(
+            (
+                ("prepare", (False, True)),
+                ("sort", (caps.candidate_topk_blocks, True)),
+            )
+        )
     launchers = {
-        (kind, recipe): _compile(kind, recipe, device_index)
-        for kind, recipe in recipes
+        (kind, recipe): _compile(kind, recipe, device_index) for kind, recipe in recipes
     }
     from torch._subclasses.fake_tensor import FakeTensorMode
     from b12x._lib.compile_plan import compile_only_launches
@@ -1468,8 +1604,10 @@ def materialize_mxfp4(caps, *, device_index, score_kind=None):
         selectors.append((caps.candidate_topk_blocks, (width + 7) // 8, False))
     with FakeTensorMode(), compile_only_launches():
         for topk, columns, gather in selectors:
+
             def empty(shape, dtype):
                 return torch.empty(shape, dtype=dtype, device=caps.device)
+
             resolved = {}
             run_row_topk(
                 row_logits=empty((caps.max_q_rows, columns), torch.float32),
@@ -1477,7 +1615,9 @@ def materialize_mxfp4(caps, *, device_index, score_kind=None):
                 topk=topk,
                 output_values=empty((caps.max_q_rows, topk), torch.float32),
                 output_indices=empty((caps.max_q_rows, topk), torch.int32),
-                output_gather_table=empty((caps.max_q_rows, columns), torch.int32) if gather else None,
+                output_gather_table=empty((caps.max_q_rows, columns), torch.int32)
+                if gather
+                else None,
                 launcher_sink=resolved,
             )
             launchers[("topk", topk)] = (resolved[("row", gather, True)], ())

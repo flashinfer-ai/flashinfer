@@ -7,6 +7,7 @@ keys for every configuration and a cached start recompiles nothing.
 The planning runs in a subprocess because the offline compile target shims
 the process-global CUDA runtime the way a compiler worker does.
 """
+
 from __future__ import annotations
 
 import json
@@ -82,9 +83,13 @@ print(json.dumps(report))
 def _plan_programs(component: str) -> dict:
     proc = subprocess.run(
         [sys.executable, "-c", PROBE.format(component=component)],
-        capture_output=True, text=True, timeout=900,
+        capture_output=True,
+        text=True,
+        timeout=900,
     )
-    assert proc.returncode == 0, f"probe failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert proc.returncode == 0, (
+        f"probe failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
@@ -111,8 +116,16 @@ def test_kda_prefill_selection_key_ignores_the_state_slot_count():
 
     identity = DeviceIdentity("nvidia", (12, 0), 148, "synthetic SM120")
     query = KdaPrefillQuery(
-        heads=6, head_dim=128, model_dtype="bfloat16", state_dtype="float32", qk_l2norm=True,
-        checkpoint_export=True, max_tokens=64, max_seqs=2, max_state_slots=7, null_state_index=0,
+        heads=6,
+        head_dim=128,
+        model_dtype="bfloat16",
+        state_dtype="float32",
+        qk_l2norm=True,
+        checkpoint_export=True,
+        max_tokens=64,
+        max_seqs=2,
+        max_state_slots=7,
+        null_state_index=0,
     )
 
     def encoded(declared):

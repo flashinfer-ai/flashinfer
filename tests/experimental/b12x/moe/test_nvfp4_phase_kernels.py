@@ -40,7 +40,9 @@ def _fake_i32(shape):
 
 
 def _fake_f32(shape):
-    return cute.runtime.make_fake_compact_tensor(cutlass.Float32, shape, assumed_align=16)
+    return cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, shape, assumed_align=16
+    )
 
 
 def _fake_u8(shape):
@@ -89,7 +91,6 @@ def _quantize_nvfp4_rows(x: torch.Tensor, global_scale: float):
     return packed, dequant.reshape(rows, cols), scale.reshape(rows, cols // 16)
 
 
-
 def _oracle_swizzled_scale(scale_f32: torch.Tensor, rows: int) -> torch.Tensor:
     """Swizzled E4M3 scale plane in the layout ``unswizzle_block_scale``
     inverts (the publisher's canonical F8_128x4 atom).
@@ -127,7 +128,9 @@ def _swizzle_scale_plane(scale_f32: torch.Tensor, rows: int) -> torch.Tensor:
     # Compact per-plane size: one padded 128-row atom contributes k4*512
     # bytes, matching tile_atom_to_shape_SF's contiguous atom packing so the
     # per-expert stride is (rows/128)*k4*512.
-    flat = torch.zeros((rows_p // 128) * k4 * 512, dtype=torch.uint8, device=e4m3.device)
+    flat = torch.zeros(
+        (rows_p // 128) * k4 * 512, dtype=torch.uint8, device=e4m3.device
+    )
     flat[off.view(-1)] = padded.view(-1)
     return flat
 
@@ -169,8 +172,9 @@ def _route_domain(m, E, top_k, topk_ids, tile_base=0):
     return expert_tile_base, phys_tiles, rows_capacity, pair_phys
 
 
-def _build_domain(*, E: int, K: int, n: int, m: int, top_k: int, seed: int,
-                  tile_base: int = 0):
+def _build_domain(
+    *, E: int, K: int, n: int, m: int, top_k: int, seed: int, tile_base: int = 0
+):
     """Build synthetic weights + routed inputs + the expert-major domain."""
     from b12x.moe._shared.kernels.reference import moe_reference_nvfp4
 
@@ -198,12 +202,16 @@ def _build_domain(*, E: int, K: int, n: int, m: int, top_k: int, seed: int,
     w13_scales = torch.stack([q[2] for q in w13_q]).contiguous()
     w2_scales = torch.stack([q[2] for q in w2_q]).contiguous()
 
-    w13_oracle_sf = torch.stack(
-        [_oracle_swizzled_scale(w13_scales[e], w1_n) for e in range(E)]
-    ).contiguous().view(E, -1)
-    w2_oracle_sf = torch.stack(
-        [_oracle_swizzled_scale(w2_scales[e], K) for e in range(E)]
-    ).contiguous().view(E, -1)
+    w13_oracle_sf = (
+        torch.stack([_oracle_swizzled_scale(w13_scales[e], w1_n) for e in range(E)])
+        .contiguous()
+        .view(E, -1)
+    )
+    w2_oracle_sf = (
+        torch.stack([_oracle_swizzled_scale(w2_scales[e], K) for e in range(E)])
+        .contiguous()
+        .view(E, -1)
+    )
     oracle = moe_reference_nvfp4(
         x.float(),
         w13_packed,
@@ -243,7 +251,9 @@ def _build_domain(*, E: int, K: int, n: int, m: int, top_k: int, seed: int,
     token_weights[phys_of_pair] = topk_weights.reshape(-1)
 
     intermediate_tiles = n // _TILE_N
-    task_expert = torch.zeros(phys_tiles * intermediate_tiles, dtype=torch.int32, device=device)
+    task_expert = torch.zeros(
+        phys_tiles * intermediate_tiles, dtype=torch.int32, device=device
+    )
     task_valid_rows = torch.zeros_like(task_expert)
     row_counts = [0] * E
     for pair in range(m * top_k):
@@ -257,7 +267,9 @@ def _build_domain(*, E: int, K: int, n: int, m: int, top_k: int, seed: int,
             for it in range(intermediate_tiles):
                 task_expert[tile * intermediate_tiles + it] = e
                 task_valid_rows[tile * intermediate_tiles + it] = valid
-    expert_tile_base_t = torch.tensor(expert_tile_base, dtype=torch.int32, device=device)
+    expert_tile_base_t = torch.tensor(
+        expert_tile_base, dtype=torch.int32, device=device
+    )
 
     # The route/pack front-end materializes one quantized activation row per
     # ROUTE (expert-major physical row), fanning a shared-token quantization
@@ -423,7 +435,9 @@ def _allocate_intermediate(domain):
     rows_capacity = domain["rows_capacity"]
     intermediate_tiles = domain["intermediate_tiles"]
     words_per_row = intermediate_tiles * 16
-    total_elements = rows_capacity * words_per_row + intermediate_tiles * rows_capacity * 2
+    total_elements = (
+        rows_capacity * words_per_row + intermediate_tiles * rows_capacity * 2
+    )
     return torch.zeros(total_elements, dtype=torch.int32, device="cuda")
 
 
@@ -469,8 +483,7 @@ def _launch_phase2(compiled, domain, intermediate_u32, down_alpha_t, scatter_out
     )
 
 
-def _run_phases(domain, *, compiled_p1=None, compiled_p2=None,
-                scatter_output=None):
+def _run_phases(domain, *, compiled_p1=None, compiled_p2=None, scatter_output=None):
     E = domain["E"]
     ones = torch.ones(E, device="cuda")
     intermediate_u32 = _allocate_intermediate(domain)
@@ -575,7 +588,9 @@ def test_nvfp4_phase_intermediate_matches_torch() -> None:
     rows_capacity = domain["rows_capacity"]
     words_per_row = domain["intermediate_tiles"] * 16
     raw = intermediate_u32.view(torch.uint8)
-    payload = raw[: rows_capacity * words_per_row * 4].view(rows_capacity, domain["n"] // 2)
+    payload = raw[: rows_capacity * words_per_row * 4].view(
+        rows_capacity, domain["n"] // 2
+    )
     sf_plane = raw[rows_capacity * words_per_row * 4 :]
 
     from b12x._lib.intrinsics import FLOAT8_E4M3_MAX, fp4_quantize_values_torch
@@ -618,9 +633,12 @@ def test_nvfp4_phase_intermediate_matches_torch() -> None:
                     sbyte = int(w0[blk])
                 else:
                     sbyte = int(w1[blk - 4])
-                sf = torch.tensor([sbyte], dtype=torch.uint8, device="cuda").view(
-                    torch.float8_e4m3fn
-                ).float().item()
+                sf = (
+                    torch.tensor([sbyte], dtype=torch.uint8, device="cuda")
+                    .view(torch.float8_e4m3fn)
+                    .float()
+                    .item()
+                )
                 lo = (kb * 16) // 2
                 # decode 16 values from 8 bytes
                 vals = []
@@ -709,12 +727,16 @@ def test_nvfp4_phase_frozen_resolution_two_counts() -> None:
     compiled_p2 = _compile_phase2(domain_a)
 
     # launch A (small live counts)
-    out_a, intermediate_a = _run_phases(domain_a, compiled_p1=compiled_p1, compiled_p2=compiled_p2)
+    out_a, intermediate_a = _run_phases(
+        domain_a, compiled_p1=compiled_p1, compiled_p2=compiled_p2
+    )
     metrics_a = compare_to_reference(out_a.float(), domain_a["oracle"])
     assert metrics_a.cos > 0.9999, metrics_a
 
     # same compiled callables, larger live counts
-    out_b, intermediate_b = _run_phases(domain_b, compiled_p1=compiled_p1, compiled_p2=compiled_p2)
+    out_b, intermediate_b = _run_phases(
+        domain_b, compiled_p1=compiled_p1, compiled_p2=compiled_p2
+    )
     metrics_b = compare_to_reference(out_b.float(), domain_b["oracle"])
     assert metrics_b.cos > 0.9999, metrics_b
     assert out_b.abs().sum().item() > 0

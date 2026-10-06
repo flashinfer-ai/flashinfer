@@ -43,7 +43,11 @@ def _netmask(ifname: str) -> Optional[str]:
     """IPv4 netmask of ``ifname`` (SIOCGIFNETMASK), or None when unavailable."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         try:
-            raw = fcntl.ioctl(sock.fileno(), _SIOCGIFNETMASK, struct.pack("256s", ifname.encode()[:15]))
+            raw = fcntl.ioctl(
+                sock.fileno(),
+                _SIOCGIFNETMASK,
+                struct.pack("256s", ifname.encode()[:15]),
+            )
         except OSError:
             return None
     return socket.inet_ntoa(raw[20:24])
@@ -62,11 +66,23 @@ def local_endpoints(
         port = root / name / "ports" / "1"
         ipv4 = None
         try:
-            raw = bytes.fromhex(port.joinpath("gids", str(gid_index)).read_text().strip().replace(":", ""))
-            ifname = port.joinpath("gid_attrs", "ndevs", str(gid_index)).read_text().strip()
+            raw = bytes.fromhex(
+                port.joinpath("gids", str(gid_index))
+                .read_text()
+                .strip()
+                .replace(":", "")
+            )
+            ifname = (
+                port.joinpath("gid_attrs", "ndevs", str(gid_index)).read_text().strip()
+            )
         except (OSError, ValueError):
             raw, ifname = b"", ""
-        if len(raw) == 16 and raw[:10] == bytes(10) and raw[10:12] == b"\xff\xff" and ifname:
+        if (
+            len(raw) == 16
+            and raw[:10] == bytes(10)
+            and raw[10:12] == b"\xff\xff"
+            and ifname
+        ):
             mask = _netmask(ifname)
             if mask is not None:
                 ipv4 = ipaddress.IPv4Interface(f"{socket.inet_ntoa(raw[12:])}/{mask}")
@@ -76,7 +92,9 @@ def local_endpoints(
 
 def _same_link(a: Endpoint, b: Endpoint) -> bool:
     """True when both endpoints have IPv4 addresses on the same network."""
-    return a.ipv4 is not None and b.ipv4 is not None and a.ipv4.network == b.ipv4.network
+    return (
+        a.ipv4 is not None and b.ipv4 is not None and a.ipv4.network == b.ipv4.network
+    )
 
 
 def _index_pairing_valid(endpoints: Sequence[Sequence[Endpoint]], rails: int) -> bool:
@@ -103,7 +121,10 @@ def _best_matching(candidates: list, rails: int) -> Optional[list[tuple[int, int
     """
     best = None
     for combo in itertools.combinations(candidates, rails):
-        if len({l for _, l, _ in combo}) < rails or len({r for _, _, r in combo}) < rails:
+        if (
+            len({l for _, l, _ in combo}) < rails
+            or len({r for _, _, r in combo}) < rails
+        ):
             continue
         score = (sum(key[0] for key, _, _ in combo), [key for key, _, _ in combo])
         if best is None or score < best[0]:
@@ -119,7 +140,9 @@ def plan_routes(
         raise ValueError(f"rails must be 1..{MAX_RAILS}, got {rails}")
     world = len(endpoints)
     if _index_pairing_valid(endpoints, rails):
-        return [[] if p == rank else [(h, h) for h in range(rails)] for p in range(world)]
+        return [
+            [] if p == rank else [(h, h) for h in range(rails)] for p in range(world)
+        ]
     local = endpoints[rank]
     routes: list[list[tuple[int, int]]] = []
     for peer in range(world):
@@ -131,9 +154,16 @@ def plan_routes(
         # same-index pairs with no IPv4 GID on either end, which cannot be checked and are trusted in
         # caller order, as index pairing would. Every key is symmetric between the two ranks.
         verified = [
-            ((0, int(local[l].ipv4.network.network_address),
-              min(int(local[l].ipv4.ip), int(remote[r].ipv4.ip)),
-              max(int(local[l].ipv4.ip), int(remote[r].ipv4.ip))), l, r)
+            (
+                (
+                    0,
+                    int(local[l].ipv4.network.network_address),
+                    min(int(local[l].ipv4.ip), int(remote[r].ipv4.ip)),
+                    max(int(local[l].ipv4.ip), int(remote[r].ipv4.ip)),
+                ),
+                l,
+                r,
+            )
             for l in range(len(local))
             for r in range(len(remote))
             if _same_link(local[l], remote[r])
@@ -146,7 +176,9 @@ def plan_routes(
         candidates = sorted(verified + unverifiable)
         chosen = _best_matching(candidates, rails)
         if chosen is None:
-            reach = next((k for k in range(rails - 1, 0, -1) if _best_matching(candidates, k)), 0)
+            reach = next(
+                (k for k in range(rails - 1, 0, -1) if _best_matching(candidates, k)), 0
+            )
             raise RuntimeError(
                 f"rank {rank}: {reach} of {rails} RoCE rails have a link to rank {peer}; "
                 f"local {[(e.name, str(e.ipv4)) for e in local]}, "

@@ -129,14 +129,18 @@ class TestKernel:
             sm90_utils.get_smem_layout_atom(utils.LayoutEnum.COL_MAJOR, bf, 128),
             bf,
         )
-        bf16_staged = cute.tile_to_shape(bf16_atom, (128, 128, self.num_stages), order=(0, 1, 2))
+        bf16_staged = cute.tile_to_shape(
+            bf16_atom, (128, 128, self.num_stages), order=(0, 1, 2)
+        )
         mma_op = _MmaMXF8Op(
             cutlass.Float8E4M3FN,
             cutlass.Float32,
             sf,
         )
         perm = sm120_utils.get_permutation_mnk(self.tile_shape_mnk, _SF_VEC_SIZE, True)
-        tiled_mma = cute.make_tiled_mma(mma_op, cute.make_layout((4, 2, 1)), permutation_mnk=perm)
+        tiled_mma = cute.make_tiled_mma(
+            mma_op, cute.make_layout((4, 2, 1)), permutation_mnk=perm
+        )
         sfa_staged = sm120_make_smem_layout_sfa(
             tiled_mma, self.tile_shape_mnk, _SF_VEC_SIZE, 1
         )
@@ -202,7 +206,9 @@ class TestKernel:
         @cute.struct
         class S:
             pmem: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
-            sBF16: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, bf16_cs], 1024]
+            sBF16: cute.struct.Align[
+                cute.struct.MemRange[cutlass.BFloat16, bf16_cs], 1024
+            ]
             # Packed-byte smem region (128*96). Required: without it the cutlass-dsl
             # backend miscompiles the quantize/load path to an illegal instruction on
             # this sm_120/ptxas build (codegen sensitive to smem layout). The packed

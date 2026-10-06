@@ -3,6 +3,7 @@
 The FP6 surface lives in ``b12x.quantization.mxfp6``; FP4/NVFP4 support lives
 elsewhere in ``b12x.quantization``.
 """
+
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
@@ -145,7 +146,9 @@ def compile_bf16_to_fp6_tma(
     sfa_fake = make_ptr(sf, 16, AddressSpace.gmem, assumed_align=16)
     mac = min(get_max_active_clusters(1), get_num_sm(torch.device("cuda")))
     kernel = FP6TestKernel(fmt, emit=emit, per_row=per_row)
-    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
     raw = b12x_compile(
         kernel,
         bf16_fake,
@@ -205,9 +208,7 @@ def compile_bf16_to_fp6_tma(
         if any(tensor.device != bf16_input.device for _, tensor, *_ in expected[1:]):
             raise ValueError("all BF16-to-FP6 tensors must be on one device")
         pa_storage = packed_a_flat.view(1, M, packed_k_bytes).permute(1, 2, 0)
-        sfa_p = make_ptr(
-            sf, scale_flat.data_ptr(), AddressSpace.gmem, assumed_align=16
-        )
+        sfa_p = make_ptr(sf, scale_flat.data_ptr(), AddressSpace.gmem, assumed_align=16)
         raw(bf16_input, global_scale, pa_storage, sfa_p, current_cuda_stream())
 
     launch = attach_programs(launch, raw)

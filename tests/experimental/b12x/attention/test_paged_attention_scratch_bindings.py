@@ -13,7 +13,11 @@ from b12x.attention import paged
 import b12x.attention.paged._forward as paged_api
 import b12x.attention.paged._scratch as scratch_api
 from b12x.attention.paged.reference import paged_attention_reference
-from b12x.attention.paged._scratch import B12XPagedAttentionBinding, B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention.paged._scratch import (
+    B12XPagedAttentionBinding,
+    B12XPagedAttentionScratchCaps,
+    plan_paged_attention_scratch,
+)
 
 from b12x.testing.reference.helpers import require_b12x
 
@@ -96,7 +100,9 @@ def _make_mimo_packed_inputs(
     seed: int = 0,
     page_table_width: int = 8,
     num_pages: int = 64,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     if len(q_seqlens) != len(cache_seqlens):
         raise ValueError("q_seqlens and cache_seqlens must have the same length")
     torch.manual_seed(seed)
@@ -106,13 +112,16 @@ def _make_mimo_packed_inputs(
     head_dim_qk = 192
     head_dim_vo = 128
     total_q = sum(q_seqlens)
-    q = torch.randn(
-        total_q,
-        q_heads,
-        head_dim_qk,
-        device=device,
-        dtype=torch.bfloat16,
-    ) / 4
+    q = (
+        torch.randn(
+            total_q,
+            q_heads,
+            head_dim_qk,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 4
+    )
 
     pages_per_request = [
         (cache_len + page_size - 1) // page_size for cache_len in cache_seqlens
@@ -122,22 +131,28 @@ def _make_mimo_packed_inputs(
     if num_pages < sum(pages_per_request):
         raise ValueError("num_pages is too small for cache_seqlens")
 
-    k_compact = torch.randn(
-        num_pages,
-        page_size,
-        kv_heads,
-        head_dim_qk,
-        device=device,
-        dtype=torch.bfloat16,
-    ) / 4
-    v_compact = torch.randn(
-        num_pages,
-        page_size,
-        kv_heads,
-        head_dim_vo,
-        device=device,
-        dtype=torch.bfloat16,
-    ) / 4
+    k_compact = (
+        torch.randn(
+            num_pages,
+            page_size,
+            kv_heads,
+            head_dim_qk,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 4
+    )
+    v_compact = (
+        torch.randn(
+            num_pages,
+            page_size,
+            kv_heads,
+            head_dim_vo,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 4
+    )
     packed_cache = torch.empty(
         (*k_compact.shape[:-1], head_dim_qk + head_dim_vo),
         dtype=torch.bfloat16,
@@ -378,10 +393,14 @@ def test_paged_attention_scratch_bind_returns_common_binding_type(
     plan = plan_paged_attention_scratch(_caps())
     (spec,) = plan.scratch_specs()
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    q, k_cache, v_cache, output, page_table, cache_seqlens, cu_seqlens_q = _runtime_tensors()
+    q, k_cache, v_cache, output, page_table, cache_seqlens, cu_seqlens_q = (
+        _runtime_tensors()
+    )
     calls = {}
 
-    def fake_prepare(self, page_table_arg, cache_seqlens_arg, cu_seqlens_q_arg, **kwargs):
+    def fake_prepare(
+        self, page_table_arg, cache_seqlens_arg, cu_seqlens_q_arg, **kwargs
+    ):
         calls["page_table"] = page_table_arg
         calls["cache_seqlens"] = cache_seqlens_arg
         calls["cu_seqlens_q"] = cu_seqlens_q_arg
@@ -418,7 +437,9 @@ def test_paged_attention_scratch_bind_returns_common_binding_type(
     assert calls["kwargs"]["active_total_q"] == 2
 
 
-def test_paged_attention_binding_run_uses_function_binding_argument(monkeypatch) -> None:
+def test_paged_attention_binding_run_uses_function_binding_argument(
+    monkeypatch,
+) -> None:
     scratch = object()
     q, k_cache, v_cache, output, *_ = _runtime_tensors()
     binding = B12XPagedAttentionBinding(
@@ -460,30 +481,57 @@ def test_heuristic_extend_binding_compiles_before_frozen_runs_high_page_ids() ->
     page_table = torch.arange(
         high_page_id, num_cache_pages, dtype=torch.int32, device=device
     ).view(batch, page_table_width)
-    q = torch.randn((q_capacity, q_heads, head_dim), dtype=torch.bfloat16, device=device) / 4
+    q = (
+        torch.randn(
+            (q_capacity, q_heads, head_dim), dtype=torch.bfloat16, device=device
+        )
+        / 4
+    )
     output = torch.full_like(q, torch.nan)
 
     capacity = paged.extend_graph_capacity(
-        device=device, q_dtype=q.dtype, kv_dtype=k_cache.dtype, num_q_heads=q_heads,
-        num_kv_heads=kv_heads, head_dim_qk=head_dim, head_dim_vo=head_dim,
-        page_size=page_size, batch=batch, total_q_capacity=q_capacity,
-        max_cache_page_count=page_table_width, window_left=-1,
+        device=device,
+        q_dtype=q.dtype,
+        kv_dtype=k_cache.dtype,
+        num_q_heads=q_heads,
+        num_kv_heads=kv_heads,
+        head_dim_qk=head_dim,
+        head_dim_vo=head_dim,
+        page_size=page_size,
+        batch=batch,
+        total_q_capacity=q_capacity,
+        max_cache_page_count=page_table_width,
+        window_left=-1,
     )
     plan = paged.plan(
         paged.Caps(
-            device=device, mode="extend", dtype=q.dtype, kv_dtype=k_cache.dtype,
-            num_q_heads=q_heads, num_kv_heads=kv_heads, head_dim_qk=head_dim,
-            head_dim_vo=head_dim, page_size=page_size, max_total_q=q_capacity,
-            max_batch=batch, max_page_table_width=page_table_width,
-            max_work_items=capacity.max_work_items, max_partial_rows=0,
-            num_cache_pages=num_cache_pages, use_cuda_graph=True,
+            device=device,
+            mode="extend",
+            dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            num_q_heads=q_heads,
+            num_kv_heads=kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            page_size=page_size,
+            max_total_q=q_capacity,
+            max_batch=batch,
+            max_page_table_width=page_table_width,
+            max_work_items=capacity.max_work_items,
+            max_partial_rows=0,
+            num_cache_pages=num_cache_pages,
+            use_cuda_graph=True,
             copy_runtime_metadata=False,
         )
     )
     plan.prepare_graph_replay_state(
         page_table=page_table,
-        cache_seqlens=torch.full((batch,), max_cache_seqlen, dtype=torch.int32, device=device),
-        cu_seqlens_q=torch.tensor([0, q_capacity // 2, q_capacity], dtype=torch.int32, device=device),
+        cache_seqlens=torch.full(
+            (batch,), max_cache_seqlen, dtype=torch.int32, device=device
+        ),
+        cu_seqlens_q=torch.tensor(
+            [0, q_capacity // 2, q_capacity], dtype=torch.int32, device=device
+        ),
         active_total_q=q_capacity,
         window_left=-1,
     )
@@ -493,14 +541,28 @@ def test_heuristic_extend_binding_compiles_before_frozen_runs_high_page_ids() ->
     def live(q_seqlens: list[int], cache_seqlens: list[int]):
         rows = sum(q_seqlens)
         lens = torch.tensor(cache_seqlens, dtype=torch.int32, device=device)
-        cu_seqlens_q = torch.tensor([0, q_seqlens[0], rows], dtype=torch.int32, device=device)
+        cu_seqlens_q = torch.tensor(
+            [0, q_seqlens[0], rows], dtype=torch.int32, device=device
+        )
         binding = plan.bind(
-            scratch=scratch, q=q[:rows], k_cache=k_cache, v_cache=v_cache,
-            output=output[:rows], page_table=page_table, cache_seqlens=lens,
-            cu_seqlens_q=cu_seqlens_q, window_left=-1,
+            scratch=scratch,
+            q=q[:rows],
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output[:rows],
+            page_table=page_table,
+            cache_seqlens=lens,
+            cu_seqlens_q=cu_seqlens_q,
+            window_left=-1,
         )
         reference, _ = paged_attention_reference(
-            q[:rows], k_cache, v_cache, page_table, lens, cu_seqlens_q, causal=True,
+            q[:rows],
+            k_cache,
+            v_cache,
+            page_table,
+            lens,
+            cu_seqlens_q,
+            causal=True,
         )
         return binding, reference
 
@@ -513,12 +575,17 @@ def test_heuristic_extend_binding_compiles_before_frozen_runs_high_page_ids() ->
     assert torch.isnan(output).all().item()
 
     # forbid_lowering installs b12x's Triton hook, so the guard also rejects Triton JIT misses.
-    with kernel_resolution_guard("paged.compile primed this binding"), forbid_lowering():
+    with (
+        kernel_resolution_guard("paged.compile primed this binding"),
+        forbid_lowering(),
+    ):
         for q_seqlens, cache_seqlens in cases:
             binding, reference = live(q_seqlens, cache_seqlens)
             output.fill_(torch.nan)
             out, _ = paged.run(binding=binding)
-            torch.testing.assert_close(out.float(), reference.float(), atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(
+                out.float(), reference.float(), atol=2e-2, rtol=2e-2
+            )
 
 
 def test_paged_attention_forward_rejects_binding_plus_runtime_tensors() -> None:
@@ -804,7 +871,9 @@ def test_mimo_v25_extend_replans_from_warmup_to_single_short_prompt() -> None:
 
 
 @torch.inference_mode()
-def test_mimo_v25_packed_diffkv_scratch_cuda_graph_replays_with_updated_metadata() -> None:
+def test_mimo_v25_packed_diffkv_scratch_cuda_graph_replays_with_updated_metadata() -> (
+    None
+):
     require_b12x()
     paged_api.clear_paged_caches()
 

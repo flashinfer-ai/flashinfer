@@ -6,7 +6,10 @@ import pytest
 
 from b12x.moe.fused_moe._tuning import TUNING, MoeDecodeConfig
 from b12x.preparation import FrozenMapping
-from tests.experimental.b12x.preparation.test_precision_choices import DEVICE, _nvfp4_query
+from tests.experimental.b12x.preparation.test_precision_choices import (
+    DEVICE,
+    _nvfp4_query,
+)
 
 
 @pytest.mark.parametrize("capacity", [4, 32, 128])
@@ -26,14 +29,22 @@ def test_prepared_compressed_planes_race_both_scale_decoders(capacity):
             assert config.backend == "dynamic"
 
 
-@pytest.mark.parametrize("changes", [
-    {"nvfp4_inline_scales": False}, {"hidden_size": 192},
-    {"intermediate_size": 96}, {"activation": "relu2"},
-    {"controls": FrozenMapping({"dynamic_tile_mn": (16, 64)})},
-])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"nvfp4_inline_scales": False},
+        {"hidden_size": 192},
+        {"intermediate_size": 96},
+        {"activation": "relu2"},
+        {"controls": FrozenMapping({"dynamic_tile_mn": (16, 64)})},
+    ],
+)
 def test_inline_scale_override_rejects_incompatible_storage_or_geometry(changes):
     query = replace(_nvfp4_query(), nvfp4_inline_scales=True)
-    config = next(c for _, c in TUNING.eligible_plan(query, DEVICE).candidates
-                  if c.nvfp4_inline_scales)
+    config = next(
+        c
+        for _, c in TUNING.eligible_plan(query, DEVICE).candidates
+        if c.nvfp4_inline_scales
+    )
     with pytest.raises(ValueError, match="prepared compressed planes"):
         TUNING.configure(replace(query, **changes), device=DEVICE, override=config)

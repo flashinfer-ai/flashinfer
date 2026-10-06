@@ -5,7 +5,12 @@ import math
 import pytest
 import torch
 
-from b12x.attention._shared.mla.api import MLASparseDecodeMetadata, MLASparseExtendMetadata, sparse_mla_decode_forward, sparse_mla_extend_forward
+from b12x.attention._shared.mla.api import (
+    MLASparseDecodeMetadata,
+    MLASparseExtendMetadata,
+    sparse_mla_decode_forward,
+    sparse_mla_extend_forward,
+)
 from b12x.attention._shared.mla.packed import extract_packed_kv_runtime_views
 
 
@@ -438,7 +443,6 @@ def test_workspace_ragged_kv_gather_reuses_fixed_capacity_buffer() -> None:
     )
 
 
-
 def test_sparse_mla_verify_uses_reference_when_sm120_unavailable(monkeypatch) -> None:
     workspace = _make_workspace(mode="verify", topk=2048)
     captured: dict[str, object] = {}
@@ -636,7 +640,10 @@ def test_mla_decode_workspace_allocates_split_buffers_and_chunk_scalars() -> Non
     assert workspace.output_buffer is not None
     assert workspace.output_buffer.shape == (8, 8, 256)
     assert workspace.output_buffer.is_contiguous()
-    assert workspace.output_buffer.data_ptr() == workspace.tmp_output[:, :, 0, :].data_ptr()
+    assert (
+        workspace.output_buffer.data_ptr()
+        == workspace.tmp_output[:, :, 0, :].data_ptr()
+    )
     assert workspace.final_lse is not None
     assert workspace.final_lse.shape == (8, 8)
     workspace.set_decode_chunk_config(kv_chunk_size=256, num_chunks=8)

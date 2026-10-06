@@ -124,9 +124,11 @@ def test_decode_wide_plan_with_short_live_lengths_replays_under_graph() -> None:
     generator = torch.Generator(device="cpu").manual_seed(11)
     plan, scratch = _plan(device, rows)
     kv = _kv_cache(device, kv_rows, generator)
-    q = (torch.randn((rows, _HEADS, _QK_DIM), generator=generator) / 4).to(
-        torch.bfloat16
-    ).to(device)
+    q = (
+        (torch.randn((rows, _HEADS, _QK_DIM), generator=generator) / 4)
+        .to(torch.bfloat16)
+        .to(device)
+    )
     lengths_a = torch.tensor([3, 64, 65, 200, 330, 1, 127, 512], dtype=torch.int32)
     lengths_b = torch.tensor([1, 2, 130, 64, 4096, 5, 63, 66], dtype=torch.int32)
     selected_a, active_a = _padded_selection(lengths_a, generator)

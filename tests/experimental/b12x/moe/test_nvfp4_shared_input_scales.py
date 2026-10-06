@@ -14,8 +14,12 @@ def _owner(scales: torch.Tensor, *, immutable=True) -> B12XFP4ExpertWeights:
     experts = 4
     plan = fused_moe.plan_weights(
         source=fused_moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
-        activation=fused_moe.ActivationSpec(mode="a4", nonlinearity="silu", io_dtype=torch.bfloat16),
-        geometry=fused_moe.MoEGeometry(num_experts=experts, hidden_size=128, intermediate_size=128),
+        activation=fused_moe.ActivationSpec(
+            mode="a4", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=experts, hidden_size=128, intermediate_size=128
+        ),
     )
     return B12XFP4ExpertWeights(
         plan=plan._impl,

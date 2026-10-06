@@ -71,9 +71,7 @@ def pack_mla_kv_cache_reference(
     fields = [torch.cat(quant_bytes, dim=1), torch.cat(scale_bytes, dim=1)]
     if k_rope_2d is not None:
         fields.append(
-            k_rope_2d.view(torch.uint8).reshape(
-                k_rope_2d.shape[0], _MLA_ROPE_DIM * 2
-            )
+            k_rope_2d.view(torch.uint8).reshape(k_rope_2d.shape[0], _MLA_ROPE_DIM * 2)
         )
     packed = torch.cat(fields, dim=1)
     return packed.unsqueeze(1).contiguous()

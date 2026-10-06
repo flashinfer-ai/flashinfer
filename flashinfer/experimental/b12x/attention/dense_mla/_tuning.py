@@ -145,7 +145,8 @@ def _tuning_parameters(query: DenseMlaQuery, device: DeviceIdentity | None):
         divisor = (capacity - 1) // (quotient - 1) + 1
     splits.add(_default_config(query, device).max_splits)
     return ParameterSpace.create(
-        TUNING.knobs, values={"max_splits": range(1, capacity + 1)},
+        TUNING.knobs,
+        values={"max_splits": range(1, capacity + 1)},
         exhaustive=query.exhaustive,
         efficiency_predicates=(lambda p: p["max_splits"] in splits,),
     )
@@ -184,9 +185,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    knobs=(
-        Knob(name="max_splits", values=None, binding=ParameterBinding.COMPILE),
-    ),
+    knobs=(Knob(name="max_splits", values=None, binding=ParameterBinding.COMPILE),),
     candidate_contract_version=3,
     parameters=_tuning_parameters,
 )

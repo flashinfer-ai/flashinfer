@@ -55,12 +55,12 @@ class _W4A8ProbeKernel:
     @cute.jit
     def __call__(
         self,
-        mA: cute.Tensor,        # [16, 16] u32 = 16x64 e4m3 bytes, row-major
-        mB: cute.Tensor,        # [8, 8] u32 = 8x32 packed fp4 bytes (k-major)
-        mResidual: cute.Tensor, # [8] u32 = 8x4 e4m3 residual bytes (n, k16)
-        mSfaTable: cute.Tensor, # [32] u32 per-lane SFA register
-        mSfbTable: cute.Tensor, # [32] u32 per-lane SFB register
-        mOut: cute.Tensor,      # [16, 8] f32
+        mA: cute.Tensor,  # [16, 16] u32 = 16x64 e4m3 bytes, row-major
+        mB: cute.Tensor,  # [8, 8] u32 = 8x32 packed fp4 bytes (k-major)
+        mResidual: cute.Tensor,  # [8] u32 = 8x4 e4m3 residual bytes (n, k16)
+        mSfaTable: cute.Tensor,  # [32] u32 per-lane SFA register
+        mSfbTable: cute.Tensor,  # [32] u32 per-lane SFB register
+        mOut: cute.Tensor,  # [16, 8] f32
         stream: cuda.CUstream,
     ):
         self.kernel(mA, mB, mResidual, mSfaTable, mSfbTable, mOut).launch(
@@ -97,7 +97,9 @@ class _W4A8ProbeKernel:
             b1 = Uint32(0)
             if const_expr(self.use_residual):
                 res_word = Uint32(mResidual[g])
-                res_byte = (res_word >> ((Uint32(2 * kb) + (Uint32(c) >> 1)) * Uint32(8))) & Uint32(0xFF)
+                res_byte = (
+                    res_word >> ((Uint32(2 * kb) + (Uint32(c) >> 1)) * Uint32(8))
+                ) & Uint32(0xFF)
                 res_h2 = broadcast_f32_to_half2(fp8_e4m3_to_f32(res_byte))
                 b0, b1 = e2m1x8_mul_residual_to_e4m3x8(w, res_h2)
             else:
@@ -112,9 +114,16 @@ class _W4A8ProbeKernel:
             sfa_kb = (sfa >> (Uint32(kb) * Uint32(16))) & Uint32(0xFFFF)
             sfb_kb = (sfb >> (Uint32(kb) * Uint32(16))) & Uint32(0xFFFF)
             d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
-                d0, d1, d2, d3,
-                a0, a1, a2, a3,
-                b0, b1,
+                d0,
+                d1,
+                d2,
+                d3,
+                a0,
+                a1,
+                a2,
+                a3,
+                b0,
+                b1,
                 sfa_kb,
                 sfb_kb,
             )
@@ -182,9 +191,7 @@ class _TrellisW4A8ProbeKernel:
             a0 = Uint32(mA[g, Int32(8 * kb) + Int32(2) * c])
             a1 = Uint32(mA[g + Int32(8), Int32(8 * kb) + Int32(2) * c])
             a2 = Uint32(mA[g, Int32(8 * kb) + Int32(2) * c + Int32(1)])
-            a3 = Uint32(
-                mA[g + Int32(8), Int32(8 * kb) + Int32(2) * c + Int32(1)]
-            )
+            a3 = Uint32(mA[g + Int32(8), Int32(8 * kb) + Int32(2) * c + Int32(1)])
 
             sfa_kb = (sfa >> (Uint32(kb) * Uint32(16))) & Uint32(0xFFFF)
             sfb_kb = (sfb >> (Uint32(kb) * Uint32(16))) & Uint32(0xFFFF)
@@ -272,12 +279,8 @@ class _NativeTrellisW4A8ProbeKernel:
             b = Uint32(mPacked[kt, ib])
             merged = (Int64(a) << Int64(32)) | Int64(b)
             win_a = Uint32(merged >> Int64(s2))
-            win_b = Uint32(
-                merged >> Int64(s2 + Int32(4 * self.bits))
-            )
-            lo, hi = packed_decode_trellis_mul1_e4m3_to_e4m3x8(
-                win_a, win_b, self.bits
-            )
+            win_b = Uint32(merged >> Int64(s2 + Int32(4 * self.bits)))
+            lo, hi = packed_decode_trellis_mul1_e4m3_to_e4m3x8(win_a, win_b, self.bits)
             chosen = hi if const_expr(self.n_high) else lo
             if const_expr(kt == 0):
                 e0 = chosen
@@ -423,9 +426,9 @@ def _decode_mul1_e4m3_reference(
     inv = torch.tensor(0x1EEE, dtype=torch.int16, device=win_a.device).view(
         torch.float16
     )
-    bias = torch.tensor(
-        0xC931 - 0x10000, dtype=torch.int16, device=win_a.device
-    ).view(torch.float16)
+    bias = torch.tensor(0xC931 - 0x10000, dtype=torch.int16, device=win_a.device).view(
+        torch.float16
+    )
     reconstructed = (accumulator.double() * inv.double() + bias.double()).to(
         torch.float16
     )
@@ -444,9 +447,9 @@ def _decode_mul1_e4m3_states_reference(states: torch.Tensor) -> torch.Tensor:
     inv = torch.tensor(0x1EEE, dtype=torch.int16, device=states.device).view(
         torch.float16
     )
-    bias = torch.tensor(
-        0xC931 - 0x10000, dtype=torch.int16, device=states.device
-    ).view(torch.float16)
+    bias = torch.tensor(0xC931 - 0x10000, dtype=torch.int16, device=states.device).view(
+        torch.float16
+    )
     reconstructed = (accumulator.double() * inv.double() + bias.double()).to(
         torch.float16
     )
@@ -476,16 +479,42 @@ def _cyclic_trellis_states(edges: torch.Tensor, bits: int) -> torch.Tensor:
 # _NativeTrellisW4A8ProbeKernel.  This is purely a permutation within K32, so
 # the activation's UE8M0 scale group remains unchanged.
 _NATIVE_MMA_K32_PERM = (
-    0, 1, 8, 9, 4, 5, 12, 13,
-    2, 3, 10, 11, 6, 7, 14, 15,
-    20, 21, 28, 29, 16, 17, 24, 25,
-    22, 23, 30, 31, 18, 19, 26, 27,
+    0,
+    1,
+    8,
+    9,
+    4,
+    5,
+    12,
+    13,
+    2,
+    3,
+    10,
+    11,
+    6,
+    7,
+    14,
+    15,
+    20,
+    21,
+    28,
+    29,
+    16,
+    17,
+    24,
+    25,
+    22,
+    23,
+    30,
+    31,
+    18,
+    19,
+    26,
+    27,
 )
 
 
-def _native_tiles_reference(
-    edge_tiles: torch.Tensor, bits: int
-) -> torch.Tensor:
+def _native_tiles_reference(edge_tiles: torch.Tensor, bits: int) -> torch.Tensor:
     """Reconstruct two native K16xN16 tiles as logical B[N=16,K=32]."""
     b = torch.empty(16, 32, dtype=torch.float32, device=edge_tiles.device)
     for kt in range(2):
@@ -502,7 +531,9 @@ def _native_tiles_reference(
 
 
 def _unit_tables(device: torch.device) -> torch.Tensor:
-    return torch.full((32,), 0x7F7F7F7F, dtype=torch.int64, device=device).to(torch.int32)
+    return torch.full((32,), 0x7F7F7F7F, dtype=torch.int64, device=device).to(
+        torch.int32
+    )
 
 
 def _pack_b(values: torch.Tensor) -> torch.Tensor:
@@ -527,7 +558,23 @@ def test_w4a8_probe_data_path_exact_unit_scales() -> None:
     a_vals = torch.tensor([0.0, 0.5, 1.0, 2.0, -1.0, -0.5, 4.0, -2.0], device=device)
     a = a_vals[torch.randint(0, 8, (_M, _K), device=device)]
     fp4_grid = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
         device=device,
     )
     b = fp4_grid[torch.randint(0, 15, (_N, _K), device=device)]
@@ -579,9 +626,7 @@ def test_mul1_e4m3_trellis_decode_feeds_w4a8_mma_exactly(bits: int) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("bits", [2, 3, 4])
 @pytest.mark.parametrize("n_high", [False, True])
-def test_native_mul1_e4m3_tiles_feed_w4a8_mma_exactly(
-    bits: int, n_high: bool
-) -> None:
+def test_native_mul1_e4m3_tiles_feed_w4a8_mma_exactly(bits: int, n_high: bool) -> None:
     """Native tile decode + one-shuffle B mapping is an exact E4M3 MMA."""
     require_b12x()
     device = torch.device("cuda")
@@ -633,7 +678,9 @@ def test_w4a8_probe_residual_path_exact() -> None:
     torch.manual_seed(1)
     a_vals = torch.tensor([0.5, 1.0, 2.0, -1.0], device=device)
     a = a_vals[torch.randint(0, 4, (_M, _K), device=device)]
-    fp4_grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -6.0], device=device)
+    fp4_grid = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -6.0], device=device
+    )
     b = fp4_grid[torch.randint(0, 9, (_N, _K), device=device)]
     # Dyadic residuals are exact under f16 multiply + e4m3 round.
     res_vals = torch.tensor([1.0, 0.5, 2.0, 0.25], device=device)
@@ -738,7 +785,23 @@ def test_w4a8_probe_full_scaled_vs_oracle() -> None:
     a_vals = torch.tensor([0.0, 0.5, 1.0, 2.0, -1.0, -0.5, 4.0, -2.0], device=device)
     a = a_vals[torch.randint(0, 8, (_M, _K), device=device)]
     fp4_grid = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
         device=device,
     )
     b = fp4_grid[torch.randint(0, 15, (_N, _K), device=device)]

@@ -49,10 +49,14 @@ def _quantize_weight_mxfp4(w: torch.Tensor):
     bmax = blocked.abs().amax(dim=-1, keepdim=True)
     safe = torch.where(bmax > 0, bmax / 6.0, torch.ones_like(bmax))
     exponent = torch.ceil(torch.log2(safe)).clamp(-127, 127)
-    byte = torch.where(bmax > 0, exponent + 127, torch.zeros_like(exponent)).to(torch.uint8)
+    byte = torch.where(bmax > 0, exponent + 127, torch.zeros_like(exponent)).to(
+        torch.uint8
+    )
     scale = torch.where(bmax > 0, torch.exp2(exponent), torch.zeros_like(exponent))
     q = fp4_quantize_values_torch(
-        torch.where(scale > 0, blocked / scale.clamp(min=1e-30), torch.zeros_like(blocked)).view(rows, cols)
+        torch.where(
+            scale > 0, blocked / scale.clamp(min=1e-30), torch.zeros_like(blocked)
+        ).view(rows, cols)
     )
     return _pack_fp4_rows(q), byte.squeeze(-1)
 
@@ -75,7 +79,9 @@ def _fake_i32(shape):
 
 
 def _fake_f32(shape):
-    return cute.runtime.make_fake_compact_tensor(cutlass.Float32, shape, assumed_align=16)
+    return cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, shape, assumed_align=16
+    )
 
 
 def _active_route_reference_inputs(
@@ -137,8 +143,7 @@ def _run_w4a8_dynamic(
     if route_weight_slot is not None:
         if not 0 <= route_weight_slot < top_k:
             raise ValueError(
-                f"route_weight_slot must be in [0, {top_k}), got "
-                f"{route_weight_slot}"
+                f"route_weight_slot must be in [0, {top_k}), got {route_weight_slot}"
             )
         topk_weights.zero_()
         topk_weights[:, route_weight_slot] = 1.0
@@ -206,9 +211,19 @@ def _run_w4a8_dynamic(
     )
     reference = moe_reference_w4a8_mx(
         x.float(),
-        ref_w13_packed, ref_w13_mx, ref_res_w13, ones,
-        w2_packed, ref_w2_mx, ref_res_w2, ones,
-        reference_ids, reference_weights, E, K, n,
+        ref_w13_packed,
+        ref_w13_mx,
+        ref_res_w13,
+        ones,
+        w2_packed,
+        ref_w2_mx,
+        ref_res_w2,
+        ones,
+        reference_ids,
+        reference_weights,
+        E,
+        K,
+        n,
         activation=activation,
     )
 
@@ -218,9 +233,7 @@ def _run_w4a8_dynamic(
     phys_tiles = E + (m * top_k + tile_m - 1) // tile_m
     rows_padded = phys_tiles * tile_m
     gate_tile_cnt = (
-        (n + _TILE_N - 1) // _TILE_N
-        if is_gated
-        else (w1_n + _TILE_N - 1) // _TILE_N
+        (n + _TILE_N - 1) // _TILE_N if is_gated else (w1_n + _TILE_N - 1) // _TILE_N
     )
     max_tasks = phys_tiles * max(gate_tile_cnt, 1)
     mac = 4
@@ -239,6 +252,7 @@ def _run_w4a8_dynamic(
         dtype=torch.int32,
         device=device,
     )
+
     def z1():
         return torch.zeros(1, dtype=torch.int32, device=device)
 
@@ -289,10 +303,9 @@ def _run_w4a8_dynamic(
     b_down_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype, (K, n, E), stride_order=(1, 0, 2), assumed_align=16
     )
+
     def fake_ptr_u8():
-        return make_ptr(
-            cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
-        )
+        return make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
 
     def fake_ptr_i32():
         return make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
@@ -315,22 +328,49 @@ def _run_w4a8_dynamic(
         fake_ptr_u8(),
         fake_ptr_u8(),
         fake_ptr_u32(),
-        _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)),
-        _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)),
-        fake_ptr_i32(), fake_ptr_i32(), fake_ptr_i32(),
-        fake_ptr_i32(), fake_ptr_i32(), fake_ptr_i32(), fake_ptr_i32(),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
         b_w13_fake,
         make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16),
         b_down_fake,
         make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16),
-        fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(),
-        fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(),
-        _fake_i32((E,)), _fake_i32((E,)), _fake_i32((E + 1,)),
-        _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)),
+        fake_ptr_u8(),
+        fake_ptr_u8(),
+        fake_ptr_u8(),
+        fake_ptr_u8(),
+        fake_ptr_u32(),
+        fake_ptr_u32(),
+        fake_ptr_u32(),
+        fake_ptr_u32(),
+        _fake_i32((E,)),
+        _fake_i32((E,)),
+        _fake_i32((E + 1,)),
+        _fake_f32((E,)),
+        _fake_f32((E,)),
+        _fake_f32((E,)),
+        _fake_f32((E,)),
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_i32(),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
-        1, 1, 1, 1, 1, 1, 1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_fields(
             "tests.w4a8_dynamic.direct",
@@ -355,8 +395,13 @@ def _run_w4a8_dynamic(
         _gptr(cutlass.Uint8, packed_a),
         _gptr(cutlass.Uint8, scale_flat),
         _gptr(cutlass.Uint32, intermediate_u32),
-        barrier_count, barrier_epoch, pair_head, producers_done, all_pub,
-        task_head, task_tail,
+        barrier_count,
+        barrier_epoch,
+        pair_head,
+        producers_done,
+        all_pub,
+        task_head,
+        task_tail,
         _gptr(cutlass.Int32, task_ready, 4),
         _gptr(cutlass.Int32, task_expert, 4),
         _gptr(cutlass.Int32, task_m_tile, 4),
@@ -376,8 +421,13 @@ def _run_w4a8_dynamic(
         _gptr(cutlass.Uint32, repacked_sentinel),
         _gptr(cutlass.Uint32, repacked_sentinel),
         _gptr(cutlass.Uint32, repacked_sentinel),
-        row_counts, expert_write_rows, expert_tile_base,
-        ones, ones, ones, ones,
+        row_counts,
+        expert_write_rows,
+        expert_tile_base,
+        ones,
+        ones,
+        ones,
+        ones,
         _gptr(cutlass.BFloat16, scatter_output),
         _gptr(cutlass.Int32, token_map, 4),
         _gptr(cutlass.Float32, token_weights, 4),
@@ -391,14 +441,17 @@ def _run_w4a8_dynamic(
         current_cuda_stream(),
     )
     torch.cuda.synchronize()
-    if sum(
-        int(enabled)
-        for enabled in (
-            capture_intermediate,
-            capture_fc1_raw,
-            capture_fc1_staged,
+    if (
+        sum(
+            int(enabled)
+            for enabled in (
+                capture_intermediate,
+                capture_fc1_raw,
+                capture_fc1_staged,
+            )
         )
-    ) > 1:
+        > 1
+    ):
         raise ValueError(
             "intermediate, raw-FC1, and staged-FC1 captures are mutually exclusive"
         )
@@ -558,9 +611,7 @@ def _run_w4a8_dynamic(
                 K,
                 fp4_lut,
             ).view(w1_n, K)
-            reference_fc1_raw[physical_rows] = (
-                x_qd[token_rows] @ w13_eff[:32].T
-            )
+            reference_fc1_raw[physical_rows] = x_qd[token_rows] @ w13_eff[:32].T
             physical_expert[physical_rows] = expert
             physical_expert_local[physical_rows] = torch.arange(
                 count, dtype=torch.int32, device=device
@@ -582,17 +633,14 @@ def _run_w4a8_dynamic(
         device_payload = raw_bytes[: payload_words * 4].view(rows_padded, K)
         device_scale = (
             raw_bytes[
-                payload_words * 4 :
-                (payload_words + staged_tiles * rows_padded) * 4
+                payload_words * 4 : (payload_words + staged_tiles * rows_padded) * 4
             ]
             .view(staged_tiles, rows_padded, 4)
             .permute(1, 0, 2)
             .reshape(rows_padded, K // 32)
         )
         source_payload = packed_a.view(rows_padded, K)
-        source_scale = scale_flat[: rows_padded * (K // 32)].view(
-            rows_padded, K // 32
-        )
+        source_scale = scale_flat[: rows_padded * (K // 32)].view(rows_padded, K // 32)
         physical_expert = torch.full(
             (rows_padded,), -1, dtype=torch.int32, device=device
         )
@@ -668,6 +716,7 @@ def _run_w4a8_dynamic(
                 )
         return scatter_output, reference, debug
     if return_launcher:
+
         def _relaunch_with(compiled_kernel):
             compiled_kernel(
                 _gptr(cutlass.BFloat16, x),
@@ -678,8 +727,13 @@ def _run_w4a8_dynamic(
                 _gptr(cutlass.Uint8, packed_a),
                 _gptr(cutlass.Uint8, scale_flat),
                 _gptr(cutlass.Uint32, intermediate_u32),
-                barrier_count, barrier_epoch, pair_head, producers_done, all_pub,
-                task_head, task_tail,
+                barrier_count,
+                barrier_epoch,
+                pair_head,
+                producers_done,
+                all_pub,
+                task_head,
+                task_tail,
                 _gptr(cutlass.Int32, task_ready, 4),
                 _gptr(cutlass.Int32, task_expert, 4),
                 _gptr(cutlass.Int32, task_m_tile, 4),
@@ -699,12 +753,23 @@ def _run_w4a8_dynamic(
                 _gptr(cutlass.Uint32, repacked_sentinel),
                 _gptr(cutlass.Uint32, repacked_sentinel),
                 _gptr(cutlass.Uint32, repacked_sentinel),
-                row_counts, expert_write_rows, expert_tile_base,
-                ones, ones, ones, ones,
+                row_counts,
+                expert_write_rows,
+                expert_tile_base,
+                ones,
+                ones,
+                ones,
+                ones,
                 _gptr(cutlass.BFloat16, scatter_output),
                 _gptr(cutlass.Int32, token_map, 4),
                 _gptr(cutlass.Float32, token_weights, 4),
-                m, m * top_k, m, rows_padded, max_tasks, phys_tiles, mac,
+                m,
+                m * top_k,
+                m,
+                rows_padded,
+                max_tasks,
+                phys_tiles,
+                mac,
                 current_cuda_stream(),
             )
 
@@ -712,6 +777,7 @@ def _run_w4a8_dynamic(
             _relaunch_with(compiled)
 
         if return_state:
+
             def _current_reference():
                 live_ids, live_weights = _active_route_reference_inputs(
                     flat_ids.view(m, top_k), flat_weights.view(m, top_k), E
@@ -789,8 +855,14 @@ def _run_w4a8_dynamic(
 def test_w4a8_dynamic_matches_oracle(recipe: str, activation: str) -> None:
     require_b12x()
     out, ref = _run_w4a8_dynamic(
-        recipe=recipe, activation=activation,
-        E=4, m=8, K=256, n=128, top_k=2, seed=11,
+        recipe=recipe,
+        activation=activation,
+        E=4,
+        m=8,
+        K=256,
+        n=128,
+        top_k=2,
+        seed=11,
     )
     assert out.abs().sum().item() > 0, "kernel produced all zeros"
     metrics = compare_to_reference(out.float(), ref)
@@ -868,16 +940,30 @@ def test_grouped_expert_prefix_handles_warp_tail_and_multiple_tiles(num_experts)
     routes = torch.tensor([[0, num_experts - 1]] * 33, dtype=torch.int32)
     routes[::4, 0] = -1
     out, ref, debug = _run_w4a8_dynamic(
-        recipe="w4a8_mx", activation="silu", E=num_experts,
-        m=33, K=256, n=128, top_k=2, seed=329, tile_m=16,
-        topk_ids_override=routes, return_debug=True,
+        recipe="w4a8_mx",
+        activation="silu",
+        E=num_experts,
+        m=33,
+        K=256,
+        n=128,
+        top_k=2,
+        seed=329,
+        tile_m=16,
+        topk_ids_override=routes,
+        return_debug=True,
     )
     counts = torch.bincount(routes[routes >= 0].long(), minlength=num_experts)
-    expected = torch.cat((
-        torch.zeros(1, dtype=torch.int64), ((counts + 15) // 16).cumsum(0),
-    ))
+    expected = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int64),
+            ((counts + 15) // 16).cumsum(0),
+        )
+    )
     torch.testing.assert_close(
-        debug["expert_tile_base"].long(), expected, rtol=0, atol=0,
+        debug["expert_tile_base"].long(),
+        expected,
+        rtol=0,
+        atol=0,
     )
     assert torch.isfinite(out).all() and torch.count_nonzero(out)
     assert compare_to_reference(out.float(), ref).cos > 0.999
@@ -966,8 +1052,14 @@ def test_w4a8_dynamic_boundary_m_sizes() -> None:
     require_b12x()
     for m in (1, 3, 127, 129):
         out, ref = _run_w4a8_dynamic(
-            recipe="w4a8_mx", activation="silu",
-            E=4, m=m, K=256, n=128, top_k=2, seed=100 + m,
+            recipe="w4a8_mx",
+            activation="silu",
+            E=4,
+            m=m,
+            K=256,
+            n=128,
+            top_k=2,
+            seed=100 + m,
         )
         assert out.abs().sum().item() > 0, m
         metrics = compare_to_reference(out.float(), ref)
@@ -1014,6 +1106,7 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
         device=device,
     )
     repacked_sentinel = torch.zeros(1, dtype=torch.uint32, device=device)
+
     def z1():
         return torch.zeros(1, dtype=torch.int32, device=device)
 
@@ -1045,10 +1138,9 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
     b_down_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype, (K, n, E), stride_order=(1, 0, 2), assumed_align=16
     )
+
     def fake_ptr_u8():
-        return make_ptr(
-            cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
-        )
+        return make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
 
     def fake_ptr_i32():
         return make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
@@ -1063,23 +1155,52 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
         make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(weight_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16),
-        fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u32(),
-        _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)),
-        _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)),
-        fake_ptr_i32(), fake_ptr_i32(), fake_ptr_i32(),
-        fake_ptr_i32(), fake_ptr_i32(), fake_ptr_i32(), fake_ptr_i32(),
+        fake_ptr_u8(),
+        fake_ptr_u8(),
+        fake_ptr_u32(),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
         b_w13_fake,
         make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16),
         b_down_fake,
         make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16),
-        fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(),
-        fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(),
-        _fake_i32((E,)), _fake_i32((E,)), _fake_i32((E + 1,)),
-        _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)),
+        fake_ptr_u8(),
+        fake_ptr_u8(),
+        fake_ptr_u8(),
+        fake_ptr_u8(),
+        fake_ptr_u32(),
+        fake_ptr_u32(),
+        fake_ptr_u32(),
+        fake_ptr_u32(),
+        _fake_i32((E,)),
+        _fake_i32((E,)),
+        _fake_i32((E + 1,)),
+        _fake_f32((E,)),
+        _fake_f32((E,)),
+        _fake_f32((E,)),
+        _fake_f32((E,)),
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_i32(),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
-        1, 1, 1, 1, 1, 1, 1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
         current_cuda_stream(),
         dsl_compile_options=_OPT_LEVEL_2,
     )
@@ -1094,8 +1215,13 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
             _gptr(cutlass.Uint8, packed_a),
             _gptr(cutlass.Uint8, scale_flat),
             _gptr(cutlass.Uint32, intermediate_u32),
-            barrier_count, barrier_epoch, pair_head, producers_done, all_pub,
-            task_head, task_tail,
+            barrier_count,
+            barrier_epoch,
+            pair_head,
+            producers_done,
+            all_pub,
+            task_head,
+            task_tail,
             _gptr(cutlass.Int32, task_ready, 4),
             _gptr(cutlass.Int32, task_expert, 4),
             _gptr(cutlass.Int32, task_m_tile, 4),
@@ -1115,12 +1241,23 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
             _gptr(cutlass.Uint32, repacked_sentinel),
             _gptr(cutlass.Uint32, repacked_sentinel),
             _gptr(cutlass.Uint32, repacked_sentinel),
-            row_counts, expert_write_rows, expert_tile_base,
-            ones, ones, ones, ones,
+            row_counts,
+            expert_write_rows,
+            expert_tile_base,
+            ones,
+            ones,
+            ones,
+            ones,
             _gptr(cutlass.BFloat16, scatter_output),
             _gptr(cutlass.Int32, token_map, 4),
             _gptr(cutlass.Float32, token_weights, 4),
-            m, m * top_k, m, rows_padded, max_tasks, phys_tiles, 4,
+            m,
+            m * top_k,
+            m,
+            rows_padded,
+            max_tasks,
+            phys_tiles,
+            4,
             current_cuda_stream(),
         )
 
@@ -1129,9 +1266,20 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
             flat_ids.view(m, top_k), flat_weights.view(m, top_k), E
         )
         return moe_reference_w4a8_mx(
-            x.float(), w13_packed, w13_mx, None, ones,
-            w2_packed, w2_mx, None, ones,
-            live_ids, live_weights, E, K, n,
+            x.float(),
+            w13_packed,
+            w13_mx,
+            None,
+            ones,
+            w2_packed,
+            w2_mx,
+            None,
+            ones,
+            live_ids,
+            live_weights,
+            E,
+            K,
+            n,
             activation="silu",
         )
 

@@ -144,13 +144,21 @@ class CanonicalV41Rows:
             scales_addr = address + Int32(64 * 624) + tid * Int32(8)
             if tag == Uint32(1):
                 stage_dsv41_fp8_scales(
-                    source_bytes, Int64(tid) * Int64(528), ratio_addr, scales_addr,
-                    True, swa=True,
+                    source_bytes,
+                    Int64(tid) * Int64(528),
+                    ratio_addr,
+                    scales_addr,
+                    True,
+                    swa=True,
                 )
             else:
                 stage_dsv41_fp8_scales(
-                    source_bytes, Int64(tid) * Int64(528), ratio_addr, scales_addr,
-                    tag == Uint32(0), swa=False,
+                    source_bytes,
+                    Int64(tid) * Int64(528),
+                    ratio_addr,
+                    scales_addr,
+                    tag == Uint32(0),
+                    swa=False,
                 )
         cute.arch.sync_threads()
         s0_normalize_dsv41_kv_to_fp8(

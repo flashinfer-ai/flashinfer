@@ -36,7 +36,9 @@ def _expect_payload(barrier, byte_count, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _shared_scale_word(stage_address, word, records_address, mask_partial=False, *, loc=None, ip=None):
+def _shared_scale_word(
+    stage_address, word, records_address, mask_partial=False, *, loc=None, ip=None
+):
     """Keep bitmap lookup temporaries local to one scale-register definition."""
     return Uint32(
         llvm.inline_asm(
@@ -95,11 +97,17 @@ def _shared_scale_word(stage_address, word, records_address, mask_partial=False,
         add.u64 replacement, $3, offset;
         ld.global.u32 $0, [replacement];
         CSF_WORD_DONE:
-        """ + ("""
+        """
+            + (
+                """
         ld.shared.u32 test, [metadata+28];
         setp.eq.u32 absent, test, 0;
         selp.b32 $0, $0, 0, absent;
-        """ if mask_partial else "") + "}",
+        """
+                if mask_partial
+                else ""
+            )
+            + "}",
             "=&r,r,r,l,~{memory}",
             # Operand slots are reused after pipeline barriers. This read must
             # not be eliminated or hoisted when its pointer repeats.
@@ -118,7 +126,9 @@ def _load_at(pointer, offset: Int64):
 
 
 @dsl_user_op
-def _global_scale_vector(codes, bases, metadata, records, lane_word, *, loc=None, ip=None):
+def _global_scale_vector(
+    codes, bases, metadata, records, lane_word, *, loc=None, ip=None
+):
     """Decode four adjacent words with shared address and exception metadata."""
     unpack = "\n".join(
         f"""
@@ -128,7 +138,8 @@ def _global_scale_vector(codes, bases, metadata, records, lane_word, *, loc=None
         and.b32 packed, packed, 0x0f0f0f0f;
         prmt.b32 base, base_word, base_word, 0x{index}{index}{index}{index};
         add.u32 ${index}, packed, base;
-        """ for index in range(4)
+        """
+        for index in range(4)
     )
     exceptions = "\n".join(
         f"""
@@ -136,12 +147,18 @@ def _global_scale_vector(codes, bases, metadata, records, lane_word, *, loc=None
         setp.ne.u32 present, test, 0;
         @present ld.global.u32 ${index}, [address];
         @present add.u64 address, address, 4;
-        """ for index in range(4)
+        """
+        for index in range(4)
     )
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32()] * 4),
-        [codes.ir_value(), bases.ir_value(), metadata.ir_value(), records.ir_value(),
-         lane_word.ir_value()],
+        [
+            codes.ir_value(),
+            bases.ir_value(),
+            metadata.ir_value(),
+            records.ir_value(),
+            lane_word.ir_value(),
+        ],
         """{
         .reg .b32 code0, code1, base_word, packed, shifted, base;
         .reg .b32 group, bit, mask, selected, flag, first, prefixes, rank, test;
@@ -149,7 +166,9 @@ def _global_scale_vector(codes, bases, metadata, records, lane_word, *, loc=None
         .reg .pred present;
         ld.global.v2.u32 {code0, code1}, [$4];
         ld.global.u32 base_word, [$5];
-        """ + unpack + """
+        """
+        + unpack
+        + """
         shr.u32 group, $8, 5;
         mad.wide.u32 address, group, 4, $6;
         ld.global.u32 mask, [address+8];
@@ -172,24 +191,36 @@ def _global_scale_vector(codes, bases, metadata, records, lane_word, *, loc=None
         cvt.u64.u32 offset, first;
         shl.b64 offset, offset, 2;
         add.u64 address, $7, offset;
-        """ + exceptions + """
+        """
+        + exceptions
+        + """
         CSF_VECTOR_DONE:
         }""",
         "=&r,=&r,=&r,=&r,l,l,l,l,r,~{memory}",
-        has_side_effects=True, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
-    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
-                 for i in range(4))
+    return tuple(
+        Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+        for i in range(4)
+    )
 
 
 @dsl_user_op
 def _store_scale_vector(address, a, b, c, d, *, loc=None, ip=None):
     llvm.inline_asm(
-        None, [x.ir_value() for x in (address, a, b, c, d)],
-        "st.global.v4.u32 [$0], {$1, $2, $3, $4};", "l,r,r,r,r,~{memory}",
-        has_side_effects=True, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        None,
+        [x.ir_value() for x in (address, a, b, c, d)],
+        "st.global.v4.u32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -364,13 +395,17 @@ class InlineNvfp4Reader:
                 address = Int64(experts) * Int64(self.fixed_bytes // 4) + tile * Int64(
                     8
                 )
-                words = cute.recast_ptr(storage, dtype=cutlass.Uint32) + Int64(_HEADER_BYTES // 4)
+                words = cute.recast_ptr(storage, dtype=cutlass.Uint32) + Int64(
+                    _HEADER_BYTES // 4
+                )
                 first = _load_at(words, address) & Uint32(0xFFFFFFFC)
                 end_word = Int64(14)
                 if cutlass.const_expr(self.columns % 8):
                     if col == Int32(self.columns // 8):
                         end_word = Int64(6)
-                end = (_load_at(words, address + end_word) + Uint32(3)) & Uint32(0xFFFFFFFC)
+                end = (_load_at(words, address + end_word) + Uint32(3)) & Uint32(
+                    0xFFFFFFFC
+                )
             return (first, end)
         else:
             return None
@@ -405,7 +440,9 @@ class InlineNvfp4Reader:
             cached_end = cute.arch.shuffle_sync(bounds[1], bound_index)
         if lane == Int32(0):
             if row_tile >= Int32(self.rows // 128):
-                cp_async_bulk_g2s_mbar(target.toint(), zero.toint(), Int32(704), barrier.toint())
+                cp_async_bulk_g2s_mbar(
+                    target.toint(), zero.toint(), Int32(704), barrier.toint()
+                )
             else:
                 slab = Int64(expert) * Int64(self.rows // 128) + Int64(row_tile)
                 fixed = slab * Int64(128 * (1 + self.columns // 2))
@@ -420,7 +457,9 @@ class InlineNvfp4Reader:
                     if cutlass.const_expr(self.columns % 8):
                         if k_tile == Int32(self.columns // 8):
                             end_word = Int64(6)
-                    end = (_load_at(metadata, end_word) + Uint32(3)) & Uint32(0xFFFFFFFC)
+                    end = (_load_at(metadata, end_word) + Uint32(3)) & Uint32(
+                        0xFFFFFFFC
+                    )
                 count = cutlass.min((end - first).to(Int32), Int32(80)) * Int32(4)
                 records = Int64(experts) * Int64(self.fixed_bytes + self.tiles * 32)
                 if count > Int32(0):
@@ -435,34 +474,49 @@ class InlineNvfp4Reader:
                     second_atom = k_tile < Int32(self.columns // 8)
                     cp_async_bulk_g2s_mbar(
                         target.toint(),
-                        (origin + fixed + Int64(128) + Int64(k_tile) * Int64(512)).toint(),
-                        Int32(256), barrier.toint(),
+                        (
+                            origin + fixed + Int64(128) + Int64(k_tile) * Int64(512)
+                        ).toint(),
+                        Int32(256),
+                        barrier.toint(),
                     )
                     second_codes = zero.toint()
                     second_metadata = (zero + Int64(640)).toint()
                     if second_atom:
-                        second_codes = (origin + fixed + Int64(384) + Int64(k_tile) * Int64(512)).toint()
+                        second_codes = (
+                            origin + fixed + Int64(384) + Int64(k_tile) * Int64(512)
+                        ).toint()
                         second_metadata = (origin + meta + Int64(32)).toint()
                     cp_async_bulk_g2s_mbar(
-                        (target + Int32(256)).toint(), second_codes,
-                        Int32(256), barrier.toint(),
+                        (target + Int32(256)).toint(),
+                        second_codes,
+                        Int32(256),
+                        barrier.toint(),
                     )
                     cp_async_bulk_g2s_mbar(
-                        (target + Int32(512)).toint(), (origin + fixed).toint(),
-                        Int32(128), barrier.toint(),
+                        (target + Int32(512)).toint(),
+                        (origin + fixed).toint(),
+                        Int32(128),
+                        barrier.toint(),
                     )
                     cp_async_bulk_g2s_mbar(
-                        (target + Int32(640)).toint(), (origin + meta).toint(),
-                        Int32(32), barrier.toint(),
+                        (target + Int32(640)).toint(),
+                        (origin + meta).toint(),
+                        Int32(32),
+                        barrier.toint(),
                     )
                     cp_async_bulk_g2s_mbar(
-                        (target + Int32(672)).toint(), second_metadata,
-                        Int32(32), barrier.toint(),
+                        (target + Int32(672)).toint(),
+                        second_metadata,
+                        Int32(32),
+                        barrier.toint(),
                     )
                 else:
                     cp_async_bulk_g2s_mbar(
                         target.toint(),
-                        (origin + fixed + Int64(128) + Int64(k_tile) * Int64(512)).toint(),
+                        (
+                            origin + fixed + Int64(128) + Int64(k_tile) * Int64(512)
+                        ).toint(),
                         Int32(512),
                         barrier.toint(),
                     )
@@ -494,13 +548,18 @@ class InlineNvfp4Reader:
         return (
             (ordinal // Int32(64)) * Int32(128)
             + (ordinal % Int32(64) // Int32(2)) * Int32(4)
-            + ordinal % Int32(2) + Int32(row_half * 2)
+            + ordinal % Int32(2)
+            + Int32(row_half * 2)
         )
 
     @cute.jit
     def _read_shared_operand(
-        self, target, records_address, thread: Int32,
-        threads: cutlass.Constexpr, row_half: cutlass.Constexpr,
+        self,
+        target,
+        records_address,
+        thread: Int32,
+        threads: cutlass.Constexpr,
+        row_half: cutlass.Constexpr,
     ):
         count = 256 if row_half < 0 else 128
         iterations = (count + threads - 1) // threads
@@ -509,14 +568,20 @@ class InlineNvfp4Reader:
             ordinal = thread + Int32(index * threads)
             if ordinal < Int32(count):
                 values[index] = self.shared_word(
-                    target.toint(), self._operand_word(ordinal, row_half), records_address
+                    target.toint(),
+                    self._operand_word(ordinal, row_half),
+                    records_address,
                 )
         return values
 
     @cute.jit
     def _store_shared_operand(
-        self, target, values, thread: Int32,
-        threads: cutlass.Constexpr, row_half: cutlass.Constexpr,
+        self,
+        target,
+        values,
+        thread: Int32,
+        threads: cutlass.Constexpr,
+        row_half: cutlass.Constexpr,
     ):
         count = 256 if row_half < 0 else 128
         output = cute.make_tensor(
@@ -529,9 +594,17 @@ class InlineNvfp4Reader:
 
     @cute.jit
     def expand_shared(
-        self, storage, experts: Int32, shared, stage: Int32,
-        threads: cutlass.Constexpr, barrier, second_shared=None, second_stage: Int32 = 0,
-        row_half: cutlass.Constexpr = -1, second_row_half: cutlass.Constexpr = -1,
+        self,
+        storage,
+        experts: Int32,
+        shared,
+        stage: Int32,
+        threads: cutlass.Constexpr,
+        barrier,
+        second_shared=None,
+        second_stage: Int32 = 0,
+        row_half: cutlass.Constexpr = -1,
+        second_row_half: cutlass.Constexpr = -1,
     ):
         """Reconstruct one or two ready operands using two consumer barriers.
 
@@ -542,14 +615,18 @@ class InlineNvfp4Reader:
         """
         thread, _, _ = cute.arch.thread_idx()
         target = cute.recast_ptr(shared, dtype=cutlass.Uint8) + stage * Int32(1024)
-        records_address = storage.toint() + Int64(_HEADER_BYTES) + Int64(experts) * Int64(
-            self.fixed_bytes + self.tiles * 32
+        records_address = (
+            storage.toint()
+            + Int64(_HEADER_BYTES)
+            + Int64(experts) * Int64(self.fixed_bytes + self.tiles * 32)
         )
         values = self._read_shared_operand(
             target, records_address, Int32(thread), threads, row_half
         )
         if cutlass.const_expr(second_shared is not None):
-            second_target = cute.recast_ptr(second_shared, dtype=cutlass.Uint8) + second_stage * Int32(1024)
+            second_target = cute.recast_ptr(
+                second_shared, dtype=cutlass.Uint8
+            ) + second_stage * Int32(1024)
             second_values = self._read_shared_operand(
                 second_target, records_address, Int32(thread), threads, second_row_half
             )
@@ -568,12 +645,16 @@ class IndexedNvfp4Plane(InlineNvfp4Reader):
     def __init__(self, geometry):
         rows, columns, codec, layout = geometry
         if codec != 0 or layout != 0:
-            raise ValueError("Indexed expansion requires native-order byte-window scales")
+            raise ValueError(
+                "Indexed expansion requires native-order byte-window scales"
+            )
         super().__init__(rows, columns)
         self.tasks = (self.rows * self.columns + 4095) // 4096
 
     @cute.jit
-    def tensors(self, fixed, exceptions, offsets, output, lut, experts, exception_bytes):
+    def tensors(
+        self, fixed, exceptions, offsets, output, lut, experts, exception_bytes
+    ):
         return fixed, cute.recast_ptr(output, dtype=cutlass.Uint32), experts
 
     @cute.jit
@@ -589,13 +670,17 @@ class IndexedNvfp4Plane(InlineNvfp4Reader):
             fixed = slab * Int64(128 * (1 + self.columns // 2))
             tile = slab * Int64(self.columns // 4) + Int64(column)
             partitions = Int64(experts) * Int64(self.fixed_bytes)
-            codes = origin + fixed + Int64(128) + (
-                Int64(column) * Int64(128) + Int64(lane_word)
-            ) * Int64(2)
+            codes = (
+                origin
+                + fixed
+                + Int64(128)
+                + (Int64(column) * Int64(128) + Int64(lane_word)) * Int64(2)
+            )
             bases = origin + fixed + Int64(lane_word)
             metadata = origin + partitions + tile * Int64(32)
             records = origin + partitions + Int64(experts) * Int64(self.tiles * 32)
             values = _global_scale_vector(codes, bases, metadata, records, lane_word)
-            destination = (Int64(expert) * Int64(self.rows * self.columns)
-                           + Int64(word) * Int64(4))
+            destination = Int64(expert) * Int64(self.rows * self.columns) + Int64(
+                word
+            ) * Int64(4)
             _store_scale_vector(output.toint() + destination, *values)

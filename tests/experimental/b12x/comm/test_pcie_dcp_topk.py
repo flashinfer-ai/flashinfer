@@ -48,12 +48,8 @@ class _FakeOwner(PCIeDCPTopKOwnerExchange):
         owner_rows = rows // self.world_size
         row_slice = slice(self.rank * owner_rows, (self.rank + 1) * owner_rows)
         views = self._candidate_views[slot]
-        views[0][:owner_rows].copy_(
-            local_indices[row_slice].repeat(1, self.world_size)
-        )
-        views[1][:owner_rows].copy_(
-            local_scores[row_slice].repeat(1, self.world_size)
-        )
+        views[0][:owner_rows].copy_(local_indices[row_slice].repeat(1, self.world_size))
+        views[1][:owner_rows].copy_(local_scores[row_slice].repeat(1, self.world_size))
         self.stage_calls.append((slot, threads, blocks, wait_for_prior_consumer))
 
 
@@ -160,9 +156,7 @@ def test_graph_capture_pins_the_next_staging_slot_and_enables_prior_wait(
     assert second_indices.data_ptr() == third_indices.data_ptr()
     assert first_scores.data_ptr() == second_scores.data_ptr()
     assert second_scores.data_ptr() == third_scores.data_ptr()
-    eager_stages = [
-        (slot % 2, 512, 1, False) for slot in range(eager_calls)
-    ]
+    eager_stages = [(slot % 2, 512, 1, False) for slot in range(eager_calls)]
     assert owner.stage_calls == eager_stages + [
         (expected_slot, 512, 1, True),
         (expected_slot, 512, 1, True),

@@ -1,4 +1,5 @@
 """Prepared lagged mHC rounding, coefficient propagation and graph replay."""
+
 from __future__ import annotations
 
 import pytest
@@ -6,9 +7,14 @@ import torch
 import torch.nn.functional as F
 
 from b12x.norm import mhc
-from b12x.testing.mhc import make_inputs as _make_inputs, pre_reference as _mhc_pre_reference, post_reference as _mhc_post_reference
+from b12x.testing.mhc import (
+    make_inputs as _make_inputs,
+    pre_reference as _mhc_pre_reference,
+    post_reference as _mhc_post_reference,
+)
 from ..conftest import require_b12x as require_sm120
 from ._mhc import prepare, bind, prepare_collapse, mhc_session
+
 
 def _lagged_reference(residual, fn, scale, bias, incoming, weight):
     flat = residual.flatten(1).float()
@@ -39,28 +45,71 @@ def test_mhc_lagged_multisublayer_propagation(hidden_size, mhc_session):
     prev_post = prev_comb = None
     for layer in range(3):
         predicted = torch.full_like(incoming, float("nan"))
-        options = dict(pre_mix=incoming, pre_out=predicted, rms_eps=1e-20,
-                       hc_eps=1e-6, sinkhorn_iters=20, norm_weight=weight, norm_eps=1e-20)
-        args = (residual, fn, scale, bias) if layer == 0 else (x, residual, prev_post, prev_comb, fn, scale, bias)
-        plan = prepare(mhc_session, "pre" if layer == 0 else "post_pre", args, options, output_mode="functional")
+        options = dict(
+            pre_mix=incoming,
+            pre_out=predicted,
+            rms_eps=1e-20,
+            hc_eps=1e-6,
+            sinkhorn_iters=20,
+            norm_weight=weight,
+            norm_eps=1e-20,
+        )
+        args = (
+            (residual, fn, scale, bias)
+            if layer == 0
+            else (x, residual, prev_post, prev_comb, fn, scale, bias)
+        )
+        plan = prepare(
+            mhc_session,
+            "pre" if layer == 0 else "post_pre",
+            args,
+            options,
+            output_mode="functional",
+        )
         if layer == 0:
             actual = mhc.run_pre(
-                residual, fn, scale, bias, pre_mix=incoming, pre_out=predicted, plan=plan,
-                rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
-                norm_weight=weight, norm_eps=1e-20,
+                residual,
+                fn,
+                scale,
+                bias,
+                pre_mix=incoming,
+                pre_out=predicted,
+                plan=plan,
+                rms_eps=1e-20,
+                hc_eps=1e-6,
+                sinkhorn_iters=20,
+                norm_weight=weight,
+                norm_eps=1e-20,
             )
             current = residual
         else:
             current = _mhc_post_reference(x, residual, prev_post, prev_comb)
             actual = mhc.run_post_pre(
-                x, residual, prev_post, prev_comb, fn, scale, bias,
-                pre_mix=incoming, pre_out=predicted, plan=plan, rms_eps=1e-20,
-                hc_eps=1e-6, sinkhorn_iters=20, norm_weight=weight, norm_eps=1e-20,
+                x,
+                residual,
+                prev_post,
+                prev_comb,
+                fn,
+                scale,
+                bias,
+                pre_mix=incoming,
+                pre_out=predicted,
+                plan=plan,
+                rms_eps=1e-20,
+                hc_eps=1e-6,
+                sinkhorn_iters=20,
+                norm_weight=weight,
+                norm_eps=1e-20,
             )
         torch.testing.assert_close(actual[0], current, rtol=0, atol=0.008)
         expected = _lagged_reference(actual[0], fn, scale, bias, incoming, weight)
         for got, want in zip((*actual[1:], predicted), expected, strict=True):
-            torch.testing.assert_close(got, want, rtol=2e-5, atol=0.008 if got.dtype == torch.bfloat16 else 4e-5)
+            torch.testing.assert_close(
+                got,
+                want,
+                rtol=2e-5,
+                atol=0.008 if got.dtype == torch.bfloat16 else 4e-5,
+            )
         residual, prev_post, prev_comb, x = actual
         incoming = predicted
         # Distinct sublayer projections prevent accidentally carrying a stale mix.
@@ -81,39 +130,87 @@ def test_mhc_lagged_rounded_variance_and_ownership(mhc_session):
     predicted = torch.empty_like(incoming)
     weight = torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
     kwargs = dict(rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
-    options = dict(kwargs, pre_mix=incoming, pre_out=predicted, norm_weight=weight, norm_eps=1e-20)
-    plan = prepare(mhc_session, "pre", (residual, fn, scale, bias), options, output_mode="functional")
+    options = dict(
+        kwargs, pre_mix=incoming, pre_out=predicted, norm_weight=weight, norm_eps=1e-20
+    )
+    plan = prepare(
+        mhc_session,
+        "pre",
+        (residual, fn, scale, bias),
+        options,
+        output_mode="functional",
+    )
     provided = prepare(mhc_session, "pre", (residual, fn, scale, bias), options)
     actual = mhc.run_pre(
-        residual, fn, scale, bias, pre_mix=incoming, pre_out=predicted,
-        norm_weight=weight, norm_eps=1e-20, plan=plan, **kwargs,
+        residual,
+        fn,
+        scale,
+        bias,
+        pre_mix=incoming,
+        pre_out=predicted,
+        norm_weight=weight,
+        norm_eps=1e-20,
+        plan=plan,
+        **kwargs,
     )
     expected = _lagged_reference(residual, fn, scale, bias, incoming, weight)
     torch.testing.assert_close(actual[-1], expected[2], rtol=0, atol=0.001)
     with pytest.raises(ValueError, match="supplied together"):
         mhc.run_pre(residual, fn, scale, bias, pre_mix=incoming, plan=plan, **kwargs)
     with pytest.raises(ValueError, match="must not alias"):
-        mhc.run_pre(residual, fn, scale, bias, pre_mix=incoming, pre_out=incoming, norm_weight=weight, norm_eps=1e-20, plan=plan, **kwargs)
+        mhc.run_pre(
+            residual,
+            fn,
+            scale,
+            bias,
+            pre_mix=incoming,
+            pre_out=incoming,
+            norm_weight=weight,
+            norm_eps=1e-20,
+            plan=plan,
+            **kwargs,
+        )
     with pytest.raises(ValueError, match="must not alias"):
         mhc.run_pre(
-            residual, fn, scale, bias, pre_mix=incoming, pre_out=predicted,
-            post_out=predicted, norm_weight=weight, norm_eps=1e-20, plan=provided, **kwargs,
+            residual,
+            fn,
+            scale,
+            bias,
+            pre_mix=incoming,
+            pre_out=predicted,
+            post_out=predicted,
+            norm_weight=weight,
+            norm_eps=1e-20,
+            plan=provided,
+            **kwargs,
         )
     binding = bind(provided, pre_out=predicted)
     with pytest.raises(ValueError, match="binding owns scratch and output buffers"):
         mhc.run_pre(
-            residual, fn, scale, bias, pre_mix=incoming, pre_out=predicted,
-            binding=binding, norm_weight=weight, norm_eps=1e-20, **kwargs,
+            residual,
+            fn,
+            scale,
+            bias,
+            pre_mix=incoming,
+            pre_out=predicted,
+            binding=binding,
+            norm_weight=weight,
+            norm_eps=1e-20,
+            **kwargs,
         )
 
 
 @pytest.mark.parametrize(
     ("phase", "capacity", "fuse_norm"),
-    [("pre", 17, False), ("pre", 17, True), ("pre", 389, True),
-     ("post_pre", 17, True), ("post_pre", 389, True)],
+    [
+        ("pre", 17, False),
+        ("pre", 17, True),
+        ("pre", 389, True),
+        ("post_pre", 17, True),
+        ("post_pre", 389, True),
+    ],
 )
 def test_mhc_lagged_frozen_multilive_graph(phase, capacity, fuse_norm, mhc_session):
-
     device = require_sm120()
     hidden_size = 5120
     residual, x, fn, scale, bias = _make_inputs(
@@ -123,28 +220,60 @@ def test_mhc_lagged_frozen_multilive_graph(phase, capacity, fuse_norm, mhc_sessi
         residual, fn, scale, bias, rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20
     )
     prev_post, prev_comb = prev_post.contiguous(), prev_comb.contiguous()
-    weight = torch.ones(hidden_size, dtype=torch.bfloat16, device=device) if fuse_norm else None
+    weight = (
+        torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
+        if fuse_norm
+        else None
+    )
     incoming = torch.zeros((capacity, 4), device=device)
     incoming[:, 0] = 1
     predicted = torch.empty_like(incoming)
-    options = dict(pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
-                   rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
-    args = (residual, fn, scale, bias) if phase == "pre" else (x, residual, prev_post, prev_comb, fn, scale, bias)
+    options = dict(
+        pre_mix=incoming,
+        norm_weight=weight,
+        norm_eps=1e-20,
+        rms_eps=1e-20,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
+    args = (
+        (residual, fn, scale, bias)
+        if phase == "pre"
+        else (x, residual, prev_post, prev_comb, fn, scale, bias)
+    )
     plan = prepare(mhc_session, phase, args, options)
     binding = bind(plan, pre_out=predicted)
 
     def run(live):
         if phase == "pre":
             return mhc.run_pre(
-                residual[:live], fn, scale, bias, binding=binding,
-                pre_mix=incoming[:live], norm_weight=weight, norm_eps=1e-20,
-                rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
+                residual[:live],
+                fn,
+                scale,
+                bias,
+                binding=binding,
+                pre_mix=incoming[:live],
+                norm_weight=weight,
+                norm_eps=1e-20,
+                rms_eps=1e-20,
+                hc_eps=1e-6,
+                sinkhorn_iters=20,
             )
         return mhc.run_post_pre(
-            x[:live], residual[:live], prev_post[:live], prev_comb[:live],
-            fn, scale, bias, binding=binding, pre_mix=incoming[:live],
-            norm_weight=weight, norm_eps=1e-20, rms_eps=1e-20,
-            hc_eps=1e-6, sinkhorn_iters=20,
+            x[:live],
+            residual[:live],
+            prev_post[:live],
+            prev_comb[:live],
+            fn,
+            scale,
+            bias,
+            binding=binding,
+            pre_mix=incoming[:live],
+            norm_weight=weight,
+            norm_eps=1e-20,
+            rms_eps=1e-20,
+            hc_eps=1e-6,
+            sinkhorn_iters=20,
         )
 
     run(capacity)
@@ -165,13 +294,23 @@ def test_mhc_lagged_frozen_multilive_graph(phase, capacity, fuse_norm, mhc_sessi
         assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
         assert tuple(t.data_ptr() for t in (*actual, predicted)) == pointers
         current = (
-            residual[:live] if phase == "pre" else
-            _mhc_post_reference(x[:live], residual[:live], prev_post[:live], prev_comb[:live])
+            residual[:live]
+            if phase == "pre"
+            else _mhc_post_reference(
+                x[:live], residual[:live], prev_post[:live], prev_comb[:live]
+            )
         )
         torch.testing.assert_close(actual[0], current, rtol=0, atol=0.008)
-        expected = _lagged_reference(actual[0], fn, scale, bias, incoming[:live], weight)
+        expected = _lagged_reference(
+            actual[0], fn, scale, bias, incoming[:live], weight
+        )
         for got, want in zip((*actual[1:], predicted[:live]), expected, strict=True):
-            torch.testing.assert_close(got, want, rtol=2e-5, atol=0.008 if got.dtype == torch.bfloat16 else 4e-5)
+            torch.testing.assert_close(
+                got,
+                want,
+                rtol=2e-5,
+                atol=0.008 if got.dtype == torch.bfloat16 else 4e-5,
+            )
         assert bool(torch.isnan(predicted[live:]).all())
         graph.reset()
 
@@ -185,16 +324,32 @@ def test_lagged_prefill_fp32_projection_precision(mhc_session):
     )
     incoming = torch.full((rows, 4), 0.25, device=device)
     weight = torch.ones(hidden, dtype=torch.bfloat16, device=device)
-    options = dict(pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
-                   rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
-    plan = prepare(mhc_session, "pre", (residual, fn, scale, bias), options, capacity=4096)
+    options = dict(
+        pre_mix=incoming,
+        norm_weight=weight,
+        norm_eps=1e-20,
+        rms_eps=1e-20,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
+    plan = prepare(
+        mhc_session, "pre", (residual, fn, scale, bias), options, capacity=4096
+    )
     assert plan.prepared.selection.config.backend == "tf32_tma"
     predicted = torch.empty_like(incoming)
     binding = bind(plan, tokens=rows, pre_out=predicted)
     _, post, _, _ = mhc.run_pre(
-        residual, fn, scale, bias, binding=binding,
-        pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
-        rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
+        residual,
+        fn,
+        scale,
+        bias,
+        binding=binding,
+        pre_mix=incoming,
+        norm_weight=weight,
+        norm_eps=1e-20,
+        rms_eps=1e-20,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
     )
     flat = residual.flatten(1).double()
     mixes = (flat @ fn.double().T) * torch.rsqrt(
@@ -221,17 +376,35 @@ def test_lagged_prefill_scalar_parity_graph(mhc_session, capacity):
     incoming = torch.zeros((capacity, 4), device=device)
     incoming[:, 0] = 1
     weight = torch.ones(hidden, dtype=torch.bfloat16, device=device)
-    options = dict(pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
-                   rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
-    plans = [prepare(mhc_session, "pre", (residual, fn, scale, bias), options,
-                     backend=backend) for backend in ("tf32_tma", "native")]
+    options = dict(
+        pre_mix=incoming,
+        norm_weight=weight,
+        norm_eps=1e-20,
+        rms_eps=1e-20,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
+    plans = [
+        prepare(
+            mhc_session, "pre", (residual, fn, scale, bias), options, backend=backend
+        )
+        for backend in ("tf32_tma", "native")
+    ]
     bindings = [bind(plan, pre_out=torch.empty_like(incoming)) for plan in plans]
 
     def run(binding, live):
         return mhc.run_pre(
-            residual[:live], fn, scale, bias, binding=binding,
-            pre_mix=incoming[:live], norm_weight=weight, norm_eps=1e-20,
-            rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
+            residual[:live],
+            fn,
+            scale,
+            bias,
+            binding=binding,
+            pre_mix=incoming[:live],
+            norm_weight=weight,
+            norm_eps=1e-20,
+            rms_eps=1e-20,
+            hc_eps=1e-6,
+            sinkhorn_iters=20,
         )
 
     for binding in bindings:
@@ -248,8 +421,11 @@ def test_lagged_prefill_scalar_parity_graph(mhc_session, capacity):
         graph.replay()
         expected = run(bindings[1], live)
         torch.cuda.synchronize(device)
-        for got, want in zip((*actual, bindings[0].pre_out[:live]),
-                             (*expected, bindings[1].pre_out[:live]), strict=True):
+        for got, want in zip(
+            (*actual, bindings[0].pre_out[:live]),
+            (*expected, bindings[1].pre_out[:live]),
+            strict=True,
+        ):
             if got.dtype == torch.bfloat16:
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
             else:
@@ -260,7 +436,6 @@ def test_lagged_prefill_scalar_parity_graph(mhc_session, capacity):
 
 @pytest.mark.parametrize("hidden", [4096, 5120, 7168])
 def test_standalone_collapse_fp32_accumulation_and_frozen_replay(hidden, mhc_session):
-
     device = require_sm120()
     capacity = 9
     state = torch.empty(capacity, 4, hidden, dtype=torch.bfloat16, device=device)
@@ -275,7 +450,9 @@ def test_standalone_collapse_fp32_accumulation_and_frozen_replay(hidden, mhc_ses
 
     def launch(rows):
         return (
-            mhc.run_collapse(state[:rows], mix[:rows], out=weighted[:rows], plan=weighted_plan),
+            mhc.run_collapse(
+                state[:rows], mix[:rows], out=weighted[:rows], plan=weighted_plan
+            ),
             mhc.run_collapse(state[:rows], None, out=mean[:rows], plan=mean_plan),
         )
 
@@ -294,7 +471,9 @@ def test_standalone_collapse_fp32_accumulation_and_frozen_replay(hidden, mhc_ses
         allocations = torch.cuda.memory_stats(device)["allocation.all.allocated"]
         graph.replay()
         torch.cuda.synchronize(device)
-        assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocations
+        assert (
+            torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocations
+        )
         assert tuple(t.data_ptr() for t in outputs) == pointers
         expected = (state[:rows].float() * mix[:rows, :, None]).sum(1).bfloat16()
         expected_mean = state[:rows].float().mean(1).bfloat16()
@@ -305,49 +484,100 @@ def test_standalone_collapse_fp32_accumulation_and_frozen_replay(hidden, mhc_ses
         graph.reset()
 
 
-@pytest.mark.parametrize("tile_k,stages,tokens,geometry", [
-    (32, 3, 1, {}), (32, 3, 17, {}), (64, 2, 1, {}), (64, 2, 17, {}),
-    (64, 2, 1, {"projection_tile_n": 64, "projection_num_m_warps": 2,
-                "projection_tile_m": 32}),
-    (64, 2, 1, {"projection_tile_n": 32, "projection_num_n_warps": 4}),
-    (256, 4, 1, {"projection_k_splits": 40}),
-])
+@pytest.mark.parametrize(
+    "tile_k,stages,tokens,geometry",
+    [
+        (32, 3, 1, {}),
+        (32, 3, 17, {}),
+        (64, 2, 1, {}),
+        (64, 2, 17, {}),
+        (
+            64,
+            2,
+            1,
+            {
+                "projection_tile_n": 64,
+                "projection_num_m_warps": 2,
+                "projection_tile_m": 32,
+            },
+        ),
+        (64, 2, 1, {"projection_tile_n": 32, "projection_num_n_warps": 4}),
+        (256, 4, 1, {"projection_k_splits": 40}),
+    ],
+)
 def test_lagged_post_pre_tf32_small_projection_tile(
-    tile_k, stages, tokens, geometry, mhc_session, monkeypatch,
+    tile_k,
+    stages,
+    tokens,
+    geometry,
+    mhc_session,
+    monkeypatch,
 ):
     if geometry:
         monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "1")
     device = require_sm120()
     hidden = 5120
     residual, x, fn, scale, bias = _make_inputs(
-        tokens=tokens, hidden_size=hidden, seed=92154, device=device,
+        tokens=tokens,
+        hidden_size=hidden,
+        seed=92154,
+        device=device,
     )
     _, prev_post, prev_comb = _mhc_pre_reference(
-        residual, fn, scale, bias, rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
+        residual,
+        fn,
+        scale,
+        bias,
+        rms_eps=1e-20,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
     )
     prev_post, prev_comb = prev_post.contiguous(), prev_comb.contiguous()
     incoming = torch.zeros((tokens, 4), device=device)
     incoming[:, 0] = 1
     weight = torch.ones(hidden, dtype=torch.bfloat16, device=device)
-    options = dict(pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
-                   rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
+    options = dict(
+        pre_mix=incoming,
+        norm_weight=weight,
+        norm_eps=1e-20,
+        rms_eps=1e-20,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
     config = mhc.MhcConfig(
-        backend="tf32_tma", projection_tile_m=16, projection_tile_n=8,
-        projection_tile_k=tile_k, projection_num_stages=stages,
-        projection_num_m_warps=1, projection_num_n_warps=1,
-        projection_k_splits=2, lagged_prepare=False,
+        backend="tf32_tma",
+        projection_tile_m=16,
+        projection_tile_n=8,
+        projection_tile_k=tile_k,
+        projection_num_stages=stages,
+        projection_num_m_warps=1,
+        projection_num_n_warps=1,
+        projection_k_splits=2,
+        lagged_prepare=False,
     )
     from dataclasses import replace
+
     config = replace(config, **geometry)
     from b12x.preparation import FrozenMapping
+
     plan = mhc.plan(
         mhc.Caps(device=device, max_tokens=tokens, hidden_size=hidden),
-        invocation=FrozenMapping(dict(operation="post_pre", lagged_mix=True,
-            has_norm_weight=True, norm_eps=1e-20, rms_eps=1e-20,
-            hc_eps=1e-6, sinkhorn_iters=20)), override=config,
+        invocation=FrozenMapping(
+            dict(
+                operation="post_pre",
+                lagged_mix=True,
+                has_norm_weight=True,
+                norm_eps=1e-20,
+                rms_eps=1e-20,
+                hc_eps=1e-6,
+                sinkhorn_iters=20,
+            )
+        ),
+        override=config,
     )
     if geometry:
         from b12x.norm.mhc._tuning import TUNING
+
         choice = config.to_dict()
         del choice["projection_tile_m"]
         TUNING.parameter_space(plan.query, None).validate(choice)
@@ -375,7 +605,11 @@ def test_lagged_post_pre_tf32_small_projection_tile(
         expected = _lagged_reference(actual[0], fn, scale, bias, incoming, weight)
         for got, want in zip((*actual[1:], predicted), expected, strict=True):
             assert bool(torch.isfinite(got).all()) and bool(got.count_nonzero())
-            torch.testing.assert_close(got, want, rtol=2e-5,
-                atol=0.008 if got.dtype == torch.bfloat16 else 4e-5)
+            torch.testing.assert_close(
+                got,
+                want,
+                rtol=2e-5,
+                atol=0.008 if got.dtype == torch.bfloat16 else 4e-5,
+            )
     finally:
         graph.reset()

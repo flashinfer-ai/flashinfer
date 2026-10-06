@@ -77,9 +77,7 @@ def _load_acquire_sys_u32(address: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
-def _store_release_sys_u32(
-    address: Int64, value: Uint32, *, loc=None, ip=None
-) -> None:
+def _store_release_sys_u32(address: Int64, value: Uint32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
         [
@@ -214,11 +212,7 @@ def _flag_address(
         base
         + Int64(region)
         + (
-            (
-                Int64(slot) * Int64(MAX_BATCH_SIZE)
-                + Int64(row)
-            )
-            * Int64(ISLAND_SIZE)
+            (Int64(slot) * Int64(MAX_BATCH_SIZE) + Int64(row)) * Int64(ISLAND_SIZE)
             + Int64(index)
         )
         * Int64(128)
@@ -230,18 +224,15 @@ def _key_address(base: Int64, region: int, slot: Int32, row: Int32) -> Int64:
     return (
         base
         + Int64(region)
-        + (
-            Int64(slot) * Int64(MAX_BATCH_SIZE) + Int64(row)
-        )
-        * Int64(8)
+        + (Int64(slot) * Int64(MAX_BATCH_SIZE) + Int64(row)) * Int64(8)
     )
 
 
 @cute.jit
 def _pack_key(score: Float32, global_index: Int32) -> Uint64:
-    return (
-        Uint64(_score_order_key(score)) << Uint64(32)
-    ) | (Uint64(0xFFFFFFFF) - Uint64(global_index))
+    return (Uint64(_score_order_key(score)) << Uint64(32)) | (
+        Uint64(0xFFFFFFFF) - Uint64(global_index)
+    )
 
 
 @cute.jit
@@ -391,9 +382,7 @@ class _VocabArgmaxLaunch:
                     + Float32(bias[bias_offset + index])
                 )
             )
-            global_index = (
-                Int64(self._rank) * local_elements + index
-            )
+            global_index = Int64(self._rank) * local_elements + index
             candidate = _pack_key(value, Int32(global_index))
             best = cutlass.max(best, candidate)
             index += Int64(THREADS)
@@ -603,9 +592,9 @@ def get_vocab_argmax_launcher(
             raise ValueError(
                 f"expected {world_size} slab addresses, got {len(slab_addresses)}"
             )
-        padded_slabs = tuple(int(address) for address in slab_addresses) + (
-            0,
-        ) * (MAX_WORLD_SIZE - world_size)
+        padded_slabs = tuple(int(address) for address in slab_addresses) + (0,) * (
+            MAX_WORLD_SIZE - world_size
+        )
         raw(
             *(
                 make_ptr(

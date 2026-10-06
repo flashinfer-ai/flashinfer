@@ -16,7 +16,9 @@ from b12x.testing.reference.helpers import require_b12x
 @pytest.mark.parametrize("with_scores", [False, True])
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
 @torch.inference_mode()
-def test_prepared_dsa_single_and_multiple_supertiles(physical, with_scores, mode, tmp_path):
+def test_prepared_dsa_single_and_multiple_supertiles(
+    physical, with_scores, mode, tmp_path
+):
     device = require_b12x()
     torch.manual_seed(161)
     rows, heads, topk, max_pages = 3, 16, 512, 48
@@ -112,7 +114,9 @@ def test_prepared_dsa_single_and_multiple_supertiles(physical, with_scores, mode
                 atol=2e-3,
             )
 
-    with PreparationSession(device=device, autotune=True, cache_dir=tmp_path) as session:
+    with PreparationSession(
+        device=device, autotune=True, cache_dir=tmp_path
+    ) as session:
         session.prepare(
             [
                 plan.request(

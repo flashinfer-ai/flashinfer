@@ -52,7 +52,9 @@ class TensorFP8LinearWeight:
     out_features: int
 
 
-Weight: TypeAlias = MXFP8LinearWeight | TensorFP8LinearWeight | NVFP4LinearWeight | IQ2XSLinearWeight
+Weight: TypeAlias = (
+    MXFP8LinearWeight | TensorFP8LinearWeight | NVFP4LinearWeight | IQ2XSLinearWeight
+)
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -234,8 +236,11 @@ def _cached_unit_activation_block_scale(
     key = (device_type, device_index, rows, width)
     value = _UNIT_BLOCK_SCALE_CACHE.get(key)
     if value is None:
-        value = torch.ones((rows, width // 128), dtype=torch.float32,
-                           device=torch.device(device_type, device_index))
+        value = torch.ones(
+            (rows, width // 128),
+            dtype=torch.float32,
+            device=torch.device(device_type, device_index),
+        )
         _UNIT_BLOCK_SCALE_CACHE[key] = value
     return value
 
@@ -428,19 +433,32 @@ def pack_weight(
     """
 
     if recipe in BLOCK_CODECS:
-        if scale is not None or global_scale is not None or global_scale_kind != "multiplier":
+        if (
+            scale is not None
+            or global_scale is not None
+            or global_scale_kind != "multiplier"
+        ):
             raise ValueError("IQ2_XS scales are embedded in its block payload")
         return pack_iq2_xs_weight(weight, codec=recipe)
     if scale is None:
         raise ValueError("this weight recipe requires a scale tensor")
     if recipe == "nvfp4":
-        return pack_nvfp4_weight(weight, scale, global_scale,
-                                 global_scale_kind=global_scale_kind)
-    if recipe not in (None, "mxfp8", "tensor_fp8") or global_scale is not None or global_scale_kind != "multiplier":
+        return pack_nvfp4_weight(
+            weight, scale, global_scale, global_scale_kind=global_scale_kind
+        )
+    if (
+        recipe not in (None, "mxfp8", "tensor_fp8")
+        or global_scale is not None
+        or global_scale_kind != "multiplier"
+    ):
         raise ValueError("global_scale/kind are specific to recipe='nvfp4'")
     if scale.dtype == torch.float32 and scale.numel() == 1 and recipe != "mxfp8":
         return pack_tensor_fp8_linear_weight(weight, scale)
-    if scale.dtype in (torch.uint8, torch.float8_e8m0fnu) and scale.ndim == 2 and recipe != "tensor_fp8":
+    if (
+        scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
+        and scale.ndim == 2
+        and recipe != "tensor_fp8"
+    ):
         return pack_mxfp8_linear_weight(weight, scale)
     raise ValueError(
         "unsupported blockscaled weight scale: expected one FP32 combined "
@@ -472,11 +490,21 @@ def _blockscaled_serialized_op(
     declaration = plan_from_handle(plan_handle) if plan_handle else None
     if declaration is None:
         from ._preparation import heuristic_plan, query_from_call
-        declaration = heuristic_plan(query_from_call(
-            (lhs_values, lhs_scale_storage), (rhs_values, rhs_scale_storage),
-            alpha=alpha, ab_dtype=ab_dtype, sf_dtype=sf_dtype, c_dtype=c_dtype,
-            sf_vec_size=sf_vec_size, block_fp8=block_fp8, expected_m=expected_m,
-        ), lhs_values.device)
+
+        declaration = heuristic_plan(
+            query_from_call(
+                (lhs_values, lhs_scale_storage),
+                (rhs_values, rhs_scale_storage),
+                alpha=alpha,
+                ab_dtype=ab_dtype,
+                sf_dtype=sf_dtype,
+                c_dtype=c_dtype,
+                sf_vec_size=sf_vec_size,
+                block_fp8=block_fp8,
+                expected_m=expected_m,
+            ),
+            lhs_values.device,
+        )
     state = require_prepared(declaration, "gemm.blockscaled.fixed", lhs_values.device)
     return state.run_serialized(
         lhs_values,
@@ -530,7 +558,14 @@ def _packed_mxfp8_op(
     stream_int: int | None,
     expected_m: int | None = None,
 ) -> torch.Tensor:
-    declaration = _fixed_plan(plan_handle, source_2d, weight_values, "mxfp8", source_2d.dtype, expected_m=expected_m)
+    declaration = _fixed_plan(
+        plan_handle,
+        source_2d,
+        weight_values,
+        "mxfp8",
+        source_2d.dtype,
+        expected_m=expected_m,
+    )
     state = require_prepared(declaration, "gemm.blockscaled.fixed", source_2d.device)
     return state.run_mxfp8(
         source_2d,
@@ -573,9 +608,18 @@ def _packed_mxfp8_prequantized_op(
     stream_int: int | None,
     expected_m: int | None = None,
 ) -> torch.Tensor:
-    declaration = _fixed_plan(plan_handle, source_values, weight_values, "mxfp8", out_dtype,
-                              source_scale_storage, expected_m=expected_m)
-    state = require_prepared(declaration, "gemm.blockscaled.fixed", source_values.device)
+    declaration = _fixed_plan(
+        plan_handle,
+        source_values,
+        weight_values,
+        "mxfp8",
+        out_dtype,
+        source_scale_storage,
+        expected_m=expected_m,
+    )
+    state = require_prepared(
+        declaration, "gemm.blockscaled.fixed", source_values.device
+    )
     return state.run_mxfp8(
         source_values,
         weight_values,
@@ -605,23 +649,39 @@ def _packed_mxfp8_prequantized_fake(
     )
 
 
-def _fixed_plan(handle, source, weight, recipe, out_dtype, source_scale=None, *, expected_m=None):
+def _fixed_plan(
+    handle, source, weight, recipe, out_dtype, source_scale=None, *, expected_m=None
+):
     if handle:
         return plan_from_handle(handle)
     from ._preparation import heuristic_plan
     from ._tuning import FixedBlockscaledQuery
+
     m, k = source.shape
     form = "none"
     if source_scale is not None:
-        form = ("compact" if source_scale.ndim == 2 and source_scale.shape == (m, k // 32)
-                else "mma" if source_scale.ndim == 6 else "swizzled")
-    return heuristic_plan(FixedBlockscaledQuery(
-        recipe=recipe, call_kind="packed", max_rows=m, in_features=k,
-        padded_in_features=weight.shape[1], out_features=weight.shape[0],
-        input_dtype=str(source.dtype).removeprefix("torch."),
-        output_dtype=str(out_dtype).removeprefix("torch."), expected_m=expected_m,
-        source_scale_form=form,
-    ), source.device)
+        form = (
+            "compact"
+            if source_scale.ndim == 2 and source_scale.shape == (m, k // 32)
+            else "mma"
+            if source_scale.ndim == 6
+            else "swizzled"
+        )
+    return heuristic_plan(
+        FixedBlockscaledQuery(
+            recipe=recipe,
+            call_kind="packed",
+            max_rows=m,
+            in_features=k,
+            padded_in_features=weight.shape[1],
+            out_features=weight.shape[0],
+            input_dtype=str(source.dtype).removeprefix("torch."),
+            output_dtype=str(out_dtype).removeprefix("torch."),
+            expected_m=expected_m,
+            source_scale_form=form,
+        ),
+        source.device,
+    )
 
 
 def _validate_bias(
@@ -762,7 +822,14 @@ def _packed_tensor_fp8_op(
     stream_int: int | None,
     expected_m: int | None = None,
 ) -> torch.Tensor:
-    declaration = _fixed_plan(plan_handle, source_2d, weight_values, "tensor_fp8", out_dtype, expected_m=expected_m)
+    declaration = _fixed_plan(
+        plan_handle,
+        source_2d,
+        weight_values,
+        "tensor_fp8",
+        out_dtype,
+        expected_m=expected_m,
+    )
     state = require_prepared(declaration, "gemm.blockscaled.fixed", source_2d.device)
     return state.run_tensor_fp8(
         source_2d,
@@ -868,7 +935,8 @@ def blockscaled_mm(
         raise TypeError("block-quantized linear weights require a prepared Plan")
 
     if isinstance(rhs, (NVFP4LinearWeight, IQ2XSLinearWeight)) or (
-        isinstance(rhs, MXFP8LinearWeight) and isinstance(lhs, torch.Tensor)
+        isinstance(rhs, MXFP8LinearWeight)
+        and isinstance(lhs, torch.Tensor)
         and lhs.dtype == torch.bfloat16
     ):
         if not isinstance(lhs, torch.Tensor):
@@ -878,25 +946,41 @@ def blockscaled_mm(
         out_dtype = options.pop("out_dtype", None)
         if out_dtype not in (None, torch.bfloat16):
             raise ValueError("BF16 blockscaled linear output must be BF16")
-        _validate_bias(bias, out_features=rhs.out_features, out_dtype=torch.bfloat16,
-                       device=lhs.device)
+        _validate_bias(
+            bias,
+            out_features=rhs.out_features,
+            out_dtype=torch.bfloat16,
+            device=lhs.device,
+        )
         if bias is not None and out is not None:
             from ._a16 import _overlap
+
             if _overlap(out, bias):
                 raise ValueError("out must not overlap bias")
         if lhs.shape[-1] != rhs.in_features:
             raise ValueError("source logical K does not match the packed weight")
         from ._ops import linear
         from ._a16 import _weight_parts
+
         values, scales, global_scale, fp4 = _weight_parts(rhs)
         result = linear(
-            lhs, values, scales, global_scale, plan=plan,
+            lhs,
+            values,
+            scales,
+            global_scale,
+            plan=plan,
             global_scale_kind=rhs.global_scale_kind if fp4 else "none",
-            out=out, expected_m=expected_m, **options,
+            out=out,
+            expected_m=expected_m,
+            **options,
         )
         if bias is not None:
             from ._a16 import _stream_context
-            with torch.cuda.device(lhs.device), _stream_context(options.get("stream"), lhs.device):
+
+            with (
+                torch.cuda.device(lhs.device),
+                _stream_context(options.get("stream"), lhs.device),
+            ):
                 result.add_(bias)
         return result
     if isinstance(rhs, MXFP8LinearWeight):
@@ -965,11 +1049,8 @@ def blockscaled_mm(
     if plan is None:
         return dense_gemm(lhs, rhs, out, expected_m=expected_m, **kwargs)
     from b12x.gemm._preparation import mm as prepared_mm
+
     return prepared_mm(lhs, rhs, out, plan=plan, **kwargs)
-
-
-
-
 
 
 __all__ = [

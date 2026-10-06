@@ -26,7 +26,7 @@ def _hadamard(order: int, device: torch.device) -> torch.Tensor:
     h = torch.ones(1, 1, dtype=torch.float64)
     while h.shape[0] < order:
         h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0)
-    return (h / (order ** 0.5)).to(device=device, dtype=torch.float32)
+    return (h / (order**0.5)).to(device=device, dtype=torch.float32)
 
 
 def _pack_native_tiles(edges: torch.Tensor, bits: int) -> torch.Tensor:
@@ -35,15 +35,16 @@ def _pack_native_tiles(edges: torch.Tensor, bits: int) -> torch.Tensor:
     values = edges.to(torch.int64) & ((1 << bits) - 1)
     spans = values.reshape(-1, 16, 16)
     symbol_shifts = torch.arange(bits - 1, -1, -1, device=edges.device)
-    bitstream = ((spans[..., None] >> symbol_shifts) & 1).reshape(
-        -1, 16, bits * 16
-    )
+    bitstream = ((spans[..., None] >> symbol_shifts) & 1).reshape(-1, 16, bits * 16)
     word_shifts = torch.arange(15, -1, -1, device=edges.device)
     words = (bitstream.reshape(-1, 16, bits, 16) << word_shifts).sum(dim=-1)
     flat = words.reshape(-1, 16 * bits)
-    return flat.reshape(-1, 16 * bits // 2, 2).flip(-1).reshape(
-        -1, 16 * bits
-    ).to(torch.int16)
+    return (
+        flat.reshape(-1, 16 * bits // 2, 2)
+        .flip(-1)
+        .reshape(-1, 16 * bits)
+        .to(torch.int16)
+    )
 
 
 def _cyclic_states(edges: torch.Tensor, bits: int) -> torch.Tensor:
@@ -51,9 +52,7 @@ def _cyclic_states(edges: torch.Tensor, bits: int) -> torch.Tensor:
 
     states = torch.zeros_like(edges, dtype=torch.int64)
     for lag in range((16 + bits - 1) // bits):
-        states |= torch.roll(edges.to(torch.int64), shifts=lag, dims=-1) << (
-            lag * bits
-        )
+        states |= torch.roll(edges.to(torch.int64), shifts=lag, dims=-1) << (lag * bits)
     return states & 0xFFFF
 
 
@@ -93,9 +92,7 @@ def build_trellis_weight(
     edges = torch.randint(
         0, 1 << bits, (windows, 256), generator=generator, device="cpu"
     ).to(device)
-    payload = _pack_native_tiles(edges, bits).reshape(
-        experts, k16, n16, 16 * bits
-    )
+    payload = _pack_native_tiles(edges, bits).reshape(experts, k16, n16, 16 * bits)
     states = _cyclic_states(edges, bits)
     direct = lut_e4m3_direct_table_cpu().to(device)
     rate = _RATE_INDEX[bits] << 16
@@ -176,12 +173,12 @@ def _boundary_intermediate_hadamard(
     )
     pre = src
     s1 = pre @ had
-    coord = (
-        torch.arange(pre_blocks, device=device)[:, None] * 64 + local[None, :]
-    )
+    coord = torch.arange(pre_blocks, device=device)[:, None] * 64 + local[None, :]
     ua_index = slot[None, :] * intermediate + coord
-    ua = rotations[experts_idx][:, ua_index.reshape(-1)].float().reshape(
-        rows, pre_blocks, 128
+    ua = (
+        rotations[experts_idx][:, ua_index.reshape(-1)]
+        .float()
+        .reshape(rows, pre_blocks, 128)
     )
     s1 = s1 * ua
     s2 = s1 @ had
@@ -190,8 +187,10 @@ def _boundary_intermediate_hadamard(
         + torch.arange(pre_blocks, device=device)[:, None] * 128
         + pos[None, :]
     )
-    presign = rotations[experts_idx][:, sign_index.reshape(-1)].float().reshape(
-        rows, pre_blocks, 128
+    presign = (
+        rotations[experts_idx][:, sign_index.reshape(-1)]
+        .float()
+        .reshape(rows, pre_blocks, 128)
     )
     s2 = s2 * presign
     h_pairs = _situ(s2[..., 0::2], s2[..., 1::2])
@@ -229,9 +228,7 @@ def trellis_moe_reference(
     flat_ids = topk_ids.reshape(-1).long()
     flat_w = topk_weights.reshape(-1).float()
     token_of = (
-        torch.arange(m, device=device)
-        .repeat_interleave(topk_ids.shape[1])
-        .long()
+        torch.arange(m, device=device).repeat_interleave(topk_ids.shape[1]).long()
     )
     xin = x_rot.float()[token_of]
     gate = torch.einsum("rk,rik->ri", xin, w13_weights[0, flat_ids].float())
@@ -241,9 +238,7 @@ def trellis_moe_reference(
             gate, up, rotations, flat_ids, intermediate, device
         )
     else:
-        h = _boundary_ordinary(
-            gate, up, rotations, flat_ids, intermediate, device
-        )
+        h = _boundary_ordinary(gate, up, rotations, flat_ids, intermediate, device)
     y = torch.einsum("ri,rki->rk", h, w2_weights[flat_ids].float())
     out.index_add_(0, token_of, y * flat_w[:, None])
     return out

@@ -20,6 +20,7 @@ BF16 and reported as skipped.
 Use ``dry_run=True`` first: it prints the plan from the index alone, writing
 nothing (the output directory is not even created).
 """
+
 from __future__ import annotations
 
 import json
@@ -268,9 +269,9 @@ def _discover_packed_experts(model: SafetensorsModel) -> Optional[MoEExpertSchem
 
     prefix_template = f"{template_pre}{{L}}.{template_module}"
     # Expert count = leading dim of the packed down tensor on the first layer.
-    e_count = model.shape_of(
-        f"{prefix_template.format(L=complete[0])}.experts.{down}"
-    )[0]
+    e_count = model.shape_of(f"{prefix_template.format(L=complete[0])}.experts.{down}")[
+        0
+    ]
     return MoEExpertScheme(
         num_experts=int(e_count),
         layers=complete,
@@ -318,10 +319,7 @@ def discover_dense_linears(model: SafetensorsModel) -> Optional[DenseLinearSchem
     mlp_fused = _find(_FUSED_GATE_UP)
 
     attn_projs = [
-        rel
-        for proj in _ATTN_ORDER
-        for rel in [f"self_attn.{proj}"]
-        if rel in all_rels
+        rel for proj in _ATTN_ORDER for rel in [f"self_attn.{proj}"] if rel in all_rels
     ]
 
     if mlp_down is None and not attn_projs:
@@ -330,9 +328,7 @@ def discover_dense_linears(model: SafetensorsModel) -> Optional[DenseLinearSchem
     # Layers that actually carry a dense MLP (or attention) we can quantize.
     mlp_names = {n for n in (mlp_gate, mlp_up, mlp_down, mlp_fused) if n}
     target = mlp_names | set(attn_projs)
-    used_layers = sorted(
-        L for L, rels in rels_by_layer.items() if rels & target
-    )
+    used_layers = sorted(L for L, rels in rels_by_layer.items() if rels & target)
     return DenseLinearScheme(
         layers=used_layers,
         mlp_gate=mlp_gate,
@@ -349,7 +345,9 @@ def _write_manifest(out: pathlib.Path, payload: dict) -> None:
     (out / "manifest.json").write_text(json.dumps(payload, indent=2))
 
 
-def _split_gate_up(gate_up: torch.Tensor, dim: int, order: str) -> tuple[torch.Tensor, torch.Tensor]:
+def _split_gate_up(
+    gate_up: torch.Tensor, dim: int, order: str
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Split a fused gate_up tensor along ``dim`` into ``(gate, up)``."""
     half = gate_up.shape[dim] // 2
     a, b = gate_up.narrow(dim, 0, half), gate_up.narrow(dim, half, half)
@@ -392,9 +390,9 @@ def _build_layer_w1_w2(
             device, torch.bfloat16
         )
         if scheme.is_fused:
-            gate_up = model.get_tensor(scheme.expert_key(layer, e, scheme.gate_name)).to(
-                device, torch.bfloat16
-            )
+            gate_up = model.get_tensor(
+                scheme.expert_key(layer, e, scheme.gate_name)
+            ).to(device, torch.bfloat16)
             gate, up = _split_gate_up(gate_up, dim=0, order=gate_up_order)
         else:
             gate = model.get_tensor(scheme.expert_key(layer, e, scheme.gate_name)).to(
@@ -462,23 +460,36 @@ def convert_moe_model_to_fp6(
         save_fp6_moe_weights(weights, str(out / fname))
         report.tensors_written += 2  # w1 + w2
         report.artifacts.append(
-            {"layer": layer, "file": fname, "experts": scheme.num_experts,
-             "k": weights.k, "n": weights.n}
+            {
+                "layer": layer,
+                "file": fname,
+                "experts": scheme.num_experts,
+                "k": weights.k,
+                "n": weights.n,
+            }
         )
         if verbose:
-            print(f"  layer {layer}: w1={tuple(w1.shape)} w2={tuple(w2.shape)} -> {fname}")
+            print(
+                f"  layer {layer}: w1={tuple(w1.shape)} w2={tuple(w2.shape)} -> {fname}"
+            )
         del w1, w2, weights
         if device == "cuda":
             torch.cuda.empty_cache()
 
-    _write_manifest(out, {
-        # historical on-disk format id; do not rename
-        "format": "b12x_fp6_model_v1", "arch": "moe",
-        "model_type": model.config.get("model_type"),
-        "num_experts": scheme.num_experts, "activation": activation,
-        "source_format": source_format, "layers": list(layers),
-        "artifacts": report.artifacts,
-    })
+    _write_manifest(
+        out,
+        {
+            # historical on-disk format id; do not rename
+            "format": "b12x_fp6_model_v1",
+            "arch": "moe",
+            "model_type": model.config.get("model_type"),
+            "num_experts": scheme.num_experts,
+            "activation": activation,
+            "source_format": source_format,
+            "layers": list(layers),
+            "artifacts": report.artifacts,
+        },
+    )
     return report
 
 
@@ -514,7 +525,13 @@ def convert_dense_model_to_fp6(
         raise ValueError(f"no dense linears discovered under {model_path}")
 
     rels: list[str] = [
-        r for r in (scheme.mlp_fused_gate_up, scheme.mlp_gate, scheme.mlp_up, scheme.mlp_down)
+        r
+        for r in (
+            scheme.mlp_fused_gate_up,
+            scheme.mlp_gate,
+            scheme.mlp_up,
+            scheme.mlp_down,
+        )
         if r
     ]
     if include_attention:
@@ -527,7 +544,9 @@ def convert_dense_model_to_fp6(
     if dry_run:
         return report
     if device != "cuda":
-        raise RuntimeError("dense conversion requires device='cuda' (GPU-only quantizer)")
+        raise RuntimeError(
+            "dense conversion requires device='cuda' (GPU-only quantizer)"
+        )
 
     out = pathlib.Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -569,12 +588,18 @@ def convert_dense_model_to_fp6(
             if verbose:
                 print(f"  layer {layer}: {len(linear_keys)} linears -> {fname}")
 
-    _write_manifest(out, {
-        # historical on-disk format id; do not rename
-        "format": "b12x_fp6_model_v1", "arch": "dense",
-        "model_type": model.config.get("model_type"),
-        "source_format": source_format, "include_attention": include_attention,
-        "layers": list(layers), "artifacts": report.artifacts,
-        "skipped": report.skipped,
-    })
+    _write_manifest(
+        out,
+        {
+            # historical on-disk format id; do not rename
+            "format": "b12x_fp6_model_v1",
+            "arch": "dense",
+            "model_type": model.config.get("model_type"),
+            "source_format": source_format,
+            "include_attention": include_attention,
+            "layers": list(layers),
+            "artifacts": report.artifacts,
+            "skipped": report.skipped,
+        },
+    )
     return report

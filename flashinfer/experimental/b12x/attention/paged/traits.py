@@ -237,9 +237,7 @@ def select_paged_forward_traits(
         # registers. Only the remaining KV warps spill the statically known
         # valid GQA rows.
         spilled_warps = num_warps_kv - 1
-        cta_sync_o_bytes = (
-            spilled_warps * compact_sync_rows * sync_o_row_stride * 4
-        )
+        cta_sync_o_bytes = spilled_warps * compact_sync_rows * sync_o_row_stride * 4
         cta_sync_md_bytes = spilled_warps * compact_sync_rows * 8
         # The compact epilogue keeps warp zero in registers and spills only
         # the other KV warps.  Its cooperative BF16 store must use a separate
@@ -252,9 +250,7 @@ def select_paged_forward_traits(
             if num_warps_kv == 1
             else num_warps_kv * cta_tile_q * sync_o_row_stride * 4
         )
-        cta_sync_md_bytes = (
-            8 if num_warps_kv == 1 else num_warps_kv * cta_tile_q * 8
-        )
+        cta_sync_md_bytes = 8 if num_warps_kv == 1 else num_warps_kv * cta_tile_q * 8
         compact_store_stage_bytes = 0
     cta_sync_storage_bytes = cta_sync_o_bytes + cta_sync_md_bytes
     smem_o_bytes = cta_tile_q * head_dim_vo * o_bytes
@@ -280,10 +276,7 @@ def select_paged_forward_traits(
     )
     candidates: list[tuple[int, int, int, int, int]] = []
     for candidate_mma_kv in range(1, max_candidate_mma_kv + 1):
-        if (
-            exact_num_mma_kv is not None
-            and candidate_mma_kv != exact_num_mma_kv
-        ):
+        if exact_num_mma_kv is not None and candidate_mma_kv != exact_num_mma_kv:
             continue
         if _paged_is_invalid(
             num_mma_q=num_mma_q,
@@ -523,12 +516,8 @@ def select_paged_forward_traits_from_plan(
         minimum_shared_storage_bytes=minimum_shared_storage_bytes,
         compact_sync_rows=compact_sync_rows,
     )
-    force_wide_bf16_extend = (
-        paged_control("B12X_PAGED_EXTEND_BF16_N32", "0") == "1"
-    )
-    force_narrow_bf16_extend = (
-        paged_control("B12X_PAGED_EXTEND_BF16_N16", "0") == "1"
-    )
+    force_wide_bf16_extend = paged_control("B12X_PAGED_EXTEND_BF16_N32", "0") == "1"
+    force_narrow_bf16_extend = paged_control("B12X_PAGED_EXTEND_BF16_N16", "0") == "1"
     wide_bf16_extend_family = (
         exact_num_mma_kv is None
         and plan.mode == "extend"
@@ -564,20 +553,17 @@ def select_paged_forward_traits_from_plan(
     average_visible_kv = max(int(plan.kv_chunk_size) - average_q_len // 2, 1)
     if plan.window_left >= 0:
         average_visible_kv = min(average_visible_kv, int(plan.window_left) + 1)
-    narrow_loop_iters = (
-        average_visible_kv + int(traits.cta_tile_kv) - 1
-    ) // int(traits.cta_tile_kv)
+    narrow_loop_iters = (average_visible_kv + int(traits.cta_tile_kv) - 1) // int(
+        traits.cta_tile_kv
+    )
     lost_resident_ctas = max(
         int(traits.num_ctas_per_sm) - int(wide_traits.num_ctas_per_sm),
         1,
     )
     min_narrow_loop_iters = (
-        _BF16_EXTEND_WIDE_TILE_MIN_NARROW_ITERS_PER_LOST_CTA
-        * lost_resident_ctas
+        _BF16_EXTEND_WIDE_TILE_MIN_NARROW_ITERS_PER_LOST_CTA * lost_resident_ctas
     )
-    num_sms = int(
-        torch.cuda.get_device_properties(plan.device).multi_processor_count
-    )
+    num_sms = int(torch.cuda.get_device_properties(plan.device).multi_processor_count)
     active_ctas = int(plan.num_qo_tiles) * int(plan.num_kv_heads)
     # N32 loses one resident CTA.  Retain N16 for the two-iteration region
     # unless the N32 grid occupies at most one quarter of the SMs.

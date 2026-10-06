@@ -40,7 +40,11 @@ from b12x.attention._shared.cute.ops import fmax
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compiler import run_compiled
-from b12x._lib.compile_plan import compile_only_launches_enabled, program_keys, record_program
+from b12x._lib.compile_plan import (
+    compile_only_launches_enabled,
+    program_keys,
+    record_program,
+)
 from b12x._lib.intrinsics import (
     fp8x4_e4m3_to_bfloat2x2_native_sm120,
     ld_global_nc_v4_u32,
@@ -1033,9 +1037,7 @@ class _CooperativeSparseGqaMergeKernel(_SparseGqaMergeKernel):
         inverse = Float32(0.0)
         if denominator > Float32(0.0):
             inverse = Float32(1.0) / denominator
-        if const_expr(self.return_lse) and (warp == Int32(0)) & (
-            lane == Int32(0)
-        ):
+        if const_expr(self.return_lse) and (warp == Int32(0)) & (lane == Int32(0)):
             merged_lse = Float32(-Float32.inf)
             if denominator > Float32(0.0):
                 merged_lse = maximum + cute.math.log2(
@@ -1106,9 +1108,7 @@ class _ShapeAdaptiveSparseGqaMergeKernel:
     def __init__(self, *, q_heads: int, return_lse: bool) -> None:
         self.q_heads = q_heads
         self.return_lse = bool(return_lse)
-        self.serial = _SparseGqaMergeKernel(
-            q_heads=q_heads, return_lse=return_lse
-        )
+        self.serial = _SparseGqaMergeKernel(q_heads=q_heads, return_lse=return_lse)
         self.cooperative = _CooperativeSparseGqaMergeKernel(
             q_heads=q_heads, return_lse=return_lse
         )

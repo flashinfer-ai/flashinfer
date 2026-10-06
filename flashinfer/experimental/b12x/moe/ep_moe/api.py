@@ -1,4 +1,5 @@
 """Public surface for session-prepared replicated-input EP MoE."""
+
 from __future__ import annotations
 
 from b12x._lib.gating import default_is_supported
@@ -13,12 +14,10 @@ from ._preparation import invocation_from_tensors, plan
 from ._tuning import EpMoeConfig, EpMoeQuery
 
 
-
 def bind(plan: Plan, **kwargs) -> Binding:
     """Bind caller tensors to one session-prepared EP plan."""
-    return require_prepared(plan, "moe.ep_moe").bind(
-        _plan=plan, **kwargs
-    )
+    return require_prepared(plan, "moe.ep_moe").bind(_plan=plan, **kwargs)
+
 
 def run(*, binding: Binding):
     """Run a bound EP partial; no compiler or selection path is available here."""
@@ -32,6 +31,16 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
-    "Caps", "Plan", "Binding", "ExpertMap", "EpMoeConfig", "EpMoeQuery", "plan",
-    "bind", "run", "prepare_expert_map", "invocation_from_tensors", "is_supported",
+    "Caps",
+    "Plan",
+    "Binding",
+    "ExpertMap",
+    "EpMoeConfig",
+    "EpMoeQuery",
+    "plan",
+    "bind",
+    "run",
+    "prepare_expert_map",
+    "invocation_from_tensors",
+    "is_supported",
 ]

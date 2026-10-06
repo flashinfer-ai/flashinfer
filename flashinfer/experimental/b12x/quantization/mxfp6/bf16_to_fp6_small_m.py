@@ -36,6 +36,7 @@ cross-CTA synced: at small-M sizes the scan is a sub-microsecond L2 read
 K=13824). A single-CTA variant was tried and cost ~1.2 ms/step in serving by
 serializing the MTP-verify quants — redundancy is the cheaper trade by far.
 """
+
 from __future__ import annotations
 
 from typing import Dict, Tuple
@@ -189,9 +190,7 @@ class SmallMQuantKernel:
                 i = Int32(tidx)
                 while i < nvec_row:
                     w0, w1, w2, w3 = ld_global_v4_u32(
-                        get_ptr_as_int64(
-                            mX, Int32(r) * k + i * Int32(8)
-                        )
+                        get_ptr_as_int64(mX, Int32(r) * k + i * Int32(8))
                     )
                     for w in (w0, w1, w2, w3):
                         hi = u32_as_f32(w & Uint32(0x7FFF0000))
@@ -199,9 +198,7 @@ class SmallMQuantKernel:
                         local = fmax_f32(local, fmax_f32(hi, lo))
                     i += Int32(_THREADS)
                 local = warp_reduce(local, fmax_f32)
-                amax_r = block_reduce(
-                    local, fmax_f32, red_buf, cutlass.Float32(0.0)
-                )
+                amax_r = block_reduce(local, fmax_f32, red_buf, cutlass.Float32(0.0))
                 # gs_r = numerator(fmt) / max(amax_r, 1e-6) with a correctly
                 # rounded f32 division (div.rn.f32, not the DSL's ``/`` which
                 # may lower to an approximate division). NOTE: torch's CUDA
@@ -240,18 +237,14 @@ class SmallMQuantKernel:
             local = cutlass.Float32(0.0)
             i = Int32(tidx)
             while i < nvec:
-                w0, w1, w2, w3 = ld_global_v4_u32(
-                    get_ptr_as_int64(mX, i * Int32(8))
-                )
+                w0, w1, w2, w3 = ld_global_v4_u32(get_ptr_as_int64(mX, i * Int32(8)))
                 for w in (w0, w1, w2, w3):
                     hi = u32_as_f32(w & Uint32(0x7FFF0000))
                     lo = u32_as_f32((w << Uint32(16)) & Uint32(0x7FFF0000))
                     local = fmax_f32(local, fmax_f32(hi, lo))
                 i += Int32(_THREADS)
             local = warp_reduce(local, fmax_f32)
-            amax_val = block_reduce(
-                local, fmax_f32, red_buf, cutlass.Float32(0.0)
-            )
+            amax_val = block_reduce(local, fmax_f32, red_buf, cutlass.Float32(0.0))
 
             # Activation global scale, fused: gs = numerator(fmt) /
             # max(amax, 1e-6) with a correctly rounded f32 division
@@ -259,9 +252,7 @@ class SmallMQuantKernel:
             # divides in f64 and casts to f32, which is bit-identical to
             # div.rn.f32 (see the per-row branch comment).
             amax_f32 = fmax_f32(amax_val, cutlass.Float32(1e-6))
-            gs_value = div_rn_f32(
-                cutlass.Float32(_GS_NUMERATOR[self.fmt]), amax_f32
-            )
+            gs_value = div_rn_f32(cutlass.Float32(_GS_NUMERATOR[self.fmt]), amax_f32)
 
         # Phase 1: one 32-element block per thread across the full grid —
         # same parallelism as the pre-fusion kernel. Same per-block math
@@ -335,7 +326,9 @@ class SmallMQuantKernel:
             st_global_u8(get_ptr_as_int64(mSFA, sf_offset), sbyte)
 
 
-def compile_bf16_to_fp6_small_m(m: int, k: int, fmt: str = "e3m2", per_row: bool = False):
+def compile_bf16_to_fp6_small_m(
+    m: int, k: int, fmt: str = "e3m2", per_row: bool = False
+):
     """Compile the small-M BF16->MX-FP6 bytes quantizer for ``(m, k)``.
 
     Returns ``launch(bf16_input, w_gscale, codes_flat, scale_flat,
@@ -352,7 +345,9 @@ def compile_bf16_to_fp6_small_m(m: int, k: int, fmt: str = "e3m2", per_row: bool
     output correction ``bf16(1/gs_r)``. With ``per_row=False`` pass any bf16
     tensor (it is never written).
     """
-    assert 1 <= m <= SMALL_M_MAX, f"small-M quantizer requires m<={SMALL_M_MAX}, got {m}"
+    assert 1 <= m <= SMALL_M_MAX, (
+        f"small-M quantizer requires m<={SMALL_M_MAX}, got {m}"
+    )
     assert k % 128 == 0, f"K must be a multiple of 128, got {k}"
     assert fmt in ("e3m2", "e2m3", "e4m3"), f"unsupported act fmt: {fmt}"
     cache_key = (m, k, fmt, per_row)
@@ -380,7 +375,9 @@ def compile_bf16_to_fp6_small_m(m: int, k: int, fmt: str = "e3m2", per_row: bool
     total_blocks = m * (k // _FP6_BLOCK_ELEMS)
     grid = (total_blocks + _THREADS - 1) // _THREADS
     kernel = SmallMQuantKernel(fmt, per_row=per_row)
-    raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
     raw = b12x_compile(
         kernel,
         bf16_fake,
@@ -399,9 +396,7 @@ def compile_bf16_to_fp6_small_m(m: int, k: int, fmt: str = "e3m2", per_row: bool
     )
 
     def launch(bf16_input, w_gscale, codes_flat, scale_flat, alpha_out, inv_gs_out):
-        sfa_p = make_ptr(
-            sf, scale_flat.data_ptr(), AddressSpace.gmem, assumed_align=16
-        )
+        sfa_p = make_ptr(sf, scale_flat.data_ptr(), AddressSpace.gmem, assumed_align=16)
         raw(
             bf16_input,
             w_gscale,

@@ -10,7 +10,12 @@ import torch
 
 from b12x.attention import paged
 from b12x.attention.paged.reference import paged_attention_reference
-from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall, require_prepared
+from b12x.preparation import (
+    FrozenMapping,
+    PreparationSession,
+    PreparedCall,
+    require_prepared,
+)
 
 from b12x.testing.reference.helpers import require_b12x
 from b12x.testing.reference.paged_attention_helpers import make_paged_inputs
@@ -31,14 +36,13 @@ _SCHEDULE_FIELDS = (
 
 def _schedule_ptrs(binding: object) -> dict[str, int]:
     scratch = binding.scratch
-    return {
-        name: int(getattr(scratch, name).data_ptr())
-        for name in _SCHEDULE_FIELDS
-    }
+    return {name: int(getattr(scratch, name).data_ptr()) for name in _SCHEDULE_FIELDS}
 
 
 @torch.inference_mode()
-def test_decode_graph_plan_owned_replay_state_survives_shared_scratch_and_big_pid() -> None:
+def test_decode_graph_plan_owned_replay_state_survives_shared_scratch_and_big_pid() -> (
+    None
+):
     """Prepared decode plans retain independent schedules outside shared scratch."""
     device = require_b12x()
     batch = 2
@@ -188,7 +192,13 @@ def test_decode_graph_plan_owned_replay_state_survives_shared_scratch_and_big_pi
     full_request = full_declaration.request(
         name="decode-full",
         prepare_call=prime(
-            "full", q_full, output_full, page_table_full, seqlens_full, cu_full, window=-1
+            "full",
+            q_full,
+            output_full,
+            page_table_full,
+            seqlens_full,
+            cu_full,
+            window=-1,
         ),
     )
     window_request = window_declaration.request(
@@ -250,19 +260,31 @@ def test_decode_graph_plan_owned_replay_state_survives_shared_scratch_and_big_pi
 
             # Public bindings share numerical workspace, while every prepared
             # plan owns the schedule addresses captured by its graph.
-            assert binding_full.scratch._owner_scratch_plan is require_prepared(plan_full, "attention.gqa").scratch_plan
-            assert binding_window.scratch._owner_scratch_plan is require_prepared(plan_window, "attention.gqa").scratch_plan
+            assert (
+                binding_full.scratch._owner_scratch_plan
+                is require_prepared(plan_full, "attention.gqa").scratch_plan
+            )
+            assert (
+                binding_window.scratch._owner_scratch_plan
+                is require_prepared(plan_window, "attention.gqa").scratch_plan
+            )
             full_ptrs = _schedule_ptrs(binding_full)
             window_ptrs = _schedule_ptrs(binding_window)
-            assert all(full_ptrs[name] != window_ptrs[name] for name in _SCHEDULE_FIELDS)
+            assert all(
+                full_ptrs[name] != window_ptrs[name] for name in _SCHEDULE_FIELDS
+            )
             scratch_start = int(shared_scratch.data_ptr())
             scratch_end = scratch_start + int(shared_scratch.numel())
             assert all(
                 not (scratch_start <= ptr < scratch_end)
                 for ptr in (*full_ptrs.values(), *window_ptrs.values())
             )
-            with pytest.raises(RuntimeError, match="cannot replace decode graph replay state"):
-                require_prepared(plan_full, "attention.gqa").prepare_decode_graph_replay_state(
+            with pytest.raises(
+                RuntimeError, match="cannot replace decode graph replay state"
+            ):
+                require_prepared(
+                    plan_full, "attention.gqa"
+                ).prepare_decode_graph_replay_state(
                     batch=batch,
                     total_q_capacity=batch,
                     max_page_table_width=page_table_width,
@@ -289,12 +311,24 @@ def test_decode_graph_plan_owned_replay_state_survives_shared_scratch_and_big_pi
                     torch.tensor(window_lengths, dtype=torch.int32, device=device)
                 )
                 expected_full, _ = paged_attention_reference(
-                    q_full, k_cache, v_cache, page_table_full, seqlens_full, cu_full,
-                    causal=True, window_left=-1,
+                    q_full,
+                    k_cache,
+                    v_cache,
+                    page_table_full,
+                    seqlens_full,
+                    cu_full,
+                    causal=True,
+                    window_left=-1,
                 )
                 expected_window, _ = paged_attention_reference(
-                    q_window, k_cache, v_cache, page_table_window, seqlens_window, cu_window,
-                    causal=True, window_left=window_left,
+                    q_window,
+                    k_cache,
+                    v_cache,
+                    page_table_window,
+                    seqlens_window,
+                    cu_window,
+                    causal=True,
+                    window_left=window_left,
                 )
                 output_full.fill_(torch.nan)
                 output_window.fill_(torch.nan)

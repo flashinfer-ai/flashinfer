@@ -8,13 +8,19 @@ import torch
 from b12x.attention.paged.reference import paged_attention_reference
 from b12x.attention._shared.contiguous.api import clear_attention_caches
 from b12x.attention.paged._forward import paged_attention_forward
-from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention.paged._scratch import (
+    B12XPagedAttentionScratchCaps,
+    plan_paged_attention_scratch,
+)
 from b12x.attention.paged.planner import create_paged_plan
 from b12x.attention.paged.planner import plan_extend_graph_capacity
 from b12x.attention.paged.planner import plan_verify_graph_capacity
 
 from b12x.testing.reference.helpers import require_b12x
-from b12x.testing.reference.paged_attention_helpers import make_paged_inputs, quantize_paged_kv_cache_e4m3
+from b12x.testing.reference.paged_attention_helpers import (
+    make_paged_inputs,
+    quantize_paged_kv_cache_e4m3,
+)
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -53,19 +59,21 @@ def test_laguna_fp8_verifier_replays_fixed_graph_across_context_lengths(
         dtype=torch.bfloat16,
         device=device,
     ).mul_(0.25)
-    combined_cache = torch.randn(
-        num_pages,
-        2,
-        page_size,
-        num_kv_heads,
-        head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    ).mul_(0.25).to(torch.float8_e4m3fn)
+    combined_cache = (
+        torch.randn(
+            num_pages,
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        .mul_(0.25)
+        .to(torch.float8_e4m3fn)
+    )
     k_cache, v_cache = combined_cache.unbind(1)
-    page_table = torch.arange(
-        num_pages, dtype=torch.int32, device=device
-    ).unsqueeze(0)
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
     cache_seqlens = torch.tensor([max_context], dtype=torch.int32, device=device)
     cu_seqlens_q = torch.tensor([0, query_len], dtype=torch.int32, device=device)
     descale = torch.ones((1,), dtype=torch.float32, device=device)
@@ -184,33 +192,37 @@ def test_laguna_fp8_extend_replays_smaller_uneven_query_capacity() -> None:
         dtype=torch.bfloat16,
         device=device,
     ).mul_(0.125)
-    k_cache = torch.randn(
-        num_pages,
-        page_size,
-        num_kv_heads,
-        head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    ).mul_(0.125).to(torch.float8_e4m3fn)
-    v_cache = torch.randn(
-        num_pages,
-        page_size,
-        num_kv_heads,
-        head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    ).mul_(0.125).to(torch.float8_e4m3fn)
+    k_cache = (
+        torch.randn(
+            num_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        .mul_(0.125)
+        .to(torch.float8_e4m3fn)
+    )
+    v_cache = (
+        torch.randn(
+            num_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        .mul_(0.125)
+        .to(torch.float8_e4m3fn)
+    )
     page_table = torch.tensor(
         [[0, 1, 2, 3], [4, 5, 6, 7]],
         dtype=torch.int32,
         device=device,
     )
-    cache_seqlens = torch.tensor(
-        [389, 501], dtype=torch.int32, device=device
-    )
-    cu_seqlens_q = torch.tensor(
-        [0, 8, live_total_q], dtype=torch.int32, device=device
-    )
+    cache_seqlens = torch.tensor([389, 501], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, 8, live_total_q], dtype=torch.int32, device=device)
     prepare_cu_seqlens_q = torch.tensor(
         [0, 1, capacity_q], dtype=torch.int32, device=device
     )
@@ -311,9 +323,7 @@ def test_laguna_fp8_extend_replays_smaller_uneven_query_capacity() -> None:
     )
 
     q.copy_(torch.randn_like(q).mul_(0.125))
-    cache_seqlens.copy_(
-        torch.tensor([257, 417], dtype=torch.int32, device=device)
-    )
+    cache_seqlens.copy_(torch.tensor([257, 417], dtype=torch.int32, device=device))
     cu_seqlens_q[1] = 5
     graph.replay()
     torch.cuda.synchronize()
@@ -346,21 +356,23 @@ def test_laguna_fp8_extend_reuses_dynamic_worklist_grid() -> None:
     num_kv_heads = 4
     head_dim = 128
     num_pages = 8
-    page_table = torch.arange(
-        num_pages, dtype=torch.int32, device=device
-    ).unsqueeze(0)
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
     cache_seqlens = torch.tensor(
         [num_pages * page_size], dtype=torch.int32, device=device
     )
-    combined_cache = torch.randn(
-        num_pages,
-        2,
-        page_size,
-        num_kv_heads,
-        head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    ).mul_(0.125).to(torch.float8_e4m3fn)
+    combined_cache = (
+        torch.randn(
+            num_pages,
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        .mul_(0.125)
+        .to(torch.float8_e4m3fn)
+    )
     k_cache, v_cache = combined_cache.unbind(1)
     descale = torch.ones((1,), dtype=torch.float32, device=device)
 
@@ -372,9 +384,7 @@ def test_laguna_fp8_extend_reuses_dynamic_worklist_grid() -> None:
             dtype=torch.bfloat16,
             device=device,
         ).mul_(0.125)
-        cu_seqlens_q = torch.tensor(
-            [0, total_q], dtype=torch.int32, device=device
-        )
+        cu_seqlens_q = torch.tensor([0, total_q], dtype=torch.int32, device=device)
         capacity = plan_extend_graph_capacity(
             device=device,
             q_dtype=q.dtype,
@@ -624,7 +634,9 @@ class _PagedGraphScratchHarness:
     reason="stale vs current decode-graph planner heuristics: capacity derivation from a live plan, LUT staging shape, and prepare ordering all need a refresh",
     strict=False,
 )
-def test_paged_attention_decode_replays_under_cuda_graph_with_variable_metadata() -> None:
+def test_paged_attention_decode_replays_under_cuda_graph_with_variable_metadata() -> (
+    None
+):
     require_b12x()
     clear_attention_caches()
 
@@ -665,16 +677,20 @@ def test_paged_attention_decode_replays_under_cuda_graph_with_variable_metadata(
     graph.replay()
     torch.cuda.synchronize()
     assert (output - ref_out_1).abs().max().item() <= 0.02
-    assert (_lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_1).abs().max().item() <= 0.03
+    assert (
+        _lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_1
+    ).abs().max().item() <= 0.03
     assert _cosine_similarity(output, ref_out_1) >= 0.99999
 
-    q_2, k_cache_2, v_cache_2, page_table_2, cache_seqlens_2, cu_seqlens_q_2 = make_paged_inputs(
-        q_seqlens=[1, 1, 1, 1],
-        cache_seqlens=[2048, 2048, 4096, 4096],
-        page_size=64,
-        seed=79,
-        page_table_width=page_table.shape[1],
-        num_pages=k_cache.shape[0],
+    q_2, k_cache_2, v_cache_2, page_table_2, cache_seqlens_2, cu_seqlens_q_2 = (
+        make_paged_inputs(
+            q_seqlens=[1, 1, 1, 1],
+            cache_seqlens=[2048, 2048, 4096, 4096],
+            page_size=64,
+            seed=79,
+            page_table_width=page_table.shape[1],
+            num_pages=k_cache.shape[0],
+        )
     )
     q.copy_(q_2)
     k_cache.copy_(k_cache_2)
@@ -696,7 +712,9 @@ def test_paged_attention_decode_replays_under_cuda_graph_with_variable_metadata(
     graph.replay()
     torch.cuda.synchronize()
     assert (output - ref_out_2).abs().max().item() <= 0.02
-    assert (_lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_2).abs().max().item() <= 0.03
+    assert (
+        _lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_2
+    ).abs().max().item() <= 0.03
     assert _cosine_similarity(output, ref_out_2) >= 0.99999
 
 
@@ -705,7 +723,9 @@ def test_paged_attention_decode_replays_under_cuda_graph_with_variable_metadata(
     reason="stale vs current decode-graph planner heuristics: capacity derivation from a live plan, LUT staging shape, and prepare ordering all need a refresh",
     strict=False,
 )
-def test_paged_attention_extend_replays_under_cuda_graph_with_smaller_metadata() -> None:
+def test_paged_attention_extend_replays_under_cuda_graph_with_smaller_metadata() -> (
+    None
+):
     require_b12x()
     clear_attention_caches()
 
@@ -737,16 +757,20 @@ def test_paged_attention_extend_replays_under_cuda_graph_with_smaller_metadata()
     graph.replay()
     torch.cuda.synchronize()
     assert (output[: q.shape[0]] - ref_out_1).abs().max().item() <= 0.02
-    assert (_lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_1).abs().max().item() <= 0.03
+    assert (
+        _lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_1
+    ).abs().max().item() <= 0.03
     assert _cosine_similarity(output[: q.shape[0]], ref_out_1) >= 0.99999
 
-    q_2, k_cache_2, v_cache_2, page_table_2, cache_seqlens_2, cu_seqlens_q_2 = make_paged_inputs(
-        q_seqlens=[4, 4, 4, 4],
-        cache_seqlens=[64, 97, 81, 113],
-        page_size=64,
-        seed=89,
-        page_table_width=page_table.shape[1],
-        num_pages=k_cache.shape[0],
+    q_2, k_cache_2, v_cache_2, page_table_2, cache_seqlens_2, cu_seqlens_q_2 = (
+        make_paged_inputs(
+            q_seqlens=[4, 4, 4, 4],
+            cache_seqlens=[64, 97, 81, 113],
+            page_size=64,
+            seed=89,
+            page_table_width=page_table.shape[1],
+            num_pages=k_cache.shape[0],
+        )
     )
     q.zero_()
     q[: q_2.shape[0]].copy_(q_2)
@@ -769,7 +793,9 @@ def test_paged_attention_extend_replays_under_cuda_graph_with_smaller_metadata()
     graph.replay()
     torch.cuda.synchronize()
     assert (output[: q_2.shape[0]] - ref_out_2).abs().max().item() <= 0.02
-    assert (_lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_2).abs().max().item() <= 0.03
+    assert (
+        _lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_2
+    ).abs().max().item() <= 0.03
     assert _cosine_similarity(output[: q_2.shape[0]], ref_out_2) >= 0.99999
 
 
@@ -831,16 +857,20 @@ def test_paged_attention_fp8_kv_replays_under_cuda_graph() -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert (output - ref_out_1).abs().max().item() <= 0.05
-    assert (_lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_1).abs().max().item() <= 0.05
+    assert (
+        _lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_1
+    ).abs().max().item() <= 0.05
     assert _cosine_similarity(output, ref_out_1) >= 0.9999
 
-    q_2, k_cache_2, v_cache_2, page_table_2, cache_seqlens_2, cu_seqlens_q_2 = make_paged_inputs(
-        q_seqlens=[6, 5, 7, 4],
-        cache_seqlens=[97, 81, 113, 68],
-        page_size=64,
-        seed=101,
-        page_table_width=page_table.shape[1],
-        num_pages=k_cache.shape[0],
+    q_2, k_cache_2, v_cache_2, page_table_2, cache_seqlens_2, cu_seqlens_q_2 = (
+        make_paged_inputs(
+            q_seqlens=[6, 5, 7, 4],
+            cache_seqlens=[97, 81, 113, 68],
+            page_size=64,
+            seed=101,
+            page_table_width=page_table.shape[1],
+            num_pages=k_cache.shape[0],
+        )
     )
     k_fp8_2, v_fp8_2, k_descale_2, v_descale_2 = quantize_paged_kv_cache_e4m3(
         k_cache_2,
@@ -872,5 +902,7 @@ def test_paged_attention_fp8_kv_replays_under_cuda_graph() -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert (output - ref_out_2).abs().max().item() <= 0.05
-    assert (_lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_2).abs().max().item() <= 0.05
+    assert (
+        _lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_2
+    ).abs().max().item() <= 0.05
     assert _cosine_similarity(output, ref_out_2) >= 0.9999

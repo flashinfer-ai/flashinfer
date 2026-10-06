@@ -39,9 +39,7 @@ class W4A8CompactMicroActivationKernel:
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
         self.fast_math = bool(fast_math)
         if self.n < 64 or self.n % 64:
-            raise ValueError(
-                "compact W4A8 micro activation requires N divisible by 64"
-            )
+            raise ValueError("compact W4A8 micro activation requires N divisible by 64")
         if self.num_experts < 1:
             raise ValueError(
                 "compact W4A8 micro activation requires at least one expert"
@@ -110,9 +108,9 @@ class W4A8CompactMicroActivationKernel:
                         )
                         # Preserve the common W4A8 contract: BF16 activation
                         # boundary first; route weights are applied after FC2.
-                        value[i] = cutlass.BFloat16(
-                            gate[i] * sigmoid * up[i]
-                        ).to(cutlass.Float32)
+                        value[i] = cutlass.BFloat16(gate[i] * sigmoid * up[i]).to(
+                            cutlass.Float32
+                        )
 
                     amax = fabs_f32(value[0])
                     for i in cutlass.range_constexpr(1, 4):

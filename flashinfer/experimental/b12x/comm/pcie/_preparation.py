@@ -1,4 +1,5 @@
 """One declaration entry point for established native PCIe resource owners."""
+
 from __future__ import annotations
 
 from importlib import import_module
@@ -7,12 +8,14 @@ from b12x.preparation import FrozenMapping, Plan
 from ._tuning import PcieConfig, PcieQuery, TUNING
 
 
-_OWNER_SURFACES = frozenset((
-    "DcpTopKOwnerExchange.stage_candidates",
-    "VocabParallelArgmax.fused_add_argmax",
-    "PCIeHierarchicalAllReduce.all_reduce",
-    "PCIeIslandRSAllReduce.all_reduce",
-))
+_OWNER_SURFACES = frozenset(
+    (
+        "DcpTopKOwnerExchange.stage_candidates",
+        "VocabParallelArgmax.fused_add_argmax",
+        "PCIeHierarchicalAllReduce.all_reduce",
+        "PCIeIslandRSAllReduce.all_reduce",
+    )
+)
 
 
 def _provider(surface: str):
@@ -22,7 +25,9 @@ def _provider(surface: str):
         module = "_dma_preparation"
     elif surface.startswith(("TwoShotReduceScatter.", "PCIeTwoShotBF16.")):
         module = "_twoshot_preparation"
-    elif surface == "kimi_topk16" or surface.startswith(("DcpAllToAll.", "DcpAllToAllPool.")):
+    elif surface == "kimi_topk16" or surface.startswith(
+        ("DcpAllToAll.", "DcpAllToAllPool.")
+    ):
         module = "_dcp_preparation"
     elif surface in _OWNER_SURFACES:
         module = "_owner_preparation"
@@ -36,8 +41,13 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
     return _provider(surface).query_from_runtime(runtime, surface=surface, call=call)
 
 
-def plan(query: PcieQuery, *, runtime=None, invocation=FrozenMapping(),
-         override: PcieConfig | None = None) -> Plan:
+def plan(
+    query: PcieQuery,
+    *,
+    runtime=None,
+    invocation=FrozenMapping(),
+    override: PcieConfig | None = None,
+) -> Plan:
     """Declare native work; neither topology nor a communicator is constructed.
 
     The all-reduce manager's ``plan`` method first selects its existing native
@@ -47,7 +57,10 @@ def plan(query: PcieQuery, *, runtime=None, invocation=FrozenMapping(),
         raise TypeError("query must be PcieQuery")
     TUNING.validate_query(query, None)
     return _provider(query.surface).plan(
-        query, runtime=runtime, invocation=invocation, override=override,
+        query,
+        runtime=runtime,
+        invocation=invocation,
+        override=override,
     )
 
 

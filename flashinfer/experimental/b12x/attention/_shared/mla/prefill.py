@@ -348,7 +348,8 @@ def run_unified_prefill(
             if prepared is not None:
                 kwargs["prepared"] = (
                     prepared[partition_index]
-                    if isinstance(prepared, tuple) else prepared
+                    if isinstance(prepared, tuple)
+                    else prepared
                 )
             if extra_kv_cache is not None:
                 kwargs.update(
@@ -395,13 +396,15 @@ def run_unified_prefill(
     #     small K-loop where the Q-quant prologue would dominate); it lands a
     #     TIGHTER numeric (no Q-quant loss) than FP8.
     _mg_enabled = (
-        os.environ.get("B12X_MLA_SM120_PREFILL_MG", "1") not in (
+        os.environ.get("B12X_MLA_SM120_PREFILL_MG", "1")
+        not in (
             "0",
             "false",
             "False",
             "off",
         )
-        if mg_enabled is None else bool(mg_enabled)
+        if mg_enabled is None
+        else bool(mg_enabled)
     )
     # ── GLM (ARBITRARY_FP32, q=576, v_has_rope=False) MG gate ──────────────────
     # GLM has the SAME FlashInfer MG head-group structure as DSV4 (one CTA fuses

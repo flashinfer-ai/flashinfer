@@ -32,7 +32,13 @@ def test_attention_corpora_have_stable_reviewed_cross_products() -> None:
     assert len(qsa_cases()) == 384
     assert len(sparse_mla_cases()) == 576
 
-    cases = (*gdn_cases(), *gqa_cases(), *mla_cases(), *qsa_cases(), *sparse_mla_cases())
+    cases = (
+        *gdn_cases(),
+        *gqa_cases(),
+        *mla_cases(),
+        *qsa_cases(),
+        *sparse_mla_cases(),
+    )
     assert len({case.case_id for case in cases}) == len(cases)
     assert len({case.query for case in gqa_cases()}) == len(gqa_cases())
 
@@ -44,9 +50,15 @@ def test_gdn_corpus_includes_qwen_and_glm_decay_contracts() -> None:
     assert {case.metadata["decay_recipe"] for case in cases} == {"gdn", "kda"}
     assert len(glm_cases) == 810
     assert {case.query["key_heads"] for case in glm_cases} == {4, 8, 16, 32, 64}
-    assert all(case.query["key_heads"] == case.query["value_heads"] for case in glm_cases)
+    assert all(
+        case.query["key_heads"] == case.query["value_heads"] for case in glm_cases
+    )
     assert (16, 16, 1) in {
-        (case.query["max_seqs"], case.query["max_tokens"], case.query["state_index_columns"])
+        (
+            case.query["max_seqs"],
+            case.query["max_tokens"],
+            case.query["state_index_columns"],
+        )
         for case in glm_cases
         if case.query["key_heads"] == 16
     }

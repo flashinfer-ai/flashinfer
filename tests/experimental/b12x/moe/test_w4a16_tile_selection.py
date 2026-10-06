@@ -87,18 +87,19 @@ def test_every_generic_route_tile_has_a_resource_model() -> None:
     for route_block_size in (8, 16, 32, 48, 64):
         cta_m_blocks = (route_block_size + 15) // 16
         configs = (
-            _LARGE_BATCH_TILE_CONFIGS
-            if cta_m_blocks > 1
-            else _SMALL_BATCH_TILE_CONFIGS
+            _LARGE_BATCH_TILE_CONFIGS if cta_m_blocks > 1 else _SMALL_BATCH_TILE_CONFIGS
         )
         for tile_k, tile_n, cta_threads in configs:
-            assert _w4a16_num_regs(
-                cta_threads=cta_threads,
-                cta_m_blocks=cta_m_blocks,
-                cta_n_blocks=tile_n // 16,
-                cta_k_blocks=tile_k // 16,
-                uses_m_block_8=route_block_size == 8,
-            ) > 0
+            assert (
+                _w4a16_num_regs(
+                    cta_threads=cta_threads,
+                    cta_m_blocks=cta_m_blocks,
+                    cta_n_blocks=tile_n // 16,
+                    cta_k_blocks=tile_k // 16,
+                    uses_m_block_8=route_block_size == 8,
+                )
+                > 0
+            )
 
 
 def test_tc_decode_planner_keeps_underfilled_direct_route() -> None:
@@ -120,16 +121,17 @@ def test_tc_decode_coverage_cap_preserves_smaller_gpu_policy() -> None:
                         routed_rows * _TC_DECODE_PACK_SM_COVERAGE_DENOMINATOR
                         >= sms * _TC_DECODE_PACK_SM_COVERAGE_NUMERATOR
                         and routed_rows * (routed_rows - 1)
-                        >= 2
-                        * _TC_DECODE_PACK_COLLIDING_PAIRS
-                        * num_experts
+                        >= 2 * _TC_DECODE_PACK_COLLIDING_PAIRS * num_experts
                     )
-                    assert _w4a16_tc_decode_preferred(
-                        m=m,
-                        topk=topk,
-                        num_experts=num_experts,
-                        sms=sms,
-                    ) is not uncapped_pack_has_reuse
+                    assert (
+                        _w4a16_tc_decode_preferred(
+                            m=m,
+                            topk=topk,
+                            num_experts=num_experts,
+                            sms=sms,
+                        )
+                        is not uncapped_pack_has_reuse
+                    )
 
 
 def test_tc_decode_planner_packs_near_full_machine_with_expected_reuse() -> None:
@@ -147,24 +149,37 @@ def test_tc_decode_planner_keeps_low_collision_direct_route() -> None:
 
 def _small_m_residency(scale_format: str, weight_layout: str = "packed"):
     """GLM-5.3 (744B) TP8 decode geometry: 256 channels per rank."""
-    common = dict(tile_n=128, tile_k=128, uses_m_block_8=True, weight_layout=weight_layout)
+    common = dict(
+        tile_n=128, tile_k=128, uses_m_block_8=True, weight_layout=weight_layout
+    )
     stages = _w4a16_pipeline_stages(scale_format=scale_format, **common)
     blocks = _determine_blocks_per_sm(
-        problem_m=4, problem_n=512, top_k=8, cta_threads=256, cta_m_blocks=1,
-        sms=188, max_shared_mem=101_376, scale_format=scale_format, **common,
+        problem_m=4,
+        problem_n=512,
+        top_k=8,
+        cta_threads=256,
+        cta_m_blocks=1,
+        sms=188,
+        max_shared_mem=101_376,
+        scale_format=scale_format,
+        **common,
     )
     return stages, blocks
 
 
 @pytest.mark.parametrize("scale_format", ["e4m3_k16"])
-def test_small_m_occupancy_two_runs_three_stages_on_two_ctas(monkeypatch, scale_format) -> None:
+def test_small_m_occupancy_two_runs_three_stages_on_two_ctas(
+    monkeypatch, scale_format
+) -> None:
     monkeypatch.delenv("B12X_W4A16_SMALL_M_OCCUPANCY", raising=False)
     assert _small_m_residency(scale_format) == (4, 1)
     monkeypatch.setenv("B12X_W4A16_SMALL_M_OCCUPANCY", "2")
     assert _small_m_residency(scale_format) == (3, 2)
 
 
-def test_small_m_occupancy_two_keeps_other_scale_formats_on_one_cta(monkeypatch) -> None:
+def test_small_m_occupancy_two_keeps_other_scale_formats_on_one_cta(
+    monkeypatch,
+) -> None:
     """E8M0 kernels need more resources than the estimate: two CTAs per SM
     fail the cooperative launch, so they keep the default schedule."""
     monkeypatch.setenv("B12X_W4A16_SMALL_M_OCCUPANCY", "2")

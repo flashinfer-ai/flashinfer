@@ -149,6 +149,7 @@ def _run_indexer(
         (_ROWS, topk), dtype=torch.int32, device=scene["q_fp8"].device
     )
     clear_indexer_caches()
+
     def run():
         return index_topk_fp8(
             q_fp8=scene["q_fp8"],
@@ -167,7 +168,7 @@ def _run_indexer(
     if graph_replay:
         from b12x._lib.runtime_control import kernel_resolution_guard
 
-        with kernel_resolution_guard('paged top-k high-page-ID replay'):
+        with kernel_resolution_guard("paged top-k high-page-ID replay"):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 run()
@@ -176,7 +177,9 @@ def _run_indexer(
                 scene["weights"].neg_()
                 scene["ref_logits"].neg_()
                 scene["kth_score"] = torch.topk(
-                    scene["ref_logits"], topk, dim=1,
+                    scene["ref_logits"],
+                    topk,
+                    dim=1,
                 ).values[:, -1]
                 selected.fill_(-2)
                 torch.cuda.synchronize(device)
@@ -184,11 +187,19 @@ def _run_indexer(
                 graph.replay()
                 torch.cuda.synchronize(device)
                 after = torch.cuda.memory_stats(device)
-                for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+                for key in (
+                    "allocation.all.allocated",
+                    "allocated_bytes.all.allocated",
+                ):
                     assert before[key] == after[key]
-                assert pointers == (scene["index_k_cache"].data_ptr(), selected.data_ptr())
+                assert pointers == (
+                    scene["index_k_cache"].data_ptr(),
+                    selected.data_ptr(),
+                )
                 _assert_selects_true_topk(
-                    scene, selected, output_physical_slots=output_physical_slots,
+                    scene,
+                    selected,
+                    output_physical_slots=output_physical_slots,
                 )
     return selected
 
@@ -348,7 +359,8 @@ def test_paged_prefill_topk_width_does_not_recompile(monkeypatch) -> None:
 
 @pytest.mark.parametrize("output_physical_slots", (False, True))
 def test_paged_topk_512_high_page_ids_graph_replay(
-    monkeypatch, output_physical_slots: bool,
+    monkeypatch,
+    output_physical_slots: bool,
 ) -> None:
     """Read live packed cache pages past the signed 32-bit byte-offset limit."""
     device = torch.device("cuda")
@@ -358,7 +370,9 @@ def test_paged_topk_512_high_page_ids_graph_replay(
     page_start = (1 << 31) // page_stride + 1
     live_pages = scene["width_blocks"]
     pool = torch.empty(
-        (page_start + live_pages, packed.shape[1]), dtype=packed.dtype, device=device,
+        (page_start + live_pages, packed.shape[1]),
+        dtype=packed.dtype,
+        device=device,
     )
     pool[page_start:].copy_(packed[_PAGE_START : _PAGE_START + live_pages])
     scene["index_k_cache"] = pool
@@ -368,8 +382,13 @@ def test_paged_topk_512_high_page_ids_graph_replay(
     assert (page_start + live_pages) * _PAGE < torch.iinfo(torch.int32).max
     # Relocating identical packed pages preserves the small scene's score oracle.
     selected = _run_indexer(
-        monkeypatch, scene, supertile_k=4096,
-        output_physical_slots=output_physical_slots, route="paged_tiled",
+        monkeypatch,
+        scene,
+        supertile_k=4096,
+        output_physical_slots=output_physical_slots,
+        route="paged_tiled",
         graph_replay=True,
     )
-    _assert_selects_true_topk(scene, selected, output_physical_slots=output_physical_slots)
+    _assert_selects_true_topk(
+        scene, selected, output_physical_slots=output_physical_slots
+    )

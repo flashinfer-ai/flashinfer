@@ -19,25 +19,43 @@ def test_public_compile_accepts_real_binding_without_running_attention(kv_dtype)
 
     require_b12x()
     q, k, v, pages, lengths, offsets = _make_inputs(
-        q_seqlens=[6, 5], cache_seqlens=[64, 64], kv_dtype=kv_dtype,
+        q_seqlens=[6, 5],
+        cache_seqlens=[64, 64],
+        kv_dtype=kv_dtype,
     )
     workspace = _make_workspace(q, k, v, mode="extend")
     workspace.prepare(pages, lengths, offsets, disable_split_kv=True)
     output = torch.full_like(q, 123)
-    descale = torch.ones(2, device=q.device) if kv_dtype == torch.float8_e4m3fn else None
+    descale = (
+        torch.ones(2, device=q.device) if kv_dtype == torch.float8_e4m3fn else None
+    )
     binding = workspace._scratch_plan.bind(
-        scratch=workspace._scratch, q=q, k_cache=k, v_cache=v, output=output,
-        page_table=pages, cache_seqlens=lengths, cu_seqlens_q=offsets,
+        scratch=workspace._scratch,
+        q=q,
+        k_cache=k,
+        v_cache=v,
+        output=output,
+        page_table=pages,
+        cache_seqlens=lengths,
+        cu_seqlens_q=offsets,
         disable_split_kv=True,
-        k_descale=descale, v_descale=descale,
+        k_descale=descale,
+        v_descale=descale,
     )
     paged.compile(binding=binding)
     torch.cuda.synchronize()
     assert bool((output == 123).all())
     actual, _ = paged.run(binding=binding)
     expected, _ = paged_attention_reference(
-        q, k, v, pages, lengths, offsets, causal=True,
-        k_descale=descale, v_descale=descale,
+        q,
+        k,
+        v,
+        pages,
+        lengths,
+        offsets,
+        causal=True,
+        k_descale=descale,
+        v_descale=descale,
     )
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.03)
 
@@ -75,12 +93,14 @@ def test_plane_tma_descriptor_cache_keeps_distinct_layer_bindings() -> None:
     v_desc_1 = torch.empty((2, 16), dtype=torch.uint64)
     k_ptrs_1 = torch.empty((2,), dtype=torch.int64)
     v_ptrs_1 = torch.empty((2,), dtype=torch.int64)
-    workspace._live_plane_tma_desc_cache[_cache_key(
-        k_cache_1,
-        v_cache_1,
-        plane_cols=plane_cols,
-        tile_rows=tile_rows,
-    )] = (k_desc_1, v_desc_1, k_ptrs_1, v_ptrs_1)
+    workspace._live_plane_tma_desc_cache[
+        _cache_key(
+            k_cache_1,
+            v_cache_1,
+            plane_cols=plane_cols,
+            tile_rows=tile_rows,
+        )
+    ] = (k_desc_1, v_desc_1, k_ptrs_1, v_ptrs_1)
 
     k_cache_2 = torch.empty((4, 64, 2, 128), dtype=torch.bfloat16)
     v_cache_2 = torch.empty((4, 64, 2, 128), dtype=torch.bfloat16)
@@ -88,12 +108,14 @@ def test_plane_tma_descriptor_cache_keeps_distinct_layer_bindings() -> None:
     v_desc_2 = torch.empty((2, 16), dtype=torch.uint64)
     k_ptrs_2 = torch.empty((2,), dtype=torch.int64)
     v_ptrs_2 = torch.empty((2,), dtype=torch.int64)
-    workspace._live_plane_tma_desc_cache[_cache_key(
-        k_cache_2,
-        v_cache_2,
-        plane_cols=plane_cols,
-        tile_rows=tile_rows,
-    )] = (k_desc_2, v_desc_2, k_ptrs_2, v_ptrs_2)
+    workspace._live_plane_tma_desc_cache[
+        _cache_key(
+            k_cache_2,
+            v_cache_2,
+            plane_cols=plane_cols,
+            tile_rows=tile_rows,
+        )
+    ] = (k_desc_2, v_desc_2, k_ptrs_2, v_ptrs_2)
 
     assert _get_cached_plane_tma_descs(
         workspace,

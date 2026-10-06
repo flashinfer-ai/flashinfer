@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 
-
 def test_mhc_decode_split_n_environment_override(monkeypatch) -> None:
     import b12x.norm.mhc._kernels as residual_kernels
 

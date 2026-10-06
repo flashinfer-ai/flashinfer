@@ -614,9 +614,7 @@ def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(mode) -> None:
     q, cache, indices, lengths = _make_dsv4_compressed_case(
         device, topk=topk, seed=topk
     )
-    scratch = _make_dsv4_scratch(
-        device, topk=topk, max_chunks=8
-    )
+    scratch = _make_dsv4_scratch(device, topk=topk, max_chunks=8)
     scratch.mode = mode
     output = compressed_sparse_mla_decode_forward(
         q_all=q,
@@ -628,12 +626,14 @@ def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(mode) -> None:
         swa_page_size=_DSV4_PAGE,
     )
     expected = compressed_sparse_mla_reference(
-        q, cache, indices, lengths, sm_scale=_DSV4_SM_SCALE,
+        q,
+        cache,
+        indices,
+        lengths,
+        sm_scale=_DSV4_SM_SCALE,
         swa_page_size=_DSV4_PAGE,
     )
     torch.testing.assert_close(output.float(), expected.float(), atol=2e-2, rtol=2e-2)
-
-
 
 
 @torch.inference_mode()

@@ -35,7 +35,9 @@ class BlockQuantLinearWeight:
 IQ2XSLinearWeight = BlockQuantLinearWeight
 
 
-def pack_iq2_xs_weight(blocks: torch.Tensor, *, codec: str = "iq2_xs") -> BlockQuantLinearWeight:
+def pack_iq2_xs_weight(
+    blocks: torch.Tensor, *, codec: str = "iq2_xs"
+) -> BlockQuantLinearWeight:
     """Retile raw blocks without expanding their packed numeric encoding."""
     from ._a16 import _check_tensor
 
@@ -43,8 +45,14 @@ def pack_iq2_xs_weight(blocks: torch.Tensor, *, codec: str = "iq2_xs") -> BlockQ
     if blocks.device.type != "cuda":
         raise ValueError("IQ2_XS weights must be on CUDA")
     _check_tensor("IQ2_XS blocks", blocks, blocks.device, torch.uint8)
-    if blocks.ndim != 3 or blocks.shape[-1] != spec.block_bytes or min(blocks.shape) <= 0:
-        raise ValueError(f"{codec.upper()} blocks must have positive shape [N,K/{spec.block_weights},{spec.block_bytes}]")
+    if (
+        blocks.ndim != 3
+        or blocks.shape[-1] != spec.block_bytes
+        or min(blocks.shape) <= 0
+    ):
+        raise ValueError(
+            f"{codec.upper()} blocks must have positive shape [N,K/{spec.block_weights},{spec.block_bytes}]"
+        )
     n, kb, _ = blocks.shape
     if n % 8:
         raise ValueError("IQ2_XS dense weights require N divisible by 8")
@@ -61,12 +69,26 @@ def pack_iq2_xs_weight(blocks: torch.Tensor, *, codec: str = "iq2_xs") -> BlockQ
         nt = (n + 127) // 128
         metadata = torch.zeros((nt, kb, 1280), dtype=torch.uint8, device=blocks.device)
         # Row padding is confined to metadata, preserving the descriptor matrix.
-        base_rows = torch.zeros((nt * 128, kb, 2), dtype=torch.uint8, device=blocks.device)
-        scale_rows = torch.zeros((nt * 128, kb, 8), dtype=torch.uint8, device=blocks.device)
+        base_rows = torch.zeros(
+            (nt * 128, kb, 2), dtype=torch.uint8, device=blocks.device
+        )
+        scale_rows = torch.zeros(
+            (nt * 128, kb, 8), dtype=torch.uint8, device=blocks.device
+        )
         base_rows[:n].copy_(bases)
         scale_rows[:n].copy_(blocks[..., 66:])
-        metadata[..., :256].copy_(base_rows.view(nt, 128, kb, 2).permute(0, 2, 1, 3).reshape(nt, kb, 256))
-        metadata[..., 256:].copy_(scale_rows.view(nt, 128, kb, 8).permute(0, 2, 3, 1).reshape(nt, kb, 1024))
+        metadata[..., :256].copy_(
+            base_rows.view(nt, 128, kb, 2).permute(0, 2, 1, 3).reshape(nt, kb, 256)
+        )
+        metadata[..., 256:].copy_(
+            scale_rows.view(nt, 128, kb, 8).permute(0, 2, 3, 1).reshape(nt, kb, 1024)
+        )
     tile_n = 128 if n % 128 == 0 else 8
-    values = blocks[..., 2:2 + spec.payload_bytes].reshape(n // tile_n, tile_n, kb, spec.payload_bytes).permute(0, 2, 1, 3).contiguous().view(n, kb * spec.payload_bytes)
+    values = (
+        blocks[..., 2 : 2 + spec.payload_bytes]
+        .reshape(n // tile_n, tile_n, kb, spec.payload_bytes)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(n, kb * spec.payload_bytes)
+    )
     return BlockQuantLinearWeight(values, metadata, kb * spec.block_weights, n, codec)

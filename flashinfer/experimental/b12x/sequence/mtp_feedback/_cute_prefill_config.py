@@ -76,9 +76,7 @@ def tensors_support_prefill(*tensors: torch.Tensor) -> bool:
 def require_qwen_cute_tensors(**tensors: torch.Tensor) -> None:
     """Validate the contiguous TMA tensor contract for Qwen projections."""
     invalid = [
-        name
-        for name, tensor in tensors.items()
-        if not tensors_support_prefill(tensor)
+        name for name, tensor in tensors.items() if not tensors_support_prefill(tensor)
     ]
     if invalid:
         raise ValueError(

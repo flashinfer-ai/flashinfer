@@ -52,7 +52,10 @@ from b12x.testing.reference.helpers import (
     prepare_tp_moe_fp4_experts,
     run_tp_moe_fp4,
 )
-from b12x.testing.reference.w4a16_reference import compare_to_reference, moe_reference_w4a16
+from b12x.testing.reference.w4a16_reference import (
+    compare_to_reference,
+    moe_reference_w4a16,
+)
 
 
 def test_w4a16_small_m_host_barrier_reset_kill_switch(
@@ -261,6 +264,7 @@ def test_w4a16_skipped_empty_row_blocks_are_bit_identical(tokens, monkeypatch):
     )
     outputs = {}
     from b12x.moe._shared.kernels.w4a16.kernel import W4A16GemmKernel
+
     original_init = W4A16GemmKernel.__init__
     compiled_controls = []
 
@@ -272,7 +276,9 @@ def test_w4a16_skipped_empty_row_blocks_are_bit_identical(tokens, monkeypatch):
     for skip in ("0", "1"):
         monkeypatch.setenv("B12X_W4A16_SKIP_EMPTY_M_BLOCKS", skip)
         weight_plan = fused_moe.plan_weights(
-            source=fused_moe.PackedSource(format=fused_moe.PackedSourceFormat("modelopt_nvfp4")),
+            source=fused_moe.PackedSource(
+                format=fused_moe.PackedSourceFormat("modelopt_nvfp4")
+            ),
             activation=fused_moe.ActivationSpec(
                 mode=fused_moe.ActivationMode.A16,
                 nonlinearity="silu",
@@ -322,7 +328,9 @@ def test_w4a16_skipped_empty_row_blocks_are_bit_identical(tokens, monkeypatch):
             )
             return PreparedCall(run=lambda: state.run(binding), owners=scratch)
 
-        with PreparationSession(device=x.device, autotune=False, compile_workers=0) as session:
+        with PreparationSession(
+            device=x.device, autotune=False, compile_workers=0
+        ) as session:
             request = plan.request(name=f"skip-empty-rows-{skip}", prepare_call=primer)
             session.prepare((request,))
             state = require_prepared(request.plan, "moe.decode")
@@ -437,14 +445,16 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
         spy_direct_launch,
     )
     bindings = ExitStack()
-    binding = bindings.enter_context(make_tp_moe_fp4_binding(
-        a=x,
-        experts=expert_weights,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        quant_mode="w4a16",
-        output=torch.empty_like(x),
-    ))
+    binding = bindings.enter_context(
+        make_tp_moe_fp4_binding(
+            a=x,
+            experts=expert_weights,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            quant_mode="w4a16",
+            output=torch.empty_like(x),
+        )
+    )
     expected = _reference_w4a16(
         x,
         *weights,
@@ -2083,18 +2093,20 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
         scale_format="e4m3_k16",
     )
     bindings = ExitStack()
-    binding = bindings.enter_context(make_tp_moe_fp4_binding(
-        a=x,
-        experts=w4a16_experts,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        output=torch.empty(
-            (m, hidden_size),
-            dtype=x.dtype,
-            device=x.device,
-        ),
-        quant_mode="w4a16",
-    ))
+    binding = bindings.enter_context(
+        make_tp_moe_fp4_binding(
+            a=x,
+            experts=w4a16_experts,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=torch.empty(
+                (m, hidden_size),
+                dtype=x.dtype,
+                device=x.device,
+            ),
+            quant_mode="w4a16",
+        )
+    )
     expected = moe_reference_w4a16_f32(
         x,
         w13,
@@ -2260,13 +2272,15 @@ def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
     )
 
     bindings = ExitStack()
-    binding = bindings.enter_context(make_tp_moe_fp4_binding(
-        a=x,
-        experts=experts_w4a16,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        quant_mode="w4a16",
-    ))
+    binding = bindings.enter_context(
+        make_tp_moe_fp4_binding(
+            a=x,
+            experts=experts_w4a16,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            quant_mode="w4a16",
+        )
+    )
     expected = moe_reference_w4a16_f32(
         x,
         w13,
@@ -2632,8 +2646,6 @@ def test_w4a16_mapped_decode_consumes_global_map_without_route_pack(
         and launch.tc_decode_fused_sum
         for launch in compiled_launches
     )
-
-
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -3688,9 +3700,7 @@ def test_w4a16_fc2_resident_bounds_reuse_frozen_kernel(
     )
     route_ids = torch.empty(capacity_m, dtype=route_ids_dtype, device="cuda")
     route_weights = torch.empty(capacity_m, dtype=torch.float32, device="cuda")
-    output = torch.empty(
-        (capacity_m, hidden_size), dtype=torch.bfloat16, device="cuda"
-    )
+    output = torch.empty((capacity_m, hidden_size), dtype=torch.bfloat16, device="cuda")
     invalid_upper = 1 << 32 if route_ids_dtype == torch.int64 else 5
     mutated_ids = [0, 2, -1, 4, 5, invalid_upper, 1, 0, 4]
     ids_source = torch.tensor(mutated_ids, dtype=route_ids_dtype, device="cuda")
@@ -3700,7 +3710,7 @@ def test_w4a16_fc2_resident_bounds_reuse_frozen_kernel(
         (item.workspace.data_ptr(), item.workspace.numel()) for item in prepared
     ]
 
-    with kernel_resolution_guard('FC2 resident bounds and live row reuse'):
+    with kernel_resolution_guard("FC2 resident bounds and live row reuse"):
         for experts in prepared:
             prewarm_w4a16_fc2_e8m0(experts, route_ids_dtype=route_ids_dtype)
             for m in (1, 3, capacity_m):
@@ -3732,7 +3742,9 @@ def test_w4a16_fc2_resident_bounds_reuse_frozen_kernel(
                 allocated_bytes = torch.cuda.memory_allocated()
                 graph.replay()
                 torch.cuda.synchronize()
-                assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+                assert (
+                    torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+                )
                 assert torch.cuda.memory_allocated() == allocated_bytes
                 assert captured is live_output
                 torch.testing.assert_close(captured, mutated_expected, rtol=0, atol=0)
@@ -3854,6 +3866,7 @@ def test_w4a16_small_m_occupancy_is_captured_for_graph_replay(tokens, monkeypatc
     )
     outputs = {}
     from b12x.moe._shared.kernels.w4a16.kernel import W4A16GemmKernel
+
     original_init = W4A16GemmKernel.__init__
     compiled_controls = []
 
@@ -3865,7 +3878,9 @@ def test_w4a16_small_m_occupancy_is_captured_for_graph_replay(tokens, monkeypatc
     for skip in ("1", "2"):
         monkeypatch.setenv("B12X_W4A16_SMALL_M_OCCUPANCY", skip)
         weight_plan = fused_moe.plan_weights(
-            source=fused_moe.PackedSource(format=fused_moe.PackedSourceFormat("modelopt_nvfp4")),
+            source=fused_moe.PackedSource(
+                format=fused_moe.PackedSourceFormat("modelopt_nvfp4")
+            ),
             activation=fused_moe.ActivationSpec(
                 mode=fused_moe.ActivationMode.A16,
                 nonlinearity="silu",
@@ -3915,7 +3930,9 @@ def test_w4a16_small_m_occupancy_is_captured_for_graph_replay(tokens, monkeypatc
             )
             return PreparedCall(run=lambda: state.run(binding), owners=scratch)
 
-        with PreparationSession(device=x.device, autotune=False, compile_workers=0) as session:
+        with PreparationSession(
+            device=x.device, autotune=False, compile_workers=0
+        ) as session:
             request = plan.request(name=f"skip-empty-rows-{skip}", prepare_call=primer)
             session.prepare((request,))
             state = require_prepared(request.plan, "moe.decode")

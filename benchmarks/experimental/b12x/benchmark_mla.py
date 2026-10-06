@@ -357,7 +357,6 @@ class CaseReport:
         return self.metadata_us + self.replay_us
 
 
-
 class BenchmarkFailure(RuntimeError):
     def __init__(self, case: DecodeCase, message: str):
         super().__init__(
@@ -852,9 +851,12 @@ def _select_ragged_topk_from_logits(
 
 def _capture_and_bench_cuda_graph(fn, *, warmup, replays, prepare=None, l2_flush=None):
     from b12x.testing.benchmark import transaction_samples
+
     graph = capture_cuda_graph(fn, warmup=warmup, prepare=prepare)
     try:
-        return transaction_samples(fn, samples=replays, prepare=prepare, l2_flush=l2_flush)
+        return transaction_samples(
+            fn, samples=replays, prepare=prepare, l2_flush=l2_flush
+        )
     finally:
         del graph
 
@@ -978,12 +980,6 @@ def _make_mla_inputs(
     )
     kv_cache = pack_mla_kv_cache_reference(k_nope_pool, k_rope_pool)
     return q_all, k_nope_pool, k_rope_pool, kv_cache
-
-
-
-
-
-
 
 
 def _make_mla_binding(
@@ -1305,7 +1301,6 @@ def _run_decode_case(
             v_head_dim=cfg.kv_lora_rank,
         )
 
-
     def run_step():
         topk_indices = _select_paged_topk_from_logits(
             logits=paged_decode_logits(
@@ -1399,7 +1394,6 @@ def _run_decode_case(
     )
     mla_us = statistics.median(mla_stats["replay_us"])
 
-
     clear_indexer_caches()
     clear_mla_caches()
     step_stats = _capture_and_bench_cuda_graph(
@@ -1422,22 +1416,18 @@ def _run_decode_case(
             )
         ),
         mla_samples_us=tuple(mla_stats["replay_us"]),
-
         metadata_us=statistics.median(step_stats["metadata_us"]),
         replay_us=statistics.median(step_stats["replay_us"]),
         indexer_us=indexer_us,
         indexer_logits_us=indexer_logits_us,
         indexer_topk_us=indexer_topk_us,
         mla_us=mla_us,
-
         split_enabled=split_cfg is not None,
         chunk_size=0 if split_cfg is None else split_cfg.chunk_size,
         num_chunks=0 if split_cfg is None else split_cfg.num_chunks,
         indexer_logits_fill=preinitialize_indexer_logits,
         indexer_topk_path=decode_topk_backend.replace("_", "-"),
         mla_sanity=mla_sanity,
-
-
     )
 
 
@@ -1994,7 +1984,6 @@ def _run_prefill_or_verify_case(
             v_head_dim=cfg.kv_lora_rank,
         )
 
-
     def run_step():
         topk_indices = map_indexer_topk(run_indexer())
         step_binding = mla_workspace.bind(
@@ -2132,14 +2121,12 @@ def _run_prefill_or_verify_case(
             )
         ),
         mla_samples_us=tuple(mla_stats["replay_us"]),
-
         metadata_us=statistics.median(step_stats["metadata_us"]),
         replay_us=statistics.median(step_stats["replay_us"]),
         indexer_us=indexer_us,
         indexer_logits_us=indexer_logits_us,
         indexer_topk_us=indexer_topk_us,
         mla_us=mla_us,
-
         mla_forward_us=mla_forward_us,
         mla_merge_us=mla_merge_us,
         split_enabled=split_cfg is not None,
@@ -2162,8 +2149,6 @@ def _run_prefill_or_verify_case(
         ),
         indexer_prefill_block_k=indexer_prefill_block_k,
         mla_sanity=mla_sanity,
-
-
     )
 
 
@@ -2211,7 +2196,7 @@ def collect_case_reports(
                 l2_flush=l2_flush,
                 skip_indexer_logits_fill=args.skip_indexer_logits_fill,
                 decode_topk_backend=args.decode_topk_backend,
-                )
+            )
             if case.mode == "decode"
             else _run_prefill_or_verify_case(
                 case=case,
@@ -2227,7 +2212,7 @@ def collect_case_reports(
                 skip_indexer_logits_fill=args.skip_indexer_logits_fill,
                 use_tiled_topk=args.use_tiled_topk,
                 prefill_indexer_layout=args.prefill_indexer_layout,
-                )
+            )
         )
         case_seed += 17
     return reports

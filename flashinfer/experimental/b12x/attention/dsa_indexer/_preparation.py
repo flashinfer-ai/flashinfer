@@ -3,6 +3,7 @@
 Declarations retain tensor ABI metadata only; scratch layouts and launch carriers are
 created only after a session chose and admitted the immutable configuration.
 """
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -22,7 +23,11 @@ from ._tuning import DsaIndexerConfig, DsaIndexerQuery, TUNING
 from .mxfp4 import MXFP4PreparedState, materialize_mxfp4
 from .paged import index_topk_fp8
 from .tiled_topk import run_row_topk
-from .scratch import B12XIndexerScratchCaps, INDEXER_SOURCE_LAYOUT_PAGED, plan_indexer_scratch
+from .scratch import (
+    B12XIndexerScratchCaps,
+    INDEXER_SOURCE_LAYOUT_PAGED,
+    plan_indexer_scratch,
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +41,7 @@ class _Mxfp4Programs:
     @property
     def __b12x_programs__(self):
         from b12x._lib.compile_plan import program_keys
+
         return program_keys(self.__b12x_dependencies__)
 
 
@@ -50,17 +56,42 @@ class _DsaIndexerState:
     def bind(self, **kwargs):
         return self.layout.bind(**kwargs)
 
-    def run(self, runtime, *, q_fp8, query_weights, index_k_cache,
-            output_indices, output_scores=None, **_ignored):
+    def run(
+        self,
+        runtime,
+        *,
+        q_fp8,
+        query_weights,
+        index_k_cache,
+        output_indices,
+        output_scores=None,
+        **_ignored,
+    ):
         return index_topk_fp8(
-            q_fp8=q_fp8, weights=query_weights, index_k_cache=index_k_cache,
-            binding=runtime, page_size=self.layout.caps.page_size,
+            q_fp8=q_fp8,
+            weights=query_weights,
+            index_k_cache=index_k_cache,
+            binding=runtime,
+            page_size=self.layout.caps.page_size,
             topk=self.layout.caps.topk,
             expected_num_q_heads=self.layout.caps.num_q_heads,
-            out_indices=output_indices, out_scores=output_scores,
-            allow_transient_fold_buffers=False, launchers=self.launchers,
+            out_indices=output_indices,
+            out_scores=output_scores,
+            allow_transient_fold_buffers=False,
+            launchers=self.launchers,
         )
-_OPERANDS = ("q_fp8", "query_weights", "index_k_cache", "page_table", "cache_lengths", "active_width", "output_indices", "output_scores")
+
+
+_OPERANDS = (
+    "q_fp8",
+    "query_weights",
+    "index_k_cache",
+    "page_table",
+    "cache_lengths",
+    "active_width",
+    "output_indices",
+    "output_scores",
+)
 
 
 def _alignment(tensor):
@@ -68,7 +99,9 @@ def _alignment(tensor):
     return min(16, pointer & -pointer) if pointer else 16
 
 
-def invocation_from_descriptors(caps, *, operands: Mapping[str, Mapping[str, object] | None]) -> FrozenMapping:
+def invocation_from_descriptors(
+    caps, *, operands: Mapping[str, Mapping[str, object] | None]
+) -> FrozenMapping:
     """Build declaration metadata from an owner-provided tensor ABI.
 
     Providers use this before temporary priming tensors exist.  It deliberately
@@ -91,17 +124,19 @@ def invocation_from_descriptors(caps, *, operands: Mapping[str, Mapping[str, obj
             # Physical pool size is a runtime bound, not a kernel specialization.
             fields = FrozenMapping({**dict(fields), "shape": (1, *fields["shape"][1:])})
         normalized[name] = fields
-    return FrozenMapping({
-        "operands": FrozenMapping(normalized),
-        "route": getattr(caps, "route", "auto"),
-        "page_size": int(getattr(caps, "page_size", 64)),
-        "requested_supertile_k": int(getattr(caps, "supertile_k", 0)),
-        "requested_prefill_block_k": int(getattr(caps, "prefill_block_k", 256)),
-        "reserve_paged_logits": bool(getattr(caps, "reserve_paged_logits", False)),
-        "paged_logits_k_rows": int(getattr(caps, "paged_logits_k_rows", 0)),
-        "score_mode": str(getattr(caps, "score_mode", "dsa")),
-        "num_idx_heads": int(getattr(caps, "num_idx_heads", 1)),
-    })
+    return FrozenMapping(
+        {
+            "operands": FrozenMapping(normalized),
+            "route": getattr(caps, "route", "auto"),
+            "page_size": int(getattr(caps, "page_size", 64)),
+            "requested_supertile_k": int(getattr(caps, "supertile_k", 0)),
+            "requested_prefill_block_k": int(getattr(caps, "prefill_block_k", 256)),
+            "reserve_paged_logits": bool(getattr(caps, "reserve_paged_logits", False)),
+            "paged_logits_k_rows": int(getattr(caps, "paged_logits_k_rows", 0)),
+            "score_mode": str(getattr(caps, "score_mode", "dsa")),
+            "num_idx_heads": int(getattr(caps, "num_idx_heads", 1)),
+        }
+    )
 
 
 def invocation_from_tensors(caps, **tensors) -> FrozenMapping:
@@ -144,16 +179,26 @@ def _fake(descriptor, device):
 
 def _scratch_caps(query, *, device, config):
     return B12XIndexerScratchCaps(
-        device=device, source_layout=query.source_layout, num_q_heads=query.num_q_heads,
-        max_q_rows=query.max_q_rows, max_k_rows=query.max_k_rows,
-        max_page_table_width=query.max_page_table_width, topk=query.top_k,
-        mode=query.mode, page_size=query.page_size, supertile_k=query.supertile_k,
-        shared_page_table=query.shared_page_table, output_physical_slots=query.output_physical_slots,
-        dtype=getattr(torch, query.dtype), kv_dtype=getattr(torch, query.kv_dtype),
-        route=query.route, prefill_block_k=query.prefill_block_k,
+        device=device,
+        source_layout=query.source_layout,
+        num_q_heads=query.num_q_heads,
+        max_q_rows=query.max_q_rows,
+        max_k_rows=query.max_k_rows,
+        max_page_table_width=query.max_page_table_width,
+        topk=query.top_k,
+        mode=query.mode,
+        page_size=query.page_size,
+        supertile_k=query.supertile_k,
+        shared_page_table=query.shared_page_table,
+        output_physical_slots=query.output_physical_slots,
+        dtype=getattr(torch, query.dtype),
+        kv_dtype=getattr(torch, query.kv_dtype),
+        route=query.route,
+        prefill_block_k=query.prefill_block_k,
         reserve_paged_logits=query.reserve_paged_logits,
         paged_logits_k_rows=query.paged_logits_k_rows,
-        score_mode=query.score_mode, num_idx_heads=query.num_idx_heads,
+        score_mode=query.score_mode,
+        num_idx_heads=query.num_idx_heads,
     )
 
 
@@ -176,14 +221,19 @@ def compile_indexer(query_payload, config_payload, ordinal):
         from types import SimpleNamespace
 
         caps = SimpleNamespace(
-            device=device, num_q_heads=query.num_q_heads,
+            device=device,
+            num_q_heads=query.num_q_heads,
             max_q_rows=query.max_q_rows,
-            max_page_table_width=query.max_page_table_width, topk=query.top_k,
-            mode=query.mode, page_size=query.page_size,
+            max_page_table_width=query.max_page_table_width,
+            topk=query.top_k,
+            mode=query.mode,
+            page_size=query.page_size,
             max_candidates=query.max_candidates,
             candidate_topk_blocks=query.candidate_topk_blocks,
         )
-        state = materialize_mxfp4(caps, device_index=ordinal, score_kind=config.mxfp4_score_kind)
+        state = materialize_mxfp4(
+            caps, device_index=ordinal, score_kind=config.mxfp4_score_kind
+        )
         return _Mxfp4Programs(state._launchers)
 
     descriptors = query.operands
@@ -198,7 +248,8 @@ def compile_indexer(query_payload, config_payload, ordinal):
             layout.scratch_specs()[0].shape, dtype=torch.uint8, device=device
         )
         binding = layout.bind(
-            scratch=scratch, real_page_table=values["page_table"],
+            scratch=scratch,
+            real_page_table=values["page_table"],
             cache_seqlens_int32=values["cache_lengths"],
             active_width=values["active_width"],
             expected_num_q_heads=query.num_q_heads,
@@ -207,13 +258,17 @@ def compile_indexer(query_payload, config_payload, ordinal):
             _initialize=False,
         )
         index_topk_fp8(
-            q_fp8=values["q_fp8"], weights=values["query_weights"],
-            index_k_cache=values["index_k_cache"], binding=binding,
-            page_size=query.page_size, topk=query.top_k,
+            q_fp8=values["q_fp8"],
+            weights=values["query_weights"],
+            index_k_cache=values["index_k_cache"],
+            binding=binding,
+            page_size=query.page_size,
+            topk=query.top_k,
             expected_num_q_heads=query.num_q_heads,
             out_indices=values["output_indices"],
             out_scores=values["output_scores"],
-            allow_transient_fold_buffers=False, launcher_sink=gathered,
+            allow_transient_fold_buffers=False,
+            launcher_sink=gathered,
         )
         if binding.route != "paged_fused":
             # A single live supertile combines the first and final top-k arms.
@@ -237,17 +292,22 @@ def compile_indexer(query_payload, config_payload, ordinal):
                     _initialize=False,
                 )
                 index_topk_fp8(
-                    q_fp8=values["q_fp8"], weights=values["query_weights"],
-                    index_k_cache=values["index_k_cache"], binding=short_binding,
-                    page_size=query.page_size, topk=query.top_k,
+                    q_fp8=values["q_fp8"],
+                    weights=values["query_weights"],
+                    index_k_cache=values["index_k_cache"],
+                    binding=short_binding,
+                    page_size=query.page_size,
+                    topk=query.top_k,
                     expected_num_q_heads=query.num_q_heads,
                     out_indices=values["output_indices"],
                     out_scores=values["output_scores"],
                     launchers=(
                         {"paged": resolved[0], "tiled": None}
-                        if binding.route == "paged_tiled" else None
+                        if binding.route == "paged_tiled"
+                        else None
                     ),
-                    allow_transient_fold_buffers=False, launcher_sink=gathered,
+                    allow_transient_fold_buffers=False,
+                    launcher_sink=gathered,
                 )
             # The two-stage fold is a declared native family even when this
             # serving state uses its fixed-scratch carry path. Compile its
@@ -269,7 +329,8 @@ def compile_indexer(query_payload, config_payload, ordinal):
 
     route = binding.route
     tiled_launchers = {
-        key: value for key, value in gathered.items()
+        key: value
+        for key, value in gathered.items()
         if isinstance(key, tuple) and key[0] in ("tiled", "row")
     }
     if route == "paged_fused":
@@ -278,7 +339,9 @@ def compile_indexer(query_payload, config_payload, ordinal):
         return {"fused": resolved[0]}
     if route == "packed_contiguous":
         if "gather" not in gathered or not resolved:
-            raise RuntimeError("prepared contiguous DSA route did not resolve every launcher")
+            raise RuntimeError(
+                "prepared contiguous DSA route did not resolve every launcher"
+            )
         return {
             "gather": gathered["gather"],
             "contiguous": resolved[0],
@@ -293,66 +356,121 @@ def _query(caps, invocation):
     operands = invocation.get("operands", FrozenMapping())
     if not isinstance(operands, FrozenMapping):
         raise ValueError("DSA invocation operands must be immutable metadata")
-    if caps.cache_format != "mxfp4" and any(name not in operands or operands[name] is None for name in _OPERANDS[:-1]):
-        raise ValueError("DSA FP8 declarations require invocation_from_tensors metadata")
+    if caps.cache_format != "mxfp4" and any(
+        name not in operands or operands[name] is None for name in _OPERANDS[:-1]
+    ):
+        raise ValueError(
+            "DSA FP8 declarations require invocation_from_tensors metadata"
+        )
     return DsaIndexerQuery(
-        source_layout=INDEXER_SOURCE_LAYOUT_PAGED, mode=caps.mode,
-        dtype="bfloat16", kv_dtype="uint8", num_q_heads=caps.num_q_heads,
-        num_idx_heads=int(invocation.get("num_idx_heads", getattr(caps, "num_idx_heads", 1))),
+        source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+        mode=caps.mode,
+        dtype="bfloat16",
+        kv_dtype="uint8",
+        num_q_heads=caps.num_q_heads,
+        num_idx_heads=int(
+            invocation.get("num_idx_heads", getattr(caps, "num_idx_heads", 1))
+        ),
         max_q_rows=caps.max_q_rows,
-        max_k_rows=caps.max_page_table_width * int(invocation.get("page_size", caps.page_size)),
-        top_k=caps.topk, page_size=int(invocation.get("page_size", caps.page_size)),
-        score_mode=str(invocation.get("score_mode", getattr(caps, "score_mode", "dsa"))),
+        max_k_rows=caps.max_page_table_width
+        * int(invocation.get("page_size", caps.page_size)),
+        top_k=caps.topk,
+        page_size=int(invocation.get("page_size", caps.page_size)),
+        score_mode=str(
+            invocation.get("score_mode", getattr(caps, "score_mode", "dsa"))
+        ),
         shared_page_table=caps.mode == "prefill",
         max_page_table_width=caps.max_page_table_width,
         route=str(invocation.get("route", getattr(caps, "route", "auto"))),
         output_physical_slots=caps.output_index_space == "physical",
-        supertile_k=int(invocation.get("requested_supertile_k", getattr(caps, "supertile_k", 0))),
-        prefill_block_k=int(invocation.get("requested_prefill_block_k", getattr(caps, "prefill_block_k", 256))),
-        reserve_paged_logits=bool(invocation.get("reserve_paged_logits", getattr(caps, "reserve_paged_logits", False))),
-        paged_logits_k_rows=int(invocation.get("paged_logits_k_rows", getattr(caps, "paged_logits_k_rows", 0))),
-        cache_format=caps.cache_format, max_candidates=caps.max_candidates,
-        candidate_topk_blocks=caps.candidate_topk_blocks, operands=operands,
+        supertile_k=int(
+            invocation.get("requested_supertile_k", getattr(caps, "supertile_k", 0))
+        ),
+        prefill_block_k=int(
+            invocation.get(
+                "requested_prefill_block_k", getattr(caps, "prefill_block_k", 256)
+            )
+        ),
+        reserve_paged_logits=bool(
+            invocation.get(
+                "reserve_paged_logits", getattr(caps, "reserve_paged_logits", False)
+            )
+        ),
+        paged_logits_k_rows=int(
+            invocation.get(
+                "paged_logits_k_rows", getattr(caps, "paged_logits_k_rows", 0)
+            )
+        ),
+        cache_format=caps.cache_format,
+        max_candidates=caps.max_candidates,
+        candidate_topk_blocks=caps.candidate_topk_blocks,
+        operands=operands,
     )
 
 
-def plan(caps, *, invocation: FrozenMapping = FrozenMapping(), override: DsaIndexerConfig | None = None) -> Plan:
+def plan(
+    caps,
+    *,
+    invocation: FrozenMapping = FrozenMapping(),
+    override: DsaIndexerConfig | None = None,
+) -> Plan:
     if not hasattr(caps, "max_page_table_width"):
         raise TypeError("plan requires dsa_indexer.Caps")
     invocation = FrozenMapping(invocation)
     query = _query(caps, invocation)
+
     def compile_jobs(config, device):
-        return (CompileJob.create("b12x.attention.dsa_indexer._preparation:compile_indexer", TUNING.encode_query(replace(query, exhaustive=False)), TUNING.encode_config(config), device.ordinal),)
+        return (
+            CompileJob.create(
+                "b12x.attention.dsa_indexer._preparation:compile_indexer",
+                TUNING.encode_query(replace(query, exhaustive=False)),
+                TUNING.encode_config(config),
+                device.ordinal,
+            ),
+        )
+
     def memory(config, device):
         if query.cache_format == "mxfp4":
             from types import SimpleNamespace
             from .mxfp4 import plan_mxfp4
+
             mx_caps = SimpleNamespace(
-                device=caps.device, num_q_heads=query.num_q_heads,
+                device=caps.device,
+                num_q_heads=query.num_q_heads,
                 max_q_rows=query.max_q_rows,
-                max_page_table_width=query.max_page_table_width, topk=query.top_k,
-                mode=query.mode, page_size=query.page_size,
+                max_page_table_width=query.max_page_table_width,
+                topk=query.top_k,
+                mode=query.mode,
+                page_size=query.page_size,
                 max_candidates=query.max_candidates,
                 candidate_topk_blocks=query.candidate_topk_blocks,
             )
             return MemoryRequirements(scratch=plan_mxfp4(mx_caps).scratch_specs())
-        layout = plan_indexer_scratch(_scratch_caps(query, device=caps.device, config=config),
-                                      fused_merge=config.fused_merge)
+        layout = plan_indexer_scratch(
+            _scratch_caps(query, device=caps.device, config=config),
+            fused_merge=config.fused_merge,
+        )
         return MemoryRequirements(scratch=layout.scratch_specs())
+
     def materialize(selection, device):
         programs = compile_indexer(
             TUNING.encode_query(replace(query, exhaustive=False)),
-            TUNING.encode_config(selection.config), device.ordinal,
+            TUNING.encode_config(selection.config),
+            device.ordinal,
         )
         load_programs(programs)
         if query.cache_format == "mxfp4":
             from types import SimpleNamespace
             from .mxfp4 import plan_mxfp4
+
             mx_caps = SimpleNamespace(
-                device=caps.device, num_q_heads=query.num_q_heads,
+                device=caps.device,
+                num_q_heads=query.num_q_heads,
                 max_q_rows=query.max_q_rows,
-                max_page_table_width=query.max_page_table_width, topk=query.top_k,
-                mode=query.mode, page_size=query.page_size,
+                max_page_table_width=query.max_page_table_width,
+                topk=query.top_k,
+                mode=query.mode,
+                page_size=query.page_size,
                 max_candidates=query.max_candidates,
                 candidate_topk_blocks=query.candidate_topk_blocks,
             )
@@ -365,16 +483,50 @@ def plan(caps, *, invocation: FrozenMapping = FrozenMapping(), override: DsaInde
         launchers = programs
         if not isinstance(launchers, Mapping):
             raise TypeError("FP8 DSA compiler factory did not return launchers")
-        return attach_programs(_DsaIndexerState(layout, selection.config, launchers), launchers)
-    return Plan(contract=TUNING, query=query, invocation=invocation, override=override, _compile_jobs=compile_jobs, _memory_requirements=memory, _materialize=materialize, _device=caps.device)
+        return attach_programs(
+            _DsaIndexerState(layout, selection.config, launchers), launchers
+        )
+
+    return Plan(
+        contract=TUNING,
+        query=query,
+        invocation=invocation,
+        override=override,
+        _compile_jobs=compile_jobs,
+        _memory_requirements=memory,
+        _materialize=materialize,
+        _device=caps.device,
+    )
 
 
 def bind(plan, **kwargs):
     return require_prepared(plan, "attention.dsa_indexer").bind(**kwargs)
 
 
-def run(*, binding, plan, q_fp8, query_weights, index_k_cache, output_indices, output_scores=None):
-    return require_prepared(plan, "attention.dsa_indexer").run(binding, q_fp8=q_fp8, query_weights=query_weights, index_k_cache=index_k_cache, output_indices=output_indices, output_scores=output_scores)
+def run(
+    *,
+    binding,
+    plan,
+    q_fp8,
+    query_weights,
+    index_k_cache,
+    output_indices,
+    output_scores=None,
+):
+    return require_prepared(plan, "attention.dsa_indexer").run(
+        binding,
+        q_fp8=q_fp8,
+        query_weights=query_weights,
+        index_k_cache=index_k_cache,
+        output_indices=output_indices,
+        output_scores=output_scores,
+    )
 
 
-__all__ = ["bind", "invocation_from_descriptors", "invocation_from_tensors", "plan", "run"]
+__all__ = [
+    "bind",
+    "invocation_from_descriptors",
+    "invocation_from_tensors",
+    "plan",
+    "run",
+]

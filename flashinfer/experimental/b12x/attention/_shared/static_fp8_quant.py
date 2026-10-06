@@ -39,9 +39,8 @@ def _byte_base_pointer(tensor: torch.Tensor) -> torch.Tensor:
 def _to_cute(tensor: torch.Tensor, dtype, *, align: int):
     if hasattr(tensor, "fake_mode"):
         from cutlass.cute.runtime import make_fake_tensor
-        return make_fake_tensor(
-            dtype, (cute.sym_int(32),), (1,), assumed_align=align
-        )
+
+        return make_fake_tensor(dtype, (cute.sym_int(32),), (1,), assumed_align=align)
     converted = from_dlpack(tensor, assumed_align=align)
     converted.element_type = dtype
     return converted.mark_layout_dynamic(leading_dim=0)
@@ -169,6 +168,7 @@ def compile(*, binding: Binding) -> None:
         with _LOCK:
             _CACHE[signature] = compiled
 
+
 @dataclass(frozen=True)
 class StaticFp8QuantLauncher:
     signature: tuple[int, int]
@@ -176,7 +176,9 @@ class StaticFp8QuantLauncher:
 
     def run(self, binding: Binding) -> torch.Tensor:
         if _signature(binding) != self.signature:
-            raise ValueError("static FP8 quant binding differs from its prepared launcher")
+            raise ValueError(
+                "static FP8 quant binding differs from its prepared launcher"
+            )
         _, args, _ = _launch(binding)
         run_compiled(self.compiled, args)
         return binding.output

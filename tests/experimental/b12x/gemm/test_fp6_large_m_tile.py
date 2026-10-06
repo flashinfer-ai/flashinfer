@@ -1,4 +1,5 @@
 """Bit equality and regime isolation for MX-FP6 dense tiles."""
+
 from __future__ import annotations
 
 import pytest
@@ -53,12 +54,11 @@ def test_fp6_tile_regime_selection(monkeypatch):
     # Narrow-N uses the coarse tile.
     assert _select_default_mma_tiler_mn(8192, 1024, **common) == (128, 128)
     # A declared expected_m regime hint owns the decision.
-    assert _select_default_mma_tiler_mn(
-        1, 7168, expected_m=8192, **common
-    ) == (128, 128)
-    assert _select_default_mma_tiler_mn(
-        8192, 7168, expected_m=8, **common
-    ) == (16, 64)
+    assert _select_default_mma_tiler_mn(1, 7168, expected_m=8192, **common) == (
+        128,
+        128,
+    )
+    assert _select_default_mma_tiler_mn(8192, 7168, expected_m=8, **common) == (16, 64)
 
 
 @cuda_required
@@ -138,9 +138,10 @@ def test_choose_epilogue_refuses_sub_atom_tiles():
         return (1, 1) if cap == 0 else (99, 2)
 
     for tile in ((16, 64), (16, 128)):
-        assert dg.DenseGemmKernel._choose_epilogue(
-            tile, (16, 16), probe_huge_gain
-        ) == (tile, 0)
+        assert dg.DenseGemmKernel._choose_epilogue(tile, (16, 16), probe_huge_gain) == (
+            tile,
+            0,
+        )
 
 
 def test_choose_epilogue_refuses_the_m1_register_store_path():

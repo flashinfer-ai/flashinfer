@@ -1848,8 +1848,11 @@ def _run_prepared(
 ) -> torch.Tensor:
     _validate_launch(a, b_values, b_scales, out, b_major=b_major, sf_axis=sf_axis)
     stream_int = (
-        None if stream is None else int(stream)
-        if isinstance(stream, int) else int(_torch_stream(stream, a.device).cuda_stream)
+        None
+        if stream is None
+        else int(stream)
+        if isinstance(stream, int)
+        else int(_torch_stream(stream, a.device).cuda_stream)
     )
     _launch_prepared(a, b_values, b_scales, out, launch=launch, stream=stream_int)
     return out
@@ -2004,10 +2007,25 @@ def _run_mla_query_projection(
         sf_axis=sf_axis,
     )
     launch = _compile_mla_query_projection(
-        b_major=major, groups=groups, m=m, n=n, k=k, output_fp8=output_fp8, device=a.device,
+        b_major=major,
+        groups=groups,
+        m=m,
+        n=n,
+        k=k,
+        output_fp8=output_fp8,
+        device=a.device,
     )
-    _launch_mla_query_prepared(a, b_values, b_scales, q_pe, q_scale, out,
-                               launch=launch, output_fp8=output_fp8, stream=stream)
+    _launch_mla_query_prepared(
+        a,
+        b_values,
+        b_scales,
+        q_pe,
+        q_scale,
+        out,
+        launch=launch,
+        output_fp8=output_fp8,
+        stream=stream,
+    )
 
 
 def _launch_mla_query_prepared(
@@ -2022,7 +2040,6 @@ def _launch_mla_query_prepared(
     output_fp8: bool,
     stream: Optional[int] = None,
 ) -> None:
-
     """Launch an already selected fused MLA query specialization."""
 
     if stream is not None:
@@ -2104,14 +2121,33 @@ def _run_mla_query_prepared(
     stream: Optional[object] = None,
 ) -> torch.Tensor:
     _, _, _, _, _, output_fp8 = _validate_mla_query_launch(
-        a, b_values, b_scales, q_pe, q_scale, out, b_major=b_major, sf_axis=sf_axis,
+        a,
+        b_values,
+        b_scales,
+        q_pe,
+        q_scale,
+        out,
+        b_major=b_major,
+        sf_axis=sf_axis,
     )
     stream_int = (
-        None if stream is None else int(stream)
-        if isinstance(stream, int) else int(_torch_stream(stream, a.device).cuda_stream)
+        None
+        if stream is None
+        else int(stream)
+        if isinstance(stream, int)
+        else int(_torch_stream(stream, a.device).cuda_stream)
     )
-    _launch_mla_query_prepared(a, b_values, b_scales, q_pe, q_scale, out,
-                               launch=launch, output_fp8=output_fp8, stream=stream_int)
+    _launch_mla_query_prepared(
+        a,
+        b_values,
+        b_scales,
+        q_pe,
+        q_scale,
+        out,
+        launch=launch,
+        output_fp8=output_fp8,
+        stream=stream_int,
+    )
     return out
 
 
@@ -2127,7 +2163,9 @@ def _op(
 ) -> None:
     state = require_prepared(plan_from_handle(plan_handle), "gemm.bmm", lhs.device)
     major = _coerce_b_major(b_major).name.lower()
-    state.run(lhs, (b_values, b_scales), out, b_major=major, sf_axis=major, stream=stream_int)
+    state.run(
+        lhs, (b_values, b_scales), out, b_major=major, sf_axis=major, stream=stream_int
+    )
 
 
 @_op.register_fake
@@ -2143,9 +2181,7 @@ def _fake(
     del lhs, b_values, b_scales, out, b_major, plan_handle, stream_int
 
 
-@torch.library.custom_op(
-    "b12x::mla_query_projection_mxfp8", mutates_args=("out",)
-)
+@torch.library.custom_op("b12x::mla_query_projection_mxfp8", mutates_args=("out",))
 def _mla_query_projection_op(
     lhs: torch.Tensor,
     b_values: torch.Tensor,
@@ -2157,7 +2193,9 @@ def _mla_query_projection_op(
     plan_handle: int,
     stream_int: Optional[int] = None,
 ) -> None:
-    state = require_prepared(plan_from_handle(plan_handle), "gemm.mla_query_projection", lhs.device)
+    state = require_prepared(
+        plan_from_handle(plan_handle), "gemm.mla_query_projection", lhs.device
+    )
     del b_major
     state.run(lhs, (b_values, b_scales), q_pe, out, q_scale=q_scale, stream=stream_int)
 
@@ -2175,7 +2213,6 @@ def _mla_query_projection_fake(
     stream_int: Optional[int] = None,
 ) -> None:
     del lhs, b_values, b_scales, q_pe, q_scale, out, b_major, plan_handle, stream_int
-
 
 
 def _stream_to_int(stream: Optional[object]) -> Optional[int]:
@@ -2221,7 +2258,6 @@ def _torch_stream(stream: Optional[object], device: torch.device) -> torch.cuda.
 # ---------------------------------------------------------------------------
 # Precompile every caller-declared graph-visible M before capture.
 # ---------------------------------------------------------------------------
-
 
 
 def can_implement(

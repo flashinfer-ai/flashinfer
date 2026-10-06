@@ -82,6 +82,7 @@ class MoeModelGeometry:
     tp_sizes: tuple[int, ...] = COMMON_TP_SIZES
 
     physical_intermediate_alignment: int | None = None
+
     def __post_init__(self) -> None:
         if not self.model_id or not self.activation or not self.source:
             raise ValueError("model geometry labels must be non-empty")
@@ -104,7 +105,10 @@ class MoeModelGeometry:
         if self.physical_intermediate_alignment is not None and (
             self.physical_intermediate_alignment <= 0
         ):
-            raise ValueError("physical_intermediate_alignment must be positive when set")
+            raise ValueError(
+                "physical_intermediate_alignment must be positive when set"
+            )
+
 
 @dataclass(frozen=True, kw_only=True)
 class MoeBenchmarkPreset:
@@ -620,7 +624,8 @@ def expand_physical_geometries(
             for recipe in compatible_recipes:
                 for tp_size in model.tp_sizes:
                     logical_sizes = _logical_shard_sizes(
-                        model.intermediate_size, tp_size,
+                        model.intermediate_size,
+                        tp_size,
                     )
                     local_experts = model.num_experts
                     if not logical_sizes:
@@ -649,7 +654,8 @@ def expand_physical_geometries(
                             global_intermediate_size=model.intermediate_size,
                             logical_intermediate_sizes=logical_sizes,
                             physical_intermediate_size=physical_size,
-                            padding_per_tp_group=physical_size * tp_size - model.intermediate_size,
+                            padding_per_tp_group=physical_size * tp_size
+                            - model.intermediate_size,
                             native_top_k=model.native_top_k,
                             source=model.source,
                         )

@@ -1,4 +1,5 @@
 """Metadata and chunk-contraction helpers for independent prefill oracles."""
+
 from __future__ import annotations
 
 import math
@@ -17,7 +18,6 @@ def _scalar(value: torch.Tensor | int) -> int:
 
 def _bf16(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.bfloat16).float()
-
 
 
 def _validate_packed(
@@ -62,7 +62,11 @@ def _validate_packed(
         final = int(final_state_indices[request])
         checkpoint = int(checkpoint_state_indices[request])
         offset = int(checkpoint_offsets[request])
-        for slot, role in ((initial, "initial"), (final, "final"), (checkpoint, "checkpoint")):
+        for slot, role in (
+            (initial, "initial"),
+            (final, "final"),
+            (checkpoint, "checkpoint"),
+        ):
             if is_null(slot):
                 continue
             if slot < 0 or slot >= state_slots:
@@ -86,9 +90,10 @@ def _validate_packed(
             continue
         conflicting = write_slots - ({final} if not is_null(final) else set())
         if initial in conflicting:
-            raise ValueError(f"initial state index {initial} is written by another sequence")
+            raise ValueError(
+                f"initial state index {initial} is written by another sequence"
+            )
     return spans
-
 
 
 @dataclass(frozen=True)
@@ -102,7 +107,6 @@ class MirrorPolicy:
     single_rounding: bool = True
     scale_dtype: Literal["fp32", "bf16"] = "fp32"
     operands: Literal["bf16", "fp32"] = "bf16"
-
 
 
 def _neumann_inverse(lower: torch.Tensor, chunk: int) -> torch.Tensor:
@@ -121,7 +125,6 @@ def _neumann_inverse(lower: torch.Tensor, chunk: int) -> torch.Tensor:
     return inverse
 
 
-
 def _recur_tile(
     state: torch.Tensor,
     v: torch.Tensor,
@@ -136,7 +139,9 @@ def _recur_tile(
     mask[:rows] = True
     v_h = torch.where(mask, v.float(), torch.zeros_like(v.float())).transpose(0, 1)
     shadow = _bf16(state) if policy.shadow else state
-    v_prime = (v_h - prep["k_tilde"] @ shadow.transpose(-1, -2)) * prep["beta"][:, :, None]
+    v_prime = (v_h - prep["k_tilde"] @ shadow.transpose(-1, -2)) * prep["beta"][
+        :, :, None
+    ]
     v_prime_op = _bf16(v_prime) if policy.operands == "bf16" else v_prime
     u = prep["inv_op"] @ v_prime_op
     u_op = _bf16(u) if policy.u_operand == "bf16" else u

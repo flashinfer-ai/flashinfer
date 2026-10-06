@@ -33,7 +33,9 @@ def _metadata_launch(
         try:
             compiled = prepared[key]
         except KeyError:
-            raise RuntimeError(f"prepared graph replay metadata is missing {key!r}") from None
+            raise RuntimeError(
+                f"prepared graph replay metadata is missing {key!r}"
+            ) from None
         # CompiledKernel takes runtime arguments only.  Its grid ABI is always
         # three-dimensional even when the Triton source uses fewer axes.
         return compiled[tuple((*grid, 1, 1)[:3])](*args)
@@ -658,8 +660,7 @@ def update_prefill_graph_work_metadata_triton(
             axis=0,
         )
         adaptive_chunk_pages = tl.maximum(
-            (policy_pages + MAX_CHUNKS_PER_Q_TILE - 1)
-            // MAX_CHUNKS_PER_Q_TILE,
+            (policy_pages + MAX_CHUNKS_PER_Q_TILE - 1) // MAX_CHUNKS_PER_Q_TILE,
             1,
         )
         kv_chunk_size = adaptive_chunk_pages * PAGE_SIZE
@@ -753,12 +754,8 @@ def update_prefill_graph_compact_nonsplit_work_metadata_triton(
         q_start = tl.load(cu_seqlens_q_ptr + req_idx).to(tl.int32)
         q_end = tl.load(cu_seqlens_q_ptr + req_idx + 1).to(tl.int32)
         q_len = tl.maximum(q_end - q_start, 0)
-        num_q_tiles = (
-            q_len * GQA_GROUP_SIZE + CTA_TILE_Q - 1
-        ) // CTA_TILE_Q
-        owns_slot = (offsets >= tile_prefix) & (
-            offsets < tile_prefix + num_q_tiles
-        )
+        num_q_tiles = (q_len * GQA_GROUP_SIZE + CTA_TILE_Q - 1) // CTA_TILE_Q
+        owns_slot = (offsets >= tile_prefix) & (offsets < tile_prefix + num_q_tiles)
         request_idx = tl.where(owns_slot, req_idx, request_idx)
         qo_tile_idx = tl.where(owns_slot, offsets - tile_prefix, qo_tile_idx)
         cache_len = tl.load(cache_seqlens_ptr + req_idx).to(tl.int32)
@@ -1231,24 +1228,55 @@ def update_decode_graph_chunk_metadata_fused(
         )
 
     _metadata_launch(
-        update_decode_graph_metadata_fused_triton, "decode_fused", _prepared, (1,),
-        (cache_seqlens, request_indices, qo_tile_indices, kv_tile_indices,
-         merge_indptr, o_indptr, block_valid_mask, kv_chunk_size_ptr,
-         kv_window_start_tokens, decode_chunk_pages_lut, max_chunks_per_req,
-         block_valid_capacity, decode_chunk_pages_lut.shape[0]),
-        {"PAGE_SIZE": page_size, "WINDOW_PAGE_SPAN": int(window_page_span),
-         "WINDOW_LEFT": int(window_left), "BATCH": bs,
-         "BLOCK_BATCH": triton.next_power_of_2(bs),
-         "BLOCK_WORK_ITEMS": triton.next_power_of_2(
-             max(work_items_capacity, block_valid_capacity))},
+        update_decode_graph_metadata_fused_triton,
+        "decode_fused",
+        _prepared,
+        (1,),
+        (
+            cache_seqlens,
+            request_indices,
+            qo_tile_indices,
+            kv_tile_indices,
+            merge_indptr,
+            o_indptr,
+            block_valid_mask,
+            kv_chunk_size_ptr,
+            kv_window_start_tokens,
+            decode_chunk_pages_lut,
+            max_chunks_per_req,
+            block_valid_capacity,
+            decode_chunk_pages_lut.shape[0],
+        ),
+        {
+            "PAGE_SIZE": page_size,
+            "WINDOW_PAGE_SPAN": int(window_page_span),
+            "WINDOW_LEFT": int(window_left),
+            "BATCH": bs,
+            "BLOCK_BATCH": triton.next_power_of_2(bs),
+            "BLOCK_WORK_ITEMS": triton.next_power_of_2(
+                max(work_items_capacity, block_valid_capacity)
+            ),
+        },
     )
     _metadata_launch(
-        update_decode_graph_compact_work_metadata_triton, "decode_compact",
-        _prepared, (bs, triton.cdiv(max_work_items_per_req, _DECODE_BLOCK_CHUNKS)),
-        (request_indices, qo_tile_indices, kv_tile_indices, o_indptr,
-         block_valid_mask, work_items_capacity, block_valid_capacity),
-        {"BATCH": bs, "MAX_Q_TILES_PER_REQ": max_q_tiles_per_req,
-         "BLOCK_CHUNKS": _DECODE_BLOCK_CHUNKS},
+        update_decode_graph_compact_work_metadata_triton,
+        "decode_compact",
+        _prepared,
+        (bs, triton.cdiv(max_work_items_per_req, _DECODE_BLOCK_CHUNKS)),
+        (
+            request_indices,
+            qo_tile_indices,
+            kv_tile_indices,
+            o_indptr,
+            block_valid_mask,
+            work_items_capacity,
+            block_valid_capacity,
+        ),
+        {
+            "BATCH": bs,
+            "MAX_Q_TILES_PER_REQ": max_q_tiles_per_req,
+            "BLOCK_CHUNKS": _DECODE_BLOCK_CHUNKS,
+        },
     )
 
 
@@ -1432,18 +1460,44 @@ def update_msa_decode_graph_chunk_metadata(
         )
 
     _metadata_launch(
-        update_msa_decode_graph_metadata_fused_triton, "msa_decode_fused", _prepared, (1,),
-        (cache_seqlens, merge_indptr, o_indptr, block_valid_mask,
-         kv_chunk_size_ptr, kv_window_start_tokens, kv_chunk_size, block_valid_capacity),
-        {"PAGE_SIZE": page_size, "PAGES_PER_BLOCK": 128 // int(page_size),
-         "BATCH": bs, "BLOCK_BATCH": triton.next_power_of_2(bs),
-         "BLOCK_WORK_ITEMS": triton.next_power_of_2(max(work_items_capacity, block_valid_capacity))},
+        update_msa_decode_graph_metadata_fused_triton,
+        "msa_decode_fused",
+        _prepared,
+        (1,),
+        (
+            cache_seqlens,
+            merge_indptr,
+            o_indptr,
+            block_valid_mask,
+            kv_chunk_size_ptr,
+            kv_window_start_tokens,
+            kv_chunk_size,
+            block_valid_capacity,
+        ),
+        {
+            "PAGE_SIZE": page_size,
+            "PAGES_PER_BLOCK": 128 // int(page_size),
+            "BATCH": bs,
+            "BLOCK_BATCH": triton.next_power_of_2(bs),
+            "BLOCK_WORK_ITEMS": triton.next_power_of_2(
+                max(work_items_capacity, block_valid_capacity)
+            ),
+        },
     )
     _metadata_launch(
-        update_decode_graph_compact_work_metadata_triton, "decode_compact", _prepared,
+        update_decode_graph_compact_work_metadata_triton,
+        "decode_compact",
+        _prepared,
         (bs, triton.cdiv(max_chunks_per_req, _DECODE_BLOCK_CHUNKS)),
-        (request_indices, qo_tile_indices, kv_tile_indices, o_indptr,
-         block_valid_mask, work_items_capacity, block_valid_capacity),
+        (
+            request_indices,
+            qo_tile_indices,
+            kv_tile_indices,
+            o_indptr,
+            block_valid_mask,
+            work_items_capacity,
+            block_valid_capacity,
+        ),
         {"BATCH": bs, "MAX_Q_TILES_PER_REQ": 1, "BLOCK_CHUNKS": _DECODE_BLOCK_CHUNKS},
     )
 
@@ -1615,7 +1669,9 @@ def _launch_regular_decode_graph_metadata_fused(
                     "kv_chunk_size tensor and cache_seqlens must be on the same device"
                 )
             if kv_chunk_size.numel() != 1:
-                raise ValueError("kv_chunk_size tensor must contain exactly one element")
+                raise ValueError(
+                    "kv_chunk_size tensor must contain exactly one element"
+                )
             kv_chunk_size_tensor = kv_chunk_size.reshape(1)
         else:
             if kv_chunk_size is None:
@@ -1626,15 +1682,30 @@ def _launch_regular_decode_graph_metadata_fused(
             if fixed_kv_chunk_size <= 0:
                 raise ValueError("kv_chunk_size must be positive")
     _metadata_launch(
-        update_regular_decode_graph_metadata_fused_triton, "regular_decode_fused",
-        _prepared, (1,),
-        (cache_seqlens, merge_indptr, o_indptr, kv_chunk_size_ptr,
-         kv_window_start_tokens, decode_chunk_pages_lut, kv_chunk_size_tensor, lut_size),
-        {"PAGE_SIZE": page_size, "WINDOW_PAGE_SPAN": int(window_page_span),
-         "WINDOW_LEFT": int(window_left), "BATCH": bs,
-         "BLOCK_BATCH": triton.next_power_of_2(bs), "USE_LUT": use_lut,
-         "HAS_KV_CHUNK_SIZE_TENSOR": has_kv_chunk_size_tensor,
-         "FIXED_KV_CHUNK_SIZE": fixed_kv_chunk_size},
+        update_regular_decode_graph_metadata_fused_triton,
+        "regular_decode_fused",
+        _prepared,
+        (1,),
+        (
+            cache_seqlens,
+            merge_indptr,
+            o_indptr,
+            kv_chunk_size_ptr,
+            kv_window_start_tokens,
+            decode_chunk_pages_lut,
+            kv_chunk_size_tensor,
+            lut_size,
+        ),
+        {
+            "PAGE_SIZE": page_size,
+            "WINDOW_PAGE_SPAN": int(window_page_span),
+            "WINDOW_LEFT": int(window_left),
+            "BATCH": bs,
+            "BLOCK_BATCH": triton.next_power_of_2(bs),
+            "USE_LUT": use_lut,
+            "HAS_KV_CHUNK_SIZE_TENSOR": has_kv_chunk_size_tensor,
+            "FIXED_KV_CHUNK_SIZE": fixed_kv_chunk_size,
+        },
     )
 
 
@@ -1668,8 +1739,12 @@ def update_decode_graph_window_start_tokens(
         _prepared,
         (1,),
         (cache_seqlens, kv_window_start_tokens),
-        {"PAGE_SIZE": page_size, "WINDOW_LEFT": int(window_left), "BATCH": bs,
-         "BLOCK_BATCH": triton.next_power_of_2(bs)},
+        {
+            "PAGE_SIZE": page_size,
+            "WINDOW_LEFT": int(window_left),
+            "BATCH": bs,
+            "BLOCK_BATCH": triton.next_power_of_2(bs),
+        },
     )
 
 
@@ -1690,17 +1765,23 @@ def update_regular_decode_graph_chunk_metadata_from_lut(
     if merge_indptr.device != device or o_indptr.device != device:
         raise ValueError("indptr buffers and cache_seqlens must be on the same device")
     if kv_chunk_size_ptr.device != device:
-        raise ValueError("decode graph buffers and cache_seqlens must be on the same device")
+        raise ValueError(
+            "decode graph buffers and cache_seqlens must be on the same device"
+        )
     if kv_window_start_tokens.device != device:
         raise ValueError(
             "kv_window_start_tokens and cache_seqlens must be on the same device"
         )
     _launch_regular_decode_graph_metadata_fused(
-        cache_seqlens=cache_seqlens, merge_indptr=merge_indptr, o_indptr=o_indptr,
+        cache_seqlens=cache_seqlens,
+        merge_indptr=merge_indptr,
+        o_indptr=o_indptr,
         kv_chunk_size_ptr=kv_chunk_size_ptr,
         kv_window_start_tokens=kv_window_start_tokens,
-        decode_chunk_pages_lut=decode_chunk_pages_lut, page_size=page_size,
-        window_page_span=window_page_span, window_left=window_left,
+        decode_chunk_pages_lut=decode_chunk_pages_lut,
+        page_size=page_size,
+        window_page_span=window_page_span,
+        window_left=window_left,
         _prepared=_prepared,
     )
 
@@ -1770,23 +1851,41 @@ def update_decode_graph_chunk_metadata(
     _prepared: Mapping[str, object] | None = None,
 ) -> None:
     device = cache_seqlens.device
-    if any(t.device != device for t in (
-        request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr,
-        block_valid_mask, kv_chunk_size_ptr, kv_window_start_tokens,
-        decode_chunk_pages_lut,
-    )):
-        raise ValueError("decode graph metadata tensors must share cache_seqlens device")
+    if any(
+        t.device != device
+        for t in (
+            request_indices,
+            qo_tile_indices,
+            kv_tile_indices,
+            merge_indptr,
+            o_indptr,
+            block_valid_mask,
+            kv_chunk_size_ptr,
+            kv_window_start_tokens,
+            decode_chunk_pages_lut,
+        )
+    ):
+        raise ValueError(
+            "decode graph metadata tensors must share cache_seqlens device"
+        )
     if page_size <= 0:
         raise ValueError("page_size must be positive")
     update_decode_graph_chunk_metadata_fused(
-        cache_seqlens=cache_seqlens, request_indices=request_indices,
-        qo_tile_indices=qo_tile_indices, kv_tile_indices=kv_tile_indices,
-        merge_indptr=merge_indptr, o_indptr=o_indptr,
-        block_valid_mask=block_valid_mask, kv_chunk_size_ptr=kv_chunk_size_ptr,
+        cache_seqlens=cache_seqlens,
+        request_indices=request_indices,
+        qo_tile_indices=qo_tile_indices,
+        kv_tile_indices=kv_tile_indices,
+        merge_indptr=merge_indptr,
+        o_indptr=o_indptr,
+        block_valid_mask=block_valid_mask,
+        kv_chunk_size_ptr=kv_chunk_size_ptr,
         kv_window_start_tokens=kv_window_start_tokens,
-        decode_chunk_pages_lut=decode_chunk_pages_lut, page_size=page_size,
-        window_page_span=window_page_span, window_left=window_left,
-        max_q_tiles_per_req=max_q_tiles_per_req, _prepared=_prepared,
+        decode_chunk_pages_lut=decode_chunk_pages_lut,
+        page_size=page_size,
+        window_page_span=window_page_span,
+        window_left=window_left,
+        max_q_tiles_per_req=max_q_tiles_per_req,
+        _prepared=_prepared,
     )
 
 
@@ -1883,18 +1982,31 @@ def update_prefill_graph_chunk_metadata(
             raise RuntimeError(
                 "prefill graph workspace kv_window_start_tokens capacity is too small"
             )
-        work_blocks = triton.cdiv(
-            block_valid_capacity, _PREFILL_BLOCK_WORK_ITEMS
-        )
+        work_blocks = triton.cdiv(block_valid_capacity, _PREFILL_BLOCK_WORK_ITEMS)
         _metadata_launch(
             update_prefill_graph_compact_nonsplit_work_metadata_triton,
-            "prefill_compact", _prepared, (work_blocks,),
-            (cache_seqlens, cu_seqlens_q, request_indices, qo_tile_indices,
-             kv_tile_indices, block_valid_mask, kv_window_start_tokens,
-             work_items_capacity, block_valid_capacity),
-            {"BATCH": bs, "CTA_TILE_Q": int(cta_tile_q),
-             "GQA_GROUP_SIZE": int(gqa_group_size), "PAGE_SIZE": int(page_size),
-             "WINDOW_LEFT": int(window_left), "BLOCK_WORK_ITEMS": _PREFILL_BLOCK_WORK_ITEMS},
+            "prefill_compact",
+            _prepared,
+            (work_blocks,),
+            (
+                cache_seqlens,
+                cu_seqlens_q,
+                request_indices,
+                qo_tile_indices,
+                kv_tile_indices,
+                block_valid_mask,
+                kv_window_start_tokens,
+                work_items_capacity,
+                block_valid_capacity,
+            ),
+            {
+                "BATCH": bs,
+                "CTA_TILE_Q": int(cta_tile_q),
+                "GQA_GROUP_SIZE": int(gqa_group_size),
+                "PAGE_SIZE": int(page_size),
+                "WINDOW_LEFT": int(window_left),
+                "BLOCK_WORK_ITEMS": _PREFILL_BLOCK_WORK_ITEMS,
+            },
         )
         return
 
@@ -1916,28 +2028,59 @@ def update_prefill_graph_chunk_metadata(
 
     work_blocks = triton.cdiv(block_valid_capacity, _PREFILL_BLOCK_WORK_ITEMS)
     _metadata_launch(
-        update_prefill_graph_work_metadata_triton, "prefill_work", _prepared, (work_blocks,),
-        (cache_seqlens, cu_seqlens_q, request_indices, qo_tile_indices,
-         kv_tile_indices, o_indptr, block_valid_mask, kv_chunk_size_ptr,
-         kv_window_start_tokens, work_items_capacity, block_valid_capacity),
-        {"BATCH": bs, "MAX_Q_TILES_PER_REQ": int(max_q_tiles_per_req),
-         "MAX_CHUNKS_PER_Q_TILE": int(max_chunks_per_q_tile),
-         "CTA_TILE_Q": int(cta_tile_q), "GQA_GROUP_SIZE": int(gqa_group_size),
-         "PAGE_SIZE": int(page_size), "WINDOW_LEFT": int(window_left),
-         "SPLIT_KV": bool(split_kv), "ADAPTIVE_CHUNKING": bool(adaptive_chunking),
-         "BLOCK_BATCH": triton.next_power_of_2(bs), "BLOCK_WORK_ITEMS": _PREFILL_BLOCK_WORK_ITEMS},
+        update_prefill_graph_work_metadata_triton,
+        "prefill_work",
+        _prepared,
+        (work_blocks,),
+        (
+            cache_seqlens,
+            cu_seqlens_q,
+            request_indices,
+            qo_tile_indices,
+            kv_tile_indices,
+            o_indptr,
+            block_valid_mask,
+            kv_chunk_size_ptr,
+            kv_window_start_tokens,
+            work_items_capacity,
+            block_valid_capacity,
+        ),
+        {
+            "BATCH": bs,
+            "MAX_Q_TILES_PER_REQ": int(max_q_tiles_per_req),
+            "MAX_CHUNKS_PER_Q_TILE": int(max_chunks_per_q_tile),
+            "CTA_TILE_Q": int(cta_tile_q),
+            "GQA_GROUP_SIZE": int(gqa_group_size),
+            "PAGE_SIZE": int(page_size),
+            "WINDOW_LEFT": int(window_left),
+            "SPLIT_KV": bool(split_kv),
+            "ADAPTIVE_CHUNKING": bool(adaptive_chunking),
+            "BLOCK_BATCH": triton.next_power_of_2(bs),
+            "BLOCK_WORK_ITEMS": _PREFILL_BLOCK_WORK_ITEMS,
+        },
     )
     _metadata_launch(
-        prefix_prefill_graph_o_indptr_triton, "prefill_prefix", _prepared, (1,), (o_indptr,),
+        prefix_prefill_graph_o_indptr_triton,
+        "prefill_prefix",
+        _prepared,
+        (1,),
+        (o_indptr,),
         {"BATCH": bs, "BLOCK_BATCH": triton.next_power_of_2(bs)},
     )
     total_num_rows_ptr[:1].copy_(cu_seqlens_q[bs : bs + 1])
 
     row_blocks = triton.cdiv(int(max_q_rows_per_req), _PREFILL_BLOCK_ROWS)
     _metadata_launch(
-        update_prefill_graph_row_indptr_triton, "prefill_rows", _prepared, (bs, row_blocks),
+        update_prefill_graph_row_indptr_triton,
+        "prefill_rows",
+        _prepared,
+        (bs, row_blocks),
         (cu_seqlens_q, o_indptr, merge_indptr),
-        {"BATCH": bs, "MAX_Q_ROWS_PER_REQ": int(max_q_rows_per_req), "BLOCK_ROWS": _PREFILL_BLOCK_ROWS},
+        {
+            "BATCH": bs,
+            "MAX_Q_ROWS_PER_REQ": int(max_q_rows_per_req),
+            "BLOCK_ROWS": _PREFILL_BLOCK_ROWS,
+        },
     )
 
 
@@ -1974,9 +2117,15 @@ def compile_graph_replay(binding: object) -> Mapping[str, object]:
     valid_capacity = int(block_valid_mask.shape[0])
     programs: dict[str, object] = {}
 
-    def warm(key: str, kernel: object, grid: tuple[int, ...], args: tuple[object, ...],
-             **constexprs: object) -> None:
+    def warm(
+        key: str,
+        kernel: object,
+        grid: tuple[int, ...],
+        args: tuple[object, ...],
+        **constexprs: object,
+    ) -> None:
         programs[key] = launch_triton(kernel, grid, *args, **constexprs)
+
     if getattr(plan, "msa_union_tile", False):
         q2k_indices = binding.q2k_indices
         if q2k_indices is None:
@@ -1984,76 +2133,175 @@ def compile_graph_replay(binding: object) -> Mapping[str, object]:
         union_blocks = require("msa_union_blocks")
         union_masks = require("msa_union_masks")
         union_counts = require("msa_union_counts")
-        warm("msa_prefill_union", build_msa_prefill_union_metadata_triton,
-             (valid_capacity, int(q2k_indices.shape[0])),
-             (q2k_indices, cache_seqlens, cu_seqlens_q, request_indices,
-              qo_tile_indices, block_valid_mask, union_blocks, union_masks,
-              union_counts, int(q2k_indices.shape[1]), valid_capacity),
-             NUM_KV_HEADS=int(q2k_indices.shape[0]), BLOCK_TOKENS=128,
-             TOPK=_MSA_UNION_TOPK, TOKENS_PER_TILE=_MSA_UNION_TOKENS_PER_TILE,
-             MAX_UNION_BLOCKS=_MSA_UNION_MAX_BLOCKS, num_warps=1)
+        warm(
+            "msa_prefill_union",
+            build_msa_prefill_union_metadata_triton,
+            (valid_capacity, int(q2k_indices.shape[0])),
+            (
+                q2k_indices,
+                cache_seqlens,
+                cu_seqlens_q,
+                request_indices,
+                qo_tile_indices,
+                block_valid_mask,
+                union_blocks,
+                union_masks,
+                union_counts,
+                int(q2k_indices.shape[1]),
+                valid_capacity,
+            ),
+            NUM_KV_HEADS=int(q2k_indices.shape[0]),
+            BLOCK_TOKENS=128,
+            TOPK=_MSA_UNION_TOPK,
+            TOKENS_PER_TILE=_MSA_UNION_TOKENS_PER_TILE,
+            MAX_UNION_BLOCKS=_MSA_UNION_MAX_BLOCKS,
+            num_warps=1,
+        )
     if not scratch.use_cuda_graph:
         return programs
 
     if scratch.mode == "decode":
         if not plan.split_kv:
             if int(plan.window_left) >= 0:
-                warm("decode_window_start", update_decode_graph_window_start_tokens_triton,
-                     (1,), (cache_seqlens, kv_window_start_tokens),
-                     PAGE_SIZE=int(scratch.page_size), WINDOW_LEFT=int(plan.window_left),
-                     BATCH=batch, BLOCK_BATCH=triton.next_power_of_2(batch))
+                warm(
+                    "decode_window_start",
+                    update_decode_graph_window_start_tokens_triton,
+                    (1,),
+                    (cache_seqlens, kv_window_start_tokens),
+                    PAGE_SIZE=int(scratch.page_size),
+                    WINDOW_LEFT=int(plan.window_left),
+                    BATCH=batch,
+                    BLOCK_BATCH=triton.next_power_of_2(batch),
+                )
             return programs
-        window_page_span = max(
-            (int(plan.window_left) + 2 * int(scratch.page_size) - 1)
-            // int(scratch.page_size), 1
-        ) if int(plan.window_left) >= 0 else 0
+        window_page_span = (
+            max(
+                (int(plan.window_left) + 2 * int(scratch.page_size) - 1)
+                // int(scratch.page_size),
+                1,
+            )
+            if int(plan.window_left) >= 0
+            else 0
+        )
         if getattr(plan, "msa_block_sparse", False):
             max_chunks = work_capacity // batch
-            warm("msa_decode_fused", update_msa_decode_graph_metadata_fused_triton,
-                 (1,), (cache_seqlens, merge_indptr, o_indptr, block_valid_mask,
-                         kv_chunk_size_ptr, kv_window_start_tokens, int(plan.kv_chunk_size),
-                         valid_capacity),
-                 PAGE_SIZE=int(scratch.page_size),
-                 PAGES_PER_BLOCK=128 // int(scratch.page_size), BATCH=batch,
-                 BLOCK_BATCH=triton.next_power_of_2(batch),
-                 BLOCK_WORK_ITEMS=triton.next_power_of_2(max(work_capacity, valid_capacity)))
-            warm("decode_compact", update_decode_graph_compact_work_metadata_triton,
-                 (batch, triton.cdiv(max_chunks, _DECODE_BLOCK_CHUNKS)),
-                 (request_indices, qo_tile_indices, kv_tile_indices, o_indptr,
-                  block_valid_mask, work_capacity, valid_capacity),
-                 BATCH=batch, MAX_Q_TILES_PER_REQ=1,
-                 BLOCK_CHUNKS=_DECODE_BLOCK_CHUNKS)
+            warm(
+                "msa_decode_fused",
+                update_msa_decode_graph_metadata_fused_triton,
+                (1,),
+                (
+                    cache_seqlens,
+                    merge_indptr,
+                    o_indptr,
+                    block_valid_mask,
+                    kv_chunk_size_ptr,
+                    kv_window_start_tokens,
+                    int(plan.kv_chunk_size),
+                    valid_capacity,
+                ),
+                PAGE_SIZE=int(scratch.page_size),
+                PAGES_PER_BLOCK=128 // int(scratch.page_size),
+                BATCH=batch,
+                BLOCK_BATCH=triton.next_power_of_2(batch),
+                BLOCK_WORK_ITEMS=triton.next_power_of_2(
+                    max(work_capacity, valid_capacity)
+                ),
+            )
+            warm(
+                "decode_compact",
+                update_decode_graph_compact_work_metadata_triton,
+                (batch, triton.cdiv(max_chunks, _DECODE_BLOCK_CHUNKS)),
+                (
+                    request_indices,
+                    qo_tile_indices,
+                    kv_tile_indices,
+                    o_indptr,
+                    block_valid_mask,
+                    work_capacity,
+                    valid_capacity,
+                ),
+                BATCH=batch,
+                MAX_Q_TILES_PER_REQ=1,
+                BLOCK_CHUNKS=_DECODE_BLOCK_CHUNKS,
+            )
         elif scratch._use_regular_decode_graph_replay:
             lut = require("_decode_graph_chunk_pages_lut")
-            warm("regular_decode_fused", update_regular_decode_graph_metadata_fused_triton,
-                 (1,), (cache_seqlens, merge_indptr, o_indptr, kv_chunk_size_ptr,
-                         kv_window_start_tokens, lut, kv_chunk_size_ptr, int(lut.shape[0])),
-                 PAGE_SIZE=int(scratch.page_size), WINDOW_PAGE_SPAN=window_page_span,
-                 WINDOW_LEFT=int(plan.window_left), BATCH=batch,
-                 BLOCK_BATCH=triton.next_power_of_2(batch), USE_LUT=True,
-                 HAS_KV_CHUNK_SIZE_TENSOR=False, FIXED_KV_CHUNK_SIZE=1)
+            warm(
+                "regular_decode_fused",
+                update_regular_decode_graph_metadata_fused_triton,
+                (1,),
+                (
+                    cache_seqlens,
+                    merge_indptr,
+                    o_indptr,
+                    kv_chunk_size_ptr,
+                    kv_window_start_tokens,
+                    lut,
+                    kv_chunk_size_ptr,
+                    int(lut.shape[0]),
+                ),
+                PAGE_SIZE=int(scratch.page_size),
+                WINDOW_PAGE_SPAN=window_page_span,
+                WINDOW_LEFT=int(plan.window_left),
+                BATCH=batch,
+                BLOCK_BATCH=triton.next_power_of_2(batch),
+                USE_LUT=True,
+                HAS_KV_CHUNK_SIZE_TENSOR=False,
+                FIXED_KV_CHUNK_SIZE=1,
+            )
         else:
             lut = require("_decode_graph_chunk_pages_lut")
             max_q_tiles = max(
                 (int(plan.gqa_group_size) + int(plan.cta_tile_q) - 1)
-                // int(plan.cta_tile_q), 1
+                // int(plan.cta_tile_q),
+                1,
             )
             max_chunks = work_capacity // batch // max_q_tiles
-            warm("decode_fused", update_decode_graph_metadata_fused_triton,
-                 (1,), (cache_seqlens, request_indices, qo_tile_indices, kv_tile_indices,
-                         merge_indptr, o_indptr, block_valid_mask, kv_chunk_size_ptr,
-                         kv_window_start_tokens, lut, max_chunks, valid_capacity,
-                         int(lut.shape[0])),
-                 PAGE_SIZE=int(scratch.page_size), WINDOW_PAGE_SPAN=window_page_span,
-                 WINDOW_LEFT=int(plan.window_left), BATCH=batch,
-                 BLOCK_BATCH=triton.next_power_of_2(batch),
-                 BLOCK_WORK_ITEMS=triton.next_power_of_2(max(work_capacity, valid_capacity)))
-            warm("decode_compact", update_decode_graph_compact_work_metadata_triton,
-                 (batch, triton.cdiv(max_chunks, _DECODE_BLOCK_CHUNKS)),
-                 (request_indices, qo_tile_indices, kv_tile_indices, o_indptr,
-                  block_valid_mask, work_capacity, valid_capacity),
-                 BATCH=batch, MAX_Q_TILES_PER_REQ=max_q_tiles,
-                 BLOCK_CHUNKS=_DECODE_BLOCK_CHUNKS)
+            warm(
+                "decode_fused",
+                update_decode_graph_metadata_fused_triton,
+                (1,),
+                (
+                    cache_seqlens,
+                    request_indices,
+                    qo_tile_indices,
+                    kv_tile_indices,
+                    merge_indptr,
+                    o_indptr,
+                    block_valid_mask,
+                    kv_chunk_size_ptr,
+                    kv_window_start_tokens,
+                    lut,
+                    max_chunks,
+                    valid_capacity,
+                    int(lut.shape[0]),
+                ),
+                PAGE_SIZE=int(scratch.page_size),
+                WINDOW_PAGE_SPAN=window_page_span,
+                WINDOW_LEFT=int(plan.window_left),
+                BATCH=batch,
+                BLOCK_BATCH=triton.next_power_of_2(batch),
+                BLOCK_WORK_ITEMS=triton.next_power_of_2(
+                    max(work_capacity, valid_capacity)
+                ),
+            )
+            warm(
+                "decode_compact",
+                update_decode_graph_compact_work_metadata_triton,
+                (batch, triton.cdiv(max_chunks, _DECODE_BLOCK_CHUNKS)),
+                (
+                    request_indices,
+                    qo_tile_indices,
+                    kv_tile_indices,
+                    o_indptr,
+                    block_valid_mask,
+                    work_capacity,
+                    valid_capacity,
+                ),
+                BATCH=batch,
+                MAX_Q_TILES_PER_REQ=max_q_tiles,
+                BLOCK_CHUNKS=_DECODE_BLOCK_CHUNKS,
+            )
         return programs
 
     scratch._cache_prefill_graph_replay_shape_from_plan()
@@ -2061,31 +2309,73 @@ def compile_graph_replay(binding: object) -> Mapping[str, object]:
     max_chunks = int(scratch._prefill_graph_max_chunks_per_q_tile)
     max_rows = int(scratch._prefill_graph_max_q_rows_per_req)
     if not plan.split_kv:
-        warm("prefill_compact", update_prefill_graph_compact_nonsplit_work_metadata_triton,
-             (triton.cdiv(valid_capacity, _PREFILL_BLOCK_WORK_ITEMS),),
-             (cache_seqlens, cu_seqlens_q, request_indices, qo_tile_indices,
-              kv_tile_indices, block_valid_mask, kv_window_start_tokens,
-              work_capacity, valid_capacity),
-             BATCH=batch, CTA_TILE_Q=int(plan.cta_tile_q),
-             GQA_GROUP_SIZE=int(plan.gqa_group_size), PAGE_SIZE=int(scratch.page_size),
-             WINDOW_LEFT=int(plan.window_left), BLOCK_WORK_ITEMS=_PREFILL_BLOCK_WORK_ITEMS)
+        warm(
+            "prefill_compact",
+            update_prefill_graph_compact_nonsplit_work_metadata_triton,
+            (triton.cdiv(valid_capacity, _PREFILL_BLOCK_WORK_ITEMS),),
+            (
+                cache_seqlens,
+                cu_seqlens_q,
+                request_indices,
+                qo_tile_indices,
+                kv_tile_indices,
+                block_valid_mask,
+                kv_window_start_tokens,
+                work_capacity,
+                valid_capacity,
+            ),
+            BATCH=batch,
+            CTA_TILE_Q=int(plan.cta_tile_q),
+            GQA_GROUP_SIZE=int(plan.gqa_group_size),
+            PAGE_SIZE=int(scratch.page_size),
+            WINDOW_LEFT=int(plan.window_left),
+            BLOCK_WORK_ITEMS=_PREFILL_BLOCK_WORK_ITEMS,
+        )
         return programs
-    warm("prefill_work", update_prefill_graph_work_metadata_triton,
-         (triton.cdiv(valid_capacity, _PREFILL_BLOCK_WORK_ITEMS),),
-         (cache_seqlens, cu_seqlens_q, request_indices, qo_tile_indices,
-          kv_tile_indices, o_indptr, block_valid_mask, kv_chunk_size_ptr,
-          kv_window_start_tokens),
-         work_items_capacity=work_capacity, block_valid_capacity=valid_capacity,
-         BATCH=batch, MAX_Q_TILES_PER_REQ=max_q_tiles,
-         MAX_CHUNKS_PER_Q_TILE=max_chunks, CTA_TILE_Q=int(plan.cta_tile_q),
-         GQA_GROUP_SIZE=int(plan.gqa_group_size), PAGE_SIZE=int(scratch.page_size),
-         WINDOW_LEFT=int(plan.window_left), SPLIT_KV=True,
-         ADAPTIVE_CHUNKING=False, BLOCK_BATCH=triton.next_power_of_2(batch),
-         BLOCK_WORK_ITEMS=_PREFILL_BLOCK_WORK_ITEMS)
-    warm("prefill_prefix", prefix_prefill_graph_o_indptr_triton, (1,), (o_indptr,),
-         BATCH=batch, BLOCK_BATCH=triton.next_power_of_2(batch))
-    warm("prefill_rows", update_prefill_graph_row_indptr_triton,
-         (batch, triton.cdiv(max_rows, _PREFILL_BLOCK_ROWS)),
-         (cu_seqlens_q, o_indptr, merge_indptr), BATCH=batch,
-         MAX_Q_ROWS_PER_REQ=max_rows, BLOCK_ROWS=_PREFILL_BLOCK_ROWS)
+    warm(
+        "prefill_work",
+        update_prefill_graph_work_metadata_triton,
+        (triton.cdiv(valid_capacity, _PREFILL_BLOCK_WORK_ITEMS),),
+        (
+            cache_seqlens,
+            cu_seqlens_q,
+            request_indices,
+            qo_tile_indices,
+            kv_tile_indices,
+            o_indptr,
+            block_valid_mask,
+            kv_chunk_size_ptr,
+            kv_window_start_tokens,
+        ),
+        work_items_capacity=work_capacity,
+        block_valid_capacity=valid_capacity,
+        BATCH=batch,
+        MAX_Q_TILES_PER_REQ=max_q_tiles,
+        MAX_CHUNKS_PER_Q_TILE=max_chunks,
+        CTA_TILE_Q=int(plan.cta_tile_q),
+        GQA_GROUP_SIZE=int(plan.gqa_group_size),
+        PAGE_SIZE=int(scratch.page_size),
+        WINDOW_LEFT=int(plan.window_left),
+        SPLIT_KV=True,
+        ADAPTIVE_CHUNKING=False,
+        BLOCK_BATCH=triton.next_power_of_2(batch),
+        BLOCK_WORK_ITEMS=_PREFILL_BLOCK_WORK_ITEMS,
+    )
+    warm(
+        "prefill_prefix",
+        prefix_prefill_graph_o_indptr_triton,
+        (1,),
+        (o_indptr,),
+        BATCH=batch,
+        BLOCK_BATCH=triton.next_power_of_2(batch),
+    )
+    warm(
+        "prefill_rows",
+        update_prefill_graph_row_indptr_triton,
+        (batch, triton.cdiv(max_rows, _PREFILL_BLOCK_ROWS)),
+        (cu_seqlens_q, o_indptr, merge_indptr),
+        BATCH=batch,
+        MAX_Q_ROWS_PER_REQ=max_rows,
+        BLOCK_ROWS=_PREFILL_BLOCK_ROWS,
+    )
     return programs

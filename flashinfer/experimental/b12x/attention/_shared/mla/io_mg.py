@@ -70,11 +70,23 @@ def io_issue_gather_dsv4_nope(
     """
     if cutlass.const_expr(kv_smem_stride == 544):
         io_issue_gather_glm_mg(
-            kv_cache_u8, topk_indices, kv_fp8_dst_addr, full_mbar_ptr,
-            g_start, g_end, page_block_size, stride_kv_block, io_lane,
-            cache_policy, bi=bi, kv_smem_stride=kv_smem_stride,
-            io_threads=io_threads, scale_format=2, has_rope=False,
-            dsv41=True, dsv41_swa=dsv41_swa,
+            kv_cache_u8,
+            topk_indices,
+            kv_fp8_dst_addr,
+            full_mbar_ptr,
+            g_start,
+            g_end,
+            page_block_size,
+            stride_kv_block,
+            io_lane,
+            cache_policy,
+            bi=bi,
+            kv_smem_stride=kv_smem_stride,
+            io_threads=io_threads,
+            scale_format=2,
+            has_rope=False,
+            dsv41=True,
+            dsv41_swa=dsv41_swa,
         )
         return
     _ios = Int64(_DSV4_IO_STRIDE)

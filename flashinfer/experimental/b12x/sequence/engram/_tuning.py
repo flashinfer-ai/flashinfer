@@ -1,4 +1,5 @@
 """Typed fixed preparation contract for native Engram hashing and lookup."""
+
 from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -33,7 +34,9 @@ def _validate_query(query, device):
         raise TypeError("Engram compact_rows must be boolean")
     if type(query.resident_scales) is not bool:
         raise TypeError("resident_scales must be boolean")
-    if query.resident_scales and (query.operation != "lookup" or not query.compact_rows):
+    if query.resident_scales and (
+        query.operation != "lookup" or not query.compact_rows
+    ):
         raise ValueError("resident scales require compact disk lookup rows")
     if query.operation == "hash" and query.compact_rows:
         raise ValueError("hash Engram declarations cannot select compact lookup rows")

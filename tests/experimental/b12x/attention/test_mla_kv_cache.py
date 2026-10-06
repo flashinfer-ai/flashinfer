@@ -545,12 +545,44 @@ def _v41_writer_inputs(rows: int, device: torch.device) -> torch.Tensor:
         # Floor-scale underflow, signed zero, ties-even, and saturation after
         # rounding the E4M3 scale all occur within independent 16-value groups.
         values[1, :16] = torch.tensor(
-            [0, -0.0, 0.0001, -0.0001, 0.001, -0.001, 0.003, -0.003,
-             0.005, -0.005, 0.007, -0.007, 0.009, -0.009, 0.01, -0.01]
+            [
+                0,
+                -0.0,
+                0.0001,
+                -0.0001,
+                0.001,
+                -0.001,
+                0.003,
+                -0.003,
+                0.005,
+                -0.005,
+                0.007,
+                -0.007,
+                0.009,
+                -0.009,
+                0.01,
+                -0.01,
+            ]
         )
         values[1, 16:32] = torch.tensor(
-            [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5, 6,
-             -0.25, -0.75, -1.25, -1.75, -2.5, -3.5, -5, -6]
+            [
+                0.25,
+                0.75,
+                1.25,
+                1.75,
+                2.5,
+                3.5,
+                5,
+                6,
+                -0.25,
+                -0.75,
+                -1.25,
+                -1.75,
+                -2.5,
+                -3.5,
+                -5,
+                -6,
+            ]
         )
         values[1, 32:48] = torch.linspace(-6.125, 6.125, 16)
         values[1, -64:] = torch.linspace(-0.31, 0.29, 64)
@@ -562,7 +594,9 @@ def _v41_writer_inputs(rows: int, device: torch.device) -> torch.Tensor:
 @pytest.mark.parametrize("high_page", [False, True], ids=["low-pid", "high-pid"])
 @torch.inference_mode()
 def test_v41_writer_recipes_odd_pages_and_int64_pool_offsets(
-    cache_kind: str, slot_dtype: torch.dtype, high_page: bool,
+    cache_kind: str,
+    slot_dtype: torch.dtype,
+    high_page: bool,
 ) -> None:
     device = require_sm120()
     page_size = 3
@@ -582,26 +616,45 @@ def test_v41_writer_recipes_odd_pages_and_int64_pool_offsets(
     cache = storage[:, :page_bytes]
     kv = _v41_writer_inputs(5, device)
     slots = torch.tensor(
-        [first_page * page_size, first_page * page_size + 2, -1,
-         (first_page + 1) * page_size + 1, -17],
-        dtype=slot_dtype, device=device,
+        [
+            first_page * page_size,
+            first_page * page_size + 2,
+            -1,
+            (first_page + 1) * page_size + 1,
+            -17,
+        ],
+        dtype=slot_dtype,
+        device=device,
     )
     expected_records = pack_deepseek_v41_cache_reference(
         kv, page_size=1, cache_kind=cache_kind
     )
     expected_tail = torch.full_like(storage[first_page:], _SENTINEL)
     for source_row, page, offset in ((0, 0, 0), (1, 0, 2), (3, 1, 1)):
-        expected_tail[page, offset * record_bytes:(offset + 1) * record_bytes] = (
+        expected_tail[page, offset * record_bytes : (offset + 1) * record_bytes] = (
             expected_records[source_row]
         )
-    plan = cache_writer.plan(cache_writer.CacheWriterQuery(
-        max_rows=5, page_size=page_size, cache_kind=cache_kind,
-        slot_dtype=str(slot_dtype).removeprefix("torch.")), device=kv.device)
+    plan = cache_writer.plan(
+        cache_writer.CacheWriterQuery(
+            max_rows=5,
+            page_size=page_size,
+            cache_kind=cache_kind,
+            slot_dtype=str(slot_dtype).removeprefix("torch."),
+        ),
+        device=kv.device,
+    )
+
     def prepare(state):
         saved = storage[first_page:].clone()
-        return PreparedCall(run=lambda: state.run(kv, cache, slots),
-                            restore=lambda: storage[first_page:].copy_(saved), owners=(saved,))
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        return PreparedCall(
+            run=lambda: state.run(kv, cache, slots),
+            restore=lambda: storage[first_page:].copy_(saved),
+            owners=(saved,),
+        )
+
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
         session.prepare((plan.request(name="cache-writer", prepare_call=prepare),))
         session.freeze()
         graph = torch.cuda.CUDAGraph()
@@ -619,11 +672,12 @@ def test_v41_writer_recipes_odd_pages_and_int64_pool_offsets(
     # their group scales and the absence of outer scales/padding in each record.
     data_bytes = 512 if cache_kind == "swa" else 256
     last64_bytes = 64 if cache_kind == "swa" else 32
-    actual_row = cache[first_page, 2 * record_bytes:3 * record_bytes]
+    actual_row = cache[first_page, 2 * record_bytes : 3 * record_bytes]
     torch.testing.assert_close(
-        actual_row[data_bytes - last64_bytes:data_bytes],
-        expected_records[1, data_bytes - last64_bytes:data_bytes],
-        rtol=0, atol=0,
+        actual_row[data_bytes - last64_bytes : data_bytes],
+        expected_records[1, data_bytes - last64_bytes : data_bytes],
+        rtol=0,
+        atol=0,
     )
 
 
@@ -638,21 +692,38 @@ def test_v41_writer_prepared_dynamic_rows_and_graph_replay(cache_kind: str) -> N
     kv = _v41_writer_inputs(5, device)
     slots = torch.arange(5, dtype=torch.int64, device=device)
     cache = torch.full((2, page_bytes), _SENTINEL, dtype=torch.uint8, device=device)
-    plan = cache_writer.plan(cache_writer.CacheWriterQuery(
-        max_rows=5, page_size=page_size, cache_kind=cache_kind), device=kv.device)
+    plan = cache_writer.plan(
+        cache_writer.CacheWriterQuery(
+            max_rows=5, page_size=page_size, cache_kind=cache_kind
+        ),
+        device=kv.device,
+    )
+
     def prepare(state):
         saved = cache.clone()
-        return PreparedCall(run=lambda: state.run(kv, cache, slots),
-                            restore=lambda: cache.copy_(saved), owners=(saved,))
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        return PreparedCall(
+            run=lambda: state.run(kv, cache, slots),
+            restore=lambda: cache.copy_(saved),
+            owners=(saved,),
+        )
+
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
         session.prepare((plan.request(name="cache-writer", prepare_call=prepare),))
-        torch.testing.assert_close(cache, torch.full_like(cache, _SENTINEL), rtol=0, atol=0)
+        torch.testing.assert_close(
+            cache, torch.full_like(cache, _SENTINEL), rtol=0, atol=0
+        )
         session.freeze()
         for rows in (0, 1, 5):
             cache.fill_(_SENTINEL)
             compressed_sparse_mla.write_cache(
-                kv[:rows], cache, slots[:rows],
-                page_size=page_size, cache_kind=cache_kind, plan=plan,
+                kv[:rows],
+                cache,
+                slots[:rows],
+                page_size=page_size,
+                cache_kind=cache_kind,
+                plan=plan,
             )
             expected = torch.full_like(cache, _SENTINEL)
             if rows:
@@ -697,26 +768,39 @@ def test_v41_indexed_writer_rounds_exact_e2m1_midpoints_to_even() -> None:
         scale = mantissas[group % 7] * (2.0 ** (group // 7 - 6))
         row, base = divmod(group * 16, 512)
         block = torch.cat((torch.tensor([6.0]), midpoints, -midpoints)) * scale
-        values[row, base:base + 15] = block
-        expected[row, base:base + 15] = torch.cat((torch.tensor([6.0]), even, -even)) * scale
+        values[row, base : base + 15] = block
+        expected[row, base : base + 15] = (
+            torch.cat((torch.tensor([6.0]), even, -even)) * scale
+        )
     kv = values.to(device=device, dtype=torch.bfloat16)
     assert torch.equal(kv.float().cpu(), values), "test values must be exact in BF16"
     cache = torch.full((1, 2 * 288), _SENTINEL, dtype=torch.uint8, device=device)
     slots = torch.arange(2, dtype=torch.int64, device=device)
-    plan = cache_writer.plan(cache_writer.CacheWriterQuery(
-        max_rows=2, page_size=2, cache_kind="indexed"), device=kv.device)
+    plan = cache_writer.plan(
+        cache_writer.CacheWriterQuery(max_rows=2, page_size=2, cache_kind="indexed"),
+        device=kv.device,
+    )
+
     def prepare(state):
         saved = cache.clone()
-        return PreparedCall(run=lambda: state.run(kv, cache, slots),
-                            restore=lambda: cache.copy_(saved), owners=(saved,))
-    with PreparationSession(device=kv.device, autotune=False, compile_workers=2) as session:
+        return PreparedCall(
+            run=lambda: state.run(kv, cache, slots),
+            restore=lambda: cache.copy_(saved),
+            owners=(saved,),
+        )
+
+    with PreparationSession(
+        device=kv.device, autotune=False, compile_workers=2
+    ) as session:
         session.prepare((plan.request(name="cache-writer", prepare_call=prepare),))
         session.freeze()
         compressed_sparse_mla.write_cache(
             kv, cache, slots, page_size=2, cache_kind="indexed", plan=plan
         )
     torch.cuda.synchronize(device)
-    decoded = _decode_deepseek_v41_records(cache.view(-1, 288), cache_kind="indexed").cpu()
+    decoded = _decode_deepseek_v41_records(
+        cache.view(-1, 288), cache_kind="indexed"
+    ).cpu()
     torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
     reference = pack_deepseek_v41_cache_reference(kv, page_size=1, cache_kind="indexed")
     torch.testing.assert_close(cache.view(-1, 288), reference, rtol=0, atol=0)

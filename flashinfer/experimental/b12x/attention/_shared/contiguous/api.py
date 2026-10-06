@@ -266,7 +266,8 @@ def _validate_attention_sink_bias_metadata(
 
 def _attention_sink_requires_copy(attention_sink_bias: torch.Tensor | None) -> bool:
     return attention_sink_bias is not None and (
-        attention_sink_bias.dtype != torch.float32 or not attention_sink_bias.is_contiguous()
+        attention_sink_bias.dtype != torch.float32
+        or not attention_sink_bias.is_contiguous()
     )
 
 
@@ -277,7 +278,9 @@ def _prepare_attention_sink_bias(
     device: torch.device,
 ) -> torch.Tensor | None:
     attention_sink_bias = _validate_attention_sink_bias_metadata(
-        attention_sink_bias, q_shape=q_shape, device=device,
+        attention_sink_bias,
+        q_shape=q_shape,
+        device=device,
     )
     if attention_sink_bias is None:
         return None
@@ -981,7 +984,11 @@ class _VarlenAttentionForwardLaunch:
             # existing unpacked-head kernel as the static fallback for those
             # shapes; this choice depends only on plan geometry and is graph
             # capture safe.
-            pack_gqa=(not block_sparse and qhead_per_kvhead != 1 and tile_m % qhead_per_kvhead == 0),
+            pack_gqa=(
+                not block_sparse
+                and qhead_per_kvhead != 1
+                and tile_m % qhead_per_kvhead == 0
+            ),
             tile_m=tile_m,
             tile_n=tile_n,
             is_block_sparse=block_sparse,
@@ -1009,16 +1016,22 @@ class _VarlenAttentionForwardLaunch:
         current_stream: cuda.CUstream,
     ):
         q_tensor = cute.make_tensor(
-            q_ptr, layout=cute.make_layout(
-                (q_rows, *self._q_shape[1:]), stride=self._q_stride)
+            q_ptr,
+            layout=cute.make_layout(
+                (q_rows, *self._q_shape[1:]), stride=self._q_stride
+            ),
         )
         k_tensor = cute.make_tensor(
-            k_ptr, layout=cute.make_layout(
-                (kv_rows, *self._k_shape[1:]), stride=self._k_stride)
+            k_ptr,
+            layout=cute.make_layout(
+                (kv_rows, *self._k_shape[1:]), stride=self._k_stride
+            ),
         )
         v_tensor = cute.make_tensor(
-            v_ptr, layout=cute.make_layout(
-                (kv_rows, *self._v_shape[1:]), stride=self._v_stride)
+            v_ptr,
+            layout=cute.make_layout(
+                (kv_rows, *self._v_shape[1:]), stride=self._v_stride
+            ),
         )
         o_tensor = cute.make_tensor(
             o_ptr, layout=cute.make_layout(self._o_shape, stride=self._o_stride)
@@ -2176,8 +2189,6 @@ def _resolve_attention_workspace(
     return resolved
 
 
-
-
 def b12x_attention_forward(
     q: torch.Tensor | None = None,
     k: torch.Tensor | None = None,
@@ -2195,33 +2206,50 @@ def b12x_attention_forward(
     if binding is None:
         raise TypeError("b12x_attention_forward requires binding")
     extras = [
-        name for name, value in (
-            ("q", q), ("k", k), ("v", v), ("plan", plan),
-            ("softmax_scale", softmax_scale), ("attention_sink_bias", attention_sink_bias),
-        ) if value is not None
+        name
+        for name, value in (
+            ("q", q),
+            ("k", k),
+            ("v", v),
+            ("plan", plan),
+            ("softmax_scale", softmax_scale),
+            ("attention_sink_bias", attention_sink_bias),
+        )
+        if value is not None
     ]
     if window_size is not None:
         extras.append("window_size")
     if extras:
-        raise ValueError("attention binding owns runtime tensors, outputs, plan, and options; "
-                         f"do not also pass {', '.join(extras)}")
+        raise ValueError(
+            "attention binding owns runtime tensors, outputs, plan, and options; "
+            f"do not also pass {', '.join(extras)}"
+        )
     q, k, v = binding.q, binding.k, binding.v
     output, lse, plan = binding.output, binding.lse, binding.plan
-    softmax_scale, attention_sink_bias = binding.softmax_scale, binding.attention_sink_bias
+    softmax_scale, attention_sink_bias = (
+        binding.softmax_scale,
+        binding.attention_sink_bias,
+    )
     if q is None or k is None or v is None or plan is None:
         raise TypeError("attention binding is incomplete")
     q_shape, k_shape, v_shape, device, dtype = _validate_forward_inputs(q, k, v)
     resolved_plan = plan
     if resolved_plan.has_attention_sink_bias:
         attention_sink_bias = _prepare_attention_sink_bias(
-            attention_sink_bias, q_shape=q_shape, device=device,
+            attention_sink_bias,
+            q_shape=q_shape,
+            device=device,
         )
         if attention_sink_bias is None:
             raise ValueError("attention_sink_bias is required by this plan")
     elif attention_sink_bias is None:
         attention_sink_bias = _attention_sink_placeholder(resolved_plan.device_index)
     _validate_attention_inputs_against_plan(
-        q_shape=q_shape, k_shape=k_shape, v_shape=v_shape, device=device, dtype=dtype,
+        q_shape=q_shape,
+        k_shape=k_shape,
+        v_shape=v_shape,
+        device=device,
+        dtype=dtype,
         plan=resolved_plan,
     )
     if output is None or lse is None:
@@ -2230,13 +2258,41 @@ def b12x_attention_forward(
     if softmax_scale is None:
         softmax_scale = _seq_dims(q_shape)[-1] ** -0.5
     resolved_plan.compiled(
-        make_ptr(resolved_plan.cutlass_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(resolved_plan.cutlass_dtype, k.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(resolved_plan.cutlass_dtype, v.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(resolved_plan.cutlass_dtype, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Float32, lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        make_ptr(cutlass.Float32, attention_sink_bias.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        float(softmax_scale), current_cuda_stream(),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            q.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            k.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            v.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float32, lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+        ),
+        make_ptr(
+            cutlass.Float32,
+            attention_sink_bias.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        float(softmax_scale),
+        current_cuda_stream(),
     )
     return output, lse
 
@@ -2263,59 +2319,107 @@ def b12x_varlen_attention_forward(
     if binding is None:
         raise TypeError("b12x_varlen_attention_forward requires binding")
     extras = [
-        name for name, value in (
-            ("q", q), ("k", k), ("v", v), ("cu_seqlens_q", cu_seqlens_q),
-            ("cu_seqlens_k", cu_seqlens_k), ("plan", plan),
-            ("max_seqlen_q", max_seqlen_q), ("max_seqlen_k", max_seqlen_k),
-            ("softmax_scale", softmax_scale), ("causal", causal),
+        name
+        for name, value in (
+            ("q", q),
+            ("k", k),
+            ("v", v),
+            ("cu_seqlens_q", cu_seqlens_q),
+            ("cu_seqlens_k", cu_seqlens_k),
+            ("plan", plan),
+            ("max_seqlen_q", max_seqlen_q),
+            ("max_seqlen_k", max_seqlen_k),
+            ("softmax_scale", softmax_scale),
+            ("causal", causal),
             ("attention_sink_bias", attention_sink_bias),
-        ) if value is not None
+        )
+        if value is not None
     ]
     if window_size is not None:
         extras.append("window_size")
     if extras:
-        raise ValueError("varlen attention binding owns runtime tensors, outputs, plan, and options; "
-                         f"do not also pass {', '.join(extras)}")
+        raise ValueError(
+            "varlen attention binding owns runtime tensors, outputs, plan, and options; "
+            f"do not also pass {', '.join(extras)}"
+        )
     q, k, v = binding.q, binding.k, binding.v
     cu_seqlens_q, cu_seqlens_k = binding.cu_seqlens_q, binding.cu_seqlens_k
     output, lse, plan = binding.output, binding.lse, binding.plan
-    if plan is not None and plan.block_sparse and (block_indices is None or block_offsets is None):
+    if (
+        plan is not None
+        and plan.block_sparse
+        and (block_indices is None or block_offsets is None)
+    ):
         raise ValueError("Sparse attention requires block_indices and block_offsets")
     max_seqlen_q, max_seqlen_k = binding.max_seqlen_q, binding.max_seqlen_k
-    softmax_scale, causal, window_size = binding.softmax_scale, binding.causal, binding.window_size
+    softmax_scale, causal, window_size = (
+        binding.softmax_scale,
+        binding.causal,
+        binding.window_size,
+    )
     attention_sink_bias = binding.attention_sink_bias
     if q is None or k is None or v is None or cu_seqlens_q is None or plan is None:
         raise TypeError("varlen attention binding is incomplete")
     if cu_seqlens_k is None:
         cu_seqlens_k = cu_seqlens_q
-    q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape, device, dtype = _validate_varlen_inputs(
-        q, k, v, cu_seqlens_q, cu_seqlens_k,
+    q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape, device, dtype = (
+        _validate_varlen_inputs(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+        )
     )
     resolved_plan = plan
     if resolved_plan.has_attention_sink_bias:
         attention_sink_bias = _prepare_attention_sink_bias(
-            attention_sink_bias, q_shape=q_shape, device=device,
+            attention_sink_bias,
+            q_shape=q_shape,
+            device=device,
         )
         if attention_sink_bias is None:
             raise ValueError("attention_sink_bias is required by this plan")
     elif attention_sink_bias is None:
         attention_sink_bias = _attention_sink_placeholder(resolved_plan.device_index)
-    if max_seqlen_q is not None and not 0 <= int(max_seqlen_q) <= resolved_plan.max_seqlen_q:
-        raise ValueError(f"max_seqlen_q mismatch: plan has {resolved_plan.max_seqlen_q}, got {max_seqlen_q}")
-    if max_seqlen_k is not None and not 0 <= int(max_seqlen_k) <= resolved_plan.max_seqlen_k:
-        raise ValueError(f"max_seqlen_k mismatch: plan has {resolved_plan.max_seqlen_k}, got {max_seqlen_k}")
+    if (
+        max_seqlen_q is not None
+        and not 0 <= int(max_seqlen_q) <= resolved_plan.max_seqlen_q
+    ):
+        raise ValueError(
+            f"max_seqlen_q mismatch: plan has {resolved_plan.max_seqlen_q}, got {max_seqlen_q}"
+        )
+    if (
+        max_seqlen_k is not None
+        and not 0 <= int(max_seqlen_k) <= resolved_plan.max_seqlen_k
+    ):
+        raise ValueError(
+            f"max_seqlen_k mismatch: plan has {resolved_plan.max_seqlen_k}, got {max_seqlen_k}"
+        )
     if causal is not None and bool(causal) != resolved_plan.causal:
-        raise ValueError(f"causal mismatch: plan has {resolved_plan.causal}, got {causal}")
+        raise ValueError(
+            f"causal mismatch: plan has {resolved_plan.causal}, got {causal}"
+        )
     if window_size is not None:
         left, right = _normalize_window_size(window_size)
-        if (left, right) != (resolved_plan.window_size_left, resolved_plan.window_size_right):
-            raise ValueError("window_size mismatch: "
-                             f"plan has {(resolved_plan.window_size_left, resolved_plan.window_size_right)}, "
-                             f"got {(left, right)}")
+        if (left, right) != (
+            resolved_plan.window_size_left,
+            resolved_plan.window_size_right,
+        ):
+            raise ValueError(
+                "window_size mismatch: "
+                f"plan has {(resolved_plan.window_size_left, resolved_plan.window_size_right)}, "
+                f"got {(left, right)}"
+            )
     _validate_varlen_inputs_against_plan(
-        q_shape=q_shape, k_shape=k_shape, v_shape=v_shape,
-        cu_seqlens_q_shape=cu_q_shape, cu_seqlens_k_shape=cu_k_shape,
-        device=device, dtype=dtype, plan=resolved_plan,
+        q_shape=q_shape,
+        k_shape=k_shape,
+        v_shape=v_shape,
+        cu_seqlens_q_shape=cu_q_shape,
+        cu_seqlens_k_shape=cu_k_shape,
+        device=device,
+        dtype=dtype,
+        plan=resolved_plan,
     )
     if output is None or lse is None:
         raise TypeError("varlen attention binding is missing output or lse")
@@ -2323,13 +2427,45 @@ def b12x_varlen_attention_forward(
     if softmax_scale is None:
         softmax_scale = q_shape[-1] ** -0.5
     resolved_plan.compiled(
-        make_ptr(resolved_plan.cutlass_dtype, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(resolved_plan.cutlass_dtype, k.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(resolved_plan.cutlass_dtype, v.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(resolved_plan.cutlass_dtype, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Float32, lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        make_ptr(cutlass.Int32, cu_seqlens_q.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        make_ptr(cutlass.Int32, cu_seqlens_k.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            q.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            k.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            v.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            resolved_plan.cutlass_dtype,
+            output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float32, lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+        ),
+        make_ptr(
+            cutlass.Int32,
+            cu_seqlens_q.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            cu_seqlens_k.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
         make_ptr(
             cutlass.Int32,
             (cu_seqlens_k if block_indices is None else block_indices).data_ptr(),
@@ -2342,11 +2478,19 @@ def b12x_varlen_attention_forward(
             cute.AddressSpace.gmem,
             assumed_align=4,
         ),
-        make_ptr(cutlass.Float32, attention_sink_bias.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        float(softmax_scale), Int32(q_shape[0]), Int32(k_shape[0]),
-        Int32(cu_q_shape[0] - 1), current_cuda_stream(),
+        make_ptr(
+            cutlass.Float32,
+            attention_sink_bias.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        float(softmax_scale),
+        Int32(q_shape[0]),
+        Int32(k_shape[0]),
+        Int32(cu_q_shape[0] - 1),
+        current_cuda_stream(),
     )
-    return output[:q_shape[0]], lse[:, :q_shape[0]]
+    return output[: q_shape[0]], lse[:, : q_shape[0]]
 
 
 __all__ = [

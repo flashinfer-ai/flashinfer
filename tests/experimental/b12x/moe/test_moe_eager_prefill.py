@@ -17,7 +17,11 @@ from b12x.moe.fused_moe._impl import (
 )
 from b12x.moe._shared.kernels.reference import compare_to_reference, moe_reference_nvfp4
 
-from b12x.testing.reference.helpers import prepare_tp_moe_fp4_experts, require_b12x, run_tp_moe_fp4
+from b12x.testing.reference.helpers import (
+    prepare_tp_moe_fp4_experts,
+    require_b12x,
+    run_tp_moe_fp4,
+)
 
 
 def _require_model_weights() -> None:
@@ -50,7 +54,9 @@ def test_moe_eager_prefill_matches_oracle_across_shapes() -> None:
     experts = None
 
     for m, seed in ((23, 2300), (80, 8000)):
-        x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=seed, device=device)
+        x, topk_ids, topk_weights = make_routed_inputs(
+            spec, m, seed=seed, device=device
+        )
         if experts is None:
             experts = prepare_tp_moe_fp4_experts(
                 a=x,
@@ -98,8 +104,12 @@ def test_moe_eager_prefill_matches_oracle_across_shapes() -> None:
         torch.cuda.synchronize(device)
 
         expected_metrics = compare_to_reference(actual, expected)
-        assert expected_metrics.max_abs <= 1e-3, f"m={m}: pooled-vs-exact max_abs={expected_metrics.max_abs:.6f}"
-        assert expected_metrics.cos > 0.9999, f"m={m}: pooled-vs-exact cos={expected_metrics.cos:.6f}"
+        assert expected_metrics.max_abs <= 1e-3, (
+            f"m={m}: pooled-vs-exact max_abs={expected_metrics.max_abs:.6f}"
+        )
+        assert expected_metrics.cos > 0.9999, (
+            f"m={m}: pooled-vs-exact cos={expected_metrics.cos:.6f}"
+        )
 
         metrics = compare_to_reference(actual, reference)
         assert metrics.max_abs <= 8e-4, f"m={m}: max_abs={metrics.max_abs:.6f}"

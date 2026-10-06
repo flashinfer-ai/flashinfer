@@ -1,4 +1,5 @@
 """Preparation tuning contract for native DSA indexer execution."""
+
 from __future__ import annotations
 
 import os
@@ -6,7 +7,12 @@ from dataclasses import dataclass, field
 
 from b12x.preparation import DeviceIdentity, FrozenMapping
 from b12x.preparation._efficiency import capture_exhaustive_search
-from b12x.preparation.tuning import Knob, ParameterBinding, ParameterSpace, TuningContract
+from b12x.preparation.tuning import (
+    Knob,
+    ParameterBinding,
+    ParameterSpace,
+    TuningContract,
+)
 
 FUSED_MERGE_AUTO = "auto"
 FUSED_MERGE_COOPERATIVE = "cooperative"
@@ -52,11 +58,21 @@ class DsaIndexerConfig:
     @classmethod
     def from_config(cls, payload: FrozenMapping) -> "DsaIndexerConfig":
         if set(payload) != {"backend", "fused_merge", "mxfp4_score_kind"}:
-            raise ValueError("DSA indexer config requires backend, fused_merge and mxfp4_score_kind")
-        return cls(backend=payload["backend"], fused_merge=payload["fused_merge"], mxfp4_score_kind=payload["mxfp4_score_kind"])
+            raise ValueError(
+                "DSA indexer config requires backend, fused_merge and mxfp4_score_kind"
+            )
+        return cls(
+            backend=payload["backend"],
+            fused_merge=payload["fused_merge"],
+            mxfp4_score_kind=payload["mxfp4_score_kind"],
+        )
 
     def to_dict(self) -> dict[str, object]:
-        return {"backend": self.backend, "fused_merge": self.fused_merge, "mxfp4_score_kind": self.mxfp4_score_kind}
+        return {
+            "backend": self.backend,
+            "fused_merge": self.fused_merge,
+            "mxfp4_score_kind": self.mxfp4_score_kind,
+        }
 
 
 def _encode_query(query: DsaIndexerQuery) -> dict[str, object]:
@@ -88,7 +104,9 @@ def _validate_query(query: DsaIndexerQuery, _device: DeviceIdentity | None) -> N
         raise ValueError("unsupported DSA cache format")
     if query.cache_format == "mxfp4":
         if query.top_k != 512 or query.page_size <= 0:
-            raise ValueError("MXFP4 requires logical top-k=512 and a positive page size")
+            raise ValueError(
+                "MXFP4 requires logical top-k=512 and a positive page size"
+            )
         if query.num_q_heads > 32 or 32 % query.num_q_heads:
             raise ValueError("MXFP4 index heads must divide 32")
         if query.max_candidates and query.candidate_topk_blocks:
@@ -99,7 +117,9 @@ def _validate_config(query, config: DsaIndexerConfig, _device) -> None:
     if not isinstance(config, DsaIndexerConfig):
         raise TypeError("config must be DsaIndexerConfig")
     if config.backend != _BACKEND:
-        raise ValueError(f"unsupported attention.dsa_indexer backend {config.backend!r}")
+        raise ValueError(
+            f"unsupported attention.dsa_indexer backend {config.backend!r}"
+        )
     if config.fused_merge not in FUSED_MERGE_CHOICES:
         raise ValueError(f"unsupported fused_merge {config.fused_merge!r}")
 
@@ -115,14 +135,24 @@ def _validate_config(query, config: DsaIndexerConfig, _device) -> None:
 def _default(query, _device) -> DsaIndexerConfig:
     score_kind = None
     if query.cache_format == "mxfp4":
-        score_kind = "score_tensorcore" if query.mode == "prefill" or query.num_q_heads == 32 else "score"
-    return DsaIndexerConfig(backend=_BACKEND, fused_merge=FUSED_MERGE_AUTO, mxfp4_score_kind=score_kind)
+        score_kind = (
+            "score_tensorcore"
+            if query.mode == "prefill" or query.num_q_heads == 32
+            else "score"
+        )
+    return DsaIndexerConfig(
+        backend=_BACKEND, fused_merge=FUSED_MERGE_AUTO, mxfp4_score_kind=score_kind
+    )
 
 
 def _tuning_ctas(query: DsaIndexerQuery, device: DeviceIdentity | None) -> int:
     from .fused_indexer import resolve_fused_indexer_path
     from .kernel import _num_q_head_tiles
-    if query.source_layout != "paged" or query.route in ("paged_tiled", "packed_contiguous"):
+
+    if query.source_layout != "paged" or query.route in (
+        "paged_tiled",
+        "packed_contiguous",
+    ):
         return 0
     if query.shared_page_table or query.mode == "prefill":
         if query.route == "paged_fused":
@@ -130,29 +160,45 @@ def _tuning_ctas(query: DsaIndexerQuery, device: DeviceIdentity | None) -> int:
         return 0
     if device is None:
         raise ValueError("paged DSA tuning requires a device identity")
-    supported = (os.getenv("B12X_FUSED_INDEXER", "1") != "0" and resolve_fused_indexer_path(
-        topk=query.top_k, num_rows=query.max_q_rows,
-        width=query.max_page_table_width * query.page_size,
-        num_heads=query.num_q_heads, compute_capability=device.compute_capability,
-    ) and _num_q_head_tiles(query.num_q_heads) in (1, 2, 4))
+    supported = (
+        os.getenv("B12X_FUSED_INDEXER", "1") != "0"
+        and resolve_fused_indexer_path(
+            topk=query.top_k,
+            num_rows=query.max_q_rows,
+            width=query.max_page_table_width * query.page_size,
+            num_heads=query.num_q_heads,
+            compute_capability=device.compute_capability,
+        )
+        and _num_q_head_tiles(query.num_q_heads) in (1, 2, 4)
+    )
     if not supported:
         if query.route == "paged_fused":
             raise ValueError("fused paged DSA is unavailable for this query")
         return 0
-    return max(1, min(query.max_page_table_width, device.sm_count // max(1, query.max_q_rows)))
+    return max(
+        1, min(query.max_page_table_width, device.sm_count // max(1, query.max_q_rows))
+    )
 
 
 def _equivalence(query, device, config):
     if query.cache_format == "mxfp4":
         return config.mxfp4_score_kind
     from .fused_indexer import resolve_fused_merge_threshold
-    return resolve_fused_merge_threshold(config.fused_merge, ctas_per_group=_tuning_ctas(query, device), num_heads=query.num_q_heads, topk=query.top_k)
+
+    return resolve_fused_merge_threshold(
+        config.fused_merge,
+        ctas_per_group=_tuning_ctas(query, device),
+        num_heads=query.num_q_heads,
+        topk=query.top_k,
+    )
 
 
 def _parameters(query, _device):
     tensorcore_prefill = (
-        query.cache_format == "mxfp4" and query.mode == "prefill"
-        and query.num_q_heads == 32 and query.max_q_rows >= 64
+        query.cache_format == "mxfp4"
+        and query.mode == "prefill"
+        and query.num_q_heads == 32
+        and query.max_q_rows >= 64
     )
     # "auto" selects the merge from each launch's live length. A fixed merge
     # tuned at one trial length cannot represent all serving lengths.
@@ -162,26 +208,46 @@ def _parameters(query, _device):
         values={
             "backend": (_BACKEND,),
             "fused_merge": (FUSED_MERGE_AUTO,),
-            "mxfp4_score_kind": ("score", "score_tensorcore") if query.cache_format == "mxfp4" else (None,),
+            "mxfp4_score_kind": ("score", "score_tensorcore")
+            if query.cache_format == "mxfp4"
+            else (None,),
         },
         exhaustive=query.exhaustive,
-        efficiency_predicates=(lambda p: not tensorcore_prefill or p["mxfp4_score_kind"] != "score",),
+        efficiency_predicates=(
+            lambda p: not tensorcore_prefill or p["mxfp4_score_kind"] != "score",
+        ),
     )
 
 
 TUNING = TuningContract(
-    component_id="attention.dsa_indexer", query_schema_version=4, config_schema_version=3,
+    component_id="attention.dsa_indexer",
+    query_schema_version=4,
+    config_schema_version=3,
     query_fields=frozenset(DsaIndexerQuery.__dataclass_fields__),
     config_fields=frozenset(DsaIndexerConfig.__dataclass_fields__),
-    encode_query=_encode_query, encode_config=_encode_config, decode_config=DsaIndexerConfig.from_config,
-    validate_query=_validate_query, validate_config=_validate_config, default_config=_default,
+    encode_query=_encode_query,
+    encode_config=_encode_config,
+    decode_config=DsaIndexerConfig.from_config,
+    validate_query=_validate_query,
+    validate_config=_validate_config,
+    default_config=_default,
     knobs=(
         Knob(name="backend", values=(_BACKEND,), binding=ParameterBinding.COMPILE),
         Knob(name="fused_merge", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="mxfp4_score_kind", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=5, equivalence_key=_equivalence, parameters=_parameters,
+    candidate_contract_version=5,
+    equivalence_key=_equivalence,
+    parameters=_parameters,
     materialize=lambda query, device, choice: DsaIndexerConfig.from_config(choice),
 )
 
-__all__ = ["DsaIndexerConfig", "DsaIndexerQuery", "TUNING", "FUSED_MERGE_AUTO", "FUSED_MERGE_CHOICES", "FUSED_MERGE_COOPERATIVE", "FUSED_MERGE_SERIAL"]
+__all__ = [
+    "DsaIndexerConfig",
+    "DsaIndexerQuery",
+    "TUNING",
+    "FUSED_MERGE_AUTO",
+    "FUSED_MERGE_CHOICES",
+    "FUSED_MERGE_COOPERATIVE",
+    "FUSED_MERGE_SERIAL",
+]

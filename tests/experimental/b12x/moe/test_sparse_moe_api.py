@@ -32,9 +32,7 @@ def _make_experts(
     quant_mode = quant_mode or (
         "w4a16" if source_format == "compressed_tensors" else "nvfp4"
     )
-    w1_fp4 = torch.zeros(
-        num_experts, 4, max(1, hidden_size // 2), dtype=torch.uint8
-    )
+    w1_fp4 = torch.zeros(num_experts, 4, max(1, hidden_size // 2), dtype=torch.uint8)
     w2_fp4 = torch.zeros(num_experts, hidden_size, 1, dtype=torch.uint8)
     w1_alphas = torch.ones(num_experts, dtype=torch.float32)
     w2_alphas = torch.ones(num_experts, dtype=torch.float32)
@@ -196,10 +194,17 @@ def test_route_experts_fast_from_gate_weight_renormalizes() -> None:
     "device",
     [
         "cpu",
-        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")),
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
     ],
 )
-def test_route_experts_fast_without_renormalize_returns_topk_logits(device: str) -> None:
+def test_route_experts_fast_without_renormalize_returns_topk_logits(
+    device: str,
+) -> None:
     hidden_states = torch.tensor([[1.0, 2.0]], dtype=torch.float32, device=device)
     router_logits = torch.tensor([[0.5, 3.0, -4.0]], dtype=torch.float32, device=device)
 
@@ -281,16 +286,16 @@ def test_sqrtsoftplus_routing_mixed_modality_unbiased_weights(
         )
     )
     torch.testing.assert_close(routing.topk_ids, expected_ids.to(torch.int32))
-    torch.testing.assert_close(routing.topk_weights, expected_weights, rtol=2e-6, atol=1e-7)
+    torch.testing.assert_close(
+        routing.topk_weights, expected_weights, rtol=2e-6, atol=1e-7
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_sqrtsoftplus_top1_and_extreme_logits() -> None:
     from b12x.moe.fused_moe import route_topk
 
-    logits = torch.tensor(
-        [[-80.0, -25.0, 0.0, 25.0, 80.0, 1000.0]], device="cuda"
-    )
+    logits = torch.tensor([[-80.0, -25.0, 0.0, 25.0, 80.0, 1000.0]], device="cuda")
     # Force selection across softplus's tiny-value, transition, and linear regions.
     for expert in range(6):
         bias = torch.zeros(6, device="cuda")
@@ -299,13 +304,18 @@ def test_sqrtsoftplus_top1_and_extreme_logits() -> None:
         ids = torch.empty(1, 1, dtype=torch.int32, device="cuda")
         weights = torch.empty_like(selected_logits)
         route_topk(
-            logits, selected_logits, ids, weights,
+            logits,
+            selected_logits,
+            ids,
+            weights,
             renormalize=True,
             score_func="sqrtsoftplus",
             correction_bias=bias,
             routed_scaling_factor=1.5,
         )
-        expected = torch.nn.functional.softplus(logits[:, expert : expert + 1]).sqrt() * 1.5
+        expected = (
+            torch.nn.functional.softplus(logits[:, expert : expert + 1]).sqrt() * 1.5
+        )
         torch.testing.assert_close(ids, torch.full_like(ids, expert))
         torch.testing.assert_close(selected_logits, logits[:, expert : expert + 1])
         torch.testing.assert_close(weights, expected, rtol=2e-6, atol=0.0)
@@ -323,15 +333,22 @@ def test_route_topk_ties_exclude_padded_and_selected_lanes(score_func: str) -> N
     ids = torch.empty(2, 6, dtype=torch.int32, device="cuda")
     weights = torch.empty_like(selected_logits)
     route_topk(
-        logits, selected_logits, ids, weights,
+        logits,
+        selected_logits,
+        ids,
+        weights,
         renormalize=score_func == "sqrtsoftplus",
         score_func=score_func,
         routed_scaling_factor=1.5,
     )
-    expected_ids = torch.arange(383, 377, -1, dtype=torch.int32, device="cuda").expand(2, -1)
+    expected_ids = torch.arange(383, 377, -1, dtype=torch.int32, device="cuda").expand(
+        2, -1
+    )
     torch.testing.assert_close(ids, expected_ids)
     torch.testing.assert_close(selected_logits, logits[:, :6])
-    expected_weights = torch.zeros_like(weights) if score_func == "sqrtsoftplus" else logits[:, :6]
+    expected_weights = (
+        torch.zeros_like(weights) if score_func == "sqrtsoftplus" else logits[:, :6]
+    )
     torch.testing.assert_close(weights, expected_weights)
 
 
@@ -351,7 +368,10 @@ def test_sqrtsoftplus_routing_graph_replays_modality_and_strided_outputs() -> No
 
     def launch(rows: int) -> None:
         route_topk(
-            logits[:rows], selected_logits[:rows], ids[:rows], weights[:rows],
+            logits[:rows],
+            selected_logits[:rows],
+            ids[:rows],
+            weights[:rows],
             renormalize=True,
             score_func="sqrtsoftplus",
             correction_bias=text_bias,
@@ -372,7 +392,9 @@ def test_sqrtsoftplus_routing_graph_replays_modality_and_strided_outputs() -> No
     selection = scores + torch.where(image_mask[:, None], image_bias, text_bias)
     expected_ids = selection.topk(6, dim=-1).indices
     expected_weights = scores.gather(1, expected_ids)
-    expected_weights = expected_weights / (expected_weights.sum(-1, keepdim=True) + 1e-20) * 1.5
+    expected_weights = (
+        expected_weights / (expected_weights.sum(-1, keepdim=True) + 1e-20) * 1.5
+    )
     torch.testing.assert_close(ids, expected_ids.to(torch.int32))
     torch.testing.assert_close(selected_logits, logits.gather(1, expected_ids))
     torch.testing.assert_close(weights, expected_weights, rtol=2e-6, atol=1e-7)
@@ -481,8 +503,6 @@ def test_sparse_moe_fp4_forwards_prepared_contract_and_launch_options() -> None:
     assert captured["swiglu_limit"] == 5.0
     assert captured["swiglu_alpha"] == 1.5
     assert captured["swiglu_beta"] == 0.25
-
-
 
 
 def test_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:

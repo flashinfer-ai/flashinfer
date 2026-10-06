@@ -6,6 +6,7 @@ fb2764a5cf321eaa5070ca8f9e892818f477c16d). This is not the vLLM V4 C4
 packing, whereas CSA2 must expose the unrotated BF16 latent for indexer K.
 Reduction and pointer/compiler handling reuse b12x helpers.
 """
+
 from __future__ import annotations
 
 from functools import lru_cache
@@ -36,33 +37,73 @@ class _Compress:
         self.max_states = max_states
 
     @cute.jit
-    def __call__(self, values: cute.Pointer, gates: cute.Pointer,
-                 weight: cute.Pointer, starts: cute.Pointer,
-                 positions: cute.Pointer, state_ids: cute.Pointer,
-                 slots: cute.Pointer, counts: cute.Pointer,
-                 pending_values: cute.Pointer, pending_gates: cute.Pointer,
-                 pending_position: cute.Pointer, out: cute.Pointer,
-                 emitted: cute.Pointer, emitted_slots: cute.Pointer,
-                 stream: cuda.CUstream):
-        self.kernel(values, gates, weight, starts, positions, state_ids,
-                    slots, counts, pending_values, pending_gates, pending_position,
-                    out, emitted, emitted_slots).launch(
-                        grid=(self.max_tokens, 1, 1), block=(128, 1, 1), stream=stream)
+    def __call__(
+        self,
+        values: cute.Pointer,
+        gates: cute.Pointer,
+        weight: cute.Pointer,
+        starts: cute.Pointer,
+        positions: cute.Pointer,
+        state_ids: cute.Pointer,
+        slots: cute.Pointer,
+        counts: cute.Pointer,
+        pending_values: cute.Pointer,
+        pending_gates: cute.Pointer,
+        pending_position: cute.Pointer,
+        out: cute.Pointer,
+        emitted: cute.Pointer,
+        emitted_slots: cute.Pointer,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            values,
+            gates,
+            weight,
+            starts,
+            positions,
+            state_ids,
+            slots,
+            counts,
+            pending_values,
+            pending_gates,
+            pending_position,
+            out,
+            emitted,
+            emitted_slots,
+        ).launch(grid=(self.max_tokens, 1, 1), block=(128, 1, 1), stream=stream)
         if cutlass.const_expr(self.ratio == 2):
             # A launch boundary is required: the first token of a request may
             # read its old carry while its last token prepares the next carry.
-            self.commit(values, gates, starts, positions, state_ids, counts,
-                        pending_values, pending_gates, pending_position).launch(
-                            grid=(self.max_requests, 1, 1), block=(128, 1, 1), stream=stream)
+            self.commit(
+                values,
+                gates,
+                starts,
+                positions,
+                state_ids,
+                counts,
+                pending_values,
+                pending_gates,
+                pending_position,
+            ).launch(grid=(self.max_requests, 1, 1), block=(128, 1, 1), stream=stream)
 
     @cute.kernel
-    def kernel(self, values: cute.Pointer, gates: cute.Pointer,
-               weight: cute.Pointer, starts: cute.Pointer,
-               positions: cute.Pointer, state_ids: cute.Pointer,
-               slots: cute.Pointer, counts: cute.Pointer,
-               pending_values: cute.Pointer, pending_gates: cute.Pointer,
-               pending_position: cute.Pointer, out: cute.Pointer,
-               emitted: cute.Pointer, emitted_slots: cute.Pointer):
+    def kernel(
+        self,
+        values: cute.Pointer,
+        gates: cute.Pointer,
+        weight: cute.Pointer,
+        starts: cute.Pointer,
+        positions: cute.Pointer,
+        state_ids: cute.Pointer,
+        slots: cute.Pointer,
+        counts: cute.Pointer,
+        pending_values: cute.Pointer,
+        pending_gates: cute.Pointer,
+        pending_position: cute.Pointer,
+        out: cute.Pointer,
+        emitted: cute.Pointer,
+        emitted_slots: cute.Pointer,
+    ):
         token, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         valid = Boolean(False)
@@ -89,7 +130,11 @@ class _Compress:
                     state_id = Int64(state_ids[low])
                     start_position = Int64(positions[low])
                     if first >= 0 and first <= token and end <= nt and token < end:
-                        if state_id >= 0 and state_id < Int64(self.max_states) and start_position >= 0:
+                        if (
+                            state_id >= 0
+                            and state_id < Int64(self.max_states)
+                            and start_position >= 0
+                        ):
                             position = start_position + Int64(token - first)
                             valid = Boolean(True)
         if cutlass.const_expr(self.ratio == 2):
@@ -128,9 +173,14 @@ class _Compress:
             square_sum += value * value
         allocator = cutlass.utils.SmemAllocator()
         reduction = allocator.allocate_tensor(
-            Float32, cute.make_layout((1, 4)), byte_alignment=16)
-        total = block_reduce(warp_reduce(square_sum, _add), _add, reduction, Float32(0.0))
-        inverse = cute.math.rsqrt(total / Float32(512.0) + Float32(1e-20), fastmath=True)
+            Float32, cute.make_layout((1, 4)), byte_alignment=16
+        )
+        total = block_reduce(
+            warp_reduce(square_sum, _add), _add, reduction, Float32(0.0)
+        )
+        inverse = cute.math.rsqrt(
+            total / Float32(512.0) + Float32(1e-20), fastmath=True
+        )
         for item in cutlass.range_constexpr(4):
             col = Int64(tid + item * 128)
             normalized = Float32(0.0)
@@ -145,11 +195,18 @@ class _Compress:
             emitted_slots[token] = destination
 
     @cute.kernel
-    def commit(self, values: cute.Pointer, gates: cute.Pointer,
-               starts: cute.Pointer, positions: cute.Pointer,
-               state_ids: cute.Pointer, counts: cute.Pointer,
-               pending_values: cute.Pointer, pending_gates: cute.Pointer,
-               pending_position: cute.Pointer):
+    def commit(
+        self,
+        values: cute.Pointer,
+        gates: cute.Pointer,
+        starts: cute.Pointer,
+        positions: cute.Pointer,
+        state_ids: cute.Pointer,
+        counts: cute.Pointer,
+        pending_values: cute.Pointer,
+        pending_gates: cute.Pointer,
+        pending_position: cute.Pointer,
+    ):
         request, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         nt = Int32(counts[0])
@@ -161,7 +218,11 @@ class _Compress:
                 sid = Int64(state_ids[request])
                 start_position = Int64(positions[request])
                 if first >= 0 and end > first and end <= nt:
-                    if sid >= 0 and sid < Int64(self.max_states) and start_position >= 0:
+                    if (
+                        sid >= 0
+                        and sid < Int64(self.max_states)
+                        and start_position >= 0
+                    ):
                         last_position = start_position + Int64(end - first - 1)
                         tag = Int64(-1)
                         if last_position % Int64(2) == 0:
@@ -176,15 +237,41 @@ class _Compress:
                             pending_position[sid] = tag
 
 
-_DTYPES = (Float32, Float32, Float32, Int32, Int64, Int64, Int64,
-           Int32, Float32, Float32, Int64, BFloat16, Boolean, Int64)
+_DTYPES = (
+    Float32,
+    Float32,
+    Float32,
+    Int32,
+    Int64,
+    Int64,
+    Int64,
+    Int32,
+    Float32,
+    Float32,
+    Int64,
+    BFloat16,
+    Boolean,
+    Int64,
+)
 
 
 def pointers(tensors):
-    dtypes = {torch.float32: Float32, torch.bfloat16: BFloat16,
-              torch.int32: Int32, torch.int64: Int64, torch.bool: Boolean}
-    return tuple(make_ptr(dtypes[t.dtype], t.data_ptr(), cute.AddressSpace.gmem,
-                          assumed_align=t.element_size()) for t in tensors)
+    dtypes = {
+        torch.float32: Float32,
+        torch.bfloat16: BFloat16,
+        torch.int32: Int32,
+        torch.int64: Int64,
+        torch.bool: Boolean,
+    }
+    return tuple(
+        make_ptr(
+            dtypes[t.dtype],
+            t.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=t.element_size(),
+        )
+        for t in tensors
+    )
 
 
 @lru_cache(maxsize=None)
@@ -195,13 +282,25 @@ def compile_compress(ratio, max_tokens, max_requests, max_states, device_index):
     types = list(_DTYPES)
     if ratio == 1:
         types[0] = BFloat16
-    fake = tuple(make_ptr(dtype, 16, cute.AddressSpace.gmem,
-                          assumed_align=max(1, dtype.width // 8)) for dtype in types)
+    fake = tuple(
+        make_ptr(
+            dtype, 16, cute.AddressSpace.gmem, assumed_align=max(1, dtype.width // 8)
+        )
+        for dtype in types
+    )
     with torch.cuda.device(device_index):
-        return compile_cute(entry, *fake, current_cuda_stream(),
-                            compile_spec=KernelCompileSpec.from_key(
-                                "attention.mla_compress.cute", 1, key))
+        return compile_cute(
+            entry,
+            *fake,
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key(
+                "attention.mla_compress.cute", 1, key
+            ),
+        )
 
 
 def launch(binding):
- with torch.cuda.device(binding._state.caps.device): run_compiled(binding._state.compiled,(*binding._pointers,current_cuda_stream()))
+    with torch.cuda.device(binding._state.caps.device):
+        run_compiled(
+            binding._state.compiled, (*binding._pointers, current_cuda_stream())
+        )

@@ -40,8 +40,12 @@ def make_routing_ids(
     if workload not in ROUTING_WORKLOADS:
         raise ValueError(f"unknown routing workload: {workload!r}")
     return _make_shared_routing_ids(
-        tokens, top_k, num_experts, sharing_percent=int(workload.removeprefix("shared_")),
-        seed=seed, device=device,
+        tokens,
+        top_k,
+        num_experts,
+        sharing_percent=int(workload.removeprefix("shared_")),
+        seed=seed,
+        device=device,
     )
 
 
@@ -56,9 +60,9 @@ def _make_shared_routing_ids(
 ) -> torch.Tensor:
     if tokens < 1 or not 1 <= top_k <= num_experts:
         raise ValueError("require positive tokens and 1 <= top_k <= num_experts")
-    unique = min(num_experts, max(
-        top_k, (tokens * top_k * (100 - sharing_percent) + 50) // 100
-    ))
+    unique = min(
+        num_experts, max(top_k, (tokens * top_k * (100 - sharing_percent) + 50) // 100)
+    )
     rng = random.Random(seed)
     expert_ids = rng.sample(range(num_experts), unique)
     counts: Counter[int] = Counter()
@@ -92,13 +96,19 @@ def make_tuning_routes(
     expert-pool constraints can clamp the realizable sharing levels.
     """
     if 2 <= tokens <= 8:
-        return torch.stack([
-            _make_shared_routing_ids(
-                tokens, top_k, num_experts, sharing_percent=sharing,
-                seed=42 + index, device=device,
-            )
-            for index, sharing in enumerate((0, 20, 40, 60, 80))
-        ])
+        return torch.stack(
+            [
+                _make_shared_routing_ids(
+                    tokens,
+                    top_k,
+                    num_experts,
+                    sharing_percent=sharing,
+                    seed=42 + index,
+                    device=device,
+                )
+                for index, sharing in enumerate((0, 20, 40, 60, 80))
+            ]
+        )
     return make_routing_ids(
         tokens, top_k, num_experts, workload="disjoint", device=device
     ).unsqueeze(0)

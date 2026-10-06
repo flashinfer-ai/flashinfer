@@ -3,6 +3,7 @@
 ``plan`` declares immutable projection geometry, ``PreparationSession`` selects and
 primes one backend, and ``bind``/``run`` consume only its prepared ``Plan``.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING

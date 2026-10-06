@@ -8,11 +8,23 @@ import pytest
 import torch
 
 import b12x.moe.fused_moe._impl as tp_moe
-from benchmarks.experimental.b12x.benchmark_moe import MODEL_PATH, TP_RANK, TP_SIZE, ModelSpec, make_oracle_reference, get_scale_contract_params, load_expert_weights
+from benchmarks.experimental.b12x.benchmark_moe import (
+    MODEL_PATH,
+    TP_RANK,
+    TP_SIZE,
+    ModelSpec,
+    make_oracle_reference,
+    get_scale_contract_params,
+    load_expert_weights,
+)
 from b12x.moe.fused_moe._impl import clear_tp_moe_caches
 from b12x.moe._shared.kernels.reference import compare_to_reference
 
-from b12x.testing.reference.helpers import prepare_tp_moe_fp4_experts, require_b12x, run_tp_moe_fp4
+from b12x.testing.reference.helpers import (
+    prepare_tp_moe_fp4_experts,
+    require_b12x,
+    run_tp_moe_fp4,
+)
 
 
 def _require_model_weights() -> None:
@@ -134,8 +146,14 @@ def test_b12x_uses_current_cuda_stream() -> None:
     topk_weights = torch.softmax(topk_logits, dim=-1)
 
     reference = make_oracle_reference(
-        "nvfp4", "nvfp4", x, weights, get_scale_contract_params(weights, "shared"),
-        topk_ids, topk_weights, activation="silu",
+        "nvfp4",
+        "nvfp4",
+        x,
+        weights,
+        get_scale_contract_params(weights, "shared"),
+        topk_ids,
+        topk_weights,
+        activation="silu",
     )
     torch.cuda.synchronize(device)
 

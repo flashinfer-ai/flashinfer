@@ -330,7 +330,9 @@ def test_packed_pair_rejects_conflicting_modes_and_aliases():
 
 @pytest.mark.parametrize("tokens", [1, 129])
 @pytest.mark.parametrize("packing", ["packed", "modelopt"])
-def test_paired_x4t_moe_without_caller_counts_matches_dense_scales(tokens, packing, monkeypatch):
+def test_paired_x4t_moe_without_caller_counts_matches_dense_scales(
+    tokens, packing, monkeypatch
+):
     from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
     from b12x.moe._shared.kernels.w4a16.prepare import (
         prepare_w4a16_fp4_e8m0_k32_weights,
@@ -344,54 +346,107 @@ def test_paired_x4t_moe_without_caller_counts_matches_dense_scales(tokens, packi
     first, logical_first = _batch(2 * intermediate, hidden // 32, 0, finite=True)
     second, logical_second = _batch(hidden, intermediate // 32, 0, finite=True)
     device = first.fixed.device
-    w13 = torch.randint(256, (experts, 2 * intermediate, hidden // 2), dtype=torch.uint8, device=device)
-    w2 = torch.randint(256, (experts, hidden, intermediate // 2), dtype=torch.uint8, device=device)
+    w13 = torch.randint(
+        256, (experts, 2 * intermediate, hidden // 2), dtype=torch.uint8, device=device
+    )
+    w2 = torch.randint(
+        256, (experts, hidden, intermediate // 2), dtype=torch.uint8, device=device
+    )
     unit = torch.ones(experts, dtype=torch.float32, device=device)
     scales = (
-        torch.empty((experts, hidden // 32, 2 * intermediate), dtype=torch.uint8, device=device),
-        torch.empty((experts, intermediate // 32, hidden), dtype=torch.uint8, device=device),
+        torch.empty(
+            (experts, hidden // 32, 2 * intermediate), dtype=torch.uint8, device=device
+        ),
+        torch.empty(
+            (experts, intermediate // 32, hidden), dtype=torch.uint8, device=device
+        ),
     )
-    prepare_dense = (prepare_w4a16_e8m0_native_weights if packing == "modelopt"
-                     else prepare_w4a16_fp4_e8m0_k32_weights)
+    prepare_dense = (
+        prepare_w4a16_e8m0_native_weights
+        if packing == "modelopt"
+        else prepare_w4a16_fp4_e8m0_k32_weights
+    )
     dense = prepare_dense(
-        w13, logical_first, unit, w2, logical_second, unit,
-        activation="situ", w13_layout="w31",
+        w13,
+        logical_first,
+        unit,
+        w2,
+        logical_second,
+        unit,
+        activation="situ",
+        w13_layout="w31",
     )
     with pytest.raises(ValueError, match="must not overlap"):
         prepare_w4a16_x4t_weights(
-            w13, first, unit, w2, second, unit, scales[0],
-            scales[0].reshape(-1)[:scales[1].numel()].reshape_as(scales[1]),
-            activation="situ", w13_layout="w31", weight_layout=packing,
+            w13,
+            first,
+            unit,
+            w2,
+            second,
+            unit,
+            scales[0],
+            scales[0].reshape(-1)[: scales[1].numel()].reshape_as(scales[1]),
+            activation="situ",
+            w13_layout="w31",
+            weight_layout=packing,
         )
     nonpaired, _ = _batch(2 * intermediate, hidden // 32, 0, task_rows=32, finite=True)
     with pytest.raises(ValueError, match="paired 64-row tasks"):
         prepare_w4a16_x4t_weights(
-            w13, nonpaired, unit, w2, second, unit, *scales,
-            activation="situ", w13_layout="w31", weight_layout=packing,
+            w13,
+            nonpaired,
+            unit,
+            w2,
+            second,
+            unit,
+            *scales,
+            activation="situ",
+            w13_layout="w31",
+            weight_layout=packing,
         )
     compressed = prepare_w4a16_x4t_weights(
-        w13, first, unit, w2, second, unit, *scales,
-        activation="situ", w13_layout="w31", weight_layout=packing,
+        w13,
+        first,
+        unit,
+        w2,
+        second,
+        unit,
+        *scales,
+        activation="situ",
+        w13_layout="w31",
+        weight_layout=packing,
     )
     x = torch.randn((tokens, hidden), dtype=torch.bfloat16, device=device) * 0.125
     ids = torch.randint(experts, (tokens, topk), dtype=torch.int32, device=device)
     route_weights = torch.softmax(torch.randn(tokens, topk, device=device), -1)
-    buffers = [make_w4a16_packed_buffers(p, m=tokens, topk=topk, dtype=x.dtype, device=device)
-               for p in (dense, compressed)]
+    buffers = [
+        make_w4a16_packed_buffers(p, m=tokens, topk=topk, dtype=x.dtype, device=device)
+        for p in (dense, compressed)
+    ]
 
     def run(prepared, scratch):
         return run_w4a16_moe(
-            x, prepared, route_weights, ids, activation="situ",
+            x,
+            prepared,
+            route_weights,
+            ids,
+            activation="situ",
             intermediate_cache13=scratch.intermediate_cache13,
             intermediate_cache2=scratch.intermediate_cache2,
-            output=scratch.output, fc1_c_tmp=scratch.fc1_c_tmp, fc2_c_tmp=scratch.fc2_c_tmp,
+            output=scratch.output,
+            fc1_c_tmp=scratch.fc1_c_tmp,
+            fc2_c_tmp=scratch.fc2_c_tmp,
             packed_route_indices=scratch.packed_route_indices,
             block_expert_ids=scratch.block_expert_ids,
             packed_route_count=scratch.packed_route_count,
             expert_offsets=scratch.expert_offsets,
         )
 
-    monkeypatch.setattr(X4TScaleBatch, "validate", lambda *_: pytest.fail("scale validation during execution"))
+    monkeypatch.setattr(
+        X4TScaleBatch,
+        "validate",
+        lambda *_: pytest.fail("scale validation during execution"),
+    )
     expected = run(dense, buffers[0]).clone()
     actual = run(compressed, buffers[1]).clone()
     assert torch.isfinite(actual).all() and actual.abs().any()

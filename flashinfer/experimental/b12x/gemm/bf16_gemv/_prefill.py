@@ -4,6 +4,7 @@ Inputs remain BF16 without activation or weight quantization. Output belongs
 to the caller. Tensor descriptors keep live row counts dynamic for graph reuse.
 The TMA pipeline follows B12X's MHC BF16 projection implementation.
 """
+
 from functools import cache
 
 import cuda.bindings.driver as cuda
@@ -20,12 +21,21 @@ from cutlass.utils import LayoutEnum
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import program_cache
-from b12x._lib.compiler import DimKey, KernelCompileSpec, compile as b12x_compile, launch, run_compiled, tensor_key
+from b12x._lib.compiler import (
+    DimKey,
+    KernelCompileSpec,
+    compile as b12x_compile,
+    launch,
+    run_compiled,
+    tensor_key,
+)
 from b12x._lib.utils import current_cuda_stream
+
 
 def _to_kernel_tensor(tensor, dtype, *, dynamic_layout=False):
     if hasattr(tensor, "fake_mode"):
         from cutlass.cute.runtime import make_fake_tensor
+
         if dynamic_layout:
             shape = tuple(cute.sym_int(32) for _ in tensor.shape)
             strides = (cute.sym_int(64), 1)
@@ -44,13 +54,23 @@ def _assume_tma_source_aligned(tensor):
     row_stride = tensor.stride[0]
     if not isinstance(row_stride, int):
         row_stride = cute.assume(row_stride, divby=8)
-    return cute.make_tensor(tensor.iterator, cute.make_layout(
-        tensor.shape, stride=(row_stride, 1)))
+    return cute.make_tensor(
+        tensor.iterator, cute.make_layout(tensor.shape, stride=(row_stride, 1))
+    )
 
 
 @cute.jit
-def _warp_gemm(tiled_mma, acc, correction, fragment_a, fragment_b, shared_a, shared_b,
-               copy_a, copy_b):
+def _warp_gemm(
+    tiled_mma,
+    acc,
+    correction,
+    fragment_a,
+    fragment_b,
+    shared_a,
+    shared_b,
+    copy_a,
+    copy_b,
+):
     target_a = copy_a.retile(fragment_a)
     target_b = copy_b.retile(fragment_b)
     cute.copy(copy_a, shared_a[None, None, 0], target_a[None, None, 0])
@@ -58,16 +78,19 @@ def _warp_gemm(tiled_mma, acc, correction, fragment_a, fragment_b, shared_a, sha
     segment = cute.make_rmem_tensor(acc.shape, Float32)
     for k in cutlass.range_constexpr(cute.size(shared_a.shape[2])):
         if k < cute.size(shared_a.shape[2]) - 1:
-            cute.copy(copy_a, shared_a[None, None, k + 1],
-                      target_a[None, None, k + 1])
-            cute.copy(copy_b, shared_b[None, None, k + 1],
-                      target_b[None, None, k + 1])
+            cute.copy(copy_a, shared_a[None, None, k + 1], target_a[None, None, k + 1])
+            cute.copy(copy_b, shared_b[None, None, k + 1], target_b[None, None, k + 1])
         # Limit tensor-core accumulation to 16 products; retain the complete
         # projection sum in FP32 ALU registers. Compensated addition retains
         # small terms across the long reduction without tensor-core carry loss.
         segment.fill(0.0)
-        cute.gemm(tiled_mma, segment, fragment_a[None, None, k],
-                  fragment_b[None, None, k], segment)
+        cute.gemm(
+            tiled_mma,
+            segment,
+            fragment_a[None, None, k],
+            fragment_b[None, None, k],
+            segment,
+        )
         addend = segment.load() - correction.load()
         total = acc.load() + addend
         correction.store((total - acc.load()) - addend)
@@ -333,7 +356,8 @@ class Bf16PrefillKernel:
                 column = n_tile * Int32(self.tile_n) + coord[1]
                 if token < num_tokens and column < Int32(self.n):
                     output[Int64(token), Int64(column)] = acc[index].to(
-                        output.element_type)
+                        output.element_type
+                    )
 
         elif warp_idx == Int32(self.producer_warp):
             producer_state = pipeline.make_pipeline_state(
@@ -359,7 +383,6 @@ class Bf16PrefillKernel:
             load_pipeline.producer_tail(producer_state)
 
 
-
 @cache
 def _kernel(n, k):
     return Bf16PrefillKernel(n, k)
@@ -375,8 +398,7 @@ def supports_prefill(x, weight, out, bias) -> bool:
         bias is None
         and tuple(weight.shape) in ((384, 5120), (512, 5120), (1024, 5120))
         and x.dtype == weight.dtype == torch.bfloat16
-        and all(t.is_contiguous() and t.data_ptr() % 16 == 0
-                for t in (x, weight, out))
+        and all(t.is_contiguous() and t.data_ptr() % 16 == 0 for t in (x, weight, out))
     )
 
 
@@ -401,21 +423,30 @@ def prefill_mm(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None
     args = (
         _to_kernel_tensor(x, cutlass.BFloat16, dynamic_layout=True),
         _to_kernel_tensor(weight, cutlass.BFloat16),
-        _to_kernel_tensor(out, cutlass.Float32 if out.dtype == torch.float32
-                          else cutlass.BFloat16, dynamic_layout=True),
-        Int32(x.shape[0]), current_cuda_stream(),
+        _to_kernel_tensor(
+            out,
+            cutlass.Float32 if out.dtype == torch.float32 else cutlass.BFloat16,
+            dynamic_layout=True,
+        ),
+        Int32(x.shape[0]),
+        current_cuda_stream(),
     )
     key = tuple(
-        tensor_key(name, t, dims=(
-            (DimKey.dynamic() if name != "weight" else DimKey.exact(t.shape[0])),
-            DimKey.exact(t.shape[1]),
-        ))
+        tensor_key(
+            name,
+            t,
+            dims=(
+                (DimKey.dynamic() if name != "weight" else DimKey.exact(t.shape[0])),
+                DimKey.exact(t.shape[1]),
+            ),
+        )
         for name, t in (("source", x), ("weight", weight), ("output", out))
     )
     launch(
         _kernel(weight.shape[0], weight.shape[1]),
         compile_spec=KernelCompileSpec.from_key("gemm.bf16_prefill", 3, key),
-        compile_args=args, runtime_args=args,
+        compile_args=args,
+        runtime_args=args,
     )
 
 
@@ -423,9 +454,13 @@ def _prepared_args(x, weight, out):
     return (
         _to_kernel_tensor(x, cutlass.BFloat16, dynamic_layout=True),
         _to_kernel_tensor(weight, cutlass.BFloat16),
-        _to_kernel_tensor(out, cutlass.Float32 if out.dtype == torch.float32
-                          else cutlass.BFloat16, dynamic_layout=True),
-        Int32(x.shape[0]), current_cuda_stream(),
+        _to_kernel_tensor(
+            out,
+            cutlass.Float32 if out.dtype == torch.float32 else cutlass.BFloat16,
+            dynamic_layout=True,
+        ),
+        Int32(x.shape[0]),
+        current_cuda_stream(),
     )
 
 
@@ -438,17 +473,24 @@ def compile_prefill(ordinal, max_rows, n, k, output_dtype):
         device = torch.device("cuda", ordinal)
         x = torch.empty((max_rows, k), dtype=torch.bfloat16, device=device)
         weight = torch.empty((n, k), dtype=torch.bfloat16, device=device)
-        out = torch.empty((max_rows, n), dtype=getattr(torch, output_dtype), device=device)
+        out = torch.empty(
+            (max_rows, n), dtype=getattr(torch, output_dtype), device=device
+        )
         args = _prepared_args(x, weight, out)
         key = tuple(
-            tensor_key(name, t, dims=(
-                DimKey.dynamic() if name != "weight" else DimKey.exact(t.shape[0]),
-                DimKey.exact(t.shape[1]),
-            ))
+            tensor_key(
+                name,
+                t,
+                dims=(
+                    DimKey.dynamic() if name != "weight" else DimKey.exact(t.shape[0]),
+                    DimKey.exact(t.shape[1]),
+                ),
+            )
             for name, t in (("source", x), ("weight", weight), ("output", out))
         )
         raw = b12x_compile(
-            _kernel(n, k), *args,
+            _kernel(n, k),
+            *args,
             compile_spec=KernelCompileSpec.from_key("gemm.bf16_prefill", 3, key),
         )
 

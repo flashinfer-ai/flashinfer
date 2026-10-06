@@ -647,7 +647,9 @@ def test_msa_contiguous_block_scores_graph_replay_tracks_live_weights() -> None:
     torch.cuda.synchronize(device)
     warm_compile_misses = compile_cache_info()["compile_misses"]
 
-    with kernel_resolution_guard('MSA contiguous graph replay must use the warmed kernel'):
+    with kernel_resolution_guard(
+        "MSA contiguous graph replay must use the warmed kernel"
+    ):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured_out = run_staged()

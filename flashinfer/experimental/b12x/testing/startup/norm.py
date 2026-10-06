@@ -98,9 +98,7 @@ def _hyper_call_factory(*, role, fixture, eps, device):
             )
             inputs = dict(normalized=source, gate_logits=logits)
         elif role == "combine":
-            run = lambda: _impl.run_combine_impl(
-                source, block, injection, plan=state
-            )
+            run = lambda: _impl.run_combine_impl(source, block, injection, plan=state)
             inputs = dict(state=source, block_output=block, injection_logits=injection)
         else:
             run = lambda: _impl.run_combine_norm_impl(
@@ -117,7 +115,8 @@ def _hyper_call_factory(*, role, fixture, eps, device):
             options["eps"] = eps
         if role == "scaled_silu":
             produce, producer_owners = (
-                fixture["projected_producer"], fixture["projected_producer_owners"]
+                fixture["projected_producer"],
+                fixture["projected_producer_owners"],
             )
         else:
             produce, producer_owners = fixture["producer"], fixture["producer_owners"]
@@ -141,7 +140,11 @@ def _hyper_call_factory(*, role, fixture, eps, device):
             reset=restore,
             restore=restore,
             owners=(
-                _Expected(role, inputs, options), binding, fixture, outputs, producer_owners,
+                _Expected(role, inputs, options),
+                binding,
+                fixture,
+                outputs,
+                producer_owners,
             ),
         )
 
@@ -161,10 +164,18 @@ def _hyper_requests(metadata, device, rows):
             m=m, hidden=hidden, streams=streams, lowrank=lowrank, eps=eps, device=device
         )
         caps = op.Caps(
-            device=device, max_tokens=m, hidden_size=hidden, streams=streams, lowrank=lowrank
+            device=device,
+            max_tokens=m,
+            hidden_size=hidden,
+            streams=streams,
+            lowrank=lowrank,
         )
         for role in (
-            "grouped_rmsnorm", "scaled_silu", "gate_mean", "combine", "combine_norm",
+            "grouped_rmsnorm",
+            "scaled_silu",
+            "gate_mean",
+            "combine",
+            "combine_norm",
         ):
             declaration = op.plan(
                 caps,
@@ -196,7 +207,9 @@ def _mhc_fixture(*, m, hidden, streams, eps, device):
         hc_scale=torch.ones(3, device=device),
         hc_base=rand((24,), torch.float32),
         prev_post=torch.full((m, streams), 0.5, device=device),
-        prev_comb=torch.eye(streams, device=device).expand(m, streams, streams).contiguous(),
+        prev_comb=torch.eye(streams, device=device)
+        .expand(m, streams, streams)
+        .contiguous(),
         norm_weight=torch.ones(hidden, device=device, dtype=torch.bfloat16),
     )
     fixture["produce"], fixture["producer_owners"] = _producer(fixture["x"], eps)
@@ -212,8 +225,13 @@ def _mhc_call_factory(*, role, fixture, eps, hc_eps, sinkhorn_iters, device):
         streams = _impl.MHC_MULT
         opts = dict(rms_eps=eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters)
         if role == "post":
-            output = torch.empty((m, streams, hidden), device=device, dtype=torch.bfloat16)
-            inputs = {name: fixture[name] for name in ("x", "residual", "prev_post", "prev_comb")}
+            output = torch.empty(
+                (m, streams, hidden), device=device, dtype=torch.bfloat16
+            )
+            inputs = {
+                name: fixture[name]
+                for name in ("x", "residual", "prev_post", "prev_comb")
+            }
             run = lambda: _impl._b12x_mhc_post_impl(**inputs, out=output, _state=state)
             binding = None
         else:
@@ -224,7 +242,9 @@ def _mhc_call_factory(*, role, fixture, eps, hc_eps, sinkhorn_iters, device):
                 y=torch.empty((m, hidden), device=device, dtype=torch.bfloat16),
                 post=torch.empty((m, streams), device=device),
                 comb=torch.empty((m, streams, streams), device=device),
-                out=torch.empty((m, streams, hidden), device=device, dtype=torch.bfloat16),
+                out=torch.empty(
+                    (m, streams, hidden), device=device, dtype=torch.bfloat16
+                ),
             )
             if role == "pre":
                 inputs = {name: fixture[name] for name in ("hc_scale", "hc_base")}
@@ -240,7 +260,15 @@ def _mhc_call_factory(*, role, fixture, eps, hc_eps, sinkhorn_iters, device):
             else:
                 inputs = {
                     name: fixture[name]
-                    for name in ("x", "residual", "prev_post", "prev_comb", "fn", "hc_scale", "hc_base")
+                    for name in (
+                        "x",
+                        "residual",
+                        "prev_post",
+                        "prev_comb",
+                        "fn",
+                        "hc_scale",
+                        "hc_base",
+                    )
                 }
                 run = lambda: _impl._b12x_mhc_post_pre_impl(
                     **inputs,
@@ -278,7 +306,8 @@ def _mhc_call_factory(*, role, fixture, eps, hc_eps, sinkhorn_iters, device):
             restore=restore,
             owners=(
                 _Expected(
-                    "mhc_" + role, inputs,
+                    "mhc_" + role,
+                    inputs,
                     dict(**opts, norm_weight=fixture["norm_weight"]),
                 ),
                 binding,

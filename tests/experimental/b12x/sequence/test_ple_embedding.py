@@ -28,13 +28,31 @@ def resources():
         yield stack
 
 
-def _small_caps(device, *, tp_rank=1, tp_size=2, max_tokens=5,
-                quant_mode="fp8_e4m3_per_tensor", table_memory="device"):
+def _small_caps(
+    device,
+    *,
+    tp_rank=1,
+    tp_size=2,
+    max_tokens=5,
+    quant_mode="fp8_e4m3_per_tensor",
+    table_memory="device",
+):
     return ple_embedding.Caps(
-        device=device, max_tokens=max_tokens, max_seqs=2, vocab_size=100,
-        eos_token_id=99, max_order=3, heads_per_order=2, dense_layer_ordinal=0,
-        base_table_size=5, embedding_dim=64, tp_size=tp_size, tp_rank=tp_rank,
-        table_alignment=8, quant_mode=quant_mode, table_memory=table_memory,
+        device=device,
+        max_tokens=max_tokens,
+        max_seqs=2,
+        vocab_size=100,
+        eos_token_id=99,
+        max_order=3,
+        heads_per_order=2,
+        dense_layer_ordinal=0,
+        base_table_size=5,
+        embedding_dim=64,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        table_alignment=8,
+        quant_mode=quant_mode,
+        table_memory=table_memory,
     )
 
 
@@ -48,21 +66,55 @@ def _small_geometry(caps):
 
 
 def _fp8_weight(shape, device):
-    return torch.arange(shape[0] * shape[1], dtype=torch.float32, device=device).remainder(15).sub(7).view(shape).to(torch.float8_e4m3fn).contiguous()
+    return (
+        torch.arange(shape[0] * shape[1], dtype=torch.float32, device=device)
+        .remainder(15)
+        .sub(7)
+        .view(shape)
+        .to(torch.float8_e4m3fn)
+        .contiguous()
+    )
 
 
 def _nvfp4_weight(shape, device):
-    codes = torch.arange(shape[0] * shape[1] * 2, dtype=torch.uint8, device=device).remainder_(16).view(shape[0], shape[1], 2)
+    codes = (
+        torch.arange(shape[0] * shape[1] * 2, dtype=torch.uint8, device=device)
+        .remainder_(16)
+        .view(shape[0], shape[1], 2)
+    )
     return (codes[..., 0] | (codes[..., 1] << 4)).contiguous()
 
 
 def _storage(layout):
     if layout.caps.quant_mode == "bf16":
-        weight = torch.arange(layout.weight_shape[0] * layout.weight_shape[1], dtype=torch.float32, device=layout.caps.device).remainder(17).sub(8).view(layout.weight_shape).to(torch.bfloat16)
+        weight = (
+            torch.arange(
+                layout.weight_shape[0] * layout.weight_shape[1],
+                dtype=torch.float32,
+                device=layout.caps.device,
+            )
+            .remainder(17)
+            .sub(8)
+            .view(layout.weight_shape)
+            .to(torch.bfloat16)
+        )
         return weight.contiguous(), None, None
     if layout.caps.quant_mode == "fp8_e4m3_per_tensor":
-        return _fp8_weight(layout.weight_shape, layout.caps.device), torch.tensor([0.25], dtype=torch.bfloat16, device=layout.caps.device), None
-    scales = torch.arange(layout.weight_scale_shape[0] * layout.weight_scale_shape[1], dtype=torch.float32, device=layout.caps.device).remainder(4).add(1).mul(0.5)
+        return (
+            _fp8_weight(layout.weight_shape, layout.caps.device),
+            torch.tensor([0.25], dtype=torch.bfloat16, device=layout.caps.device),
+            None,
+        )
+    scales = (
+        torch.arange(
+            layout.weight_scale_shape[0] * layout.weight_scale_shape[1],
+            dtype=torch.float32,
+            device=layout.caps.device,
+        )
+        .remainder(4)
+        .add(1)
+        .mul(0.5)
+    )
     return (
         _nvfp4_weight(layout.weight_shape, layout.caps.device),
         scales.view(layout.weight_scale_shape).to(torch.float8_e4m3fn).contiguous(),
@@ -77,12 +129,27 @@ def _tensors(layout, geometry_tensors, *, num_tokens=4, num_seqs=2):
         "weight": weight,
         "weight_scale": weight_scale,
         "weight_scale_2": weight_scale_2,
-        "token_ids": torch.arange(max_tokens, dtype=torch.int64, device=layout.caps.device).add_(3),
-        "query_start_loc": torch.tensor([0, 2, 4], dtype=torch.int32, device=layout.caps.device),
-        "committed_history": torch.tensor([[99, 99], [7, 8]], dtype=torch.int64, device=layout.caps.device),
-        "num_seqs": torch.tensor([num_seqs], dtype=torch.int32, device=layout.caps.device),
-        "num_tokens": torch.tensor([num_tokens], dtype=torch.int32, device=layout.caps.device),
-        "out": torch.full(layout.output_shape, 37, dtype=layout.output_dtype, device=layout.caps.device),
+        "token_ids": torch.arange(
+            max_tokens, dtype=torch.int64, device=layout.caps.device
+        ).add_(3),
+        "query_start_loc": torch.tensor(
+            [0, 2, 4], dtype=torch.int32, device=layout.caps.device
+        ),
+        "committed_history": torch.tensor(
+            [[99, 99], [7, 8]], dtype=torch.int64, device=layout.caps.device
+        ),
+        "num_seqs": torch.tensor(
+            [num_seqs], dtype=torch.int32, device=layout.caps.device
+        ),
+        "num_tokens": torch.tensor(
+            [num_tokens], dtype=torch.int32, device=layout.caps.device
+        ),
+        "out": torch.full(
+            layout.output_shape,
+            37,
+            dtype=layout.output_dtype,
+            device=layout.caps.device,
+        ),
         "_geometry": geometry_tensors,
     }
 
@@ -91,22 +158,29 @@ def _reference(binding):
     layout = binding._state
     geometry = binding._hash_binding.geometry
     return reference.fused(
-        binding.weight, binding.weight_scale, binding.token_ids, binding.query_start_loc,
-        binding.committed_history, quant_mode=layout.caps.quant_mode,
-        weight_scale_2=binding.weight_scale_2, num_seqs=int(binding.num_seqs.item()),
-        num_tokens=int(binding.num_tokens.item()), eos_token_id=layout.caps.eos_token_id,
-        multipliers=geometry.multipliers, prime_sizes=geometry.prime_sizes,
-        table_offsets=geometry.table_offsets, heads_per_order=layout.caps.heads_per_order,
-        shard_start=layout.shard_start, embedding_dim=layout.caps.embedding_dim,
+        binding.weight,
+        binding.weight_scale,
+        binding.token_ids,
+        binding.query_start_loc,
+        binding.committed_history,
+        quant_mode=layout.caps.quant_mode,
+        weight_scale_2=binding.weight_scale_2,
+        num_seqs=int(binding.num_seqs.item()),
+        num_tokens=int(binding.num_tokens.item()),
+        eos_token_id=layout.caps.eos_token_id,
+        multipliers=geometry.multipliers,
+        prime_sizes=geometry.prime_sizes,
+        table_offsets=geometry.table_offsets,
+        heads_per_order=layout.caps.heads_per_order,
+        shard_start=layout.shard_start,
+        embedding_dim=layout.caps.embedding_dim,
         output_dtype=layout.output_dtype,
     )
 
 
 def _prepared_binding(resources, caps, *, name="embedding", tensors=None):
     geometry = (
-        _small_geometry(caps)
-        if tensors is None
-        else tensors["_geometry"].geometry
+        _small_geometry(caps) if tensors is None else tensors["_geometry"].geometry
     )
     layout = ple_embedding.storage_layout(caps, geometry=geometry)
     geometry_tensors = (
@@ -116,22 +190,42 @@ def _prepared_binding(resources, caps, *, name="embedding", tensors=None):
     )
     tensors = _tensors(layout, geometry_tensors) if tensors is None else tensors
     declaration = ple_embedding.plan(
-        caps, geometry=geometry, prime_sizes=geometry_tensors.prime_sizes,
-        table_offsets=geometry_tensors.table_offsets, multipliers=geometry_tensors.multipliers,
-        invocation=ple_embedding.invocation_from_tensors(**{key: value for key, value in tensors.items() if key != "_geometry"}),
+        caps,
+        geometry=geometry,
+        prime_sizes=geometry_tensors.prime_sizes,
+        table_offsets=geometry_tensors.table_offsets,
+        multipliers=geometry_tensors.multipliers,
+        invocation=ple_embedding.invocation_from_tensors(
+            **{key: value for key, value in tensors.items() if key != "_geometry"}
+        ),
     )
 
     def prepare_call(state):
         (spec,) = state.layout.scratch_specs()
-        tensors["scratch"] = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-        trial = state.bind(**{key: value for key, value in tensors.items() if key != "_geometry"})
+        tensors["scratch"] = torch.empty(
+            spec.shape, dtype=spec.dtype, device=spec.device
+        )
+        trial = state.bind(
+            **{key: value for key, value in tensors.items() if key != "_geometry"}
+        )
         return PreparedCall(run=lambda: state.run(trial))
 
-    session = resources.enter_context(PreparationSession(device=caps.device, autotune=False, compile_workers=2))
-    result = resources.enter_context(session.prepare((declaration.request(
-        name=name, prepare_call=prepare_call),)))
+    session = resources.enter_context(
+        PreparationSession(device=caps.device, autotune=False, compile_workers=2)
+    )
+    result = resources.enter_context(
+        session.prepare((declaration.request(name=name, prepare_call=prepare_call),))
+    )
     plan = declaration
-    binding = ple_embedding.bind(plan, **{key: value for key, value in tensors.items() if key not in {"_geometry", "scratch"}}, scratch=tensors["scratch"])
+    binding = ple_embedding.bind(
+        plan,
+        **{
+            key: value
+            for key, value in tensors.items()
+            if key not in {"_geometry", "scratch"}
+        },
+        scratch=tensors["scratch"],
+    )
     return binding, tensors, layout, session, result
 
 
@@ -158,21 +252,50 @@ def test_host_geometry_and_storage_layout_partition_table(quant_mode):
 
 @pytest.mark.parametrize("tp_rank", range(4))
 def test_host_layout_matches_16_head_320m_table_partition(tp_rank):
-    caps = ple_embedding.Caps(device="cpu", max_tokens=1, max_seqs=1, vocab_size=248_320,
-        eos_token_id=248_044, max_order=3, heads_per_order=8, dense_layer_ordinal=0,
-        base_table_size=20_000_000, embedding_dim=2_560, tp_size=4, tp_rank=tp_rank,
-        table_alignment=128, quant_mode="bf16")
-    layout = ple_embedding.storage_layout(caps, geometry=ple_embedding.compute_geometry(caps))
+    caps = ple_embedding.Caps(
+        device="cpu",
+        max_tokens=1,
+        max_seqs=1,
+        vocab_size=248_320,
+        eos_token_id=248_044,
+        max_order=3,
+        heads_per_order=8,
+        dense_layer_ordinal=0,
+        base_table_size=20_000_000,
+        embedding_dim=2_560,
+        tp_size=4,
+        tp_rank=tp_rank,
+        table_alignment=128,
+        quant_mode="bf16",
+    )
+    layout = ple_embedding.storage_layout(
+        caps, geometry=ple_embedding.compute_geometry(caps)
+    )
     assert layout.table_vocab_size == 320_001_446
     assert layout.padded_vocab_size == 320_001_536
-    assert (layout.shard_start, layout.shard_end) == (tp_rank * 80_000_384, (tp_rank + 1) * 80_000_384)
+    assert (layout.shard_start, layout.shard_end) == (
+        tp_rank * 80_000_384,
+        (tp_rank + 1) * 80_000_384,
+    )
     assert layout.weight_shape == (80_000_384, 160)
 
 
 def test_caps_reject_unsupported_storage_contracts():
-    common = dict(device="cpu", max_tokens=2, max_seqs=1, vocab_size=100, eos_token_id=99,
-        max_order=3, heads_per_order=2, dense_layer_ordinal=0, base_table_size=5,
-        embedding_dim=64, tp_size=2, tp_rank=0, table_alignment=8)
+    common = dict(
+        device="cpu",
+        max_tokens=2,
+        max_seqs=1,
+        vocab_size=100,
+        eos_token_id=99,
+        max_order=3,
+        heads_per_order=2,
+        dense_layer_ordinal=0,
+        base_table_size=5,
+        embedding_dim=64,
+        tp_size=2,
+        tp_rank=0,
+        table_alignment=8,
+    )
     with pytest.raises(ValueError, match="embedding_dim=.*head_count"):
         ple_embedding.Caps(**{**common, "embedding_dim": 65})
     with pytest.raises(ValueError, match="tp_rank"):
@@ -203,8 +326,15 @@ def test_public_bind_rejects_output_aliasing_read_only_table(resources):
     kwargs = {
         name: getattr(binding, name)
         for name in (
-            "scratch", "weight", "weight_scale", "weight_scale_2", "token_ids",
-            "query_start_loc", "committed_history", "num_seqs", "num_tokens",
+            "scratch",
+            "weight",
+            "weight_scale",
+            "weight_scale_2",
+            "token_ids",
+            "query_start_loc",
+            "committed_history",
+            "num_seqs",
+            "num_tokens",
         )
     }
     with pytest.raises(ValueError, match="mutable out must not overlap"):
@@ -214,9 +344,13 @@ def test_public_bind_rejects_output_aliasing_read_only_table(resources):
             out=binding.weight.view(binding.out.shape),
         )
 
+
 @pytest.mark.parametrize("quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"])
 def test_reference_composes_hash_tp_lookup_and_dequantization(quant_mode):
-    caps0, caps1 = _small_caps("cpu", tp_rank=0, quant_mode=quant_mode), _small_caps("cpu", tp_rank=1, quant_mode=quant_mode)
+    caps0, caps1 = (
+        _small_caps("cpu", tp_rank=0, quant_mode=quant_mode),
+        _small_caps("cpu", tp_rank=1, quant_mode=quant_mode),
+    )
     full_caps = _small_caps("cpu", tp_rank=0, tp_size=1, quant_mode=quant_mode)
     geometry = _small_geometry(caps0)
     layout0 = ple_embedding.storage_layout(caps0, geometry=geometry)
@@ -228,49 +362,109 @@ def test_reference_composes_hash_tp_lookup_and_dequantization(quant_mode):
     history = torch.tensor([[99, 99], [7, 8]], dtype=torch.int64)
     outputs = []
     for layout in (layout0, layout1):
-        local_scale = scale if quant_mode != "nvfp4_group16" else scale[layout.shard_start:layout.shard_end]
-        outputs.append(reference.fused(weight[layout.shard_start:layout.shard_end], local_scale, token_ids, starts, history,
-            quant_mode=quant_mode, weight_scale_2=scale_2, num_seqs=2, num_tokens=4,
-            eos_token_id=99, multipliers=torch.tensor(geometry.multipliers), prime_sizes=torch.tensor(geometry.prime_sizes),
-            table_offsets=torch.tensor(geometry.table_offsets), heads_per_order=2, shard_start=layout.shard_start,
-            embedding_dim=64))
-    ids = ple_hash_packed_reference(token_ids[:4], starts, history, eos_token_id=99,
-        multipliers=torch.tensor(geometry.multipliers), prime_sizes=torch.tensor(geometry.prime_sizes),
-        table_offsets=torch.tensor(geometry.table_offsets), heads_per_order=2)
+        local_scale = (
+            scale
+            if quant_mode != "nvfp4_group16"
+            else scale[layout.shard_start : layout.shard_end]
+        )
+        outputs.append(
+            reference.fused(
+                weight[layout.shard_start : layout.shard_end],
+                local_scale,
+                token_ids,
+                starts,
+                history,
+                quant_mode=quant_mode,
+                weight_scale_2=scale_2,
+                num_seqs=2,
+                num_tokens=4,
+                eos_token_id=99,
+                multipliers=torch.tensor(geometry.multipliers),
+                prime_sizes=torch.tensor(geometry.prime_sizes),
+                table_offsets=torch.tensor(geometry.table_offsets),
+                heads_per_order=2,
+                shard_start=layout.shard_start,
+                embedding_dim=64,
+            )
+        )
+    ids = ple_hash_packed_reference(
+        token_ids[:4],
+        starts,
+        history,
+        eos_token_id=99,
+        multipliers=torch.tensor(geometry.multipliers),
+        prime_sizes=torch.tensor(geometry.prime_sizes),
+        table_offsets=torch.tensor(geometry.table_offsets),
+        heads_per_order=2,
+    )
     selected = weight.index_select(0, ids.flatten())
     if quant_mode == "bf16":
         gathered = selected.reshape(4, 4, 16).float()
     elif quant_mode == "fp8_e4m3_per_tensor":
         gathered = selected.reshape(4, 4, 16).float() * scale.float()
     else:
-        codes = torch.stack((selected & 0xF, (selected >> 4) & 0xF), dim=-1).reshape(4, 4, 16)
-        lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6])
-        gathered = lut[codes.long()] * scale.index_select(0, ids.flatten()).float().reshape(4, 4, 1) * scale_2.float()
+        codes = torch.stack((selected & 0xF, (selected >> 4) & 0xF), dim=-1).reshape(
+            4, 4, 16
+        )
+        lut = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6]
+        )
+        gathered = (
+            lut[codes.long()]
+            * scale.index_select(0, ids.flatten()).float().reshape(4, 4, 1)
+            * scale_2.float()
+        )
     expected = torch.zeros((5, 64), dtype=torch.bfloat16)
     expected[:4].copy_(gathered.to(torch.bfloat16).flatten(-2))
     torch.testing.assert_close(outputs[0] + outputs[1], expected, rtol=0, atol=0)
 
 
 def test_nvfp4_reference_decodes_low_nibble_first_and_applies_both_scales():
-    codes = torch.stack((torch.arange(16, dtype=torch.uint8), torch.arange(15, -1, -1, dtype=torch.uint8)))
+    codes = torch.stack(
+        (
+            torch.arange(16, dtype=torch.uint8),
+            torch.arange(15, -1, -1, dtype=torch.uint8),
+        )
+    )
     packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).contiguous()
-    actual = reference.lookup(packed, torch.tensor([[2.0], [4.0]], dtype=torch.float8_e4m3fn),
-        torch.tensor([[10, 11, 9, 12]], dtype=torch.int64), quant_mode="nvfp4_group16",
-        weight_scale_2=torch.tensor([.25]), shard_start=10, embedding_dim=64)
-    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6])
+    actual = reference.lookup(
+        packed,
+        torch.tensor([[2.0], [4.0]], dtype=torch.float8_e4m3fn),
+        torch.tensor([[10, 11, 9, 12]], dtype=torch.int64),
+        quant_mode="nvfp4_group16",
+        weight_scale_2=torch.tensor([0.25]),
+        shard_start=10,
+        embedding_dim=64,
+    )
+    lut = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6])
     expected = torch.zeros((1, 4, 16), dtype=torch.bfloat16)
-    expected[0, 0].copy_((lut * .5).to(torch.bfloat16))
+    expected[0, 0].copy_((lut * 0.5).to(torch.bfloat16))
     expected[0, 1].copy_((lut.flip(0)).to(torch.bfloat16))
     torch.testing.assert_close(actual, expected.flatten(-2), rtol=0, atol=0)
 
 
 @torch.inference_mode()
 @pytest.mark.parametrize("quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"])
-def test_cuda_prepared_execution_matches_reference_and_preserves_read_only_tensors(resources, quant_mode):
-    binding, _, _, _, _ = _prepared_binding(resources, _small_caps(require_b12x(), quant_mode=quant_mode))
+def test_cuda_prepared_execution_matches_reference_and_preserves_read_only_tensors(
+    resources, quant_mode
+):
+    binding, _, _, _, _ = _prepared_binding(
+        resources, _small_caps(require_b12x(), quant_mode=quant_mode)
+    )
     expected = _reference(binding)
-    read_names = ["weight", "token_ids", "query_start_loc", "committed_history", "num_seqs", "num_tokens"]
-    read_names.extend(name for name in ("weight_scale", "weight_scale_2") if getattr(binding, name) is not None)
+    read_names = [
+        "weight",
+        "token_ids",
+        "query_start_loc",
+        "committed_history",
+        "num_seqs",
+        "num_tokens",
+    ]
+    read_names.extend(
+        name
+        for name in ("weight_scale", "weight_scale_2")
+        if getattr(binding, name) is not None
+    )
     before = {name: getattr(binding, name).clone() for name in read_names}
     actual = ple_embedding.run(binding)
     torch.cuda.synchronize(binding.out.device)
@@ -291,18 +485,46 @@ class _TmpfsTableRegion:
         self.closed = 0
         self._libc = ctypes.CDLL(None, use_errno=True)
         self._libc.mmap.restype = ctypes.c_void_p
-        self._libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        self._libc.mmap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_long,
+        ]
         self._libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
         self._fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         os.posix_fallocate(self._fd, 0, self.nbytes)
-        self._pointer = self._libc.mmap(None, self.nbytes, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, self._fd, 0)
+        self._pointer = self._libc.mmap(
+            None,
+            self.nbytes,
+            mmap.PROT_READ | mmap.PROT_WRITE,
+            mmap.MAP_SHARED,
+            self._fd,
+            0,
+        )
         with torch.cuda.device(device):
-            (error,) = cudart.cudaHostRegister(self._pointer, self.nbytes, cudart.cudaHostRegisterMapped)
+            (error,) = cudart.cudaHostRegister(
+                self._pointer, self.nbytes, cudart.cudaHostRegisterMapped
+            )
             assert error == cudart.cudaError_t.cudaSuccess, error
             error, device_pointer = cudart.cudaHostGetDevicePointer(self._pointer, 0)
             assert error == cudart.cudaError_t.cudaSuccess, error
-        self.host_view = _tensor_from_pointer(self._pointer, shape=shape, dtype=dtype, device=torch.device("cpu"), nbytes=self.nbytes)
-        self.device_view = _tensor_from_pointer(int(device_pointer), shape=shape, dtype=dtype, device=device, nbytes=self.nbytes)
+        self.host_view = _tensor_from_pointer(
+            self._pointer,
+            shape=shape,
+            dtype=dtype,
+            device=torch.device("cpu"),
+            nbytes=self.nbytes,
+        )
+        self.device_view = _tensor_from_pointer(
+            int(device_pointer),
+            shape=shape,
+            dtype=dtype,
+            device=device,
+            nbytes=self.nbytes,
+        )
 
     def close(self):
         from cuda.bindings import runtime as cudart
@@ -323,26 +545,37 @@ def test_cuda_storage_runs_from_caller_registered_tmpfs_regions(resources):
         pytest.skip("requires a /dev/shm tmpfs")
     directory = tempfile.mkdtemp(dir="/dev/shm")
     resources.callback(shutil.rmtree, directory, ignore_errors=True)
-    caps = _small_caps(require_b12x(), quant_mode="nvfp4_group16", table_memory="mapped_host")
+    caps = _small_caps(
+        require_b12x(), quant_mode="nvfp4_group16", table_memory="mapped_host"
+    )
     device = caps.device
     geometry = _small_geometry(caps)
     layout = ple_embedding.storage_layout(caps, geometry=geometry)
     regions = {}
 
     def host_allocator(name, shape, dtype):
-        regions[name] = _TmpfsTableRegion(os.path.join(directory, name), shape, dtype, device)
+        regions[name] = _TmpfsTableRegion(
+            os.path.join(directory, name), shape, dtype, device
+        )
         return regions[name]
 
     storage = layout.allocate_storage(host_allocator=host_allocator)
     assert list(regions) == ["weight", "weight_scale"]
     assert storage.weight.data_ptr() == regions["weight"].device_view.data_ptr()
-    assert storage.weight_scale.data_ptr() == regions["weight_scale"].device_view.data_ptr()
+    assert (
+        storage.weight_scale.data_ptr()
+        == regions["weight_scale"].device_view.data_ptr()
+    )
     weight, weight_scale, weight_scale_2 = _storage(layout)
     storage.weight_load_view.copy_(weight.cpu())
     storage.weight_scale_load_view.copy_(weight_scale.cpu())
     storage.weight_scale_2_load_view.copy_(weight_scale_2)
     tensors = _tensors(layout, ple_embedding.allocate_geometry(geometry, device=device))
-    tensors.update(weight=storage.weight, weight_scale=storage.weight_scale, weight_scale_2=storage.weight_scale_2)
+    tensors.update(
+        weight=storage.weight,
+        weight_scale=storage.weight_scale,
+        weight_scale_2=storage.weight_scale_2,
+    )
     binding, _, _, _, _ = _prepared_binding(resources, caps, tensors=tensors)
 
     actual = ple_embedding.run(binding)
@@ -357,8 +590,12 @@ def test_host_allocator_requires_mapped_host_tables():
     caps = _small_caps("cpu", quant_mode="nvfp4_group16")
     layout = ple_embedding.storage_layout(caps, geometry=_small_geometry(caps))
 
-    with pytest.raises(ValueError, match="host_allocator requires table_memory='mapped_host'"):
-        layout.allocate_storage(host_allocator=lambda *_: pytest.fail("allocator called"))
+    with pytest.raises(
+        ValueError, match="host_allocator requires table_memory='mapped_host'"
+    ):
+        layout.allocate_storage(
+            host_allocator=lambda *_: pytest.fail("allocator called")
+        )
 
 
 class _TrackedAllocation:
@@ -376,7 +613,11 @@ class _TrackedAllocation:
 def test_cuda_storage_rejects_and_closes_a_mismatched_region():
     caps = _small_caps(require_b12x(), quant_mode="bf16", table_memory="mapped_host")
     layout = ple_embedding.storage_layout(caps, geometry=_small_geometry(caps))
-    region = _TrackedAllocation(MappedHostAllocation((1, layout.weight_shape[1]), layout.weight_dtype, caps.device))
+    region = _TrackedAllocation(
+        MappedHostAllocation(
+            (1, layout.weight_shape[1]), layout.weight_dtype, caps.device
+        )
+    )
 
     with pytest.raises(ValueError, match="host_allocator returned weight"):
         layout.allocate_storage(host_allocator=lambda *_: region)
@@ -385,7 +626,9 @@ def test_cuda_storage_rejects_and_closes_a_mismatched_region():
 
 @pytest.mark.parametrize("failure", ["allocate", "validate", "cleanup"])
 def test_cuda_storage_closes_all_regions_after_allocation_failure(failure):
-    caps = _small_caps(require_b12x(), quant_mode="nvfp4_group16", table_memory="mapped_host")
+    caps = _small_caps(
+        require_b12x(), quant_mode="nvfp4_group16", table_memory="mapped_host"
+    )
     layout = ple_embedding.storage_layout(caps, geometry=_small_geometry(caps))
     regions = []
 
@@ -407,7 +650,9 @@ def test_cuda_storage_closes_all_regions_after_allocation_failure(failure):
         return region
 
     expected = OSError if failure == "allocate" else ValueError
-    with pytest.raises(expected, match="scale allocation failed|host_allocator returned weight_scale") as info:
+    with pytest.raises(
+        expected, match="scale allocation failed|host_allocator returned weight_scale"
+    ) as info:
         layout.allocate_storage(host_allocator=allocate)
     assert all(region.closed == 1 for region in regions)
     if failure == "cleanup":
@@ -415,7 +660,9 @@ def test_cuda_storage_closes_all_regions_after_allocation_failure(failure):
 
 
 def test_cuda_storage_close_attempts_every_region_once():
-    caps = _small_caps(require_b12x(), quant_mode="nvfp4_group16", table_memory="mapped_host")
+    caps = _small_caps(
+        require_b12x(), quant_mode="nvfp4_group16", table_memory="mapped_host"
+    )
     layout = ple_embedding.storage_layout(caps, geometry=_small_geometry(caps))
     regions = []
 
@@ -443,7 +690,9 @@ def test_cuda_storage_close_attempts_every_region_once():
 @torch.inference_mode()
 @pytest.mark.parametrize("quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"])
 def test_cuda_prepared_execution_compiles_fullgraph(resources, quant_mode):
-    binding, _, _, _, _ = _prepared_binding(resources, _small_caps(require_b12x(), quant_mode=quant_mode))
+    binding, _, _, _, _ = _prepared_binding(
+        resources, _small_caps(require_b12x(), quant_mode=quant_mode)
+    )
     expected = _reference(binding)
     actual = torch.compile(lambda: ple_embedding.run(binding), fullgraph=True)()
     torch.cuda.synchronize(binding.out.device)
@@ -453,8 +702,12 @@ def test_cuda_prepared_execution_compiles_fullgraph(resources, quant_mode):
 @torch.inference_mode()
 @pytest.mark.parametrize("quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"])
 @pytest.mark.parametrize("token_count", [None, 3])
-def test_cuda_graph_replay_uses_prepared_execution_without_allocating(resources, quant_mode, token_count):
-    binding, _, layout, session, result = _prepared_binding(resources, _small_caps(require_b12x(), quant_mode=quant_mode))
+def test_cuda_graph_replay_uses_prepared_execution_without_allocating(
+    resources, quant_mode, token_count
+):
+    binding, _, layout, session, result = _prepared_binding(
+        resources, _small_caps(require_b12x(), quant_mode=quant_mode)
+    )
     binding.num_seqs.fill_(2)
     live_tokens = 4 if token_count is None else token_count
     binding.num_tokens.fill_(live_tokens)
@@ -476,13 +729,17 @@ def test_cuda_graph_replay_uses_prepared_execution_without_allocating(resources,
             .neg_()
             .to(torch.float8_e4m3fn)
         )
-        binding.weight_scale.fill_(.5)
+        binding.weight_scale.fill_(0.5)
     else:
         binding.weight.bitwise_xor_(0x88)
-        binding.weight_scale.fill_(.5)
-        binding.weight_scale_2.fill_(.75)
-    binding.token_ids[:2].copy_(torch.tensor([8, 9], dtype=torch.int64, device=binding.out.device))
-    binding.query_start_loc.copy_(torch.tensor([0, 2, 0], dtype=torch.int32, device=binding.out.device))
+        binding.weight_scale.fill_(0.5)
+        binding.weight_scale_2.fill_(0.75)
+    binding.token_ids[:2].copy_(
+        torch.tensor([8, 9], dtype=torch.int64, device=binding.out.device)
+    )
+    binding.query_start_loc.copy_(
+        torch.tensor([0, 2, 0], dtype=torch.int32, device=binding.out.device)
+    )
     binding.num_seqs.fill_(1)
     binding.num_tokens.fill_(2)
     expected = _reference(binding)
@@ -501,13 +758,23 @@ def test_cuda_large_local_row_uses_int64_scaled_addressing(resources):
     prime = nth_prime_after(1 << 24, 1)
     target_id = prime - 1
     caps = ple_embedding.Caps(
-        device=device, max_tokens=1, max_seqs=1, vocab_size=prime + 2,
-        eos_token_id=prime + 1, max_order=2, heads_per_order=1,
-        dense_layer_ordinal=0, base_table_size=prime, embedding_dim=160,
-        tp_size=1, tp_rank=0, table_alignment=128,
+        device=device,
+        max_tokens=1,
+        max_seqs=1,
+        vocab_size=prime + 2,
+        eos_token_id=prime + 1,
+        max_order=2,
+        heads_per_order=1,
+        dense_layer_ordinal=0,
+        base_table_size=prime,
+        embedding_dim=160,
+        tp_size=1,
+        tp_rank=0,
+        table_alignment=128,
     )
     geometry = ple_embedding.compute_geometry(
-        caps, prime_sizes=torch.tensor([prime], dtype=torch.int64),
+        caps,
+        prime_sizes=torch.tensor([prime], dtype=torch.int64),
         table_offsets=torch.tensor([0], dtype=torch.int64),
         multipliers=torch.tensor([1, 1], dtype=torch.int64),
     )
@@ -518,14 +785,16 @@ def test_cuda_large_local_row_uses_int64_scaled_addressing(resources):
         "weight": torch.empty(
             layout.weight_shape, dtype=layout.weight_dtype, device=device
         ),
-        "weight_scale": torch.tensor([.25], dtype=torch.bfloat16, device=device),
+        "weight_scale": torch.tensor([0.25], dtype=torch.bfloat16, device=device),
         "weight_scale_2": None,
         "token_ids": torch.tensor([target_id], dtype=torch.int64, device=device),
         "query_start_loc": torch.tensor([0, 1], dtype=torch.int32, device=device),
         "committed_history": torch.tensor([[0]], dtype=torch.int64, device=device),
         "num_seqs": torch.tensor([1], dtype=torch.int32, device=device),
         "num_tokens": torch.tensor([1], dtype=torch.int32, device=device),
-        "out": torch.empty(layout.output_shape, dtype=layout.output_dtype, device=device),
+        "out": torch.empty(
+            layout.output_shape, dtype=layout.output_dtype, device=device
+        ),
         "_geometry": geometry_tensors,
     }
     tensors["weight"][target_id].fill_(2.0)
@@ -533,12 +802,16 @@ def test_cuda_large_local_row_uses_int64_scaled_addressing(resources):
         resources, caps, name="large-row", tensors=tensors
     )
     torch.testing.assert_close(
-        ple_embedding.run(binding), torch.full_like(binding.out, .5), rtol=0, atol=0
+        ple_embedding.run(binding), torch.full_like(binding.out, 0.5), rtol=0, atol=0
     )
 
 
 def _disk_binding(resources, oracle_binding, tmp_path, *, name="disk"):
-    caps = replace(oracle_binding._state.caps, device=oracle_binding.out.device, table_memory="io_uring")
+    caps = replace(
+        oracle_binding._state.caps,
+        device=oracle_binding.out.device,
+        table_memory="io_uring",
+    )
     geometry = oracle_binding._hash_binding.geometry.geometry
     layout = ple_embedding.storage_layout(caps, geometry=geometry)
     table = ple_embedding.DiskTable(layout, shard_rows=7, queue_depth=4)
@@ -546,18 +819,36 @@ def _disk_binding(resources, oracle_binding, tmp_path, *, name="disk"):
     if caps.quant_mode == "nvfp4_group16":
         payloads.append((True, oracle_binding.weight_scale))
     for scale, local in payloads:
-        full = torch.zeros((layout.padded_vocab_size, local.shape[1]), dtype=local.dtype)
-        full[layout.shard_start:layout.shard_end].copy_(local.cpu())
+        full = torch.zeros(
+            (layout.padded_vocab_size, local.shape[1]), dtype=local.dtype
+        )
+        full[layout.shard_start : layout.shard_end].copy_(local.cpu())
         for index, start in enumerate(range(0, layout.padded_vocab_size, 7)):
             path = tmp_path / f"{scale}-{index}.bin"
-            path.write_bytes(bytes(4093) + full[start:start + 7].view(torch.uint8).numpy().tobytes())
+            path.write_bytes(
+                bytes(4093)
+                + full[start : start + 7].view(torch.uint8).numpy().tobytes()
+            )
             table.add_shard(index, str(path), 4093, scale=scale)
     geometry_tensors = ple_embedding.allocate_geometry(geometry, device=caps.device)
     tensors = _tensors(layout, geometry_tensors)
-    tensors.update(weight=None, disk_table=table, weight_scale=(oracle_binding.weight_scale.to(caps.device) if caps.quant_mode == "fp8_e4m3_per_tensor" else None),
-        weight_scale_2=None if oracle_binding.weight_scale_2 is None else oracle_binding.weight_scale_2.to(caps.device),
-        token_ids=oracle_binding.token_ids.to(caps.device), query_start_loc=oracle_binding.query_start_loc.to(caps.device),
-        committed_history=oracle_binding.committed_history.to(caps.device), num_seqs=oracle_binding.num_seqs.to(caps.device), num_tokens=oracle_binding.num_tokens.to(caps.device))
+    tensors.update(
+        weight=None,
+        disk_table=table,
+        weight_scale=(
+            oracle_binding.weight_scale.to(caps.device)
+            if caps.quant_mode == "fp8_e4m3_per_tensor"
+            else None
+        ),
+        weight_scale_2=None
+        if oracle_binding.weight_scale_2 is None
+        else oracle_binding.weight_scale_2.to(caps.device),
+        token_ids=oracle_binding.token_ids.to(caps.device),
+        query_start_loc=oracle_binding.query_start_loc.to(caps.device),
+        committed_history=oracle_binding.committed_history.to(caps.device),
+        num_seqs=oracle_binding.num_seqs.to(caps.device),
+        num_tokens=oracle_binding.num_tokens.to(caps.device),
+    )
     return _prepared_binding(resources, caps, name=name, tensors=tensors), table
 
 
@@ -571,7 +862,9 @@ def test_disk_preparation_matches_resident_and_graph_consumes_only_output(
         _small_caps(require_b12x(), quant_mode=quant_mode),
         name="resident",
     )
-    (binding, _, _, session, result), table = _disk_binding(resources, resident, tmp_path)
+    (binding, _, _, session, result), table = _disk_binding(
+        resources, resident, tmp_path
+    )
     assert table.layout == binding._state
     with pytest.raises(RuntimeError, match="after binding"):
         table.add_shard(0, str(tmp_path / "absent"), 0)
@@ -591,7 +884,11 @@ def test_disk_preparation_matches_resident_and_graph_consumes_only_output(
     graph.replay()
     torch.testing.assert_close(consumed, expected * 2, rtol=0, atol=0)
     with monkeypatch.context() as patch:
-        patch.setattr(table._cache, "read_rows", lambda *args: pytest.fail("consumer graph must not issue disk I/O"))
+        patch.setattr(
+            table._cache,
+            "read_rows",
+            lambda *args: pytest.fail("consumer graph must not issue disk I/O"),
+        )
         graph.replay()
         torch.testing.assert_close(consumed, expected * 2, rtol=0, atol=0)
     with monkeypatch.context() as patch:
@@ -603,15 +900,29 @@ def test_disk_preparation_matches_resident_and_graph_consumes_only_output(
 @torch.inference_mode()
 @pytest.mark.parametrize("quant_mode", ["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"])
 @pytest.mark.parametrize("tp_rank", [0, 1])
-def test_disk_compact_rows_preserve_duplicates_and_tp_shard_boundaries(resources, quant_mode, tp_rank, tmp_path):
+def test_disk_compact_rows_preserve_duplicates_and_tp_shard_boundaries(
+    resources, quant_mode, tp_rank, tmp_path
+):
     device = require_b12x()
-    resident, _, _, _, _ = _prepared_binding(resources, _small_caps(device, tp_rank=tp_rank, quant_mode=quant_mode), name="resident-rows")
-    (binding, _, layout, session, result), table = _disk_binding(resources, resident, tmp_path, name="disk-rows")
+    resident, _, _, _, _ = _prepared_binding(
+        resources,
+        _small_caps(device, tp_rank=tp_rank, quant_mode=quant_mode),
+        name="resident-rows",
+    )
+    (binding, _, layout, session, result), table = _disk_binding(
+        resources, resident, tmp_path, name="disk-rows"
+    )
     edge = ((layout.shard_start + 7) // 7) * 7
-    ids = torch.tensor([[layout.shard_start, layout.shard_start, edge - 1, edge],
-        [layout.shard_start - 1, layout.shard_end - 1, layout.shard_end, -1],
-        [layout.table_vocab_size, layout.padded_vocab_size, edge, edge],
-        [edge + 1, edge - 1, layout.shard_start, -2], [-1, -1, -1, -1]], dtype=torch.int64)
+    ids = torch.tensor(
+        [
+            [layout.shard_start, layout.shard_start, edge - 1, edge],
+            [layout.shard_start - 1, layout.shard_end - 1, layout.shard_end, -1],
+            [layout.table_vocab_size, layout.padded_vocab_size, edge, edge],
+            [edge + 1, edge - 1, layout.shard_start, -2],
+            [-1, -1, -1, -1],
+        ],
+        dtype=torch.int64,
+    )
     binding._ids.copy_(ids.to(device))
     torch.cuda.synchronize(binding.out.device)
     with table._cache.transaction():
@@ -619,15 +930,29 @@ def test_disk_compact_rows_preserve_duplicates_and_tp_shard_boundaries(resources
         torch.cuda.synchronize(binding.out.device)
     binding.num_tokens.fill_(4)
     state = require_prepared(binding.plan, "sequence.ple_embedding", binding.out.device)
-    scale = table.weight_scale if quant_mode == "nvfp4_group16" else binding.weight_scale
+    scale = (
+        table.weight_scale if quant_mode == "nvfp4_group16" else binding.weight_scale
+    )
     with session.capture():
         state.run_lookup(
-            table.weight, scale, binding.weight_scale_2,
-            binding._ids, binding.num_tokens, binding.out, token_count=layout.caps.max_tokens,
+            table.weight,
+            scale,
+            binding.weight_scale_2,
+            binding._ids,
+            binding.num_tokens,
+            binding.out,
+            token_count=layout.caps.max_tokens,
         )
-    expected = reference.lookup(resident.weight, resident.weight_scale, ids.masked_fill(ids >= layout.table_vocab_size, -1).to(binding.out.device),
-        quant_mode=quant_mode, weight_scale_2=resident.weight_scale_2, num_tokens=4,
-        shard_start=layout.shard_start, embedding_dim=layout.caps.embedding_dim)
+    expected = reference.lookup(
+        resident.weight,
+        resident.weight_scale,
+        ids.masked_fill(ids >= layout.table_vocab_size, -1).to(binding.out.device),
+        quant_mode=quant_mode,
+        weight_scale_2=resident.weight_scale_2,
+        num_tokens=4,
+        shard_start=layout.shard_start,
+        embedding_dim=layout.caps.embedding_dim,
+    )
     torch.testing.assert_close(binding.out, expected, rtol=0, atol=0)
     stats = table.stats()
     assert stats["lookups"] == ids.numel()

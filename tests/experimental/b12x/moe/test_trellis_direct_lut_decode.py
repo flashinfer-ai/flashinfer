@@ -78,7 +78,11 @@ class _DecodeProbe:
             wa, wb, value_table_addr, self.bits, value_table_in_shared=False
         )
         lo_d, hi_d = packed_decode_lut_e4m3_direct_to_e4m3x8(
-            wa, wb, dir_addr, self.bits, rate_indexed=not self.shared,
+            wa,
+            wb,
+            dir_addr,
+            self.bits,
+            rate_indexed=not self.shared,
             in_shared=self.shared,
         )
         out[4 * lane] = Int32(lo_t)
@@ -111,9 +115,7 @@ def test_direct_table_decode_bit_equals_value_table(bits: int, shared: bool) -> 
     mismatched = 0
     for _ in range(512):
         wins.copy_(
-            torch.randint(
-                -(2**31), 2**31 - 1, (64,), dtype=torch.int32, device=device
-            )
+            torch.randint(-(2**31), 2**31 - 1, (64,), dtype=torch.int32, device=device)
         )
         compiled(*args())
         torch.cuda.synchronize()
@@ -136,8 +138,10 @@ def test_shared_direct_lut_covers_all_codewords(bits: int) -> None:
     value_table = lut_e4m3_value_table_cpu().to(device)
     direct = lut_e4m3_direct_table_cpu().to(device)
     out = torch.empty(65536 * 4, device=device, dtype=torch.int32)
-    args = tuple(from_dlpack(tensor, assumed_align=16)
-                 for tensor in (wins, value_table, direct, out)) + (current_cuda_stream(),)
+    args = tuple(
+        from_dlpack(tensor, assumed_align=16)
+        for tensor in (wins, value_table, direct, out)
+    ) + (current_cuda_stream(),)
     compiled = b12x_compile(_DecodeProbe(bits, shared=True), *args)
     compiled(*args)
     torch.cuda.synchronize()

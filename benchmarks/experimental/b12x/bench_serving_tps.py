@@ -8,6 +8,7 @@ Usage:
     python scripts/bench_serving_tps.py --api-key KEY [--url http://localhost:8001] \
         [--model Qwen3.6-27B-FP6-W6A6] [--tokens 512] [--runs 3]
 """
+
 from __future__ import annotations
 
 import argparse

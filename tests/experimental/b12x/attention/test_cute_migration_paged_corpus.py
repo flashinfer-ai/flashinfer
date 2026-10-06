@@ -31,11 +31,17 @@ from b12x._lib.compiler import (
 from b12x._lib.utils import current_cuda_stream
 from b12x.attention._shared.contiguous.api import clear_attention_caches
 from b12x.attention.paged._forward import paged_attention_forward
-from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention.paged._scratch import (
+    B12XPagedAttentionScratchCaps,
+    plan_paged_attention_scratch,
+)
 from b12x.attention.paged.planner import create_paged_plan
 
 from b12x.testing.reference.helpers import require_b12x
-from b12x.testing.reference.paged_attention_helpers import make_paged_inputs, quantize_paged_kv_cache_e4m3
+from b12x.testing.reference.paged_attention_helpers import (
+    make_paged_inputs,
+    quantize_paged_kv_cache_e4m3,
+)
 
 
 _Q_HEADS = 8
@@ -173,17 +179,15 @@ def test_paged_fp8_prefill_size_graph_oracle(q_len: int) -> None:
     """Pin every requested generic-prefill size to an oracle and graph replay."""
     require_b12x()
     clear_attention_caches()
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
-        make_paged_inputs(
-            q_seqlens=[q_len],
-            cache_seqlens=[q_len],
-            page_size=_PAGE_SIZE,
-            q_heads=_Q_HEADS,
-            kv_heads=_KV_HEADS,
-            head_dim=_HEAD_DIM,
-            dtype=torch.bfloat16,
-            seed=9100 + q_len,
-        )
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
+        q_seqlens=[q_len],
+        cache_seqlens=[q_len],
+        page_size=_PAGE_SIZE,
+        q_heads=_Q_HEADS,
+        kv_heads=_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        dtype=torch.bfloat16,
+        seed=9100 + q_len,
     )
     k_fp8, v_fp8, k_descale, v_descale = quantize_paged_kv_cache_e4m3(
         k_cache,
@@ -259,17 +263,15 @@ def _run_paged_forward_graph_oracle(
     clear_attention_caches()
     mode = "decode" if disable_split_kv else "verify"
     q_len = 1 if mode == "decode" else 4
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
-        make_paged_inputs(
-            q_seqlens=[q_len],
-            cache_seqlens=[256],
-            page_size=_PAGE_SIZE,
-            q_heads=_Q_HEADS,
-            kv_heads=_KV_HEADS,
-            head_dim=_HEAD_DIM,
-            dtype=torch.bfloat16,
-            seed=9200 + (1 if kv_dtype == torch.float8_e4m3fn else 0),
-        )
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
+        q_seqlens=[q_len],
+        cache_seqlens=[256],
+        page_size=_PAGE_SIZE,
+        q_heads=_Q_HEADS,
+        kv_heads=_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        dtype=torch.bfloat16,
+        seed=9200 + (1 if kv_dtype == torch.float8_e4m3fn else 0),
     )
     k_descale = None
     v_descale = None
@@ -685,17 +687,15 @@ def test_paged_unreachable_raw_body_graph_oracle(case: _RawCase) -> None:
     """Migration-only proof for raw bodies that have no serving call sites."""
     require_b12x()
     cache_len = 128 if case.split_kv else 64
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
-        make_paged_inputs(
-            q_seqlens=[case.q_len],
-            cache_seqlens=[cache_len],
-            page_size=_PAGE_SIZE,
-            q_heads=_Q_HEADS,
-            kv_heads=_KV_HEADS,
-            head_dim=_HEAD_DIM,
-            dtype=torch.bfloat16,
-            seed=9300 + case.q_len + (100 if case.split_kv else 0),
-        )
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
+        q_seqlens=[case.q_len],
+        cache_seqlens=[cache_len],
+        page_size=_PAGE_SIZE,
+        q_heads=_Q_HEADS,
+        kv_heads=_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        dtype=torch.bfloat16,
+        seed=9300 + case.q_len + (100 if case.split_kv else 0),
     )
     k_descale = None
     v_descale = None
@@ -802,9 +802,7 @@ def test_raw_extend_page128_graph_handles_high_pool_page_id(case: _RawCase) -> N
 
     kv_dtype = torch.float8_e4m3fn if case.fp8_kv else torch.bfloat16
     element_size = torch.empty((), dtype=kv_dtype).element_size()
-    page_stride_bytes = (
-        case.page_size * _KV_HEADS * _HEAD_DIM * element_size
-    )
+    page_stride_bytes = case.page_size * _KV_HEADS * _HEAD_DIM * element_size
     int32_max = torch.iinfo(torch.int32).max
     high_page_id = int32_max // page_stride_bytes + 2
     num_cache_pages = high_page_id + 1
@@ -837,34 +835,25 @@ def test_raw_extend_page128_graph_handles_high_pool_page_id(case: _RawCase) -> N
     stage_tile_rows = 64 if case.fp8_kv else 32
     page_tiles_per_page = case.page_size // stage_tile_rows
     tile_stride_bytes = stage_tile_rows * _HEAD_DIM * element_size
-    assert (
-        high_page_id * page_tiles_per_page * tile_stride_bytes > int32_max
-    )
+    assert high_page_id * page_tiles_per_page * tile_stride_bytes > int32_max
 
-    q = torch.randn(
-        (case.q_len, _Q_HEADS, _HEAD_DIM),
-        dtype=torch.bfloat16,
-        device=device,
-    ) / 4
-    page_table = torch.tensor(
-        [[high_page_id]], dtype=torch.int32, device=device
+    q = (
+        torch.randn(
+            (case.q_len, _Q_HEADS, _HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 4
     )
+    page_table = torch.tensor([[high_page_id]], dtype=torch.int32, device=device)
     page_table_expected = page_table.clone()
-    cache_seqlens = torch.tensor(
-        [case.page_size], dtype=torch.int32, device=device
-    )
-    cu_seqlens_q = torch.tensor(
-        [0, case.q_len], dtype=torch.int32, device=device
-    )
+    cache_seqlens = torch.tensor([case.page_size], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, case.q_len], dtype=torch.int32, device=device)
     k_descale = (
-        torch.ones(1, dtype=torch.float32, device=device)
-        if case.fp8_kv
-        else None
+        torch.ones(1, dtype=torch.float32, device=device) if case.fp8_kv else None
     )
     v_descale = (
-        torch.ones(1, dtype=torch.float32, device=device)
-        if case.fp8_kv
-        else None
+        torch.ones(1, dtype=torch.float32, device=device) if case.fp8_kv else None
     )
     expected, expected_lse = paged_attention_reference(
         q,
@@ -972,17 +961,15 @@ def test_paged_fp8_planewords_atom_byte_contract_graph(
     monkeypatch.setenv("B12X_PAGED_KV_TMA_PLANE_SWIZZLE", "3,4,3")
     clear_attention_caches()
     request.addfinalizer(clear_attention_caches)
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
-        make_paged_inputs(
-            q_seqlens=[4],
-            cache_seqlens=[64],
-            page_size=_PAGE_SIZE,
-            q_heads=_Q_HEADS,
-            kv_heads=_KV_HEADS,
-            head_dim=_HEAD_DIM,
-            dtype=torch.bfloat16,
-            seed=9400,
-        )
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
+        q_seqlens=[4],
+        cache_seqlens=[64],
+        page_size=_PAGE_SIZE,
+        q_heads=_Q_HEADS,
+        kv_heads=_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        dtype=torch.bfloat16,
+        seed=9400,
     )
     k_fp8, v_fp8, k_descale, v_descale = quantize_paged_kv_cache_e4m3(
         k_cache,

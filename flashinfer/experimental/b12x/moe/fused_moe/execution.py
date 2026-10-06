@@ -1,4 +1,5 @@
 """Declarative canonical fused-MoE execution preparation."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from b12x.preparation import FrozenMapping
 @dataclass(frozen=True, kw_only=True)
 class ExecutionCapacity:
     """Prefill token capacity and exact planned decode specializations."""
+
     max_tokens: int
     top_k: int
     warmup_token_counts: tuple[int, ...] = ()
@@ -35,6 +37,7 @@ class ExecutionCapacity:
 @dataclass(frozen=True, kw_only=True)
 class RoutingSpec:
     """Immutable routing and numerical controls captured by preparation."""
+
     apply_router_weight_on_input: bool = False
     logits_dtype: torch.dtype | None = None
     deterministic_output: bool | None = None
@@ -46,11 +49,25 @@ class RoutingSpec:
     has_image_mask: bool = False
     routed_scaling_factor: float = 1.0
 
-def plan_execution(*, experts, capacity: ExecutionCapacity, routing: RoutingSpec | None = None,
-                   invocation: FrozenMapping = FrozenMapping(), override=None):
+
+def plan_execution(
+    *,
+    experts,
+    capacity: ExecutionCapacity,
+    routing: RoutingSpec | None = None,
+    invocation: FrozenMapping = FrozenMapping(),
+    override=None,
+):
     """Return a composite declaration, never an executable plan or warmup handle."""
     from ._preparation import plan
-    return plan(experts, capacity=capacity, routing=routing, invocation=invocation, override=override)
+
+    return plan(
+        experts,
+        capacity=capacity,
+        routing=routing,
+        invocation=invocation,
+        override=override,
+    )
 
 
 __all__ = ["ExecutionCapacity", "RoutingSpec", "plan_execution"]

@@ -37,13 +37,17 @@ class FlashInferTrtllmFP4E8M0K32Weights:
 def _block_scale_interleave_128x4_torch(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     """Byte-preserving torch equivalent of FlashInfer/TRT-LLM block_scale_interleave."""
     if unswizzled_sf.dtype not in {torch.uint8, torch.bfloat16}:
-        raise TypeError(f"expected uint8 or bfloat16 scale tensor, got {unswizzled_sf.dtype}")
+        raise TypeError(
+            f"expected uint8 or bfloat16 scale tensor, got {unswizzled_sf.dtype}"
+        )
     if unswizzled_sf.dim() == 2:
         sf = unswizzled_sf.reshape(1, unswizzled_sf.shape[0], unswizzled_sf.shape[1])
     elif unswizzled_sf.dim() == 3:
         sf = unswizzled_sf
     else:
-        raise ValueError(f"expected 2D or 3D scale tensor, got shape {tuple(unswizzled_sf.shape)}")
+        raise ValueError(
+            f"expected 2D or 3D scale tensor, got shape {tuple(unswizzled_sf.shape)}"
+        )
 
     batches, rows, cols = sf.shape
     rows_padded = ((int(rows) + 127) // 128) * 128
@@ -123,7 +127,9 @@ def prepare_flashinfer_trtllm_fp4_e8m0_k32_weights(
     if not w13_fp4.is_cuda or not w2_fp4.is_cuda:
         raise RuntimeError("FlashInfer TRT-LLM FP4 preparation requires CUDA tensors")
     if int(K) % 32 != 0 or int(I_tp) % 32 != 0:
-        raise ValueError(f"FlashInfer MXFP4 prep requires K and I_tp divisible by 32, got K={K}, I_tp={I_tp}")
+        raise ValueError(
+            f"FlashInfer MXFP4 prep requires K and I_tp divisible by 32, got K={K}, I_tp={I_tp}"
+        )
     rows_w13 = moe_activation_w1_rows(activation, I_tp)
     if tuple(w13_e8m0_scale.shape) != (int(w13_fp4.shape[0]), rows_w13, int(K) // 32):
         raise ValueError(
@@ -219,7 +225,9 @@ def _per_expert_float32(
     if scale.numel() == 1:
         return scale.reshape(1).expand(num_experts).contiguous()
     if scale.numel() != num_experts:
-        raise ValueError(f"expected scalar or {num_experts} per-expert scales, got {scale.numel()}")
+        raise ValueError(
+            f"expected scalar or {num_experts} per-expert scales, got {scale.numel()}"
+        )
     return scale.reshape(num_experts).contiguous()
 
 
@@ -229,7 +237,9 @@ def pack_flashinfer_trtllm_topk_ids_weights(
 ) -> torch.Tensor:
     """Pack top-k ids/weights exactly like vLLM/SGLang's TRT-LLM wrappers."""
     if topk_ids.shape != topk_weights.shape:
-        raise ValueError(f"shape mismatch: topk_ids={tuple(topk_ids.shape)} topk_weights={tuple(topk_weights.shape)}")
+        raise ValueError(
+            f"shape mismatch: topk_ids={tuple(topk_ids.shape)} topk_weights={tuple(topk_weights.shape)}"
+        )
     weight_bits = (
         topk_weights.contiguous().to(torch.bfloat16).view(torch.int16).to(torch.int32)
         & 0xFFFF
@@ -308,9 +318,13 @@ def moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared(
             "FlashInfer TRT-LLM FP4 oracle does not support swigluoai_uninterleave"
         )
     if x.dtype != torch.bfloat16:
-        raise TypeError(f"FlashInfer W4A16 oracle expects BF16 activations, got {x.dtype}")
+        raise TypeError(
+            f"FlashInfer W4A16 oracle expects BF16 activations, got {x.dtype}"
+        )
     if int(E) != int(prepared.w13.shape[0]) or int(E) != int(prepared.w2.shape[0]):
-        raise ValueError("E must match the expert dimension of FlashInfer prepared weights")
+        raise ValueError(
+            "E must match the expert dimension of FlashInfer prepared weights"
+        )
 
     try:
         from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
@@ -327,7 +341,9 @@ def moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared(
     if swiglu_limit is not None:
         if activation != "silu":
             raise ValueError("swiglu_limit requires a gated W4A16 activation")
-        clamp_limit = torch.full((int(E),), float(swiglu_limit), dtype=torch.float32, device=x.device)
+        clamp_limit = torch.full(
+            (int(E),), float(swiglu_limit), dtype=torch.float32, device=x.device
+        )
 
     if activation == "silu":
         activation_type = int(ActivationType.Swiglu)

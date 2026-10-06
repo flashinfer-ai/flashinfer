@@ -1104,6 +1104,7 @@ def _prepare_case(
             slot = prior % caps.raw_ring_capacity
             raw_tags[request, slot] = prior
             raw_rope[request, slot, :] = prior
+
     def prepare_call(state):
         (spec,) = state.scratch_specs()
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
@@ -1553,8 +1554,14 @@ def _validate_correctness(
 
 def _time_eager(run, restore, *, warmup, replays, l2_flush):
     from b12x.testing.benchmark import measure_call
-    return measure_call(run, warmup=warmup, samples=replays, reset=restore,
-                        eviction=l2_flush or (lambda: None)).raw_samples("workload")
+
+    return measure_call(
+        run,
+        warmup=warmup,
+        samples=replays,
+        reset=restore,
+        eviction=l2_flush or (lambda: None),
+    ).raw_samples("workload")
 
 
 def _summary(samples: Sequence[float]) -> dict[str, float]:
@@ -1842,7 +1849,14 @@ def main(argv: list[str] | None = None) -> int:
             },
             "contract": {
                 "model": "Qwen3.8 Flash Next",
-                "api": ["Caps", "declaration", "PreparationSession", "Plan", "bind", "run"],
+                "api": [
+                    "Caps",
+                    "declaration",
+                    "PreparationSession",
+                    "Plan",
+                    "bind",
+                    "run",
+                ],
                 "timed_operation": "bound qsa.run transaction",
                 "setup_operation": "Caps -> declaration -> prepare -> bind",
                 "main_kv_pool": (

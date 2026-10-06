@@ -192,8 +192,8 @@ class Nvfp4MaterializedPhase2Kernel:
         # contraction (intermediate) dim contiguous, so each hidden output
         # row's K64 slice is 32 contiguous bytes.  Pool-scaled weight-row
         # offsets stay Int64.
-        expert_row_base = Int64(expert_idx) * Int64(output_n128_tiles) * Int64(
-            self.tile_n
+        expert_row_base = (
+            Int64(expert_idx) * Int64(output_n128_tiles) * Int64(self.tile_n)
         )
         row_base = expert_row_base + Int64(output_tile) * Int64(self.tile_n)
         down_row_words = intermediate_tiles * Int32(16)
@@ -333,9 +333,7 @@ class Nvfp4MaterializedPhase2Kernel:
             b_hi = cute.make_rmem_tensor((4,), Uint32)
             sfb_w = cute.make_rmem_tensor((4,), Uint32)
             for g in cutlass.range_constexpr(4):
-                b_row = Int32(8) * (warp_idx * Int32(4) + Int32(g)) + (
-                    lane >> Int32(2)
-                )
+                b_row = Int32(8) * (warp_idx * Int32(4) + Int32(g)) + (lane >> Int32(2))
                 b_lo[g] = ld_shared_u32(b_base + b_row * Int32(32) + Int32(4) * c)
                 b_hi[g] = ld_shared_u32(
                     b_base + b_row * Int32(32) + Int32(4) * c + Int32(16)
@@ -364,9 +362,11 @@ class Nvfp4MaterializedPhase2Kernel:
                 # lanes with c in {1, 3}; the c in {2, 3} lanes re-read the
                 # c in {0, 1} words (clamped to a live row) which the
                 # hardware ignores for this atom.
-                sf_row = Int32(16) * Int32(blk) + (lane >> Int32(2)) + Int32(
-                    8
-                ) * (lane & Int32(1))
+                sf_row = (
+                    Int32(16) * Int32(blk)
+                    + (lane >> Int32(2))
+                    + Int32(8) * (lane & Int32(1))
+                )
                 sfa_w = ld_shared_u32(sfa_base + (sf_row << Int32(2)))
 
                 for g in cutlass.range_constexpr(4):
@@ -408,9 +408,7 @@ class Nvfp4MaterializedPhase2Kernel:
         # folded into the materialized SFA2 plane).
         down_scale = down_alpha[expert_idx].to(cutlass.Float32)
         col_base = (
-            output_tile * Int32(self.tile_n)
-            + warp_idx * Int32(32)
-            + (c << Int32(1))
+            output_tile * Int32(self.tile_n) + warp_idx * Int32(32) + (c << Int32(1))
         )
         for nt in cutlass.range_constexpr(4):
             col = col_base + Int32(nt * 8)
@@ -421,20 +419,22 @@ class Nvfp4MaterializedPhase2Kernel:
                 if row_lo < valid_rows:
                     phys_row = physical_row_base + row_lo
                     tok = token_map[phys_row].to(Int32)
-                    scale = down_scale * token_weights[phys_row].to(
-                        cutlass.Float32
-                    )
+                    scale = down_scale * token_weights[phys_row].to(cutlass.Float32)
                     if cutlass.const_expr(self.deterministic_output):
                         st_global_u32(
                             get_ptr_as_int64(
-                                scatter_output, Int64(tok) * Int64(scatter_n) + Int64(col)
+                                scatter_output,
+                                Int64(tok) * Int64(scatter_n) + Int64(col),
                             ),
-                            pack_f32x2_to_bfloat2(scale * fragment[0], scale * fragment[1]),
+                            pack_f32x2_to_bfloat2(
+                                scale * fragment[0], scale * fragment[1]
+                            ),
                         )
                     else:
                         scatter_add_bf16x2(
                             get_ptr_as_int64(
-                                scatter_output, Int64(tok) * Int64(scatter_n) + Int64(col)
+                                scatter_output,
+                                Int64(tok) * Int64(scatter_n) + Int64(col),
                             ),
                             scale * fragment[0],
                             scale * fragment[1],
@@ -442,20 +442,22 @@ class Nvfp4MaterializedPhase2Kernel:
                 if row_hi < valid_rows:
                     phys_row = physical_row_base + row_hi
                     tok = token_map[phys_row].to(Int32)
-                    scale = down_scale * token_weights[phys_row].to(
-                        cutlass.Float32
-                    )
+                    scale = down_scale * token_weights[phys_row].to(cutlass.Float32)
                     if cutlass.const_expr(self.deterministic_output):
                         st_global_u32(
                             get_ptr_as_int64(
-                                scatter_output, Int64(tok) * Int64(scatter_n) + Int64(col)
+                                scatter_output,
+                                Int64(tok) * Int64(scatter_n) + Int64(col),
                             ),
-                            pack_f32x2_to_bfloat2(scale * fragment[2], scale * fragment[3]),
+                            pack_f32x2_to_bfloat2(
+                                scale * fragment[2], scale * fragment[3]
+                            ),
                         )
                     else:
                         scatter_add_bf16x2(
                             get_ptr_as_int64(
-                                scatter_output, Int64(tok) * Int64(scatter_n) + Int64(col)
+                                scatter_output,
+                                Int64(tok) * Int64(scatter_n) + Int64(col),
                             ),
                             scale * fragment[2],
                             scale * fragment[3],

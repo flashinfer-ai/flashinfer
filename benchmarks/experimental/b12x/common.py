@@ -16,9 +16,7 @@ FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 _AUTO_L2_FLUSH_MULTIPLIER = 2
 _FALLBACK_L2_FLUSH_BYTES = 128 << 20
-_L2_FLUSH_BUFFER_CACHE: dict[
-    tuple[int, int], tuple[torch.Tensor, torch.Tensor]
-] = {}
+_L2_FLUSH_BUFFER_CACHE: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 _NVIDIA_SMI_GPU_MODE_FIELDS = (
@@ -176,7 +174,9 @@ def make_sparse_pool_locs(
         raise ValueError(
             f"pool page capacity {pool_pages} is smaller than active page count {active_pages}"
         )
-    page_ids = torch.randperm(pool_pages, generator=gen, dtype=torch.int64)[:active_pages]
+    page_ids = torch.randperm(pool_pages, generator=gen, dtype=torch.int64)[
+        :active_pages
+    ]
     locs = []
     remaining = active_tokens
     for page_id in page_ids.tolist():
@@ -220,7 +220,9 @@ def make_dense_candidate_page_table(
         device=token_locs.device,
     )
     if token_locs.numel():
-        page_table[:, : token_locs.shape[0]] = token_locs.unsqueeze(0).expand(batch_size, -1)
+        page_table[:, : token_locs.shape[0]] = token_locs.unsqueeze(0).expand(
+            batch_size, -1
+        )
     return page_table
 
 
@@ -250,7 +252,9 @@ def make_dense_real_page_table(
         device=token_locs.device,
     )
     if page_ids.numel():
-        real_page_table[:, : page_ids.shape[0]] = page_ids.unsqueeze(0).expand(batch_size, -1)
+        real_page_table[:, : page_ids.shape[0]] = page_ids.unsqueeze(0).expand(
+            batch_size, -1
+        )
     return real_page_table
 
 
@@ -278,11 +282,13 @@ def capture_cuda_graph(
 
 def bench_cuda_graph(graph, *, replays, prepare=None, l2_flush=None):
     from b12x.testing.benchmark import graph_samples
+
     return graph_samples(graph, replays=replays, prepare=prepare, l2_flush=l2_flush)
 
 
 def bench_gpu_ms(fn, *, warmup, iters, l2_flush=None):
     from b12x.testing.benchmark import median_ms
+
     return median_ms(fn, warmup=warmup, iters=iters, l2_flush=l2_flush)
 
 
@@ -305,7 +311,9 @@ def make_quantized_operand(
     scale: float = 0.25,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     source = torch.randn(shape, device="cuda", dtype=dtype) * scale
-    row_counts = torch.full((shape[0],), shape[1], dtype=torch.int32, device=source.device)
+    row_counts = torch.full(
+        (shape[0],), shape[1], dtype=torch.int32, device=source.device
+    )
     tensor_amax = source.abs().max().to(torch.float32)
     global_scale = torch.tensor(
         [FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax],

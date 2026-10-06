@@ -10,6 +10,7 @@ Compile planning runs in a spawned offline compiler worker, the same process
 shape the compile pool uses, so the host test needs no GPU and leaves the
 test process's CUDA state untouched.
 """
+
 from __future__ import annotations
 
 import multiprocessing
@@ -45,7 +46,14 @@ def _program_keys_by_geometry(payload: dict[str, object] | None, connection) -> 
 
         activity = multiprocessing.get_context("spawn").Array("q", (0, 0))
         compile_pool._initialize_worker(
-            0, (12, 0), DEVICE_UUID, PRODUCT_NAME, 170, 232448, 232448, activity,
+            0,
+            (12, 0),
+            DEVICE_UUID,
+            PRODUCT_NAME,
+            170,
+            232448,
+            232448,
+            activity,
         )
         identity = DeviceIdentity("nvidia", (12, 0), 170, PRODUCT_NAME)
         if payload is None:
@@ -76,23 +84,29 @@ def _program_keys_by_geometry(payload: dict[str, object] | None, connection) -> 
         keys = {}
         minimum_main, minimum_compressed = _smallest_legal_page_counts(payload)
         for main_pages, compressed_pages in (
-            *PAGE_COUNTS, _smallest_legal_page_counts(payload),
+            *PAGE_COUNTS,
+            _smallest_legal_page_counts(payload),
         ):
             if main_pages < minimum_main or compressed_pages < minimum_compressed:
                 continue
-            query = QsaQuery(**{
-                **payload,
-                "num_main_cache_pages": main_pages,
-                "num_compressed_cache_pages": compressed_pages,
-            })
+            query = QsaQuery(
+                **{
+                    **payload,
+                    "num_main_cache_pages": main_pages,
+                    "num_compressed_cache_pages": compressed_pages,
+                }
+            )
             config = TUNING.default_config(query, identity)
             job = CompileJob.create(
                 "b12x.attention.qsa._contract:compile_qsa",
-                query.to_dict(), TUNING.encode_config(config), 0,
+                query.to_dict(),
+                TUNING.encode_config(config),
+                0,
             )
             plan = describe_compilation(job)
             keys[(main_pages, compressed_pages)] = sorted(
-                (program.dialect, program.key, program.name) for program in plan.programs
+                (program.dialect, program.key, program.name)
+                for program in plan.programs
             )
         connection.send(("ok", keys))
     except Exception as error:
@@ -112,7 +126,9 @@ def _plan_in_offline_worker(payload: dict[str, object], cache_dir: pathlib.Path)
     previous = {name: os.environ.get(name) for name in environment}
     os.environ.update(environment)
     try:
-        process = context.Process(target=_program_keys_by_geometry, args=(payload, child))
+        process = context.Process(
+            target=_program_keys_by_geometry, args=(payload, child)
+        )
         process.start()
     finally:
         for name, value in previous.items():
@@ -139,8 +155,12 @@ def test_qsa_multi_chunk_programs_are_retained(tmp_path) -> None:
         assert programs == reference
     assert sum(program[2] == "_stage_topk_carry_kernel" for program in reference) > 1
     names = {program[2] for program in reference}
-    assert not names.intersection({
-        "_remap_topk_group_ids_kernel", "_stable_topk_threshold_kernel",
-        "_count_stable_topk_candidates_kernel", "_emit_stable_topk_kernel",
-    })
+    assert not names.intersection(
+        {
+            "_remap_topk_group_ids_kernel",
+            "_stable_topk_threshold_kernel",
+            "_count_stable_topk_candidates_kernel",
+            "_emit_stable_topk_kernel",
+        }
+    )
     assert any(program[2] == "attention.qsa.stable_selection" for program in reference)

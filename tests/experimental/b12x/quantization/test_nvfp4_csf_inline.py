@@ -28,13 +28,18 @@ def test_indexed_expansion_routes_tail_and_frozen_replay(ids_dtype, rows, column
 
     first, expected13 = _fixture(rows, columns, 0, "cuda")
     second, expected2 = _fixture(256, 16, 0, "cuda")
-    outputs = tuple(torch.empty_like(t).view(torch.float8_e4m3fn)
-                    for t in (expected13, expected2))
+    outputs = tuple(
+        torch.empty_like(t).view(torch.float8_e4m3fn) for t in (expected13, expected2)
+    )
     decoder = Nvfp4CsfDecoder.prepare(
-        first, second, *outputs,
+        first,
+        second,
+        *outputs,
         inline_scales=tuple(prepare_inline_scales(p) for p in (first, second)),
     )
-    barriers = tuple(torch.empty(97, dtype=torch.int32, device="cuda") for _ in range(2))
+    barriers = tuple(
+        torch.empty(97, dtype=torch.int32, device="cuda") for _ in range(2)
+    )
     for count in (1, 5, 31, 63, 64, 128):
         routes = torch.ones(count, dtype=ids_dtype, device="cuda")
         if count > 1:
@@ -54,9 +59,15 @@ def test_indexed_expansion_routes_tail_and_frozen_replay(ids_dtype, rows, column
                 allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
                 graph.replay()
                 torch.cuda.synchronize()
-                assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
-                for output, expected in zip(outputs, (expected13, expected2), strict=True):
-                    assert torch.equal(output.view(torch.uint8)[active], expected[active])
+                assert (
+                    torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+                )
+                for output, expected in zip(
+                    outputs, (expected13, expected2), strict=True
+                ):
+                    assert torch.equal(
+                        output.view(torch.uint8)[active], expected[active]
+                    )
                     if count < 64:
                         assert (output.view(torch.uint8)[[0, 2, 3]] == 0xD6).all()
                 assert all(torch.count_nonzero(t) == 0 for t in barriers)
@@ -168,7 +179,9 @@ class StagedWords:
         self, source: cute.Pointer, output: cute.Pointer, experts: Int32, stream
     ):
         kernel = self.reused_kernel if self.reuse_slots else self.kernel
-        blocks = (self.reader.rows // 128 + 1) * (1 if self.reuse_slots else (self.reader.columns + 7) // 8)
+        blocks = (self.reader.rows // 128 + 1) * (
+            1 if self.reuse_slots else (self.reader.columns + 7) // 8
+        )
         kernel(source, output, experts).launch(
             grid=(experts * Int32(blocks), 1, 1),
             block=(256, 1, 1),
@@ -198,8 +211,10 @@ class StagedWords:
                 source, experts, expert, row, column, shared.iterator, stage, barrier
             )
         cute.arch.mbarrier_wait(barrier, phase=0)
-        records = source.toint() + Int64(1024) + Int64(experts) * Int64(
-            self.reader.fixed_bytes + self.reader.tiles * 32
+        records = (
+            source.toint()
+            + Int64(1024)
+            + Int64(experts) * Int64(self.reader.fixed_bytes + self.reader.tiles * 32)
         )
         value = self.reader.shared_word(
             shared.iterator.toint() + stage * Int32(1024), Int32(tid), records
@@ -223,8 +238,10 @@ class StagedWords:
         if tid == 0:
             cute.arch.mbarrier_init(barrier, 1)
         cute.arch.sync_threads()
-        records = source.toint() + Int64(1024) + Int64(experts) * Int64(
-            self.reader.fixed_bytes + self.reader.tiles * 32
+        records = (
+            source.toint()
+            + Int64(1024)
+            + Int64(experts) * Int64(self.reader.fixed_bytes + self.reader.tiles * 32)
         )
         for column in range((self.reader.columns + 7) // 8, unroll=4):
             if tid == 0:
@@ -295,10 +312,19 @@ def _exception_fixture(rows, columns, period):
 @pytest.mark.parametrize("rows,columns", [(256, 16), (256, 20), (128, 4)])
 @pytest.mark.parametrize("period", [0, 1, 17, 97])
 @pytest.mark.parametrize("reuse_slots", [False, True])
-def test_staged_words_cover_empty_dense_and_partial_payloads(period, reuse_slots, rows, columns):
+def test_staged_words_cover_empty_dense_and_partial_payloads(
+    period, reuse_slots, rows, columns
+):
     batch, expected = _exception_fixture(rows, columns, period)
     atoms = expected.reshape(4, rows // 128, columns // 4, 512)
-    padded = torch.zeros(4, rows // 128 + 1, ((columns + 7) // 8) * 2, 512, device="cuda", dtype=torch.uint8)
+    padded = torch.zeros(
+        4,
+        rows // 128 + 1,
+        ((columns + 7) // 8) * 2,
+        512,
+        device="cuda",
+        dtype=torch.uint8,
+    )
     padded[:, : rows // 128, : columns // 4].copy_(atoms)
     expected = padded
     program = b12x_compile(
@@ -355,8 +381,9 @@ def test_indexed_vectors_cover_exception_masks(period, rows, columns):
 
     batch, expected = _exception_fixture(rows, columns, period)
     plane = prepare_inline_scales(batch)
-    outputs = tuple(torch.empty_like(expected).view(torch.float8_e4m3fn)
-                    for _ in range(2))
+    outputs = tuple(
+        torch.empty_like(expected).view(torch.float8_e4m3fn) for _ in range(2)
+    )
     decoder = Nvfp4CsfDecoder.prepare(
         batch, batch, *outputs, inline_scales=(plane, plane)
     )
@@ -366,8 +393,13 @@ def test_indexed_vectors_cover_exception_masks(period, rows, columns):
         with torch.cuda.graph(graph):
             decoder.decode(routes, *outputs)
         for active in ([1, 3], [0, 2]):
-            routes.copy_(torch.tensor([active[0], -1, active[1], active[0]],
-                                     device="cuda", dtype=torch.int64))
+            routes.copy_(
+                torch.tensor(
+                    [active[0], -1, active[1], active[0]],
+                    device="cuda",
+                    dtype=torch.int64,
+                )
+            )
             for output in outputs:
                 output.view(torch.uint8).fill_(0xD6)
             allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
@@ -392,32 +424,44 @@ def test_indexed_vectors_use_64bit_expert_offsets():
     for columns in (8192, 4):
         fixed_bytes = rows * (1 + columns // 2)
         metadata_bytes = rows * columns // 512 * 32
-        storage = torch.empty(1024 + experts * (fixed_bytes + metadata_bytes),
-                              device="cuda", dtype=torch.uint8)
-        fixed = storage[1024:1024 + experts * fixed_bytes].view(experts, 1, fixed_bytes)
+        storage = torch.empty(
+            1024 + experts * (fixed_bytes + metadata_bytes),
+            device="cuda",
+            dtype=torch.uint8,
+        )
+        fixed = storage[1024 : 1024 + experts * fixed_bytes].view(
+            experts, 1, fixed_bytes
+        )
         fixed[selected].zero_()
         fixed[selected, 0, :128].fill_(10)
         metadata = 1024 + experts * fixed_bytes + selected * metadata_bytes
-        storage[metadata:metadata + metadata_bytes].zero_()
+        storage[metadata : metadata + metadata_bytes].zero_()
         batch = Nvfp4CsfBatch(
-            fixed, torch.empty(0, device="cuda", dtype=torch.uint8),
-            torch.zeros((experts, 2), device="cuda", dtype=torch.int64), rows, columns
+            fixed,
+            torch.empty(0, device="cuda", dtype=torch.uint8),
+            torch.zeros((experts, 2), device="cuda", dtype=torch.int64),
+            rows,
+            columns,
         )
         batch.validate()
         batches.append(batch)
         planes.append(InlineNvfp4Scales(storage, rows, columns, experts))
-        outputs.append(torch.empty((experts, rows, columns), device="cuda",
-                                   dtype=torch.float8_e4m3fn))
+        outputs.append(
+            torch.empty(
+                (experts, rows, columns), device="cuda", dtype=torch.float8_e4m3fn
+            )
+        )
     decoder = Nvfp4CsfDecoder.prepare(*batches, *outputs, inline_scales=tuple(planes))
-    routes = torch.tensor([selected, -1, selected, 2**32 + selected],
-                          device="cuda", dtype=torch.int64)
+    routes = torch.tensor(
+        [selected, -1, selected, 2**32 + selected], device="cuda", dtype=torch.int64
+    )
     with kernel_resolution_guard("Expert scale offsets above 4 GiB"):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             decoder.decode(routes, *outputs)
         for _ in range(2):
             for output in outputs:
-                output.view(torch.uint8)[selected - 1:].fill_(0xD6)
+                output.view(torch.uint8)[selected - 1 :].fill_(0xD6)
             allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
             graph.replay()
             torch.cuda.synchronize()

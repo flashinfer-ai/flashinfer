@@ -275,9 +275,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             tuple(int(ptr) for ptr in staging0_ptrs),
             tuple(int(ptr) for ptr in staging1_ptrs),
         )
-        self._candidate_plane_elems = (
-            self.max_owner_rows * self.world_size * self.topk
-        )
+        self._candidate_plane_elems = self.max_owner_rows * self.world_size * self.topk
         self._next_slot = 0
         self._graph_slot: Optional[int] = None
         self._capture_context_depth = 0

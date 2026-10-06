@@ -29,7 +29,9 @@ def test_pack_fp6_codes_tensor_shape() -> None:
 
 
 def test_fp6_quantize_respects_max() -> None:
-    x = torch.tensor([FLOAT6_E3M2_MAX * 2.0, -FLOAT6_E2M3_MAX * 2.0], dtype=torch.float32)
+    x = torch.tensor(
+        [FLOAT6_E3M2_MAX * 2.0, -FLOAT6_E2M3_MAX * 2.0], dtype=torch.float32
+    )
     q3 = fp6_quantize_values_torch(x[:1], fmt="e3m2")
     q2 = fp6_quantize_values_torch(x[1:], fmt="e2m3")
     assert float(q3.abs().max()) <= FLOAT6_E3M2_MAX + 1e-3

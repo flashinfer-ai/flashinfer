@@ -229,11 +229,9 @@ class IntermediateHadamardUniformMaterializer:
             n16_local = local_tile & Int32(7)
             k16 = kb * Int32(_TILE16) + k16_local
             n16 = nb * Int32(_TILE16) + n16_local
-            tile = (
-                (source_matrix * Int32(self.k16) + k16)
-                * Int32(self.source_n16)
-                + n16
-            )
+            tile = (source_matrix * Int32(self.k16) + k16) * Int32(
+                self.source_n16
+            ) + n16
             warp_ring = ring_base + warp * Int32(_MAX_WORDS_PER_TILE * 4)
             if lane < words_per_tile:
                 word = Int64(tile) * Int64(8 * self.bits) + Int64(lane)
@@ -311,14 +309,8 @@ class IntermediateHadamardUniformMaterializer:
                 source_col = (source_half << Int32(6)) + local_col
                 slot_in_pair = local_col >> Int32(5)
                 within_slot = local_col & Int32(31)
-                logical_col = (
-                    slot_in_pair * Int32(64)
-                    + Int32(slot * 32)
-                    + within_slot
-                )
-                staging[row, logical_col] = cutlass.BFloat16(
-                    work[row, source_col]
-                )
+                logical_col = slot_in_pair * Int32(64) + Int32(slot * 32) + within_slot
+                staging[row, logical_col] = cutlass.BFloat16(work[row, source_col])
             cute.arch.sync_threads()
         for iteration in cutlass.range_constexpr(64):
             element = tid + Int32(iteration * _THREADS)
@@ -353,9 +345,7 @@ class IntermediateHadamardUniformMaterializer:
             if cutlass.const_expr(self.joined_upstream):
                 projection = output_nb // Int32(self.source_n128)
                 scale_expert = projection * Int32(self.experts) + expert
-            scale_base = (
-                scale_expert * Int32(self.k) + kb * Int32(_TILE) + row
-            )
+            scale_base = scale_expert * Int32(self.k) + kb * Int32(_TILE) + row
             sign_base = expert * Int32(self.k) + kb * Int32(_TILE) + row
             if cutlass.const_expr(first):
                 v0 *= scale[scale_base + Int32(0)].to(cutlass.Float32)
@@ -398,11 +388,7 @@ class IntermediateHadamardUniformMaterializer:
             scale_nb = source_nb
             if cutlass.const_expr(self.joined_upstream):
                 scale_nb = output_nb
-            base = (
-                expert * Int32(self.logical_n)
-                + scale_nb * Int32(_TILE)
-                + col
-            )
+            base = expert * Int32(self.logical_n) + scale_nb * Int32(_TILE) + col
             if cutlass.const_expr(first):
                 v0 *= scale[base + Int32(0)].to(cutlass.Float32)
                 v1 *= scale[base + Int32(1)].to(cutlass.Float32)
@@ -410,9 +396,7 @@ class IntermediateHadamardUniformMaterializer:
                 v3 *= scale[base + Int32(3)].to(cutlass.Float32)
             elif cutlass.const_expr(self.hidden_axis == "k"):
                 sign_base = (
-                    expert * Int32(self.logical_n)
-                    + output_nb * Int32(_TILE)
-                    + col
+                    expert * Int32(self.logical_n) + output_nb * Int32(_TILE) + col
                 )
                 v0 *= signs_n[sign_base + Int32(0)].to(cutlass.Float32)
                 v1 *= signs_n[sign_base + Int32(1)].to(cutlass.Float32)
@@ -582,9 +566,7 @@ class IntermediateHadamardUniformMaterializer:
                 first=False,
             )
             coefficient0 = _h4_coefficient(source_group, output_group)
-            coefficient1 = _h4_coefficient(
-                source_group, output_group + Int32(1)
-            )
+            coefficient1 = _h4_coefficient(source_group, output_group + Int32(1))
             for index in cutlass.range_constexpr(64):
                 element = tid + Int32(index * _THREADS)
                 output_row = element // Int32(_TILE)
@@ -631,9 +613,7 @@ class IntermediateHadamardUniformMaterializer:
                 )
                 if cutlass.const_expr(self.hidden_axis == "k"):
                     sign_index = (
-                        expert * Int32(self.k)
-                        + target_kb * Int32(_TILE)
-                        + output_col
+                        expert * Int32(self.k) + target_kb * Int32(_TILE) + output_col
                     )
                     value *= signs_k[sign_index].to(cutlass.Float32)
                 else:
@@ -651,9 +631,7 @@ class IntermediateHadamardUniformMaterializer:
                 cute.copy(
                     tma_store,
                     shared_partition[(None, Int32(0))],
-                    global_partition[
-                        (None, global_row_block, target_kb, Int32(0))
-                    ],
+                    global_partition[(None, global_row_block, target_kb, Int32(0))],
                 )
                 store_pipeline.producer_commit()
                 store_pipeline.producer_acquire()
@@ -699,7 +677,9 @@ def _compile_materializer(
         _cute_tensor(signs_k.reshape(-1), cutlass.Float16),
         _cute_tensor(signs_n.reshape(-1), cutlass.Float16),
         _cute_tensor(lut_e4m3_value_table(device), cutlass.Uint8),
-        _cute_tensor(output.view(output.shape[0], output.shape[1], 1), cutlass.BFloat16),
+        _cute_tensor(
+            output.view(output.shape[0], output.shape[1], 1), cutlass.BFloat16
+        ),
         current_cuda_stream(),
     )
     return b12x_compile(
@@ -732,7 +712,9 @@ def prepare_intermediate_hadamard_uniform_materializer_inputs(
         raise ValueError("materializer inputs require intermediate-Hadamard extents")
     bits = int(lower.trellis_bits)
     if bits not in (2, 3) or any(int(value.trellis_bits) != bits for value in values):
-        raise ValueError("materializer inputs require matching uniform K2 or K3 extents")
+        raise ValueError(
+            "materializer inputs require matching uniform K2 or K3 extents"
+        )
     experts = int(lower.num_experts)
     hidden = int(lower.hidden_size)
     half_intermediate = int(lower.intermediate_size)
@@ -908,18 +890,12 @@ def materialize_intermediate_hadamard_uniform(
 
     if packed.dtype != torch.int16 or not packed.is_contiguous():
         raise ValueError("packed payload must be contiguous int16")
-    if any(
-        value.dtype != torch.float16
-        for value in (suh, svh, signs_k, signs_n)
-    ):
+    if any(value.dtype != torch.float16 for value in (suh, svh, signs_k, signs_n)):
         raise ValueError("materializer scales and signs must be FP16")
     if output.dtype != torch.bfloat16 or not output.is_contiguous():
         raise ValueError("materializer output must be contiguous BF16")
     device = packed.device
-    if any(
-        value.device != device
-        for value in (suh, svh, signs_k, signs_n, output)
-    ):
+    if any(value.device != device for value in (suh, svh, signs_k, signs_n, output)):
         raise ValueError("materializer tensors must share one CUDA device")
     compiled(
         _cute_tensor(packed.view(torch.int32), cutlass.Uint32),
@@ -928,15 +904,21 @@ def materialize_intermediate_hadamard_uniform(
         _cute_tensor(signs_k.reshape(-1), cutlass.Float16),
         _cute_tensor(signs_n.reshape(-1), cutlass.Float16),
         _cute_tensor(lut_e4m3_value_table(device), cutlass.Uint8),
-        _cute_tensor(output.view(output.shape[0], output.shape[1], 1), cutlass.BFloat16),
+        _cute_tensor(
+            output.view(output.shape[0], output.shape[1], 1), cutlass.BFloat16
+        ),
         current_cuda_stream(),
     )
 
 
-IntermediateHadamardUniformK2MaterializerInputs = IntermediateHadamardUniformMaterializerInputs
+IntermediateHadamardUniformK2MaterializerInputs = (
+    IntermediateHadamardUniformMaterializerInputs
+)
 
 
-class IntermediateHadamardUniformK2Materializer(IntermediateHadamardUniformMaterializer):
+class IntermediateHadamardUniformK2Materializer(
+    IntermediateHadamardUniformMaterializer
+):
     """Compatibility constructor for the uniform-K2 materializer."""
 
     def __init__(

@@ -183,8 +183,6 @@ def _validate(
     return heads, m, output_fp8
 
 
-
-
 def _run_prepared(
     q_nope: torch.Tensor,
     weight: torch.Tensor,
@@ -204,10 +202,27 @@ def _run_prepared(
     context = torch.cuda.stream(target) if target is not None else nullcontext()
     with context:
         launcher[(_LATENT_DIM // _BLOCK_N, heads, 1)](
-            q_nope, weight, q_pe, q_scale if q_scale is not None else out, out, m,
-            q_nope.stride(0), q_nope.stride(1), weight.stride(0), weight.stride(1),
-            q_pe.stride(0), q_pe.stride(1), out.stride(0), out.stride(1),
-            output_fp8, _NOPE_DIM, _LATENT_DIM, _ROPE_DIM, block_m, _BLOCK_N, _BLOCK_K,
+            q_nope,
+            weight,
+            q_pe,
+            q_scale if q_scale is not None else out,
+            out,
+            m,
+            q_nope.stride(0),
+            q_nope.stride(1),
+            weight.stride(0),
+            weight.stride(1),
+            q_pe.stride(0),
+            q_pe.stride(1),
+            out.stride(0),
+            out.stride(1),
+            output_fp8,
+            _NOPE_DIM,
+            _LATENT_DIM,
+            _ROPE_DIM,
+            block_m,
+            _BLOCK_N,
+            _BLOCK_K,
         )
         if target is not None:
             for tensor in (q_nope, weight, q_pe, out):
@@ -226,7 +241,9 @@ def _op(
     out: torch.Tensor,
     plan_handle: int,
 ) -> None:
-    state = require_prepared(plan_from_handle(plan_handle), "gemm.mla_query_projection", q_nope.device)
+    state = require_prepared(
+        plan_from_handle(plan_handle), "gemm.mla_query_projection", q_nope.device
+    )
     state.run(q_nope, weight, q_pe, out, q_scale=q_scale)
 
 
@@ -289,8 +306,6 @@ def can_implement(
         and int(latent_dim) == _LATENT_DIM
         and output_dtype in (torch.bfloat16, torch.float8_e4m3fn)
     )
-
-
 
 
 __all__ = ["can_implement", "run"]

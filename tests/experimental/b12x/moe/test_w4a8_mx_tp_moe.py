@@ -174,9 +174,7 @@ def _prepare(
     )
     # Exact N64 repacks preserve the source storage and specialize the runtime
     # layout in place. Legacy ceil-tiled tails require larger allocations.
-    has_legacy_tail = (
-        (n % 128 != 0 or (2 * n) % 256 != 0) and not runtime.n64_repack
-    )
+    has_legacy_tail = (n % 128 != 0 or (2 * n) % 256 != 0) and not runtime.n64_repack
     if has_legacy_tail:
         assert runtime_ptrs != source_ptrs
     else:
@@ -323,15 +321,17 @@ def test_w4a8_mx_situ_cuda_graph_replay_matches_oracle(m: int) -> None:
     prepared = _prepare(weights, n=n, activation="situ")
     output = torch.zeros(m, _K, dtype=torch.bfloat16, device="cuda")
     bindings = ExitStack()
-    binding = bindings.enter_context(make_tp_moe_fp4_binding(
-        a=x,
-        experts=prepared,
-        topk_weights=topk_weights.contiguous(),
-        topk_ids=topk_ids.contiguous(),
-        output=output,
-        input_scales_static=True,
-        quant_mode="w4a8_mx",
-    ))
+    binding = bindings.enter_context(
+        make_tp_moe_fp4_binding(
+            a=x,
+            experts=prepared,
+            topk_weights=topk_weights.contiguous(),
+            topk_ids=topk_ids.contiguous(),
+            output=output,
+            input_scales_static=True,
+            quant_mode="w4a8_mx",
+        )
+    )
 
     b12x_moe_fp4(binding=binding)
     torch.cuda.synchronize()
@@ -464,15 +464,17 @@ def test_w4a8_mx_kimi_k3_tp8_situ_reuses_checkpoint_storage() -> None:
 
     output = torch.zeros(m, hidden_size, dtype=torch.bfloat16, device=device)
     bindings = ExitStack()
-    binding = bindings.enter_context(make_tp_moe_fp4_binding(
-        a=x,
-        experts=prepared,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        output=output,
-        input_scales_static=True,
-        quant_mode="w4a8_mx",
-    ))
+    binding = bindings.enter_context(
+        make_tp_moe_fp4_binding(
+            a=x,
+            experts=prepared,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+            input_scales_static=True,
+            quant_mode="w4a8_mx",
+        )
+    )
     run(binding=binding)
     torch.cuda.synchronize()
 
@@ -802,15 +804,17 @@ def test_w4a8_mx_dynamic_graph_replay_tracks_routing_updates() -> None:
     bindings = ExitStack()
 
     def _make_binding(out: torch.Tensor):
-        return bindings.enter_context(make_tp_moe_fp4_binding(
-            a=x,
-            experts=prepared,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            output=out,
-            input_scales_static=True,
-            quant_mode="w4a8_mx",
-        ))
+        return bindings.enter_context(
+            make_tp_moe_fp4_binding(
+                a=x,
+                experts=prepared,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                output=out,
+                input_scales_static=True,
+                quant_mode="w4a8_mx",
+            )
+        )
 
     graph_binding = _make_binding(graph_out)
     eager_binding = _make_binding(eager_out)
@@ -879,15 +883,17 @@ def test_w4a8_mx_m9_graph_replay_with_aux_stream_work() -> None:
     x, topk_ids, topk_weights = _routed_inputs(m, 92)
     output = torch.zeros(m, _K, dtype=torch.bfloat16, device=device)
     bindings = ExitStack()
-    binding = bindings.enter_context(make_tp_moe_fp4_binding(
-        a=x,
-        experts=prepared,
-        topk_weights=topk_weights.contiguous(),
-        topk_ids=topk_ids.contiguous(),
-        output=output,
-        input_scales_static=True,
-        quant_mode="w4a8_mx",
-    ))
+    binding = bindings.enter_context(
+        make_tp_moe_fp4_binding(
+            a=x,
+            experts=prepared,
+            topk_weights=topk_weights.contiguous(),
+            topk_ids=topk_ids.contiguous(),
+            output=output,
+            input_scales_static=True,
+            quant_mode="w4a8_mx",
+        )
+    )
 
     def _launch() -> None:
         b12x_moe_fp4(binding=binding)
@@ -977,7 +983,10 @@ def test_w4a8_mx_dynamic_glm_shard_geometry() -> None:
 @pytest.mark.parametrize("max_active_clusters", (None, 1, 64, 128))
 @pytest.mark.parametrize("capacity", (1, 8))
 def test_repacked_decode_grid_reaches_launch_and_replays_without_allocation(
-    monkeypatch, tile_m: int, max_active_clusters: int | None, capacity: int,
+    monkeypatch,
+    tile_m: int,
+    max_active_clusters: int | None,
+    capacity: int,
 ) -> None:
     _skip_if_unavailable()
     from b12x.preparation import PreparationSession, PreparedCall
@@ -992,7 +1001,8 @@ def test_repacked_decode_grid_reaches_launch_and_replays_without_allocation(
         pytest.skip("Requested test grid exceeds this GPU's resident bound")
     for name in (
         "B12X_DYNAMIC_W4A8_DECODE_MAX_ACTIVE_CLUSTERS",
-        "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS", "B12X_LEVEL10_MAX_ACTIVE_CLUSTERS",
+        "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS",
+        "B12X_LEVEL10_MAX_ACTIVE_CLUSTERS",
     ):
         monkeypatch.delenv(name, raising=False)
     _impl.clear_tp_moe_caches()
@@ -1001,30 +1011,55 @@ def test_repacked_decode_grid_reaches_launch_and_replays_without_allocation(
     x, ids, scales = _routed_inputs(capacity, 282)
     references = {
         rows: moe_reference_w4a8_mx(
-            x[:rows].float(), weights["w13_fp4"], weights["w13_mx"], None,
-            weights["alphas"], weights["w2_fp4"], weights["w2_mx"], None,
-            weights["alphas"], ids[:rows], scales[:rows], _E, _K, _N,
+            x[:rows].float(),
+            weights["w13_fp4"],
+            weights["w13_mx"],
+            None,
+            weights["alphas"],
+            weights["w2_fp4"],
+            weights["w2_mx"],
+            None,
+            weights["alphas"],
+            ids[:rows],
+            scales[:rows],
+            _E,
+            _K,
+            _N,
             activation="silu",
-        ) for rows in counts
+        )
+        for rows in counts
     }
     weight_plan = fused_moe.plan_weights(
         source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w13"),
-        activation=fused_moe.ActivationSpec(mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16),
-        geometry=fused_moe.MoEGeometry(num_experts=_E, hidden_size=_K, intermediate_size=_N),
+        activation=fused_moe.ActivationSpec(
+            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=_E, hidden_size=_K, intermediate_size=_N
+        ),
     )
-    experts = fused_moe.prepare_weights(plan=weight_plan, weights=fused_moe.PackedWeights(
-        w13=weights["w13_fp4"], w2=weights["w2_fp4"],
-        w13_block_scales=weights["w13_mx"], w2_block_scales=weights["w2_mx"],
-        w13_global_scales=weights["alphas"], w2_global_scales=weights["alphas"],
-        input_scale=weights["input_scale"], intermediate_scale=weights["input_scale"],
-    ))
+    experts = fused_moe.prepare_weights(
+        plan=weight_plan,
+        weights=fused_moe.PackedWeights(
+            w13=weights["w13_fp4"],
+            w2=weights["w2_fp4"],
+            w13_block_scales=weights["w13_mx"],
+            w2_block_scales=weights["w2_mx"],
+            w13_global_scales=weights["alphas"],
+            w2_global_scales=weights["alphas"],
+            input_scale=weights["input_scale"],
+            intermediate_scale=weights["input_scale"],
+        ),
+    )
     plan = fused_moe.plan_execution(
         experts=experts,
         capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=_TOPK),
         invocation={"fast_math": False},
         override=MoeDecodeConfig(
-            backend="dynamic", route_planner="internal",
-            max_active_clusters=max_active_clusters, dynamic_tile_m=tile_m,
+            backend="dynamic",
+            route_planner="internal",
+            max_active_clusters=max_active_clusters,
+            dynamic_tile_m=tile_m,
             dynamic_route_mode="grouped",
         ),
     )
@@ -1039,27 +1074,47 @@ def test_repacked_decode_grid_reaches_launch_and_replays_without_allocation(
     monkeypatch.setattr(_impl, "_get_dynamic_kernel", record_grid)
 
     def prepare(state):
-        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
-                        for spec in state.scratch.scratch_specs())
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            for spec in state.scratch.scratch_specs()
+        )
         output = torch.empty_like(x)
-        binding = state.bind(scratch=scratch, a=x, topk_ids=ids,
-                             topk_weights=scales, output=output, input_scales_static=True)
-        return PreparedCall(run=lambda: state.run(binding), output=output,
-                            owners=(scratch, binding))
+        binding = state.bind(
+            scratch=scratch,
+            a=x,
+            topk_ids=ids,
+            topk_weights=scales,
+            output=output,
+            input_scales_static=True,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding), output=output, owners=(scratch, binding)
+        )
 
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
-        session.prepare((plan.request(name="w4a8-resident-grid", prepare_call=prepare),))
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
+        session.prepare(
+            (plan.request(name="w4a8-resident-grid", prepare_call=prepare),)
+        )
         expected_grid = min(2 * sms, max_active_clusters or 2 * sms)
-        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
-                        for spec in plan.scratch_specs())
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            for spec in plan.scratch_specs()
+        )
         output = torch.empty_like(x)
         storage = (*scratch, output, x, ids, scales)
         pointers = tuple(t.data_ptr() for t in storage)
         # Compile planning may request the same callable with a placeholder
         # grid. Observe an actual launch after preparation, not those requests.
         binding = fused_moe.bind(
-            plan, scratch=scratch, a=x, topk_ids=ids, topk_weights=scales,
-            output=output, input_scales_static=True,
+            plan,
+            scratch=scratch,
+            a=x,
+            topk_ids=ids,
+            topk_weights=scales,
+            output=output,
+            input_scales_static=True,
         )
         calls.clear()
         session.freeze()
@@ -1070,26 +1125,37 @@ def test_repacked_decode_grid_reaches_launch_and_replays_without_allocation(
         prepared_callable = calls[-1][0]
         for rows in counts:
             binding = fused_moe.bind(
-                plan, scratch=scratch, a=x[:rows], topk_ids=ids[:rows],
-                topk_weights=scales[:rows], output=output[:rows], input_scales_static=True,
+                plan,
+                scratch=scratch,
+                a=x[:rows],
+                topk_ids=ids[:rows],
+                topk_weights=scales[:rows],
+                output=output[:rows],
+                input_scales_static=True,
             )
             calls.clear()
             graph = torch.cuda.CUDAGraph()
             with session.capture(), torch.cuda.graph(graph):
                 fused_moe.run(binding=binding)
-            assert calls and all(compiled is prepared_callable and grid == expected_grid
-                                 for compiled, grid in calls)
+            assert calls and all(
+                compiled is prepared_callable and grid == expected_grid
+                for compiled, grid in calls
+            )
             for _ in range(3):
                 output.fill_(float("nan"))
                 allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
                 graph.replay()
                 torch.cuda.synchronize()
-                assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+                assert (
+                    torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+                )
                 assert tuple(t.data_ptr() for t in storage) == pointers
                 actual = output[:rows]
                 assert actual.isfinite().all() and actual.abs().sum() > 0
                 cosine = torch.nn.functional.cosine_similarity(
-                    actual.float().flatten(), references[rows].float().flatten(), dim=0,
+                    actual.float().flatten(),
+                    references[rows].float().flatten(),
+                    dim=0,
                 ).item()
                 assert cosine > 0.998, (rows, expected_grid, cosine)
                 assert torch.isnan(output[rows:]).all()
@@ -1145,15 +1211,26 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
 
     declaration = fused_moe.plan_weights(
         source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w13"),
-        activation=fused_moe.ActivationSpec(mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16),
-        geometry=fused_moe.MoEGeometry(num_experts=_E, hidden_size=_K, intermediate_size=n),
+        activation=fused_moe.ActivationSpec(
+            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=_E, hidden_size=_K, intermediate_size=n
+        ),
     )
-    experts = fused_moe.prepare_weights(plan=declaration, weights=fused_moe.PackedWeights(
-        w13=weights["w13_fp4"], w2=weights["w2_fp4"],
-        w13_block_scales=weights["w13_mx"], w2_block_scales=weights["w2_mx"],
-        w13_global_scales=weights["alphas"], w2_global_scales=weights["alphas"],
-        input_scale=weights["input_scale"], intermediate_scale=weights["input_scale"],
-    ))
+    experts = fused_moe.prepare_weights(
+        plan=declaration,
+        weights=fused_moe.PackedWeights(
+            w13=weights["w13_fp4"],
+            w2=weights["w2_fp4"],
+            w13_block_scales=weights["w13_mx"],
+            w2_block_scales=weights["w2_mx"],
+            w13_global_scales=weights["alphas"],
+            w2_global_scales=weights["alphas"],
+            input_scale=weights["input_scale"],
+            intermediate_scale=weights["input_scale"],
+        ),
+    )
     allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
     plan = fused_moe.plan_execution(
         experts=experts,
@@ -1164,33 +1241,58 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
             route_planner=route_planner,
             max_active_clusters=max_active_clusters,
             dynamic_tile_m=16 if expected_implementation == "dynamic" else None,
-            dynamic_route_mode="grouped" if expected_implementation == "dynamic" else None,
+            dynamic_route_mode="grouped"
+            if expected_implementation == "dynamic"
+            else None,
         ),
     )
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
 
     def prepare(state):
-        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
-                        for spec in state.scratch.scratch_specs())
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            for spec in state.scratch.scratch_specs()
+        )
         output = torch.empty_like(x)
-        binding = state.bind(scratch=scratch, a=x, topk_ids=topk_ids,
-                             topk_weights=topk_weights, output=output, input_scales_static=True)
-        return PreparedCall(run=lambda: state.run(binding), output=output, owners=(scratch, binding))
+        binding = state.bind(
+            scratch=scratch,
+            a=x,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            output=output,
+            input_scales_static=True,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding), output=output, owners=(scratch, binding)
+        )
 
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
         session.prepare((plan.request(name="compact-n64", prepare_call=prepare),))
-        assert plan.prepared.state.scratch.launch_plan.implementation == expected_implementation
+        assert (
+            plan.prepared.state.scratch.launch_plan.implementation
+            == expected_implementation
+        )
         assert plan.prepared.state.scratch.launch_plan.execution.tile_m == 16
-        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
-                        for spec in plan.scratch_specs())
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            for spec in plan.scratch_specs()
+        )
         output = torch.empty_like(x)
         storage = (*scratch, output, x, topk_ids, topk_weights)
         addresses = tuple(t.data_ptr() for t in storage)
         session.freeze()
         for rows in replay_counts:
-            binding = fused_moe.bind(plan, scratch=scratch, a=x[:rows],
-                                     topk_ids=topk_ids[:rows], topk_weights=topk_weights[:rows],
-                                     output=output[:rows], input_scales_static=True)
+            binding = fused_moe.bind(
+                plan,
+                scratch=scratch,
+                a=x[:rows],
+                topk_ids=topk_ids[:rows],
+                topk_weights=topk_weights[:rows],
+                output=output[:rows],
+                input_scales_static=True,
+            )
             allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
             fused_moe.run(binding=binding)
             torch.cuda.synchronize()
@@ -1206,12 +1308,17 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
                 allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
                 graph.replay()
                 torch.cuda.synchronize()
-                assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+                assert (
+                    torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+                )
                 assert tuple(t.data_ptr() for t in storage) == addresses
                 replayed = output[:rows]
                 assert replayed.isfinite().all() and replayed.abs().sum() > 0
                 cosine = torch.nn.functional.cosine_similarity(
-                    replayed.float().flatten(), references[rows].float().flatten(), dim=0).item()
+                    replayed.float().flatten(),
+                    references[rows].float().flatten(),
+                    dim=0,
+                ).item()
                 assert cosine > 0.998, (rows, cosine)
                 assert torch.isnan(output[rows:]).all()
             graph.reset()
@@ -1233,8 +1340,7 @@ def test_compact_n64_micro_zero_and_tiny_blocks_use_common_mxfp8_scales() -> Non
     _, topk_ids, topk_weights = _routed_inputs(capacity, 192)
     x = torch.zeros(capacity, _K, dtype=torch.bfloat16, device="cuda")
     x[1] = (
-        torch.linspace(-1.0, 1.0, _K, dtype=torch.float32, device="cuda")
-        * (2.0**-8)
+        torch.linspace(-1.0, 1.0, _K, dtype=torch.float32, device="cuda") * (2.0**-8)
     ).to(torch.bfloat16)
     experts = _prepare(weights, n=n)
     runtime = experts.representation_for("w4a8_mx")
@@ -1371,15 +1477,26 @@ def test_compact_n64_grouped_prefill_honors_swiglu_limit() -> None:
 
     declaration = fused_moe.plan_weights(
         source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w13"),
-        activation=fused_moe.ActivationSpec(mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16, swiglu_limit=10.0),
-        geometry=fused_moe.MoEGeometry(num_experts=_E, hidden_size=_K, intermediate_size=n),
+        activation=fused_moe.ActivationSpec(
+            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16, swiglu_limit=10.0
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=_E, hidden_size=_K, intermediate_size=n
+        ),
     )
-    experts = fused_moe.prepare_weights(plan=declaration, weights=fused_moe.PackedWeights(
-        w13=weights["w13_fp4"], w2=weights["w2_fp4"],
-        w13_block_scales=weights["w13_mx"], w2_block_scales=weights["w2_mx"],
-        w13_global_scales=weights["alphas"], w2_global_scales=weights["alphas"],
-        input_scale=weights["input_scale"], intermediate_scale=weights["input_scale"],
-    ))
+    experts = fused_moe.prepare_weights(
+        plan=declaration,
+        weights=fused_moe.PackedWeights(
+            w13=weights["w13_fp4"],
+            w2=weights["w2_fp4"],
+            w13_block_scales=weights["w13_mx"],
+            w2_block_scales=weights["w2_mx"],
+            w13_global_scales=weights["alphas"],
+            w2_global_scales=weights["alphas"],
+            input_scale=weights["input_scale"],
+            intermediate_scale=weights["input_scale"],
+        ),
+    )
     allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
     plan = fused_moe.plan_execution(
         experts=experts,
@@ -1389,25 +1506,48 @@ def test_compact_n64_grouped_prefill_honors_swiglu_limit() -> None:
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
 
     def prepare(state):
-        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
-                        for spec in state.scratch.scratch_specs())
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            for spec in state.scratch.scratch_specs()
+        )
         output = torch.empty_like(x)
-        binding = state.bind(scratch=scratch, a=x, topk_ids=topk_ids,
-                             topk_weights=topk_weights, output=output, input_scales_static=True)
-        return PreparedCall(run=lambda: state.run(binding), output=output, owners=(scratch, binding))
+        binding = state.bind(
+            scratch=scratch,
+            a=x,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            output=output,
+            input_scales_static=True,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding), output=output, owners=(scratch, binding)
+        )
 
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
         session.prepare((plan.request(name="compact-n64-clamp", prepare_call=prepare),))
         assert plan.prepared.state.scratch.launch_plan.implementation == "dynamic"
-        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
-                        for spec in plan.scratch_specs())
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            for spec in plan.scratch_specs()
+        )
         output = torch.empty_like(x)
-        binding = fused_moe.bind(plan, scratch=scratch, a=x, topk_ids=topk_ids,
-                                 topk_weights=topk_weights, output=output, input_scales_static=True)
+        binding = fused_moe.bind(
+            plan,
+            scratch=scratch,
+            a=x,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            output=output,
+            input_scales_static=True,
+        )
         session.freeze()
         actual = fused_moe.run(binding=binding)
         torch.cuda.synchronize()
         cosine = torch.nn.functional.cosine_similarity(
-            actual.float().flatten(), clamped.float().flatten(), dim=0,
+            actual.float().flatten(),
+            clamped.float().flatten(),
+            dim=0,
         ).item()
         assert cosine > 0.998, cosine

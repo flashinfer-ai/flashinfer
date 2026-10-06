@@ -611,7 +611,11 @@ def test_tp2_graph_peer_push_preserves_payload_bits(monkeypatch: pytest.MonkeyPa
 
 
 def _shape_growth_wrap_worker(
-    rank: int, world_size: int, port: int, dtype_name: str, retained_tag: int,
+    rank: int,
+    world_size: int,
+    port: int,
+    dtype_name: str,
+    retained_tag: int,
 ) -> None:
     import b12x
 
@@ -620,21 +624,30 @@ def _shape_growth_wrap_worker(
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     dist.init_process_group(
-        "nccl", init_method=f"tcp://127.0.0.1:{port}",
-        rank=rank, world_size=world_size,
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
     )
     capacity_bytes = 4 * 4096 * 2
     pool = PCIeOneshotAllReducePool(
-        rank=rank, world_size=world_size, device=device,
-        exchange_group=dist.group.WORLD, eager_buffer_bytes=capacity_bytes,
-        max_size=capacity_bytes, rank_data_bytes=capacity_bytes, single_channel=True,
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        exchange_group=dist.group.WORLD,
+        eager_buffer_bytes=capacity_bytes,
+        max_size=capacity_bytes,
+        rank_data_bytes=capacity_bytes,
+        single_channel=True,
     )
     stream = torch.cuda.Stream(device=device)
     graphs, inputs, outputs = [], [], []
     try:
         for rows in (1, 4):
             source = torch.full(
-                (rows, 4096), float(rank + 1), device=device,
+                (rows, 4096),
+                float(rank + 1),
+                device=device,
                 dtype=getattr(torch, dtype_name),
             )
             output = torch.empty_like(source)
@@ -658,25 +671,34 @@ def _shape_growth_wrap_worker(
         for slot in range(2):
             _copy_host_to_device(
                 channel,
-                channel._eager_ptrs[slot][rank] + state.plain_remote_push_region_packs * 16,
-                records, stream,
+                channel._eager_ptrs[slot][rank]
+                + state.plain_remote_push_region_packs * 16,
+                records,
+                stream,
             )
         control = (ctypes.c_uint32 * 2)(0xFFFFFFFC, 0)
         _copy_host_to_device(
-            channel, channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET,
-            control, stream,
+            channel,
+            channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET,
+            control,
+            stream,
         )
         stream.synchronize()
         dist.barrier()
-        with kernel_resolution_guard('TP2 shape growth across epoch rollover'):
+        with kernel_resolution_guard("TP2 shape growth across epoch rollover"):
             with torch.cuda.stream(stream):
                 graphs[0].replay()
                 graphs[0].replay()
             stream.synchronize()
             assert torch.all(outputs[0] == 3)
-            assert _read_local_u32(
-                channel, channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET, stream,
-            ) == 0
+            assert (
+                _read_local_u32(
+                    channel,
+                    channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET,
+                    stream,
+                )
+                == 0
+            )
             dist.barrier()
             address = outputs[1].data_ptr()
             allocated = torch.cuda.memory_allocated(device)
@@ -707,5 +729,7 @@ def test_tp2_graph_rollover_clears_unused_shape_capacity(dtype_name, retained_ta
         pytest.skip("TP2 graph peer-push requires two CUDA devices")
     mp.spawn(
         _shape_growth_wrap_worker,
-        args=(2, _free_port(), dtype_name, retained_tag), nprocs=2, join=True,
+        args=(2, _free_port(), dtype_name, retained_tag),
+        nprocs=2,
+        join=True,
     )

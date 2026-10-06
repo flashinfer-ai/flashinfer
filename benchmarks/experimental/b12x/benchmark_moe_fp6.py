@@ -29,7 +29,11 @@ from benchmarks.experimental.b12x.fp6_common import (
     unswizzled_ue8m0_grid,
 )
 from b12x.preparation import PreparationSession
-from benchmarks.experimental.b12x.moe_preparation import prepared_call, request_for_capacity, scratch_for
+from benchmarks.experimental.b12x.moe_preparation import (
+    prepared_call,
+    request_for_capacity,
+    scratch_for,
+)
 
 
 def main() -> None:
@@ -41,7 +45,9 @@ def main() -> None:
     parser.add_argument("--topk", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--flush-l2", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--flush-l2", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--l2-flush-bytes", type=int, default=0)
     args = parser.parse_args()
 
@@ -63,9 +69,9 @@ def main() -> None:
 
     x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 0.1
     topk_ids = torch.randint(0, e, (m, topk), device=device, dtype=torch.int32)
-    topk_weights = torch.softmax(
-        torch.randn(m, topk, device=device), dim=-1
-    ).to(torch.float32)
+    topk_weights = torch.softmax(torch.randn(m, topk, device=device), dim=-1).to(
+        torch.float32
+    )
 
     w1_bf = torch.randn(e, 2 * n, k, device=device, dtype=torch.bfloat16) * 0.15
     w2_bf = torch.randn(e, k, n, device=device, dtype=torch.bfloat16) * 0.15
@@ -174,6 +180,7 @@ def main() -> None:
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     replay()
     from b12x.testing.benchmark import samples_ms
+
     times = samples_ms(launch, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush)
     med = statistics.median(times)
     print(

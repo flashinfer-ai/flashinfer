@@ -1,4 +1,5 @@
 """Offline MX-FP6 MoE weight-quantization pipeline: round-trip + kernel equivalence."""
+
 from __future__ import annotations
 
 # TODO(port): the kernel-equivalence half of this suite drove the historical
@@ -66,14 +67,29 @@ def _run_kernel(x, weights: FP6MoEWeights, topk_ids, topk_weights):
 
     clear_tp_moe_caches()
     workspace = allocate_tp_moe_workspace(
-        x, weights.a1_gscale, weights.w1_fp6, weights.a2_gscale, weights.w2_fp6,
-        topk_ids, quant_mode="w6a6", input_scales_static=True,
+        x,
+        weights.a1_gscale,
+        weights.w1_fp6,
+        weights.a2_gscale,
+        weights.w2_fp6,
+        topk_ids,
+        quant_mode="w6a6",
+        input_scales_static=True,
     )
     out = b12x_moe_fp6(
-        x, weights.a1_gscale, weights.w1_fp6, weights.w1_blockscale, weights.w1_alphas,
-        weights.a2_gscale, weights.w2_fp6, weights.w2_blockscale, weights.w2_alphas,
-        topk_weights, topk_ids,
-        workspace=workspace, input_scales_static=True,
+        x,
+        weights.a1_gscale,
+        weights.w1_fp6,
+        weights.w1_blockscale,
+        weights.w1_alphas,
+        weights.a2_gscale,
+        weights.w2_fp6,
+        weights.w2_blockscale,
+        weights.w2_alphas,
+        topk_weights,
+        topk_ids,
+        workspace=workspace,
+        input_scales_static=True,
         source_format=weights.source_format,
     )
     torch.cuda.synchronize()
@@ -94,7 +110,9 @@ def test_fp6_moe_weight_pipeline_roundtrip_and_equivalence(tmp_path) -> None:
     torch.manual_seed(11)
     x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 0.1
     topk_ids = torch.randint(0, experts, (m, topk), device=device, dtype=torch.int32)
-    topk_weights = torch.softmax(torch.randn(m, topk, device=device), dim=-1).to(torch.float32)
+    topk_weights = torch.softmax(torch.randn(m, topk, device=device), dim=-1).to(
+        torch.float32
+    )
     w1_bf = torch.randn(experts, 2 * n, k, device=device, dtype=torch.bfloat16) * 0.15
     w2_bf = torch.randn(experts, k, n, device=device, dtype=torch.bfloat16) * 0.15
 
@@ -122,11 +140,20 @@ def test_fp6_moe_weight_pipeline_roundtrip_and_equivalence(tmp_path) -> None:
     # Equivalence to the reference recipe fed through the same kernel.
     w1_fp6_r, w1_sf_r, w2_fp6_r, w2_sf_r = _reference_recipe(w1_bf, w2_bf)
     ref_weights = FP6MoEWeights(
-        w1_fp6=w1_fp6_r, w1_blockscale=w1_sf_r, w1_alphas=weights.w1_alphas,
-        w2_fp6=w2_fp6_r, w2_blockscale=w2_sf_r, w2_alphas=weights.w2_alphas,
-        a1_gscale=weights.a1_gscale, a2_gscale=weights.a2_gscale,
-        num_experts=experts, k=k, n=n, weight_fmt="e2m3",
-        source_format="mxfp6_default", activation="silu",
+        w1_fp6=w1_fp6_r,
+        w1_blockscale=w1_sf_r,
+        w1_alphas=weights.w1_alphas,
+        w2_fp6=w2_fp6_r,
+        w2_blockscale=w2_sf_r,
+        w2_alphas=weights.w2_alphas,
+        a1_gscale=weights.a1_gscale,
+        a2_gscale=weights.a2_gscale,
+        num_experts=experts,
+        k=k,
+        n=n,
+        weight_fmt="e2m3",
+        source_format="mxfp6_default",
+        activation="silu",
     )
     out_ref = _run_kernel(x, ref_weights, topk_ids, topk_weights)
     cos = _cos(out_pipeline, out_ref)

@@ -36,9 +36,7 @@ def route_pack_prewarm_key(
     normalized = {name: int(value) for name, value in values.items()}
     invalid = {name: value for name, value in normalized.items() if value < 1}
     if invalid:
-        raise ValueError(
-            f"route-pack prewarm dimensions must be positive: {invalid}"
-        )
+        raise ValueError(f"route-pack prewarm dimensions must be positive: {invalid}")
     return (
         str(device_type),
         int(device_index),

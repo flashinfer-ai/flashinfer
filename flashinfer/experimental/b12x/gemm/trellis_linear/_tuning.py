@@ -28,6 +28,7 @@ class TrellisQuery:
     gemm_output_f16_provided: bool = False
     output_f16_provided: bool = False
 
+
 @dataclass(frozen=True, kw_only=True)
 class TrellisConfig:
     backend: str
@@ -75,7 +76,11 @@ def validate_query(query):
     )
 
     if normalize_codebook(query.codebook) != query.codebook or query.bits not in (
-        2, 3, 4, 5, 6,
+        2,
+        3,
+        4,
+        5,
+        6,
     ):
         raise ValueError(
             "Trellis queries require a canonical codebook and supported native rate"
@@ -191,7 +196,11 @@ TUNING = TuningContract(
     candidate_contract_version=2,
     knobs=(
         Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),
-        Knob(name="block_rows", values=(8, 16, 32, 48, 64), binding=ParameterBinding.COMPILE),
+        Knob(
+            name="block_rows",
+            values=(8, 16, 32, 48, 64),
+            binding=ParameterBinding.COMPILE,
+        ),
         Knob(name="tile_k", values=(64, 128), binding=ParameterBinding.COMPILE),
         Knob(name="tile_n", values=(64, 128, 256), binding=ParameterBinding.COMPILE),
     ),

@@ -71,9 +71,13 @@ class B12XCompressedSparseMLAScratchCaps:
         object.__setattr__(self, "max_q_rows", max(int(self.max_q_rows), 1))
         object.__setattr__(self, "max_width", max(int(self.max_width), 1))
         if self.layout != "compressed_dsv4":
-            raise ValueError(f"unsupported compressed sparse MLA layout {self.layout!r}")
+            raise ValueError(
+                f"unsupported compressed sparse MLA layout {self.layout!r}"
+            )
         if self.cache_format not in ("deepseek_v4", "deepseek_v41"):
-            raise ValueError(f"unsupported compressed MLA cache_format {self.cache_format!r}")
+            raise ValueError(
+                f"unsupported compressed MLA cache_format {self.cache_format!r}"
+            )
         if self.mode not in ("decode", "extend", "verify", "draft_extend"):
             raise ValueError(f"unsupported compressed sparse MLA mode {self.mode!r}")
         legacy_shared_width = (
@@ -103,9 +107,7 @@ class B12XCompressedSparseMLAScratchCaps:
         if swa_width < 0 or indexed_width < 0:
             raise ValueError("swa_width and indexed_width must be non-negative")
         if not legacy_shared_width and swa_width + indexed_width != self.max_width:
-            raise ValueError(
-                "swa_width + indexed_width must equal max_width"
-            )
+            raise ValueError("swa_width + indexed_width must equal max_width")
         object.__setattr__(self, "swa_width", swa_width)
         object.__setattr__(self, "indexed_width", indexed_width)
         object.__setattr__(self, "shared_width_capacity", legacy_shared_width)
@@ -261,6 +263,7 @@ class B12XCompressedSparseMLABinding:
     indexed_lengths: torch.Tensor | None = None
     indexed_page_table: torch.Tensor | None = None
     plan: Plan | None = None
+
 
 def _compressed_sparse_mla_scratch_layout(
     caps: B12XCompressedSparseMLAScratchCaps,
@@ -626,9 +629,7 @@ def build_compressed_sparse_mla_binding(
             name="indexed_indices",
         )
         indexed_width = int(indexed_indices.shape[1])
-        max_indexed_width = int(
-            getattr(scratch, "max_indexed_width", scratch.topk)
-        )
+        max_indexed_width = int(getattr(scratch, "max_indexed_width", scratch.topk))
         if indexed_width > max_indexed_width:
             raise ValueError(
                 f"indexed_indices width {indexed_width} exceeds planned "
@@ -741,9 +742,8 @@ def plan_compressed_sparse_mla_scratch(
             caps,
             max_chunks_per_row=getattr(execution_config, "max_chunks_per_row", 64),
         )
-    elif (
-        execution_config is not None
-        and caps.max_chunks_per_row != getattr(execution_config, "max_chunks_per_row", None)
+    elif execution_config is not None and caps.max_chunks_per_row != getattr(
+        execution_config, "max_chunks_per_row", None
     ):
         raise ValueError("caps.max_chunks_per_row must match execution_config")
     layout = _compressed_sparse_mla_scratch_layout(caps)

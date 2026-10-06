@@ -250,7 +250,9 @@ def make_benchmark_requests(
                 source = torch.empty_like(seed)
                 norm = torch.ones(k, device=device, dtype=torch.bfloat16)
                 bias = (
-                    torch.randn((weight.out_features,), device=device, dtype=torch.bfloat16).mul_(0.01)
+                    torch.randn(
+                        (weight.out_features,), device=device, dtype=torch.bfloat16
+                    ).mul_(0.01)
                     if role.startswith("vision.")
                     else None
                 )

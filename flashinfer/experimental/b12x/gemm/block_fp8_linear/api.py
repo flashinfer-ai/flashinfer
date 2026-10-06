@@ -1,4 +1,5 @@
 """Prepared public surface for serialized block-FP8 linear."""
+
 from __future__ import annotations
 
 from b12x.preparation import Plan
@@ -29,7 +30,16 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
-    "Caps", "Plan", "Binding", "Weight", "DenseGemmConfig",
-    "BlockFp8LinearQuery", "plan", "bind", "run", "pack_weight",
-    "quantize_input", "is_supported",
+    "Caps",
+    "Plan",
+    "Binding",
+    "Weight",
+    "DenseGemmConfig",
+    "BlockFp8LinearQuery",
+    "plan",
+    "bind",
+    "run",
+    "pack_weight",
+    "quantize_input",
+    "is_supported",
 ]

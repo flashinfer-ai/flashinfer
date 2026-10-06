@@ -145,7 +145,11 @@ def build_packed_csf_scales(batch) -> PackedCsfScales:
     lut = batch.value_lut.to(device)
     offset = _table_offset(lut)
     raw = batch.exceptions
-    raw = raw.contiguous().view(torch.int32) if raw.numel() else raw.new_empty(0, dtype=torch.int32)
+    raw = (
+        raw.contiguous().view(torch.int32)
+        if raw.numel()
+        else raw.new_empty(0, dtype=torch.int32)
+    )
     exceptions = raw.to(torch.int64) & 0xFFFFFFFF
     offsets = batch.task_offsets
     masks_all, counts_all, words_all = [], [], []
@@ -207,9 +211,9 @@ def build_packed_csf_scales(batch) -> PackedCsfScales:
     storage[:256] = lut
     storage[256] = offset
     blocks = storage[HEADER_BYTES:words_offset].view(experts, expert_bytes)
-    blocks[:, : slabs * slab_bytes] = _stored_fixed(batch.fixed, columns, offset).reshape(
-        experts, -1
-    )
+    blocks[:, : slabs * slab_bytes] = _stored_fixed(
+        batch.fixed, columns, offset
+    ).reshape(experts, -1)
     blocks[:, slabs * slab_bytes :] = records
     if words.numel():
         storage[words_offset : words_offset + words.numel() * 4] = words.view(
@@ -289,7 +293,9 @@ class PackedCsfPlane:
 
     def validate(self):
         if self.rows % 128 or self.columns % 4 or self.fixed.device.type != "cuda":
-            raise ValueError("Packed CSF storage needs 128-row slabs and whole atoms on CUDA")
+            raise ValueError(
+                "Packed CSF storage needs 128-row slabs and whole atoms on CUDA"
+            )
 
 
 def _load_at(pointer, offset: Int64):
@@ -307,7 +313,9 @@ class PackedStoragePlane:
         self.expert_bytes = self.tasks * (self.slab_bytes + self.atoms * RECORD_BYTES)
 
     @cute.jit
-    def tensors(self, fixed, exceptions, offsets, output, lut, experts, exception_bytes):
+    def tensors(
+        self, fixed, exceptions, offsets, output, lut, experts, exception_bytes
+    ):
         return fixed, output
 
     @cute.jit
@@ -323,30 +331,39 @@ class PackedStoragePlane:
             + Int64(self.tasks * self.slab_bytes)
             + Int64(task) * Int64(self.atoms * RECORD_BYTES)
         )
-        destination = (
-            Int64(expert) * Int64(self.rows * self.columns) + Int64(task) * Int64(128)
-        )
+        destination = Int64(expert) * Int64(self.rows * self.columns) + Int64(
+            task
+        ) * Int64(128)
         word = tid
         while word < Int32(self.columns * 32):
             group = word // Int32(32)
             lane = word % Int32(32)
             codes = _load_at(
-                bytes16, (slab + Int64(128 + 2 * lane) + Int64(group) * Int64(64)) // Int64(2)
+                bytes16,
+                (slab + Int64(128 + 2 * lane) + Int64(group) * Int64(64)) // Int64(2),
             ).to(Uint32)
             codes = (codes | (codes << Uint32(12))) & Uint32(0x0F0F0F0F)
-            value = (codes + _load_at(words, (slab + Int64(4 * lane)) // Int64(4))).to(Uint32)
-            record = (records + Int64(group // Int32(4)) * Int64(RECORD_BYTES)) // Int64(4)
+            value = (codes + _load_at(words, (slab + Int64(4 * lane)) // Int64(4))).to(
+                Uint32
+            )
+            record = (
+                records + Int64(group // Int32(4)) * Int64(RECORD_BYTES)
+            ) // Int64(4)
             mask = _load_at(words, record + Int64(4 + group % Int32(4)))
             bit = Uint32(1) << lane.to(Uint32)
             if (mask & bit) != Uint32(0):
                 prefixes = _load_at(words, record + Int64(1))
                 index = (
                     _load_at(words, record)
-                    + ((prefixes >> ((group % Int32(4)).to(Uint32) * Uint32(8))) & Uint32(255))
+                    + (
+                        (prefixes >> ((group % Int32(4)).to(Uint32) * Uint32(8)))
+                        & Uint32(255)
+                    )
                     + cute.arch.popc(mask & (bit - Uint32(1))).to(Uint32)
                 )
                 value = _load_at(words, index.to(Int64)).to(Uint32)
             out[
-                (destination + Int64(group) * Int64(self.rows) + Int64(4 * lane)) // Int64(4)
+                (destination + Int64(group) * Int64(self.rows) + Int64(4 * lane))
+                // Int64(4)
             ] = value
             word += Int32(256)

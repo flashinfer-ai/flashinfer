@@ -9,7 +9,9 @@ from b12x.moe._shared.kernels.reference import (
     moe_reference_w4a16_fp4_e8m0_k32,
 )
 
-from b12x.moe._shared.kernels.micro import MoEMicroKernelBackend as NVFP4MoEMicroKernelBackend
+from b12x.moe._shared.kernels.micro import (
+    MoEMicroKernelBackend as NVFP4MoEMicroKernelBackend,
+)
 from b12x.testing.reference.w4a16_reference import moe_reference_w4a16
 
 
@@ -54,11 +56,9 @@ def _e8m0_blockscale_constant(
     return scales.to(torch.float8_e8m0fnu)
 
 
-
-
-
-
-def test_w4a16_reference_uses_bf16_activation_and_intermediate_without_activation_scales() -> None:
+def test_w4a16_reference_uses_bf16_activation_and_intermediate_without_activation_scales() -> (
+    None
+):
     experts, hidden, intermediate, topk = 1, 16, 16, 1
     x = torch.full((1, hidden), 0.25, dtype=torch.bfloat16)
     topk_ids = torch.zeros(1, topk, dtype=torch.int32)
@@ -219,10 +219,6 @@ def test_w4a16_fp4_e8m0_k32_oracle_uses_raw_k32_scale_grid() -> None:
     )
 
 
-
-
-
-
 def test_nvfp4_direct_micro_supports_partial_512_k_groups() -> None:
     for batch_size in (1, 2, 4, 8):
         assert NVFP4MoEMicroKernelBackend.is_supported(
@@ -254,5 +250,7 @@ def test_nvfp4_direct_micro_supports_partial_512_k_groups() -> None:
         routed_rows=6,
         max_rows=6,
     )
-    barrier_spec = next(spec for spec in plan.tensor_specs if spec.name == "barrier_count")
+    barrier_spec = next(
+        spec for spec in plan.tensor_specs if spec.name == "barrier_count"
+    )
     assert barrier_spec.shape == (22,)

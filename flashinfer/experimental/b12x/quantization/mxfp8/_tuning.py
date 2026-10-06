@@ -8,6 +8,7 @@ from b12x.preparation import BackendConfig, make_fixed_contract
 @dataclass(frozen=True, kw_only=True)
 class Mxfp8Query:
     """Complete immutable row-quantization declaration metadata."""
+
     rows: int
     columns: int
     dtype: str

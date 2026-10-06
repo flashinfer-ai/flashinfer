@@ -26,7 +26,8 @@ from ..conftest import require_b12x as require_sm120
 
 
 _test_resources: ContextVar[ExitStack | None] = ContextVar(
-    "qsa_test_resources", default=None,
+    "qsa_test_resources",
+    default=None,
 )
 
 
@@ -51,6 +52,7 @@ def _cuda_graph() -> torch.cuda.CUDAGraph:
     graph = getattr(torch.cuda, "CUDAGraph")()
     _resources().callback(graph.reset)
     return graph
+
 
 def _caps(
     device: torch.device | str | None = None,
@@ -80,26 +82,37 @@ def _caps(
     }
     values.update(changes)
     return qsa.Caps(**values)
+
+
 def _invocation(
-    caps: qsa.Caps, *, shared_pool: bool = False, **overrides: dict[str, object],
+    caps: qsa.Caps,
+    *,
+    shared_pool: bool = False,
+    **overrides: dict[str, object],
 ) -> object:
     operands = dict(qsa_contract._canonical_abi(caps))
     if shared_pool:
         page_elements = caps.compressed_page_size * caps.index_head_dim
         page_i64 = caps.compressed_page_nbytes // torch.int64.itemsize
-        operands.update({
-            "raw_k_ring": {
-                "dtype": "bfloat16", "strides": (page_elements, caps.index_head_dim, 1),
-            },
-            "raw_logical_positions": {"dtype": "int64", "strides": (page_i64, 1)},
-            "raw_rope_positions": {
-                "dtype": "int64", "strides": (page_i64, caps.position_axes, 1),
-            },
-            "raw_interval_start_positions": {"dtype": "int64", "strides": (page_i64,)},
-        })
+        operands.update(
+            {
+                "raw_k_ring": {
+                    "dtype": "bfloat16",
+                    "strides": (page_elements, caps.index_head_dim, 1),
+                },
+                "raw_logical_positions": {"dtype": "int64", "strides": (page_i64, 1)},
+                "raw_rope_positions": {
+                    "dtype": "int64",
+                    "strides": (page_i64, caps.position_axes, 1),
+                },
+                "raw_interval_start_positions": {
+                    "dtype": "int64",
+                    "strides": (page_i64,),
+                },
+            }
+        )
     operands.update(overrides)
     return qsa.invocation_from_descriptors(caps, operands=operands)
-
 
 
 def _allocate_binding(
@@ -194,17 +207,27 @@ def _allocate_binding(
         device=device,
     )
     binding_kwargs = dict(
-        main_k_cache=main_k, main_v_cache=main_v,
+        main_k_cache=main_k,
+        main_v_cache=main_v,
         k_descale=torch.ones(1, device=device)
-        if caps.kv_dtype == torch.float8_e4m3fn else None,
+        if caps.kv_dtype == torch.float8_e4m3fn
+        else None,
         v_descale=torch.ones(1, device=device)
-        if caps.kv_dtype == torch.float8_e4m3fn else None,
-        main_block_table=main_table, compressed_k_cache=compressed,
-        compressed_block_table=compressed_table, raw_k_ring=raw_ring,
-        raw_logical_positions=raw_tags, raw_rope_positions=raw_rope,
-        raw_interval_start_positions=raw_interval_start, raw_state_slot_ids=slot_ids,
-        index_q_norm_weight=q_weight, index_k_norm_weight=k_weight,
-        rope_cos=rope_cos, rope_sin=rope_sin, output=output,
+        if caps.kv_dtype == torch.float8_e4m3fn
+        else None,
+        main_block_table=main_table,
+        compressed_k_cache=compressed,
+        compressed_block_table=compressed_table,
+        raw_k_ring=raw_ring,
+        raw_logical_positions=raw_tags,
+        raw_rope_positions=raw_rope,
+        raw_interval_start_positions=raw_interval_start,
+        raw_state_slot_ids=slot_ids,
+        index_q_norm_weight=q_weight,
+        index_k_norm_weight=k_weight,
+        rope_cos=rope_cos,
+        rope_sin=rope_sin,
+        output=output,
         selected_positions=selected,
     )
     prepared: dict[str, object] = {}
@@ -214,9 +237,12 @@ def _allocate_binding(
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
         binding = state.bind_for_preparation(scratch=scratch, **binding_kwargs)
         restore_tensors = (
-            binding.compressed_k_cache, binding.raw_k_ring,
-            binding.raw_logical_positions, binding.raw_rope_positions,
-            binding.raw_interval_start_positions, binding.output,
+            binding.compressed_k_cache,
+            binding.raw_k_ring,
+            binding.raw_logical_positions,
+            binding.raw_rope_positions,
+            binding.raw_interval_start_positions,
+            binding.output,
             binding.selected_positions,
         )
         snapshots = tuple(tensor.clone() for tensor in restore_tensors)
@@ -236,9 +262,14 @@ def _allocate_binding(
 
     resources = _resources()
     session = resources.enter_context(PreparationSession(device=device, autotune=False))
-    result = session.prepare((declaration.request(
-        name="qsa-test", prepare_call=prepare_call,
-    ),))
+    result = session.prepare(
+        (
+            declaration.request(
+                name="qsa-test",
+                prepare_call=prepare_call,
+            ),
+        )
+    )
     resources.callback(result.close)
     spec = prepared["spec"]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
@@ -393,17 +424,27 @@ def _allocate_shared_compressed_raw_binding(
         device=device,
     )
     binding_kwargs = dict(
-        main_k_cache=main_k, main_v_cache=main_v,
+        main_k_cache=main_k,
+        main_v_cache=main_v,
         k_descale=torch.ones(1, device=device)
-        if caps.kv_dtype == torch.float8_e4m3fn else None,
+        if caps.kv_dtype == torch.float8_e4m3fn
+        else None,
         v_descale=torch.ones(1, device=device)
-        if caps.kv_dtype == torch.float8_e4m3fn else None,
-        main_block_table=main_table, compressed_k_cache=compressed,
-        compressed_block_table=compressed_table, raw_k_ring=raw_ring,
-        raw_logical_positions=raw_tags, raw_rope_positions=raw_rope,
-        raw_interval_start_positions=raw_interval_start, raw_state_slot_ids=slot_ids,
-        index_q_norm_weight=q_weight, index_k_norm_weight=k_weight,
-        rope_cos=rope_cos, rope_sin=rope_sin, output=output,
+        if caps.kv_dtype == torch.float8_e4m3fn
+        else None,
+        main_block_table=main_table,
+        compressed_k_cache=compressed,
+        compressed_block_table=compressed_table,
+        raw_k_ring=raw_ring,
+        raw_logical_positions=raw_tags,
+        raw_rope_positions=raw_rope,
+        raw_interval_start_positions=raw_interval_start,
+        raw_state_slot_ids=slot_ids,
+        index_q_norm_weight=q_weight,
+        index_k_norm_weight=k_weight,
+        rope_cos=rope_cos,
+        rope_sin=rope_sin,
+        output=output,
         selected_positions=selected,
     )
 
@@ -411,7 +452,13 @@ def _allocate_shared_compressed_raw_binding(
         prime_scratch = torch.empty_like(scratch)
         binding = state.bind_for_preparation(scratch=prime_scratch, **binding_kwargs)
         restored = (
-            compressed, raw_ring, raw_tags, raw_rope, raw_interval_start, output, selected,
+            compressed,
+            raw_ring,
+            raw_tags,
+            raw_rope,
+            raw_interval_start,
+            output,
+            selected,
         )
         snapshots = tuple(tensor.clone() for tensor in restored)
         dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
@@ -429,12 +476,14 @@ def _allocate_shared_compressed_raw_binding(
 
     resources = _resources()
     session = resources.enter_context(PreparationSession(device=device, autotune=False))
-    result = session.prepare((
-        declaration.request(
-            name="qsa-shared-test",
-            prepare_call=prepare_call,
-        ),
-    ))
+    result = session.prepare(
+        (
+            declaration.request(
+                name="qsa-shared-test",
+                prepare_call=prepare_call,
+            ),
+        )
+    )
     resources.callback(result.close)
     return qsa.bind(
         declaration,
@@ -618,10 +667,6 @@ def _bf16_eager_rope_reference(
     return result
 
 
-
-
-
-
 def test_qsa_cache_requirements_are_pure_and_describe_shared_page_layout() -> None:
     requirements = qsa.cache_requirements(
         main_page_size=64,
@@ -681,8 +726,6 @@ def test_qsa_cache_requirements_are_pure_and_describe_shared_page_layout() -> No
         position_axes=3,
     )
     assert not too_small.shared_compressed_raw_storage_legal
-
-
 
 
 def test_qsa_caps_reject_unmodeled_or_inconsistent_state() -> None:
@@ -752,10 +795,6 @@ def test_qsa_caps_reject_unmodeled_or_inconsistent_state() -> None:
         mrope_interleaved=True,
     )
     assert target.mrope_sections == (11, 11, 10)
-
-
-
-
 
 
 @pytest.mark.parametrize("rows", [1, 16, 32, 257, 513])
@@ -932,7 +971,6 @@ def test_qsa_shared_raw_storage_rejects_page_tail_overflow() -> None:
             raw_rope_positions=raw_rope,
             raw_interval_start_positions=raw_interval_start,
         )
-
 
 
 def test_qsa_run_rejects_dynamic_dtype_drift_before_launch() -> None:
@@ -1639,7 +1677,7 @@ def test_qsa_cute_scores_preserve_paged_contract_under_graph_replay(
         )
 
     invoke(launch_cute, 16, 0, groups, True)
-    with kernel_resolution_guard('QSA score rows and chunks are runtime quantities'):
+    with kernel_resolution_guard("QSA score rows and chunks are runtime quantities"):
         for rows, offset, count in ((1, 0, 65), (4, 0, groups), (16, 32768, 32768)):
             graph = _cuda_graph()
             with torch.cuda.graph(graph):
@@ -1954,7 +1992,9 @@ def test_qsa_cute_score_respects_dcp_rank_eligibility(
         device=device,
     )
     table = torch.arange(
-        caps.compressed_table_width, dtype=torch.int32, device=device,
+        caps.compressed_table_width,
+        dtype=torch.int32,
+        device=device,
     ).unsqueeze(0)
     scores = torch.empty((1, caps.max_groups), dtype=torch.float32, device=device)
     eligible = torch.empty((1,), dtype=torch.int32, device=device)
@@ -3091,7 +3131,9 @@ def test_qsa_score_uses_tensor_device_and_stream() -> None:
         assert torch.cuda.current_device() == other
     stream.synchronize()
     warmed = tuple(implementation._CACHE.items())
-    with kernel_resolution_guard('QSA scorer retains tensor device under ambient device changes'):
+    with kernel_resolution_guard(
+        "QSA scorer retains tensor device under ambient device changes"
+    ):
         with torch.cuda.stream(stream), torch.cuda.device(other):
             graph = _cuda_graph()
             with (
@@ -3158,7 +3200,7 @@ def test_qsa_run_prewarm_covers_bound_capacity_and_graph_replay(
     buffers = (binding.scratch, binding.output, binding.selected_positions)
     pointers = tuple(t.data_ptr() for t in buffers)
     completion_event = binding._selection_done
-    with kernel_resolution_guard('QSA run uses prewarmed capacity across live rows'):
+    with kernel_resolution_guard("QSA run uses prewarmed capacity across live rows"):
         for dtype in (torch.int32, torch.int64):
             for rows in sorted({1, min(4, output_rows), output_rows}):
                 dynamic = _dynamic_inputs(
@@ -3505,7 +3547,9 @@ def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
         invoke = torch.compile(invoke, fullgraph=True)
     for rows in (1, 3, 4):
         invoke(rows)
-    with kernel_resolution_guard('QSA draft reuse must retain prewarmed reader capacity'):
+    with kernel_resolution_guard(
+        "QSA draft reuse must retain prewarmed reader capacity"
+    ):
         for rows in (1, 3, 4):
             graph = _cuda_graph()
             with torch.cuda.graph(graph):

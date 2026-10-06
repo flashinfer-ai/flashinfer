@@ -230,17 +230,28 @@ def test_pooled_topk_expands_to_physical_slots(rows: int, planned: bool) -> None
         from b12x.preparation import PreparationSession, PreparedCall
 
         plan = sparse_mla.plan_pooled_selection(
-            device=device, max_rows=32, page_size=block_size,
-            max_page_table_width=80, num_cache_blocks=num_cache_blocks,
+            device=device,
+            max_rows=32,
+            page_size=block_size,
+            max_page_table_width=80,
+            num_cache_blocks=num_cache_blocks,
         )
         request = plan.request(
             name="pooled selection",
-            prepare_call=lambda state: PreparedCall(run=lambda: state.run(
-                pool_indices, positions, request_ids, block_table, output,
-                active_counts, pool_size=pool_size, block_size=block_size,
-                block_stride_rows=block_stride_rows,
-                num_cache_blocks=num_cache_blocks,
-            )),
+            prepare_call=lambda state: PreparedCall(
+                run=lambda: state.run(
+                    pool_indices,
+                    positions,
+                    request_ids,
+                    block_table,
+                    output,
+                    active_counts,
+                    pool_size=pool_size,
+                    block_size=block_size,
+                    block_stride_rows=block_stride_rows,
+                    num_cache_blocks=num_cache_blocks,
+                )
+            ),
         )
         PreparationSession(device=device, compile_workers=0).prepare((request,))
 
@@ -314,9 +325,16 @@ def test_pooled_topk_physical_expansion_replays_live_inputs() -> None:
         name="glm-c4-selection",
         prepare_call=lambda state: PreparedCall(
             run=lambda: state.run(
-                pool_indices, positions, request_ids, block_table, output,
-                active_counts, pool_size=4, block_size=256,
-                block_stride_rows=256, num_cache_blocks=8_000_000,
+                pool_indices,
+                positions,
+                request_ids,
+                block_table,
+                output,
+                active_counts,
+                pool_size=4,
+                block_size=256,
+                block_stride_rows=256,
+                num_cache_blocks=8_000_000,
             ),
             owners=(
                 pool_indices,

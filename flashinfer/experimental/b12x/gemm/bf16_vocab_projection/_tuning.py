@@ -172,13 +172,30 @@ TUNING = TuningContract(
     default_config=_default_config,
     candidate_contract_version=2,
     knobs=(
-        Knob(name="backend", values=("torch", "triton"), binding=ParameterBinding.COMPILE),
-        Knob(name="algorithm", values=("row", "loop"), binding=ParameterBinding.COMPILE,
-             when=FrozenMapping({"backend": "triton"}), otherwise="torch"),
-        Knob(name="block_k", values=None, binding=ParameterBinding.COMPILE,
-             when=FrozenMapping({"backend": "triton"}), otherwise=0),
-        Knob(name="num_warps", values=(1, 2, 4, 8), binding=ParameterBinding.COMPILE,
-             when=FrozenMapping({"backend": "triton"}), otherwise=0),
+        Knob(
+            name="backend", values=("torch", "triton"), binding=ParameterBinding.COMPILE
+        ),
+        Knob(
+            name="algorithm",
+            values=("row", "loop"),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "triton"}),
+            otherwise="torch",
+        ),
+        Knob(
+            name="block_k",
+            values=None,
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "triton"}),
+            otherwise=0,
+        ),
+        Knob(
+            name="num_warps",
+            values=(1, 2, 4, 8),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "triton"}),
+            otherwise=0,
+        ),
     ),
     parameters=_tuning_parameters,
 )

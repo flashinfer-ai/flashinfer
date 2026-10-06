@@ -486,8 +486,6 @@ class Bf16GemmKernel:
                 )
 
 
-
-
 def _pointer(tensor: torch.Tensor):
     return make_ptr(
         _DTYPES[tensor.dtype],
@@ -495,10 +493,6 @@ def _pointer(tensor: torch.Tensor):
         cute.AddressSpace.gmem,
         assumed_align=tensor.element_size(),
     )
-
-
-
-
 
 
 def _validate(x, weight, out, bias):
@@ -546,45 +540,105 @@ def _validate(x, weight, out, bias):
 
 @program_cache
 def compile_projection(
-    ordinal: int, backend: str, rows_per_tile: int, n: int, k: int,
-    source_dtype: str, weight_dtype: str, output_dtype: str, bias_dtype: str | None,
+    ordinal: int,
+    backend: str,
+    rows_per_tile: int,
+    n: int,
+    k: int,
+    source_dtype: str,
+    weight_dtype: str,
+    output_dtype: str,
+    bias_dtype: str | None,
 ):
     """Compile one selected concrete kernel from immutable operand metadata."""
-    x_type, w_type, y_type = (getattr(torch, name) for name in (
-        source_dtype, weight_dtype, output_dtype,
-    ))
+    x_type, w_type, y_type = (
+        getattr(torch, name)
+        for name in (
+            source_dtype,
+            weight_dtype,
+            output_dtype,
+        )
+    )
     kernel = (
-        SmallNGemvKernel(n, k, x_type == w_type == torch.bfloat16,
-                        bias_dtype is not None, rows_per_tile)
-        if backend == "simt" else Bf16GemmKernel(n, k, bias_dtype is not None)
+        SmallNGemvKernel(
+            n,
+            k,
+            x_type == w_type == torch.bfloat16,
+            bias_dtype is not None,
+            rows_per_tile,
+        )
+        if backend == "simt"
+        else Bf16GemmKernel(n, k, bias_dtype is not None)
     )
     if backend not in ("simt", "mma"):
         raise ValueError("projection compiler requires a selected SIMT or MMA backend")
-    types = (x_type, w_type, x_type if bias_dtype is None else getattr(torch, bias_dtype), y_type)
-    key = (ordinal, backend, rows_per_tile if backend == "simt" else None,
-           n, k, source_dtype, weight_dtype, output_dtype, bias_dtype)
-    fake = tuple(make_ptr(_DTYPES[dtype], 16, cute.AddressSpace.gmem,
-                          assumed_align=dtype.itemsize) for dtype in types)
+    types = (
+        x_type,
+        w_type,
+        x_type if bias_dtype is None else getattr(torch, bias_dtype),
+        y_type,
+    )
+    key = (
+        ordinal,
+        backend,
+        rows_per_tile if backend == "simt" else None,
+        n,
+        k,
+        source_dtype,
+        weight_dtype,
+        output_dtype,
+        bias_dtype,
+    )
+    fake = tuple(
+        make_ptr(
+            _DTYPES[dtype], 16, cute.AddressSpace.gmem, assumed_align=dtype.itemsize
+        )
+        for dtype in types
+    )
     with torch.cuda.device(ordinal):
         raw = b12x_compile(
-            kernel, *fake, Int32(1), Int64(k), Int64(k), Int64(n),
-            Int64(1), Int64(1), Int32(0), current_cuda_stream(),
-            compile_spec=KernelCompileSpec.from_key("gemm.bf16_projection.selected", 1, key),
+            kernel,
+            *fake,
+            Int32(1),
+            Int64(k),
+            Int64(k),
+            Int64(n),
+            Int64(1),
+            Int64(1),
+            Int32(0),
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key(
+                "gemm.bf16_projection.selected", 1, key
+            ),
         )
 
     def run(x, weight, out, bias=None):
         vector_loads = int(
-            x.data_ptr() % 16 == 0 and weight.data_ptr() % 16 == 0
-            and x.stride(0) % 8 == 0 and weight.stride(0) % 8 == 0
-            and x.stride(1) == 1 and weight.stride(1) == 1 and k % 8 == 0
+            x.data_ptr() % 16 == 0
+            and weight.data_ptr() % 16 == 0
+            and x.stride(0) % 8 == 0
+            and weight.stride(0) % 8 == 0
+            and x.stride(1) == 1
+            and weight.stride(1) == 1
+            and k % 8 == 0
         )
         with torch.cuda.device(ordinal):
-            run_compiled(raw, (
-                _pointer(x), _pointer(weight), _pointer(x if bias is None else bias),
-                _pointer(out), Int32(x.shape[0]), Int64(x.stride(0)),
-                Int64(weight.stride(0)), Int64(out.stride(0)),
-                Int64(x.stride(1)), Int64(weight.stride(1)), Int32(vector_loads),
-                current_cuda_stream(),
-            ))
+            run_compiled(
+                raw,
+                (
+                    _pointer(x),
+                    _pointer(weight),
+                    _pointer(x if bias is None else bias),
+                    _pointer(out),
+                    Int32(x.shape[0]),
+                    Int64(x.stride(0)),
+                    Int64(weight.stride(0)),
+                    Int64(out.stride(0)),
+                    Int64(x.stride(1)),
+                    Int64(weight.stride(1)),
+                    Int32(vector_loads),
+                    current_cuda_stream(),
+                ),
+            )
 
     return attach_programs(run, raw)

@@ -1,4 +1,5 @@
 """Prepared CSA compressor numerical, replay, and 64-bit addressing contracts."""
+
 from __future__ import annotations
 
 import pytest
@@ -20,10 +21,16 @@ def _device():
 
 def _prepared(ratio=2, states=8, *, sparse_pending=False):
     device = _device()
-    caps = op.Caps(device=device, max_tokens=12, max_requests=4, max_states=states, ratio=ratio)
+    caps = op.Caps(
+        device=device, max_tokens=12, max_requests=4, max_states=states, ratio=ratio
+    )
     declaration = op.plan(caps)
     owned = dict(
-        values=torch.empty((12, 512), dtype=torch.float32 if ratio == 2 else torch.bfloat16, device=device),
+        values=torch.empty(
+            (12, 512),
+            dtype=torch.float32 if ratio == 2 else torch.bfloat16,
+            device=device,
+        ),
         weight=torch.linspace(-1.1, 1.3, 512, device=device),
         query_start_loc=torch.zeros(5, dtype=torch.int32, device=device),
         positions=torch.zeros(4, dtype=torch.int64, device=device),
@@ -37,8 +44,12 @@ def _prepared(ratio=2, states=8, *, sparse_pending=False):
     if ratio == 2:
         owned.update(
             gates=torch.empty((12, 512), dtype=torch.float32, device=device),
-            pending_values=torch.empty((states, 512), dtype=torch.float32, device=device),
-            pending_gates=torch.empty((states, 512), dtype=torch.float32, device=device),
+            pending_values=torch.empty(
+                (states, 512), dtype=torch.float32, device=device
+            ),
+            pending_gates=torch.empty(
+                (states, 512), dtype=torch.float32, device=device
+            ),
             pending_position=(
                 torch.empty((states,), dtype=torch.int64, device=device)
                 if sparse_pending
@@ -50,20 +61,36 @@ def _prepared(ratio=2, states=8, *, sparse_pending=False):
         # Prime an actual pair, then restore only the caller-owned rows touched.
         snapshots = {
             name: owned[name].clone()
-            for name in ("values", "gates", "query_start_loc", "positions", "state_ids",
-                         "live_counts", "out", "emitted", "emitted_slots")
+            for name in (
+                "values",
+                "gates",
+                "query_start_loc",
+                "positions",
+                "state_ids",
+                "live_counts",
+                "out",
+                "emitted",
+                "emitted_slots",
+            )
             if name in owned
         }
         pending = None
         if ratio == 2:
             pending = (
-                owned["pending_values"][0].clone(), owned["pending_gates"][0].clone(),
+                owned["pending_values"][0].clone(),
+                owned["pending_gates"][0].clone(),
                 owned["pending_position"][0].clone(),
             )
         owned["values"].fill_(1)
-        owned["query_start_loc"][:] = torch.tensor([0, 2, 2, 2, 2], dtype=torch.int32, device=device)
-        owned["positions"][:] = torch.tensor([0, -1, -1, -1], dtype=torch.int64, device=device)
-        owned["state_ids"][:] = torch.tensor([0, -1, -1, -1], dtype=torch.int64, device=device)
+        owned["query_start_loc"][:] = torch.tensor(
+            [0, 2, 2, 2, 2], dtype=torch.int32, device=device
+        )
+        owned["positions"][:] = torch.tensor(
+            [0, -1, -1, -1], dtype=torch.int64, device=device
+        )
+        owned["state_ids"][:] = torch.tensor(
+            [0, -1, -1, -1], dtype=torch.int64, device=device
+        )
         owned["live_counts"][:] = torch.tensor([2, 1], dtype=torch.int32, device=device)
         if ratio == 2:
             owned["gates"].zero_()
@@ -80,7 +107,9 @@ def _prepared(ratio=2, states=8, *, sparse_pending=False):
         return PreparedCall(run=lambda: state.run(binding), restore=restore)
 
     session = PreparationSession(device=device, autotune=False, compile_workers=2)
-    result = session.prepare((declaration.request(name="mla-compress", prepare_call=prepare_call),))
+    result = session.prepare(
+        (declaration.request(name="mla-compress", prepare_call=prepare_call),)
+    )
     return session, result, result.plans["mla-compress"], owned
 
 
@@ -89,10 +118,28 @@ def _prepare(binding, lengths, positions, ids, seed):
     for length in lengths:
         starts.append(starts[-1] + length)
     n = starts[-1]
-    binding.query_start_loc.copy_(torch.tensor(starts + [n] * (5 - len(starts)), dtype=torch.int32, device=binding.values.device))
-    binding.positions.copy_(torch.tensor(positions + [-1] * (4 - len(positions)), dtype=torch.int64, device=binding.values.device))
-    binding.state_ids.copy_(torch.tensor(ids + [-1] * (4 - len(ids)), dtype=torch.int64, device=binding.values.device))
-    binding.live_counts.copy_(torch.tensor([n, len(lengths)], dtype=torch.int32, device=binding.values.device))
+    binding.query_start_loc.copy_(
+        torch.tensor(
+            starts + [n] * (5 - len(starts)),
+            dtype=torch.int32,
+            device=binding.values.device,
+        )
+    )
+    binding.positions.copy_(
+        torch.tensor(
+            positions + [-1] * (4 - len(positions)),
+            dtype=torch.int64,
+            device=binding.values.device,
+        )
+    )
+    binding.state_ids.copy_(
+        torch.tensor(
+            ids + [-1] * (4 - len(ids)), dtype=torch.int64, device=binding.values.device
+        )
+    )
+    binding.live_counts.copy_(
+        torch.tensor([n, len(lengths)], dtype=torch.int32, device=binding.values.device)
+    )
     generator = torch.Generator().manual_seed(seed)
     values = torch.randn((12, 512), generator=generator).to(binding.values.dtype)
     binding.values.copy_(values)
@@ -101,7 +148,16 @@ def _prepare(binding, lengths, positions, ids, seed):
         gates = torch.randn((12, 512), generator=generator) * 30
         gates[:, ::2] *= -1
         binding.gates.copy_(gates)
-    return dict(values=values, gates=gates, weight=binding.weight.cpu(), starts=starts, positions=positions, state_ids=ids, slots=binding.destination_slots.cpu(), ratio=binding._state.caps.ratio)
+    return dict(
+        values=values,
+        gates=gates,
+        weight=binding.weight.cpu(),
+        starts=starts,
+        positions=positions,
+        state_ids=ids,
+        slots=binding.destination_slots.cpu(),
+        ratio=binding._state.caps.ratio,
+    )
 
 
 def _assert_result(binding, expected):
@@ -116,22 +172,28 @@ def test_prepared_compressor_replays_dynamic_counts_against_streaming_oracle(rat
     graph = None
     try:
         binding = op.bind(plan, **owned)
-        _prepare(binding, [2], [0], [1], 4); op.run(binding)
+        _prepare(binding, [2], [0], [1], 4)
+        op.run(binding)
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
             op.run(binding)
         state = {}
-        for seed, (lengths, positions, ids) in enumerate((([3, 1], [0, 0], [4, 2]), ([1, 2, 1], [1, 3, 7], [2, 4, -1]), ([], [], []))):
+        for seed, (lengths, positions, ids) in enumerate(
+            (([3, 1], [0, 0], [4, 2]), ([1, 2, 1], [1, 3, 7], [2, 4, -1]), ([], [], []))
+        ):
             kwargs = _prepare(binding, lengths, positions, ids, seed + 20)
             expected = streaming_reference(**kwargs, state=state)
-            binding.out.fill_(float("nan")); binding.emitted.fill_(True); binding.emitted_slots.fill_(42)
-            graph.replay(); torch.cuda.synchronize(binding.values.device)
+            binding.out.fill_(float("nan"))
+            binding.emitted.fill_(True)
+            binding.emitted_slots.fill_(42)
+            graph.replay()
+            torch.cuda.synchronize(binding.values.device)
             _assert_result(binding, expected)
     finally:
         if graph is not None:
             graph.reset()
-        result.close(); session.close()
-
+        result.close()
+        session.close()
 
 
 @pytest.mark.parametrize("ratio", [1, 2])
@@ -146,16 +208,16 @@ def test_prepared_compressor_compiles_through_prepared_plan(ratio):
         torch.cuda.synchronize(binding.values.device)
         _assert_result(binding, expected)
     finally:
-        result.close(); session.close()
+        result.close()
+        session.close()
+
 
 def test_prepared_compressor_high_state_id_uses_int64_offsets():
     device = _device()
     state_id = 2**31 // 512 + 1
     # The large state arrays are virtual/uninitialized; only the addressed row
     # participates in this probe, so it never clones or initializes the pool.
-    session, result, plan, owned = _prepared(
-        states=state_id + 2, sparse_pending=True
-    )
+    session, result, plan, owned = _prepared(states=state_id + 2, sparse_pending=True)
     try:
         binding = op.bind(plan, **owned)
         binding.pending_position[state_id].fill_(-1)
@@ -163,7 +225,9 @@ def test_prepared_compressor_high_state_id_uses_int64_offsets():
         for seed, position in enumerate((0, 1)):
             kwargs = _prepare(binding, [1], [position], [state_id], seed + 50)
             expected = streaming_reference(**kwargs, state=state)
-            op.run(binding); _assert_result(binding, expected)
+            op.run(binding)
+            _assert_result(binding, expected)
         assert binding.pending_position[state_id].item() == -1
     finally:
-        result.close(); session.close()
+        result.close()
+        session.close()

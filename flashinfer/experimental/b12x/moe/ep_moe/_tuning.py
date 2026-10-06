@@ -1,4 +1,5 @@
 """Fixed W4A16 configuration contract for prepared expert-parallel MoE."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

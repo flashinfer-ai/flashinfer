@@ -20,7 +20,11 @@ from .config import (
 )
 from .weights import ScaleFactors, TrellisWeights
 from .source import TrellisExtent, TrellisSource
-from .trellis_layout import TrellisStaging, append_intermediate_signs, assemble_uniform_slots
+from .trellis_layout import (
+    TrellisStaging,
+    append_intermediate_signs,
+    assemble_uniform_slots,
+)
 
 
 _SLOT_CHANNELS = 32
@@ -99,9 +103,7 @@ def _selected_scale_tensor(
     name: str,
     device: torch.device,
 ) -> torch.Tensor:
-    return _require_cuda_tensor(
-        tensor, name=name, dtype=torch.float16, device=device
-    )
+    return _require_cuda_tensor(tensor, name=name, dtype=torch.float16, device=device)
 
 
 def _validate_factor_presence(
@@ -112,7 +114,9 @@ def _validate_factor_presence(
 ) -> None:
     if declaration.gains is ScaleGranularity.NONE:
         if factors.gains is not None:
-            raise ValueError(f"{name}.gains is declared 'none' but a tensor was supplied")
+            raise ValueError(
+                f"{name}.gains is declared 'none' but a tensor was supplied"
+            )
     elif factors.gains is None:
         raise ValueError(f"{name}.gains requires a tensor")
 
@@ -139,9 +143,7 @@ def _effective_input_scales(
         elif tuple(vectors.shape) == (2, hidden_size):
             vectors = vectors.reshape(1, 2, hidden_size)
         else:
-            raise ValueError(
-                "selected input scale vectors must be fp16 [H] or [2,H]"
-            )
+            raise ValueError("selected input scale vectors must be fp16 [H] or [2,H]")
     else:
         if tuple(vectors.shape) == (num_experts, hidden_size):
             vectors = vectors.reshape(num_experts, 1, hidden_size)
@@ -154,9 +156,7 @@ def _effective_input_scales(
     if gains is None:
         effective = vectors
     else:
-        gains = _selected_scale_tensor(
-            gains, name="input_scales.gains", device=device
-        )
+        gains = _selected_scale_tensor(gains, name="input_scales.gains", device=device)
         gain_experts = num_experts if _expert_axis(declaration.gains) else 1
         allowed = (
             {(), (1,), (2,)}
@@ -189,9 +189,7 @@ def _effective_intermediate_scales(
     intermediate_size: int,
     device: torch.device,
 ) -> torch.Tensor:
-    _validate_factor_presence(
-        factors, declaration, name="intermediate_scales"
-    )
+    _validate_factor_presence(factors, declaration, name="intermediate_scales")
     vectors = _selected_scale_tensor(
         factors.vectors, name="intermediate_scales.vectors", device=device
     )
@@ -227,9 +225,7 @@ def _effective_intermediate_scales(
             elif tuple(gains.shape) == (3,):
                 gains = gains.reshape(1, 3)
             else:
-                raise ValueError(
-                    "selected intermediate gains must be fp16 [1] or [3]"
-                )
+                raise ValueError("selected intermediate gains must be fp16 [1] or [3]")
         vectors = vectors * gains.unsqueeze(-1)
     return vectors.expand(num_experts, -1, -1).contiguous()
 
@@ -258,9 +254,7 @@ def _effective_output_scales(
 
     gains = factors.gains
     if gains is not None:
-        gains = _selected_scale_tensor(
-            gains, name="output_scales.gains", device=device
-        )
+        gains = _selected_scale_tensor(gains, name="output_scales.gains", device=device)
         if _expert_axis(declaration.gains):
             if tuple(gains.shape) != (num_experts,):
                 raise ValueError("per-expert output gains must be fp16 [E]")
@@ -297,9 +291,7 @@ def _local_rate_matrix(
         return rate.reshape(num_experts, 1).expand(-1, _PROJECTIONS)
     expected = (num_experts, _PROJECTIONS)
     if tuple(rate.shape) != expected:
-        raise ValueError(
-            f"selected per-expert-projection rate must be uint8{expected}"
-        )
+        raise ValueError(f"selected per-expert-projection rate must be uint8{expected}")
     return rate
 
 
@@ -343,9 +335,7 @@ def _bundle_offsets(bits: torch.Tensor, hidden_size: int) -> list[list[int]]:
         expert_offsets = []
         for projection in range(_PROJECTIONS):
             expert_offsets.append(cursor)
-            cursor += _matrix_section_bytes(
-                hidden_size, int(bits[expert, projection])
-            )
+            cursor += _matrix_section_bytes(hidden_size, int(bits[expert, projection]))
         offsets.append(expert_offsets)
     return offsets
 
@@ -377,13 +367,17 @@ def _projection_native(
         )
     sections = torch.stack(
         tuple(
-            codes[:, offsets[expert][projection] : offsets[expert][projection] + section]
+            codes[
+                :, offsets[expert][projection] : offsets[expert][projection] + section
+            ]
             for expert in experts
         ),
         dim=1,
     )
-    words = sections.contiguous().view(torch.int16).reshape(
-        slots, len(experts), 2, hidden_tiles, 16 * bits
+    words = (
+        sections.contiguous()
+        .view(torch.int16)
+        .reshape(slots, len(experts), 2, hidden_tiles, 16 * bits)
     )
     if fc1:
         return words.permute(1, 3, 0, 2, 4).reshape(
@@ -402,10 +396,12 @@ def _intermediate_hadamard_rows(
     device: torch.device,
 ) -> torch.Tensor:
     return append_intermediate_signs(
-        values.to(device=device), sign_patterns,
+        values.to(device=device),
+        sign_patterns,
         extent=TrellisExtent(
             global_intermediate_size=intermediate_size,
-            first_slot=0, slot_count=intermediate_size // 32,
+            first_slot=0,
+            slot_count=intermediate_size // 32,
         ),
     )
 
@@ -437,8 +433,12 @@ def _uniform_prepared(
     from b12x.moe._shared.kernels.w4a16.prepare import prepare_trellis256_moe_weights
 
     w13, down = assemble_uniform_slots(
-        weights.codes, num_experts=num_experts, hidden_size=hidden_size,
-        bits=bit, device=gate_suh.device, staging=staging,
+        weights.codes,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        bits=bit,
+        device=gate_suh.device,
+        staging=staging,
     )
     prepared = prepare_trellis256_moe_weights(
         w13=w13,
@@ -469,7 +469,9 @@ def _uniform_prepared(
         return prepared
     sign_patterns = weights.expert_sign_patterns
     if sign_patterns is None:
-        raise ValueError("intermediate_hadamard preparation requires expert_sign_patterns")
+        raise ValueError(
+            "intermediate_hadamard preparation requires expert_sign_patterns"
+        )
     _require_cuda_tensor(
         sign_patterns,
         name="expert_sign_patterns",
@@ -492,9 +494,11 @@ def _uniform_prepared(
             intermediate_rotations=append_intermediate_signs(
                 intermediate.reshape(num_experts, -1),
                 sign_patterns,
-                extent=extent or TrellisExtent(
+                extent=extent
+                or TrellisExtent(
                     global_intermediate_size=intermediate_size,
-                    first_slot=0, slot_count=intermediate_size // 32,
+                    first_slot=0,
+                    slot_count=intermediate_size // 32,
                 ),
             ),
         ),
@@ -516,7 +520,8 @@ def _projection_prepared(
     down_svh: torch.Tensor,
 ) -> PreparedProjectionTrellisWeights:
     from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
-        MixedTrellisRotations, build_projection_tiered_maps,
+        MixedTrellisRotations,
+        build_projection_tiered_maps,
     )
     from b12x.moe._shared.kernels.w4a16.prepare import (
         _finalize_prepared_trellis_weights,
@@ -575,11 +580,7 @@ def _projection_prepared(
         )
         if gate_ids or up_ids:
             w13 = torch.cat(
-                tuple(
-                    value
-                    for value, ids in ((gate, gate_ids), (up, up_ids))
-                    if ids
-                )
+                tuple(value for value, ids in ((gate, gate_ids), (up, up_ids)) if ids)
             ).contiguous()
         else:
             w13 = gate
@@ -620,9 +621,7 @@ def _projection_prepared(
         )
         tiers.append(prepared)
 
-    combined_w13, tier_w13 = _coalesce_payloads(
-        tuple(tier.w13 for tier in tiers)
-    )
+    combined_w13, tier_w13 = _coalesce_payloads(tuple(tier.w13 for tier in tiers))
     combined_w2, tier_w2 = _coalesce_payloads(tuple(tier.w2 for tier in tiers))
     rebound = [
         replace(tier, w13=w13, w2=w2)
@@ -654,9 +653,7 @@ def _projection_prepared(
             else torch.cat((gate_suh,) * 3, dim=0).contiguous()
         ),
         up_suh=(
-            up_suh
-            if broadcast_input
-            else torch.cat((up_suh,) * 3, dim=0).contiguous()
+            up_suh if broadcast_input else torch.cat((up_suh,) * 3, dim=0).contiguous()
         ),
         down_svh=(
             down_svh
@@ -718,19 +715,30 @@ def prepare_trellis_weights(
     if device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
     if codes.device.type != "cpu" and codes.device != device:
-        raise ValueError("trellis codes must reside on CPU or the destination CUDA device")
+        raise ValueError(
+            "trellis codes must reside on CPU or the destination CUDA device"
+        )
     if codes.ndim != 2 or codes.stride(1) != 1:
         raise ValueError("codes must have contiguous uint8 logical rows")
-    uniform = source.uniform_bits is not None or config.codebook is not TrellisCodebook.MCG
+    uniform = (
+        source.uniform_bits is not None or config.codebook is not TrellisCodebook.MCG
+    )
     if not uniform and (codes.device != device or not codes.is_contiguous()):
-        raise ValueError("projection-tiered MCG preparation requires contiguous CUDA codes")
+        raise ValueError(
+            "projection-tiered MCG preparation requires contiguous CUDA codes"
+        )
     if not uniform and staging is not None:
         raise ValueError("bounded host staging is supported only for uniform rates")
     staging = staging or TrellisStaging()
     if not isinstance(staging, TrellisStaging):
         raise TypeError("staging must be a TrellisStaging")
-    if source.extent is not None and source.extent.intermediate_size != intermediate_size:
-        raise ValueError("trellis extent width differs from the local intermediate size")
+    if (
+        source.extent is not None
+        and source.extent.intermediate_size != intermediate_size
+    ):
+        raise ValueError(
+            "trellis extent width differs from the local intermediate size"
+        )
     if int(codes.shape[0]) * _SLOT_CHANNELS != intermediate_size:
         raise ValueError(
             "codes first dimension must equal intermediate_size/32: "
@@ -749,8 +757,7 @@ def prepare_trellis_weights(
     bits = _symmetric_bits(config, rates, uniform_bits=source.uniform_bits)
     offsets = _bundle_offsets(bits, hidden_size)
     required_row_bytes = max(
-        offset
-        + _matrix_section_bytes(hidden_size, int(bits[expert, projection]))
+        offset + _matrix_section_bytes(hidden_size, int(bits[expert, projection]))
         for expert, expert_offsets in enumerate(offsets)
         for projection, offset in enumerate(expert_offsets)
     )
@@ -764,7 +771,9 @@ def prepare_trellis_weights(
         if tensor is None:
             return None
         if tensor.device.type != "cpu" and tensor.device != device:
-            raise ValueError("trellis metadata must reside on CPU or the destination device")
+            raise ValueError(
+                "trellis metadata must reside on CPU or the destination device"
+            )
         return tensor.to(device=device)
 
     def move_scales(factors: ScaleFactors) -> ScaleFactors:

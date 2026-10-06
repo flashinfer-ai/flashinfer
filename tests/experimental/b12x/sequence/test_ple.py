@@ -75,14 +75,11 @@ def test_ple_hash_geometry_is_distinct_deterministic_and_aligned() -> None:
         6891410296393783,
     )
     assert geometry.multipliers == expected_multipliers
-    assert (
-        ple_multipliers(
-            vocab_size=1000,
-            max_order=3,
-            dense_layer_ordinal=0,
-        ).tolist()
-        == list(expected_multipliers)
-    )
+    assert ple_multipliers(
+        vocab_size=1000,
+        max_order=3,
+        dense_layer_ordinal=0,
+    ).tolist() == list(expected_multipliers)
     assert all(value & 1 for value in geometry.multipliers)
     assert max(geometry.multipliers) <= ((1 << 63) - 1) // 1000
 
@@ -176,8 +173,6 @@ def test_ple_packed_hash_matches_per_request_complete_history() -> None:
     torch.testing.assert_close(actual, torch.cat(expected_parts))
 
 
-
-
 @pytest.mark.parametrize("alias_kind", ["out_input", "scratch_input"])
 @torch.inference_mode()
 def test_ple_hash_prepared_bind_rejects_read_only_aliases(alias_kind: str) -> None:
@@ -240,6 +235,7 @@ def test_ple_hash_prepared_bind_rejects_geometry_alias() -> None:
     inputs["scratch"] = binding.scratch
     with pytest.raises(ValueError, match="out.*read-only tensor prime_sizes"):
         ple_hash.bind(binding.plan, **inputs)
+
 
 def _projected_inputs(tokens: int, streams: int, hidden: int):
     generator = torch.Generator().manual_seed(4107)
@@ -348,9 +344,16 @@ def _bind_cuda_layer(
     max_tokens, streams, hidden = residual.shape
     max_seqs = int(state_slot_ids.numel())
     caps = ple.Caps(
-        device=residual.device, mode=mode, max_tokens=max_tokens, max_seqs=max_seqs,
-        max_state_slots=conv_state.shape[0], max_speculative_tokens=max_speculative_tokens,
-        streams=streams, hidden_size=hidden, kernel_size=conv_weight.shape[-1], dilation=dilation,
+        device=residual.device,
+        mode=mode,
+        max_tokens=max_tokens,
+        max_seqs=max_seqs,
+        max_state_slots=conv_state.shape[0],
+        max_speculative_tokens=max_speculative_tokens,
+        streams=streams,
+        hidden_size=hidden,
+        kernel_size=conv_weight.shape[-1],
+        dilation=dilation,
     )
     out = torch.full_like(residual, 91)
     tensors = dict(
@@ -374,7 +377,13 @@ def _bind_cuda_layer(
         request_is_prefill=request_is_prefill,
     )
     declaration = ple.plan(caps, invocation=ple.invocation_from_tensors(**tensors))
-    slots = sorted({int(slot) for slot in state_slot_ids.tolist() if 0 <= int(slot) < conv_state.shape[0]})
+    slots = sorted(
+        {
+            int(slot)
+            for slot in state_slot_ids.tolist()
+            if 0 <= int(slot) < conv_state.shape[0]
+        }
+    )
     indices = torch.tensor(slots, dtype=torch.int64, device=residual.device)
     original_state = conv_state.index_select(0, indices)
     original_output = out.clone()
@@ -385,12 +394,16 @@ def _bind_cuda_layer(
 
     def prepare_call(state):
         (spec,) = state.layout.scratch_specs()
-        tensors["scratch"] = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        tensors["scratch"] = torch.empty(
+            spec.shape, dtype=spec.dtype, device=spec.device
+        )
         trial = state.bind(**tensors)
         return PreparedCall(run=lambda: state.run(trial, eps=1e-6), restore=restore)
 
     resources = _case_resources.get()
-    session = resources.enter_context(PreparationSession(device=residual.device, autotune=False, compile_workers=2))
+    session = resources.enter_context(
+        PreparationSession(device=residual.device, autotune=False, compile_workers=2)
+    )
     request = declaration.request(name="ple", prepare_call=prepare_call)
     session.prepare((request,))
     binding = ple.bind(declaration, **tensors)
@@ -571,8 +584,6 @@ def test_ple_packed_oracle_is_request_local() -> None:
         )
         torch.testing.assert_close(packed[start:end], expected, rtol=0, atol=0)
         torch.testing.assert_close(states[request], expected_state, rtol=0, atol=0)
-
-
 
 
 @torch.inference_mode()
@@ -777,9 +788,7 @@ def test_ple_hash_target_cuda_graph_replays_dynamic_packed_metadata() -> None:
         dense_layer_ordinal=0,
         base_table_size=20000000,
     )
-    token_ids = torch.tensor(
-        [1, 2, 0, 0, 0, 0, 0, 0], dtype=torch.int64, device=device
-    )
+    token_ids = torch.tensor([1, 2, 0, 0, 0, 0, 0, 0], dtype=torch.int64, device=device)
     query_start_loc = torch.tensor([0, 2, 2, 2], dtype=torch.int32, device=device)
     committed_history = torch.full(
         (caps.max_seqs, caps.max_order - 1),
@@ -1610,6 +1619,8 @@ def test_ple_target_mixed_graph_replays_dynamic_packed_metadata(
     assert bool((binding.out[captured_out.shape[0] :] == 91).all().item())
     torch.testing.assert_close(live_state, expected_state, rtol=0, atol=0)
     torch.testing.assert_close(live_state, full_state, rtol=0, atol=0)
+
+
 @torch.inference_mode()
 def test_ple_prepared_runs_compile_and_capture_mutating_outputs() -> None:
     device = require_b12x()

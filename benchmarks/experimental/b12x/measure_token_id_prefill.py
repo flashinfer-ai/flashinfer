@@ -62,7 +62,9 @@ def read_metrics(base_url: str) -> dict[str, float]:
     return result
 
 
-def check_uncached(before, after, usage, *, sglang_reports_only_hits=False) -> float | None:
+def check_uncached(
+    before, after, usage, *, sglang_reports_only_hits=False
+) -> float | None:
     details = usage.get("prompt_tokens_details") or {}
     reported = details.get("cached_tokens")
     # SGLang with enable_cache_report omits this object specifically for zero
@@ -70,7 +72,9 @@ def check_uncached(before, after, usage, *, sglang_reports_only_hits=False) -> f
     if reported is None and sglang_reports_only_hits:
         reported = 0
     metric = "vllm:prefix_cache_hits_total"
-    observed = after[metric] - before[metric] if metric in before and metric in after else None
+    observed = (
+        after[metric] - before[metric] if metric in before and metric in after else None
+    )
     if reported is None and observed is None:
         raise RuntimeError("Cannot qualify cold prefill without cache-hit evidence")
     for value in (reported, observed):
@@ -104,10 +108,16 @@ def main() -> None:
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260903)
     parser.add_argument("--temperature", type=temperature, default=1.0)
-    parser.add_argument("--cache-salt", default=None,
-                        help="vLLM cache namespace; default is unique per invocation")
-    parser.add_argument("--sglang-flush-cache", action="store_true",
-                        help="Verify cache reporting and flush an idle SGLang cache before each request")
+    parser.add_argument(
+        "--cache-salt",
+        default=None,
+        help="vLLM cache namespace; default is unique per invocation",
+    )
+    parser.add_argument(
+        "--sglang-flush-cache",
+        action="store_true",
+        help="Verify cache reporting and flush an idle SGLang cache before each request",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -116,7 +126,9 @@ def main() -> None:
         with urllib.request.urlopen(base_url + "/server_info", timeout=30) as response:
             server_info = json.load(response)
         if server_info.get("enable_cache_report") is not True:
-            raise RuntimeError("SGLang must expose cache reporting for an uncached qualification")
+            raise RuntimeError(
+                "SGLang must expose cache reporting for an uncached qualification"
+            )
     samples: list[dict[str, object]] = []
     cache_salt = args.cache_salt or uuid.uuid4().hex
     total_runs = args.warmups + args.samples
@@ -128,9 +140,13 @@ def main() -> None:
             # Response delivery can precede retirement of an overlapped batch.
             # SGLang's deferred flush waits for its full internal idle condition;
             # zero scheduler gauges alone do not imply that condition is met.
-            request = urllib.request.Request(base_url + "/flush_cache?timeout=30", method="POST")
+            request = urllib.request.Request(
+                base_url + "/flush_cache?timeout=30", method="POST"
+            )
             with urllib.request.urlopen(request, timeout=45) as response:
-                if response.status != 200 or not response.read().startswith(b"Cache flushed."):
+                if response.status != 200 or not response.read().startswith(
+                    b"Cache flushed."
+                ):
                     raise RuntimeError("SGLang did not confirm cache flush")
         rng = random.Random(args.seed + run)
         token_ids = [rng.randrange(1000, 150000) for _ in range(args.tokens)]
@@ -152,9 +168,12 @@ def main() -> None:
         usage = response.get("usage", {})
         prompt_tokens = int(usage.get("prompt_tokens", args.tokens))
         if prompt_tokens != args.tokens:
-            raise RuntimeError(f"Expected {args.tokens} input tokens, got {prompt_tokens}")
-        cached_tokens = check_uncached(before, after, usage,
-                                       sglang_reports_only_hits=args.sglang_flush_cache)
+            raise RuntimeError(
+                f"Expected {args.tokens} input tokens, got {prompt_tokens}"
+            )
+        cached_tokens = check_uncached(
+            before, after, usage, sglang_reports_only_hits=args.sglang_flush_cache
+        )
         sample: dict[str, object] = {
             "run": run,
             "warmup": run < args.warmups,
@@ -164,9 +183,7 @@ def main() -> None:
             "wall_tokens_per_second": prompt_tokens / wall_seconds,
         }
         for metric in METRICS:
-            sample[metric.removeprefix("vllm:")] = metric_delta(
-                before, after, metric
-            )
+            sample[metric.removeprefix("vllm:")] = metric_delta(before, after, metric)
         prefill_seconds = sample["request_prefill_time_seconds"]
         sample["engine_prefill_tokens_per_second"] = (
             prompt_tokens / prefill_seconds if prefill_seconds else None
@@ -184,7 +201,9 @@ def main() -> None:
         "seed": args.seed,
         "sampling": {**DEFAULT_SAMPLING, "temperature": args.temperature},
         "cache_salt": cache_salt,
-        "cache_control": "sglang_flush" if args.sglang_flush_cache else "vllm_salt_and_observed_zero_hits",
+        "cache_control": "sglang_flush"
+        if args.sglang_flush_cache
+        else "vllm_salt_and_observed_zero_hits",
         "median_wall_tokens_per_second": statistics.median(
             float(sample["wall_tokens_per_second"]) for sample in measured
         ),

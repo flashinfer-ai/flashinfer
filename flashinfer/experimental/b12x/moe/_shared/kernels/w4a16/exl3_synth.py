@@ -98,9 +98,7 @@ def _layer_rate_codes(
     pairs = config.num_slots // SLOTS_PER_PAIR
     if config.bits is not None:
         code = rate_code(config.bits, config.bits)
-        table = torch.full(
-            (pairs, config.num_experts), code, dtype=torch.uint8
-        )
+        table = torch.full((pairs, config.num_experts), code, dtype=torch.uint8)
         return table, table
     assert config.rate_tables is not None
     rates_fc1, rates_fc2 = config.rate_tables[layer]
@@ -117,9 +115,7 @@ def _layer_rate_codes(
     return rates_fc1, rates_fc2
 
 
-def synth_layer_payloads(
-    config: Exl3SynthConfig, layer: int
-) -> Exl3LayerPayloads:
+def synth_layer_payloads(config: Exl3SynthConfig, layer: int) -> Exl3LayerPayloads:
     """Deterministic random content for one layer."""
 
     generator = torch.Generator().manual_seed(
@@ -164,6 +160,7 @@ def synth_layer_payloads(
         if config.unit_hidden_rotations:
             return torch.ones(h_shape, dtype=torch.float16)
         return _values(h_shape)
+
     sign_patterns = None
     if config.intermediate_hadamard:
         sign_patterns = torch.randint(
@@ -225,8 +222,7 @@ def _manifest_dict(config: Exl3SynthConfig) -> dict:
         for rates_fc1, rates_fc2 in config.rate_tables.values():
             for table in (rates_fc1, rates_fc2):
                 kinds.update(
-                    RATE_CODE_PAIR_KINDS[int(code)]
-                    for code in table.unique().tolist()
+                    RATE_CODE_PAIR_KINDS[int(code)] for code in table.unique().tolist()
                 )
         rates = {
             "structure": RATE_STRUCTURE_PER_EXPERT_PAIR,
@@ -303,9 +299,7 @@ def write_exl3_checkpoint(
         if payloads.sign_pattern is not None:
             tensors["sign_pattern"] = payloads.sign_pattern
         filename = layer_filename(layer)
-        save_file(
-            tensors, str(root / filename), metadata=layer_metadata(config, layer)
-        )
+        save_file(tensors, str(root / filename), metadata=layer_metadata(config, layer))
         digest = hashlib.sha256((root / filename).read_bytes()).hexdigest()
         manifest["layers"][str(int(layer))] = {
             "file": filename,

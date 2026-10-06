@@ -39,9 +39,7 @@ def _run_micro_trellis(
     down_payload, down_w = build_trellis_weight(gen, E, K, n, _BITS, device)
     # Micro layout is projection-major [2][E][K16][N16].
     w1_payload = (
-        torch.stack((gate_payload, up_payload), dim=0)
-        .contiguous()
-        .view(torch.uint8)
+        torch.stack((gate_payload, up_payload), dim=0).contiguous().view(torch.uint8)
     )
     w2_payload = down_payload.contiguous().view(torch.uint8)
     w13_ref = torch.stack((gate_w, up_w), dim=0)
@@ -50,14 +48,10 @@ def _run_micro_trellis(
     topk_ids = torch.stack(
         [torch.randperm(E, device=device)[:top_k] for _ in range(m)]
     ).to(torch.int32)
-    topk_weights = torch.softmax(
-        torch.randn(m, top_k, device=device), dim=-1
-    ).float()
+    topk_weights = torch.softmax(torch.randn(m, top_k, device=device), dim=-1).float()
     rot_segments = 6 if intermediate_hadamard else 3
     rotations = (
-        torch.rand(
-            (E, rot_segments * n), generator=gen, dtype=torch.float32
-        ).add_(0.5)
+        torch.rand((E, rot_segments * n), generator=gen, dtype=torch.float32).add_(0.5)
     ).to(device=device, dtype=torch.float16)
 
     oracle = trellis_moe_reference(
@@ -83,20 +77,14 @@ def _run_micro_trellis(
         share_input_across_experts=True,
         single_token=m == 1,
     )
-    kernel.configure(
-        m=m, k=K, n=n, num_topk=top_k, weight_E=E, max_active_ctas=mac
-    )
+    kernel.configure(m=m, k=K, n=n, num_topk=top_k, weight_E=E, max_active_ctas=mac)
     cfg = kernel._cfg
 
     ones = torch.ones(E, dtype=torch.float32, device=device)
     dummy_scale = torch.zeros(64, dtype=torch.uint8, device=device)
-    inter = torch.zeros(
-        kernel.inter_alloc_u32, dtype=torch.float32, device=device
-    )
+    inter = torch.zeros(kernel.inter_alloc_u32, dtype=torch.float32, device=device)
     out = torch.zeros(m, K, dtype=torch.bfloat16, device=device)
-    barrier_count = torch.zeros(
-        m * top_k + m * 16, dtype=torch.int32, device=device
-    )
+    barrier_count = torch.zeros(m * top_k + m * 16, dtype=torch.int32, device=device)
     barrier_epoch = torch.zeros_like(barrier_count)
     value_table = lut_e4m3_value_table_cpu().to(device)
     rot_flat = rotations.reshape(-1).contiguous()
@@ -137,7 +125,13 @@ def test_micro_trellis_matches_reference(
     m: int, mac: int, intermediate_hadamard: bool
 ) -> None:
     got, want = _run_micro_trellis(
-        E=8, m=m, K=512, n=256, top_k=4, seed=20260815, mac=mac,
+        E=8,
+        m=m,
+        K=512,
+        n=256,
+        top_k=4,
+        seed=20260815,
+        mac=mac,
         intermediate_hadamard=intermediate_hadamard,
     )
     assert torch.isfinite(got).all()

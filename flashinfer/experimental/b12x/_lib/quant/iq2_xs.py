@@ -99,7 +99,10 @@ def iq2_xs_grid_cpu(codec: str = "iq2_xs") -> torch.Tensor:
     if codec not in IQ2_CODECS:
         raise ValueError(f"{codec!r} has no IQ2 magnitude grid")
     spec = block_codec(codec)
-    packed = torch.tensor(list(_IQ2_XS_GRID_2BIT if codec == "iq2_xs" else _IQ2_XXS_GRID_2BIT), dtype=torch.uint8)
+    packed = torch.tensor(
+        list(_IQ2_XS_GRID_2BIT if codec == "iq2_xs" else _IQ2_XXS_GRID_2BIT),
+        dtype=torch.uint8,
+    )
     codes = torch.stack(tuple((packed >> shift) & 3 for shift in (0, 2, 4, 6)), 1)
     magnitudes = torch.tensor((8, 25, 43, 0), dtype=torch.uint8)
     return magnitudes[codes.long()].reshape(spec.grid_entries, 8).contiguous()
@@ -123,7 +126,11 @@ def iq2_xs_pair_selectors_cpu(codec: str = "iq2_xs") -> torch.Tensor:
     grid = iq2_xs_grid_cpu(codec)
     codes = (grid == 25).to(torch.int32) + 2 * (grid == 43).to(torch.int32)
     lo, hi = 2 * codes[:, 0::2], 2 * codes[:, 1::2]
-    return (lo | ((lo + 1) << 4) | (hi << 8) | ((hi + 1) << 12)).to(torch.int16).contiguous()
+    return (
+        (lo | ((lo + 1) << 4) | (hi << 8) | ((hi + 1) << 12))
+        .to(torch.int16)
+        .contiguous()
+    )
 
 
 _DEVICE_TABLES: dict[tuple[str, int | None, bool, str], torch.Tensor] = {}
@@ -141,8 +148,11 @@ def _iq2_xs_execution_lut_device(
 
 
 def iq2_xs_execution_lut(
-    device: torch.device | str, *, prepare: bool = False, selectors: bool = False,
-    codec: str = "iq2_xs"
+    device: torch.device | str,
+    *,
+    prepare: bool = False,
+    selectors: bool = False,
+    codec: str = "iq2_xs",
 ) -> torch.Tensor:
     """Return the codec-specific magnitude or byte-selector table."""
 

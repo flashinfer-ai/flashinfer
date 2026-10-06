@@ -11,15 +11,12 @@ from b12x.loader import capabilities
 from b12x.loader._checkpoint import DirectWeightSession
 
 
-
 @pytest.fixture
 def session():
     if capabilities()["host_page_tables"]:
         pytest.skip("discrete-GPU checkpoint transport required")
     with (
-
         DirectWeightSession(io_threads=2, read_mode="gds") as session,
-
     ):
         yield session
 

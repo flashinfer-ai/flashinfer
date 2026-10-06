@@ -4,6 +4,7 @@ Validates that the opaque op matches the eager :func:`dense_fp6_linear` path
 bit-for-bit and that ``torch.compile(fullgraph=True)`` traces a model using the
 op without graph breaks — the property vLLM's VLLM_COMPILE mode relies on.
 """
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -43,22 +44,33 @@ def _prepared_execution(w, m: int):
     from b12x.quantization.mxfp6 import Mxfp6DenseQuery, plan
     from b12x.quantization.mxfp6.fp6_dense_weights import _DENSE_PER_ROW_GS
 
-    declaration = plan(Mxfp6DenseQuery(
-        max_tokens=m, in_features=w.in_features, out_features=w.out_features,
-        weight_format=w.fmt, activation_format=w.act_fmt,
-        weight_storage="expanded", global_scale_kind="multiplier",
-        output_mode="functional", per_row_global_scale=_DENSE_PER_ROW_GS,
-    ))
+    declaration = plan(
+        Mxfp6DenseQuery(
+            max_tokens=m,
+            in_features=w.in_features,
+            out_features=w.out_features,
+            weight_format=w.fmt,
+            activation_format=w.act_fmt,
+            weight_storage="expanded",
+            global_scale_kind="multiplier",
+            output_mode="functional",
+            per_row_global_scale=_DENSE_PER_ROW_GS,
+        )
+    )
     source = torch.zeros((m, w.in_features), dtype=torch.bfloat16, device="cuda")
     output = torch.empty((m, w.out_features), dtype=torch.bfloat16, device="cuda")
     request = declaration.request(
         name=f"fp6-op-{m}",
         prepare_call=lambda state: PreparedCall(
             run=lambda: state.run(
-                source, w.expanded_weight(), w.scale_storage, w.global_scale,
+                source,
+                w.expanded_weight(),
+                w.scale_storage,
+                w.global_scale,
                 out=output.unsqueeze(-1),
             ),
-            output=output, owners=(source, output),
+            output=output,
+            owners=(source, output),
         ),
     )
     with PreparationSession(device=source.device, autotune=False) as session:

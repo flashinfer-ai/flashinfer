@@ -81,6 +81,7 @@ def swizzle_block_scale(scale: torch.Tensor) -> torch.Tensor:
     swizzled = swizzled.reshape(batch, rows_padded, cols_padded)
     return swizzled[0] if squeeze_batch else swizzled
 
+
 # UE8M0 0xFF is the encoding's NaN.  No MX block scale may be NaN, and a
 # clamp would silently change every dequantized weight in the block, so the
 # preparation path rejects it instead of carrying it into the kernel.
@@ -107,8 +108,7 @@ def validate_e8m0_scale_grid(
         raise TypeError(f"{name} must be a torch.Tensor")
     if grid.dtype not in (torch.uint8, torch.float8_e8m0fnu):
         raise TypeError(
-            f"{name} must hold UE8M0 bytes (uint8/float8_e8m0fnu), "
-            f"got {grid.dtype}"
+            f"{name} must hold UE8M0 bytes (uint8/float8_e8m0fnu), got {grid.dtype}"
         )
     if k % sf_block:
         raise ValueError(
@@ -131,7 +131,6 @@ def validate_e8m0_scale_grid(
             "scales must be finite (0x00..0xFE) and are never clamped"
         )
     return bytes_
-
 
 
 def as_grouped_scale_view(
@@ -3094,10 +3093,14 @@ def nvfp4_pair_to_bf16x2_sm120(
 
     Every finite E2M1 * E4M3 product is exactly representable in BF16.
     """
-    return Uint32(llvm.inline_asm(
-        T.i32(), [Uint32(packed).ir_value(loc=loc, ip=ip),
-                  Uint32(scale).ir_value(loc=loc, ip=ip)],
-        """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Uint32(packed).ir_value(loc=loc, ip=ip),
+                Uint32(scale).ir_value(loc=loc, ip=ip),
+            ],
+            """
         {
             .reg .b8 q;
             .reg .b16 sf;
@@ -3111,9 +3114,14 @@ def nvfp4_pair_to_bf16x2_sm120(
             mul.bf16x2 $0, values, factors;
         }
         """,
-        "=r,r,r", has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
-    ))
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -3121,10 +3129,14 @@ def mxfp8_pair_to_bf16x2_sm120(
     packed: Uint32, scale: Uint32, *, loc=None, ip=None
 ) -> Uint32:
     """Decode E4M3 pairs and an unmodified UE8M0 byte on SM120a."""
-    return Uint32(llvm.inline_asm(
-        T.i32(), [Uint32(packed).ir_value(loc=loc, ip=ip),
-                  Uint32(scale).ir_value(loc=loc, ip=ip)],
-        """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Uint32(packed).ir_value(loc=loc, ip=ip),
+                Uint32(scale).ir_value(loc=loc, ip=ip),
+            ],
+            """
         {
             .reg .b16 q, sf;
             .reg .b32 values, factors, sf_pair;
@@ -3137,9 +3149,14 @@ def mxfp8_pair_to_bf16x2_sm120(
             mul.bf16x2 $0, values, factors;
         }
         """,
-        "=r,r,r", has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
-    ))
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -4136,9 +4153,7 @@ def nvfp4_mma_m16n8k64_f32_e2m1(
         return cutlass._mlir.ir.Operation.create(
             "llvm.mlir.constant",
             results=[i16_ty],
-            attributes={
-                "value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(v))
-            },
+            attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(v))},
         ).result
 
     result = llvm.inline_asm(
@@ -6678,9 +6693,7 @@ def packed_decode_lut_e4m3_to_e4m3x8(
     bits = int(bits)
     value_table_in_shared = bool(value_table_in_shared)
     if bits not in (2, 3, 4):
-        raise ValueError(
-            f"unsupported lut_e4m3 bit width {bits}; expected 2, 3, or 4"
-        )
+        raise ValueError(f"unsupported lut_e4m3 bit width {bits}; expected 2, 3, or 4")
     width = 16 - bits
     low_index_mask = (1 << (width - 4)) - 1
     decode_blocks: list[str] = []
@@ -6748,18 +6761,12 @@ def packed_decode_lut_e4m3_to_e4m3x8(
             )
         decode_blocks.append(
             "\n".join(
-                extract_lines
-                + product_lines
-                + rank_lines
-                + load_lines
-                + pack_lines
+                extract_lines + product_lines + rank_lines + load_lines + pack_lines
             )
         )
 
     address_reg = (
-        ".reg .b32 addr0,addr1;"
-        if value_table_in_shared
-        else ".reg .b64 addr0,addr1;"
+        ".reg .b32 addr0,addr1;" if value_table_in_shared else ".reg .b64 addr0,addr1;"
     )
     asm = (
         """
@@ -6848,9 +6855,7 @@ def packed_decode_lut_fp16_to_half2x4(
             else:
                 source = "$5" if index < 4 else "$4"
                 bit_shift = (3 - (index & 3)) * bits
-                extract_lines.append(
-                    f"bfe.u32 w{slot}, {source}, {bit_shift}, 16;"
-                )
+                extract_lines.append(f"bfe.u32 w{slot}, {source}, {bit_shift}, 16;")
             graph_lines.append(
                 f"""
                 shr.u32 p{slot}, w{slot}, {bits};
@@ -6982,9 +6987,7 @@ def packed_decode_lut_e4m3_direct_to_e4m3x8(
 
     bits = int(bits)
     if bits not in (2, 3, 4):
-        raise ValueError(
-            f"unsupported lut_e4m3 bit width {bits}; expected 2, 3, or 4"
-        )
+        raise ValueError(f"unsupported lut_e4m3 bit width {bits}; expected 2, 3, or 4")
     table_offset = ((bits - 2) << 16) if rate_indexed else 0
     extract_lines: list[str] = []
     load_lines: list[str] = []
@@ -6995,15 +6998,12 @@ def packed_decode_lut_e4m3_direct_to_e4m3x8(
         # the "=r" outputs: without early-clobber the outputs may alias the
         # window inputs that later iterations still read.
         if shift:
-            extract_lines.append(
-                f"bfe.u32 w{index}, {source}, {shift}, 16;"
-            )
+            extract_lines.append(f"bfe.u32 w{index}, {source}, {shift}, 16;")
         else:
             extract_lines.append(f"and.b32 w{index}, {source}, 0xffff;")
         if in_shared:
             load_lines.append(
-                f"add.u32 w{index}, w{index}, $4;"
-                f" ld.shared.u8 w{index}, [w{index}];"
+                f"add.u32 w{index}, w{index}, $4; ld.shared.u8 w{index}, [w{index}];"
             )
         else:
             load_lines.append(
@@ -7040,7 +7040,8 @@ def packed_decode_lut_e4m3_direct_to_e4m3x8(
     )
     table_base = (
         Int32(direct_lut_addr) + Int32(table_offset)
-        if in_shared else Int64(direct_lut_addr) + Int64(table_offset)
+        if in_shared
+        else Int64(direct_lut_addr) + Int64(table_offset)
     )
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
@@ -7267,7 +7268,10 @@ def q8_0_pair_to_bf16x2(packed, base, *, loc=None, ip=None):
     """Multiply signed INT8 values by the FP16 block scale, rounding once."""
     result = llvm.inline_asm(
         T.i32(),
-        [Uint32(packed).ir_value(loc=loc, ip=ip), Uint32(base).ir_value(loc=loc, ip=ip)],
+        [
+            Uint32(packed).ir_value(loc=loc, ip=ip),
+            Uint32(base).ir_value(loc=loc, ip=ip),
+        ],
         """{
             .reg .b16 dh;
             .reg .s32 q0, q1;
@@ -7282,27 +7286,43 @@ def q8_0_pair_to_bf16x2(packed, base, *, loc=None, ip=None):
             mul.f32 hi, hi, d;
             cvt.rn.bf16x2.f32 $0, hi, lo;
         }""",
-        "=r,r,r", has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        "=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
     return Uint32(result)
 
 
 @dsl_user_op
-def iq2_xs_pair_to_bf16x2(descriptor, base, subscale, lut_addr, pair_offset, *,
-                         shared_lut=False, loc=None, ip=None):
+def iq2_xs_pair_to_bf16x2(
+    descriptor,
+    base,
+    subscale,
+    lut_addr,
+    pair_offset,
+    *,
+    shared_lut=False,
+    loc=None,
+    ip=None,
+):
     """Decode adjacent IQ2_XS weights with one BF16 rounding step."""
     load = (
         "cvt.u32.u64 shared_address, address; ld.shared.u32 word, [shared_address];"
-        if shared_lut else "ld.global.nc.u32 word, [address];"
+        if shared_lut
+        else "ld.global.nc.u32 word, [address];"
     )
     result = llvm.inline_asm(
         T.i32(),
-        [Uint32(descriptor).ir_value(loc=loc, ip=ip),
-         Uint32(base).ir_value(loc=loc, ip=ip),
-         Uint32(subscale).ir_value(loc=loc, ip=ip),
-         Int64(lut_addr).ir_value(loc=loc, ip=ip),
-         Int32(pair_offset).ir_value(loc=loc, ip=ip)],
+        [
+            Uint32(descriptor).ir_value(loc=loc, ip=ip),
+            Uint32(base).ir_value(loc=loc, ip=ip),
+            Uint32(subscale).ir_value(loc=loc, ip=ip),
+            Int64(lut_addr).ir_value(loc=loc, ip=ip),
+            Int32(pair_offset).ir_value(loc=loc, ip=ip),
+        ],
         """
         {
             .reg .b16 dh;
@@ -7324,7 +7344,9 @@ def iq2_xs_pair_to_bf16x2(descriptor, base, subscale, lut_addr, pair_offset, *,
             shl.b32 offset, $5, 1;
             cvt.u64.u32 byte_offset, offset;
             add.u64 address, address, byte_offset;
-            """ + load + """
+            """
+        + load
+        + """
             shl.b32 lo, word, 16;
             and.b32 hi, word, 0xffff0000;
             mul.f32 lo, lo, scale;
@@ -7335,15 +7357,19 @@ def iq2_xs_pair_to_bf16x2(descriptor, base, subscale, lut_addr, pair_offset, *,
         }
         """,
         "=r,r,r,r,l,r",
-        has_side_effects=bool(shared_lut), is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        has_side_effects=bool(shared_lut),
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
     return Uint32(result)
 
 
 @dsl_user_op
-def iq2_xs_descriptor_pair_to_bf16x2x2(descriptors, base, subscale, lut_addr, pair_offset,
-                                      *, loc=None, ip=None):
+def iq2_xs_descriptor_pair_to_bf16x2x2(
+    descriptors, base, subscale, lut_addr, pair_offset, *, loc=None, ip=None
+):
     """Decode matching pairs from two adjacent descriptors using one FP32 scale."""
     decode = []
     for i in range(2):
@@ -7365,7 +7391,8 @@ def iq2_xs_descriptor_pair_to_bf16x2x2(descriptors, base, subscale, lut_addr, pa
             mul.lo.u32 sign_pair, signs, 0x40008000;
             lop3.b32 ${i}, ${i}, sign_pair, 0x80008000, 0x78;
         """)
-    asm = """{
+    asm = (
+        """{
         .reg .b16 dh;
         .reg .u32 descriptor, descriptor_word, grid, signs, parity, word, sign_pair, offset, address, table, pair_start;
         .reg .f32 scale, nibble, lo, hi;
@@ -7379,16 +7406,31 @@ def iq2_xs_descriptor_pair_to_bf16x2x2(descriptors, base, subscale, lut_addr, pa
         mul.f32 scale, scale, 0f3e800000;
         cvt.u32.u64 table, $5;
         shl.b32 offset, $6, 1;
-    """ + "".join(decode) + "\n}"
+    """
+        + "".join(decode)
+        + "\n}"
+    )
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
-        [Uint32(descriptors).ir_value(loc=loc, ip=ip), Uint32(base).ir_value(loc=loc, ip=ip),
-         Uint32(subscale).ir_value(loc=loc, ip=ip), Int64(lut_addr).ir_value(loc=loc, ip=ip),
-         Int32(pair_offset).ir_value(loc=loc, ip=ip)],
-        asm, "=r,=r,r,r,r,l,r", has_side_effects=True, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        [
+            Uint32(descriptors).ir_value(loc=loc, ip=ip),
+            Uint32(base).ir_value(loc=loc, ip=ip),
+            Uint32(subscale).ir_value(loc=loc, ip=ip),
+            Int64(lut_addr).ir_value(loc=loc, ip=ip),
+            Int32(pair_offset).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "=r,=r,r,r,r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
-    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(2))
+    return tuple(
+        Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+        for i in range(2)
+    )
 
 
 def _packed_decode_iq2_xs_to_bfloat2x4(

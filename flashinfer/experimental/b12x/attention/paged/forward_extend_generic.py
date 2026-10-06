@@ -322,9 +322,7 @@ def _issue_paged_kv_tma_copy_2planes_fp8_raw_impl(
     page_row_offset = tile_token_base - page_idx * page_size
     page_id = (
         Int32(0)
-        if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
-        )
+        if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
         else mPageTable[request_idx, page_idx]
     )
     # Page ids are allocator-owned pool coordinates.  Widen before scaling so
@@ -885,17 +883,15 @@ def _repack_fp8_tile_to_16b(
                 + ((quarter_u32 >> Uint32(1)) << Uint32(1))
                 + (lane_in_quarter_u32 & Uint32(1))
             )
-            src_vec_u32 = (
-                (quarter_u32 & Uint32(1)) << Uint32(2)
-            ) + (lane_in_quarter_u32 >> Uint32(1))
+            src_vec_u32 = ((quarter_u32 & Uint32(1)) << Uint32(2)) + (
+                lane_in_quarter_u32 >> Uint32(1)
+            )
             src_offset = Int32(
-                row_u32 * Uint32(8)
-                + (src_vec_u32 ^ (row_u32 & Uint32(7)))
+                row_u32 * Uint32(8) + (src_vec_u32 ^ (row_u32 & Uint32(7)))
             )
             dst_vec0_u32 = src_vec_u32 << Uint32(1)
             dst_offset0 = Int32(
-                row_u32 * Uint32(16)
-                + (dst_vec0_u32 ^ (row_u32 & Uint32(7)))
+                row_u32 * Uint32(16) + (dst_vec0_u32 ^ (row_u32 & Uint32(7)))
             )
             dst_offset1 = Int32(
                 row_u32 * Uint32(16)
@@ -937,9 +933,7 @@ def _repack_fp8_tile_to_16b(
             if linear_vec < Int32(num_fp8_vectors):
                 row = linear_vec // Int32(fp8_stride_128b)
                 src_vec = linear_vec - row * Int32(fp8_stride_128b)
-                src_offset = _permuted_offset_128b(
-                    row, src_vec, Int32(fp8_stride_128b)
-                )
+                src_offset = _permuted_offset_128b(row, src_vec, Int32(fp8_stride_128b))
                 x0, x1, x2, x3 = ld_shared_v4_u32(
                     _smem_addr_from_b128_offset(src_base_addr, src_offset)
                 )
@@ -1382,12 +1376,8 @@ def _f16_mma_m16n16k16_f32(
     b2,
     b3,
 ):
-    r0, r1, r2, r3 = f16_mma_m16n8k16_f32(
-        d0, d1, d2, d3, a0, a1, a2, a3, b0, b1
-    )
-    r4, r5, r6, r7 = f16_mma_m16n8k16_f32(
-        d4, d5, d6, d7, a0, a1, a2, a3, b2, b3
-    )
+    r0, r1, r2, r3 = f16_mma_m16n8k16_f32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1)
+    r4, r5, r6, r7 = f16_mma_m16n8k16_f32(d4, d5, d6, d7, a0, a1, a2, a3, b2, b3)
     return r0, r1, r2, r3, r4, r5, r6, r7
 
 
@@ -1487,11 +1477,7 @@ def _literal_qk_mma_into_sfrag_fp8_quarter_repack(
                         a_regs[mma_q, 2] = q_regs_q0[mma_d_local, mma_q, 2]
                         a_regs[mma_q, 3] = q_regs_q0[mma_d_local, mma_q, 3]
                     else:
-                        q_row = (
-                            warp_q_idx * num_mma_q * 16
-                            + mma_q * 16
-                            + lane % 16
-                        )
+                        q_row = warp_q_idx * num_mma_q * 16 + mma_q * 16 + lane % 16
                         q_col = mma_d * 2 + lane // 16
                         q_offset = _permuted_offset_128b(q_row, q_col, Int32(32))
                         a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
@@ -1502,11 +1488,7 @@ def _literal_qk_mma_into_sfrag_fp8_quarter_repack(
                         a_regs[mma_q, 2] = a2
                         a_regs[mma_q, 3] = a3
                 else:
-                    q_row = (
-                        warp_q_idx * num_mma_q * 16
-                        + mma_q * 16
-                        + lane % 16
-                    )
+                    q_row = warp_q_idx * num_mma_q * 16 + mma_q * 16 + lane % 16
                     q_col = mma_d * 2 + lane // 16
                     q_offset = _permuted_offset_128b(q_row, q_col, Int32(32))
                     a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
@@ -1531,25 +1513,23 @@ def _literal_qk_mma_into_sfrag_fp8_quarter_repack(
                     _smem_addr_from_b128_offset(k_repack_base_addr, k_offset)
                 )
                 for mma_q in cutlass.range_constexpr(num_mma_q):
-                    d0, d1, d2, d3, d4, d5, d6, d7 = (
-                        bf16_mma_m16n16k16_f32(
-                            s_frag[mma_q, mma_kv, 0],
-                            s_frag[mma_q, mma_kv, 1],
-                            s_frag[mma_q, mma_kv, 2],
-                            s_frag[mma_q, mma_kv, 3],
-                            s_frag[mma_q, mma_kv, 4],
-                            s_frag[mma_q, mma_kv, 5],
-                            s_frag[mma_q, mma_kv, 6],
-                            s_frag[mma_q, mma_kv, 7],
-                            a_regs[mma_q, 0],
-                            a_regs[mma_q, 1],
-                            a_regs[mma_q, 2],
-                            a_regs[mma_q, 3],
-                            b0,
-                            b1,
-                            b2,
-                            b3,
-                        )
+                    d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
+                        s_frag[mma_q, mma_kv, 0],
+                        s_frag[mma_q, mma_kv, 1],
+                        s_frag[mma_q, mma_kv, 2],
+                        s_frag[mma_q, mma_kv, 3],
+                        s_frag[mma_q, mma_kv, 4],
+                        s_frag[mma_q, mma_kv, 5],
+                        s_frag[mma_q, mma_kv, 6],
+                        s_frag[mma_q, mma_kv, 7],
+                        a_regs[mma_q, 0],
+                        a_regs[mma_q, 1],
+                        a_regs[mma_q, 2],
+                        a_regs[mma_q, 3],
+                        b0,
+                        b1,
+                        b2,
+                        b3,
                     )
                     s_frag[mma_q, mma_kv, 0] = d0
                     s_frag[mma_q, mma_kv, 1] = d1
@@ -2167,18 +2147,10 @@ def _literal_pv_mma_into_ofrag_bf16_packed(
         )
         for mma_q in cutlass.range_constexpr(num_mma_q):
             if const_expr(apply_v_scale):
-                a_regs[mma_q, 0] = bfloat2_mul(
-                    p_frag[mma_q, mma_kv, 0], v_scale_bf2
-                )
-                a_regs[mma_q, 1] = bfloat2_mul(
-                    p_frag[mma_q, mma_kv, 1], v_scale_bf2
-                )
-                a_regs[mma_q, 2] = bfloat2_mul(
-                    p_frag[mma_q, mma_kv, 2], v_scale_bf2
-                )
-                a_regs[mma_q, 3] = bfloat2_mul(
-                    p_frag[mma_q, mma_kv, 3], v_scale_bf2
-                )
+                a_regs[mma_q, 0] = bfloat2_mul(p_frag[mma_q, mma_kv, 0], v_scale_bf2)
+                a_regs[mma_q, 1] = bfloat2_mul(p_frag[mma_q, mma_kv, 1], v_scale_bf2)
+                a_regs[mma_q, 2] = bfloat2_mul(p_frag[mma_q, mma_kv, 2], v_scale_bf2)
+                a_regs[mma_q, 3] = bfloat2_mul(p_frag[mma_q, mma_kv, 3], v_scale_bf2)
             else:
                 a_regs[mma_q, 0] = p_frag[mma_q, mma_kv, 0]
                 a_regs[mma_q, 1] = p_frag[mma_q, mma_kv, 1]
@@ -2205,46 +2177,42 @@ def _literal_pv_mma_into_ofrag_bf16_packed(
                     debug_regs[dst_idx + 3] = b3
             for mma_q in cutlass.range_constexpr(num_mma_q):
                 if const_expr(apply_v_scale):
-                    d0, d1, d2, d3, d4, d5, d6, d7 = (
-                        bf16_mma_m16n16k16_f32(
-                            o_frag[mma_q, mma_d_out, 0],
-                            o_frag[mma_q, mma_d_out, 1],
-                            o_frag[mma_q, mma_d_out, 2],
-                            o_frag[mma_q, mma_d_out, 3],
-                            o_frag[mma_q, mma_d_out, 4],
-                            o_frag[mma_q, mma_d_out, 5],
-                            o_frag[mma_q, mma_d_out, 6],
-                            o_frag[mma_q, mma_d_out, 7],
-                            a_regs[mma_q, 0],
-                            a_regs[mma_q, 1],
-                            a_regs[mma_q, 2],
-                            a_regs[mma_q, 3],
-                            b0,
-                            b1,
-                            b2,
-                            b3,
-                        )
+                    d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
+                        o_frag[mma_q, mma_d_out, 0],
+                        o_frag[mma_q, mma_d_out, 1],
+                        o_frag[mma_q, mma_d_out, 2],
+                        o_frag[mma_q, mma_d_out, 3],
+                        o_frag[mma_q, mma_d_out, 4],
+                        o_frag[mma_q, mma_d_out, 5],
+                        o_frag[mma_q, mma_d_out, 6],
+                        o_frag[mma_q, mma_d_out, 7],
+                        a_regs[mma_q, 0],
+                        a_regs[mma_q, 1],
+                        a_regs[mma_q, 2],
+                        a_regs[mma_q, 3],
+                        b0,
+                        b1,
+                        b2,
+                        b3,
                     )
                 else:
-                    d0, d1, d2, d3, d4, d5, d6, d7 = (
-                        _f16_mma_m16n16k16_f32(
-                            o_frag[mma_q, mma_d_out, 0],
-                            o_frag[mma_q, mma_d_out, 1],
-                            o_frag[mma_q, mma_d_out, 2],
-                            o_frag[mma_q, mma_d_out, 3],
-                            o_frag[mma_q, mma_d_out, 4],
-                            o_frag[mma_q, mma_d_out, 5],
-                            o_frag[mma_q, mma_d_out, 6],
-                            o_frag[mma_q, mma_d_out, 7],
-                            a_regs[mma_q, 0],
-                            a_regs[mma_q, 1],
-                            a_regs[mma_q, 2],
-                            a_regs[mma_q, 3],
-                            b0,
-                            b1,
-                            b2,
-                            b3,
-                        )
+                    d0, d1, d2, d3, d4, d5, d6, d7 = _f16_mma_m16n16k16_f32(
+                        o_frag[mma_q, mma_d_out, 0],
+                        o_frag[mma_q, mma_d_out, 1],
+                        o_frag[mma_q, mma_d_out, 2],
+                        o_frag[mma_q, mma_d_out, 3],
+                        o_frag[mma_q, mma_d_out, 4],
+                        o_frag[mma_q, mma_d_out, 5],
+                        o_frag[mma_q, mma_d_out, 6],
+                        o_frag[mma_q, mma_d_out, 7],
+                        a_regs[mma_q, 0],
+                        a_regs[mma_q, 1],
+                        a_regs[mma_q, 2],
+                        a_regs[mma_q, 3],
+                        b0,
+                        b1,
+                        b2,
+                        b3,
                     )
                 o_frag[mma_q, mma_d_out, 0] = d0
                 o_frag[mma_q, mma_d_out, 1] = d1
@@ -3094,9 +3062,7 @@ def _literal_update_mdo_states_fp32_pack_p(
                 else Float32(0.0)
             )
             scale_term = (
-                _exp2_approx_ftz_f32(
-                    _fma_rn_f32(m_prev, sm_scale_log2, -m_scaled)
-                )
+                _exp2_approx_ftz_f32(_fma_rn_f32(m_prev, sm_scale_log2, -m_scaled))
                 if const_expr(assume_finite)
                 else (
                     Float32(1.0)
@@ -3185,19 +3151,11 @@ def _literal_update_mdo_states_fp32_pack_p(
                     )
                 )
                 if const_expr(assume_finite):
-                    p_frag[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_half2(
-                        p0, p1
-                    )
-                    p_frag[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_half2(
-                        p2, p3
-                    )
+                    p_frag[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_half2(p0, p1)
+                    p_frag[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_half2(p2, p3)
                 else:
-                    p_frag[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(
-                        p0, p1
-                    )
-                    p_frag[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(
-                        p2, p3
-                    )
+                    p_frag[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p0, p1)
+                    p_frag[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(p2, p3)
                 if const_expr(p_frag_scalar is not None):
                     p_frag_scalar[mma_q, mma_kv, row_slot * 2 + 0] = cutlass.BFloat16(
                         p0
@@ -3504,8 +3462,7 @@ class PagedForwardKernel:
             and not self.use_paged_v_tma
         )
         self.use_qwen_fp8_qk_quarter_repack = (
-            paged_control("B12X_PAGED_EXTEND_QWEN_FP8_QK_QUARTER_REPACK", "1")
-            != "0"
+            paged_control("B12X_PAGED_EXTEND_QWEN_FP8_QK_QUARTER_REPACK", "1") != "0"
             and self.kv_is_fp8
             and dtype_q == cutlass.BFloat16
             and dtype_o == cutlass.BFloat16
@@ -3522,9 +3479,7 @@ class PagedForwardKernel:
             and self.num_stages == 1
             and not self.msa_block_sparse
         )
-        fp8_pv_repack_env = os.environ.get(
-            "B12X_PAGED_EXTEND_QWEN_FP8_PV_REPACK"
-        )
+        fp8_pv_repack_env = os.environ.get("B12X_PAGED_EXTEND_QWEN_FP8_PV_REPACK")
         fp8_pv_repack_enabled = (
             bool(use_fp8_pv_repack)
             if fp8_pv_repack_env is None
@@ -3873,10 +3828,7 @@ class PagedForwardKernel:
                     else token_idx // page_size
                 )
                 entry_idx = (
-                    (
-                        tile_token_base
-                        - (tile_token_base // page_size) * page_size
-                    )
+                    (tile_token_base - (tile_token_base // page_size) * page_size)
                     + row_idx
                     if const_expr(self.msa_block_sparse)
                     else token_idx - page_iter * page_size
@@ -3934,10 +3886,7 @@ class PagedForwardKernel:
         page_idx = tile_token_base // page_size
         page_id = (
             Int32(0)
-            if const_expr(
-                paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
-                == "1"
-            )
+            if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
@@ -3961,10 +3910,7 @@ class PagedForwardKernel:
         page_idx = tile_token_base // page_size
         page_id = (
             Int32(0)
-            if const_expr(
-                paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
-                == "1"
-            )
+            if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
@@ -5221,9 +5167,7 @@ class PagedForwardKernel:
         )
         if const_expr(self.use_kv_repack_fp16):
             packed_tile_rows_uniform = cute.arch.make_warp_uniform(packed_tile_rows)
-            tile_causal_start_uniform = cute.arch.make_warp_uniform(
-                tile_causal_start
-            )
+            tile_causal_start_uniform = cute.arch.make_warp_uniform(tile_causal_start)
         # For the exact Laguna FP8 prefill entry, K descale is uniform for the
         # request/head.  Keep the QK accumulator unscaled and fold descale into
         # the softmax exponent scale instead of multiplying every score.  The
@@ -5317,11 +5261,7 @@ class PagedForwardKernel:
             if warp_q_idx < Int32(2):
                 for mma_d in cutlass.range_constexpr(4):
                     for mma_q in cutlass.range_constexpr(num_mma_q):
-                        q_row = (
-                            warp_q_idx * num_mma_q * 16
-                            + mma_q * 16
-                            + lane % 16
-                        )
+                        q_row = warp_q_idx * num_mma_q * 16 + mma_q * 16 + lane % 16
                         q_col = mma_d * 2 + lane // 16
                         q_offset = _permuted_offset_128b(
                             q_row, q_col, tc_upcast_stride_qk
@@ -5343,19 +5283,11 @@ class PagedForwardKernel:
             )
             for mma_d in cutlass.range_constexpr(self.traits.num_mma_d_qk):
                 for mma_q in cutlass.range_constexpr(num_mma_q):
-                    q_row = (
-                        warp_q_idx * num_mma_q * 16
-                        + mma_q * 16
-                        + lane % 16
-                    )
+                    q_row = warp_q_idx * num_mma_q * 16 + mma_q * 16 + lane % 16
                     q_col = mma_d * 2 + lane // 16
-                    q_offset = _permuted_offset_128b(
-                        q_row, q_col, tc_upcast_stride_qk
-                    )
+                    q_offset = _permuted_offset_128b(q_row, q_col, tc_upcast_stride_qk)
                     a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
-                        _smem_addr_from_b128_offset(
-                            q_smem_base_addr, q_offset
-                        )
+                        _smem_addr_from_b128_offset(q_smem_base_addr, q_offset)
                     )
                     q_regs_qk[mma_d, mma_q, 0] = cvt_bf16x2_to_f16x2_via_f32(a0)
                     q_regs_qk[mma_d, mma_q, 1] = cvt_bf16x2_to_f16x2_via_f32(a1)
@@ -5695,11 +5627,15 @@ class PagedForwardKernel:
                 tile_tokens_uniform = cute.arch.make_warp_uniform(tile_tokens)
                 tile_key_base_uniform = cute.arch.make_warp_uniform(tile_key_base)
                 score_tile_fully_visible = (
-                    cute.arch.make_warp_uniform(packed_tile_rows)
-                    == Int32(self.traits.cta_tile_q)
-                ) & (tile_tokens_uniform == Int32(stage_tile_rows)) & (
-                    tile_key_base_uniform + Int32(stage_tile_rows - 1)
-                    <= cute.arch.make_warp_uniform(tile_causal_start)
+                    (
+                        cute.arch.make_warp_uniform(packed_tile_rows)
+                        == Int32(self.traits.cta_tile_q)
+                    )
+                    & (tile_tokens_uniform == Int32(stage_tile_rows))
+                    & (
+                        tile_key_base_uniform + Int32(stage_tile_rows - 1)
+                        <= cute.arch.make_warp_uniform(tile_causal_start)
+                    )
                 )
             if const_expr(self.use_paged_k_tma):
                 if const_expr(self.use_paged_kv_tma_fp8_raw_issue):
@@ -5727,8 +5663,7 @@ class PagedForwardKernel:
             if const_expr(self.use_kv_repack):
                 _repack_fp8_tile_to_16b(
                     shared_ptr_to_u32(
-                        sKStageBytes.iterator
-                        + Int32(consume_stage_idx * k_stage_bytes)
+                        sKStageBytes.iterator + Int32(consume_stage_idx * k_stage_bytes)
                     ),
                     kv_repack_base_addr,
                     tidx,
@@ -6031,7 +5966,7 @@ class PagedForwardKernel:
                             self.traits.num_mma_d_qk,
                             tc_upcast_stride_qk,
                             self.traits.upcast_stride_k,
-                    )
+                        )
                     # Exact cooperative-repack boundary mask.
                     if const_expr(self.use_kv_repack_fp16):
                         _mask_exact_fp8_boundary_scores(
@@ -6230,9 +6165,7 @@ class PagedForwardKernel:
                                     )
                                     for reg_id in cutlass.range_constexpr(8):
                                         row_slot = (reg_id % 4) // 2
-                                        row_limit = (
-                                            limit0 if row_slot == 0 else limit1
-                                        )
+                                        row_limit = limit0 if row_slot == 0 else limit1
                                         key_local = (
                                             key_pair_base
                                             + 8 * (reg_id // 4)
@@ -6264,13 +6197,16 @@ class PagedForwardKernel:
                                     if valid:
                                         key_pos = tile_key_base + key_local
                                         if const_expr(self.msa_union_tile):
-                                            valid = valid and self._msa_union_row_has_block(
-                                                mMSAUnionMasks,
-                                                work_idx,
-                                                kv_head_idx,
-                                                tile_base,
-                                                q_token_local[mma_q, row_slot],
-                                                msa_tile_first_token,
+                                            valid = (
+                                                valid
+                                                and self._msa_union_row_has_block(
+                                                    mMSAUnionMasks,
+                                                    work_idx,
+                                                    kv_head_idx,
+                                                    tile_base,
+                                                    q_token_local[mma_q, row_slot],
+                                                    msa_tile_first_token,
+                                                )
                                             )
                                         valid = (
                                             valid
@@ -7665,9 +7601,7 @@ def build_extend_forward_kernel(
     page_size: int = 64,
     use_fp8_pv_repack: bool = False,
 ):
-    enable_paged_kv_tma = (
-        paged_control("B12X_PAGED_KV_TMA", "1") != "0"
-    )
+    enable_paged_kv_tma = paged_control("B12X_PAGED_KV_TMA", "1") != "0"
     return PagedExtendForwardKernel(
         _torch_to_cutlass_dtype(traits.q_dtype),
         _torch_to_cutlass_dtype(traits.kv_dtype),

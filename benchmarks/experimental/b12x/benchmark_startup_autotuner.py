@@ -30,7 +30,9 @@ def _parser():
     )
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument(
-        "--devices", required=True, help="Two explicitly assigned GPU ordinals or UUIDs for TP2"
+        "--devices",
+        required=True,
+        help="Two explicitly assigned GPU ordinals or UUIDs for TP2",
     )
     parser.add_argument(
         "--rows",
@@ -48,11 +50,15 @@ def _parser():
         help="Total serial compiler processes across both TP ranks",
     )
     parser.add_argument(
-        "--startup-target", type=float, default=120,
+        "--startup-target",
+        type=float,
+        default=120,
         help="Advisory startup target in seconds; never prunes candidates or fails acceptance",
     )
     parser.add_argument(
-        "--process-timeout", type=float, default=0,
+        "--process-timeout",
+        type=float,
+        default=0,
         help="Operational phase timeout in seconds; 0 waits for complete runs without a deadline",
     )
     parser.add_argument("--run-dir", type=Path)
@@ -62,15 +68,14 @@ def _parser():
     )
     parser.add_argument("--cosine", type=float, default=0.998)
     parser.add_argument(
-        "--startup-only", action="store_true",
+        "--startup-only",
+        action="store_true",
         help="Measure startup/restart without the separate post-startup quality rerace",
     )
     parser.add_argument("--worker-rank", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--cached", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--phase-dir", type=Path, help=argparse.SUPPRESS)
     return parser
-
-
 
 
 def _prepare_world(session, requests):
@@ -86,19 +91,27 @@ def _prepare_world(session, requests):
             try:
                 progress = job.advance(collective_key=authorization)
                 local = {
-                    "rank": rank, "done": progress.done, "error": None,
-                    "ready": tuple((item.key, item.ranks) for item in progress.ready_collectives),
+                    "rank": rank,
+                    "done": progress.done,
+                    "error": None,
+                    "ready": tuple(
+                        (item.key, item.ranks) for item in progress.ready_collectives
+                    ),
                 }
             except BaseException as failure:
                 error = failure
                 local = {
-                    "rank": rank, "done": False, "ready": (),
+                    "rank": rank,
+                    "done": False,
+                    "ready": (),
                     "error": f"{type(failure).__name__}: {failure}",
                 }
             gathered = [None] * size
             dist.all_gather_object(gathered, local)
             if {entry["rank"] for entry in gathered} != set(range(size)):
-                raise RuntimeError("benchmark collective control domain is inconsistent")
+                raise RuntimeError(
+                    "benchmark collective control domain is inconsistent"
+                )
             failures = [entry for entry in gathered if entry["error"] is not None]
             if failures:
                 if error is not None:
@@ -113,15 +126,20 @@ def _prepare_world(session, requests):
                     if participants.setdefault(key, ranks) != ranks:
                         raise RuntimeError("benchmark collective participants disagree")
                     if not set(ranks) <= set(range(size)) or entry["rank"] not in ranks:
-                        raise RuntimeError("benchmark collective names an invalid participant")
+                        raise RuntimeError(
+                            "benchmark collective names an invalid participant"
+                        )
                     reporters.setdefault(key, set()).add(entry["rank"])
             choices = [
-                key for key, ranks in participants.items()
+                key
+                for key, ranks in participants.items()
                 if set(ranks) <= reporters[key]
             ]
             selected = min(choices) if choices else None
             authorization = (
-                selected if selected is not None and rank in participants[selected] else None
+                selected
+                if selected is not None and rank in participants[selected]
+                else None
             )
             if progress.pending_compilation and session._pool is not None:
                 session._pool.wait_for_progress(timeout=0.05)
@@ -140,7 +158,10 @@ def _worker(args):
     from b12x.preparation._measurement import no_compilation
     from b12x.preparation.types import _close_all
     from b12x.testing.startup import make_benchmark_requests, model_metadata
-    from benchmarks.experimental.b12x.startup_quality import check_quality, flatten_requests
+    from benchmarks.experimental.b12x.startup_quality import (
+        check_quality,
+        flatten_requests,
+    )
 
     rank = args.worker_rank
     torch.set_num_threads(1)
@@ -148,8 +169,11 @@ def _worker(args):
     torch.manual_seed(42)
     device = torch.device("cuda", rank)
     metadata = model_metadata(
-        args.model, tp=args.tp, checkpoint=args.checkpoint,
-        max_seqs=args.max_seqs, cache_tokens=args.cache_tokens,
+        args.model,
+        tp=args.tp,
+        checkpoint=args.checkpoint,
+        max_seqs=args.max_seqs,
+        cache_tokens=args.cache_tokens,
         spec_tokens=args.spec_tokens,
     )
     metadata["_tp_rank"] = rank
@@ -157,15 +181,21 @@ def _worker(args):
     if not rows or min(rows) <= 0:
         raise ValueError("planned rows must be positive concrete counts")
     if max(rows) < args.max_seqs * (args.spec_tokens + 1):
-        raise ValueError("maximum planned rows must cover the declared verifier capacity")
+        raise ValueError(
+            "maximum planned rows must cover the declared verifier capacity"
+        )
     metadata["_rows"] = rows
     groups = None if args.groups is None else tuple(args.groups.split(","))
     use_comm = groups is None or "comm" in groups
     if use_comm:
         dist.init_process_group(
-            "gloo", init_method=f"file://{args.phase_dir / 'rendezvous'}",
-            rank=rank, world_size=args.tp,
-            timeout=timedelta(seconds=args.process_timeout) if args.process_timeout else timedelta(days=365),
+            "gloo",
+            init_method=f"file://{args.phase_dir / 'rendezvous'}",
+            rank=rank,
+            world_size=args.tp,
+            timeout=timedelta(seconds=args.process_timeout)
+            if args.process_timeout
+            else timedelta(days=365),
         )
     result = session = None
     collective_calls = []
@@ -174,49 +204,79 @@ def _worker(args):
     try:
         with torch.inference_mode():
             requests, owners = make_benchmark_requests(
-                metadata, device=device, rows=rows,
-                groups=None if groups is None else tuple(group for group in groups if group != "comm"),
+                metadata,
+                device=device,
+                rows=rows,
+                groups=None
+                if groups is None
+                else tuple(group for group in groups if group != "comm"),
             )
             if use_comm:
                 from b12x.testing.startup import comm
-                collective = comm.make_benchmark_requests(metadata, device=device, rows=rows)
+
+                collective = comm.make_benchmark_requests(
+                    metadata, device=device, rows=rows
+                )
                 requests.extend(collective)
                 owners.update({request.name: comm for request in collective})
             detected = detect_device(device)
             session = PreparationSession(
-                device=detected, cache_dir=args.run_dir / "choices",
+                device=detected,
+                cache_dir=args.run_dir / "choices",
                 namespace={
-                    "model": args.model, "tp": args.tp, "config": digest(metadata),
-                    "rows": rows, "groups": groups,
+                    "model": args.model,
+                    "tp": args.tp,
+                    "config": digest(metadata),
+                    "rows": rows,
+                    "groups": groups,
                 },
                 compile_workers=args.compile_workers // args.tp,
                 cache_only=args.cached,
             )
-            result = _prepare_world(session, requests) if use_comm else session.prepare(requests)
+            result = (
+                _prepare_world(session, requests)
+                if use_comm
+                else session.prepare(requests)
+            )
             collective_calls = [
-                call for name, call in result.benchmark_calls.items() if name.startswith("comm.")
+                call
+                for name, call in result.benchmark_calls.items()
+                if name.startswith("comm.")
             ]
             torch.cuda.synchronize(device)
             completed = time.monotonic()
             leaves, _ = flatten_requests(requests, owners, detected)
             summary = {
-                "rank": rank, "model": args.model, "cached": args.cached,
+                "rank": rank,
+                "model": args.model,
+                "cached": args.cached,
                 "startup_completed": completed,
                 "program_counts": dict(result.program_counts),
-                "device_ordinal": rank, "requests": len(leaves), "names": list(leaves),
+                "device_ordinal": rank,
+                "requests": len(leaves),
+                "names": list(leaves),
                 "cache_hits": result.cache_hits,
                 "benchmarked_candidates": result.benchmarked_candidates,
                 "parent_cute_compilations": result.parent_cute_compilations,
                 "parent_triton_compilations": result.parent_triton_compilations,
-                "compilation": None if result.compilation is None else asdict(result.compilation),
+                "compilation": None
+                if result.compilation is None
+                else asdict(result.compilation),
                 "overlapped_benchmark_samples": result.overlapped_benchmark_samples,
                 "tuner_seconds": result.elapsed_seconds,
                 "choices": {
-                    name: leaves[name].plan.contract.config_payload(selection.config).to_dict()
+                    name: leaves[name]
+                    .plan.contract.config_payload(selection.config)
+                    .to_dict()
                     for name, selection in result.selections.items()
                 },
-                "selection_sources": {name: selection.source for name, selection in result.selections.items()},
-                "coverage": {name: dict(value) for name, value in result.coverage.items()},
+                "selection_sources": {
+                    name: selection.source
+                    for name, selection in result.selections.items()
+                },
+                "coverage": {
+                    name: dict(value) for name, value in result.coverage.items()
+                },
             }
             startup_path.write_text(json.dumps(summary, indent=2) + "\n")
             # No rank's independent recheck competes with its peer's preparation.
@@ -226,22 +286,39 @@ def _worker(args):
             summary["quality"] = None
             if not args.startup_only:
                 summary["quality"] = check_quality(
-                    requests, owners, result, device=detected, device_ordinal=rank,
-                    cosine=args.cosine, cached=args.cached,
+                    requests,
+                    owners,
+                    result,
+                    device=detected,
+                    device_ordinal=rank,
+                    cosine=args.cosine,
+                    cached=args.cached,
                     prohibit_compilation=no_compilation,
                     prepare_collective_batch=_prepare_world if use_comm else None,
                 )
             final_path.write_text(json.dumps(summary, indent=2) + "\n")
-            print(json.dumps({
-                "rank": rank, "cache_hits": result.cache_hits, "requests": len(leaves),
-                "quality": None if summary["quality"] is None else summary["quality"]["aggregate"],
-            }), flush=True)
+            print(
+                json.dumps(
+                    {
+                        "rank": rank,
+                        "cache_hits": result.cache_hits,
+                        "requests": len(leaves),
+                        "quality": None
+                        if summary["quality"] is None
+                        else summary["quality"]["aggregate"],
+                    }
+                ),
+                flush=True,
+            )
     except BaseException as error:
         failure = {
-            "rank": rank, "error": f"{type(error).__name__}: {error}",
+            "rank": rank,
+            "error": f"{type(error).__name__}: {error}",
             "traceback": traceback.format_exc(),
         }
-        (args.phase_dir / f"rank-{rank}.failure.json").write_text(json.dumps(failure, indent=2) + "\n")
+        (args.phase_dir / f"rank-{rank}.failure.json").write_text(
+            json.dumps(failure, indent=2) + "\n"
+        )
         raise
     finally:
         closers = []
@@ -251,6 +328,7 @@ def _worker(args):
             closers.append(session.close)
         if collective_calls:
             from b12x.testing.startup import comm
+
             closers.append(lambda: comm.close_calls(collective_calls))
         if dist.is_initialized():
             closers.append(dist.destroy_process_group)
@@ -264,7 +342,9 @@ def _phase(args, cached):
     environment = {
         **os.environ,
         "CUDA_VISIBLE_DEVICES": args.devices,
-        "PYTHONPATH": os.pathsep.join(filter(None, (str(_ROOT), os.environ.get("PYTHONPATH")))),
+        "PYTHONPATH": os.pathsep.join(
+            filter(None, (str(_ROOT), os.environ.get("PYTHONPATH")))
+        ),
         "PYTHONDONTWRITEBYTECODE": "1",
         "B12X_COMPILE_CACHE_DIR": str(args.run_dir / "cute"),
         "TRITON_CACHE_DIR": str(args.run_dir / "triton"),
@@ -365,21 +445,30 @@ def _phase(args, cached):
     quality = None
     if not args.startup_only:
         from benchmarks.experimental.b12x.startup_quality import aggregate_quality
+
         quality = aggregate_quality([row["quality"] for row in ranks], cached=cached)
         if not quality["passed"]:
             failures.extend(quality["failures"])
         for row in ranks:
             if not row["quality"]["aggregate"]["passed"]:
-                failures.append({"rank": row["rank"], "quality": row["quality"]["aggregate"]["failures"]})
+                failures.append(
+                    {
+                        "rank": row["rank"],
+                        "quality": row["quality"]["aggregate"]["failures"],
+                    }
+                )
     if cached and any(
         row["benchmarked_candidates"]
         or row["parent_cute_compilations"]
         or row["parent_triton_compilations"]
         or row["compilation"] is not None
-        or (row["quality"] is not None and (
-            row["quality"]["aggregate"]["measured_count"]
-            or row["quality"]["performance_recheck"]
-        ))
+        or (
+            row["quality"] is not None
+            and (
+                row["quality"]["aggregate"]["measured_count"]
+                or row["quality"]["performance_recheck"]
+            )
+        )
         for row in ranks
     ):
         failures.append("cached startup performed compilation or benchmarking")
@@ -398,11 +487,22 @@ def _phase(args, cached):
 def main():
     args = _parser().parse_args()
     devices = tuple(value.strip() for value in args.devices.split(","))
-    if args.tp != 2 or len(devices) != 2 or len(set(devices)) != 2 or any(not value for value in devices):
-        raise SystemExit("TP2 startup requires two distinct assigned GPU ordinals or UUIDs")
+    if (
+        args.tp != 2
+        or len(devices) != 2
+        or len(set(devices)) != 2
+        or any(not value for value in devices)
+    ):
+        raise SystemExit(
+            "TP2 startup requires two distinct assigned GPU ordinals or UUIDs"
+        )
 
-    if not 0 < args.startup_target < float("inf") or not 0 <= args.process_timeout < float("inf"):
-        raise SystemExit("startup target must be positive finite; process timeout must be nonnegative finite")
+    if not 0 < args.startup_target < float(
+        "inf"
+    ) or not 0 <= args.process_timeout < float("inf"):
+        raise SystemExit(
+            "startup target must be positive finite; process timeout must be nonnegative finite"
+        )
     if not 0 < args.cosine <= 1:
         raise SystemExit("cosine threshold must be in (0, 1]")
     if args.worker_rank is not None:
@@ -423,9 +523,9 @@ def main():
         "full_model_workload": args.groups is None,
         "startup_target_seconds": args.startup_target,
         "startup_target_advisory": True,
-        "acceptance_scope": "startup_timing_only" if args.startup_only else (
-            "diagnostic_subset" if args.groups is not None else "full_model"
-        ),
+        "acceptance_scope": "startup_timing_only"
+        if args.startup_only
+        else ("diagnostic_subset" if args.groups is not None else "full_model"),
         "full_acceptance": False,
         "results": {},
     }
@@ -440,7 +540,9 @@ def main():
                     {
                         "phase": name,
                         "startup_seconds": report["results"][name]["startup_seconds"],
-                        "startup_target_met": report["results"][name]["startup_target_met"],
+                        "startup_target_met": report["results"][name][
+                            "startup_target_met"
+                        ],
                         "quality": report["results"][name]["quality"],
                         "passed": report["results"][name]["passed"],
                         "result": str(output),
@@ -449,10 +551,14 @@ def main():
                 flush=True,
             )
         report["passed"] = all(phase["passed"] for phase in report["results"].values())
-        report["full_acceptance"] = report["passed"] and args.groups is None and not args.startup_only
+        report["full_acceptance"] = (
+            report["passed"] and args.groups is None and not args.startup_only
+        )
         output.write_text(json.dumps(report, indent=2) + "\n")
         if not report["passed"]:
-            raise AssertionError("startup acceptance failed; full coverage/quality failures are recorded in results.json")
+            raise AssertionError(
+                "startup acceptance failed; full coverage/quality failures are recorded in results.json"
+            )
     except BaseException as error:
         report["error"] = f"{type(error).__name__}: {error}"
         report["passed"] = False

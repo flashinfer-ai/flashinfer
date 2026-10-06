@@ -16,7 +16,10 @@ from b12x.attention.paged._forward import _build_extend_forward_kernel
 from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
 from b12x.attention._shared.contiguous.api import clear_attention_caches
 from b12x.attention.paged._forward import paged_attention_forward
-from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention.paged._scratch import (
+    B12XPagedAttentionScratchCaps,
+    plan_paged_attention_scratch,
+)
 from b12x.attention.paged.planner import create_paged_plan
 
 from b12x.testing.reference.helpers import require_b12x
@@ -181,11 +184,13 @@ def _run_decode_graph_check(
         dtype=torch.bfloat16,
         seed=1,
     )
-    k_fp8, v_fp8, k_descale, v_descale, k_scale, v_scale = _quantize_paged_kv_cache_global_e4m3(
-        k_cache,
-        v_cache,
-        batch=batch,
-        kv_heads=1,
+    k_fp8, v_fp8, k_descale, v_descale, k_scale, v_scale = (
+        _quantize_paged_kv_cache_global_e4m3(
+            k_cache,
+            v_cache,
+            batch=batch,
+            kv_heads=1,
+        )
     )
     backend = _capture_backend_graph(
         q=q,
@@ -204,8 +209,15 @@ def _run_decode_graph_check(
         window_left=-1,
     )
     reference, _ = paged_attention_reference(
-        q, k_fp8, v_fp8, page_table, cache_seqlens, cu_seqlens_q,
-        k_descale=k_descale, v_descale=v_descale, causal=True,
+        q,
+        k_fp8,
+        v_fp8,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
     )
     return backend.output, reference, backend.plan_desc
 
@@ -236,11 +248,13 @@ def _run_decode_reference_check(
         dtype=torch.bfloat16,
         seed=1,
     )
-    k_fp8, v_fp8, k_descale, v_descale, _k_scale, _v_scale = _quantize_paged_kv_cache_global_e4m3(
-        k_cache,
-        v_cache,
-        batch=batch,
-        kv_heads=1,
+    k_fp8, v_fp8, k_descale, v_descale, _k_scale, _v_scale = (
+        _quantize_paged_kv_cache_global_e4m3(
+            k_cache,
+            v_cache,
+            batch=batch,
+            kv_heads=1,
+        )
     )
     backend = _capture_backend_graph(
         q=q,
@@ -445,7 +459,9 @@ def test_paged_forward_matches_reference_decode_with_sliding_window_and_sink() -
         kv_dtype=torch.bfloat16,
     )
     window_left = 80
-    attention_sink_bias = torch.linspace(-0.2, 0.2, q.shape[1], dtype=torch.float32, device=q.device)
+    attention_sink_bias = torch.linspace(
+        -0.2, 0.2, q.shape[1], dtype=torch.float32, device=q.device
+    )
     workspace = _make_workspace(q, k_cache, v_cache, mode="decode")
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q, window_left=window_left)
     output, lse_base2 = workspace.run(
@@ -732,7 +748,9 @@ def test_paged_forward_decode_graph_replays_with_relative_bias(
 
 
 @torch.inference_mode()
-def test_paged_forward_matches_reference_decode_mimo_gqa_shape_with_sliding_window_and_sink() -> None:
+def test_paged_forward_matches_reference_decode_mimo_gqa_shape_with_sliding_window_and_sink() -> (
+    None
+):
     require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1],
@@ -745,14 +763,18 @@ def test_paged_forward_matches_reference_decode_mimo_gqa_shape_with_sliding_wind
         kv_dtype=torch.bfloat16,
     )
     window_left = 80
-    attention_sink_bias = torch.linspace(-0.2, 0.2, q.shape[1], dtype=torch.float32, device=q.device)
+    attention_sink_bias = torch.linspace(
+        -0.2, 0.2, q.shape[1], dtype=torch.float32, device=q.device
+    )
     workspace = _make_workspace(q, k_cache, v_cache, mode="decode")
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q, window_left=window_left)
     output, lse_base2 = workspace.run(
         q,
         k_cache,
         v_cache,
-        output=torch.empty(q.shape[0], q.shape[1], v_cache.shape[3], dtype=q.dtype, device=q.device),
+        output=torch.empty(
+            q.shape[0], q.shape[1], v_cache.shape[3], dtype=q.dtype, device=q.device
+        ),
         attention_sink_bias=attention_sink_bias,
     )
     torch.cuda.synchronize()
@@ -782,13 +804,19 @@ def test_paged_forward_attention_sink_affects_denominator_only() -> None:
     head_dim = 256
     page_size = 64
     q = torch.zeros((1, q_heads, head_dim), dtype=torch.bfloat16, device="cuda")
-    k_cache = torch.zeros((1, page_size, kv_heads, head_dim), dtype=torch.bfloat16, device="cuda")
-    v_cache = torch.zeros((1, page_size, kv_heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.zeros(
+        (1, page_size, kv_heads, head_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    v_cache = torch.zeros(
+        (1, page_size, kv_heads, head_dim), dtype=torch.bfloat16, device="cuda"
+    )
     v_cache[:, 0, :, :].fill_(1.0)
     page_table = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
     cache_seqlens = torch.ones((1,), dtype=torch.int32, device="cuda")
     cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
-    attention_sink_bias = torch.full((q_heads,), math.log(3.0), dtype=torch.float32, device="cuda")
+    attention_sink_bias = torch.full(
+        (q_heads,), math.log(3.0), dtype=torch.float32, device="cuda"
+    )
 
     workspace = _make_workspace(q, k_cache, v_cache, mode="decode")
     workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
@@ -802,7 +830,9 @@ def test_paged_forward_attention_sink_affects_denominator_only() -> None:
     torch.cuda.synchronize()
 
     expected_output = torch.full_like(output, 0.25)
-    expected_lse = torch.full((1, q_heads), math.log(4.0), dtype=torch.float32, device="cuda")
+    expected_lse = torch.full(
+        (1, q_heads), math.log(4.0), dtype=torch.float32, device="cuda"
+    )
     lse_natural = lse_base2 * math.log(2.0)
     assert (output - expected_output).abs().max().item() <= 0.002
     assert (lse_natural - expected_lse).abs().max().item() <= 0.002
@@ -947,7 +977,9 @@ def test_paged_forward_bf16_extend_dual_tma_tail_matches_reference() -> None:
     assert warm_output.data_ptr() == output.data_ptr()
     assert bool(torch.isfinite(warm_lse).all().item())
 
-    with kernel_resolution_guard('BF16 paged dual-TMA serving replay must use the warmed specialization'):
+    with kernel_resolution_guard(
+        "BF16 paged dual-TMA serving replay must use the warmed specialization"
+    ):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured_output, captured_lse = run_bound()
@@ -1199,7 +1231,9 @@ def test_paged_forward_matches_reference_extend_with_sliding_window_and_sink() -
         kv_dtype=torch.bfloat16,
     )
     window_left = 96
-    attention_sink_bias = torch.linspace(0.1, -0.1, q.shape[1], dtype=torch.float32, device=q.device)
+    attention_sink_bias = torch.linspace(
+        0.1, -0.1, q.shape[1], dtype=torch.float32, device=q.device
+    )
     workspace = _make_workspace(q, k_cache, v_cache, mode="extend")
     workspace.prepare(
         page_table,

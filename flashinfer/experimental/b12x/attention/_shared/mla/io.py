@@ -132,13 +132,9 @@ def stage_dsv41_fp8_scales(
                 # UE8M0 exponents make source/canonical an exact power of two;
                 # avoid a general floating-point divide on the producer path.
                 if canonical - lo <= Uint32(18):
-                    ratio_lo = ue8m0_to_output_scale(
-                        Uint32(127) + canonical - lo
-                    )
+                    ratio_lo = ue8m0_to_output_scale(Uint32(127) + canonical - lo)
                 if canonical - hi <= Uint32(18):
-                    ratio_hi = ue8m0_to_output_scale(
-                        Uint32(127) + canonical - hi
-                    )
+                    ratio_hi = ue8m0_to_output_scale(Uint32(127) + canonical - hi)
                 ratio_pair = pack_f32x2_to_f16x2(ratio_lo, ratio_lo)
                 st_shared_u32(ratio_addr + Int32(group * 8), ratio_pair)
                 ratio_pair = pack_f32x2_to_f16x2(ratio_hi, ratio_hi)
@@ -472,12 +468,14 @@ def io_issue_gather(
                     metadata_idx = Int32(0)
                 metadata_block = metadata_idx // _section_pbs
                 metadata_local = metadata_idx - metadata_block * _section_pbs
-                metadata_record_offset = (
-                    Int64(metadata_block) * _section_stride
-                    + Int64(metadata_local)
-                    * Int64(528 if dsv41_swa else 288)
+                metadata_record_offset = Int64(
+                    metadata_block
+                ) * _section_stride + Int64(metadata_local) * Int64(
+                    528 if dsv41_swa else 288
                 )
-                ratio_addr = kv_fp8_dst_addr + entry * Int32(kv_smem_stride) + Int32(544)
+                ratio_addr = (
+                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride) + Int32(544)
+                )
                 if cutlass.const_expr(ratio_stride):
                     ratio_addr = ratio_base_addr + entry * Int32(ratio_stride)
                 stage_dsv41_fp8_scales(
@@ -551,7 +549,9 @@ def io_issue_gather(
             if io_lane == Int32(0):
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     full_mbar_ptr,
-                    Int32(bi) * _NOPE if cutlass.const_expr(dsv41) else Int32(bulk_tx_bytes),
+                    Int32(bi) * _NOPE
+                    if cutlass.const_expr(dsv41)
+                    else Int32(bulk_tx_bytes),
                 )
         _issue_payload()
 

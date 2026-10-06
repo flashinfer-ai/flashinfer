@@ -55,8 +55,12 @@ def emit_mxfp6_dense_mma_k_block(
     # Operand fragments are byte-containers (Float8E4M3FN); reinterpret the raw
     # register bits as Uint32 (4 bytes -> 1 register) for the inline MMA rather
     # than numerically converting each element (which would emit fptoui).
-    a_frag = cute.flatten(cute.recast_tensor(tCrA[None, mt, k_block_idx], cutlass.Uint32))
-    b_frag = cute.flatten(cute.recast_tensor(tCrB[None, nt, k_block_idx], cutlass.Uint32))
+    a_frag = cute.flatten(
+        cute.recast_tensor(tCrA[None, mt, k_block_idx], cutlass.Uint32)
+    )
+    b_frag = cute.flatten(
+        cute.recast_tensor(tCrB[None, nt, k_block_idx], cutlass.Uint32)
+    )
     sfa_frag = tCrSFA[None, mt, k_block_idx]
     sfb_frag = tCrSFB[None, nt, k_block_idx]
     sfa = _mxfp6_scale_u32_from_sf_frag(sfa_frag)
@@ -64,61 +68,125 @@ def emit_mxfp6_dense_mma_k_block(
 
     if cutlass.const_expr(fmt_a == "e3m2" and fmt_b == "e3m2"):
         d0, d1, d2, d3 = mxfp6_mma_m16n8k32_f32_e3m2_e3m2(
-            acc[0], acc[1], acc[2], acc[3],
-            a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-            b_frag[0], b_frag[1],
-            sfa, sfb,
+            acc[0],
+            acc[1],
+            acc[2],
+            acc[3],
+            a_frag[0],
+            a_frag[1],
+            a_frag[2],
+            a_frag[3],
+            b_frag[0],
+            b_frag[1],
+            sfa,
+            sfb,
         )
     elif cutlass.const_expr(fmt_a == "e2m3" and fmt_b == "e2m3"):
         d0, d1, d2, d3 = mxfp6_mma_m16n8k32_f32_e2m3_e2m3(
-            acc[0], acc[1], acc[2], acc[3],
-            a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-            b_frag[0], b_frag[1],
-            sfa, sfb,
+            acc[0],
+            acc[1],
+            acc[2],
+            acc[3],
+            a_frag[0],
+            a_frag[1],
+            a_frag[2],
+            a_frag[3],
+            b_frag[0],
+            b_frag[1],
+            sfa,
+            sfb,
         )
     elif cutlass.const_expr(fmt_a == "e2m3" and fmt_b == "e3m2"):
         d0, d1, d2, d3 = mxfp6_mma_m16n8k32_f32_e2m3_e3m2(
-            acc[0], acc[1], acc[2], acc[3],
-            a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-            b_frag[0], b_frag[1],
-            sfa, sfb,
+            acc[0],
+            acc[1],
+            acc[2],
+            acc[3],
+            a_frag[0],
+            a_frag[1],
+            a_frag[2],
+            a_frag[3],
+            b_frag[0],
+            b_frag[1],
+            sfa,
+            sfb,
         )
     elif cutlass.const_expr(fmt_a == "e4m3" and fmt_b == "e2m3"):
         # W6A8: A = FP8 activations, B = FP6 weights (dense and MoE).
         d0, d1, d2, d3 = mxfp6_mma_m16n8k32_f32_e4m3_e2m3(
-            acc[0], acc[1], acc[2], acc[3],
-            a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-            b_frag[0], b_frag[1],
-            sfa, sfb,
+            acc[0],
+            acc[1],
+            acc[2],
+            acc[3],
+            a_frag[0],
+            a_frag[1],
+            a_frag[2],
+            a_frag[3],
+            b_frag[0],
+            b_frag[1],
+            sfa,
+            sfb,
         )
     elif cutlass.const_expr(fmt_a == "e4m3" and fmt_b == "e3m2"):
         d0, d1, d2, d3 = mxfp6_mma_m16n8k32_f32_e4m3_e3m2(
-            acc[0], acc[1], acc[2], acc[3],
-            a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-            b_frag[0], b_frag[1],
-            sfa, sfb,
+            acc[0],
+            acc[1],
+            acc[2],
+            acc[3],
+            a_frag[0],
+            a_frag[1],
+            a_frag[2],
+            a_frag[3],
+            b_frag[0],
+            b_frag[1],
+            sfa,
+            sfb,
         )
     elif cutlass.const_expr(fmt_a == "e2m3" and fmt_b == "e4m3"):
         # Cross-format (A=FP6, B=FP8) — not used by the dense W6A8 path.
         d0, d1, d2, d3 = mxfp6_mma_m16n8k32_f32_e2m3_e4m3(
-            acc[0], acc[1], acc[2], acc[3],
-            a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-            b_frag[0], b_frag[1],
-            sfa, sfb,
+            acc[0],
+            acc[1],
+            acc[2],
+            acc[3],
+            a_frag[0],
+            a_frag[1],
+            a_frag[2],
+            a_frag[3],
+            b_frag[0],
+            b_frag[1],
+            sfa,
+            sfb,
         )
     elif cutlass.const_expr(fmt_a == "e3m2" and fmt_b == "e4m3"):
         d0, d1, d2, d3 = mxfp6_mma_m16n8k32_f32_e3m2_e4m3(
-            acc[0], acc[1], acc[2], acc[3],
-            a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-            b_frag[0], b_frag[1],
-            sfa, sfb,
+            acc[0],
+            acc[1],
+            acc[2],
+            acc[3],
+            a_frag[0],
+            a_frag[1],
+            a_frag[2],
+            a_frag[3],
+            b_frag[0],
+            b_frag[1],
+            sfa,
+            sfb,
         )
     else:
         d0, d1, d2, d3 = mxfp6_mma_m16n8k32_f32_e3m2_e2m3(
-            acc[0], acc[1], acc[2], acc[3],
-            a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-            b_frag[0], b_frag[1],
-            sfa, sfb,
+            acc[0],
+            acc[1],
+            acc[2],
+            acc[3],
+            a_frag[0],
+            a_frag[1],
+            a_frag[2],
+            a_frag[3],
+            b_frag[0],
+            b_frag[1],
+            sfa,
+            sfb,
         )
     acc[0] = d0
     acc[1] = d1

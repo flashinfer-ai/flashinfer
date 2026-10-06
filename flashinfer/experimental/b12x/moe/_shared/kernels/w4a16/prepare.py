@@ -223,11 +223,7 @@ class PreparedW4A16MoeWeights:
 
     @property
     def intermediate_rotations(self) -> torch.Tensor | None:
-        return (
-            None
-            if self.trellis is None
-            else self.trellis.intermediate_rotations
-        )
+        return None if self.trellis is None else self.trellis.intermediate_rotations
 
     @property
     def down_svh(self) -> torch.Tensor | None:
@@ -983,7 +979,9 @@ def prepare_w4a16_modelopt_native_weights(
         ("w13_blockscale", w13_blockscale, shape.w13_rows, hidden_size),
         ("w2_blockscale", w2_blockscale, hidden_size, intermediate_size),
     ):
-        expected_bytes = num_experts * ((rows + 127) // 128 * 128) * ((cols // 16 + 3) // 4 * 4)
+        expected_bytes = (
+            num_experts * ((rows + 127) // 128 * 128) * ((cols // 16 + 3) // 4 * 4)
+        )
         if scales.dtype not in (torch.float8_e4m3fn, torch.uint8):
             raise TypeError(f"{name} must contain E4M3 bytes")
         if (
@@ -1185,9 +1183,7 @@ def prepare_w4a16_fc2_e8m0_weights(
         size_k=intermediate_size,
         size_n=hidden_size,
     )
-    global_scale = torch.ones(
-        (num_experts,), dtype=torch.float32, device=w2_fp4.device
-    )
+    global_scale = torch.ones((num_experts,), dtype=torch.float32, device=w2_fp4.device)
     return W4A16FC2Weights(
         w2=w2_fp4,
         w2_scale=packed_scale,
@@ -1356,9 +1352,7 @@ def prepare_w4a16_x4t_weights(
 
     from b12x._lib.quant.x4t_scales import X4TScaleBatch
 
-    if not isinstance(w13_x4t, X4TScaleBatch) or not isinstance(
-        w2_x4t, X4TScaleBatch
-    ):
+    if not isinstance(w13_x4t, X4TScaleBatch) or not isinstance(w2_x4t, X4TScaleBatch):
         raise TypeError("X4T preparation requires X4TScaleBatch scale planes")
     w13_x4t.validate()
     w2_x4t.validate()
@@ -1425,9 +1419,7 @@ def prepare_w4a16_x4t_weights(
         raise ValueError("X4T scale pair destinations must not overlap")
     w13_row_rotation = intermediate_size if w13_layout == "w13" else 0
     packed_programs = None
-    if ds41 or (
-        w13_x4t.exception_task_rows == 64 and w2_x4t.exception_task_rows == 64
-    ):
+    if ds41 or (w13_x4t.exception_task_rows == 64 and w2_x4t.exception_task_rows == 64):
         from b12x._lib.quant.x4t_packed_scales import _compiled_packed_scale_pair
 
         for plane, rotation in ((w13_x4t, w13_row_rotation), (w2_x4t, 0)):
@@ -1436,17 +1428,32 @@ def prepare_w4a16_x4t_weights(
                 or plane.task_exception_offsets is None
                 or plane.exception_row_rotation != rotation
             ):
-                raise ValueError("Paired X4T requires rotation-aligned 64-row exception tasks")
+                raise ValueError(
+                    "Paired X4T requires rotation-aligned 64-row exception tasks"
+                )
         # Retain both routing ABIs independently of compiler cache lifetime.
         packed_programs = tuple(
-            _compiled_packed_scale_pair(*tuple(
-                (plane.rows, plane.columns, 64, plane.exception_row_rotation,
-                 True, False, counts, ids64, sorted_ids)
-                for plane in (w13_x4t, w2_x4t)
-            ))
+            _compiled_packed_scale_pair(
+                *tuple(
+                    (
+                        plane.rows,
+                        plane.columns,
+                        64,
+                        plane.exception_row_rotation,
+                        True,
+                        False,
+                        counts,
+                        ids64,
+                        sorted_ids,
+                    )
+                    for plane in (w13_x4t, w2_x4t)
+                )
+            )
             for counts, ids64, sorted_ids in (
-                (False, False, False), (True, False, False),
-                (False, True, False), (False, False, True),
+                (False, False, False),
+                (True, False, False),
+                (False, True, False),
+                (False, False, True),
             )
         )
     elif (
@@ -1461,17 +1468,27 @@ def prepare_w4a16_x4t_weights(
         raise ValueError("X4T requires paired 64-row tasks or packed Kimi TP12 tasks")
     if weight_layout == "modelopt":
         return W4A16ModelOptWeights(
-            w13=w13_fp4, w2=w2_fp4,
-            w13_scale=packed_w13_scale, w2_scale=packed_w2_scale,
-            w13_global_scale=w13_global_scale, w2_global_scale=w2_global_scale,
+            w13=w13_fp4,
+            w2=w2_fp4,
+            w13_scale=packed_w13_scale,
+            w2_scale=packed_w2_scale,
+            w13_global_scale=w13_global_scale,
+            w2_global_scale=w2_global_scale,
             workspace=_make_workspace(device, max_blocks_per_sm=4),
-            hidden_size=hidden_size, intermediate_size=intermediate_size,
-            num_experts=num_experts, is_gated=True, params_dtype=params_dtype,
-            source_format="fp4_e8m0_k32", scale_format="e8m0_k32",
-            micro_w13_scale=packed_w13_scale, micro_w2_scale=packed_w2_scale,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            is_gated=True,
+            params_dtype=params_dtype,
+            source_format="fp4_e8m0_k32",
+            scale_format="e8m0_k32",
+            micro_w13_scale=packed_w13_scale,
+            micro_w2_scale=packed_w2_scale,
             micro_w13_global_scale=w13_global_scale,
-            micro_w2_global_scale=w2_global_scale, w13_layout=w13_layout,
-            x4t_w13_scale=w13_x4t, x4t_w2_scale=w2_x4t,
+            micro_w2_global_scale=w2_global_scale,
+            w13_layout=w13_layout,
+            x4t_w13_scale=w13_x4t,
+            x4t_w2_scale=w2_x4t,
             x4t_packed_pair_programs=packed_programs,
         )
     packed_w13 = _repack_weight(
@@ -1552,6 +1569,8 @@ def make_w4a16_packed_buffers(
 
 
 _TRELLIS256_W13_LAYOUTS = {"packed", "trellis_t256_proj"}
+
+
 def _normalize_trellis256_codebook(codebook: str | int) -> str:
     return normalize_codebook(codebook)
 
@@ -2056,8 +2075,7 @@ def _trellis256_marker_codebook(
 ) -> str:
     if mul1_e4m3 is not None:
         raise ValueError(
-            "the MUL1 runtime marker is not supported; use the mcg or "
-            "lut_e4m3 codebook"
+            "the MUL1 runtime marker is not supported; use the mcg or lut_e4m3 codebook"
         )
     marker_codebook: str | None = None
     if mcg is not None:
@@ -2232,21 +2250,31 @@ def prepare_trellis256_pair_dense_weight(
         raise ValueError(f"trellis pair_kind must be P24 or P33, got {pair_kind!r}")
     rate_axis = str(rate_axis).lower()
     if rate_axis not in {"k", "n"}:
-        raise ValueError(f"trellis pair rate_axis must be 'k' or 'n', got {rate_axis!r}")
+        raise ValueError(
+            f"trellis pair rate_axis must be 'k' or 'n', got {rate_axis!r}"
+        )
     if params_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("trellis_t256 pair compute requires fp16 or bf16 MMA inputs")
     if payload.dtype != torch.int16:
-        raise TypeError(f"trellis pair payload must use torch.int16, got {payload.dtype}")
+        raise TypeError(
+            f"trellis pair payload must use torch.int16, got {payload.dtype}"
+        )
     if payload.ndim != 1 or not payload.is_contiguous():
-        raise ValueError("trellis pair payload must be a contiguous one-dimensional tensor")
+        raise ValueError(
+            "trellis pair payload must be a contiguous one-dimensional tensor"
+        )
     if payload.device.type != "cuda":
-        raise ValueError(f"trellis pair payload requires CUDA storage, got {payload.device}")
+        raise ValueError(
+            f"trellis pair payload requires CUDA storage, got {payload.device}"
+        )
     device = payload.device
     for name, scale in (("suh", suh), ("svh", svh)):
         if scale.device != device:
             raise ValueError(f"trellis pair {name} must be on {device}")
         if scale.dtype != torch.float16:
-            raise TypeError(f"trellis pair {name} must be torch.float16, got {scale.dtype}")
+            raise TypeError(
+                f"trellis pair {name} must be torch.float16, got {scale.dtype}"
+            )
         if scale.ndim != 1 or not scale.is_contiguous():
             raise ValueError(f"trellis pair {name} must be a contiguous vector")
         if not bool(torch.all(torch.isfinite(scale))):
@@ -2288,9 +2316,7 @@ def prepare_trellis256_pair_dense_weight(
         # time, so retain the same bytes while interleaving the two complete
         # record spans at K16 granularity.
         low = payload[:low_words].reshape(orthogonal_tiles, 8 * 16 * low_bits)
-        high = payload[low_words:].reshape(
-            orthogonal_tiles, 8 * 16 * high_bits
-        )
+        high = payload[low_words:].reshape(orthogonal_tiles, 8 * 16 * high_bits)
         prepared_i16 = torch.cat((low, high), dim=1).contiguous().reshape(-1)
     else:
         prepared_i16 = payload
@@ -2313,9 +2339,7 @@ def prepare_trellis256_pair_dense_weight(
             else (
                 None
                 if mul1_e4m3 is None
-                else torch.tensor(
-                    mul1_e4m3, dtype=torch.uint32, device=device
-                )
+                else torch.tensor(mul1_e4m3, dtype=torch.uint32, device=device)
             )
         ),
         codebook=codebook,
@@ -2347,9 +2371,7 @@ def prepare_trellis256_pair_dense_weight(
         trellis_bits=3,
         trellis_codebook=normalized_codebook,
         mcg=mcg if isinstance(mcg, torch.Tensor) else None,
-        mul1_e4m3=(
-            mul1_e4m3 if isinstance(mul1_e4m3, torch.Tensor) else None
-        ),
+        mul1_e4m3=(mul1_e4m3 if isinstance(mul1_e4m3, torch.Tensor) else None),
         trellis_pair_kind=pair_kind,
         trellis_rate_axis=rate_axis,
     )
@@ -2370,9 +2392,7 @@ def _restore_plane_words(
         low = low.permute(0, 2, 1, 3).reshape(count, low.shape[2], -1)
         high = high.permute(0, 2, 1, 3).reshape(count, high.shape[2], -1)
         return torch.cat((low, high), dim=2).reshape(count, -1)
-    return torch.cat(
-        (low.reshape(count, -1), high.reshape(count, -1)), dim=1
-    )
+    return torch.cat((low.reshape(count, -1), high.reshape(count, -1)), dim=1)
 
 
 def _finalize_prepared_trellis_weights(
@@ -2516,18 +2536,10 @@ def _intermediate_hadamard_signs(
         return torch.ones(length, dtype=torch.float32)
     generator = torch.Generator(device="cpu")
     generator.manual_seed(
-        (
-            0x6A09E667F3BCC909 * int(sign_pattern)
-            + 0xBB67AE8584CAA73B * int(axis)
-        )
+        (0x6A09E667F3BCC909 * int(sign_pattern) + 0xBB67AE8584CAA73B * int(axis))
         & ((1 << 63) - 1)
     )
-    return (
-        torch.randint(0, 2, (length,), generator=generator)
-        .mul_(2)
-        .sub_(1)
-        .float()
-    )
+    return torch.randint(0, 2, (length,), generator=generator).mul_(2).sub_(1).float()
 
 
 __all__ = [

@@ -20,6 +20,7 @@ from b12x.preparation import (
 @dataclass(frozen=True)
 class MoeDecodeQuery:
     """Numerical and lowering contract for a planned token capacity."""
+
     quant_mode: str
     quant_modes: tuple[str, ...]
     source_format: str
@@ -141,19 +142,27 @@ class MoeDecodeConfig:
             raise TypeError("dynamic_route_mode must be a string or null")
         if w4a16_route_mode is not None and not isinstance(w4a16_route_mode, str):
             raise TypeError("w4a16_route_mode must be a string or null")
-        if any(type(payload[name]) is not bool for name in (
-            "nvfp4_share_input", "nvfp4_materialize_intermediate", "nvfp4_inline_scales",
-        )):
+        if any(
+            type(payload[name]) is not bool
+            for name in (
+                "nvfp4_share_input",
+                "nvfp4_materialize_intermediate",
+                "nvfp4_inline_scales",
+            )
+        ):
             raise TypeError("NVFP4 lowering controls must be boolean")
         for name in ("w4a16_block_size_m", "w4a16_pipeline_stages"):
             if payload[name] is not None and type(payload[name]) is not int:
                 raise TypeError(f"{name} must be an integer or null")
         tiles = payload["w4a16_tile_config"]
         if tiles is not None and (
-            not isinstance(tiles, tuple) or len(tiles) != 4
+            not isinstance(tiles, tuple)
+            or len(tiles) != 4
             or any(type(value) is not int for value in tiles)
         ):
-            raise TypeError("w4a16_tile_config must contain FC1 K/N and FC2 K/N integers")
+            raise TypeError(
+                "w4a16_tile_config must contain FC1 K/N and FC2 K/N integers"
+            )
         return cls(
             backend=backend,
             route_planner=route_planner,
@@ -193,16 +202,25 @@ _BLOCK_MOE_TILES = ((128, 64), (64, 128), (128, 128), (64, 256))
 
 
 def _validate_block_moe_launch(query, config):
-    knobs = (config.w4a16_tile_config, config.w4a16_block_size_m,
-             config.w4a16_pipeline_stages)
+    knobs = (
+        config.w4a16_tile_config,
+        config.w4a16_block_size_m,
+        config.w4a16_pipeline_stages,
+    )
     if all(value is None for value in knobs):
         return
     if config.backend != "w4a16" or query.source_format not in BLOCK_CODECS:
         raise ValueError("W4A16 tile tuning requires a block-codec W4A16 query")
     if any(value is None for value in knobs):
-        raise ValueError("W4A16 tile, route-block and pipeline choices must be specified together")
+        raise ValueError(
+            "W4A16 tile, route-block and pipeline choices must be specified together"
+        )
     tiles, block, stages = knobs
-    if not isinstance(tiles, tuple) or len(tiles) != 4 or any(type(v) is not int for v in tiles):
+    if (
+        not isinstance(tiles, tuple)
+        or len(tiles) != 4
+        or any(type(v) is not int for v in tiles)
+    ):
         raise ValueError("W4A16 tile config must contain four integers")
     if type(block) is not int or block not in (8, 16, 32, 48, 64):
         raise ValueError("unsupported W4A16 route-block size")
@@ -217,21 +235,30 @@ def _validate_block_moe_launch(query, config):
     if tiles[0] * tiles[1] != tiles[2] * tiles[3]:
         raise ValueError("fused W4A16 FC1/FC2 thread counts must match")
     from b12x.moe._shared.kernels.w4a16.kernel import (
-        _candidate_tile_fits, _DEFAULT_MAX_SHARED_MEM,
+        _candidate_tile_fits,
+        _DEFAULT_MAX_SHARED_MEM,
     )
+
     fc1_n = query.intermediate_size * (2 if query.activation == "silu" else 1)
     for n, k, tile_k, tile_n in (
         (fc1_n, query.hidden_size, *tiles[:2]),
         (query.hidden_size, query.intermediate_size, *tiles[2:]),
     ):
         if not _candidate_tile_fits(
-            problem_n=n, problem_k=k, cta_m_blocks=(block + 15) // 16,
-            tile_n=tile_n, tile_k=tile_k, cta_threads=tile_n * tile_k // 64,
+            problem_n=n,
+            problem_k=k,
+            cta_m_blocks=(block + 15) // 16,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            cta_threads=tile_n * tile_k // 64,
             max_shared_mem=_DEFAULT_MAX_SHARED_MEM - 512,
-            weight_layout=query.source_format, uses_m_block_8=block == 8,
+            weight_layout=query.source_format,
+            uses_m_block_8=block == 8,
             pipeline_stages=stages,
         ):
-            raise ValueError("W4A16 tile/pipeline exceeds geometry or shared-memory limits")
+            raise ValueError(
+                "W4A16 tile/pipeline exceeds geometry or shared-memory limits"
+            )
 
 
 def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> None:
@@ -239,13 +266,19 @@ def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> No
         raise TypeError("query must be MoeDecodeQuery")
     if not isinstance(query.controls, FrozenMapping):
         raise TypeError("MoE controls must be frozen declaration metadata")
-    if query.controls.get("trellis_decode_table", "auto") not in {"auto", "compact", "full"}:
+    if query.controls.get("trellis_decode_table", "auto") not in {
+        "auto",
+        "compact",
+        "full",
+    }:
         raise ValueError("trellis decode table must be auto, compact, or full")
     if query.io_dtype not in {"bfloat16", "float16"}:
         raise TypeError("MoE I/O dtype must be bfloat16 or float16")
     if query.route_logits_dtype not in {None, "float16", "bfloat16", "float32"}:
         raise TypeError("MoE router logits dtype is unsupported")
-    if query.numerical_recipe is not None and not isinstance(query.numerical_recipe, str):
+    if query.numerical_recipe is not None and not isinstance(
+        query.numerical_recipe, str
+    ):
         raise TypeError("MoE numerical_recipe must be a string or null")
     if type(query.shared_input_scales) is not bool:
         raise TypeError("shared_input_scales must be boolean")
@@ -253,6 +286,7 @@ def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> No
         raise TypeError("nvfp4_inline_scales must be boolean")
     if not query.weight_layouts:
         raise ValueError("MoE query requires declared weight layouts")
+
 
 def _nvfp4_query(query):
     return query.quant_mode in {"nvfp4", "nvfp4_auto"} or (
@@ -308,7 +342,8 @@ def _nvfp4_materialization_eligible(query, config):
         and not query.deterministic_output
         and query.hidden_size % 128 == 0
         and query.intermediate_size % 128 == 0
-        and query.controls.get("dynamic_work_source", "materialized_queue") != "ready_queue"
+        and query.controls.get("dynamic_work_source", "materialized_queue")
+        != "ready_queue"
         and not query.controls.get("dynamic_down_scale", False)
         and query.controls.get("dynamic_swap_ab") in (None, "0")
         and query.shared_input_scales
@@ -326,10 +361,17 @@ def validate_moe_decode_config(
     if query.source_format in BLOCK_CODECS:
         if query.quant_mode != "w4a16" or query.io_dtype != "bfloat16":
             raise ValueError("IQ2_XS requires BF16 W4A16 execution")
-        if query.activation not in {"silu", "relu2"} or query.hidden_size % max(128, block_codec(query.source_format).block_weights) or query.intermediate_size % max(128, block_codec(query.source_format).block_weights):
+        if (
+            query.activation not in {"silu", "relu2"}
+            or query.hidden_size
+            % max(128, block_codec(query.source_format).block_weights)
+            or query.intermediate_size
+            % max(128, block_codec(query.source_format).block_weights)
+        ):
             raise ValueError("IQ2_XS requires aligned SiLU or ReLU² geometry")
         if config.w4a16_route_mode == "direct":
             from ._impl import _w4a16_direct_routing_supported
+
             if not _w4a16_direct_routing_supported(query):
                 raise ValueError(
                     "IQ2_XS direct routing requires nondeterministic SiLU or ReLU² capacity <= 8, "
@@ -338,12 +380,16 @@ def validate_moe_decode_config(
     if query.quant_mode == "multi":
         if config.backend == "w4a16":
             if "w4a16" not in query.quant_modes:
-                raise ValueError("W4A16 backend is absent from the declared MoE recipes")
+                raise ValueError(
+                    "W4A16 backend is absent from the declared MoE recipes"
+                )
             query = replace(query, quant_mode="w4a16")
         else:
             non_a16 = tuple(mode for mode in query.quant_modes if mode != "w4a16")
             if len(non_a16) != 1:
-                raise ValueError("non-W4A16 multi-recipe MoE requires an explicit recipe route")
+                raise ValueError(
+                    "non-W4A16 multi-recipe MoE requires an explicit recipe route"
+                )
             query = replace(query, quant_mode=non_a16[0])
     if query.quant_mode == "nvfp4_auto":
         if query.source_format != "modelopt_nvfp4" or query.activation != "silu":
@@ -358,26 +404,46 @@ def validate_moe_decode_config(
             raise ValueError(
                 "source-native A16 direct decode requires capacity at most 8"
             )
-        query = replace(query, quant_mode="w4a16" if config.backend == "w4a16" else "nvfp4")
-    if any(type(value) is not bool for value in (
-        config.nvfp4_share_input, config.nvfp4_materialize_intermediate,
-        config.nvfp4_inline_scales,
-    )):
+        query = replace(
+            query, quant_mode="w4a16" if config.backend == "w4a16" else "nvfp4"
+        )
+    if any(
+        type(value) is not bool
+        for value in (
+            config.nvfp4_share_input,
+            config.nvfp4_materialize_intermediate,
+            config.nvfp4_inline_scales,
+        )
+    ):
         raise TypeError("NVFP4 lowering controls must be boolean")
     if config.nvfp4_share_input and not (
-        query.quant_mode == "nvfp4" and config.backend == "dynamic" and query.shared_input_scales
+        query.quant_mode == "nvfp4"
+        and config.backend == "dynamic"
+        and query.shared_input_scales
     ):
-        raise ValueError("shared NVFP4 input requires validated uniform input scales and dynamic execution")
-    if config.nvfp4_materialize_intermediate and not _nvfp4_materialization_eligible(query, config):
-        raise ValueError("NVFP4 split materialization requires shared input and the nondeterministic SiLU M128 contract")
+        raise ValueError(
+            "shared NVFP4 input requires validated uniform input scales and dynamic execution"
+        )
+    if config.nvfp4_materialize_intermediate and not _nvfp4_materialization_eligible(
+        query, config
+    ):
+        raise ValueError(
+            "NVFP4 split materialization requires shared input and the nondeterministic SiLU M128 contract"
+        )
     if config.nvfp4_inline_scales and not _nvfp4_inline_eligible(query, config):
-        raise ValueError("NVFP4 inline scales require prepared compressed planes and fused dynamic SiLU execution")
+        raise ValueError(
+            "NVFP4 inline scales require prepared compressed planes and fused dynamic SiLU execution"
+        )
     if (
-        query.quant_mode == "w4a8_mx" and query.source_format == "fp4_e8m0_k32"
-        and query.intermediate_size % 128 == 64 and config.backend == "dynamic"
+        query.quant_mode == "w4a8_mx"
+        and query.source_format == "fp4_e8m0_k32"
+        and query.intermediate_size % 128 == 64
+        and config.backend == "dynamic"
         and (config.dynamic_tile_m != 16 or config.dynamic_route_mode != "grouped")
     ):
-        raise ValueError("compact N64 W4A8 dynamic execution requires grouped M16 routing")
+        raise ValueError(
+            "compact N64 W4A8 dynamic execution requires grouped M16 routing"
+        )
     if config.backend not in {"micro", "dynamic", "w4a16"}:
         raise ValueError(f"unsupported MoE backend {config.backend!r}")
     if query.quant_mode == "w4a16":
@@ -389,19 +455,16 @@ def validate_moe_decode_config(
             from ._impl import _w4a16_direct_routing_supported
 
             if not _w4a16_direct_routing_supported(query):
-                raise ValueError("W4A16 direct routing does not support this concrete query")
+                raise ValueError(
+                    "W4A16 direct routing does not support this concrete query"
+                )
     else:
         if config.backend == "w4a16":
             raise ValueError("the W4A16 backend requires quant_mode='w4a16'")
         if config.w4a16_route_mode is not None:
             raise ValueError("w4a16_route_mode is only valid for W4A16")
-    if (
-        query.quant_mode in {"w6a8_mx", "w8a8_mx"}
-        and config.backend != "dynamic"
-    ):
-        raise ValueError(
-            "MX byte-container queries require the dynamic backend"
-        )
+    if query.quant_mode in {"w6a8_mx", "w8a8_mx"} and config.backend != "dynamic":
+        raise ValueError("MX byte-container queries require the dynamic backend")
     if config.route_planner not in {"internal", "triton"}:
         raise ValueError(f"unsupported MoE route planner {config.route_planner!r}")
     if config.route_planner == "triton" and config.backend != "dynamic":
@@ -411,18 +474,27 @@ def validate_moe_decode_config(
     if config.route_planner == "triton" and config.dynamic_tile_m != 16:
         raise ValueError("the Triton route planner requires dynamic_tile_m=16")
     if config.route_planner == "triton" and not (
-        (query.quant_mode == "nvfp4" or (
-            _compact_w4a8_query(query) and not query.deterministic_output
-            and query.controls.get("dynamic_work_source", "materialized_queue")
-            in {"materialized_queue", "persistent_grid"}
-        )) and query.activation == "silu" and 0 < query.routed_rows <= 256
+        (
+            query.quant_mode == "nvfp4"
+            or (
+                _compact_w4a8_query(query)
+                and not query.deterministic_output
+                and query.controls.get("dynamic_work_source", "materialized_queue")
+                in {"materialized_queue", "persistent_grid"}
+            )
+        )
+        and query.activation == "silu"
+        and 0 < query.routed_rows <= 256
     ):
-        raise ValueError("the Triton route planner requires small NVFP4 or compact W4A8 SiLU workloads")
+        raise ValueError(
+            "the Triton route planner requires small NVFP4 or compact W4A8 SiLU workloads"
+        )
     if config.max_active_clusters is not None and config.max_active_clusters <= 0:
         raise ValueError("max_active_clusters must be positive when set")
     if config.max_active_clusters is not None:
         if (
-            config.route_planner == "triton" and _device is not None
+            config.route_planner == "triton"
+            and _device is not None
             and config.max_active_clusters > _device.sm_count
         ):
             raise ValueError("NVFP4 grid exceeds the resident SM count")
@@ -431,30 +503,37 @@ def validate_moe_decode_config(
             and config.backend == "dynamic"
             and config.dynamic_tile_m in {16, 32}
         )
-        if config.route_planner != "triton" and not (
-            _compact_w4a8_query(query) and config.backend in {"micro", "dynamic"}
-        ) and not repacked_decode:
+        if (
+            config.route_planner != "triton"
+            and not (
+                _compact_w4a8_query(query) and config.backend in {"micro", "dynamic"}
+            )
+            and not repacked_decode
+        ):
             raise ValueError(
                 "max_active_clusters requires Triton routing, compact W4A8, "
                 "or repacked W4A8 M16/M32 decode"
             )
         if (
-            _compact_w4a8_query(query) and _device is not None
+            _compact_w4a8_query(query)
+            and _device is not None
             and config.max_active_clusters > _device.sm_count
         ):
-            raise ValueError("max_active_clusters must not exceed the resident SM count")
+            raise ValueError(
+                "max_active_clusters must not exceed the resident SM count"
+            )
         if (
-            repacked_decode and _device is not None
+            repacked_decode
+            and _device is not None
             and config.max_active_clusters > 2 * _device.sm_count
         ):
-            raise ValueError("max_active_clusters exceeds the two-CTA-per-SM resident grid")
+            raise ValueError(
+                "max_active_clusters exceeds the two-CTA-per-SM resident grid"
+            )
     if config.backend == "dynamic":
         if config.dynamic_tile_m not in {16, 32, 64, 128}:
             raise ValueError("dynamic_tile_m must be one of 16, 32, 64, 128")
-        if (
-            query.quant_mode in {"w6a8_mx", "w8a8_mx"}
-            and config.dynamic_tile_m != 128
-        ):
+        if query.quant_mode in {"w6a8_mx", "w8a8_mx"} and config.dynamic_tile_m != 128:
             # The MX byte-container dynamic kernels build only the (128, 128)
             # MMA tile; a smaller declared tile could not be materialized.
             raise ValueError(
@@ -468,22 +547,34 @@ def validate_moe_decode_config(
         raise ValueError("dynamic_route_mode is only valid for dynamic MoE")
 
 
-def _default_config(query: MoeDecodeQuery, device: DeviceIdentity | None) -> MoeDecodeConfig:
+def _default_config(
+    query: MoeDecodeQuery, device: DeviceIdentity | None
+) -> MoeDecodeConfig:
     from ._impl import _heuristic_moe_decode_config
 
     if query.quant_mode == "multi":
         non_a16 = tuple(mode for mode in query.quant_modes if mode != "w4a16")
         if len(non_a16) != 1:
-            raise ValueError("multi-recipe MoE requires an explicit default recipe route")
+            raise ValueError(
+                "multi-recipe MoE requires an explicit default recipe route"
+            )
         query = replace(query, quant_mode=non_a16[0])
     config = _heuristic_moe_decode_config(query, device)
-    config = replace(config, nvfp4_share_input=bool(
-        _nvfp4_query(query) and config.backend == "dynamic" and query.shared_input_scales
-    ))
-    config = replace(config, nvfp4_materialize_intermediate=bool(
-        _nvfp4_materialization_eligible(query, config)
-        and query.controls.get("dynamic_nvfp4_materialized") is not False
-    ))
+    config = replace(
+        config,
+        nvfp4_share_input=bool(
+            _nvfp4_query(query)
+            and config.backend == "dynamic"
+            and query.shared_input_scales
+        ),
+    )
+    config = replace(
+        config,
+        nvfp4_materialize_intermediate=bool(
+            _nvfp4_materialization_eligible(query, config)
+            and query.controls.get("dynamic_nvfp4_materialized") is not False
+        ),
+    )
     return replace(config, nvfp4_inline_scales=_nvfp4_inline_eligible(query, config))
 
 
@@ -498,7 +589,14 @@ def _materialize_tuning(query, device, choice):
     config = MoeDecodeConfig.from_config(choice)
     validate_moe_decode_config(query, config, device)
     if (
-        min(query.num_experts, query.hidden_size, query.intermediate_size, query.top_k, query.num_tokens) <= 0
+        min(
+            query.num_experts,
+            query.hidden_size,
+            query.intermediate_size,
+            query.top_k,
+            query.num_tokens,
+        )
+        <= 0
         or query.top_k > query.num_experts
         or query.routed_rows != query.num_tokens * query.top_k
     ):
@@ -510,12 +608,18 @@ def _materialize_tuning(query, device, choice):
         else:
             non_a16 = tuple(mode for mode in query.quant_modes if mode != "w4a16")
             if len(non_a16) != 1:
-                raise ValueError("non-W4A16 multi-recipe MoE requires an explicit recipe route")
+                raise ValueError(
+                    "non-W4A16 multi-recipe MoE requires an explicit recipe route"
+                )
             effective_query = replace(query, quant_mode=non_a16[0])
     elif query.quant_mode == "nvfp4_auto" and config.backend != "w4a16":
         effective_query = replace(query, quant_mode="nvfp4")
-    if (config.backend == "micro" and effective_query.quant_mode == "w4a8_mx"
-            and query.intermediate_size % 128 == 64 and query.io_dtype != "bfloat16"):
+    if (
+        config.backend == "micro"
+        and effective_query.quant_mode == "w4a8_mx"
+        and query.intermediate_size % 128 == 64
+        and query.io_dtype != "bfloat16"
+    ):
         raise ValueError("compact W4A8 micro requires BF16 activations")
     if config.backend == "micro" and not _policy_micro_supported(effective_query):
         raise ValueError("micro MoE does not support this concrete query")
@@ -534,7 +638,9 @@ def _materialize_tuning(query, device, choice):
                 activation=query.activation,
                 routed_rows=query.routed_rows,
                 num_experts=query.num_experts,
-                n=_dynamic_kernel_intermediate_size(query.intermediate_size, effective_query.quant_mode),
+                n=_dynamic_kernel_intermediate_size(
+                    query.intermediate_size, effective_query.quant_mode
+                ),
                 deterministic_output=False,
                 planned_tile_m=config.dynamic_tile_m,
             )
@@ -549,10 +655,16 @@ def _tuning_parameters(query, device):
     if query.source_format in BLOCK_CODECS:
         from itertools import product
 
-        tiles = tuple(a + b for a, b in product(_BLOCK_MOE_TILES, repeat=2)
-                      if a[0] * a[1] == b[0] * b[1])
-        blocks = ((query.w4a16_block_size_m,) if query.w4a16_block_size_m is not None
-                  else (8, 16, 32, 48, 64))
+        tiles = tuple(
+            a + b
+            for a, b in product(_BLOCK_MOE_TILES, repeat=2)
+            if a[0] * a[1] == b[0] * b[1]
+        )
+        blocks = (
+            (query.w4a16_block_size_m,)
+            if query.w4a16_block_size_m is not None
+            else (8, 16, 32, 48, 64)
+        )
         return {
             "max_active_clusters": (None,),
             "w4a16_tile_config": (None, *tiles),
@@ -570,7 +682,8 @@ def _tuning_parameters(query, device):
         return ParameterSpace.create(
             tuple(
                 replace(knob, when=FrozenMapping())
-                if knob.name == "max_active_clusters" else knob
+                if knob.name == "max_active_clusters"
+                else knob
                 for knob in TUNING.knobs
             ),
             values={"max_active_clusters": (None, *ladder)},
@@ -587,7 +700,8 @@ def _tuning_parameters(query, device):
         return ParameterSpace.create(
             tuple(
                 replace(knob, when=FrozenMapping({"backend": "dynamic"}))
-                if knob.name == "max_active_clusters" else knob
+                if knob.name == "max_active_clusters"
+                else knob
                 for knob in TUNING.knobs
             ),
             values={"max_active_clusters": (None, *ladder)},
@@ -612,8 +726,11 @@ def _tuning_parameters(query, device):
     # Race partial resident grids without compiling another kernel.
     ladder = sorted(
         {1 << exponent for exponent in range(clamp.bit_length())}
-        | {clamp, min(clamp, max(1, device.sm_count // 2)),
-           min(clamp, max(1, 3 * device.sm_count // 4))}
+        | {
+            clamp,
+            min(clamp, max(1, device.sm_count // 2)),
+            min(clamp, max(1, 3 * device.sm_count // 4)),
+        }
     )
     return {"max_active_clusters": (None, *ladder)}
 
@@ -621,6 +738,7 @@ def _tuning_parameters(query, device):
 @dataclass(frozen=True, kw_only=True)
 class MoeRouteQuery:
     """Immutable ABI for the native top-k routing program."""
+
     num_tokens: int
     num_experts: int
     top_k: int
@@ -640,6 +758,7 @@ class MoeRouteQuery:
 @dataclass(frozen=True, kw_only=True)
 class MoeFC2Query:
     """Immutable ABI for the standalone W4A16 FC2 launch."""
+
     max_routes: int
     hidden_size: int
     intermediate_size: int
@@ -657,14 +776,31 @@ def _validate_route_query(query: MoeRouteQuery, _device) -> None:
     if query.score_func not in {"softmax", "sqrtsoftplus"}:
         raise ValueError("unsupported router score function")
     if query.has_image_correction_bias != query.has_image_mask:
-        raise ValueError("image correction bias and image mask must be supplied together")
-    if min(query.logits_row_stride, query.topk_row_stride, query.ids_row_stride,
-           query.weights_row_stride) <= 0:
+        raise ValueError(
+            "image correction bias and image mask must be supplied together"
+        )
+    if (
+        min(
+            query.logits_row_stride,
+            query.topk_row_stride,
+            query.ids_row_stride,
+            query.weights_row_stride,
+        )
+        <= 0
+    ):
         raise ValueError("route row strides must be positive")
 
 
 def _validate_fc2_query(query: MoeFC2Query, _device) -> None:
-    if min(query.max_routes, query.hidden_size, query.intermediate_size, query.num_experts) <= 0:
+    if (
+        min(
+            query.max_routes,
+            query.hidden_size,
+            query.intermediate_size,
+            query.num_experts,
+        )
+        <= 0
+    ):
         raise ValueError("FC2 preparation requires positive geometry")
     if query.route_ids_dtype not in {"int32", "int64"}:
         raise TypeError("FC2 route IDs must be int32 or int64")
@@ -696,18 +832,79 @@ TUNING = TuningContract(
     candidate_contract_version=23,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
-        Knob(name="backend", values=("w4a16", "micro", "dynamic"), binding=ParameterBinding.COMPILE),
-        Knob(name="route_planner", values=("internal", "triton"), binding=ParameterBinding.COMPILE),
-        Knob(name="max_active_clusters", values=None, binding=ParameterBinding.RUNTIME, when=FrozenMapping({"route_planner": "triton"})),
-        Knob(name="dynamic_tile_m", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "dynamic"})),
-        Knob(name="dynamic_route_mode", values=("direct", "grouped"), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "dynamic"})),
-        Knob(name="nvfp4_share_input", values=(False, True), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "dynamic"}), otherwise=False),
-        Knob(name="nvfp4_materialize_intermediate", values=(False, True), binding=ParameterBinding.COMPILE, when=FrozenMapping({"nvfp4_share_input": True}), otherwise=False),
-        Knob(name="nvfp4_inline_scales", values=(False, True), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "dynamic"}), otherwise=False),
-        Knob(name="w4a16_route_mode", values=("direct", "packed"), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "w4a16"})),
-        Knob(name="w4a16_tile_config", values=(None,), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "w4a16"})),
-        Knob(name="w4a16_block_size_m", values=(None,), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "w4a16"})),
-        Knob(name="w4a16_pipeline_stages", values=(None,), binding=ParameterBinding.COMPILE, when=FrozenMapping({"backend": "w4a16"})),
+        Knob(
+            name="backend",
+            values=("w4a16", "micro", "dynamic"),
+            binding=ParameterBinding.COMPILE,
+        ),
+        Knob(
+            name="route_planner",
+            values=("internal", "triton"),
+            binding=ParameterBinding.COMPILE,
+        ),
+        Knob(
+            name="max_active_clusters",
+            values=None,
+            binding=ParameterBinding.RUNTIME,
+            when=FrozenMapping({"route_planner": "triton"}),
+        ),
+        Knob(
+            name="dynamic_tile_m",
+            values=(16, 32, 64, 128),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "dynamic"}),
+        ),
+        Knob(
+            name="dynamic_route_mode",
+            values=("direct", "grouped"),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "dynamic"}),
+        ),
+        Knob(
+            name="nvfp4_share_input",
+            values=(False, True),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "dynamic"}),
+            otherwise=False,
+        ),
+        Knob(
+            name="nvfp4_materialize_intermediate",
+            values=(False, True),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"nvfp4_share_input": True}),
+            otherwise=False,
+        ),
+        Knob(
+            name="nvfp4_inline_scales",
+            values=(False, True),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "dynamic"}),
+            otherwise=False,
+        ),
+        Knob(
+            name="w4a16_route_mode",
+            values=("direct", "packed"),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "w4a16"}),
+        ),
+        Knob(
+            name="w4a16_tile_config",
+            values=(None,),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "w4a16"}),
+        ),
+        Knob(
+            name="w4a16_block_size_m",
+            values=(None,),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "w4a16"}),
+        ),
+        Knob(
+            name="w4a16_pipeline_stages",
+            values=(None,),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "w4a16"}),
+        ),
     ),
     materialize=_materialize_tuning,
     parameters=_tuning_parameters,
@@ -715,7 +912,12 @@ TUNING = TuningContract(
 
 
 __all__ = [
-    "TUNING", "ROUTE_TUNING", "FC2_TUNING", "MoeDecodeConfig",
-    "MoeDecodeQuery", "MoeRouteQuery", "MoeFC2Query",
+    "TUNING",
+    "ROUTE_TUNING",
+    "FC2_TUNING",
+    "MoeDecodeConfig",
+    "MoeDecodeQuery",
+    "MoeRouteQuery",
+    "MoeFC2Query",
     "validate_moe_decode_config",
 ]

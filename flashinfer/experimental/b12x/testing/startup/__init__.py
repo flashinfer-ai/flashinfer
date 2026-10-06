@@ -64,7 +64,9 @@ def make_benchmark_requests(metadata, *, device, rows, groups=None):
     requests, owners = [], {}
     for name in names:
         module = importlib.import_module(f"{__name__}.{name}")
-        for request in module.make_benchmark_requests(metadata, device=device, rows=rows):
+        for request in module.make_benchmark_requests(
+            metadata, device=device, rows=rows
+        ):
             if request.name in owners:
                 raise ValueError(f"duplicate native startup request {request.name!r}")
             requests.append(request)

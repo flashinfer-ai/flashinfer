@@ -92,7 +92,6 @@ def _geometry(checkpoint, prefix):
     )
 
 
-
 def _embedding_requests(metadata, device, rows):
     from b12x.sequence import ple_embedding, ple_hash
 
@@ -112,8 +111,11 @@ def _embedding_requests(metadata, device, rows):
     vocab, order, heads, base, dim = (
         int(metadata[key])
         for key in (
-            "vocab_size", "ngram_size", "heads_per_ngram",
-            "ngram_vocab_size_base", "ple_embed_dim",
+            "vocab_size",
+            "ngram_size",
+            "heads_per_ngram",
+            "ngram_vocab_size_base",
+            "ple_embed_dim",
         )
     )
     eos = int(metadata["eos_token_id"])
@@ -129,28 +131,45 @@ def _embedding_requests(metadata, device, rows):
         for m in rows:
             lengths = _lengths(m, int(metadata.get("_max_seqs", 1)))
             common = dict(
-                device=device, max_tokens=m, max_seqs=len(lengths),
-                vocab_size=vocab, eos_token_id=eos, max_order=order,
-                heads_per_order=heads, dense_layer_ordinal=ordinal,
-                base_table_size=base, table_alignment=align,
+                device=device,
+                max_tokens=m,
+                max_seqs=len(lengths),
+                vocab_size=vocab,
+                eos_token_id=eos,
+                max_order=order,
+                heads_per_order=heads,
+                dense_layer_ordinal=ordinal,
+                base_table_size=base,
+                table_alignment=align,
             )
             hash_caps = ple_hash.Caps(**common)
             geometry = ple_hash.compute_geometry(hash_caps, **geometry_tensors)
             hash_plan = ple_hash.plan(
-                hash_caps, geometry=geometry, **geometry_tensors, invocation=FrozenMapping(),
+                hash_caps,
+                geometry=geometry,
+                **geometry_tensors,
+                invocation=FrozenMapping(),
             )
             embedding_caps = ple_embedding.Caps(
-                **common, embedding_dim=dim, tp_size=tp, tp_rank=rank,
-                quant_mode=quant, table_memory=memory,
+                **common,
+                embedding_dim=dim,
+                tp_size=tp,
+                tp_rank=rank,
+                quant_mode=quant,
+                table_memory=memory,
             )
             embedding_plan = ple_embedding.plan(
-                embedding_caps, geometry=geometry, **geometry_tensors, invocation=FrozenMapping(),
+                embedding_caps,
+                geometry=geometry,
+                **geometry_tensors,
+                invocation=FrozenMapping(),
             )
 
             def hash_call(state, *, m=m, lengths=lengths):
                 args = _hash_inputs(m, lengths, order, vocab, eos, device)
                 binding = state.bind(
-                    scratch=_scratch(state.layout, device), **args,
+                    scratch=_scratch(state.layout, device),
+                    **args,
                     out=torch.empty(
                         (m, (order - 1) * heads), device=device, dtype=torch.int64
                     ),
@@ -161,15 +180,22 @@ def _embedding_requests(metadata, device, rows):
                     owners=(_Expected("hash", binding),),
                 )
 
-            requests.append(hash_plan.request(
-                name=f"ple.hash.layer{layer}.m{m}",
-                prepare_call=hash_call,
-                benchmark_call=hash_call,
-                retain_benchmark_call=True,
-            ))
+            requests.append(
+                hash_plan.request(
+                    name=f"ple.hash.layer{layer}.m{m}",
+                    prepare_call=hash_call,
+                    benchmark_call=hash_call,
+                    retain_benchmark_call=True,
+                )
+            )
 
             def embedding_call(
-                state, *, m=m, lengths=lengths, prefix=prefix, ordinal=ordinal,
+                state,
+                *,
+                m=m,
+                lengths=lengths,
+                prefix=prefix,
+                ordinal=ordinal,
             ):
                 args = _hash_inputs(m, lengths, order, vocab, eos, device)
                 if memory == "io_uring":
@@ -181,14 +207,17 @@ def _embedding_requests(metadata, device, rows):
                     first_shard = state.layout.shard_start // shard_rows
                     last_shard = (state.layout.shard_end + shard_rows - 1) // shard_rows
                     for shard in range(first_shard, last_shard):
-                        for scale in ((False, True) if quant == "nvfp4_group16" else (False,)):
+                        for scale in (
+                            (False, True) if quant == "nvfp4_group16" else (False,)
+                        ):
                             name = f"{prefix}ngram_embedding.shard_{shard}.weight" + (
                                 "_scale" if scale else ""
                             )
                             path, offset, item = checkpoint.location(name)
                             expected_cols = (
                                 state.layout.head_dim // 16
-                                if scale else state.layout.weight_shape[1]
+                                if scale
+                                else state.layout.weight_shape[1]
                             )
                             if item["shape"][1] != expected_cols:
                                 raise ValueError(
@@ -197,8 +226,11 @@ def _embedding_requests(metadata, device, rows):
                                 )
                             disk.add_shard(shard, str(path), offset, scale=scale)
                     scale2 = (
-                        checkpoint.small(prefix + "ngram_embedding.weight_scale_2").to(device)
-                        if quant == "nvfp4_group16" else None
+                        checkpoint.small(prefix + "ngram_embedding.weight_scale_2").to(
+                            device
+                        )
+                        if quant == "nvfp4_group16"
+                        else None
                     )
                     if quant == "fp8_e4m3_per_tensor":
                         raise ValueError(
@@ -220,32 +252,41 @@ def _embedding_requests(metadata, device, rows):
                     table = supplied[ordinal]
                     storage, owners = (
                         dict(
-                            weight=table.weight, weight_scale=table.weight_scale,
+                            weight=table.weight,
+                            weight_scale=table.weight_scale,
                             weight_scale_2=table.weight_scale_2,
                         ),
                         (table,),
                     )
                 binding = state.bind(
-                    scratch=_scratch(state.layout, device), **args, **storage,
+                    scratch=_scratch(state.layout, device),
+                    **args,
+                    **storage,
                     out=torch.empty(
-                        state.layout.output_shape, device=device,
+                        state.layout.output_shape,
+                        device=device,
                         dtype=state.layout.output_dtype,
                     ),
                 )
                 return PreparedCall(
                     run=lambda: state.run(binding, token_count=m),
                     output=binding.out,
-                    owners=(_Expected("embedding", binding, checkpoint, prefix), *owners),
+                    owners=(
+                        _Expected("embedding", binding, checkpoint, prefix),
+                        *owners,
+                    ),
                     close=(lambda: _close_disk(disk)) if memory == "io_uring" else None,
                     capture_safe=memory != "io_uring",
                 )
 
-            requests.append(embedding_plan.request(
-                name=f"ple.embedding.layer{layer}.m{m}",
-                prepare_call=embedding_call,
-                benchmark_call=embedding_call,
-                retain_benchmark_call=True,
-            ))
+            requests.append(
+                embedding_plan.request(
+                    name=f"ple.embedding.layer{layer}.m{m}",
+                    prepare_call=embedding_call,
+                    benchmark_call=embedding_call,
+                    retain_benchmark_call=True,
+                )
+            )
     return requests
 
 
@@ -262,20 +303,33 @@ def _convolution_requests(metadata, device, rows):
     for m in rows:
         lengths = _lengths(m, int(metadata.get("_max_seqs", 1)))
         n = len(lengths)
-        declaration = op.plan(op.Caps(
-            device=device, mode="mixed", max_tokens=m, max_seqs=n,
-            max_state_slots=n, max_speculative_tokens=spec, streams=s,
-            hidden_size=h, kernel_size=k, dilation=dilation,
-        ))
+        declaration = op.plan(
+            op.Caps(
+                device=device,
+                mode="mixed",
+                max_tokens=m,
+                max_seqs=n,
+                max_state_slots=n,
+                max_speculative_tokens=spec,
+                streams=s,
+                hidden_size=h,
+                kernel_size=k,
+                dilation=dilation,
+            )
+        )
 
         def convolution_call(state, *, m=m, n=n, lengths=lengths):
             def rand(shape):
                 return torch.randn(shape, device=device, dtype=torch.bfloat16) * 0.1
 
             args = dict(
-                residual=rand((m, s, h)), key=rand((m, s, h)), value=rand((m, h)),
-                k_norm_weight=rand((s * h,)), q_norm_weight=rand((s * h,)),
-                u_norm_weight=rand((s * h,)), conv_weight=rand((s * h, k)),
+                residual=rand((m, s, h)),
+                key=rand((m, s, h)),
+                value=rand((m, h)),
+                k_norm_weight=rand((s * h,)),
+                q_norm_weight=rand((s * h,)),
+                u_norm_weight=rand((s * h,)),
+                conv_weight=rand((s * h, k)),
                 query_start_loc=torch.tensor(
                     [0, *accumulate(lengths)], device=device, dtype=torch.int32
                 ),
@@ -287,7 +341,8 @@ def _convolution_requests(metadata, device, rows):
                 conv_state=rand((n, s * h, state.state_capacity)),
                 request_is_prefill=torch.tensor(
                     [length > spec + 1 for length in lengths],
-                    device=device, dtype=torch.bool,
+                    device=device,
+                    dtype=torch.bool,
                 ),
                 out=torch.empty((m, s, h), device=device, dtype=torch.bfloat16),
             )
@@ -304,16 +359,24 @@ def _convolution_requests(metadata, device, rows):
 
             return PreparedCall(
                 run=lambda: state.run(binding, eps=eps, token_count=m),
-                output=binding.out, produce=produce, reset=reset, restore=reset,
-                owners=(_Expected("convolution", binding, initial=initial, eps=eps), owners),
+                output=binding.out,
+                produce=produce,
+                reset=reset,
+                restore=reset,
+                owners=(
+                    _Expected("convolution", binding, initial=initial, eps=eps),
+                    owners,
+                ),
             )
 
-        requests.append(declaration.request(
-            name=f"ple.convolution.mixed.m{m}",
-            prepare_call=convolution_call,
-            benchmark_call=convolution_call,
-            retain_benchmark_call=True,
-        ))
+        requests.append(
+            declaration.request(
+                name=f"ple.convolution.mixed.m{m}",
+                prepare_call=convolution_call,
+                benchmark_call=convolution_call,
+                retain_benchmark_call=True,
+            )
+        )
     return requests
 
 
@@ -362,12 +425,17 @@ def test_expected(call: PreparedCall):
             **{
                 key: getattr(b, key)
                 for key in (
-                    "k_norm_weight", "q_norm_weight", "u_norm_weight", "conv_weight",
+                    "k_norm_weight",
+                    "q_norm_weight",
+                    "u_norm_weight",
+                    "conv_weight",
                 )
             },
             eps=context.eps,
             dilation=b._state.caps.dilation,
-            prior_states=context.initial[:, :, : b._state.caps.state_length].contiguous(),
+            prior_states=context.initial[
+                :, :, : b._state.caps.state_length
+            ].contiguous(),
         )[0]
     ids = _expected_ids(b).cpu()
     layout = b._state
@@ -392,9 +460,7 @@ def test_expected(call: PreparedCall):
 
     disk, checkpoint = b.disk_table, context.checkpoint
     packed = torch.zeros((*ids.shape, layout.head_dim // 2), dtype=torch.uint8)
-    scales = torch.zeros(
-        (*ids.shape, layout.head_dim // 16), dtype=torch.float8_e4m3fn
-    )
+    scales = torch.zeros((*ids.shape, layout.head_dim // 16), dtype=torch.float8_e4m3fn)
     for row in range(ids.shape[0]):
         for head in range(ids.shape[1]):
             index = int(ids[row, head])

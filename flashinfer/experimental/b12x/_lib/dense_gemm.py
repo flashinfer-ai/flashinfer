@@ -182,9 +182,7 @@ class _DenseGemmPlan:
 
 
 @triton.jit(do_not_specialize=["total"], do_not_specialize_on_alignment=["total"])
-def _reduce_split_k2_bf16_kernel(
-    partials, out, total, BLOCK: tl.constexpr
-) -> None:
+def _reduce_split_k2_bf16_kernel(partials, out, total, BLOCK: tl.constexpr) -> None:
     pid = tl.program_id(0).to(tl.int64)
     total = total.to(tl.int64)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -480,9 +478,7 @@ def _dense_gemm_policy_for(
         elif generalize_mxfp8_split_k:
             if not _use_low_sm_dense_tactics(sm_count):
                 work_tiles = (
-                    ((m + tile_m - 1) // tile_m)
-                    * ((n + tile_n - 1) // tile_n)
-                    * l
+                    ((m + tile_m - 1) // tile_m) * ((n + tile_n - 1) // tile_n) * l
                 )
                 four_way_fits = (
                     (m == 8 or k >= 5120)
@@ -499,9 +495,7 @@ def _dense_gemm_policy_for(
             # slice sweep. Preserve their established policy until they are.
             split_k_slices = (
                 4
-                if m == 8
-                and (n, k) == (4096, 4096)
-                and mma_tiler_mn == (16, 128)
+                if m == 8 and (n, k) == (4096, 4096) and mma_tiler_mn == (16, 128)
                 else 2
             )
     if not _B12X_DENSE_SPLITK_TURBO:
@@ -510,9 +504,7 @@ def _dense_gemm_policy_for(
     # A declared expected_m owns compile-time tuning for its regime. Without a
     # hint, keep the unroll choice stable throughout the persistent scheduler
     # regime so one warmed kernel covers every live M in that regime.
-    large_m_unroll_threshold = (
-        4096 if _use_low_sm_dense_tactics(sm_count) else 8192
-    )
+    large_m_unroll_threshold = 4096 if _use_low_sm_dense_tactics(sm_count) else 8192
     use_large_m_unroll = (
         expected_m >= large_m_unroll_threshold
         if expected_m is not None
@@ -573,11 +565,7 @@ def _select_block_fp8_decode_slices(
 
     n_tiles_64 = (n + 63) // 64
     minimum_tiles = (2 * sm_count + 2) // 3
-    if (
-        m > 6
-        or n_tiles_64 < minimum_tiles
-        or k < 4096
-    ):
+    if m > 6 or n_tiles_64 < minimum_tiles or k < 4096:
         return 1
     if k % (4 * 128) == 0:
         return 4
@@ -775,18 +763,40 @@ class DenseGemmKernel:
         self.a16_block = weight_only in BLOCK_CODECS
         self.a16_iq2_xxs = weight_only == "iq2_xxs"
         self.a16_q8 = weight_only == "q8_0"
-        self.a16_lut_bytes = block_codec(weight_only).lut_bytes() if self.a16_block else 0
+        self.a16_lut_bytes = (
+            block_codec(weight_only).lut_bytes() if self.a16_block else 0
+        )
         self.a16_block_transposed = self.a16_block and swap_ab
-        self.a16_pack_factor = block_codec(weight_only).pack_factor if self.a16_block else 2 if self.a16_fp4 else 1
+        self.a16_pack_factor = (
+            block_codec(weight_only).pack_factor
+            if self.a16_block
+            else 2
+            if self.a16_fp4
+            else 1
+        )
         self.alpha_reciprocal = bool(alpha_reciprocal)
         if self.a16:
-            if (load_path != "tma" or (swap_ab and not self.a16_block_transposed) or fused_quant_a or plain_fp8
-                    or block_fp8 or b_packed or quantize_c or sfb_k_reuse):
+            if (
+                load_path != "tma"
+                or (swap_ab and not self.a16_block_transposed)
+                or fused_quant_a
+                or plain_fp8
+                or block_fp8
+                or b_packed
+                or quantize_c
+                or sfb_k_reuse
+            ):
                 raise ValueError("A16 requires ordinary K-major TMA operands")
             if mma_k != 16 or sf_vec_size != (16 if self.a16_fp4 else 32):
-                raise ValueError("A16 requires BF16 K16 MMA and matching weight scale groups")
-            if self.a16_block_transposed and (mma_tiler_mn[0] != 8 or split_k_slices != 1):
-                raise ValueError("transposed IQ2_XS requires an eight-row tile without split-K")
+                raise ValueError(
+                    "A16 requires BF16 K16 MMA and matching weight scale groups"
+                )
+            if self.a16_block_transposed and (
+                mma_tiler_mn[0] != 8 or split_k_slices != 1
+            ):
+                raise ValueError(
+                    "transposed IQ2_XS requires an eight-row tile without split-K"
+                )
         # When set, A/B operands are MX codes carried in Float8E4M3FN
         # byte-containers: the whole kernel runs the MXFP8 smem/TMA/ldmatrix
         # machinery, and only the mainloop MMA is emitted as the inline
@@ -1045,14 +1055,18 @@ class DenseGemmKernel:
             )
         atom_shape = self.atom_shape
         atom_layout = cute.make_layout(atom_shape)
-        permutation_mnk = self.mma_tile_shape_mnk if self.a16 else sm120_utils.get_permutation_mnk(
-            self.mma_tile_shape_mnk,
-            32 if self.block_fp8 else self.sf_vec_size,
-            cutlass.const_expr(
-                self.a_dtype == cutlass.Float8E4M3FN
-                or self.a_dtype == cutlass.Float6E3M2FN
-                or self.a_dtype == cutlass.Float6E2M3FN
-            ),
+        permutation_mnk = (
+            self.mma_tile_shape_mnk
+            if self.a16
+            else sm120_utils.get_permutation_mnk(
+                self.mma_tile_shape_mnk,
+                32 if self.block_fp8 else self.sf_vec_size,
+                cutlass.const_expr(
+                    self.a_dtype == cutlass.Float8E4M3FN
+                    or self.a_dtype == cutlass.Float6E3M2FN
+                    or self.a_dtype == cutlass.Float6E2M3FN
+                ),
+            )
         )
         self.tiled_mma = cute.make_tiled_mma(
             mma_op,
@@ -1072,7 +1086,15 @@ class DenseGemmKernel:
 
         # Compute the smem size of SFA/SFB
         if self.a16:
-            self.a16_scale_bytes = (128 * block_codec(self.weight_only).metadata_bytes * (self.tile_shape_mnk[2] // 32 if self.a16_q8 else 1)) if self.a16_block else max(1, self.tile_shape_mnk[2] // (self.sf_vec_size * 4)) * 512
+            self.a16_scale_bytes = (
+                (
+                    128
+                    * block_codec(self.weight_only).metadata_bytes
+                    * (self.tile_shape_mnk[2] // 32 if self.a16_q8 else 1)
+                )
+                if self.a16_block
+                else max(1, self.tile_shape_mnk[2] // (self.sf_vec_size * 4)) * 512
+            )
             sfa_smem_layout_per_stage = cute.make_layout((1, 1))
             sfb_smem_layout_per_stage = cute.make_layout((self.a16_scale_bytes, 1))
         elif self.block_fp8:
@@ -1122,15 +1144,24 @@ class DenseGemmKernel:
             )
             self.ab_stage, self.epi_stage = _probe_stages(self.epi_tile, epi_stage_cap)
         elif self.a16:
+
             def _probe_a16_stages():
                 return self._compute_stages(
-                    self.tile_shape_mnk, self.a_dtype,
+                    self.tile_shape_mnk,
+                    self.a_dtype,
                     cutlass.Float4E2M1FN if self.a16_fp4 else cutlass.Uint8,
-                    self.sf_dtype, sfa_smem_layout_per_stage, sfb_smem_layout_per_stage,
-                    self.epi_tile, self.c_dtype,
+                    self.sf_dtype,
+                    sfa_smem_layout_per_stage,
+                    sfb_smem_layout_per_stage,
+                    self.epi_tile,
+                    self.c_dtype,
                     self.smem_capacity - self.a16_lut_bytes * self.occupancy,
-                    self.occupancy, epi_stage_cap=1, minimum_ab_stage=0,
-                    b_storage_bits=8 // self.a16_pack_factor if self.a16_block else None,
+                    self.occupancy,
+                    epi_stage_cap=1,
+                    minimum_ab_stage=0,
+                    b_storage_bits=8 // self.a16_pack_factor
+                    if self.a16_block
+                    else None,
                 )
 
             self.ab_stage, self.epi_stage = _probe_a16_stages()
@@ -1204,11 +1235,17 @@ class DenseGemmKernel:
         # packed mode pays zero extra smem -> one more pipeline stage. The
         # stage stride is sB's full stage size, NOT the packed tile size.
         if self.a16:
-            self.sfb_smem_layout_staged = cute.make_layout((self.a16_scale_bytes, 1, self.ab_stage))
+            self.sfb_smem_layout_staged = cute.make_layout(
+                (self.a16_scale_bytes, 1, self.ab_stage)
+            )
             self.a16_packed_k = self.tile_shape_mnk[2] // self.a16_pack_factor
             self.a16_b_smem_layout = cute.make_layout(
                 (self.tile_shape_mnk[1], self.a16_packed_k, self.ab_stage),
-                stride=(self.a16_packed_k, 1, self.tile_shape_mnk[1] * self.a16_packed_k),
+                stride=(
+                    self.a16_packed_k,
+                    1,
+                    self.tile_shape_mnk[1] * self.a16_packed_k,
+                ),
             )
         if self.b_packed:
             self.b_packed_smem_layout_staged = cute.make_layout(
@@ -1321,8 +1358,10 @@ class DenseGemmKernel:
 
         if cutlass.const_expr(self.a16):
             tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
-                b, self.a16_b_smem_layout,
-                (self.tile_shape_mnk[1], self.a16_packed_k), 1,
+                b,
+                self.a16_b_smem_layout,
+                (self.tile_shape_mnk[1], self.a16_packed_k),
+                1,
             )
         elif cutlass.const_expr(self.b_packed):
             # TMA loads the packed tile (tile_n, 3*tile_k/4 bytes) into the
@@ -1371,7 +1410,10 @@ class DenseGemmKernel:
                 internal_type=cutlass.Int16,
             )
         if cutlass.const_expr(
-            self.block_fp8 or self.a16 or self.manual_bk64_sf or self.direct_sfb_representative
+            self.block_fp8
+            or self.a16
+            or self.manual_bk64_sf
+            or self.direct_sfb_representative
         ):
             tma_atom_sfb = tma_atom_b
             tma_tensor_sfb = sfb_tensor
@@ -1413,7 +1455,9 @@ class DenseGemmKernel:
             sB: cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.Uint8 if self.a16 else self.b_dtype,
-                    cute.cosize(self.a16_b_smem_layout) if self.a16 else cute.cosize(self.b_smem_layout_staged)
+                    cute.cosize(self.a16_b_smem_layout)
+                    if self.a16
+                    else cute.cosize(self.b_smem_layout_staged),
                 ],
                 self.buffer_align_bytes,
             ]
@@ -1663,9 +1707,16 @@ class DenseGemmKernel:
 
     @cute.jit
     def _load_a16_b_fragment(
-        self, fragment: cute.Tensor, coordinates: cute.Tensor,
-        packed: cute.Tensor, scales: cute.Tensor, lut: cute.Tensor, stage: Int32,
-        n_tile: Int32, k_tile: Int32, size_n: cutlass.Constexpr,
+        self,
+        fragment: cute.Tensor,
+        coordinates: cute.Tensor,
+        packed: cute.Tensor,
+        scales: cute.Tensor,
+        lut: cute.Tensor,
+        stage: Int32,
+        n_tile: Int32,
+        k_tile: Int32,
+        size_n: cutlass.Constexpr,
         size_k: cutlass.Constexpr,
     ):
         pairs = cute.recast_tensor(fragment, Uint32)
@@ -1674,50 +1725,81 @@ class DenseGemmKernel:
             packed_u32 = cute.recast_tensor(packed, Uint32)
             bases = cute.recast_tensor(scales, cutlass.Uint16)
             rows_per_fragment = 2 if self.a16_block_transposed else 1
-            for i in cutlass.range_constexpr(cute.size(fragment) // (4 * rows_per_fragment)):
+            for i in cutlass.range_constexpr(
+                cute.size(fragment) // (4 * rows_per_fragment)
+            ):
                 for row in cutlass.range_constexpr(rows_per_fragment):
                     local_n, local_k = coordinates[i * 4 * rows_per_fragment + row * 2]
-                    scale_n = local_n + (n_tile % self.sfb_tiles_per_block) * self.tile_shape_mnk[1]
+                    scale_n = (
+                        local_n
+                        + (n_tile % self.sfb_tiles_per_block) * self.tile_shape_mnk[1]
+                    )
                     block_k = (k_tile * self.tile_shape_mnk[2] + local_k) % 256
                     if cutlass.const_expr(self.a16_q8):
                         base = Uint32(bases[local_k // 32 * 128 + scale_n, 0, stage])
-                        p0 = q8_0_pair_to_bf16x2(Uint32(packed_u16[local_n, local_k // 2, stage]), base)
-                        p1 = q8_0_pair_to_bf16x2(Uint32(packed_u16[local_n, (local_k + 8) // 2, stage]), base)
+                        p0 = q8_0_pair_to_bf16x2(
+                            Uint32(packed_u16[local_n, local_k // 2, stage]), base
+                        )
+                        p1 = q8_0_pair_to_bf16x2(
+                            Uint32(packed_u16[local_n, (local_k + 8) // 2, stage]), base
+                        )
                     else:
                         if cutlass.const_expr(self.a16_iq2_xxs):
-                            grids = Uint32(packed_u32[local_n, local_k // 32 * 2, stage])
-                            signs_scale = Uint32(packed_u32[local_n, local_k // 32 * 2 + 1, stage])
-                            descriptors = iq2_xxs_descriptor_pair(grids, signs_scale, Int32(local_k // 16 % 2))
+                            grids = Uint32(
+                                packed_u32[local_n, local_k // 32 * 2, stage]
+                            )
+                            signs_scale = Uint32(
+                                packed_u32[local_n, local_k // 32 * 2 + 1, stage]
+                            )
+                            descriptors = iq2_xxs_descriptor_pair(
+                                grids, signs_scale, Int32(local_k // 16 % 2)
+                            )
                             subscale = signs_scale >> 28
                         else:
-                            scale_pair = Uint32(scales[256 + (block_k // 32) * 128 + scale_n, 0, stage])
+                            scale_pair = Uint32(
+                                scales[256 + (block_k // 32) * 128 + scale_n, 0, stage]
+                            )
                             subscale = (scale_pair >> ((block_k // 16 % 2) * 4)) & 15
-                            descriptors = Uint32(packed_u32[local_n, local_k // 16, stage])
+                            descriptors = Uint32(
+                                packed_u32[local_n, local_k // 16, stage]
+                            )
                         p0, p1 = iq2_xs_descriptor_pair_to_bf16x2x2(
                             descriptors,
-                            Uint32(bases[scale_n, 0, stage]), subscale,
-                            Int64(shared_ptr_to_u32(lut.iterator)), Int32(local_k % 8),
+                            Uint32(bases[scale_n, 0, stage]),
+                            subscale,
+                            Int64(shared_ptr_to_u32(lut.iterator)),
+                            Int32(local_k % 8),
                         )
                     pairs[i * 2 * rows_per_fragment + row] = p0
                     pairs[i * 2 * rows_per_fragment + row + rows_per_fragment] = p1
         else:
             for i in cutlass.range_constexpr(cute.size(fragment) // 2):
                 local_n, local_k = coordinates[i * 2]
-                scale_n = local_n + (n_tile % self.sfb_tiles_per_block) * self.tile_shape_mnk[1]
+                scale_n = (
+                    local_n
+                    + (n_tile % self.sfb_tiles_per_block) * self.tile_shape_mnk[1]
+                )
                 valid = cutlass.Boolean(True)
                 if cutlass.const_expr(size_k % self.tile_shape_mnk[2] != 0):
                     valid = Int64(k_tile) * self.tile_shape_mnk[2] + local_k < size_k
                 packed_pair = Uint32(0)
                 if valid:
                     group = local_k // self.sf_vec_size
-                    if cutlass.const_expr(self.tile_shape_mnk[2] < self.sf_vec_size * 4):
+                    if cutlass.const_expr(
+                        self.tile_shape_mnk[2] < self.sf_vec_size * 4
+                    ):
                         group += (k_tile % 2) * 2
-                    scale_offset = (group // 4 * 512 + (scale_n % 32) * 16
-                                    + (scale_n // 32) * 4 + group % 4)
+                    scale_offset = (
+                        group // 4 * 512
+                        + (scale_n % 32) * 16
+                        + (scale_n // 32) * 4
+                        + group % 4
+                    )
                     byte = Uint32(scales[scale_offset, 0, stage])
                     if cutlass.const_expr(self.a16_fp4):
                         packed_pair = nvfp4_pair_to_bf16x2_sm120(
-                            Uint32(packed[local_n, local_k // 2, stage]), byte,
+                            Uint32(packed[local_n, local_k // 2, stage]),
+                            byte,
                         )
                     else:
                         word = Uint32(packed_u16[local_n, local_k // 2, stage])
@@ -1822,7 +1904,9 @@ class DenseGemmKernel:
             b_tma_smem_layout = b_smem_layout
         if cutlass.const_expr(self.a16):
             tma_copy_bytes = cute.size_in_bytes(self.a_dtype, a_smem_layout)
-            tma_copy_bytes += self.tile_shape_mnk[1] * self.a16_packed_k + self.a16_scale_bytes
+            tma_copy_bytes += (
+                self.tile_shape_mnk[1] * self.a16_packed_k + self.a16_scale_bytes
+            )
         elif cutlass.const_expr(self.block_fp8):
             tma_copy_bytes = cute.size_in_bytes(
                 self.a_dtype, a_smem_layout
@@ -1863,13 +1947,22 @@ class DenseGemmKernel:
         storage = smem.allocate(self.shared_storage)
         a16_lut = directSFA_mkl
         if cutlass.const_expr(self.a16_lut_bytes > 0):
-            a16_lut = smem.allocate_tensor(cutlass.Uint8, cute.make_layout((self.a16_lut_bytes,)), byte_alignment=16)
+            a16_lut = smem.allocate_tensor(
+                cutlass.Uint8,
+                cute.make_layout((self.a16_lut_bytes,)),
+                byte_alignment=16,
+            )
             lut_address = shared_ptr_to_u32(a16_lut.iterator)
-            for chunk_base in cutlass.range_constexpr((self.a16_lut_bytes // 16 + self.threads_per_cta - 1) // self.threads_per_cta):
+            for chunk_base in cutlass.range_constexpr(
+                (self.a16_lut_bytes // 16 + self.threads_per_cta - 1)
+                // self.threads_per_cta
+            ):
                 chunk = Int32(tidx) + chunk_base * self.threads_per_cta
                 if chunk < self.a16_lut_bytes // 16:
-                    cp_async4_shared_global(lut_address + chunk * 16,
-                                           get_ptr_as_int64(directSFA_mkl, Int64(chunk) * 16))
+                    cp_async4_shared_global(
+                        lut_address + chunk * 16,
+                        get_ptr_as_int64(directSFA_mkl, Int64(chunk) * 16),
+                    )
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
 
@@ -1960,7 +2053,8 @@ class DenseGemmKernel:
         )
         if cutlass.const_expr(self.a16):
             gB_nkl = cute.local_tile(
-                mB_nkl, (self.tile_shape_mnk[1], self.a16_packed_k),
+                mB_nkl,
+                (self.tile_shape_mnk[1], self.a16_packed_k),
                 (None, None, None),
             )
         elif cutlass.const_expr(self.b_packed):
@@ -1989,7 +2083,9 @@ class DenseGemmKernel:
             )
         if cutlass.const_expr(not self.a16):
             gSFB_nkl = cute.local_tile(
-                mSFB_nkl, self.sfb_tile_shape_nk, (None, None, None),
+                mSFB_nkl,
+                self.sfb_tile_shape_nk,
+                (None, None, None),
             )
         if cutlass.const_expr(self.load_path == "cpasync"):
             gA_cpasync_mkl = cute.local_tile(
@@ -2159,19 +2255,25 @@ class DenseGemmKernel:
         tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
         if cutlass.const_expr(self.a16):
             if cutlass.const_expr(self.swap_ab):
-                tCgC = thr_mma.partition_C(cute.make_identity_tensor(
-                    (self.tile_shape_mnk[1], self.tile_shape_mnk[0])
-                ))
+                tCgC = thr_mma.partition_C(
+                    cute.make_identity_tensor(
+                        (self.tile_shape_mnk[1], self.tile_shape_mnk[0])
+                    )
+                )
                 a16_weight_fragments = tCrA
-                a16_b_coordinates = thr_mma.partition_A(cute.make_identity_tensor(
-                    (self.tile_shape_mnk[1], self.tile_shape_mnk[2])
-                ))
+                a16_b_coordinates = thr_mma.partition_A(
+                    cute.make_identity_tensor(
+                        (self.tile_shape_mnk[1], self.tile_shape_mnk[2])
+                    )
+                )
             else:
                 tCgC = thr_mma.partition_C(gC_mnl)
                 a16_weight_fragments = tCrB
-                a16_b_coordinates = thr_mma.partition_B(cute.make_identity_tensor(
-                    (self.tile_shape_mnk[1], self.tile_shape_mnk[2])
-                ))
+                a16_b_coordinates = thr_mma.partition_B(
+                    cute.make_identity_tensor(
+                        (self.tile_shape_mnk[1], self.tile_shape_mnk[2])
+                    )
+                )
         elif cutlass.const_expr(self.block_fp8):
             tCgC = thr_mma.partition_C(gC_mnl)
         elif cutlass.const_expr(self.swap_ab):
@@ -2234,7 +2336,9 @@ class DenseGemmKernel:
         if cutlass.const_expr(self.split_k_slices > 1):
             if cutlass.const_expr(self.a16):
                 k_tile_start = Int32(block_idx[1]) * k_tile_cnt // self.split_k_slices
-                k_tile_iter_cnt = (Int32(block_idx[1]) + 1) * k_tile_cnt // self.split_k_slices - k_tile_start
+                k_tile_iter_cnt = (
+                    Int32(block_idx[1]) + 1
+                ) * k_tile_cnt // self.split_k_slices - k_tile_start
             else:
                 k_tiles_per_split = k_tile_cnt // self.split_k_slices
                 k_tile_start = Int32(block_idx[1]) * Int32(k_tiles_per_split)
@@ -2246,7 +2350,11 @@ class DenseGemmKernel:
                 tile_sched_params.problem_shape_ntile_mnl[1]
             )
             work_tile = WorkTileInfo(
-                (Int32(block_idx[0]) if self.a16 else Int32(0), Int32(block_idx[2]), Int32(0)),
+                (
+                    Int32(block_idx[0]) if self.a16 else Int32(0),
+                    Int32(block_idx[2]),
+                    Int32(0),
+                ),
                 direct_tile_valid,
             )
         else:
@@ -2286,7 +2394,9 @@ class DenseGemmKernel:
                     self.b_dtype,
                 )
                 atom_copy_ldmatrix_B = cute.make_copy_atom(
-                    cute.nvgpu.warp.LdMatrix8x8x16bOp(self.a_layout.is_m_major_a(), 2 if self.a16 else 4),
+                    cute.nvgpu.warp.LdMatrix8x8x16bOp(
+                        self.a_layout.is_m_major_a(), 2 if self.a16 else 4
+                    ),
                     self.a_dtype,
                 )
             else:
@@ -2475,17 +2585,29 @@ class DenseGemmKernel:
                         None, None, None, mainloop_consumer_state.index
                     ]
                 if cutlass.const_expr(self.a16_block_transposed):
-                    cute.copy(smem_tiled_copy_B, tCsB_p[None, None, 0],
-                              tCrB_copy_view[None, None, 0])
+                    cute.copy(
+                        smem_tiled_copy_B,
+                        tCsB_p[None, None, 0],
+                        tCrB_copy_view[None, None, 0],
+                    )
                 else:
-                    cute.copy(smem_tiled_copy_A, tCsA_p[None, None, 0],
-                              tCrA_copy_view[None, None, 0])
+                    cute.copy(
+                        smem_tiled_copy_A,
+                        tCsA_p[None, None, 0],
+                        tCrA_copy_view[None, None, 0],
+                    )
                 if cutlass.const_expr(self.a16):
                     self._load_a16_b_fragment(
-                        a16_weight_fragments[None, None, 0], a16_b_coordinates[None, None, 0],
-                        sBPacked, sSFB, a16_lut, mainloop_consumer_state.index,
-                        tile_coord_mnl[1], k_tile_start,
-                        cute.size(directB_nkl, mode=[0]), cute.size(directB_nkl, mode=[1]) * self.a16_pack_factor,
+                        a16_weight_fragments[None, None, 0],
+                        a16_b_coordinates[None, None, 0],
+                        sBPacked,
+                        sSFB,
+                        a16_lut,
+                        mainloop_consumer_state.index,
+                        tile_coord_mnl[1],
+                        k_tile_start,
+                        cute.size(directB_nkl, mode=[0]),
+                        cute.size(directB_nkl, mode=[1]) * self.a16_pack_factor,
                     )
                 else:
                     cute.copy(
@@ -2622,9 +2744,13 @@ class DenseGemmKernel:
                                 )
 
                         if cutlass.const_expr(self.a16):
-                            cute.gemm(tiled_mma, accumulators,
-                                      tCrA[None, None, k_block_idx],
-                                      tCrB[None, None, k_block_idx], accumulators)
+                            cute.gemm(
+                                tiled_mma,
+                                accumulators,
+                                tCrA[None, None, k_block_idx],
+                                tCrB[None, None, k_block_idx],
+                                accumulators,
+                            )
                         # Manual atom unroll: avoids hasAuxTensor address space bug
                         for _mt in range(self.num_m_tiles):
                             for _nt in range(self.num_n_tiles):
@@ -2698,17 +2824,31 @@ class DenseGemmKernel:
                             if k_block_idx == num_k_blocks - 1:
                                 self.mma_sync_barrier.arrive_and_wait()
                         if cutlass.const_expr(self.a16_block_transposed):
-                            cute.copy(smem_tiled_copy_B, tCsB_p[None, None, k_block_next],
-                                      tCrB_copy_view[None, None, k_block_next])
+                            cute.copy(
+                                smem_tiled_copy_B,
+                                tCsB_p[None, None, k_block_next],
+                                tCrB_copy_view[None, None, k_block_next],
+                            )
                         else:
-                            cute.copy(smem_tiled_copy_A, tCsA_p[None, None, k_block_next],
-                                      tCrA_copy_view[None, None, k_block_next])
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tCsA_p[None, None, k_block_next],
+                                tCrA_copy_view[None, None, k_block_next],
+                            )
                         if cutlass.const_expr(self.a16):
                             self._load_a16_b_fragment(
-                                a16_weight_fragments[None, None, k_block_next], a16_b_coordinates[None, None, k_block_next],
-                                sBPacked, sSFB, a16_lut, mainloop_consumer_state.index,
-                                tile_coord_mnl[1], k_tile_start + Int32(k_tile) + (1 if k_block_next == 0 else 0),
-                                cute.size(directB_nkl, mode=[0]), cute.size(directB_nkl, mode=[1]) * self.a16_pack_factor,
+                                a16_weight_fragments[None, None, k_block_next],
+                                a16_b_coordinates[None, None, k_block_next],
+                                sBPacked,
+                                sSFB,
+                                a16_lut,
+                                mainloop_consumer_state.index,
+                                tile_coord_mnl[1],
+                                k_tile_start
+                                + Int32(k_tile)
+                                + (1 if k_block_next == 0 else 0),
+                                cute.size(directB_nkl, mode=[0]),
+                                cute.size(directB_nkl, mode=[1]) * self.a16_pack_factor,
                             )
                         else:
                             cute.copy(
@@ -2770,17 +2910,29 @@ class DenseGemmKernel:
 
                     if k_block_next > 0:
                         if cutlass.const_expr(self.a16_block_transposed):
-                            cute.copy(smem_tiled_copy_B, tCsB_p[None, None, k_block_next],
-                                      tCrB_copy_view[None, None, k_block_next])
+                            cute.copy(
+                                smem_tiled_copy_B,
+                                tCsB_p[None, None, k_block_next],
+                                tCrB_copy_view[None, None, k_block_next],
+                            )
                         else:
-                            cute.copy(smem_tiled_copy_A, tCsA_p[None, None, k_block_next],
-                                      tCrA_copy_view[None, None, k_block_next])
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tCsA_p[None, None, k_block_next],
+                                tCrA_copy_view[None, None, k_block_next],
+                            )
                         if cutlass.const_expr(self.a16):
                             self._load_a16_b_fragment(
-                                a16_weight_fragments[None, None, k_block_next], a16_b_coordinates[None, None, k_block_next],
-                                sBPacked, sSFB, a16_lut, mainloop_consumer_state.index,
-                                tile_coord_mnl[1], k_tile_start + Int32(k_tile_iter_cnt - 1),
-                                cute.size(directB_nkl, mode=[0]), cute.size(directB_nkl, mode=[1]) * self.a16_pack_factor,
+                                a16_weight_fragments[None, None, k_block_next],
+                                a16_b_coordinates[None, None, k_block_next],
+                                sBPacked,
+                                sSFB,
+                                a16_lut,
+                                mainloop_consumer_state.index,
+                                tile_coord_mnl[1],
+                                k_tile_start + Int32(k_tile_iter_cnt - 1),
+                                cute.size(directB_nkl, mode=[0]),
+                                cute.size(directB_nkl, mode=[1]) * self.a16_pack_factor,
                             )
                         else:
                             cute.copy(
@@ -2791,9 +2943,13 @@ class DenseGemmKernel:
                         # SF registers for the whole stage were bulk-loaded at
                         # stage acquisition; nothing to reload per k block.
                     if cutlass.const_expr(self.a16):
-                        cute.gemm(tiled_mma, accumulators,
-                                  tCrA[None, None, k_block_idx],
-                                  tCrB[None, None, k_block_idx], accumulators)
+                        cute.gemm(
+                            tiled_mma,
+                            accumulators,
+                            tCrA[None, None, k_block_idx],
+                            tCrB[None, None, k_block_idx],
+                            accumulators,
+                        )
                     # Manual atom unroll: avoids hasAuxTensor address space bug
                     for _mt in range(self.num_m_tiles):
                         for _nt in range(self.num_n_tiles):
@@ -4234,55 +4390,144 @@ class DenseGemmKernel:
 
                     if cutlass.const_expr(self.a16):
                         if Int32(tidx % self.num_threads_per_warp) == 0:
-                            logical_k = cute.size(directB_nkl, mode=[1]) * self.a16_pack_factor
+                            logical_k = (
+                                cute.size(directB_nkl, mode=[1]) * self.a16_pack_factor
+                            )
                             if cutlass.const_expr(self.a16_block):
                                 if cutlass.const_expr(self.a16_iq2_xxs or self.a16_q8):
                                     size_n = cute.size(directB_nkl, mode=[0])
-                                    base_n = Int64(tile_coord_mnl[1]) * self.tile_shape_mnk[1] // 128 * 128
+                                    base_n = (
+                                        Int64(tile_coord_mnl[1])
+                                        * self.tile_shape_mnk[1]
+                                        // 128
+                                        * 128
+                                    )
                                     block_k = 32 if self.a16_q8 else 256
-                                    barrier = shared_ptr_to_u32(mainloop_pipeline.producer_get_barrier(mainloop_producer_state))
-                                    for unit in cutlass.range_constexpr(self.a16_scale_bytes // 256):
-                                        base_k = Int64(k_tile_global) * self.tile_shape_mnk[2] // block_k + unit
+                                    barrier = shared_ptr_to_u32(
+                                        mainloop_pipeline.producer_get_barrier(
+                                            mainloop_producer_state
+                                        )
+                                    )
+                                    for unit in cutlass.range_constexpr(
+                                        self.a16_scale_bytes // 256
+                                    ):
+                                        base_k = (
+                                            Int64(k_tile_global)
+                                            * self.tile_shape_mnk[2]
+                                            // block_k
+                                            + unit
+                                        )
                                         if base_k >= logical_k // block_k:
                                             base_k = Int64(logical_k // block_k - 1)
-                                        dst = shared_ptr_to_u32(elem_pointer(sSFB, (unit * 256, 0, mainloop_producer_state.index)))
+                                        dst = shared_ptr_to_u32(
+                                            elem_pointer(
+                                                sSFB,
+                                                (
+                                                    unit * 256,
+                                                    0,
+                                                    mainloop_producer_state.index,
+                                                ),
+                                            )
+                                        )
                                         base_chunk = 0
                                         base_row = Int64(0)
                                         if base_n + 128 <= size_n:
-                                            cp_async_bulk_g2s_mbar(dst, get_ptr_as_int64(directSFB_nkl, (base_k * size_n + base_n) * 2), Int32(256), barrier)
+                                            cp_async_bulk_g2s_mbar(
+                                                dst,
+                                                get_ptr_as_int64(
+                                                    directSFB_nkl,
+                                                    (base_k * size_n + base_n) * 2,
+                                                ),
+                                                Int32(256),
+                                                barrier,
+                                            )
                                         else:
                                             # N8 alignment permits whole 16-byte transfers;
                                             # masked channels reuse a valid base span.
-                                            for base_chunk in cutlass.range_constexpr(16):
-                                                base_row = base_n + Int64(base_chunk * 8)
+                                            for base_chunk in cutlass.range_constexpr(
+                                                16
+                                            ):
+                                                base_row = base_n + Int64(
+                                                    base_chunk * 8
+                                                )
                                                 if base_row >= size_n:
                                                     base_row = Int64(0)
-                                                cp_async_bulk_g2s_mbar(dst + Int32(base_chunk * 16), get_ptr_as_int64(directSFB_nkl, (base_k * size_n + base_row) * 2), Int32(16), barrier)
+                                                cp_async_bulk_g2s_mbar(
+                                                    dst + Int32(base_chunk * 16),
+                                                    get_ptr_as_int64(
+                                                        directSFB_nkl,
+                                                        (base_k * size_n + base_row)
+                                                        * 2,
+                                                    ),
+                                                    Int32(16),
+                                                    barrier,
+                                                )
                                 else:
                                     scale_offset = (
-                                        Int64(tile_coord_mnl[1]) * self.tile_shape_mnk[1] // 128 * (logical_k // 256)
-                                        + Int64(k_tile_global) * self.tile_shape_mnk[2] // 256
+                                        Int64(tile_coord_mnl[1])
+                                        * self.tile_shape_mnk[1]
+                                        // 128
+                                        * (logical_k // 256)
+                                        + Int64(k_tile_global)
+                                        * self.tile_shape_mnk[2]
+                                        // 256
                                     ) * 1280
                                     cp_async_bulk_g2s_mbar(
-                                        shared_ptr_to_u32(elem_pointer(sSFB, (0, 0, mainloop_producer_state.index))),
-                                        get_ptr_as_int64(directSFB_nkl, scale_offset), Int32(1280),
-                                        shared_ptr_to_u32(mainloop_pipeline.producer_get_barrier(mainloop_producer_state)),
+                                        shared_ptr_to_u32(
+                                            elem_pointer(
+                                                sSFB,
+                                                (0, 0, mainloop_producer_state.index),
+                                            )
+                                        ),
+                                        get_ptr_as_int64(directSFB_nkl, scale_offset),
+                                        Int32(1280),
+                                        shared_ptr_to_u32(
+                                            mainloop_pipeline.producer_get_barrier(
+                                                mainloop_producer_state
+                                            )
+                                        ),
                                     )
                             else:
                                 scale_k_tiles = (logical_k // self.sf_vec_size + 3) // 4
-                                for unit in cutlass.range_constexpr(self.a16_scale_bytes // 512):
-                                    scale_k = Int64(k_tile_global) * self.tile_shape_mnk[2] // (self.sf_vec_size * 4) + unit
-                                    if cutlass.const_expr(logical_k % self.tile_shape_mnk[2] != 0):
+                                for unit in cutlass.range_constexpr(
+                                    self.a16_scale_bytes // 512
+                                ):
+                                    scale_k = (
+                                        Int64(k_tile_global)
+                                        * self.tile_shape_mnk[2]
+                                        // (self.sf_vec_size * 4)
+                                        + unit
+                                    )
+                                    if cutlass.const_expr(
+                                        logical_k % self.tile_shape_mnk[2] != 0
+                                    ):
                                         if scale_k >= scale_k_tiles:
                                             scale_k = Int64(scale_k_tiles - 1)
                                     scale_offset = (
-                                        Int64(tile_coord_mnl[1]) * self.tile_shape_mnk[1] // 128 * scale_k_tiles
+                                        Int64(tile_coord_mnl[1])
+                                        * self.tile_shape_mnk[1]
+                                        // 128
+                                        * scale_k_tiles
                                         + scale_k
                                     ) * 512
                                     cp_async_bulk_g2s_mbar(
-                                        shared_ptr_to_u32(elem_pointer(sSFB, (unit * 512, 0, mainloop_producer_state.index))),
-                                        get_ptr_as_int64(directSFB_nkl, scale_offset), Int32(512),
-                                        shared_ptr_to_u32(mainloop_pipeline.producer_get_barrier(mainloop_producer_state)),
+                                        shared_ptr_to_u32(
+                                            elem_pointer(
+                                                sSFB,
+                                                (
+                                                    unit * 512,
+                                                    0,
+                                                    mainloop_producer_state.index,
+                                                ),
+                                            )
+                                        ),
+                                        get_ptr_as_int64(directSFB_nkl, scale_offset),
+                                        Int32(512),
+                                        shared_ptr_to_u32(
+                                            mainloop_pipeline.producer_get_barrier(
+                                                mainloop_producer_state
+                                            )
+                                        ),
                                     )
                     elif cutlass.const_expr(
                         self.load_path == "cpasync"
@@ -4347,7 +4592,8 @@ class DenseGemmKernel:
                             if cutlass.const_expr(
                                 tile_sched_params.swizzle_size > 1
                                 and ((directB_nkl.shape[0] + 127) // 128)
-                                % tile_sched_params.swizzle_size != 0
+                                % tile_sched_params.swizzle_size
+                                != 0
                             ):
                                 sfb_pair = Uint32(0x7F7F)
                                 if sfb_tile < Int32(
@@ -4505,20 +4751,35 @@ class DenseGemmKernel:
                                 if Int32(tidx % self.num_threads_per_warp) == 0:
                                     size_n = cute.size(directB_nkl, mode=[0])
                                     storage_k = cute.size(directB_nkl, mode=[1])
-                                    n_start = Int64(tile_coord_mnl[1]) * self.tile_shape_mnk[1]
+                                    n_start = (
+                                        Int64(tile_coord_mnl[1])
+                                        * self.tile_shape_mnk[1]
+                                    )
                                     descriptor_offset = (
                                         Int64(tile_coord_mnl[2]) * size_n * storage_k
-                                        + (n_start // 128 * (storage_k // 64)
-                                           + Int64(k_tile_global)) * 8192
+                                        + (
+                                            n_start // 128 * (storage_k // 64)
+                                            + Int64(k_tile_global)
+                                        )
+                                        * 8192
                                         + n_start % 128 * 64
                                     )
                                     cp_async_bulk_g2s_mbar(
-                                        shared_ptr_to_u32(elem_pointer(
-                                            sBPacked, (0, 0, mainloop_producer_state.index),
-                                        )),
-                                        get_ptr_as_int64(directB_nkl, descriptor_offset),
+                                        shared_ptr_to_u32(
+                                            elem_pointer(
+                                                sBPacked,
+                                                (0, 0, mainloop_producer_state.index),
+                                            )
+                                        ),
+                                        get_ptr_as_int64(
+                                            directB_nkl, descriptor_offset
+                                        ),
                                         Int32(self.tile_shape_mnk[1] * 64),
-                                        shared_ptr_to_u32(mainloop_pipeline.producer_get_barrier(mainloop_producer_state)),
+                                        shared_ptr_to_u32(
+                                            mainloop_pipeline.producer_get_barrier(
+                                                mainloop_producer_state
+                                            )
+                                        ),
                                     )
                             elif cutlass.const_expr(self.b_tile_major):
                                 cute.copy(
@@ -4612,7 +4873,9 @@ class DenseGemmKernel:
         b_shape = cute.slice_(tile_shape_mnk, (0, None, None))
         ab_bytes_per_stage = (
             cute.size(a_shape) * a_dtype.width // 8
-            + cute.size(b_shape) * (b_dtype.width if b_storage_bits is None else b_storage_bits) // 8
+            + cute.size(b_shape)
+            * (b_dtype.width if b_storage_bits is None else b_storage_bits)
+            // 8
         )
         # b_packed costs no extra smem: the packed TMA tile is aliased into the
         # bottom of each sB stage and expanded in place.
@@ -4793,7 +5056,11 @@ class DenseGemmKernel:
             ),
         )
         if cutlass.const_expr(split_k_slices > 1 or split_k_all_m):
-            grid = (num_ctas_mnl[0] if split_k_all_m else 1, split_k_slices, num_ctas_mnl[1])
+            grid = (
+                num_ctas_mnl[0] if split_k_all_m else 1,
+                split_k_slices,
+                num_ctas_mnl[1],
+            )
         else:
             grid = utils.StaticPersistentTileScheduler.get_grid_shape(
                 tile_sched_params, max_active_clusters
@@ -4866,13 +5133,27 @@ class DenseGemmKernel:
                 and sf_dtype == cutlass.Uint8
                 and sf_vec_size == (16 if weight_only == "nvfp4" else 32)
                 and c_dtype in (cutlass.BFloat16, cutlass.Float32)
-                and (mma_tiler_mn in ((16, 64), (16, 128), (32, 64), (32, 128), (64, 64), (64, 128))
-                     or weight_only in BLOCK_CODECS and mma_tiler_mn in ((8, 64), (8, 128)))
-                and cluster_shape_mn == (1, 1) and l == 1
-                and a_major == b_major == "k" and c_major == "n"
-                and load_path == "tma" and not block_fp8
+                and (
+                    mma_tiler_mn
+                    in ((16, 64), (16, 128), (32, 64), (32, 128), (64, 64), (64, 128))
+                    or weight_only in BLOCK_CODECS
+                    and mma_tiler_mn in ((8, 64), (8, 128))
+                )
+                and cluster_shape_mn == (1, 1)
+                and l == 1
+                and a_major == b_major == "k"
+                and c_major == "n"
+                and load_path == "tma"
+                and not block_fp8
                 and swap_ab == (weight_only in BLOCK_CODECS and mma_tiler_mn[0] == 8)
-                and n % 8 == 0 and k % (block_codec(weight_only).block_weights if weight_only in BLOCK_CODECS else 32) == 0
+                and n % 8 == 0
+                and k
+                % (
+                    block_codec(weight_only).block_weights
+                    if weight_only in BLOCK_CODECS
+                    else 32
+                )
+                == 0
             )
         # The current target only supports cluster (1,1)
         if cluster_shape_mn != (1, 1):
@@ -5001,7 +5282,13 @@ class _DenseGemmLaunch:
         self._weight_only = weight_only
         self._alpha_reciprocal = alpha_reciprocal
         self._input_k = k if input_k is None else input_k
-        self._storage_k = k // (block_codec(weight_only).pack_factor if weight_only in BLOCK_CODECS else 2 if weight_only == "nvfp4" else 1)
+        self._storage_k = k // (
+            block_codec(weight_only).pack_factor
+            if weight_only in BLOCK_CODECS
+            else 2
+            if weight_only == "nvfp4"
+            else 1
+        )
         self._n = n
         self._k = k
         self._l = l
@@ -5130,8 +5417,15 @@ class _DenseGemmLaunch:
             self._plain_fp8,
         )
 
-        return key if self._weight_only is None else key + (
-            self._weight_only, self._alpha_reciprocal, self._input_k,
+        return (
+            key
+            if self._weight_only is None
+            else key
+            + (
+                self._weight_only,
+                self._alpha_reciprocal,
+                self._input_k,
+            )
         )
 
     @cute.jit
@@ -5160,9 +5454,16 @@ class _DenseGemmLaunch:
             descriptor_tile_n = 128 if self._n % 128 == 0 else 8
             spec = block_codec(self._weight_only)
             b_layout = cute.make_layout(
-                ((descriptor_tile_n, self._n // descriptor_tile_n), (spec.payload_bytes, self._k // spec.block_weights), self._l),
-                stride=((spec.payload_bytes, descriptor_tile_n * self._storage_k),
-                        (1, descriptor_tile_n * spec.payload_bytes), self._n * self._storage_k),
+                (
+                    (descriptor_tile_n, self._n // descriptor_tile_n),
+                    (spec.payload_bytes, self._k // spec.block_weights),
+                    self._l,
+                ),
+                stride=(
+                    (spec.payload_bytes, descriptor_tile_n * self._storage_k),
+                    (1, descriptor_tile_n * spec.payload_bytes),
+                    self._n * self._storage_k,
+                ),
             )
         elif cutlass.const_expr(self._b_tile_major):
             b_layout = cute.make_layout(
@@ -5220,12 +5521,32 @@ class _DenseGemmLaunch:
             layout=cute.make_ordered_layout((1,), order=(0,)),
         )
         if cutlass.const_expr(self._weight_only is not None):
-            scale_bytes = ((self._n + 127) // 128) * ((self._k // self._sf_vec_size + 3) // 4) * 512
+            scale_bytes = (
+                ((self._n + 127) // 128)
+                * ((self._k // self._sf_vec_size + 3) // 4)
+                * 512
+            )
             if cutlass.const_expr(self._weight_only in BLOCK_CODECS):
-                scale_bytes = (self._n * (self._k // block_codec(self._weight_only).block_weights) * 2 if self._weight_only != "iq2_xs"
-                               else ((self._n + 127) // 128) * (self._k // 256) * 1280)
-            sfa_tensor = cute.make_tensor(sfa_ptr, layout=cute.make_layout((max(1, block_codec(self._weight_only).lut_bytes()) if self._weight_only in BLOCK_CODECS else 1,)))
-            sfb_tensor = cute.make_tensor(sfb_ptr, layout=cute.make_layout((scale_bytes,)))
+                scale_bytes = (
+                    self._n
+                    * (self._k // block_codec(self._weight_only).block_weights)
+                    * 2
+                    if self._weight_only != "iq2_xs"
+                    else ((self._n + 127) // 128) * (self._k // 256) * 1280
+                )
+            sfa_tensor = cute.make_tensor(
+                sfa_ptr,
+                layout=cute.make_layout(
+                    (
+                        max(1, block_codec(self._weight_only).lut_bytes())
+                        if self._weight_only in BLOCK_CODECS
+                        else 1,
+                    )
+                ),
+            )
+            sfb_tensor = cute.make_tensor(
+                sfb_ptr, layout=cute.make_layout((scale_bytes,))
+            )
         elif cutlass.const_expr(self._block_fp8):
             sfa_tensor = cute.make_tensor(
                 sfa_ptr,
@@ -6560,7 +6881,12 @@ def _get_compiled_dense_gemm(
 
         return [
             make_ptr(ab_dtype, a_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
-            make_ptr(cutlass.Uint8 if weight_only else ab_dtype, b_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(
+                cutlass.Uint8 if weight_only else ab_dtype,
+                b_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
             make_ptr(sf_dtype, sfa_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
             make_ptr(sf_dtype, sfb_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
             make_ptr(c_dtype, c_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
@@ -7218,9 +7544,7 @@ def _select_default_mma_tiler_mn(
                 and _use_low_sm_dense_tactics(sm_count)
             ):
                 return (64, 128)
-            if _use_high_sm_mxfp8_bk64_prefill(
-                expected_m, n, k, sm_count
-            ):
+            if _use_high_sm_mxfp8_bk64_prefill(expected_m, n, k, sm_count):
                 return (128, 128)
             if (
                 expected_m >= 2048
@@ -7413,8 +7737,7 @@ def _select_mxfp8_tile_k(
         and _use_low_sm_dense_tactics(sm_count)
     ):
         medium_prefill_bk64 = (
-            1536 <= plan_m <= 2048
-            and (n + 127) // 128 <= 2 * sm_count
+            1536 <= plan_m <= 2048 and (n + 127) // 128 <= 2 * sm_count
         )
         return 64 if medium_prefill_bk64 else 128
     if (
@@ -7501,22 +7824,11 @@ def _select_default_dense_gemm_plan(
         k=k,
     )
     plan_m = expected_m if expected_m is not None else m
-    if (
-        block_fp8
-        and _select_block_fp8_decode_slices(plan_m, n, k, sm_count) > 1
-    ):
+    if block_fp8 and _select_block_fp8_decode_slices(plan_m, n, k, sm_count) > 1:
         tile = (32, 64)
-    elif (
-        block_fp8
-        and not _use_low_sm_dense_tactics(sm_count)
-        and plan_m >= 2048
-    ):
+    elif block_fp8 and not _use_low_sm_dense_tactics(sm_count) and plan_m >= 2048:
         tile = (64, 128)
-    elif (
-        block_fp8
-        and not _use_low_sm_dense_tactics(sm_count)
-        and 96 <= plan_m <= 128
-    ):
+    elif block_fp8 and not _use_low_sm_dense_tactics(sm_count) and 96 <= plan_m <= 128:
         work_tiles = ((plan_m + 63) // 64) * ((n + 127) // 128)
         if (sm_count + 1) // 2 <= work_tiles <= sm_count:
             tile = (64, 128)
@@ -7610,11 +7922,7 @@ def _select_default_dense_gemm_plan(
         # 128-row tile halves those reloads while the large M dimension still
         # leaves a deeply oversubscribed grid. Large-SM grids retain 64 output
         # columns to expose enough independent CTAs.
-        tile = (
-            (128, 128)
-            if _use_low_sm_dense_tactics(sm_count)
-            else (128, 64)
-        )
+        tile = (128, 128) if _use_low_sm_dense_tactics(sm_count) else (128, 64)
     if (
         block_fp8
         and expected_m is not None
@@ -7821,11 +8129,17 @@ def _expand_packed_mxfp6_ab(t: torch.Tensor, num_codes: int) -> torch.Tensor:
 def _dense_split_storage(workspace, slices, m, n, device):
     if workspace is None:
         return torch.empty((slices, m, n), dtype=torch.float32, device=device)
-    if (workspace.dtype != torch.float32 or workspace.device != device
-            or not workspace.is_contiguous() or workspace.data_ptr() % 16
-            or workspace.numel() < slices * m * n):
-        raise ValueError("split-K workspace must be aligned contiguous FP32 storage with sufficient capacity")
-    return workspace.view(-1)[:slices * m * n].view(slices, m, n)
+    if (
+        workspace.dtype != torch.float32
+        or workspace.device != device
+        or not workspace.is_contiguous()
+        or workspace.data_ptr() % 16
+        or workspace.numel() < slices * m * n
+    ):
+        raise ValueError(
+            "split-K workspace must be aligned contiguous FP32 storage with sufficient capacity"
+        )
+    return workspace.view(-1)[: slices * m * n].view(slices, m, n)
 
 
 def dense_gemm(
@@ -8248,10 +8562,7 @@ def dense_gemm(
             and sf_dtype == "float8_e8m0fnu"
         )
         block_fp8_autotune = (
-            is_mxfp8
-            and block_fp8
-            and sf_vec_size == 128
-            and sf_dtype == "float32"
+            is_mxfp8 and block_fp8 and sf_vec_size == 128 and sf_dtype == "float32"
         )
         if not (mxfp8_autotune or block_fp8_autotune):
             raise ValueError(
@@ -8276,10 +8587,7 @@ def dense_gemm(
                     f"to divide evenly across slices; got K={k}, BK={tile_k}, "
                     f"slices={_split_k_slices_override}"
                 )
-            if (
-                _split_k_slices_override > 2
-                and not _B12X_DENSE_SPLITK_TURBO
-            ):
+            if _split_k_slices_override > 2 and not _B12X_DENSE_SPLITK_TURBO:
                 raise ValueError(
                     "four-way split-K requires atomic-BF16 or an explicit "
                     "caller-owned FP32 reduction"
@@ -8748,6 +9056,7 @@ class _DenseLowering:
 
     def to_dict(self):
         from dataclasses import asdict
+
         return asdict(self)
 
     @classmethod
@@ -8757,6 +9066,7 @@ class _DenseLowering:
         for name in ("mma_tiler_mn", "cluster_shape_mn"):
             values[name] = tuple(values[name])
         return cls(**values)
+
 
 def _lower_dense_gemm(
     lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -9128,10 +9438,7 @@ def _lower_dense_gemm(
             and sf_dtype == "float8_e8m0fnu"
         )
         block_fp8_autotune = (
-            is_mxfp8
-            and block_fp8
-            and sf_vec_size == 128
-            and sf_dtype == "float32"
+            is_mxfp8 and block_fp8 and sf_vec_size == 128 and sf_dtype == "float32"
         )
         if not (mxfp8_autotune or block_fp8_autotune):
             raise ValueError(
@@ -9219,24 +9526,57 @@ def _lower_dense_gemm(
     alpha_is_one = alpha is None
 
     common = dict(
-        m=m, n=n, k=k, l=l, sf_vec_size=sf_vec_size, tile_k=tile_k,
-        mma_tiler_mn=mma_tiler_mn, load_path=load_path, swap_ab=swap_ab,
-        b_tile_major=rhs_values_tiled is not None, sfb_k_reuse=sfb_k_reuse,
+        m=m,
+        n=n,
+        k=k,
+        l=l,
+        sf_vec_size=sf_vec_size,
+        tile_k=tile_k,
+        mma_tiler_mn=mma_tiler_mn,
+        load_path=load_path,
+        swap_ab=swap_ab,
+        b_tile_major=rhs_values_tiled is not None,
+        sfb_k_reuse=sfb_k_reuse,
         is_mxfp8=is_mxfp8,
     )
     return _DenseLowering(
-        m=m, n=n, k=k, l=l, a_storage_k=lhs[0].shape[1], b_storage_k=rhs[0].shape[1],
-        ab_dtype=ab_dtype, sf_dtype=sf_dtype, c_dtype=c_dtype, alpha_dtype=alpha_dtype,
-        sf_vec_size=sf_vec_size, sm_count=sm_count, mma_k=mma_k, tile_k=tile_k,
-        mma_tiler_mn=tuple(mma_tiler_mn), cluster_shape_mn=tuple(cluster_shape_mn),
-        policy=policy, load_path=load_path, swap_ab=swap_ab, expected_m=expected_m,
-        kernel_c_l=kernel_c_l, alpha_is_one=alpha_is_one, is_mxfp6=is_mxfp6,
-        mxfp6_fmt_a=mxfp6_fmt_a, mxfp6_fmt_b=mxfp6_fmt_b,
-        a_preexpanded=a_preexpanded, b_preexpanded=b_preexpanded, b_packed=b_packed,
-        plain_fp8=plain_fp8, block_fp8=block_fp8, sfb_k_reuse=sfb_k_reuse,
-        b_tile_major=rhs_values_tiled is not None, quantize_c=_quantized_c is not None,
-        fused_quant=_DENSE_FUSED_QUANT and x_bf16 is not None, row_scale=row_scale is not None,
-        output_provided=out is not None, target_occupancy_override=_target_occupancy_override,
+        m=m,
+        n=n,
+        k=k,
+        l=l,
+        a_storage_k=lhs[0].shape[1],
+        b_storage_k=rhs[0].shape[1],
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        alpha_dtype=alpha_dtype,
+        sf_vec_size=sf_vec_size,
+        sm_count=sm_count,
+        mma_k=mma_k,
+        tile_k=tile_k,
+        mma_tiler_mn=tuple(mma_tiler_mn),
+        cluster_shape_mn=tuple(cluster_shape_mn),
+        policy=policy,
+        load_path=load_path,
+        swap_ab=swap_ab,
+        expected_m=expected_m,
+        kernel_c_l=kernel_c_l,
+        alpha_is_one=alpha_is_one,
+        is_mxfp6=is_mxfp6,
+        mxfp6_fmt_a=mxfp6_fmt_a,
+        mxfp6_fmt_b=mxfp6_fmt_b,
+        a_preexpanded=a_preexpanded,
+        b_preexpanded=b_preexpanded,
+        b_packed=b_packed,
+        plain_fp8=plain_fp8,
+        block_fp8=block_fp8,
+        sfb_k_reuse=sfb_k_reuse,
+        b_tile_major=rhs_values_tiled is not None,
+        quantize_c=_quantized_c is not None,
+        fused_quant=_DENSE_FUSED_QUANT and x_bf16 is not None,
+        row_scale=row_scale is not None,
+        output_provided=out is not None,
+        target_occupancy_override=_target_occupancy_override,
         direct_sfa_live16=_use_direct_sfa_live16(**common, alpha_is_one=alpha_is_one),
         direct_m1_wo_a_inputs=_use_direct_m1_wo_a_inputs(**common),
     )
@@ -9250,31 +9590,53 @@ def _compile_dense_lowering(payload, device_ordinal):
     atomic = split and p.policy.split_k_atomic_bf16
     output_type = "float32" if split and not atomic else p.c_dtype
     common = dict(
-        n=p.n, k=p.k, l=p.l, c_l=p.kernel_c_l,
-        a_major="k", b_major="k", c_major="n",
+        n=p.n,
+        k=p.k,
+        l=p.l,
+        c_l=p.kernel_c_l,
+        a_major="k",
+        b_major="k",
+        c_major="n",
         ab_dtype=cutlass.Float8E4M3FN if p.is_mxfp6 else get_cutlass_dtype(p.ab_dtype),
-        sf_dtype=get_cutlass_dtype(p.sf_dtype), c_dtype=get_cutlass_dtype(output_type),
-        alpha_dtype=get_cutlass_dtype(p.alpha_dtype), sf_vec_size=p.sf_vec_size,
-        mma_k=p.mma_k, tile_k=p.tile_k, mma_tiler_mn=p.mma_tiler_mn,
-        cluster_shape_mn=p.cluster_shape_mn, policy=p.policy, sm_count=p.sm_count,
-        sm_version="sm_120", alpha_is_one=p.alpha_is_one,
+        sf_dtype=get_cutlass_dtype(p.sf_dtype),
+        c_dtype=get_cutlass_dtype(output_type),
+        alpha_dtype=get_cutlass_dtype(p.alpha_dtype),
+        sf_vec_size=p.sf_vec_size,
+        mma_k=p.mma_k,
+        tile_k=p.tile_k,
+        mma_tiler_mn=p.mma_tiler_mn,
+        cluster_shape_mn=p.cluster_shape_mn,
+        policy=p.policy,
+        sm_count=p.sm_count,
+        sm_version="sm_120",
+        alpha_is_one=p.alpha_is_one,
     )
     with torch.cuda.device(device_ordinal):
         if p.is_mxfp6:
             gemm = _get_compiled_dense_gemm_mxfp6(
-                **common, mxfp6_fmt_a=p.mxfp6_fmt_a, mxfp6_fmt_b=p.mxfp6_fmt_b,
-                b_packed=p.b_packed, a_preexpanded=p.a_preexpanded,
-                b_preexpanded=p.b_preexpanded, row_scale=p.row_scale,
+                **common,
+                mxfp6_fmt_a=p.mxfp6_fmt_a,
+                mxfp6_fmt_b=p.mxfp6_fmt_b,
+                b_packed=p.b_packed,
+                a_preexpanded=p.a_preexpanded,
+                b_preexpanded=p.b_preexpanded,
+                row_scale=p.row_scale,
                 fused_quant=p.fused_quant,
             )
         else:
             gemm = _get_compiled_dense_gemm(
-                **common, load_path=p.load_path, swap_ab=p.swap_ab,
+                **common,
+                load_path=p.load_path,
+                swap_ab=p.swap_ab,
                 sfb_k_reuse=False if p.plain_fp8 else p.sfb_k_reuse,
                 b_tile_major=False if p.plain_fp8 else p.b_tile_major,
-                quantize_c=p.quantize_c, plain_fp8=p.plain_fp8, block_fp8=p.block_fp8,
+                quantize_c=p.quantize_c,
+                plain_fp8=p.plain_fp8,
+                block_fp8=p.block_fp8,
                 direct_sfa_live16=False if p.plain_fp8 else p.direct_sfa_live16,
-                direct_m1_wo_a_inputs=False if p.plain_fp8 or p.quantize_c else p.direct_m1_wo_a_inputs,
+                direct_m1_wo_a_inputs=False
+                if p.plain_fp8 or p.quantize_c
+                else p.direct_m1_wo_a_inputs,
                 target_occupancy_override=p.target_occupancy_override,
             )
         programs = {"gemm": gemm}
@@ -9282,7 +9644,10 @@ def _compile_dense_lowering(payload, device_ordinal):
             if p.policy.split_k_slices != 2:
                 raise ValueError("non-atomic dense reduction requires two slices")
             programs["reduce"] = _reduce_split_k2_bf16_kernel.warmup(
-                torch.float32, torch.bfloat16, p.m * p.n, BLOCK=1024,
+                torch.float32,
+                torch.bfloat16,
+                p.m * p.n,
+                BLOCK=1024,
                 grid=(triton.cdiv(p.m * p.n, 1024),),
             )
         return programs
@@ -9294,7 +9659,10 @@ def _require_dense_value(tensor, shape, dtype, device, name):
     # Pointer-based launchers use physical [L,M,K] / [L,M,N], ignoring strides
     # on singleton axes. Reject padded rows rather than silently misaddress them.
     strides = (shape[1], 1, shape[0] * shape[1])
-    if any(size > 1 and actual != expected for size, actual, expected in zip(shape, tensor.stride(), strides)):
+    if any(
+        size > 1 and actual != expected
+        for size, actual, expected in zip(shape, tensor.stride(), strides)
+    ):
         raise ValueError(f"{name} must retain the prepared group-major layout")
     if tensor.numel() and tensor.data_ptr() % 16:
         raise ValueError(f"{name} must be 16-byte aligned")
@@ -9308,40 +9676,68 @@ class _DenseExecutionState:
     reduction: object | None
     alpha_one: torch.Tensor | None
 
-    def run(self, lhs, rhs, out=None, *, alpha=None, stream=None,
-            rhs_values_tiled=None, quantized_c=None, x_bf16=None, w_gscale=None,
-            row_scale=None, split_k_workspace=None):
+    def run(
+        self,
+        lhs,
+        rhs,
+        out=None,
+        *,
+        alpha=None,
+        stream=None,
+        rhs_values_tiled=None,
+        quantized_c=None,
+        x_bf16=None,
+        w_gscale=None,
+        row_scale=None,
+        split_k_workspace=None,
+    ):
         p = self.lowering
         a, sfa = lhs
         b, sfb = rhs
         m = int(a.shape[0])
         if m > p.m:
-            raise ValueError(
-                "dense execution exceeds its planned capacity"
-            )
-        value_dtype = torch.uint8 if p.ab_dtype != "float8_e4m3fn" else torch.float8_e4m3fn
+            raise ValueError("dense execution exceeds its planned capacity")
+        value_dtype = (
+            torch.uint8 if p.ab_dtype != "float8_e4m3fn" else torch.float8_e4m3fn
+        )
         a_dtype = torch.float8_e4m3fn if p.mxfp6_fmt_a == "e4m3" else value_dtype
         _require_dense_value(a, (m, p.a_storage_k, p.l), a_dtype, self.device, "A")
-        _require_dense_value(b, (p.n, p.b_storage_k, p.l), value_dtype, self.device, "B")
+        _require_dense_value(
+            b, (p.n, p.b_storage_k, p.l), value_dtype, self.device, "B"
+        )
         for name, scale in (("SFA", sfa), ("SFB", sfb)):
             if scale.device != self.device or scale.dtype != getattr(torch, p.sf_dtype):
                 raise ValueError(f"{name} differs from prepared dense dtype/device")
         if (alpha is None) != p.alpha_is_one:
             raise ValueError("dense scalar-alpha presence differs from preparation")
         if alpha is not None and (
-            alpha.device != self.device or alpha.dtype != getattr(torch, p.alpha_dtype)
-            or alpha.numel() != 1 or not alpha.is_contiguous()
+            alpha.device != self.device
+            or alpha.dtype != getattr(torch, p.alpha_dtype)
+            or alpha.numel() != 1
+            or not alpha.is_contiguous()
         ):
             raise ValueError("dense alpha must retain its declared scalar dtype/device")
         if (rhs_values_tiled is not None) != p.b_tile_major:
             raise ValueError("dense tiled weight representation changed")
-        if (quantized_c is not None) != p.quantize_c or (row_scale is not None) != p.row_scale:
+        if (quantized_c is not None) != p.quantize_c or (
+            row_scale is not None
+        ) != p.row_scale:
             raise ValueError("dense auxiliary operand presence changed")
         if out is not None:
-            _require_dense_value(out, (m, p.n, p.l), getattr(torch, p.c_dtype), self.device, "C")
+            _require_dense_value(
+                out, (m, p.n, p.l), getattr(torch, p.c_dtype), self.device, "C"
+            )
         if m == 0:
-            return out if out is not None else _empty_dense_gemm_output(
-                0, p.n, p.l, dtype=getattr(torch, p.c_dtype), device=self.device,
+            return (
+                out
+                if out is not None
+                else _empty_dense_gemm_output(
+                    0,
+                    p.n,
+                    p.l,
+                    dtype=getattr(torch, p.c_dtype),
+                    device=self.device,
+                )
             )
         if p.is_mxfp6:
             if not p.a_preexpanded:
@@ -9349,29 +9745,46 @@ class _DenseExecutionState:
             if not (p.b_preexpanded or p.b_packed):
                 b = _expand_packed_mxfp6_ab(b, p.k)
         if out is None:
-            out = _empty_dense_gemm_output(m, p.n, p.l, dtype=getattr(torch, p.c_dtype), device=self.device)
+            out = _empty_dense_gemm_output(
+                m, p.n, p.l, dtype=getattr(torch, p.c_dtype), device=self.device
+            )
         alpha_value = self.alpha_one if alpha is None else alpha
         stream_int = cuda_stream_to_int(stream)
         if p.is_mxfp6:
             if row_scale is not None and (
-                row_scale.shape != (m,) or row_scale.dtype != getattr(torch, p.c_dtype)
-                or row_scale.device != self.device or not row_scale.is_contiguous()
+                row_scale.shape != (m,)
+                or row_scale.dtype != getattr(torch, p.c_dtype)
+                or row_scale.device != self.device
+                or not row_scale.is_contiguous()
                 or row_scale.data_ptr() % 16
             ):
                 raise ValueError("dense FP6 row scale differs from its planned layout")
             return self.gemm(
-                a_tensor_gpu=a, b_tensor_gpu=b, sfa_tensor_gpu=sfa, sfb_tensor_gpu=sfb,
-                c_tensor_gpu=out, alpha_tensor_gpu=alpha_value, stream_int=stream_int,
-                x_bf16_tensor_gpu=x_bf16, w_gscale_tensor_gpu=w_gscale,
+                a_tensor_gpu=a,
+                b_tensor_gpu=b,
+                sfa_tensor_gpu=sfa,
+                sfb_tensor_gpu=sfb,
+                c_tensor_gpu=out,
+                alpha_tensor_gpu=alpha_value,
+                stream_int=stream_int,
+                x_bf16_tensor_gpu=x_bf16,
+                w_gscale_tensor_gpu=w_gscale,
                 row_scale_tensor_gpu=row_scale,
             )
         b_launch = b if rhs_values_tiled is None else rhs_values_tiled
         if p.quantize_c:
             values, rows, mma = quantized_c
             return self.gemm(
-                a_tensor_gpu=a, b_tensor_gpu=b_launch, sfa_tensor_gpu=sfa, sfb_tensor_gpu=sfb,
-                c_tensor_gpu=out, alpha_tensor_gpu=alpha_value, stream_int=stream_int,
-                quant_c_values_gpu=values, quant_c_scale_rows_gpu=rows, quant_c_scale_mma_gpu=mma,
+                a_tensor_gpu=a,
+                b_tensor_gpu=b_launch,
+                sfa_tensor_gpu=sfa,
+                sfb_tensor_gpu=sfb,
+                c_tensor_gpu=out,
+                alpha_tensor_gpu=alpha_value,
+                stream_int=stream_int,
+                quant_c_values_gpu=values,
+                quant_c_scale_rows_gpu=rows,
+                quant_c_scale_mma_gpu=mma,
             )
         split = p.policy.split_k_slices > 1
         atomic = split and p.policy.split_k_atomic_bf16
@@ -9379,21 +9792,32 @@ class _DenseExecutionState:
         if atomic:
             out.zero_()
         elif split:
-            temporary = _dense_split_storage(split_k_workspace, p.policy.split_k_slices, m, p.n, self.device)
+            temporary = _dense_split_storage(
+                split_k_workspace, p.policy.split_k_slices, m, p.n, self.device
+            )
         self.gemm(
-            a_tensor_gpu=a, b_tensor_gpu=b_launch, sfa_tensor_gpu=sfa, sfb_tensor_gpu=sfb,
+            a_tensor_gpu=a,
+            b_tensor_gpu=b_launch,
+            sfa_tensor_gpu=sfa,
+            sfb_tensor_gpu=sfb,
             c_tensor_gpu=out if temporary is None else temporary.permute(1, 2, 0),
-            alpha_tensor_gpu=alpha_value, stream_int=stream_int,
+            alpha_tensor_gpu=alpha_value,
+            stream_int=stream_int,
         )
         if temporary is not None:
-            self.reduction[(triton.cdiv(m * p.n, 1024), 1, 1)](temporary, out, m * p.n, 1024)
+            self.reduction[(triton.cdiv(m * p.n, 1024), 1, 1)](
+                temporary, out, m * p.n, 1024
+            )
         return out
 
 
 def _materialize_dense(lowering, device):
     programs = _compile_dense_lowering(lowering.to_dict(), device.index)
     return _DenseExecutionState(
-        lowering, device, programs["gemm"], programs.get("reduce"),
+        lowering,
+        device,
+        programs["gemm"],
+        programs.get("reduce"),
         _cached_alpha_one(device) if lowering.alpha_is_one else None,
     )
 
@@ -9433,6 +9857,7 @@ class _DenseFusedQuantLowering:
 
     def to_dict(self):
         from dataclasses import asdict
+
         return asdict(self)
 
     @classmethod
@@ -9445,10 +9870,24 @@ class _DenseFusedQuantLowering:
 
 
 def _lower_dense_gemm_fused_quant_a(
-    source, b, sfb, *, sm_count, groups=None, out=None, positions=None,
-    cos_sin_cache=None, head_dim=0, nope_dim=0, rope_dim=0, expected_m=None,
-    sfb_k_replicated=False, rhs_values_tiled=None, a_inner_span=0,
-    mma_tiler_mn=None, _atomic_output_precleared=False,
+    source,
+    b,
+    sfb,
+    *,
+    sm_count,
+    groups=None,
+    out=None,
+    positions=None,
+    cos_sin_cache=None,
+    head_dim=0,
+    nope_dim=0,
+    rope_dim=0,
+    expected_m=None,
+    sfb_k_replicated=False,
+    rhs_values_tiled=None,
+    a_inner_span=0,
+    mma_tiler_mn=None,
+    _atomic_output_precleared=False,
 ) -> _DenseFusedQuantLowering:
     """Lower the existing fused-quant branches without allocation or compilation."""
     grouped = groups is not None
@@ -9458,38 +9897,70 @@ def _lower_dense_gemm_fused_quant_a(
         raise ValueError("fused MXFP8 activation quantization requires BF16 A")
     if grouped:
         if a_inner_span or rhs_values_tiled is not None or _atomic_output_precleared:
-            raise ValueError("grouped fused quantization does not use WO-B storage options")
+            raise ValueError(
+                "grouped fused quantization does not use WO-B storage options"
+            )
         if source.ndim != 3 or int(source.shape[1]) != groups:
             raise ValueError("grouped fused quantization requires [M,groups,K]")
         m, k = int(source.shape[0]), int(source.shape[2])
         if source.stride(2) != 1 or source.stride(1) != k or source.stride(0) % 8:
-            raise ValueError("grouped fused A requires contiguous trailing dimensions and an aligned row stride")
+            raise ValueError(
+                "grouped fused A requires contiguous trailing dimensions and an aligned row stride"
+            )
     elif not a_inner_span:
         if source.ndim != 2 or not source.is_contiguous():
-            raise ValueError("fused MXFP8 activation quantization requires contiguous BF16 [M,K]")
+            raise ValueError(
+                "fused MXFP8 activation quantization requires contiguous BF16 [M,K]"
+            )
         m, k = map(int, source.shape)
     else:
-        if a_inner_span % 32 or source.ndim != 3 or int(source.shape[1]) != a_inner_span:
-            raise ValueError("L-blocked fused A requires an aligned [M,span,K/span] view")
+        if (
+            a_inner_span % 32
+            or source.ndim != 3
+            or int(source.shape[1]) != a_inner_span
+        ):
+            raise ValueError(
+                "L-blocked fused A requires an aligned [M,span,K/span] view"
+            )
         m, k = int(source.shape[0]), a_inner_span * int(source.shape[2])
         if source.stride() != (a_inner_span, 1, m * a_inner_span):
-            raise ValueError("L-blocked fused A must retain the group-major source layout")
+            raise ValueError(
+                "L-blocked fused A must retain the group-major source layout"
+            )
     if not 1 <= m <= 8 or k % 128:
-        raise ValueError("fused MXFP8 activation quantization requires M1..8 and K divisible by128")
+        raise ValueError(
+            "fused MXFP8 activation quantization requires M1..8 and K divisible by128"
+        )
     if b.ndim != 3 or tuple(b.shape[1:]) != (k, groups):
         raise ValueError(f"fused B must have shape [N,{k},{groups}]")
     n = int(b.shape[0])
     inv_rope = positions is not None or cos_sin_cache is not None
     if inv_rope:
         if not grouped or positions is None or cos_sin_cache is None:
-            raise ValueError("grouped inverse-RoPE requires positions and cos_sin_cache")
-        if positions.shape != (m,) or not positions.is_contiguous() or not cos_sin_cache.is_contiguous():
-            raise ValueError("inverse-RoPE positions/cache must retain contiguous planned geometry")
+            raise ValueError(
+                "grouped inverse-RoPE requires positions and cos_sin_cache"
+            )
+        if (
+            positions.shape != (m,)
+            or not positions.is_contiguous()
+            or not cos_sin_cache.is_contiguous()
+        ):
+            raise ValueError(
+                "inverse-RoPE positions/cache must retain contiguous planned geometry"
+            )
         if cos_sin_cache.ndim != 2 or int(cos_sin_cache.shape[1]) != rope_dim:
             raise ValueError("inverse-RoPE cache width differs from rope_dim")
-        if (head_dim <= 0 or nope_dim + rope_dim != head_dim or head_dim % 32
-                or nope_dim % 32 or rope_dim % 32 or k % head_dim):
-            raise ValueError("inverse-RoPE head/nope/rope dimensions must preserve the aligned source contract")
+        if (
+            head_dim <= 0
+            or nope_dim + rope_dim != head_dim
+            or head_dim % 32
+            or nope_dim % 32
+            or rope_dim % 32
+            or k % head_dim
+        ):
+            raise ValueError(
+                "inverse-RoPE head/nope/rope dimensions must preserve the aligned source contract"
+            )
         _cutlass_positions_dtype(positions.dtype)
         _cutlass_cos_sin_dtype(cos_sin_cache.dtype)
         positions_dtype = str(positions.dtype).removeprefix("torch.")
@@ -9499,7 +9970,12 @@ def _lower_dense_gemm_fused_quant_a(
         positions_dtype, cos_sin_dtype = "int64", "bfloat16"
     if mma_tiler_mn is None:
         selected = _select_default_dense_gemm_plan(
-            m, n, k, sm_count, is_mxfp8=True, expected_m=expected_m,
+            m,
+            n,
+            k,
+            sm_count,
+            is_mxfp8=True,
+            expected_m=expected_m,
         )
         if selected.swap_ab or selected.load_path != "tma":
             raise ValueError("fused quantization requires the unswapped TMA plan")
@@ -9508,15 +9984,28 @@ def _lower_dense_gemm_fused_quant_a(
     if rhs_values_tiled is not None:
         if (n, k) != (4096, 4096) or mma_tiler_mn not in ((16, 64), (16, 128)):
             raise ValueError("tile-major fused RHS requires the existing WO-B4096 plan")
-        if (rhs_values_tiled.shape != (1, 32, 32, 128, 128)
-                or rhs_values_tiled.dtype != b.dtype or rhs_values_tiled.device != b.device
-                or not rhs_values_tiled.is_contiguous()):
-            raise ValueError("tile-major fused RHS differs from its native storage contract")
+        if (
+            rhs_values_tiled.shape != (1, 32, 32, 128, 128)
+            or rhs_values_tiled.dtype != b.dtype
+            or rhs_values_tiled.device != b.device
+            or not rhs_values_tiled.is_contiguous()
+        ):
+            raise ValueError(
+                "tile-major fused RHS differs from its native storage contract"
+            )
     policy = _dense_gemm_policy_for(
-        m=m, n=n, k=k, l=groups, ab_dtype=cutlass.Float8E4M3FN,
-        c_dtype=cutlass.BFloat16, mma_tiler_mn=mma_tiler_mn,
-        cluster_shape_mn=(1, 1), sm_count=sm_count, tile_k=128,
-        expected_m=expected_m, generalize_mxfp8_split_k=True,
+        m=m,
+        n=n,
+        k=k,
+        l=groups,
+        ab_dtype=cutlass.Float8E4M3FN,
+        c_dtype=cutlass.BFloat16,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=(1, 1),
+        sm_count=sm_count,
+        tile_k=128,
+        expected_m=expected_m,
+        generalize_mxfp8_split_k=True,
     )
     if grouped and policy.split_k_slices != 1:
         raise ValueError("grouped fused quantization does not support split-K")
@@ -9525,12 +10014,30 @@ def _lower_dense_gemm_fused_quant_a(
     if out is not None and (out.shape != (m, n, groups) or out.dtype != torch.bfloat16):
         raise ValueError("fused output must retain the planned BF16 shape")
     return _DenseFusedQuantLowering(
-        m, n, k, groups, grouped, tuple(source.shape), tuple(source.stride()),
-        str(b.dtype).removeprefix("torch."), str(sfb.dtype).removeprefix("torch."),
-        expected_m, int(sm_count), mma_tiler_mn, policy, bool(sfb_k_replicated),
-        rhs_values_tiled is not None, a_inner_span, inv_rope, int(head_dim),
-        int(nope_dim), int(rope_dim), positions_dtype, cos_sin_dtype,
-        out is not None, bool(_atomic_output_precleared),
+        m,
+        n,
+        k,
+        groups,
+        grouped,
+        tuple(source.shape),
+        tuple(source.stride()),
+        str(b.dtype).removeprefix("torch."),
+        str(sfb.dtype).removeprefix("torch."),
+        expected_m,
+        int(sm_count),
+        mma_tiler_mn,
+        policy,
+        bool(sfb_k_replicated),
+        rhs_values_tiled is not None,
+        a_inner_span,
+        inv_rope,
+        int(head_dim),
+        int(nope_dim),
+        int(rope_dim),
+        positions_dtype,
+        cos_sin_dtype,
+        out is not None,
+        bool(_atomic_output_precleared),
     )
 
 
@@ -9543,24 +10050,46 @@ def _compile_dense_fused_quant_lowering(payload, device_ordinal):
     with torch.cuda.device(device_ordinal):
         if p.grouped:
             gemm = _get_compiled_dense_gemm_fused_quant_a_grouped(
-                p.n, p.k, p.groups, p.policy, p.mma_tiler_mn, p.sm_count,
-                p.sfb_k_replicated, p.source_strides[0], p.k, p.inv_rope,
-                p.head_dim, p.nope_dim, p.rope_dim, one_m,
+                p.n,
+                p.k,
+                p.groups,
+                p.policy,
+                p.mma_tiler_mn,
+                p.sm_count,
+                p.sfb_k_replicated,
+                p.source_strides[0],
+                p.k,
+                p.inv_rope,
+                p.head_dim,
+                p.nope_dim,
+                p.rope_dim,
+                one_m,
                 _cutlass_positions_dtype(getattr(torch, p.positions_dtype)),
                 _cutlass_cos_sin_dtype(getattr(torch, p.cos_sin_dtype)),
             )
         else:
             gemm = _get_compiled_dense_gemm_fused_quant_a(
-                p.n, p.k, cutlass.Float32 if partials else cutlass.BFloat16,
-                p.policy, p.mma_tiler_mn, p.sm_count, p.sfb_k_replicated,
-                p.b_tile_major, p.a_inner_span, p.policy.split_k_slices if partials else 1, one_m,
+                p.n,
+                p.k,
+                cutlass.Float32 if partials else cutlass.BFloat16,
+                p.policy,
+                p.mma_tiler_mn,
+                p.sm_count,
+                p.sfb_k_replicated,
+                p.b_tile_major,
+                p.a_inner_span,
+                p.policy.split_k_slices if partials else 1,
+                one_m,
             )
         programs = {"gemm": gemm}
         if partials:
             if p.policy.split_k_slices != 2:
                 raise ValueError("fused non-atomic split reduction requires two slices")
             programs["reduce"] = _reduce_split_k2_bf16_kernel.warmup(
-                torch.float32, torch.bfloat16, p.m * p.n, BLOCK=1024,
+                torch.float32,
+                torch.bfloat16,
+                p.m * p.n,
+                BLOCK=1024,
                 grid=(triton.cdiv(p.m * p.n, 1024),),
             )
         return programs
@@ -9574,16 +10103,38 @@ class _DenseFusedQuantState:
     reduction: object | None
     alpha_one: torch.Tensor
 
-    def run(self, source, b, sfb, out=None, *, positions=None, cos_sin_cache=None,
-            rhs_values_tiled=None, split_k_workspace=None, stream=None):
+    def run(
+        self,
+        source,
+        b,
+        sfb,
+        out=None,
+        *,
+        positions=None,
+        cos_sin_cache=None,
+        rhs_values_tiled=None,
+        split_k_workspace=None,
+        stream=None,
+    ):
         p = self.lowering
         m = int(source.shape[0])
-        shape_matches = (tuple(source.shape[1:]) == p.source_shape[1:] and m <= p.m
-                         and (not p.grouped or m == p.m))
-        if (not shape_matches or source.stride() != p.source_strides
-                or source.dtype != torch.bfloat16 or source.device != self.device):
-            raise ValueError("fused A exceeds its prepared capacity or differs in layout/device")
-        _require_dense_value(b, (p.n, p.k, p.groups), getattr(torch, p.b_dtype), self.device, "fused B")
+        shape_matches = (
+            tuple(source.shape[1:]) == p.source_shape[1:]
+            and m <= p.m
+            and (not p.grouped or m == p.m)
+        )
+        if (
+            not shape_matches
+            or source.stride() != p.source_strides
+            or source.dtype != torch.bfloat16
+            or source.device != self.device
+        ):
+            raise ValueError(
+                "fused A exceeds its prepared capacity or differs in layout/device"
+            )
+        _require_dense_value(
+            b, (p.n, p.k, p.groups), getattr(torch, p.b_dtype), self.device, "fused B"
+        )
         if sfb.device != self.device or sfb.dtype != getattr(torch, p.sfb_dtype):
             raise ValueError("fused SFB differs from its prepared dtype/device")
         if (out is not None) != p.output_provided:
@@ -9591,27 +10142,43 @@ class _DenseFusedQuantState:
         if (rhs_values_tiled is not None) != p.b_tile_major:
             raise ValueError("fused tiled RHS presence changed")
         if p.inv_rope:
-            if (positions is None or positions.shape != (m,)
-                    or positions.dtype != getattr(torch, p.positions_dtype)
-                    or positions.device != self.device or not positions.is_contiguous()
-                    or cos_sin_cache is None or cos_sin_cache.ndim != 2
-                    or int(cos_sin_cache.shape[1]) != p.rope_dim
-                    or cos_sin_cache.dtype != getattr(torch, p.cos_sin_dtype)
-                    or cos_sin_cache.device != self.device or not cos_sin_cache.is_contiguous()):
+            if (
+                positions is None
+                or positions.shape != (m,)
+                or positions.dtype != getattr(torch, p.positions_dtype)
+                or positions.device != self.device
+                or not positions.is_contiguous()
+                or cos_sin_cache is None
+                or cos_sin_cache.ndim != 2
+                or int(cos_sin_cache.shape[1]) != p.rope_dim
+                or cos_sin_cache.dtype != getattr(torch, p.cos_sin_dtype)
+                or cos_sin_cache.device != self.device
+                or not cos_sin_cache.is_contiguous()
+            ):
                 raise ValueError("fused inverse-RoPE operands differ from preparation")
         elif positions is not None or cos_sin_cache is not None:
             raise ValueError("inverse-RoPE was not declared")
         if out is None:
-            out = _empty_dense_gemm_output(m, p.n, p.groups, dtype=torch.bfloat16, device=self.device)
+            out = _empty_dense_gemm_output(
+                m, p.n, p.groups, dtype=torch.bfloat16, device=self.device
+            )
         else:
-            _require_dense_value(out, (m, p.n, p.groups), torch.bfloat16, self.device, "fused C")
+            _require_dense_value(
+                out, (m, p.n, p.groups), torch.bfloat16, self.device, "fused C"
+            )
         if m == 0:
             return out
         stream_int = cuda_stream_to_int(stream)
         if p.grouped:
             self.gemm(
-                source, positions if p.inv_rope else source, cos_sin_cache if p.inv_rope else source,
-                b, sfb, out, self.alpha_one, stream_int,
+                source,
+                positions if p.inv_rope else source,
+                cos_sin_cache if p.inv_rope else source,
+                b,
+                sfb,
+                out,
+                self.alpha_one,
+                stream_int,
             )
             return out
         split = p.policy.split_k_slices > 1
@@ -9621,22 +10188,40 @@ class _DenseFusedQuantState:
             if not p.atomic_output_precleared:
                 out.zero_()
         elif split:
-            temporary = _dense_split_storage(split_k_workspace, p.policy.split_k_slices, m, p.n, self.device)
+            temporary = _dense_split_storage(
+                split_k_workspace, p.policy.split_k_slices, m, p.n, self.device
+            )
         b_launch = b
         if rhs_values_tiled is not None:
-            if (rhs_values_tiled.shape != (1, 32, 32, 128, 128)
-                    or rhs_values_tiled.dtype != b.dtype or rhs_values_tiled.device != self.device
-                    or not rhs_values_tiled.is_contiguous()):
+            if (
+                rhs_values_tiled.shape != (1, 32, 32, 128, 128)
+                or rhs_values_tiled.dtype != b.dtype
+                or rhs_values_tiled.device != self.device
+                or not rhs_values_tiled.is_contiguous()
+            ):
                 raise ValueError("fused tile-major RHS storage changed")
             b_launch = rhs_values_tiled
-        self.gemm(source, b_launch, sfb, out if temporary is None else temporary, self.alpha_one, stream_int)
+        self.gemm(
+            source,
+            b_launch,
+            sfb,
+            out if temporary is None else temporary,
+            self.alpha_one,
+            stream_int,
+        )
         if temporary is not None:
-            self.reduction[(triton.cdiv(m * p.n, 1024), 1, 1)](temporary, out, m * p.n, 1024)
+            self.reduction[(triton.cdiv(m * p.n, 1024), 1, 1)](
+                temporary, out, m * p.n, 1024
+            )
         return out
 
 
 def _materialize_dense_fused_quant(lowering, device):
     programs = _compile_dense_fused_quant_lowering(lowering.to_dict(), device.index)
     return _DenseFusedQuantState(
-        lowering, device, programs["gemm"], programs.get("reduce"), _cached_alpha_one(device),
+        lowering,
+        device,
+        programs["gemm"],
+        programs.get("reduce"),
+        _cached_alpha_one(device),
     )

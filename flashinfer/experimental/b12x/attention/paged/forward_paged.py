@@ -251,9 +251,7 @@ def _issue_paged_kv_tma_copy_planes_tma(
     page_idx = tile_token_base // page_size
     page_id = (
         Int32(0)
-        if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
-        )
+        if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
         else mPageTable[request_idx, page_idx]
     )
     pipeline_tma.producer_acquire(producer_state)
@@ -277,9 +275,7 @@ def _issue_paged_kv_tma_copy_2planes_tma(
     page_idx = tile_token_base // page_size
     page_id = (
         Int32(0)
-        if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
-        )
+        if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
         else mPageTable[request_idx, page_idx]
     )
     pipeline_tma.producer_acquire(producer_state)
@@ -333,9 +329,7 @@ def _issue_paged_kv_tma_copy_2planes_tma_manual(
     page_tiles_per_page = page_size // stage_tile_rows
     page_id = (
         Int32(0)
-        if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
-        )
+        if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
         else mPageTable[request_idx, page_idx]
     )
     full_mbar_ptr = mbar_ptr + producer_state.index
@@ -348,9 +342,7 @@ def _issue_paged_kv_tma_copy_2planes_tma_manual(
     # hand out ids whose byte address is beyond the signed-Int32 range even
     # though the page table itself stores Int32 ids, so widen before scaling it
     # into the flattened TMA-tile coordinate.
-    src_idx = (
-        Int64(page_id) * Int64(page_tiles_per_page) + Int64(page_tile_idx)
-    )
+    src_idx = Int64(page_id) * Int64(page_tiles_per_page) + Int64(page_tile_idx)
     load_tma0(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
     load_tma1(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
 
@@ -373,9 +365,7 @@ def _issue_paged_kv_tma_copy_1plane_tma_manual(
     page_tile_idx = page_row_offset // stage_tile_rows
     page_id = (
         Int32(0)
-        if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
-        )
+        if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
         else mPageTable[request_idx, page_idx]
     )
     full_mbar_ptr = mbar_ptr + producer_state.index
@@ -386,9 +376,7 @@ def _issue_paged_kv_tma_copy_1plane_tma_manual(
         )
     # The page-table id scales by the physical cache stride. Combined K/V
     # caches can span more TMA tiles per allocator entry than the logical page.
-    src_idx = (
-        Int64(page_id) * Int64(page_tiles_per_entry) + Int64(page_tile_idx)
-    )
+    src_idx = Int64(page_id) * Int64(page_tiles_per_entry) + Int64(page_tile_idx)
     load_tma0(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
 
 
@@ -413,9 +401,7 @@ def _issue_paged_kv_tma_copy_4planes_tma_manual(
     page_tiles_per_page = page_size // stage_tile_rows
     page_id = (
         Int32(0)
-        if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
-        )
+        if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
         else mPageTable[request_idx, page_idx]
     )
     full_mbar_ptr = mbar_ptr + producer_state.index
@@ -425,9 +411,7 @@ def _issue_paged_kv_tma_copy_4planes_tma_manual(
             expected_bytes,
         )
     # Keep the page-scaled coordinate in Int64 for large/recycled serving pools.
-    src_idx = (
-        Int64(page_id) * Int64(page_tiles_per_page) + Int64(page_tile_idx)
-    )
+    src_idx = Int64(page_id) * Int64(page_tiles_per_page) + Int64(page_tile_idx)
     load_tma0(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
     load_tma1(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
     load_tma2(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
@@ -493,10 +477,7 @@ def _dump_permuted_bf16_rows(
         col = linear - row * head_dim
         vec = col // Int32(8)
         elem_in_vec = col - vec * Int32(8)
-        src_elem = (
-            _permuted_offset_128b(row, vec, stride_128b) * Int32(8)
-            + elem_in_vec
-        )
+        src_elem = _permuted_offset_128b(row, vec, stride_128b) * Int32(8) + elem_in_vec
         dst_q = row // mDst.shape[1]
         dst_h = row - dst_q * mDst.shape[1]
         mDst[dst_q, dst_h, col] = sSrcFlat[src_elem]
@@ -1114,9 +1095,7 @@ def _issue_paged_kv_cp_async_64x128(
     page_row_offset = tile_token_base - page_idx * page_size
     page_id = (
         Int32(0)
-        if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
-        )
+        if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
         else mPageTable[request_idx, page_idx]
     )
     k_smem_base_addr = shared_ptr_to_u32(sKStageBytes.iterator)
@@ -2047,18 +2026,10 @@ def _literal_pv_mma_into_ofrag_plane_bf16_packed(
             Uint32,
         )
         for mma_q in cutlass.range_constexpr(num_mma_q):
-            a_regs[mma_q, 0] = bfloat2_mul(
-                p_frag[mma_q, mma_kv, 0], v_scale_bf2
-            )
-            a_regs[mma_q, 1] = bfloat2_mul(
-                p_frag[mma_q, mma_kv, 1], v_scale_bf2
-            )
-            a_regs[mma_q, 2] = bfloat2_mul(
-                p_frag[mma_q, mma_kv, 2], v_scale_bf2
-            )
-            a_regs[mma_q, 3] = bfloat2_mul(
-                p_frag[mma_q, mma_kv, 3], v_scale_bf2
-            )
+            a_regs[mma_q, 0] = bfloat2_mul(p_frag[mma_q, mma_kv, 0], v_scale_bf2)
+            a_regs[mma_q, 1] = bfloat2_mul(p_frag[mma_q, mma_kv, 1], v_scale_bf2)
+            a_regs[mma_q, 2] = bfloat2_mul(p_frag[mma_q, mma_kv, 2], v_scale_bf2)
+            a_regs[mma_q, 3] = bfloat2_mul(p_frag[mma_q, mma_kv, 3], v_scale_bf2)
 
         v_row = row_base + warp_kv_idx * num_mma_kv * 16 + mma_kv * 16 + lane % 16
         for mma_d in cutlass.range_constexpr(num_mma_d_vo):
@@ -2501,9 +2472,7 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1(
             v_offset_cur = (
                 v_offset_cur + Int32(2)
                 if const_expr(wide_fp8_plane)
-                else _advance_offset_by_column_128b_2(
-                    v_offset_cur, mma_d // 2
-                )
+                else _advance_offset_by_column_128b_2(v_offset_cur, mma_d // 2)
             )
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             o_frag[0, mma_d, 0],
@@ -3034,9 +3003,7 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
             scale_term = (
                 Float32(1.0)
                 if m_new == -Float32.inf
-                else _exp2_approx_ftz_f32(
-                    m_prev * sm_scale_log2 - m_new_scaled
-                )
+                else _exp2_approx_ftz_f32(m_prev * sm_scale_log2 - m_new_scaled)
             )
             d_frag[mma_q, row_slot] = Float32(d_frag[mma_q, row_slot] * scale_term)
             for mma_d in cutlass.range_constexpr(num_mma_d_vo):
@@ -3050,8 +3017,7 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag0[mma_q, mma_kv, row_slot * 2 + 0]
-                        * sm_scale_log2
+                        s_frag0[mma_q, mma_kv, row_slot * 2 + 0] * sm_scale_log2
                         - m_new_scaled
                     )
                 )
@@ -3059,8 +3025,7 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag0[mma_q, mma_kv, row_slot * 2 + 1]
-                        * sm_scale_log2
+                        s_frag0[mma_q, mma_kv, row_slot * 2 + 1] * sm_scale_log2
                         - m_new_scaled
                     )
                 )
@@ -3068,8 +3033,7 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag0[mma_q, mma_kv, row_slot * 2 + 4]
-                        * sm_scale_log2
+                        s_frag0[mma_q, mma_kv, row_slot * 2 + 4] * sm_scale_log2
                         - m_new_scaled
                     )
                 )
@@ -3077,8 +3041,7 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag0[mma_q, mma_kv, row_slot * 2 + 5]
-                        * sm_scale_log2
+                        s_frag0[mma_q, mma_kv, row_slot * 2 + 5] * sm_scale_log2
                         - m_new_scaled
                     )
                 )
@@ -3086,8 +3049,7 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag1[mma_q, mma_kv, row_slot * 2 + 0]
-                        * sm_scale_log2
+                        s_frag1[mma_q, mma_kv, row_slot * 2 + 0] * sm_scale_log2
                         - m_new_scaled
                     )
                 )
@@ -3095,8 +3057,7 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag1[mma_q, mma_kv, row_slot * 2 + 1]
-                        * sm_scale_log2
+                        s_frag1[mma_q, mma_kv, row_slot * 2 + 1] * sm_scale_log2
                         - m_new_scaled
                     )
                 )
@@ -3104,8 +3065,7 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag1[mma_q, mma_kv, row_slot * 2 + 4]
-                        * sm_scale_log2
+                        s_frag1[mma_q, mma_kv, row_slot * 2 + 4] * sm_scale_log2
                         - m_new_scaled
                     )
                 )
@@ -3113,23 +3073,14 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
                     Float32(0.0)
                     if m_new == -Float32.inf
                     else _exp2_approx_ftz_f32(
-                        s_frag1[mma_q, mma_kv, row_slot * 2 + 5]
-                        * sm_scale_log2
+                        s_frag1[mma_q, mma_kv, row_slot * 2 + 5] * sm_scale_log2
                         - m_new_scaled
                     )
                 )
-                p_frag0[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(
-                    p00, p01
-                )
-                p_frag0[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(
-                    p02, p03
-                )
-                p_frag1[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(
-                    p10, p11
-                )
-                p_frag1[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(
-                    p12, p13
-                )
+                p_frag0[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p00, p01)
+                p_frag0[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(p02, p03)
+                p_frag1[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p10, p11)
+                p_frag1[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(p12, p13)
 
             m_frag[mma_q, row_slot] = Float32(m_new)
 
@@ -3175,9 +3126,7 @@ class PagedForwardKernel:
         self.single_qtile_decode_graph = single_qtile_decode_graph
         self.regularized_decode_graph = regularized_decode_graph
         self.analytic_laguna_decode_graph = analytic_laguna_decode_graph
-        self.analytic_laguna_decode_batch = int(
-            analytic_laguna_decode_batch
-        )
+        self.analytic_laguna_decode_batch = int(analytic_laguna_decode_batch)
         self.analytic_laguna_decode_total_chunks = int(
             analytic_laguna_decode_total_chunks
         )
@@ -3252,8 +3201,7 @@ class PagedForwardKernel:
             decode_only
             and not self.has_relative_attention_bias
             and self.page_size == 64
-            and paged_control("B12X_PAGED_BF16_MINIMAX_ROLE_SPECIALIZED", "0")
-            == "1"
+            and paged_control("B12X_PAGED_BF16_MINIMAX_ROLE_SPECIALIZED", "0") == "1"
             and dtype_q == cutlass.BFloat16
             and dtype_kv == cutlass.BFloat16
             and dtype_o == cutlass.BFloat16
@@ -3271,14 +3219,12 @@ class PagedForwardKernel:
         laguna_decode_n128 = (
             traits.cta_tile_kv == 128
             and self.gqa_group_size == 6
-            and paged_control("B12X_PAGED_LAGUNA_DECODE_N128", "0")
-            == "1"
+            and paged_control("B12X_PAGED_LAGUNA_DECODE_N128", "0") == "1"
         )
         laguna_fp8_role_specialized_decode = bool(
             self.analytic_laguna_decode_graph
             and (
-                q_stage_bytes + 2 * kv_stage_bytes
-                <= traits.max_smem_per_threadblock
+                q_stage_bytes + 2 * kv_stage_bytes <= traits.max_smem_per_threadblock
                 or (
                     laguna_decode_n128
                     and q_stage_bytes + kv_stage_bytes
@@ -3298,18 +3244,15 @@ class PagedForwardKernel:
             and traits.num_warps_kv == 4
             and traits.head_dim_qk == 128
             and traits.head_dim_vo == 128
-            and paged_control("B12X_PAGED_LAGUNA_HEAD_PAIR_DECODE", "0")
-            == "1"
+            and paged_control("B12X_PAGED_LAGUNA_HEAD_PAIR_DECODE", "0") == "1"
         )
         self.laguna_fp8_head_pair_wide_tma = bool(
             self.laguna_fp8_head_pair_decode
-            and paged_control("B12X_PAGED_LAGUNA_HEAD_PAIR_WIDE_TMA", "0")
-            == "1"
+            and paged_control("B12X_PAGED_LAGUNA_HEAD_PAIR_WIDE_TMA", "0") == "1"
         )
         self.laguna_fp8_head_pair_wide_headlocal = bool(
             self.laguna_fp8_head_pair_wide_tma
-            and paged_control("B12X_PAGED_LAGUNA_HEAD_PAIR_WIDE_HEADLOCAL", "0")
-            == "1"
+            and paged_control("B12X_PAGED_LAGUNA_HEAD_PAIR_WIDE_HEADLOCAL", "0") == "1"
         )
         self.laguna_fp8_head_pair_wide_math = bool(
             self.laguna_fp8_head_pair_wide_tma
@@ -3318,15 +3261,12 @@ class PagedForwardKernel:
         self.heads_per_cta = 2 if self.laguna_fp8_head_pair_decode else 1
         self.total_warps *= self.heads_per_cta
         self.math_num_threads = traits.num_threads * self.heads_per_cta
-        self.laguna_fp8_role_specialized_decode = (
-            laguna_fp8_role_specialized_decode
-        )
+        self.laguna_fp8_role_specialized_decode = laguna_fp8_role_specialized_decode
         self.role_specialized_decode = bool(
             bf16_minimax_head128_decode or laguna_fp8_role_specialized_decode
         )
-        self.launch_warps_kv = (
-            traits.num_warps_kv * self.heads_per_cta
-            + (1 if self.role_specialized_decode else 0)
+        self.launch_warps_kv = traits.num_warps_kv * self.heads_per_cta + (
+            1 if self.role_specialized_decode else 0
         )
         self.num_stages = (
             3
@@ -3823,9 +3763,7 @@ class PagedForwardKernel:
     def _tile_src_idx_from_page_id(self, page_id, sub_tile):
         if const_expr(self.page_size == 64):
             return Int64(page_id)
-        return (
-            Int64(page_id) * Int64(self.page_tiles_per_entry) + Int64(sub_tile)
-        )
+        return Int64(page_id) * Int64(self.page_tiles_per_entry) + Int64(sub_tile)
 
     @cute.jit
     def _issue_paged_kv_tma_copy_planes(
@@ -3843,10 +3781,7 @@ class PagedForwardKernel:
     ):
         page_id = (
             Int32(0)
-            if const_expr(
-                paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
-                == "1"
-            )
+            if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
@@ -3871,10 +3806,7 @@ class PagedForwardKernel:
     ):
         page_id = (
             Int32(0)
-            if const_expr(
-                paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
-                == "1"
-            )
+            if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
@@ -3897,10 +3829,7 @@ class PagedForwardKernel:
     ):
         page_id = (
             Int32(0)
-            if const_expr(
-                paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
-                == "1"
-            )
+            if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
@@ -3921,10 +3850,7 @@ class PagedForwardKernel:
     ):
         page_id = (
             Int32(0)
-            if const_expr(
-                paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
-                == "1"
-            )
+            if const_expr(paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1")
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
@@ -4329,12 +4255,9 @@ class PagedForwardKernel:
             head_lane,
             Int32(0),
         )
-        kv_head_idx = (
-            kv_head_cta_idx * Int32(self.heads_per_cta) + math_head_lane
-        )
+        kv_head_idx = kv_head_cta_idx * Int32(self.heads_per_cta) + math_head_lane
         warp_kv_idx = (
-            launch_warp_kv_idx
-            - math_head_lane * Int32(self.traits.num_warps_kv)
+            launch_warp_kv_idx - math_head_lane * Int32(self.traits.num_warps_kv)
             if const_expr(self.laguna_fp8_head_pair_decode)
             else launch_warp_kv_idx
         )
@@ -4353,17 +4276,14 @@ class PagedForwardKernel:
             )
             extra_chunk_requests_const = (
                 self.analytic_laguna_decode_total_chunks
-                - base_chunks_per_req_const
-                * self.analytic_laguna_decode_batch
+                - base_chunks_per_req_const * self.analytic_laguna_decode_batch
             )
             base_chunks_per_req = Int32(base_chunks_per_req_const)
             extra_chunk_requests = Int32(extra_chunk_requests_const)
             if const_expr(extra_chunk_requests_const == 0):
                 request_idx = Int32(block_z)
                 kv_tile_idx = Int32(block_y)
-                request_partial_start = (
-                    request_idx * base_chunks_per_req
-                )
+                request_partial_start = request_idx * base_chunks_per_req
                 work_idx = request_partial_start + kv_tile_idx
             else:
                 work_idx = Int32(block_y)
@@ -4374,14 +4294,11 @@ class PagedForwardKernel:
                 ):
                     candidate_extra = (
                         request_candidate
-                        if const_expr(
-                            request_candidate < extra_chunk_requests_const
-                        )
+                        if const_expr(request_candidate < extra_chunk_requests_const)
                         else extra_chunk_requests_const
                     )
                     candidate_start = Int32(
-                        request_candidate * base_chunks_per_req_const
-                        + candidate_extra
+                        request_candidate * base_chunks_per_req_const + candidate_extra
                     )
                     owns_or_follows_candidate = work_idx >= candidate_start
                     request_idx = cutlass.select_(
@@ -4401,9 +4318,9 @@ class PagedForwardKernel:
             q_start = request_idx
             qo_len = Int32(1)
             cache_len = mCacheSeqlens[request_idx]
-            live_stage_tiles = (
-                cache_len + Int32(self.stage_tile_rows - 1)
-            ) // Int32(self.stage_tile_rows)
+            live_stage_tiles = (cache_len + Int32(self.stage_tile_rows - 1)) // Int32(
+                self.stage_tile_rows
+            )
             num_chunks_kv = cutlass.select_(
                 live_stage_tiles < request_chunk_capacity,
                 live_stage_tiles,
@@ -4430,21 +4347,15 @@ class PagedForwardKernel:
                 kv_tile_idx,
                 extra_tile_chunks,
             )
-            chunk_stage_start = (
-                kv_tile_idx * base_tiles_per_chunk + prefix_extra_tiles
-            )
+            chunk_stage_start = kv_tile_idx * base_tiles_per_chunk + prefix_extra_tiles
             chunk_stage_count = base_tiles_per_chunk + cutlass.select_(
                 kv_tile_idx < extra_tile_chunks, Int32(1), Int32(0)
             )
-            analytic_chunk_start = (
-                chunk_stage_start * Int32(self.stage_tile_rows)
-            )
+            analytic_chunk_start = chunk_stage_start * Int32(self.stage_tile_rows)
             analytic_chunk_end = cutlass.select_(
-                (chunk_stage_start + chunk_stage_count)
-                * Int32(self.stage_tile_rows)
+                (chunk_stage_start + chunk_stage_count) * Int32(self.stage_tile_rows)
                 < cache_len,
-                (chunk_stage_start + chunk_stage_count)
-                * Int32(self.stage_tile_rows),
+                (chunk_stage_start + chunk_stage_count) * Int32(self.stage_tile_rows),
                 cache_len,
             )
             request_partial_end = request_partial_start + num_chunks_kv
@@ -4567,8 +4478,7 @@ class PagedForwardKernel:
             num_chunks_kv = (
                 num_chunks_kv
                 if const_expr(
-                    self.regularized_decode_graph
-                    or self.analytic_laguna_decode_graph
+                    self.regularized_decode_graph or self.analytic_laguna_decode_graph
                 )
                 else (
                     request_partial_end - request_partial_start
@@ -4607,15 +4517,11 @@ class PagedForwardKernel:
         kv_plane_total_bytes = self.num_stages * kv_plane_stage_bytes
         k_payload_bytes = max(
             k_bytes,
-            self.k_tma_plane_count
-            * kv_plane_total_bytes
-            * self.heads_per_cta,
+            self.k_tma_plane_count * kv_plane_total_bytes * self.heads_per_cta,
         )
         v_payload_bytes = max(
             v_bytes,
-            self.v_tma_plane_count
-            * kv_plane_total_bytes
-            * self.heads_per_cta,
+            self.v_tma_plane_count * kv_plane_total_bytes * self.heads_per_cta,
         )
         v_payload_offset = q_bytes + k_payload_bytes
         k_head_plane_stride = self.k_tma_plane_count * kv_plane_total_bytes
@@ -4655,10 +4561,7 @@ class PagedForwardKernel:
         payload_u8 = cute.make_tensor(
             payload_ptr, cute.make_layout((self.shared_storage_bytes,), stride=(1,))
         )
-        q_payload_ptr = (
-            payload_u8.iterator
-            + math_head_lane * Int32(q_head_bytes)
-        )
+        q_payload_ptr = payload_u8.iterator + math_head_lane * Int32(q_head_bytes)
         sQ = cute.make_tensor(
             cute.recast_ptr(q_payload_ptr.align(16), dtype=self.dtype_q),
             cute.make_layout(
@@ -4668,9 +4571,7 @@ class PagedForwardKernel:
         )
         sQTile = sQ
         k_payload_ptr = (
-            payload_u8.iterator
-            + Int32(q_bytes)
-            + math_head_lane * Int32(k_head_bytes)
+            payload_u8.iterator + Int32(q_bytes) + math_head_lane * Int32(k_head_bytes)
         )
         sK = cute.make_tensor(
             cute.recast_ptr(k_payload_ptr.align(16), dtype=self.dtype_kv_storage),
@@ -4721,11 +4622,7 @@ class PagedForwardKernel:
                 self.num_stages
                 * stage_tile_rows
                 * self.kv_tma_plane_head_dim
-                * (
-                    2
-                    if const_expr(self.laguna_fp8_head_pair_wide_tma)
-                    else 1
-                ),
+                * (2 if const_expr(self.laguna_fp8_head_pair_wide_tma) else 1),
             ),
             (
                 self._get_paged_kv_tma_head_pair_stage_layout()
@@ -4782,11 +4679,7 @@ class PagedForwardKernel:
                 self.num_stages
                 * stage_tile_rows
                 * self.kv_tma_plane_head_dim
-                * (
-                    2
-                    if const_expr(self.laguna_fp8_head_pair_wide_tma)
-                    else 1
-                ),
+                * (2 if const_expr(self.laguna_fp8_head_pair_wide_tma) else 1),
             ),
             (
                 self._get_paged_kv_tma_head_pair_stage_layout()
@@ -5151,13 +5044,10 @@ class PagedForwardKernel:
             )
             if const_expr(decode_qwen_single_row_fastpath):
                 spill_warps = self.traits.num_warps_kv - 1
-                sync_o_elems = (
-                    spill_warps * self.gqa_group_size * sync_o_row_stride
-                )
+                sync_o_elems = spill_warps * self.gqa_group_size * sync_o_row_stride
                 sync_md_elems = spill_warps * self.gqa_group_size * 2
-                sync_head_ptr = (
-                    sync_payload.iterator
-                    + math_head_lane * Int32(sync_o_elems + sync_md_elems)
+                sync_head_ptr = sync_payload.iterator + math_head_lane * Int32(
+                    sync_o_elems + sync_md_elems
                 )
                 sSyncO = cute.make_tensor(
                     sync_head_ptr,
@@ -5205,12 +5095,9 @@ class PagedForwardKernel:
                     * self.traits.cta_tile_q
                     * sync_o_row_stride
                 )
-                sync_md_elems = (
-                    self.traits.num_warps_kv * self.traits.cta_tile_q * 2
-                )
-                sync_head_ptr = (
-                    sync_payload.iterator
-                    + math_head_lane * Int32(sync_o_elems + sync_md_elems)
+                sync_md_elems = self.traits.num_warps_kv * self.traits.cta_tile_q * 2
+                sync_head_ptr = sync_payload.iterator + math_head_lane * Int32(
+                    sync_o_elems + sync_md_elems
                 )
                 sSyncO = cute.make_tensor(
                     sync_head_ptr,
@@ -5381,8 +5268,7 @@ class PagedForwardKernel:
                             role_sub_tile,
                         )
                     elif const_expr(
-                        self.laguna_fp8_head_pair_decode
-                        or self.k_tma_plane_count > 1
+                        self.laguna_fp8_head_pair_decode or self.k_tma_plane_count > 1
                     ):
                         self._issue_paged_kv_tma_copy_2planes(
                             load_K_tma0,
@@ -5416,8 +5302,7 @@ class PagedForwardKernel:
                             role_sub_tile,
                         )
                     elif const_expr(
-                        self.laguna_fp8_head_pair_decode
-                        or self.v_tma_plane_count > 1
+                        self.laguna_fp8_head_pair_decode or self.v_tma_plane_count > 1
                     ):
                         self._issue_paged_kv_tma_copy_2planes(
                             load_V_tma0,
@@ -5475,9 +5360,7 @@ class PagedForwardKernel:
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
             if const_expr(self.role_specialized_decode):
-                cute.arch.barrier(
-                    barrier_id=1, number_of_threads=self.math_num_threads
-                )
+                cute.arch.barrier(barrier_id=1, number_of_threads=self.math_num_threads)
             else:
                 cute.arch.sync_threads()
         else:
@@ -5603,10 +5486,9 @@ class PagedForwardKernel:
             frag_p_layout,
             Uint32,
         )
-        q_smem_base_addr = (
-            shared_ptr_to_u32(payload_u8.iterator)
-            + math_head_lane * Int32(q_head_bytes)
-        )
+        q_smem_base_addr = shared_ptr_to_u32(
+            payload_u8.iterator
+        ) + math_head_lane * Int32(q_head_bytes)
         decode_q_head_base = (
             Int32(kv_head_idx * group_size + packed_tile_start)
             if const_expr(decode_row_metadata_fastpath)
@@ -5758,8 +5640,7 @@ class PagedForwardKernel:
                             prefetch_sub_tile,
                         )
                     elif const_expr(
-                        self.laguna_fp8_head_pair_decode
-                        or self.k_tma_plane_count > 1
+                        self.laguna_fp8_head_pair_decode or self.k_tma_plane_count > 1
                     ):
                         self._issue_paged_kv_tma_copy_2planes(
                             load_K_tma0,
@@ -5817,8 +5698,7 @@ class PagedForwardKernel:
                             prefetch_sub_tile,
                         )
                     elif const_expr(
-                        self.laguna_fp8_head_pair_decode
-                        or self.v_tma_plane_count > 1
+                        self.laguna_fp8_head_pair_decode or self.v_tma_plane_count > 1
                     ):
                         self._issue_paged_kv_tma_copy_2planes(
                             load_V_tma0,
@@ -5872,9 +5752,7 @@ class PagedForwardKernel:
                 pipeline_k.consumer_try_wait(k_consumer_state),
             )
             if const_expr(self.role_specialized_decode):
-                cute.arch.barrier(
-                    barrier_id=1, number_of_threads=self.math_num_threads
-                )
+                cute.arch.barrier(barrier_id=1, number_of_threads=self.math_num_threads)
             else:
                 cute.arch.sync_threads()
 
@@ -5933,18 +5811,10 @@ class PagedForwardKernel:
                     k_stage_plane_offset = (
                         math_head_lane * Int32(kv_plane_total_bytes)
                         + Int32(consume_stage_idx * kv_plane_stage_bytes)
-                        if const_expr(
-                            self.laguna_fp8_head_pair_wide_headlocal
-                        )
-                        else
-                        Int32(
-                            consume_stage_idx
-                            * 2
-                            * kv_plane_stage_bytes
-                        )
+                        if const_expr(self.laguna_fp8_head_pair_wide_headlocal)
+                        else Int32(consume_stage_idx * 2 * kv_plane_stage_bytes)
                         if const_expr(self.laguna_fp8_head_pair_wide_tma)
-                        else
-                        math_head_lane * Int32(kv_plane_total_bytes)
+                        else math_head_lane * Int32(kv_plane_total_bytes)
                         + Int32(consume_stage_idx * kv_plane_stage_bytes)
                         if const_expr(self.laguna_fp8_head_pair_decode)
                         else Int32(consume_stage_idx * kv_plane_stage_bytes)
@@ -6274,9 +6144,10 @@ class PagedForwardKernel:
                         Float32,
                     )
                     frag_S.fill(0.0)
-                    k_stage_plane_offset = Int32(
-                        consume_stage_idx * kv_plane_stage_bytes
-                    ) + k_head_plane_offset
+                    k_stage_plane_offset = (
+                        Int32(consume_stage_idx * kv_plane_stage_bytes)
+                        + k_head_plane_offset
+                    )
                     if const_expr(decode_bf16_row0_qk_fastpath):
                         _literal_qk_mma_into_sfrag_plane_bf16_row0_1x1(
                             frag_S,
@@ -6711,9 +6582,10 @@ class PagedForwardKernel:
                             else subtile_base
                         )
                         if const_expr(self.kv_is_fp8):
-                            v_stage_plane_offset = Int32(
-                                consume_stage_idx * kv_plane_stage_bytes
-                            ) + v_head_plane_offset
+                            v_stage_plane_offset = (
+                                Int32(consume_stage_idx * kv_plane_stage_bytes)
+                                + v_head_plane_offset
+                            )
                             v_plane1_total_offset = Int32(
                                 kv_plane_total_bytes
                                 if const_expr(self.v_tma_plane_count > 1)
@@ -6743,9 +6615,10 @@ class PagedForwardKernel:
                                 mDebugU32,
                             )
                         else:
-                            v_stage_plane_offset = Int32(
-                                consume_stage_idx * kv_plane_stage_bytes
-                            ) + v_head_plane_offset
+                            v_stage_plane_offset = (
+                                Int32(consume_stage_idx * kv_plane_stage_bytes)
+                                + v_head_plane_offset
+                            )
                             v_plane1_total_offset = Int32(
                                 kv_plane_total_bytes
                                 if const_expr(self.v_tma_plane_count > 1)
@@ -6825,18 +6698,10 @@ class PagedForwardKernel:
                     v_stage_plane_offset = (
                         math_head_lane * Int32(kv_plane_total_bytes)
                         + Int32(consume_stage_idx * kv_plane_stage_bytes)
-                        if const_expr(
-                            self.laguna_fp8_head_pair_wide_headlocal
-                        )
-                        else
-                        Int32(
-                            consume_stage_idx
-                            * 2
-                            * kv_plane_stage_bytes
-                        )
+                        if const_expr(self.laguna_fp8_head_pair_wide_headlocal)
+                        else Int32(consume_stage_idx * 2 * kv_plane_stage_bytes)
                         if const_expr(self.laguna_fp8_head_pair_wide_tma)
-                        else
-                        math_head_lane * Int32(kv_plane_total_bytes)
+                        else math_head_lane * Int32(kv_plane_total_bytes)
                         + Int32(consume_stage_idx * kv_plane_stage_bytes)
                         if const_expr(self.laguna_fp8_head_pair_decode)
                         else Int32(consume_stage_idx * kv_plane_stage_bytes)
@@ -6980,9 +6845,10 @@ class PagedForwardKernel:
                             v_scale,
                         )
                 else:
-                    v_stage_plane_offset = Int32(
-                        consume_stage_idx * kv_plane_stage_bytes
-                    ) + v_head_plane_offset
+                    v_stage_plane_offset = (
+                        Int32(consume_stage_idx * kv_plane_stage_bytes)
+                        + v_head_plane_offset
+                    )
                     v_plane1_total_offset = Int32(
                         kv_plane_total_bytes
                         if const_expr(self.v_tma_plane_count > 1)
@@ -7120,9 +6986,7 @@ class PagedForwardKernel:
                         prefetch_base += stage_tile_rows
 
             if const_expr(self.role_specialized_decode):
-                cute.arch.barrier(
-                    barrier_id=1, number_of_threads=self.math_num_threads
-                )
+                cute.arch.barrier(barrier_id=1, number_of_threads=self.math_num_threads)
             else:
                 cute.arch.sync_threads()
             if const_expr(self.num_stages == 2):
@@ -7244,12 +7108,12 @@ class PagedForwardKernel:
                         sSyncO[qwen_spill_warp, packed_row_local, dim_low + 1] = o_frag[
                             0, mma_d, 1
                         ]
-                        sSyncO[qwen_spill_warp, packed_row_local, dim_high + 0] = o_frag[
-                            0, mma_d, 4
-                        ]
-                        sSyncO[qwen_spill_warp, packed_row_local, dim_high + 1] = o_frag[
-                            0, mma_d, 5
-                        ]
+                        sSyncO[qwen_spill_warp, packed_row_local, dim_high + 0] = (
+                            o_frag[0, mma_d, 4]
+                        )
+                        sSyncO[qwen_spill_warp, packed_row_local, dim_high + 1] = (
+                            o_frag[0, mma_d, 5]
+                        )
             elif const_expr(
                 (self.single_request_decode_graph or self.single_qtile_decode_graph)
                 and self.gqa_group_size <= 8
@@ -7326,9 +7190,7 @@ class PagedForwardKernel:
                                     o_frag[mma_q, mma_d, reg_base + 5]
                                 )
             if const_expr(self.role_specialized_decode):
-                cute.arch.barrier(
-                    barrier_id=1, number_of_threads=self.math_num_threads
-                )
+                cute.arch.barrier(barrier_id=1, number_of_threads=self.math_num_threads)
             else:
                 cute.arch.sync_threads()
 
@@ -8107,9 +7969,7 @@ class PagedForwardKernel:
 
         if const_expr(decode_store_v128):
             if const_expr(self.role_specialized_decode):
-                cute.arch.barrier(
-                    barrier_id=1, number_of_threads=self.math_num_threads
-                )
+                cute.arch.barrier(barrier_id=1, number_of_threads=self.math_num_threads)
             else:
                 cute.arch.sync_threads()
             decode_chunks_per_row = self.traits.head_dim_vo // 8
@@ -8732,10 +8592,7 @@ class PagedFp8DecodeRawForwardKernel:
                 1,
                 self.num_mma_d_vo,
             )
-            if const_expr(
-                paged_control("B12X_PAGED_KV_DEBUG_DUMP", "")
-                == "SREGS"
-            ):
+            if const_expr(paged_control("B12X_PAGED_KV_DEBUG_DUMP", "") == "SREGS"):
                 if (
                     kv_head_idx == Int32(0)
                     and warp_q_idx == Int32(0)
@@ -8748,10 +8605,7 @@ class PagedFp8DecodeRawForwardKernel:
                         lane,
                     )
                 _exit_thread()
-            if const_expr(
-                paged_control("B12X_PAGED_KV_DEBUG_DUMP", "")
-                == "PREGS"
-            ):
+            if const_expr(paged_control("B12X_PAGED_KV_DEBUG_DUMP", "") == "PREGS"):
                 if (
                     kv_head_idx == Int32(0)
                     and warp_q_idx == Int32(0)
@@ -8774,10 +8628,7 @@ class PagedFp8DecodeRawForwardKernel:
             )
             d_frag[0, 0] = d0
             d_frag[0, 1] = d1
-            if const_expr(
-                paged_control("B12X_PAGED_KV_DEBUG_DUMP", "")
-                == "PVREGS"
-            ):
+            if const_expr(paged_control("B12X_PAGED_KV_DEBUG_DUMP", "") == "PVREGS"):
                 if (
                     kv_head_idx == Int32(0)
                     and warp_q_idx == Int32(0)
@@ -9886,8 +9737,7 @@ class PagedBf16ExtendRawForwardKernel:
         if const_expr(
             not (
                 self.split_kv
-                and paged_control("B12X_DEBUG_BF16_EXTEND_DIRECT_STORE", "")
-                == "1"
+                and paged_control("B12X_DEBUG_BF16_EXTEND_DIRECT_STORE", "") == "1"
             )
         ):
             cute.arch.sync_threads()
@@ -9998,9 +9848,7 @@ class PagedFp8ExtendRawForwardKernel:
         self.use_q64_laguna_verifier = cta_tile_q == 64 and head_dim == 128
         self.analytic_verify_batch = int(analytic_verify_batch)
         self.analytic_verify_max_chunks = int(analytic_verify_max_chunks)
-        self.analytic_verify_two_wave_b1 = bool(
-            analytic_verify_two_wave_b1
-        )
+        self.analytic_verify_two_wave_b1 = bool(analytic_verify_two_wave_b1)
         if self.use_q64_laguna_verifier and (
             not 1 <= self.analytic_verify_batch <= 8
             or self.analytic_verify_max_chunks <= 0
@@ -10010,11 +9858,11 @@ class PagedFp8ExtendRawForwardKernel:
                 "fixed split capacity"
             )
         self.use_cooperative_bf16_stage = self.use_q64_laguna_verifier
-        self.use_cooperative_kv_load = (
-            self.use_cooperative_bf16_stage and not bool(use_tma_kv_load)
+        self.use_cooperative_kv_load = self.use_cooperative_bf16_stage and not bool(
+            use_tma_kv_load
         )
-        self.use_overlapped_tma_kv_load = (
-            self.use_q64_laguna_verifier and bool(use_tma_kv_load)
+        self.use_overlapped_tma_kv_load = self.use_q64_laguna_verifier and bool(
+            use_tma_kv_load
         )
         self.use_vectorized_store = cta_tile_q in (48, 64)
         if cta_tile_q not in (32, 48, 64):
@@ -10030,13 +9878,9 @@ class PagedFp8ExtendRawForwardKernel:
             raise ValueError("the raw verifier entries require head_dim=128")
         self.stage_tile_rows = 32 if self.use_q48_long_form else 64
         self.num_stages = 2 if self.use_q48_long_form else 1
-        self.compute_tile_rows = (
-            16 if self.use_q48_long_form else 32
-        )
+        self.compute_tile_rows = 16 if self.use_q48_long_form else 32
         self.num_mma_q = 1
-        self.num_mma_kv = (
-            1 if self.use_q48_long_form else 2
-        )
+        self.num_mma_kv = 1 if self.use_q48_long_form else 2
         self.num_mma_d_qk = head_dim // 16
         self.num_mma_d_vo = head_dim // 16
         self.num_warps_q = cta_tile_q // 16
@@ -10071,29 +9915,15 @@ class PagedFp8ExtendRawForwardKernel:
         self.kv_storage_dtype = cutlass.Uint8
         self.use_paged_kv_tma = True
         self.kv_tma_plane_head_dim = 128
-        self.kv_tma_plane_count = (
-            self.head_dim_qk // self.kv_tma_plane_head_dim
-        )
+        self.kv_tma_plane_count = self.head_dim_qk // self.kv_tma_plane_head_dim
         self.q_bytes = self.cta_tile_q * self.head_dim_qk * 2
-        self.k_bytes = (
-            self.num_stages
-            * self.stage_tile_rows
-            * self.head_dim_qk
-        )
-        self.v_bytes = (
-            self.num_stages
-            * self.stage_tile_rows
-            * self.head_dim_vo
-        )
+        self.k_bytes = self.num_stages * self.stage_tile_rows * self.head_dim_qk
+        self.v_bytes = self.num_stages * self.stage_tile_rows * self.head_dim_vo
         # The verifier consumes one 64-row BF16 tile at a time. Q is loaded
         # into registers before the mainloop, so that dead 16-KiB shared region
         # can hold the expanded K/V tile without increasing the CTA footprint.
         self.expanded_kv_bytes = (
-            64
-            * self.head_dim_qk
-            * 2
-            if self.use_cooperative_bf16_stage
-            else 0
+            64 * self.head_dim_qk * 2 if self.use_cooperative_bf16_stage else 0
         )
         self.shared_storage_bytes = self.q_bytes + self.k_bytes + self.v_bytes
         self.kv_plane_stage_bytes = self.stage_tile_rows * self.kv_tma_plane_head_dim
@@ -10114,12 +9944,8 @@ class PagedFp8ExtendRawForwardKernel:
         annotations = {}
         if not self.use_cooperative_kv_load:
             annotations = {
-                "mbar_ptr_K": cute.struct.MemRange[
-                    cutlass.Int64, 2 * self.num_stages
-                ],
-                "mbar_ptr_V": cute.struct.MemRange[
-                    cutlass.Int64, 2 * self.num_stages
-                ],
+                "mbar_ptr_K": cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages],
+                "mbar_ptr_V": cute.struct.MemRange[cutlass.Int64, 2 * self.num_stages],
             }
         annotations = {
             **annotations,
@@ -10265,13 +10091,9 @@ class PagedFp8ExtendRawForwardKernel:
             kv_head_idx = Int32(block_x)
             work_idx = Int32(block_y)
         tidx = lane + warp_q_idx * Int32(32)
-        tma_producer_warp_idx = Int32(
-            3 if self.use_q64_laguna_verifier else 0
-        )
+        tma_producer_warp_idx = Int32(3 if self.use_q64_laguna_verifier else 0)
         math_warp_active = (
-            warp_q_idx < Int32(3)
-            if const_expr(self.use_q64_laguna_verifier)
-            else True
+            warp_q_idx < Int32(3) if const_expr(self.use_q64_laguna_verifier) else True
         )
         if const_expr(self.use_q64_laguna_verifier):
             # Each verifier request owns a fixed split grid.  Derive the
@@ -10283,12 +10105,12 @@ class PagedFp8ExtendRawForwardKernel:
             kv_tile_idx = Int32(work_idx)
             cache_len = mCacheSeqlens[request_idx]
             max_chunks_kv = Int32(self.analytic_verify_max_chunks)
-            request_partial_start = (
-                request_idx * Int32(8 * self.analytic_verify_max_chunks)
+            request_partial_start = request_idx * Int32(
+                8 * self.analytic_verify_max_chunks
             )
-            live_stage_tiles = (
-                cache_len + Int32(self.stage_tile_rows - 1)
-            ) // Int32(self.stage_tile_rows)
+            live_stage_tiles = (cache_len + Int32(self.stage_tile_rows - 1)) // Int32(
+                self.stage_tile_rows
+            )
             live_chunk_cap = max_chunks_kv
             if const_expr(self.analytic_verify_two_wave_b1):
                 # A 262K-capacity B1 graph reserves two resident SM waves, but
@@ -10311,17 +10133,13 @@ class PagedFp8ExtendRawForwardKernel:
                 # validation deterministic.
                 if tidx < Int32(48):
                     neutral_token = tidx // Int32(6)
-                    neutral_group_lane = (
-                        tidx - neutral_token * Int32(6)
-                    )
+                    neutral_group_lane = tidx - neutral_token * Int32(6)
                     neutral_partial_row = (
                         request_partial_start
                         + neutral_token * max_chunks_kv
                         + kv_tile_idx
                     )
-                    neutral_q_head = (
-                        kv_head_idx * Int32(6) + neutral_group_lane
-                    )
+                    neutral_q_head = kv_head_idx * Int32(6) + neutral_group_lane
                     mLSE[neutral_partial_row, neutral_q_head] = -Float32.inf
                 cute.arch.sync_threads()
                 cute.arch.griddepcontrol_launch_dependents()
@@ -10338,16 +10156,13 @@ class PagedFp8ExtendRawForwardKernel:
                 kv_tile_idx,
                 extra_tile_chunks,
             )
-            chunk_start_tile = (
-                kv_tile_idx * base_tiles_per_chunk + leading_extra_tiles
-            )
+            chunk_start_tile = kv_tile_idx * base_tiles_per_chunk + leading_extra_tiles
             chunk_tile_count = base_tiles_per_chunk + cutlass.select_(
                 kv_tile_idx < extra_tile_chunks, Int32(1), Int32(0)
             )
             chunk_start = chunk_start_tile * Int32(self.stage_tile_rows)
-            chunk_end_unclamped = (
-                chunk_start
-                + chunk_tile_count * Int32(self.stage_tile_rows)
+            chunk_end_unclamped = chunk_start + chunk_tile_count * Int32(
+                self.stage_tile_rows
             )
             chunk_end = cutlass.select_(
                 chunk_end_unclamped < cache_len,
@@ -10478,9 +10293,7 @@ class PagedFp8ExtendRawForwardKernel:
                 _make_payload_memrange(
                     payload_u8,
                     cutlass.Uint8,
-                    self.q_bytes
-                    + self.k_bytes
-                    + 0 * self.kv_plane_total_bytes,
+                    self.q_bytes + self.k_bytes + 0 * self.kv_plane_total_bytes,
                     plane_num_elems,
                 ),
                 plane_stage_layout,
@@ -10490,9 +10303,7 @@ class PagedFp8ExtendRawForwardKernel:
                     _make_payload_memrange(
                         payload_u8,
                         cutlass.Uint8,
-                        self.q_bytes
-                        + self.k_bytes
-                        + 1 * self.kv_plane_total_bytes,
+                        self.q_bytes + self.k_bytes + 1 * self.kv_plane_total_bytes,
                         plane_num_elems,
                     ),
                     plane_stage_layout,
@@ -10593,19 +10404,11 @@ class PagedFp8ExtendRawForwardKernel:
             )
             for mma_d in cutlass.range_constexpr(self.num_mma_d_qk):
                 for mma_q in cutlass.range_constexpr(self.num_mma_q):
-                    q_row = (
-                        warp_q_idx * self.num_mma_q * 16
-                        + mma_q * 16
-                        + lane % 16
-                    )
+                    q_row = warp_q_idx * self.num_mma_q * 16 + mma_q * 16 + lane % 16
                     q_col = mma_d * 2 + lane // 16
-                    q_offset = _permuted_offset_128b(
-                        q_row, q_col, tc_upcast_stride_q
-                    )
+                    q_offset = _permuted_offset_128b(q_row, q_col, tc_upcast_stride_q)
                     q0, q1, q2, q3 = ldmatrix_m8n8x4_b16(
-                        _smem_addr_from_b128_offset(
-                            q_smem_base_addr, q_offset
-                        )
+                        _smem_addr_from_b128_offset(q_smem_base_addr, q_offset)
                     )
                     q_bf16_regs[mma_d, mma_q, 0] = q0
                     q_bf16_regs[mma_d, mma_q, 1] = q1
@@ -10764,15 +10567,11 @@ class PagedFp8ExtendRawForwardKernel:
             # conversion; a CTA rendezvous here would only serialize warps
             # that have already satisfied the same dependency.
             if const_expr(
-                self.use_cooperative_kv_load
-                or not self.use_overlapped_tma_kv_load
+                self.use_cooperative_kv_load or not self.use_overlapped_tma_kv_load
             ):
                 cute.arch.sync_threads()
             if const_expr(self.num_stages > 1):
-                if (
-                    prefetch_base < chunk_end
-                    and warp_q_idx == tma_producer_warp_idx
-                ):
+                if prefetch_base < chunk_end and warp_q_idx == tma_producer_warp_idx:
                     self._issue_tma_copy(
                         load_K_tma0,
                         load_K_tma1,
@@ -10795,18 +10594,13 @@ class PagedFp8ExtendRawForwardKernel:
                     )
                     producer_state.advance()
             consume_stage_idx = consumer_state.index
-            stage_plane_offset = consume_stage_idx * Int32(
-                self.kv_plane_stage_bytes
-            )
+            stage_plane_offset = consume_stage_idx * Int32(self.kv_plane_stage_bytes)
 
             if const_expr(self.use_cooperative_bf16_stage):
-                expanded_storage_base_addr = shared_ptr_to_u32(
-                    payload_u8.iterator
-                )
+                expanded_storage_base_addr = shared_ptr_to_u32(payload_u8.iterator)
                 expanded_plane0_base_addr = expanded_storage_base_addr
-                expanded_plane1_base_addr = (
-                    expanded_storage_base_addr
-                    + Int32(self.expanded_kv_bytes // 2)
+                expanded_plane1_base_addr = expanded_storage_base_addr + Int32(
+                    self.expanded_kv_bytes // 2
                 )
                 raw_k_base_addr = shared_ptr_to_u32(
                     sKStageBytes.iterator + stage_plane_offset
@@ -10823,10 +10617,7 @@ class PagedFp8ExtendRawForwardKernel:
                     warp_q_idx,
                 )
                 cute.arch.sync_threads()
-                if const_expr(
-                    self.use_overlapped_tma_kv_load
-                    and self.num_stages == 1
-                ):
+                if const_expr(self.use_overlapped_tma_kv_load and self.num_stages == 1):
                     if (
                         prefetch_base < chunk_end
                         and warp_q_idx == tma_producer_warp_idx
@@ -10894,8 +10685,7 @@ class PagedFp8ExtendRawForwardKernel:
                 mask_iteration_start = cache_len - qo_len
                 needs_logits_mask = (
                     tile_tokens < Int32(self.stage_tile_rows)
-                    or tile_base + Int32(self.stage_tile_rows)
-                    > mask_iteration_start
+                    or tile_base + Int32(self.stage_tile_rows) > mask_iteration_start
                 )
                 if needs_logits_mask:
                     for mma_q in cutlass.range_constexpr(self.num_mma_q):
@@ -10990,10 +10780,7 @@ class PagedFp8ExtendRawForwardKernel:
                     warp_q_idx,
                 )
                 cute.arch.sync_threads()
-                if const_expr(
-                    self.use_overlapped_tma_kv_load
-                    and self.num_stages == 1
-                ):
+                if const_expr(self.use_overlapped_tma_kv_load and self.num_stages == 1):
                     if (
                         prefetch_base < chunk_end
                         and warp_q_idx == tma_producer_warp_idx

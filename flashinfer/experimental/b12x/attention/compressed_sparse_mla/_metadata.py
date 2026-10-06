@@ -59,11 +59,20 @@ def _map_indexed_pages_launch(
     stream: cuda.CUstream,
 ):
     _map_indexed_pages_kernel(
-        indices, lengths, page_table, output, rows, width, table_width,
-        table_stride, page_size, num_pages,
+        indices,
+        lengths,
+        page_table,
+        output,
+        rows,
+        width,
+        table_width,
+        table_stride,
+        page_size,
+        num_pages,
     ).launch(
         grid=((Int64(rows) * Int64(width) + Int64(255)) // Int64(256), 1, 1),
-        block=(256, 1, 1), stream=stream,
+        block=(256, 1, 1),
+        stream=stream,
     )
 
 
@@ -82,8 +91,10 @@ def _map_indexed_pages_args(
     output = storage.as_strided((rows, width), (width, 1))
     table_flat = (
         page_table.as_strided((page_table.shape[1],), (1,))
-        if page_table.stride(0) == 0 else page_table.view(-1)
+        if page_table.stride(0) == 0
+        else page_table.view(-1)
     )
+
     def tensor_arg(tensor: torch.Tensor):
         if hasattr(tensor, "fake_mode"):
             from cutlass.cute.runtime import make_fake_tensor
@@ -94,9 +105,7 @@ def _map_indexed_pages_args(
                 (1,),
                 assumed_align=4,
             )
-        return from_dlpack(tensor, assumed_align=4).mark_layout_dynamic(
-            leading_dim=0
-        )
+        return from_dlpack(tensor, assumed_align=4).mark_layout_dynamic(leading_dim=0)
 
     tensors = (indices.view(-1), lengths, table_flat, output.view(-1))
     args = tuple(tensor_arg(tensor) for tensor in tensors) + (
@@ -123,8 +132,12 @@ def map_indexed_pages(
 ) -> torch.Tensor:
     """Map logical indexed slots into prepared storage; invalid entries are -1."""
     output, args = _map_indexed_pages_args(
-        indices, lengths, page_table, storage,
-        page_size=page_size, num_pages=num_pages,
+        indices,
+        lengths,
+        page_table,
+        storage,
+        page_size=page_size,
+        num_pages=num_pages,
     )
     if output.numel() == 0:
         return output

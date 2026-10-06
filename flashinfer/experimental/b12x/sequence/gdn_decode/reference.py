@@ -251,9 +251,7 @@ def decode_kda(
     )
     q_width = heads * key_head_dim
     q = mixed_qkv[:, :q_width].view(-1, heads, key_head_dim).float()
-    k = mixed_qkv[:, q_width : 2 * q_width].view(
-        -1, heads, key_head_dim
-    ).float()
+    k = mixed_qkv[:, q_width : 2 * q_width].view(-1, heads, key_head_dim).float()
     v = mixed_qkv[:, 2 * q_width :].view(-1, heads, value_head_dim).float()
     if qk_l2norm:
         q = l2_normalize(q)
@@ -275,9 +273,9 @@ def decode_kda(
                 state = state * torch.exp(log_decay).unsqueeze(0)
                 beta = beta_all[token, head]
                 delta = v[token, head] - state.mv(k[token, head])
-                state = state + (delta * beta).unsqueeze(1) * k[
-                    token, head
-                ].unsqueeze(0)
+                state = state + (delta * beta).unsqueeze(1) * k[token, head].unsqueeze(
+                    0
+                )
                 output[token, head] = state.mv(q[token, head]).to(torch.bfloat16)
                 destination_slot = int(state_indices[request, relative_token])
                 if (

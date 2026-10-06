@@ -21,27 +21,54 @@ from b12x.gemm import bf16_gemv
 
 @pytest.fixture
 def projection_session():
-    with PreparationSession(device="cuda", autotune=False, compile_workers=2) as session:
+    with PreparationSession(
+        device="cuda", autotune=False, compile_workers=2
+    ) as session:
         yield session
 
 
-def _prepare_projection(session, x, weight, *, out=None, bias=None, output_dtype=None, override=None):
-    declaration = bf16_gemv.plan(bf16_gemv.query_from_call(
-        x, weight, out=out, bias=bias, output_dtype=output_dtype,
-    ), override=override)
-    session.prepare((declaration.request(
-        name="projection", prepare_call=lambda state: PreparedCall(
-            run=lambda: state.run(x, weight, out=out, bias=bias),
+def _prepare_projection(
+    session, x, weight, *, out=None, bias=None, output_dtype=None, override=None
+):
+    declaration = bf16_gemv.plan(
+        bf16_gemv.query_from_call(
+            x,
+            weight,
+            out=out,
+            bias=bias,
+            output_dtype=output_dtype,
         ),
-    ),))
+        override=override,
+    )
+    session.prepare(
+        (
+            declaration.request(
+                name="projection",
+                prepare_call=lambda state: PreparedCall(
+                    run=lambda: state.run(x, weight, out=out, bias=bias),
+                ),
+            ),
+        )
+    )
     return declaration
 
 
 def _mm(x, weight, *, out=None, bias=None, output_dtype=None, override=None):
-    with PreparationSession(device=x.device, autotune=False, compile_workers=2) as session:
-        plan = _prepare_projection(session, x, weight, out=out, bias=bias,
-                                   output_dtype=output_dtype, override=override)
-        return bf16_gemv.mm(x, weight, out=out, bias=bias, output_dtype=output_dtype, plan=plan)
+    with PreparationSession(
+        device=x.device, autotune=False, compile_workers=2
+    ) as session:
+        plan = _prepare_projection(
+            session,
+            x,
+            weight,
+            out=out,
+            bias=bias,
+            output_dtype=output_dtype,
+            override=override,
+        )
+        return bf16_gemv.mm(
+            x, weight, out=out, bias=bias, output_dtype=output_dtype, plan=plan
+        )
 
 
 def _op():
@@ -59,9 +86,17 @@ def test_prepared_torch_projection_reuses_dynamic_graphs(with_bias):
     weight = torch.randn(512, 1024, device="cuda", dtype=torch.bfloat16) * 0.125
     bias = torch.randn(512, device="cuda", dtype=torch.bfloat16) if with_bias else None
     output = torch.empty(65, 512, device="cuda", dtype=torch.bfloat16)
-    with PreparationSession(device=source.device, autotune=False, compile_workers=0) as session:
-        plan = _prepare_projection(session, source, weight, out=output, bias=bias,
-                                   override=bf16_gemv.GemvConfig(backend="torch"))
+    with PreparationSession(
+        device=source.device, autotune=False, compile_workers=0
+    ) as session:
+        plan = _prepare_projection(
+            session,
+            source,
+            weight,
+            out=output,
+            bias=bias,
+            override=bf16_gemv.GemvConfig(backend="torch"),
+        )
         session.freeze()
         state = require_prepared(plan, "gemm.bf16_gemv", source.device)
         launcher = state.launcher
@@ -69,7 +104,9 @@ def test_prepared_torch_projection_reuses_dynamic_graphs(with_bias):
             for rows in (1, 3, 8, 17, 65):
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    bf16_gemv.mm(source[:rows], weight, out=output[:rows], bias=bias, plan=plan)
+                    bf16_gemv.mm(
+                        source[:rows], weight, out=output[:rows], bias=bias, plan=plan
+                    )
                 source.neg_()
                 output.fill_(float("nan"))
                 allocated = torch.cuda.memory_allocated()
@@ -79,7 +116,9 @@ def test_prepared_torch_projection_reuses_dynamic_graphs(with_bias):
                 expected = source[:rows].float() @ weight.float().T
                 if bias is not None:
                     expected += bias.float()
-                torch.testing.assert_close(output[:rows].float(), expected, rtol=0.01, atol=0.01)
+                torch.testing.assert_close(
+                    output[:rows].float(), expected, rtol=0.01, atol=0.01
+                )
                 assert torch.isfinite(output[:rows]).all()
                 assert torch.count_nonzero(output[:rows])
                 assert torch.isnan(output[rows:]).all()
@@ -128,7 +167,9 @@ def test_last_element_contributes():
 
 @cuda_required
 @pytest.mark.parametrize("n", [32, 384, 512])
-def test_long_k_row_tiles_reuse_graph_and_preserve_fp32_projection(n, projection_session):
+def test_long_k_row_tiles_reuse_graph_and_preserve_fp32_projection(
+    n, projection_session
+):
     """Prepared long-K projections retain FP32 output with runtime row counts."""
     from b12x.gemm import bf16_gemv
 
@@ -138,7 +179,9 @@ def test_long_k_row_tiles_reuse_graph_and_preserve_fp32_projection(n, projection
     bias = torch.linspace(-0.25, 0.25, n, device="cuda")
     storage = torch.full((18, n + 8), 123.0, device="cuda")
     output = storage[:17, :n]
-    plan = _prepare_projection(projection_session, source, weight, out=output, bias=bias)
+    plan = _prepare_projection(
+        projection_session, source, weight, out=output, bias=bias
+    )
     projection_session.freeze()
     try:
         for rows in (1, 3, 7, 8, 9, 17):
@@ -204,10 +247,14 @@ def test_unquantized_bias_and_live_rows_reuse_native_graph(
     bias = torch.linspace(-0.03, 0.04, n, device=device, dtype=torch.float32)
     output = torch.empty(capacity, n + 3, device=device, dtype=output_dtype)
 
-    plan = _prepare_projection(projection_session, source, weight, bias=bias, out=output[:, :n])
+    plan = _prepare_projection(
+        projection_session, source, weight, bias=bias, out=output[:, :n]
+    )
 
     def launch(rows):
-        return bf16_gemv.mm(source[:rows], weight, bias=bias, out=output[:rows, :n], plan=plan)
+        return bf16_gemv.mm(
+            source[:rows], weight, bias=bias, out=output[:rows, :n], plan=plan
+        )
 
     launch(1)
     torch.cuda.synchronize()
@@ -366,7 +413,9 @@ def test_fp32_operand_is_not_rounded_for_tensor_cores(input_dtype, weight_dtype)
 
 @cuda_required
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
-def test_prepared_layouts_cover_live_rows_under_freeze(output_dtype, projection_session):
+def test_prepared_layouts_cover_live_rows_under_freeze(
+    output_dtype, projection_session
+):
     from b12x.gemm import bf16_gemv
 
     torch.manual_seed(41093)
@@ -384,14 +433,18 @@ def test_prepared_layouts_cover_live_rows_under_freeze(output_dtype, projection_
     bias = torch.linspace(-0.25, 0.25, n, device="cuda", dtype=torch.float32)
     storage = torch.empty(capacity + 1, n + 3, device="cuda", dtype=output_dtype)
     output = storage[:capacity, 1 : n + 1]
-    plans = [_prepare_projection(projection_session, x, weight, out=output, bias=bias)
-             for x, weight in zip(sources, weights, strict=True)]
+    plans = [
+        _prepare_projection(projection_session, x, weight, out=output, bias=bias)
+        for x, weight in zip(sources, weights, strict=True)
+    ]
     projection_session.freeze()
     try:
         for x, weight, plan in zip(sources, weights, plans, strict=True):
             for rows in (0, 1, 8, 9, 127, 128, 129, capacity):
                 storage.fill_(123)
-                actual = bf16_gemv.mm(x[:rows], weight, bias=bias, out=output[:rows], plan=plan)
+                actual = bf16_gemv.mm(
+                    x[:rows], weight, bias=bias, out=output[:rows], plan=plan
+                )
                 expected = (x[:rows].double() @ weight.double().T + bias.double()).to(
                     output_dtype
                 )
@@ -412,7 +465,9 @@ def test_prepared_layouts_cover_live_rows_under_freeze(output_dtype, projection_
                 )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            actual = bf16_gemv.mm(sources[1], weights[1], bias=bias, out=output, plan=plans[1])
+            actual = bf16_gemv.mm(
+                sources[1], weights[1], bias=bias, out=output, plan=plans[1]
+            )
         sources[1].mul_(0.5)
         bias.add_(0.03125)
         graph.replay()

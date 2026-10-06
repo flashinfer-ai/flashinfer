@@ -40,8 +40,8 @@ def detect_device(device: object | None = None) -> DetectedDevice:
     identity = _DEVICE_CACHE.get(ordinal)
     uuid = _DEVICE_UUID_CACHE.get(ordinal)
     max_shared_memory = _DEVICE_SHARED_MEMORY_CACHE.get(ordinal)
-    max_multiprocessor_shared_memory = (
-        _DEVICE_MULTIPROCESSOR_SHARED_MEMORY_CACHE.get(ordinal)
+    max_multiprocessor_shared_memory = _DEVICE_MULTIPROCESSOR_SHARED_MEMORY_CACHE.get(
+        ordinal
     )
     if (
         identity is None

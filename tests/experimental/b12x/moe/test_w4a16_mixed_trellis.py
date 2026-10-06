@@ -102,9 +102,7 @@ def test_three_tier_kernel_uses_projection_specific_k3_k4_k5_bounds() -> None:
     emit_source = textwrap.dedent(
         inspect.getsource(W4A16MixedTrellis3Kernel._emit_tier_tile3)
     )
-    call_parameters = inspect.signature(
-        W4A16MixedTrellis3Kernel.__call__
-    ).parameters
+    call_parameters = inspect.signature(W4A16MixedTrellis3Kernel.__call__).parameters
 
     for tier in range(3):
         assert f"tier{tier}_num_experts" in call_parameters
@@ -271,9 +269,7 @@ def test_mixed_runtime_tracks_topk_sum_contract() -> None:
     ]
 
 
-@pytest.mark.parametrize(
-    "runner", [run_bound_mixed_trellis, run_bound_mixed_trellis3]
-)
+@pytest.mark.parametrize("runner", [run_bound_mixed_trellis, run_bound_mixed_trellis3])
 def test_bound_mixed_runtime_does_not_revalidate_fixed_artifacts(runner) -> None:
     """Serving validates only request tensors and preallocated capacity."""
 
@@ -644,9 +640,7 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(
                     dtype=torch.int32,
                     device=device,
                 ),
-                torch.arange(
-                    experts_per_tier, dtype=torch.int32, device=device
-                ),
+                torch.arange(experts_per_tier, dtype=torch.int32, device=device),
                 torch.full(
                     ((2 - tier) * experts_per_tier,),
                     -1,
@@ -681,9 +675,7 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(
         force_tile_config=(128, 128, 128, 128),
         trellis_codebook="mcg",
     )
-    projection_tiers = tuple(
-        tier for tier in range(3) for _ in range(experts_per_tier)
-    )
+    projection_tiers = tuple(tier for tier in range(3) for _ in range(experts_per_tier))
     global_to_combined, descriptor = build_projection_tiered_maps(
         projection_tiers,
         projection_tiers,
@@ -875,9 +867,7 @@ def test_projection_padded_launch_uses_exact_route_namespace() -> None:
 
     assert launch.topk_sum.num_experts == 7
     assert launch.topk_sum.route_num_experts == 6
-    assert warmup_mixed_trellis_route_pack(
-        launch, buffers, expert_map=route_map
-    ) > 0
+    assert warmup_mixed_trellis_route_pack(launch, buffers, expert_map=route_map) > 0
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
@@ -901,9 +891,7 @@ def test_projection_padded_k345_runner_matches_serial_and_captures() -> None:
         for bits, experts in ((3, 3), (4, 3), (5, 1))
     )
     x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
-    topk_ids = torch.tensor(
-        [[0, 3, 5], [4, 2, 1]], dtype=torch.int32, device=device
-    )
+    topk_ids = torch.tensor([[0, 3, 5], [4, 2, 1]], dtype=torch.int32, device=device)
     topk_weights = torch.tensor(
         [[0.5, 0.3, 0.2], [0.25, 0.25, 0.5]],
         dtype=torch.float32,
@@ -1011,8 +999,7 @@ def test_mixed_k3_k4_shared_h_matches_expanded_and_captures() -> None:
 
     def shared_row() -> torch.Tensor:
         return (
-            0.875
-            + 0.25 * torch.rand((1, hidden), generator=generator, device=device)
+            0.875 + 0.25 * torch.rand((1, hidden), generator=generator, device=device)
         ).to(torch.float16)
 
     shared_h = (shared_row(), shared_row(), shared_row())
@@ -1352,9 +1339,7 @@ def test_build_tiered_maps_rejects_invalid_partitions() -> None:
 
 
 def test_build_tiered_maps_repeats_projection_independent_descriptor_row() -> None:
-    route, descriptor = build_tiered_maps(
-        (2, 0), (3, 1), device=torch.device("cpu")
-    )
+    route, descriptor = build_tiered_maps((2, 0), (3, 1), device=torch.device("cpu"))
     assert route.tolist() == [1, 3, 0, 2]
     rows = descriptor.reshape(3, 4)
     assert rows[0].tolist() == [0, 1, 1 << 8, (1 << 8) | 1]
@@ -1724,66 +1709,137 @@ def test_glm52_large_m_mixed_k3_k4_matches_serial() -> None:
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-@pytest.mark.parametrize("route_ids_dtype,broadcast,intermediate_hadamard", [
-    (torch.int32, False, False),
-    (torch.int64, True, False),
-    (torch.int64, False, True),
-    (torch.int32, True, True),
-])
-def test_full_rotation_prefill_capacity_reuses_native_launchers(tmp_path, route_ids_dtype, broadcast, intermediate_hadamard):
+@pytest.mark.parametrize(
+    "route_ids_dtype,broadcast,intermediate_hadamard",
+    [
+        (torch.int32, False, False),
+        (torch.int64, True, False),
+        (torch.int64, False, True),
+        (torch.int32, True, True),
+    ],
+)
+def test_full_rotation_prefill_capacity_reuses_native_launchers(
+    tmp_path, route_ids_dtype, broadcast, intermediate_hadamard
+):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.moe.fused_moe import _impl as impl
     from b12x.moe._shared.kernels.w4a16.exl3 import read_exl3_layer
-    from b12x.moe._shared.kernels.w4a16.exl3_synth import Exl3SynthConfig, write_exl3_checkpoint
+    from b12x.moe._shared.kernels.w4a16.exl3_synth import (
+        Exl3SynthConfig,
+        write_exl3_checkpoint,
+    )
 
     device = torch.device("cuda", torch.cuda.current_device())
-    hidden, intermediate, experts, capacity, topk = 512 if intermediate_hadamard else 256, 256, 3, 128, 2
+    hidden, intermediate, experts, capacity, topk = (
+        512 if intermediate_hadamard else 256,
+        256,
+        3,
+        128,
+        2,
+    )
     codebook = "lut_e4m3" if intermediate_hadamard else "mcg"
-    manifest = write_exl3_checkpoint(tmp_path, Exl3SynthConfig(
-        codebook=codebook, num_experts=experts, hidden_size=hidden,
-        intermediate_size=intermediate, moe_layer_indices=(0,), bits=3,
-        per_expert_input_rotations=not broadcast, intermediate_hadamard=intermediate_hadamard,
-        pre_block=512 if intermediate_hadamard else None, post_block=128 if intermediate_hadamard else None,
-        extent_alignment_slots=4, seed=5,
-    ))
-    layer = read_exl3_layer(tmp_path, manifest, 0, first_slot=0, slot_count=intermediate // 32)
+    manifest = write_exl3_checkpoint(
+        tmp_path,
+        Exl3SynthConfig(
+            codebook=codebook,
+            num_experts=experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            moe_layer_indices=(0,),
+            bits=3,
+            per_expert_input_rotations=not broadcast,
+            intermediate_hadamard=intermediate_hadamard,
+            pre_block=512 if intermediate_hadamard else None,
+            post_block=128 if intermediate_hadamard else None,
+            extent_alignment_slots=4,
+            seed=5,
+        ),
+    )
+    layer = read_exl3_layer(
+        tmp_path, manifest, 0, first_slot=0, slot_count=intermediate // 32
+    )
     weight_plan = impl.plan_b12x_fp4_moe_weights(
-        quant_modes="w4a16", source_format="exl3", trellis_codebook=codebook,
-        activation="silu", params_dtype=torch.float16, num_experts=experts,
-        hidden_size=hidden, intermediate_size=intermediate, trellis_bits=3,
-        trellis_tile_config=(64, 256, 64, 256), intermediate_hadamard=intermediate_hadamard,
+        quant_modes="w4a16",
+        source_format="exl3",
+        trellis_codebook=codebook,
+        activation="silu",
+        params_dtype=torch.float16,
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        trellis_bits=3,
+        trellis_tile_config=(64, 256, 64, 256),
+        intermediate_hadamard=intermediate_hadamard,
     )
     weights = impl.prepare_b12x_fp4_moe_weights(
-        plan=weight_plan, params_dtype=torch.float16, exl3_layer=layer, exl3_device=device,
+        plan=weight_plan,
+        params_dtype=torch.float16,
+        exl3_layer=layer,
+        exl3_device=device,
     )
-    plan = impl.plan_tp_moe_scratch(impl.TPMoEScratchCaps(
-        max_tokens=capacity, core_token_counts=(capacity,), num_topk=topk,
-        route_num_experts=experts, device=device, weight_plan=weight_plan,
-        quant_mode="w4a16", w4a16_block_size_m=64,
-        decode_config=impl.MoeDecodeConfig(backend="w4a16", route_planner="internal", max_active_clusters=None, w4a16_route_mode="packed"),
-    ))
+    plan = impl.plan_tp_moe_scratch(
+        impl.TPMoEScratchCaps(
+            max_tokens=capacity,
+            core_token_counts=(capacity,),
+            num_topk=topk,
+            route_num_experts=experts,
+            device=device,
+            weight_plan=weight_plan,
+            quant_mode="w4a16",
+            w4a16_block_size_m=64,
+            decode_config=impl.MoeDecodeConfig(
+                backend="w4a16",
+                route_planner="internal",
+                max_active_clusters=None,
+                w4a16_route_mode="packed",
+            ),
+        )
+    )
     assert {rows for rows, _ in plan._prewarmed_fused_launches} == {capacity}
-    scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device) for spec in plan.scratch_specs())
+    scratch = tuple(
+        torch.empty(spec.shape, dtype=spec.dtype, device=device)
+        for spec in plan.scratch_specs()
+    )
     torch.manual_seed(614)
     source = (torch.randn(capacity, hidden, device=device) * 0.125).half()
     route_weights = torch.softmax(torch.randn(capacity, topk, device=device), dim=1)
-    route_ids = torch.randint(experts, (capacity, topk), device=device, dtype=route_ids_dtype)
+    route_ids = torch.randint(
+        experts, (capacity, topk), device=device, dtype=route_ids_dtype
+    )
     expert_map = torch.arange(experts, device=device, dtype=torch.int32)
     output = torch.empty_like(source)
+
     def bind(rows):
         return plan.bind(
-            scratch=scratch, a=source[:rows], experts=weights,
-            topk_weights=route_weights[:rows], topk_ids=route_ids[:rows],
-            output=output[:rows], route_expert_map=expert_map, output_expert_map=expert_map,
+            scratch=scratch,
+            a=source[:rows],
+            experts=weights,
+            topk_weights=route_weights[:rows],
+            topk_ids=route_ids[:rows],
+            output=output[:rows],
+            route_expert_map=expert_map,
+            output_expert_map=expert_map,
         )
+
     def reference(rows):
-        return _serial_tier(source[:rows], weights.representation.value, route_weights[:rows], route_ids[:rows], expert_map, block_size_m=64).to(output.dtype)
+        return _serial_tier(
+            source[:rows],
+            weights.representation.value,
+            route_weights[:rows],
+            route_ids[:rows],
+            expert_map,
+            block_size_m=64,
+        ).to(output.dtype)
+
     bind(capacity).run()
     addresses = tuple(tensor.data_ptr() for tensor in (*scratch, output))
     for rows in (3, 11, 125, capacity):
         with kernel_resolution_guard("Trellis prefill capacity"):
             binding = bind(rows)
-            assert any(binding.fused_launch is launch for _, launch in plan._prewarmed_fused_launches)
+            assert any(
+                binding.fused_launch is launch
+                for _, launch in plan._prewarmed_fused_launches
+            )
             assert binding.fused_launch.broadcast_suh == broadcast
             assert binding.topk_sum_launch.broadcast_svh == broadcast
             actual = binding.run().clone()
@@ -1793,7 +1849,10 @@ def test_full_rotation_prefill_capacity_reuses_native_launchers(tmp_path, route_
     binding = bind(11)
     graph = torch.cuda.CUDAGraph()
     try:
-        with kernel_resolution_guard("Trellis capacity replay"), torch.cuda.graph(graph):
+        with (
+            kernel_resolution_guard("Trellis capacity replay"),
+            torch.cuda.graph(graph),
+        ):
             binding.run()
         source.mul_(-0.5)
         graph.replay()

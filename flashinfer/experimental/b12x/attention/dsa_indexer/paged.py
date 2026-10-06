@@ -922,9 +922,13 @@ def index_topk_fp8(
         row_count=q_rows,
     )
     write_final_values = out_scores is not None
-    final_values = out_scores if out_scores is not None else scratch_values.narrow(1, 0, topk)
+    final_values = (
+        out_scores if out_scores is not None else scratch_values.narrow(1, 0, topk)
+    )
     final_raw_indices = (
-        out_indices if out_indices is not None else scratch_raw_indices.narrow(1, 0, topk)
+        out_indices
+        if out_indices is not None
+        else scratch_raw_indices.narrow(1, 0, topk)
     )
     if final_values.shape != (q_rows, topk) or final_raw_indices.shape != (
         q_rows,
@@ -1134,23 +1138,27 @@ def index_topk_fp8(
         if carry_buf_values is not None:
             carry_values = (
                 carry_buf_values.select(0, (chunk_idx - 1) % 2)
-                .narrow(0, 0, q_rows).narrow(1, 0, topk)
+                .narrow(0, 0, q_rows)
+                .narrow(1, 0, topk)
             )
             carry_indices = (
                 carry_buf_indices.select(0, (chunk_idx - 1) % 2)
-                .narrow(0, 0, q_rows).narrow(1, 0, topk)
+                .narrow(0, 0, q_rows)
+                .narrow(1, 0, topk)
             )
             out_values = (
                 final_values
                 if is_last
                 else carry_buf_values.select(0, chunk_idx % 2)
-                .narrow(0, 0, q_rows).narrow(1, 0, topk)
+                .narrow(0, 0, q_rows)
+                .narrow(1, 0, topk)
             )
             out_indices = (
                 final_raw_indices
                 if is_last
                 else carry_buf_indices.select(0, chunk_idx % 2)
-                .narrow(0, 0, q_rows).narrow(1, 0, topk)
+                .narrow(0, 0, q_rows)
+                .narrow(1, 0, topk)
             )
         else:
             # Single chunk: is_first folds nothing and writes straight to the output.

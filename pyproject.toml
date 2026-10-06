@@ -259,3 +259,9 @@ ignore = [
 ]
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+# b12x was migrated wholesale (#5767); its pre-existing lint debt is waived here
+# rather than auto-fixed, because F401 fixes would strip re-exports from its
+# api.py op surfaces. Undefined names (F821) stay enforced.
+"flashinfer/experimental/b12x/**" = ["B007", "B008", "B009", "B010", "B011", "B018", "B905", "F401", "F811", "F841", "SIM105", "SIM114", "SIM115", "SIM117", "SIM300"]
+"tests/experimental/b12x/**" = ["B007", "B008", "B009", "B010", "B011", "B018", "B905", "F401", "F811", "F841", "SIM105", "SIM114", "SIM115", "SIM117", "SIM300"]
+"benchmarks/experimental/b12x/**" = ["B007", "B008", "B009", "B010", "B011", "B018", "B905", "F401", "F811", "F841", "SIM105", "SIM114", "SIM115", "SIM117", "SIM300"]

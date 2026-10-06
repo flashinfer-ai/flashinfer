@@ -36,14 +36,24 @@ def test_common_models_expand_across_supported_parallelism() -> None:
 
 def test_unaligned_three_wide_shard_is_padded_instead_of_rejected() -> None:
     recipe = MoeRecipe(
-        recipe_id="nvfp4-test", family_id="test", quant_mode="nvfp4",
-        source_format="modelopt_nvfp4", intermediate_alignment=16,
-        minimum_intermediate_size=16, compatible_activations=("silu",),
+        recipe_id="nvfp4-test",
+        family_id="test",
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        intermediate_alignment=16,
+        minimum_intermediate_size=16,
+        compatible_activations=("silu",),
     )
     model = MoeModelGeometry(
-        model_id="small-test", hidden_size=256, intermediate_size=47,
-        num_experts=16, native_top_k=2, activation="silu",
-        recipe_families=(recipe.family_id,), source="test", tp_sizes=(16,),
+        model_id="small-test",
+        hidden_size=256,
+        intermediate_size=47,
+        num_experts=16,
+        native_top_k=2,
+        activation="silu",
+        recipe_families=(recipe.family_id,),
+        source="test",
+        tp_sizes=(16,),
     )
     (geometry,) = expand_physical_geometries(models=(model,), recipes=(recipe,))
     (alias,) = geometry.aliases
@@ -55,17 +65,35 @@ def test_unaligned_three_wide_shard_is_padded_instead_of_rejected() -> None:
 
 def test_recipe_families_only_expand_compatible_activations() -> None:
     recipes = (
-        MoeRecipe(recipe_id="silu-recipe", family_id="shared", quant_mode="nvfp4",
-                  source_format="modelopt_nvfp4", intermediate_alignment=16,
-                  minimum_intermediate_size=16, compatible_activations=("silu",)),
-        MoeRecipe(recipe_id="relu-recipe", family_id="shared", quant_mode="w4a16",
-                  source_format="modelopt_nvfp4", intermediate_alignment=64,
-                  minimum_intermediate_size=64, compatible_activations=("relu2",)),
+        MoeRecipe(
+            recipe_id="silu-recipe",
+            family_id="shared",
+            quant_mode="nvfp4",
+            source_format="modelopt_nvfp4",
+            intermediate_alignment=16,
+            minimum_intermediate_size=16,
+            compatible_activations=("silu",),
+        ),
+        MoeRecipe(
+            recipe_id="relu-recipe",
+            family_id="shared",
+            quant_mode="w4a16",
+            source_format="modelopt_nvfp4",
+            intermediate_alignment=64,
+            minimum_intermediate_size=64,
+            compatible_activations=("relu2",),
+        ),
     )
     model = MoeModelGeometry(
-        model_id="silu-model", hidden_size=256, intermediate_size=96,
-        num_experts=16, native_top_k=2, activation="silu",
-        recipe_families=("shared",), source="test", tp_sizes=(1,),
+        model_id="silu-model",
+        hidden_size=256,
+        intermediate_size=96,
+        num_experts=16,
+        native_top_k=2,
+        activation="silu",
+        recipe_families=("shared",),
+        source="test",
+        tp_sizes=(1,),
     )
 
     geometries = expand_physical_geometries(models=(model,), recipes=recipes)
@@ -75,7 +103,10 @@ def test_recipe_families_only_expand_compatible_activations() -> None:
 def test_moe_token_axes_keep_decode_and_prefill_capacity_distinct() -> None:
     assert COMMON_DECODE_TOKENS == (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128)
     assert COMMON_PREFILL_TOKEN_CAPACITIES == (512, 1_024, 2_048, 4_096, 8_192)
-    assert COMMON_PLAN_TOKEN_COUNTS == (*COMMON_DECODE_TOKENS, *COMMON_PREFILL_TOKEN_CAPACITIES)
+    assert COMMON_PLAN_TOKEN_COUNTS == (
+        *COMMON_DECODE_TOKENS,
+        *COMMON_PREFILL_TOKEN_CAPACITIES,
+    )
 
 
 def test_qwen_nondivisible_parallel_shards_share_a_padded_geometry() -> None:

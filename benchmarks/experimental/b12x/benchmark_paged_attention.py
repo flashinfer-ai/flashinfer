@@ -126,8 +126,13 @@ def _capture_graph(fn: Callable[[], None], *, warmup: int) -> torch.cuda.CUDAGra
 
 def _bench_graph(graph, *, replays, l2_flush=None):
     from b12x.testing.benchmark import graph_samples
-    return [value / 1000.0 for value in graph_samples(
-        graph, replays=replays, l2_flush=l2_flush)["replay_us"]]
+
+    return [
+        value / 1000.0
+        for value in graph_samples(graph, replays=replays, l2_flush=l2_flush)[
+            "replay_us"
+        ]
+    ]
 
 
 def _export_graph_trace(
@@ -152,10 +157,6 @@ def _export_graph_trace(
 
 
 _PAIRED_AB_BA_TIMING_METHOD = "paired-interleaved-ab-ba"
-
-
-
-
 
 
 def _replay_graph_for_correctness(
@@ -212,21 +213,16 @@ def _reference_gate(
             )
             row_ref_norm = torch.linalg.vector_norm(reference_rows, dim=-1)
             row_relative_l2 = row_diff_norm / row_ref_norm.clamp_min(1.0e-12)
-            worst_rows = torch.topk(
-                row_relative_l2, k=min(24, row_relative_l2.numel())
-            )
-            row_diagnostics = (
-                ", worst_row_rel_l2="
-                + repr(
-                    [
-                        (int(row), float(error))
-                        for error, row in zip(
-                            worst_rows.values.tolist(),
-                            worst_rows.indices.tolist(),
-                            strict=True,
-                        )
-                    ]
-                )
+            worst_rows = torch.topk(row_relative_l2, k=min(24, row_relative_l2.numel()))
+            row_diagnostics = ", worst_row_rel_l2=" + repr(
+                [
+                    (int(row), float(error))
+                    for error, row in zip(
+                        worst_rows.values.tolist(),
+                        worst_rows.indices.tolist(),
+                        strict=True,
+                    )
+                ]
             )
         raise AssertionError(
             f"{backend} paged attention failed the Torch reference gate: "
@@ -277,8 +273,7 @@ def _json_sha256(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _decode_graph_replay_policy_metadata(
-) -> dict[str, object]:
+def _decode_graph_replay_policy_metadata() -> dict[str, object]:
     """Describe the persistent device metadata consumed by the b12x call."""
     backends: dict[str, object] = {
         "b12x": {
@@ -306,7 +301,6 @@ def _decode_graph_replay_policy_metadata(
         "schema": "b12x-decode-graph-replay-policy-v2",
         "measurement_scope": "prepared-call-stream-gated-events",
         "backends": backends,
-
     }
     payload["sha256"] = _json_sha256(payload)
     return payload
@@ -323,9 +317,7 @@ def _decode_graph_timing_metadata(
             "sample_index": "sample-index",
         }
     )
-    timing["replay_policy"] = _decode_graph_replay_policy_metadata(
-
-    )
+    timing["replay_policy"] = _decode_graph_replay_policy_metadata()
     return timing
 
 
@@ -393,7 +385,9 @@ def _extend_read_only_input_snapshot(
     tensor_hashes = {} if base is None else dict(base.tensor_sha256)
     duplicate_names = set(clones).intersection(inputs)
     if duplicate_names:
-        raise ValueError(f"read-only input snapshot names must be unique: {sorted(duplicate_names)}")
+        raise ValueError(
+            f"read-only input snapshot names must be unique: {sorted(duplicate_names)}"
+        )
     for name, tensor in inputs.items():
         if tensor is None:
             continue
@@ -430,7 +424,9 @@ def _assert_read_only_inputs_unchanged(
         if _tensor_content_sha256(actual_inputs[name]) != expected_hash:
             mutated.append(name)
     if mutated:
-        raise AssertionError(f"read-only paged-attention inputs were mutated: {mutated}")
+        raise AssertionError(
+            f"read-only paged-attention inputs were mutated: {mutated}"
+        )
 
 
 def _read_only_input_provenance(snapshot: _ReadOnlyInputSnapshot) -> dict[str, object]:
@@ -667,9 +663,7 @@ def _initialize_raw_sample_log(
                 "stable_allocations": True,
                 "fixed_workspace_capacity": True,
                 "decode_graph_replay_policy": (
-                    _decode_graph_replay_policy_metadata(
-
-                    )
+                    _decode_graph_replay_policy_metadata()
                     if args.mode == "decode-graph-buckets"
                     else {"status": "not-applicable-to-legacy-matrix"}
                 ),
@@ -797,10 +791,6 @@ def _gqa_group_size(*, q_heads: int, kv_heads: int) -> int:
     return q_heads // kv_heads
 
 
-
-
-
-
 @dataclass(frozen=True)
 class ShapeCase:
     phase: str
@@ -828,8 +818,6 @@ class BackendCapture:
     plan_desc: str
     read_only_snapshot: _ReadOnlyInputSnapshot | None
     read_only_inputs: dict[str, torch.Tensor] | None
-
-
 
 
 def _build_shape_cases(
@@ -900,8 +888,7 @@ def _kv_cache_layout_contract(
     v_cache: torch.Tensor,
 ) -> dict[str, object]:
     same_storage = (
-        k_cache.untyped_storage().data_ptr()
-        == v_cache.untyped_storage().data_ptr()
+        k_cache.untyped_storage().data_ptr() == v_cache.untyped_storage().data_ptr()
     )
     return {
         "schema": "b12x-paged-kv-layout-v1",
@@ -1060,8 +1047,6 @@ def _quantize_paged_kv_cache_global_e4m3(
     )
 
 
-
-
 def _format_plan_desc(*, kv_chunk_size: int, split_kv: bool) -> str:
     desc = f"chunk={int(kv_chunk_size)}"
     return f"{desc},split" if split_kv else f"{desc},nosplit"
@@ -1074,8 +1059,7 @@ def _format_decode_graph_replay_plan_desc(
     assert workspace.request_indices is not None
     split_desc = "split" if plan.split_kv else "nosplit"
     return (
-        f"chunk=device-lut,grid={int(workspace.request_indices.numel())},"
-        f"{split_desc}"
+        f"chunk=device-lut,grid={int(workspace.request_indices.numel())},{split_desc}"
     )
 
 
@@ -1110,11 +1094,14 @@ def _observe_decode_graph_replay_topology(
             "kv_chunk_size_ptr",
         )
     }
-    missing = [name for name, tensor in required.items() if not isinstance(tensor, torch.Tensor)]
+    missing = [
+        name
+        for name, tensor in required.items()
+        if not isinstance(tensor, torch.Tensor)
+    ]
     if missing:
         raise RuntimeError(
-            "decode graph replay topology is missing workspace tensors: "
-            f"{missing}"
+            f"decode graph replay topology is missing workspace tensors: {missing}"
         )
     if batch <= 0 or batch > int(plan.total_q):
         raise ValueError(
@@ -1136,9 +1123,7 @@ def _observe_decode_graph_replay_topology(
             f"merge_rows={partial_rows}, output_rows={output_rows}"
         )
     work_item_capacity = int(required["request_indices"].numel())
-    regularized = bool(
-        getattr(workspace, "_use_regular_decode_graph_replay", False)
-    )
+    regularized = bool(getattr(workspace, "_use_regular_decode_graph_replay", False))
     useful_work_items = (
         partial_rows
         if regularized
@@ -1163,9 +1148,7 @@ def _observe_decode_graph_replay_topology(
         "padded_work_items": work_item_capacity - useful_work_items,
         "forward_grid_ctas": work_item_capacity * num_kv_heads,
         "useful_forward_ctas": useful_work_items * num_kv_heads,
-        "early_exit_forward_ctas": (
-            work_item_capacity - useful_work_items
-        )
+        "early_exit_forward_ctas": (work_item_capacity - useful_work_items)
         * num_kv_heads,
         "partial_rows": partial_rows,
     }
@@ -1264,9 +1247,7 @@ _WORKSPACE_RUNTIME_METADATA_FIELDS = (
     "cu_seqlens_q",
 )
 
-_WORKSPACE_POLICY_READ_ONLY_FIELDS = (
-    "_decode_graph_chunk_pages_lut",
-)
+_WORKSPACE_POLICY_READ_ONLY_FIELDS = ("_decode_graph_chunk_pages_lut",)
 
 
 def _workspace_read_only_inputs(
@@ -1304,7 +1285,9 @@ def _snapshot_backend_replay_inputs(
     return snapshot, {**base_inputs, **workspace_inputs}
 
 
-def _poison_backend_result_regions(capture: BackendCapture | B12XDecodeGraphBucket) -> None:
+def _poison_backend_result_regions(
+    capture: BackendCapture | B12XDecodeGraphBucket,
+) -> None:
     capture.guarded_output.poison()
     workspace = capture.workspace
     for tensor in (workspace.lse, workspace.tmp_output, workspace.tmp_lse):
@@ -1324,7 +1307,9 @@ def _active_split_kv_temporary_results(
     if batch <= 0:
         raise AssertionError(f"decode graph replay produced an invalid batch: {batch}")
     if int(o_indptr.shape[0]) < batch + 1:
-        raise AssertionError("decode graph replay o_indptr is smaller than the graph batch")
+        raise AssertionError(
+            "decode graph replay o_indptr is smaller than the graph batch"
+        )
 
     active_partial_rows = int(o_indptr[batch].item())
     if not 0 < active_partial_rows <= int(tmp_output.shape[0]):
@@ -1359,9 +1344,7 @@ def _active_split_kv_temporary_results(
         tmp_output.reshape(batch, max_chunks_per_request, *tmp_output.shape[1:])[
             active_mask
         ],
-        tmp_lse.reshape(batch, max_chunks_per_request, *tmp_lse.shape[1:])[
-            active_mask
-        ],
+        tmp_lse.reshape(batch, max_chunks_per_request, *tmp_lse.shape[1:])[active_mask],
     )
 
 
@@ -1373,7 +1356,9 @@ def _assert_backend_result_regions_overwritten(
     plan = workspace.plan
     lse = workspace.current_lse_view()
     if not bool(torch.isfinite(lse).all().item()):
-        raise AssertionError("b12x logical LSE result was not fully overwritten with finite values")
+        raise AssertionError(
+            "b12x logical LSE result was not fully overwritten with finite values"
+        )
     if plan.split_kv:
         assert workspace.tmp_output is not None
         assert workspace.tmp_lse is not None
@@ -1389,14 +1374,9 @@ def _assert_backend_result_regions_overwritten(
                 tmp_lse=tmp_lse,
                 o_indptr=workspace.o_indptr,
                 batch=capture.batch,
-                regular_decode_graph=bool(
-                    workspace._use_regular_decode_graph_replay
-                ),
+                regular_decode_graph=bool(workspace._use_regular_decode_graph_replay),
             )
-        elif (
-            workspace.use_cuda_graph
-            and workspace.mode in ("extend", "verify")
-        ):
+        elif workspace.use_cuda_graph and workspace.mode in ("extend", "verify"):
             assert workspace.o_indptr is not None
             tmp_output, tmp_lse = _active_split_kv_temporary_results(
                 tmp_output=tmp_output,
@@ -1432,7 +1412,9 @@ def _strict_backend_replay_for_correctness(
     l2_flush=None,
 ) -> None:
     if capture.read_only_snapshot is None or capture.read_only_inputs is None:
-        raise RuntimeError("strict correctness replay requires pre-launch input snapshots")
+        raise RuntimeError(
+            "strict correctness replay requires pre-launch input snapshots"
+        )
     if l2_flush is not None:
         l2_flush()
         torch.cuda.synchronize()
@@ -1457,7 +1439,9 @@ def _strict_guarded_replay_for_correctness(
     l2_flush=None,
 ) -> None:
     if read_only_snapshot is None or read_only_inputs is None:
-        raise RuntimeError("strict correctness replay requires pre-launch input snapshots")
+        raise RuntimeError(
+            "strict correctness replay requires pre-launch input snapshots"
+        )
     if l2_flush is not None:
         l2_flush()
         torch.cuda.synchronize()
@@ -1583,6 +1567,7 @@ def _resolve_decode_graph_bucket_policy(
         + page_size
         - 1
     ) // page_size
+
     def resolve_capacity(
         max_work_items: int | None = None,
         max_partial_rows: int | None = None,
@@ -1713,7 +1698,9 @@ def _make_decode_bucket_shared_inputs(
         num_cache_pages=num_cache_pages,
     )
     if q_strides is not None:
-        q = torch.empty_strided(q.shape, q_strides, dtype=q.dtype, device=q.device).copy_(q)
+        q = torch.empty_strided(
+            q.shape, q_strides, dtype=q.dtype, device=q.device
+        ).copy_(q)
     if os.environ.get("B12X_PAGED_DEBUG_IDENTICAL_KV_HEADS", "0") == "1":
         k_cache.copy_(k_cache[:, :, :1, :].expand_as(k_cache))
         v_cache.copy_(v_cache[:, :, :1, :].expand_as(v_cache))
@@ -1844,8 +1831,6 @@ class B12XDecodeGraphBucket:
         else:
             self.read_only_snapshot = None
             self.read_only_inputs = None
-
-
 
 
 def _capture_backend_graph(
@@ -2048,12 +2033,6 @@ def _capture_backend_graph(
     )
 
 
-
-
-
-
-
-
 def _capture_b12x_decode_graph_bucket(
     *,
     shared: DecodeBucketSharedInputs,
@@ -2102,19 +2081,29 @@ def _capture_b12x_decode_graph_bucket(
     guarded_output = _allocate_guarded_output(shared.q)
     output = guarded_output.output
     operands = dict(
-        q=shared.q, k_cache=shared.k_cache, v_cache=shared.v_cache, output=output,
-        page_table=shared.capture_page_table, cache_seqlens=replay_cache_seqlens,
-        cu_seqlens_q=shared.cu_seqlens_q, k_descale=shared.k_descale, v_descale=shared.v_descale,
+        q=shared.q,
+        k_cache=shared.k_cache,
+        v_cache=shared.v_cache,
+        output=output,
+        page_table=shared.capture_page_table,
+        cache_seqlens=replay_cache_seqlens,
+        cu_seqlens_q=shared.cu_seqlens_q,
+        k_descale=shared.k_descale,
+        v_descale=shared.v_descale,
     )
     invocation = paged.invocation_from_tensors(caps, **operands)
     if serving_declaration is not None:
         actual = json.loads(json.dumps(invocation["operands"].to_dict()))
         expected = serving_declaration["invocation"]["operands"]
         if actual != expected:
-            differences = {name: {"actual": actual.get(name), "expected": expected.get(name)}
-                           for name in actual.keys() | expected.keys()
-                           if actual.get(name) != expected.get(name)}
-            raise ValueError(f"benchmark operand metadata differs from the serving declaration: {differences}")
+            differences = {
+                name: {"actual": actual.get(name), "expected": expected.get(name)}
+                for name in actual.keys() | expected.keys()
+                if actual.get(name) != expected.get(name)
+            }
+            raise ValueError(
+                f"benchmark operand metadata differs from the serving declaration: {differences}"
+            )
     scratch_plan = paged.plan(caps, invocation=invocation)
     source_values = shared.q.clone()
 
@@ -2122,17 +2111,29 @@ def _capture_b12x_decode_graph_bucket(
         spec = state.scratch_plan.scratch_specs()[0]
         storage = torch.empty(spec.shape, dtype=spec.dtype, device=caps.device)
         binding = state.bind(scratch=storage, active_total_q=shared.batch, **operands)
-        return PreparedCall(run=lambda: state.run(binding),
-                            produce=lambda: shared.q.copy_(source_values),
-                            owners=(storage, binding), capture_safe=False)
+        return PreparedCall(
+            run=lambda: state.run(binding),
+            produce=lambda: shared.q.copy_(source_values),
+            owners=(storage, binding),
+            capture_safe=False,
+        )
 
-    preparation = PreparationSession(device=caps.device, autotune=True, compile_workers=1)
-    preparation.prepare((scratch_plan.request(name="paged-decode", prepare_call=prepare,
-                                              benchmark_call=prepare),))
+    preparation = PreparationSession(
+        device=caps.device, autotune=True, compile_workers=1
+    )
+    preparation.prepare(
+        (
+            scratch_plan.request(
+                name="paged-decode", prepare_call=prepare, benchmark_call=prepare
+            ),
+        )
+    )
     preparation.freeze()
     state = require_prepared(scratch_plan, "attention.gqa", caps.device)
     (scratch_spec,) = state.scratch_plan.scratch_specs()
-    scratch_storage = torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=caps.device)
+    scratch_storage = torch.empty(
+        scratch_spec.shape, dtype=scratch_spec.dtype, device=caps.device
+    )
     captured_binding: object | None = None
 
     def run() -> None:
@@ -2203,8 +2204,6 @@ def _capture_b12x_decode_graph_bucket(
     )
 
 
-
-
 def _reference_output_from_snapshot(
     snapshot: _ReadOnlyInputSnapshot,
     *,
@@ -2269,7 +2268,6 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             "paged_mode": args.paged_mode,
             "window_left": args.window_left,
             "replays": args.replays,
-
             "l2_flush": args.flush_l2,
         },
     )
@@ -2424,7 +2422,6 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             mean_us=statistics.fmean(backend_times_ms) * 1000.0,
         )
 
-
         line = (
             f"{case.phase:>6s} "
             f"bs={case.batch:2d} "
@@ -2434,7 +2431,6 @@ def _run_legacy_matrix(args: argparse.Namespace) -> None:
             f"| {backend_metrics.backend} mean={backend_metrics.mean_us:8.1f} us"
         )
         print(line + check_suffix)
-
 
 
 def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
@@ -2450,9 +2446,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
         context_tokens=decode_contexts,
     )
     if args.torch_profile_trace is not None and len(cases) != 1:
-        raise ValueError(
-            "--torch-profile-trace requires exactly one decode graph case"
-        )
+        raise ValueError("--torch-profile-trace requires exactly one decode graph case")
 
     print(
         "decode graph buckets:",
@@ -2476,7 +2470,6 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             "fixed_split_pages": args.fixed_split_pages,
             "graph_ctas_per_sm": args.graph_ctas_per_sm,
             "replays": args.replays,
-
             "l2_flush": args.flush_l2,
         },
     )
@@ -2486,16 +2479,25 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
         if args.preparation_queries is not None:
             for line in args.preparation_queries.read_text().splitlines():
                 record = json.loads(line)
-                if (record.get("component") == "attention.gqa"
-                        and record["invocation"]["caps"]["mode"] == "decode"
-                        and record["invocation"]["caps"]["max_batch"] == batch):
+                if (
+                    record.get("component") == "attention.gqa"
+                    and record["invocation"]["caps"]["mode"] == "decode"
+                    and record["invocation"]["caps"]["max_batch"] == batch
+                ):
                     serving_declaration = record
             if serving_declaration is None:
                 raise ValueError(f"no serving decode declaration for batch={batch}")
             declared = serving_declaration["invocation"]["caps"]
-            geometry = (declared["num_q_heads"], declared["num_kv_heads"], declared["head_dim_qk"], declared["page_size"])
+            geometry = (
+                declared["num_q_heads"],
+                declared["num_kv_heads"],
+                declared["head_dim_qk"],
+                declared["page_size"],
+            )
             if geometry != (args.q_heads, args.kv_heads, args.head_dim, args.page_size):
-                raise ValueError("benchmark attention geometry differs from serving declaration")
+                raise ValueError(
+                    "benchmark attention geometry differs from serving declaration"
+                )
             capture_context = declared["max_page_table_width"] * args.page_size - 1
         else:
             capture_context = int(args.capture_context)
@@ -2515,7 +2517,8 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
         )
         if serving_declaration is not None:
             bucket_policy = replace(
-                bucket_policy, max_work_items=declared["max_work_items"],
+                bucket_policy,
+                max_work_items=declared["max_work_items"],
                 max_partial_rows=declared["max_partial_rows"],
                 max_chunks_per_request=declared["max_partial_rows"] // batch,
                 source="serving-declaration",
@@ -2532,9 +2535,16 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             seed=1 + bucket_idx,
             strict_check=args.check,
             combined_kv_cache=args.combined_kv_cache,
-            num_cache_pages=None if serving_declaration is None else declared["num_cache_pages"],
-            q_strides=(None if serving_declaration is None else
-                       tuple(serving_declaration["invocation"]["operands"]["q"]["strides"])),
+            num_cache_pages=None
+            if serving_declaration is None
+            else declared["num_cache_pages"],
+            q_strides=(
+                None
+                if serving_declaration is None
+                else tuple(
+                    serving_declaration["invocation"]["operands"]["q"]["strides"]
+                )
+            ),
         )
         b12x_bucket = _capture_b12x_decode_graph_bucket(
             shared=shared,
@@ -2576,9 +2586,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             check_suffix = ""
             b12x_correctness: dict[str, object] | None = None
             if args.check:
-                tma_debug_dump = os.environ.get(
-                    "B12X_PAGED_KV_TMA_DEBUG_DUMP", ""
-                )
+                tma_debug_dump = os.environ.get("B12X_PAGED_KV_TMA_DEBUG_DUMP", "")
                 if tma_debug_dump in ("K", "Q", "S", "V"):
                     if l2_flush is not None:
                         l2_flush()
@@ -2590,9 +2598,11 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                     assert tmp_output is not None
                     if tma_debug_dump == "Q":
                         expected_q = b12x_bucket.q[0, :6, :].float()
-                        dumped_q = tmp_output.flatten()[
-                            : expected_q.numel()
-                        ].view_as(expected_q).float()
+                        dumped_q = (
+                            tmp_output.flatten()[: expected_q.numel()]
+                            .view_as(expected_q)
+                            .float()
+                        )
                         delta = dumped_q - expected_q
                         q_candidates = b12x_bucket.q[0].float()
                         nearest_q = torch.argmin(
@@ -2607,13 +2617,11 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                         )
                         return
                     if tma_debug_dump == "S":
-                        live_tokens = int(
-                            b12x_bucket.current_cache_seqlens[0].item()
-                        )
-                        page_count = (live_tokens + args.page_size - 1) // args.page_size
-                        page_ids = b12x_bucket.current_page_table[
-                            0, :page_count
-                        ].long()
+                        live_tokens = int(b12x_bucket.current_cache_seqlens[0].item())
+                        page_count = (
+                            live_tokens + args.page_size - 1
+                        ) // args.page_size
+                        page_ids = b12x_bucket.current_page_table[0, :page_count].long()
                         logical_k = (
                             b12x_bucket.k_cache[page_ids]
                             .reshape(-1, args.kv_heads, args.head_dim)[
@@ -2624,20 +2632,17 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                         k_scale = 1.0
                         if b12x_bucket.k_descale is not None:
                             if b12x_bucket.k_descale.ndim == 1:
-                                k_scale = float(
-                                    b12x_bucket.k_descale[0].item()
-                                )
+                                k_scale = float(b12x_bucket.k_descale[0].item())
                             else:
-                                k_scale = float(
-                                    b12x_bucket.k_descale[0, 0].item()
-                                )
+                                k_scale = float(b12x_bucket.k_descale[0, 0].item())
                         expected_scores = (
-                            b12x_bucket.q[0, :6, :].float()
-                            @ logical_k.transpose(0, 1)
+                            b12x_bucket.q[0, :6, :].float() @ logical_k.transpose(0, 1)
                         ) * k_scale
-                        dumped_scores = tmp_output.flatten()[
-                            : 6 * live_tokens
-                        ].view(6, live_tokens).float()
+                        dumped_scores = (
+                            tmp_output.flatten()[: 6 * live_tokens]
+                            .view(6, live_tokens)
+                            .float()
+                        )
                         delta = dumped_scores - expected_scores
                         rel_l2 = float(
                             torch.linalg.vector_norm(delta)
@@ -2648,11 +2653,14 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                             .reshape(-1, args.kv_heads, args.head_dim)[:64]
                             .float()
                         )
-                        candidate_scores = torch.einsum(
-                            "qd,thd->thq",
-                            b12x_bucket.q[0, :6, :].float(),
-                            candidate_k,
-                        ) * k_scale
+                        candidate_scores = (
+                            torch.einsum(
+                                "qd,thd->thq",
+                                b12x_bucket.q[0, :6, :].float(),
+                                candidate_k,
+                            )
+                            * k_scale
+                        )
                         nearest = []
                         for key_col in range(live_tokens):
                             candidate_error = torch.linalg.vector_norm(
@@ -2673,7 +2681,9 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                                         float(err.item()),
                                     )
                                     for err, idx in zip(
-                                        nearest_flat.values, nearest_flat.indices, strict=True
+                                        nearest_flat.values,
+                                        nearest_flat.indices,
+                                        strict=True,
                                     )
                                 ]
                             )
@@ -2691,13 +2701,9 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                         if tma_debug_dump == "K"
                         else b12x_bucket.v_cache
                     )
-                    expected_codes = (
-                        cache[page_id, :24, 0, :]
-                        .view(torch.uint8)
-                        .float()
-                    )
+                    expected_codes = cache[page_id, :24, 0, :].view(torch.uint8).float()
                     dumped_codes = tmp_output[0, :24, :].float()
-                    mismatch = (dumped_codes != expected_codes)
+                    mismatch = dumped_codes != expected_codes
                     candidate_codes = (
                         cache[page_id, :64, :, :]
                         .view(torch.uint8)
@@ -2712,8 +2718,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                         row_mapping = []
                         for dump_vec in range(dumped_vectors.shape[1]):
                             matches = (
-                                candidate_codes
-                                == dumped_vectors[dump_row, dump_vec]
+                                candidate_codes == dumped_vectors[dump_row, dump_vec]
                             ).all(dim=-1)
                             match_idx = matches.nonzero()
                             row_mapping.append(
@@ -2773,7 +2778,6 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             )
             timing_metadata = _decode_graph_timing_metadata(
                 timing_metadata,
-
             )
             observed_replay_topology = _observe_decode_graph_replay_topology(
                 b12x_bucket.workspace,
@@ -2790,15 +2794,11 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                     "capture_context_tokens": bucket_policy.capture_context_tokens,
                     "capture_page_count": bucket_policy.capture_page_count,
                     "graph_ctas_per_sm": bucket_policy.graph_ctas_per_sm,
-                    "query_tiles_per_request": (
-                        bucket_policy.query_tiles_per_request
-                    ),
+                    "query_tiles_per_request": (bucket_policy.query_tiles_per_request),
                     "architecture_max_chunks_per_request": (
                         bucket_policy.architecture_max_chunks_per_request
                     ),
-                    "max_chunks_per_request": (
-                        bucket_policy.max_chunks_per_request
-                    ),
+                    "max_chunks_per_request": (bucket_policy.max_chunks_per_request),
                     "max_work_items": bucket_policy.max_work_items,
                     "max_partial_rows": bucket_policy.max_partial_rows,
                     "worst_page_count": bucket_policy.worst_page_count,
@@ -2815,12 +2815,8 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                     "timing_method": "stream_gated_events_v1",
                     "replay_policy": replay_policy,
                     "plan": b12x_bucket.current_plan_desc,
-                    "b12x_forward_traits": (
-                        b12x_bucket.forward_traits_contract
-                    ),
-                    "b12x_observed_replay_topology": (
-                        observed_replay_topology
-                    ),
+                    "b12x_forward_traits": (b12x_bucket.forward_traits_contract),
+                    "b12x_observed_replay_topology": (observed_replay_topology),
                 },
                 input_seed=1 + bucket_idx,
                 input_generator="decode-bucket-shared-inputs-v1",
@@ -2837,7 +2833,6 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                 backend="b12x",
                 mean_us=statistics.fmean(backend_times_ms) * 1000.0,
             )
-
 
             line = (
                 f"decode-graph "
@@ -2858,7 +2853,6 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
         del b12x_bucket
         del shared
         torch.cuda.empty_cache()
-
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -2883,8 +2877,11 @@ def main(argv: list[str] | None = None) -> None:
         "--decode-contexts", type=str, default="128,16384,32768,65536,131072"
     )
     parser.add_argument("--capture-context", type=int, default=0)
-    parser.add_argument("--preparation-queries", type=pathlib.Path,
-                        help="Replay the last recorded decode declaration per batch from a serving query log")
+    parser.add_argument(
+        "--preparation-queries",
+        type=pathlib.Path,
+        help="Replay the last recorded decode declaration per batch from a serving query log",
+    )
     parser.add_argument("--q-seqlens", type=str, default="1")
     parser.add_argument("--cache-seqlens", type=str, default="64,512,2048,8192")
     parser.add_argument("--page-size", type=int, default=64)
@@ -2966,9 +2963,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.window_left < -1:
         raise ValueError("--window-left must be -1 or a non-negative token count")
     if args.mode != "legacy-matrix" and args.window_left != -1:
-        raise ValueError("--window-left is currently supported only in legacy-matrix mode")
+        raise ValueError(
+            "--window-left is currently supported only in legacy-matrix mode"
+        )
     if args.mode != "legacy-matrix" and args.paged_mode != "auto":
-        raise ValueError("--paged-mode is currently supported only in legacy-matrix mode")
+        raise ValueError(
+            "--paged-mode is currently supported only in legacy-matrix mode"
+        )
     if args.replays <= 0:
         raise ValueError("--replays must be positive for graph-replay benchmarking")
     if args.max_chunks_per_request < 0:

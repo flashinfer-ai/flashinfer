@@ -48,11 +48,7 @@ class _Owner:
             self.runtime = None
 
 
-
-
-def make_benchmark_requests(
-    metadata, *, device, rows
-) -> list[PreparationRequest]:
+def make_benchmark_requests(metadata, *, device, rows) -> list[PreparationRequest]:
     import torch
     import torch.distributed as dist
     from b12x.comm import pcie
@@ -62,8 +58,13 @@ def make_benchmark_requests(
     rank = dist.get_rank()
     tp = dist.get_world_size()
     if tp != 2:
-        raise ValueError(f"PCIe benchmark fixtures require actual TP2, got world size {tp}")
-    maximum = max(512 << 10, max(rows) * hidden * torch.empty((), dtype=torch.bfloat16).element_size())
+        raise ValueError(
+            f"PCIe benchmark fixtures require actual TP2, got world size {tp}"
+        )
+    maximum = max(
+        512 << 10,
+        max(rows) * hidden * torch.empty((), dtype=torch.bfloat16).element_size(),
+    )
     owner = _Owner(device=device, max_bytes=maximum, group=dist.group.WORLD)
     runtime = owner.get()
     requests = []
@@ -73,10 +74,14 @@ def make_benchmark_requests(
                 continue
             surface = (
                 "OneshotAllReduce.all_reduce_fused_add_rms_norm"
-                if fused else "OneshotAllReduce.all_reduce"
+                if fused
+                else "OneshotAllReduce.all_reduce"
             )
             query = query_from_metadata(
-                runtime, surface=surface, shape=(tokens, hidden), dtype=torch.bfloat16,
+                runtime,
+                surface=surface,
+                shape=(tokens, hidden),
+                dtype=torch.bfloat16,
             )
             declaration = pcie.plan(query, runtime=runtime)
 
@@ -84,9 +89,12 @@ def make_benchmark_requests(
                 generator = torch.Generator(device=device).manual_seed(239)
                 base = (
                     torch.randn(
-                        (tokens, hidden), device=device, dtype=torch.bfloat16,
+                        (tokens, hidden),
+                        device=device,
+                        dtype=torch.bfloat16,
                         generator=generator,
-                    ) * 0.1
+                    )
+                    * 0.1
                 )
                 source = (base.float() + rank * 0.01).to(torch.bfloat16)
                 residual = torch.ones_like(source) * 0.25
@@ -102,11 +110,13 @@ def make_benchmark_requests(
                 out_initial = out.clone()
                 residual_out_initial = residual_out.clone()
                 if fused:
+
                     def run():
                         return state.run_fused(
                             source, residual, weight, out, residual_out, epsilon
                         )
                 else:
+
                     def run():
                         return state.run_plain(source, out)
 
@@ -124,18 +134,18 @@ def make_benchmark_requests(
                     owners=(context, owner),
                 )
 
-            request_name = (
-                f"comm.{'fused_rmsnorm' if fused else 'allreduce'}.m{tokens}"
+            request_name = f"comm.{'fused_rmsnorm' if fused else 'allreduce'}.m{tokens}"
+            requests.append(
+                declaration.request(
+                    name=request_name,
+                    prepare_call=collective_call,
+                    benchmark_call=collective_call,
+                    collective=CollectiveRequirement(
+                        key=f"benchmark.{request_name}", ranks=(0, 1)
+                    ),
+                    retain_benchmark_call=True,
+                )
             )
-            requests.append(declaration.request(
-                name=request_name,
-                prepare_call=collective_call,
-                benchmark_call=collective_call,
-                collective=CollectiveRequirement(
-                    key=f"benchmark.{request_name}", ranks=(0, 1)
-                ),
-                retain_benchmark_call=True,
-            ))
     return requests
 
 

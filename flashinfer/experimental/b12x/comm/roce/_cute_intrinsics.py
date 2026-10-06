@@ -17,7 +17,9 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 
-def _asm(result_type, operands, text, constraints, *, side_effects=True, loc=None, ip=None):
+def _asm(
+    result_type, operands, text, constraints, *, side_effects=True, loc=None, ip=None
+):
     """Emit one inline PTX statement through the CuTe DSL and return its result."""
     return llvm.inline_asm(
         result_type,
@@ -63,12 +65,17 @@ def ld_relaxed_sys_u32(addr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
-def atomic_add_relaxed_gpu_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> Uint32:
+def atomic_add_relaxed_gpu_u32(
+    addr: Int64, value: Uint32, *, loc=None, ip=None
+) -> Uint32:
     """GPU-scope relaxed atomic add; returns the prior value."""
     return Uint32(
         _asm(
             T.i32(),
-            [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(value).ir_value(loc=loc, ip=ip)],
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                Uint32(value).ir_value(loc=loc, ip=ip),
+            ],
             "atom.relaxed.gpu.global.add.u32 $0, [$1], $2;",
             "=r,l,r",
             loc=loc,
@@ -170,12 +177,15 @@ def ld_relaxed_sys_v4_u32(
         ip=ip,
     )
     return tuple(
-        Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4)
+        Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+        for i in range(4)
     )
 
 
 @dsl_user_op
-def ld_global_v4_u32(addr: Int64, *, loc=None, ip=None) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+def ld_global_v4_u32(
+    addr: Int64, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
     """Plain global 16-byte load as four 32-bit words."""
     result = _asm(
         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
@@ -186,7 +196,8 @@ def ld_global_v4_u32(addr: Int64, *, loc=None, ip=None) -> Tuple[Uint32, Uint32,
         ip=ip,
     )
     return tuple(
-        Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4)
+        Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+        for i in range(4)
     )
 
 
@@ -299,7 +310,10 @@ def pack_f32x2_to_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint
     return Uint32(
         _asm(
             T.i32(),
-            [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+            [
+                Float32(lo).ir_value(loc=loc, ip=ip),
+                Float32(hi).ir_value(loc=loc, ip=ip),
+            ],
             """
             {
                 .reg .b16 blo, bhi;
@@ -322,7 +336,10 @@ def pack_f32x2_to_f16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint3
     return Uint32(
         _asm(
             T.i32(),
-            [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+            [
+                Float32(lo).ir_value(loc=loc, ip=ip),
+                Float32(hi).ir_value(loc=loc, ip=ip),
+            ],
             "cvt.rn.f16x2.f32 $0, $2, $1;",
             "=r,f,f",
             side_effects=False,

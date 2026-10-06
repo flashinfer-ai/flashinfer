@@ -267,29 +267,69 @@ def _gated_rmsnorm_kernel(
     mutates_args=("recurrent_state", "output"),
 )
 def _gdn_decode_op(
-    mixed_qkv: torch.Tensor, a: torch.Tensor, b: torch.Tensor, z: torch.Tensor,
-    A_log: torch.Tensor, dt_bias: torch.Tensor, norm_weight: torch.Tensor,
-    recurrent_state: torch.Tensor, query_start_loc: torch.Tensor,
-    num_accepted_tokens: torch.Tensor, state_indices: torch.Tensor,
-    num_seqs: torch.Tensor, num_tokens: torch.Tensor, output: torch.Tensor,
-    eps: float, scale: float, lower_bound: float, plan_handle: int,
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+    scale: float,
+    lower_bound: float,
+    plan_handle: int,
 ) -> None:
-    state = require_prepared(plan_from_handle(plan_handle), "attention.gdn", mixed_qkv.device)
+    state = require_prepared(
+        plan_from_handle(plan_handle), "attention.gdn", mixed_qkv.device
+    )
     state.run_tensors(
-        mixed_qkv, a, b, z, A_log, dt_bias, norm_weight, recurrent_state,
-        query_start_loc, num_accepted_tokens, state_indices, num_seqs, num_tokens,
-        output, eps=eps, scale=scale, lower_bound=lower_bound,
+        mixed_qkv,
+        a,
+        b,
+        z,
+        A_log,
+        dt_bias,
+        norm_weight,
+        recurrent_state,
+        query_start_loc,
+        num_accepted_tokens,
+        state_indices,
+        num_seqs,
+        num_tokens,
+        output,
+        eps=eps,
+        scale=scale,
+        lower_bound=lower_bound,
     )
 
 
 @_gdn_decode_op.register_fake
 def _gdn_decode_fake(
-    mixed_qkv: torch.Tensor, a: torch.Tensor, b: torch.Tensor, z: torch.Tensor,
-    A_log: torch.Tensor, dt_bias: torch.Tensor, norm_weight: torch.Tensor,
-    recurrent_state: torch.Tensor, query_start_loc: torch.Tensor,
-    num_accepted_tokens: torch.Tensor, state_indices: torch.Tensor,
-    num_seqs: torch.Tensor, num_tokens: torch.Tensor, output: torch.Tensor,
-    eps: float, scale: float, lower_bound: float, plan_handle: int,
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+    scale: float,
+    lower_bound: float,
+    plan_handle: int,
 ) -> None:
     del mixed_qkv, a, b, z, A_log, dt_bias, norm_weight, recurrent_state
     del query_start_loc, num_accepted_tokens, state_indices, num_seqs, num_tokens
@@ -297,7 +337,9 @@ def _gdn_decode_fake(
 
 
 def run_gdn_decode(*tensors, eps, scale, lower_bound, plan):
-    torch.ops.b12x.gdn_decode(*tensors, float(eps), float(scale), float(lower_bound), plan.handle)
+    torch.ops.b12x.gdn_decode(
+        *tensors, float(eps), float(scale), float(lower_bound), plan.handle
+    )
 
 
 __all__ = ["run_gdn_decode"]

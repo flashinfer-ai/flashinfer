@@ -1,4 +1,5 @@
 """Metadata-only preparation and retained native unquantized projections."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -32,10 +33,13 @@ def query_from_call(x, weight, *, bias=None, out=None, output_dtype=None):
     query = GemvQuery(
         source_dtype=str(x.dtype).removeprefix("torch."),
         weight_dtype=str(weight.dtype).removeprefix("torch."),
-        max_rows=int(x.shape[0]), in_features=int(x.shape[1]),
+        max_rows=int(x.shape[0]),
+        in_features=int(x.shape[1]),
         out_features=int(weight.shape[0]),
-        source_contiguous=x.is_contiguous(), source_aligned=_is_aligned(x),
-        weight_contiguous=weight.is_contiguous(), weight_aligned=_is_aligned(weight),
+        source_contiguous=x.is_contiguous(),
+        source_aligned=_is_aligned(x),
+        weight_contiguous=weight.is_contiguous(),
+        weight_aligned=_is_aligned(weight),
         output_dtype=str(dtype).removeprefix("torch."),
         output_contiguous=out is None or out.is_contiguous(),
         output_aligned=out is None or _is_aligned(out),
@@ -56,14 +60,27 @@ def compile_gemv(query_payload, config_payload, ordinal):
         return {}
     if config.backend == "prefill":
         from ._prefill import compile_prefill
-        launcher = compile_prefill(ordinal, query.max_rows, query.out_features,
-                                   query.in_features, query.output_dtype)
+
+        launcher = compile_prefill(
+            ordinal,
+            query.max_rows,
+            query.out_features,
+            query.in_features,
+            query.output_dtype,
+        )
     else:
         from ._kernel import compile_projection
+
         launcher = compile_projection(
-            ordinal, config.backend, config.rows_per_tile, query.out_features,
-            query.in_features, query.source_dtype, query.weight_dtype,
-            query.output_dtype, query.bias_dtype,
+            ordinal,
+            config.backend,
+            config.rows_per_tile,
+            query.out_features,
+            query.in_features,
+            query.source_dtype,
+            query.weight_dtype,
+            query.output_dtype,
+            query.bias_dtype,
         )
     return {"gemv": launcher}
 
@@ -87,17 +104,29 @@ class _GemvExecutionState:
         query = self.query
         if x.device != self.device or weight.device != self.device:
             raise ValueError("projection operands differ from the prepared device")
-        if x.ndim != 2 or x.shape[1] != query.in_features or x.shape[0] > query.max_rows:
+        if (
+            x.ndim != 2
+            or x.shape[1] != query.in_features
+            or x.shape[0] > query.max_rows
+        ):
             raise ValueError("projection source exceeds its declared geometry")
         if tuple(weight.shape) != (query.out_features, query.in_features):
             raise ValueError("projection weight geometry differs from preparation")
-        if str(x.dtype).removeprefix("torch.") != query.source_dtype or str(weight.dtype).removeprefix("torch.") != query.weight_dtype:
+        if (
+            str(x.dtype).removeprefix("torch.") != query.source_dtype
+            or str(weight.dtype).removeprefix("torch.") != query.weight_dtype
+        ):
             raise ValueError("projection operand dtypes differ from preparation")
-        if (None if bias is None else str(bias.dtype).removeprefix("torch.")) != query.bias_dtype:
+        if (
+            None if bias is None else str(bias.dtype).removeprefix("torch.")
+        ) != query.bias_dtype:
             raise ValueError("projection bias differs from preparation")
         if out is None:
-            out = torch.empty((x.shape[0], query.out_features),
-                              dtype=getattr(torch, query.output_dtype), device=self.device)
+            out = torch.empty(
+                (x.shape[0], query.out_features),
+                dtype=getattr(torch, query.output_dtype),
+                device=self.device,
+            )
         if str(out.dtype).removeprefix("torch.") != query.output_dtype:
             raise ValueError("projection output dtype differs from preparation")
         for name, tensor in (("source", x), ("weight", weight), ("output", out)):
@@ -121,10 +150,14 @@ def plan(query: GemvQuery, *, invocation=FrozenMapping(), override=None) -> Plan
     def compile_jobs(config, device):
         if config.backend == "torch":
             return ()
-        return (CompileJob.create(
-            "b12x.gemm.bf16_gemv._preparation:compile_gemv",
-            TUNING.encode_query(query), TUNING.encode_config(config), device.ordinal,
-        ),)
+        return (
+            CompileJob.create(
+                "b12x.gemm.bf16_gemv._preparation:compile_gemv",
+                TUNING.encode_query(query),
+                TUNING.encode_config(config),
+                device.ordinal,
+            ),
+        )
 
     def memory(config, device):
         TUNING.validate_config(query, config, device)
@@ -132,42 +165,83 @@ def plan(query: GemvQuery, *, invocation=FrozenMapping(), override=None) -> Plan
 
     def materialize(selection, device):
         if selection.config.backend == "torch":
-            return _GemvExecutionState(query, torch.device("cuda", device.ordinal), _torch_projection)
+            return _GemvExecutionState(
+                query, torch.device("cuda", device.ordinal), _torch_projection
+            )
         programs = compile_gemv(
-            TUNING.encode_query(query), TUNING.encode_config(selection.config), device.ordinal,
+            TUNING.encode_query(query),
+            TUNING.encode_config(selection.config),
+            device.ordinal,
         )
         load_programs(programs)
         return attach_programs(
-            _GemvExecutionState(query, torch.device("cuda", device.ordinal), programs["gemv"]),
+            _GemvExecutionState(
+                query, torch.device("cuda", device.ordinal), programs["gemv"]
+            ),
             programs,
         )
 
-    return Plan(contract=TUNING, query=query, invocation=invocation, override=override, shared=True,
-                _compile_jobs=compile_jobs, _memory_requirements=memory, _materialize=materialize)
+    return Plan(
+        contract=TUNING,
+        query=query,
+        invocation=invocation,
+        override=override,
+        shared=True,
+        _compile_jobs=compile_jobs,
+        _memory_requirements=memory,
+        _materialize=materialize,
+    )
 
 
 @torch.library.custom_op("b12x::bf16_gemv_small_n", mutates_args=())
-def bf16_gemv_small_n(x: torch.Tensor, weight: torch.Tensor, plan_handle: int,
-                     bias: torch.Tensor | None = None, output_dtype: torch.dtype | None = None) -> torch.Tensor:
+def bf16_gemv_small_n(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    plan_handle: int,
+    bias: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     state = require_prepared(plan_from_handle(plan_handle), "gemm.bf16_gemv", x.device)
-    if output_dtype is not None and output_dtype != getattr(torch, state.query.output_dtype):
+    if output_dtype is not None and output_dtype != getattr(
+        torch, state.query.output_dtype
+    ):
         raise ValueError("output_dtype differs from preparation")
     return state.run(x, weight, bias=bias)
 
 
 @bf16_gemv_small_n.register_fake
-def _bf16_gemv_small_n_fake(x: torch.Tensor, weight: torch.Tensor, plan_handle: int,
-                           bias: torch.Tensor | None = None, output_dtype: torch.dtype | None = None) -> torch.Tensor:
-    return x.new_empty((x.shape[0], weight.shape[0]), dtype=x.dtype if output_dtype is None else output_dtype)
+def _bf16_gemv_small_n_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    plan_handle: int,
+    bias: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    return x.new_empty(
+        (x.shape[0], weight.shape[0]),
+        dtype=x.dtype if output_dtype is None else output_dtype,
+    )
 
 
 @torch.library.custom_op("b12x::bf16_gemv_small_n_out", mutates_args=("out",))
-def bf16_gemv_small_n_out(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor,
-                         plan_handle: int, bias: torch.Tensor | None = None) -> None:
-    require_prepared(plan_from_handle(plan_handle), "gemm.bf16_gemv", x.device).run(x, weight, out=out, bias=bias)
+def bf16_gemv_small_n_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    plan_handle: int,
+    bias: torch.Tensor | None = None,
+) -> None:
+    require_prepared(plan_from_handle(plan_handle), "gemm.bf16_gemv", x.device).run(
+        x, weight, out=out, bias=bias
+    )
 
 
 @bf16_gemv_small_n_out.register_fake
-def _bf16_gemv_small_n_out_fake(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor,
-                               plan_handle: int, bias: torch.Tensor | None = None) -> None:
+def _bf16_gemv_small_n_out_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    plan_handle: int,
+    bias: torch.Tensor | None = None,
+) -> None:
     return None

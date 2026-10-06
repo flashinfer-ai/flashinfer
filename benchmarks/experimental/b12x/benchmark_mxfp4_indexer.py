@@ -19,7 +19,10 @@ import torch
 from b12x.preparation import PreparationSession
 from benchmarks.experimental.b12x.attention_preparation import prepare_mxfp4
 from b12x.attention import dsa_indexer as indexer
-from benchmarks.experimental.b12x.common import make_l2_flush_fn, nvidia_smi_gpu_mode_snapshot
+from benchmarks.experimental.b12x.common import (
+    make_l2_flush_fn,
+    nvidia_smi_gpu_mode_snapshot,
+)
 from benchmarks.experimental.b12x.benchmark_v41_serving import repository_state
 
 
@@ -161,12 +164,26 @@ def run_mode(args, candidates_mode):
     )
 
     session = PreparationSession(device=device, autotune=False, compile_workers=2)
-    prepare_mxfp4(session, plan, q=q, keys=keys, slots=slots, arguments=dict(
-        q_mxfp4=packed, q_scales=scales, query_weights=weights,
-        index_k_cache=pool, page_table=table, cache_lengths=lengths, active_width=active,
-        output_indices=output_indices, output_scores=output_scores,
-        candidate_indices=candidate_ids, candidate_lengths=candidate_lengths,
-    ))
+    prepare_mxfp4(
+        session,
+        plan,
+        q=q,
+        keys=keys,
+        slots=slots,
+        arguments=dict(
+            q_mxfp4=packed,
+            q_scales=scales,
+            query_weights=weights,
+            index_k_cache=pool,
+            page_table=table,
+            cache_lengths=lengths,
+            active_width=active,
+            output_indices=output_indices,
+            output_scores=output_scores,
+            candidate_indices=candidate_ids,
+            candidate_lengths=candidate_lengths,
+        ),
+    )
     torch.testing.assert_close(packed, q_reference, rtol=0, atol=0)
     torch.testing.assert_close(scales, sf_reference, rtol=0, atol=0)
 
@@ -373,7 +390,11 @@ def main():
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--replays", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=200)
-    parser.add_argument("--cold-l2", action="store_true", help="Read-evict L2 before each timed graph; requires --replays 1")
+    parser.add_argument(
+        "--cold-l2",
+        action="store_true",
+        help="Read-evict L2 before each timed graph; requires --replays 1",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.rows = [int(value) for value in args.rows.split(",")]
@@ -409,7 +430,10 @@ def main():
         },
         "source_sha256": {
             str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in (Path(__file__), ROOT / "flashinfer/experimental/b12x/attention/dsa_indexer/mxfp4.py")
+            for path in (
+                Path(__file__),
+                ROOT / "flashinfer/experimental/b12x/attention/dsa_indexer/mxfp4.py",
+            )
         },
         "gpu_before": nvidia_smi_gpu_mode_snapshot(),
         "scope": "Real public MXFP4 score/selection plans, no TP collective. Latencies are not full-model throughput. Source-version comparisons use identical score hashes and explicit baseline/candidate latency ratios.",

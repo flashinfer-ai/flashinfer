@@ -41,16 +41,12 @@ def _run(env_setup: str) -> dict:
 
 
 def test_patches_apply_by_default():
-    data = _run(
-        'os.environ.pop("B12X_DISABLE_CUTLASS_RUNTIME_PATCHES", None)'
-    )
+    data = _run('os.environ.pop("B12X_DISABLE_CUTLASS_RUNTIME_PATCHES", None)')
     assert data["warning_patched"] is True
     assert data["frameinfo_patched"] is True
 
 
 def test_kill_switch_disables_all_patches():
-    data = _run(
-        'os.environ["B12X_DISABLE_CUTLASS_RUNTIME_PATCHES"] = "1"'
-    )
+    data = _run('os.environ["B12X_DISABLE_CUTLASS_RUNTIME_PATCHES"] = "1"')
     assert data["warning_patched"] is False
     assert data["frameinfo_patched"] is False

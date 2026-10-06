@@ -189,10 +189,14 @@ def _wfp8_row_xor(row: Int32) -> Int32:
 def _to_cute(x, dtype, align=16, dynamic_layout=False):
     if x.device.type == "meta" and compile_only_launches_enabled():
         if dynamic_layout:
-            raise ValueError("metadata cache descriptors require the production static layout")
+            raise ValueError(
+                "metadata cache descriptors require the production static layout"
+            )
         from cutlass.cute.runtime import make_fake_tensor
 
-        return make_fake_tensor(dtype, tuple(x.shape), tuple(x.stride()), assumed_align=align)
+        return make_fake_tensor(
+            dtype, tuple(x.shape), tuple(x.stride()), assumed_align=align
+        )
     if compile_only_launches_enabled() and hasattr(x, "fake_mode"):
         from cutlass.cute.runtime import make_fake_tensor
 
@@ -202,8 +206,7 @@ def _to_cute(x, dtype, align=16, dynamic_layout=False):
         if dynamic_layout and x.ndim >= 1 and leading_dim is not None:
             shape = tuple(cute.sym_int(32) for _ in x.shape)
             strides = tuple(
-                1 if idx == leading_dim else cute.sym_int(64)
-                for idx in range(x.ndim)
+                1 if idx == leading_dim else cute.sym_int(64) for idx in range(x.ndim)
             )
         else:
             if x.numel() == 0:
@@ -213,7 +216,10 @@ def _to_cute(x, dtype, align=16, dynamic_layout=False):
 
                 with unset_fake_temporarily():
                     empty = torch.empty_strided(
-                        tuple(x.shape), tuple(x.stride()), dtype=x.dtype, device="cpu",
+                        tuple(x.shape),
+                        tuple(x.stride()),
+                        dtype=x.dtype,
+                        device="cpu",
                     )
                 converted = from_dlpack(empty, assumed_align=align)
                 converted.element_type = dtype
@@ -2681,28 +2687,44 @@ class UnifiedPrefillMGKernel:
                                 g_end = extra_section_len
                             if cutlass.const_expr(is_dsv41):
                                 io_issue_gather_glm_mg(
-                                    extra_kv_cache_u8, extra_row,
-                                    kv_fp8_addr + buf * kv_fp8_buf, mbar_base + buf,
-                                    g_start, g_end, Int32(self.pbs_extra),
-                                    stride_extra_kv_block, io_lane, kv_l2_policy,
-                                    bi=t.bi, kv_smem_stride=L.kv_smem_stride,
+                                    extra_kv_cache_u8,
+                                    extra_row,
+                                    kv_fp8_addr + buf * kv_fp8_buf,
+                                    mbar_base + buf,
+                                    g_start,
+                                    g_end,
+                                    Int32(self.pbs_extra),
+                                    stride_extra_kv_block,
+                                    io_lane,
+                                    kv_l2_policy,
+                                    bi=t.bi,
+                                    kv_smem_stride=L.kv_smem_stride,
                                     io_threads=_PREFILL_IO_THREADS,
-                                    scale_format=t.scale_format, fp8_rope=t.fp8_rope,
+                                    scale_format=t.scale_format,
+                                    fp8_rope=t.fp8_rope,
                                     has_rope=has_rope,
                                     kv_sc_dst_addr=kv_sc_addr + buf * kv_sc_buf,
-                                    dsv41=True, dsv41_swa=False,
+                                    dsv41=True,
+                                    dsv41_swa=False,
                                     dsv41_fp8=dsv41_fp8_pv,
                                     ratio_dst_addr=kv_ratio_addr + buf * kv_ratio_buf,
                                     ratio_stride=L.kv_ratio_stride,
                                 )
                             else:
                                 io_issue_gather_dsv4_nope(
-                                    extra_kv_cache_u8, extra_row,
+                                    extra_kv_cache_u8,
+                                    extra_row,
                                     kv_fp8_addr + buf * kv_fp8_buf,
-                                    kv_sc_addr + buf * kv_sc_buf, mbar_base + buf,
-                                    g_start, g_end, Int32(self.pbs_extra),
-                                    stride_extra_kv_block, io_lane, kv_l2_policy,
-                                    bi=t.bi, kv_smem_stride=L.kv_smem_stride,
+                                    kv_sc_addr + buf * kv_sc_buf,
+                                    mbar_base + buf,
+                                    g_start,
+                                    g_end,
+                                    Int32(self.pbs_extra),
+                                    stride_extra_kv_block,
+                                    io_lane,
+                                    kv_l2_policy,
+                                    bi=t.bi,
+                                    kv_smem_stride=L.kv_smem_stride,
                                     io_threads=_PREFILL_IO_THREADS,
                                 )
                         else:
@@ -2712,28 +2734,44 @@ class UnifiedPrefillMGKernel:
                                 g_end = section_len
                             if cutlass.const_expr(is_dsv41):
                                 io_issue_gather_glm_mg(
-                                    kv_cache_u8, topk_row,
-                                    kv_fp8_addr + buf * kv_fp8_buf, mbar_base + buf,
-                                    g_start, g_end, Int32(self.page_block_size),
-                                    stride_kv_block, io_lane, kv_l2_policy,
-                                    bi=t.bi, kv_smem_stride=L.kv_smem_stride,
+                                    kv_cache_u8,
+                                    topk_row,
+                                    kv_fp8_addr + buf * kv_fp8_buf,
+                                    mbar_base + buf,
+                                    g_start,
+                                    g_end,
+                                    Int32(self.page_block_size),
+                                    stride_kv_block,
+                                    io_lane,
+                                    kv_l2_policy,
+                                    bi=t.bi,
+                                    kv_smem_stride=L.kv_smem_stride,
                                     io_threads=_PREFILL_IO_THREADS,
-                                    scale_format=t.scale_format, fp8_rope=t.fp8_rope,
+                                    scale_format=t.scale_format,
+                                    fp8_rope=t.fp8_rope,
                                     has_rope=has_rope,
                                     kv_sc_dst_addr=kv_sc_addr + buf * kv_sc_buf,
-                                    dsv41=True, dsv41_swa=True,
+                                    dsv41=True,
+                                    dsv41_swa=True,
                                     dsv41_fp8=dsv41_fp8_pv,
                                     ratio_dst_addr=kv_ratio_addr + buf * kv_ratio_buf,
                                     ratio_stride=L.kv_ratio_stride,
                                 )
                             else:
                                 io_issue_gather_dsv4_nope(
-                                    kv_cache_u8, topk_row,
+                                    kv_cache_u8,
+                                    topk_row,
                                     kv_fp8_addr + buf * kv_fp8_buf,
-                                    kv_sc_addr + buf * kv_sc_buf, mbar_base + buf,
-                                    g_start, g_end, Int32(self.page_block_size),
-                                    stride_kv_block, io_lane, kv_l2_policy,
-                                    bi=t.bi, kv_smem_stride=L.kv_smem_stride,
+                                    kv_sc_addr + buf * kv_sc_buf,
+                                    mbar_base + buf,
+                                    g_start,
+                                    g_end,
+                                    Int32(self.page_block_size),
+                                    stride_kv_block,
+                                    io_lane,
+                                    kv_l2_policy,
+                                    bi=t.bi,
+                                    kv_smem_stride=L.kv_smem_stride,
                                     io_threads=_PREFILL_IO_THREADS,
                                 )
                     else:
@@ -3055,17 +3093,30 @@ class UnifiedPrefillMGKernel:
 
                 if cutlass.const_expr(dsv41_fp8_pv):
                     s0_normalize_dsv41_kv_to_fp8(
-                        kv_fp8_b, kv_ratio_addr + buf * kv_ratio_buf,
-                        warp_id, lane, bi=t.bi, kv_smem_stride=L.kv_smem_stride,
-                        ratio_smem_stride=L.kv_ratio_stride, math_warps=8,
+                        kv_fp8_b,
+                        kv_ratio_addr + buf * kv_ratio_buf,
+                        warp_id,
+                        lane,
+                        bi=t.bi,
+                        kv_smem_stride=L.kv_smem_stride,
+                        ratio_smem_stride=L.kv_ratio_stride,
+                        math_warps=8,
                     )
                     cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
                     qk0, qk1 = s1_qk_nope_bf16_mg2(
-                        qk0, qk1, q_nope_bf16_g0, q_nope_bf16_g1,
-                        kv_fp8_b, kv_sc_b, warp_first_cand, lane,
-                        num_scales=t.num_scales, quant_tile=t.quant_tile,
+                        qk0,
+                        qk1,
+                        q_nope_bf16_g0,
+                        q_nope_bf16_g1,
+                        kv_fp8_b,
+                        kv_sc_b,
+                        warp_first_cand,
+                        lane,
+                        num_scales=t.num_scales,
+                        quant_tile=t.quant_tile,
                         q_nope_bf16_stride=L.q_nope_bf16_stride,
-                        kv_smem_stride=L.kv_smem_stride, scale_bytes_per_token=8,
+                        kv_smem_stride=L.kv_smem_stride,
+                        scale_bytes_per_token=8,
                         n_hg=n_hg,
                     )
                 elif cutlass.const_expr(is_nvfp4):
@@ -4085,7 +4136,9 @@ def _sparse_mla_prefill_mg_flat_launch(
     entry = kernel.call_dual if has_extra else kernel
     if prepared is not None:
         return run_compiled(prepared, args)
-    return b12x_launch(entry, compile_spec=compile_spec, compile_args=args, runtime_args=args)
+    return b12x_launch(
+        entry, compile_spec=compile_spec, compile_args=args, runtime_args=args
+    )
 
 
 @torch.library.custom_op(
@@ -4468,24 +4521,65 @@ def run_unified_prefill_mg(
             and not compile_only_launches_enabled()
         ):
             torch.ops.b12x.sparse_mla_sm120_prefill_mg_dual(
-                q, _cache_base_tensor(kv_cache), topk_indices, topk_length,
-                attn_sink_t, output, lse_out, _cache_base_tensor(extra_kv_cache),
-                extra_indices_t, extra_len_t, float(sm_scale), float(latent_scale),
-                int(page_block_size), int(topk), int(num_tiles), int(stride_kv_block),
-                bool(has_sink), int(compute_mode), int(mg_n_hg), model_type,
-                scale_format, int(extra_topk), int(num_main_tiles), int(pbs_extra),
-                int(stride_extra_kv_block), bool(row_xor),
+                q,
+                _cache_base_tensor(kv_cache),
+                topk_indices,
+                topk_length,
+                attn_sink_t,
+                output,
+                lse_out,
+                _cache_base_tensor(extra_kv_cache),
+                extra_indices_t,
+                extra_len_t,
+                float(sm_scale),
+                float(latent_scale),
+                int(page_block_size),
+                int(topk),
+                int(num_tiles),
+                int(stride_kv_block),
+                bool(has_sink),
+                int(compute_mode),
+                int(mg_n_hg),
+                model_type,
+                scale_format,
+                int(extra_topk),
+                int(num_main_tiles),
+                int(pbs_extra),
+                int(stride_extra_kv_block),
+                bool(row_xor),
             )
         else:
             result = _sparse_mla_prefill_mg_flat_launch(
-                q, _cache_base_tensor(kv_cache), topk_indices, topk_length,
-                attn_sink_t, output, lse_out, _cache_base_tensor(extra_kv_cache),
-                extra_indices_t, extra_len_t, float(sm_scale), float(latent_scale),
-                int(page_block_size), int(topk), int(num_tiles), int(stride_kv_block),
-                bool(has_sink), int(compute_mode), int(mg_n_hg), model_type,
-                scale_format, False, True, int(extra_topk), int(num_main_tiles),
-                int(pbs_extra), int(stride_extra_kv_block), bool(row_xor),
-                active_heads=active_heads, head_offset=head_offset,
+                q,
+                _cache_base_tensor(kv_cache),
+                topk_indices,
+                topk_length,
+                attn_sink_t,
+                output,
+                lse_out,
+                _cache_base_tensor(extra_kv_cache),
+                extra_indices_t,
+                extra_len_t,
+                float(sm_scale),
+                float(latent_scale),
+                int(page_block_size),
+                int(topk),
+                int(num_tiles),
+                int(stride_kv_block),
+                bool(has_sink),
+                int(compute_mode),
+                int(mg_n_hg),
+                model_type,
+                scale_format,
+                False,
+                True,
+                int(extra_topk),
+                int(num_main_tiles),
+                int(pbs_extra),
+                int(stride_extra_kv_block),
+                bool(row_xor),
+                active_heads=active_heads,
+                head_offset=head_offset,
                 fp8_internal=bool(traits.fp8_internal),
                 prepared=prepared,
             )

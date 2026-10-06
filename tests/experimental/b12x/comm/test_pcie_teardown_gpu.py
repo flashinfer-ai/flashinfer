@@ -75,14 +75,15 @@ def _worker(rank: int, port: int) -> None:
             stream = torch.cuda.Stream(device=device)
             stream.wait_stream(torch.cuda.current_stream(device))
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.stream(stream), pool.capture(
-                stream=stream, channel_id="graph:transient"
+            with (
+                torch.cuda.stream(stream),
+                pool.capture(stream=stream, channel_id="graph:transient"),
             ):
                 for _ in range(2):
                     pool.all_reduce(inp, out=output)
                 stream.synchronize()
                 dist.barrier(group=group, device_ids=[rank])
-                with kernel_resolution_guard('PCIe teardown graph preparation'):
+                with kernel_resolution_guard("PCIe teardown graph preparation"):
                     with torch.cuda.graph(graph, stream=stream):
                         pool.all_reduce(inp, out=output)
             torch.cuda.synchronize(device)
@@ -91,11 +92,16 @@ def _worker(rank: int, port: int) -> None:
                 inp.fill_(rank + 1 + step)
                 output.fill_(float("nan"))
                 dist.barrier(group=group, device_ids=[rank])
-                allocations = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+                allocations = torch.cuda.memory_stats(device)[
+                    "allocation.all.allocated"
+                ]
                 allocated_bytes = torch.cuda.memory_allocated(device)
                 graph.replay()
                 torch.cuda.synchronize(device)
-                assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocations
+                assert (
+                    torch.cuda.memory_stats(device)["allocation.all.allocated"]
+                    == allocations
+                )
                 assert torch.cuda.memory_allocated(device) == allocated_bytes
                 assert (inp.data_ptr(), output.data_ptr()) == addresses
                 _check_reduction(output, 3 + 2 * step)

@@ -17,7 +17,16 @@ META = OpMeta(
     name="mxfp8_linear",
     group="gemm",
     api_style="planned",
-    entry_points=("Weight", "BlockscaledQuery", "FixedBlockscaledQuery", "plan", "query_from_call", "mm", "pack_weight", "is_supported"),
+    entry_points=(
+        "Weight",
+        "BlockscaledQuery",
+        "FixedBlockscaledQuery",
+        "plan",
+        "query_from_call",
+        "mm",
+        "pack_weight",
+        "is_supported",
+    ),
     dtypes=("bf16", "fp16"),
     recipes=("mxfp8",),
     requires=("triton",),
@@ -31,6 +40,15 @@ META = OpMeta(
 )
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
-    from .api import BlockscaledQuery, FixedBlockscaledQuery, Weight, is_supported, mm, pack_weight, plan, query_from_call  # noqa: F401
+    from .api import (
+        BlockscaledQuery,
+        FixedBlockscaledQuery,
+        Weight,
+        is_supported,
+        mm,
+        pack_weight,
+        plan,
+        query_from_call,
+    )  # noqa: F401
 
 install_lazy_api(globals(), META)

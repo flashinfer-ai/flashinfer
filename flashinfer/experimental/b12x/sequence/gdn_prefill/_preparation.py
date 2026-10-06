@@ -1,4 +1,5 @@
 """GDN prefill declaration and shared native pipeline materialization."""
+
 from .._shared.delta_prefill.preparation import invocation_from_tensors
 from .._shared.delta_prefill.preparation import make_plan as _make_plan
 from . import _impl, _tuning

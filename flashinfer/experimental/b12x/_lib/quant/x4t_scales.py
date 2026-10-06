@@ -97,8 +97,13 @@ class X4TScaleBatch:
             )
         if self.exceptions.dtype != torch.uint32 or self.exceptions.ndim != 1:
             raise TypeError("X4T exceptions must be a one-dimensional uint32 tensor")
-        if self.exception_offsets.dtype != torch.int64 or self.exception_offsets.ndim != 1:
-            raise TypeError("X4T exception offsets must be a one-dimensional int64 tensor")
+        if (
+            self.exception_offsets.dtype != torch.int64
+            or self.exception_offsets.ndim != 1
+        ):
+            raise TypeError(
+                "X4T exception offsets must be a one-dimensional int64 tensor"
+            )
         if int(self.exception_offsets.numel()) != self.num_experts + 1:
             raise ValueError("X4T exception offsets must contain E+1 entries")
         tensors = (self.fixed, self.exceptions, self.exception_offsets)
@@ -325,14 +330,11 @@ class _X4TBaseDecodeLaunch:
                 value = Uint32(247)
         if cutlass.const_expr(self.packed_w4a16):
             packed_row = self._packed_row(row)
-            offset = (
-                (expert * Int32(self.columns) + column) * Int32(self.rows)
-                + packed_row
-            )
+            offset = (expert * Int32(self.columns) + column) * Int32(
+                self.rows
+            ) + packed_row
         else:
-            offset = (
-                (expert * Int32(self.rows) + row) * Int32(self.columns) + column
-            )
+            offset = (expert * Int32(self.rows) + row) * Int32(self.columns) + column
         output[offset] = Uint8(value)
 
     @cute.kernel
@@ -354,9 +356,8 @@ class _X4TBaseDecodeLaunch:
             tile = task - slot * Int32(self.tile_count)
             expert = expert_ids[slot].to(Int32)
             if expert >= Int32(0) and expert < num_experts:
-                tile_base = (
-                    (expert * Int32(self.tile_count) + tile)
-                    * Int32(self.tile_bytes)
+                tile_base = (expert * Int32(self.tile_count) + tile) * Int32(
+                    self.tile_bytes
                 )
                 element = Int32(tid)
                 tile_values = Int32(X4T_TILE_ROWS * self.columns)
@@ -422,7 +423,9 @@ class _X4TExceptionScatterLaunch:
             output_ptr,
             cute.make_layout((num_experts * self.rows * self.columns,)),
         )
-        self.kernel(exceptions, offsets, expert_ids, output, num_experts, active_capacity).launch(
+        self.kernel(
+            exceptions, offsets, expert_ids, output, num_experts, active_capacity
+        ).launch(
             grid=(grid_x, 1, 1),
             block=(self.threads, 1, 1),
             cluster=(1, 1, 1),
@@ -478,17 +481,13 @@ class _X4TExceptionScatterLaunch:
                     column = Int32(position - Uint32(row * Int32(self.columns)))
                     if cutlass.const_expr(self.packed_w4a16):
                         packed_row = self._packed_row(row)
-                        output_offset = (
-                            (expert * Int32(self.columns) + column)
-                            * Int32(self.rows)
-                            + packed_row
-                        )
+                        output_offset = (expert * Int32(self.columns) + column) * Int32(
+                            self.rows
+                        ) + packed_row
                     else:
-                        output_offset = (
-                            (expert * Int32(self.rows) + row)
-                            * Int32(self.columns)
-                            + column
-                        )
+                        output_offset = (expert * Int32(self.rows) + row) * Int32(
+                            self.columns
+                        ) + column
                     output[output_offset] = Uint8(value)
                     cursor += Int64(self.threads)
             slot += Int32(grid)
@@ -584,9 +583,7 @@ class _X4TTP12W4A16DecodeLaunch:
         )
         w13_output = cute.make_tensor(
             w13_output_ptr,
-            cute.make_layout(
-                (num_experts * _TP12_W13_COLUMNS * _TP12_W13_ROWS,)
-            ),
+            cute.make_layout((num_experts * _TP12_W13_COLUMNS * _TP12_W13_ROWS,)),
         )
         w2_output = cute.make_tensor(
             w2_output_ptr,
@@ -682,15 +679,11 @@ class _X4TTP12W4A16DecodeLaunch:
         packed_row_base = task * Int32(_TP12_W13_ROWS_PER_TASK)
         output_u32 = cute.recast_tensor(output, cutlass.Uint32)
         word = tid
-        word_count = Int32(
-            _TP12_W13_ROWS_PER_TASK * _TP12_W13_COLUMNS // 4
-        )
+        word_count = Int32(_TP12_W13_ROWS_PER_TASK * _TP12_W13_COLUMNS // 4)
         while word < word_count:
             packed_element = word << Int32(2)
             column = packed_element // Int32(_TP12_W13_ROWS_PER_TASK)
-            packed_in_task = (
-                packed_element - column * Int32(_TP12_W13_ROWS_PER_TASK)
-            )
+            packed_in_task = packed_element - column * Int32(_TP12_W13_ROWS_PER_TASK)
             packed_values = Uint32(0)
             for lane in cutlass.range_constexpr(4):
                 packed_row = packed_in_task + Int32(lane)
@@ -715,13 +708,10 @@ class _X4TTP12W4A16DecodeLaunch:
                     + local_row * selector_bytes
                     + (column >> Int32(3))
                 ].to(Uint32)
-                value = base + (
-                    (selector >> Uint32(column & Int32(7))) & Uint32(1)
-                )
+                value = base + ((selector >> Uint32(column & Int32(7))) & Uint32(1))
                 packed_values |= self._clamp_scale(value) << Uint32(8 * lane)
             output_byte_offset = (
-                (expert * Int32(_TP12_W13_COLUMNS) + column)
-                * Int32(_TP12_W13_ROWS)
+                (expert * Int32(_TP12_W13_COLUMNS) + column) * Int32(_TP12_W13_ROWS)
                 + packed_row_base
                 + packed_in_task
             )
@@ -736,17 +726,14 @@ class _X4TTP12W4A16DecodeLaunch:
             entry = exceptions[cursor].to(Uint32)
             position = entry & Uint32(X4T_POSITION_MASK)
             source_row = Int32(position // Uint32(_TP12_W13_COLUMNS))
-            column = Int32(
-                position - Uint32(source_row * Int32(_TP12_W13_COLUMNS))
-            )
+            column = Int32(position - Uint32(source_row * Int32(_TP12_W13_COLUMNS)))
             rotated_row = source_row
             if cutlass.const_expr(self.w13_row_rotation > 0):
                 rotated_row -= Int32(self.w13_row_rotation)
                 if rotated_row < Int32(0):
                     rotated_row += Int32(_TP12_W13_ROWS)
             output[
-                (expert * Int32(_TP12_W13_COLUMNS) + column)
-                * Int32(_TP12_W13_ROWS)
+                (expert * Int32(_TP12_W13_COLUMNS) + column) * Int32(_TP12_W13_ROWS)
                 + self._packed_row(rotated_row)
             ] = Uint8(self._clamp_scale(entry >> Uint32(24)))
             cursor += Int64(_TP12_THREADS)
@@ -772,9 +759,7 @@ class _X4TTP12W4A16DecodeLaunch:
         while word < word_count:
             packed_element = word << Int32(2)
             column = packed_element // Int32(_TP12_W2_ROWS_PER_TASK)
-            packed_in_task = (
-                packed_element - column * Int32(_TP12_W2_ROWS_PER_TASK)
-            )
+            packed_in_task = packed_element - column * Int32(_TP12_W2_ROWS_PER_TASK)
             packed_values = Uint32(0)
             for lane in cutlass.range_constexpr(4):
                 packed_row = packed_in_task + Int32(lane)
@@ -788,16 +773,13 @@ class _X4TTP12W4A16DecodeLaunch:
                 local_row = source_row & Int32(15)
                 tile_base = (expert * tile_count + tile) * tile_bytes
                 base = fixed[tile_base + local_row].to(Uint32)
-                selector = fixed[
-                    tile_base + Int32(X4T_TILE_ROWS) + local_row
-                ].to(Uint32)
-                value = base + (
-                    (selector >> Uint32(column & Int32(7))) & Uint32(1)
+                selector = fixed[tile_base + Int32(X4T_TILE_ROWS) + local_row].to(
+                    Uint32
                 )
+                value = base + ((selector >> Uint32(column & Int32(7))) & Uint32(1))
                 packed_values |= self._clamp_scale(value) << Uint32(8 * lane)
             output_byte_offset = (
-                (expert * Int32(_TP12_W2_COLUMNS) + column)
-                * Int32(_TP12_W2_ROWS)
+                (expert * Int32(_TP12_W2_COLUMNS) + column) * Int32(_TP12_W2_ROWS)
                 + packed_row_base
                 + packed_in_task
             )
@@ -814,8 +796,7 @@ class _X4TTP12W4A16DecodeLaunch:
             source_row = Int32(position >> Uint32(3))
             column = Int32(position & Uint32(7))
             output[
-                (expert * Int32(_TP12_W2_COLUMNS) + column)
-                * Int32(_TP12_W2_ROWS)
+                (expert * Int32(_TP12_W2_COLUMNS) + column) * Int32(_TP12_W2_ROWS)
                 + self._packed_row(source_row)
             ] = Uint8(self._clamp_scale(entry >> Uint32(24)))
             cursor += Int64(_TP12_THREADS)
@@ -862,9 +843,7 @@ class _X4TTP12W4A16DecodeLaunch:
 
             @cute.struct
             class Storage:
-                expert: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Int32, 1], 4
-                ]
+                expert: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 4]
 
             storage = smem.allocate(Storage)
             shared_expert = storage.expert.get_tensor(cute.make_layout(1))
@@ -1067,9 +1046,7 @@ def decode_x4t_tp12_w4a16_scales(
     w13.validate()
     w2.validate()
     if (w13.rows, w13.columns) != (_TP12_W13_ROWS, _TP12_W13_COLUMNS):
-        raise ValueError(
-            "TP12 X4T w13 scales must have logical shape [E,512,112]"
-        )
+        raise ValueError("TP12 X4T w13 scales must have logical shape [E,512,112]")
     if (w2.rows, w2.columns) != (_TP12_W2_ROWS, _TP12_W2_COLUMNS):
         raise ValueError("TP12 X4T w2 scales must have logical shape [E,3584,8]")
     if w13.num_experts != w2.num_experts:
@@ -1100,9 +1077,13 @@ def decode_x4t_tp12_w4a16_scales(
         raise ValueError("TP12 X4T expert_ids must be contiguous on the batch device")
     if expert_map is not None:
         if expert_map.dtype != torch.int32 or expert_map.ndim != 1:
-            raise TypeError("TP12 X4T expert_map must be a one-dimensional int32 tensor")
+            raise TypeError(
+                "TP12 X4T expert_map must be a one-dimensional int32 tensor"
+            )
         if not expert_map.is_contiguous() or expert_map.device != device:
-            raise ValueError("TP12 X4T expert_map must be contiguous on the batch device")
+            raise ValueError(
+                "TP12 X4T expert_map must be contiguous on the batch device"
+            )
     expected_w13 = (w13.num_experts, _TP12_W13_COLUMNS, _TP12_W13_ROWS)
     expected_w2 = (w13.num_experts, _TP12_W2_COLUMNS, _TP12_W2_ROWS)
     for name, tensor, expected in (
@@ -1126,18 +1107,75 @@ def decode_x4t_tp12_w4a16_scales(
     )
     stream = current_cuda_stream() if stream is None else stream
     compiled(
-        make_ptr(cutlass.Uint8, w13.fixed.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Uint32, w13.exceptions.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Int64, w13.exception_offsets.data_ptr(), cute.AddressSpace.gmem, assumed_align=8),
-        make_ptr(cutlass.Int64, w13.task_exception_offsets.data_ptr(), cute.AddressSpace.gmem, assumed_align=8),
-        make_ptr(cutlass.Uint8, w2.fixed.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Uint32, w2.exceptions.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Int64, w2.exception_offsets.data_ptr(), cute.AddressSpace.gmem, assumed_align=8),
-        make_ptr(cutlass.Int64, w2.task_exception_offsets.data_ptr(), cute.AddressSpace.gmem, assumed_align=8),
-        make_ptr(cutlass.Int32, expert_ids.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        make_ptr(cutlass.Int32, map_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        make_ptr(cutlass.Uint8, w13_output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Uint8, w2_output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(
+            cutlass.Uint8,
+            w13.fixed.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Uint32,
+            w13.exceptions.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Int64,
+            w13.exception_offsets.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=8,
+        ),
+        make_ptr(
+            cutlass.Int64,
+            w13.task_exception_offsets.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=8,
+        ),
+        make_ptr(
+            cutlass.Uint8, w2.fixed.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        ),
+        make_ptr(
+            cutlass.Uint32,
+            w2.exceptions.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Int64,
+            w2.exception_offsets.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=8,
+        ),
+        make_ptr(
+            cutlass.Int64,
+            w2.task_exception_offsets.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=8,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            expert_ids.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            map_tensor.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            cutlass.Uint8,
+            w13_output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Uint8,
+            w2_output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
         w13.num_experts,
         int(w13.exceptions.numel()),
         int(w2.exceptions.numel()),
@@ -1192,7 +1230,9 @@ def decode_x4t_scales(
     threads = 128 if int(batch.columns) <= 8 else 256
     active_capacity = int(expert_ids.numel())
     total_tiles = active_capacity * batch.tile_count
-    sm_count = torch.cuda.get_device_properties(batch.fixed.device).multi_processor_count
+    sm_count = torch.cuda.get_device_properties(
+        batch.fixed.device
+    ).multi_processor_count
     base_grid = max(1, min(total_tiles, sm_count * _GRID_CTAS_PER_SM))
     base = _compiled_x4t_base(
         batch.rows,
@@ -1203,9 +1243,21 @@ def decode_x4t_scales(
         threads,
     )
     base(
-        make_ptr(cutlass.Uint8, batch.fixed.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Int32, expert_ids.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        make_ptr(cutlass.Uint8, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(
+            cutlass.Uint8,
+            batch.fixed.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            expert_ids.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            cutlass.Uint8, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        ),
         batch.num_experts,
         active_capacity,
         base_grid,
@@ -1222,10 +1274,27 @@ def decode_x4t_scales(
         threads,
     )
     scatter(
-        make_ptr(cutlass.Uint32, batch.exceptions.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Int64, batch.exception_offsets.data_ptr(), cute.AddressSpace.gmem, assumed_align=8),
-        make_ptr(cutlass.Int32, expert_ids.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        make_ptr(cutlass.Uint8, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(
+            cutlass.Uint32,
+            batch.exceptions.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Int64,
+            batch.exception_offsets.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=8,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            expert_ids.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            cutlass.Uint8, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        ),
         batch.num_experts,
         int(batch.exceptions.numel()),
         active_capacity,

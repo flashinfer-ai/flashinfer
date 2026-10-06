@@ -52,8 +52,22 @@ def _source_weights(e: int, h: int, i: int, device: torch.device, *, seed: int):
         return torch.full((e, size), 0.5, dtype=torch.float8_e4m3fn, device=device)
 
     return api.PackedWeights(
-        w13=torch.randint(0, 256, (e, 2 * i, h // 2), dtype=torch.uint8, device=device, generator=generator),
-        w2=torch.randint(0, 256, (e, h, i // 2), dtype=torch.uint8, device=device, generator=generator),
+        w13=torch.randint(
+            0,
+            256,
+            (e, 2 * i, h // 2),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        ),
+        w2=torch.randint(
+            0,
+            256,
+            (e, h, i // 2),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        ),
         w13_block_scales=blocks(2 * i, h),
         w2_block_scales=blocks(h, i),
         w13_global_scales=torch.linspace(0.008, 0.016, e, device=device),
@@ -68,13 +82,33 @@ def _source_fp6_weights(e: int, h: int, i: int, device: torch.device, *, seed: i
     from b12x.moe.fused_moe import api
 
     if h % 128 or i % 128:
-        raise ValueError("MXFP6 benchmark geometry requires 128-aligned hidden and intermediate sizes")
+        raise ValueError(
+            "MXFP6 benchmark geometry requires 128-aligned hidden and intermediate sizes"
+        )
     generator = torch.Generator(device=device).manual_seed(seed)
     return api.PackedWeights(
-        w13=torch.randint(0, 64, (e, 2 * i, 3 * h // 4), dtype=torch.uint8, device=device, generator=generator),
-        w2=torch.randint(0, 64, (e, h, 3 * i // 4), dtype=torch.uint8, device=device, generator=generator),
-        w13_block_scales=torch.full((e, 2 * i, h // 32), 127, dtype=torch.uint8, device=device),
-        w2_block_scales=torch.full((e, h, i // 32), 127, dtype=torch.uint8, device=device),
+        w13=torch.randint(
+            0,
+            64,
+            (e, 2 * i, 3 * h // 4),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        ),
+        w2=torch.randint(
+            0,
+            64,
+            (e, h, 3 * i // 4),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        ),
+        w13_block_scales=torch.full(
+            (e, 2 * i, h // 32), 127, dtype=torch.uint8, device=device
+        ),
+        w2_block_scales=torch.full(
+            (e, h, i // 32), 127, dtype=torch.uint8, device=device
+        ),
         w13_global_scales=torch.linspace(0.008, 0.016, e, device=device),
         w2_global_scales=torch.linspace(0.008, 0.016, e, device=device),
         input_scale=None,
@@ -93,12 +127,27 @@ def _fixture(
     )
     from b12x.moe.fused_moe import api
 
-    return source, api.prepare_weights(plan=_weight_plan(e, h, i, mode, limit), weights=source), seed
+    return (
+        source,
+        api.prepare_weights(plan=_weight_plan(e, h, i, mode, limit), weights=source),
+        seed,
+    )
 
 
 def _call_factory(
-    *, tokens: int, experts, source, mode: str, limit: float | None,
-    e: int, h: int, i: int, topk: int, sigmoid: bool, scale: float, eps: float,
+    *,
+    tokens: int,
+    experts,
+    source,
+    mode: str,
+    limit: float | None,
+    e: int,
+    h: int,
+    i: int,
+    topk: int,
+    sigmoid: bool,
+    scale: float,
+    eps: float,
     weight_seed: int,
 ) -> Callable[[object], PreparedCall]:
     """Create isolated benchmark/trial state while borrowing immutable fixture weights."""
@@ -113,8 +162,12 @@ def _call_factory(
         seed = torch.randn((tokens, h), device=experts.device, dtype=torch.bfloat16)
         x = torch.empty_like(seed)
         norm = torch.ones(h, device=experts.device, dtype=torch.bfloat16)
-        router = torch.randn((e, h), device=experts.device, dtype=torch.float32).mul_(h**-0.5)
-        bias = torch.linspace(-0.01, 0.01, e, device=experts.device) if sigmoid else None
+        router = torch.randn((e, h), device=experts.device, dtype=torch.float32).mul_(
+            h**-0.5
+        )
+        bias = (
+            torch.linspace(-0.01, 0.01, e, device=experts.device) if sigmoid else None
+        )
         ids = torch.empty((tokens, topk), device=experts.device, dtype=torch.int32)
         weights = torch.empty((tokens, topk), device=experts.device)
         selected = torch.empty((tokens, topk), device=experts.device)
@@ -151,6 +204,7 @@ def _call_factory(
             topk_weights=weights,
             input_scales_static=True,
         )
+
         def restore() -> None:
             reset()
             produce()
@@ -163,7 +217,13 @@ def _call_factory(
             restore=restore,
             owners=(
                 _Expected(x, source, ids, weights, limit, mode, (e, h, i), weight_seed),
-                seed, norm, router, bias, selected, scratch, binding,
+                seed,
+                norm,
+                router,
+                bias,
+                selected,
+                scratch,
+                binding,
             ),
         )
 
@@ -199,54 +259,78 @@ def make_benchmark_requests(
         source, experts, weight_seed = _fixture(
             e=e, h=h, i=i, mode=mode, limit=limit, device=device
         )
-        invocation = FrozenMapping({
-            "role": role,
-            "tp": tp,
-            "numerical_recipe": "w6a8_mxfp6" if mode == "fp6" else ("w4a16" if mode == "a16" else "nvfp4_a4"),
-            "source_format": "mxfp6_e2m3" if mode == "fp6" else "modelopt_nvfp4",
-            "w13_layout": "w13",
-            "activation_dtype": "bfloat16",
-            "route_ids_dtype": "int32",
-            "route_logits_dtype": "float32",
-            "swiglu_limit": limit,
-            "scoring_func": "sigmoid" if sigmoid else "softmax",
-            "routed_scaling_factor": scale,
-            "score_correction": sigmoid,
-            "input_scale_layout": "expert_vector" if mode != "fp6" else "mxfp8_k32",
-            "deterministic_output": False,
-        })
+        invocation = FrozenMapping(
+            {
+                "role": role,
+                "tp": tp,
+                "numerical_recipe": "w6a8_mxfp6"
+                if mode == "fp6"
+                else ("w4a16" if mode == "a16" else "nvfp4_a4"),
+                "source_format": "mxfp6_e2m3" if mode == "fp6" else "modelopt_nvfp4",
+                "w13_layout": "w13",
+                "activation_dtype": "bfloat16",
+                "route_ids_dtype": "int32",
+                "route_logits_dtype": "float32",
+                "swiglu_limit": limit,
+                "scoring_func": "sigmoid" if sigmoid else "softmax",
+                "routed_scaling_factor": scale,
+                "score_correction": sigmoid,
+                "input_scale_layout": "expert_vector" if mode != "fp6" else "mxfp8_k32",
+                "deterministic_output": False,
+            }
+        )
         declaration = api.plan_execution(
             experts=experts,
             capacity=api.ExecutionCapacity(
-                max_tokens=counts[-1], top_k=topk,
-                warmup_token_counts=counts[:-1], route_num_experts=e,
+                max_tokens=counts[-1],
+                top_k=topk,
+                warmup_token_counts=counts[:-1],
+                route_num_experts=e,
             ),
-            routing=api.RoutingSpec(logits_dtype=torch.float32, deterministic_output=False),
+            routing=api.RoutingSpec(
+                logits_dtype=torch.float32, deterministic_output=False
+            ),
             invocation=invocation,
         )
         token_counts = getattr(declaration, "token_counts", (counts[-1],))
         factories = {
             tokens: _call_factory(
-                tokens=tokens, experts=experts, source=source, mode=mode, limit=limit,
-                e=e, h=h, i=i, topk=topk, sigmoid=sigmoid, scale=scale, eps=eps,
+                tokens=tokens,
+                experts=experts,
+                source=source,
+                mode=mode,
+                limit=limit,
+                e=e,
+                h=h,
+                i=i,
+                topk=topk,
+                sigmoid=sigmoid,
+                scale=scale,
+                eps=eps,
                 weight_seed=weight_seed,
             )
             for tokens in token_counts
         }
         name = f"moe.{role}"
         if hasattr(declaration, "token_counts"):
-            requests.append(declaration.request(
-                name=name,
-                prepare_calls=factories, benchmark_calls=factories,
-                retain_benchmark_call=True,
-            ))
+            requests.append(
+                declaration.request(
+                    name=name,
+                    prepare_calls=factories,
+                    benchmark_calls=factories,
+                    retain_benchmark_call=True,
+                )
+            )
         else:
             factory = factories[counts[-1]]
-            requests.append(declaration.request(
-                name=name,
-                prepare_call=factory, benchmark_call=factory,
-                retain_benchmark_call=True,
-            ))
+            requests.append(
+                declaration.request(
+                    name=name,
+                    prepare_call=factory,
+                    benchmark_call=factory,
+                    retain_benchmark_call=True,
+                )
+            )
     return requests
 
 
@@ -263,7 +347,9 @@ def test_expected(call: PreparedCall) -> torch.Tensor:
     if context.mode == "fp6":
         return test_actual(call)
     w = (
-        _source_weights(*context.geometry, context.source.device, seed=context.weight_seed)
+        _source_weights(
+            *context.geometry, context.source.device, seed=context.weight_seed
+        )
         if context.mode == "a16"
         else context.weights
     )
@@ -273,18 +359,34 @@ def test_expected(call: PreparedCall) -> torch.Tensor:
     )
 
     def dequant(codes, blocks, gs):
-        values = torch.stack((lut[(codes & 15).long()], lut[(codes >> 4).long()]), -1).flatten(-2)
+        values = torch.stack(
+            (lut[(codes & 15).long()], lut[(codes >> 4).long()]), -1
+        ).flatten(-2)
         n, k = values.shape
-        return values * unswizzle_block_scale(blocks, n, k // 16).repeat_interleave(16, -1) * gs
+        return (
+            values
+            * unswizzle_block_scale(blocks, n, k // 16).repeat_interleave(16, -1)
+            * gs
+        )
 
     def activation_quant(values, global_scale):
         blocks = values.reshape(*values.shape[:-1], -1, 16)
-        raw_scale = (blocks.abs().amax(-1, keepdim=True).double() * global_scale.double() / 6).float()
+        raw_scale = (
+            blocks.abs().amax(-1, keepdim=True).double() * global_scale.double() / 6
+        ).float()
         scale = raw_scale.clamp(max=448).to(torch.float8_e4m3fn).float()
         effective = (scale / global_scale).clamp_min(1e-30)
         scaled = blocks * effective.reciprocal()
         z = scaled.abs().clamp(max=6)
-        code = ((z > 0.25).int() + (z >= 0.75).int() + (z > 1.25).int() + (z >= 1.75).int() + (z > 2.5).int() + (z >= 3.5).int() + (z > 5).int())
+        code = (
+            (z > 0.25).int()
+            + (z >= 0.75).int()
+            + (z > 1.25).int()
+            + (z >= 1.75).int()
+            + (z > 2.5).int()
+            + (z >= 3.5).int()
+            + (z > 5).int()
+        )
         return (lut[code] * scaled.sign() * scale).reshape_as(values)
 
     result = torch.zeros_like(context.source, dtype=torch.float32)
@@ -293,7 +395,11 @@ def test_expected(call: PreparedCall) -> torch.Tensor:
         x = context.source[token].float()
         if context.mode == "a4":
             x = activation_quant(x, w.input_scale[expert])
-        w13 = dequant(w.w13[expert], w.w13_block_scales[expert], 1.0 if context.mode == "a4" else w.w13_global_scales[expert])
+        w13 = dequant(
+            w.w13[expert],
+            w.w13_block_scales[expert],
+            1.0 if context.mode == "a4" else w.w13_global_scales[expert],
+        )
         projections = x @ w13.T
         if context.mode == "a4":
             projections *= w.w13_global_scales[expert] / w.input_scale[expert]
@@ -304,9 +410,15 @@ def test_expected(call: PreparedCall) -> torch.Tensor:
         intermediate = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16).float()
         if context.mode == "a4":
             intermediate = activation_quant(intermediate, w.intermediate_scale[expert])
-        down = dequant(w.w2[expert], w.w2_block_scales[expert], 1.0 if context.mode == "a4" else w.w2_global_scales[expert])
+        down = dequant(
+            w.w2[expert],
+            w.w2_block_scales[expert],
+            1.0 if context.mode == "a4" else w.w2_global_scales[expert],
+        )
         projected = intermediate @ down.T
         if context.mode == "a4":
             projected *= w.w2_global_scales[expert] / w.intermediate_scale[expert]
-        result.index_add_(0, token, projected * context.probabilities[token, slot, None])
+        result.index_add_(
+            0, token, projected * context.probabilities[token, slot, None]
+        )
     return result.to(torch.bfloat16)

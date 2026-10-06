@@ -48,7 +48,9 @@ def require_row_contiguous(
     dtypes: tuple[torch.dtype, ...],
 ) -> None:
     """Require contiguous rows whose outer stride may exceed the row size."""
-    require_tensor(name, tensor, shape=shape, device=device, dtypes=dtypes, contiguous=False)
+    require_tensor(
+        name, tensor, shape=shape, device=device, dtypes=dtypes, contiguous=False
+    )
     expected_inner_strides = []
     stride = 1
     for size in reversed(shape[1:]):
@@ -76,7 +78,12 @@ def require_paged_recurrent_state(
 ) -> None:
     """Require ``[slot, head, value_dim, key_dim]`` slots that may be padded."""
     require_tensor(
-        "recurrent_state", tensor, shape=shape, device=device, dtypes=(dtype,), contiguous=False
+        "recurrent_state",
+        tensor,
+        shape=shape,
+        device=device,
+        dtypes=(dtype,),
+        contiguous=False,
     )
     _, heads, value_dim, key_dim = shape
     slot_elements = heads * value_dim * key_dim

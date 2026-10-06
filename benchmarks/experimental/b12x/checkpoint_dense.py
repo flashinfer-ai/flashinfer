@@ -30,7 +30,10 @@ from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.gemm import blockscaled
 from b12x.preparation import PreparationSession, PreparedCall, require_prepared
 from b12x.testing.iq2_xs_reference import dequantize_blocks
-from benchmarks.experimental.b12x.common import make_l2_flush_fn, nvidia_smi_gpu_mode_snapshot
+from benchmarks.experimental.b12x.common import (
+    make_l2_flush_fn,
+    nvidia_smi_gpu_mode_snapshot,
+)
 
 
 def checkpoint_cases(model: Path):
@@ -248,8 +251,12 @@ def run(args):
         for case in cases:
             weight, decoded, multiplier, hashes = load_weight(model, index, case)
             values = weight.values
-            scales = weight.metadata if case["recipe"] in BLOCK_CODECS else weight.scale_mma
-            global_scale = None if case["recipe"] in BLOCK_CODECS else weight.global_scale
+            scales = (
+                weight.metadata if case["recipe"] in BLOCK_CODECS else weight.scale_mma
+            )
+            global_scale = (
+                None if case["recipe"] in BLOCK_CODECS else weight.global_scale
+            )
             for m in counts:
                 source = torch.empty(
                     (m, case["k"]), device="cuda", dtype=torch.bfloat16

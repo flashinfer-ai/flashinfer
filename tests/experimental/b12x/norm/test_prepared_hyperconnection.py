@@ -73,7 +73,9 @@ def _prepare_engram(
 def test_prepared_engram_uses_signed_zero_and_odd_offset_mask() -> None:
     device = require_b12x()
     streams, hidden, tokens = 4, 5120, 3
-    state = torch.full((tokens, streams * hidden), -0.5, device=device, dtype=torch.bfloat16)
+    state = torch.full(
+        (tokens, streams * hidden), -0.5, device=device, dtype=torch.bfloat16
+    )
     projected = torch.zeros(
         (tokens, (streams + 1) * hidden), device=device, dtype=torch.bfloat16
     )
@@ -83,15 +85,28 @@ def test_prepared_engram_uses_signed_zero_and_odd_offset_mask() -> None:
     mask = mask_owner[1:]
     output = torch.empty_like(state)
     declaration, request = _prepare_engram(
-        device, capacity=tokens, hidden=hidden, state=state, projected=projected,
-        weights=weights, mask=mask, output=output,
+        device,
+        capacity=tokens,
+        hidden=hidden,
+        state=state,
+        projected=projected,
+        weights=weights,
+        mask=mask,
+        output=output,
     )
 
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
         session.prepare((request,))
         actual = hc.run_engram_mix(
-            state, projected, weights, eps=1e-20, plan=declaration,
-            out=output, token_mask=mask,
+            state,
+            projected,
+            weights,
+            eps=1e-20,
+            plan=declaration,
+            out=output,
+            token_mask=mask,
         )
         expected = _engram_reference(state, projected, weights, streams, 1e-20, mask)
         torch.testing.assert_close(actual, expected, rtol=0, atol=1e-6)
@@ -104,31 +119,59 @@ def test_prepared_engram_replays_changed_inputs(with_mask) -> None:
     device = require_b12x()
     streams, hidden, capacity = 4, 5120, 7
     generator = torch.Generator(device=device).manual_seed(4109)
-    state = torch.randn((capacity, streams * hidden), generator=generator, device=device, dtype=torch.bfloat16)
-    projected = torch.randn((capacity, (streams + 1) * hidden), generator=generator, device=device, dtype=torch.bfloat16)
+    state = torch.randn(
+        (capacity, streams * hidden),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    projected = torch.randn(
+        (capacity, (streams + 1) * hidden),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
     weights = torch.randn(streams * hidden, generator=generator, device=device)
     mask = torch.ones(capacity, dtype=torch.bool, device=device) if with_mask else None
     output = torch.empty_like(state)
     declaration, request = _prepare_engram(
-        device, capacity=capacity, hidden=hidden, state=state, projected=projected,
-        weights=weights, mask=mask, output=output,
+        device,
+        capacity=capacity,
+        hidden=hidden,
+        state=state,
+        projected=projected,
+        weights=weights,
+        mask=mask,
+        output=output,
     )
 
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
         session.prepare((request,))
         plan = declaration
 
         def launch(rows: int) -> torch.Tensor:
             return hc.run_engram_mix(
-                state[:rows], projected[:rows], weights, eps=1e-20,
-                plan=plan, out=output[:rows], token_mask=mask[:rows] if mask is not None else None,
+                state[:rows],
+                projected[:rows],
+                weights,
+                eps=1e-20,
+                plan=plan,
+                out=output[:rows],
+                token_mask=mask[:rows] if mask is not None else None,
             )
 
         for rows in (0, 1, capacity):
             output.fill_(123)
             actual = launch(rows)
             expected = _engram_reference(
-                state[:rows], projected[:rows], weights, streams, 1e-20, mask[:rows] if mask is not None else None
+                state[:rows],
+                projected[:rows],
+                weights,
+                streams,
+                1e-20,
+                mask[:rows] if mask is not None else None,
             )
             torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
             torch.testing.assert_close(
@@ -188,12 +231,16 @@ def test_prepared_swiglu_preserves_asymmetric_clamp_and_vision_rounding() -> Non
         ),
     )
 
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
         session.prepare((request,))
         hc.run_swiglu(gate_up, limit=2.0, out=clamped, plan=declaration)
         expected = (
-            F.silu(gate.float().clamp(max=2.0)) * up.float().clamp(-2.0, 2.0)
-        ).bfloat16().reshape_as(clamped)
+            (F.silu(gate.float().clamp(max=2.0)) * up.float().clamp(-2.0, 2.0))
+            .bfloat16()
+            .reshape_as(clamped)
+        )
         torch.testing.assert_close(clamped, expected, rtol=0, atol=0)
         assert clamped[0, 0].abs() < 1e-6
 
@@ -244,7 +291,9 @@ def test_prepared_swiglu_preserves_asymmetric_clamp_and_vision_rounding() -> Non
             )
         ),
     )
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
         session.prepare((standard_request, vision_request))
         hc.run_swiglu(
             merged,
@@ -290,7 +339,9 @@ def test_prepared_add_retains_fp32_before_cancellation() -> None:
                 run=lambda: _impl.run_add_impl(left, right, out=out, plan=prepared)
             ),
         )
-        with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        with PreparationSession(
+            device=device, autotune=False, compile_workers=2
+        ) as session:
             session.prepare((request,))
             actual = hc.run_add(left, right, out=out, plan=declaration)
             assert actual.data_ptr() == out.data_ptr()
@@ -308,34 +359,68 @@ def test_ordinary_rmsnorm_uses_affine_weight_without_offset(hidden, weight_dtype
     weight = torch.linspace(-0.5, 1.5, hidden, device=device).to(weight_dtype)
     normalized = torch.empty_like(state)
     plan = hc.plan(
-        hc.Caps(device=device, max_tokens=capacity, hidden_size=hidden, streams=1, lowrank=1),
-        invocation=FrozenMapping({"operation": "grouped_rmsnorm", "eps": 1e-20,
-                                  "zero_centered": False,
-                                  "weight_dtype": str(weight_dtype).removeprefix("torch.")}),
+        hc.Caps(
+            device=device, max_tokens=capacity, hidden_size=hidden, streams=1, lowrank=1
+        ),
+        invocation=FrozenMapping(
+            {
+                "operation": "grouped_rmsnorm",
+                "eps": 1e-20,
+                "zero_centered": False,
+                "weight_dtype": str(weight_dtype).removeprefix("torch."),
+            }
+        ),
     )
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
-        session.prepare((plan.request(name="rmsnorm", prepare_call=lambda prepared: PreparedCall(
-            run=lambda: _impl.run_grouped_rmsnorm_impl(
-                state, weight, eps=1e-20, plan=prepared, out=normalized, zero_centered=False,
-            ),
-        )),))
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="rmsnorm",
+                    prepare_call=lambda prepared: PreparedCall(
+                        run=lambda: _impl.run_grouped_rmsnorm_impl(
+                            state,
+                            weight,
+                            eps=1e-20,
+                            plan=prepared,
+                            out=normalized,
+                            zero_centered=False,
+                        ),
+                    ),
+                ),
+            )
+        )
         bottleneck = torch.empty((capacity, 1), device=device, dtype=torch.bfloat16)
         block_input = torch.empty_like(state)
         session.freeze()
         for rows in (0, 1, capacity):
-            binding = hc.bind(plan, normalized=normalized, bottleneck=bottleneck,
-                              block_input=block_input, tokens=rows)
+            binding = hc.bind(
+                plan,
+                normalized=normalized,
+                bottleneck=bottleneck,
+                block_input=block_input,
+                tokens=rows,
+            )
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                actual = hc.run_grouped_rmsnorm(state[:rows], weight, eps=1e-20,
-                                                binding=binding, zero_centered=False)
+                actual = hc.run_grouped_rmsnorm(
+                    state[:rows],
+                    weight,
+                    eps=1e-20,
+                    binding=binding,
+                    zero_centered=False,
+                )
             state.mul_(0.75)
             weight.neg_()
             normalized.fill_(float("nan"))
             graph.replay()
             values = state[:rows].float()
-            expected = (values * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-20)
-                        * weight.float()).bfloat16()
+            expected = (
+                values
+                * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-20)
+                * weight.float()
+            ).bfloat16()
             torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
             assert torch.isnan(normalized[rows:]).all()
             graph.reset()

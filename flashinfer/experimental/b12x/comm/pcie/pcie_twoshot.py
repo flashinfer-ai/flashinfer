@@ -46,8 +46,7 @@ _MAX_BLOCKS = 64
 _MAX_RANKS = 16
 _FLAG_STRIDE = 32
 _SIGNAL_BYTES = (
-    _MAX_BLOCKS * _MAX_RANKS * 4
-    + 2 * _MAX_BLOCKS * (_MAX_RANKS * _FLAG_STRIDE) * 4
+    _MAX_BLOCKS * _MAX_RANKS * 4 + 2 * _MAX_BLOCKS * (_MAX_RANKS * _FLAG_STRIDE) * 4
 )
 
 
@@ -245,9 +244,7 @@ class PCIeTwoShotSP:
             ipc=ipc,
         )
         peer_ptrs = list(shared.peer_ptrs)
-        signal_ptrs = _pad_scalar_peer_ptrs(
-            peer_ptrs, rank=rank, world_size=world_size
-        )
+        signal_ptrs = _pad_scalar_peer_ptrs(peer_ptrs, rank=rank, world_size=world_size)
         staging_ptrs = (
             _pad_scalar_peer_ptrs(
                 [p + layout.signal_bytes for p in peer_ptrs],
@@ -330,7 +327,9 @@ class PCIeTwoShotSP:
         state = require_prepared(plan, "comm.pcie", self.device)
         state.require_runtime(self)
         if self._capture_context_depth:
-            raise RuntimeError("overlapping PCIe twoshot capture contexts are not allowed")
+            raise RuntimeError(
+                "overlapping PCIe twoshot capture contexts are not allowed"
+            )
         self._capture_context_depth = 1
         try:
             yield self
@@ -338,15 +337,25 @@ class PCIeTwoShotSP:
             self._capture_context_depth = 0
 
     def _launch_prepared(
-        self, payload: torch.Tensor, scale: torch.Tensor, out: torch.Tensor, *,
-        state, threads: int, block_limit: int,
+        self,
+        payload: torch.Tensor,
+        scale: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        state,
+        threads: int,
+        block_limit: int,
     ) -> None:
         operation = state.query.call["operation"]
         rows_per_rank = (
             payload.shape[0] // self.world_size
-            if operation == "reduce_scatter" else payload.shape[0]
+            if operation == "reduce_scatter"
+            else payload.shape[0]
         )
-        if int(threads) != state.query.call["threads"] or int(block_limit) != state.query.call["block_limit"]:
+        if (
+            int(threads) != state.query.call["threads"]
+            or int(block_limit) != state.query.call["block_limit"]
+        ):
             raise ValueError("two-shot launch controls differ from the prepared plan")
         shard_packs = rows_per_rank * (self.row_elems // 16)
         if shard_packs > self._pack_stride or rows_per_rank > self._scale_stride:
@@ -354,7 +363,9 @@ class PCIeTwoShotSP:
         blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
         capturing = _is_current_stream_capturing(self.device)
         if capturing and self._capture_context_depth <= 0:
-            raise RuntimeError("PCIe twoshot CUDA graph capture requires runtime.capture(plan=...)")
+            raise RuntimeError(
+                "PCIe twoshot CUDA graph capture requires runtime.capture(plan=...)"
+            )
         if capturing and not self._device_slot_selection:
             self._device_slot_bias = self._slot & 1
             self._device_slot_selection = True
@@ -365,10 +376,19 @@ class PCIeTwoShotSP:
             self._slot += 1
         launcher = state.launcher(self._device_slot_selection, self._device_slot_bias)
         launcher(
-            payload.data_ptr(), scale.data_ptr(), self._staging_ptrs[slot],
-            self._signal_ptrs, out.data_ptr(), self.rank, self._pack_stride,
-            self._scale_offset, self._scale_stride, self._slot_bytes,
-            rows_per_rank, self.row_elems, blocks,
+            payload.data_ptr(),
+            scale.data_ptr(),
+            self._staging_ptrs[slot],
+            self._signal_ptrs,
+            out.data_ptr(),
+            self.rank,
+            self._pack_stride,
+            self._scale_offset,
+            self._scale_stride,
+            self._slot_bytes,
+            rows_per_rank,
+            self.row_elems,
+            blocks,
         )
 
     def reduce_scatter_fp8(
@@ -388,7 +408,12 @@ class PCIeTwoShotSP:
             raise ValueError("plan does not prepare FP8 reduce-scatter")
         with _device_guard(self.device):
             return self._reduce_scatter_fp8_on_device(
-                payload, scale, out, state=state, threads=threads, block_limit=block_limit,
+                payload,
+                scale,
+                out,
+                state=state,
+                threads=threads,
+                block_limit=block_limit,
             )
 
     def _reduce_scatter_fp8_on_device(
@@ -418,9 +443,16 @@ class PCIeTwoShotSP:
             or out.device != self.device
             or not out.is_contiguous()
         ):
-            raise ValueError("output must be contiguous BF16 with the local shard shape")
+            raise ValueError(
+                "output must be contiguous BF16 with the local shard shape"
+            )
         self._launch_prepared(
-            payload, scale, out, state=state, threads=threads, block_limit=block_limit,
+            payload,
+            scale,
+            out,
+            state=state,
+            threads=threads,
+            block_limit=block_limit,
         )
         return out
 
@@ -441,7 +473,12 @@ class PCIeTwoShotSP:
             raise ValueError("plan does not prepare FP8 all-gather")
         with _device_guard(self.device):
             return self._all_gather_fp8_on_device(
-                payload, scale, out, state=state, threads=threads, block_limit=block_limit,
+                payload,
+                scale,
+                out,
+                state=state,
+                threads=threads,
+                block_limit=block_limit,
             )
 
     def _all_gather_fp8_on_device(
@@ -471,7 +508,12 @@ class PCIeTwoShotSP:
         ):
             raise ValueError("output must be contiguous BF16 with the gathered shape")
         self._launch_prepared(
-            payload, scale, out, state=state, threads=threads, block_limit=block_limit,
+            payload,
+            scale,
+            out,
+            state=state,
+            threads=threads,
+            block_limit=block_limit,
         )
         return out
 

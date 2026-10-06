@@ -1,9 +1,11 @@
 """Launch configuration shared by the delta-rule prefill contracts."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from b12x.preparation import FrozenMapping
 from .workspace import BACKEND
+
 
 @dataclass(frozen=True)
 class PrefillConfig:
@@ -31,7 +33,11 @@ class PrefillConfig:
     def from_config(cls, payload: FrozenMapping) -> "PrefillConfig":
         keys = set(payload.keys())
         if "backend" not in keys or not keys <= {
-            "backend", "v_split", "k_split", "stages", "window_tiles"
+            "backend",
+            "v_split",
+            "k_split",
+            "stages",
+            "window_tiles",
         }:
             raise ValueError(
                 "Delta-rule prefill configs require backend and accept only v_split, "
@@ -41,7 +47,12 @@ class PrefillConfig:
         if not isinstance(backend, str):
             raise TypeError("backend must be a string")
         values = {}
-        for name, default in (("v_split", 64), ("k_split", 1), ("stages", 3), ("window_tiles", 64)):
+        for name, default in (
+            ("v_split", 64),
+            ("k_split", 1),
+            ("stages", 3),
+            ("window_tiles", 64),
+        ):
             value = payload.get(name, default)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{name} must be an integer")
@@ -59,15 +70,30 @@ class PrefillConfig:
 
 
 def validate_metadata_query(query):
-    if any(type(value) is not int or value <= 0 for value in (
-        query.max_state_slots, query.max_tokens, query.max_seqs, query.heads,
-    )) or query.max_seqs > 4096:
-        raise ValueError("prefill dimensions must be positive with at most 4096 sequences")
+    if (
+        any(
+            type(value) is not int or value <= 0
+            for value in (
+                query.max_state_slots,
+                query.max_tokens,
+                query.max_seqs,
+                query.heads,
+            )
+        )
+        or query.max_seqs > 4096
+    ):
+        raise ValueError(
+            "prefill dimensions must be positive with at most 4096 sequences"
+        )
     if query.null_state_index is not None and (
-        type(query.null_state_index) is not int or not 0 <= query.null_state_index < query.max_state_slots
+        type(query.null_state_index) is not int
+        or not 0 <= query.null_state_index < query.max_state_slots
     ):
         raise ValueError("prefill null state index must name a valid slot")
-    if query.a_log_dtype not in ("bfloat16", "float32") or query.dt_bias_dtype not in ("bfloat16", "float32"):
+    if query.a_log_dtype not in ("bfloat16", "float32") or query.dt_bias_dtype not in (
+        "bfloat16",
+        "float32",
+    ):
         raise ValueError("prefill parameters require bfloat16 or float32")
     if query.state_indices_dtype not in ("int32", "int64"):
         raise ValueError("prefill state indices require int32 or int64")

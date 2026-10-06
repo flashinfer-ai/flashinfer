@@ -586,6 +586,7 @@ def plain_graph_epoch_arrive(
         ip=ip,
     )
 
+
 @dsl_user_op
 def threadfence_gpu(*, loc=None, ip=None) -> None:
     llvm.inline_asm(

@@ -62,9 +62,11 @@ def _lut_fp16_segment_table_device(
     key = (device_type, device_index)
     cached = _LUT_FP16_SEGMENT_TABLE_DEVICE.get(key)
     if cached is None:
-        cached = lut_fp16_segment_table_cpu().to(
-            device=torch.device(device_type, device_index)
-        ).contiguous()
+        cached = (
+            lut_fp16_segment_table_cpu()
+            .to(device=torch.device(device_type, device_index))
+            .contiguous()
+        )
         _LUT_FP16_SEGMENT_TABLE_DEVICE[key] = cached
     return cached
 
@@ -89,9 +91,7 @@ def lut_fp16_segment_table_resident(
     return _LUT_FP16_SEGMENT_TABLE_DEVICE.get((resolved.type, index))
 
 
-def lut_fp16_permutation(
-    codewords: torch.Tensor, bits: int
-) -> torch.Tensor:
+def lut_fp16_permutation(codewords: torch.Tensor, bits: int) -> torch.Tensor:
     """Map 5- or 6-bit decode windows to value-law ranks."""
     if bits not in (5, 6):
         raise ValueError(f"lut_fp16 supports only K5/K6, got K{bits}")

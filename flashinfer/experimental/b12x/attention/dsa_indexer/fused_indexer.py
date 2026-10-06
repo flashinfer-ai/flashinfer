@@ -569,9 +569,7 @@ def _coop_scan_round12(
     bin's own count; with ``read_total`` it also receives the group's
     candidate total.
     """
-    base = _fused_state_ptr(
-        merge_state, group_id, Int32(coarse_off) + lane * Int32(8)
-    )
+    base = _fused_state_ptr(merge_state, group_id, Int32(coarse_off) + lane * Int32(8))
     h0, h1, h2, h3 = ld_global_cg_v4_u32(base)
     h4, h5, h6, h7 = ld_global_cg_v4_u32(base + Int64(16))
     s7 = Int32(h7)
@@ -588,8 +586,17 @@ def _coop_scan_round12(
         if lane + Int32(d) < Int32(_WARP_THREADS):
             above = above + other
     above = above - s0
-    suffix = [s0 + above, s1 + above, s2 + above, s3 + above,
-              s4 + above, s5 + above, s6 + above, s7 + above, above]
+    suffix = [
+        s0 + above,
+        s1 + above,
+        s2 + above,
+        s3 + above,
+        s4 + above,
+        s5 + above,
+        s6 + above,
+        s7 + above,
+        above,
+    ]
     coarse_bin = Int32(-1)
     coarse_gt = Int32(-1)
     for j in cutlass.range_constexpr(8):
@@ -625,11 +632,19 @@ def _coop_scan_round12(
         if lane + Int32(d) < Int32(4):
             fine_above = fine_above + other
     fine_above = fine_above - t0 + coarse_gt
-    fsuffix = [t0 + fine_above, t1 + fine_above, t2 + fine_above, t3 + fine_above, fine_above]
+    fsuffix = [
+        t0 + fine_above,
+        t1 + fine_above,
+        t2 + fine_above,
+        t3 + fine_above,
+        fine_above,
+    ]
     if lane < Int32(4):
         for j in cutlass.range_constexpr(4):
             if (fsuffix[j] >= remaining_k) & (fsuffix[j + 1] < remaining_k):
-                s_coop_scalars[0] = Uint32(coarse_bin * Int32(16) + lane * Int32(4) + Int32(j))
+                s_coop_scalars[0] = Uint32(
+                    coarse_bin * Int32(16) + lane * Int32(4) + Int32(j)
+                )
                 s_coop_scalars[1] = Uint32(fsuffix[j + 1])
                 s_coop_scalars[2] = Uint32(fsuffix[j] - fsuffix[j + 1])
     if cutlass.const_expr(read_total):
@@ -668,9 +683,7 @@ def _coop_scan_round(
     bin's own count; with ``read_total`` it also receives the group's
     candidate total.
     """
-    base = _fused_state_ptr(
-        merge_state, group_id, Int32(hist_off) + lane * Int32(8)
-    )
+    base = _fused_state_ptr(merge_state, group_id, Int32(hist_off) + lane * Int32(8))
     h0, h1, h2, h3 = ld_global_cg_v4_u32(base)
     h4, h5, h6, h7 = ld_global_cg_v4_u32(base + Int64(16))
     s7 = Int32(h7)
@@ -687,8 +700,17 @@ def _coop_scan_round(
         if lane + Int32(d) < Int32(_WARP_THREADS):
             above = above + other
     above = above - s0
-    suffix = [s0 + above, s1 + above, s2 + above, s3 + above,
-              s4 + above, s5 + above, s6 + above, s7 + above, above]
+    suffix = [
+        s0 + above,
+        s1 + above,
+        s2 + above,
+        s3 + above,
+        s4 + above,
+        s5 + above,
+        s6 + above,
+        s7 + above,
+        above,
+    ]
     for j in cutlass.range_constexpr(8):
         if (suffix[j] >= remaining_k) & (suffix[j + 1] < remaining_k):
             s_coop_scalars[0] = Uint32(lane * Int32(8) + Int32(j))
@@ -1817,7 +1839,8 @@ class DSAFusedIndexerKernel:
                     )
                 q_tile = q_head // Int32(_PAGED_Q_HEAD_TILE)
                 q_dst_addr = _smem_addr_from_b128_offset(
-                    q_smem_base_addr + q_tile * Int32(_PAGED_Q_HEAD_TILE * _INDEX_HEAD_DIM),
+                    q_smem_base_addr
+                    + q_tile * Int32(_PAGED_Q_HEAD_TILE * _INDEX_HEAD_DIM),
                     _permuted_offset_128b(
                         q_head - q_tile * Int32(_PAGED_Q_HEAD_TILE),
                         q_vec,
@@ -2536,7 +2559,9 @@ class DSAFusedIndexerKernel:
                 # which is idle once scoring is done.
                 if tx == Int32(0):
                     red_add_global_i32(
-                        _fused_state_ptr(merge_state, group_id, Int32(_FUSED_STATE_TOTAL)),
+                        _fused_state_ptr(
+                            merge_state, group_id, Int32(_FUSED_STATE_TOTAL)
+                        ),
                         carry_count,
                     )
                 cute.arch.cp_async_wait_group(0)
@@ -2708,7 +2733,9 @@ class DSAFusedIndexerKernel:
                     while i < carry_count:
                         key = _convert_to_uint32(Float32(s_c0_values[i])) & mask
                         if key > prefix:
-                            pos = gt_base + _smem_xadd(coop_ctr_addr, Int32(0), Int32(1))
+                            pos = gt_base + _smem_xadd(
+                                coop_ctr_addr, Int32(0), Int32(1)
+                            )
                             out_values[group_id, pos] = Float32(s_c0_values[i])
                             out_indices[group_id, pos] = Int32(s_c0_gindex[i])
                         else:
@@ -2731,7 +2758,9 @@ class DSAFusedIndexerKernel:
                 if tx == Int32(0):
                     threadfence()
                     s_relay[0] = atomic_add_global_i32(
-                        _fused_state_ptr(merge_state, group_id, Int32(_FUSED_STATE_CLEANUP)),
+                        _fused_state_ptr(
+                            merge_state, group_id, Int32(_FUSED_STATE_CLEANUP)
+                        ),
                         Int32(1),
                     )
                 cute.arch.sync_threads()
@@ -2970,8 +2999,6 @@ def fused_indexer_scratch_capacity(
     pack_elems = max(1, int(num_sms)) * int(topk)
     state_words = max(1, int(max_rows)) * _COOP_STATE_WORDS
     return pack_elems, state_words
-
-
 
 
 def _can_vectorize_q_load(q_bytes: torch.Tensor) -> bool:

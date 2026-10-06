@@ -28,15 +28,25 @@ def main():
     if not (0 <= args.temperature <= 2 and 0 < args.top_p <= 1):
         parser.error("Temperature must be in [0, 2] and top-p in (0, 1]")
     samples = []
-    result = {"conditions": {"prompt_tokens": args.tokens, "max_tokens": 1,
-                             "duration_seconds": args.duration,
-                             "temperature": args.temperature, "top_p": args.top_p,
-                             "prompt_type": "deterministic cyclic token IDs with unique leading nonce"},
-              "warmup": None, "samples": samples}
+    result = {
+        "conditions": {
+            "prompt_tokens": args.tokens,
+            "max_tokens": 1,
+            "duration_seconds": args.duration,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "prompt_type": "deterministic cyclic token IDs with unique leading nonce",
+        },
+        "warmup": None,
+        "samples": samples,
+    }
     with httpx.Client(timeout=600) as client:
         measured_started = None
-        while (measured_started is None or not samples
-               or time.monotonic() - measured_started < args.duration):
+        while (
+            measured_started is None
+            or not samples
+            or time.monotonic() - measured_started < args.duration
+        ):
             nonce = time.time_ns()
             prompt = [1000 + byte for byte in nonce.to_bytes(8, "little")]
             prompt.extend(1400 + i % 127 for i in range(args.tokens - 8))
@@ -44,12 +54,23 @@ def main():
             started = time.monotonic()
             first = None
             usage = {}
-            with client.stream("POST", f"{args.base_url}/v1/completions", json={
-                "model": args.model, "prompt": prompt, "max_tokens": 1,
-                "temperature": args.temperature, "top_p": args.top_p,
-                "ignore_eos": True, "stream": True,
-                "stream_options": {"include_usage": True, "continuous_usage_stats": True},
-            }) as response:
+            with client.stream(
+                "POST",
+                f"{args.base_url}/v1/completions",
+                json={
+                    "model": args.model,
+                    "prompt": prompt,
+                    "max_tokens": 1,
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "ignore_eos": True,
+                    "stream": True,
+                    "stream_options": {
+                        "include_usage": True,
+                        "continuous_usage_stats": True,
+                    },
+                },
+            ) as response:
                 response.raise_for_status()
                 for line in response.iter_lines():
                     if not line.startswith("data: ") or line == "data: [DONE]":
@@ -59,16 +80,25 @@ def main():
                         raise RuntimeError(chunk["error"])
                     if chunk.get("usage"):
                         usage = chunk["usage"]
-                    if first is None and (usage.get("completion_tokens", 0) > 0 or
-                                          any(c.get("text") for c in chunk.get("choices", []))):
+                    if first is None and (
+                        usage.get("completion_tokens", 0) > 0
+                        or any(c.get("text") for c in chunk.get("choices", []))
+                    ):
                         first = time.monotonic()
             assert first is not None and usage["prompt_tokens"] == args.tokens
             sources = delta(before, metrics(args.base_url))
-            assert sources == {"external_kv_transfer": 0, "local_compute": args.tokens, "local_cache_hit": 0}, sources
-            sample = {"nonce": nonce, "prompt_tokens": args.tokens,
-                      "ttft_seconds": first - started,
-                      "tok_per_sec": args.tokens / (first - started),
-                      "prompt_sources": sources}
+            assert sources == {
+                "external_kv_transfer": 0,
+                "local_compute": args.tokens,
+                "local_cache_hit": 0,
+            }, sources
+            sample = {
+                "nonce": nonce,
+                "prompt_tokens": args.tokens,
+                "ttft_seconds": first - started,
+                "tok_per_sec": args.tokens / (first - started),
+                "prompt_sources": sources,
+            }
             if measured_started is None:
                 result["warmup"] = sample
                 measured_started = time.monotonic()

@@ -1,4 +1,5 @@
 """Metadata declaration and resolved launch ownership for the NVFP4 quantizer."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,7 +19,9 @@ def compile_quantizer(query_payload, config_payload, ordinal):
     config = Nvfp4QuantizationConfig.from_config(config_payload)
     with torch.cuda.device(ordinal):
         return compile_bf16_to_fp4_tma(
-            query.rows, query.columns, liveness_strategy=config.liveness_strategy,
+            query.rows,
+            query.columns,
+            liveness_strategy=config.liveness_strategy,
         )
 
 
@@ -34,22 +37,36 @@ class _Nvfp4ExecutionState:
         self.launch(x, global_scale, outputs.packed_a_flat, outputs.scale_flat)
 
 
-def plan(m: int, k: int, *, invocation: FrozenMapping = FrozenMapping(),
-         override: Nvfp4QuantizationConfig | None = None) -> Plan:
+def plan(
+    m: int,
+    k: int,
+    *,
+    invocation: FrozenMapping = FrozenMapping(),
+    override: Nvfp4QuantizationConfig | None = None,
+) -> Plan:
     query = Nvfp4QuantizationQuery(dtype="bfloat16", rows=int(m), columns=int(k))
 
     def compile_jobs(config, device):
-        return (CompileJob.create(
-            "b12x.quantization.nvfp4._preparation:compile_quantizer",
-            TUNING.encode_query(query), config.to_dict(), device.ordinal,
-        ),)
+        return (
+            CompileJob.create(
+                "b12x.quantization.nvfp4._preparation:compile_quantizer",
+                TUNING.encode_query(query),
+                config.to_dict(),
+                device.ordinal,
+            ),
+        )
 
     def materialize(selection, device):
-        launch = compile_quantizer(TUNING.encode_query(query), selection.config.to_dict(), device.ordinal)
+        launch = compile_quantizer(
+            TUNING.encode_query(query), selection.config.to_dict(), device.ordinal
+        )
         return _Nvfp4ExecutionState(query, torch.device("cuda", device.ordinal), launch)
 
     return Plan(
-        contract=TUNING, query=query, invocation=invocation, override=override,
+        contract=TUNING,
+        query=query,
+        invocation=invocation,
+        override=override,
         _compile_jobs=compile_jobs,
         _memory_requirements=lambda config, device: MemoryRequirements(),
         _materialize=materialize,

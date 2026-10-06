@@ -95,7 +95,10 @@ def test_sglang_nsa_replay_cuda_graph_handles_frozen_metadata_for_b12x_decode() 
         out_cache_loc=None,
     )
 
-    assert torch.equal(metadata.cache_seqlens_int32, torch.tensor([4], dtype=torch.int32, device=device))
+    assert torch.equal(
+        metadata.cache_seqlens_int32,
+        torch.tensor([4], dtype=torch.int32, device=device),
+    )
     assert torch.equal(metadata.page_table_1[0, :4], req_to_token[0])
     if device.type == "cuda":
         assert metadata.paged_mqa_schedule_metadata is not None

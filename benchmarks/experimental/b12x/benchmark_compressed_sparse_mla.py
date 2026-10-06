@@ -105,7 +105,6 @@ class CaseReport:
     indexed_valid: int | None = None
 
 
-
 @dataclass(frozen=True)
 class TargetSummary:
     rows1_geo_us: float
@@ -179,8 +178,6 @@ def _resolve_cached_hf_config(
         f"cached Hugging Face config not found for {repo_id!r} in {cache_desc}; "
         "populate the cache or pass --model-config /path/to/config.json"
     )
-
-
 
 
 def _trace_layer_weights(config: dict[str, object]) -> dict[str, int]:
@@ -545,7 +542,9 @@ def _make_cache_views(
         )
         b12x_view[:active_pages].copy_(packed_cache)
 
-    return CacheViews(b12x=b12x_view, )
+    return CacheViews(
+        b12x=b12x_view,
+    )
 
 
 def _make_indices(
@@ -788,29 +787,46 @@ def _benchmark_case(
             (case.rows,), indexed_valid, dtype=torch.int32, device=device
         )
 
-    split_chunks = _planned_split_chunks(case, production_decode_cap=production_decode_cap)
+    split_chunks = _planned_split_chunks(
+        case, production_decode_cap=production_decode_cap
+    )
     output = torch.empty_like(q)
     run_args = dict(
-        swa_k_cache=swa_cache.b12x, swa_page_size=swa_page_size,
+        swa_k_cache=swa_cache.b12x,
+        swa_page_size=swa_page_size,
         indexed_k_cache=indexed_cache.b12x if indexed_cache is not None else None,
-        indexed_page_size=case.indexed_page_size, attn_sink=attn_sink,
-        sm_scale=_SM_SCALE, expected_num_q_heads=num_q_heads, out=output,
+        indexed_page_size=case.indexed_page_size,
+        attn_sink=attn_sink,
+        sm_scale=_SM_SCALE,
+        expected_num_q_heads=num_q_heads,
+        out=output,
     )
     session = PreparationSession(device=device, autotune=False, compile_workers=2)
     plan, binding = prepare_compressed(
         session,
         B12XCompressedSparseMLAScratchCaps(
-            device=device, num_q_heads=num_q_heads, max_q_rows=case.rows,
-            max_width=max(1, case.topk), head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
-            v_head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM, max_batch=case.rows,
-            page_size=swa_page_size, swa_width=case.swa_width,
-            indexed_width=case.indexed_width, indexed_page_size=case.indexed_page_size,
+            device=device,
+            num_q_heads=num_q_heads,
+            max_q_rows=case.rows,
+            max_width=max(1, case.topk),
+            head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
+            v_head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
+            max_batch=case.rows,
+            page_size=swa_page_size,
+            swa_width=case.swa_width,
+            indexed_width=case.indexed_width,
+            indexed_page_size=case.indexed_page_size,
             max_chunks_per_row=split_chunks,
             mode=_benchmark_workspace_mode(shared_indexed_cache=shared_indexed_cache),
             use_cuda_graph=True,
         ),
-        bind_args=dict(q=q, swa_indices=swa_indices, swa_lengths=swa_lengths,
-                       indexed_indices=indexed_indices, indexed_lengths=indexed_lengths),
+        bind_args=dict(
+            q=q,
+            swa_indices=swa_indices,
+            swa_lengths=swa_lengths,
+            indexed_indices=indexed_indices,
+            indexed_lengths=indexed_lengths,
+        ),
         run_args=run_args,
     )
 
@@ -855,7 +871,6 @@ def _benchmark_case(
     if not bool(torch.count_nonzero(output).item()):
         raise BenchmarkFailure(f"all-zero B12X output for case={case.name}")
 
-
     gc.collect()
     torch.cuda.empty_cache()
     return CaseReport(
@@ -866,11 +881,6 @@ def _benchmark_case(
         else max(replay_us),
         sanity_algorithm=sanity_algorithm,
         replay_samples_us=tuple(replay_us),
-
-
-
-
-
         split_chunks=split_chunks,
         swa_valid=swa_valid,
         indexed_valid=indexed_valid,
@@ -910,7 +920,7 @@ def collect_case_reports(
                 cache_num_pages=args.cache_num_pages,
                 production_decode_cap=args.production_decode_cap,
                 use_attn_sink=args.attn_sink,
-                    context_length=args.context_length,
+                context_length=args.context_length,
                 shared_indexed_cache=args.shared_indexed_cache,
                 reuse_cache_pool=args.reuse_cache_pool,
             )
@@ -963,9 +973,7 @@ def _compute_trace_weighted_summary(
     )
     return TraceWeightedSummary(
         b12x_total_us=b12x_total,
-
         b12x_avg_us=b12x_total / layer_count,
-
         layer_count=layer_count,
     )
 

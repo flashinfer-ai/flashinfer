@@ -15,6 +15,7 @@ Because the per-row FP6 packing and per-block UE8M0 scale are computed
 independently, quantizing ``gate``/``up`` separately on disk and re-stacking here
 reproduces the single-matrix offline path bit-for-bit.
 """
+
 from __future__ import annotations
 
 from typing import Callable, Optional
@@ -111,8 +112,12 @@ def load_fp6_moe_weights_from_safetensors(
         w2_codes.append(down_w)
         w1_scales.append(fc1_s)
         w2_scales.append(down_s)
-        w1_gs.append(get_tensor(f"{base}.{gate_name}{WEIGHT_SCALE_2_SUFFIX}").reshape(()))
-        w2_gs.append(get_tensor(f"{base}.{down_name}{WEIGHT_SCALE_2_SUFFIX}").reshape(()))
+        w1_gs.append(
+            get_tensor(f"{base}.{gate_name}{WEIGHT_SCALE_2_SUFFIX}").reshape(())
+        )
+        w2_gs.append(
+            get_tensor(f"{base}.{down_name}{WEIGHT_SCALE_2_SUFFIX}").reshape(())
+        )
         a1_is.append(get_tensor(f"{base}.{gate_name}{INPUT_SCALE_SUFFIX}").reshape(()))
         a2_is.append(get_tensor(f"{base}.{down_name}{INPUT_SCALE_SUFFIX}").reshape(()))
 
@@ -229,7 +234,9 @@ def load_fp6_dense_weight_from_safetensors(
     fmt = weight_format_for_source(source_format)
     act_fmt = activation_format_for_source(source_format)
     scale_storage = (
-        swizzle_block_scale(wscale.view(torch.float8_e8m0fnu)).reshape(-1).view(torch.uint8)
+        swizzle_block_scale(wscale.view(torch.float8_e8m0fnu))
+        .reshape(-1)
+        .view(torch.uint8)
     )
     dev = torch.device(device)
     return FP6DenseWeight(

@@ -26,17 +26,25 @@ from unittest.mock import Mock, patch
 
 
 LIB = Path(__file__).resolve().parents[4] / "flashinfer/experimental/b12x/_lib"
-spec = importlib.util.spec_from_file_location("cache_integrity", LIB / "cache_integrity.py")
+spec = importlib.util.spec_from_file_location(
+    "cache_integrity", LIB / "cache_integrity.py"
+)
 integrity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(integrity)
 
 
 def load_functions(path, names, namespace):
-    nodes = [node for node in ast.parse(path.read_text()).body
-             if isinstance(node, ast.FunctionDef) and node.name in names]
+    nodes = [
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
     assert {node.name for node in nodes} == set(names)
     future = ast.parse("from __future__ import annotations").body
-    exec(compile(ast.Module(body=future + nodes, type_ignores=[]), str(path), "exec"), namespace)
+    exec(
+        compile(ast.Module(body=future + nodes, type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
 
 
 class CompileCacheIntegrityTests(unittest.TestCase):
@@ -52,19 +60,36 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         self.data = b"compiled object fixture"
         self.compiled = SimpleNamespace(dump_to_object=lambda _: self.data)
         self.compile_kernel = Mock(return_value=self.compiled)
-        self.loader = Mock(return_value=SimpleNamespace(**{
-            "b12x_cute_" + self.key: self.compiled,
-        }))
-        self.modules = {name: ModuleType(name) for name in (
-            "b12x", "b12x._lib", "b12x._lib.compiler", "b12x._lib.compile_plan",
-            "b12x._lib.runtime_control", "cutlass", "cutlass.cute",
-            "cutlass.base_dsl", "cutlass.base_dsl.export",
-            "cutlass.base_dsl.export.external_binary_module",
-        )}
+        self.loader = Mock(
+            return_value=SimpleNamespace(
+                **{
+                    "b12x_cute_" + self.key: self.compiled,
+                }
+            )
+        )
+        self.modules = {
+            name: ModuleType(name)
+            for name in (
+                "b12x",
+                "b12x._lib",
+                "b12x._lib.compiler",
+                "b12x._lib.compile_plan",
+                "b12x._lib.runtime_control",
+                "cutlass",
+                "cutlass.cute",
+                "cutlass.base_dsl",
+                "cutlass.base_dsl.export",
+                "cutlass.base_dsl.export.external_binary_module",
+            )
+        }
         self.modules["cutlass"].cute = self.modules["cutlass.cute"]
         self.modules["cutlass.cute"].compile = Mock()
-        self.modules["cutlass.base_dsl.export.external_binary_module"].ExternalBinaryModule = self.loader
-        self.modules["b12x._lib.runtime_control"].raise_if_kernel_resolution_frozen = Mock()
+        self.modules[
+            "cutlass.base_dsl.export.external_binary_module"
+        ].ExternalBinaryModule = self.loader
+        self.modules[
+            "b12x._lib.runtime_control"
+        ].raise_if_kernel_resolution_frozen = Mock()
         self.program_type = namedtuple("ProgramKey", "dialect key name")
         plan = self.modules["b12x._lib.compile_plan"]
         plan.ProgramKey = self.program_type
@@ -76,14 +101,23 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         self.namespace = self.module.__dict__
         self.memory = {}
         self.namespace.update(
-            __package__="b12x._lib", Path=Path, os=os, json=json, hashlib=hashlib,
-            tempfile=tempfile, shutil=shutil, contextmanager=contextmanager,
-            nullcontext=nullcontext, suppress=suppress,
+            __package__="b12x._lib",
+            Path=Path,
+            os=os,
+            json=json,
+            hashlib=hashlib,
+            tempfile=tempfile,
+            shutil=shutil,
+            contextmanager=contextmanager,
+            nullcontext=nullcontext,
+            suppress=suppress,
             atomic_write_bytes=integrity.atomic_write_bytes,
-            _mkdir_durable=integrity._mkdir_durable, valid_object=integrity.valid_object,
+            _mkdir_durable=integrity._mkdir_durable,
+            valid_object=integrity.valid_object,
             _cute_compile_cache_dir=lambda: self.root,
             _build_compile_manifest=lambda key, payload, func, data, **kw: {
-                "cache_key": key, "object_bytes": len(data),
+                "cache_key": key,
+                "object_bytes": len(data),
                 "object_sha256": hashlib.sha256(data).hexdigest(),
             },
             _compile_memory_cache_key=lambda *args: "memory-key",
@@ -95,17 +129,34 @@ class CompileCacheIntegrityTests(unittest.TestCase):
             _cute_compile_log_enabled=lambda: False,
             _compile_target_name=lambda func: "test.kernel",
             _call_cute_compile=self.compile_kernel,
-            _MEMORY_CACHE_LOCK=RLock(), _DISK_CACHE_HITS=0, _COMPILE_MISSES=0,
+            _MEMORY_CACHE_LOCK=RLock(),
+            _DISK_CACHE_HITS=0,
+            _COMPILE_MISSES=0,
             _OFFLINE_CUTE_NO_JIT=False,
         )
-        load_functions(LIB / "compiler.py", (
-            "_cache_prefix", "_cache_object_path", "_cache_manifest_path", "_cache_lock_path",
-            "_write_compile_manifest", "_valid_cute_compile_cache", "_ensure_cute_compile_manifest",
-            "_disk_cache_key_lock", "_load_cute_compile_from_disk", "_store_cute_compile_to_disk",
-            "compile",
-        ), self.namespace)
-        plan.__dict__.update(__package__="b12x._lib", _RESIDENT_PROGRAMS=set(), Path=Path)
-        load_functions(LIB / "compile_plan.py", ("compiled_program_available",), plan.__dict__)
+        load_functions(
+            LIB / "compiler.py",
+            (
+                "_cache_prefix",
+                "_cache_object_path",
+                "_cache_manifest_path",
+                "_cache_lock_path",
+                "_write_compile_manifest",
+                "_valid_cute_compile_cache",
+                "_ensure_cute_compile_manifest",
+                "_disk_cache_key_lock",
+                "_load_cute_compile_from_disk",
+                "_store_cute_compile_to_disk",
+                "compile",
+            ),
+            self.namespace,
+        )
+        plan.__dict__.update(
+            __package__="b12x._lib", _RESIDENT_PROGRAMS=set(), Path=Path
+        )
+        load_functions(
+            LIB / "compile_plan.py", ("compiled_program_available",), plan.__dict__
+        )
         self.available = plan.compiled_program_available
         self.program = self.program_type("cute", self.key, "test.kernel")
         modules_patch = patch.dict(sys.modules, self.modules)
@@ -114,10 +165,15 @@ class CompileCacheIntegrityTests(unittest.TestCase):
 
     def write_pair(self):
         self.obj.write_bytes(self.data)
-        self.manifest.write_text(json.dumps({
-            "cache_key": self.key, "object_bytes": len(self.data),
-            "object_sha256": hashlib.sha256(self.data).hexdigest(),
-        }))
+        self.manifest.write_text(
+            json.dumps(
+                {
+                    "cache_key": self.key,
+                    "object_bytes": len(self.data),
+                    "object_sha256": hashlib.sha256(self.data).hexdigest(),
+                }
+            )
+        )
 
     def test_valid_cache_reused_without_compilation(self):
         self.write_pair()
@@ -149,9 +205,13 @@ class CompileCacheIntegrityTests(unittest.TestCase):
                 self.assertTrue(self.available(self.program))
 
     def test_invalid_manifest_fields_are_misses(self):
-        for field, value in (("cache_key", "wrong"), ("object_bytes", True),
-                             ("object_bytes", -1), ("object_sha256", None),
-                             ("object_sha256", "x" * 64)):
+        for field, value in (
+            ("cache_key", "wrong"),
+            ("object_bytes", True),
+            ("object_bytes", -1),
+            ("object_sha256", None),
+            ("object_sha256", "x" * 64),
+        ):
             with self.subTest(field=field, value=value):
                 self.write_pair()
                 data = json.loads(self.manifest.read_text())
@@ -181,26 +241,34 @@ class CompileCacheIntegrityTests(unittest.TestCase):
                     path: integrity._file_identity(path)
                     for path in (self.obj, self.manifest)
                 }
-                with patch.object(integrity, "_file_identity", side_effect=identities.__getitem__):
+                with patch.object(
+                    integrity, "_file_identity", side_effect=identities.__getitem__
+                ):
                     self.assertTrue(self.available(self.program))
                     if target == self.obj:
                         target.write_bytes(b"x" * len(self.data))
                     else:
-                        target.write_text(target.read_text().replace(self.key, "0" * len(self.key)))
+                        target.write_text(
+                            target.read_text().replace(self.key, "0" * len(self.key))
+                        )
                     self.assertEqual(target.stat().st_size, identities[target][2])
                     self.assertFalse(self.available(self.program))
 
     def test_staged_copy_is_validated_and_canonical_object_is_not_modified(self):
         self.write_pair()
+
         def mutate_copy(path):
             Path(path).write_bytes(b"loader changed this private copy")
             return SimpleNamespace(**{"b12x_cute_" + self.key: self.compiled})
+
         self.loader.side_effect = mutate_copy
         self.assertIs(self.module._load_cute_compile_from_disk(self.key), self.compiled)
         self.assertEqual(self.obj.read_bytes(), self.data)
         self.assertTrue(self.available(self.program))
+
         def corrupt_copy(source, target):
             Path(target).write_bytes(b"bad staged object")
+
         self.loader.reset_mock()
         with patch.object(shutil, "copy2", side_effect=corrupt_copy):
             self.assertIsNone(self.module._load_cute_compile_from_disk(self.key))
@@ -212,11 +280,16 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         neighbor.write_bytes(b"keep this")
         self.data = b"new object with a different checksum"
         with (
-            patch.object(self.module, "_write_compile_manifest", side_effect=OSError("crash")),
+            patch.object(
+                self.module, "_write_compile_manifest", side_effect=OSError("crash")
+            ),
             self.assertRaises(OSError),
         ):
             self.module._store_cute_compile_to_disk(
-                self.key, self.compiled, cache_payload=(1,), func=object(),
+                self.key,
+                self.compiled,
+                cache_payload=(1,),
+                func=object(),
             )
         self.assertFalse(self.available(self.program))
         self.module.compile(object())
@@ -225,11 +298,15 @@ class CompileCacheIntegrityTests(unittest.TestCase):
 
     def test_compiler_rechecks_after_another_writer_repairs_the_entry(self):
         self.obj.write_bytes(b"corrupt")
+
         @contextmanager
         def repaired_by_other_writer(key):
             self.write_pair()
             yield
-        with patch.object(self.module, "_disk_cache_key_lock", repaired_by_other_writer):
+
+        with patch.object(
+            self.module, "_disk_cache_key_lock", repaired_by_other_writer
+        ):
             self.module.compile(object())
         self.compile_kernel.assert_not_called()
         self.assertTrue(self.available(self.program))
@@ -237,15 +314,21 @@ class CompileCacheIntegrityTests(unittest.TestCase):
     def test_publication_fsyncs_file_before_rename_then_directory(self):
         events = []
         real_fsync, real_replace = os.fsync, os.replace
+
         def fsync(fd):
             events.append("fsync")
             real_fsync(fd)
+
         def replace(source, target):
             events.append("replace")
             real_replace(source, target)
+
         with patch.object(os, "fsync", fsync), patch.object(os, "replace", replace):
             self.module._store_cute_compile_to_disk(
-                self.key, self.compiled, cache_payload=(1,), func=object(),
+                self.key,
+                self.compiled,
+                cache_payload=(1,),
+                func=object(),
             )
         self.assertEqual(events, ["fsync", "replace", "fsync"] * 2)
         self.assertTrue(self.available(self.program))
@@ -262,10 +345,14 @@ class CompileCacheIntegrityTests(unittest.TestCase):
 
     def test_new_cache_directory_entries_are_synced(self):
         target = self.root / "new" / "shard" / "object.o"
-        with patch.object(integrity, "_fsync_directory", wraps=integrity._fsync_directory) as sync:
+        with patch.object(
+            integrity, "_fsync_directory", wraps=integrity._fsync_directory
+        ) as sync:
             integrity.atomic_write_bytes(target, self.data)
-        self.assertEqual([call.args[0] for call in sync.call_args_list],
-                         [self.root, self.root / "new", self.root / "new/shard"])
+        self.assertEqual(
+            [call.args[0] for call in sync.call_args_list],
+            [self.root, self.root / "new", self.root / "new/shard"],
+        )
 
     def test_preparation_metadata_is_not_scanned(self):
         selection = self.root / "preparation" / "selection.json"

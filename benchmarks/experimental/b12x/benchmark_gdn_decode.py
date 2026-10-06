@@ -80,7 +80,9 @@ def resolve_capacity(
     capacity_columns: int | None,
 ) -> tuple[int, int, int]:
     max_seqs = max(4, case.sequences) if capacity_seqs is None else int(capacity_seqs)
-    columns = max(4, case.columns) if capacity_columns is None else int(capacity_columns)
+    columns = (
+        max(4, case.columns) if capacity_columns is None else int(capacity_columns)
+    )
     if (
         case.sequences > max_seqs
         or case.columns > columns
@@ -189,12 +191,8 @@ def build_case(
             device=device,
             generator=generator,
         ),
-        "a": _randn(
-            (max_tokens, case.value_heads), device=device, generator=generator
-        ),
-        "b": _randn(
-            (max_tokens, case.value_heads), device=device, generator=generator
-        ),
+        "a": _randn((max_tokens, case.value_heads), device=device, generator=generator),
+        "b": _randn((max_tokens, case.value_heads), device=device, generator=generator),
         "z": _randn(
             (max_tokens, case.value_heads, 128), device=device, generator=generator
         ),
@@ -229,9 +227,7 @@ def build_case(
             scale=0.1,
         ),
         "query_start_loc": query_start_loc,
-        "num_accepted_tokens": torch.ones(
-            max_seqs, dtype=torch.int32, device=device
-        ),
+        "num_accepted_tokens": torch.ones(max_seqs, dtype=torch.int32, device=device),
         "state_indices": state_indices,
         "num_seqs": torch.tensor([live_seqs], dtype=torch.int32, device=device),
         "num_tokens": torch.tensor([live_tokens], dtype=torch.int32, device=device),
@@ -342,10 +338,15 @@ def _timing(samples: list[float], restore: list[float] | None = None) -> Timing:
 
 def _bench_eager(buffers, *, warmup, iterations, l2_flush):
     from b12x.testing.benchmark import measure_call
+
     binding = buffers.binding
-    result = measure_call(lambda: gdn.run(binding), warmup=warmup, samples=iterations,
+    result = measure_call(
+        lambda: gdn.run(binding),
+        warmup=warmup,
+        samples=iterations,
         reset=lambda: binding.recurrent_state.copy_(buffers.initial_state),
-        eviction=l2_flush or (lambda: None))
+        eviction=l2_flush or (lambda: None),
+    )
     return _timing(result.raw_samples("workload"))
 
 
@@ -530,15 +531,24 @@ def _jsonable(value: Any) -> Any:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--operation", choices=("decode", "prefill"), default="decode")
-    parser.add_argument("--capacity-tokens", type=int, help="planned prefill token capacity")
-    parser.add_argument("--policy-profile", type=pathlib.Path,
-                        help="prefill profile artifact; require measured coverage for every case")
+    parser.add_argument(
+        "--capacity-tokens", type=int, help="planned prefill token capacity"
+    )
+    parser.add_argument(
+        "--policy-profile",
+        type=pathlib.Path,
+        help="prefill profile artifact; require measured coverage for every case",
+    )
     parser.add_argument("--cases", default="all")
     parser.add_argument("--mode", choices=("eager", "graph", "both"), default="both")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument("--profile-replays", type=int, default=0,
-                        help="prefill diagnostic graph replays inside a CUDA profiler capture range")
+    parser.add_argument(
+        "--profile-replays",
+        type=int,
+        default=0,
+        help="prefill diagnostic graph replays inside a CUDA profiler capture range",
+    )
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--l2-flush", action="store_true")
     parser.add_argument("--l2-flush-bytes", type=int, default=0)
@@ -570,10 +580,16 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"refusing to overwrite existing output: {args.json}")
     if args.operation == "prefill":
         from benchmarks.experimental.b12x._gdn_prefill_race import main as prefill_main
+
         return prefill_main(args, list(sys.argv[1:] if argv is None else argv), parser)
-    if (args.capacity_tokens is not None
-            or args.policy_profile is not None or args.profile_replays):
-        parser.error("--capacity-tokens, --policy-profile, and --profile-replays require --operation prefill")
+    if (
+        args.capacity_tokens is not None
+        or args.policy_profile is not None
+        or args.profile_replays
+    ):
+        parser.error(
+            "--capacity-tokens, --policy-profile, and --profile-replays require --operation prefill"
+        )
     try:
         cases = select_cases(args.cases)
     except ValueError as error:

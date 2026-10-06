@@ -16,7 +16,10 @@ from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x._lib.compiler import compile_cache_info
 from b12x._lib.intrinsics import swizzle_block_scale
 
-from b12x.testing.reference.helpers import make_tp_moe_fp4_binding, prepare_tp_moe_fp4_experts
+from b12x.testing.reference.helpers import (
+    make_tp_moe_fp4_binding,
+    prepare_tp_moe_fp4_experts,
+)
 from ..conftest import require_b12x
 
 
@@ -115,7 +118,7 @@ def test_run_w4a16_replays_under_cuda_graph_with_frozen_resolution() -> None:
         torch.cuda.synchronize()
 
         misses_before = compile_cache_info()["compile_misses"]
-        with kernel_resolution_guard('fused-moe graph capture test'):
+        with kernel_resolution_guard("fused-moe graph capture test"):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 captured = fused_moe.run(binding=binding)
@@ -153,9 +156,7 @@ def test_run_w4a16_m9_graph_replay_with_prequeued_aux_work() -> None:
         intermediate_size=intermediate_size,
     )
     experts = prepare_experts(a, weights, torch.arange(global_e))
-    topk_ids = torch.randint(
-        0, global_e, (m, topk), dtype=torch.int32, device=device
-    )
+    topk_ids = torch.randint(0, global_e, (m, topk), dtype=torch.int32, device=device)
     topk_weights = torch.softmax(torch.randn(m, topk, device=device), dim=-1)
     output = torch.empty_like(a)
     with make_tp_moe_fp4_binding(

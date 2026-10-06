@@ -161,10 +161,7 @@ def _prepare_kernel(
     else:
         stripe = tail // CP_INTERLEAVE
         owner = stripe % DCP_SIZE
-        local_tail = (
-            (stripe // DCP_SIZE) * CP_INTERLEAVE
-            + tail % CP_INTERLEAVE
-        )
+        local_tail = (stripe // DCP_SIZE) * CP_INTERLEAVE + tail % CP_INTERLEAVE
         value = tl.where(
             column < WIDTH,
             original,

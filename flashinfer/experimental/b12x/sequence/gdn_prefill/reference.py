@@ -14,7 +14,12 @@ import torch.nn.functional as F
 
 from .._shared.kda_math import l2_normalize
 from .._shared.delta_prefill.reference import (
-    MirrorPolicy, _bf16, _neumann_inverse, _recur_tile, _scalar, _validate_packed,
+    MirrorPolicy,
+    _bf16,
+    _neumann_inverse,
+    _recur_tile,
+    _scalar,
+    _validate_packed,
 )
 
 HEAD_DIM = 128
@@ -23,7 +28,9 @@ CHUNK = 16
 
 def gdn_log_decay(a, dt_bias, A_log):
     """Natural-log state decay for each token and value head, in FP32."""
-    return -torch.exp(A_log.float()) * F.softplus(a.float() + dt_bias.float(), threshold=20)
+    return -torch.exp(A_log.float()) * F.softplus(
+        a.float() + dt_bias.float(), threshold=20
+    )
 
 
 def gdn_beta(b):
@@ -32,8 +39,19 @@ def gdn_beta(b):
 
 
 def recurrent_gdn(
-    q, k, v, a, b, A_log, dt_bias, *, initial_state,
-    checkpoint_offset=-1, scale=None, eps=1e-6, qk_l2norm=True,
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    *,
+    initial_state,
+    checkpoint_offset=-1,
+    scale=None,
+    eps=1e-6,
+    qk_l2norm=True,
 ):
     """Return BF16 token outputs, FP32 final state, and an optional checkpoint."""
     scale = HEAD_DIM**-0.5 if scale is None else float(scale)
@@ -105,57 +123,128 @@ def prepare_chunk(q, k, a, b, A_log, dt_bias, *, scale=None, eps=1e-6, qk_l2norm
         "k_tilde": _bf16(kn * lam),
         "k_r": _bf16(kn * torch.exp(suffix)[:, :, None]),
         "lambda_c": torch.exp(cumulative[:, -1, None]).expand(heads, HEAD_DIM),
-        "beta": beta, "L": lower, "inv": inverse,
-        "inv_op": _bf16(inverse), "mqk": _bf16(mqk),
+        "beta": beta,
+        "L": lower,
+        "inv": inverse,
+        "inv_op": _bf16(inverse),
+        "mqk": _bf16(mqk),
     }
 
 
-def chunk_mirror(q, k, v, a, b, A_log, dt_bias, *, initial_state,
-                 checkpoint_offset=-1, scale=None, eps=1e-6, qk_l2norm=True):
+def chunk_mirror(
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    *,
+    initial_state,
+    checkpoint_offset=-1,
+    scale=None,
+    eps=1e-6,
+    qk_l2norm=True,
+):
     """Run the chunk algebra; use recurrent_gdn as the independent oracle."""
     state = initial_state.float().clone()
     output = torch.empty_like(v)
     checkpoint = state.clone() if checkpoint_offset == 0 else None
     for start in range(0, q.shape[0], CHUNK):
         end = min(start + CHUNK, q.shape[0])
-        prep = prepare_chunk(q[start:end], k[start:end], a[start:end], b[start:end], A_log, dt_bias,
-                             scale=scale, eps=eps, qk_l2norm=qk_l2norm)
+        prep = prepare_chunk(
+            q[start:end],
+            k[start:end],
+            a[start:end],
+            b[start:end],
+            A_log,
+            dt_bias,
+            scale=scale,
+            eps=eps,
+            qk_l2norm=qk_l2norm,
+        )
         values = torch.zeros((CHUNK, *v.shape[1:]), dtype=v.dtype, device=v.device)
-        values[:end-start] = v[start:end]
-        out, state, _ = _recur_tile(state, values, prep, rows=end-start, chunk=CHUNK, policy=MirrorPolicy())
-        output[start:end] = out[:end-start]
+        values[: end - start] = v[start:end]
+        out, state, _ = _recur_tile(
+            state, values, prep, rows=end - start, chunk=CHUNK, policy=MirrorPolicy()
+        )
+        output[start:end] = out[: end - start]
         if end == checkpoint_offset:
             checkpoint = state.clone()
     return output, state, checkpoint
 
 
-def prefill_gdn(q, k, v, a, b, A_log, dt_bias, recurrent_state, cu_seqlens,
-                initial_state_indices, final_state_indices, checkpoint_state_indices,
-                checkpoint_offsets, num_seqs, num_tokens, *, scale=None, eps=1e-6,
-                qk_l2norm=True, null_state_index=None, output=None):
+def prefill_gdn(
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    recurrent_state,
+    cu_seqlens,
+    initial_state_indices,
+    final_state_indices,
+    checkpoint_state_indices,
+    checkpoint_offsets,
+    num_seqs,
+    num_tokens,
+    *,
+    scale=None,
+    eps=1e-6,
+    qk_l2norm=True,
+    null_state_index=None,
+    output=None,
+):
     """Apply the sequential oracle to packed requests and caller-owned state slots."""
     scale = HEAD_DIM**-0.5 if scale is None else float(scale)
     if not math.isfinite(scale) or scale <= 0 or not math.isfinite(eps) or eps <= 0:
         raise ValueError("scale and eps must be finite and positive")
     spans = _validate_packed(
-        cu_seqlens=cu_seqlens, initial_state_indices=initial_state_indices,
-        final_state_indices=final_state_indices, checkpoint_state_indices=checkpoint_state_indices,
-        checkpoint_offsets=checkpoint_offsets, num_seqs=_scalar(num_seqs), num_tokens=_scalar(num_tokens),
-        token_capacity=q.shape[0], seq_capacity=cu_seqlens.numel()-1,
-        state_slots=recurrent_state.shape[0], chunk=CHUNK, null_state_index=null_state_index,
+        cu_seqlens=cu_seqlens,
+        initial_state_indices=initial_state_indices,
+        final_state_indices=final_state_indices,
+        checkpoint_state_indices=checkpoint_state_indices,
+        checkpoint_offsets=checkpoint_offsets,
+        num_seqs=_scalar(num_seqs),
+        num_tokens=_scalar(num_tokens),
+        token_capacity=q.shape[0],
+        seq_capacity=cu_seqlens.numel() - 1,
+        state_slots=recurrent_state.shape[0],
+        chunk=CHUNK,
+        null_state_index=null_state_index,
     )
     if output is None:
         output = torch.zeros_like(v)
     for seq, (start, end) in enumerate(spans):
-        initial, final, checkpoint = (int(t[seq]) for t in (
-            initial_state_indices, final_state_indices, checkpoint_state_indices))
+        initial, final, checkpoint = (
+            int(t[seq])
+            for t in (
+                initial_state_indices,
+                final_state_indices,
+                checkpoint_state_indices,
+            )
+        )
         offset = int(checkpoint_offsets[seq])
-        state = (torch.zeros_like(recurrent_state[0]) if initial == null_state_index
-                 else recurrent_state[initial])
+        state = (
+            torch.zeros_like(recurrent_state[0])
+            if initial == null_state_index
+            else recurrent_state[initial]
+        )
         out, state, saved = recurrent_gdn(
-            q[start:end], k[start:end], v[start:end], a[start:end], b[start:end], A_log, dt_bias,
-            initial_state=state, checkpoint_offset=offset if offset > 0 else -1,
-            scale=scale, eps=eps, qk_l2norm=qk_l2norm,
+            q[start:end],
+            k[start:end],
+            v[start:end],
+            a[start:end],
+            b[start:end],
+            A_log,
+            dt_bias,
+            initial_state=state,
+            checkpoint_offset=offset if offset > 0 else -1,
+            scale=scale,
+            eps=eps,
+            qk_l2norm=qk_l2norm,
         )
         output[start:end] = out
         if saved is not None and checkpoint != null_state_index:
@@ -165,4 +254,11 @@ def prefill_gdn(q, k, v, a, b, A_log, dt_bias, recurrent_state, cu_seqlens,
     return output
 
 
-__all__ = ["chunk_mirror", "gdn_beta", "gdn_log_decay", "prefill_gdn", "prepare_chunk", "recurrent_gdn"]
+__all__ = [
+    "chunk_mirror",
+    "gdn_beta",
+    "gdn_log_decay",
+    "prefill_gdn",
+    "prepare_chunk",
+    "recurrent_gdn",
+]

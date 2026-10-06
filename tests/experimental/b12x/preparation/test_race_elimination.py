@@ -4,6 +4,7 @@ The race protocol lives in ``b12x.preparation._measurement``; these cases drive
 it with timers that report fixed latencies, so the survivor set, the round
 budget and the reported medians are exact rather than device-dependent.
 """
+
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -12,7 +13,10 @@ import torch
 
 from b12x.preparation import _measurement
 from b12x.preparation._measurement import (
-    ELIMINATION_MARGIN, PreparedRace, SURVIVOR_ROUNDS, measure_race_steps,
+    ELIMINATION_MARGIN,
+    PreparedRace,
+    SURVIVOR_ROUNDS,
+    measure_race_steps,
 )
 
 
@@ -35,12 +39,17 @@ class _Timer:
 @pytest.fixture
 def host_timing(monkeypatch):
     """Run the protocol on the host: no device selection, no compilation guard."""
+
     @contextmanager
     def scope(*_args, **_kwargs):
         yield None
 
     monkeypatch.setattr(torch.cuda, "device", scope)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_args: SimpleNamespace(synchronize=lambda: None))
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda *_args: SimpleNamespace(synchronize=lambda: None),
+    )
     monkeypatch.setattr(_measurement, "no_compilation", scope)
     monkeypatch.setattr(_measurement, "ROUND_BUDGET_US", 0)
 
@@ -50,7 +59,9 @@ def _race(timers):
 
 
 def _measure(prepared, *, eliminate=True, **kwargs):
-    steps = measure_race_steps(prepared, device_ordinal=0, eliminate=eliminate, **kwargs)
+    steps = measure_race_steps(
+        prepared, device_ordinal=0, eliminate=eliminate, **kwargs
+    )
     while True:
         try:
             next(steps)
@@ -189,12 +200,18 @@ def queued_timing(host_timing, monkeypatch):
             timer.completed += 1
         queue.clear()
 
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_args: SimpleNamespace(synchronize=synchronize))
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda *_args: SimpleNamespace(synchronize=synchronize),
+    )
     return queue, order, synchronizations
 
 
 @pytest.mark.parametrize("capture_safe", [False, True])
-def test_batched_replays_preserve_individual_timing_and_balanced_order(queued_timing, capture_safe):
+def test_batched_replays_preserve_individual_timing_and_balanced_order(
+    queued_timing, capture_safe
+):
     queue, order, synchronizations = queued_timing
     timers = tuple(
         _QueuedTimer(name, latency, queue, order)
@@ -208,8 +225,22 @@ def test_batched_replays_preserve_individual_timing_and_balanced_order(queued_ti
     assert measurement.latencies_us == (8.0, 15.0, 50.0)
     assert [timer.replays for timer in timers] == [8, 6, 2]
     assert order == [
-        "fast", "middle", "slow", "middle", "fast", "fast", "middle", "fast",
-        "slow", "middle", "fast", "fast", "middle", "middle", "fast", "fast",
+        "fast",
+        "middle",
+        "slow",
+        "middle",
+        "fast",
+        "fast",
+        "middle",
+        "fast",
+        "slow",
+        "middle",
+        "fast",
+        "fast",
+        "middle",
+        "middle",
+        "fast",
+        "fast",
     ]
     assert len(synchronizations) == 8
     assert not queue
@@ -219,7 +250,9 @@ def test_failed_replay_drains_preceding_gpu_work(queued_timing):
     queue, order, synchronizations = queued_timing
     first = _QueuedTimer("first", 8.0, queue, order)
     failing = _QueuedTimer("failing", 8.0, queue, order, fail=True)
-    steps = measure_race_steps(PreparedRace((first, failing), None, 8), device_ordinal=0)
+    steps = measure_race_steps(
+        PreparedRace((first, failing), None, 8), device_ordinal=0
+    )
 
     with pytest.raises(RuntimeError, match="replay failed"):
         next(steps)
@@ -244,7 +277,9 @@ def test_cancellation_yields_with_completed_gpu_work(queued_timing):
 
 
 @pytest.mark.parametrize("latency", [0.0, -1.0, float("nan"), float("inf")])
-def test_invalid_first_measurement_is_rejected_before_sizing_replays(host_timing, latency):
+def test_invalid_first_measurement_is_rejected_before_sizing_replays(
+    host_timing, latency
+):
     timer = _Timer(latency)
     timer.call.capture_safe = True
     with pytest.raises(RuntimeError, match="invalid latency"):

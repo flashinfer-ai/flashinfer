@@ -575,8 +575,10 @@ def _run_extend_case(
     _assert_topk_set_match(actual[: expected.shape[0]], expected)
 
     from b12x.testing.benchmark import measure_call
-    measured = measure_call(run, warmup=warmup, samples=replays,
-                            eviction=l2_flush or (lambda: None))
+
+    measured = measure_call(
+        run, warmup=warmup, samples=replays, eviction=l2_flush or (lambda: None)
+    )
     replay_us = measured.raw_samples("workload")
     print(
         json.dumps(

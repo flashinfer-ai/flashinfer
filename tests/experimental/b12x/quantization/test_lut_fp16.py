@@ -29,9 +29,9 @@ def test_lut_fp16_segment_table_has_frozen_identity() -> None:
 def test_lut_fp16_value_law_is_finite_sign_symmetric_and_close_to_gaussian() -> None:
     ranks = torch.arange(1 << 16, dtype=torch.int64)
     actual = lut_fp16_decode_ranks_torch(ranks)
-    target = (
-        1.5 * torch.special.ndtri((ranks.double() + 0.5) / (1 << 16))
-    ).to(torch.float16)
+    target = (1.5 * torch.special.ndtri((ranks.double() + 0.5) / (1 << 16))).to(
+        torch.float16
+    )
     assert actual.dtype == torch.float16
     assert bool(torch.isfinite(actual).all())
     assert torch.equal(actual, -actual.flip(0))

@@ -252,8 +252,7 @@ def _to_kernel_tensor(
         )
         shape = tuple(cute.sym_int(32) for _ in tensor.shape)
         strides = tuple(
-            1 if idx == leading_dim else cute.sym_int(64)
-            for idx in range(tensor.ndim)
+            1 if idx == leading_dim else cute.sym_int(64) for idx in range(tensor.ndim)
         )
         return make_fake_tensor(
             dtype,

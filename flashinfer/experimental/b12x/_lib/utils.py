@@ -108,7 +108,9 @@ def is_mxfp6_ab_dtype_string(dtype: str) -> bool:
 def mxfp6_tile_k(sf_vec_size: int = MXFP6_SF_VEC_SIZE) -> int:
     """K tile size for one MX-FP6 pipeline stage (four ``m16n8k32`` MMA slices)."""
     if sf_vec_size != MXFP6_SF_VEC_SIZE:
-        raise ValueError(f"MX-FP6 expects sf_vec_size={MXFP6_SF_VEC_SIZE}, got {sf_vec_size}")
+        raise ValueError(
+            f"MX-FP6 expects sf_vec_size={MXFP6_SF_VEC_SIZE}, got {sf_vec_size}"
+        )
     return sf_vec_size * 4
 
 
@@ -129,9 +131,7 @@ def mxfp6_packed_k_bytes(k: int) -> int:
 def mxfp6_logical_k_from_packed_bytes(packed_k_bytes: int) -> int:
     """Logical K element count from packed byte width along K."""
     if packed_k_bytes % 3 != 0:
-        raise ValueError(
-            f"packed_k_bytes must be divisible by 3, got {packed_k_bytes}"
-        )
+        raise ValueError(f"packed_k_bytes must be divisible by 3, got {packed_k_bytes}")
     return (packed_k_bytes * 4) // 3
 
 
@@ -153,9 +153,13 @@ def verify_mxfp6_smem_tile_k(
     Returns ``mma_nsf = tile_k // sf_vec_size`` (4 when ``tile_k=128``).
     """
     if sf_vec_size != MXFP6_SF_VEC_SIZE:
-        raise ValueError(f"MX-FP6 expects sf_vec_size={MXFP6_SF_VEC_SIZE}, got {sf_vec_size}")
+        raise ValueError(
+            f"MX-FP6 expects sf_vec_size={MXFP6_SF_VEC_SIZE}, got {sf_vec_size}"
+        )
     if tile_k % sf_vec_size != 0:
-        raise ValueError(f"tile_k={tile_k} must be divisible by sf_vec_size={sf_vec_size}")
+        raise ValueError(
+            f"tile_k={tile_k} must be divisible by sf_vec_size={sf_vec_size}"
+        )
     mma_nsf = tile_k // sf_vec_size
     blk_sf = 4
     if tile_k % (blk_sf * mma_nsf) != 0:

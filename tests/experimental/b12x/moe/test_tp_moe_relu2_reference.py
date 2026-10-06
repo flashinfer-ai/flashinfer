@@ -3,12 +3,21 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x._lib.intrinsics import FLOAT4_E2M1_MAX, fp4_quantize_values_torch, pack_grouped_fp4_values, swizzle_block_scale
+from b12x._lib.intrinsics import (
+    FLOAT4_E2M1_MAX,
+    fp4_quantize_values_torch,
+    pack_grouped_fp4_values,
+    swizzle_block_scale,
+)
 import b12x.moe.fused_moe._impl as tp_moe
 from b12x.moe.fused_moe._impl import clear_tp_moe_caches
 from b12x.moe._shared.kernels.reference import compare_to_reference, moe_reference_nvfp4
 
-from b12x.testing.reference.helpers import prepare_tp_moe_fp4_experts, require_b12x, run_tp_moe_fp4
+from b12x.testing.reference.helpers import (
+    prepare_tp_moe_fp4_experts,
+    require_b12x,
+    run_tp_moe_fp4,
+)
 
 
 BACKEND_CASES = [
@@ -23,15 +32,25 @@ def _quantize_moe_weight_storage(
     global_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_groups, rows, cols = input_tensor.shape
-    quantized = torch.zeros((num_groups, rows, cols), dtype=torch.float32, device=input_tensor.device)
-    scales = torch.zeros((num_groups, rows, cols // 16), dtype=torch.float32, device=input_tensor.device)
+    quantized = torch.zeros(
+        (num_groups, rows, cols), dtype=torch.float32, device=input_tensor.device
+    )
+    scales = torch.zeros(
+        (num_groups, rows, cols // 16), dtype=torch.float32, device=input_tensor.device
+    )
     for group_idx in range(num_groups):
         x = input_tensor[group_idx].float()
         sliced = x.view(rows, cols // 16, 16)
         block_max = sliced.abs().amax(dim=-1, keepdim=True)
-        scale = (global_scale[group_idx] * (block_max / FLOAT4_E2M1_MAX)).to(torch.float8_e4m3fn).to(torch.float32)
+        scale = (
+            (global_scale[group_idx] * (block_max / FLOAT4_E2M1_MAX))
+            .to(torch.float8_e4m3fn)
+            .to(torch.float32)
+        )
         output_scale = 1.0 / (scale * (1.0 / global_scale[group_idx]))
-        clipped = torch.clamp(sliced * output_scale, -FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX).view(rows, cols)
+        clipped = torch.clamp(
+            sliced * output_scale, -FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX
+        ).view(rows, cols)
         quantized[group_idx] = fp4_quantize_values_torch(clipped)
         scales[group_idx] = scale.squeeze(-1)
 

@@ -23,18 +23,34 @@ def require_mxf8_mma() -> None:
 
 @contextmanager
 def _prepared(source, packed, *, expected_m=None):
-    plan = tensor_fp8_linear.plan(tensor_fp8_linear.query_from_call(
-        source, packed, expected_m=expected_m,
-    ))
-    with PreparationSession(device=source.device, autotune=False, compile_workers=2) as session:
-        session.prepare((plan.request(
-            name="tensor_fp8", prepare_call=lambda state: PreparedCall(
-                run=lambda: state.run_tensor_fp8(
-                    source, packed.values, packed.scale_mma, packed.block_scale,
-                    packed.output_scale, out_dtype=torch.bfloat16, stream=None,
+    plan = tensor_fp8_linear.plan(
+        tensor_fp8_linear.query_from_call(
+            source,
+            packed,
+            expected_m=expected_m,
+        )
+    )
+    with PreparationSession(
+        device=source.device, autotune=False, compile_workers=2
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="tensor_fp8",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.run_tensor_fp8(
+                            source,
+                            packed.values,
+                            packed.scale_mma,
+                            packed.block_scale,
+                            packed.output_scale,
+                            out_dtype=torch.bfloat16,
+                            stream=None,
+                        ),
+                    ),
                 ),
-            ),
-        ),))
+            )
+        )
         session.freeze()
         yield plan
 

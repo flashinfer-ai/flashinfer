@@ -26,8 +26,17 @@ _enabled = None
 
 @triton.jit(do_not_specialize=["rows"])
 def _record_routes(
-    ids, weights, enabled, counter, counts, recorded_ids, recorded_weights,
-    rows, TOPK: tl.constexpr, CAPACITY: tl.constexpr, BLOCK: tl.constexpr,
+    ids,
+    weights,
+    enabled,
+    counter,
+    counts,
+    recorded_ids,
+    recorded_weights,
+    rows,
+    TOPK: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     if tl.load(enabled) != 0:
         slot = tl.atomic_add(counter, 1)
@@ -59,14 +68,27 @@ def _observe(owner, ids, weights):
             owner,
             torch.zeros(1, device=ids.device, dtype=torch.int32),
             torch.empty(_RECORDS, device=ids.device, dtype=torch.int32),
-            torch.empty((_RECORDS, _MAX_TOKENS, topk), device=ids.device, dtype=torch.int32),
-            torch.empty((_RECORDS, _MAX_TOKENS, topk), device=ids.device, dtype=torch.float32),
+            torch.empty(
+                (_RECORDS, _MAX_TOKENS, topk), device=ids.device, dtype=torch.int32
+            ),
+            torch.empty(
+                (_RECORDS, _MAX_TOKENS, topk), device=ids.device, dtype=torch.float32
+            ),
         )
     _, counter, counts, recorded_ids, recorded_weights = _owners[key]
     _record_routes[(1,)](
-        ids, weights, _enabled, counter, counts, recorded_ids, recorded_weights,
-        ids.shape[0], TOPK=ids.shape[1], CAPACITY=_RECORDS,
-        BLOCK=triton.next_power_of_2(_MAX_TOKENS * ids.shape[1]), num_warps=1,
+        ids,
+        weights,
+        _enabled,
+        counter,
+        counts,
+        recorded_ids,
+        recorded_weights,
+        ids.shape[0],
+        TOPK=ids.shape[1],
+        CAPACITY=_RECORDS,
+        BLOCK=triton.next_power_of_2(_MAX_TOKENS * ids.shape[1]),
+        num_warps=1,
     )
 
 
@@ -106,6 +128,7 @@ class RoutingTraceWorker:
         if rows is None:
             manager.get_num_tokens = original
         else:
+
             def fixed_rows(manager, num_tokens_per_req, draft_tokens):
                 result = original(num_tokens_per_req, draft_tokens)
                 drafts, non_drafts, _ = manager._batch_budget
@@ -146,18 +169,26 @@ class RoutingTraceWorker:
             captured_ids = ids[:count].cpu().tolist()
             captured_weights = weights[:count].cpu().tolist()
             prepared = owner._prepared()
-            records.append({
-                "layer": owner._routing_trace_layer_name,
-                "num_experts": prepared.num_experts,
-                "hidden_size": prepared.hidden_size,
-                "intermediate_size": prepared.intermediate_size,
-                "total_calls": observed,
-                "truncated": observed > _RECORDS,
-                "calls": [
-                    {"tokens": rows, "ids": call_ids[:rows], "weights": call_weights[:rows]}
-                    for rows, call_ids, call_weights in zip(lengths, captured_ids, captured_weights, strict=True)
-                ],
-            })
+            records.append(
+                {
+                    "layer": owner._routing_trace_layer_name,
+                    "num_experts": prepared.num_experts,
+                    "hidden_size": prepared.hidden_size,
+                    "intermediate_size": prepared.intermediate_size,
+                    "total_calls": observed,
+                    "truncated": observed > _RECORDS,
+                    "calls": [
+                        {
+                            "tokens": rows,
+                            "ids": call_ids[:rows],
+                            "weights": call_weights[:rows],
+                        }
+                        for rows, call_ids, call_weights in zip(
+                            lengths, captured_ids, captured_weights, strict=True
+                        )
+                    ],
+                }
+            )
         path = Path(destination)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(records))

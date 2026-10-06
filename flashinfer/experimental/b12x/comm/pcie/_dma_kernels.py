@@ -165,9 +165,7 @@ def _st_global_u8(addr: Int64, value: Uint32, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def _ld_global_v2_u32(
-    addr: Int64, *, loc=None, ip=None
-) -> tuple[Uint32, Uint32]:
+def _ld_global_v2_u32(addr: Int64, *, loc=None, ip=None) -> tuple[Uint32, Uint32]:
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
         [Int64(addr).ir_value(loc=loc, ip=ip)],
@@ -238,9 +236,7 @@ def _publish_flag_sys(
 
 
 @dsl_user_op
-def _wait_flag_sys(
-    flag_addr: Int64, counter_addr: Int64, *, loc=None, ip=None
-) -> None:
+def _wait_flag_sys(flag_addr: Int64, counter_addr: Int64, *, loc=None, ip=None) -> None:
     """Increment the expected value and wait with acquire-system loads."""
 
     llvm.inline_asm(
@@ -274,9 +270,7 @@ def _wait_flag_sys(
 
 
 @dsl_user_op
-def _unpack_bf16x2(
-    packed: Uint32, *, loc=None, ip=None
-) -> tuple[Float32, Float32]:
+def _unpack_bf16x2(packed: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
         [Uint32(packed).ir_value(loc=loc, ip=ip)],
@@ -302,9 +296,7 @@ def _unpack_bf16x2(
 
 
 @dsl_user_op
-def _pack_bf16x2(
-    v0: Float32, v1: Float32, *, loc=None, ip=None
-) -> Uint32:
+def _pack_bf16x2(v0: Float32, v1: Float32, *, loc=None, ip=None) -> Uint32:
     return Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -531,24 +523,18 @@ def _store_bf16x4(
 
 
 @cute.jit
-def _warp_amax_32(
-    v0: Float32, v1: Float32, v2: Float32, v3: Float32
-) -> Float32:
+def _warp_amax_32(v0: Float32, v1: Float32, v2: Float32, v3: Float32) -> Float32:
     amax = fmax_f32(
         fmax_f32(fabs_f32(v0), fabs_f32(v1)),
         fmax_f32(fabs_f32(v2), fabs_f32(v3)),
     )
     for offset in cutlass.range_constexpr(5):
-        amax = fmax_f32(
-            amax, cute.arch.shuffle_sync_bfly(amax, offset=16 >> offset)
-        )
+        amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, offset=16 >> offset))
     return amax
 
 
 @cute.jit
-def _warp_amax_8(
-    v0: Float32, v1: Float32, v2: Float32, v3: Float32
-) -> Float32:
+def _warp_amax_8(v0: Float32, v1: Float32, v2: Float32, v3: Float32) -> Float32:
     amax = fmax_f32(
         fmax_f32(fabs_f32(v0), fabs_f32(v1)),
         fmax_f32(fabs_f32(v2), fabs_f32(v3)),
@@ -559,7 +545,9 @@ def _warp_amax_8(
             cute.arch.shuffle_sync_bfly(
                 # CUDA's ``width=8`` encodes both the 8-lane clamp and the
                 # segment mask in the PTX ``c`` operand: ((32-8)<<8)|7.
-                amax, offset=4 >> offset, mask_and_clamp=0x1807
+                amax,
+                offset=4 >> offset,
+                mask_and_clamp=0x1807,
             ),
         )
     return amax
@@ -718,9 +706,7 @@ class _QuantLaunch:
                 scale_group = lane >> Int32(3)
                 scale_lane = lane & Int32(7)
                 if scale_lane == Int32(0):
-                    scale_idx = block * Int64(_MX_SCALES_PER_BLOCK) + Int64(
-                        scale_group
-                    )
+                    scale_idx = block * Int64(_MX_SCALES_PER_BLOCK) + Int64(scale_group)
                     _st_global_u8(get_ptr_as_int64(scales, scale_idx), scale_byte)
                 inv_scale = _mx_inv_scale(scale_byte)
                 packed = cvt_f32x4_to_e4m3x4(
@@ -826,9 +812,7 @@ class _DequantStoreLaunch:
         block = Int64(bidx) * Int64(_WARPS_PER_CTA) + Int64(warp)
         step = Int64(gdim) * Int64(_WARPS_PER_CTA)
         while block < blocks:
-            v0, v1, v2, v3 = _decode_payload(
-                self._codec, payload, scales, block, lane
-            )
+            v0, v1, v2, v3 = _decode_payload(self._codec, payload, scales, block, lane)
             elem0 = block * Int64(_QUANT_BLOCK) + Int64(lane) * Int64(4)
             _store_bf16x4(out, elem0, v0, v1, v2, v3)
             block += step
@@ -1130,9 +1114,7 @@ class _DequantAddQuantLaunch:
                 scale_group = lane >> Int32(3)
                 scale_lane = lane & Int32(7)
                 if scale_lane == Int32(0):
-                    scale_idx = block * Int64(_MX_SCALES_PER_BLOCK) + Int64(
-                        scale_group
-                    )
+                    scale_idx = block * Int64(_MX_SCALES_PER_BLOCK) + Int64(scale_group)
                     _st_global_u8(get_ptr_as_int64(scales_out, scale_idx), scale)
                 inv_scale = _mx_inv_scale(scale)
                 packed = cvt_f32x4_to_e4m3x4(
@@ -1164,9 +1146,7 @@ class _DequantAddQuantLaunch:
                         v2 * inv_scale,
                         v3 * inv_scale,
                     )
-            _st_global_u32(
-                get_ptr_as_int64(payload_out, elem0 // Int64(4)), packed
-            )
+            _st_global_u32(get_ptr_as_int64(payload_out, elem0 // Int64(4)), packed)
             if cutlass.const_expr(self._store_bf16):
                 _store_bf16x4(out, elem0, v0, v1, v2, v3)
             block += step
@@ -1343,14 +1323,20 @@ class DmaLaunchers:
     @property
     def __b12x_dependencies__(self):
         return (
-            self.set_flag, self.wait_flag, self.add, self.quant,
-            self.dequant_store, self.dequant_accum,
-            self.dequant_add_quant_false, self.dequant_add_quant_true,
+            self.set_flag,
+            self.wait_flag,
+            self.add,
+            self.quant,
+            self.dequant_store,
+            self.dequant_accum,
+            self.dequant_add_quant_false,
+            self.dequant_add_quant_true,
         )
 
     @property
     def __b12x_programs__(self):
         from b12x._lib.compile_plan import program_keys
+
         return program_keys(self.__b12x_dependencies__)
 
 
@@ -1369,9 +1355,15 @@ def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
         add=tuple(_compiled_add(dtype) for dtype in _DTYPES),
         quant=_compiled_quant(codec) if compressed else None,
         dequant_store=_compiled_dequant_store(codec) if compressed else None,
-        dequant_accum=_compiled_dequant_accum(codec, int(world_size) - 1) if a2a else None,
-        dequant_add_quant_false=_compiled_dequant_add_quant(codec, False) if compressed else None,
-        dequant_add_quant_true=_compiled_dequant_add_quant(codec, True) if compressed else None,
+        dequant_accum=_compiled_dequant_accum(codec, int(world_size) - 1)
+        if a2a
+        else None,
+        dequant_add_quant_false=_compiled_dequant_add_quant(codec, False)
+        if compressed
+        else None,
+        dequant_add_quant_true=_compiled_dequant_add_quant(codec, True)
+        if compressed
+        else None,
     )
 
 
@@ -1548,7 +1540,13 @@ def _install_codec_methods() -> None:
         setattr(
             DmaKernels,
             f"dma_dequant_accum{suffix}",
-            lambda self, out, inp, payloads, scales, elems, _codec=codec: self._dequant_accum(
+            lambda self,
+            out,
+            inp,
+            payloads,
+            scales,
+            elems,
+            _codec=codec: self._dequant_accum(
                 _codec, out, inp, payloads, scales, elems
             ),
         )
@@ -1576,6 +1574,7 @@ def _install_codec_methods() -> None:
                 store_bf16,
             ),
         )
+
 
 _install_codec_methods()
 

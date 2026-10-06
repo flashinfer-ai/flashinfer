@@ -66,6 +66,7 @@ def mx_gs_numerator(fmt: str) -> float:
     f8_max = float(torch.finfo(torch.float8_e4m3fn).max)
     return f8_max * _GS_FMT_MAX[fmt]
 
+
 Fp6Format = Literal["e3m2", "e2m3"]
 
 # =============================================================================
@@ -198,12 +199,9 @@ def mxfp6_swizzled_scale_offset(
     c0 = Int64(block >> Int32(2))  # block // 4
     c1 = Int64(block & Int32(3))  # block % 4
     return (
-        (
-            (((r0 * Int64(cols_padded_div4) + c0) * Int64(32) + r2) * Int64(4) + r1)
-            * Int64(4)
-        )
-        + c1
-    )
+        (((r0 * Int64(cols_padded_div4) + c0) * Int64(32) + r2) * Int64(4) + r1)
+        * Int64(4)
+    ) + c1
 
 
 def _encode_fp6_nearest(value: float, fmt: Fp6Format) -> int:
@@ -323,9 +321,7 @@ def expand_mxfp6_packed_to_bytes(packed: torch.Tensor, num_fp6: int) -> torch.Te
     groups = num_fp6 // 4
     *lead, packed_cols = packed.shape
     if packed_cols != groups * 3:
-        raise ValueError(
-            f"packed last dim {packed_cols} != 3*num_fp6/4 ({groups * 3})"
-        )
+        raise ValueError(f"packed last dim {packed_cols} != 3*num_fp6/4 ({groups * 3})")
     p = packed.reshape(*lead, groups, 3).to(torch.int32)
     bits = p[..., 0] | (p[..., 1] << 8) | (p[..., 2] << 16)
     c0 = bits & 0x3F
@@ -392,17 +388,25 @@ def dequant_mxfp6_torch(
     decode = _decode_fp6_e3m2 if fmt == "e3m2" else _decode_fp6_e2m3
     codes = unpack_fp6_packed_tensor(packed, num_fp6)
     flat_codes = codes.reshape(-1, num_fp6)
-    flat_out = torch.empty(flat_codes.shape[0], num_fp6, dtype=torch.float32, device=packed.device)
+    flat_out = torch.empty(
+        flat_codes.shape[0], num_fp6, dtype=torch.float32, device=packed.device
+    )
     num_blocks = num_fp6 // SF_VEC_SIZE_FP6
     if scales_swizzled:
-        scale_flat = unswizzle_mxfp6_scales(scales_ue8m0, flat_codes.shape[0], num_blocks)
+        scale_flat = unswizzle_mxfp6_scales(
+            scales_ue8m0, flat_codes.shape[0], num_blocks
+        )
     else:
         scale_flat = scales_ue8m0.reshape(-1, num_blocks)
     if scale_flat.shape[0] != flat_out.shape[0]:
         raise ValueError("scale row count does not match packed row count")
     gs = 1.0
     if global_scale is not None:
-        gs = float(global_scale.reshape(-1)[0].item()) if global_scale.numel() > 1 else float(global_scale.item())
+        gs = (
+            float(global_scale.reshape(-1)[0].item())
+            if global_scale.numel() > 1
+            else float(global_scale.item())
+        )
     # ``quantize`` stores ``code ~= x * gs / block_scale`` (scaled *up* by the global
     # scale), so reconstructing the original value divides it back out. Using ``* gs``
     # returns ``x * gs**2``; that cancels under the scale-invariant cosine checks but
@@ -411,14 +415,20 @@ def dequant_mxfp6_torch(
     for row in range(flat_out.shape[0]):
         for blk in range(num_fp6 // SF_VEC_SIZE_FP6):
             ue = int(scale_flat[row, blk].view(torch.uint8).item())
-            block_scale = 0.0 if ue == 0 else float(torch.pow(torch.tensor(2.0), float(ue - 127)))
+            block_scale = (
+                0.0 if ue == 0 else float(torch.pow(torch.tensor(2.0), float(ue - 127)))
+            )
             for j in range(SF_VEC_SIZE_FP6):
                 idx = blk * SF_VEC_SIZE_FP6 + j
-                flat_out[row, idx] = decode(int(flat_codes[row, idx].item())) * block_scale * inv_gs
+                flat_out[row, idx] = (
+                    decode(int(flat_codes[row, idx].item())) * block_scale * inv_gs
+                )
     return flat_out.reshape(*codes.shape[:-1], num_fp6)
 
 
-def _ue8m0_scale_from_block_max(block_max: torch.Tensor, fmt_max: float) -> torch.Tensor:
+def _ue8m0_scale_from_block_max(
+    block_max: torch.Tensor, fmt_max: float
+) -> torch.Tensor:
     """Compute per-block UE8M0 scale bytes from block amax (Torch reference)."""
     block_max = block_max.float().clamp(min=0.0)
     ratio = block_max / fmt_max
@@ -437,12 +447,16 @@ def pack_grouped_fp6_values(
     num_groups, rows, cols = values.shape
     if cols % 4 != 0:
         raise ValueError(f"cols must be divisible by 4 for FP6 packing, got {cols}")
-    codes = torch.empty((num_groups, rows, cols), dtype=torch.uint8, device=values.device)
+    codes = torch.empty(
+        (num_groups, rows, cols), dtype=torch.uint8, device=values.device
+    )
     for g in range(num_groups):
         for r in range(rows):
             for c in range(cols):
                 codes[g, r, c] = _encode_fp6_nearest(float(values[g, r, c].item()), fmt)
-    packed = torch.empty((rows, cols * 3 // 4, num_groups), dtype=torch.uint8, device=values.device)
+    packed = torch.empty(
+        (rows, cols * 3 // 4, num_groups), dtype=torch.uint8, device=values.device
+    )
     for g in range(num_groups):
         packed[..., g] = pack_fp6_codes_tensor(codes[g])
     return packed
@@ -490,7 +504,9 @@ def quantize_grouped_mxfp6_torch(
     if global_scale.numel() == 1:
         global_scale = global_scale.expand(num_groups).contiguous()
 
-    quantized = torch.zeros((num_groups, rows, cols), dtype=torch.float32, device=input_tensor.device)
+    quantized = torch.zeros(
+        (num_groups, rows, cols), dtype=torch.float32, device=input_tensor.device
+    )
     scales = torch.zeros(
         (num_groups, rows, cols // SF_VEC_SIZE_FP6),
         dtype=torch.uint8,
@@ -529,16 +545,38 @@ def quantize_grouped_mxfp6_torch(
         valid_rows = int(row_counts[group_idx].item())
         if valid_rows == 0:
             packed_groups.append(
-                torch.zeros((rows, cols * 3 // 4), dtype=torch.uint8, device=input_tensor.device)
+                torch.zeros(
+                    (rows, cols * 3 // 4), dtype=torch.uint8, device=input_tensor.device
+                )
             )
             continue
-        codes = torch.zeros((valid_rows, cols), dtype=torch.uint8, device=input_tensor.device)
+        codes = torch.zeros(
+            (valid_rows, cols), dtype=torch.uint8, device=input_tensor.device
+        )
         for r in range(valid_rows):
             for c in range(cols):
-                codes[r, c] = _encode_fp6_nearest(float(quantized[group_idx, r, c].item()), fmt)
+                codes[r, c] = _encode_fp6_nearest(
+                    float(quantized[group_idx, r, c].item()), fmt
+                )
         packed_groups.append(pack_fp6_codes_tensor(codes))
     packed = torch.stack(
-        [p if p.shape[0] == rows else torch.cat([p, torch.zeros(rows - p.shape[0], cols * 3 // 4, dtype=torch.uint8, device=p.device)], dim=0) for p in packed_groups],
+        [
+            p
+            if p.shape[0] == rows
+            else torch.cat(
+                [
+                    p,
+                    torch.zeros(
+                        rows - p.shape[0],
+                        cols * 3 // 4,
+                        dtype=torch.uint8,
+                        device=p.device,
+                    ),
+                ],
+                dim=0,
+            )
+            for p in packed_groups
+        ],
         dim=-1,
     )
     # ``scales`` already holds raw UE8M0 exponent bytes; reinterpret the bits as
@@ -896,8 +934,25 @@ def mxfp6_mma_m16n8k32_f32_e3m2_e3m2(
 ) -> Tuple[Float32, Float32, Float32, Float32]:
     """Warp MMA for SM120 MX-FP6 ``m16n8k32`` with E3M2 x E3M2 operands."""
     return _mxfp6_mma_inline(
-        "e3m2.e3m2", d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sfa, sfb,
-        bid_a, tid_a, bid_b, tid_b, loc=loc, ip=ip,
+        "e3m2.e3m2",
+        d0,
+        d1,
+        d2,
+        d3,
+        a0,
+        a1,
+        a2,
+        a3,
+        b0,
+        b1,
+        sfa,
+        sfb,
+        bid_a,
+        tid_a,
+        bid_b,
+        tid_b,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -925,8 +980,25 @@ def mxfp6_mma_m16n8k32_f32_e2m3_e2m3(
 ) -> Tuple[Float32, Float32, Float32, Float32]:
     """Warp MMA for SM120 MX-FP6 ``m16n8k32`` with E2M3 x E2M3 operands."""
     return _mxfp6_mma_inline(
-        "e2m3.e2m3", d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sfa, sfb,
-        bid_a, tid_a, bid_b, tid_b, loc=loc, ip=ip,
+        "e2m3.e2m3",
+        d0,
+        d1,
+        d2,
+        d3,
+        a0,
+        a1,
+        a2,
+        a3,
+        b0,
+        b1,
+        sfa,
+        sfb,
+        bid_a,
+        tid_a,
+        bid_b,
+        tid_b,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -954,8 +1026,25 @@ def mxfp6_mma_m16n8k32_f32_e2m3_e3m2(
 ) -> Tuple[Float32, Float32, Float32, Float32]:
     """Warp MMA for SM120 MX-FP6 ``m16n8k32`` with E2M3 x E3M2 operands (default weight/act)."""
     return _mxfp6_mma_inline(
-        "e2m3.e3m2", d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sfa, sfb,
-        bid_a, tid_a, bid_b, tid_b, loc=loc, ip=ip,
+        "e2m3.e3m2",
+        d0,
+        d1,
+        d2,
+        d3,
+        a0,
+        a1,
+        a2,
+        a3,
+        b0,
+        b1,
+        sfa,
+        sfb,
+        bid_a,
+        tid_a,
+        bid_b,
+        tid_b,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -983,8 +1072,25 @@ def mxfp6_mma_m16n8k32_f32_e3m2_e2m3(
 ) -> Tuple[Float32, Float32, Float32, Float32]:
     """Warp MMA for SM120 MX-FP6 ``m16n8k32`` with E3M2 x E2M3 operands."""
     return _mxfp6_mma_inline(
-        "e3m2.e2m3", d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sfa, sfb,
-        bid_a, tid_a, bid_b, tid_b, loc=loc, ip=ip,
+        "e3m2.e2m3",
+        d0,
+        d1,
+        d2,
+        d3,
+        a0,
+        a1,
+        a2,
+        a3,
+        b0,
+        b1,
+        sfa,
+        sfb,
+        bid_a,
+        tid_a,
+        bid_b,
+        tid_b,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -1018,8 +1124,25 @@ def mxfp6_mma_m16n8k32_f32_e4m3_e2m3(
 ) -> Tuple[Float32, Float32, Float32, Float32]:
     """Warp MMA ``m16n8k32`` with E4M3 (act) x E2M3 (weight) operands."""
     return _mxfp6_mma_inline(
-        "e4m3.e2m3", d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sfa, sfb,
-        bid_a, tid_a, bid_b, tid_b, loc=loc, ip=ip,
+        "e4m3.e2m3",
+        d0,
+        d1,
+        d2,
+        d3,
+        a0,
+        a1,
+        a2,
+        a3,
+        b0,
+        b1,
+        sfa,
+        sfb,
+        bid_a,
+        tid_a,
+        bid_b,
+        tid_b,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -1047,8 +1170,25 @@ def mxfp6_mma_m16n8k32_f32_e4m3_e3m2(
 ) -> Tuple[Float32, Float32, Float32, Float32]:
     """Warp MMA ``m16n8k32`` with E4M3 (act) x E3M2 (weight) operands."""
     return _mxfp6_mma_inline(
-        "e4m3.e3m2", d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sfa, sfb,
-        bid_a, tid_a, bid_b, tid_b, loc=loc, ip=ip,
+        "e4m3.e3m2",
+        d0,
+        d1,
+        d2,
+        d3,
+        a0,
+        a1,
+        a2,
+        a3,
+        b0,
+        b1,
+        sfa,
+        sfb,
+        bid_a,
+        tid_a,
+        bid_b,
+        tid_b,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -1076,8 +1216,25 @@ def mxfp6_mma_m16n8k32_f32_e2m3_e4m3(
 ) -> Tuple[Float32, Float32, Float32, Float32]:
     """Warp MMA ``m16n8k32`` with E2M3 (weight) x E4M3 (act) operands."""
     return _mxfp6_mma_inline(
-        "e2m3.e4m3", d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sfa, sfb,
-        bid_a, tid_a, bid_b, tid_b, loc=loc, ip=ip,
+        "e2m3.e4m3",
+        d0,
+        d1,
+        d2,
+        d3,
+        a0,
+        a1,
+        a2,
+        a3,
+        b0,
+        b1,
+        sfa,
+        sfb,
+        bid_a,
+        tid_a,
+        bid_b,
+        tid_b,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -1105,8 +1262,25 @@ def mxfp6_mma_m16n8k32_f32_e3m2_e4m3(
 ) -> Tuple[Float32, Float32, Float32, Float32]:
     """Warp MMA ``m16n8k32`` with E3M2 (weight) x E4M3 (act) operands."""
     return _mxfp6_mma_inline(
-        "e3m2.e4m3", d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sfa, sfb,
-        bid_a, tid_a, bid_b, tid_b, loc=loc, ip=ip,
+        "e3m2.e4m3",
+        d0,
+        d1,
+        d2,
+        d3,
+        a0,
+        a1,
+        a2,
+        a3,
+        b0,
+        b1,
+        sfa,
+        sfb,
+        bid_a,
+        tid_a,
+        bid_b,
+        tid_b,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -1168,7 +1342,9 @@ def pack_4_byte_containers_to_3bytes(
     c3: Uint32,
 ) -> Tuple[Uint8, Uint8, Uint8]:
     """Pack four FP6 byte-container registers (6-bit payloads) into three bytes."""
-    return pack_4_fp6_codes_to_3bytes(c0 & Uint32(0x3F), c1 & Uint32(0x3F), c2 & Uint32(0x3F), c3 & Uint32(0x3F))
+    return pack_4_fp6_codes_to_3bytes(
+        c0 & Uint32(0x3F), c1 & Uint32(0x3F), c2 & Uint32(0x3F), c3 & Uint32(0x3F)
+    )
 
 
 @cute.jit

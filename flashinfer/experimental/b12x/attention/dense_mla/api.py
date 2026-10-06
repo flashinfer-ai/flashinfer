@@ -1,4 +1,5 @@
 """Prepared public API for paged dense MLA."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -50,7 +51,9 @@ def bind(
     """Bind caller-owned views to an already prepared dense-MLA plan."""
     if not isinstance(plan, Plan):
         raise TypeError("bind requires a session-prepared Plan")
-    device = kwargs.get("q").device if isinstance(kwargs.get("q"), torch.Tensor) else None
+    device = (
+        kwargs.get("q").device if isinstance(kwargs.get("q"), torch.Tensor) else None
+    )
     return Binding(
         plan=plan,
         runtime=_state(plan, device=device).bind(**kwargs),
@@ -93,7 +96,20 @@ def clear_caches() -> None:
 
 
 __all__ = [
-    "Binding", "Budget", "DenseMlaConfig", "DenseMlaQuery", "Caps", "Plan",
-    "Scratch", "bind", "clear_caches", "infer_mode", "invocation_from_descriptors",
-    "invocation_from_tensors", "is_supported", "plan", "reference", "run",
+    "Binding",
+    "Budget",
+    "DenseMlaConfig",
+    "DenseMlaQuery",
+    "Caps",
+    "Plan",
+    "Scratch",
+    "bind",
+    "clear_caches",
+    "infer_mode",
+    "invocation_from_descriptors",
+    "invocation_from_tensors",
+    "is_supported",
+    "plan",
+    "reference",
+    "run",
 ]

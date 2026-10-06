@@ -59,9 +59,16 @@ def _run_eager(
     declaration = paged.plan(
         caps,
         invocation=paged.invocation_from_tensors(
-            caps, q=q, k_cache=k_cache, v_cache=v_cache, output=metadata_output,
-            page_table=page_table, cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q, k_descale=k_descale, v_descale=v_descale,
+            caps,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=metadata_output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            k_descale=k_descale,
+            v_descale=v_descale,
         ),
     )
 
@@ -75,19 +82,24 @@ def _run_eager(
             (q.shape[0], q.shape[1], v_cache.shape[3]), dtype=q.dtype, device=q.device
         )
         binding = state.bind(
-            scratch=scratch, q=q, k_cache=k_cache, v_cache=v_cache, output=output,
-            page_table=page_table, cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q, active_total_q=int(q.shape[0]),
-            k_descale=k_descale, v_descale=v_descale,
+            scratch=scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            active_total_q=int(q.shape[0]),
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         return PreparedCall(run=lambda: state.run(binding), output=output)
 
     with PreparationSession(device=q.device, autotune=False) as session:
-        result = session.prepare((
-            declaration.request(
-                name="paged", prepare_call=prepare_call
-            ),
-        ))
+        result = session.prepare(
+            (declaration.request(name="paged", prepare_call=prepare_call),)
+        )
         plan = result.plans["paged"]
         spec = prepared["spec"]
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=q.device)
@@ -95,10 +107,18 @@ def _run_eager(
             (q.shape[0], q.shape[1], v_cache.shape[3]), dtype=q.dtype, device=q.device
         )
         binding = paged.bind(
-            plan, scratch=scratch, q=q, k_cache=k_cache, v_cache=v_cache,
-            output=output, page_table=page_table, cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q, active_total_q=int(q.shape[0]),
-            k_descale=k_descale, v_descale=v_descale,
+            plan,
+            scratch=scratch,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            active_total_q=int(q.shape[0]),
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         out, lse = paged.run(binding=binding, plan=plan)
         result.close()

@@ -39,7 +39,10 @@ from b12x._lib.quant.x4t_scales import make_x4t_scale_batch  # noqa: E402
 from b12x.moe import fused_moe as moe  # noqa: E402
 from b12x.preparation import PreparationSession, PreparedCall  # noqa: E402
 from b12x.preparation._measurement import _prepare_race, measure_race_steps  # noqa: E402
-from b12x.moe._shared.kernels.reference import compare_to_reference, moe_reference_w4a8_mx  # noqa: E402
+from b12x.moe._shared.kernels.reference import (
+    compare_to_reference,
+    moe_reference_w4a8_mx,
+)  # noqa: E402
 
 
 def synthetic_planes(rng, experts, rows, columns, exceptions, dense_rows, device):
@@ -57,15 +60,21 @@ def synthetic_planes(rng, experts, rows, columns, exceptions, dense_rows, device
         selectors = np.packbits(selected, axis=1, bitorder="little")
         fixed.append(
             torch.from_numpy(
-                np.concatenate((bases.reshape(-1, 16), selectors.reshape(rows // 16, -1)), 1)
+                np.concatenate(
+                    (bases.reshape(-1, 16), selectors.reshape(rows // 16, -1)), 1
+                )
             )
         )
         position = np.flatnonzero(outside).astype(np.uint32)
         records.append(
-            torch.from_numpy(position | (grid.reshape(-1)[position].astype(np.uint32) << 24))
+            torch.from_numpy(
+                position | (grid.reshape(-1)[position].astype(np.uint32) << 24)
+            )
         )
         grids.append(grid)
-    batch = make_x4t_scale_batch(fixed, records, rows=rows, columns=columns, device=device)
+    batch = make_x4t_scale_batch(
+        fixed, records, rows=rows, columns=columns, device=device
+    )
     return batch, torch.from_numpy(np.stack(grids)).to(device)
 
 
@@ -82,14 +91,22 @@ def checkpoint_layer(args, device):
         torch.empty((e, n // 32, h), dtype=torch.uint8, device=device),
     )
     weights = read_mxfp4_csf_layer(
-        args.checkpoint, args.layer, num_experts=e, hidden_size=h,
-        intermediate_size=full, tp_rank=args.rank, tp_size=args.tp,
-        device=device, w13_scale_scratch=scratch[0], w2_scale_scratch=scratch[1],
+        args.checkpoint,
+        args.layer,
+        num_experts=e,
+        hidden_size=h,
+        intermediate_size=full,
+        tp_rank=args.rank,
+        tp_size=args.tp,
+        device=device,
+        w13_scale_scratch=scratch[0],
+        w2_scale_scratch=scratch[1],
     )
     planes, grids = [], []
     ids = torch.arange(e, dtype=torch.int32, device=device)
     for source, rows, columns in (
-        (weights.w13_scales, 2 * n, h // 32), (weights.w2_scales, h, n // 32)
+        (weights.w13_scales, 2 * n, h // 32),
+        (weights.w2_scales, h, n // 32),
     ):
         batch = make_x4t_scale_batch(
             source.fixed, source.exceptions, rows=rows, columns=columns, device=device
@@ -115,8 +132,12 @@ def main() -> None:
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--tp", type=int, default=4)
     parser.add_argument("--rank", type=int, default=0)
-    parser.add_argument("--replays", type=int, default=20, help="samples per balanced timing round")
-    parser.add_argument("--rounds", type=int, default=15, help="balanced cold-L2 timing rounds")
+    parser.add_argument(
+        "--replays", type=int, default=20, help="samples per balanced timing round"
+    )
+    parser.add_argument(
+        "--rounds", type=int, default=15, help="balanced cold-L2 timing rounds"
+    )
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     device = torch.device("cuda")
@@ -125,11 +146,15 @@ def main() -> None:
     if args.checkpoint is not None:
         w13, w2, planes, grids = checkpoint_layer(args, device)
     else:
-        w13 = torch.randint(0, 256, (e, 2 * n, h // 2), dtype=torch.uint8, device=device)
+        w13 = torch.randint(
+            0, 256, (e, 2 * n, h // 2), dtype=torch.uint8, device=device
+        )
         w2 = torch.randint(0, 256, (e, h, n // 2), dtype=torch.uint8, device=device)
         planes, grids = zip(
             *(
-                synthetic_planes(rng, e, rows, columns, args.exceptions, args.dense_rows, device)
+                synthetic_planes(
+                    rng, e, rows, columns, args.exceptions, args.dense_rows, device
+                )
                 for rows, columns in ((2 * n, h // 32), (h, n // 32))
             ),
             strict=True,
@@ -137,16 +162,21 @@ def main() -> None:
     one = torch.ones(e, device=device)
     plan = moe.plan_weights(
         source=moe.PackedSource(format="fp4_e8m0_k32", w13_layout=args.w13_layout),
-        activation=moe.ActivationSpec(mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16),
+        activation=moe.ActivationSpec(
+            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
         geometry=moe.MoEGeometry(num_experts=e, hidden_size=h, intermediate_size=n),
     )
     arms = {
         "native": moe.prepare_weights(
             plan=plan,
             weights=moe.PackedWeights(
-                w13=w13.clone(), w2=w2.clone(),
-                w13_block_scales=grids[0].clone(), w2_block_scales=grids[1].clone(),
-                w13_global_scales=one, w2_global_scales=one,
+                w13=w13.clone(),
+                w2=w2.clone(),
+                w13_block_scales=grids[0].clone(),
+                w2_block_scales=grids[1].clone(),
+                w13_global_scales=one,
+                w2_global_scales=one,
             ),
         )
     }
@@ -155,8 +185,10 @@ def main() -> None:
         arms[name] = moe.prepare_weights(
             plan=plan,
             weights=moe.Mxfp4CsfWeights(
-                w13=w13.clone(), w2=w2.clone(),
-                w13_scales=planes[0], w2_scales=planes[1],
+                w13=w13.clone(),
+                w2=w2.clone(),
+                w13_scales=planes[0],
+                w2_scales=planes[1],
                 w13_scale_scratch=torch.empty_like(grids[0]),
                 w2_scale_scratch=torch.empty_like(grids[1]),
             ),
@@ -180,10 +212,25 @@ def main() -> None:
         ids = torch.stack(
             [torch.randperm(e, device=device)[: args.topk] for _ in range(tokens)]
         ).to(torch.int32)
-        weights = torch.softmax(torch.randn(tokens, args.topk, device=device), dim=-1).float()
+        weights = torch.softmax(
+            torch.randn(tokens, args.topk, device=device), dim=-1
+        ).float()
         reference = moe_reference_w4a8_mx(
-            x, w13, grids[0], None, one, w2, grids[1], None, one,
-            ids, weights, e, h, n, w13_layout=args.w13_layout,
+            x,
+            w13,
+            grids[0],
+            None,
+            one,
+            w2,
+            grids[1],
+            None,
+            one,
+            ids,
+            weights,
+            e,
+            h,
+            n,
+            w13_layout=args.w13_layout,
         )
         plans = {
             name: moe.plan_execution(
@@ -201,31 +248,52 @@ def main() -> None:
                 for s in state.scratch.scratch_specs()
             )
             output = torch.empty_like(x)
-            binding = state.bind(a=x, topk_ids=ids, topk_weights=weights, output=output,
-                                 scratch=scratch, input_scales_static=True)
-            return PreparedCall(run=lambda: state.run(binding), output=output,
-                                owners=(scratch, binding))
+            binding = state.bind(
+                a=x,
+                topk_ids=ids,
+                topk_weights=weights,
+                output=output,
+                scratch=scratch,
+                input_scales_static=True,
+            )
+            return PreparedCall(
+                run=lambda: state.run(binding), output=output, owners=(scratch, binding)
+            )
 
         graphs, outputs, owners = {}, {}, []
-        with PreparationSession(device=device, autotune=False, compile_workers=0) as session:
-            session.prepare(tuple(
-                p.request(name=f"w4a8-csf-{name}-{tokens}", prepare_call=prepare)
-                for name, p in plans.items()
-            ))
+        with PreparationSession(
+            device=device, autotune=False, compile_workers=0
+        ) as session:
+            session.prepare(
+                tuple(
+                    p.request(name=f"w4a8-csf-{name}-{tokens}", prepare_call=prepare)
+                    for name, p in plans.items()
+                )
+            )
             bindings = {}
             for name, p in plans.items():
                 scratch = tuple(
-                    torch.empty(s.shape, dtype=s.dtype, device=device) for s in p.scratch_specs()
+                    torch.empty(s.shape, dtype=s.dtype, device=device)
+                    for s in p.scratch_specs()
                 )
                 outputs[name] = torch.empty_like(x)
                 bindings[name] = moe.bind(
-                    p, a=x, topk_ids=ids, topk_weights=weights, output=outputs[name],
-                    scratch=scratch, input_scales_static=True,
+                    p,
+                    a=x,
+                    topk_ids=ids,
+                    topk_weights=weights,
+                    output=outputs[name],
+                    scratch=scratch,
+                    input_scales_static=True,
                 )
                 owners.append(scratch)
             session.freeze()
-            backends = {name: p.decode_config.backend for name, p in
-                        ((name, b.execution_plan) for name, b in bindings.items())}
+            backends = {
+                name: p.decode_config.backend
+                for name, p in (
+                    (name, b.execution_plan) for name, b in bindings.items()
+                )
+            }
             for name, binding in bindings.items():
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
@@ -235,7 +303,9 @@ def main() -> None:
                 graph.replay()
             torch.cuda.synchronize()
             for name in ("expand", "inline"):
-                if not torch.equal(outputs[name].view(torch.int16), outputs["native"].view(torch.int16)):
+                if not torch.equal(
+                    outputs[name].view(torch.int16), outputs["native"].view(torch.int16)
+                ):
                     raise AssertionError(f"{name} output differs from native")
             oracle_metrics = {}
             for output in outputs.values():
@@ -252,17 +322,33 @@ def main() -> None:
             for graph in graphs.values():
                 graph.replay()
             torch.cuda.synchronize()
-            assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+            assert (
+                torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+            )
             for output in outputs.values():
                 assert torch.isfinite(output).all() and torch.count_nonzero(output)
-                assert torch.equal(output.view(torch.int16), outputs["native"].view(torch.int16))
-            calls = tuple(PreparedCall(run=graph.replay, produce=lambda: None,
-                                      owners=(graph, bindings, owners)) for graph in graphs.values())
-            race = _prepare_race(calls, device_ordinal=torch.cuda.current_device(),
-                                 samples=args.replays, primed=True)
+                assert torch.equal(
+                    output.view(torch.int16), outputs["native"].view(torch.int16)
+                )
+            calls = tuple(
+                PreparedCall(
+                    run=graph.replay,
+                    produce=lambda: None,
+                    owners=(graph, bindings, owners),
+                )
+                for graph in graphs.values()
+            )
+            race = _prepare_race(
+                calls,
+                device_ordinal=torch.cuda.current_device(),
+                samples=args.replays,
+                primed=True,
+            )
             raw_rounds, seen = [], 0
             try:
-                for _ in measure_race_steps(race, device_ordinal=torch.cuda.current_device(), rounds=args.rounds):
+                for _ in measure_race_steps(
+                    race, device_ordinal=torch.cuda.current_device(), rounds=args.rounds
+                ):
                     if race.completed_rounds != seen:
                         seen = race.completed_rounds
                         raw_rounds.append(tuple(race.latest_round_us))
@@ -270,14 +356,17 @@ def main() -> None:
                     raw_rounds.append(tuple(race.latest_round_us))
             finally:
                 race.close()
-            samples = {name: [row[i] for row in raw_rounds] for i, name in enumerate(graphs)}
+            samples = {
+                name: [row[i] for row in raw_rounds] for i, name in enumerate(graphs)
+            }
             for graph in graphs.values():
                 graph.reset()
         row = {
             "tokens": tokens,
             "backend": backends,
             **{name: statistics.median(v) for name, v in samples.items()},
-            "samples_us": samples, "oracle_metrics": oracle_metrics,
+            "samples_us": samples,
+            "oracle_metrics": oracle_metrics,
         }
         results.append(row)
         print(
@@ -288,16 +377,30 @@ def main() -> None:
             flush=True,
         )
     if args.json:
-        args.json.write_text(json.dumps(
-            {"args": {k: str(v) for k, v in vars(args).items()},
-             "device": torch.cuda.get_device_name(), "results": results,
-             "uuid": str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid),
-             "torch": torch.__version__, "cuda": torch.version.cuda,
-             "source": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-             "diff": subprocess.check_output(["git", "diff", "--binary"], text=True),
-             "method": "balanced cold-L2 graph replay using preparation timing; lower microseconds is better"},
-            indent=1,
-        ))
+        args.json.write_text(
+            json.dumps(
+                {
+                    "args": {k: str(v) for k, v in vars(args).items()},
+                    "device": torch.cuda.get_device_name(),
+                    "results": results,
+                    "uuid": str(
+                        torch.cuda.get_device_properties(
+                            torch.cuda.current_device()
+                        ).uuid
+                    ),
+                    "torch": torch.__version__,
+                    "cuda": torch.version.cuda,
+                    "source": subprocess.check_output(
+                        ["git", "rev-parse", "HEAD"], text=True
+                    ).strip(),
+                    "diff": subprocess.check_output(
+                        ["git", "diff", "--binary"], text=True
+                    ),
+                    "method": "balanced cold-L2 graph replay using preparation timing; lower microseconds is better",
+                },
+                indent=1,
+            )
+        )
 
 
 if __name__ == "__main__":

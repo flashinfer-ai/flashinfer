@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from b12x._lib.scratch import scratch_buffer_spec
-from b12x._lib.scratch_layout import SCRATCH_ALIGN_BYTES, align_up, materialize_scratch_view
+from b12x._lib.scratch_layout import (
+    SCRATCH_ALIGN_BYTES,
+    align_up,
+    materialize_scratch_view,
+)
 
 if TYPE_CHECKING:
     from ._impl import Binding, _Layout
@@ -44,10 +48,17 @@ def materialize(plan: _Layout, *, segment_tokens: int) -> _Layout:
     segments = (caps.max_tokens + segment_tokens - 1) // segment_tokens + caps.max_seqs
     reuse_outputs = plan.k_split == 1
     slots = 2 + (4 if reuse_outputs else 3) * segments + caps.max_seqs
-    inner_caps = replace(caps, max_seqs=segments, max_state_slots=slots, null_state_index=0)
+    inner_caps = replace(
+        caps, max_seqs=segments, max_state_slots=slots, null_state_index=0
+    )
     inner = materialize_layout(
-        inner_caps, layout_type=type(plan), v_split=plan.v_split, k_split=plan.k_split, stages=plan.stages,
-        window_tiles=inner_caps.tiles_capacity, workspace_windows=1,
+        inner_caps,
+        layout_type=type(plan),
+        v_split=plan.v_split,
+        k_split=plan.k_split,
+        stages=plan.stages,
+        window_tiles=inner_caps.tiles_capacity,
+        workspace_windows=1,
         max_sequence_tiles=segment_tokens // 16,
     )
     regions = {}
@@ -77,9 +88,13 @@ def materialize(plan: _Layout, *, segment_tokens: int) -> _Layout:
             elements *= dimension
         cursor += elements * dtype.itemsize
     parallel = ParallelPlan(inner, segment_tokens, segments, reuse_outputs, regions)
-    return replace(plan, parallel=parallel, _scratch_specs=(
-        scratch_buffer_spec(caps.op_name, nbytes=cursor, device=caps.device),
-    ))
+    return replace(
+        plan,
+        parallel=parallel,
+        _scratch_specs=(
+            scratch_buffer_spec(caps.op_name, nbytes=cursor, device=caps.device),
+        ),
+    )
 
 
 def bind(binding: Binding) -> ParallelBinding:
@@ -87,37 +102,68 @@ def bind(binding: Binding) -> ParallelBinding:
 
     plan = binding._state.parallel
     assert plan is not None
-    views = {name: materialize_scratch_view(binding.scratch, offset_bytes=offset,
-                                           shape=shape, dtype=dtype)[0]
-             for name, (offset, shape, dtype) in plan.regions.items()}
+    views = {
+        name: materialize_scratch_view(
+            binding.scratch, offset_bytes=offset, shape=shape, dtype=dtype
+        )[0]
+        for name, (offset, shape, dtype) in plan.regions.items()
+    }
     shared = dict(
-        scratch=views["segment_scratch"], q=binding.q, k=binding.k, v=binding.v,
-        a=binding.a, b=binding.b, A_log=binding.A_log, dt_bias=binding.dt_bias,
-        recurrent_state=views["pool"], cu_seqlens=views["cu_seqlens"],
-        num_seqs=views["num_seqs"], num_tokens=views["num_tokens"], output=binding.output,
+        scratch=views["segment_scratch"],
+        q=binding.q,
+        k=binding.k,
+        v=binding.v,
+        a=binding.a,
+        b=binding.b,
+        A_log=binding.A_log,
+        dt_bias=binding.dt_bias,
+        recurrent_state=views["pool"],
+        cu_seqlens=views["cu_seqlens"],
+        num_seqs=views["num_seqs"],
+        num_tokens=views["num_tokens"],
+        output=binding.output,
     )
     transfer = bind_segment(
-        plan.segment_plan, **shared, initial_state_indices=views["identity_indices"],
+        plan.segment_plan,
+        **shared,
+        initial_state_indices=views["identity_indices"],
         final_state_indices=views["transfer_indices"],
-        checkpoint_state_indices=views["no_checkpoints"], checkpoint_offsets=views["no_checkpoints"],
+        checkpoint_state_indices=views["no_checkpoints"],
+        checkpoint_offsets=views["no_checkpoints"],
     )
     local = bind_segment(
-        plan.segment_plan, **shared, initial_state_indices=views["zero_indices"],
+        plan.segment_plan,
+        **shared,
+        initial_state_indices=views["zero_indices"],
         final_state_indices=views["local_indices"],
-        checkpoint_state_indices=views["checkpoint_indices"], checkpoint_offsets=views["checkpoint_offsets"],
+        checkpoint_state_indices=views["checkpoint_indices"],
+        checkpoint_offsets=views["checkpoint_offsets"],
     )
     output = bind_segment(
-        plan.segment_plan, **shared, initial_state_indices=views["output_indices"],
+        plan.segment_plan,
+        **shared,
+        initial_state_indices=views["output_indices"],
         final_state_indices=views["output_indices"],
-        checkpoint_state_indices=views["checkpoint_indices"], checkpoint_offsets=views["checkpoint_offsets"],
+        checkpoint_state_indices=views["checkpoint_indices"],
+        checkpoint_offsets=views["checkpoint_offsets"],
     )
-    return ParallelBinding(plan, transfer, local, output, views["seq_segments"], views["pool"],
-                           views["packed_transfer"], views["transfer_flags"])
+    return ParallelBinding(
+        plan,
+        transfer,
+        local,
+        output,
+        views["seq_segments"],
+        views["pool"],
+        views["packed_transfer"],
+        views["transfer_flags"],
+    )
 
 
 def compile_binding(binding: Binding) -> tuple:
     from .._shared.delta_prefill._cute_kernels import (
-        _compile_prepare, _compile_prologue, _compile_recurrence,
+        _compile_prepare,
+        _compile_prologue,
+        _compile_recurrence,
     )
     from ._parallel_kernels import compile_auxiliary
 
@@ -128,12 +174,14 @@ def compile_binding(binding: Binding) -> tuple:
         _compile_prologue(parallel.output)[1],
         _compile_prepare(parallel.output)[1],
         _compile_recurrence(parallel.transfer, 2)[1],
-        _compile_recurrence(parallel.local_state, 4 if parallel._state.reuse_outputs else 1)[1],
-        _compile_recurrence(parallel.output, 5 if parallel._state.reuse_outputs else 0)[1],
+        _compile_recurrence(
+            parallel.local_state, 4 if parallel._state.reuse_outputs else 1
+        )[1],
+        _compile_recurrence(parallel.output, 5 if parallel._state.reuse_outputs else 0)[
+            1
+        ],
         compile_auxiliary(binding),
     )
-
-
 
 
 def run(binding: Binding, *, programs: tuple, scale: float, eps: float) -> None:

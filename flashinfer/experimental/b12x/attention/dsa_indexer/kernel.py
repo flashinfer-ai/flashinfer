@@ -323,8 +323,7 @@ def _to_kernel_tensor(
         if leading_dim is not None and tensor.ndim >= 2:
             shape = tuple(cute.sym_int(32) for _ in tensor.shape)
             strides = tuple(
-                1 if i == leading_dim else cute.sym_int(64)
-                for i in range(tensor.ndim)
+                1 if i == leading_dim else cute.sym_int(64) for i in range(tensor.ndim)
             )
         else:
             shape, strides = tuple(tensor.shape), tuple(tensor.stride())
@@ -2859,7 +2858,9 @@ def _run_paged_tiled_logits_kernel_common(
     device_index = q_fp8.device.index or 0
     if compile_only_launches_enabled():
         k_tma_desc_ptrs = torch.empty((1,), dtype=torch.int64, device=q_fp8.device)
-        use_scalar_k_load_tensor = torch.empty((1,), dtype=torch.int32, device=q_fp8.device)
+        use_scalar_k_load_tensor = torch.empty(
+            (1,), dtype=torch.int32, device=q_fp8.device
+        )
     else:
         k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
         use_scalar_k_load_tensor = _cached_int32_scalar(

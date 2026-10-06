@@ -42,9 +42,14 @@ def _fragments(copy, begin, end):
             raise ValueError("shared BF16 reads must preserve element boundaries")
         yield (
             low - begin,
-            copy.destination + row * copy.destination_stride
+            copy.destination
+            + row * copy.destination_stride
             + (low - start) * (1 + copy.expand),
-            high - low, count, stride, copy.destination_stride, copy.expand,
+            high - low,
+            count,
+            stride,
+            copy.destination_stride,
+            copy.expand,
         )
 
     if full_first <= full_last:
@@ -69,16 +74,28 @@ def plan_reads(copies, *, rank, world_size, chunk_bytes=4653056):
         raise ValueError("invalid shared read rank or aligned chunk capacity")
     ordered = sorted(copies, key=lambda c: (c.file, c.offset))
     for copy in ordered:
-        values = (copy.file, copy.offset, copy.width, copy.destination,
-                  copy.source_stride, copy.destination_stride)
+        values = (
+            copy.file,
+            copy.offset,
+            copy.width,
+            copy.destination,
+            copy.source_stride,
+            copy.destination_stride,
+        )
         if any(v < 0 or v > (1 << 63) - 1 for v in values):
             raise ValueError("shared read descriptor exceeds signed 64-bit bounds")
         if copy.rows <= 0 or copy.width <= 0 or copy.expand not in (0, 1):
             raise ValueError("invalid shared read row geometry")
-        if (copy.end > (1 << 63) - 1
-                or copy.destination + (copy.rows - 1) * copy.destination_stride
-                + copy.width * (1 + copy.expand) > (1 << 63) - 1):
-            raise ValueError("shared read address arithmetic exceeds signed 64-bit bounds")
+        if (
+            copy.end > (1 << 63) - 1
+            or copy.destination
+            + (copy.rows - 1) * copy.destination_stride
+            + copy.width * (1 + copy.expand)
+            > (1 << 63) - 1
+        ):
+            raise ValueError(
+                "shared read address arithmetic exceeds signed 64-bit bounds"
+            )
         if copy.rows > 1 and copy.destination_stride < copy.width * (1 + copy.expand):
             raise ValueError("overlapping shared read destination rows")
     chunks, fragments = array("Q"), array("Q")
@@ -88,7 +105,11 @@ def plan_reads(copies, *, rank, world_size, chunk_bytes=4653056):
         file = ordered[start].file
         begin = ordered[start].offset // 4096 * 4096
         end = (ordered[start].end + 4095) // 4096 * 4096
-        while stop < len(ordered) and ordered[stop].file == file and ordered[stop].offset <= end:
+        while (
+            stop < len(ordered)
+            and ordered[stop].file == file
+            and ordered[stop].offset <= end
+        ):
             end = max(end, (ordered[stop].end + 4095) // 4096 * 4096)
             stop += 1
         active, next_copy = [], start
@@ -103,7 +124,9 @@ def plan_reads(copies, *, rank, world_size, chunk_bytes=4653056):
                 for copy in active:
                     for fragment in _fragments(copy, offset, limit):
                         fragments.extend(fragment)
-                chunks.extend((file, offset, limit - offset, first, len(fragments) // 7 - first))
+                chunks.extend(
+                    (file, offset, limit - offset, first, len(fragments) // 7 - first)
+                )
             sequence += 1
         start = stop
     return chunks, fragments

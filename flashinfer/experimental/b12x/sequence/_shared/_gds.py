@@ -1,4 +1,5 @@
 """Registered device staging and byte gathering for immutable disk row planes."""
+
 from __future__ import annotations
 
 import torch
@@ -34,7 +35,9 @@ class _Pointer:
 def compile_gather(ordinal):
     with torch.cuda.device(ordinal):
         byte, descriptor = _Pointer(torch.uint8), _Pointer(torch.int64)
-        return _gather.warmup(byte, descriptor, byte, byte, BLOCK=256, num_warps=4, grid=(1,))
+        return _gather.warmup(
+            byte, descriptor, byte, byte, BLOCK=256, num_warps=4, grid=(1,)
+        )
 
 
 class GdsRows:
@@ -51,26 +54,68 @@ class GdsRows:
         with torch.cuda.device(cache.device):
             try:
                 self.reader = self.native.create(
-                    cache.shard_rows, cache.table_rows, cache.shard_start, cache.shard_end,
-                    cache.weight_row_bytes, cache.scale_row_bytes, cache.max_lookups,
-                    queue_depth, cache.device.index,
+                    cache.shard_rows,
+                    cache.table_rows,
+                    cache.shard_start,
+                    cache.shard_end,
+                    cache.weight_row_bytes,
+                    cache.scale_row_bytes,
+                    cache.max_lookups,
+                    queue_depth,
+                    cache.device.index,
                 )
-                arena, descriptors, nbytes, capacity, self.batch_count = self.native.info(self.reader)
-                self.arena = _tensor_from_pointer(arena, shape=(nbytes,), dtype=torch.uint8,
-                                                  device=cache.device, nbytes=nbytes)
-                self.descriptors = _tensor_from_pointer(descriptors, shape=(capacity, 4), dtype=torch.int64,
-                                                        device=cache.device, nbytes=capacity * 32)
-                self.weight = torch.empty((cache.max_lookups, cache.weight_row_bytes), dtype=torch.uint8, device=cache.device)
-                self.scale = torch.empty((cache.max_lookups, cache.scale_row_bytes), dtype=torch.uint8, device=cache.device) if cache.scale_row_bytes else None
+                arena, descriptors, nbytes, capacity, self.batch_count = (
+                    self.native.info(self.reader)
+                )
+                self.arena = _tensor_from_pointer(
+                    arena,
+                    shape=(nbytes,),
+                    dtype=torch.uint8,
+                    device=cache.device,
+                    nbytes=nbytes,
+                )
+                self.descriptors = _tensor_from_pointer(
+                    descriptors,
+                    shape=(capacity, 4),
+                    dtype=torch.int64,
+                    device=cache.device,
+                    nbytes=capacity * 32,
+                )
+                self.weight = torch.empty(
+                    (cache.max_lookups, cache.weight_row_bytes),
+                    dtype=torch.uint8,
+                    device=cache.device,
+                )
+                self.scale = (
+                    torch.empty(
+                        (cache.max_lookups, cache.scale_row_bytes),
+                        dtype=torch.uint8,
+                        device=cache.device,
+                    )
+                    if cache.scale_row_bytes
+                    else None
+                )
                 self.program = compile_gather(cache.device.index)
                 self.program._init_handles()
                 metadata = self.program.metadata
-                if (metadata.global_scratch_size or metadata.profile_scratch_size or
-                        metadata.num_ctas != 1 or metadata.launch_cooperative_grid or metadata.launch_pdl):
-                    raise RuntimeError("GDS byte gather requires a scratch-free ordinary CUDA launch")
-                self.native.configure_gather(self.reader, self.program.function,
-                    metadata.num_warps * metadata.warp_size, metadata.shared,
-                    self.weight.data_ptr(), (self.scale if self.scale is not None else self.weight).data_ptr())
+                if (
+                    metadata.global_scratch_size
+                    or metadata.profile_scratch_size
+                    or metadata.num_ctas != 1
+                    or metadata.launch_cooperative_grid
+                    or metadata.launch_pdl
+                ):
+                    raise RuntimeError(
+                        "GDS byte gather requires a scratch-free ordinary CUDA launch"
+                    )
+                self.native.configure_gather(
+                    self.reader,
+                    self.program.function,
+                    metadata.num_warps * metadata.warp_size,
+                    metadata.shared,
+                    self.weight.data_ptr(),
+                    (self.scale if self.scale is not None else self.weight).data_ptr(),
+                )
             except BaseException:
                 self.close()
                 raise

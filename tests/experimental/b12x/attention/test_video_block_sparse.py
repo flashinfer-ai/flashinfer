@@ -11,6 +11,7 @@ The kernel walks an authoritative CSR list of K blocks per q tile instead of the
   runs its walk still passes the equality test. Only the empty/degenerate case proves the walk
   is live.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -44,17 +45,21 @@ def _list(S: int, radius: int | None, device):
             blocks = range(max(0, c - radius), min(num_blocks, c + radius + 1))
         idx.extend(blocks)
         off.append(len(idx))
-    return (torch.tensor(idx, device=device, dtype=torch.int32),
-            torch.tensor(off, device=device, dtype=torch.int32))
+    return (
+        torch.tensor(idx, device=device, dtype=torch.int32),
+        torch.tensor(off, device=device, dtype=torch.int32),
+    )
 
 
 def _mask(S: int, block_indices, block_offsets, device):
     mask = torch.zeros(S, S, dtype=torch.bool)
     indices, offsets = block_indices.cpu().tolist(), block_offsets.cpu().tolist()
     for m in range(len(offsets) - 1):
-        for block in indices[offsets[m]:offsets[m + 1]]:
-            mask[m * TILE_M:min((m + 1) * TILE_M, S),
-                 block * BLOCK_K:min((block + 1) * BLOCK_K, S)] = True
+        for block in indices[offsets[m] : offsets[m + 1]]:
+            mask[
+                m * TILE_M : min((m + 1) * TILE_M, S),
+                block * BLOCK_K : min((block + 1) * BLOCK_K, S),
+            ] = True
     return mask.to(device)
 
 
@@ -86,25 +91,56 @@ def _run(S, H, D, radius, device):
     q, k, v, cu, bi, bo = _case(S, H, D, radius, device)
     num_tiles = (S + TILE_M - 1) // TILE_M
     declaration = varlen.plan(
-        q, k, v, cu, cu, max_seqlen_q=S, max_seqlen_k=S, causal=False,
-        block_sparse=True, num_q_tiles=num_tiles,
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q=S,
+        max_seqlen_k=S,
+        causal=False,
+        block_sparse=True,
+        num_q_tiles=num_tiles,
         total_blocks_cap=max(1, int(bo[-1].item())),
     )
-    with PreparationSession(device=device, autotune=False, compile_workers=1) as session:
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=1
+    ) as session:
+
         def prepare(state):
-            spec, = state.scratch_plan.scratch_specs()
+            (spec,) = state.scratch_plan.scratch_specs()
             scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
-            binding = state.bind(scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu,
-                                 cu_seqlens_k=cu, block_indices=bi, block_offsets=bo)
+            binding = state.bind(
+                scratch=scratch,
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu,
+                cu_seqlens_k=cu,
+                block_indices=bi,
+                block_offsets=bo,
+            )
             return PreparedCall(run=lambda: state.run(binding), owners=(scratch,))
 
-        session.prepare((declaration.request(name="video-block-sparse", prepare_call=prepare),))
+        session.prepare(
+            (declaration.request(name="video-block-sparse", prepare_call=prepare),)
+        )
         state = require_prepared(declaration, "attention.varlen", device)
-        spec, = state.scratch_plan.scratch_specs()
+        (spec,) = state.scratch_plan.scratch_specs()
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
-        binding = varlen.bind(declaration, scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu,
-                              cu_seqlens_k=cu, max_seqlen_q=S, max_seqlen_k=S,
-                              block_indices=bi, block_offsets=bo)
+        binding = varlen.bind(
+            declaration,
+            scratch=scratch,
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            max_seqlen_q=S,
+            max_seqlen_k=S,
+            block_indices=bi,
+            block_offsets=bo,
+        )
         result = state.run(binding)
         torch.cuda.synchronize()
     out = result[0] if isinstance(result, tuple) else result
@@ -116,20 +152,38 @@ def _dense(S, H, D, device):
     from b12x.preparation import PreparationSession, PreparedCall, require_prepared
 
     q, k, v, cu, _, _ = _case(S, H, D, None, device)
-    declaration = varlen.plan(q, k, v, cu, cu, max_seqlen_q=S, max_seqlen_k=S, causal=False)
-    with PreparationSession(device=device, autotune=False, compile_workers=1) as session:
+    declaration = varlen.plan(
+        q, k, v, cu, cu, max_seqlen_q=S, max_seqlen_k=S, causal=False
+    )
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=1
+    ) as session:
+
         def prepare(state):
-            spec, = state.scratch_plan.scratch_specs()
+            (spec,) = state.scratch_plan.scratch_specs()
             scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
-            binding = state.bind(scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu, cu_seqlens_k=cu)
+            binding = state.bind(
+                scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu, cu_seqlens_k=cu
+            )
             return PreparedCall(run=lambda: state.run(binding), owners=(scratch,))
 
-        session.prepare((declaration.request(name="video-dense", prepare_call=prepare),))
+        session.prepare(
+            (declaration.request(name="video-dense", prepare_call=prepare),)
+        )
         state = require_prepared(declaration, "attention.varlen", device)
-        spec, = state.scratch_plan.scratch_specs()
+        (spec,) = state.scratch_plan.scratch_specs()
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
-        binding = varlen.bind(declaration, scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu,
-                              cu_seqlens_k=cu, max_seqlen_q=S, max_seqlen_k=S)
+        binding = varlen.bind(
+            declaration,
+            scratch=scratch,
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            max_seqlen_q=S,
+            max_seqlen_k=S,
+        )
         result = state.run(binding)
         torch.cuda.synchronize()
     return (result[0] if isinstance(result, tuple) else result), q, k, v
@@ -149,7 +203,9 @@ def test_sparse_matches_masked_oracle():
     """A partial list must equal the fp32 oracle restricted to the same mask."""
     device = _require_backend()
     out, mask, (q, k, v, _, _), _ = _run(1024, 8, 128, 3, device)
-    assert 0.0 < mask.float().mean().item() < 1.0, "the test list must be genuinely sparse"
+    assert 0.0 < mask.float().mean().item() < 1.0, (
+        "the test list must be genuinely sparse"
+    )
     ref = _oracle(q, k, v, mask)
     cosine = torch.nn.functional.cosine_similarity(
         out.float().flatten(), ref.float().flatten(), dim=0
@@ -170,27 +226,60 @@ def test_empty_list_attends_nothing():
 
     q, k, v, cu, _, _ = _case(S, H, D, None, device)
     empty_idx = torch.zeros(1, device=device, dtype=torch.int32)
-    empty_off = torch.zeros((S + TILE_M - 1) // TILE_M + 1, device=device, dtype=torch.int32)
-    declaration = varlen.plan(
-        q, k, v, cu, cu, max_seqlen_q=S, max_seqlen_k=S, causal=False,
-        block_sparse=True, num_q_tiles=(S + TILE_M - 1) // TILE_M, total_blocks_cap=1,
+    empty_off = torch.zeros(
+        (S + TILE_M - 1) // TILE_M + 1, device=device, dtype=torch.int32
     )
-    with PreparationSession(device=device, autotune=False, compile_workers=1) as session:
+    declaration = varlen.plan(
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q=S,
+        max_seqlen_k=S,
+        causal=False,
+        block_sparse=True,
+        num_q_tiles=(S + TILE_M - 1) // TILE_M,
+        total_blocks_cap=1,
+    )
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=1
+    ) as session:
+
         def prepare(state):
-            spec, = state.scratch_plan.scratch_specs()
+            (spec,) = state.scratch_plan.scratch_specs()
             scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
-            binding = state.bind(scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu,
-                                 cu_seqlens_k=cu, block_indices=empty_idx,
-                                 block_offsets=empty_off)
+            binding = state.bind(
+                scratch=scratch,
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu,
+                cu_seqlens_k=cu,
+                block_indices=empty_idx,
+                block_offsets=empty_off,
+            )
             return PreparedCall(run=lambda: state.run(binding), owners=(scratch,))
 
-        session.prepare((declaration.request(name="video-empty", prepare_call=prepare),))
+        session.prepare(
+            (declaration.request(name="video-empty", prepare_call=prepare),)
+        )
         state = require_prepared(declaration, "attention.varlen", device)
-        spec, = state.scratch_plan.scratch_specs()
+        (spec,) = state.scratch_plan.scratch_specs()
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
-        binding = varlen.bind(declaration, scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu,
-                              cu_seqlens_k=cu, max_seqlen_q=S, max_seqlen_k=S,
-                              block_indices=empty_idx, block_offsets=empty_off)
+        binding = varlen.bind(
+            declaration,
+            scratch=scratch,
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            max_seqlen_q=S,
+            max_seqlen_k=S,
+            block_indices=empty_idx,
+            block_offsets=empty_off,
+        )
         result = state.run(binding)
         torch.cuda.synchronize()
     out = result[0] if isinstance(result, tuple) else result
@@ -199,8 +288,12 @@ def test_empty_list_attends_nothing():
     cosine = torch.nn.functional.cosine_similarity(
         out.float().flatten(), dense_ref.float().flatten(), dim=0
     ).item()
-    assert (out != 0).float().mean().item() < 0.5, "empty list must not return a dense result"
-    assert cosine < 0.9, f"empty list still resembles dense (cosine {cosine}) -- the walk is inert"
+    assert (out != 0).float().mean().item() < 0.5, (
+        "empty list must not return a dense result"
+    )
+    assert cosine < 0.9, (
+        f"empty list still resembles dense (cosine {cosine}) -- the walk is inert"
+    )
 
 
 @pytest.mark.parametrize("S", [1000, 4097])
@@ -231,24 +324,57 @@ def test_list_index_mapping(block):
         off.append(len(idx))
     bi = torch.tensor(idx, device=device, dtype=torch.int32)
     bo = torch.tensor(off, device=device, dtype=torch.int32)
-    declaration = varlen.plan(q, k, v, cu, cu, max_seqlen_q=S, max_seqlen_k=S, causal=False,
-                              block_sparse=True, num_q_tiles=num_tiles,
-                              total_blocks_cap=int(bo[-1].item()))
-    with PreparationSession(device=device, autotune=False, compile_workers=1) as session:
+    declaration = varlen.plan(
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q=S,
+        max_seqlen_k=S,
+        causal=False,
+        block_sparse=True,
+        num_q_tiles=num_tiles,
+        total_blocks_cap=int(bo[-1].item()),
+    )
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=1
+    ) as session:
+
         def prepare(state):
-            spec, = state.scratch_plan.scratch_specs()
+            (spec,) = state.scratch_plan.scratch_specs()
             scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
-            binding = state.bind(scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu,
-                                 cu_seqlens_k=cu, block_indices=bi, block_offsets=bo)
+            binding = state.bind(
+                scratch=scratch,
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu,
+                cu_seqlens_k=cu,
+                block_indices=bi,
+                block_offsets=bo,
+            )
             return PreparedCall(run=lambda: state.run(binding), owners=(scratch,))
 
-        session.prepare((declaration.request(name=f"video-map-{block}", prepare_call=prepare),))
+        session.prepare(
+            (declaration.request(name=f"video-map-{block}", prepare_call=prepare),)
+        )
         state = require_prepared(declaration, "attention.varlen", device)
-        spec, = state.scratch_plan.scratch_specs()
+        (spec,) = state.scratch_plan.scratch_specs()
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
-        binding = varlen.bind(declaration, scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu,
-                              cu_seqlens_k=cu, max_seqlen_q=S, max_seqlen_k=S,
-                              block_indices=bi, block_offsets=bo)
+        binding = varlen.bind(
+            declaration,
+            scratch=scratch,
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            max_seqlen_q=S,
+            max_seqlen_k=S,
+            block_indices=bi,
+            block_offsets=bo,
+        )
         result = state.run(binding)
         torch.cuda.synchronize()
     out = result[0] if isinstance(result, tuple) else result
@@ -263,17 +389,27 @@ def test_bind_allocates_no_device_memory():
     """Bindings must not allocate: the vLLM path has to be CUDA-graph capturable."""
     device = _require_backend()
     _, _, (q, k, v, state, binding), declaration = _run(2048, 8, 128, 3, device)
-    spec, = state.scratch_plan.scratch_specs()
+    (spec,) = state.scratch_plan.scratch_specs()
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
     # refresh the CSR tensors from the same list the case used
     bi, bo = _list(2048, 3, device)
     from b12x.attention import varlen
+
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
-    varlen.bind(declaration, scratch=scratch, q=q, k=k, v=v,
-                cu_seqlens_q=torch.tensor([0, 2048], device=device, dtype=torch.int32),
-                cu_seqlens_k=torch.tensor([0, 2048], device=device, dtype=torch.int32),
-                max_seqlen_q=2048, max_seqlen_k=2048, block_indices=bi, block_offsets=bo)
+    varlen.bind(
+        declaration,
+        scratch=scratch,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=torch.tensor([0, 2048], device=device, dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 2048], device=device, dtype=torch.int32),
+        max_seqlen_q=2048,
+        max_seqlen_k=2048,
+        block_indices=bi,
+        block_offsets=bo,
+    )
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated() == before, "bind allocated device memory"
 
@@ -305,15 +441,32 @@ def _binding(q, k, v, cu, bi, bo, **kwargs):
 
     length = int((cu[1:] - cu[:-1]).max())
     plan = varlen.plan(
-        q, k, v, cu, cu, max_seqlen_q=length, max_seqlen_k=length,
-        block_sparse=True, num_q_tiles=bo.numel() - 1, total_blocks_cap=bi.numel(),
-        override=VarlenAttentionConfig(tile_m=TILE_M, tile_n=BLOCK_K), **kwargs,
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q=length,
+        max_seqlen_k=length,
+        block_sparse=True,
+        num_q_tiles=bo.numel() - 1,
+        total_blocks_cap=bi.numel(),
+        override=VarlenAttentionConfig(tile_m=TILE_M, tile_n=BLOCK_K),
+        **kwargs,
     )
     state = require_prepared(plan, "attention.varlen", q.device)
-    spec, = state.scratch_plan.scratch_specs()
+    (spec,) = state.scratch_plan.scratch_specs()
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=q.device)
-    args = dict(scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu,
-                cu_seqlens_k=cu, block_indices=bi, block_offsets=bo)
+    args = dict(
+        scratch=scratch,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        block_indices=bi,
+        block_offsets=bo,
+    )
     return state, state.bind(**args), args
 
 
@@ -340,7 +493,9 @@ def test_sparse_partial_block_masks_nonfinite_values_from_next_segment():
     state, binding, _ = _binding(q, k, v, cu, bi, bo)
     actual = state.run(binding)[0][:length]
     assert torch.isfinite(actual).all()
-    expected = _oracle(q[:length], k[:length], v[:length], _mask(length, bi, bo, device))
+    expected = _oracle(
+        q[:length], k[:length], v[:length], _mask(length, bi, bo, device)
+    )
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
 
 
@@ -349,15 +504,23 @@ def test_sparse_grouped_query_heads_keep_logical_query_tiles():
     q, k, v, cu, bi, bo = _case(256, 4, 128, 0, device)
     k, v = k[:, :2].contiguous(), v[:, :2].contiguous()
     state, binding, _ = _binding(q, k, v, cu, bi, bo)
-    expected = _oracle(q, k.repeat_interleave(2, 1), v.repeat_interleave(2, 1),
-                       _mask(256, bi, bo, device))
+    expected = _oracle(
+        q,
+        k.repeat_interleave(2, 1),
+        v.repeat_interleave(2, 1),
+        _mask(256, bi, bo, device),
+    )
     torch.testing.assert_close(state.run(binding)[0], expected, rtol=0.02, atol=0.002)
 
 
-@pytest.mark.parametrize("field,malformation", [
-    (field, kind) for field in ("block_indices", "block_offsets")
-    for kind in ("missing", "dtype", "device", "short", "strided", "rank")
-])
+@pytest.mark.parametrize(
+    "field,malformation",
+    [
+        (field, kind)
+        for field in ("block_indices", "block_offsets")
+        for kind in ("missing", "dtype", "device", "short", "strided", "rank")
+    ],
+)
 def test_sparse_bind_rejects_invalid_csr_storage(field, malformation):
     device = _require_backend()
     state, _, args = _binding(*_case(256, 2, 128, None, device))
@@ -391,13 +554,25 @@ def test_sparse_tuning_preserves_csr_geometry():
     device = _require_backend()
     q, k, v, cu, bi, bo = _case(256, 2, 128, None, device)
     declaration = varlen.plan(
-        q, k, v, cu, cu, max_seqlen_q=256, max_seqlen_k=256,
-        block_sparse=True, num_q_tiles=bo.numel()-1, total_blocks_cap=bi.numel(),
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q=256,
+        max_seqlen_k=256,
+        block_sparse=True,
+        num_q_tiles=bo.numel() - 1,
+        total_blocks_cap=bi.numel(),
     )
-    candidates = [config for _, config in TUNING.eligible_plan(declaration.query, None).candidates]
+    candidates = [
+        config for _, config in TUNING.eligible_plan(declaration.query, None).candidates
+    ]
     assert candidates == [VarlenAttentionConfig(tile_m=TILE_M, tile_n=BLOCK_K)]
     with pytest.raises(ValueError, match="CSR block geometry"):
-        TUNING.validate_config(declaration.query, VarlenAttentionConfig(tile_m=64, tile_n=64), None)
+        TUNING.validate_config(
+            declaration.query, VarlenAttentionConfig(tile_m=64, tile_n=64), None
+        )
 
 
 @pytest.mark.parametrize("tiles,capacity", [(0, 1), (1, 1), (2, -1), (True, 1)])
@@ -407,8 +582,18 @@ def test_sparse_plan_rejects_invalid_capacities(tiles, capacity):
     device = _require_backend()
     q, k, v, cu, _, _ = _case(256, 2, 128, None, device)
     with pytest.raises(ValueError, match="Sparse attention"):
-        varlen.plan(q, k, v, cu, cu, max_seqlen_q=256, max_seqlen_k=256,
-                    block_sparse=True, num_q_tiles=tiles, total_blocks_cap=capacity)
+        varlen.plan(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max_seqlen_q=256,
+            max_seqlen_k=256,
+            block_sparse=True,
+            num_q_tiles=tiles,
+            total_blocks_cap=capacity,
+        )
 
 
 def test_sparse_graph_replay_reads_mutated_lists_without_allocating():

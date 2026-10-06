@@ -8,7 +8,10 @@ from dataclasses import replace
 import pytest
 import torch
 
-from b12x.moe._shared.kernels.reference import compare_to_reference, moe_reference_w4a8_mx
+from b12x.moe._shared.kernels.reference import (
+    compare_to_reference,
+    moe_reference_w4a8_mx,
+)
 
 from b12x.testing.reference.helpers import make_tp_moe_fp4_binding, require_b12x
 from .test_w4a8_dynamic_kernel import _run_w4a8_dynamic
@@ -244,33 +247,43 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
             w13_layout=fused_moe.W13Layout.W13,
         ),
         activation=fused_moe.ActivationSpec(
-            mode=fused_moe.ActivationMode.A8, nonlinearity="silu", io_dtype=x.dtype,
+            mode=fused_moe.ActivationMode.A8,
+            nonlinearity="silu",
+            io_dtype=x.dtype,
         ),
         geometry=fused_moe.MoEGeometry(
-            num_experts=_E, hidden_size=_K, intermediate_size=_N,
+            num_experts=_E,
+            hidden_size=_K,
+            intermediate_size=_N,
         ),
     )
     prepared = fused_moe.prepare_weights(
         plan=weight_plan,
         weights=fused_moe.PackedWeights(
-            w13=weights["w13_fp4"], w2=weights["w2_fp4"],
-            w13_block_scales=weights["w13_mx"], w2_block_scales=weights["w2_mx"],
-            w13_global_scales=weights["alphas"], w2_global_scales=weights["alphas"],
-            input_scale=weights["input_scale"], intermediate_scale=weights["input_scale"],
+            w13=weights["w13_fp4"],
+            w2=weights["w2_fp4"],
+            w13_block_scales=weights["w13_mx"],
+            w2_block_scales=weights["w2_mx"],
+            w13_global_scales=weights["alphas"],
+            w2_global_scales=weights["alphas"],
+            input_scale=weights["input_scale"],
+            intermediate_scale=weights["input_scale"],
         ),
     )
     output = torch.zeros(m, _K, dtype=torch.bfloat16, device=device)
     bindings = ExitStack()
     request.addfinalizer(bindings.close)
-    binding = bindings.enter_context(make_tp_moe_fp4_binding(
-        a=x,
-        experts=prepared,
-        topk_weights=topk_weights.contiguous(),
-        topk_ids=topk_ids.contiguous(),
-        output=output,
-        input_scales_static=True,
-        quant_mode="w4a8_mx",
-    ))
+    binding = bindings.enter_context(
+        make_tp_moe_fp4_binding(
+            a=x,
+            experts=prepared,
+            topk_weights=topk_weights.contiguous(),
+            topk_ids=topk_ids.contiguous(),
+            output=output,
+            input_scales_static=True,
+            quant_mode="w4a8_mx",
+        )
+    )
     assert binding.deterministic_output
     assert binding.route_output is not None
     assert tuple(binding.route_output.shape) == (m * topk_ids.shape[1], _K)
@@ -367,15 +380,17 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "0")
     clear_tp_moe_caches()
     atomic_output = torch.full_like(output, float("nan"))
-    atomic_binding = bindings.enter_context(make_tp_moe_fp4_binding(
-        a=live_x,
-        experts=prepared,
-        topk_weights=live_topk_weights,
-        topk_ids=live_topk_ids,
-        output=atomic_output,
-        input_scales_static=True,
-        quant_mode="w4a8_mx",
-    ))
+    atomic_binding = bindings.enter_context(
+        make_tp_moe_fp4_binding(
+            a=live_x,
+            experts=prepared,
+            topk_weights=live_topk_weights,
+            topk_ids=live_topk_ids,
+            output=atomic_output,
+            input_scales_static=True,
+            quant_mode="w4a8_mx",
+        )
+    )
     assert not atomic_binding.deterministic_output
     assert atomic_binding.route_output is not None
     assert tuple(atomic_binding.route_output.shape) == (1, _K)

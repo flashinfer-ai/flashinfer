@@ -320,13 +320,27 @@ def _run_mxfp4_form(args, profile, form):
 
     session = PreparationSession(device=device, autotune=False, compile_workers=2)
     if reindex_form:
-        prepare_mxfp4(session, source_plan, q=source_q, keys=keys, slots=slots,
-                      arguments=publisher_args(rows_capacity))
+        prepare_mxfp4(
+            session,
+            source_plan,
+            q=source_q,
+            keys=keys,
+            slots=slots,
+            arguments=publisher_args(rows_capacity),
+        )
         api.run(bind_publisher(rows_capacity))
-    prepare_mxfp4(session, plan, q=source_q if source_form else q, keys=keys, slots=slots,
-                  arguments=bind_args(rows_capacity, source=source_form))
+    prepare_mxfp4(
+        session,
+        plan,
+        q=source_q if source_form else q,
+        keys=keys,
+        slots=slots,
+        arguments=bind_args(rows_capacity, source=source_form),
+    )
     api.quantize_q_mxfp4(plan, q, q_mxfp4=native_q, q_scales=native_scales)
-    api.quantize_q_mxfp4(plan, source_q, q_mxfp4=native_source, q_scales=native_source_scales)
+    api.quantize_q_mxfp4(
+        plan, source_q, q_mxfp4=native_source, q_scales=native_source_scales
+    )
     torch.testing.assert_close(native_q, packed, rtol=0, atol=0)
     torch.testing.assert_close(native_scales, scales, rtol=0, atol=0)
     records = []
@@ -663,30 +677,51 @@ def _run_v4_c4(args, profile, form):
     plans, workspaces = {}, {}
     for rows in args.rows:
         caps = api.Caps(
-                device=device,
-                num_q_heads=form.heads,
-                max_q_rows=rows,
-                max_page_table_width=(capacity + 63) // 64,
-                topk=form.topk,
-                mode="prefill" if args.mode == "extend" else args.mode,
-                cache_format="fp8",
+            device=device,
+            num_q_heads=form.heads,
+            max_q_rows=rows,
+            max_page_table_width=(capacity + 63) // 64,
+            topk=form.topk,
+            mode="prefill" if args.mode == "extend" else args.mode,
+            cache_format="fp8",
         )
-        tensors = dict(q_fp8=q[:rows], query_weights=weights[:rows], index_k_cache=pool,
-                       page_table=table[:rows] if args.mode == "decode" else table,
-                       cache_lengths=lengths[:rows], active_width=active, output_indices=out[:rows])
+        tensors = dict(
+            q_fp8=q[:rows],
+            query_weights=weights[:rows],
+            index_k_cache=pool,
+            page_table=table[:rows] if args.mode == "decode" else table,
+            cache_lengths=lengths[:rows],
+            active_width=active,
+            output_indices=out[:rows],
+        )
         plan = api.plan(caps, invocation=api.invocation_from_tensors(caps, **tensors))
+
         def prepare(state):
-            scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
-                            for spec in state.layout.scratch_specs())
+            scratch = tuple(
+                torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                for spec in state.layout.scratch_specs()
+            )
             trial_output = torch.empty_like(out[:rows])
-            binding = state.bind(scratch=scratch, real_page_table=tensors["page_table"],
-                                 cache_seqlens_int32=tensors["cache_lengths"], active_width=active,
-                                 expected_num_q_heads=form.heads,
-                                 shared_page_table=plan.query.shared_page_table,
-                                 output_physical_slots=False)
-            return PreparedCall(run=lambda: state.run(binding, q_fp8=tensors["q_fp8"],
-                                query_weights=tensors["query_weights"], index_k_cache=pool,
-                                output_indices=trial_output), owners=(scratch, binding, trial_output))
+            binding = state.bind(
+                scratch=scratch,
+                real_page_table=tensors["page_table"],
+                cache_seqlens_int32=tensors["cache_lengths"],
+                active_width=active,
+                expected_num_q_heads=form.heads,
+                shared_page_table=plan.query.shared_page_table,
+                output_physical_slots=False,
+            )
+            return PreparedCall(
+                run=lambda: state.run(
+                    binding,
+                    q_fp8=tensors["q_fp8"],
+                    query_weights=tensors["query_weights"],
+                    index_k_cache=pool,
+                    output_indices=trial_output,
+                ),
+                owners=(scratch, binding, trial_output),
+            )
+
         session.prepare((plan.request(name="fp8-indexer", prepare_call=prepare),))
         scratch = tuple(
             torch.empty(spec.shape, dtype=spec.dtype, device=device)

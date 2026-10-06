@@ -16,7 +16,16 @@ META = OpMeta(
     name="tensor_fp8_linear",
     group="gemm",
     api_style="planned",
-    entry_points=("Weight", "FixedBlockscaledQuery", "plan", "query_from_call", "mm", "pack_weight", "prewarm", "is_supported"),
+    entry_points=(
+        "Weight",
+        "FixedBlockscaledQuery",
+        "plan",
+        "query_from_call",
+        "mm",
+        "pack_weight",
+        "prewarm",
+        "is_supported",
+    ),
     dtypes=("fp8_e4m3", "bf16", "fp16"),
     recipes=("tensor_fp8",),
     requires=("triton",),
@@ -30,6 +39,15 @@ META = OpMeta(
 )
 
 if TYPE_CHECKING:
-    from .api import FixedBlockscaledQuery, Weight, is_supported, mm, pack_weight, plan, prewarm, query_from_call  # noqa: F401
+    from .api import (
+        FixedBlockscaledQuery,
+        Weight,
+        is_supported,
+        mm,
+        pack_weight,
+        plan,
+        prewarm,
+        query_from_call,
+    )  # noqa: F401
 
 install_lazy_api(globals(), META)

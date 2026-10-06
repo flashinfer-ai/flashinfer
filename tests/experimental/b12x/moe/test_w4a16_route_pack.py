@@ -154,25 +154,40 @@ def test_route_pack_reuses_provided_fixed_capacity_for_prefill_tail() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("capacity, bucket_tokens", ((128, True), (129, False), (8192, True)))
+@pytest.mark.parametrize(
+    "capacity, bucket_tokens", ((128, True), (129, False), (8192, True))
+)
 @pytest.mark.parametrize("ids_dtype", (torch.int32, torch.int64))
 @pytest.mark.parametrize("mapped", (False, True))
-def test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(capacity, bucket_tokens, ids_dtype, mapped):
+def test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(
+    capacity, bucket_tokens, ids_dtype, mapped
+):
     launches = route_pack_module.compile_w4a16_route_pack_launches(
-        tokens=capacity, topk=2, block_size=8, num_experts=32,
+        tokens=capacity,
+        topk=2,
+        block_size=8,
+        num_experts=32,
         ordinal=torch.cuda.current_device(),
         bucket_tokens=bucket_tokens,
     )
     if not bucket_tokens:
         assert launches.numel_capacity == capacity * 2
     buffers = dict(
-        packed_route_indices=torch.empty(launches.max_packed_routes, dtype=torch.int32, device="cuda"),
-        block_expert_ids=torch.empty(launches.max_route_blocks, dtype=torch.int32, device="cuda"),
+        packed_route_indices=torch.empty(
+            launches.max_packed_routes, dtype=torch.int32, device="cuda"
+        ),
+        block_expert_ids=torch.empty(
+            launches.max_route_blocks, dtype=torch.int32, device="cuda"
+        ),
         packed_route_count=torch.empty(1, dtype=torch.int32, device="cuda"),
         expert_offsets=torch.empty(33, dtype=torch.int32, device="cuda"),
         expert_counts=torch.empty(32, dtype=torch.int32, device="cuda"),
     )
-    ids = torch.arange(capacity * 2, dtype=ids_dtype, device="cuda").remainder_(32).reshape(capacity, 2)
+    ids = (
+        torch.arange(capacity * 2, dtype=ids_dtype, device="cuda")
+        .remainder_(32)
+        .reshape(capacity, 2)
+    )
     expert_map = None
     if mapped:
         expert_map = torch.arange(31, -1, -1, dtype=torch.int32, device="cuda")
@@ -181,28 +196,42 @@ def test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(capacity, buck
 
     def run(rows):
         return route_pack_module.pack_topk_routes_by_expert(
-            ids[:rows], 8, 32, expert_map=expert_map, launches=launches, **buffers,
+            ids[:rows],
+            8,
+            32,
+            expert_map=expert_map,
+            launches=launches,
+            **buffers,
         )
 
     def check(rows, output):
         routes, blocks, count = output
         expected_ids, valid, expected_count, expected_blocks = _expected_route_pack(
-            ids[:rows], 8, 32, expert_map,
+            ids[:rows],
+            8,
+            32,
+            expert_map,
         )
         torch.testing.assert_close(count.cpu(), expected_count, rtol=0, atol=0)
-        torch.testing.assert_close(blocks[:len(expected_blocks)].cpu(), expected_blocks, rtol=0, atol=0)
-        assert (blocks[len(expected_blocks):] == -1).all()
-        assert (routes[int(expected_count.item()):] == rows * 2).all()
+        torch.testing.assert_close(
+            blocks[: len(expected_blocks)].cpu(), expected_blocks, rtol=0, atol=0
+        )
+        assert (blocks[len(expected_blocks) :] == -1).all()
+        assert (routes[int(expected_count.item()) :] == rows * 2).all()
         host_routes = routes.cpu().to(torch.int64)
         payload = host_routes[host_routes < rows * 2]
         expected_payload = torch.nonzero(valid).flatten()
-        torch.testing.assert_close(payload.sort().values, expected_payload, rtol=0, atol=0)
+        torch.testing.assert_close(
+            payload.sort().values, expected_payload, rtol=0, atol=0
+        )
         for block, expert in enumerate(expected_blocks.tolist()):
-            block_routes = host_routes[block * 8:(block + 1) * 8]
+            block_routes = host_routes[block * 8 : (block + 1) * 8]
             block_payload = block_routes[block_routes < rows * 2]
             assert (expected_ids[block_payload] == expert).all()
         for tensor, name in zip(
-            output, ("packed_route_indices", "block_expert_ids", "packed_route_count"), strict=True,
+            output,
+            ("packed_route_indices", "block_expert_ids", "packed_route_count"),
+            strict=True,
         ):
             assert tensor.data_ptr() == buffers[name].data_ptr()
         assert routes.numel() == launches.max_packed_routes
@@ -516,10 +545,7 @@ def test_pack_topk_routes_by_expert_large_expert_decode_capture(
     torch.manual_seed(20260811 + num_experts + tokens)
     topk_ids = (
         torch.stack(
-            [
-                torch.randperm(num_experts, device="cuda")[:topk]
-                for _ in range(tokens)
-            ]
+            [torch.randperm(num_experts, device="cuda")[:topk] for _ in range(tokens)]
         )
         .to(torch.int32)
         .contiguous()
@@ -532,16 +558,12 @@ def test_pack_topk_routes_by_expert_large_expert_decode_capture(
         "packed_route_indices": torch.empty(
             cap_routes, dtype=torch.int32, device="cuda"
         ),
-        "block_expert_ids": torch.empty(
-            cap_blocks, dtype=torch.int32, device="cuda"
-        ),
+        "block_expert_ids": torch.empty(cap_blocks, dtype=torch.int32, device="cuda"),
         "packed_route_count": torch.empty(1, dtype=torch.int32, device="cuda"),
         "expert_offsets": torch.empty(
             num_experts + 1, dtype=torch.int32, device="cuda"
         ),
-        "expert_counts": torch.empty(
-            num_experts, dtype=torch.int32, device="cuda"
-        ),
+        "expert_counts": torch.empty(num_experts, dtype=torch.int32, device="cuda"),
     }
 
     def run() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

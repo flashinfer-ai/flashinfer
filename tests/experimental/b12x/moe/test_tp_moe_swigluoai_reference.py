@@ -18,7 +18,10 @@ from b12x.moe._shared.kernels.activations import (
     SWIGLUOAI_DEFAULT_LIMIT,
     SWIGLUOAI_UNINTERLEAVE,
 )
-from b12x.moe._shared.kernels.reference import _apply_gated_activation, moe_reference_w4a16_f32
+from b12x.moe._shared.kernels.reference import (
+    _apply_gated_activation,
+    moe_reference_w4a16_f32,
+)
 
 
 def _pack_dense_fp4(dense: torch.Tensor) -> torch.Tensor:
@@ -183,14 +186,10 @@ def test_fp4_binding_owns_swigluoai_params() -> None:
     )
     layout = weight_plan.required_weight_layout("w4a16")
     assert layout is not None
-    w1_fp4 = torch.zeros(
-        experts, 2 * intermediate, hidden // 2, dtype=torch.uint8
-    )
+    w1_fp4 = torch.zeros(experts, 2 * intermediate, hidden // 2, dtype=torch.uint8)
     w1_blockscale = torch.zeros(experts, 1, dtype=torch.uint8)
     w1_alphas = torch.ones(experts, dtype=torch.float32)
-    w2_fp4 = torch.zeros(
-        experts, hidden, intermediate // 2, dtype=torch.uint8
-    )
+    w2_fp4 = torch.zeros(experts, hidden, intermediate // 2, dtype=torch.uint8)
     w2_blockscale = torch.zeros(experts, 1, dtype=torch.uint8)
     w2_alphas = torch.ones(experts, dtype=torch.float32)
     payload = SimpleNamespace(

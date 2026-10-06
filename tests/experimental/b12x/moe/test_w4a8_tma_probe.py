@@ -70,8 +70,9 @@ class _TmaBLayoutProbe:
 
     num_threads = 32
 
-    def __init__(self, *, mode: str, stage_idx: int, k_tile: int,
-                 n_total: int, k_total: int):
+    def __init__(
+        self, *, mode: str, stage_idx: int, k_tile: int, n_total: int, k_total: int
+    ):
         assert mode in ("dump", "read", "gemm")
         self.mode = mode
         self.stage_idx = int(stage_idx)
@@ -83,15 +84,13 @@ class _TmaBLayoutProbe:
     def __call__(
         self,
         b_ptr: cute.Pointer,  # fp4 weights, (n_total, K_total, 1) k-major
-        mA: cute.Tensor,    # gemm mode: [16, 32] u32 = 16x128 e4m3 bytes
+        mA: cute.Tensor,  # gemm mode: [16, 32] u32 = 16x128 e4m3 bytes
         mOut: cute.Tensor,  # dump: [words] u32 ; read: [128,4,4] u32 ; gemm: [16,8] f32
         stream: cuda.CUstream,
     ):
         mB = cute.make_tensor(
             b_ptr,
-            cute.make_ordered_layout(
-                (self.n_total, self.k_total, 1), order=(1, 0, 2)
-            ),
+            cute.make_ordered_layout((self.n_total, self.k_total, 1), order=(1, 0, 2)),
         )
         # Mirror dense.py `_make_smem_layouts` for the B operand exactly.
         b_layout = utils.LayoutEnum.from_tensor(mB)
@@ -130,16 +129,12 @@ class _TmaBLayoutProbe:
         class Storage:
             mbar: cute.struct.MemRange[cutlass.Int64, 1]
             sB: cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Float4E2M1FN, cute.cosize(b_smem_staged)
-                ],
+                cute.struct.MemRange[cutlass.Float4E2M1FN, cute.cosize(b_smem_staged)],
                 1024,
             ]
 
         storage = smem.allocate(Storage)
-        sB = storage.sB.get_tensor(
-            b_smem_staged.outer, swizzle=b_smem_staged.inner
-        )
+        sB = storage.sB.get_tensor(b_smem_staged.outer, swizzle=b_smem_staged.inner)
 
         mbar_ptr = storage.mbar.data_ptr()
         if Int32(tidx) == Int32(0):
@@ -149,9 +144,7 @@ class _TmaBLayoutProbe:
 
         # Tile and index the coordinate tensor EXACTLY like dynamic.py
         # (3-D (n, K, E); slice to (grouped, k_tile) before the copy loop).
-        gB_tiled = cute.local_tile(
-            mB, (_TILE_N, _TILE_K), (None, None, None)
-        )
+        gB_tiled = cute.local_tile(mB, (_TILE_N, _TILE_K), (None, None, None))
         tBsB, tBgB = cpasync.tma_partition(
             tma_b,
             Int32(0),
@@ -161,9 +154,7 @@ class _TmaBLayoutProbe:
         )
         tBgB_nk = tBgB[(None, 0, None, 0)]
         if Int32(tidx) == Int32(0):
-            cute.arch.mbarrier_arrive_and_expect_tx(
-                mbar_ptr, Int32(2 * _STAGE_BYTES)
-            )
+            cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, Int32(2 * _STAGE_BYTES))
         cute.copy(
             tma_b,
             tBgB_nk[(None, self.k_tile)],
@@ -235,10 +226,18 @@ class _TmaBLayoutProbe:
                 a2 = Uint32(mA[g, Int32(8 * kb) + Int32(2) * c + Int32(1)])
                 a3 = Uint32(mA[g + Int32(8), Int32(8 * kb) + Int32(2) * c + Int32(1)])
                 d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
-                    d0, d1, d2, d3,
-                    a0, a1, a2, a3,
-                    b0, b1,
-                    Uint32(0x7F7F), Uint32(0x7F7F),
+                    d0,
+                    d1,
+                    d2,
+                    d3,
+                    a0,
+                    a1,
+                    a2,
+                    a3,
+                    b0,
+                    b1,
+                    Uint32(0x7F7F),
+                    Uint32(0x7F7F),
                 )
             col = Int32(2) * c
             mOut[g, col] = d0
@@ -260,11 +259,7 @@ def _make_b_source(device: torch.device, n_tiles: int = 1, k_tiles: int = 2):
     words += rows[:, None, None]
     words += wis[None, None, :] << 8
     words += chunks[None, :, None] << 16
-    u8 = (
-        words.to(torch.int32)
-        .view(torch.int32)
-        .reshape(n_total, k_chunks_total * 4)
-    )
+    u8 = words.to(torch.int32).view(torch.int32).reshape(n_total, k_chunks_total * 4)
     return u8.contiguous().to(device)
 
 
@@ -276,13 +271,20 @@ def _u32_tensor(x: torch.Tensor) -> cute.Tensor:
 
 def _fp4_ptr(b_words: torch.Tensor) -> cute.Pointer:
     return make_ptr(
-        cutlass.Float4E2M1FN, b_words.data_ptr(), cute.AddressSpace.gmem,
+        cutlass.Float4E2M1FN,
+        b_words.data_ptr(),
+        cute.AddressSpace.gmem,
         assumed_align=16,
     )
 
 
-def _run(mode: str, b_words: torch.Tensor, stage_idx: int = 0, k_tile: int = 0,
-         a_bytes: torch.Tensor | None = None):
+def _run(
+    mode: str,
+    b_words: torch.Tensor,
+    stage_idx: int = 0,
+    k_tile: int = 0,
+    a_bytes: torch.Tensor | None = None,
+):
     device = b_words.device
     if mode == "dump":
         out = torch.zeros(2 * _STAGE_BYTES // 4, dtype=torch.int32, device=device)
@@ -300,8 +302,11 @@ def _run(mode: str, b_words: torch.Tensor, stage_idx: int = 0, k_tile: int = 0,
         cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
     probe = _TmaBLayoutProbe(
-        mode=mode, stage_idx=stage_idx, k_tile=k_tile,
-        n_total=n, k_total=k_words * 8,
+        mode=mode,
+        stage_idx=stage_idx,
+        k_tile=k_tile,
+        n_total=n,
+        k_total=k_words * 8,
     )
     compiled = cute.compile(probe, *args)
     compiled(*args)
@@ -338,9 +343,7 @@ def test_tma_b_layout_dump_matches_swizzle_formula():
                 if got_p != expect and len(mismatches) < 8:
                     # Locate where the word actually landed.
                     where = (dump == expect).nonzero()
-                    mismatches.append(
-                        (stage, row, ch, [int(x) * 4 for x in where[:4]])
-                    )
+                    mismatches.append((stage, row, ch, [int(x) * 4 for x in where[:4]]))
     total = 2 * _TILE_N * 4
     assert hits_primary == total or hits_fallback == total, (
         f"primary {hits_primary}/{total}, fallback {hits_fallback}/{total}; "
@@ -369,8 +372,13 @@ def test_tma_b_corrected_read_formula():
                 for c in range(4):
                     expect = int(src[row, gch0 + kb, c])
                     assert int(got[row, kb, c]) == expect, (
-                        stage_idx, k_tile, row, kb, c,
-                        hex(int(got[row, kb, c])), hex(expect),
+                        stage_idx,
+                        k_tile,
+                        row,
+                        kb,
+                        c,
+                        hex(int(got[row, kb, c])),
+                        hex(expect),
                     )
 
 
@@ -385,7 +393,23 @@ def test_tma_b_gemm_bit_exact():
     a_vals = torch.tensor([0.0, 0.5, 1.0, 2.0, -1.0, -0.5, 4.0, -2.0], device=device)
     a = a_vals[torch.randint(0, 8, (16, 128), device=device)]
     fp4_grid = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
         device=device,
     )
     # Two k-tiles of B (256 fp4 positions per row): stage 0 <- k 0..127,
@@ -395,9 +419,11 @@ def test_tma_b_gemm_bit_exact():
 
     for stage_idx in (0, 1):
         out = _run(
-            "gemm", b_words, stage_idx=stage_idx,
+            "gemm",
+            b_words,
+            stage_idx=stage_idx,
             a_bytes=_e4m3_bytes(a).contiguous(),
         )
         k0 = stage_idx * 128
-        ref = a @ b[0:8, k0:k0 + 128].T
+        ref = a @ b[0:8, k0 : k0 + 128].T
         torch.testing.assert_close(out, ref, atol=0.0, rtol=0.0)

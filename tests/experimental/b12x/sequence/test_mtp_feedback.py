@@ -88,15 +88,20 @@ def _make_case(
 
     def prepare_call(state):
         (spec,) = state.layout.scratch_specs()
-        tensors["scratch"] = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        tensors["scratch"] = torch.empty(
+            spec.shape, dtype=spec.dtype, device=spec.device
+        )
         # Prime the capacity path even when this test's requested live view is empty.
         full = state.bind(**tensors)
         return PreparedCall(
-            run=lambda: state.run(full), restore=lambda: tensors["output"].copy_(original_output),
+            run=lambda: state.run(full),
+            restore=lambda: tensors["output"].copy_(original_output),
         )
 
     resources = _case_resources.get()
-    session = resources.enter_context(PreparationSession(device=device, autotune=False, compile_workers=2))
+    session = resources.enter_context(
+        PreparationSession(device=device, autotune=False, compile_workers=2)
+    )
     request = declaration.request(name="feedback", prepare_call=prepare_call)
     resources.enter_context(session.prepare((request,)))
     binding = mtp.bind(declaration, **tensors, tokens=tokens)
@@ -186,8 +191,6 @@ def test_state_norm_uses_one_flattened_stream_group() -> None:
     assert not torch.equal(flattened, per_stream)
     assert flattened[0, 0, 0].abs() < flattened[0, 1, 0].abs()
     torch.testing.assert_close(per_stream[0, 0], per_stream[0, 1], rtol=0, atol=0)
-
-
 
 
 def test_bind_rejects_bad_shapes_dtypes_and_mutable_aliases() -> None:
@@ -324,7 +327,9 @@ def test_cuda_graph_replay_uses_bound_scratch_and_output() -> None:
         torch.testing.assert_close(captured, expected, rtol=2e-2, atol=4e-2)
 
 
-def test_capacity_specialization_is_reused_for_distinct_live_counts_when_frozen() -> None:
+def test_capacity_specialization_is_reused_for_distinct_live_counts_when_frozen() -> (
+    None
+):
     device = require_sm120()
     one_token, tensors = _make_case(device=device, max_tokens=17, tokens=1)
     with kernel_resolution_guard("MTP live rows reuse prepared capacity kernels"):
@@ -368,8 +373,6 @@ def test_target_geometry_cuda_graph_replay_uses_bound_storage() -> None:
     torch.testing.assert_close(captured, expected, rtol=2e-2, atol=4e-2)
 
 
-
-
 @pytest.mark.filterwarnings("ignore:The CUDA Graph is empty.*:UserWarning")
 def test_standalone_cute_norm_rejects_cold_cuda_graph_capture() -> None:
     device = require_sm120()
@@ -405,13 +408,9 @@ def test_standalone_cute_norm_reuses_binaries_across_live_token_counts_when_froz
 
     def launch(tokens: int) -> None:
         token_source = _randn((tokens, hidden_size), device=device, scale=0.4)
-        state_source = _randn(
-            (tokens, streams, hidden_size), device=device, scale=0.4
-        )
+        state_source = _randn((tokens, streams, hidden_size), device=device, scale=0.4)
         token_weight = _randn((hidden_size,), device=device, scale=0.05)
-        state_weight = _randn(
-            (streams * hidden_size,), device=device, scale=0.05
-        )
+        state_weight = _randn((streams * hidden_size,), device=device, scale=0.05)
         token_output = torch.empty_like(token_source)
         state_output = torch.empty_like(state_source)
 
@@ -436,12 +435,8 @@ def test_standalone_cute_norm_reuses_binaries_across_live_token_counts_when_froz
         expected_state = mtp.reference.gemma_rmsnorm(
             state_source.flatten(-2), state_weight
         ).view_as(state_source)
-        torch.testing.assert_close(
-            token_output, expected_token, rtol=2e-2, atol=4e-2
-        )
-        torch.testing.assert_close(
-            state_output, expected_state, rtol=2e-2, atol=4e-2
-        )
+        torch.testing.assert_close(token_output, expected_token, rtol=2e-2, atol=4e-2)
+        torch.testing.assert_close(state_output, expected_state, rtol=2e-2, atol=4e-2)
 
     _cute_norm.clear_caches()
     monkeypatch.setattr(_cute_norm, "compile_cute", traced_compile)
@@ -451,7 +446,7 @@ def test_standalone_cute_norm_reuses_binaries_across_live_token_counts_when_froz
         assert compiled_after_first_launch.count("_TokenNorm") == 1
         assert compiled_after_first_launch.count("_StateNorm") == 1
 
-        with kernel_resolution_guard('MTP normalization live-token cache reuse test'):
+        with kernel_resolution_guard("MTP normalization live-token cache reuse test"):
             launch(17)
             assert tuple(compile_targets) == compiled_after_first_launch
     finally:
@@ -468,9 +463,7 @@ def test_standalone_cute_norm_uses_source_device_when_non_current() -> None:
     target = torch.device("cuda", target_index)
     tokens, streams, hidden_size = 2, 4, 2560
     token_source = _randn((tokens, hidden_size), device=target, scale=0.4)
-    state_source = _randn(
-        (tokens, streams, hidden_size), device=target, scale=0.4
-    )
+    state_source = _randn((tokens, streams, hidden_size), device=target, scale=0.4)
     token_weight = _randn((hidden_size,), device=target, scale=0.05)
     state_weight = _randn((streams * hidden_size,), device=target, scale=0.05)
     token_output = torch.empty_like(token_source)
@@ -507,9 +500,7 @@ def test_standalone_cute_norm_correctness_and_graph_stability() -> None:
     device = require_sm120()
     tokens, streams, hidden_size = 4, 4, 2560
     token_source = _randn((tokens, hidden_size), device=device, scale=0.4)
-    state_source = _randn(
-        (tokens, streams, hidden_size), device=device, scale=0.4
-    )
+    state_source = _randn((tokens, streams, hidden_size), device=device, scale=0.4)
     token_weight = _randn((hidden_size,), device=device, scale=0.05)
     state_weight = _randn((streams * hidden_size,), device=device, scale=0.05)
     token_output = torch.empty_like(token_source)

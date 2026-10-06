@@ -1,4 +1,5 @@
 """Prepared launch ownership for a caller-created RoCE runtime."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -16,7 +17,9 @@ def _dtypes(query: RoceQuery) -> tuple[torch.dtype, ...]:
     values = tuple(query.call.get("dtypes", ()))
     if not values:
         raise ValueError("RoCE declaration requires call.dtypes")
-    return tuple(getattr(torch, value) if isinstance(value, str) else value for value in values)
+    return tuple(
+        getattr(torch, value) if isinstance(value, str) else value for value in values
+    )
 
 
 @program_cache(scope="preparation")
@@ -55,12 +58,8 @@ class _PreparedRoce:
     def all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor | None = None):
         return self.runtime._run_prepared_all_reduce(inp, prepared=self, out=out)
 
-    def all_gather(
-        self, inp: torch.Tensor, *, out: torch.Tensor | None = None
-    ):
-        return self.runtime._run_prepared_all_gather(
-            inp, prepared=self, dim=0, out=out
-        )
+    def all_gather(self, inp: torch.Tensor, *, out: torch.Tensor | None = None):
+        return self.runtime._run_prepared_all_gather(inp, prepared=self, dim=0, out=out)
 
 
 def prepared_call(
@@ -96,7 +95,9 @@ def plan(
 ) -> Plan:
     from .roce_oneshot import RoceOneshotAllReduce
 
-    if not isinstance(query, RoceQuery) or not isinstance(runtime, RoceOneshotAllReduce):
+    if not isinstance(query, RoceQuery) or not isinstance(
+        runtime, RoceOneshotAllReduce
+    ):
         raise TypeError("RoCE plan requires query and caller runtime")
     if (
         query.world_size != runtime.world_size
@@ -119,7 +120,11 @@ def plan(
         programs = compile_roce(payload, device.ordinal)
         gather = programs["gather"]
         runtime._prepare_resources(_dtypes(query), padded_gather=True)
-        return _PreparedRoce(runtime, {key: value for key, value in programs.items() if key != "gather"}, gather)
+        return _PreparedRoce(
+            runtime,
+            {key: value for key, value in programs.items() if key != "gather"},
+            gather,
+        )
 
     return Plan(
         contract=TUNING,

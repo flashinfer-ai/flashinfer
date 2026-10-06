@@ -383,9 +383,7 @@ def test_strict_close_reports_unmap_failure_retains_exports_and_retries_only_fai
     ):
         runtime.close()
 
-    expected_events = (
-        [] if isinstance(runtime, PCIeTwoShotSP) else [("dispose", 123)]
-    )
+    expected_events = [] if isinstance(runtime, PCIeTwoShotSP) else [("dispose", 123)]
     assert events == expected_events + [
         ("close", 2000),
         ("close", 3000),
@@ -458,9 +456,7 @@ def test_strict_close_reports_free_failure_and_retains_only_failed_export(
     with pytest.raises(RuntimeError, match="failed during IPC export free"):
         runtime.close()
 
-    expected_events = (
-        [] if isinstance(runtime, PCIeTwoShotSP) else [("dispose", 123)]
-    )
+    expected_events = [] if isinstance(runtime, PCIeTwoShotSP) else [("dispose", 123)]
     assert events == expected_events + [
         ("close", 2000),
         ("close", 3000),

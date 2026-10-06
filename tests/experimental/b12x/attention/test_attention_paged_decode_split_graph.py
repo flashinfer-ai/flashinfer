@@ -12,6 +12,7 @@ metadata tensors passed at capture must keep stable addresses across replays —
 callers update their contents in place (this is what a serving engine does with
 persistent buffers).
 """
+
 from __future__ import annotations
 
 import math
@@ -21,7 +22,10 @@ import torch
 from b12x.attention.paged.reference import paged_attention_reference
 from b12x.attention._shared.contiguous.api import clear_attention_caches
 from b12x.attention.paged._forward import paged_attention_forward
-from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention.paged._scratch import (
+    B12XPagedAttentionScratchCaps,
+    plan_paged_attention_scratch,
+)
 from b12x.attention.paged.planner import create_paged_plan
 
 from b12x.testing.reference.helpers import require_b12x
@@ -259,18 +263,16 @@ def test_direct_decode_graph_gqa128_writes_every_query_tile() -> None:
     """GQA128 / CTA16 must consume all eight q tiles and write every head."""
     device = require_b12x()
     clear_attention_caches()
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
-        make_paged_inputs(
-            q_seqlens=[1],
-            cache_seqlens=[193],
-            page_size=64,
-            seed=197,
-            q_heads=128,
-            kv_heads=1,
-            head_dim=256,
-            page_table_width=4,
-            num_pages=8,
-        )
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
+        q_seqlens=[1],
+        cache_seqlens=[193],
+        page_size=64,
+        seed=197,
+        q_heads=128,
+        kv_heads=1,
+        head_dim=256,
+        page_table_width=4,
+        num_pages=8,
     )
     bootstrap_plan = create_paged_plan(
         q,

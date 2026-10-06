@@ -1,4 +1,5 @@
 """Exactness tests for large-M per-row FP6 activation quantization."""
+
 from __future__ import annotations
 
 import pytest
@@ -85,9 +86,7 @@ def test_per_row_quantizer_matches_host_chain(m, fmt):
     codes, scale, alpha, inv_gs = _quantize_matrix_fp6_bytes_per_row(x, fmt, w_gs)
 
     torch.testing.assert_close(codes, codes_ref, rtol=0.0, atol=0.0)
-    torch.testing.assert_close(
-        scale.view(-1), scale_ref.view(-1), rtol=0.0, atol=0.0
-    )
+    torch.testing.assert_close(scale.view(-1), scale_ref.view(-1), rtol=0.0, atol=0.0)
     torch.testing.assert_close(alpha, alpha_ref, rtol=0.0, atol=0.0)
     torch.testing.assert_close(inv_gs, inv_gs_ref.view(-1), rtol=0.0, atol=0.0)
 

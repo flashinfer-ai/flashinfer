@@ -1,4 +1,5 @@
 """Workload metadata shared by numerical fixtures and native benchmarks."""
+
 from __future__ import annotations
 
 import hashlib
@@ -21,19 +22,29 @@ class WorkloadCase:
 
     @classmethod
     def create(
-        cls, *, group_id: str, query: Mapping[str, object], scenario: str = "default",
-        metadata: Mapping[str, object] | None = None, label: str | None = None,
+        cls,
+        *,
+        group_id: str,
+        query: Mapping[str, object],
+        scenario: str = "default",
+        metadata: Mapping[str, object] | None = None,
+        label: str | None = None,
     ) -> WorkloadCase:
         identity = {
-            "group_id": group_id, "query": dict(query), "scenario": scenario,
+            "group_id": group_id,
+            "query": dict(query),
+            "scenario": scenario,
             "metadata": dict(metadata or {}),
         }
         # Preserve the existing fixture IDs while retiring the offline sweep.
         encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
         suffix = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
         return cls(
-            case_id=f"{label or group_id}-{suffix}", group_id=group_id,
-            query=FrozenMapping(query), scenario=scenario, metadata=FrozenMapping(metadata),
+            case_id=f"{label or group_id}-{suffix}",
+            group_id=group_id,
+            query=FrozenMapping(query),
+            scenario=scenario,
+            metadata=FrozenMapping(metadata),
         )
 
     def __post_init__(self) -> None:

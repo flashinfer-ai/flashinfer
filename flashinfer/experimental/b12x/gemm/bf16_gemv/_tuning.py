@@ -31,36 +31,61 @@ class GemvConfig:
 def validate_query(query):
     if not isinstance(query, GemvQuery):
         raise TypeError("projection query must be GemvQuery")
-    if any(dtype not in ("bfloat16", "float32") for dtype in (
-        query.source_dtype, query.weight_dtype, query.output_dtype,
-    )) or query.bias_dtype not in (None, "bfloat16", "float32"):
+    if any(
+        dtype not in ("bfloat16", "float32")
+        for dtype in (
+            query.source_dtype,
+            query.weight_dtype,
+            query.output_dtype,
+        )
+    ) or query.bias_dtype not in (None, "bfloat16", "float32"):
         raise ValueError("unquantized projection requires BF16 or FP32 operands")
-    if not 0 < query.max_rows < 2**31 or min(query.in_features, query.out_features) <= 0:
-        raise ValueError("projection geometry must be positive and row capacity fit Int32")
-    for name in ("source_contiguous", "source_aligned", "weight_contiguous",
-                 "weight_aligned", "output_contiguous", "output_aligned"):
+    if (
+        not 0 < query.max_rows < 2**31
+        or min(query.in_features, query.out_features) <= 0
+    ):
+        raise ValueError(
+            "projection geometry must be positive and row capacity fit Int32"
+        )
+    for name in (
+        "source_contiguous",
+        "source_aligned",
+        "weight_contiguous",
+        "weight_aligned",
+        "output_contiguous",
+        "output_aligned",
+    ):
         if type(getattr(query, name)) is not bool:
             raise TypeError(f"projection {name} must be a boolean")
 
 
 def _mma_eligible(query):
-    return (query.source_dtype == query.weight_dtype == "bfloat16"
-            and query.out_features >= 256 and query.in_features >= 16)
+    return (
+        query.source_dtype == query.weight_dtype == "bfloat16"
+        and query.out_features >= 256
+        and query.in_features >= 16
+    )
 
 
 def _torch_eligible(query):
-    return (query.source_dtype == query.weight_dtype == query.output_dtype == "bfloat16"
-            and query.bias_dtype in (None, "bfloat16"))
+    return (
+        query.source_dtype == query.weight_dtype == query.output_dtype == "bfloat16"
+        and query.bias_dtype in (None, "bfloat16")
+    )
 
 
 def _prefill_eligible(query):
     return (
         query.bias_dtype is None
         and query.source_dtype == query.weight_dtype == "bfloat16"
-        and (query.out_features, query.in_features) in ((384, 5120), (512, 5120), (1024, 5120))
-        and query.source_contiguous and query.source_aligned
-        and query.weight_contiguous and query.weight_aligned
-        and query.output_contiguous and query.output_aligned
+        and (query.out_features, query.in_features)
+        in ((384, 5120), (512, 5120), (1024, 5120))
+        and query.source_contiguous
+        and query.source_aligned
+        and query.weight_contiguous
+        and query.weight_aligned
+        and query.output_contiguous
+        and query.output_aligned
     )
 
 
@@ -77,10 +102,13 @@ def default_config(query, device):
     rows_per_tile = 8
     if (
         query.source_dtype == query.weight_dtype == "bfloat16"
-        and query.in_features == 5120 and query.out_features in (32, 384, 512)
+        and query.in_features == 5120
+        and query.out_features in (32, 384, 512)
         and query.max_rows <= 8
-        and query.source_contiguous and query.source_aligned
-        and query.weight_contiguous and query.weight_aligned
+        and query.source_contiguous
+        and query.source_aligned
+        and query.weight_contiguous
+        and query.weight_aligned
     ):
         rows_per_tile = 2 if query.out_features == 32 else 4
     return GemvConfig(backend="simt", rows_per_tile=rows_per_tile)
@@ -94,7 +122,12 @@ def validate_config(query, config, device):
     if not isinstance(config, GemvConfig):
         raise TypeError("projection config must be GemvConfig")
     if config.backend == "simt":
-        if type(config.rows_per_tile) is not int or config.rows_per_tile not in (1, 2, 4, 8):
+        if type(config.rows_per_tile) is not int or config.rows_per_tile not in (
+            1,
+            2,
+            4,
+            8,
+        ):
             raise ValueError("SIMT projection rows_per_tile must be 1, 2, 4 or 8")
         return
     if config.rows_per_tile != 8:
@@ -105,7 +138,9 @@ def validate_config(query, config, device):
         return
     if config.backend == "prefill" and _prefill_eligible(query):
         return
-    raise ValueError(f"projection backend {config.backend!r} is ineligible for this query")
+    raise ValueError(
+        f"projection backend {config.backend!r} is ineligible for this query"
+    )
 
 
 def _parameters(query, device):
@@ -117,7 +152,9 @@ def _parameters(query, device):
     if _torch_eligible(query):
         backends.append("torch")
     return ParameterSpace.create(
-        TUNING.knobs, values={"backend": tuple(backends)}, predicates=(_eligible,),
+        TUNING.knobs,
+        values={"backend": tuple(backends)},
+        predicates=(_eligible,),
     )
 
 
@@ -139,7 +176,9 @@ TUNING = TuningContract(
     default_config=default_config,
     knobs=(
         Knob(name="backend", values=None, binding=ParameterBinding.COMPILE),
-        Knob(name="rows_per_tile", values=(1, 2, 4, 8), binding=ParameterBinding.COMPILE),
+        Knob(
+            name="rows_per_tile", values=(1, 2, 4, 8), binding=ParameterBinding.COMPILE
+        ),
     ),
     candidate_contract_version=3,
     parameters=_parameters,

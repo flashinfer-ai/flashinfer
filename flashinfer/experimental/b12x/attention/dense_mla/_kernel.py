@@ -36,6 +36,8 @@ _FORWARD_CACHE: dict[tuple[object, ...], object] = {}
 _MERGE_CACHE: dict[tuple[object, ...], object] = {}
 register_program_cache(_FORWARD_CACHE, lock=_LOCK)
 register_program_cache(_MERGE_CACHE, lock=_LOCK)
+
+
 def _to_cute(
     tensor: torch.Tensor,
     dtype,
@@ -45,6 +47,7 @@ def _to_cute(
 ):
     if compile_only_launches_enabled() and hasattr(tensor, "fake_mode"):
         from cutlass.cute.runtime import make_fake_tensor
+
         leading_dim = next(
             (index for index, stride in enumerate(tensor.stride()) if int(stride) == 1),
             None,
@@ -370,6 +373,7 @@ def _compile_entries(binding: Binding) -> tuple[object, object | None]:
             _MERGE_CACHE[signature] = compiled_merge
     return compiled_forward, compiled_merge
 
+
 @dataclass(frozen=True)
 class DenseMlaLaunchers:
     """Resolved native entries retained by a prepared sparse-MLA state."""
@@ -385,7 +389,9 @@ class DenseMlaLaunchers:
         run_compiled(self.forward, forward.args)
         if binding.scratch.num_splits > 1 and binding.active_splits > 1:
             if self.merge is None:
-                raise RuntimeError("prepared dense MLA binding is missing its merge launcher")
+                raise RuntimeError(
+                    "prepared dense MLA binding is missing its merge launcher"
+                )
             merge = _merge_launch(binding)
             assert merge is not None
             run_compiled(self.merge, merge.args)

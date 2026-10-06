@@ -21,7 +21,9 @@ def test_reviewed_launch_geometry_needs_no_opt_in(monkeypatch) -> None:
 def test_nondefault_launch_geometry_is_diagnostic_only(monkeypatch) -> None:
     monkeypatch.delenv(DIAGNOSTIC_GEOMETRY_ENV, raising=False)
 
-    with pytest.raises(ValueError, match="non-default launch geometry.*diagnostic-only"):
+    with pytest.raises(
+        ValueError, match="non-default launch geometry.*diagnostic-only"
+    ):
         require_diagnostic_geometry(
             "twoshot",
             threads=(256, 512),

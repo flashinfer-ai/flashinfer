@@ -18,7 +18,11 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.compile_plan import compile_only_launches_enabled, program_keys, record_program
+from b12x._lib.compile_plan import (
+    compile_only_launches_enabled,
+    program_keys,
+    record_program,
+)
 from b12x._lib.program_cache import register_program_cache
 from b12x._lib.intrinsics import (
     bf16_mma_m16n8k16_f32,
@@ -233,7 +237,9 @@ class _RepresentativeScoreKernel:
                     ),
                     Int32(self.group_interleave),
                 )
-                eligible = complete_rounds * Int32(self.group_interleave) + rank_remainder
+                eligible = (
+                    complete_rounds * Int32(self.group_interleave) + rank_remainder
+                )
             eligible = cutlass.min(eligible, Int32(self.max_groups))
         carry = cutlass.min(cutlass.min(eligible, group_offset), Int32(self.budget))
         if (block == 0) & (thread == 0):
@@ -340,22 +346,34 @@ def compile_score_representatives(
 ):
     """Resolve the exact configured CuTe score executable for QSA preparation."""
     tensors = (
-        prepared_query, query_positions, request_ids, sequence_lengths,
-        compressed_cache, compressed_block_table, scores,
-        eligible_counts, merge_lengths,
+        prepared_query,
+        query_positions,
+        request_ids,
+        sequence_lengths,
+        compressed_cache,
+        compressed_block_table,
+        scores,
+        eligible_counts,
+        merge_lengths,
     )
     types = tuple(
         {
-            torch.bfloat16: BFloat16, torch.float32: Float32,
-            torch.int32: Int32, torch.int64: Int64,
+            torch.bfloat16: BFloat16,
+            torch.float32: Float32,
+            torch.int32: Int32,
+            torch.int64: Int64,
         }[tensor.dtype]
         for tensor in tensors
     )
     geometry = (
-        int(caps.index_heads), int(caps.index_head_dim),
-        int(caps.compress_ratio), int(caps.compressed_page_size),
-        int(caps.max_groups), int(caps.group_budget),
-        int(caps.dcp_size), int(caps.dcp_rank),
+        int(caps.index_heads),
+        int(caps.index_head_dim),
+        int(caps.compress_ratio),
+        int(caps.compressed_page_size),
+        int(caps.max_groups),
+        int(caps.group_budget),
+        int(caps.dcp_size),
+        int(caps.dcp_rank),
         int(caps.cp_kv_cache_interleave_size),
     )
     device_index = prepared_query.device.index
@@ -366,14 +384,21 @@ def compile_score_representatives(
         raw = _CACHE.get(key)
         if raw is None:
             kernel = _RepresentativeScoreKernel(*geometry)
-            raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
+            raise_if_kernel_resolution_frozen(
+                "cute.compile", target=kernel, cache_key=key
+            )
             fake = tuple(
                 make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=t.width // 8)
                 for t in types
             )
             raw = b12x_compile(
-                kernel, fake, (Int64(1),) * 4, Int32(1), Int32(0),
-                Int32(1), current_cuda_stream(),
+                kernel,
+                fake,
+                (Int64(1),) * 4,
+                Int32(1),
+                Int32(0),
+                Int32(1),
+                current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "attention.qsa.representative_score", 2, key
                 ),
@@ -418,17 +443,21 @@ def launch_score_representatives(
         }[t.dtype]
         for t in tensors
     )
-    raw = _prepared if _prepared is not None else compile_score_representatives(
-        prepared_query=prepared_query,
-        query_positions=query_positions,
-        request_ids=request_ids,
-        sequence_lengths=sequence_lengths,
-        compressed_cache=compressed_cache,
-        compressed_block_table=compressed_block_table,
-        scores=scores,
-        eligible_counts=eligible_counts,
-        merge_lengths=merge_lengths,
-        caps=caps,
+    raw = (
+        _prepared
+        if _prepared is not None
+        else compile_score_representatives(
+            prepared_query=prepared_query,
+            query_positions=query_positions,
+            request_ids=request_ids,
+            sequence_lengths=sequence_lengths,
+            compressed_cache=compressed_cache,
+            compressed_block_table=compressed_block_table,
+            scores=scores,
+            eligible_counts=eligible_counts,
+            merge_lengths=merge_lengths,
+            caps=caps,
+        )
     )
     if compile_only_launches_enabled():
         for program in program_keys(raw):

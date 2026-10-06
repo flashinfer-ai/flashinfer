@@ -5,6 +5,7 @@ to byte-containers in smem; with identical activation codes, scales, and alpha
 it must be BIT-IDENTICAL to the validated ``b_preexpanded`` path — only the B
 streaming format differs.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -32,9 +33,7 @@ def _gemm_operands(m: int, n: int, k: int, source_format: str):
     fp6w = quantize_dense_weight_to_fp6(w_bf16, source_format=source_format)
     x = (torch.randn(m, k, device=device) * 0.1).to(torch.bfloat16)
     a_amax = (
-        torch.linalg.vector_norm(x, ord=float("inf"))
-        .to(torch.float32)
-        .clamp_min_(1e-6)
+        torch.linalg.vector_norm(x, ord=float("inf")).to(torch.float32).clamp_min_(1e-6)
     )
     a_gs = (f8_max * 28.0 / a_amax).reshape(1)
     m_pad = ((m + _TILE - 1) // _TILE) * _TILE
@@ -156,6 +155,8 @@ def test_dense_gemm_requires_fused_inputs_as_a_pair(missing):
             w_gscale=None if missing == "scale" else scale,
             **common,
         )
+
+
 @cuda_required
 @pytest.mark.parametrize("m", [1, 3, 128])
 def test_linear_autodetects_packed_weight(m):

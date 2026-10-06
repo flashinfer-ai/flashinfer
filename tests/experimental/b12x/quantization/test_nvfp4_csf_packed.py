@@ -40,7 +40,9 @@ def _value_table(kind, device):
     if kind == "permutation":
         table = np.random.default_rng(7).permutation(256).astype(np.uint8)
         return torch.from_numpy(table).to(device)
-    alphabet = torch.arange(256, dtype=torch.uint8, device=device).view(torch.float8_e4m3fn)
+    alphabet = torch.arange(256, dtype=torch.uint8, device=device).view(
+        torch.float8_e4m3fn
+    )
     alphabet = alphabet[:, None].expand(256, 4).contiguous().to(torch.bfloat16)
     packed = _process_nvfp4_packed_scales(alphabet, scale_factor=2.0)
     return packed.view(torch.uint8)[:, 0].contiguous()
@@ -62,12 +64,18 @@ def _native_batch(source, device):
         )
         position = np.flatnonzero(outside).astype(np.uint32)
         exceptions.append(position | (plane.ravel()[position].astype(np.uint32) << 24))
-    return make_nvfp4_csf_batch(fixed, exceptions, rows=rows, columns=columns, device=device)
+    return make_nvfp4_csf_batch(
+        fixed, exceptions, rows=rows, columns=columns, device=device
+    )
 
 
 def test_packed_slab_positions_invert_the_plane_permutation():
     perm = (
-        np.arange(64).reshape(8, 8).T.reshape(-1).reshape(-1, 4)[:, [0, 2, 1, 3]].reshape(-1)
+        np.arange(64)
+        .reshape(8, 8)
+        .T.reshape(-1)
+        .reshape(-1, 4)[:, [0, 2, 1, 3]]
+        .reshape(-1)
     )
     perm = np.concatenate((perm, perm + 64))
     positions = packed_slab_position(torch.arange(128)).numpy()
@@ -75,7 +83,9 @@ def test_packed_slab_positions_invert_the_plane_permutation():
 
 
 @pytest.mark.parametrize("table", ["w4a16", "permutation"])
-@pytest.mark.parametrize("rows,columns,rotation", [(256, 64, 128), (512, 16, 0), (128, 256, 0)])
+@pytest.mark.parametrize(
+    "rows,columns,rotation", [(256, 64, 128), (512, 16, 0), (128, 256, 0)]
+)
 def test_index_matches_the_expansion_pass(rows, columns, rotation, table):
     device = require_b12x()
     experts = 5
@@ -120,14 +130,23 @@ def test_index_matches_the_expansion_pass(rows, columns, rotation, table):
 def test_pair_decodes_each_projection_storage_layout(packed_index):
     device = require_b12x()
     lut = _value_table("w4a16", device)
-    planes = [repack_nvfp4_csf_batch(
-        _native_batch(_logical_scales(3, 256, 16, seed), device),
-        row_rotation=0, value_lut=lut,
-    ) for seed in (9, 13)]
-    expected = [torch.empty(3, 16, 256, dtype=torch.float8_e4m3fn, device=device) for _ in planes]
+    planes = [
+        repack_nvfp4_csf_batch(
+            _native_batch(_logical_scales(3, 256, 16, seed), device),
+            row_rotation=0,
+            value_lut=lut,
+        )
+        for seed in (9, 13)
+    ]
+    expected = [
+        torch.empty(3, 16, 256, dtype=torch.float8_e4m3fn, device=device)
+        for _ in planes
+    ]
     ids = torch.arange(3, device=device, dtype=torch.int32)
     Nvfp4CsfDecoder.prepare(*planes, *expected).decode(ids, *expected)
-    planes[packed_index] = PackedCsfPlane.of(build_packed_csf_scales(planes[packed_index]))
+    planes[packed_index] = PackedCsfPlane.of(
+        build_packed_csf_scales(planes[packed_index])
+    )
     actual = [torch.empty_like(t) for t in expected]
     Nvfp4CsfDecoder.prepare(*planes, *actual).decode(ids, *actual)
     torch.cuda.synchronize()

@@ -85,8 +85,7 @@ def _selected_peers(rank: int, world_size: int = 16) -> tuple[int, ...]:
 
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(
-            "vocabulary argmax requires "
-            f"{SUPPORTED_WORLD_SIZES}, got TP{world_size}"
+            f"vocabulary argmax requires {SUPPORTED_WORLD_SIZES}, got TP{world_size}"
         )
     if not 0 <= rank < world_size:
         raise ValueError(f"invalid rank {rank} for TP{world_size}")
@@ -144,9 +143,7 @@ class PCIeVocabParallelArgmax:
             ):
                 raise ValueError("global vocabulary must fit a positive int32 index")
             if not 0 < normalized_max_batch_size <= MAX_BATCH_SIZE:
-                raise ValueError(
-                    f"max_batch_size must be in [1, {MAX_BATCH_SIZE}]"
-                )
+                raise ValueError(f"max_batch_size must be in [1, {MAX_BATCH_SIZE}]")
             return (
                 device_obj,
                 normalized_local_vocab_size,

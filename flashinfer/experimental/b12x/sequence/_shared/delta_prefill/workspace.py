@@ -36,10 +36,18 @@ WINDOW_BYTES_BUDGET = 36 << 20
 SM12X_SHARED_MEMORY_LIMIT = 99 * 1024
 
 
-def recurrence_shared_bytes(v_split: int, k_split: int, stages: int, window_tiles: int,
-                            *, max_sequence_tiles: int = 0, summary_mode: int = 0,
-                            reuse_value_buffer: bool = True) -> int:
+def recurrence_shared_bytes(
+    v_split: int,
+    k_split: int,
+    stages: int,
+    window_tiles: int,
+    *,
+    max_sequence_tiles: int = 0,
+    summary_mode: int = 0,
+    reuse_value_buffer: bool = True,
+) -> int:
     """Kernel-allocated bytes for band positions, pipeline, reductions, and barriers."""
+
     def align(value, multiple):
         return -(-value // multiple) * multiple
 
@@ -55,12 +63,25 @@ def recurrence_shared_bytes(v_split: int, k_split: int, stages: int, window_tile
     return cursor + (4 if summary_mode in (2, 3, 5) and k_split == 1 else 0)
 
 
-def validate_shared_memory(v_split: int, k_split: int, stages: int, window_tiles: int,
-                           *, max_sequence_tiles: int = 0, summary_mode: int = 0,
-                           reuse_value_buffer: bool = True) -> None:
-    required = recurrence_shared_bytes(v_split, k_split, stages, window_tiles,
-                                      max_sequence_tiles=max_sequence_tiles, summary_mode=summary_mode,
-                                      reuse_value_buffer=reuse_value_buffer)
+def validate_shared_memory(
+    v_split: int,
+    k_split: int,
+    stages: int,
+    window_tiles: int,
+    *,
+    max_sequence_tiles: int = 0,
+    summary_mode: int = 0,
+    reuse_value_buffer: bool = True,
+) -> None:
+    required = recurrence_shared_bytes(
+        v_split,
+        k_split,
+        stages,
+        window_tiles,
+        max_sequence_tiles=max_sequence_tiles,
+        summary_mode=summary_mode,
+        reuse_value_buffer=reuse_value_buffer,
+    )
     if required > SM12X_SHARED_MEMORY_LIMIT:
         raise ValueError(
             f"prefill recurrence requires {required} shared-memory bytes; "
@@ -76,4 +97,6 @@ def tiles_capacity(max_tokens: int, max_seqs: int) -> int:
 def default_window_tiles(heads: int, max_tokens: int, max_seqs: int) -> int:
     """Tiles per pipeline window so a window's prepared tiles fit the L2 budget."""
     per_row = int(heads) * WORKSPACE_RECORD_BYTES
-    return max(1, min(tiles_capacity(max_tokens, max_seqs), WINDOW_BYTES_BUDGET // per_row))
+    return max(
+        1, min(tiles_capacity(max_tokens, max_seqs), WINDOW_BYTES_BUDGET // per_row)
+    )

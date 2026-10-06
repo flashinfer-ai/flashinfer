@@ -1,4 +1,5 @@
 """Declarative and prepared BF16 vocabulary projection boundary."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -46,7 +47,9 @@ class Binding:
 
 
 def plan(
-    caps: Caps, *, invocation: FrozenMapping = FrozenMapping(),
+    caps: Caps,
+    *,
+    invocation: FrozenMapping = FrozenMapping(),
     override: Bf16VocabProjectionConfig | None = None,
 ) -> Plan:
     """Declare vocabulary projection preparation without resolving a backend."""
@@ -55,9 +58,13 @@ def plan(
     return make_plan(caps, invocation=invocation, override=override)
 
 
-def _bind(caps: Caps, *, plan: Plan, source: torch.Tensor, weight: torch.Tensor) -> Binding:
+def _bind(
+    caps: Caps, *, plan: Plan, source: torch.Tensor, weight: torch.Tensor
+) -> Binding:
     if source.ndim != 2 or not 0 < source.shape[0] <= caps.max_tokens:
-        raise ValueError(f"source must have 1..{caps.max_tokens} rows, got {tuple(source.shape)}")
+        raise ValueError(
+            f"source must have 1..{caps.max_tokens} rows, got {tuple(source.shape)}"
+        )
     if source.shape[1] != caps.in_features:
         raise ValueError(f"source K must be {caps.in_features}, got {source.shape[1]}")
     if tuple(weight.shape) != (caps.out_features, caps.in_features):
@@ -85,7 +92,9 @@ def run(binding: Binding) -> torch.Tensor:
     if not isinstance(binding, Binding):
         raise TypeError("binding must be Binding")
     return torch.ops.b12x.bf16_vocab_projection(
-        binding.source, binding.weight, binding.plan.handle,
+        binding.source,
+        binding.weight,
+        binding.plan.handle,
     )
 
 

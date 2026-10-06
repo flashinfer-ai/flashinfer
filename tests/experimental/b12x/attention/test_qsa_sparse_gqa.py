@@ -140,11 +140,15 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
                     graphs[label, rows, splits].replay()
                     torch.cuda.synchronize()
                     after = torch.cuda.memory_stats()
-                    for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+                    for key in (
+                        "allocation.all.allocated",
+                        "allocated_bytes.all.allocated",
+                    ):
                         assert after[key] == before[key]
-                    assert tuple(
-                        t.data_ptr() for t in (partials, lse, output, output_lse)
-                    ) == pointers
+                    assert (
+                        tuple(t.data_ptr() for t in (partials, lse, output, output_lse))
+                        == pointers
+                    )
 
                 replay("serial")
                 expected = output.clone()
@@ -183,7 +187,7 @@ def test_split_prewarm_matches_planned_selection_capacity(selection_width: int) 
         request_ids=requests,
         selection_width=selection_width,
     )
-    with kernel_resolution_guard('planned selected-attention warmup capacity'):
+    with kernel_resolution_guard("planned selected-attention warmup capacity"):
         try:
 
             def launch(rows):
@@ -260,19 +264,30 @@ def test_planned_selection_capacity_consumes_tail_with_frozen_graph_replay(
 
     def launch(rows):
         return launch_sparse_paged_gqa(
-            query=query[:rows], key_cache=cache, value_cache=cache,
-            k_descale=descale, v_descale=descale, block_table=block_table,
-            request_ids=request_ids[:rows], selected_positions=selected[:rows],
-            query_positions=positions[:rows], output=output[:rows],
+            query=query[:rows],
+            key_cache=cache,
+            value_cache=cache,
+            k_descale=descale,
+            v_descale=descale,
+            block_table=block_table,
+            request_ids=request_ids[:rows],
+            selected_positions=selected[:rows],
+            query_positions=positions[:rows],
+            output=output[:rows],
             output_lse=output_lse[:rows],
-            partial_output=partials[:rows], partial_lse=lse[:rows],
-            softmax_scale=1 / 16, block_n=16, splits=splits,
+            partial_output=partials[:rows],
+            partial_lse=lse[:rows],
+            softmax_scale=1 / 16,
+            block_n=16,
+            splits=splits,
         )
 
     launch(live_counts[0])
     warmed = tuple(implementation._KERNEL_CACHE.items())
     warmed_merge = tuple(implementation._MERGE_CACHE.items())
-    with kernel_resolution_guard('QSA fixed selected-position capacity across live rows'):
+    with kernel_resolution_guard(
+        "QSA fixed selected-position capacity across live rows"
+    ):
         for rows in live_counts:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -287,7 +302,10 @@ def test_planned_selection_capacity_consumes_tail_with_frozen_graph_replay(
                 graph.replay()
                 torch.cuda.synchronize()
                 after = torch.cuda.memory_stats()
-                for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+                for key in (
+                    "allocation.all.allocated",
+                    "allocated_bytes.all.allocated",
+                ):
                     assert after[key] == before[key]
                 assert tuple(t.data_ptr() for t in buffers) == pointers
                 assert torch.all(output[:rows] == value)
@@ -348,6 +366,7 @@ def test_qsa_plan_hydrates_all_native_divisible_head_layouts(
 
     hydrated = qsa_contract._caps_from_query(declaration.query, ordinal=0)
     assert (hydrated.q_heads, hydrated.kv_heads) == (q_heads, kv_heads)
+
 
 @pytest.mark.parametrize("page_size", [16, 1504, 3008])
 def test_qsa_caps_accepts_runtime_qwen_page_sizes(
@@ -680,9 +699,7 @@ def test_non_qwen_geometry_has_no_sparse_gqa_fallback(
             selected_positions=selected_positions,
             query_positions=torch.empty((rows,), dtype=torch.int64, device="meta"),
             output=torch.empty_like(query),
-            output_lse=torch.empty(
-                (rows, q_heads), dtype=torch.float32, device="meta"
-            ),
+            output_lse=torch.empty((rows, q_heads), dtype=torch.float32, device="meta"),
             partial_output=torch.empty(
                 (rows, 4, q_heads, head_dim), dtype=torch.float32, device="meta"
             ),
@@ -719,9 +736,7 @@ def test_large_prefill_rejects_layouts_not_supported_by_selected_abi() -> None:
         "request_ids": request_ids,
         "selected_positions": selected_positions,
         "query_positions": query_positions,
-        "output_lse": torch.empty(
-            (rows, q_heads), dtype=torch.float32, device=device
-        ),
+        "output_lse": torch.empty((rows, q_heads), dtype=torch.float32, device=device),
         "partial_output": None,
         "partial_lse": None,
         "softmax_scale": 1.0 / math.sqrt(head_dim),
@@ -845,9 +860,7 @@ def test_sparse_gqa_matches_gathered_dense_reference(
         dtype=torch.bfloat16,
         device=device,
     )
-    output_lse = torch.empty(
-        (rows + 2, q_heads), dtype=torch.float32, device=device
-    )
+    output_lse = torch.empty((rows + 2, q_heads), dtype=torch.float32, device=device)
     partial_output = (
         torch.empty(
             (rows, splits, q_heads, head_dim),

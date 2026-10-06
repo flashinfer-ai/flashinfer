@@ -215,6 +215,7 @@ def compressed_sparse_mla_decode_forward(
                     "mapped indexed_page_table is only supported for deepseek_v41"
                 )
             from ...compressed_sparse_mla._metadata import map_indexed_pages
+
             mapped = getattr(scratch, "mapped_indices", None)
             if mapped is None:
                 raise ValueError(
@@ -274,9 +275,13 @@ def compressed_sparse_mla_decode_forward(
     # A prepared compressed execution owns one exact route.  In particular,
     # live row counts must not rerun the SM121 split-vs-single-pass heuristic:
     # the prefill tuple and unified decode launch are distinct executable owners.
-    if scratch.mode in ("extend", "verify", "draft_extend") or isinstance(prepared, tuple):
+    if scratch.mode in ("extend", "verify", "draft_extend") or isinstance(
+        prepared, tuple
+    ):
         if prepared is None:
-            raise RuntimeError("compressed MLA prefill requires prepared native launchers")
+            raise RuntimeError(
+                "compressed MLA prefill requires prepared native launchers"
+            )
         return _run_sm120_compressed_prefill(
             q3=q3,
             swa_k_cache=swa_k_cache,
@@ -618,6 +623,8 @@ def _validate_compressed_cache_layout(
             f"{payload_nbytes} or padded width {padded_page_nbytes} for "
             f"page_size {page_size}, got {page_nbytes}"
         )
+
+
 def _compressed_sparse_mla_cache_byte_view(
     cache: torch.Tensor, *, name: str
 ) -> torch.Tensor:

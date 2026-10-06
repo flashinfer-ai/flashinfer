@@ -80,7 +80,9 @@ class SparseMlaConfig:
             "v41_heads_per_block",
         }
         if set(payload) != expected:
-            raise ValueError("compressed MLA configs require exact split and V4.1 fields")
+            raise ValueError(
+                "compressed MLA configs require exact split and V4.1 fields"
+            )
         chunks = payload["max_chunks_per_row"]
         chunk_size = payload["split_chunk_size"]
         single_pass = payload["single_pass"]
@@ -104,7 +106,9 @@ class SparseMlaConfig:
 
 
 def _single_pass(query: SparseMlaQuery, device: DeviceIdentity | None) -> bool:
-    from b12x.attention._shared.mla.compressed_api import _should_use_sm121_single_pass_decode
+    from b12x.attention._shared.mla.compressed_api import (
+        _should_use_sm121_single_pass_decode,
+    )
 
     if query.mode in ("extend", "verify", "draft_extend"):
         return True
@@ -114,13 +118,17 @@ def _single_pass(query: SparseMlaQuery, device: DeviceIdentity | None) -> bool:
         swa_width=query.swa_width,
         indexed_width=query.indexed_width,
         swa_page_size=query.swa_page_size,
-        indexed_page_size=query.indexed_page_size if query.indexed_cache_present else None,
+        indexed_page_size=query.indexed_page_size
+        if query.indexed_cache_present
+        else None,
         compute_capability=(0, 0) if device is None else device.compute_capability,
     )
 
 
 def _split_config(query: SparseMlaQuery, max_chunks: int):
-    from b12x.attention._shared.mla.compressed_config import compressed_sparse_mla_split_config_for_contract
+    from b12x.attention._shared.mla.compressed_config import (
+        compressed_sparse_mla_split_config_for_contract,
+    )
 
     return compressed_sparse_mla_split_config_for_contract(
         rows=query.query_rows,
@@ -130,20 +138,23 @@ def _split_config(query: SparseMlaQuery, max_chunks: int):
     )
 
 
-def _default_config(query: SparseMlaQuery, device: DeviceIdentity | None) -> SparseMlaConfig:
+def _default_config(
+    query: SparseMlaQuery, device: DeviceIdentity | None
+) -> SparseMlaConfig:
     single_pass = _single_pass(query, device)
-    split = (
-        None
-        if single_pass
-        else _split_config(query, 256)
-    )
+    split = None if single_pass else _split_config(query, 256)
     return SparseMlaConfig(
         max_chunks_per_row=1 if split is None else split.num_chunks,
         split_chunk_size=1 if split is None else split.chunk_size,
         single_pass=single_pass,
         v41_compute_mode="fp8",
-        v41_heads_per_block=(8 if query.cache_format == "deepseek_v41" and not single_pass
-                             and query.num_q_heads % 16 else 16),
+        v41_heads_per_block=(
+            8
+            if query.cache_format == "deepseek_v41"
+            and not single_pass
+            and query.num_q_heads % 16
+            else 16
+        ),
     )
 
 
@@ -168,9 +179,14 @@ def _validate_query(query: SparseMlaQuery, _device: DeviceIdentity | None) -> No
         raise ValueError("compressed MLA widths must be nonnegative")
     if query.swa_page_size <= 0 or query.indexed_page_size <= 0:
         raise ValueError("compressed MLA page sizes must be positive")
-    if not query.indexed_cache_present and (query.indexed_cache_shape is not None or query.indexed_cache_stride is not None):
+    if not query.indexed_cache_present and (
+        query.indexed_cache_shape is not None or query.indexed_cache_stride is not None
+    ):
         raise ValueError("absent indexed cache cannot carry storage metadata")
-    if query.lse_scale not in ("base2", "natural") or query.output_mode not in ("internal", "provided"):
+    if query.lse_scale not in ("base2", "natural") or query.output_mode not in (
+        "internal",
+        "provided",
+    ):
         raise ValueError("invalid compressed MLA numerical/output contract")
     if len(query.q_shape) not in (3, 4) or len(query.q_shape) != len(query.q_stride):
         raise ValueError("q metadata must retain its rank and strides")
@@ -199,7 +215,11 @@ def _validate_config(
         raise ValueError("v41_compute_mode must be 'bf16' or 'fp8'")
     if config.v41_heads_per_block not in (8, 16):
         raise ValueError("v41_heads_per_block must be 8 or 16")
-    fp8_decode = query.cache_format == "deepseek_v41" and not config.single_pass and config.v41_compute_mode == "fp8"
+    fp8_decode = (
+        query.cache_format == "deepseek_v41"
+        and not config.single_pass
+        and config.v41_compute_mode == "fp8"
+    )
     if not fp8_decode and config.v41_heads_per_block != 16:
         raise ValueError("head grouping only configures V4.1 FP8 decode")
     if fp8_decode and config.v41_heads_per_block == 16 and query.num_q_heads % 16:
@@ -211,8 +231,13 @@ def _validate_config(
             raise ValueError("single-pass compressed MLA has no split workspace")
         return
     split = _split_config(query, config.max_chunks_per_row)
-    if split.num_chunks > config.max_chunks_per_row or split.chunk_size != config.split_chunk_size:
-        raise ValueError("compressed MLA config is inconsistent with the declared split contract")
+    if (
+        split.num_chunks > config.max_chunks_per_row
+        or split.chunk_size != config.split_chunk_size
+    ):
+        raise ValueError(
+            "compressed MLA config is inconsistent with the declared split contract"
+        )
 
 
 def _parameters(

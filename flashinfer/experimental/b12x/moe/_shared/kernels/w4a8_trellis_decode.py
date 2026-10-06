@@ -71,10 +71,38 @@ def _w4a8_stage_trellis_b_tile(
 # (tests/moe/test_w4a8_fragment_probe.py::_NATIVE_MMA_K32_PERM). The UE8M0
 # scale group is unchanged because the permutation stays inside one K32.
 _W4A8_TRELLIS_A_K32_PERM = (
-    0, 1, 8, 9, 4, 5, 12, 13,
-    2, 3, 10, 11, 6, 7, 14, 15,
-    20, 21, 28, 29, 16, 17, 24, 25,
-    22, 23, 30, 31, 18, 19, 26, 27,
+    0,
+    1,
+    8,
+    9,
+    4,
+    5,
+    12,
+    13,
+    2,
+    3,
+    10,
+    11,
+    6,
+    7,
+    14,
+    15,
+    20,
+    21,
+    28,
+    29,
+    16,
+    17,
+    24,
+    25,
+    22,
+    23,
+    30,
+    31,
+    18,
+    19,
+    26,
+    27,
 )
 
 
@@ -220,6 +248,7 @@ def _w4a8_trellis_pair_words(
     peer = Uint32(cute.arch.shuffle_sync_bfly(send, offset=2))
     return own, peer
 
+
 @cute.jit
 def _w4a8_trellis_decode_both(
     smem_base: Int32,
@@ -280,11 +309,25 @@ def _w4a8_trellis_pair_words_both(
     """
 
     e0_lo, e0_hi = _w4a8_trellis_decode_both(
-        smem_base, base0_u32, ia, ib, s2, bits, lut_addr, lut_in_smem,
+        smem_base,
+        base0_u32,
+        ia,
+        ib,
+        s2,
+        bits,
+        lut_addr,
+        lut_in_smem,
         direct_lut,
     )
     e1_lo, e1_hi = _w4a8_trellis_decode_both(
-        smem_base, base1_u32, ia, ib, s2, bits, lut_addr, lut_in_smem,
+        smem_base,
+        base1_u32,
+        ia,
+        ib,
+        s2,
+        bits,
+        lut_addr,
+        lut_in_smem,
         direct_lut,
     )
     c = lane & Int32(3)

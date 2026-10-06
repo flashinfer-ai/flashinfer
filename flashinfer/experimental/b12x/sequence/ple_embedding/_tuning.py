@@ -1,4 +1,5 @@
 """Fixed native hash-and-lookup preparation contract for PLE tables."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -36,7 +37,11 @@ def _validate_query(query, device):
         raise ValueError("unsupported PLE table storage")
     if query.output_dtype != "bfloat16":
         raise ValueError("PLE embedding output must be BF16")
-    if type(query.embedding_dim) is not int or query.embedding_dim <= 0 or query.embedding_dim % query.head_count:
+    if (
+        type(query.embedding_dim) is not int
+        or query.embedding_dim <= 0
+        or query.embedding_dim % query.head_count
+    ):
         raise ValueError("embedding_dim must be positive and divisible by head_count")
     if type(query.tp_size) is not int or query.tp_size <= 0:
         raise ValueError("tp_size must be positive")
@@ -48,13 +53,20 @@ def _validate_query(query, device):
         raise ValueError("TP-local PLE weight extent must fit signed int64 indexing")
     if query.quant_mode == "nvfp4_group16" and query.head_dim % 16:
         raise ValueError("NVFP4 table head_dim must be divisible by 16")
-    if len(query.lookup_alignments) != 4 or any(type(value) is not int or value not in (1, 2, 4, 8, 16) for value in query.lookup_alignments):
+    if len(query.lookup_alignments) != 4 or any(
+        type(value) is not int or value not in (1, 2, 4, 8, 16)
+        for value in query.lookup_alignments
+    ):
         raise ValueError("invalid PLE lookup pointer alignment")
 
 
 PleEmbeddingConfig = BackendConfig
 TUNING = replace(
-    make_fixed_contract(component_id="sequence.ple_embedding", query_type=PleEmbeddingQuery, backend="triton"),
+    make_fixed_contract(
+        component_id="sequence.ple_embedding",
+        query_type=PleEmbeddingQuery,
+        backend="triton",
+    ),
     query_schema_version=3,
     validate_query=_validate_query,
 )

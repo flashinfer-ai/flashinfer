@@ -31,7 +31,9 @@ def _prepare(caps, tensors, *, restore_state=None):
     if restore_state is None:
         original_state = tensors["recurrent_state"].clone()
         restore_state = lambda: tensors["recurrent_state"].copy_(original_state)
-    declaration = gdn.plan(caps, invocation=gdn.invocation_from_tensors(caps, **tensors))
+    declaration = gdn.plan(
+        caps, invocation=gdn.invocation_from_tensors(caps, **tensors)
+    )
 
     def restore():
         restore_state()
@@ -40,14 +42,19 @@ def _prepare(caps, tensors, *, restore_state=None):
     def prepare_call(state):
         if "scratch" not in tensors:
             (spec,) = state.layout.scratch_specs()
-            tensors["scratch"] = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            tensors["scratch"] = torch.empty(
+                spec.shape, dtype=spec.dtype, device=spec.device
+            )
         binding = state.bind(**tensors)
         return PreparedCall(run=lambda: state.run(binding), restore=restore)
 
     resources = _case_resources.get()
-    session = resources.enter_context(PreparationSession(device=caps.device, autotune=False, compile_workers=2))
+    session = resources.enter_context(
+        PreparationSession(device=caps.device, autotune=False, compile_workers=2)
+    )
     request = declaration.request(
-        name="gdn", prepare_call=prepare_call,
+        name="gdn",
+        prepare_call=prepare_call,
     )
     resources.enter_context(session.prepare((request,)))
     return gdn.bind(declaration, **tensors)
@@ -276,9 +283,11 @@ def test_bounded_views_reuse_planned_kernels(
     def reject_resolution(*args, **kwargs):
         pytest.fail("Bound capacities must reuse warmed planned kernels")
 
-    monkeypatch.setattr(_kernels._gated_rmsnorm_kernel, "_do_compile", reject_resolution)
+    monkeypatch.setattr(
+        _kernels._gated_rmsnorm_kernel, "_do_compile", reject_resolution
+    )
 
-    with kernel_resolution_guard('Qwen GDN bounded-view replay qualification'):
+    with kernel_resolution_guard("Qwen GDN bounded-view replay qualification"):
         for rows, requests, columns in ((1, 1, 1), (4, 1, 4), (8, 2, 4), (2, 1, 2)):
             live = dict(tensors)
             for name in ("mixed_qkv", "a", "b", "z", "output"):
@@ -727,10 +736,17 @@ def test_qwen_binding_rejects_equal_head_kda_execution() -> None:
 
 @pytest.mark.parametrize("query_lengths", [(4,), (4, 4)])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_small_softplus_with_large_rate_preserves_decay(query_lengths, state_dtype) -> None:
+def test_small_softplus_with_large_rate_preserves_decay(
+    query_lengths, state_dtype
+) -> None:
     device = require_sm120()
-    binding, _ = _make_case(device=device, query_lengths=query_lengths,
-                           key_heads=2, value_heads=6, state_dtype=state_dtype)
+    binding, _ = _make_case(
+        device=device,
+        query_lengths=query_lengths,
+        key_heads=2,
+        value_heads=6,
+        state_dtype=state_dtype,
+    )
     binding.a.fill_(-20)
     binding.A_log.fill_(20)
     binding.dt_bias.zero_()
@@ -748,7 +764,9 @@ def test_small_softplus_with_large_rate_preserves_decay(query_lengths, state_dty
     torch.testing.assert_close(binding.output, expected, rtol=1e-2, atol=2e-2)
     state_rtol = 1e-2 if state_dtype == torch.bfloat16 else 1e-5
     state_atol = 8e-3 if state_dtype == torch.bfloat16 else 2e-5
-    torch.testing.assert_close(binding.recurrent_state, state_reference, rtol=state_rtol, atol=state_atol)
+    torch.testing.assert_close(
+        binding.recurrent_state, state_reference, rtol=state_rtol, atol=state_atol
+    )
 
 
 def test_qwen_bf16_state_uses_cute_recurrence() -> None:
@@ -933,8 +951,12 @@ def test_bind_rejects_scratch_alias_with_mutable_output() -> None:
 def test_distant_state_slots_across_requests_match_reference() -> None:
     device = require_sm120()
     binding, _ = _make_case(
-        device=device, query_lengths=(1, 1), max_seqs=16,
-        state_slots=129, key_heads=1, value_heads=3,
+        device=device,
+        query_lengths=(1, 1),
+        max_seqs=16,
+        state_slots=129,
+        key_heads=1,
+        value_heads=3,
     )
     binding.state_indices[:2, 0].copy_(
         torch.tensor([0, 128], dtype=torch.int32, device=device)
@@ -1100,8 +1122,11 @@ def test_qwen_grouped_state_slot_offset_past_int32_boundary() -> None:
         output=output,
     )
     binding = _prepare(
-        caps, tensors,
-        restore_state=lambda: recurrent_state[tail_slot : tail_slot + 1].copy_(compact_reference_state),
+        caps,
+        tensors,
+        restore_state=lambda: recurrent_state[tail_slot : tail_slot + 1].copy_(  # noqa: F821  # undefined in the b12x migration (#5767)
+            compact_reference_state
+        ),
     )
     expected = gdn.reference.decode(
         mixed_qkv,

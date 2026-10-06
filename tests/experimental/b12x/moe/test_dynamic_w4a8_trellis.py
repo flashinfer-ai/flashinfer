@@ -44,10 +44,8 @@ _BITS = 2
 def _h128(device: torch.device) -> torch.Tensor:
     h = torch.ones(1, 1, dtype=torch.float64)
     while h.shape[0] < 128:
-        h = torch.cat(
-            (torch.cat((h, h), dim=1), torch.cat((h, -h), dim=1)), dim=0
-        )
-    return (h / (128.0 ** 0.5)).to(device=device, dtype=torch.float32)
+        h = torch.cat((torch.cat((h, h), dim=1), torch.cat((h, -h), dim=1)), dim=0)
+    return (h / (128.0**0.5)).to(device=device, dtype=torch.float32)
 
 
 def _run_trellis_dynamic(
@@ -91,17 +89,11 @@ def _run_trellis_dynamic(
                 "topk_ids_override must have shape "
                 f"{(m, top_k)}, got {tuple(topk_ids_override.shape)}"
             )
-        topk_ids = topk_ids_override.to(
-            device=device, dtype=torch.int32
-        ).contiguous()
-    topk_weights = torch.softmax(
-        torch.randn(m, top_k, device=device), dim=-1
-    ).float()
+        topk_ids = topk_ids_override.to(device=device, dtype=torch.int32).contiguous()
+    topk_weights = torch.softmax(torch.randn(m, top_k, device=device), dim=-1).float()
 
     active_routes = (topk_ids >= 0) & (topk_ids < E)
-    reference_ids = torch.where(
-        active_routes, topk_ids, torch.zeros_like(topk_ids)
-    )
+    reference_ids = torch.where(active_routes, topk_ids, torch.zeros_like(topk_ids))
     reference_weights = torch.where(
         active_routes, topk_weights, torch.zeros_like(topk_weights)
     )
@@ -190,12 +182,9 @@ def _run_trellis_dynamic(
     flat_weights = topk_weights.reshape(-1).contiguous()
 
     import os as _os
+
     _direct = direct or _os.environ.get("BENCH_DIRECT", "0") == "1"
-    _share = (
-        split_materialized
-        or _direct
-        or _os.environ.get("BENCH_SHARE", "0") == "1"
-    )
+    _share = split_materialized or _direct or _os.environ.get("BENCH_SHARE", "0") == "1"
     if recipe == "w4a8_trellis":
         kernel = MoEDynamicKernelBackend(
             16,
@@ -225,16 +214,20 @@ def _run_trellis_dynamic(
         )
         w13_flat = torch.zeros(
             E * (w1_n // 256) * (K // 128) * 4096,
-            dtype=torch.int32, device=device,
+            dtype=torch.int32,
+            device=device,
         )
         down_flat = torch.zeros(
             E * (K // 256) * (n // 128) * 4096,
-            dtype=torch.int32, device=device,
+            dtype=torch.int32,
+            device=device,
         )
         sentinel_u32 = torch.zeros(
-            max(E * (w1_n // 256) * (K // 128) * 256,
-                E * (K // 256) * (n // 128) * 256),
-            dtype=torch.uint32, device=device,
+            max(
+                E * (w1_n // 256) * (K // 128) * 256, E * (K // 256) * (n // 128) * 256
+            ),
+            dtype=torch.uint32,
+            device=device,
         )
     launch = _DynamicMoEW4A8Launch(kernel, k=K, n=n, w1_n=w1_n, num_topk=top_k)
 
@@ -247,9 +240,7 @@ def _run_trellis_dynamic(
     )
 
     def fake_ptr_u8():
-        return make_ptr(
-            cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
-        )
+        return make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
 
     def fake_ptr_i32():
         return make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
@@ -267,22 +258,49 @@ def _run_trellis_dynamic(
         fake_ptr_u8(),
         fake_ptr_u8(),
         fake_ptr_u32(),
-        _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)),
-        _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)), _fake_i32((1,)),
-        fake_ptr_i32(), fake_ptr_i32(), fake_ptr_i32(),
-        fake_ptr_i32(), fake_ptr_i32(), fake_ptr_i32(), fake_ptr_i32(),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        _fake_i32((1,)),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
+        fake_ptr_i32(),
         b_w13_fake,
         make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16),
         b_down_fake,
         make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16),
-        fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(),
-        fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(),
-        _fake_i32((E,)), _fake_i32((E,)), _fake_i32((E + 1,)),
-        _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)),
+        fake_ptr_u8(),
+        fake_ptr_u8(),
+        fake_ptr_u8(),
+        fake_ptr_u8(),
+        fake_ptr_u32(),
+        fake_ptr_u32(),
+        fake_ptr_u32(),
+        fake_ptr_u32(),
+        _fake_i32((E,)),
+        _fake_i32((E,)),
+        _fake_i32((E + 1,)),
+        _fake_f32((E,)),
+        _fake_f32((E,)),
+        _fake_f32((E,)),
+        _fake_f32((E,)),
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_i32(),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
-        1, 1, 1, 1, 1, 1, 1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
         current_cuda_stream(),
         fake_ptr_u8(),
         make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -315,8 +333,13 @@ def _run_trellis_dynamic(
         _gptr(cutlass.Uint8, packed_a),
         _gptr(cutlass.Uint8, scale_flat),
         _gptr(cutlass.Uint32, intermediate_u32),
-        barrier_count, barrier_epoch, pair_head, producers_done, all_pub,
-        task_head, task_tail,
+        barrier_count,
+        barrier_epoch,
+        pair_head,
+        producers_done,
+        all_pub,
+        task_head,
+        task_tail,
         _gptr(cutlass.Int32, task_ready, 4),
         _gptr(cutlass.Int32, task_expert, 4),
         _gptr(cutlass.Int32, task_m_tile, 4),
@@ -336,8 +359,13 @@ def _run_trellis_dynamic(
         _gptr(cutlass.Uint32, sentinel_u32),
         _gptr(cutlass.Uint32, down_flat),
         _gptr(cutlass.Uint32, sentinel_u32),
-        row_counts, expert_write_rows, expert_tile_base,
-        ones, ones, ones, ones,
+        row_counts,
+        expert_write_rows,
+        expert_tile_base,
+        ones,
+        ones,
+        ones,
+        ones,
         _gptr(cutlass.BFloat16, scatter_output),
         _gptr(cutlass.Int32, token_map, 4),
         _gptr(cutlass.Float32, token_weights, 4),
@@ -503,7 +531,9 @@ def test_dynamic_trellis_intermediate_hadamard_matches_scaffold(m: int) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("intermediate_hadamard", [False, True])
-def test_dynamic_trellis_direct_table_matches_value_table(intermediate_hadamard: bool) -> None:
+def test_dynamic_trellis_direct_table_matches_value_table(
+    intermediate_hadamard: bool,
+) -> None:
     """The direct table precomposes the lut_e4m3 permutation with the value
     table, so the split phase kernels decode identical weight
     bytes under either mode (pinned bit-level by
@@ -512,8 +542,16 @@ def test_dynamic_trellis_direct_table_matches_value_table(intermediate_hadamard:
     within that noise floor and against the reference."""
 
     kwargs = dict(
-        activation="situ", E=8, m=96, K=512, n=256, top_k=4,
-        seed=20260812, tile_m=64, split_materialized=True, intermediate_hadamard=intermediate_hadamard,
+        activation="situ",
+        E=8,
+        m=96,
+        K=512,
+        n=256,
+        top_k=4,
+        seed=20260812,
+        tile_m=64,
+        split_materialized=True,
+        intermediate_hadamard=intermediate_hadamard,
     )
     got_value_table, want = _run_trellis_dynamic(**kwargs, direct_lut=False)
     got_direct, _ = _run_trellis_dynamic(**kwargs, direct_lut=True)

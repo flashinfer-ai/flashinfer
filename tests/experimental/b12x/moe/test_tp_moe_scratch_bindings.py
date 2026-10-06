@@ -21,6 +21,8 @@ from b12x.moe.fused_moe._impl import (
 from b12x.moe._shared.execution import PreparedWeightLayout
 from b12x.moe._shared.kernels.w4a8.weights import repack_w4a8_weights
 from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
+
 def _weight_plan(
     quant_mode: str = "nvfp4",
     *,
@@ -126,7 +128,10 @@ def test_w4a16_prefill_reduction_freezes_caller_scratch_contract(monkeypatch):
     assert (
         fused.layout.core_workspace_nbytes < materialized.layout.core_workspace_nbytes
     )
-    assert calibrated.layout.core_workspace_nbytes == materialized.layout.core_workspace_nbytes
+    assert (
+        calibrated.layout.core_workspace_nbytes
+        == materialized.layout.core_workspace_nbytes
+    )
 
 
 def test_dynamic_deterministic_output_is_opt_in(
@@ -699,7 +704,9 @@ def test_trellis_scratch_plan_resolves_default_route_block(
         weight_plan=weight_plan,
         quant_mode="w4a16",
         decode_config=MoeDecodeConfig(
-            backend="w4a16", route_planner="internal", max_active_clusters=None,
+            backend="w4a16",
+            route_planner="internal",
+            max_active_clusters=None,
         ),
     )
 
@@ -718,20 +725,32 @@ def test_trellis_route_block_respects_fixed_tile_shared_memory(
 ) -> None:
     """Packed projection tiles constrain route size before launches are compiled."""
     monkeypatch.setattr(
-        torch.cuda, "get_device_properties",
+        torch.cuda,
+        "get_device_properties",
         lambda _device: SimpleNamespace(shared_memory_per_block_optin=shared_memory),
     )
     plan = plan_b12x_fp4_moe_weights(
-        quant_modes="w4a16", source_format="exl3", trellis_codebook="lut_e4m3",
-        activation="silu", params_dtype=torch.bfloat16,
-        num_experts=2, hidden_size=512, intermediate_size=256,
-        trellis_bits=2, trellis_tile_config=(128, 128, 128, 128),
+        quant_modes="w4a16",
+        source_format="exl3",
+        trellis_codebook="lut_e4m3",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=2,
+        hidden_size=512,
+        intermediate_size=256,
+        trellis_bits=2,
+        trellis_tile_config=(128, 128, 128, 128),
     )
     caps = TPMoEScratchCaps(
-        max_tokens=129, num_topk=2, device="cuda:0", weight_plan=plan,
+        max_tokens=129,
+        num_topk=2,
+        device="cuda:0",
+        weight_plan=plan,
         quant_mode="w4a16",
         decode_config=MoeDecodeConfig(
-            backend="w4a16", route_planner="internal", max_active_clusters=None,
+            backend="w4a16",
+            route_planner="internal",
+            max_active_clusters=None,
         ),
     )
     assert tp_moe_impl._resolve_trellis_route_block_size(caps) == expected_rows
@@ -1174,7 +1193,8 @@ def test_tp_moe_fp4_binding_rehydrates_micro_workspace_view(
 
 @pytest.mark.parametrize("layout", ["vector", "scalar", "strided", "float64"])
 def test_dynamic_scale_binding_maps_views_and_refresh_observes_live_values(
-    monkeypatch: pytest.MonkeyPatch, layout: str,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
 ) -> None:
     plan = plan_tp_moe_scratch(_caps(max_tokens=400, route_num_experts=0))
     scratch = _scratch_for_plan(plan)
@@ -1195,11 +1215,16 @@ def test_dynamic_scale_binding_maps_views_and_refresh_observes_live_values(
     with monkeypatch.context() as guard:
         guard.setattr(torch.Tensor, "copy_", reject_copy)
         binding = plan.bind(
-            scratch=scratch, **_binding_args(tensors, experts), output=output,
+            scratch=scratch,
+            **_binding_args(tensors, experts),
+            output=output,
         )
     workspace = SimpleNamespace(
-        input_gs=binding.input_gs, down_input_scale=binding.down_input_scale,
-        weight_E=8, input_gs_src_ptr=0, down_input_scale_src_ptr=0,
+        input_gs=binding.input_gs,
+        down_input_scale=binding.down_input_scale,
+        weight_E=8,
+        input_gs_src_ptr=0,
+        down_input_scale_src_ptr=0,
     )
     assert (binding.input_gs.data_ptr() == experts.a1_gscale.data_ptr()) == (
         layout == "vector"
@@ -1211,14 +1236,18 @@ def test_dynamic_scale_binding_maps_views_and_refresh_observes_live_values(
             if layout == "vector":
                 guard.setattr(torch.Tensor, "copy_", reject_copy)
             tp_moe_impl._refresh_dynamic_workspace_scales(
-                workspace, experts.a1_gscale, experts.a2_gscale,
+                workspace,
+                experts.a1_gscale,
+                experts.a2_gscale,
                 input_scales_static=False,
             )
         torch.testing.assert_close(
-            binding.input_gs, experts.a1_gscale.expand(8).float(),
+            binding.input_gs,
+            experts.a1_gscale.expand(8).float(),
         )
         torch.testing.assert_close(
-            binding.down_input_scale, experts.a2_gscale.expand(8).float(),
+            binding.down_input_scale,
+            experts.a2_gscale.expand(8).float(),
         )
 
 

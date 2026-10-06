@@ -13,7 +13,6 @@ from safetensors.torch import save_file
 from b12x.loader import DirectWeightSession
 
 
-
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -55,7 +54,6 @@ def test_transform_materialization_owns_values_after_session_close(tmp_path):
     path = tmp_path / "transform.safetensors"
     save_file({"weight": expected}, path)
     with (
-
         DirectWeightSession() as session,
     ):
         source = dict(session.weights([path]))["weight"][:, 64:]
@@ -65,9 +63,7 @@ def test_transform_materialization_owns_values_after_session_close(tmp_path):
 
 
 @pytest.mark.parametrize("offset", [0, 4103, 2**32 + 4103])
-def test_ring_reads_exact_bytes_with_large_file_offsets(
-    tmp_path, offset
-):
+def test_ring_reads_exact_bytes_with_large_file_offsets(tmp_path, offset):
     path = tmp_path / "payload"
     expected = bytes(range(256)) * 65537
     with path.open("wb") as output:
@@ -82,10 +78,26 @@ def test_ring_reads_exact_bytes_with_large_file_offsets(
             path.open("rb") as buffered,
             pytest.raises(RuntimeError, match="requires O_DIRECT"),
         ):
-            session._execute(array("Q", (buffered.fileno(), offset, len(expected), target.data_ptr(), 0, 1, 0, 0)))
+            session._execute(
+                array(
+                    "Q",
+                    (
+                        buffered.fileno(),
+                        offset,
+                        len(expected),
+                        target.data_ptr(),
+                        0,
+                        1,
+                        0,
+                        0,
+                    ),
+                )
+            )
         fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
         try:
-            session._execute(array("Q", (fd, offset, len(expected), target.data_ptr(), 0, 1, 0, 0)))
+            session._execute(
+                array("Q", (fd, offset, len(expected), target.data_ptr(), 0, 1, 0, 0))
+            )
         finally:
             os.close(fd)
         stats = session.stats()
@@ -155,7 +167,9 @@ def test_truncated_direct_input_fails_without_buffered_retry(tmp_path):
         fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
         try:
             with pytest.raises(RuntimeError, match="file range"):
-                session._execute(array("Q", (fd, 0, 8192, target.data_ptr(), 0, 1, 0, 0)))
+                session._execute(
+                    array("Q", (fd, 0, 8192, target.data_ptr(), 0, 1, 0, 0))
+                )
         finally:
             os.close(fd)
 
@@ -178,9 +192,7 @@ def test_dtype_conversion_reuses_bounded_gpu_scratch(tmp_path, dtype):
 
 
 @pytest.mark.parametrize("count", [0, 1, 48, 65536, (8 << 20) + 2])
-def test_bf16_expands_in_ring_without_extra_transform_scratch(
-    tmp_path, count
-):
+def test_bf16_expands_in_ring_without_extra_transform_scratch(tmp_path, count):
     path = tmp_path / "model.safetensors"
     # Include every BF16 bit pattern, including signed zeros, subnormals and NaNs.
     bits = torch.arange(count, dtype=torch.int32).to(torch.int16)
@@ -212,7 +224,6 @@ def test_batch_reorders_disjoint_destinations_and_retains_views_until_completion
     expected = torch.arange(1024 * 1024, dtype=torch.float32).reshape(256, -1)
     save_file({"weight": expected}, path)
     with (
-
         DirectWeightSession(io_threads=4, read_mode="bounce") as session,
     ):
         source = dict(session.weights([path]))["weight"]
@@ -290,16 +301,18 @@ def test_cpu_scale_descriptors_keep_sources_alive_and_write_in_one_batch():
 
 
 @pytest.mark.parametrize("io_threads", [1, 8, 16])
-def test_bounce_ring_recycles_slots_without_changing_final_weights(tmp_path, io_threads):
+def test_bounce_ring_recycles_slots_without_changing_final_weights(
+    tmp_path, io_threads
+):
     """A payload larger than both the ring and batch chunk must survive reuse."""
     path = tmp_path / "large.safetensors"
     expected = torch.arange((18 << 20) + 129, dtype=torch.int32)
     save_file({"weight": expected}, path)
-    with DirectWeightSession(
-        io_threads=io_threads, read_mode="bounce"
-    ) as session:
+    with DirectWeightSession(io_threads=io_threads, read_mode="bounce") as session:
         source = dict(session.weights([path]))["weight"]
-        backing = torch.full((expected.numel() + 2,), -1, device="cuda", dtype=expected.dtype)
+        backing = torch.full(
+            (expected.numel() + 2,), -1, device="cuda", dtype=expected.dtype
+        )
         target = backing[1:-1]
         session(target, source)
         session.flush()
@@ -342,7 +355,10 @@ def test_preexisting_cuda_storage_survives_session_and_orders_loading_stream(tmp
 def test_expandable_weights_span_cuda_mappings_and_reject_unmapped_tail(tmp_path):
     """Large ordinary weights cross mapping boundaries; reserved VA is not storage."""
     subprocess.run(
-        [sys.executable, "-c", textwrap.dedent("""
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
             import ctypes as c
             import sys
             from array import array
@@ -378,9 +394,14 @@ def test_expandable_weights_span_cuda_mappings_and_reject_unmapped_tail(tmp_path
                     assert "CUDA device allocation" in str(error), error
                 else:
                     raise AssertionError("accepted an unmapped destination tail")
-        """), str(tmp_path / "expandable.safetensors")],
-        env={**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-             "PYTORCH_ALLOC_CONF": "expandable_segments:True"},
+        """),
+            str(tmp_path / "expandable.safetensors"),
+        ],
+        env={
+            **os.environ,
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+        },
         check=True,
         timeout=60,
     )

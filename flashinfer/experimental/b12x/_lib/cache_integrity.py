@@ -52,10 +52,16 @@ def valid_object(object_path: Path, manifest_path: Path, cache_key: str) -> bool
         object_identity = _file_identity(object_path)
         manifest_identity = _file_identity(manifest_path)
         valid = _validate_object(
-            object_path, manifest_path, cache_key, object_identity,
+            object_path,
+            manifest_path,
+            cache_key,
+            object_identity,
         )
-        return (valid and object_identity == _file_identity(object_path)
-                and manifest_identity == _file_identity(manifest_path))
+        return (
+            valid
+            and object_identity == _file_identity(object_path)
+            and manifest_identity == _file_identity(manifest_path)
+        )
     except (OSError, ValueError, UnicodeError):
         return False
 
@@ -91,7 +97,10 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
-            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False,
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
         ) as stream:
             temporary = stream.name
             stream.write(data)

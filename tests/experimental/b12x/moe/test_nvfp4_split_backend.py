@@ -46,9 +46,7 @@ _TILE_N = 128
 
 
 def _fake_i32(shape):
-    return cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, shape, assumed_align=4
-    )
+    return cute.runtime.make_fake_compact_tensor(cutlass.Int32, shape, assumed_align=4)
 
 
 def _fake_f32(shape):
@@ -206,9 +204,7 @@ def _compile_launch(domain, *, materialize: bool, spec_name: str):
         _fake_f32((E,)),
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_i32(),
-        make_ptr(
-            cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16
-        ),
+        make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
         1,
         1,
         1,
@@ -408,8 +404,7 @@ def test_nvfp4_split_cuda_graph_replay_bitwise_and_allocations() -> None:
         ), f"replay {replay_idx} is not bitwise identical"
     after = torch.cuda.memory_allocated()
     assert before == after, (
-        "CUDA-graph replay allocated new device memory "
-        f"({before} -> {after} bytes)"
+        f"CUDA-graph replay allocated new device memory ({before} -> {after} bytes)"
     )
 
 
@@ -479,7 +474,9 @@ def test_nvfp4_split_backend_rejects_invalid_materialized_combos() -> None:
         ("dynamic down scale", {"dynamic_down_scale": True}),
     ]:
         try:
-            MoEDynamicKernelBackend(**{**base, "share_input_across_experts": True, **bad})
+            MoEDynamicKernelBackend(
+                **{**base, "share_input_across_experts": True, **bad}
+            )
             pytest.fail(f"{name}: expected ValueError but construction succeeded")
         except ValueError:
             pass

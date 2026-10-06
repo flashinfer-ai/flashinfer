@@ -1,4 +1,5 @@
 """Validated, file-backed CuTe artifacts for preparation peer transfers."""
+
 from __future__ import annotations
 
 import fcntl
@@ -14,12 +15,16 @@ class CuTeArtifactCache:
     def __init__(self, root: Path | None = None):
         if root is None:
             from b12x._lib.compiler import _cute_compile_cache_dir
+
             root = _cute_compile_cache_dir()
         self.root = Path(root)
 
     def path(self, key: str, suffix: str) -> Path:
-        if (len(key) != 64 or any(c not in "0123456789abcdef" for c in key)
-                or suffix not in (".o", ".json", ".lock")):
+        if (
+            len(key) != 64
+            or any(c not in "0123456789abcdef" for c in key)
+            or suffix not in (".o", ".json", ".lock")
+        ):
             raise ValueError("invalid CuTe artifact path")
         return self.root / key[:2] / (key + suffix)
 
@@ -35,7 +40,9 @@ class CuTeArtifactCache:
 
     def publish(self, key: str, staged: Path) -> bool:
         """Publish a verified pair without waiting for an active local compiler."""
-        object_path, manifest_path = (staged / (key + suffix) for suffix in (".o", ".json"))
+        object_path, manifest_path = (
+            staged / (key + suffix) for suffix in (".o", ".json")
+        )
         if not valid_object(object_path, manifest_path, key):
             return False
         with self.path(key, ".lock").open("a") as lock:

@@ -23,6 +23,7 @@ Scaling mirrors the validated ``test_dense_gemm_mxfp6_*`` recipe: each operand
 uses a bf16 global-scale that maps its amax into FP6 range, and
 ``alpha = 1 / (a_gscale * b_gscale)`` undoes both at the epilogue.
 """
+
 from __future__ import annotations
 
 import os
@@ -53,13 +54,15 @@ _DENSE_PER_ROW_GS = os.getenv("B12X_DENSE_PER_ROW_GS", "1").lower() not in (
     "0",
     "false",
 )
-_PERSISTENT_SCRATCH = os.getenv(
-    "B12X_DENSE_PERSISTENT_SCRATCH", "1"
-).lower() not in ("0", "false")
+_PERSISTENT_SCRATCH = os.getenv("B12X_DENSE_PERSISTENT_SCRATCH", "1").lower() not in (
+    "0",
+    "false",
+)
 # The fallback host chain and in-kernel per-row scaling are bit-identical.
-_PER_ROW_IN_KERNEL = os.getenv(
-    "B12X_DENSE_PER_ROW_IN_KERNEL", "1"
-).lower() not in ("0", "false")
+_PER_ROW_IN_KERNEL = os.getenv("B12X_DENSE_PER_ROW_IN_KERNEL", "1").lower() not in (
+    "0",
+    "false",
+)
 # Applies the per-row output correction inside the GEMM epilogue instead of as
 # a trailing ``result.mul_(inv_gs)``. Bit-identical by construction: the
 # epilogue reproduces both roundings to bf16 that the eager multiply performs
@@ -83,9 +86,7 @@ def _small_m_quant_scratch(m_pad: int, k: int, device: torch.device) -> tuple:
     capturing = device.type == "cuda" and torch.cuda.is_current_stream_capturing()
     # Stream ownership permits independent main and side-stream execution.
     stream = (
-        torch.cuda.current_stream(device).cuda_stream
-        if device.type == "cuda"
-        else 0
+        torch.cuda.current_stream(device).cuda_stream if device.type == "cuda" else 0
     )
     key = (device.type, device.index or 0, stream, m_pad, k)
     bucket_key = (device.type, device.index or 0, m_pad, k)
@@ -118,6 +119,7 @@ def _small_m_quant_scratch(m_pad: int, k: int, device: torch.device) -> tuple:
     if _PERSISTENT_SCRATCH and not capturing:
         _QUANT_SCRATCH[key] = entry
     return entry
+
 
 # Minimum out_features for which the GEMM streams the 3:4-packed weight
 # directly (``b_packed=True``) instead of a cached 1-byte/code expansion.
@@ -523,13 +525,11 @@ def dense_fp6_linear_expanded(
     _per_row_in_kernel = _per_row and not _fused_quant and _PER_ROW_IN_KERNEL
     if _per_row and not _per_row_in_kernel:
         _num = mx_gs_numerator(a_fmt)
-        a_amax_pr = x.abs().amax(dim=1, keepdim=True).float()      # (m, 1)
+        a_amax_pr = x.abs().amax(dim=1, keepdim=True).float()  # (m, 1)
         # f64 division followed by an f32 cast matches div.rn.f32 in the GPU
         # kernels and keeps the BF16 pre-scale bit-identical.
-        a_gs_pr = (
-            _num / a_amax_pr.clamp_min_(1e-6).double()
-        ).float()                                                  # (m, 1)
-        x = (x.float() * a_gs_pr).to(torch.bfloat16)               # pre-scaled
+        a_gs_pr = (_num / a_amax_pr.clamp_min_(1e-6).double()).float()  # (m, 1)
+        x = (x.float() * a_gs_pr).to(torch.bfloat16)  # pre-scaled
         _gs_unit = torch.ones(1, dtype=torch.float32, device=device)
     else:
         a_gs_pr = None
@@ -550,12 +550,8 @@ def dense_fp6_linear_expanded(
             a_codes = _scratch.packed_a_storage.view(m_pad, k)
             a_scale = _scratch.scale_storage
         else:
-            a_codes = torch.zeros(
-                m_pad, k, dtype=torch.uint8, device=device
-            )
-            a_scale = torch.zeros(
-                m_pad * k // 32, dtype=torch.uint8, device=device
-            )
+            a_codes = torch.zeros(m_pad, k, dtype=torch.uint8, device=device)
+            a_scale = torch.zeros(m_pad * k // 32, dtype=torch.uint8, device=device)
     elif m <= _SMALL_M_QUANT_MAX:
         if _per_row_in_kernel:
             # The kernel computes row amax, applies the BF16 pre-scale,
@@ -593,9 +589,7 @@ def dense_fp6_linear_expanded(
             a_codes, a_scale = _quantize_matrix_fp6_bytes(x, a_fmt, _gs_unit)
             alpha = torch.reciprocal(_gs_unit * global_scale)
         else:
-            a_amax_raw = torch.linalg.vector_norm(
-                x, ord=float("inf")
-            ).reshape(1)
+            a_amax_raw = torch.linalg.vector_norm(x, ord=float("inf")).reshape(1)
             # f64 divide + cast = correctly-rounded f32 division; keeps this
             # per-tensor fallback bit-consistent with the small-M kernel's
             # in-kernel div.rn gs (see the per-row comment above).
@@ -619,9 +613,7 @@ def dense_fp6_linear_expanded(
     # ``inv_gs_pr`` is a contiguous bf16 (m,) buffer that both per-row quant
     # kernels write; the (m, 1) view exists only for the broadcast multiply.
     _row_scale = (
-        inv_gs_pr.view(m)
-        if _ROW_SCALE_EPILOGUE and inv_gs_pr is not None
-        else None
+        inv_gs_pr.view(m) if _ROW_SCALE_EPILOGUE and inv_gs_pr is not None else None
     )
     dense_gemm(
         (a_codes[:m].unsqueeze(-1), a_sf),
@@ -638,11 +630,7 @@ def dense_fp6_linear_expanded(
         a_fmt=a_fmt,
         b_fmt=fmt,
         x_bf16=x if _fused_quant else None,
-        w_gscale=(
-            global_scale.to(torch.float32).reshape(1)
-            if _fused_quant
-            else None
-        ),
+        w_gscale=(global_scale.to(torch.float32).reshape(1) if _fused_quant else None),
         row_scale=_row_scale,
     )
     result = y[:, :, 0]
@@ -656,9 +644,7 @@ def dense_fp6_linear_expanded(
         # this step undoes only the per-row activation scaling. f64 reciprocal
         # + f32 cast = correctly-rounded f32 division, matching the kernel's
         # div.rn-computed inv_gs bit-for-bit (see the a_gs_pr comment above).
-        result.mul_(
-            (1.0 / a_gs_pr[:m].double()).float().to(torch.bfloat16)
-        )
+        result.mul_((1.0 / a_gs_pr[:m].double()).float().to(torch.bfloat16))
     if out is not None:
         out.copy_(result)
         return out

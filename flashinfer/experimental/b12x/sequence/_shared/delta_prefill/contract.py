@@ -9,9 +9,20 @@ from typing import Protocol
 import torch
 
 from b12x._lib.scratch import ScratchBufferSpec, scratch_buffer_spec, scratch_tensor
-from b12x._lib.scratch_layout import SCRATCH_ALIGN_BYTES, align_up, dtype_nbytes, materialize_scratch_view
+from b12x._lib.scratch_layout import (
+    SCRATCH_ALIGN_BYTES,
+    align_up,
+    dtype_nbytes,
+    materialize_scratch_view,
+)
 from b12x.preparation import Plan
-from ..tensors import overlaps, positive, require_paged_recurrent_state, require_row_contiguous, require_tensor
+from ..tensors import (
+    overlaps,
+    positive,
+    require_paged_recurrent_state,
+    require_row_contiguous,
+    require_tensor,
+)
 from .workspace import V_SPLIT_CHOICES, WorkspaceRecord, tiles_capacity
 
 HEAD_DIM = 128
@@ -72,25 +83,34 @@ class Layout:
         """Grid rows of one recurrence launch: sequences a window can intersect."""
         return min(self.caps.max_seqs, self.window_tiles)
 
-    def launched_windows(self, max_live_tokens: int | None, max_live_seqs: int | None) -> int:
+    def launched_windows(
+        self, max_live_tokens: int | None, max_live_seqs: int | None
+    ) -> int:
         """Windows to launch for a run bounded by the given live counts."""
         if max_live_tokens is None and max_live_seqs is None:
             return self.max_windows
-        tokens = self.caps.max_tokens if max_live_tokens is None else int(max_live_tokens)
+        tokens = (
+            self.caps.max_tokens if max_live_tokens is None else int(max_live_tokens)
+        )
         seqs = self.caps.max_seqs if max_live_seqs is None else int(max_live_seqs)
         if tokens < 0 or tokens > self.caps.max_tokens:
-            raise ValueError(f"max_live_tokens={tokens} exceeds capacity {self.caps.max_tokens}")
+            raise ValueError(
+                f"max_live_tokens={tokens} exceeds capacity {self.caps.max_tokens}"
+            )
         if seqs < 0 or seqs > self.caps.max_seqs:
-            raise ValueError(f"max_live_seqs={seqs} exceeds capacity {self.caps.max_seqs}")
+            raise ValueError(
+                f"max_live_seqs={seqs} exceeds capacity {self.caps.max_seqs}"
+            )
         tiles = tiles_capacity(tokens, seqs)
         return max(1, min(self.max_windows, -(-tiles // self.window_tiles)))
 
     def output_shape(self, tokens: int | None = None) -> tuple[int, int, int]:
         live_tokens = self.caps.max_tokens if tokens is None else int(tokens)
         if live_tokens < 0 or live_tokens > self.caps.max_tokens:
-            raise ValueError(f"tokens={live_tokens} exceeds capacity {self.caps.max_tokens}")
+            raise ValueError(
+                f"tokens={live_tokens} exceeds capacity {self.caps.max_tokens}"
+            )
         return (live_tokens, self.caps.heads, HEAD_DIM)
-
 
 
 @dataclass(frozen=True)
@@ -182,7 +202,11 @@ def materialize_layout(
 
 
 def _record_view(
-    storage: torch.Tensor, plan: Layout, name: str, shape: tuple[int, ...], dtype: torch.dtype
+    storage: torch.Tensor,
+    plan: Layout,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
 ) -> torch.Tensor:
     view, _ = materialize_scratch_view(
         storage, offset_bytes=plan.offsets[name], shape=shape, dtype=dtype
@@ -226,7 +250,9 @@ def bind_tensors(
     tiles = caps.tiles_capacity
     token_capacity = positive("q token capacity", q.shape[0]) if q.dim() == 3 else 0
     if token_capacity > caps.max_tokens:
-        raise ValueError(f"token capacity {token_capacity} exceeds planned {caps.max_tokens}")
+        raise ValueError(
+            f"token capacity {token_capacity} exceeds planned {caps.max_tokens}"
+        )
     seq_capacity = int(cu_seqlens.numel()) - 1
     if seq_capacity < 1 or seq_capacity > caps.max_seqs:
         raise ValueError(
@@ -234,19 +260,46 @@ def bind_tensors(
         )
     row_shape = (token_capacity, heads, HEAD_DIM)
     for name, tensor in (("q", q), ("k", k)):
-        require_row_contiguous(name, tensor, shape=(token_capacity, caps.key_heads, HEAD_DIM), device=device, dtypes=(torch.bfloat16,))
-    require_row_contiguous("v", v, shape=row_shape, device=device, dtypes=(torch.bfloat16,))
+        require_row_contiguous(
+            name,
+            tensor,
+            shape=(token_capacity, caps.key_heads, HEAD_DIM),
+            device=device,
+            dtypes=(torch.bfloat16,),
+        )
+    require_row_contiguous(
+        "v", v, shape=row_shape, device=device, dtypes=(torch.bfloat16,)
+    )
     decay_shape = (token_capacity, heads) if caps.is_gdn else row_shape
-    require_row_contiguous("a" if caps.is_gdn else "raw_g", raw_g, shape=decay_shape, device=device, dtypes=(torch.bfloat16,))
+    require_row_contiguous(
+        "a" if caps.is_gdn else "raw_g",
+        raw_g,
+        shape=decay_shape,
+        device=device,
+        dtypes=(torch.bfloat16,),
+    )
     require_tensor(
-        "raw_beta", raw_beta, shape=(token_capacity, heads), device=device,
-        dtypes=(torch.bfloat16,), contiguous=False,
+        "raw_beta",
+        raw_beta,
+        shape=(token_capacity, heads),
+        device=device,
+        dtypes=(torch.bfloat16,),
+        contiguous=False,
     )
     if any(s <= 0 for s in raw_beta.stride()):
         raise ValueError("raw_beta must have positive strides")
-    require_tensor("A_log", A_log, shape=(heads,), device=device, dtypes=(torch.bfloat16, torch.float32))
     require_tensor(
-        "dt_bias", dt_bias, shape=(heads,) if caps.is_gdn else (heads, HEAD_DIM), device=device,
+        "A_log",
+        A_log,
+        shape=(heads,),
+        device=device,
+        dtypes=(torch.bfloat16, torch.float32),
+    )
+    require_tensor(
+        "dt_bias",
+        dt_bias,
+        shape=(heads,) if caps.is_gdn else (heads, HEAD_DIM),
+        device=device,
         dtypes=(torch.bfloat16, torch.float32),
     )
     require_paged_recurrent_state(
@@ -255,13 +308,21 @@ def bind_tensors(
         device=device,
         dtype=caps.state_dtype,
     )
-    require_tensor("cu_seqlens", cu_seqlens, shape=(seq_capacity + 1,), device=device, dtypes=(torch.int32,))
+    require_tensor(
+        "cu_seqlens",
+        cu_seqlens,
+        shape=(seq_capacity + 1,),
+        device=device,
+        dtypes=(torch.int32,),
+    )
     index_dtypes = (torch.int32, torch.int64)
     for name, tensor in (
         ("initial_state_indices", initial_state_indices),
         ("checkpoint_state_indices", checkpoint_state_indices),
     ):
-        require_tensor(name, tensor, shape=(seq_capacity,), device=device, dtypes=index_dtypes)
+        require_tensor(
+            name, tensor, shape=(seq_capacity,), device=device, dtypes=index_dtypes
+        )
     require_tensor(
         "final_state_indices",
         final_state_indices,
@@ -272,35 +333,65 @@ def bind_tensors(
     )
     if final_state_indices.stride(0) <= 0:
         raise ValueError("final_state_indices must have a positive stride")
-    if not (initial_state_indices.dtype == final_state_indices.dtype == checkpoint_state_indices.dtype):
+    if not (
+        initial_state_indices.dtype
+        == final_state_indices.dtype
+        == checkpoint_state_indices.dtype
+    ):
         raise TypeError("state index tensors must share one dtype")
     require_tensor(
-        "checkpoint_offsets", checkpoint_offsets, shape=(seq_capacity,), device=device, dtypes=(torch.int32,)
+        "checkpoint_offsets",
+        checkpoint_offsets,
+        shape=(seq_capacity,),
+        device=device,
+        dtypes=(torch.int32,),
     )
     for name, tensor in (("num_seqs", num_seqs), ("num_tokens", num_tokens)):
         require_tensor(name, tensor, shape=(1,), device=device, dtypes=(torch.int32,))
-    require_row_contiguous("output", output, shape=row_shape, device=device, dtypes=(torch.bfloat16,))
+    require_row_contiguous(
+        "output", output, shape=row_shape, device=device, dtypes=(torch.bfloat16,)
+    )
 
     storage = scratch_tensor(scratch, plan.scratch_specs(), owner=caps.op_name)
     ring = plan.workspace_windows * plan.window_tiles
     views = {
-        "band_base": _record_view(storage, plan, "band_base", (tiles + 2,), torch.int32),
-        "sorted_seq": _record_view(storage, plan, "sorted_seq", (caps.max_seqs,), torch.int32),
-        "rank_of": _record_view(storage, plan, "rank_of", (caps.max_seqs,), torch.int32),
+        "band_base": _record_view(
+            storage, plan, "band_base", (tiles + 2,), torch.int32
+        ),
+        "sorted_seq": _record_view(
+            storage, plan, "sorted_seq", (caps.max_seqs,), torch.int32
+        ),
+        "rank_of": _record_view(
+            storage, plan, "rank_of", (caps.max_seqs,), torch.int32
+        ),
         "pos_seq": _record_view(storage, plan, "pos_seq", (tiles,), torch.int32),
         "pos_local": _record_view(storage, plan, "pos_local", (tiles,), torch.int32),
-        "window_table": _record_view(storage, plan, "window_table", (plan.max_windows, 2), torch.int32),
-        "ready_flags": _record_view(storage, plan, "ready_flags", (ring, heads), torch.int32),
-        "ws": _record_view(storage, plan, "ws", (ring, heads, WorkspaceRecord.BYTES), torch.uint8),
+        "window_table": _record_view(
+            storage, plan, "window_table", (plan.max_windows, 2), torch.int32
+        ),
+        "ready_flags": _record_view(
+            storage, plan, "ready_flags", (ring, heads), torch.int32
+        ),
+        "ws": _record_view(
+            storage, plan, "ws", (ring, heads, WorkspaceRecord.BYTES), torch.uint8
+        ),
     }
     mutable = {"scratch": storage, "recurrent_state": recurrent_state, "output": output}
     read_only = {
-        "q": q, "k": k, "v": v, "raw_g": raw_g, "raw_beta": raw_beta, "A_log": A_log,
-        "dt_bias": dt_bias, "cu_seqlens": cu_seqlens,
+        "q": q,
+        "k": k,
+        "v": v,
+        "raw_g": raw_g,
+        "raw_beta": raw_beta,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "cu_seqlens": cu_seqlens,
         "initial_state_indices": initial_state_indices,
         "final_state_indices": final_state_indices,
         "checkpoint_state_indices": checkpoint_state_indices,
-        "checkpoint_offsets": checkpoint_offsets, "num_seqs": num_seqs, "num_tokens": num_tokens,
+        "checkpoint_offsets": checkpoint_offsets,
+        "num_seqs": num_seqs,
+        "num_tokens": num_tokens,
     }
     names = list(mutable)
     for left in range(len(names)):
@@ -316,11 +407,22 @@ def bind_tensors(
         plan=_plan,
         scratch=storage,
         **views,
-        q=q, k=k, v=v, raw_g=raw_g, raw_beta=raw_beta, A_log=A_log, dt_bias=dt_bias,
-        recurrent_state=recurrent_state, cu_seqlens=cu_seqlens,
+        q=q,
+        k=k,
+        v=v,
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        recurrent_state=recurrent_state,
+        cu_seqlens=cu_seqlens,
         initial_state_indices=initial_state_indices,
         final_state_indices=final_state_indices,
         checkpoint_state_indices=checkpoint_state_indices,
-        checkpoint_offsets=checkpoint_offsets, num_seqs=num_seqs, num_tokens=num_tokens,
-        output=output, token_capacity=token_capacity, seq_capacity=seq_capacity,
+        checkpoint_offsets=checkpoint_offsets,
+        num_seqs=num_seqs,
+        num_tokens=num_tokens,
+        output=output,
+        token_capacity=token_capacity,
+        seq_capacity=seq_capacity,
     )

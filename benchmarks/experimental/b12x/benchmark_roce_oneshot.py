@@ -154,7 +154,10 @@ def _tolerance(dtype: torch.dtype, world: int) -> tuple[float, float]:
 
 def _time_eager(fn, warmups, samples, prep=None):
     from b12x.testing.benchmark import measure_call
-    return measure_call(fn, warmup=warmups, samples=samples, reset=prep).raw_samples("workload")
+
+    return measure_call(fn, warmup=warmups, samples=samples, reset=prep).raw_samples(
+        "workload"
+    )
 
 
 def _capture_graph(
@@ -175,9 +178,11 @@ def _capture_graph(
             fn()
     torch.cuda.synchronize()
     dist.barrier()
+
     def invoke():
         for _ in range(per_graph):
             fn()
+
     graph._b12x_benchmark_call = invoke
     return graph
 
@@ -188,14 +193,22 @@ Arm = tuple[Callable[[], object], Callable[[], object] | None, int]
 def _time_arms(arms, warmups, samples, blocks):
     from b12x.preparation import PreparedCall
     from b12x.testing.benchmark import measure_calls
+
     calls = {}
     for name, (fn, prep, _) in arms.items():
         owner = getattr(fn, "__self__", None)
-        run = owner._b12x_benchmark_call if owner is not None and hasattr(owner, "_b12x_benchmark_call") else fn
+        run = (
+            owner._b12x_benchmark_call
+            if owner is not None and hasattr(owner, "_b12x_benchmark_call")
+            else fn
+        )
         calls[name] = PreparedCall(run=run, reset=prep, produce=lambda: None)
-    result = measure_calls(calls, warmup=warmups, samples=samples, rounds=blocks,
-                           collective=True)
-    raw = {name: [v / arms[name][2] for v in result.raw_samples(name)] for name in calls}
+    result = measure_calls(
+        calls, warmup=warmups, samples=samples, rounds=blocks, collective=True
+    )
+    raw = {
+        name: [v / arms[name][2] for v in result.raw_samples(name)] for name in calls
+    }
     return raw, [row.name for row in result.samples]
 
 
@@ -299,7 +312,11 @@ def main() -> None:
         expected = torch.zeros_like(inp, dtype=torch.float32)
         for peer in range(world):
             generator = torch.Generator(device=device).manual_seed(peer + 17)
-            expected.add_(torch.randn(numel, dtype=dtype, device=device, generator=generator).float())
+            expected.add_(
+                torch.randn(
+                    numel, dtype=dtype, device=device, generator=generator
+                ).float()
+            )
         expected = expected.to(dtype)
         runtime.all_reduce(inp, out=out, plan=plan)
         torch.cuda.synchronize()
@@ -309,10 +326,16 @@ def main() -> None:
         scale = expected.float().abs().max().item() or 1.0
         progress(f"size {nbytes}: timing (interleaved)")
         roce_graph = _capture_graph(
-            lambda: runtime.all_reduce(inp, out=out, plan=plan), args.warmups, args.graph_ops
+            lambda: runtime.all_reduce(inp, out=out, plan=plan),
+            args.warmups,
+            args.graph_ops,
         )
         arms: dict[str, Arm] = {
-            "roce_eager": (lambda: runtime.all_reduce(inp, out=out, plan=plan), None, 1),
+            "roce_eager": (
+                lambda: runtime.all_reduce(inp, out=out, plan=plan),
+                None,
+                1,
+            ),
             "roce_graph": (roce_graph.replay, None, args.graph_ops),
         }
         raw, order = _time_arms(arms, args.warmups, args.samples, args.blocks)
@@ -342,10 +365,15 @@ def main() -> None:
     gather_rows = []
     for gather_row_count in (int(r) for r in args.gather_rows.split(",") if r.strip()):
         shape = [gather_row_count, args.gather_cols]
-        parts = [torch.randn(
-            *shape, dtype=dtype, device=device,
-            generator=torch.Generator(device=device).manual_seed(peer + 17),
-        ) for peer in range(world)]
+        parts = [
+            torch.randn(
+                *shape,
+                dtype=dtype,
+                device=device,
+                generator=torch.Generator(device=device).manual_seed(peer + 17),
+            )
+            for peer in range(world)
+        ]
         shard = parts[rank]
         if not runtime.should_all_gather(shard, -1):
             continue
@@ -355,7 +383,9 @@ def main() -> None:
         runtime.all_gather(shard, dim=-1, out=got, plan=plan)
         torch.cuda.synchronize()
         if not torch.equal(got, expected):
-            raise RuntimeError(f"RoCE all-gather {shape} is not bit-exact against the numerical reference")
+            raise RuntimeError(
+                f"RoCE all-gather {shape} is not bit-exact against the numerical reference"
+            )
         progress(f"all-gather {shape}: timing (interleaved)")
         roce_graph = _capture_graph(
             lambda: runtime.all_gather(shard, dim=-1, out=got, plan=plan),
@@ -363,7 +393,11 @@ def main() -> None:
             args.graph_ops,
         )
         arms = {
-            "roce_eager": (lambda: runtime.all_gather(shard, dim=-1, out=got, plan=plan), None, 1),
+            "roce_eager": (
+                lambda: runtime.all_gather(shard, dim=-1, out=got, plan=plan),
+                None,
+                1,
+            ),
             "roce_graph": (roce_graph.replay, None, args.graph_ops),
         }
         raw, order = _time_arms(arms, args.warmups, args.samples, args.blocks)

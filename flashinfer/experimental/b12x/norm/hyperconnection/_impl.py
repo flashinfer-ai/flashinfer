@@ -97,7 +97,9 @@ class _HyperConnectionState:
 
     def require_operation(self, operation, *, eps=None):
         if self.query.operation != operation:
-            raise ValueError(f"execution prepares {self.query.operation}, not {operation}")
+            raise ValueError(
+                f"execution prepares {self.query.operation}, not {operation}"
+            )
         if eps is not None and float(eps) != self.query.eps:
             raise ValueError("normalization epsilon differs from prepared invocation")
 
@@ -171,8 +173,6 @@ class _HyperConnectionState:
             bottleneck_capacity=bottleneck,
             block_input_capacity=block_input,
         )
-
-
 
 
 def _validate_capacity(
@@ -275,7 +275,9 @@ def _require_eps(eps: float) -> float:
     return value
 
 
-def run_grouped_rmsnorm_impl(state, weight, *, eps, plan: _HyperConnectionState, out, zero_centered=True):
+def run_grouped_rmsnorm_impl(
+    state, weight, *, eps, plan: _HyperConnectionState, out, zero_centered=True
+):
     _require_cuda(plan)
     plan.require_operation("grouped_rmsnorm", eps=eps)
     if bool(zero_centered) != plan.query.zero_centered:
@@ -286,9 +288,22 @@ def run_grouped_rmsnorm_impl(state, weight, *, eps, plan: _HyperConnectionState,
     _validate_input(state, shape=(tokens, width), caps=caps, name="state")
     if weight.dtype != getattr(torch, plan.query.weight_dtype):
         raise ValueError("affine weight dtype differs from preparation")
-    if weight.shape != (width,) or weight.device != caps.device or not weight.is_contiguous():
-        raise ValueError("affine weight must retain the declared contiguous geometry and device")
-    _validate_capacity(out, tokens=tokens, tail=(width,), dtype=caps.dtype, device=caps.device, name="out")
+    if (
+        weight.shape != (width,)
+        or weight.device != caps.device
+        or not weight.is_contiguous()
+    ):
+        raise ValueError(
+            "affine weight must retain the declared contiguous geometry and device"
+        )
+    _validate_capacity(
+        out,
+        tokens=tokens,
+        tail=(width,),
+        dtype=caps.dtype,
+        device=caps.device,
+        name="out",
+    )
     _validate_output_disjoint("normalized", out, (("state", state), ("weight", weight)))
     if tokens:
         plan.launch(state, weight, out, eps=eps)
@@ -300,10 +315,21 @@ def run_scaled_silu_impl(projected_down, *, plan: _HyperConnectionState, out):
     plan.require_operation("scaled_silu")
     caps = plan.caps
     tokens = plan._live_tokens(projected_down.shape[0])
-    _validate_input(projected_down, shape=(tokens, caps.lowrank), caps=caps,
-                    name="projected_down", row_strided=True)
-    _validate_capacity(out, tokens=tokens, tail=(caps.lowrank,), dtype=caps.dtype,
-                       device=caps.device, name="out")
+    _validate_input(
+        projected_down,
+        shape=(tokens, caps.lowrank),
+        caps=caps,
+        name="projected_down",
+        row_strided=True,
+    )
+    _validate_capacity(
+        out,
+        tokens=tokens,
+        tail=(caps.lowrank,),
+        dtype=caps.dtype,
+        device=caps.device,
+        name="out",
+    )
     _validate_output_disjoint("bottleneck", out, (("projected_down", projected_down),))
     if tokens:
         plan.launch(projected_down, out)
@@ -318,9 +344,17 @@ def run_gate_mean_impl(normalized, gate_logits, *, plan: _HyperConnectionState, 
     shape = (tokens, caps.streams * caps.hidden_size)
     _validate_input(normalized, shape=shape, caps=caps, name="normalized")
     _validate_input(gate_logits, shape=shape, caps=caps, name="gate_logits")
-    _validate_capacity(out, tokens=tokens, tail=(caps.hidden_size,), dtype=caps.dtype,
-                       device=caps.device, name="out")
-    _validate_output_disjoint("block_input", out, (("normalized", normalized), ("gate_logits", gate_logits)))
+    _validate_capacity(
+        out,
+        tokens=tokens,
+        tail=(caps.hidden_size,),
+        dtype=caps.dtype,
+        device=caps.device,
+        name="out",
+    )
+    _validate_output_disjoint(
+        "block_input", out, (("normalized", normalized), ("gate_logits", gate_logits))
+    )
     if tokens:
         plan.launch(normalized, gate_logits, out)
     return out[:tokens]
@@ -407,14 +441,28 @@ def run_combine_norm_impl(
     )
     eps = _require_eps(eps)
     from ._cute_config import require_cute_combine_norm
+
     combined, normalized = torch.empty_like(state), torch.empty_like(state)
     require_cute_combine_norm(
-        state=state, block_output=block_output, injection_logits=injection_logits,
-        next_norm_weight=next_norm_weight, combined=combined, normalized=normalized,
-        streams=caps.streams, hidden_size=caps.hidden_size,
+        state=state,
+        block_output=block_output,
+        injection_logits=injection_logits,
+        next_norm_weight=next_norm_weight,
+        combined=combined,
+        normalized=normalized,
+        streams=caps.streams,
+        hidden_size=caps.hidden_size,
     )
     if tokens:
-        plan.launch(state, block_output, injection_logits, next_norm_weight, combined, normalized, eps=eps)
+        plan.launch(
+            state,
+            block_output,
+            injection_logits,
+            next_norm_weight,
+            combined,
+            normalized,
+            eps=eps,
+        )
     return combined, normalized
 
 
@@ -470,17 +518,30 @@ def run_engram_mix_impl(
     _validate_output_disjoint(
         "out",
         out,
-        (("state", state), ("projected_kv", projected_kv), ("norm_weights", norm_weights)),
+        (
+            ("state", state),
+            ("projected_kv", projected_kv),
+            ("norm_weights", norm_weights),
+        ),
     )
     eps = _require_eps(eps)
     if tokens:
-        plan.launch(state, projected_kv, norm_weights,
-                    state if token_mask is None else token_mask, out, eps=eps)
+        plan.launch(
+            state,
+            projected_kv,
+            norm_weights,
+            state if token_mask is None else token_mask,
+            out,
+            eps=eps,
+        )
     return out
 
 
 def _validate_pointwise_tensor(
-    tensor: torch.Tensor, *, name: str, shape: tuple[int, ...],
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    shape: tuple[int, ...],
     device: torch.device,
 ) -> None:
     if tensor.device.type != "cuda" or tensor.device != device:
@@ -492,7 +553,10 @@ def _validate_pointwise_tensor(
 
 
 def run_swiglu_impl(
-    gate_up: torch.Tensor, *, limit: float, out: torch.Tensor,
+    gate_up: torch.Tensor,
+    *,
+    limit: float,
+    out: torch.Tensor,
     round_silu: bool = False,
     plan: _HyperConnectionState,
 ) -> torch.Tensor:
@@ -515,10 +579,15 @@ def run_swiglu_impl(
     if gate_up.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
         raise TypeError("gate_up and out must be BF16")
     _validate_pointwise_tensor(
-        gate_up, name="gate_up", shape=tuple(gate_up.shape), device=gate_up.device,
+        gate_up,
+        name="gate_up",
+        shape=tuple(gate_up.shape),
+        device=gate_up.device,
     )
     _validate_pointwise_tensor(
-        out, name="out", shape=(gate_up.shape[0], gate_up.shape[1] // 2),
+        out,
+        name="out",
+        shape=(gate_up.shape[0], gate_up.shape[1] // 2),
         device=gate_up.device,
     )
     limit = float(limit)
@@ -531,18 +600,27 @@ def run_swiglu_impl(
 
 
 def run_add_impl(
-    left: torch.Tensor, right: torch.Tensor, *, out: torch.Tensor, plan: _HyperConnectionState,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    plan: _HyperConnectionState,
 ) -> torch.Tensor:
     """Add BF16/FP32 operands in FP32, casting once to disjoint BF16/FP32 out."""
     _require_cuda(plan)
     plan.require_operation("add")
-    if (str(left.dtype).removeprefix("torch.") != plan.query.left_dtype
-            or str(right.dtype).removeprefix("torch.") != plan.query.right_dtype
-            or str(out.dtype).removeprefix("torch.") != plan.query.output_dtype):
+    if (
+        str(left.dtype).removeprefix("torch.") != plan.query.left_dtype
+        or str(right.dtype).removeprefix("torch.") != plan.query.right_dtype
+        or str(out.dtype).removeprefix("torch.") != plan.query.output_dtype
+    ):
         raise ValueError("operand dtype differs from prepared add invocation")
     for name, tensor in (("left", left), ("right", right), ("out", out)):
         _validate_pointwise_tensor(
-            tensor, name=name, shape=tuple(left.shape), device=left.device,
+            tensor,
+            name=name,
+            shape=tuple(left.shape),
+            device=left.device,
         )
     _validate_output_disjoint("out", out, (("left", left), ("right", right)))
     if out.numel():
@@ -550,16 +628,20 @@ def run_add_impl(
     return out
 
 
-
 def run_sigmoid_impl(source, *, out, plan: _HyperConnectionState):
     _require_cuda(plan)
     plan.require_operation("sigmoid")
-    if (str(source.dtype).removeprefix("torch.") != plan.query.left_dtype
-            or str(out.dtype).removeprefix("torch.") != plan.query.output_dtype):
+    if (
+        str(source.dtype).removeprefix("torch.") != plan.query.left_dtype
+        or str(out.dtype).removeprefix("torch.") != plan.query.output_dtype
+    ):
         raise ValueError("operand dtype differs from prepared sigmoid invocation")
     for name, tensor in (("source", source), ("out", out)):
         _validate_pointwise_tensor(
-            tensor, name=name, shape=tuple(source.shape), device=source.device,
+            tensor,
+            name=name,
+            shape=tuple(source.shape),
+            device=source.device,
         )
     _validate_output_disjoint("out", out, (("source", source),))
     if out.numel():

@@ -288,9 +288,7 @@ class MTPPrefillBf16GemmKernel:
         storage = allocator.allocate(SharedStorage)
         shared_a = storage.a.get_tensor(layout_a.outer, swizzle=layout_a.inner)
         shared_b = storage.b.get_tensor(layout_b.outer, swizzle=layout_b.inner)
-        copy_bytes = (
-            (self.tile_m + _TILE_N) * _TILE_K * cutlass.BFloat16.width // 8
-        )
+        copy_bytes = (self.tile_m + _TILE_N) * _TILE_K * cutlass.BFloat16.width // 8
         load_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=_STAGES,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
@@ -393,17 +391,15 @@ class MTPPrefillBf16GemmKernel:
                     value = accumulator_mn[accumulator_m, accumulator_n]
                     if cutlass.const_expr(self.add_token_path):
                         token = row // Int32(self.streams)
-                        token_offset = (
-                            token.to(Int64) * Int64(self.output_columns)
-                            + column.to(Int64)
-                        )
+                        token_offset = token.to(Int64) * Int64(
+                            self.output_columns
+                        ) + column.to(Int64)
                         token_value = token_path[token_offset]
                         value = Float32(cutlass.BFloat16(value)) + Float32(token_value)
                     if row < live_rows:
-                        output_offset = (
-                            row.to(Int64) * Int64(self.output_columns)
-                            + column.to(Int64)
-                        )
+                        output_offset = row.to(Int64) * Int64(
+                            self.output_columns
+                        ) + column.to(Int64)
                         output[output_offset] = cutlass.BFloat16(value)
 
         elif warp_index == Int32(self.producer_warp):
@@ -480,8 +476,7 @@ def compile_mtp_prefill_bf16_gemm(
         )
         if tile_m is None:
             raise ValueError(
-                "MTP CuTe rows must be a multiple of 16 and at least 16, "
-                f"got {rows}"
+                f"MTP CuTe rows must be a multiple of 16 and at least 16, got {rows}"
             )
         kernel = MTPPrefillBf16GemmKernel(
             rows=rows,

@@ -46,58 +46,100 @@ def _relocate_pages(cache, scenarios, page_size):
 @torch.inference_mode()
 @pytest.mark.parametrize(
     "high_main,high_extra,extra_page_size,heads,extra_width",
-    [(True, False, 64, 16, 32), (True, False, 64, 16, 64),
-     (False, True, 2, 32, 64), (True, True, 64, 40, 64)],
+    [
+        (True, False, 64, 16, 32),
+        (True, False, 64, 16, 64),
+        (False, True, 2, 32, 64),
+        (True, True, 64, 40, 64),
+    ],
 )
 @pytest.mark.parametrize("main_width", [512, 1024])
 def test_dual_cache_high_pages_public_graph(
-    high_main: bool, high_extra: bool, extra_page_size: int, heads: int,
-    extra_width: int, main_width: int,
+    high_main: bool,
+    high_extra: bool,
+    extra_page_size: int,
+    heads: int,
+    extra_width: int,
+    main_width: int,
 ) -> None:
     device = require_b12x()
     rows = 2
     inputs = _make_inputs(
-        rows=rows, heads=heads, main_width=main_width, extra_width=extra_width,
-        extra_page_size=extra_page_size, per_token=True, device=device,
+        rows=rows,
+        heads=heads,
+        main_width=main_width,
+        extra_width=extra_width,
+        extra_page_size=extra_page_size,
+        per_token=True,
+        device=device,
     )
-    _poison_inactive_topk_tails(inputs.main_index_scenarios, inputs.main_length_scenarios)
-    _poison_inactive_topk_tails(inputs.extra_index_scenarios, inputs.extra_length_scenarios)
+    _poison_inactive_topk_tails(
+        inputs.main_index_scenarios, inputs.main_length_scenarios
+    )
+    _poison_inactive_topk_tails(
+        inputs.extra_index_scenarios, inputs.extra_length_scenarios
+    )
     # Relocation preserves the packed records and therefore this union oracle.
     expected = tuple(_reference(inputs, scenario) for scenario in range(2))
     if high_main:
-        cache, indices = _relocate_pages(inputs.main_cache, inputs.main_index_scenarios, 64)
+        cache, indices = _relocate_pages(
+            inputs.main_cache, inputs.main_index_scenarios, 64
+        )
         inputs = replace(inputs, main_cache=cache, main_index_scenarios=indices)
     if high_extra:
         cache, indices = _relocate_pages(
-            inputs.extra_cache, inputs.extra_index_scenarios, extra_page_size,
+            inputs.extra_cache,
+            inputs.extra_index_scenarios,
+            extra_page_size,
         )
         inputs = replace(inputs, extra_cache=cache, extra_index_scenarios=indices)
     assert inputs.main_cache.data_ptr() != inputs.extra_cache.data_ptr()
     output = torch.empty((rows, heads, 512), dtype=torch.bfloat16, device=device)
-    plan = mla.plan(mla.Caps(
-        device=device, num_q_heads=heads, max_q_rows=rows,
-        max_width=main_width + extra_width, swa_width=main_width,
-        indexed_width=extra_width, swa_page_size=64,
-        indexed_page_size=extra_page_size, mode="extend", use_cuda_graph=True,
-    ), invocation=mla.invocation_from_tensors(
-        q=inputs.q, swa_k_cache=inputs.main_cache, indexed_k_cache=inputs.extra_cache,
-        out=output, return_lse=True,
-    ))
+    plan = mla.plan(
+        mla.Caps(
+            device=device,
+            num_q_heads=heads,
+            max_q_rows=rows,
+            max_width=main_width + extra_width,
+            swa_width=main_width,
+            indexed_width=extra_width,
+            swa_page_size=64,
+            indexed_page_size=extra_page_size,
+            mode="extend",
+            use_cuda_graph=True,
+        ),
+        invocation=mla.invocation_from_tensors(
+            q=inputs.q,
+            swa_k_cache=inputs.main_cache,
+            indexed_k_cache=inputs.extra_cache,
+            out=output,
+            return_lse=True,
+        ),
+    )
 
     def prepare(state):
-        spec, = state.scratch_plan.scratch_specs()
+        (spec,) = state.scratch_plan.scratch_specs()
         trial_scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
         trial_binding = state.bind_for_preparation(
-            scratch=trial_scratch, q=inputs.q, swa_indices=inputs.main_indices,
-            swa_lengths=inputs.main_lengths, indexed_indices=inputs.extra_indices,
+            scratch=trial_scratch,
+            q=inputs.q,
+            swa_indices=inputs.main_indices,
+            swa_lengths=inputs.main_lengths,
+            indexed_indices=inputs.extra_indices,
             indexed_lengths=inputs.extra_lengths,
         )
-        return PreparedCall(run=lambda: state.run(
-            trial_binding, swa_k_cache=inputs.main_cache,
-            indexed_k_cache=inputs.extra_cache, sm_scale=_SM_SCALE,
-            swa_page_size=64, indexed_page_size=extra_page_size,
-            out=output, return_lse=True,
-        ))
+        return PreparedCall(
+            run=lambda: state.run(
+                trial_binding,
+                swa_k_cache=inputs.main_cache,
+                indexed_k_cache=inputs.extra_cache,
+                sm_scale=_SM_SCALE,
+                swa_page_size=64,
+                indexed_page_size=extra_page_size,
+                out=output,
+                return_lse=True,
+            )
+        )
 
     with PreparationSession(device=device, autotune=False) as session:
         _install_scenario(inputs, 0)
@@ -106,19 +148,29 @@ def test_dual_cache_high_pages_public_graph(
 
 
 def _check_graph(session, plan, inputs, output, expected, device, extra_page_size):
-    spec, = plan.scratch_specs()
+    (spec,) = plan.scratch_specs()
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
     binding = mla.bind(
-        plan, scratch=scratch, q=inputs.q, swa_indices=inputs.main_indices,
-        swa_lengths=inputs.main_lengths, indexed_indices=inputs.extra_indices,
+        plan,
+        scratch=scratch,
+        q=inputs.q,
+        swa_indices=inputs.main_indices,
+        swa_lengths=inputs.main_lengths,
+        indexed_indices=inputs.extra_indices,
         indexed_lengths=inputs.extra_lengths,
     )
+
     def run():
         return mla.run(
-            plan=plan, binding=binding, swa_k_cache=inputs.main_cache,
-            indexed_k_cache=inputs.extra_cache, sm_scale=_SM_SCALE,
-            swa_page_size=64, indexed_page_size=extra_page_size,
-            out=output, return_lse=True,
+            plan=plan,
+            binding=binding,
+            swa_k_cache=inputs.main_cache,
+            indexed_k_cache=inputs.extra_cache,
+            sm_scale=_SM_SCALE,
+            swa_page_size=64,
+            indexed_page_size=extra_page_size,
+            out=output,
+            return_lse=True,
         )
 
     _install_scenario(inputs, 0)
@@ -129,7 +181,14 @@ def _check_graph(session, plan, inputs, output, expected, device, extra_page_siz
         try:
             with torch.cuda.graph(graph):
                 captured, lse = run()
-            tensors = (inputs.q, inputs.main_cache, inputs.extra_cache, scratch, output, lse)
+            tensors = (
+                inputs.q,
+                inputs.main_cache,
+                inputs.extra_cache,
+                scratch,
+                output,
+                lse,
+            )
             pointers = tuple(tensor.data_ptr() for tensor in tensors)
             assert captured.data_ptr() == output.data_ptr()
             for scenario in range(2):
@@ -141,11 +200,15 @@ def _check_graph(session, plan, inputs, output, expected, device, extra_page_siz
                 torch.cuda.synchronize(device)
                 assert _allocator_counters(device) == before
                 assert tuple(tensor.data_ptr() for tensor in tensors) == pointers
-                _assert_output(output, expected[scenario][0], label="dual-cache high pages")
+                _assert_output(
+                    output, expected[scenario][0], label="dual-cache high pages"
+                )
                 assert torch.isfinite(lse).all()
                 torch.testing.assert_close(
-                    lse, expected[scenario][1] / math.log(2.0),
-                    atol=6.0e-2, rtol=2.0e-2,
+                    lse,
+                    expected[scenario][1] / math.log(2.0),
+                    atol=6.0e-2,
+                    rtol=2.0e-2,
                 )
         finally:
             graph.reset()

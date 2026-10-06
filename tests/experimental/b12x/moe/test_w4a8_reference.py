@@ -34,7 +34,9 @@ def _pack_fp4_rows(values: torch.Tensor) -> torch.Tensor:
     return (pair[..., 0] | (pair[..., 1] << 4)).contiguous()
 
 
-def _quantize_weight_nvfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _quantize_weight_nvfp4(
+    w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize [rows, K] f32 weights to NVFP4 with global scale 1.0.
 
     Returns (packed_u8 [rows, K/2], scales_e4m3 [rows, K/16] f32, dequant f32).
@@ -49,7 +51,9 @@ def _quantize_weight_nvfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor,
     return packed, scale.squeeze(-1), dequant
 
 
-def _quantize_weight_mxfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _quantize_weight_mxfp4(
+    w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize [rows, K] f32 weights to MXFP4 (e8m0/K32, ceil scale).
 
     Returns (packed_u8, scale_bytes [rows, K/32] uint8, dequant f32).
@@ -59,10 +63,14 @@ def _quantize_weight_mxfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor,
     bmax = blocked.abs().amax(dim=-1, keepdim=True)
     safe = torch.where(bmax > 0, bmax / 6.0, torch.ones_like(bmax))
     exponent = torch.ceil(torch.log2(safe)).clamp(-127, 127)
-    byte = torch.where(bmax > 0, exponent + 127, torch.zeros_like(exponent)).to(torch.uint8)
+    byte = torch.where(bmax > 0, exponent + 127, torch.zeros_like(exponent)).to(
+        torch.uint8
+    )
     scale = torch.where(bmax > 0, torch.exp2(exponent), torch.zeros_like(exponent))
     q = fp4_quantize_values_torch(
-        torch.where(scale > 0, blocked / scale.clamp(min=1e-30), torch.zeros_like(blocked)).view(rows, cols)
+        torch.where(
+            scale > 0, blocked / scale.clamp(min=1e-30), torch.zeros_like(blocked)
+        ).view(rows, cols)
     )
     packed = _pack_fp4_rows(q)
     dequant = (q.view(rows, cols // 32, 32) * scale).view(rows, cols)
@@ -120,7 +128,9 @@ def test_quality_report_clean_for_benign_scales() -> None:
     raw = (torch.rand(32, 32) * 2.0 + 0.5).to(torch.float8_e4m3fn).to(torch.float32)
     report = nvfp4_mx_residual_quality_report(raw)
     assert report["flushed_fraction"] == 0.0
-    assert report["max_rel_residual_error"] == 0.0  # residual mantissa == scale mantissa
+    assert (
+        report["max_rel_residual_error"] == 0.0
+    )  # residual mantissa == scale mantissa
 
 
 def _make_synthetic_case(E: int, m: int, K: int, I_tp: int, top_k: int, seed: int):
@@ -139,7 +149,9 @@ def _make_synthetic_case(E: int, m: int, K: int, I_tp: int, top_k: int, seed: in
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_trace_matches_full_oracle() -> None:
     E, m, K, I_tp, top_k = 4, 5, 128, 64, 2
-    x, w13, w2, topk_ids, topk_weights = _make_synthetic_case(E, m, K, I_tp, top_k, seed=2)
+    x, w13, w2, topk_ids, topk_weights = _make_synthetic_case(
+        E, m, K, I_tp, top_k, seed=2
+    )
 
     w13_q = [_quantize_weight_nvfp4(w13[e]) for e in range(E)]
     w2_q = [_quantize_weight_nvfp4(w2[e]) for e in range(E)]
@@ -152,8 +164,20 @@ def test_w4a8_trace_matches_full_oracle() -> None:
     ones = torch.ones(E, device=x.device)
 
     args = (
-        x, w1_fp4, w1_ue8m0, w1_res, ones, w2_fp4, w2_ue8m0, w2_res, ones,
-        topk_ids, topk_weights, E, K, I_tp,
+        x,
+        w1_fp4,
+        w1_ue8m0,
+        w1_res,
+        ones,
+        w2_fp4,
+        w2_ue8m0,
+        w2_res,
+        ones,
+        topk_ids,
+        topk_weights,
+        E,
+        K,
+        I_tp,
     )
     activation_kwargs = {"swiglu_limit": 0.25}
     full = moe_reference_w4a8_mx(*args, **activation_kwargs)
@@ -210,7 +234,11 @@ def test_w4a8_fc1_stage_exact_on_representable_inputs() -> None:
     torch.manual_seed(3)
     # Activations drawn from the E4M3 grid with block max exactly 448 -> the
     # MX quantizer's scale byte is 127 and the payload reproduces x exactly.
-    x = (torch.randn(m, K, device=device) * 100).to(torch.float8_e4m3fn).to(torch.float32)
+    x = (
+        (torch.randn(m, K, device=device) * 100)
+        .to(torch.float8_e4m3fn)
+        .to(torch.float32)
+    )
     x[:, ::32] = 448.0
     assert torch.equal(quant_dequant_mxfp8_torch(x), x)
 
@@ -230,9 +258,22 @@ def test_w4a8_fc1_stage_exact_on_representable_inputs() -> None:
     ones = torch.ones(E, device=device)
 
     trace = trace_moe_reference_w4a8_route(
-        x, w1_fp4, w1_bytes, None, ones, w2_fp4, w2_bytes, None, ones,
-        topk_ids, topk_weights, E, K, I_tp,
-        token_idx=0, route_idx=0,
+        x,
+        w1_fp4,
+        w1_bytes,
+        None,
+        ones,
+        w2_fp4,
+        w2_bytes,
+        None,
+        ones,
+        topk_ids,
+        topk_weights,
+        E,
+        K,
+        I_tp,
+        token_idx=0,
+        route_idx=0,
     )
     expected_up = w1_dequant[1, :I_tp] @ x[0]
     expected_gate = w1_dequant[1, I_tp:] @ x[0]
@@ -286,18 +327,48 @@ def test_w4a8_oracle_beats_w4a4_oracle(activation: str) -> None:
     w1_ue8m0, w1_res = decompose_nvfp4_scales_to_mx_residual(w1_scales)
     w2_ue8m0, w2_res = decompose_nvfp4_scales_to_mx_residual(w2_scales)
     out_w4a8 = moe_reference_w4a8_mx(
-        x, w1_fp4, w1_ue8m0, w1_res, ones, w2_fp4, w2_ue8m0, w2_res, ones,
-        topk_ids, topk_weights, E, K, I_tp, activation=activation,
+        x,
+        w1_fp4,
+        w1_ue8m0,
+        w1_res,
+        ones,
+        w2_fp4,
+        w2_ue8m0,
+        w2_res,
+        ones,
+        topk_ids,
+        topk_weights,
+        E,
+        K,
+        I_tp,
+        activation=activation,
     )
 
     # w4a4 oracle on the same packed weights/scales (global scales 1.0).
     from b12x._lib.intrinsics import swizzle_block_scale
 
-    w1_swizzled = swizzle_block_scale(w1_scales.to(torch.float8_e4m3fn)).view(torch.uint8)
-    w2_swizzled = swizzle_block_scale(w2_scales.to(torch.float8_e4m3fn)).view(torch.uint8)
+    w1_swizzled = swizzle_block_scale(w1_scales.to(torch.float8_e4m3fn)).view(
+        torch.uint8
+    )
+    w2_swizzled = swizzle_block_scale(w2_scales.to(torch.float8_e4m3fn)).view(
+        torch.uint8
+    )
     out_w4a4 = moe_reference_f32(
-        x, w1_fp4, w1_swizzled, ones, w2_fp4, w2_swizzled, ones,
-        ones, ones, topk_ids, topk_weights, E, K, I_tp, activation=activation,
+        x,
+        w1_fp4,
+        w1_swizzled,
+        ones,
+        w2_fp4,
+        w2_swizzled,
+        ones,
+        ones,
+        ones,
+        topk_ids,
+        topk_weights,
+        E,
+        K,
+        I_tp,
+        activation=activation,
     )
 
     def _cos(a: torch.Tensor, b: torch.Tensor) -> float:

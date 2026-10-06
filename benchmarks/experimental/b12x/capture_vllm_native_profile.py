@@ -88,7 +88,9 @@ def http_json(
     timeout_s: int = 3600,
 ) -> tuple[int, str]:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=data, headers=headers, method="POST" if payload is not None else "GET")
+    request = urllib.request.Request(
+        url, data=data, headers=headers, method="POST" if payload is not None else "GET"
+    )
     try:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
             return response.getcode(), response.read().decode("utf-8", errors="replace")
@@ -125,15 +127,35 @@ def parse_args() -> argparse.Namespace:
             "wait for the first token, then use vLLM's native profiling endpoints."
         )
     )
-    parser.add_argument("--base-url", required=True, help="Server base URL, for example http://127.0.0.1:8000")
+    parser.add_argument(
+        "--base-url",
+        required=True,
+        help="Server base URL, for example http://127.0.0.1:8000",
+    )
     parser.add_argument("--mode", choices=("decode", "mtp"), default="decode")
-    parser.add_argument("--model", default=None, help="Model id. Auto-detected from /v1/models when omitted.")
-    parser.add_argument("--prompt", default=None, help="Inline prompt. Ignored when --prompt-file is set.")
-    parser.add_argument("--prompt-file", default=None, help="Read the prompt from a file.")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Model id. Auto-detected from /v1/models when omitted.",
+    )
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Inline prompt. Ignored when --prompt-file is set.",
+    )
+    parser.add_argument(
+        "--prompt-file", default=None, help="Read the prompt from a file."
+    )
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--capture-seconds", type=float, default=10.0)
-    parser.add_argument("--out-dir", default=None, help="Local output directory for logs and metadata.")
-    parser.add_argument("--api-key", default=None, help="Optional bearer token. Falls back to OPENAI_API_KEY.")
+    parser.add_argument(
+        "--out-dir", default=None, help="Local output directory for logs and metadata."
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Optional bearer token. Falls back to OPENAI_API_KEY.",
+    )
     parser.add_argument("--first-token-timeout", type=float, default=60.0)
     return parser.parse_args()
 
@@ -158,7 +180,9 @@ def main() -> None:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    out_dir = Path(args.out_dir or f"/tmp/vllm-native-{args.mode}-{time.strftime('%Y%m%d-%H%M%S')}")
+    out_dir = Path(
+        args.out_dir or f"/tmp/vllm-native-{args.mode}-{time.strftime('%Y%m%d-%H%M%S')}"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     prompt = load_prompt(args)
@@ -208,7 +232,9 @@ def main() -> None:
         )
     if status != 200:
         stream.stop()
-        raise RuntimeError(f"/start_profile failed with status {status}: {body.strip()}")
+        raise RuntimeError(
+            f"/start_profile failed with status {status}: {body.strip()}"
+        )
 
     deadline = time.time() + args.capture_seconds
     while time.time() < deadline:

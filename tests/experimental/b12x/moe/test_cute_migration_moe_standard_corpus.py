@@ -1392,7 +1392,9 @@ def test_standard_moe_glm53_tp4_nvfp4_multishape_graph_replay(
             (inputs.a, inputs.topk_ids, inputs.topk_weights, output, scratch)
         )
     live_addresses = tuple(tensor.data_ptr() for tensor in live_tensors)
-    guard = kernel_resolution_guard("GLM-shaped MoE replay with full and inactive routes")
+    guard = kernel_resolution_guard(
+        "GLM-shaped MoE replay with full and inactive routes"
+    )
     guard.__enter__()
     request.addfinalizer(lambda: guard.__exit__(None, None, None))
 

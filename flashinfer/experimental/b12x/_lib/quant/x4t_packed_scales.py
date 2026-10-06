@@ -594,13 +594,25 @@ def decode_x4t_packed_scale_pair(
         )
         compiled = _compiled_packed_scale_pair(*keys)
     _launch_x4t_packed_scale_pair(
-        first, second, expert_ids, output_first, output_second,
-        program=compiled, stream=stream,
+        first,
+        second,
+        expert_ids,
+        output_first,
+        output_second,
+        program=compiled,
+        stream=stream,
     )
 
 
 def _launch_x4t_packed_scale_pair(
-    first, second, expert_ids, output_first, output_second, *, program, stream=None,
+    first,
+    second,
+    expert_ids,
+    output_first,
+    output_second,
+    *,
+    program,
+    stream=None,
 ):
     """Launch a retained decoder over buffers validated during preparation."""
     if not expert_ids.numel():

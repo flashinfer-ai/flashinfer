@@ -16,11 +16,27 @@ import pytest
 PACKAGE = Path(__file__).resolve().parents[4] / "flashinfer/experimental/b12x"
 
 ALLOWED = {
-    "torch.Tensor", "Tensor", "torch.Tensor | None", "Tensor | None",
-    "list[torch.Tensor]", "list[Tensor]", "Sequence[torch.Tensor]",
-    "int", "int | None", "float", "float | None", "bool", "bool | None",
-    "str", "str | None", "torch.dtype", "torch.dtype | None",
-    "list[int]", "tuple[int, ...]", "list[int] | None", "list[float]",
+    "torch.Tensor",
+    "Tensor",
+    "torch.Tensor | None",
+    "Tensor | None",
+    "list[torch.Tensor]",
+    "list[Tensor]",
+    "Sequence[torch.Tensor]",
+    "int",
+    "int | None",
+    "float",
+    "float | None",
+    "bool",
+    "bool | None",
+    "str",
+    "str | None",
+    "torch.dtype",
+    "torch.dtype | None",
+    "list[int]",
+    "tuple[int, ...]",
+    "list[int] | None",
+    "list[float]",
 }
 
 
@@ -57,8 +73,12 @@ def op_boundary_violations(root=PACKAGE):
                         f"{function.name}({argument.arg}: {annotation})"
                     )
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("register_opaque_type"):
-                violations.append(f"{path.relative_to(root.parent)}:{node.lineno} register_opaque_type")
+            if isinstance(node, ast.Call) and ast.unparse(node.func).endswith(
+                "register_opaque_type"
+            ):
+                violations.append(
+                    f"{path.relative_to(root.parent)}:{node.lineno} register_opaque_type"
+                )
     return violations
 
 

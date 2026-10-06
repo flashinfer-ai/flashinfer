@@ -9,7 +9,14 @@ from threading import RLock
 import time
 
 from b12x.preparation._progress import (
-    _bar, _duration, _plain, _DIM, _ERROR, _INK, _SIGNAL, _TRACK,
+    _bar,
+    _duration,
+    _plain,
+    _DIM,
+    _ERROR,
+    _INK,
+    _SIGNAL,
+    _TRACK,
 )
 
 _STAGES = ("ROUTE", "SETUP", "PLAN", "READ", "SYNC", "READY")
@@ -62,8 +69,11 @@ class CheckpointDisplay:
                     self._console.print(line, markup=False, highlight=False)
                 self._pending_output.clear()
                 self._live = Live(
-                    console=self._console, get_renderable=self._render,
-                    refresh_per_second=8, transient=False, vertical_overflow="crop",
+                    console=self._console,
+                    get_renderable=self._render,
+                    refresh_per_second=8,
+                    transient=False,
+                    vertical_overflow="crop",
                 )
                 self._live.start(refresh=True)
         return self
@@ -92,20 +102,29 @@ class CheckpointDisplay:
 
     def _record_phase(self, now):
         phase = self._frame.phase
-        self._phase_seconds[phase] = self._phase_seconds.get(phase, 0) + now - self._phase_started
+        self._phase_seconds[phase] = (
+            self._phase_seconds.get(phase, 0) + now - self._phase_started
+        )
         self._phase_started = now
 
     def complete(self, summary):
         self._ended = time.monotonic()
         self._record_phase(self._ended)
-        stages = {phase: self._phase_seconds.get(phase, 0)
-                  for phase in ("prepare", "plan", "execute", "unmap")}
-        summary = dict(summary, routing_seconds=max(0, summary["load_seconds"] - sum(stages.values())),
-                       **{phase + "_seconds": seconds for phase, seconds in stages.items()})
+        stages = {
+            phase: self._phase_seconds.get(phase, 0)
+            for phase in ("prepare", "plan", "execute", "unmap")
+        }
+        summary = dict(
+            summary,
+            routing_seconds=max(0, summary["load_seconds"] - sum(stages.values())),
+            **{phase + "_seconds": seconds for phase, seconds in stages.items()},
+        )
         self._publish(phase="ready", summary=tuple(summary.items()))
 
     def _elapsed(self):
-        return (self._ended if self._ended is not None else time.monotonic()) - self._started
+        return (
+            self._ended if self._ended is not None else time.monotonic()
+        ) - self._started
 
     def _publish(self, **changes):
         self._frame = replace(self._frame, **changes)
@@ -119,19 +138,33 @@ class CheckpointDisplay:
             self._last_stage, self._last_log = stage, now
             summary = dict(frame.summary)
             if summary:
-                detail = self._result(summary) + "; " + self._timing(summary) + "; " + self._breakdown(summary)
+                detail = (
+                    self._result(summary)
+                    + "; "
+                    + self._timing(summary)
+                    + "; "
+                    + self._breakdown(summary)
+                )
             else:
-                detail = (f"{frame.shards}/{frame.total} shards routed, "
-                          f"{frame.selected_bytes / 1e9:.2f} GB selected on rank 0, "
-                          f"{_duration(self._elapsed())}")
+                detail = (
+                    f"{frame.shards}/{frame.total} shards routed, "
+                    f"{frame.selected_bytes / 1e9:.2f} GB selected on rank 0, "
+                    f"{_duration(self._elapsed())}"
+                )
             self._stream.write(f"b12x {label.lower()}: {detail}\n")
             self._stream.flush()
 
     @staticmethod
     def _result(summary):
-        scope = f"across {summary['ranks']} TP ranks" if summary["ranks"] > 1 else "on rank 0"
-        return (f"{summary['payload_bytes'] / 1e9:.2f} GB selected {scope}"
-                f" · {summary['physical_bytes'] / 1e9:.2f} GB physical reads")
+        scope = (
+            f"across {summary['ranks']} TP ranks"
+            if summary["ranks"] > 1
+            else "on rank 0"
+        )
+        return (
+            f"{summary['payload_bytes'] / 1e9:.2f} GB selected {scope}"
+            f" · {summary['physical_bytes'] / 1e9:.2f} GB physical reads"
+        )
 
     @staticmethod
     def _transfer_rate(summary):
@@ -144,7 +177,9 @@ class CheckpointDisplay:
     def _timing(cls, summary):
         text = f"{summary['load_seconds']:.2f} s total loading"
         if "shared_transfer_seconds" in summary:
-            text += f" · {summary['shared_transfer_seconds']:.2f} s shared read + scatter"
+            text += (
+                f" · {summary['shared_transfer_seconds']:.2f} s shared read + scatter"
+            )
         rate = cls._transfer_rate(summary)
         if rate is not None:
             text += f" · ≈{rate:.1f} GB/s"
@@ -152,8 +187,10 @@ class CheckpointDisplay:
 
     @staticmethod
     def _breakdown(summary):
-        return " · ".join(f"{_PHASES[phase][0]} {summary[phase + '_seconds']:.2f}s"
-                          for phase in ("routing", "prepare", "plan", "execute", "unmap"))
+        return " · ".join(
+            f"{_PHASES[phase][0]} {summary[phase + '_seconds']:.2f}s"
+            for phase in ("routing", "prepare", "plan", "execute", "unmap")
+        )
 
     def _render(self):
         from rich import box
@@ -173,9 +210,13 @@ class CheckpointDisplay:
                 self._console.size = size
         width = self._console.width
         color = _ERROR if stage == "FAILED" else _SIGNAL
-        phase_elapsed = (self._ended if self._ended is not None else time.monotonic()) - self._phase_started
+        phase_elapsed = (
+            self._ended if self._ended is not None else time.monotonic()
+        ) - self._phase_started
         if width < 76 or self._console.height < 10:
-            line = Text("b12x  ", style=f"bold {_INK}", no_wrap=True, overflow="ellipsis")
+            line = Text(
+                "b12x  ", style=f"bold {_INK}", no_wrap=True, overflow="ellipsis"
+            )
             line.append(stage, style=f"bold {color}")
             if frame.summary:
                 summary = dict(frame.summary)
@@ -184,7 +225,15 @@ class CheckpointDisplay:
                 if rate is not None:
                     line.append(f" · ≈{rate:.1f} GB/s", style=_INK)
                 return line
-            detail = (f"{frame.shards}/{frame.total} shards" if frame.total else "reading metadata") if frame.phase == "routing" else label.lower()
+            detail = (
+                (
+                    f"{frame.shards}/{frame.total} shards"
+                    if frame.total
+                    else "reading metadata"
+                )
+                if frame.phase == "routing"
+                else label.lower()
+            )
             line.append(f"  {detail}  {_duration(phase_elapsed)}", style=_DIM)
             return line
         rail = Text(no_wrap=True)
@@ -205,9 +254,14 @@ class CheckpointDisplay:
         elif frame.phase in ("ready", "failed"):
             bar = _bar(int(frame.phase == "ready"), bar_width)
         else:
-            bar = ProgressBar(total=None, pulse=True, width=bar_width,
-                              style=_TRACK, pulse_style=_SIGNAL,
-                              animation_time=phase_elapsed)
+            bar = ProgressBar(
+                total=None,
+                pulse=True,
+                width=bar_width,
+                style=_TRACK,
+                pulse_style=_SIGNAL,
+                animation_time=phase_elapsed,
+            )
         activity = Table.grid(padding=(0, 1))
         activity.add_row(bar, Text(detail, style=color, no_wrap=True))
         grid = Table.grid(expand=True)
@@ -228,9 +282,20 @@ class CheckpointDisplay:
             if frame.phase != "routing":
                 source = f"{frame.total} checkpoint shards"
             grid.add_row(Text(f"SOURCE    {source}", style=_DIM))
-            grid.add_row(Text(f"SELECTED  {frame.selected_bytes / 1e9:.2f} GB on rank 0", style=_INK))
-        return Panel(grid, box=box.SQUARE, border_style=_TRACK, padding=(0, 2),
-                     title=Text(" b12x / weight loading ", style=f"bold {_INK}"), title_align="left")
+            grid.add_row(
+                Text(
+                    f"SELECTED  {frame.selected_bytes / 1e9:.2f} GB on rank 0",
+                    style=_INK,
+                )
+            )
+        return Panel(
+            grid,
+            box=box.SQUARE,
+            border_style=_TRACK,
+            padding=(0, 2),
+            title=Text(" b12x / weight loading ", style=f"bold {_INK}"),
+            title_align="left",
+        )
 
     def stop(self):
         if self._live is not None:

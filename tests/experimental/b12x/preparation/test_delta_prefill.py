@@ -19,6 +19,7 @@ from b12x.testing.delta_prefill_cases import (
 
 def _gpu():
     from ..conftest import require_b12x
+
     return require_b12x()
 
 
@@ -51,7 +52,9 @@ def test_prepared_prefill_preserves_null_and_checkpoint_slots(lengths) -> None:
     initial = tensors["recurrent_state"].clone()
     expected, state = oracle(case, tensors, null_state_index=null)
 
-    with prepared_binding(case, tensors, checkpoint_export=True, null_state_index=null) as binding:
+    with prepared_binding(
+        case, tensors, checkpoint_export=True, null_state_index=null
+    ) as binding:
         gdn.run(binding)
         check_binding(case, binding, expected, state, initial)
 
@@ -65,7 +68,9 @@ def test_prepared_prefill_handles_large_int32_state_offsets() -> None:
     elements, stride = 3 * 128 * 128, 3 * 128 * 128 + 128
     high = (1 << 31) // stride + 1
     storage = torch.empty((high + 3) * stride, dtype=torch.float32, device=device)
-    pool = torch.as_strided(storage, (high + 3, 3, 128, 128), (stride, 128 * 128, 128, 1))
+    pool = torch.as_strided(
+        storage, (high + 3, 3, 128, 128), (stride, 128 * 128, 128, 1)
+    )
     pool[high].copy_(compact_initial[0])
     pool[high + 1].fill_(float("nan"))
     pool[high + 2].fill_(5)
@@ -85,7 +90,11 @@ def test_prepared_prefill_handles_large_int32_state_offsets() -> None:
 def test_prepared_prefill_keeps_strided_inputs_immutable() -> None:
     case = PrefillCase("gdn", 1, 3, (63, 128))
     tensors = make_inputs(case, device=_gpu())
-    for name in ("initial_state_indices", "final_state_indices", "checkpoint_state_indices"):
+    for name in (
+        "initial_state_indices",
+        "final_state_indices",
+        "checkpoint_state_indices",
+    ):
         tensors[name] = tensors[name].to(torch.int64)
     for name in ("raw_g", "raw_beta"):
         shape = (case.tokens, 2, 3) if name == "raw_g" else (case.tokens, 3, 2)
@@ -94,7 +103,11 @@ def test_prepared_prefill_keeps_strided_inputs_immutable() -> None:
         view.copy_(tensors[name])
         tensors[name] = view
     initial = tensors["recurrent_state"].clone()
-    saved = {name: value.clone() for name, value in tensors.items() if name not in ("output", "recurrent_state")}
+    saved = {
+        name: value.clone()
+        for name, value in tensors.items()
+        if name not in ("output", "recurrent_state")
+    }
     expected, state = oracle(case, tensors, qk_l2norm=False)
 
     with prepared_binding(case, tensors, qk_l2norm=False) as binding:

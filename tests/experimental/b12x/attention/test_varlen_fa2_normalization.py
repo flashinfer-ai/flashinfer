@@ -19,17 +19,27 @@ def _fa2():
     try:
         from vllm.vllm_flash_attn import flash_attn_varlen_func
     except ImportError:
-        pytest.skip("Normalization comparison requires vLLM's FlashAttention 2 extension")
+        pytest.skip(
+            "Normalization comparison requires vLLM's FlashAttention 2 extension"
+        )
     return flash_attn_varlen_func
 
 
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("q_lengths,k_lengths", [
-    ([1], [1]), ([63, 65, 129], [127, 129, 257]),
-    ([1025], [1025]), ([2049], [4097]),
-])
+@pytest.mark.parametrize(
+    "q_lengths,k_lengths",
+    [
+        ([1], [1]),
+        ([63, 65, 129], [127, 129, 257]),
+        ([1025], [1025]),
+        ([2049], [4097]),
+    ],
+)
 def test_mla_normalization_matches_fa2_under_replay(
-    monkeypatch, causal, q_lengths, k_lengths,
+    monkeypatch,
+    causal,
+    q_lengths,
+    k_lengths,
 ):
     from b12x.attention import varlen
     from b12x.attention._shared.contiguous import api as native
@@ -42,32 +52,52 @@ def test_mla_normalization_matches_fa2_under_replay(
     device = q.device
     k = torch.randn((sum(k_lengths), 3, 192), dtype=q.dtype, device=device)
     v = torch.randn((sum(k_lengths), 3, 128), dtype=q.dtype, device=device)
-    cq = torch.tensor([0, *torch.tensor(q_lengths).cumsum(0).tolist()],
-                      dtype=torch.int32, device=device)
-    ck = torch.tensor([0, *torch.tensor(k_lengths).cumsum(0).tolist()],
-                      dtype=torch.int32, device=device)
+    cq = torch.tensor(
+        [0, *torch.tensor(q_lengths).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    ck = torch.tensor(
+        [0, *torch.tensor(k_lengths).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
     scale = 1 / math.sqrt(192)
     declaration = varlen.plan(
-        q, k, v, cq, ck,
-        max_seqlen_q=max(q_lengths), max_seqlen_k=max(k_lengths), causal=causal,
+        q,
+        k,
+        v,
+        cq,
+        ck,
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max(k_lengths),
+        causal=causal,
         override=varlen.VarlenAttentionConfig(tile_m=128, tile_n=64),
     )
 
     def prepare(state):
-        spec, = state.scratch_plan.scratch_specs()
+        (spec,) = state.scratch_plan.scratch_specs()
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
         binding = state.bind(
-            scratch=scratch, q=q, k=k, v=v,
-            cu_seqlens_q=cq, cu_seqlens_k=ck,
+            scratch=scratch,
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cq,
+            cu_seqlens_k=ck,
             softmax_scale=scale,
         )
         return PreparedCall(run=lambda: state.run(binding), owners=(scratch,))
 
-    with PreparationSession(device=device, autotune=False, compile_workers=1) as session:
-        session.prepare((declaration.request(name="mla-normalization", prepare_call=prepare),))
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=1
+    ) as session:
+        session.prepare(
+            (declaration.request(name="mla-normalization", prepare_call=prepare),)
+        )
         state = require_prepared(declaration, "attention.varlen", device)
         program = state.plan.compiled
-        spec, = state.scratch_plan.scratch_specs()
+        (spec,) = state.scratch_plan.scratch_specs()
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
 
         def no_compile(*args, **kwargs):
@@ -75,9 +105,15 @@ def test_mla_normalization_matches_fa2_under_replay(
 
         monkeypatch.setattr(native, "_compile_varlen_attention", no_compile)
         binding = varlen.bind(
-            declaration, scratch=scratch, q=q, k=k, v=v,
-            cu_seqlens_q=cq, cu_seqlens_k=ck,
-            max_seqlen_q=max(q_lengths), max_seqlen_k=max(k_lengths),
+            declaration,
+            scratch=scratch,
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cq,
+            cu_seqlens_k=ck,
+            max_seqlen_q=max(q_lengths),
+            max_seqlen_k=max(k_lengths),
             softmax_scale=scale,
         )
         assert binding.binding.plan.compiled is program
@@ -94,11 +130,17 @@ def test_mla_normalization_matches_fa2_under_replay(
                 actual_lse.fill_(float("nan"))
                 graph.replay()
                 expected, expected_lse = flash_attention(
-                    q=q, k=k, v=functional.pad(v, (0, 64)),
-                    cu_seqlens_q=cq, cu_seqlens_k=ck,
-                    max_seqlen_q=max(q_lengths), max_seqlen_k=max(k_lengths),
-                    softmax_scale=scale, causal=causal,
-                    return_softmax_lse=True, fa_version=2,
+                    q=q,
+                    k=k,
+                    v=functional.pad(v, (0, 64)),
+                    cu_seqlens_q=cq,
+                    cu_seqlens_k=ck,
+                    max_seqlen_q=max(q_lengths),
+                    max_seqlen_k=max(k_lengths),
+                    softmax_scale=scale,
+                    causal=causal,
+                    return_softmax_lse=True,
+                    fa_version=2,
                 )
                 torch.testing.assert_close(actual, expected[..., :128], rtol=0, atol=0)
                 torch.testing.assert_close(actual_lse, expected_lse, rtol=0, atol=0)
@@ -106,26 +148,40 @@ def test_mla_normalization_matches_fa2_under_replay(
                 assert torch.isfinite(actual_lse).all()
                 q_start = k_start = 0
                 for q_length, k_length in zip(q_lengths, k_lengths, strict=True):
-                    rows = torch.linspace(0, q_length - 1, 9, device=device).long().unique()
-                    scores = torch.einsum(
-                        "qhd,khd->hqk", q[q_start + rows].double(),
-                        k[k_start:k_start + k_length].double(),
-                    ) * scale
+                    rows = (
+                        torch.linspace(0, q_length - 1, 9, device=device)
+                        .long()
+                        .unique()
+                    )
+                    scores = (
+                        torch.einsum(
+                            "qhd,khd->hqk",
+                            q[q_start + rows].double(),
+                            k[k_start : k_start + k_length].double(),
+                        )
+                        * scale
+                    )
                     if causal:
                         mask = torch.arange(k_length, device=device)[None] > (
                             rows[:, None] + k_length - q_length
                         )
                         scores.masked_fill_(mask[None], -torch.inf)
                     truth = torch.einsum(
-                        "hqk,khd->qhd", scores.softmax(-1),
-                        v[k_start:k_start + k_length].double(),
+                        "hqk,khd->qhd",
+                        scores.softmax(-1),
+                        v[k_start : k_start + k_length].double(),
                     )
                     torch.testing.assert_close(
-                        actual[q_start + rows].double(), truth, atol=0.02, rtol=0.01,
+                        actual[q_start + rows].double(),
+                        truth,
+                        atol=0.02,
+                        rtol=0.01,
                     )
                     torch.testing.assert_close(
-                        actual_lse[:, q_start + rows].double(), scores.logsumexp(-1),
-                        atol=0.0001, rtol=0.00001,
+                        actual_lse[:, q_start + rows].double(),
+                        scores.logsumexp(-1),
+                        atol=0.0001,
+                        rtol=0.00001,
                     )
                     q_start += q_length
                     k_start += k_length

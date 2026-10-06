@@ -1,4 +1,5 @@
 """Safetensors-only calibration IO — pickle must be rejected everywhere."""
+
 from __future__ import annotations
 
 from pathlib import Path

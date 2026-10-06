@@ -234,9 +234,10 @@ def test_a2a_graph_epoch_tail_uses_serialized_stream_fast_path() -> None:
     assert "ld.global.u32 generation, [$0];" in source
     assert "st.global.u32 [$0], generation;" in source
     assert "fence.sc.gpu" not in source
-    assert "generation" not in inspect.signature(
-        kernels._a2a_graph_epoch_arrive
-    ).parameters
+    assert (
+        "generation"
+        not in inspect.signature(kernels._a2a_graph_epoch_arrive).parameters
+    )
 
     assert "_a2a_graph_epoch_arrive(" in inspect.getsource(
         kernels._LseReduceScatterLaunch.kernel
@@ -303,9 +304,7 @@ def test_block_pair_barrier_selects_once_and_keeps_scaled_offsets_int64() -> Non
     from b12x.comm.pcie import _dcp_cute_common as common
 
     source = inspect.getsource(common.block_pair_barrier)
-    prefix, body = source.split(
-        "if Int32(tidx) < Int32(world_size):", maxsplit=1
-    )
+    prefix, body = source.split("if Int32(tidx) < Int32(world_size):", maxsplit=1)
     assert "for peer in cutlass.range_constexpr(1, world_size):" not in prefix
     assert "for peer in cutlass.range_constexpr(1, world_size):" in body
     assert "peer_signal_address = Int64(signals[peer].toint())" in body
@@ -346,12 +345,14 @@ def test_lse_log_base_is_a_runtime_kernel_argument() -> None:
 
     key = kernels._lse_launcher_key(8, 0, "bf16", 256, True)
     assert key == (8, 0, "bf16", 256, True)
-    assert "natural_log" in inspect.signature(
-        kernels._LseReduceScatterLaunch.__call__
-    ).parameters
-    assert "natural_log" in inspect.signature(
-        kernels._LseReduceScatterLaunch.kernel
-    ).parameters
+    assert (
+        "natural_log"
+        in inspect.signature(kernels._LseReduceScatterLaunch.__call__).parameters
+    )
+    assert (
+        "natural_log"
+        in inspect.signature(kernels._LseReduceScatterLaunch.kernel).parameters
+    )
     source = inspect.getsource(kernels._LseReduceScatterLaunch.kernel)
     assert source.count("if natural_log != Int32(0):") == 1
     branch = source.split("if natural_log != Int32(0):", maxsplit=1)[1]
@@ -368,8 +369,7 @@ def test_lse_uses_one_runtime_selected_lse_load_per_lane() -> None:
 
     assert "lane_lse_base = Int64(local_lse.toint())" in lse_phase
     assert (
-        "for source_index in cutlass.range_constexpr(1, self._world_size):"
-        in lse_phase
+        "for source_index in cutlass.range_constexpr(1, self._world_size):" in lse_phase
     )
     assert "if lane == Int32(source_index):" in lse_phase
     assert "if lane < Int32(self._world_size):" in lse_phase
@@ -671,9 +671,7 @@ def test_first_capture_freezes_the_next_eager_slot_as_graph_base(monkeypatch) ->
 
 def test_runtime_accepts_head_major_input_and_output():
     runtime = _make_runtime()
-    input_storage = torch.arange(
-        32 * 4 * 64, dtype=torch.bfloat16
-    ).reshape(32, 4, 64)
+    input_storage = torch.arange(32 * 4 * 64, dtype=torch.bfloat16).reshape(32, 4, 64)
     partial_output = input_storage.transpose(0, 1)[:2]
     partial_lse = torch.zeros(2, 32, dtype=torch.float32)
     output_storage = torch.empty(16, 2, 64, dtype=torch.bfloat16)
@@ -692,12 +690,12 @@ def test_kimi_pair_topk_dispatches_compact_outputs(world_size: int) -> None:
     runtime = _make_kimi_runtime(world_size, ext)
     local_down_width = 3584 // world_size
     local_router_width = 896 // world_size
-    local_down = torch.arange(
-        local_down_width, dtype=torch.bfloat16
-    ).view(1, local_down_width)
-    local_router = torch.arange(
-        local_router_width, dtype=torch.float32
-    ).view(1, local_router_width)
+    local_down = torch.arange(local_down_width, dtype=torch.bfloat16).view(
+        1, local_down_width
+    )
+    local_router = torch.arange(local_router_width, dtype=torch.float32).view(
+        1, local_router_width
+    )
     correction_bias = torch.zeros(896, dtype=torch.float32)
 
     down, weights, ids = runtime.all_gather_pair_kimi_topk(
@@ -716,13 +714,9 @@ def test_kimi_pair_topk_dispatches_compact_outputs(world_size: int) -> None:
 
 @pytest.mark.parametrize("world_size", (2, 4, 8, 16))
 @pytest.mark.parametrize("rows", (1, 8))
-def test_kimi_topk16_dispatches_compact_outputs(
-    world_size: int, rows: int
-) -> None:
+def test_kimi_topk16_dispatches_compact_outputs(world_size: int, rows: int) -> None:
     runtime = _make_kimi_runtime(world_size)
-    router_logits = torch.arange(
-        rows * 896, dtype=torch.float32
-    ).view(rows, 896)
+    router_logits = torch.arange(rows * 896, dtype=torch.float32).view(rows, 896)
     correction_bias = torch.zeros(896, dtype=torch.float32)
 
     weights, ids = runtime.kimi_topk16(router_logits, correction_bias)
@@ -1008,12 +1002,8 @@ def test_pool_rejects_logical_channel_set_mismatch_before_allocation(monkeypatch
         _requested, existing = local_state
         return [(("other",), existing), local_state]
 
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_dcp_a2a._broadcast_gather_object", gather
-    )
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
-    )
+    monkeypatch.setattr("b12x.comm.pcie.pcie_dcp_a2a._broadcast_gather_object", gather)
+    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
 
     with pytest.raises(RuntimeError, match="differs across ranks"):
         pool.prepare_channels(("target",))
@@ -1155,9 +1145,7 @@ def test_pool_capture_allows_opposite_order_from_agreed_catalog(monkeypatch):
         assert requested == "graph:target"
         return [local_state, ("graph:draft", catalog)]
 
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
-    )
+    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
 
     with pool.capture(7, channel_id="graph:target") as channel:
         assert channel is target
@@ -1190,9 +1178,7 @@ def test_pool_capture_rejects_divergent_catalog_before_allocation(monkeypatch):
             return [(), ()]
         return [local_state, ("graph:target", ())]
 
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
-    )
+    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
 
     with (
         pytest.raises(RuntimeError, match="prepared channel catalog differs"),
@@ -1227,9 +1213,7 @@ def test_pool_capture_rejects_differing_unprepared_ids(monkeypatch):
         _, catalog = local_state
         return [local_state, ("graph:unknown", catalog)]
 
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
-    )
+    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
 
     with (
         pytest.raises(RuntimeError, match="unprepared logical channels"),

@@ -13,7 +13,12 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from benchmarks.experimental.b12x.benchmark_moe import MODEL_PATH, TP_RANK, TP_SIZE, ModelSpec
+from benchmarks.experimental.b12x.benchmark_moe import (
+    MODEL_PATH,
+    TP_RANK,
+    TP_SIZE,
+    ModelSpec,
+)
 
 
 def _skip_if_no_sm120() -> None:

@@ -120,9 +120,7 @@ def use_paged_extend_fp8_pv_repack(
     num_sms = max(int(num_sms), 1)
     active_ctas = int(plan.num_qo_tiles) * int(plan.num_kv_heads)
     resident_wave_capacity = num_sms * resident_ctas_per_sm
-    return active_ctas <= (
-        _FP8_PV_REPACK_MAX_RESIDENT_WAVES * resident_wave_capacity
-    )
+    return active_ctas <= (_FP8_PV_REPACK_MAX_RESIDENT_WAVES * resident_wave_capacity)
 
 
 def _msa_decode_chunk_tokens(policy_batch: int) -> int:
@@ -162,14 +160,10 @@ def _decode_graph_chunk_pages_env(name: str) -> int | None:
 
 
 def _apply_decode_graph_chunk_pages_debug_policy(chunk_pages: int) -> int:
-    forced = _decode_graph_chunk_pages_env(
-        "B12X_PAGED_DECODE_GRAPH_CHUNK_PAGES"
-    )
+    forced = _decode_graph_chunk_pages_env("B12X_PAGED_DECODE_GRAPH_CHUNK_PAGES")
     if forced is not None:
         return forced
-    minimum = _decode_graph_chunk_pages_env(
-        "B12X_PAGED_DECODE_GRAPH_MIN_CHUNK_PAGES"
-    )
+    minimum = _decode_graph_chunk_pages_env("B12X_PAGED_DECODE_GRAPH_MIN_CHUNK_PAGES")
     if minimum is not None:
         return max(int(chunk_pages), minimum)
     return int(chunk_pages)
@@ -247,9 +241,7 @@ def decode_graph_max_chunks_per_request_budget(
         num_kv_heads=num_kv_heads,
         graph_ctas_per_sm=graph_ctas_per_sm,
     )
-    work_items_per_chunk = max(int(batch), 1) * max(
-        int(query_tiles_per_request), 1
-    )
+    work_items_per_chunk = max(int(batch), 1) * max(int(query_tiles_per_request), 1)
     return max(max_batch_size_if_split // work_items_per_chunk, 1)
 
 
@@ -300,10 +292,7 @@ def _scale_chunk_budget_for_sm_count(
     reference_sm_count: int,
 ) -> int:
     return max(
-        (
-            int(chunks_at_reference_count) * int(num_sms)
-            + int(reference_sm_count) // 2
-        )
+        (int(chunks_at_reference_count) * int(num_sms) + int(reference_sm_count) // 2)
         // int(reference_sm_count),
         1,
     )
@@ -1348,9 +1337,7 @@ def _plan_decode_graph_capacity_heuristic(
             max_chunks_budget, max(max_work_items // direct_work_items, 1)
         )
         if analytic_total_work_budget is not None:
-            analytic_total_work_budget = min(
-                analytic_total_work_budget, max_work_items
-            )
+            analytic_total_work_budget = min(analytic_total_work_budget, max_work_items)
     if max_partial_rows is not None:
         max_partial_rows = int(max_partial_rows)
         if max_partial_rows < 0:
@@ -1361,9 +1348,7 @@ def _plan_decode_graph_capacity_heuristic(
                 f"request ({batch}), capacity is {max_partial_rows}"
             )
         partial_chunk_capacity = (
-            max(max_partial_rows // batch, 1)
-            if max_partial_rows >= batch
-            else 1
+            max(max_partial_rows // batch, 1) if max_partial_rows >= batch else 1
         )
         max_chunks_budget = min(max_chunks_budget, partial_chunk_capacity)
         if analytic_total_work_budget is not None:
@@ -1406,9 +1391,7 @@ def _plan_decode_graph_capacity_heuristic(
     ):
         capacity_max_work_items = int(analytic_total_work_budget)
         capacity_max_partial_rows = int(analytic_total_work_budget)
-        capacity_max_chunks_per_request = _ceil_div(
-            analytic_total_work_budget, batch
-        )
+        capacity_max_chunks_per_request = _ceil_div(analytic_total_work_budget, batch)
         architecture_max_chunks = max(
             architecture_max_chunks, capacity_max_chunks_per_request
         )
@@ -1490,6 +1473,8 @@ def plan_decode_graph_capacity(
         worst_page_count=config.worst_page_count,
         chunk_pages_lut=config.chunk_pages_lut(),
     )
+
+
 def plan_extend_graph_capacity(
     *,
     device: torch.device | str,
@@ -1564,27 +1549,22 @@ def plan_extend_graph_capacity(
         page_size=page_size,
         max_effective_kv_pages=max_effective_kv_pages,
     )
-    if (
-        max_qo_len > 64
-        and _is_laguna_fp8_gqa6_full_prefill_graph(
-            device=device,
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            page_size=page_size,
-            batch=batch,
-            window_left=window_left,
-        )
+    if max_qo_len > 64 and _is_laguna_fp8_gqa6_full_prefill_graph(
+        device=device,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        page_size=page_size,
+        batch=batch,
+        window_left=window_left,
     ):
         cta_tile_q = 64
 
     total_num_qo_tiles = (
-        _ceil_div(total_q_capacity * gqa_group_size, cta_tile_q)
-        + batch
-        - 1
+        _ceil_div(total_q_capacity * gqa_group_size, cta_tile_q) + batch - 1
     )
     resolved_graph_ctas_per_sm = _resolve_graph_ctas_per_sm(
         mode="extend",
@@ -1691,9 +1671,7 @@ def plan_verify_graph_capacity(
         page_size=page_size,
         max_effective_kv_pages=max_effective_kv_pages,
     )
-    total_num_qo_tiles = batch * _ceil_div(
-        query_len * gqa_group_size, cta_tile_q
-    )
+    total_num_qo_tiles = batch * _ceil_div(query_len * gqa_group_size, cta_tile_q)
     analytic_laguna_verify = _is_laguna_fp8_gqa6_analytic_verify_graph(
         device=device,
         q_dtype=q_dtype,
@@ -1981,9 +1959,7 @@ def create_paged_plan(
         )
     if host_q_lengths is None:
         q_lengths = _q_lengths_from_cu_seqlens(cu_seqlens_q)
-        cache_lengths = _metadata_to_cpu_int_list(
-            cache_seqlens, name="cache_seqlens"
-        )
+        cache_lengths = _metadata_to_cpu_int_list(cache_seqlens, name="cache_seqlens")
         inferred_mode = infer_paged_mode(cu_seqlens_q)
     else:
         q_lengths = [int(length) for length in host_q_lengths]
@@ -1995,7 +1971,8 @@ def create_paged_plan(
         if sum(q_lengths) != total_q:
             raise ValueError("host query lengths must sum to q total_q")
         inferred_mode = (
-            "decode" if batch > 0 and all(length == 1 for length in q_lengths)
+            "decode"
+            if batch > 0 and all(length == 1 for length in q_lengths)
             else "extend"
         )
     if any(cache_len <= 0 for cache_len in cache_lengths):
@@ -2008,8 +1985,7 @@ def create_paged_plan(
         msa_union_tile = (
             msa_block_sparse
             and mode == "extend"
-            and paged_control("B12X_PAGED_MSA_UNION_PREFILL", "1")
-            != "0"
+            and paged_control("B12X_PAGED_MSA_UNION_PREFILL", "1") != "0"
         )
     else:
         msa_union_tile = bool(msa_union_tile)
@@ -2176,9 +2152,7 @@ def create_paged_plan(
             # Query capacity is static; live KV length does not participate.
             cta_tile_q = 64
         if mode == "decode":
-            total_num_qo_tiles = batch * _ceil_div(
-                gqa_group_size, cta_tile_q
-            )
+            total_num_qo_tiles = batch * _ceil_div(gqa_group_size, cta_tile_q)
         elif mode == "verify":
             total_num_qo_tiles = sum(
                 _ceil_div(packed_qo_len, cta_tile_q)
@@ -2186,9 +2160,7 @@ def create_paged_plan(
             )
         else:
             total_num_qo_tiles = (
-                _ceil_div(total_num_rows * gqa_group_size, cta_tile_q)
-                + batch
-                - 1
+                _ceil_div(total_num_rows * gqa_group_size, cta_tile_q) + batch - 1
             )
     else:
         avg_packed_qo_len = sum(packed_qo_len_arr) // max(batch, 1)
@@ -2508,9 +2480,7 @@ def create_paged_plan(
         # The exact entry launches a uniform split rectangle and stores one
         # partial for each of its eight query positions.
         analytic_chunks_per_request = max(padded_batch_size // batch, 1)
-        total_num_partial_rows = (
-            batch * 8 * analytic_chunks_per_request
-        )
+        total_num_partial_rows = batch * 8 * analytic_chunks_per_request
     if (
         split_kv
         and mode == "decode"
@@ -2538,8 +2508,7 @@ def create_paged_plan(
         # The generic metadata remains valid in its prefix; only the analytic
         # entries consume the extra fixed-capacity rows.
         analytic_stage_capacity = sum(
-            _ceil_div(max(int(cache_len), 1), 64)
-            for cache_len in cache_lengths
+            _ceil_div(max(int(cache_len), 1), 64) for cache_len in cache_lengths
         )
         total_num_partial_rows = max(
             total_num_partial_rows,

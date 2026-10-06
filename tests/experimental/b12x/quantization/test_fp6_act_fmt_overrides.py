@@ -4,6 +4,7 @@ Pattern matching is architecture-neutral: any dense model can tune
 ``*.linear_attn.*`` / ``*.mlp.*`` / ``*.self_attn.*`` groups without
 hardcoding a model family.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -16,7 +17,10 @@ from b12x.quantization.mxfp6.fp6_checkpoint import (
 
 
 def test_resolve_default_when_no_overrides() -> None:
-    assert resolve_activation_format("layers.0.mlp.gate_proj", default_fmt="e4m3") == "e4m3"
+    assert (
+        resolve_activation_format("layers.0.mlp.gate_proj", default_fmt="e4m3")
+        == "e4m3"
+    )
 
 
 def test_resolve_first_matching_pattern_wins() -> None:
@@ -73,7 +77,9 @@ def test_parse_rejects_bad_fmt() -> None:
 
 def test_load_merges_env_before_config(monkeypatch) -> None:
     monkeypatch.setenv("B12X_FP6_ACT_FMT_OVERRIDES", "*.linear_attn.*=e2m3")
-    qcfg = {"activation_format_overrides": {"*.linear_attn.*": "e3m2", "*.mlp.*": "e4m3"}}
+    qcfg = {
+        "activation_format_overrides": {"*.linear_attn.*": "e3m2", "*.mlp.*": "e4m3"}
+    }
     got = load_act_fmt_overrides(qcfg)
     # Env first: first match for linear_attn is e2m3, not the config e3m2.
     assert got[0] == ("*.linear_attn.*", "e2m3")

@@ -9,12 +9,12 @@ compiles, allocates quantizer scratch, or resolves a launcher.
 Importing this module performs the registration; the vLLM plugin imports it
 while publishing loaded FP6 weights, before model compilation.
 """
+
 from __future__ import annotations
 
 import torch
 
 from b12x.preparation.types import plan_from_handle, require_prepared
-
 
 
 @torch.library.custom_op("b12x::fp6_dense_linear", mutates_args=())
@@ -39,11 +39,15 @@ def fp6_dense_linear(
     activation sub-format (empty string -> same as ``fmt``; ``"e4m3"`` for W6A8).
     Returns ``(M, out_features)`` bf16.
     """
-    state = require_prepared(plan_from_handle(plan_handle), "quantization.mxfp6", x.device)
-    if (state.query.weight_format != fmt
-            or state.query.activation_format != (act_fmt or fmt)
-            or state.query.out_features != out_features
-            or state.query.in_features != in_features):
+    state = require_prepared(
+        plan_from_handle(plan_handle), "quantization.mxfp6", x.device
+    )
+    if (
+        state.query.weight_format != fmt
+        or state.query.activation_format != (act_fmt or fmt)
+        or state.query.out_features != out_features
+        or state.query.in_features != in_features
+    ):
         raise ValueError("FP6 dense arguments differ from prepared plan")
     return state.run(x.to(torch.bfloat16), weight, scale_storage, global_scale)
 

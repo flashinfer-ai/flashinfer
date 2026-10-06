@@ -38,13 +38,19 @@ def _make_inputs(
     head_dim_vo: int = 256,
     dtype: torch.dtype = torch.bfloat16,
     kv_dtype: torch.dtype = torch.float8_e4m3fn,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     device = "cuda"
     batch = len(q_seqlens)
     total_q = sum(q_seqlens)
     q = torch.randn(total_q, q_heads, head_dim_qk, dtype=dtype, device=device)
-    max_pages = max((cache_len + page_size - 1) // page_size for cache_len in cache_seqlens)
-    num_pages = sum((cache_len + page_size - 1) // page_size for cache_len in cache_seqlens) + 8
+    max_pages = max(
+        (cache_len + page_size - 1) // page_size for cache_len in cache_seqlens
+    )
+    num_pages = (
+        sum((cache_len + page_size - 1) // page_size for cache_len in cache_seqlens) + 8
+    )
     k_cache = torch.randn(
         num_pages, page_size, kv_heads, head_dim_qk, dtype=torch.float32, device=device
     ).to(kv_dtype)
@@ -55,7 +61,9 @@ def _make_inputs(
     cursor = 0
     for request_idx, cache_len in enumerate(cache_seqlens):
         req_pages = (cache_len + page_size - 1) // page_size
-        page_ids = torch.arange(cursor, cursor + req_pages, dtype=torch.int32, device=device)
+        page_ids = torch.arange(
+            cursor, cursor + req_pages, dtype=torch.int32, device=device
+        )
         cursor += req_pages
         page_table[request_idx, :req_pages] = page_ids
         page_table[request_idx, req_pages:] = page_ids[-1]
@@ -107,12 +115,16 @@ def test_fp8_pv_repack_policy_rejects_other_contracts() -> None:
 
 
 def test_paged_infers_decode_mode() -> None:
-    _, _, _, _, _, cu_seqlens_q = _make_inputs(q_seqlens=[1, 1, 1], cache_seqlens=[64, 128, 192])
+    _, _, _, _, _, cu_seqlens_q = _make_inputs(
+        q_seqlens=[1, 1, 1], cache_seqlens=[64, 128, 192]
+    )
     assert infer_paged_mode(cu_seqlens_q) == "decode"
 
 
 def test_paged_infers_extend_mode() -> None:
-    _, _, _, _, _, cu_seqlens_q = _make_inputs(q_seqlens=[1, 6], cache_seqlens=[64, 128])
+    _, _, _, _, _, cu_seqlens_q = _make_inputs(
+        q_seqlens=[1, 6], cache_seqlens=[64, 128]
+    )
     assert infer_paged_mode(cu_seqlens_q) == "extend"
 
 
@@ -207,7 +219,9 @@ def test_paged_scratch_shapes_follow_plan_metadata() -> None:
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
-        output=torch.empty((q.shape[0], q.shape[1], v_cache.shape[3]), dtype=q.dtype, device=q.device),
+        output=torch.empty(
+            (q.shape[0], q.shape[1], v_cache.shape[3]), dtype=q.dtype, device=q.device
+        ),
         page_table=page_table,
         cache_seqlens=cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
@@ -347,12 +361,16 @@ def test_paged_graph_budget_is_independent_of_cache_length() -> None:
         graph_ctas_per_sm=2,
     )
 
-    expected_budget = int(torch.cuda.get_device_properties("cuda").multi_processor_count) * 2
+    expected_budget = (
+        int(torch.cuda.get_device_properties("cuda").multi_processor_count) * 2
+    )
     assert short_plan.graph_ctas_per_sm == 2
     assert long_plan.graph_ctas_per_sm == 2
     assert short_plan.max_batch_size_if_split == expected_budget
     assert long_plan.max_batch_size_if_split == expected_budget
-    assert short_plan.padded_batch_size == long_plan.padded_batch_size == expected_budget
+    assert (
+        short_plan.padded_batch_size == long_plan.padded_batch_size == expected_budget
+    )
 
 
 def test_paged_graph_mode_falls_back_when_heuristic_overflows_budget() -> None:
@@ -469,7 +487,9 @@ def test_paged_graph_mode_defaults_to_decode_graph_split_heuristic() -> None:
         enable_cuda_graph=True,
         graph_chunk_policy=True,
     )
-    expected_budget = int(torch.cuda.get_device_properties("cuda").multi_processor_count) * 2
+    expected_budget = (
+        int(torch.cuda.get_device_properties("cuda").multi_processor_count) * 2
+    )
     assert plan.graph_ctas_per_sm == 2
     assert plan.max_batch_size_if_split == expected_budget
     expected_chunk_pages = decode_chunk_pages_for_graph(
@@ -650,9 +670,7 @@ def test_decode_graph_capacity_is_static_exact_and_capacity_aware() -> None:
     assert direct_only.max_partial_rows == 0
     assert all(
         (page_count + chunk_pages - 1) // chunk_pages == 1
-        for page_count, chunk_pages in enumerate(
-            direct_only.chunk_pages_lut, start=1
-        )
+        for page_count, chunk_pages in enumerate(direct_only.chunk_pages_lut, start=1)
     )
 
 
@@ -1056,9 +1074,7 @@ def test_prepare_windowed_decode_uses_nonmonotone_lut_worst_page_count() -> None
     )
 
     assert scratch_plan.plan.new_batch_size == capacity.max_work_items
-    assert (
-        scratch_plan.plan.total_num_partial_rows == capacity.max_partial_rows
-    )
+    assert scratch_plan.plan.total_num_partial_rows == capacity.max_partial_rows
 
 
 def test_decode_graph_chunk_pages_for_graph_uses_heuristic() -> None:
@@ -1344,15 +1360,9 @@ def test_decode_graph_page128_laguna_keeps_adaptive_one_wave_grid(
         max_chunks_per_req=94,
     )
 
-    assert decode_chunk_pages_for_graph(
-        max_effective_kv_pages=511, **kwargs
-    ) == 11
-    assert decode_chunk_pages_for_graph(
-        max_effective_kv_pages=512, **kwargs
-    ) == 11
-    assert decode_chunk_pages_for_graph(
-        max_effective_kv_pages=513, **kwargs
-    ) == 11
+    assert decode_chunk_pages_for_graph(max_effective_kv_pages=511, **kwargs) == 11
+    assert decode_chunk_pages_for_graph(max_effective_kv_pages=512, **kwargs) == 11
+    assert decode_chunk_pages_for_graph(max_effective_kv_pages=513, **kwargs) == 11
 
     monkeypatch.setattr(
         torch.cuda,

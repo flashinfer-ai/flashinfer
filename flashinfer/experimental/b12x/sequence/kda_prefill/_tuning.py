@@ -82,7 +82,9 @@ def _validate_query(query: KdaPrefillQuery, device) -> None:
         raise TypeError("query must be KdaPrefillQuery")
     validate_metadata_query(query)
     if query.head_dim != 128:
-        raise ValueError(f"sequence.kda_prefill requires head_dim 128, got {query.head_dim}")
+        raise ValueError(
+            f"sequence.kda_prefill requires head_dim 128, got {query.head_dim}"
+        )
     if query.model_dtype != "bfloat16" or query.state_dtype != "float32":
         raise ValueError(
             "sequence.kda_prefill requires bfloat16 activations and float32 "
@@ -95,26 +97,42 @@ def _validate_config(query: KdaPrefillQuery, config: KdaPrefillConfig, device) -
     if config.backend != BACKEND:
         raise ValueError(f"unsupported sequence.kda_prefill backend {config.backend!r}")
     if config.v_split not in V_SPLIT_CHOICES:
-        raise ValueError(f"unsupported sequence.kda_prefill v_split {config.v_split!r}; expected one of {V_SPLIT_CHOICES}")
+        raise ValueError(
+            f"unsupported sequence.kda_prefill v_split {config.v_split!r}; expected one of {V_SPLIT_CHOICES}"
+        )
     if config.k_split not in K_SPLIT_CHOICES:
-        raise ValueError(f"unsupported sequence.kda_prefill k_split {config.k_split!r}; expected one of {K_SPLIT_CHOICES}")
+        raise ValueError(
+            f"unsupported sequence.kda_prefill k_split {config.k_split!r}; expected one of {K_SPLIT_CHOICES}"
+        )
     if config.stages not in STAGE_CHOICES:
-        raise ValueError(f"unsupported sequence.kda_prefill stages {config.stages!r}; expected one of {STAGE_CHOICES}")
+        raise ValueError(
+            f"unsupported sequence.kda_prefill stages {config.stages!r}; expected one of {STAGE_CHOICES}"
+        )
     if 2 * config.v_split * config.k_split + 32 > 1024:
-        raise ValueError("sequence.kda_prefill v_split x k_split exceeds the thread limit")
+        raise ValueError(
+            "sequence.kda_prefill v_split x k_split exceeds the thread limit"
+        )
     if isinstance(config.window_tiles, bool) or int(config.window_tiles) < 1:
         raise ValueError("sequence.kda_prefill window_tiles must be a positive integer")
-    validate_shared_memory(config.v_split, config.k_split, config.stages, config.window_tiles, reuse_value_buffer=False)
+    validate_shared_memory(
+        config.v_split,
+        config.k_split,
+        config.stages,
+        config.window_tiles,
+        reuse_value_buffer=False,
+    )
 
 
 def _tuning_parameters(query: KdaPrefillQuery, device):
     del device
     capacity = tiles_capacity(query.max_tokens, query.max_seqs)
     windows = powers_of_two(capacity) | {
-        capacity, default_window_tiles(query.heads, query.max_tokens, query.max_seqs),
+        capacity,
+        default_window_tiles(query.heads, query.max_tokens, query.max_seqs),
     }
     return ParameterSpace.create(
-        TUNING.knobs, values={"window_tiles": range(1, capacity + 1)},
+        TUNING.knobs,
+        values={"window_tiles": range(1, capacity + 1)},
         exhaustive=query.exhaustive,
         efficiency_predicates=(lambda p: p["window_tiles"] in windows,),
     )
@@ -126,18 +144,48 @@ _KEY_FIELDS = frozenset(KdaPrefillQuery.__dataclass_fields__) - {"max_state_slot
 
 
 def _encode_query(query: KdaPrefillQuery) -> dict[str, object]:
-    return {name: value for name, value in query.to_dict().items() if name in _KEY_FIELDS}
+    return {
+        name: value for name, value in query.to_dict().items() if name in _KEY_FIELDS
+    }
 
 
 TUNING = TuningContract(
-    component_id="sequence.kda_prefill", query_schema_version=5, config_schema_version=1,
+    component_id="sequence.kda_prefill",
+    query_schema_version=5,
+    config_schema_version=1,
     query_fields=_KEY_FIELDS,
-    config_fields=frozenset({"backend", "v_split", "k_split", "stages", "window_tiles"}),
-    encode_query=_encode_query, encode_config=KdaPrefillConfig.to_dict,
-    decode_config=KdaPrefillConfig.from_config, validate_query=_validate_query,
-    validate_config=_validate_config, default_config=_default_config,
-    knobs=(Knob(name="backend", values=(BACKEND,), binding=ParameterBinding.COMPILE), Knob(name="v_split", values=V_SPLIT_CHOICES, binding=ParameterBinding.COMPILE), Knob(name="k_split", values=K_SPLIT_CHOICES, binding=ParameterBinding.COMPILE), Knob(name="stages", values=STAGE_CHOICES, binding=ParameterBinding.COMPILE), Knob(name="window_tiles", values=None, binding=ParameterBinding.COMPILE)),
-    candidate_contract_version=3, parameters=_tuning_parameters,
+    config_fields=frozenset(
+        {"backend", "v_split", "k_split", "stages", "window_tiles"}
+    ),
+    encode_query=_encode_query,
+    encode_config=KdaPrefillConfig.to_dict,
+    decode_config=KdaPrefillConfig.from_config,
+    validate_query=_validate_query,
+    validate_config=_validate_config,
+    default_config=_default_config,
+    knobs=(
+        Knob(name="backend", values=(BACKEND,), binding=ParameterBinding.COMPILE),
+        Knob(name="v_split", values=V_SPLIT_CHOICES, binding=ParameterBinding.COMPILE),
+        Knob(name="k_split", values=K_SPLIT_CHOICES, binding=ParameterBinding.COMPILE),
+        Knob(name="stages", values=STAGE_CHOICES, binding=ParameterBinding.COMPILE),
+        Knob(name="window_tiles", values=None, binding=ParameterBinding.COMPILE),
+    ),
+    candidate_contract_version=3,
+    parameters=_tuning_parameters,
 )
 
-__all__ = ["BACKEND", "CHUNK_TOKENS", "K_SPLIT_CHOICES", "KdaPrefillConfig", "KdaPrefillQuery", "STAGE_CHOICES", "V_SPLIT_CHOICES", "WINDOW_BYTES_BUDGET", "WORKSPACE_RECORD_BYTES", "WorkspaceRecord", "default_window_tiles", "tiles_capacity", "TUNING"]
+__all__ = [
+    "BACKEND",
+    "CHUNK_TOKENS",
+    "K_SPLIT_CHOICES",
+    "KdaPrefillConfig",
+    "KdaPrefillQuery",
+    "STAGE_CHOICES",
+    "V_SPLIT_CHOICES",
+    "WINDOW_BYTES_BUDGET",
+    "WORKSPACE_RECORD_BYTES",
+    "WorkspaceRecord",
+    "default_window_tiles",
+    "tiles_capacity",
+    "TUNING",
+]

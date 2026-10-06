@@ -34,15 +34,21 @@ def is_disabled() -> bool:
 
 
 def mm(
-    x: torch.Tensor, weight: torch.Tensor, *, plan: Plan,
-    bias: torch.Tensor | None = None, out: torch.Tensor | None = None,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    plan: Plan,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Run the selected native projection; caller-owned output supports replay."""
     if output_dtype is None:
         output_dtype = getattr(torch, plan.query.output_dtype)
     if out is None:
-        return torch.ops.b12x.bf16_gemv_small_n(x, weight, plan.handle, bias, output_dtype)
+        return torch.ops.b12x.bf16_gemv_small_n(
+            x, weight, plan.handle, bias, output_dtype
+        )
     if output_dtype is not None and out.dtype != output_dtype:
         raise ValueError("output_dtype disagrees with caller-owned output")
     torch.ops.b12x.bf16_gemv_small_n_out(x, weight, out, plan.handle, bias)

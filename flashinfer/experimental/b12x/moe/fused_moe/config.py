@@ -77,9 +77,7 @@ class TrellisRateConfig:
         )
         group_size = data.get("group_size")
         if group_size is not None:
-            group_size = _positive_int(
-                group_size, name="b12x_trellis.rate.group_size"
-            )
+            group_size = _positive_int(group_size, name="b12x_trellis.rate.group_size")
             if group_size % 32:
                 raise ValueError(
                     "b12x_trellis.rate.group_size must be a multiple of the "
@@ -105,9 +103,7 @@ class TrellisRateConfig:
 
         num_layers = _positive_int(num_layers, name="num_layers")
         num_experts = _positive_int(num_experts, name="num_experts")
-        intermediate_size = _positive_int(
-            intermediate_size, name="intermediate_size"
-        )
+        intermediate_size = _positive_int(intermediate_size, name="intermediate_size")
         if self.granularity is RateGranularity.UNIFORM:
             shape: tuple[int, ...] = (1,)
         elif self.granularity is RateGranularity.PER_LAYER:
@@ -137,17 +133,13 @@ class TrellisScaleFactorsConfig:
     gains: ScaleGranularity
 
     @classmethod
-    def from_dict(
-        cls, value: object, *, name: str
-    ) -> "TrellisScaleFactorsConfig":
+    def from_dict(cls, value: object, *, name: str) -> "TrellisScaleFactorsConfig":
         data = _object(
             value,
             name=name,
             required=frozenset({"vectors", "gains"}),
         )
-        vectors = _enum(
-            ScaleGranularity, data["vectors"], name=f"{name}.vectors"
-        )
+        vectors = _enum(ScaleGranularity, data["vectors"], name=f"{name}.vectors")
         gains = _enum(ScaleGranularity, data["gains"], name=f"{name}.gains")
         if vectors is ScaleGranularity.NONE:
             raise ValueError(f"{name}.vectors cannot be 'none'")
@@ -221,9 +213,7 @@ class TrellisProjectionTransform:
                 f"'scaled_hadamard'; got {kind!r}"
             )
         if "block_size" not in data:
-            raise ValueError(
-                "scaled_hadamard projection transforms require block_size"
-            )
+            raise ValueError("scaled_hadamard projection transforms require block_size")
         block_size = _positive_int(
             data["block_size"],
             name="b12x_trellis.transform.projection.block_size",
@@ -348,9 +338,7 @@ class TrellisConfig:
         data = _object(
             value,
             name="quantization_config.b12x_trellis",
-            required=frozenset(
-                {"version", "codebook", "rate", "scale", "transform"}
-            ),
+            required=frozenset({"version", "codebook", "rate", "scale", "transform"}),
         )
         version = data["version"]
         if not isinstance(version, int) or isinstance(version, bool):
@@ -377,9 +365,7 @@ class TrellisConfig:
             required=frozenset({"quant_method", "b12x_trellis"}),
         )
         if data["quant_method"] != "b12x_trellis":
-            raise ValueError(
-                "quantization_config.quant_method must be 'b12x_trellis'"
-            )
+            raise ValueError("quantization_config.quant_method must be 'b12x_trellis'")
         return cls.from_dict(data["b12x_trellis"])
 
     @property

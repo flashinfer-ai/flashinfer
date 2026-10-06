@@ -31,22 +31,57 @@ from typing import TYPE_CHECKING
 from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 
 META = OpMeta(
-    name="gdn_prefill", group="sequence", api_style="planned",
-    entry_points=("Binding", "Caps", "GdnPrefillConfig", "GdnPrefillQuery", "Plan",
-                  "bind", "clear_caches", "is_supported", "plan", "invocation_from_tensors",
-                  "reference", "run", "staging_memory"),
-    dtypes=("bf16", "fp32", "int32", "int64"), recipes=("scalar_gdn",),
-    provenance=Provenance(repo="https://github.com/lukealonso/b12x", commit="79e228ec6",
-                          paths=("b12x/sequence/kda_prefill/_cute_kernels.py",
-                                 "b12x/sequence/gdn_decode/_cute_kernels.py")),
-    test_path="tests/experimental/b12x/preparation/test_delta_prefill.py", since="1.4.0",
-    notes=("BF16 activations, FP32 state, "
-           "head dim 128, three value heads per Q/K head, 16-token chunks."),
+    name="gdn_prefill",
+    group="sequence",
+    api_style="planned",
+    entry_points=(
+        "Binding",
+        "Caps",
+        "GdnPrefillConfig",
+        "GdnPrefillQuery",
+        "Plan",
+        "bind",
+        "clear_caches",
+        "is_supported",
+        "plan",
+        "invocation_from_tensors",
+        "reference",
+        "run",
+        "staging_memory",
+    ),
+    dtypes=("bf16", "fp32", "int32", "int64"),
+    recipes=("scalar_gdn",),
+    provenance=Provenance(
+        repo="https://github.com/lukealonso/b12x",
+        commit="79e228ec6",
+        paths=(
+            "b12x/sequence/kda_prefill/_cute_kernels.py",
+            "b12x/sequence/gdn_decode/_cute_kernels.py",
+        ),
+    ),
+    test_path="tests/experimental/b12x/preparation/test_delta_prefill.py",
+    since="1.4.0",
+    notes=(
+        "BF16 activations, FP32 state, "
+        "head dim 128, three value heads per Q/K head, 16-token chunks."
+    ),
 )
 
 if TYPE_CHECKING:
-    from .api import (Binding, Caps, GdnPrefillConfig, GdnPrefillQuery, Plan, bind,
-                      clear_caches, is_supported, plan, invocation_from_tensors, reference,
-                      run, staging_memory)
+    from .api import (
+        Binding,
+        Caps,
+        GdnPrefillConfig,
+        GdnPrefillQuery,
+        Plan,
+        bind,
+        clear_caches,
+        is_supported,
+        plan,
+        invocation_from_tensors,
+        reference,
+        run,
+        staging_memory,
+    )
 
 install_lazy_api(globals(), META)

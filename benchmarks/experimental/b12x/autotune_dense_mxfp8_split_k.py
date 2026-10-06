@@ -159,9 +159,7 @@ def _check_candidate(
     slices: int,
 ) -> tuple[float, float]:
     if not bool(torch.isfinite(candidate).all().item()):
-        raise RuntimeError(
-            f"non-finite output for {shape.name} M={m} split_k={slices}"
-        )
+        raise RuntimeError(f"non-finite output for {shape.name} M={m} split_k={slices}")
     if not bool(torch.count_nonzero(candidate).item()):
         raise RuntimeError(f"zero output for {shape.name} M={m} split_k={slices}")
     max_abs = (candidate.float() - baseline.float()).abs().max().item()
@@ -272,13 +270,10 @@ def main() -> None:
                     k=shape.k,
                     plan=plan,
                 )
-                tile_k = _select_mxfp8_tile_k(
-                    m, shape.n, shape.k, m, sm_count
-                )
+                tile_k = _select_mxfp8_tile_k(m, shape.n, shape.k, m, sm_count)
                 work_tiles = (
-                    ((m + plan.mma_tiler_mn[0] - 1) // plan.mma_tiler_mn[0])
-                    * ((shape.n + plan.mma_tiler_mn[1] - 1) // plan.mma_tiler_mn[1])
-                )
+                    (m + plan.mma_tiler_mn[0] - 1) // plan.mma_tiler_mn[0]
+                ) * ((shape.n + plan.mma_tiler_mn[1] - 1) // plan.mma_tiler_mn[1])
                 prepared: list[CandidateRun] = []
 
                 for slices in args.split_k_list:
@@ -370,7 +365,9 @@ def main() -> None:
                     direct = next(
                         (value for value, item in scored if item.slices == 1), None
                     )
-                    speedup = f" ({direct / winner_us:.3f}x vs direct)" if direct else ""
+                    speedup = (
+                        f" ({direct / winner_us:.3f}x vs direct)" if direct else ""
+                    )
                     print(
                         f"  -> M={m:<2} winner splitK={winner.slices} "
                         f"{winner_us:.2f} us{speedup}"

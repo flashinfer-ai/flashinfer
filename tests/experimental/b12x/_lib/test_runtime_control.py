@@ -1,4 +1,5 @@
 """Independent capture/session scopes may not unfreeze one another."""
+
 import pytest
 
 from b12x._lib import runtime_control as rc

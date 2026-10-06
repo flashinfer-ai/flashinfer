@@ -173,7 +173,9 @@ def build_mxfp4_csf_inline(
     with _allocations_from(pool):
         exact = all(
             torch.equal(
-                decode_mxfp4_csf_inline(plane, e0, min(e0 + _EXPERT_CHUNK, plane.num_experts)),
+                decode_mxfp4_csf_inline(
+                    plane, e0, min(e0 + _EXPERT_CHUNK, plane.num_experts)
+                ),
                 native[e0 : e0 + _EXPERT_CHUNK],
             )
             for e0 in range(0, plane.num_experts, _EXPERT_CHUNK)
@@ -255,7 +257,9 @@ def _encode_inline_storage(
             first = torch.cumsum(light, 0) - light
             rank = torch.arange(position.shape[0], device=device)
             rank = rank - first[expert * tiles + tile]
-            word = slot | (column << 8) | (values[expert, tile, slot, column].long() << 16)
+            word = (
+                slot | (column << 8) | (values[expert, tile, slot, column].long() << 16)
+            )
             records.append((expert + e0, tile, rank, word))
     heavy = counts > RECORDS
     heavy_tiles = int(heavy.sum())
@@ -290,7 +294,9 @@ def decode_mxfp4_csf_inline(
     offsets = torch.from_numpy(
         _slot_offsets(plane.rows, plane.columns, plane.group_rows)
     ).to(device)
-    tile_blocks = storage[: plane.tiles_bytes].view(plane.num_experts, tiles, TILE_BYTES)
+    tile_blocks = storage[: plane.tiles_bytes].view(
+        plane.num_experts, tiles, TILE_BYTES
+    )
     tile_blocks = tile_blocks[first:last]
     bases = storage[plane.tiles_bytes : plane.tiles_bytes + plane.bases_bytes]
     bases = bases.view(plane.num_experts, blocks, 1, 128)[first:last]
@@ -312,9 +318,9 @@ def decode_mxfp4_csf_inline(
             continue
         expert, tile = live.nonzero().unbind(1)
         word = words[expert, tile, 1 + record]
-        values[expert, tile, word & 127, (word >> 8) & 3] = (
-            (word >> 16) & 255
-        ).to(torch.uint8)
+        values[expert, tile, word & 127, (word >> 8) & 3] = ((word >> 16) & 255).to(
+            torch.uint8
+        )
     target = offsets.view(-1)
     keep = target >= 0
     native = torch.zeros(
@@ -373,7 +379,9 @@ def _expand_tiles(
         shift = (((patch >> 8) & 3) * 8).to(tl.uint32)
         value = ((patch >> 16) & 255).to(tl.uint32) << shift
         hit = active[:, None] & (slot == (patch & 127))
-        word = tl.where(hit, (word & ~(tl.full((), 255, tl.uint32) << shift)) | value, word)
+        word = tl.where(
+            hit, (word & ~(tl.full((), 255, tl.uint32) << shift)) | value, word
+        )
     raw_tile = (RAW_WORDS + (header.to(tl.int64) & 0x7FFFFFFF) * 128)[:, None]
     raw = tl.load(Words + raw_tile + slot, (live & heavy)[:, None], 0)
     word = tl.where(heavy[:, None], raw.to(tl.uint32), word)
@@ -522,17 +530,23 @@ def inline_scale_words(tile: Int32, bases: Uint32, slot0: Int32, raw: Int64):
         else:
             for index in cutlass.range_constexpr(RECORDS):
                 if Uint32(index) < header:
-                    record = ld_shared_u32(
-                        tile + Int32(SELECTOR_BYTES + 4 + 4 * index)
-                    )
+                    record = ld_shared_u32(tile + Int32(SELECTOR_BYTES + 4 + 4 * index))
                     slot = Int32(record & Uint32(127)) - slot0
                     byte_shift = ((record >> Uint32(8)) & Uint32(3)) << Uint32(3)
                     value = ((record >> Uint32(16)) & Uint32(0xFF)) << byte_shift
                     keep = (Uint32(0xFF) << byte_shift) ^ Uint32(0xFFFFFFFF)
-                    w0 = Uint32(cutlass.select_(slot == Int32(0), (w0 & keep) | value, w0))
-                    w1 = Uint32(cutlass.select_(slot == Int32(1), (w1 & keep) | value, w1))
-                    w2 = Uint32(cutlass.select_(slot == Int32(2), (w2 & keep) | value, w2))
-                    w3 = Uint32(cutlass.select_(slot == Int32(3), (w3 & keep) | value, w3))
+                    w0 = Uint32(
+                        cutlass.select_(slot == Int32(0), (w0 & keep) | value, w0)
+                    )
+                    w1 = Uint32(
+                        cutlass.select_(slot == Int32(1), (w1 & keep) | value, w1)
+                    )
+                    w2 = Uint32(
+                        cutlass.select_(slot == Int32(2), (w2 & keep) | value, w2)
+                    )
+                    w3 = Uint32(
+                        cutlass.select_(slot == Int32(3), (w3 & keep) | value, w3)
+                    )
     return w0, w1, w2, w3
 
 

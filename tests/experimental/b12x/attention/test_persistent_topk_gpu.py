@@ -137,7 +137,7 @@ def test_persistent_topk_multirow_eager_and_changed_graph_gpu(rows: int) -> None
     _assert_exact(output, logits, lengths, page_table)
     warm_compile_misses = int(compile_cache_info()["compile_misses"])
 
-    with kernel_resolution_guard('persistent top-k graph must reuse the eager kernel'):
+    with kernel_resolution_guard("persistent top-k graph must reuse the eager kernel"):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = run()

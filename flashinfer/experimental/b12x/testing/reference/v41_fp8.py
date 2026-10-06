@@ -31,8 +31,15 @@ def canonical_fp8_rows(payload: torch.Tensor, kind: str):
 
 
 def split64_fp8_attention(
-    q, key_values, key_scales, valid, sm_scale, attn_sink=None,
-    *, qk_fp8=True, round_split_outputs=True,
+    q,
+    key_values,
+    key_scales,
+    valid,
+    sm_scale,
+    attn_sink=None,
+    *,
+    qk_fp8=True,
+    round_split_outputs=True,
 ):
     """FP8 Q/K dot and per-output-group FP8 probability/V products.
 
@@ -45,7 +52,9 @@ def split64_fp8_attention(
         grouped_q = qdq.reshape(rows, heads, dim // 64, 64)
         raw = grouped_q.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448
         qscale = torch.exp2(torch.ceil(torch.log2(raw)))
-        qdq = ((grouped_q / qscale).to(torch.float8_e4m3fn).float() * qscale).reshape_as(q)
+        qdq = (
+            (grouped_q / qscale).to(torch.float8_e4m3fn).float() * qscale
+        ).reshape_as(q)
     kdq = key_values * key_scales.repeat_interleave(64, dim=-1)
     if not qk_fp8:
         kdq = kdq.bfloat16().float()

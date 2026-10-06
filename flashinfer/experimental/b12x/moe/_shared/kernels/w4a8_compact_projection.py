@@ -278,10 +278,7 @@ class W4A8CompactMicroProjectionKernel:
                 # Row block ``projection * n_tiles + output_tile``.
                 stage_inline_tile(
                     get_ptr_as_int64(w13_sfb, Int32(0)),
-                    (
-                        Int64(expert) * Int64(2 * self.n_tiles)
-                        + Int64(projection_tile)
-                    )
+                    (Int64(expert) * Int64(2 * self.n_tiles) + Int64(projection_tile))
                     * Int64(self.k // 128)
                     + Int64(k128_slice),
                     sfb_base,
@@ -432,9 +429,7 @@ class W4A8CompactMicroProjectionKernel:
                         sfb = csf_scales[nt] >> scale_shift
                     else:
                         sfb = (
-                            ld_shared_u32(
-                                sfb_base + ((n8 * Int32(8) + q) << Int32(2))
-                            )
+                            ld_shared_u32(sfb_base + ((n8 * Int32(8) + q) << Int32(2)))
                             >> scale_shift
                         )
                     fragment = acc[nt]

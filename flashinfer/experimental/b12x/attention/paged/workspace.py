@@ -973,9 +973,7 @@ class PagedAttentionWorkspace:
                 page_size=self.page_size,
                 window_page_span=window_page_span,
                 window_left=int(self._plan.window_left),
-                max_q_tiles_per_req=int(
-                    self._decode_graph_max_q_tiles_per_req or 1
-                ),
+                max_q_tiles_per_req=int(self._decode_graph_max_q_tiles_per_req or 1),
             )
         return self
 
@@ -1240,12 +1238,8 @@ class PagedAttentionWorkspace:
             capacity.chunk_pages_lut,
             device=self.device,
         )
-        self._decode_graph_max_chunks_per_req = int(
-            capacity.max_chunks_per_request
-        )
-        self._decode_graph_max_q_tiles_per_req = int(
-            capacity.query_tiles_per_request
-        )
+        self._decode_graph_max_chunks_per_req = int(capacity.max_chunks_per_request)
+        self._decode_graph_max_q_tiles_per_req = int(capacity.query_tiles_per_request)
         self._use_regular_decode_graph_replay = False
         self._decode_graph_metadata_captured_in_graph = False
         # The LUT's chunk count is non-monotone in effective page count.  Build
@@ -1270,10 +1264,7 @@ class PagedAttentionWorkspace:
             max_page_table_width, dtype=torch.int32, device=self.device
         )
         max_page_table = (
-            (max_page_ids % num_cache_pages)
-            .unsqueeze(0)
-            .expand(batch, -1)
-            .contiguous()
+            (max_page_ids % num_cache_pages).unsqueeze(0).expand(batch, -1).contiguous()
         )
         max_cu_seqlens_q = self._build_capacity_cu_seqlens_q(
             batch=batch,
@@ -1585,9 +1576,7 @@ class PagedAttentionWorkspace:
                 page_size=self.page_size,
                 window_page_span=window_page_span,
                 window_left=int(self._plan.window_left),
-                max_q_tiles_per_req=int(
-                    self._decode_graph_max_q_tiles_per_req or 1
-                ),
+                max_q_tiles_per_req=int(self._decode_graph_max_q_tiles_per_req or 1),
             )
         return self
 
@@ -2114,11 +2103,7 @@ class PagedAttentionWorkspace:
         if batch <= 0:
             raise ValueError("decode graph replay requires bs > 0")
         plan_q_tiles_per_req = max(
-            (
-                int(self._plan.gqa_group_size)
-                + int(self._plan.cta_tile_q)
-                - 1
-            )
+            (int(self._plan.gqa_group_size) + int(self._plan.cta_tile_q) - 1)
             // int(self._plan.cta_tile_q),
             1,
         )
@@ -2148,12 +2133,8 @@ class PagedAttentionWorkspace:
             partial_rows_capacity = (
                 0 if self.tmp_output is None else int(self.tmp_output.shape[0])
             )
-            tmp_lse_capacity = (
-                0 if self.tmp_lse is None else int(self.tmp_lse.shape[0])
-            )
-            required_partial_rows = (
-                batch * int(self._decode_graph_max_chunks_per_req)
-            )
+            tmp_lse_capacity = 0 if self.tmp_lse is None else int(self.tmp_lse.shape[0])
+            required_partial_rows = batch * int(self._decode_graph_max_chunks_per_req)
             if (
                 partial_rows_capacity < required_partial_rows
                 or tmp_lse_capacity < required_partial_rows

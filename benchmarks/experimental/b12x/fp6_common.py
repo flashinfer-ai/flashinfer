@@ -111,9 +111,7 @@ def unswizzled_ue8m0_grid(w_bf16: torch.Tensor) -> torch.Tensor:
 
     e, rows, cols = w_bf16.shape
     blocks = cols // SF_VEC_SIZE_FP6
-    block_max = (
-        w_bf16.float().abs().view(e, rows, blocks, SF_VEC_SIZE_FP6).amax(dim=-1)
-    )
+    block_max = w_bf16.float().abs().view(e, rows, blocks, SF_VEC_SIZE_FP6).amax(dim=-1)
     return _ue8m0_scale_from_block_max(block_max, FLOAT6_E2M3_MAX).contiguous()
 
 

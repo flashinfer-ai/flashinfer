@@ -57,9 +57,7 @@ def test_twoshot_barrier_intrinsics_pin_native_ptx_modifiers() -> None:
 
 
 def test_twoshot_payload_paths_pin_native_ptx_address_spaces() -> None:
-    assert "ld.global.nc.v4.u32" in inspect.getsource(
-        _twoshot_cute.ld_global_nc_v4_u32
-    )
+    assert "ld.global.nc.v4.u32" in inspect.getsource(_twoshot_cute.ld_global_nc_v4_u32)
     assert "ld.v4.b32" in inspect.getsource(_twoshot_cute._ld_generic_v4_u32)
     assert "st.v4.b32" in inspect.getsource(_twoshot_cute._st_generic_v4_u32)
     assert "st.b32" in inspect.getsource(_twoshot_cute._st_generic_u32)
@@ -101,9 +99,7 @@ def test_twoshot_graph_slot_retires_epoch_before_remote_push() -> None:
 
 
 def test_twoshot_serialized_epoch_arrival_uses_one_relaxed_atomic() -> None:
-    source = inspect.getsource(
-        _twoshot_cute.graph_epoch_arrive_serialized
-    )
+    source = inspect.getsource(_twoshot_cute.graph_epoch_arrive_serialized)
     assert source.count("atom.relaxed.gpu.global.inc.u32") == 1
     assert "atom.global.add" not in source
     assert "ld.relaxed.gpu.global.u32" in source

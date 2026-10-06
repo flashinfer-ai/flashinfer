@@ -20,6 +20,7 @@ The packed codes come from the GPU quantizer (``compile_bf16_to_fp6_tma``) — t
 kernel's own quantizer, bit-identical to the torch reference — and the block scales
 are computed with the same per-32-block UE8M0 + cutlass swizzle the kernel reads.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
@@ -103,11 +104,11 @@ def _swizzled_block_scales(
     fmt_max = FLOAT6_E3M2_MAX if fmt == "e3m2" else FLOAT6_E2M3_MAX
     groups, rows, cols = values_bf16.shape
     if cols % SF_VEC_SIZE_FP6 != 0:
-        raise ValueError(
-            f"K/N must be divisible by {SF_VEC_SIZE_FP6}, got {cols}"
-        )
+        raise ValueError(f"K/N must be divisible by {SF_VEC_SIZE_FP6}, got {cols}")
     blocks = cols // SF_VEC_SIZE_FP6
-    scales = torch.zeros((groups, rows, blocks), dtype=torch.uint8, device=values_bf16.device)
+    scales = torch.zeros(
+        (groups, rows, blocks), dtype=torch.uint8, device=values_bf16.device
+    )
     for g in range(groups):
         x = values_bf16[g].float()
         sliced = x.view(rows, blocks, SF_VEC_SIZE_FP6)
@@ -136,10 +137,14 @@ def _quantize_codes(
 
         launch = compile_bf16_to_fp6_tma(m, k, fmt=fmt)
         gs_one = torch.ones(1, dtype=torch.float32, device=values_bf16.device)
-        packed = torch.empty(experts, m, packed_k, dtype=torch.uint8, device=values_bf16.device)
+        packed = torch.empty(
+            experts, m, packed_k, dtype=torch.uint8, device=values_bf16.device
+        )
         for e in range(experts):
             out = allocate_bf16_to_fp6_tma_outputs(m, k, device=values_bf16.device)
-            launch(values_bf16[e].contiguous(), gs_one, out.packed_a_flat, out.scale_flat)
+            launch(
+                values_bf16[e].contiguous(), gs_one, out.packed_a_flat, out.scale_flat
+            )
             packed[e] = out.packed_a_storage.view(m, packed_k)
         torch.cuda.synchronize()
         return packed
@@ -149,7 +154,10 @@ def _quantize_codes(
     row_counts = torch.full((experts,), m, dtype=torch.int32, device=values_bf16.device)
     gs = torch.ones(experts, dtype=torch.float32, device=values_bf16.device)
     packed_grp, _ = quantize_grouped_mxfp6_torch(
-        values_bf16, row_counts, gs, fmt=fmt  # type: ignore[arg-type]
+        values_bf16,
+        row_counts,
+        gs,
+        fmt=fmt,  # type: ignore[arg-type]
     )
     return packed_grp.permute(2, 0, 1).contiguous()
 

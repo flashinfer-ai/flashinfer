@@ -248,10 +248,7 @@ def test_paged_bf16_decode_traits_cover_padded_sync_storage_for_128_vo() -> None
     )
 
     padded_sync_bytes = (
-        traits.num_warps_kv
-        * traits.cta_tile_q
-        * (traits.head_dim_vo + 24)
-        * 4
+        traits.num_warps_kv * traits.cta_tile_q * (traits.head_dim_vo + 24) * 4
         + traits.num_warps_kv * traits.cta_tile_q * 8
     )
     assert traits.shared_storage_bytes >= padded_sync_bytes

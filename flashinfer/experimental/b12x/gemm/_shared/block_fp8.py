@@ -50,12 +50,10 @@ def _physical_mxfp8_k(logical_k: int) -> int:
     return _align_up(logical_k, 128)
 
 
-
 def _packed_physical_mxfp8_k(packed_weight: BlockFP8LinearWeight) -> int:
     physical_k = int(packed_weight.weight.values.shape[1])
     _check_mxfp8_k(physical_k)
     return physical_k
-
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -106,6 +104,7 @@ class BlockFP8LinearScratchCaps:
 @dataclass(frozen=True)
 class _BlockFP8LinearScratchPlan:
     """Private scratch-view mapper retained by a prepared plan state."""
+
     caps: BlockFP8LinearScratchCaps
     _scratch_specs: tuple[ScratchBufferSpec, ...]
     mma_tiler_mn: tuple[int, int]
@@ -128,7 +127,9 @@ class _BlockFP8LinearScratchPlan:
         source_2d = _source_2d(source)
         tokens, in_features = map(int, source_2d.shape)
         if tokens > self.caps.max_tokens or in_features != self.caps.in_features:
-            raise ValueError("block-FP8 binding geometry differs from its prepared capacity")
+            raise ValueError(
+                "block-FP8 binding geometry differs from its prepared capacity"
+            )
         if packed_weight.out_features != self.caps.out_features:
             raise ValueError("packed weight output geometry differs from preparation")
         if packed_weight.block_size != self.caps.block_size:
@@ -138,18 +139,31 @@ class _BlockFP8LinearScratchPlan:
         scratch = scratch_tensor(scratch, self._scratch_specs, owner="block FP8 linear")
         workspace = None
         if self.workspace_nbytes:
-            offset = _align_up(_block_fp8_linear_scratch_layout(
-                tokens=self.caps.max_tokens, in_features=self.caps.in_features,
-                out_features=self.caps.out_features, output_dtype=self.caps.output_dtype,
-            ).nbytes, _SCRATCH_ALIGN_BYTES)
-            workspace = scratch.narrow(0, offset, self.workspace_nbytes).view(torch.float32)
+            offset = _align_up(
+                _block_fp8_linear_scratch_layout(
+                    tokens=self.caps.max_tokens,
+                    in_features=self.caps.in_features,
+                    out_features=self.caps.out_features,
+                    output_dtype=self.caps.output_dtype,
+                ).nbytes,
+                _SCRATCH_ALIGN_BYTES,
+            )
+            workspace = scratch.narrow(0, offset, self.workspace_nbytes).view(
+                torch.float32
+            )
         return build_block_fp8_linear_binding(
-            plan=plan, source=source, packed_weight=packed_weight,
+            plan=plan,
+            source=source,
+            packed_weight=packed_weight,
             x_q=_block_fp8_linear_x_q_from_scratch(
-                scratch, tokens=tokens, in_features=self.caps.in_features,
+                scratch,
+                tokens=tokens,
+                in_features=self.caps.in_features,
                 output_dtype=self.caps.output_dtype,
             ),
-            output=output, workspace=workspace, bias=bias,
+            output=output,
+            workspace=workspace,
+            bias=bias,
             expected_m=self.caps.max_tokens if expected_m is None else expected_m,
             mma_tiler_mn=self.mma_tiler_mn,
         )
@@ -376,33 +390,54 @@ def build_block_fp8_linear_binding(
     if source_2d.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("source dtype must be bf16/fp16")
     _check_block_fp8_linear_tensors(
-        x_q, output, tokens=tokens, packed_weight=packed_weight, output_dtype=output.dtype,
+        x_q,
+        output,
+        tokens=tokens,
+        packed_weight=packed_weight,
+        output_dtype=output.dtype,
     )
     return BlockFP8LinearBinding(
-        plan=plan, source=source, packed_weight=packed_weight, x_q=x_q,
-        output=output, workspace=workspace, bias=bias, expected_m=expected_m,
+        plan=plan,
+        source=source,
+        packed_weight=packed_weight,
+        x_q=x_q,
+        output=output,
+        workspace=workspace,
+        bias=bias,
+        expected_m=expected_m,
         mma_tiler_mn=mma_tiler_mn,
     )
 
 
 def _scratch_plan(
-    caps: BlockFP8LinearScratchCaps, mma_tiler_mn: tuple[int, int], *,
+    caps: BlockFP8LinearScratchCaps,
+    mma_tiler_mn: tuple[int, int],
+    *,
     workspace_nbytes: int = 0,
 ) -> _BlockFP8LinearScratchPlan:
     workspace_nbytes = int(workspace_nbytes)
     if workspace_nbytes < 0 or workspace_nbytes % 4:
-        raise ValueError("block-FP8 fused workspace must be a nonnegative FP32 byte count")
+        raise ValueError(
+            "block-FP8 fused workspace must be a nonnegative FP32 byte count"
+        )
     layout = _block_fp8_linear_scratch_layout(
-        tokens=caps.max_tokens, in_features=caps.in_features,
-        out_features=caps.out_features, output_dtype=caps.output_dtype,
+        tokens=caps.max_tokens,
+        in_features=caps.in_features,
+        out_features=caps.out_features,
+        output_dtype=caps.output_dtype,
     )
     total = _align_up(layout.nbytes, _SCRATCH_ALIGN_BYTES) + workspace_nbytes
     return _BlockFP8LinearScratchPlan(
         caps=caps,
-        _scratch_specs=(scratch_buffer_spec(
-            "block_fp8_linear.scratch", nbytes=total, device=caps.device,
-        ),),
-        mma_tiler_mn=mma_tiler_mn, workspace_nbytes=workspace_nbytes,
+        _scratch_specs=(
+            scratch_buffer_spec(
+                "block_fp8_linear.scratch",
+                nbytes=total,
+                device=caps.device,
+            ),
+        ),
+        mma_tiler_mn=mma_tiler_mn,
+        workspace_nbytes=workspace_nbytes,
     )
 
 
@@ -469,8 +504,6 @@ def pack_block_fp8_linear_weight_mxfp8(
     )
 
 
-
-
 def quantize_block_fp8_linear_input_mxfp8(
     source_tk: torch.Tensor,
     *,
@@ -494,16 +527,23 @@ def block_fp8_linear_mxfp8(
 ) -> torch.Tensor:
     """Execute only a session-prepared block-FP8 declaration."""
     if binding is not None:
-        if any(value is not None for value in (source, packed_weight, plan, bias, workspace)):
+        if any(
+            value is not None
+            for value in (source, packed_weight, plan, bias, workspace)
+        ):
             raise ValueError("block-FP8 binding owns inputs and prepared plan")
-        state = require_prepared(binding.plan, "gemm.block_fp8_linear", binding.source.device)
+        state = require_prepared(
+            binding.plan, "gemm.block_fp8_linear", binding.source.device
+        )
         return state.run_binding(binding, stream=stream)
     if source is None or packed_weight is None or plan is None:
         raise TypeError(
             "block_fp8_linear_mxfp8 requires source, packed_weight, and a prepared plan"
         )
     state = require_prepared(plan, "gemm.block_fp8_linear", source.device)
-    return state.run(source, packed_weight, bias=bias, workspace=workspace, stream=stream)
+    return state.run(
+        source, packed_weight, bias=bias, workspace=workspace, stream=stream
+    )
 
 
 __all__ = [

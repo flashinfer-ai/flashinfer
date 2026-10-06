@@ -301,9 +301,7 @@ def _threadblock_sync_state(
     _state_normalize(state_o, state_d)
     if const_expr(finite_states and vec_size == 8):
         _store_shared_f32x8_as_bf16(
-            shared_ptr_to_u32(
-                s_partial.iterator + Int32(ty * head_dim + base_k)
-            ),
+            shared_ptr_to_u32(s_partial.iterator + Int32(ty * head_dim + base_k)),
             state_o,
         )
     else:
@@ -328,9 +326,7 @@ def _threadblock_sync_state(
             )
         else:
             for vec_idx in cutlass.range_constexpr(vec_size):
-                other_o[vec_idx] = s_partial[
-                    iter_idx, base_k + vec_idx
-                ].to(Float32)
+                other_o[vec_idx] = s_partial[iter_idx, base_k + vec_idx].to(Float32)
         if const_expr(finite_states):
             state_m, state_d = _state_merge_finite_normalized_lse_base2(
                 state_o,
@@ -402,10 +398,7 @@ def _merge_async_slot(
                     shared_ptr_to_u32(
                         s_stage_partial.iterator
                         + Int32(
-                            (
-                                (cur_iter % num_smem_stages) * bdy + ty
-                            )
-                            * head_dim
+                            ((cur_iter % num_smem_stages) * bdy + ty) * head_dim
                             + base_k
                         )
                     ),
@@ -511,15 +504,10 @@ class PagedPersistentMergeKernel:
         self.direct_grid = bool(direct_grid)
         self.regular_decode_graph = bool(regular_decode_graph)
         self.analytic_laguna_verify_graph = bool(analytic_laguna_verify_graph)
-        self.analytic_laguna_decode_graph = bool(
-            analytic_laguna_decode_graph
-        )
+        self.analytic_laguna_decode_graph = bool(analytic_laguna_decode_graph)
         self.pair_bf16_partial_loads = bool(pair_bf16_partial_loads)
         self.finite_bf16_decode_graph = bool(
-            (
-                self.regular_decode_graph
-                or self.analytic_laguna_decode_graph
-            )
+            (self.regular_decode_graph or self.analytic_laguna_decode_graph)
             and self.dtype is cutlass.BFloat16
             and self.dtype_partial is cutlass.BFloat16
             and self.head_dim == 128
@@ -575,6 +563,7 @@ class PagedPersistentMergeKernel:
         stage_lse_storage = cute.struct.MemRange[
             cutlass.Float32, int(self.bdx * self.bdy)
         ]
+
         class SharedStorage:
             pass
 
@@ -730,9 +719,7 @@ class PagedPersistentMergeKernel:
             s_partial = storage.sPartial.get_tensor(
                 cute.make_layout((self.bdy, head_dim), stride=(head_dim, 1))
             )
-            s_lse = storage.sLSE.get_tensor(
-                cute.make_layout((self.bdy,), stride=(1,))
-            )
+            s_lse = storage.sLSE.get_tensor(cute.make_layout((self.bdy,), stride=(1,)))
 
         if const_expr(not self.direct_grid):
             cute.arch.griddepcontrol_wait()
@@ -747,27 +734,19 @@ class PagedPersistentMergeKernel:
         max_chunks_per_req = Int32(0)
         analytic_decode_base_chunks = Int32(0)
         analytic_decode_extra_rows = Int32(0)
-        if const_expr(
-            self.regular_decode_graph
-            or self.analytic_laguna_verify_graph
-        ):
+        if const_expr(self.regular_decode_graph or self.analytic_laguna_verify_graph):
             max_chunks_per_req = Int32(mV_partial.shape[0] // mO.shape[0])
         if const_expr(self.analytic_laguna_decode_graph):
-            analytic_decode_base_chunks = Int32(
-                mV_partial.shape[0] // mO.shape[0]
-            )
+            analytic_decode_base_chunks = Int32(mV_partial.shape[0] // mO.shape[0])
             analytic_decode_extra_rows = Int32(
-                mV_partial.shape[0]
-                - analytic_decode_base_chunks * mO.shape[0]
+                mV_partial.shape[0] - analytic_decode_base_chunks * mO.shape[0]
             )
         live_verify_chunks = Int32(0)
         if const_expr(self.analytic_laguna_verify_graph):
             # Match the exact verifier forward kernel's graph-static grid and
             # device-only wave balancing.  No merge-indptr or live host plan is
             # needed, and every row uses the same fixed scratch stride.
-            live_stage_tiles = (
-                mCacheSeqlens[0] + Int32(63)
-            ) // Int32(64)
+            live_stage_tiles = (mCacheSeqlens[0] + Int32(63)) // Int32(64)
             live_verify_chunks = cutlass.select_(
                 live_stage_tiles < max_chunks_per_req,
                 live_stage_tiles,
@@ -787,25 +766,19 @@ class PagedPersistentMergeKernel:
                 num_index_sets = live_verify_chunks
                 end_idx = start_idx + num_index_sets
             elif const_expr(self.analytic_laguna_decode_graph):
-                request_chunk_capacity = (
-                    analytic_decode_base_chunks
-                    + cutlass.select_(
-                        row_idx < analytic_decode_extra_rows,
-                        Int32(1),
-                        Int32(0),
-                    )
+                request_chunk_capacity = analytic_decode_base_chunks + cutlass.select_(
+                    row_idx < analytic_decode_extra_rows,
+                    Int32(1),
+                    Int32(0),
                 )
-                start_idx = (
-                    row_idx * analytic_decode_base_chunks
-                    + cutlass.select_(
-                        row_idx < analytic_decode_extra_rows,
-                        row_idx,
-                        analytic_decode_extra_rows,
-                    )
+                start_idx = row_idx * analytic_decode_base_chunks + cutlass.select_(
+                    row_idx < analytic_decode_extra_rows,
+                    row_idx,
+                    analytic_decode_extra_rows,
                 )
-                live_decode_stage_tiles = (
-                    mCacheSeqlens[row_idx] + Int32(63)
-                ) // Int32(64)
+                live_decode_stage_tiles = (mCacheSeqlens[row_idx] + Int32(63)) // Int32(
+                    64
+                )
                 num_index_sets = cutlass.select_(
                     live_decode_stage_tiles < request_chunk_capacity,
                     live_decode_stage_tiles,
@@ -1144,29 +1117,20 @@ class LagunaVerifierMergeKernel:
         stream: cuda.CUstream,
     ):
         if const_expr(
-            len(mV_partial.shape) != 3
-            or mV_partial.element_type != cutlass.BFloat16
+            len(mV_partial.shape) != 3 or mV_partial.element_type != cutlass.BFloat16
         ):
             raise TypeError("Laguna verifier partial output must be BF16 [*,24,128]")
         if const_expr(
-            len(mLSE_partial.shape) != 2
-            or mLSE_partial.element_type != cutlass.Float32
+            len(mLSE_partial.shape) != 2 or mLSE_partial.element_type != cutlass.Float32
         ):
             raise TypeError("Laguna verifier partial LSE must be FP32 [*,24]")
         if const_expr(
-            len(mCacheSeqlens.shape) != 1
-            or mCacheSeqlens.element_type != cutlass.Int32
+            len(mCacheSeqlens.shape) != 1 or mCacheSeqlens.element_type != cutlass.Int32
         ):
             raise TypeError("Laguna verifier cache lengths must be Int32 [batch]")
-        if const_expr(
-            len(mO.shape) != 3
-            or mO.element_type != cutlass.BFloat16
-        ):
+        if const_expr(len(mO.shape) != 3 or mO.element_type != cutlass.BFloat16):
             raise TypeError("Laguna verifier output must be BF16 [8,24,128]")
-        if const_expr(
-            len(mLSE.shape) != 2
-            or mLSE.element_type != cutlass.Float32
-        ):
+        if const_expr(len(mLSE.shape) != 2 or mLSE.element_type != cutlass.Float32):
             raise TypeError("Laguna verifier output LSE must be FP32 [24,8]")
 
         self.kernel(
@@ -1199,9 +1163,7 @@ class LagunaVerifierMergeKernel:
         base_k = tx * Int32(self.vec_size)
         max_chunks_per_row = Int32(mV_partial.shape[0] // mO.shape[0])
         request_idx = row_idx // Int32(8)
-        live_stage_tiles = (
-            mCacheSeqlens[request_idx] + Int32(63)
-        ) // Int32(64)
+        live_stage_tiles = (mCacheSeqlens[request_idx] + Int32(63)) // Int32(64)
         live_chunk_cap = max_chunks_per_row
         if const_expr(self.two_wave_b1):
             one_wave_chunks = max_chunks_per_row // Int32(2)
@@ -1230,9 +1192,7 @@ class LagunaVerifierMergeKernel:
         )
         s_partial = cute.make_tensor(
             s_stage_partial.iterator,
-            cute.make_layout(
-                (self.bdy, self.head_dim), stride=(self.head_dim, 1)
-            ),
+            cute.make_layout((self.bdy, self.head_dim), stride=(self.head_dim, 1)),
         )
         s_lse = cute.make_tensor(
             s_stage_lse.iterator,
@@ -1261,26 +1221,20 @@ class LagunaVerifierMergeKernel:
                 staged_linear_idx = stage_idx * self.bdy + ty
                 smem_addr = shared_ptr_to_u32(
                     s_stage_partial.iterator
-                    + Int32(
-                        (stage_idx * self.bdy + ty) * self.head_dim + base_k
-                    )
+                    + Int32((stage_idx * self.bdy + ty) * self.head_dim + base_k)
                 )
                 if staged_linear_idx < num_index_sets:
                     partial_idx = start_idx + staged_linear_idx
                     gmem_addr = get_ptr_as_int64(
                         mV_partial,
-                        (
-                            Int64(partial_idx) * Int64(24) + Int64(head_idx)
-                        )
+                        (Int64(partial_idx) * Int64(24) + Int64(head_idx))
                         * Int64(self.head_dim)
                         + Int64(base_k),
                     )
                     _cp_async_load_128b(smem_addr, gmem_addr)
                 cute.arch.cp_async_commit_group()
 
-            num_stage_iters = (
-                num_index_sets + Int32(self.bdy - 1)
-            ) // Int32(self.bdy)
+            num_stage_iters = (num_index_sets + Int32(self.bdy - 1)) // Int32(self.bdy)
             iter_idx = Int32(0)
             while iter_idx < num_stage_iters:
                 state_m, state_d = _merge_async_slot(
@@ -1395,11 +1349,9 @@ class LagunaVerifierMergeKernel:
                 finite_states=True,
             )
             _state_normalize(state_o, state_d)
-            output_offset = (
-                (Int64(row_idx) * Int64(24) + Int64(head_idx))
-                * Int64(self.head_dim)
-                + Int64(base_k)
-            )
+            output_offset = (Int64(row_idx) * Int64(24) + Int64(head_idx)) * Int64(
+                self.head_dim
+            ) + Int64(base_k)
             _st_global_v2_u32(
                 get_ptr_as_int64(mO, output_offset),
                 pack_f32x2_to_bfloat2(state_o[0], state_o[1]),
@@ -1411,8 +1363,6 @@ class LagunaVerifierMergeKernel:
                 pack_f32x2_to_bfloat2(state_o[6], state_o[7]),
             )
             if tx == Int32(0) and ty == Int32(0):
-                mLSE[head_idx, row_idx] = _state_get_lse_base2(
-                    state_m, state_d
-                )
+                mLSE[head_idx, row_idx] = _state_get_lse_base2(state_m, state_d)
 
         cute.arch.griddepcontrol_launch_dependents()

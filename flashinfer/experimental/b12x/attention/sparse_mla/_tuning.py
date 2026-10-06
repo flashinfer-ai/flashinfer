@@ -45,6 +45,7 @@ class SparseMlaQuery:
     pool_size: int = 0
     pool_topk: int = 0
 
+
 SparseMlaConfig = BackendConfig
 TUNING = replace(
     make_fixed_contract(

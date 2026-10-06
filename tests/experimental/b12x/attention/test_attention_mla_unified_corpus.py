@@ -801,7 +801,8 @@ def _assert_prefill_boundary_heads(
     ids=lambda case: case.test_id,
 )
 def test_unified_prefill_mg_specialization_live_graph_oracle(
-    case: _MGPrefillServingCase, monkeypatch: pytest.MonkeyPatch,
+    case: _MGPrefillServingCase,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Validate each typed-SMEM MG group-count/compute arm under live replay.
 

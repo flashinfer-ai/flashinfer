@@ -1,4 +1,5 @@
 """Public surface for :mod:`b12x.gemm.bf16_vocab_projection`."""
+
 from __future__ import annotations
 
 from b12x.preparation import Plan

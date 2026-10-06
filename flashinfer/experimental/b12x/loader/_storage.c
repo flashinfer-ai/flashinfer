@@ -2,7 +2,6 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <cuda_runtime_api.h>
-
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -16,61 +15,60 @@
 typedef char require_64_bit_offsets[(sizeof(off_t) == 8 && sizeof(size_t) == 8) ? 1 : -1];
 
 typedef struct {
-    char message[512];
+  char message[512];
 } failure_t;
 
-static bool cuda_ok(cudaError_t status, const char *operation, failure_t *failure) {
-    if (status == cudaSuccess) return true;
-    snprintf(failure->message, sizeof(failure->message), "%s: %s",
-             operation, cudaGetErrorString(status));
-    return false;
+static bool cuda_ok(cudaError_t status, const char* operation, failure_t* failure) {
+  if (status == cudaSuccess) return true;
+  snprintf(failure->message, sizeof(failure->message), "%s: %s", operation,
+           cudaGetErrorString(status));
+  return false;
 }
 
-static void system_error(failure_t *failure, const char *operation) {
-    snprintf(failure->message, sizeof(failure->message), "%s: %s",
-             operation, strerror(errno));
+static void system_error(failure_t* failure, const char* operation) {
+  snprintf(failure->message, sizeof(failure->message), "%s: %s", operation, strerror(errno));
 }
 
-static PyObject *py_capabilities(PyObject *self, PyObject *args) {
-    (void)self;
-    int device;
-    if (!PyArg_ParseTuple(args, "i", &device)) return NULL;
-    static const struct {
-        const char *name;
-        enum cudaDeviceAttr attribute;
-    } keys[] = {
-        {"integrated", cudaDevAttrIntegrated},
-        {"can_map_host_memory", cudaDevAttrCanMapHostMemory},
-        {"managed_memory", cudaDevAttrManagedMemory},
-        {"concurrent_managed_access", cudaDevAttrConcurrentManagedAccess},
-        {"pageable_memory_access", cudaDevAttrPageableMemoryAccess},
-        {"host_page_tables", cudaDevAttrPageableMemoryAccessUsesHostPageTables},
-        {"host_register_supported", cudaDevAttrHostRegisterSupported},
-        {"registered_host_pointer", cudaDevAttrCanUseHostPointerForRegisteredMem},
-    };
-    PyObject *result = PyDict_New();
-    if (!result) return NULL;
-    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-        int value;
-        failure_t failure;
-        if (!cuda_ok(cudaDeviceGetAttribute(&value, keys[i].attribute, device),
-                     "cudaDeviceGetAttribute", &failure)) {
-            Py_DECREF(result);
-            return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
-        }
-        PyObject *number = PyLong_FromLong(value);
-        if (!number || PyDict_SetItemString(result, keys[i].name, number) != 0) {
-            Py_XDECREF(number);
-            Py_DECREF(result);
-            return NULL;
-        }
-        Py_DECREF(number);
+static PyObject* py_capabilities(PyObject* self, PyObject* args) {
+  (void)self;
+  int device;
+  if (!PyArg_ParseTuple(args, "i", &device)) return NULL;
+  static const struct {
+    const char* name;
+    enum cudaDeviceAttr attribute;
+  } keys[] = {
+      {"integrated", cudaDevAttrIntegrated},
+      {"can_map_host_memory", cudaDevAttrCanMapHostMemory},
+      {"managed_memory", cudaDevAttrManagedMemory},
+      {"concurrent_managed_access", cudaDevAttrConcurrentManagedAccess},
+      {"pageable_memory_access", cudaDevAttrPageableMemoryAccess},
+      {"host_page_tables", cudaDevAttrPageableMemoryAccessUsesHostPageTables},
+      {"host_register_supported", cudaDevAttrHostRegisterSupported},
+      {"registered_host_pointer", cudaDevAttrCanUseHostPointerForRegisteredMem},
+  };
+  PyObject* result = PyDict_New();
+  if (!result) return NULL;
+  for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+    int value;
+    failure_t failure;
+    if (!cuda_ok(cudaDeviceGetAttribute(&value, keys[i].attribute, device),
+                 "cudaDeviceGetAttribute", &failure)) {
+      Py_DECREF(result);
+      return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
     }
-    return result;
+    PyObject* number = PyLong_FromLong(value);
+    if (!number || PyDict_SetItemString(result, keys[i].name, number) != 0) {
+      Py_XDECREF(number);
+      Py_DECREF(result);
+      return NULL;
+    }
+    Py_DECREF(number);
+  }
+  return result;
 }
 
-#include "_direct.c"
 #include "_batch.c"
+#include "_direct.c"
 #include "_ple_reader.c"
 
 static PyMethodDef methods[] = {
@@ -89,15 +87,17 @@ static PyMethodDef methods[] = {
     {NULL, NULL, 0, NULL},
 };
 static PyModuleDef module = {
-    PyModuleDef_HEAD_INIT, .m_name = "_b12x_loader_storage", .m_size = -1,
+    PyModuleDef_HEAD_INIT,
+    .m_name = "_b12x_loader_storage",
+    .m_size = -1,
     .m_methods = methods,
 };
 
 PyMODINIT_FUNC PyInit__b12x_loader_storage(void) {
-    PyObject *result = PyModule_Create(&module);
-    if (result && PyModule_AddIntConstant(result, "ABI_VERSION", 1) < 0) {
-        Py_DECREF(result);
-        return NULL;
-    }
-    return result;
+  PyObject* result = PyModule_Create(&module);
+  if (result && PyModule_AddIntConstant(result, "ABI_VERSION", 1) < 0) {
+    Py_DECREF(result);
+    return NULL;
+  }
+  return result;
 }

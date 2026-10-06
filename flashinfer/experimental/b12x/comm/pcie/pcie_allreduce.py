@@ -322,9 +322,14 @@ class PCIeAllReduce:
         return self._use_island_rs(inp)
 
     def plan(
-        self, inp: torch.Tensor, *, operation: str = "all_reduce",
-        stream: object = None, channel_id: Optional[str] = None,
-        invocation: FrozenMapping = FrozenMapping(), override: PcieConfig | None = None,
+        self,
+        inp: torch.Tensor,
+        *,
+        operation: str = "all_reduce",
+        stream: object = None,
+        channel_id: Optional[str] = None,
+        invocation: FrozenMapping = FrozenMapping(),
+        override: PcieConfig | None = None,
         **call,
     ) -> Plan:
         """Select an existing native channel once, then declare its plan.
@@ -348,43 +353,71 @@ class PCIeAllReduce:
         return plan(query, runtime=target, invocation=invocation, override=override)
 
     def all_reduce(
-        self, inp: torch.Tensor, *, plan: Plan,
+        self,
+        inp: torch.Tensor,
+        *,
+        plan: Plan,
         out: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
-        blocks: Optional[int] = None, stream: object = None,
+        blocks: Optional[int] = None,
+        stream: object = None,
         channel_id: Optional[str] = None,
     ) -> torch.Tensor:
         state = require_prepared(plan, "comm.pcie", inp.device)
         if self.algorithm == "hierarchical":
             if peer_input_ptrs is not None:
-                raise ValueError("peer_input_ptrs are unavailable for hierarchical all-reduce")
+                raise ValueError(
+                    "peer_input_ptrs are unavailable for hierarchical all-reduce"
+                )
             target = state.runtime
             if target is not self._runtime and target is not self._island_rs:
                 raise ValueError("plan belongs to another all-reduce manager")
             return target.all_reduce(
-                inp, plan=plan, out=out, blocks=blocks,
-                stream=stream, channel_id=channel_id,
+                inp,
+                plan=plan,
+                out=out,
+                blocks=blocks,
+                stream=stream,
+                channel_id=channel_id,
             )
         if blocks is not None:
             raise ValueError("blocks is only available for hierarchical all-reduce")
         return self._runtime.all_reduce(
-            inp, plan=plan, out=out, peer_input_ptrs=peer_input_ptrs,
-            stream=stream, channel_id=channel_id,
+            inp,
+            plan=plan,
+            out=out,
+            peer_input_ptrs=peer_input_ptrs,
+            stream=stream,
+            channel_id=channel_id,
         )
 
     def all_reduce_fused_add_rms_norm(
-        self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
-        epsilon: float, *, plan: Plan,
-        out: Optional[torch.Tensor] = None, residual_out: Optional[torch.Tensor] = None,
-        peer_input_ptrs: Optional[Sequence[int]] = None, stream: object = None,
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        *,
+        plan: Plan,
+        out: Optional[torch.Tensor] = None,
+        residual_out: Optional[torch.Tensor] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+        stream: object = None,
         channel_id: Optional[str] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.algorithm != "oneshot":
             raise ValueError("fused RMSNorm requires an all-peer oneshot runtime")
         return self._runtime.all_reduce_fused_add_rms_norm(
-            inp, residual, weight, epsilon, plan=plan, out=out,
-            residual_out=residual_out, peer_input_ptrs=peer_input_ptrs,
-            stream=stream, channel_id=channel_id,
+            inp,
+            residual,
+            weight,
+            epsilon,
+            plan=plan,
+            out=out,
+            residual_out=residual_out,
+            peer_input_ptrs=peer_input_ptrs,
+            stream=stream,
+            channel_id=channel_id,
         )
 
     @contextmanager

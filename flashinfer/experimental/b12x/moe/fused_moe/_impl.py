@@ -1095,18 +1095,25 @@ class TPMoEScratchPlan:
             if select is None:
                 raise TypeError("prepared W4A16 launch owner has no selector")
             fused_launch, topk_sum_launch, route_pack_launches = select(
-                tokens=int(a.shape[0]), route_ids_dtype=topk_ids.dtype,
+                tokens=int(a.shape[0]),
+                route_ids_dtype=topk_ids.dtype,
                 has_route_map=route_expert_map is not None,
                 activation_amax=activation_amax,
             )
-        elif self.caps.quant_mode == "w4a16" and self._core_workspace_plan.full_rotation:
+        elif (
+            self.caps.quant_mode == "w4a16" and self._core_workspace_plan.full_rotation
+        ):
             route_pack_launches = self._prewarmed_route_pack_launches
             tokens = int(a.shape[0])
             prepared = experts.representation_for("w4a16")
             broadcast_suh = prepared.gate_suh.numel() == self.caps.k
             broadcast_svh = prepared.down_svh.numel() == self.caps.k
             capacity = min(
-                (count for count, _ in self._prewarmed_fused_launches if count >= tokens),
+                (
+                    count
+                    for count, _ in self._prewarmed_fused_launches
+                    if count >= tokens
+                ),
                 default=None,
             )
             fused_launch = next(
@@ -1122,7 +1129,8 @@ class TPMoEScratchPlan:
                     launch
                     for ids_dtype, mapped, launch in self._prewarmed_topk_sum_launches
                     if ids_dtype == topk_ids.dtype
-                    and mapped == (output_expert_map is not None or route_expert_map is not None)
+                    and mapped
+                    == (output_expert_map is not None or route_expert_map is not None)
                     and launch.broadcast_svh == broadcast_svh
                 ),
                 None,
@@ -1162,7 +1170,8 @@ class TPMoEScratchPlan:
             route_pack_launches=route_pack_launches,
         )
         return replace(
-            binding, scales_expanded=bool(scales_expanded),
+            binding,
+            scales_expanded=bool(scales_expanded),
             w4a8_csf_inline=self.caps.w4a8_csf_inline,
         )
 
@@ -1538,9 +1547,8 @@ def _normalize_quant_mode_requested(quant_mode: str | None) -> str:
         return "nvfp4"
     normalized = str(quant_mode).lower()
     if (
-        normalized not in {"nvfp4", "w4a16"}
-        | _W4A8_QUANT_MODES
-        | _MX_BYTE_CONTAINER_QUANT_MODES
+        normalized
+        not in {"nvfp4", "w4a16"} | _W4A8_QUANT_MODES | _MX_BYTE_CONTAINER_QUANT_MODES
     ):
         raise ValueError(f"unsupported quant_mode {quant_mode!r}")
     return normalized
@@ -1619,7 +1627,14 @@ def _w4a16_weight_layout_for_source(
     return "packed"
 
 
-_W4A16_WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis_t256", "iq2_xs", "iq2_xxs", "q8_0"}
+_W4A16_WEIGHT_LAYOUTS = {
+    "packed",
+    "modelopt",
+    "trellis_t256",
+    "iq2_xs",
+    "iq2_xxs",
+    "q8_0",
+}
 
 
 def _normalize_w4a16_weight_layout(weight_layout: str) -> str:
@@ -1812,7 +1827,9 @@ def _select_dynamic_tile_mn(
         if planned_tile_m not in {16, 32, 64, 128}:
             raise ValueError("planned dynamic tile M must be one of 16, 32, 64, 128")
         if quant_mode in _MX_BYTE_CONTAINER_QUANT_MODES and planned_tile_m != 128:
-            raise ValueError("MX byte-container recipes support only the M128 dynamic tile")
+            raise ValueError(
+                "MX byte-container recipes support only the M128 dynamic tile"
+            )
         return planned_tile_m, _LEVEL_TILE_N
     routed_rows = max(1, int(routed_rows))
     num_experts = max(1, int(num_experts))
@@ -2132,8 +2149,10 @@ def _dynamic_external_route_plan_supported(
     w4a8_n64_repacked: bool = False,
 ) -> bool:
     return bool(
-        (_normalize_quant_mode(quant_mode) == "nvfp4"
-         or (_normalize_quant_mode(quant_mode) == "w4a8_mx" and w4a8_n64_repacked))
+        (
+            _normalize_quant_mode(quant_mode) == "nvfp4"
+            or (_normalize_quant_mode(quant_mode) == "w4a8_mx" and w4a8_n64_repacked)
+        )
         and activation == "silu"
         and int(planned_tile_m) == 16
         and 0 < int(routed_rows) <= _DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS
@@ -2668,7 +2687,8 @@ def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
     weight_layout = (
         "modelopt"
         if query.quant_mode == "nvfp4_auto"
-        else query.w4a16_weight_layout or _w4a16_weight_layout_for_source(
+        else query.w4a16_weight_layout
+        or _w4a16_weight_layout_for_source(
             query.source_format,
             intermediate_size=query.intermediate_size,
         )
@@ -2679,12 +2699,15 @@ def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
         )
 
         capacity_supported = (
-            query.activation in {"silu", "relu2"} and query.num_tokens <= _TC_DECODE_MAX_M
+            query.activation in {"silu", "relu2"}
+            and query.num_tokens <= _TC_DECODE_MAX_M
         )
         return bool(
-            capacity_supported and query.io_dtype == "bfloat16"
+            capacity_supported
+            and query.io_dtype == "bfloat16"
             and not query.deterministic_output
-            and not query.collect_activation_amax and not query.apply_router_weight_on_input
+            and not query.collect_activation_amax
+            and not query.apply_router_weight_on_input
         )
     if weight_layout == "trellis_t256":
         return False
@@ -2708,7 +2731,8 @@ def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
             element_dtype="bf16" if query.io_dtype == "bfloat16" else "fp16",
             weight_layout=weight_layout,
             w13_layout=query.w13_layout,
-            scale_format=query.w4a16_scale_format or _w4a16_scale_format_for_source(query.source_format),
+            scale_format=query.w4a16_scale_format
+            or _w4a16_scale_format_for_source(query.source_format),
         )
     # Planned launches carry the unmapped direct top-k kernel only up to
     # _MAX_DIRECT_TOPK_ROUTE_M rows; the TC-decode variant that would serve
@@ -2835,7 +2859,9 @@ def _heuristic_moe_decode_config(
                 query.quant_mode,
                 num_experts=query.num_experts,
                 activation=query.activation,
-                compute_capability=(None if device is None else device.compute_capability),
+                compute_capability=(
+                    None if device is None else device.compute_capability
+                ),
             )[0]
             dynamic_route_mode = _heuristic_dynamic_route_mode(
                 query,
@@ -6562,9 +6588,7 @@ def _prepare_w8a8_from_mxfp8_source(
         )
     activation = normalize_moe_activation(activation)
     if activation != "silu":
-        raise ValueError(
-            f"W8A8 MXFP8 preparation requires silu, got {activation!r}"
-        )
+        raise ValueError(f"W8A8 MXFP8 preparation requires silu, got {activation!r}")
     w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     if w13_layout == "w31":
         _ensure_w13_kernel_order_inplace(
@@ -6598,9 +6622,7 @@ def _prepare_w8a8_from_mxfp8_source(
         prepared.w2_alpha,
         intermediate_size,
         hidden_size,
-        activation_spec=_get_activation_kernel_spec(
-            activation, quant_mode="w8a8_mx"
-        ),
+        activation_spec=_get_activation_kernel_spec(activation, quant_mode="w8a8_mx"),
     )
     return replace(prepared, launch_views=launch_views)
 
@@ -7062,21 +7084,34 @@ def prepare_b12x_x4t_weights(*, plan, weights) -> B12XFP4ExpertWeights:
     unit = torch.ones(plan.num_experts, dtype=torch.float32, device=weights.w13.device)
     native = WeightPreparationTransform.W4A16_NATIVE in plan.transforms
     value = prepare_w4a16_x4t_weights(
-        weights.w13, weights.w13_scales, unit,
-        weights.w2, weights.w2_scales, unit,
-        weights.w13_scale_scratch, weights.w2_scale_scratch,
-        activation=plan.activation, params_dtype=getattr(torch, plan.io_dtype),
+        weights.w13,
+        weights.w13_scales,
+        unit,
+        weights.w2,
+        weights.w2_scales,
+        unit,
+        weights.w13_scale_scratch,
+        weights.w2_scale_scratch,
+        activation=plan.activation,
+        params_dtype=getattr(torch, plan.io_dtype),
         w13_layout=plan.w13_layout,
         weight_layout="modelopt" if native else "packed",
     )
     return B12XFP4ExpertWeights(
-        plan=plan, a1_gscale=unit, a2_gscale=unit,
-        w1_fp4=value.w13, w2_fp4=value.w2,
-        w1_blockscale=value.w13_scale, w2_blockscale=value.w2_scale,
-        w1_alphas=value.w13_global_scale, w2_alphas=value.w2_global_scale,
+        plan=plan,
+        a1_gscale=unit,
+        a2_gscale=unit,
+        w1_fp4=value.w13,
+        w2_fp4=value.w2,
+        w1_blockscale=value.w13_scale,
+        w2_blockscale=value.w2_scale,
+        w1_alphas=value.w13_global_scale,
+        w2_alphas=value.w2_global_scale,
         representation=_PreparedWeightRepresentation(
             quant_mode="w4a16",
-            layout=PreparedWeightLayout.SOURCE_NATIVE if native else PreparedWeightLayout.MMA_PACKED,
+            layout=PreparedWeightLayout.SOURCE_NATIVE
+            if native
+            else PreparedWeightLayout.MMA_PACKED,
             value=value,
         ),
     )
@@ -7087,18 +7122,30 @@ def prepare_b12x_iq2_xs_weights(*, plan, weights) -> B12XFP4ExpertWeights:
     from b12x.moe._shared.kernels.w4a16.iq2_xs import prepare_iq2_xs_moe_weights
 
     value = prepare_iq2_xs_moe_weights(
-        weights.w13, weights.w2, hidden_size=plan.hidden_size,
-        intermediate_size=plan.intermediate_size, num_experts=plan.num_experts,
-        activation=plan.activation, w13_layout=plan.w13_layout, codec=weights.codec,
+        weights.w13,
+        weights.w2,
+        hidden_size=plan.hidden_size,
+        intermediate_size=plan.intermediate_size,
+        num_experts=plan.num_experts,
+        activation=plan.activation,
+        w13_layout=plan.w13_layout,
+        codec=weights.codec,
     )
     unit = torch.ones((), dtype=torch.float32, device=value.w13.device)
     return B12XFP4ExpertWeights(
-        plan=plan, a1_gscale=unit, a2_gscale=unit,
-        w1_fp4=value.w13, w2_fp4=value.w2,
-        w1_blockscale=value.w13_scale, w2_blockscale=value.w2_scale,
-        w1_alphas=value.w13_global_scale, w2_alphas=value.w2_global_scale,
+        plan=plan,
+        a1_gscale=unit,
+        a2_gscale=unit,
+        w1_fp4=value.w13,
+        w2_fp4=value.w2,
+        w1_blockscale=value.w13_scale,
+        w2_blockscale=value.w2_scale,
+        w1_alphas=value.w13_global_scale,
+        w2_alphas=value.w2_global_scale,
         representation=_PreparedWeightRepresentation(
-            quant_mode="w4a16", layout=PreparedWeightLayout(weights.codec + "_compact"), value=value,
+            quant_mode="w4a16",
+            layout=PreparedWeightLayout(weights.codec + "_compact"),
+            value=value,
         ),
     )
 
@@ -7275,17 +7322,38 @@ def run_w4a16_fc2_e8m0(
 
     if launcher is None:
         torch.ops.b12x.w4a16_fc2_direct_launch(
-            intermediate, experts.w2, experts.w2_scale, experts.w2_global_scale,
-            route_expert_ids, route_weights, output, experts.workspace[-2:-1],
-            experts.workspace[-1:], m, experts.hidden_size, experts.intermediate_size,
-            experts.num_experts, int(current_cuda_stream()),
+            intermediate,
+            experts.w2,
+            experts.w2_scale,
+            experts.w2_global_scale,
+            route_expert_ids,
+            route_weights,
+            output,
+            experts.workspace[-2:-1],
+            experts.workspace[-1:],
+            m,
+            experts.hidden_size,
+            experts.intermediate_size,
+            experts.num_experts,
+            int(current_cuda_stream()),
         )
     else:
         _w4a16_kernel._w4a16_fc2_direct_launch_flat(
-            intermediate, experts.w2, experts.w2_scale, experts.w2_global_scale,
-            route_expert_ids, route_weights, output, experts.workspace[-2:-1],
-            experts.workspace[-1:], m, experts.hidden_size, experts.intermediate_size,
-            experts.num_experts, int(current_cuda_stream()), launcher=launcher,
+            intermediate,
+            experts.w2,
+            experts.w2_scale,
+            experts.w2_global_scale,
+            route_expert_ids,
+            route_weights,
+            output,
+            experts.workspace[-2:-1],
+            experts.workspace[-1:],
+            m,
+            experts.hidden_size,
+            experts.intermediate_size,
+            experts.num_experts,
+            int(current_cuda_stream()),
+            launcher=launcher,
         )
     return output
 
@@ -7537,9 +7605,7 @@ def plan_tp_moe_execution(
     )
     if compact_w4a8_micro:
         if apply_router_weight_on_input:
-            raise ValueError(
-                "compact W4A8 micro requires route weights after FC2"
-            )
+            raise ValueError("compact W4A8 micro requires route weights after FC2")
         execution = replace(
             execution,
             gemm_engine=GemmEngine.MXFP8_QMMA,
@@ -10145,11 +10211,14 @@ def build_tp_moe_route_binding(
 ) -> TPMoERouteBinding:
     """Bind prepared routing; score controls match :func:`route_topk`."""
     if scratch is not None and not isinstance(
-        scratch, (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool),
+        scratch,
+        (TPMoEWorkspace, TPW4A16Workspace, TPMoEWorkspacePool),
     ):
         raise TypeError("scratch must be a TP MoE scratch object or None")
     if hidden_states.ndim != 2:
-        raise ValueError(f"expected hidden_states with rank 2, got shape {tuple(hidden_states.shape)}")
+        raise ValueError(
+            f"expected hidden_states with rank 2, got shape {tuple(hidden_states.shape)}"
+        )
     if int(top_k) <= 0:
         raise ValueError(f"top_k must be positive, got {top_k}")
     if router_logits is not None and gate_weight is not None:
@@ -10157,11 +10226,18 @@ def build_tp_moe_route_binding(
     if router_logits is None and gate_weight is None:
         raise ValueError("expected router_logits or gate_weight")
     return TPMoERouteBinding(
-        hidden_states=hidden_states, top_k=int(top_k), scratch=scratch,
-        gate_weight=gate_weight, gate_bias=gate_bias, router_logits=router_logits,
-        renormalize=bool(renormalize), score_func=score_func,
-        correction_bias=correction_bias, image_correction_bias=image_correction_bias,
-        image_mask=image_mask, routed_scaling_factor=float(routed_scaling_factor),
+        hidden_states=hidden_states,
+        top_k=int(top_k),
+        scratch=scratch,
+        gate_weight=gate_weight,
+        gate_bias=gate_bias,
+        router_logits=router_logits,
+        renormalize=bool(renormalize),
+        score_func=score_func,
+        correction_bias=correction_bias,
+        image_correction_bias=image_correction_bias,
+        image_mask=image_mask,
+        routed_scaling_factor=float(routed_scaling_factor),
     )
 
 
@@ -10362,7 +10438,9 @@ def _get_micro_kernel(
     if micro_trellis:
         micro_kwargs["weight_layout"] = weight_layout
         micro_kwargs["trellis_bits"] = int(trellis_bits)
-        micro_kwargs["trellis_intermediate_hadamard"] = bool(trellis_intermediate_hadamard)
+        micro_kwargs["trellis_intermediate_hadamard"] = bool(
+            trellis_intermediate_hadamard
+        )
     # The native NVFP4 split is currently a GLM SiLU decode specialization.
     # Keep existing activation wrappers untouched for the normal fused phase.
     if compile_time_phase:
@@ -10379,7 +10457,9 @@ def _get_micro_kernel(
     )
     # Compile planning produces deferred programs that must never be memoized
     # or returned in place of a compiled kernel.
-    reuse_compiled = not planning() and os.environ.get("B12X_MICRO_REUSE_COMPILED", "1") != "0"
+    reuse_compiled = (
+        not planning() and os.environ.get("B12X_MICRO_REUSE_COMPILED", "1") != "0"
+    )
     if reuse_compiled:
         cached = _MICRO_KERNEL_CACHE.get(cache_key)
         if cached is not None:
@@ -11074,7 +11154,9 @@ class _DynamicMoEW4A8Launch:
                             row_counts.shape[0]
                             * (
                                 6
-                                if getattr(self._kernel, "trellis_intermediate_hadamard", False)
+                                if getattr(
+                                    self._kernel, "trellis_intermediate_hadamard", False
+                                )
                                 else 3
                             )
                             * self._n,
@@ -11298,7 +11380,9 @@ def _get_dynamic_kernel(
         kernel_kwargs["quant_recipe"] = "w4a8_trellis"
         kernel_kwargs["w4a8_repacked"] = True
         kernel_kwargs["trellis_bits"] = int(trellis_bits)
-        kernel_kwargs["trellis_intermediate_hadamard"] = bool(trellis_intermediate_hadamard)
+        kernel_kwargs["trellis_intermediate_hadamard"] = bool(
+            trellis_intermediate_hadamard
+        )
     elif is_w4a8:
         kernel_kwargs["quant_recipe"] = quant_mode
         kernel_kwargs["w4a8_repacked"] = bool(w4a8_repacked)
@@ -11824,8 +11908,11 @@ def _launch_dynamic_flat(
             )
         effective_mac = min(effective_mac, direct_task_count)
     if (
-        (external_route_plan or w4a8_n64_repacked
-         or (w4a8_repacked and n % 128 == 0 and selected_tile_m <= 32))
+        (
+            external_route_plan
+            or w4a8_n64_repacked
+            or (w4a8_repacked and n % 128 == 0 and selected_tile_m <= 32)
+        )
         and policy_max_active_clusters > 0
         and _first_env(
             f"B12X_{mac_backend.upper()}_MAX_ACTIVE_CLUSTERS",
@@ -13131,11 +13218,15 @@ def _finalize_trellis_output(
 
 
 # Planned token capacity limit for W4A16 per-stage compressed-scale reads.
-W4A16_CSF_STAGE_MAX_TOKENS = int(os.environ.get("B12X_W4A16_CSF_STAGE_MAX_TOKENS", "1536"))
+W4A16_CSF_STAGE_MAX_TOKENS = int(
+    os.environ.get("B12X_W4A16_CSF_STAGE_MAX_TOKENS", "1536")
+)
 
 
 # Planned token capacity limit for compact W4A8 inline scale reads.
-W4A8_CSF_INLINE_MAX_TOKENS = int(os.environ.get("B12X_W4A8_CSF_INLINE_MAX_TOKENS", "1536"))
+W4A8_CSF_INLINE_MAX_TOKENS = int(
+    os.environ.get("B12X_W4A8_CSF_INLINE_MAX_TOKENS", "1536")
+)
 
 
 def _w4a16_reads_stage_scales(binding) -> bool:
@@ -13208,7 +13299,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         # expert's scales, expanded once from the inline storage.
         from b12x._lib.quant.mxfp4_csf_inline import expand_mxfp4_csf_inline
 
-        for plane, scales in zip(csf_inline, (w1_blockscale, w2_blockscale), strict=True):
+        for plane, scales in zip(
+            csf_inline, (w1_blockscale, w2_blockscale), strict=True
+        ):
             expand_mxfp4_csf_inline(
                 plane, scales.view(torch.uint8).view(plane.num_experts, -1)
             )
@@ -14351,7 +14444,9 @@ def b12x_route_experts_fast(
         raise ValueError(f"top_k={top_k} exceeds num_experts={num_experts}")
 
     if not hidden_states.is_cuda or num_experts > 1024:
-        raise ValueError("prepared native routing requires CUDA and at most 1024 experts")
+        raise ValueError(
+            "prepared native routing requires CUDA and at most 1024 experts"
+        )
 
     route_workspace = _get_route_workspace(
         hidden_states,
@@ -14476,7 +14571,8 @@ def b12x_sparse_moe_fp4(
             routed_scaling_factor=routed_scaling_factor,
         )
         selected = b12x_route_experts_fast(
-            binding=route_binding, route_topk_launcher=route_topk_launcher,
+            binding=route_binding,
+            route_topk_launcher=route_topk_launcher,
         )
 
     _validate_sparse_routing(hidden_states, selected)

@@ -18,6 +18,7 @@ its original dtype and recorded in ``quantization_config.exclude_modules``.
   b12x FP4 loader, regardless of whether the source stored them packed.
 * Dense: MLP (+ optional attention) linears are quantized in place.
 """
+
 from __future__ import annotations
 
 import json
@@ -63,7 +64,7 @@ _DENSE_IGNORE_ALWAYS = (
     r"(?:^|\.)position_embeddings?\.",
     r"(?:^|\.)patch_embed\.",
     r"(?:^|\.)mtp(?:\.|_)",
-    r"\.mlp\.gate\.weight$",            # MoE router gate (NOT mlp.gate_proj)
+    r"\.mlp\.gate\.weight$",  # MoE router gate (NOT mlp.gate_proj)
     r"\.shared_expert_gate\.",
     r"\.(?:input_layernorm|post_attention_layernorm|q_norm|k_norm|norm|layernorm|ln_?\w*)\.",
     r"\.rotary",
@@ -95,7 +96,13 @@ def _dense_ignore_re(
 def _module_pattern(key: str) -> str:
     """Collapse a tensor key to a layer/expert-agnostic module glob pattern."""
     k = key
-    for suffix in (".weight", ".bias", ".weight_scale", ".weight_scale_2", ".input_scale"):
+    for suffix in (
+        ".weight",
+        ".bias",
+        ".weight_scale",
+        ".weight_scale_2",
+        ".input_scale",
+    ):
         if k.endswith(suffix):
             k = k[: -len(suffix)]
             break
@@ -258,9 +265,7 @@ def _copy_aux_files(src: pathlib.Path, dst: pathlib.Path) -> None:
         shutil.copy2(item, dst / item.name)
 
 
-def _write_config(
-    src_config: dict, out_dir: pathlib.Path, quant_config: dict
-) -> None:
+def _write_config(src_config: dict, out_dir: pathlib.Path, quant_config: dict) -> None:
     cfg = dict(src_config)
     cfg["quantization_config"] = quant_config
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
@@ -429,8 +434,7 @@ def export_moe_model_to_fp6_safetensors(
             quant_keys.add(key)
 
     expert_quant = (
-        0 if skip_experts
-        else len(layers) * scheme.num_experts * (3 if is_gated else 2)
+        0 if skip_experts else len(layers) * scheme.num_experts * (3 if is_gated else 2)
     )
     if verbose:
         print(
@@ -459,8 +463,13 @@ def export_moe_model_to_fp6_safetensors(
             name = key[: -len(".weight")]
             w = model.get_tensor(key).to(device, torch.bfloat16)
             quantized = _emit_quantized_linear(
-                writer, report, name, w, source_format=source_format,
-                use_gpu=use_gpu, block_scale_rule=block_scale_rule,
+                writer,
+                report,
+                name,
+                w,
+                source_format=source_format,
+                use_gpu=use_gpu,
+                block_scale_rule=block_scale_rule,
                 error_stats=error_stats,
             )
             if not quantized:
@@ -481,20 +490,35 @@ def export_moe_model_to_fp6_safetensors(
         prefix = scheme.prefix_template.format(L=layer)
         for e in range(scheme.num_experts):
             _emit_quantized_linear(
-                writer, report, f"{prefix}.experts.{e}.{_DOWN_PROJ}",
-                down_e[e], source_format=source_format, use_gpu=use_gpu,
-                block_scale_rule=block_scale_rule, error_stats=error_stats,
+                writer,
+                report,
+                f"{prefix}.experts.{e}.{_DOWN_PROJ}",
+                down_e[e],
+                source_format=source_format,
+                use_gpu=use_gpu,
+                block_scale_rule=block_scale_rule,
+                error_stats=error_stats,
             )
             _emit_quantized_linear(
-                writer, report, f"{prefix}.experts.{e}.{_GATE_PROJ}",
-                gate_e[e], source_format=source_format, use_gpu=use_gpu,
-                block_scale_rule=block_scale_rule, error_stats=error_stats,
+                writer,
+                report,
+                f"{prefix}.experts.{e}.{_GATE_PROJ}",
+                gate_e[e],
+                source_format=source_format,
+                use_gpu=use_gpu,
+                block_scale_rule=block_scale_rule,
+                error_stats=error_stats,
             )
             if is_gated:
                 _emit_quantized_linear(
-                    writer, report, f"{prefix}.experts.{e}.{_UP_PROJ}",
-                    up_e[e], source_format=source_format, use_gpu=use_gpu,
-                    block_scale_rule=block_scale_rule, error_stats=error_stats,
+                    writer,
+                    report,
+                    f"{prefix}.experts.{e}.{_UP_PROJ}",
+                    up_e[e],
+                    source_format=source_format,
+                    use_gpu=use_gpu,
+                    block_scale_rule=block_scale_rule,
+                    error_stats=error_stats,
                 )
         if verbose:
             print(f"  layer {layer}: {scheme.num_experts} experts -> FP6")
@@ -562,9 +586,9 @@ def _layer_expert_matrices(
             )
         )
         if scheme.is_fused:
-            gate_up = model.get_tensor(scheme.expert_key(layer, e, scheme.gate_name)).to(
-                device, torch.bfloat16
-            )
+            gate_up = model.get_tensor(
+                scheme.expert_key(layer, e, scheme.gate_name)
+            ).to(device, torch.bfloat16)
             g, u = _split_gate_up(gate_up, dim=0, order=gate_up_order)
         else:
             g = model.get_tensor(scheme.expert_key(layer, e, scheme.gate_name)).to(
@@ -670,8 +694,13 @@ def export_dense_model_to_fp6_safetensors(
             name = key[: -len(".weight")]
             w = model.get_tensor(key).to(device, torch.bfloat16)
             quantized = _emit_quantized_linear(
-                writer, report, name, w, source_format=source_format,
-                use_gpu=use_gpu, block_scale_rule=block_scale_rule,
+                writer,
+                report,
+                name,
+                w,
+                source_format=source_format,
+                use_gpu=use_gpu,
+                block_scale_rule=block_scale_rule,
                 error_stats=error_stats,
             )
             if not quantized:
@@ -763,9 +792,7 @@ def dequantize_fp6_checkpoint_to_bf16(
             scale = model.get_tensor(name + ".weight_scale").to(device)
             ws2_key = name + ".weight_scale_2"
             ws2 = model.get_tensor(ws2_key).to(device) if model.has(ws2_key) else None
-            w = dequantize_linear_from_fp6(
-                packed, scale, fmt=fmt, weight_scale_2=ws2
-            )
+            w = dequantize_linear_from_fp6(packed, scale, fmt=fmt, weight_scale_2=ws2)
             writer.add(key, w.to(torch.bfloat16))
             report.quantized_tensors += 1
             del packed, scale, w

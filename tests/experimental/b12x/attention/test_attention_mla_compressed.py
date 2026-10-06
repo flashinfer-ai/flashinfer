@@ -49,10 +49,6 @@ _LOCAL_Q_HEADS = 32
 _SM_SCALE = 1.0 / math.sqrt(_COMPRESSED_HEAD_DIM)
 
 
-
-
-
-
 def test_spark_h16_policy_keeps_swa_h8_and_promotes_c4() -> None:
     assert not _dsv4_h16_auto(
         rows=8,
@@ -146,7 +142,9 @@ def test_split_sink_merge_live_rows_do_not_resolve_new_kernel() -> None:
         device=device,
         seed=6121,
     )
-    with kernel_resolution_guard('split sink merge live rows and chunks should reuse padded capture'):
+    with kernel_resolution_guard(
+        "split sink merge live rows and chunks should reuse padded capture"
+    ):
         mla_split_impl.run_sparse_mla_split_decode_merge(
             tmp_output=live_args[0],
             tmp_lse=live_args[1],

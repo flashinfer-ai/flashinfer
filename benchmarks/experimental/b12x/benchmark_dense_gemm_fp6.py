@@ -67,11 +67,16 @@ def bench_one_fp6(
     replay = capture_graph_replay(launch)
     replay()
     from b12x.testing.benchmark import samples_ms
+
     times = samples_ms(launch, warmup=warmup, iters=iters, l2_flush=l2_flush)
 
     if check:
-        a_f = dequant_mxfp6_torch(a_packed, a_sf, num_fp6=k, fmt="e3m2", global_scale=a_gs)
-        b_f = dequant_mxfp6_torch(b_packed, b_sf, num_fp6=k, fmt="e3m2", global_scale=b_gs)
+        a_f = dequant_mxfp6_torch(
+            a_packed, a_sf, num_fp6=k, fmt="e3m2", global_scale=a_gs
+        )
+        b_f = dequant_mxfp6_torch(
+            b_packed, b_sf, num_fp6=k, fmt="e3m2", global_scale=b_gs
+        )
         ref = a_f @ b_f.T
         check_outputs(
             out[:, :, 0],
@@ -95,7 +100,9 @@ def main() -> None:
     parser.add_argument("--n", type=int, default=128)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--no-check", action="store_true")
-    parser.add_argument("--flush-l2", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--flush-l2", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--l2-flush-bytes", type=int, default=0)
     args = parser.parse_args()
 

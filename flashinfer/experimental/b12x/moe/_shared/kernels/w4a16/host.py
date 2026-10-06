@@ -368,7 +368,9 @@ def plan_w4a16_buffers(
     # upper bound once routed_rows > route_num_experts. Keep the generic buffer
     # helper graph-safe for every currently supported TC-decode shape.
     gemm_route_slots = route_slots
-    if int(m) <= 8 and (bool(prepared.is_gated) or prepared.weight_layout in BLOCK_CODECS):
+    if int(m) <= 8 and (
+        bool(prepared.is_gated) or prepared.weight_layout in BLOCK_CODECS
+    ):
         gemm_route_slots = max(gemm_route_slots, routed_rows * block_size_m)
     scratch_sms = int(sms)
     weight_layout = str(
@@ -416,9 +418,7 @@ def plan_w4a16_buffers(
         block_size_m=block_size_m,
         rotation_a_elements=(routed_rows * hidden_size if full_rotation else 0),
         prefill_sum_accum_elements=(
-            int(m) * hidden_size
-            if use_prefill_fused_sum
-            else 0
+            int(m) * hidden_size if use_prefill_fused_sum else 0
         ),
     )
 
@@ -487,8 +487,12 @@ def make_w4a16_packed_buffers(
             device=device,
         ),
         intermediate_cache2=torch.empty(
-            (plan.routed_rows, plan.intermediate_cache2_elements // plan.routed_rows
-             if plan.routed_rows else int(prepared.intermediate_size)),
+            (
+                plan.routed_rows,
+                plan.intermediate_cache2_elements // plan.routed_rows
+                if plan.routed_rows
+                else int(prepared.intermediate_size),
+            ),
             dtype=dtype,
             device=device,
         ),

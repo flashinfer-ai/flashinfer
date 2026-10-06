@@ -139,9 +139,13 @@ def _parse_load_paths(raw: str) -> list[str]:
 def _parse_bool_list(raw: str) -> list[bool]:
     aliases = {"0": False, "false": False, "1": True, "true": True}
     try:
-        values = [aliases[item.strip().lower()] for item in raw.split(",") if item.strip()]
+        values = [
+            aliases[item.strip().lower()] for item in raw.split(",") if item.strip()
+        ]
     except KeyError as exc:
-        raise argparse.ArgumentTypeError("swap values must be 0/1 or false/true") from exc
+        raise argparse.ArgumentTypeError(
+            "swap values must be 0/1 or false/true"
+        ) from exc
     if not values:
         raise argparse.ArgumentTypeError("swap list must not be empty")
     return values
@@ -245,7 +249,9 @@ def main() -> None:
     parser.add_argument("--k", type=int)
     parser.add_argument("--n-list", type=_parse_int_list)
     parser.add_argument("--k-list", type=_parse_int_list)
-    parser.add_argument("--m-list", type=_parse_int_list, default=_parse_int_list("1,2,4,6,8"))
+    parser.add_argument(
+        "--m-list", type=_parse_int_list, default=_parse_int_list("1,2,4,6,8")
+    )
     parser.add_argument(
         "--tile-k-list", type=_parse_int_list, default=_parse_int_list("128,256,512")
     )
@@ -289,8 +295,7 @@ def main() -> None:
     if any(tile_k not in (128, 256, 512) for tile_k in args.tile_k_list):
         parser.error("--tile-k-list is restricted to 128,256,512")
     if args.target_occupancy_list is not None and any(
-        occupancy not in (1, 2, 3, 4)
-        for occupancy in args.target_occupancy_list
+        occupancy not in (1, 2, 3, 4) for occupancy in args.target_occupancy_list
     ):
         parser.error("--target-occupancy-list is restricted to 1,2,3,4")
     if args.joint and any(
@@ -358,9 +363,7 @@ def main() -> None:
                     swap_ab_list=args.swap_ab_list,
                     target_occupancy_list=args.target_occupancy_list,
                 )
-                if not any(
-                    shape.k % candidate.tile_k == 0 for candidate in candidates
-                ):
+                if not any(shape.k % candidate.tile_k == 0 for candidate in candidates):
                     for candidate in candidates:
                         output.write(
                             f"{shape.name}\t{m}\t{shape.n}\t{shape.k}\t"
@@ -420,7 +423,9 @@ def main() -> None:
                             "unsupported\t\t\t\t\t\t\n"
                         )
                         continue
-                    out = torch.empty((m, shape.n, 1), device="cuda", dtype=torch.bfloat16)
+                    out = torch.empty(
+                        (m, shape.n, 1), device="cuda", dtype=torch.bfloat16
+                    )
 
                     def launch(
                         out: torch.Tensor = out,
@@ -523,9 +528,7 @@ def main() -> None:
                     )
                     speedup = ""
                     if baseline_us is not None:
-                        speedup = (
-                            f" ({baseline_us / winner_us:.3f}x vs default/BK128)"
-                        )
+                        speedup = f" ({baseline_us / winner_us:.3f}x vs default/BK128)"
                     print(
                         f"  -> M={m:<3} winner {winner.candidate.label()} "
                         f"{winner_us:.2f} us{speedup}"

@@ -192,7 +192,12 @@ def make_glm_decode_case(
 
     q = (
         torch.randn(
-            num_tokens, num_heads, GLM_Q_HEAD_DIM, device=device, dtype=dtype, generator=gen
+            num_tokens,
+            num_heads,
+            GLM_Q_HEAD_DIM,
+            device=device,
+            dtype=dtype,
+            generator=gen,
         )
         / 10.0
     ).clamp(-1, 1)
@@ -239,11 +244,15 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     s_kv = 64
     gen = torch.Generator(device=device).manual_seed(7)
     k_nope = (
-        torch.randn(s_kv, 1, GLM_D_NOPE, device=device, dtype=torch.bfloat16, generator=gen)
+        torch.randn(
+            s_kv, 1, GLM_D_NOPE, device=device, dtype=torch.bfloat16, generator=gen
+        )
         / 10.0
     ).clamp(-1, 1)
     k_rope = (
-        torch.randn(s_kv, 1, GLM_D_ROPE, device=device, dtype=torch.bfloat16, generator=gen)
+        torch.randn(
+            s_kv, 1, GLM_D_ROPE, device=device, dtype=torch.bfloat16, generator=gen
+        )
         / 10.0
     ).clamp(-1, 1)
     packed = pack_mla_kv_cache_reference(k_nope, k_rope)
@@ -270,9 +279,7 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     orig_rope = k_rope.squeeze(1).float()
     rope_err = (deq[:, GLM_D_NOPE:] - orig_rope).abs().max().item()
     assert rope_err < 1e-2, f"rope round-trip error too large: {rope_err}"
-    nope_rel = (
-        (deq[:, :GLM_D_NOPE] - orig_nope).abs() / orig_nope.abs().clamp(min=1e-3)
-    )
+    nope_rel = (deq[:, :GLM_D_NOPE] - orig_nope).abs() / orig_nope.abs().clamp(min=1e-3)
     assert nope_rel.median().item() < 0.1, (
         f"nope round-trip median rel error too large: {nope_rel.median().item()}"
     )
@@ -298,7 +305,9 @@ def _self_test(device: str | torch.device = "cuda") -> None:
             denom = w.sum()
             brute_O[t, h] = (w @ rows[:, :GLM_D_V]) / denom  # V = first 512 dims only
             brute_lse[t, h] = (m + torch.log(denom)) / math.log(2.0)
-    torch.testing.assert_close(case["expected_O"].float(), brute_O, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        case["expected_O"].float(), brute_O, atol=2e-2, rtol=2e-2
+    )
     torch.testing.assert_close(case["expected_lse"], brute_lse, atol=1e-3, rtol=1e-3)
 
     # (4) Default decode case: shapes/dtypes/sm_scale match the unified GLM contract.
@@ -323,7 +332,10 @@ def _self_test(device: str | torch.device = "cuda") -> None:
     )
     case_e["topk_indices"][:] = -1
     O_e, lse_e = glm_decode_reference(
-        case_e["q"], case_e["kv_cache"], case_e["topk_indices"], case_e["sm_scale"],
+        case_e["q"],
+        case_e["kv_cache"],
+        case_e["topk_indices"],
+        case_e["sm_scale"],
         return_lse=True,
     )
     assert torch.all(lse_e == float("-inf")), "all-invalid LSE must be -inf"
@@ -331,7 +343,9 @@ def _self_test(device: str | torch.device = "cuda") -> None:
 
     # (6) topk sweep {64, 128, 512}: finite, correctly-shaped outputs.
     for tk in (64, 128, 512):
-        nblk = max(1, (tk + GLM_DECODE_PAGE_BLOCK_SIZE - 1) // GLM_DECODE_PAGE_BLOCK_SIZE)
+        nblk = max(
+            1, (tk + GLM_DECODE_PAGE_BLOCK_SIZE - 1) // GLM_DECODE_PAGE_BLOCK_SIZE
+        )
         c = make_glm_decode_case(num_heads=128, topk=tk, num_blocks=nblk, device=device)
         assert c["q"].shape == (1, 128, GLM_Q_HEAD_DIM)
         assert c["expected_O"].shape == (1, 128, GLM_D_V)

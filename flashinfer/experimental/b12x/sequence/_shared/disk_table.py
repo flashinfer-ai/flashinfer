@@ -16,6 +16,7 @@ from contextlib import contextmanager, suppress
 from typing import TYPE_CHECKING, Iterator
 
 import torch
+
 if TYPE_CHECKING:
     from cuda.bindings import runtime as cudart
 
@@ -117,7 +118,12 @@ class MappedHostAllocation:
         self._closed = True
 
     def __del__(self) -> None:
-        if self._closed or self._host_pointer == 0 or sys is None or sys.is_finalizing():
+        if (
+            self._closed
+            or self._host_pointer == 0
+            or sys is None
+            or sys.is_finalizing()
+        ):
             return
         with suppress(Exception):
             self.close()
@@ -191,6 +197,7 @@ class DiskRowCache:
         self._weight_buffer = self._scale_buffer = None
         if self._backend == "gds":
             from ._gds import GdsRows
+
             self._gds = GdsRows(self, queue_depth)
             self.weight, self.scale = self._gds.weight, self._gds.scale
         else:
@@ -270,9 +277,13 @@ class DiskRowCache:
             if end <= self.shard_start or start >= self.shard_end:
                 return
             if self._gds is not None:
-                self._gds.native.add(self._gds.reader, shard_index, os.fspath(path), offset, scale)
+                self._gds.native.add(
+                    self._gds.reader, shard_index, os.fspath(path), offset, scale
+                )
             else:
-                self._native.ple_reader_add(self._reader, shard_index, os.fspath(path), offset, scale)
+                self._native.ple_reader_add(
+                    self._reader, shard_index, os.fspath(path), offset, scale
+                )
             self._sources.add(key)
 
     def require_complete(self) -> None:
@@ -358,14 +369,21 @@ class DiskRowCache:
     def stats(self) -> dict[str, int | float]:
         self._require_open()
         with self._lock:
-            result = dict(self._gds.native.stats(self._gds.reader) if self._gds is not None
-                          else self._native.ple_reader_stats(self._reader))
+            result = dict(
+                self._gds.native.stats(self._gds.reader)
+                if self._gds is not None
+                else self._native.ple_reader_stats(self._reader)
+            )
             result["ids_host_bytes"] = (
                 self.ids_host.numel() * self.ids_host.element_size()
             )
-            result["weight_cache_bytes"] = self.weight.numel() * self.weight.element_size()
+            result["weight_cache_bytes"] = (
+                self.weight.numel() * self.weight.element_size()
+            )
             result["scale_cache_bytes"] = (
-                self.scale.numel() * self.scale.element_size() if self.scale is not None else 0
+                self.scale.numel() * self.scale.element_size()
+                if self.scale is not None
+                else 0
             )
             result["cache_bytes"] = (
                 result["weight_cache_bytes"] + result["scale_cache_bytes"]
@@ -377,9 +395,17 @@ class DiskRowCache:
             )
             descriptors = result.get("descriptor_bytes", 0)
             result["gds_enabled"] = int(self._gds is not None)
-            result["device_staging_bytes"] = (result["staging_bytes"] + result["cache_bytes"] + descriptors) if self._gds else 0
-            result["owned_host_bytes"] = result["ids_host_bytes"] + descriptors + result["metadata_bytes"]
+            result["device_staging_bytes"] = (
+                (result["staging_bytes"] + result["cache_bytes"] + descriptors)
+                if self._gds
+                else 0
+            )
+            result["owned_host_bytes"] = (
+                result["ids_host_bytes"] + descriptors + result["metadata_bytes"]
+            )
             if self._gds is None:
-                result["owned_host_bytes"] += result["staging_bytes"] + result["cache_bytes"]
+                result["owned_host_bytes"] += (
+                    result["staging_bytes"] + result["cache_bytes"]
+                )
             result["owned_staging_bytes"] += 2 * descriptors
             return result

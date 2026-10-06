@@ -6,7 +6,12 @@ import math
 from dataclasses import dataclass, replace
 
 from b12x.preparation import DeviceIdentity, FrozenMapping
-from b12x.preparation.tuning import Knob, ParameterBinding, ParameterSpace, TuningContract
+from b12x.preparation.tuning import (
+    Knob,
+    ParameterBinding,
+    ParameterSpace,
+    TuningContract,
+)
 
 _MHC_MULT = 4
 _PREFILL_TF32_MIN_TOKENS = 384
@@ -39,8 +44,6 @@ class MhcQuery:
     smem_limit: int = 0
     controls: FrozenMapping = FrozenMapping()
     codegen: FrozenMapping = FrozenMapping()
-
-
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -120,15 +123,34 @@ def _projection_default_config(
     hidden_size = int(query.hidden_size)
     eligible = _tf32_eligible(query)
     pin = _tf32_pin(query)
-    backend = "tf32_tma" if eligible and (
-        pin is True or (pin is None and tokens >= _PREFILL_TF32_MIN_TOKENS)
-    ) else "native"
+    backend = (
+        "tf32_tma"
+        if eligible
+        and (pin is True or (pin is None and tokens >= _PREFILL_TF32_MIN_TOKENS))
+        else "native"
+    )
     if hidden_size == 5_120 and tokens == 128:
-        return _tf32_config(backend=backend, tile_m=32, tile_n=8, tile_k=256,
-                            num_stages=1, num_m_warps=2, num_n_warps=1, k_splits=8)
+        return _tf32_config(
+            backend=backend,
+            tile_m=32,
+            tile_n=8,
+            tile_k=256,
+            num_stages=1,
+            num_m_warps=2,
+            num_n_warps=1,
+            k_splits=8,
+        )
     if hidden_size == 5_120 and tokens == 4_096:
-        return _tf32_config(backend=backend, tile_m=64, tile_n=24, tile_k=64,
-                            num_stages=2, num_m_warps=4, num_n_warps=1, k_splits=4)
+        return _tf32_config(
+            backend=backend,
+            tile_m=64,
+            tile_n=24,
+            tile_k=64,
+            num_stages=2,
+            num_m_warps=4,
+            num_n_warps=1,
+            k_splits=4,
+        )
     if hidden_size == 4_096 and tokens >= 8_192:
         return _tf32_config(
             backend=backend,
@@ -187,10 +209,15 @@ def _projection_default_config(
 
 def _tf32_eligible(query):
     return (
-        query.has_norm_weight and query.hidden_size in (4096, 5120, 7168)
+        query.has_norm_weight
+        and query.hidden_size in (4096, 5120, 7168)
         and (
             query.operation == "post_pre"
-            or (query.operation == "pre" and query.expanded_residual and query.lagged_mix)
+            or (
+                query.operation == "pre"
+                and query.expanded_residual
+                and query.lagged_mix
+            )
         )
     )
 
@@ -202,20 +229,33 @@ def _default_config(query, device):
     if query.operation == "pre":
         prepared = prepared and query.max_tokens < threshold
     else:
-        prepared = prepared and (not query.has_norm_weight or query.max_tokens < threshold)
+        prepared = prepared and (
+            not query.has_norm_weight or query.max_tokens < threshold
+        )
         splits = query.controls.get("B12X_MHC_DECODE_SPLITS")
         if splits not in (None, ""):
             prepared = prepared and int(splits) == 0
-        elif device is not None and device.compute_capability == (12, 1) and query.hidden_size == 4096 and query.max_tokens >= 8:
+        elif (
+            device is not None
+            and device.compute_capability == (12, 1)
+            and query.hidden_size == 4096
+            and query.max_tokens >= 8
+        ):
             prepared = False
     partials = 4
     if prepared:
         raw = query.controls.get("B12X_MHC_PARTIALS_PER_CTA")
         if raw not in (None, ""):
             partials = int(raw)
-        elif (query.operation == "pre" and device is not None
-              and device.compute_capability == (12, 1) and query.hidden_size == 4096):
-            partials = 25 if query.max_tokens >= 8 else 9 if query.max_tokens >= 4 else 4
+        elif (
+            query.operation == "pre"
+            and device is not None
+            and device.compute_capability == (12, 1)
+            and query.hidden_size == 4096
+        ):
+            partials = (
+                25 if query.max_tokens >= 8 else 9 if query.max_tokens >= 4 else 4
+            )
     return replace(config, lagged_prepare=prepared, partials_per_cta=partials)
 
 
@@ -230,7 +270,11 @@ def _validate(
 ) -> None:
     if not isinstance(config, MhcConfig):
         raise TypeError("config must be MhcConfig")
-    if any(type(getattr(config, field)) is not int for field in config.__dataclass_fields__ if field not in ("backend", "lagged_prepare")):
+    if any(
+        type(getattr(config, field)) is not int
+        for field in config.__dataclass_fields__
+        if field not in ("backend", "lagged_prepare")
+    ):
         raise TypeError("projection geometry fields must be integers")
     if config.backend not in {"native", "tf32_tma"}:
         raise ValueError(f"unsupported mHC backend {config.backend!r}")
@@ -245,7 +289,9 @@ def _validate(
     if config.backend == "native":
         return
     if not _tf32_eligible(query):
-        raise ValueError("TF32 requires post-pre with norm or expanded lagged pre with norm")
+        raise ValueError(
+            "TF32 requires post-pre with norm or expanded lagged pre with norm"
+        )
     if config.projection_num_stages not in range(1, 9):
         raise ValueError("projection_num_stages must be in [1, 8]")
     if config.projection_num_m_warps <= 0 or config.projection_num_n_warps <= 0:
@@ -261,7 +307,9 @@ def _validate(
     if config.projection_tile_k <= 0 or config.projection_tile_k % 8:
         raise ValueError("projection_tile_k must be a positive multiple of 8")
     if config.projection_tile_k < 32:
-        raise ValueError("TF32 TMA projection requires at least 32 FP32 weights per row")
+        raise ValueError(
+            "TF32 TMA projection requires at least 32 FP32 weights per row"
+        )
     if total_k % config.projection_tile_k:
         raise ValueError("projection_tile_k must divide the flattened hidden width")
     k_tiles = total_k // config.projection_tile_k
@@ -290,33 +338,55 @@ def _validate_query(query, device):
         raise ValueError("unknown mHC operation")
     if query.dtype != "bfloat16":
         raise ValueError("mHC requires bfloat16 state")
-    if any(type(value) is not int or value <= 0 for value in (
-        query.max_tokens, query.hidden_size, query.split_k, query.block_k, query.block_h,
-    )):
+    if any(
+        type(value) is not int or value <= 0
+        for value in (
+            query.max_tokens,
+            query.hidden_size,
+            query.split_k,
+            query.block_k,
+            query.block_h,
+        )
+    ):
         raise ValueError("mHC dimensions must be positive integers")
     hidden_sizes = (4096, 5120, 7168)
     if query.hidden_size not in hidden_sizes:
         raise ValueError(f"{query.operation} supports hidden sizes {hidden_sizes}")
     if query.operation in ("pre", "post_pre"):
-        if (4 * query.hidden_size % query.block_k
-                or query.split_k != 4 * query.hidden_size // query.block_k
-                or query.block_k != 256 or query.block_h != 512):
+        if (
+            4 * query.hidden_size % query.block_k
+            or query.split_k != 4 * query.hidden_size // query.block_k
+            or query.block_k != 256
+            or query.block_h != 512
+        ):
             raise ValueError("mHC requires the production fused Gram geometry")
         if type(query.sinkhorn_iters) is not int or query.sinkhorn_iters != 20:
             raise ValueError("mHC production kernels require 20 Sinkhorn iterations")
         if query.rms_eps not in (1.0e-20, 1.0e-6, 1.0e-5) or query.hc_eps != 1.0e-6:
-            raise ValueError("mHC epsilon values differ from the production numerical contract")
+            raise ValueError(
+                "mHC epsilon values differ from the production numerical contract"
+            )
     if query.has_norm_weight and (
-        not math.isfinite(query.norm_eps) or query.norm_eps < 0
+        not math.isfinite(query.norm_eps)
+        or query.norm_eps < 0
         or query.norm_weight_dtype not in ("bfloat16", "float32")
     ):
-        raise ValueError("normalization requires BF16/FP32 weights and nonnegative epsilon")
+        raise ValueError(
+            "normalization requires BF16/FP32 weights and nonnegative epsilon"
+        )
     if query.output_mode not in ("functional", "provided"):
         raise ValueError("unknown mHC output form")
-    if any(type(value) is not bool for value in (
-        query.has_norm_weight, query.has_fn_bf16, query.collapse_weighted,
-        query.bf16x2_eligible, query.lagged_mix, query.expanded_residual,
-    )):
+    if any(
+        type(value) is not bool
+        for value in (
+            query.has_norm_weight,
+            query.has_fn_bf16,
+            query.collapse_weighted,
+            query.bf16x2_eligible,
+            query.lagged_mix,
+            query.expanded_residual,
+        )
+    ):
         raise TypeError("operand-presence and layout flags must be boolean")
     if query.expanded_residual and query.operation != "pre":
         raise ValueError("expanded pre layout only applies to the pre operation")
@@ -336,7 +406,9 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
     values = {
         "backend": backends,
         "lagged_prepare": (False, True) if query.lagged_mix else (False,),
-        "partials_per_cta": (int(partials),) if partials not in (None, "") else (4, 9, 13, 25),
+        "partials_per_cta": (int(partials),)
+        if partials not in (None, "")
+        else (4, 9, 13, 25),
         "projection_tile_k": tuple(
             k for k in (8, 16, 32, 64, 128, 256) if total_k % k == 0
         ),
@@ -353,7 +425,9 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
 
     smem_limit = query.smem_limit
     if type(smem_limit) is not int or smem_limit <= 0:
-        raise ValueError("TF32 preparation requires the declared device's shared-memory limit")
+        raise ValueError(
+            "TF32 preparation requires the declared device's shared-memory limit"
+        )
     alignment = MHCPrefillTf32ProjectTmaKernel.buffer_align_bytes
     n_cover = 1 << (_MIXES - 1).bit_length()
 
@@ -374,8 +448,9 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
             )
         )
 
-    m_warp_values = next(knob.values for knob in TUNING.knobs
-                         if knob.name == "projection_num_m_warps")
+    m_warp_values = next(
+        knob.values for knob in TUNING.knobs if knob.name == "projection_num_m_warps"
+    )
     min_grid = 1 if device is None else max(1, (device.sm_count + 7) // 8)
 
     def compact_m_grid(p):
@@ -394,20 +469,23 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
             return True
         tile_m = 16 * p["projection_num_m_warps"]
         tile_n = p["projection_tile_n"]
-        return (
-            ((query.max_tokens + tile_m - 1) // tile_m)
-            * ((_MIXES + tile_n - 1) // tile_n)
-            * p["projection_k_splits"]
-            >= min_grid
-        )
+        return ((query.max_tokens + tile_m - 1) // tile_m) * (
+            (_MIXES + tile_n - 1) // tile_n
+        ) * p["projection_k_splits"] >= min_grid
 
     def bounded_split_grid(p):
-        if p["backend"] != "tf32_tma" or device is None or p["projection_k_splits"] <= 8:
+        if (
+            p["backend"] != "tf32_tma"
+            or device is None
+            or p["projection_k_splits"] <= 8
+        ):
             return True
         tile_m = 16 * p["projection_num_m_warps"]
-        grid = ((query.max_tokens + tile_m - 1) // tile_m) * (
-            (_MIXES + p["projection_tile_n"] - 1) // p["projection_tile_n"]
-        ) * p["projection_k_splits"]
+        grid = (
+            ((query.max_tokens + tile_m - 1) // tile_m)
+            * ((_MIXES + p["projection_tile_n"] - 1) // p["projection_tile_n"])
+            * p["projection_k_splits"]
+        )
         return grid <= 4 * device.sm_count
 
     def prefill_warp_layout(p):
@@ -415,26 +493,29 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
             return True
         m_warps = p["projection_num_m_warps"]
         return p["projection_num_n_warps"] == 1 and (
-            m_warps % 4 == 0
-            or (p["projection_tile_n"] == 8 and m_warps >= 2)
+            m_warps % 4 == 0 or (p["projection_tile_n"] == 8 and m_warps >= 2)
         )
 
     def prefill_column_tiles(p):
-        return (p["backend"] != "tf32_tma" or query.max_tokens < 2048
-                or p["projection_tile_n"] >= _MIXES)
+        return (
+            p["backend"] != "tf32_tma"
+            or query.max_tokens < 2048
+            or p["projection_tile_n"] >= _MIXES
+        )
 
     def prefill_pipeline(p):
         if p["backend"] != "tf32_tma" or query.max_tokens < 384:
             return True
         stages = p["projection_num_stages"]
         buffered_k = stages * p["projection_tile_k"]
-        return 128 <= buffered_k <= 256 and (
-            stages > 1 or p["projection_tile_n"] == 8
-        )
+        return 128 <= buffered_k <= 256 and (stages > 1 or p["projection_tile_n"] == 8)
 
     def prefill_split_work(p):
-        return (p["backend"] != "tf32_tma" or query.max_tokens < 2048
-                or total_k // p["projection_k_splits"] >= 2048)
+        return (
+            p["backend"] != "tf32_tma"
+            or query.max_tokens < 2048
+            or total_k // p["projection_k_splits"] >= 2048
+        )
 
     return ParameterSpace.create(
         TUNING.knobs,
@@ -514,10 +595,20 @@ TUNING = TuningContract(
             values=("native", "tf32_tma"),
             binding=ParameterBinding.COMPILE,
         ),
-        Knob(name="lagged_prepare", values=None, binding=ParameterBinding.COMPILE,
-             when=FrozenMapping({"backend": "native"}), otherwise=False),
-        Knob(name="partials_per_cta", values=None, binding=ParameterBinding.COMPILE,
-             when=FrozenMapping({"backend": "native", "lagged_prepare": True}), otherwise=4),
+        Knob(
+            name="lagged_prepare",
+            values=None,
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "native"}),
+            otherwise=False,
+        ),
+        Knob(
+            name="partials_per_cta",
+            values=None,
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "native", "lagged_prepare": True}),
+            otherwise=4,
+        ),
         Knob(
             name="projection_tile_n",
             values=(8, 16, 24, 32, 48, 64),

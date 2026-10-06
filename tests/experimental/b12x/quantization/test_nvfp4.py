@@ -45,8 +45,9 @@ def test_run_matches_torch_grouped_quantizer() -> None:
     )
     with PreparationSession(device=source.device, autotune=False) as session:
         session.prepare((request,))
-        nvfp4.run(plan=declaration, x=source,
-                  global_scale=global_scale, outputs=outputs)
+        nvfp4.run(
+            plan=declaration, x=source, global_scale=global_scale, outputs=outputs
+        )
         torch.cuda.synchronize()
 
     actual_packed = outputs.packed_a_storage.view(-1)

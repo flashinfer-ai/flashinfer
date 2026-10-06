@@ -22,17 +22,15 @@ from b12x.testing.reference.gemm import nvfp4_gemm_reference
 from b12x.testing.reference.helpers import require_b12x
 
 
-
-
-
-
 def _make_quantized_operand(
     shape: tuple[int, int, int],
     *,
     dtype: torch.dtype,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     source = torch.randn(shape, device="cuda", dtype=dtype) / 4
-    row_counts = torch.full((shape[0],), shape[1], dtype=torch.int32, device=source.device)
+    row_counts = torch.full(
+        (shape[0],), shape[1], dtype=torch.int32, device=source.device
+    )
     tensor_amax = source.abs().max().to(torch.float32)
     global_scale = torch.tensor(
         [torch.finfo(torch.float8_e4m3fn).max * 6.0 / tensor_amax],
@@ -79,12 +77,9 @@ def _block_fp8_reference(
 ) -> torch.Tensor:
     m, k = a.shape
     n = b.shape[0]
-    a_dequant = (
-        a.float().view(m, k // 128, 128) * a_scale[:, :, None]
-    ).reshape(m, k)
+    a_dequant = (a.float().view(m, k // 128, 128) * a_scale[:, :, None]).reshape(m, k)
     b_dequant = (
-        b.float().view(n // 128, 128, k // 128, 128)
-        * b_scale[:, None, :, None]
+        b.float().view(n // 128, 128, k // 128, 128) * b_scale[:, None, :, None]
     ).reshape(n, k)
     return (a_dequant @ b_dequant.T).to(torch.bfloat16)
 
@@ -126,9 +121,7 @@ def test_dense_gemm_block_fp8_matches_quantized_reference(
     a = (torch.randn(m, k, device="cuda") / 8).to(torch.float8_e4m3fn)
     b = (torch.randn(n, k, device="cuda") / 8).to(torch.float8_e4m3fn)
     a_scale = (torch.rand(m, k // 128, device="cuda") + 0.25).contiguous()
-    b_scale = (
-        torch.rand(n // 128, k // 128, device="cuda") + 0.25
-    ).contiguous()
+    b_scale = (torch.rand(n // 128, k // 128, device="cuda") + 0.25).contiguous()
 
     actual = _run_block_fp8_dense(a, b, a_scale, b_scale)[:, :, 0]
     reference = _block_fp8_reference(a, b, a_scale, b_scale)
@@ -173,9 +166,7 @@ def test_dense_gemm_block_fp8_split_k_matches_quantized_reference() -> None:
     a = (torch.randn(m, k, device="cuda") / 16).to(torch.float8_e4m3fn)
     b = (torch.randn(n, k, device="cuda") / 16).to(torch.float8_e4m3fn)
     a_scale = (torch.rand(m, k // 128, device="cuda") + 0.25).contiguous()
-    b_scale = (
-        torch.rand(n // 128, k // 128, device="cuda") + 0.25
-    ).contiguous()
+    b_scale = (torch.rand(n // 128, k // 128, device="cuda") + 0.25).contiguous()
 
     actual = _run_block_fp8_dense(a, b, a_scale, b_scale)[:, :, 0]
     reference = _block_fp8_reference(a, b, a_scale, b_scale)
@@ -183,20 +174,26 @@ def test_dense_gemm_block_fp8_split_k_matches_quantized_reference() -> None:
     torch.testing.assert_close(actual, reference, rtol=2e-2, atol=4e-3)
 
 
-@pytest.mark.parametrize("M,N,K", [
-    (128, 128, 128),
-    (256, 128, 128),
-    (128, 256, 128),
-    (128, 128, 256),
-    (256, 256, 256),
-    (256, 512, 128),
-    (128, 256, 512),
-    (512, 256, 256),
-    (256, 256, 512),
-])
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        (128, 128, 128),
+        (256, 128, 128),
+        (128, 256, 128),
+        (128, 128, 256),
+        (256, 256, 256),
+        (256, 512, 128),
+        (128, 256, 512),
+        (512, 256, 256),
+        (256, 256, 512),
+    ],
+)
 @pytest.mark.parametrize("c_dtype_str", ["bfloat16", "float16"])
 def test_dense_gemm_matches_quantized_reference(
-    M: int, N: int, K: int, c_dtype_str: str,
+    M: int,
+    N: int,
+    K: int,
+    c_dtype_str: str,
 ) -> None:
     require_b12x()
     torch.manual_seed(42)
@@ -217,7 +214,12 @@ def test_dense_gemm_matches_quantized_reference(
     )
 
     oracle = nvfp4_gemm_reference(
-        lhs, rhs, lhs_scale, rhs_scale, k=K, dtype=c_dtype,
+        lhs,
+        rhs,
+        lhs_scale,
+        rhs_scale,
+        k=K,
+        dtype=c_dtype,
     )[0]
 
     torch.testing.assert_close(dense_out[:, :, 0], oracle, rtol=0, atol=0)
@@ -251,7 +253,12 @@ def test_dense_gemm_fp4_swap_ab_small_tilen_matches_quantized_reference(
     )
 
     oracle = nvfp4_gemm_reference(
-        lhs, rhs, lhs_scale, rhs_scale, k=K, dtype=torch.bfloat16,
+        lhs,
+        rhs,
+        lhs_scale,
+        rhs_scale,
+        k=K,
+        dtype=torch.bfloat16,
     )[0]
 
     torch.testing.assert_close(dense_out[:, :, 0], oracle, rtol=0, atol=0)
@@ -273,7 +280,6 @@ def test_dense_gemm_fp4_small_tilen_support_matrix() -> None:
     )
 
     assert not DenseGemmKernel.can_implement(
-
         **base,
         mma_tiler_mn=(64, 32),
         load_path="tma",
@@ -418,9 +424,7 @@ def test_dense_gemm_mxfp8_bk64_grouped_batches_use_their_own_scales(
         sfb_k_replicated=True,
     )
     a_deq = dequantize_mxfp8_rows_torch(a_q.values, a_q.scale_rows)
-    b_deq = dequantize_mxfp8_rows_torch(
-        b_q.values, b_q.scale_rows
-    ).to(torch.bfloat16)
+    b_deq = dequantize_mxfp8_rows_torch(b_q.values, b_q.scale_rows).to(torch.bfloat16)
     a_deq = a_deq.to(torch.bfloat16)
     ref = torch.einsum("mkl,nkl->mnl", a_deq, b_deq).to(torch.bfloat16)
 
@@ -445,10 +449,18 @@ def test_dense_gemm_shared_expert_pair_replays_under_cuda_graph(
     assert gate_m == down_m
     assert gate_n == down_k
 
-    gate_lhs, gate_lhs_scale = _make_quantized_operand((1, gate_m, gate_k), dtype=torch.bfloat16)
-    gate_rhs, gate_rhs_scale = _make_quantized_operand((1, gate_n, gate_k), dtype=torch.bfloat16)
-    down_lhs, down_lhs_scale = _make_quantized_operand((1, down_m, down_k), dtype=torch.bfloat16)
-    down_rhs, down_rhs_scale = _make_quantized_operand((1, down_n, down_k), dtype=torch.bfloat16)
+    gate_lhs, gate_lhs_scale = _make_quantized_operand(
+        (1, gate_m, gate_k), dtype=torch.bfloat16
+    )
+    gate_rhs, gate_rhs_scale = _make_quantized_operand(
+        (1, gate_n, gate_k), dtype=torch.bfloat16
+    )
+    down_lhs, down_lhs_scale = _make_quantized_operand(
+        (1, down_m, down_k), dtype=torch.bfloat16
+    )
+    down_rhs, down_rhs_scale = _make_quantized_operand(
+        (1, down_n, down_k), dtype=torch.bfloat16
+    )
 
     eager_gate = _run_dense_gemm(gate_lhs, gate_rhs, gate_lhs_scale, gate_rhs_scale)
     eager_down = _run_dense_gemm(down_lhs, down_rhs, down_lhs_scale, down_rhs_scale)

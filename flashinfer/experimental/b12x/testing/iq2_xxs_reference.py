@@ -2,6 +2,7 @@
 
 Table: ggml-org/ggml 64302f42eb959556633c89ae651915d8157dcd63 src/ggml-common.h (MIT).
 """
+
 import struct
 import torch
 
@@ -271,7 +272,9 @@ def dequantize_blocks(blocks: torch.Tensor) -> torch.Tensor:
     raw = blocks.cpu().contiguous()
     base = raw[..., :2].contiguous().view(torch.float16).float().squeeze(-1)
     records = raw[..., 2:].reshape(*raw.shape[:-1], 8, 8).long()
-    grid = torch.tensor(list(b"".join(struct.pack("<Q", w) for w in _GRID_WORDS)), dtype=torch.float32).reshape(256, 8)
+    grid = torch.tensor(
+        list(b"".join(struct.pack("<Q", w) for w in _GRID_WORDS)), dtype=torch.float32
+    ).reshape(256, 8)
     control = sum(records[..., 4 + j] << (8 * j) for j in range(4))
     scale = (base[..., None] * ((control >> 28).float() + 0.5)) * 0.25
     values = []

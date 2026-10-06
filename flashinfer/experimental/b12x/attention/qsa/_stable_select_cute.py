@@ -8,7 +8,11 @@ from cutlass import Float32, Int32, Int64
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.compile_plan import compile_only_launches_enabled, program_keys, record_program
+from b12x._lib.compile_plan import (
+    compile_only_launches_enabled,
+    program_keys,
+    record_program,
+)
 from b12x._lib.program_cache import register_program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
@@ -23,10 +27,17 @@ class StableSelectionKernel:
         self.budget = int(budget)
 
     @cute.jit
-    def __call__(self, pointers: tuple, stride: Int64, rows: Int32,
-                 group_offset: Int32, stream: cuda.CUstream):
+    def __call__(
+        self,
+        pointers: tuple,
+        stride: Int64,
+        rows: Int32,
+        group_offset: Int32,
+        stream: cuda.CUstream,
+    ):
         self.kernel(pointers, stride, group_offset).launch(
-            grid=(rows, 1, 1), block=(256, 1, 1), stream=stream)
+            grid=(rows, 1, 1), block=(256, 1, 1), stream=stream
+        )
 
     @cute.kernel
     def kernel(self, pointers: tuple, stride: Int64, group_offset: Int32):
@@ -39,24 +50,36 @@ class StableSelectionKernel:
         length = lengths[row].to(Int32)
         selected = cutlass.min(length, Int32(self.budget))
         allocator = cutlass.utils.SmemAllocator()
-        minima = allocator.allocate_tensor(Float32, cute.make_layout((8,)), byte_alignment=16)
-        greater_counts = allocator.allocate_tensor(Int32, cute.make_layout((8,)), byte_alignment=16)
-        tie_counts = allocator.allocate_tensor(Int32, cute.make_layout((8,)), byte_alignment=16)
-        threshold = allocator.allocate_tensor(Float32, cute.make_layout((1,)), byte_alignment=4)
-        minimum = Float32(float('inf'))
+        minima = allocator.allocate_tensor(
+            Float32, cute.make_layout((8,)), byte_alignment=16
+        )
+        greater_counts = allocator.allocate_tensor(
+            Int32, cute.make_layout((8,)), byte_alignment=16
+        )
+        tie_counts = allocator.allocate_tensor(
+            Int32, cute.make_layout((8,)), byte_alignment=16
+        )
+        threshold = allocator.allocate_tensor(
+            Float32, cute.make_layout((1,)), byte_alignment=4
+        )
+        minimum = Float32(float("inf"))
         for part in cutlass.range_constexpr(self.budget // 256):
             column = tid + Int32(part * 256)
             if column < selected:
-                minimum = cutlass.min(minimum, Float32(top_values[base + column.to(Int64)]))
-            values[base + column.to(Int64)] = Float32(-float('inf'))
+                minimum = cutlass.min(
+                    minimum, Float32(top_values[base + column.to(Int64)])
+                )
+            values[base + column.to(Int64)] = Float32(-float("inf"))
             ids[base + column.to(Int64)] = Int32(-1)
         for shift in cutlass.range_constexpr(5):
-            minimum = cutlass.min(minimum, cute.arch.shuffle_sync_bfly(minimum, offset=16 >> shift))
+            minimum = cutlass.min(
+                minimum, cute.arch.shuffle_sync_bfly(minimum, offset=16 >> shift)
+            )
         if lane == Int32(0):
             minima[warp] = minimum
         cute.arch.sync_threads()
         if tid == Int32(0):
-            minimum = Float32(float('inf'))
+            minimum = Float32(float("inf"))
             for w in cutlass.range_constexpr(8):
                 minimum = cutlass.min(minimum, Float32(minima[w]))
             threshold[0] = minimum
@@ -91,10 +114,12 @@ class StableSelectionKernel:
                 greater_before += count
                 ties_before += Int32(tie_counts[w])
         need = selected - total_greater
-        carry = cutlass.min(cutlass.min(eligible[row].to(Int32), group_offset), Int32(self.budget))
+        carry = cutlass.min(
+            cutlass.min(eligible[row].to(Int32), group_offset), Int32(self.budget)
+        )
         for tile in cutlass.range(tiles):
             column = start + tile * Int32(32) + lane
-            value = Float32(-float('inf'))
+            value = Float32(-float("inf"))
             is_greater, is_tie = Int32(0), Int32(0)
             if column < length:
                 value = Float32(scores[score_base + column.to(Int64)])
@@ -112,7 +137,9 @@ class StableSelectionKernel:
                     gp += g
                     tp += t
             tie_rank = ties_before + tp - Int32(1)
-            chosen = (is_greater != Int32(0)) | ((is_tie != Int32(0)) & (tie_rank < need))
+            chosen = (is_greater != Int32(0)) | (
+                (is_tie != Int32(0)) & (tie_rank < need)
+            )
             if chosen:
                 destination = greater_before + gp - Int32(1)
                 if is_tie != Int32(0):
@@ -131,28 +158,72 @@ def compile_stable_selection(budget, device):
     raw = _CACHE.get(key)
     if raw is None:
         kernel = StableSelectionKernel(budget)
-        raise_if_kernel_resolution_frozen('cute.compile', target=kernel, cache_key=key)
-        pointers = tuple(make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=t.width // 8) for t in _TYPES)
-        raw = b12x_compile(kernel, pointers, Int64(1), Int32(1), Int32(0), current_cuda_stream(),
-                          compile_spec=KernelCompileSpec.from_key('attention.qsa.stable_selection', 1, key))
+        raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
+        pointers = tuple(
+            make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=t.width // 8)
+            for t in _TYPES
+        )
+        raw = b12x_compile(
+            kernel,
+            pointers,
+            Int64(1),
+            Int32(1),
+            Int32(0),
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key(
+                "attention.qsa.stable_selection", 1, key
+            ),
+        )
         _CACHE[key] = raw
     return raw
 
 
-def launch_stable_selection(*, scores, merge_lengths, prior_ids, eligible_counts,
-                            topk_values, stable_values, stable_ids, group_offset,
-                            group_budget, prepared=None):
+def launch_stable_selection(
+    *,
+    scores,
+    merge_lengths,
+    prior_ids,
+    eligible_counts,
+    topk_values,
+    stable_values,
+    stable_ids,
+    group_offset,
+    group_budget,
+    prepared=None,
+):
     device = scores.device.index
     if device is None:
         device = torch.cuda.current_device()
     with torch.cuda.device(device):
-        raw = prepared if prepared is not None else compile_stable_selection(group_budget, device)
+        raw = (
+            prepared
+            if prepared is not None
+            else compile_stable_selection(group_budget, device)
+        )
         if compile_only_launches_enabled():
             for key in program_keys(raw):
                 record_program(key)
             return raw
-        tensors = (scores, merge_lengths, prior_ids, eligible_counts, topk_values, stable_values, stable_ids)
-        pointers = tuple(make_ptr(t, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=t.width // 8)
-                         for t, tensor in zip(_TYPES, tensors, strict=True))
-        raw(pointers, Int64(scores.stride(0)), Int32(scores.shape[0]), Int32(group_offset), current_cuda_stream())
+        tensors = (
+            scores,
+            merge_lengths,
+            prior_ids,
+            eligible_counts,
+            topk_values,
+            stable_values,
+            stable_ids,
+        )
+        pointers = tuple(
+            make_ptr(
+                t, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=t.width // 8
+            )
+            for t, tensor in zip(_TYPES, tensors, strict=True)
+        )
+        raw(
+            pointers,
+            Int64(scores.stride(0)),
+            Int32(scores.shape[0]),
+            Int32(group_offset),
+            current_cuda_stream(),
+        )
         return raw

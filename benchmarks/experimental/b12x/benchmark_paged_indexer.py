@@ -158,8 +158,10 @@ def _validate_analytic_topk(
 
 def _event_time_us(fn, *, warmup: int, iters: int, l2_flush=None) -> list[float]:
     from b12x.testing.benchmark import measure_call
-    result = measure_call(fn, warmup=warmup, samples=iters,
-                          eviction=l2_flush or (lambda: None))
+
+    result = measure_call(
+        fn, warmup=warmup, samples=iters, eviction=l2_flush or (lambda: None)
+    )
     return result.raw_samples("workload")
 
 
@@ -211,7 +213,6 @@ def _graph_time_us(
         )
 
     return _event_time_us(fn, warmup=0, iters=iters, l2_flush=l2_flush)
-
 
 
 def main() -> None:
@@ -714,7 +715,6 @@ def main() -> None:
             supertile_k=supertile_k,
         )
 
-
     # First call compiles the CuTe DSL kernel before timing or capture.
     out = run()
     torch.cuda.synchronize()
@@ -762,7 +762,6 @@ def main() -> None:
             torch_profile=bool(args.torch_profile),
         )
         timing_mode = "graph"
-
 
     median_us = statistics.median(samples_us)
     min_us = min(samples_us)

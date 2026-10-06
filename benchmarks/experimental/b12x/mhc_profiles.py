@@ -58,13 +58,18 @@ def _cached_snapshot(repo_id: str) -> Path | None:
     from huggingface_hub.errors import LocalEntryNotFoundError
 
     try:
-        path = Path(snapshot_download(
-            repo_id=repo_id, local_files_only=True,
-            allow_patterns=("config.json", "model.safetensors.index.json"),
-        ))
+        path = Path(
+            snapshot_download(
+                repo_id=repo_id,
+                local_files_only=True,
+                allow_patterns=("config.json", "model.safetensors.index.json"),
+            )
+        )
     except LocalEntryNotFoundError:
         return None
-    if (path / "config.json").is_file() and (path / "model.safetensors.index.json").is_file():
+    if (path / "config.json").is_file() and (
+        path / "model.safetensors.index.json"
+    ).is_file():
         return path
     return None
 
@@ -93,7 +98,9 @@ def _ensure_required_shards(
     try:
         shards = {weight_map[key] for key in required_keys}
     except KeyError as exc:
-        raise ValueError(f"checkpoint is missing required mHC tensor {exc.args[0]!r}") from exc
+        raise ValueError(
+            f"checkpoint is missing required mHC tensor {exc.args[0]!r}"
+        ) from exc
     missing = sorted(shard for shard in shards if not (model_path / shard).is_file())
     if not missing:
         return
@@ -110,7 +117,9 @@ def _ensure_required_shards(
     )
     still_missing = [shard for shard in missing if not (model_path / shard).is_file()]
     if still_missing:
-        raise FileNotFoundError(f"required checkpoint shards unavailable: {still_missing}")
+        raise FileNotFoundError(
+            f"required checkpoint shards unavailable: {still_missing}"
+        )
 
 
 def _resolve_model_path(profile: MHCProfile, model_path: str | Path | None) -> Path:
@@ -144,7 +153,9 @@ def _text_config(profile: MHCProfile, raw_config: dict[str, Any]) -> dict[str, A
     return dict(config)
 
 
-def _validate_tensor(name: str, tensor: torch.Tensor, *, shape: tuple[int, ...], dtype: torch.dtype) -> None:
+def _validate_tensor(
+    name: str, tensor: torch.Tensor, *, shape: tuple[int, ...], dtype: torch.dtype
+) -> None:
     if tensor.device.type != "cpu":
         raise ValueError(f"{name} must be loaded on CPU")
     if tensor.dtype != dtype or tuple(tensor.shape) != shape:
@@ -194,12 +205,19 @@ def load_mhc_profile(
     if not isinstance(hidden_size, int) or hidden_size <= 0:
         raise ValueError("checkpoint hidden_size must be a positive integer")
     for key in ("fn", "prev_fn"):
-        _validate_tensor(key, tensors[key], shape=(24, 4 * hidden_size), dtype=torch.float32)
+        _validate_tensor(
+            key, tensors[key], shape=(24, 4 * hidden_size), dtype=torch.float32
+        )
     for key in ("scale", "prev_scale"):
         _validate_tensor(key, tensors[key], shape=(3,), dtype=torch.float32)
     for key in ("bias", "prev_bias"):
         _validate_tensor(key, tensors[key], shape=(24,), dtype=torch.float32)
     _validate_tensor(
-        "norm_weight", tensors["norm_weight"], shape=(hidden_size,), dtype=torch.bfloat16
+        "norm_weight",
+        tensors["norm_weight"],
+        shape=(hidden_size,),
+        dtype=torch.bfloat16,
     )
-    return MHCProfileBundle(profile=profile, model_path=path, config=config, tensors=tensors)
+    return MHCProfileBundle(
+        profile=profile, model_path=path, config=config, tensors=tensors
+    )

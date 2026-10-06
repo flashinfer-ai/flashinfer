@@ -348,7 +348,9 @@ class MoEWeightPreparationPlan:
         object.__setattr__(
             self, "storage_policy", WeightStoragePolicy(self.storage_policy)
         )
-        object.__setattr__(self, "intermediate_hadamard", bool(self.intermediate_hadamard))
+        object.__setattr__(
+            self, "intermediate_hadamard", bool(self.intermediate_hadamard)
+        )
         if self.source_format in _TRELLIS_SOURCE_FORMATS:
             bits = 3 if self.trellis_bits is None else int(self.trellis_bits)
             codebook = (
@@ -384,9 +386,7 @@ class MoEWeightPreparationPlan:
             pair_kinds = (
                 None
                 if self.trellis_pair_kinds is None
-                else frozenset(
-                    str(kind).upper() for kind in self.trellis_pair_kinds
-                )
+                else frozenset(str(kind).upper() for kind in self.trellis_pair_kinds)
             )
             if granularity in {"uniform", "per_layer", "per_expert"}:
                 if pair_kinds is not None:
@@ -406,8 +406,7 @@ class MoEWeightPreparationPlan:
                     )
                 if pair_kinds is None:
                     raise ValueError(
-                        "per-expert-pair Trellis rates declare "
-                        "trellis_pair_kinds"
+                        "per-expert-pair Trellis rates declare trellis_pair_kinds"
                     )
                 if "P44" in pair_kinds:
                     raise ValueError(
@@ -447,9 +446,7 @@ class MoEWeightPreparationPlan:
             blocks = (
                 None
                 if self.intermediate_hadamard_blocks is None
-                else tuple(
-                    int(value) for value in self.intermediate_hadamard_blocks
-                )
+                else tuple(int(value) for value in self.intermediate_hadamard_blocks)
             )
             if self.intermediate_hadamard:
                 if self.trellis_codebook != _TRELLIS_LUT_E4M3:
@@ -468,9 +465,7 @@ class MoEWeightPreparationPlan:
                 raise ValueError(
                     "intermediate_hadamard_blocks require intermediate_hadamard"
                 )
-            object.__setattr__(
-                self, "trellis_rate_granularity", granularity
-            )
+            object.__setattr__(self, "trellis_rate_granularity", granularity)
             object.__setattr__(self, "trellis_pair_kinds", pair_kinds)
             object.__setattr__(self, "intermediate_hadamard_blocks", blocks)
         elif (
@@ -482,9 +477,7 @@ class MoEWeightPreparationPlan:
             or self.trellis_pair_kinds is not None
             or self.intermediate_hadamard_blocks is not None
         ):
-            raise ValueError(
-                "trellis storage settings require a trellis source format"
-            )
+            raise ValueError("trellis storage settings require a trellis source format")
         for name in ("num_experts", "hidden_size", "intermediate_size"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
@@ -555,7 +548,10 @@ class MoEWeightPreparationPlan:
 
     @property
     def w4a16_weight_layout(self) -> str | None:
-        if any(WeightPreparationTransform("w4a16_" + codec) in self.transforms for codec in BLOCK_CODECS):
+        if any(
+            WeightPreparationTransform("w4a16_" + codec) in self.transforms
+            for codec in BLOCK_CODECS
+        ):
             return self.specs[0].source_format
         if WeightPreparationTransform.W4A16_TRELLIS in self.transforms:
             return "trellis_t256"
@@ -597,7 +593,10 @@ class MoEWeightPreparationPlan:
                 f"quant_mode={quant_mode!r} is absent from this preparation plan"
             )
         if quant_mode == "w4a16":
-            if any(WeightPreparationTransform("w4a16_" + codec) in self.transforms for codec in BLOCK_CODECS):
+            if any(
+                WeightPreparationTransform("w4a16_" + codec) in self.transforms
+                for codec in BLOCK_CODECS
+            ):
                 return PreparedWeightLayout(self.specs[0].source_format + "_compact")
             if WeightPreparationTransform.W4A16_TRELLIS in self.transforms:
                 return PreparedWeightLayout.TRELLIS_NATIVE
@@ -769,8 +768,9 @@ def make_moe_spec(
         activation_encoding=activation_encoding,
         activation_scale=activation_scale,
         weight_encoding=(
-            OperandEncoding(source_format) if source_format in BLOCK_CODECS else
-            OperandEncoding.FP6_E2M3
+            OperandEncoding(source_format)
+            if source_format in BLOCK_CODECS
+            else OperandEncoding.FP6_E2M3
             if quant_mode == "w6a8_mx"
             else OperandEncoding.MXFP8_E4M3
             if quant_mode == "w8a8_mx"
@@ -844,13 +844,16 @@ def plan_moe_weight_preparation(
         requested_w4a16_layout is PreparedWeightLayout.TRELLIS_NATIVE
         and source_format not in _TRELLIS_SOURCE_FORMATS
     ):
-        raise ValueError(
-            "trellis_native layout requires a trellis source format"
-        )
+        raise ValueError("trellis_native layout requires a trellis source format")
 
     for codec in BLOCK_CODECS:
-        if requested_w4a16_layout is PreparedWeightLayout(codec + "_compact") and source_format != codec:
-            raise ValueError(f"{codec}_compact packing requires {codec.upper()} weights")
+        if (
+            requested_w4a16_layout is PreparedWeightLayout(codec + "_compact")
+            and source_format != codec
+        ):
+            raise ValueError(
+                f"{codec}_compact packing requires {codec.upper()} weights"
+            )
 
     transforms: set[WeightPreparationTransform] = set()
     weight_layouts: set[PreparedWeightLayout] = set()
@@ -970,11 +973,21 @@ def plan_moe_weight_preparation(
             continue
         if spec.quant_mode == "w4a16":
             if source_format in BLOCK_CODECS:
-                if spec.io_dtype != "bfloat16" or spec.activation not in {"silu", "relu2"}:
+                if spec.io_dtype != "bfloat16" or spec.activation not in {
+                    "silu",
+                    "relu2",
+                }:
                     raise ValueError("IQ2_XS requires BF16 A16 with SiLU or ReLU²")
-                if hidden_size % max(128, block_codec(source_format).block_weights) or intermediate_size % max(128, block_codec(source_format).block_weights):
+                if hidden_size % max(
+                    128, block_codec(source_format).block_weights
+                ) or intermediate_size % max(
+                    128, block_codec(source_format).block_weights
+                ):
                     raise ValueError("IQ2_XS requires H/I divisible by 256")
-                if requested_w4a16_layout not in {None, PreparedWeightLayout(source_format + "_compact")}:
+                if requested_w4a16_layout not in {
+                    None,
+                    PreparedWeightLayout(source_format + "_compact"),
+                }:
                     raise ValueError("IQ2_XS requires iq2_xs_compact packing")
                 transforms.add(WeightPreparationTransform("w4a16_" + source_format))
                 weight_layouts.add(PreparedWeightLayout(source_format + "_compact"))
@@ -982,16 +995,12 @@ def plan_moe_weight_preparation(
                 continue
             if source_format in _TRELLIS_SOURCE_FORMATS:
                 if spec.activation not in {"silu", "situ"}:
-                    raise ValueError(
-                        "Trellis W4A16 currently requires silu or situ"
-                    )
+                    raise ValueError("Trellis W4A16 currently requires silu or situ")
                 if requested_w4a16_layout not in {
                     None,
                     PreparedWeightLayout.TRELLIS_NATIVE,
                 }:
-                    raise ValueError(
-                        "Trellis W4A16 requires trellis_native layout"
-                    )
+                    raise ValueError("Trellis W4A16 requires trellis_native layout")
                 transforms.add(WeightPreparationTransform.W4A16_TRELLIS)
                 weight_layouts.add(PreparedWeightLayout.TRELLIS_NATIVE)
                 scale_layouts.add(PreparedScaleLayout.SOURCE_NATIVE)
@@ -1037,7 +1046,8 @@ def plan_moe_weight_preparation(
             weight_layouts.add(layout)
             scale_layouts.add(
                 PreparedScaleLayout.SOURCE_NATIVE
-                if source_format == "modelopt_nvfp4" and layout is PreparedWeightLayout.SOURCE_NATIVE
+                if source_format == "modelopt_nvfp4"
+                and layout is PreparedWeightLayout.SOURCE_NATIVE
                 else PreparedScaleLayout.MMA_PACKED
             )
             continue
@@ -1049,7 +1059,10 @@ def plan_moe_weight_preparation(
     }
     native_representation = (
         WeightPreparationTransform.W4A16_NATIVE in transforms
-        or any(WeightPreparationTransform("w4a16_" + codec) in transforms for codec in BLOCK_CODECS)
+        or any(
+            WeightPreparationTransform("w4a16_" + codec) in transforms
+            for codec in BLOCK_CODECS
+        )
         or WeightPreparationTransform.W4A16_TRELLIS in transforms
         or WeightPreparationTransform.W4A8_TRELLIS in transforms
         # W6A8-MXFP6 keeps the packed FP6 bytes unchanged and transfers

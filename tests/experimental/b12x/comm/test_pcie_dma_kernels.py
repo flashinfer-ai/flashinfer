@@ -14,9 +14,7 @@ def test_dma_rejects_unreviewed_world_sizes_before_backend_setup(
     world_size: int,
 ) -> None:
     monkeypatch.setattr(pcie_dma.dist, "get_rank", lambda group: 0)
-    monkeypatch.setattr(
-        pcie_dma.dist, "get_world_size", lambda group: world_size
-    )
+    monkeypatch.setattr(pcie_dma.dist, "get_world_size", lambda group: world_size)
 
     def unexpected_backend_setup():
         raise AssertionError("backend setup must not run for an unreviewed world size")

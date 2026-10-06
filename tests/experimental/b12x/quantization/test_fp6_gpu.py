@@ -16,7 +16,10 @@ from b12x._lib.fp6 import (
 )
 from b12x._lib.utils import mxfp6_packed_k_bytes
 from b12x._lib.dense_gemm import dense_gemm
-from b12x.quantization.mxfp6 import allocate_bf16_to_fp6_tma_outputs, compile_bf16_to_fp6_tma
+from b12x.quantization.mxfp6 import (
+    allocate_bf16_to_fp6_tma_outputs,
+    compile_bf16_to_fp6_tma,
+)
 from b12x.testing.reference.helpers import require_b12x
 
 # TODO(port): several tests below drove the retired pre-facade b12x.integration.tp_moe
@@ -28,8 +31,6 @@ from b12x.testing.reference.helpers import require_b12x
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for FP6 GPU tests"
 )
-
-
 
 
 def _one_ulp_rtol(fmt: str) -> float:
@@ -48,8 +49,6 @@ def _one_ulp_rtol(fmt: str) -> float:
     against float comparison at the exact boundary.
     """
     return 0.26 if fmt == "e3m2" else 0.13
-
-
 
 
 @pytest.mark.parametrize("fmt", ["e3m2", "e2m3"])
@@ -186,10 +185,16 @@ def _synthetic_mxfp6_moe_weights(
     gs1 = torch.ones(experts, device=device, dtype=torch.float32)
     gs2 = torch.ones(experts, device=device, dtype=torch.float32)
     w1_packed, _ = quantize_grouped_mxfp6_torch(
-        w1_bf, row_full, gs1, fmt=weight_fmt  # type: ignore[arg-type]
+        w1_bf,
+        row_full,
+        gs1,
+        fmt=weight_fmt,  # type: ignore[arg-type]
     )
     w2_packed, _ = quantize_grouped_mxfp6_torch(
-        w2_bf, row_w2, gs2, fmt=weight_fmt  # type: ignore[arg-type]
+        w2_bf,
+        row_w2,
+        gs2,
+        fmt=weight_fmt,  # type: ignore[arg-type]
     )
     w1_fp6 = w1_packed.permute(2, 0, 1).contiguous()
     w2_fp6 = w2_packed.permute(2, 0, 1).contiguous()
@@ -213,9 +218,9 @@ def test_moe_fp6_synthetic_smoke() -> None:
     torch.manual_seed(3)
     x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 0.1
     topk_ids = torch.randint(0, experts, (m, topk), device=device, dtype=torch.int32)
-    topk_weights = torch.softmax(
-        torch.randn(m, topk, device=device), dim=-1
-    ).to(torch.float32)
+    topk_weights = torch.softmax(torch.randn(m, topk, device=device), dim=-1).to(
+        torch.float32
+    )
     w1_fp6, w1_sf, w2_fp6, w2_sf = _synthetic_mxfp6_moe_weights(
         experts=experts, k=k, n=n, device=device
     )
@@ -268,7 +273,11 @@ def _fp6_qdq_vec(vec: torch.Tensor, gs: float, fmt: str) -> torch.Tensor:
     gst = torch.tensor([gs], dtype=torch.float32, device=vec.device)
     packed, sv = quantize_grouped_mxfp6_torch(x, rc, gst, fmt=fmt, bf16_round=True)  # type: ignore[arg-type]
     deq = dequant_mxfp6_torch(
-        packed[:, :, 0], sv, num_fp6=k, fmt=fmt, global_scale=gst  # type: ignore[arg-type]
+        packed[:, :, 0],
+        sv,
+        num_fp6=k,
+        fmt=fmt,
+        global_scale=gst,  # type: ignore[arg-type]
     )
     return deq.view(k)
 
@@ -344,13 +353,30 @@ def test_moe_fp6_numeric_vs_reference() -> None:
     w2_alphas = torch.ones(experts, device=device, dtype=torch.float32)
 
     workspace = allocate_tp_moe_workspace(
-        x, a1_gscale, w1_fp6, a2_gscale, w2_fp6, topk_ids,
-        quant_mode="w6a6", input_scales_static=True,
+        x,
+        a1_gscale,
+        w1_fp6,
+        a2_gscale,
+        w2_fp6,
+        topk_ids,
+        quant_mode="w6a6",
+        input_scales_static=True,
     )
     out = b12x_moe_fp6(
-        x, a1_gscale, w1_fp6, w1_sf, w1_alphas, a2_gscale, w2_fp6, w2_sf, w2_alphas,
-        topk_weights, topk_ids,
-        workspace=workspace, input_scales_static=True, source_format="mxfp6_default",
+        x,
+        a1_gscale,
+        w1_fp6,
+        w1_sf,
+        w1_alphas,
+        a2_gscale,
+        w2_fp6,
+        w2_sf,
+        w2_alphas,
+        topk_weights,
+        topk_ids,
+        workspace=workspace,
+        input_scales_static=True,
+        source_format="mxfp6_default",
     )
     torch.cuda.synchronize()
 
@@ -378,7 +404,9 @@ def test_moe_fp6_numeric_vs_reference() -> None:
                 second = w1e[n:] @ x_deq
                 gate, up = (first, second) if gate_first else (second, first)
                 inter = (torch.sigmoid(gate) * gate * up).to(torch.bfloat16)
-                inter_deq = _fp6_qdq_vec(inter, 1.0, "e3m2") if quantized else inter.float()
+                inter_deq = (
+                    _fp6_qdq_vec(inter, 1.0, "e3m2") if quantized else inter.float()
+                )
                 down = w2e @ inter_deq
                 ref[t] += rw * down
         return ref
@@ -393,15 +421,19 @@ def test_moe_fp6_numeric_vs_reference() -> None:
     cos_fp6 = _cos(out, ref_fp6)
     cos_bf16 = _cos(out, ref_bf16)
     per_tok = [
-        (round(_cos(out[t], ref_fp6[t]), 3),
-         round(float(out[t].float().norm()), 3),
-         round(float(ref_fp6[t].norm()), 3),
-         int(topk_ids[t, 0].item()))
+        (
+            round(_cos(out[t], ref_fp6[t]), 3),
+            round(float(out[t].float().norm()), 3),
+            round(float(ref_fp6[t].norm()), 3),
+            int(topk_ids[t, 0].item()),
+        )
         for t in range(m)
     ]
     print(f"\nMoE FP6: cos_fp6={cos_fp6:.4f} cos_bf16={cos_bf16:.4f}")
     print(f"per-token (cos,out_norm,ref_norm,eid): {per_tok}")
-    assert cos_fp6 > 0.93, f"MoE FP6 cosine {cos_fp6:.4f} (bf16-ref {cos_bf16:.4f}) too low"
+    assert cos_fp6 > 0.93, (
+        f"MoE FP6 cosine {cos_fp6:.4f} (bf16-ref {cos_bf16:.4f}) too low"
+    )
 
 
 @pytest.mark.parametrize("shape", [(256, 512), (128, 512), (256, 256)])
@@ -423,8 +455,10 @@ def test_bf16_to_fp6_tma_multi_ktile_row_stride(shape, fmt: str) -> None:
     nblk = k // SF_VEC_SIZE_FP6
     gain = (2.0 ** (torch.arange(nblk, device="cuda") % 6 - 3)).float()
     bf16 = (
-        bf16.float().view(m, nblk, SF_VEC_SIZE_FP6) * gain.view(1, nblk, 1)
-    ).view(m, k).to(torch.bfloat16)
+        (bf16.float().view(m, nblk, SF_VEC_SIZE_FP6) * gain.view(1, nblk, 1))
+        .view(m, k)
+        .to(torch.bfloat16)
+    )
 
     ref_packed, ref_scales = _quantize_bf16_matrix(bf16, fmt=fmt)
     gs = _bf16_global_scale(float(bf16.abs().max().item()))
@@ -435,7 +469,11 @@ def test_bf16_to_fp6_tma_multi_ktile_row_stride(shape, fmt: str) -> None:
 
     assert out.packed_a_storage.shape == (1, m, mxfp6_packed_k_bytes(k))
     ref_deq = dequant_mxfp6_torch(
-        ref_packed, ref_scales, num_fp6=k, fmt=fmt, global_scale=gs  # type: ignore[arg-type]
+        ref_packed,
+        ref_scales,
+        num_fp6=k,
+        fmt=fmt,
+        global_scale=gs,  # type: ignore[arg-type]
     )
     ker_deq = dequant_mxfp6_torch(
         out.packed_a_storage.squeeze(0),
@@ -508,13 +546,30 @@ def test_moe_fp6_multi_ktile_numeric(backend: str, monkeypatch) -> None:
     w2_alphas = torch.ones(experts, device=device, dtype=torch.float32)
 
     workspace = allocate_tp_moe_workspace(
-        x, a1_gscale, w1_fp6, a2_gscale, w2_fp6, topk_ids,
-        quant_mode="w6a6", input_scales_static=True,
+        x,
+        a1_gscale,
+        w1_fp6,
+        a2_gscale,
+        w2_fp6,
+        topk_ids,
+        quant_mode="w6a6",
+        input_scales_static=True,
     )
     out = b12x_moe_fp6(
-        x, a1_gscale, w1_fp6, w1_sf, w1_alphas, a2_gscale, w2_fp6, w2_sf, w2_alphas,
-        topk_weights, topk_ids,
-        workspace=workspace, input_scales_static=True, source_format="mxfp6_default",
+        x,
+        a1_gscale,
+        w1_fp6,
+        w1_sf,
+        w1_alphas,
+        a2_gscale,
+        w2_fp6,
+        w2_sf,
+        w2_alphas,
+        topk_weights,
+        topk_ids,
+        workspace=workspace,
+        input_scales_static=True,
+        source_format="mxfp6_default",
     )
     torch.cuda.synchronize()
 

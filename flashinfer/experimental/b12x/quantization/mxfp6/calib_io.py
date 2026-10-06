@@ -4,6 +4,7 @@ b12x policy: NO pickle artifacts, ever. ``torch.save`` / ``.pt`` paths are
 rejected outright. Hidden-state captures are single-tensor safetensors files
 with the tensor under the key ``"hidden_states"``.
 """
+
 from __future__ import annotations
 
 import pathlib

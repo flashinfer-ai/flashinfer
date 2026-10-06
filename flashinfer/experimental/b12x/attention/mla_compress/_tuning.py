@@ -1,4 +1,5 @@
 """Typed fixed contract for CSA1/CSA2 MLA compression."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

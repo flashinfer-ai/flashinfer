@@ -15,12 +15,24 @@ def ep(name, iface=None):
 # Three DGX Sparks cabled port 0 -> next node's port 1 (no switch). Every cable shows up as two
 # PCIe functions, each with its own /30, so each peer is reachable over exactly two local devices.
 RING = [
-    [ep("rocep1s0f0", "10.10.0.1/30"), ep("rocep1s0f1", "10.10.4.2/30"),
-     ep("roceP2p1s0f0", "10.10.1.1/30"), ep("roceP2p1s0f1", "10.10.5.2/30")],
-    [ep("rocep1s0f0", "10.10.2.1/30"), ep("rocep1s0f1", "10.10.0.2/30"),
-     ep("roceP2p1s0f0", "10.10.3.1/30"), ep("roceP2p1s0f1", "10.10.1.2/30")],
-    [ep("rocep1s0f0", "10.10.4.1/30"), ep("rocep1s0f1", "10.10.2.2/30"),
-     ep("roceP2p1s0f0", "10.10.5.1/30"), ep("roceP2p1s0f1", "10.10.3.2/30")],
+    [
+        ep("rocep1s0f0", "10.10.0.1/30"),
+        ep("rocep1s0f1", "10.10.4.2/30"),
+        ep("roceP2p1s0f0", "10.10.1.1/30"),
+        ep("roceP2p1s0f1", "10.10.5.2/30"),
+    ],
+    [
+        ep("rocep1s0f0", "10.10.2.1/30"),
+        ep("rocep1s0f1", "10.10.0.2/30"),
+        ep("roceP2p1s0f0", "10.10.3.1/30"),
+        ep("roceP2p1s0f1", "10.10.1.2/30"),
+    ],
+    [
+        ep("rocep1s0f0", "10.10.4.1/30"),
+        ep("rocep1s0f1", "10.10.2.2/30"),
+        ep("roceP2p1s0f0", "10.10.5.1/30"),
+        ep("roceP2p1s0f1", "10.10.3.2/30"),
+    ],
 ]
 
 
@@ -79,7 +91,9 @@ def test_switched_fabric_keeps_index_pairing():
 
 def test_one_flat_subnet_with_extra_devices_keeps_index_pairing_on_the_first_rails():
     """Four devices on one subnet: the rails use devices 0 and 1 at both ends."""
-    flat = [[ep(f"d{h}", f"10.0.0.{10 * r + h}/24") for h in range(4)] for r in range(2)]
+    flat = [
+        [ep(f"d{h}", f"10.0.0.{10 * r + h}/24") for h in range(4)] for r in range(2)
+    ]
     assert plan_routes(flat, 0, 2)[1] == [(0, 0), (1, 1)]
 
 
@@ -103,7 +117,7 @@ def test_single_rail_uses_one_link_per_peer():
     """With one rail, each peer gets one route over a real link."""
     routes = plan_routes(RING, 1, 1)
     for peer in (0, 2):
-        (local, remote), = routes[peer]
+        ((local, remote),) = routes[peer]
         assert _link(RING, 1, peer, local, remote)
 
 
@@ -142,7 +156,11 @@ def test_fallback_prefers_verified_links_over_unverifiable_pairs():
 def test_fallback_finds_a_complete_matching_a_greedy_pick_would_miss():
     """A verified link that blocks the only unverifiable pair is skipped for one that leaves room for it."""
     local = [ep("roce0", "10.0.0.1/24"), ep("ib1")]
-    remote = [ep("roce0", "10.0.9.2/24"), ep("roce1", "10.0.0.2/24"), ep("roce2", "10.0.0.3/24")]
+    remote = [
+        ep("roce0", "10.0.9.2/24"),
+        ep("roce1", "10.0.0.2/24"),
+        ep("roce2", "10.0.0.3/24"),
+    ]
     # Taking (0, 1) first would leave (1, 1) unusable; (0, 2) plus the trusted (1, 1) supplies both rails.
     assert plan_routes([local, remote], 0, 2)[1] == [(0, 2), (1, 1)]
     assert plan_routes([local, remote], 1, 2)[0] == [(2, 0), (1, 1)]
@@ -166,13 +184,18 @@ def test_rails_out_of_range_rejected():
         plan_routes(RING, 0, 3)
 
 
-@pytest.mark.parametrize("gid,netmask,expected", [
-    ("0000:0000:0000:0000:0000:ffff:0a0a:0001", "255.255.255.252", "10.10.0.1/30"),
-    ("0000:0000:0000:0000:0000:ffff:0a0a:0001", None, None),
-    ("fe80:0000:0000:0000:0000:0000:0000:0001", "255.255.255.252", None),
-    ("invalid", "255.255.255.252", None),
-])
-def test_local_endpoints_uses_gid_netdev_prefix(tmp_path, monkeypatch, gid, netmask, expected):
+@pytest.mark.parametrize(
+    "gid,netmask,expected",
+    [
+        ("0000:0000:0000:0000:0000:ffff:0a0a:0001", "255.255.255.252", "10.10.0.1/30"),
+        ("0000:0000:0000:0000:0000:ffff:0a0a:0001", None, None),
+        ("fe80:0000:0000:0000:0000:0000:0000:0001", "255.255.255.252", None),
+        ("invalid", "255.255.255.252", None),
+    ],
+)
+def test_local_endpoints_uses_gid_netdev_prefix(
+    tmp_path, monkeypatch, gid, netmask, expected
+):
     from b12x.comm.roce import _routes
 
     port = tmp_path / "rdma0" / "ports" / "1"

@@ -21,8 +21,7 @@ def validate_geometry(
         raise ValueError("compress_ratio must be positive")
     if size > 1 and token_interleave % compress_ratio:
         raise ValueError(
-            "QSA DCP requires cp_kv_cache_interleave_size divisible by "
-            "compress_ratio"
+            "QSA DCP requires cp_kv_cache_interleave_size divisible by compress_ratio"
         )
 
 

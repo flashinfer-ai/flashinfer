@@ -18,7 +18,11 @@ from b12x.preparation import (
 from b12x.preparation.types import require_prepared
 from .._shared.tensors import canonical_device, positive
 from .._shared.delta_prefill.contract import (
-    HEAD_DIM, Binding as _SharedBinding, Layout as _SharedLayout, bind_tensors, materialize_layout,
+    HEAD_DIM,
+    Binding as _SharedBinding,
+    Layout as _SharedLayout,
+    bind_tensors,
+    materialize_layout,
 )
 from ._tuning import CHUNK_TOKENS, GdnPrefillConfig, GdnPrefillQuery, tiles_capacity
 from ._parallel import ParallelBinding, ParallelPlan
@@ -49,7 +53,13 @@ class Caps:
         if device.type != "cuda":
             raise ValueError(f"GDN prefill requires a CUDA device, got {device}")
         object.__setattr__(self, "device", device)
-        for name in ("max_tokens", "max_seqs", "max_state_slots", "key_heads", "value_heads"):
+        for name in (
+            "max_tokens",
+            "max_seqs",
+            "max_state_slots",
+            "key_heads",
+            "value_heads",
+        ):
             object.__setattr__(self, name, positive(name, getattr(self, name)))
         if self.value_heads != 3 * self.key_heads:
             raise ValueError("GDN prefill requires three value heads per key head")
@@ -73,7 +83,10 @@ class Caps:
             object.__setattr__(self, "null_state_index", null)
         if self.staging_key is not None:
             hash(self.staging_key)
-        if type(self.staging_resident_nbytes) is not int or self.staging_resident_nbytes < 0:
+        if (
+            type(self.staging_resident_nbytes) is not int
+            or self.staging_resident_nbytes < 0
+        ):
             raise ValueError("staging_resident_nbytes must be a nonnegative integer")
 
     @property
@@ -101,7 +114,6 @@ class _Layout(_SharedLayout):
     caps: Caps
     _scratch_specs: tuple[ScratchBufferSpec, ...]
     parallel: ParallelPlan | None = None
-
 
 
 @dataclass(frozen=True)
@@ -140,13 +152,15 @@ def staging_memory(caps: Caps) -> MemoryRequirements:
         + caps.max_tokens * caps.value_heads * caps.head_dim * element_size
         + ((caps.max_seqs + 1) + 4 * caps.max_seqs + 2) * int32_size
     )
-    return MemoryRequirements(persistent=(
-        PersistentMemory(
-            caps.staging_key,
-            required,
-            caps.staging_resident_nbytes,
-        ),
-    ))
+    return MemoryRequirements(
+        persistent=(
+            PersistentMemory(
+                caps.staging_key,
+                required,
+                caps.staging_resident_nbytes,
+            ),
+        )
+    )
 
 
 def _query(caps: Caps, invocation: FrozenMapping) -> GdnPrefillQuery:
@@ -160,26 +174,38 @@ def _query(caps: Caps, invocation: FrozenMapping) -> GdnPrefillQuery:
         checkpoint_export=caps.checkpoint_export,
         max_tokens=caps.max_tokens,
         max_seqs=caps.max_seqs,
-        max_state_slots=caps.max_state_slots, null_state_index=caps.null_state_index,
+        max_state_slots=caps.max_state_slots,
+        null_state_index=caps.null_state_index,
         **dict(invocation),
     )
 
 
 def _materialize_layout(caps: Caps, config: GdnPrefillConfig) -> _Layout:
     result = materialize_layout(
-        caps, layout_type=_Layout, v_split=config.v_split, k_split=config.k_split,
-        stages=config.stages, window_tiles=config.window_tiles,
+        caps,
+        layout_type=_Layout,
+        v_split=config.v_split,
+        k_split=config.k_split,
+        stages=config.stages,
+        window_tiles=config.window_tiles,
         workspace_windows=0 if config.algorithm == "chunk_parallel" else 2,
     )
     if config.algorithm == "chunk_parallel":
         from ._parallel import materialize
+
         result = materialize(result, segment_tokens=config.segment_tokens)
     return result
 
 
-def plan(caps: Caps, *, invocation: FrozenMapping = FrozenMapping(), override: GdnPrefillConfig | None = None) -> Plan:
+def plan(
+    caps: Caps,
+    *,
+    invocation: FrozenMapping = FrozenMapping(),
+    override: GdnPrefillConfig | None = None,
+) -> Plan:
     """Declare GDN prefill without compiling or allocating resources."""
     from ._preparation import make_plan
+
     if not isinstance(caps, Caps):
         raise TypeError("caps must be gdn_prefill.Caps")
     return make_plan(caps, invocation=invocation, override=override)
@@ -220,12 +246,26 @@ def _bind(
     if not isinstance(plan, _Layout):
         raise TypeError("binding requires a GDN prefill layout")
     result = bind_tensors(
-        plan, binding_type=Binding, _plan=_plan, scratch=scratch, q=q, k=k, v=v,
-        raw_g=a, raw_beta=b, A_log=A_log, dt_bias=dt_bias,
-        recurrent_state=recurrent_state, cu_seqlens=cu_seqlens,
-        initial_state_indices=initial_state_indices, final_state_indices=final_state_indices,
-        checkpoint_state_indices=checkpoint_state_indices, checkpoint_offsets=checkpoint_offsets,
-        num_seqs=num_seqs, num_tokens=num_tokens, output=output,
+        plan,
+        binding_type=Binding,
+        _plan=_plan,
+        scratch=scratch,
+        q=q,
+        k=k,
+        v=v,
+        raw_g=a,
+        raw_beta=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        recurrent_state=recurrent_state,
+        cu_seqlens=cu_seqlens,
+        initial_state_indices=initial_state_indices,
+        final_state_indices=final_state_indices,
+        checkpoint_state_indices=checkpoint_state_indices,
+        checkpoint_offsets=checkpoint_offsets,
+        num_seqs=num_seqs,
+        num_tokens=num_tokens,
+        output=output,
     )
     if plan.parallel is not None:
         from ._parallel import bind as bind_parallel
@@ -266,11 +306,16 @@ def run(
     """
     if not isinstance(binding, Binding):
         raise TypeError("binding must be gdn_prefill.Binding")
-    state = require_prepared(binding.plan, "sequence.gdn_prefill", binding.output.device)
-    return state.run(binding, scale=scale, eps=eps,
-                     max_live_tokens=max_live_tokens, max_live_seqs=max_live_seqs)
-
-
+    state = require_prepared(
+        binding.plan, "sequence.gdn_prefill", binding.output.device
+    )
+    return state.run(
+        binding,
+        scale=scale,
+        eps=eps,
+        max_live_tokens=max_live_tokens,
+        max_live_seqs=max_live_seqs,
+    )
 
 
 __all__ = [

@@ -105,9 +105,7 @@ def _ld_relaxed_sys_u32(address: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
-def _st_relaxed_sys_u32(
-    address: Int64, value: Uint32, *, loc=None, ip=None
-) -> None:
+def _st_relaxed_sys_u32(address: Int64, value: Uint32, *, loc=None, ip=None) -> None:
     """Exact flag store used by the native block-pair barrier."""
 
     llvm.inline_asm(
@@ -170,9 +168,7 @@ def _ld_generic_v4_u32(
 
 
 @dsl_user_op
-def _st_generic_u32(
-    address: Int64, value: Uint32, *, loc=None, ip=None
-) -> None:
+def _st_generic_u32(address: Int64, value: Uint32, *, loc=None, ip=None) -> None:
     """Store one scale word through an IPC generic/UVA address."""
 
     llvm.inline_asm(
@@ -369,22 +365,26 @@ class _TwoShotLaunch:
 
             flag_slot = Int64(value % Uint32(2))
             peer_base = self._select_address(signals, tidx)
-            peer_counter_address = peer_base + Int64(_SELF_COUNTER_BYTES) + (
-                (
-                    flag_slot * Int64(_MAX_BLOCKS)
-                    + Int64(bidx)
+            peer_counter_address = (
+                peer_base
+                + Int64(_SELF_COUNTER_BYTES)
+                + (
+                    (flag_slot * Int64(_MAX_BLOCKS) + Int64(bidx))
+                    * Int64(_MAX_RANKS * _FLAG_STRIDE)
+                    + Int64(rank) * Int64(_FLAG_STRIDE)
                 )
-                * Int64(_MAX_RANKS * _FLAG_STRIDE)
-                + Int64(rank) * Int64(_FLAG_STRIDE)
-            ) * Int64(4)
-            self_counter_address = self_base + Int64(_SELF_COUNTER_BYTES) + (
-                (
-                    flag_slot * Int64(_MAX_BLOCKS)
-                    + Int64(bidx)
+                * Int64(4)
+            )
+            self_counter_address = (
+                self_base
+                + Int64(_SELF_COUNTER_BYTES)
+                + (
+                    (flag_slot * Int64(_MAX_BLOCKS) + Int64(bidx))
+                    * Int64(_MAX_RANKS * _FLAG_STRIDE)
+                    + Int64(tidx) * Int64(_FLAG_STRIDE)
                 )
-                * Int64(_MAX_RANKS * _FLAG_STRIDE)
-                + Int64(tidx) * Int64(_FLAG_STRIDE)
-            ) * Int64(4)
+                * Int64(4)
+            )
             _st_relaxed_sys_u32(peer_counter_address, value)
             observed = _ld_relaxed_sys_u32(self_counter_address)
             while observed != value:
@@ -403,9 +403,7 @@ class _TwoShotLaunch:
             values = cvt_e4m3x4_to_f32x4(words[word_index])
             for lane in cutlass.range_constexpr(4):
                 element = word_index * 4 + lane
-                accumulator[element] = (
-                    accumulator[element] + values[lane] * scale
-                )
+                accumulator[element] = accumulator[element] + values[lane] * scale
 
     @cute.jit
     def _load_accumulate_pack_generic(
@@ -419,14 +417,10 @@ class _TwoShotLaunch:
             values = cvt_e4m3x4_to_f32x4(words[word_index])
             for lane in cutlass.range_constexpr(4):
                 element = word_index * 4 + lane
-                accumulator[element] = (
-                    accumulator[element] + values[lane] * scale
-                )
+                accumulator[element] = accumulator[element] + values[lane] * scale
 
     @cute.jit
-    def _store_pack(
-        self, output_address: Int64, accumulator: cute.Tensor
-    ) -> None:
+    def _store_pack(self, output_address: Int64, accumulator: cute.Tensor) -> None:
         st_global_v4_u32(
             output_address,
             pack_f32x2_to_bf16x2(accumulator[0], accumulator[1]),
@@ -508,9 +502,7 @@ class _TwoShotLaunch:
         if end > shard_packs:
             end = shard_packs
         row_begin = begin // Int64(packs_per_row)
-        row_end = (end + Int64(packs_per_row) - Int64(1)) // Int64(
-            packs_per_row
-        )
+        row_end = (end + Int64(packs_per_row) - Int64(1)) // Int64(packs_per_row)
 
         payload_address = Int64(payload.toint())
         scale_address = Int64(scale.toint())
@@ -520,14 +512,9 @@ class _TwoShotLaunch:
                 self_signal = Int64(signals[self._rank].toint())
             else:
                 self_signal = self._select_address(signals, local_rank)
-            generation = ld_relaxed_gpu_u32(
-                self_signal + Int64(_GRAPH_EPOCH_OFFSET)
-            )
+            generation = ld_relaxed_gpu_u32(self_signal + Int64(_GRAPH_EPOCH_OFFSET))
             staging_slot_offset = (
-                Int64(
-                    (generation + Uint32(self._slot_bias)) % Uint32(2)
-                )
-                * slot_bytes
+                Int64((generation + Uint32(self._slot_bias)) % Uint32(2)) * slot_bytes
             )
             # Once every thread in the CTA has selected this launch's slot,
             # retire its epoch contribution on the last warp.  Other warps
@@ -547,8 +534,7 @@ class _TwoShotLaunch:
         while peer_index < Int32(self._world_size):
             destination = (local_rank + peer_index) % Int32(self._world_size)
             destination_base = (
-                self._select_address(staging, destination)
-                + staging_slot_offset
+                self._select_address(staging, destination) + staging_slot_offset
             )
             destination_payload = destination_base + (
                 Int64(local_rank) * pack_stride * Int64(16)
@@ -625,9 +611,7 @@ class _TwoShotLaunch:
                     Int32(1),
                     unroll=1,
                 ):
-                    source_rank = (
-                        local_rank + peer_index
-                    ) % Int32(self._world_size)
+                    source_rank = (local_rank + peer_index) % Int32(self._world_size)
                     staged_pack = (
                         self_base
                         + Int64(source_rank) * pack_stride * Int64(16)
@@ -636,10 +620,7 @@ class _TwoShotLaunch:
                     staged_scale = ld_generic_f32(
                         self_base
                         + scale_offset
-                        + (
-                            Int64(source_rank) * scale_stride + row
-                        )
-                        * Int64(4),
+                        + (Int64(source_rank) * scale_stride + row) * Int64(4),
                     )
                     self._load_accumulate_pack_generic(
                         accumulator,
@@ -647,54 +628,41 @@ class _TwoShotLaunch:
                         staged_scale,
                     )
 
-                self._store_pack(
-                    output_address + index * Int64(32), accumulator
-                )
+                self._store_pack(output_address + index * Int64(32), accumulator)
                 index += Int64(self._threads)
         else:
             first_index = begin + Int64(tidx)
             iteration_count = Int32(
-                (
-                    end
-                    - first_index
-                    + Int64(self._threads - 1)
-                )
-                // Int64(self._threads)
+                (end - first_index + Int64(self._threads - 1)) // Int64(self._threads)
             )
             peer_index = Int32(0)
             index = Int64(0)
             while peer_index < Int32(self._world_size):
-                source_rank = (
-                    local_rank + peer_index
-                ) % Int32(self._world_size)
+                source_rank = (local_rank + peer_index) % Int32(self._world_size)
                 source_payload_base = Int64(0)
                 source_scale_base = Int64(0)
                 if source_rank == local_rank:
                     source_payload_base = payload_address
                     source_scale_base = scale_address
                 else:
-                    source_payload_base = (
-                        self_base
-                        + Int64(source_rank) * pack_stride * Int64(16)
-                    )
+                    source_payload_base = self_base + Int64(
+                        source_rank
+                    ) * pack_stride * Int64(16)
                     source_scale_base = (
                         self_base
                         + scale_offset
                         + Int64(source_rank) * scale_stride * Int64(4)
                     )
-                destination_base = (
-                    output_address
-                    + Int64(source_rank) * shard_packs * Int64(32)
-                )
+                destination_base = output_address + Int64(
+                    source_rank
+                ) * shard_packs * Int64(32)
                 for iteration in cutlass.range(
                     Int32(0),
                     iteration_count,
                     Int32(1),
                     unroll=1,
                 ):
-                    index = first_index + Int64(iteration) * Int64(
-                        self._threads
-                    )
+                    index = first_index + Int64(iteration) * Int64(self._threads)
                     row = index // Int64(packs_per_row)
                     accumulator = cute.make_rmem_tensor((16,), cutlass.Float32)
                     for lane in cutlass.range_constexpr(16):
@@ -703,14 +671,11 @@ class _TwoShotLaunch:
                     self._load_accumulate_pack_generic(
                         accumulator,
                         source_payload_base + index * Int64(16),
-                        ld_generic_f32(
-                            source_scale_base + row * Int64(4)
-                        ),
+                        ld_generic_f32(source_scale_base + row * Int64(4)),
                     )
-                    self._store_pack(
-                        destination_base + index * Int64(32), accumulator
-                    )
+                    self._store_pack(destination_base + index * Int64(32), accumulator)
                 peer_index += Int32(1)
+
 
 def _twoshot_process_key(
     operation: str,
@@ -732,8 +697,6 @@ def _twoshot_process_key(
         int(row_elems),
         int(device_index),
     )
-
-
 
 
 @functools.cache
@@ -897,5 +860,6 @@ def get_twoshot_launcher(
         raw(*raw_args)
 
     return attach_programs(run, raw)
+
 
 __all__ = ["get_twoshot_launcher"]

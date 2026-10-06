@@ -216,9 +216,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # CUTLASS typed shared storage cannot expose a zero-length MemRange. The
     # GLM_NEXT recipe has d_rope==0, so reserve one unused padded row while all
     # RoPE math and IO remain const-expr-elided by d_rope.
-    q_rope_stride = (
-        d_rope + (8 if traits.has_extra_cache else 0) if d_rope else 8
-    )
+    q_rope_stride = d_rope + (8 if traits.has_extra_cache else 0) if d_rope else 8
     q_rope_bytes = hpb * q_rope_stride * 2
     off = q_rope_off + q_rope_bytes  # FlashInfer packs Q regions back-to-back
 
@@ -227,9 +225,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # retains its BF16 Q staging.
     q_fp8_off = off
     q_element_bytes = (
-        1
-        if traits.fp8_internal or traits.scale_format != ScaleFormat.NVFP4_E4M3
-        else 2
+        1 if traits.fp8_internal or traits.scale_format != ScaleFormat.NVFP4_E4M3 else 2
     )
     q_fp8_bytes = hpb * q_nope_stride * q_element_bytes
     off = q_fp8_off + q_fp8_bytes

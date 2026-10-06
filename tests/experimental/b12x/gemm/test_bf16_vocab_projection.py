@@ -14,10 +14,15 @@ cuda_required = pytest.mark.skipif(
 
 def test_unknown_device_default_uses_selected_torch_backend() -> None:
     query = projection.Bf16VocabProjectionQuery(
-        dtype="bfloat16", max_tokens=1, in_features=2_560, out_features=248_320,
+        dtype="bfloat16",
+        max_tokens=1,
+        in_features=2_560,
+        out_features=248_320,
     )
     device = DeviceIdentity(
-        vendor="nvidia", compute_capability=(9, 0), sm_count=120,
+        vendor="nvidia",
+        compute_capability=(9, 0),
+        sm_count=120,
         product_name="Synthetic GPU",
     )
 
@@ -34,22 +39,37 @@ def test_prepared_projection_matches_reference_and_replays_graph() -> None:
     weight = torch.randn(4_096, 256, device=device, dtype=torch.bfloat16)
     declaration = projection.plan(
         projection.Caps(
-            device=device, max_tokens=1, in_features=256, out_features=4_096,
+            device=device,
+            max_tokens=1,
+            in_features=256,
+            out_features=4_096,
         ),
         override=projection.Bf16VocabProjectionConfig(
-            backend="triton", algorithm="row", block_k=256, num_warps=8,
+            backend="triton",
+            algorithm="row",
+            block_k=256,
+            num_warps=8,
         ),
     )
 
     def prepare_call(state):
         return PreparedCall(run=lambda: state.run(source, weight))
 
-    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
-        session.prepare((declaration.request(
-            name="vocab", prepare_call=prepare_call,
-        ),))
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
+        session.prepare(
+            (
+                declaration.request(
+                    name="vocab",
+                    prepare_call=prepare_call,
+                ),
+            )
+        )
         binding = projection.bind(
-            declaration, source=source, weight=weight,
+            declaration,
+            source=source,
+            weight=weight,
         )
         expected = torch.nn.functional.linear(source, weight)
         graph = torch.cuda.CUDAGraph()

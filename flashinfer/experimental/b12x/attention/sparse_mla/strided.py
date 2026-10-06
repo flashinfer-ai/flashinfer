@@ -94,6 +94,7 @@ class Caps:
             raise ValueError("max_physical_records exceeds the index int32 range")
         object.__setattr__(self, "max_physical_records", max_physical_records)
 
+
 @dataclass(frozen=True)
 class Binding:
     plan: PreparationPlan | None
@@ -176,6 +177,7 @@ def _materialize_layout(caps: Caps) -> _StridedLayout:
         ),
     )
 
+
 @program_cache(scope="preparation")
 def compile_strided_sparse_mla(caps: Caps, ordinal: int):
     """Compile the real quantize/remap/decode/merge program set from metadata."""
@@ -201,6 +203,7 @@ def compile_strided_sparse_mla(caps: Caps, ordinal: int):
     )
     layout = _materialize_layout(caps)
     with FakeTensorMode(), compile_only_launches():
+
         def empty(shape, dtype):
             return torch.empty(shape, dtype=dtype, device=device)
 
@@ -208,9 +211,7 @@ def compile_strided_sparse_mla(caps: Caps, ordinal: int):
         storage = empty(spec.shape, spec.dtype)
         rows = caps.max_q_rows
         q = empty((rows, caps.num_q_heads, QK_DIM), torch.bfloat16)
-        cache = empty(
-            (caps.num_cache_blocks, BLOCK_SIZE, PHYSICAL_RECORD_WIDTH), FP8
-        )
+        cache = empty((caps.num_cache_blocks, BLOCK_SIZE, PHYSICAL_RECORD_WIDTH), FP8)
         output = empty((rows, caps.num_q_heads, VALUE_DIM), torch.bfloat16)
         indices = empty((rows, TOPK), torch.int32)
         counts = empty((rows,), torch.int32)
@@ -266,8 +267,6 @@ def compile_strided_sparse_mla(caps: Caps, ordinal: int):
     return programs
 
 
-
-
 @dataclass(frozen=True)
 class _StridedState:
     layout: _StridedLayout
@@ -282,19 +281,25 @@ class _StridedState:
         return _bind_indexed(self, plan=None, **kwargs)
 
     def prime(self, binding: Binding):
-        from b12x.attention._shared.static_fp8_quant import resolve_static_fp8_quant_launcher
+        from b12x.attention._shared.static_fp8_quant import (
+            resolve_static_fp8_quant_launcher,
+        )
         from b12x.attention.dense_mla._kernel import resolve_dense_mla_launchers
+
         object.__setattr__(
-            self, "_quant_launcher",
+            self,
+            "_quant_launcher",
             resolve_static_fp8_quant_launcher(binding=binding.query_quant),
         )
         object.__setattr__(
-            self, "_dense_launchers",
+            self,
+            "_dense_launchers",
             resolve_dense_mla_launchers(binding=binding.native),
         )
         if binding.index_remap is not None:
             object.__setattr__(
-                self, "_remap_launcher",
+                self,
+                "_remap_launcher",
                 _paged_index_remap._resolve_launcher(binding=binding.index_remap),
             )
 
@@ -312,6 +317,8 @@ class _StridedState:
             self._remap_launcher.run(binding.index_remap)
         self._quant_launcher.run(binding.query_quant)
         return self._dense_launchers.run(binding.native)
+
+
 def plan(
     caps: Caps,
     *,
@@ -324,13 +331,25 @@ def plan(
     if invocation:
         raise ValueError("strided sparse MLA invocation is fixed by its Caps")
     query = SparseMlaQuery(
-        mode="decode", dtype="bfloat16", kv_dtype=str(FP8).removeprefix("torch."),
-        num_q_heads=int(caps.num_q_heads), qk_head_dim=QK_DIM, v_head_dim=VALUE_DIM,
-        max_q_rows=int(caps.max_q_rows), max_width=TOPK, page_size=BLOCK_SIZE,
-        model_type=None, head_major_output=False, scale_format=0,
-        cache_record_bytes=PHYSICAL_RECORD_WIDTH, fp8_rope=False,
-        latent_scale_per_token=False, has_attention_sink=False,
-        cache_layout="strided_physical", operation="strided_attention", slot_dtype="int32",
+        mode="decode",
+        dtype="bfloat16",
+        kv_dtype=str(FP8).removeprefix("torch."),
+        num_q_heads=int(caps.num_q_heads),
+        qk_head_dim=QK_DIM,
+        v_head_dim=VALUE_DIM,
+        max_q_rows=int(caps.max_q_rows),
+        max_width=TOPK,
+        page_size=BLOCK_SIZE,
+        model_type=None,
+        head_major_output=False,
+        scale_format=0,
+        cache_record_bytes=PHYSICAL_RECORD_WIDTH,
+        fp8_rope=False,
+        latent_scale_per_token=False,
+        has_attention_sink=False,
+        cache_layout="strided_physical",
+        operation="strided_attention",
+        slot_dtype="int32",
         prefill_mg_enabled=False,
         max_batch=int(caps.max_q_rows),
         max_page_table_width=TOPK,
@@ -340,21 +359,24 @@ def plan(
         max_physical_records=int(caps.max_physical_records),
         tp_size=int(caps.tp_size),
         use_cuda_graph=bool(caps.use_cuda_graph),
-        budget_max_splits=(
-            None if caps.budget is None else caps.budget.max_splits
-        ),
+        budget_max_splits=(None if caps.budget is None else caps.budget.max_splits),
         budget_max_partial_rows=(
             None if caps.budget is None else caps.budget.max_partial_rows
         ),
     )
     layout = _materialize_layout(caps)
     return PreparationPlan(
-        contract=TUNING, query=query, invocation=invocation, override=override,
-        _compile_jobs=lambda config, device: (CompileJob.create(
-            "b12x.attention.sparse_mla.strided:compile_strided_sparse_mla",
-            caps,
-            device.ordinal,
-        ),),
+        contract=TUNING,
+        query=query,
+        invocation=invocation,
+        override=override,
+        _compile_jobs=lambda config, device: (
+            CompileJob.create(
+                "b12x.attention.sparse_mla.strided:compile_strided_sparse_mla",
+                caps,
+                device.ordinal,
+            ),
+        ),
         _memory_requirements=lambda config, device: MemoryRequirements(
             scratch=layout.scratch_specs()
         ),
@@ -511,26 +533,46 @@ def _bind_physical(
     active_splits: int | None = None,
 ) -> Binding:
     layout = state.layout
-    scratch_storage = scratch_tensor(scratch, layout.scratch_specs(), owner="strided sparse MLA")
+    scratch_storage = scratch_tensor(
+        scratch, layout.scratch_specs(), owner="strided sparse MLA"
+    )
     rows = int(q.shape[0])
     record_indices, remapped_counts = _index_scratch(layout, scratch_storage, rows)
-    flat_cache, block_stride_records, token_stride_records = _physical_record_view(layout, kv_cache)
+    flat_cache, block_stride_records, token_stride_records = _physical_record_view(
+        layout, kv_cache
+    )
     binding = _bind_native(
-        layout, scratch_storage=scratch_storage, q=q, flat_cache=flat_cache,
-        original_cache=kv_cache, output=output, record_indices=record_indices,
-        selected_counts=remapped_counts, cu_seqlens_q=cu_seqlens_q,
-        kv_scale=kv_scale, q_scale=q_scale, active_splits=active_splits,
+        layout,
+        scratch_storage=scratch_storage,
+        q=q,
+        flat_cache=flat_cache,
+        original_cache=kv_cache,
+        output=output,
+        record_indices=record_indices,
+        selected_counts=remapped_counts,
+        cu_seqlens_q=cu_seqlens_q,
+        kv_scale=kv_scale,
+        q_scale=q_scale,
+        active_splits=active_splits,
     )
     remap = _paged_index_remap.bind_physical_slots(
-        physical_slots=selected_indices, input_counts=selected_counts,
-        physical_indices=record_indices, selected_counts=remapped_counts,
-        max_q_rows=int(layout.caps.max_q_rows), num_cache_blocks=int(kv_cache.shape[0]),
-        block_stride_records=block_stride_records, token_stride_records=token_stride_records,
+        physical_slots=selected_indices,
+        input_counts=selected_counts,
+        physical_indices=record_indices,
+        selected_counts=remapped_counts,
+        max_q_rows=int(layout.caps.max_q_rows),
+        num_cache_blocks=int(kv_cache.shape[0]),
+        block_stride_records=block_stride_records,
+        token_stride_records=token_stride_records,
     )
     return Binding(
-        plan=plan, native=binding.native, query_quant=binding.query_quant,
-        index_remap=remap, kv_cache=binding.kv_cache,
-        selected_indices=binding.selected_indices, selected_counts=binding.selected_counts,
+        plan=plan,
+        native=binding.native,
+        query_quant=binding.query_quant,
+        index_remap=remap,
+        kv_cache=binding.kv_cache,
+        selected_indices=binding.selected_indices,
+        selected_counts=binding.selected_counts,
     )
 
 
@@ -551,27 +593,49 @@ def _bind_indexed(
     active_splits: int | None = None,
 ) -> Binding:
     layout = state.layout
-    scratch_storage = scratch_tensor(scratch, layout.scratch_specs(), owner="strided sparse MLA")
+    scratch_storage = scratch_tensor(
+        scratch, layout.scratch_specs(), owner="strided sparse MLA"
+    )
     rows = int(q.shape[0])
     physical_indices, selected_counts = _index_scratch(layout, scratch_storage, rows)
-    flat_cache, block_stride_records, token_stride_records = _physical_record_view(layout, kv_cache)
+    flat_cache, block_stride_records, token_stride_records = _physical_record_view(
+        layout, kv_cache
+    )
     binding = _bind_native(
-        layout, scratch_storage=scratch_storage, q=q, flat_cache=flat_cache,
-        original_cache=kv_cache, output=output, record_indices=physical_indices,
-        selected_counts=selected_counts, cu_seqlens_q=cu_seqlens_q,
-        kv_scale=kv_scale, q_scale=q_scale, active_splits=active_splits,
+        layout,
+        scratch_storage=scratch_storage,
+        q=q,
+        flat_cache=flat_cache,
+        original_cache=kv_cache,
+        output=output,
+        record_indices=physical_indices,
+        selected_counts=selected_counts,
+        cu_seqlens_q=cu_seqlens_q,
+        kv_scale=kv_scale,
+        q_scale=q_scale,
+        active_splits=active_splits,
     )
     remap = _paged_index_remap.bind(
-        request_ids=request_ids, block_table=block_table, logical_indices=logical_indices,
-        physical_indices=physical_indices, selected_counts=selected_counts,
-        max_q_rows=int(layout.caps.max_q_rows), num_cache_blocks=int(kv_cache.shape[0]),
-        block_stride_records=block_stride_records, token_stride_records=token_stride_records,
+        request_ids=request_ids,
+        block_table=block_table,
+        logical_indices=logical_indices,
+        physical_indices=physical_indices,
+        selected_counts=selected_counts,
+        max_q_rows=int(layout.caps.max_q_rows),
+        num_cache_blocks=int(kv_cache.shape[0]),
+        block_stride_records=block_stride_records,
+        token_stride_records=token_stride_records,
     )
     return Binding(
-        plan=plan, native=binding.native, query_quant=binding.query_quant,
-        index_remap=remap, kv_cache=binding.kv_cache,
-        selected_indices=binding.selected_indices, selected_counts=binding.selected_counts,
+        plan=plan,
+        native=binding.native,
+        query_quant=binding.query_quant,
+        index_remap=remap,
+        kv_cache=binding.kv_cache,
+        selected_indices=binding.selected_indices,
+        selected_counts=binding.selected_counts,
     )
+
 
 def _state_for(plan: PreparationPlan, device: torch.device) -> _StridedState:
     state = require_prepared(plan, TUNING.component_id, device)
@@ -602,8 +666,6 @@ def bind_indexed(
     )
 
 
-
-
 def run_decode(*, binding: Binding) -> tuple[torch.Tensor, torch.Tensor]:
     state = require_prepared(binding.plan, TUNING.component_id, binding.kv_cache.device)
     if not isinstance(state, _StridedState):
@@ -613,6 +675,7 @@ def run_decode(*, binding: Binding) -> tuple[torch.Tensor, torch.Tensor]:
 
 def run_extend(*, binding: Binding) -> tuple[torch.Tensor, torch.Tensor]:
     return run_decode(binding=binding)
+
 
 def reference(
     q: torch.Tensor,

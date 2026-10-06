@@ -126,8 +126,19 @@ def _prefill_binding(state, recipe, args, device):
     return state.bind(scratch=_scratch_for(state, device), **kwargs)
 
 
-def _fixture_call(state, *, recipe, mode, args, producer, producer_owners, initial_state, initial_output,
-                  device, options):
+def _fixture_call(
+    state,
+    *,
+    recipe,
+    mode,
+    args,
+    producer,
+    producer_owners,
+    initial_state,
+    initial_output,
+    device,
+    options,
+):
     binding = (
         _decode_binding(state, recipe, args, device)
         if mode == "decode"
@@ -153,7 +164,10 @@ def _fixture_call(state, *, recipe, mode, args, producer, producer_owners, initi
         produce=produce,
         reset=restore,
         restore=restore,
-        owners=(_Expected(recipe, mode, binding, initial_state, options), *producer_owners),
+        owners=(
+            _Expected(recipe, mode, binding, initial_state, options),
+            *producer_owners,
+        ),
     )
 
 
@@ -260,12 +274,14 @@ def _delta_requests(metadata, device, rows):
                 )
 
             name = f"sequence.{recipe}.decode.m{m}"
-            requests.append(plan.request(
-                name=name,
-                prepare_call=call,
-                benchmark_call=call,
-                retain_benchmark_call=True,
-            ))
+            requests.append(
+                plan.request(
+                    name=name,
+                    prepare_call=call,
+                    benchmark_call=call,
+                    retain_benchmark_call=True,
+                )
+            )
         geometry = (
             {"key_heads": kh, "value_heads": vh} if recipe == "gdn" else {"heads": vh}
         )
@@ -327,12 +343,14 @@ def _delta_requests(metadata, device, rows):
             )
 
         name = f"sequence.{recipe}.prefill.m{m}"
-        requests.append(plan.request(
-            name=name,
-            prepare_call=call,
-            benchmark_call=call,
-            retain_benchmark_call=True,
-        ))
+        requests.append(
+            plan.request(
+                name=name,
+                prepare_call=call,
+                benchmark_call=call,
+                retain_benchmark_call=True,
+            )
+        )
     return requests
 
 
@@ -347,9 +365,9 @@ def _feedback_requests(metadata, device, rows):
         embedding_fc_weight=torch.randn(
             (h, h), device=device, dtype=torch.bfloat16
         ).div_(h**0.5),
-        hidden_fc_weight=torch.randn(
-            (h, h), device=device, dtype=torch.bfloat16
-        ).div_(h**0.5),
+        hidden_fc_weight=torch.randn((h, h), device=device, dtype=torch.bfloat16).div_(
+            h**0.5
+        ),
     )
     requests = []
     for m in rows:
@@ -406,13 +424,16 @@ def _feedback_requests(metadata, device, rows):
                     *session["producer_owners"],
                 ),
             )
+
         name = f"sequence.mtp.feedback.m{m}"
-        requests.append(plan.request(
-            name=name,
-            prepare_call=call,
-            benchmark_call=call,
-            retain_benchmark_call=True,
-        ))
+        requests.append(
+            plan.request(
+                name=name,
+                prepare_call=call,
+                benchmark_call=call,
+                retain_benchmark_call=True,
+            )
+        )
     return requests
 
 

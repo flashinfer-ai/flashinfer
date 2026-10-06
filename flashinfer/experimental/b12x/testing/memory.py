@@ -51,7 +51,11 @@ def absorb_small_page_fragments(device: int = 0) -> int:
         return 0
     from cuda.bindings import runtime as cudart
 
-    wanted = int(float(request) * (1 << 30)) if request != "auto" else _small_fragment_bytes()
+    wanted = (
+        int(float(request) * (1 << 30))
+        if request != "auto"
+        else _small_fragment_bytes()
+    )
     torch.cuda.set_device(device)
     free_bytes = torch.cuda.mem_get_info(device)[0]
     size = min(wanted, max(0, free_bytes - _KEEP_FREE_BYTES)) & ~((2 << 20) - 1)

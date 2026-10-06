@@ -1,4 +1,5 @@
 """Declarative preparation for the fixed rowwise-MXFP8 BMM."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,8 +19,11 @@ def compile_bmm(query_payload, device_ordinal):
 
     query = BmmQuery(**query_payload)
     return kernels._compile(
-        b_major=kernels._coerce_b_major(query.b_major), groups=query.batch,
-        m=query.max_rows, n=query.out_features, k=query.in_features,
+        b_major=kernels._coerce_b_major(query.b_major),
+        groups=query.batch,
+        m=query.max_rows,
+        n=query.out_features,
+        k=query.in_features,
         device=torch.device("cuda", device_ordinal),
     )
 
@@ -39,9 +43,15 @@ class _BmmExecutionState:
             raise ValueError("BMM operands differ from the prepared device")
         if int(lhs.shape[1]) != self.query.max_rows:
             raise ValueError("BMM plan requires its exact planned M")
-        return kernels._run_prepared(lhs, *kernels._rhs_tensors(rhs), out,
-                                     b_major=b_major, sf_axis=sf_axis,
-                                     launch=self.launch, stream=stream)
+        return kernels._run_prepared(
+            lhs,
+            *kernels._rhs_tensors(rhs),
+            out,
+            b_major=b_major,
+            sf_axis=sf_axis,
+            launch=self.launch,
+            stream=stream,
+        )
 
 
 def plan(query: BmmQuery, *, invocation=FrozenMapping(), override=None) -> Plan:
@@ -53,10 +63,13 @@ def plan(query: BmmQuery, *, invocation=FrozenMapping(), override=None) -> Plan:
 
     def compile_jobs(config, device):
         del config
-        return (CompileJob.create(
-            "b12x.gemm._bmm._preparation:compile_bmm",
-            TUNING.encode_query(query), device.ordinal,
-        ),)
+        return (
+            CompileJob.create(
+                "b12x.gemm._bmm._preparation:compile_bmm",
+                TUNING.encode_query(query),
+                device.ordinal,
+            ),
+        )
 
     def memory(config, device):
         del config, device
@@ -64,10 +77,17 @@ def plan(query: BmmQuery, *, invocation=FrozenMapping(), override=None) -> Plan:
 
     def materialize(selection, device):
         return _BmmExecutionState(
-            query, compile_bmm(TUNING.encode_query(query), device.ordinal),
+            query,
+            compile_bmm(TUNING.encode_query(query), device.ordinal),
             torch.device("cuda", device.ordinal),
         )
 
-    return Plan(contract=TUNING, query=query, invocation=invocation, override=override,
-                _compile_jobs=compile_jobs, _memory_requirements=memory,
-                _materialize=materialize)
+    return Plan(
+        contract=TUNING,
+        query=query,
+        invocation=invocation,
+        override=override,
+        _compile_jobs=compile_jobs,
+        _memory_requirements=memory,
+        _materialize=materialize,
+    )

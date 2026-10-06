@@ -143,7 +143,9 @@ def test_projection_tier_payloads_share_one_flat_allocation() -> None:
     combined, views = _coalesce_payloads(payloads)
 
     assert tuple(combined.shape) == (74,)
-    assert all(view.untyped_storage().data_ptr() == combined.data_ptr() for view in views)
+    assert all(
+        view.untyped_storage().data_ptr() == combined.data_ptr() for view in views
+    )
     for actual, expected in zip(views, payloads, strict=True):
         assert tuple(actual.shape) == tuple(expected.shape)
         torch.testing.assert_close(actual, expected)
@@ -154,9 +156,7 @@ def test_projection_payload_supports_tp4_512_channel_extent() -> None:
     num_slots = 512 // 32
     bits = torch.tensor(((3, 4, 5), (4, 3, 5)), dtype=torch.int64)
     offsets = _bundle_offsets(bits, hidden_size)
-    row_stride = offsets[-1][-1] + _matrix_section_bytes(
-        hidden_size, int(bits[-1, -1])
-    )
+    row_stride = offsets[-1][-1] + _matrix_section_bytes(hidden_size, int(bits[-1, -1]))
     codes = (
         torch.arange(num_slots * row_stride, dtype=torch.int64)
         .remainder(256)

@@ -159,7 +159,9 @@ class _SiluQuantBlockKernel(_QuantBlockKernel):
     fuse_silu = True
 
 
-def _run_expand(values_u32: torch.Tensor, residual: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+def _run_expand(
+    values_u32: torch.Tensor, residual: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor]:
     device = values_u32.device
     lo = torch.zeros_like(values_u32)
     hi = torch.zeros_like(values_u32)
@@ -229,12 +231,17 @@ def test_e2m1x8_to_e4m3x8_exact() -> None:
     torch.manual_seed(0)
     # All 16 codes in every nibble position, plus random patterns.
     sweep = torch.arange(16, device=device, dtype=torch.int64)
-    sweep = (sweep.unsqueeze(-1) * (2 ** (4 * torch.arange(8, device=device, dtype=torch.int64)))).sum(
-        dim=0, keepdim=False
-    )
+    sweep = (
+        sweep.unsqueeze(-1)
+        * (2 ** (4 * torch.arange(8, device=device, dtype=torch.int64)))
+    ).sum(dim=0, keepdim=False)
     patterns = torch.cat(
         [
-            torch.tensor([0x76543210, 0xFEDCBA98, 0x0, 0xFFFFFFFF], device=device, dtype=torch.int64),
+            torch.tensor(
+                [0x76543210, 0xFEDCBA98, 0x0, 0xFFFFFFFF],
+                device=device,
+                dtype=torch.int64,
+            ),
             torch.randint(0, 2**32, (4096,), device=device, dtype=torch.int64),
         ]
     ).to(torch.int32)
@@ -255,7 +262,9 @@ def test_e2m1x8_mul_residual_to_e4m3x8_matches_f16_reference() -> None:
     device = torch.device("cuda")
     torch.manual_seed(1)
     n = 4096
-    patterns = torch.randint(0, 2**32, (n,), device=device, dtype=torch.int64).to(torch.int32)
+    patterns = torch.randint(0, 2**32, (n,), device=device, dtype=torch.int64).to(
+        torch.int32
+    )
     # Residuals in (2^-9, 2): the NVFP4 decomposition range, incl. subnormal-ish tails.
     exponents = torch.randint(-9, 1, (n,), device=device, dtype=torch.float32)
     mantissa = 1.0 + torch.rand(n, device=device) * 0.999
@@ -285,17 +294,20 @@ def _quant_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     rounded, byte = pow2_ceil_ue8m0_torch(block_max * (1.0 / 448.0))
     del rounded
     inv_bits = (254 - byte.to(torch.int32)).clamp(min=0) << 23
-    inv = torch.where(byte == 0, torch.zeros_like(byte, dtype=torch.float32), inv_bits.view(torch.float32))
+    inv = torch.where(
+        byte == 0,
+        torch.zeros_like(byte, dtype=torch.float32),
+        inv_bits.view(torch.float32),
+    )
     payload = (
-        (blocked * inv)
-        .clamp(-448.0, 448.0)
-        .to(torch.float8_e4m3fn)
-        .view(torch.uint8)
+        (blocked * inv).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
     )
     return payload, byte.squeeze(-1)
 
 
-def _run_quant(kernel_cls, x: torch.Tensor, up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _run_quant(
+    kernel_cls, x: torch.Tensor, up: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     device = x.device
     rows = x.shape[0]
     payload = torch.zeros(rows, 8, device=device, dtype=torch.int32)
@@ -313,7 +325,11 @@ def _run_quant(kernel_cls, x: torch.Tensor, up: torch.Tensor) -> tuple[torch.Ten
     compiled(*args)
     torch.cuda.synchronize()
     payload_bytes = (
-        (payload.unsqueeze(-1) >> (torch.arange(4, device=device, dtype=torch.int32) * 8)) & 0xFF
+        (
+            payload.unsqueeze(-1)
+            >> (torch.arange(4, device=device, dtype=torch.int32) * 8)
+        )
+        & 0xFF
     ).reshape(rows, 32)
     return payload_bytes, scale
 
@@ -367,7 +383,11 @@ def test_silu_mul_quantize_block_fp8_mx_close_to_torch() -> None:
     # a subnormal floor of the block scale; the kernel's rcp.approx/ex2.approx
     # sigmoid adds only ~1ulp f32 on top.
     block_max = activated.abs().amax(dim=-1, keepdim=True)
-    tol = torch.clamp(block_max / 448.0, min=1e-6) * 0.75 + activated.abs() * 0.0725 + 1e-3
+    tol = (
+        torch.clamp(block_max / 448.0, min=1e-6) * 0.75
+        + activated.abs() * 0.0725
+        + 1e-3
+    )
     assert torch.all((dequant - activated).abs() <= tol), (
         (dequant - activated).abs().max().item(),
         tol.min().item(),
@@ -381,7 +401,9 @@ def test_pow2_ceil_ue8m0_torch_semantics() -> None:
         [0.0, 0.5, 1.0, 1.0, 2.0, 2.0, 4.0, 2.0**-126, 512.0]
     )
     torch.testing.assert_close(rounded, expected_rounded, atol=0, rtol=0)
-    expected_byte = torch.tensor([0, 126, 127, 127, 128, 128, 129, 1, 136], dtype=torch.uint8)
+    expected_byte = torch.tensor(
+        [0, 126, 127, 127, 128, 128, 129, 1, 136], dtype=torch.uint8
+    )
     torch.testing.assert_close(byte, expected_byte, atol=0, rtol=0)
 
 
@@ -407,7 +429,9 @@ def test_quantize_grouped_mxfp8_torch_roundtrip() -> None:
     blocked = x[0].float().view(rows, sf_blocks, MX_SF_VEC_SIZE)
     block_max = blocked.abs().amax(dim=-1, keepdim=True)
     rounded, _ = pow2_ceil_ue8m0_torch(block_max * (1.0 / 448.0))
-    dequant = (payload_g0.view(rows, sf_blocks, MX_SF_VEC_SIZE) * rounded).view(rows, cols)
+    dequant = (payload_g0.view(rows, sf_blocks, MX_SF_VEC_SIZE) * rounded).view(
+        rows, cols
+    )
     torch.testing.assert_close(dequant, qd, atol=0, rtol=0)
 
     # Group with zero valid rows must be all-zero payload.
@@ -457,13 +481,17 @@ def test_quant_dequant_e4m3_2_matches_prefill_quantizer() -> None:
     require_b12x()
     device = torch.device("cuda")
     torch.manual_seed(5)
-    x = torch.cat(
-        [
-            torch.randn(512, 32, device=device) * 4.0,
-            torch.zeros(4, 32, device=device),
-            torch.randn(64, 32, device=device) * 300.0,
-        ]
-    ).float().contiguous()
+    x = (
+        torch.cat(
+            [
+                torch.randn(512, 32, device=device) * 4.0,
+                torch.zeros(4, 32, device=device),
+                torch.randn(64, 32, device=device) * 300.0,
+            ]
+        )
+        .float()
+        .contiguous()
+    )
     out = torch.zeros_like(x)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     kernel = _QdE4M3Kernel()

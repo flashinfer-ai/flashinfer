@@ -20,7 +20,12 @@ from ._disk import DiskTable
 from ._storage import TableStorage, allocate_storage
 from ._tuning import PleEmbeddingConfig, PleEmbeddingQuery
 from ._preparation import invocation_from_tensors
-from b12x.sequence.ple_hash.geometry import Geometry, GeometryTensors, compute_geometry, allocate_geometry
+from b12x.sequence.ple_hash.geometry import (
+    Geometry,
+    GeometryTensors,
+    compute_geometry,
+    allocate_geometry,
+)
 
 
 def is_supported(device=None) -> bool:

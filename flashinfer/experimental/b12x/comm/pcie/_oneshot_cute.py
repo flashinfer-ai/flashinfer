@@ -475,9 +475,17 @@ class _OneshotLaunch(_PackedMath):
                         clear_base = plain_local_slot0
                         if cutlass.const_expr(clear_slot == 1):
                             clear_base = plain_local_slot1
-                        line = clear_base + plain_region_packs * Int64(16) + clear_index * Int64(32)
-                        st_global_v4_u32(line, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
-                        st_global_v4_u32(line + Int64(16), Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                        line = (
+                            clear_base
+                            + plain_region_packs * Int64(16)
+                            + clear_index * Int64(32)
+                        )
+                        st_global_v4_u32(
+                            line, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                        )
+                        st_global_v4_u32(
+                            line + Int64(16), Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                        )
                     clear_index += Int64(stride)
                 # The peer cannot publish another epoch until its receiver's
                 # matching CTA has completed the clear with system visibility.

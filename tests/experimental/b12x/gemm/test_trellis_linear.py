@@ -17,6 +17,7 @@ from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_LINEAR_BETA,
 )
 from b12x.moe._shared.kernels.w4a16.kernel import _trellis256_dense_launch_geometry
+
 _MCG = np.uint64(0xCBAC1FED)
 _MUL1 = np.uint64(0x83DCD12D)
 _MASK = np.uint32(0x8FFF8FFF)
@@ -67,24 +68,16 @@ def _decode_mul1_e4m3_fp16(window: np.ndarray) -> np.ndarray:
     )
 
 
-
-
-
-
 @lru_cache(maxsize=None)
 def _lut_e4m3_table(bits: int) -> np.ndarray:
     if bits not in (2, 3, 4):
         raise ValueError(f"unsupported lut_e4m3 test rate K{bits}")
     rate_index = bits - 2
-    labels = lut_e4m3_direct_table_cpu()[
-        rate_index << 16 : (rate_index + 1) << 16
-    ]
+    labels = lut_e4m3_direct_table_cpu()[rate_index << 16 : (rate_index + 1) << 16]
     return labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
 
 
-def _decode_lut_e4m3_fp16(
-    window: np.ndarray, bits: int
-) -> np.ndarray:
+def _decode_lut_e4m3_fp16(window: np.ndarray, bits: int) -> np.ndarray:
     indices = np.asarray(window, dtype=np.uint32) & np.uint32(0xFFFF)
     return _lut_e4m3_table(bits)[indices]
 
@@ -107,9 +100,7 @@ def _decode_lane(
         first = tile_words[..., first_word % width].astype(np.uint64)
         last = tile_words[..., last_word % width].astype(np.uint64)
         merged = (first << np.uint64(32)) | last
-        window = ((merged >> np.uint64(shift)) & np.uint64(0xFFFF)).astype(
-            np.uint32
-        )
+        window = ((merged >> np.uint64(shift)) & np.uint64(0xFFFF)).astype(np.uint32)
         if codebook == "mcg":
             values.append(_decode_3inst_fp16(window))
         elif codebook == "mul1-e4m3":
@@ -136,9 +127,7 @@ def _reconstruct_native(
         for n_tile in range(n_tiles):
             lanes = np.stack(
                 [
-                    _decode_lane(
-                        words[k_tile, n_tile], lane, bits, codebook=codebook
-                    )
+                    _decode_lane(words[k_tile, n_tile], lane, bits, codebook=codebook)
                     for lane in range(32)
                 ]
             )
@@ -170,13 +159,8 @@ def _reference_mxfp8_rows(source: torch.Tensor) -> torch.Tensor:
     exponent = torch.ceil(torch.log2(safe)).clamp(-127, 127)
     scale = torch.pow(torch.tensor(2.0, device=source.device), exponent)
     scale = torch.where(max_abs > 0, scale, torch.ones_like(scale))
-    return (
-        (blocks / scale)
-        .to(torch.float8_e4m3fn)
-        .float()
-        .mul(scale)
-        .reshape(m, k)
-    )
+    return (blocks / scale).to(torch.float8_e4m3fn).float().mul(scale).reshape(m, k)
+
 
 @contextmanager
 def _prepared_trellis(x, weight, *, c_tmp, hadamard_128=None, **run_kwargs):
@@ -184,25 +168,36 @@ def _prepared_trellis(x, weight, *, c_tmp, hadamard_128=None, **run_kwargs):
         weight,
         max_rows=x.shape[0],
         input_dtype=x.dtype,
-        output_mode="provided" if run_kwargs.get("output") is not None else "functional",
+        output_mode="provided"
+        if run_kwargs.get("output") is not None
+        else "functional",
         c_tmp_mode="provided",
         hadamard_128=hadamard_128,
         **{
             f"{name}_provided": run_kwargs.get(name) is not None
             for name in (
-                "gemm_output", "input_f16", "rotated_f16", "rotated_compute",
-                "gemm_output_f16", "output_f16",
+                "gemm_output",
+                "input_f16",
+                "rotated_f16",
+                "rotated_compute",
+                "gemm_output_f16",
+                "output_f16",
             )
         },
     )
     declaration = trellis_linear.plan(
-        query, weight=weight, c_tmp=c_tmp, hadamard_128=hadamard_128,
+        query,
+        weight=weight,
+        c_tmp=c_tmp,
+        hadamard_128=hadamard_128,
     )
     request = declaration.request(
         name="trellis",
         prepare_call=lambda state: PreparedCall(run=lambda: state.run(x, **run_kwargs)),
     )
-    with PreparationSession(device=x.device, autotune=False, compile_workers=2) as session:
+    with PreparationSession(
+        device=x.device, autotune=False, compile_workers=2
+    ) as session:
         result = session.prepare((request,))
         yield declaration, session, result
 
@@ -230,8 +225,6 @@ def test_prepare_pair_weight_rejects_malformed_descriptor_before_cuda(
             pair_kind=pair_kind,
             rate_axis=rate_axis,
         )
-
-
 
 
 def test_is_supported_uses_standard_sm12x_gate(monkeypatch) -> None:
@@ -278,6 +271,7 @@ def test_dense_launch_geometry_avoids_short_spill_waves(
         )
         == expected
     )
+
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 def test_trellis_dense_cuda_graph_replay_is_stable() -> None:
@@ -371,7 +365,11 @@ def test_dense_bf16_reuses_all_scratch_during_cuda_graph_capture(bits: int) -> N
         "output_f16": output_f16,
     }
     with _prepared_trellis(
-        x, weight, c_tmp=c_tmp, hadamard_128=hadamard_128, **kwargs,
+        x,
+        weight,
+        c_tmp=c_tmp,
+        hadamard_128=hadamard_128,
+        **kwargs,
     ) as (plan, session, result):
         expected = trellis_linear.run(x, plan=plan, **kwargs).clone()
         torch.cuda.synchronize(device)
@@ -408,9 +406,7 @@ def test_dense_lut_e4m3_matches_reference(bits: int) -> None:
         params_dtype=torch.float16,
     )
     assert weight.trellis_codebook == "lut_e4m3"
-    reference_weight = _reconstruct_native(
-        trellis, codebook="lut_e4m3"
-    ).to(device)
+    reference_weight = _reconstruct_native(trellis, codebook="lut_e4m3").to(device)
     x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
 
     def identity_hadamard(
@@ -432,7 +428,11 @@ def test_dense_lut_e4m3_matches_reference(bits: int) -> None:
         "rotated_f16": rotated_f16,
     }
     with _prepared_trellis(
-        x, weight, c_tmp=c_tmp, hadamard_128=identity_hadamard, **kwargs,
+        x,
+        weight,
+        c_tmp=c_tmp,
+        hadamard_128=identity_hadamard,
+        **kwargs,
     ) as (plan, _, _):
         actual = trellis_linear.run(x, plan=plan, **kwargs).clone()
         torch.cuda.synchronize(device)
@@ -512,11 +512,7 @@ def test_dense_pair_matches_independent_reference_and_captures(
     suh = torch.ones(reference_weight.shape[0], dtype=torch.float16, device=device)
     svh = torch.ones(reference_weight.shape[1], dtype=torch.float16, device=device)
     codebook_kwargs = (
-        {
-            "mcg": torch.tensor(
-                0xCBAC1FED, dtype=torch.uint32, device=device
-            )
-        }
+        {"mcg": torch.tensor(0xCBAC1FED, dtype=torch.uint32, device=device)}
         if codebook == "mcg"
         else {"codebook": codebook}
     )
@@ -565,7 +561,11 @@ def test_dense_pair_matches_independent_reference_and_captures(
         "rotated_f16": rotated_f16,
     }
     with _prepared_trellis(
-        x, weight, c_tmp=c_tmp, hadamard_128=identity_hadamard, **kwargs,
+        x,
+        weight,
+        c_tmp=c_tmp,
+        hadamard_128=identity_hadamard,
+        **kwargs,
     ) as (plan, session, result):
         actual = trellis_linear.run(x, plan=plan, **kwargs).clone()
         torch.cuda.synchronize(device)
@@ -582,12 +582,6 @@ def test_dense_pair_matches_independent_reference_and_captures(
         graph.replay()
         torch.cuda.synchronize(device)
         assert torch.equal(captured, actual)
-
-
-
-
-
-
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")

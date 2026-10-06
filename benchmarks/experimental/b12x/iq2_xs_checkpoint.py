@@ -52,15 +52,25 @@ def load_iq2_xs_layer(
     snapshot = Path(snapshot).expanduser().resolve()
     config = json.loads((snapshot / "config.json").read_text())
     text = config.get("llm_config", config.get("text_config", config))
-    num_layers = len(text["block_configs"]) if "block_configs" in text else int(text["num_hidden_layers"])
+    num_layers = (
+        len(text["block_configs"])
+        if "block_configs" in text
+        else int(text["num_hidden_layers"])
+    )
     if not 0 <= layer < num_layers:
         raise ValueError("layer is outside the checkpoint")
     if text.get("model_type") == "nemotron_h_puzzle":
         block = text["block_configs"][layer]
         if block["block_type"] != "moe" or text["mlp_hidden_act"] != "relu2":
             raise ValueError("the selected Puzzle 3 layer must be a ReLU2 MoE block")
-        h = int(block.get("moe_latent_size", text.get("moe_latent_size", text.get("hidden_size"))))
-        i, e = (int(block[key]) for key in ("moe_intermediate_size", "n_routed_experts"))
+        h = int(
+            block.get(
+                "moe_latent_size", text.get("moe_latent_size", text.get("hidden_size"))
+            )
+        )
+        i, e = (
+            int(block[key]) for key in ("moe_intermediate_size", "n_routed_experts")
+        )
         top_k = int(block["num_experts_per_tok"])
         backbone = "language_model.model" if "llm_config" in config else "backbone"
         prefix = f"{backbone}.layers.{layer}.mixer.experts"
@@ -93,7 +103,9 @@ def load_iq2_xs_layer(
     quant = json.loads((snapshot / "hf_quant_config.json").read_text())["quantization"]
     recipes = quant["quantized_layers"]
     first_name = f"{prefix}.{selected[0]}.{projections[0]}_proj"
-    codec = recipes.get(first_name, recipes.get(prefix, {})).get("quant_algo", "").lower()
+    codec = (
+        recipes.get(first_name, recipes.get(prefix, {})).get("quant_algo", "").lower()
+    )
     spec = block_codec(codec)
     expected = {
         "quant_algo": codec.upper(),
@@ -107,10 +119,17 @@ def load_iq2_xs_layer(
     local_i = i // tp_size
     lo, hi = tp_rank * local_i, (tp_rank + 1) * local_i
     w13 = torch.empty(
-        (len(selected), (2 if activation == "silu" else 1) * local_i, h // 256, spec.block_bytes),
+        (
+            len(selected),
+            (2 if activation == "silu" else 1) * local_i,
+            h // 256,
+            spec.block_bytes,
+        ),
         dtype=torch.uint8,
     )
-    w2 = torch.empty((len(selected), h, local_i // 256, spec.block_bytes), dtype=torch.uint8)
+    w2 = torch.empty(
+        (len(selected), h, local_i // 256, spec.block_bytes), dtype=torch.uint8
+    )
     with ExitStack() as stack:
         handles = {}
         for local, expert in enumerate(selected):
@@ -132,7 +151,11 @@ def load_iq2_xs_layer(
                         safe_open(snapshot / shard, framework="pt", device="cpu")
                     )
                 source = handles[shard].get_slice(name)
-                shape = (h, i // 256, spec.block_bytes) if projection == "down" else (i, h // 256, spec.block_bytes)
+                shape = (
+                    (h, i // 256, spec.block_bytes)
+                    if projection == "down"
+                    else (i, h // 256, spec.block_bytes)
+                )
                 if tuple(source.get_shape()) != shape or source.get_dtype() != "U8":
                     raise ValueError(
                         f"invalid IQ2_XS tensor {name}: expected uint8{shape}"

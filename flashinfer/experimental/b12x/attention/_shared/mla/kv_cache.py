@@ -556,8 +556,7 @@ class ConcatAndCacheGlmNextMlaKernel:
 
             if cutlass.const_expr(self.dsv41):
                 scale, scale_byte = pow2_ceil_ue8m0(
-                    fmax_f32(group_amax, Float32(1e-4))
-                    * Float32(_E4M3_MAX_RCP)
+                    fmax_f32(group_amax, Float32(1e-4)) * Float32(_E4M3_MAX_RCP)
                 )
             else:
                 # Preserve the GLM_NEXT zero-group unit scale.
@@ -585,7 +584,9 @@ class ConcatAndCacheGlmNextMlaKernel:
                     )
                 else:
                     st_global_f32(
-                        dst + Int64(_GLM_NEXT_SCALE_OFFSET) + group.to(Int64) * Int64(4),
+                        dst
+                        + Int64(_GLM_NEXT_SCALE_OFFSET)
+                        + group.to(Int64) * Int64(4),
                         scale,
                     )
 
@@ -647,11 +648,14 @@ def _to_kernel_tensor(
 ) -> cute.Tensor:
     if hasattr(tensor, "fake_mode"):
         from cutlass.cute.runtime import make_fake_tensor
+
         return make_fake_tensor(
             _torch_to_cutlass_dtype(tensor.dtype),
             tuple(cute.sym_int(32) for _ in tensor.shape),
-            tuple(1 if index == leading_dim else cute.sym_int(64)
-                  for index in range(tensor.ndim)),
+            tuple(
+                1 if index == leading_dim else cute.sym_int(64)
+                for index in range(tensor.ndim)
+            ),
             assumed_align=assumed_align,
         )
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
@@ -862,8 +866,6 @@ def _validate_glm_next_mla_cache_writer_args(
         raise ValueError("all tensors must be on the same device")
 
 
-
-
 def concat_and_cache_glm_next_mla(
     kv_c: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -873,6 +875,7 @@ def concat_and_cache_glm_next_mla(
 ) -> None:
     """Write GLM_NEXT cache records through a prepared plan."""
     from b12x.attention.sparse_mla._preparation import writer_state
+
     writer_state(plan, device=kv_cache.device).run(kv_c, kv_cache, slot_mapping)
 
 
@@ -1210,6 +1213,7 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
         kv_c, k_pe, kv_cache, slot_mapping, per_token_scale
     )
 
+
 def page_nbytes(
     page_size: int,
     *,
@@ -1280,7 +1284,9 @@ def _validate_compressed_cache_writer(
         or cache.stride(0) % 16
         or cache.data_ptr() % 16
     ):
-        raise ValueError("cache requires contiguous byte rows and 16-byte aligned pages")
+        raise ValueError(
+            "cache requires contiguous byte rows and 16-byte aligned pages"
+        )
     if int(cache.shape[0]) <= 0:
         raise ValueError("cache must contain at least one page")
     if rows >= 2**31:
@@ -1294,8 +1300,6 @@ def _validate_compressed_cache_writer(
         raise ValueError("all tensors must be on CUDA")
     if len({kv.device, cache.device, slot_mapping.device}) != 1:
         raise ValueError("all tensors must be on the same device")
-
-
 
 
 def _compressed_cache_writer_args(kv, cache, slot_mapping, page_size, cache_kind):
@@ -1345,6 +1349,13 @@ def _compressed_cache_writer_launch(kv, cache, slot_mapping, page_size, cache_ki
             cache_kind,
             "deepseek_v41",
         ),
-        labels=("kv", "cache", "slot_mapping", "page_size", "cache_kind", "cache_format"),
+        labels=(
+            "kv",
+            "cache",
+            "slot_mapping",
+            "page_size",
+            "cache_kind",
+            "cache_format",
+        ),
     )
     return kernel, args, spec

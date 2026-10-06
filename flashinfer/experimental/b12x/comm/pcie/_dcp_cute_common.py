@@ -121,12 +121,8 @@ def block_pair_barrier(
         cute.arch.store(self_ptr, value)
 
         slot = Int64(value % Uint32(2))
-        common_index = (
-            Int64(max_blocks * _MAX_RANKS)
-            + (
-                (slot * Int64(max_blocks) + Int64(bidx))
-                * Int64(_MAX_RANKS * _FLAG_STRIDE)
-            )
+        common_index = Int64(max_blocks * _MAX_RANKS) + (
+            (slot * Int64(max_blocks) + Int64(bidx)) * Int64(_MAX_RANKS * _FLAG_STRIDE)
         )
         peer_index = common_index + Int64(rank * _FLAG_STRIDE)
         mine_index = common_index + Int64(tidx) * Int64(_FLAG_STRIDE)
@@ -140,10 +136,7 @@ def block_pair_barrier(
 
 def signal_bytes(max_blocks: int) -> int:
     """Return the exact native ``Signal`` layout size."""
-    return (
-        max_blocks * _MAX_RANKS
-        + 2 * max_blocks * _MAX_RANKS * _FLAG_STRIDE
-    ) * 4
+    return (max_blocks * _MAX_RANKS + 2 * max_blocks * _MAX_RANKS * _FLAG_STRIDE) * 4
 
 
 __all__ = ["block_pair_barrier", "signal_bytes"]

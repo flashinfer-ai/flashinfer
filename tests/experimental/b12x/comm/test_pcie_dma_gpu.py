@@ -16,6 +16,7 @@ from b12x.comm.pcie._dma_preparation import (
 )
 from b12x.comm.pcie.pcie_dma import PCIeDmaAllReduce
 from b12x.preparation import PreparationSession
+import torch.multiprocessing as mp
 
 
 pytestmark = pytest.mark.skipif(
@@ -66,7 +67,6 @@ def _assert_close(actual: torch.Tensor, ref: torch.Tensor, world_size: int) -> N
         )
 
 
-
 def _prepare_dma(ring: PCIeDmaAllReduce):
     session = PreparationSession(device=ring.device, autotune=False)
     query = query_from_runtime(ring, surface="DmaAllReduce.all_reduce", call={})
@@ -87,6 +87,8 @@ def _prepared_mx_kernels() -> DmaKernels:
     kernels = DmaKernels(CudaRTLibrary())
     kernels.install(compile_launchers(world_size=2, wire_mode="mx"))
     return kernels
+
+
 def _worker(rank: int, world_size: int, port: int) -> None:
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
@@ -104,17 +106,21 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     )
     session, result, plan = _prepare_dma(ring)
     try:
-        explicit_inp = _make_input(valid_rows(8), hidden, torch.bfloat16, device, rank, 0)
+        explicit_inp = _make_input(
+            valid_rows(8), hidden, torch.bfloat16, device, rank, 0
+        )
         explicit_ref = _reference(explicit_inp)
         explicit_out = torch.empty_like(explicit_inp)
         with pytest.raises(ValueError, match="device"):
             ring.all_reduce(
-                explicit_inp, plan=plan,
+                explicit_inp,
+                plan=plan,
                 out=torch.empty_like(explicit_inp, device="cpu"),
             )
         with pytest.raises(ValueError, match="device"):
             ring.all_reduce(
-                explicit_inp, plan=plan,
+                explicit_inp,
+                plan=plan,
                 out=torch.empty_like(explicit_inp, device=(rank + 1) % world_size),
             )
         wrong_device = (rank + 1) % world_size
@@ -140,7 +146,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 _assert_close(out, ref, world_size)
                 retained_outputs.append(out)
                 retained_refs.append(ref)
-                for retained, retained_ref in zip(retained_outputs, retained_refs, strict=True):
+                for retained, retained_ref in zip(
+                    retained_outputs, retained_refs, strict=True
+                ):
                     _assert_close(retained, retained_ref, world_size)
 
         rows = valid_rows(256)
@@ -150,7 +158,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         with session.capture(), torch.cuda.graph(graph):
             ring.all_reduce(inp, plan=plan, out=out)
         for iteration in range(1, 4):
-            inp.copy_(_make_input(rows, hidden, torch.bfloat16, device, rank, iteration))
+            inp.copy_(
+                _make_input(rows, hidden, torch.bfloat16, device, rank, iteration)
+            )
             ref = _reference(inp)
             graph.replay()
             torch.cuda.synchronize(device)
@@ -278,9 +288,7 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
     absolute_bits = bit_patterns.to(torch.int32) & 0x7FFF
     exponent = absolute_bits >> 7
     fraction = absolute_bits & 0x7F
-    expected_scales = torch.clamp(
-        exponent - 8 + (fraction > 96).to(torch.int32), min=0
-    )
+    expected_scales = torch.clamp(exponent - 8 + (fraction > 96).to(torch.int32), min=0)
     expected_scales = torch.where(
         absolute_bits == 0, torch.full_like(expected_scales, 127), expected_scales
     )
@@ -303,8 +311,8 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
         expected_scales == 255, torch.tensor(float("nan")), scale_values
     )
     expected_payload = (
-        source_values.float() / scale_values
-    ).to(torch.float8_e4m3fn).view(torch.uint8)
+        (source_values.float() / scale_values).to(torch.float8_e4m3fn).view(torch.uint8)
+    )
     is_inf = (exponent == 255) & (fraction == 0)
     is_nan = (exponent == 255) & (fraction != 0)
     expected_payload = torch.where(
@@ -321,9 +329,7 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
     )
 
     assert torch.equal(scales.cpu(), expected_scales)
-    assert torch.equal(
-        payload.cpu(), expected_payload.repeat_interleave(32)
-    )
+    assert torch.equal(payload.cpu(), expected_payload.repeat_interleave(32))
 
 
 def _preparation_skew_worker(rank: int, world_size: int, port: int) -> None:
@@ -334,11 +340,16 @@ def _preparation_skew_worker(rank: int, world_size: int, port: int) -> None:
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     dist.init_process_group(
-        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
-        world_size=world_size, timeout=timedelta(seconds=45),
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=45),
     )
     ring = PCIeDmaAllReduce(
-        exchange_group=dist.group.WORLD, device=device, max_bytes=80 << 20,
+        exchange_group=dist.group.WORLD,
+        device=device,
+        max_bytes=80 << 20,
         fp8="",
     )
     session = PreparationSession(device=device, autotune=False)
@@ -347,11 +358,16 @@ def _preparation_skew_worker(rank: int, world_size: int, port: int) -> None:
         cases = []
         for index, rows in enumerate((4089, 4096)):
             source = torch.full(
-                (rows, 5120), rank + 1, device=device, dtype=torch.bfloat16,
+                (rows, 5120),
+                rank + 1,
+                device=device,
+                dtype=torch.bfloat16,
             )
             output = torch.empty_like(source)
             declaration = dma_plan(
-                query_from_metadata(ring, shape=tuple(source.shape), dtype=source.dtype),
+                query_from_metadata(
+                    ring, shape=tuple(source.shape), dtype=source.dtype
+                ),
                 runtime=ring,
             )
 
@@ -360,8 +376,12 @@ def _preparation_skew_worker(rank: int, world_size: int, port: int) -> None:
                     time.sleep(0.3)
                 return prepared_call(state, inp=source, out=output)
 
-            session.prepare((declaration.request(name=f"dma.m{rows}", prepare_call=call),))
-            torch.testing.assert_close(output, torch.full_like(output, 10), rtol=0, atol=0)
+            session.prepare(
+                (declaration.request(name=f"dma.m{rows}", prepare_call=call),)
+            )
+            torch.testing.assert_close(
+                output, torch.full_like(output, 10), rtol=0, atol=0
+            )
             cases.append((declaration, source, output))
             dist.barrier()
         session.freeze()
@@ -378,8 +398,10 @@ def _preparation_skew_worker(rank: int, world_size: int, port: int) -> None:
                 assert output.data_ptr() == address
                 assert torch.cuda.memory_allocated(device) == allocated
                 torch.testing.assert_close(
-                    output, torch.full_like(output, 10 + world_size * iteration),
-                    rtol=0, atol=0,
+                    output,
+                    torch.full_like(output, 10 + world_size * iteration),
+                    rtol=0,
+                    atol=0,
                 )
             graph.reset()
         dist.barrier()
@@ -397,7 +419,10 @@ def test_pcie_dma_preparation_tolerates_rank_skew_and_replays() -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() < 4:
         pytest.skip("requires four CUDA devices")
     workers = mp.spawn(
-        _preparation_skew_worker, args=(4, _free_port()), nprocs=4, join=False,
+        _preparation_skew_worker,
+        args=(4, _free_port()),
+        nprocs=4,
+        join=False,
     )
     finished = False
     deadline = time.monotonic() + 60

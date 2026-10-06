@@ -1,4 +1,5 @@
 """Triton kernels and opaque prepared dispatch for BF16 vocabulary projection."""
+
 from __future__ import annotations
 
 import torch
@@ -21,7 +22,9 @@ def _row_kernel(
     token_row = tl.program_id(1)
     offsets = tl.arange(0, BLOCK_K)
     mask = offsets < K
-    values = tl.load(source + token_row * K + offsets, mask=mask, other=0.0).to(tl.float32)
+    values = tl.load(source + token_row * K + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
     weights = tl.load(
         weight + vocab_row * K + offsets,
         mask=mask,
@@ -46,7 +49,9 @@ def _row_loop_kernel(
     for start in range(0, K, BLOCK_K):
         positions = start + offsets
         mask = positions < K
-        values = tl.load(source + token_row * K + positions, mask=mask, other=0.0).to(tl.float32)
+        values = tl.load(source + token_row * K + positions, mask=mask, other=0.0).to(
+            tl.float32
+        )
         weights = tl.load(
             weight + vocab_row * K + positions,
             mask=mask,
@@ -63,7 +68,9 @@ def bf16_vocab_projection(
     plan_handle: int,
 ) -> torch.Tensor:
     """Execute an already prepared Torch or Triton projection backend."""
-    state = require_prepared(plan_from_handle(plan_handle), "gemm.bf16_vocab_projection", source.device)
+    state = require_prepared(
+        plan_from_handle(plan_handle), "gemm.bf16_vocab_projection", source.device
+    )
     return state.run(source, weight)
 
 

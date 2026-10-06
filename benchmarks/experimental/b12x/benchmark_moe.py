@@ -49,12 +49,20 @@ from b12x.moe._shared.kernels.activations import (
     normalize_moe_activation,
 )
 from b12x._lib.intrinsics import as_grouped_scale_view, swizzle_block_scale
-from benchmarks.experimental.b12x.common import make_l2_flush_fn, resolve_l2_flush_bytes, nvidia_smi_gpu_mode_snapshot
+from benchmarks.experimental.b12x.common import (
+    make_l2_flush_fn,
+    resolve_l2_flush_bytes,
+    nvidia_smi_gpu_mode_snapshot,
+)
 from b12x.testing.reference.w4a16_reference import moe_reference_w4a16
 
 from b12x.moe import fused_moe
 from b12x.preparation import PreparationSession
-from benchmarks.experimental.b12x.moe_preparation import prepared_call, request_for_capacity, scratch_for
+from benchmarks.experimental.b12x.moe_preparation import (
+    prepared_call,
+    request_for_capacity,
+    scratch_for,
+)
 
 LEGACY_BATCH_SIZES = [1, 2, 4, 8]
 NANO35_MTP_BATCH_SIZES = [1, 4, 9]
@@ -141,6 +149,7 @@ def require_sm120() -> None:
 
 def bench_events(fn, *, warmup, iters, l2_flush=None):
     from b12x.testing.benchmark import samples_ms
+
     return samples_ms(fn, warmup=warmup, iters=iters, l2_flush=l2_flush)
 
 
@@ -181,8 +190,6 @@ class TimingStats:
             min(self.per_repeat_median_ms) * 1000.0,
             max(self.per_repeat_median_ms) * 1000.0,
         )
-
-
 
 
 @dataclass(frozen=True)
@@ -234,8 +241,6 @@ def fmt_timing_stats(stats: TimingStats) -> str:
     )
 
 
-
-
 @dataclass(frozen=True)
 class ScaleContractParams:
     a1_gscale: torch.Tensor
@@ -278,14 +283,22 @@ class ShapeSpec:
 
 
 def logical_expert_bytes(
-    spec: ModelSpec, *, activation: str, quant_mode: str, source_format: str,
+    spec: ModelSpec,
+    *,
+    activation: str,
+    quant_mode: str,
+    source_format: str,
 ) -> int:
     """Unique weight payload, excluding padding, activations, and rereads."""
     elements = spec.hidden_size * (
         moe_activation_w1_rows(activation, spec.I_tp) + spec.I_tp
     )
     if source_format in IQ2_CODECS:
-        return elements // block_codec(source_format).block_weights * block_codec(source_format).block_bytes
+        return (
+            elements
+            // block_codec(source_format).block_weights
+            * block_codec(source_format).block_bytes
+        )
     if quant_mode == "w4a8_nvfp4":
         # Native FP4 plus K32 exponents and K16 residual scales.
         return elements // 2 + elements // 32 + elements // 16
@@ -596,12 +609,19 @@ MODEL_PROFILES = {
 # Both GGML IQ2 codecs share checkpoint geometry and the same production route.
 for _profile in ("puzzle3-iq2-xs", "qwen36-35b-iq2-xs"):
     MODEL_PROFILES[_profile.replace("-iq2-xs", "-iq2-xxs")] = replace(
-        MODEL_PROFILES[_profile], label=MODEL_PROFILES[_profile].label.replace("IQ2_XS", "IQ2_XXS"),
+        MODEL_PROFILES[_profile],
+        label=MODEL_PROFILES[_profile].label.replace("IQ2_XS", "IQ2_XXS"),
     )
 
 
 def _cached_snapshot_path(repo_id: str) -> pathlib.Path | None:
-    cache_root = pathlib.Path.home() / ".cache" / "huggingface" / "hub" / f"models--{repo_id.replace('/', '--')}"
+    cache_root = (
+        pathlib.Path.home()
+        / ".cache"
+        / "huggingface"
+        / "hub"
+        / f"models--{repo_id.replace('/', '--')}"
+    )
     snapshots_root = cache_root / "snapshots"
     if not snapshots_root.is_dir():
         return None
@@ -609,11 +629,13 @@ def _cached_snapshot_path(repo_id: str) -> pathlib.Path | None:
     main_ref = cache_root / "refs" / "main"
     if main_ref.is_file():
         candidate = snapshots_root / main_ref.read_text().strip()
-        if candidate.is_dir() and (candidate / "model.safetensors.index.json").is_file():
+        if (
+            candidate.is_dir()
+            and (candidate / "model.safetensors.index.json").is_file()
+        ):
             return candidate
     indexed_snapshots = [
-        path for path in snapshots
-        if (path / "model.safetensors.index.json").is_file()
+        path for path in snapshots if (path / "model.safetensors.index.json").is_file()
     ]
     if indexed_snapshots:
         return indexed_snapshots[-1]
@@ -665,6 +687,7 @@ def resolve_model_path(
         f"no default path found for {profile.label}; pass --model-path explicitly"
     )
 
+
 MODEL_PATH = _default_model_path()
 
 
@@ -708,8 +731,6 @@ class ExpertWeights:
     w13_layout: str = "w31"
 
 
-
-
 def _load_config(model_path: pathlib.Path) -> dict:
     raw_cfg = json.loads((model_path / "config.json").read_text())
     return raw_cfg.get("text_config", raw_cfg)
@@ -721,6 +742,7 @@ def _fp4_checkpoint_bytes(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.element_size() != 1:
         raise TypeError(f"expected one-byte packed FP4 tensor, got {tensor.dtype}")
     return tensor.view(torch.uint8)
+
 
 def _slice_v41_tp_shard(
     source: torch.Tensor,
@@ -742,7 +764,14 @@ def _slice_v41_tp_shard(
     return source.narrow(dimension, offset, shard_width).contiguous()
 
 
-def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size_override: int | None = None, tp_rank: int = 0, layer_idx: int | None = None) -> ModelSpec:
+def build_model_spec(
+    model_path: pathlib.Path,
+    profile: ModelProfile,
+    *,
+    tp_size_override: int | None = None,
+    tp_rank: int = 0,
+    layer_idx: int | None = None,
+) -> ModelSpec:
     tp = tp_size_override if tp_size_override is not None else profile.tp_size
     if profile.shape is not None:
         return ModelSpec(
@@ -760,13 +789,19 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size
         block = cfg["block_configs"][selected]
         if cfg.get("model_type") != "nemotron_h_puzzle" or block["block_type"] != "moe":
             raise ValueError("Puzzle 3 IQ2_XS requires a Nemotron Puzzle MoE layer")
-        return ModelSpec(hidden_size=block["moe_latent_size"],
-                         intermediate_size=block["moe_intermediate_size"],
-                         num_experts=block["n_routed_experts"],
-                         top_k=block["num_experts_per_tok"], tp_size=tp, tp_rank=tp_rank)
+        return ModelSpec(
+            hidden_size=block["moe_latent_size"],
+            intermediate_size=block["moe_intermediate_size"],
+            num_experts=block["n_routed_experts"],
+            top_k=block["num_experts_per_tok"],
+            tp_size=tp,
+            tp_rank=tp_rank,
+        )
     if profile.checkpoint_family == "deepseek_v41_flash":
         if cfg.get("model_type") != "deepseek_v41_text":
-            raise ValueError("DeepSeek V4.1 Flash requires its V4.1 text config, not V4.0")
+            raise ValueError(
+                "DeepSeek V4.1 Flash requires its V4.1 text config, not V4.0"
+            )
         if tp <= 0 or not 0 <= tp_rank < tp:
             raise ValueError("V4.1 requires a valid TP rank")
         logical_I_tp, remainder = divmod(cfg["moe_intermediate_size"], tp)
@@ -899,12 +934,24 @@ def make_shape_only_expert_weights(
         gen = torch.Generator(device=device).manual_seed(10_000 + layer_idx)
         w13_weight.random_(0, 256, generator=gen)
         w2_weight.random_(0, 256, generator=gen)
-        w13_sf = torch.empty(E, w13_rows, K // 16, device=device).uniform_(
-            0.01, 0.03, generator=gen,
-        ).to(torch.float8_e4m3fn)
-        down_sf = torch.empty(E, K, I_tp // 16, device=device).uniform_(
-            0.01, 0.03, generator=gen,
-        ).to(torch.float8_e4m3fn)
+        w13_sf = (
+            torch.empty(E, w13_rows, K // 16, device=device)
+            .uniform_(
+                0.01,
+                0.03,
+                generator=gen,
+            )
+            .to(torch.float8_e4m3fn)
+        )
+        down_sf = (
+            torch.empty(E, K, I_tp // 16, device=device)
+            .uniform_(
+                0.01,
+                0.03,
+                generator=gen,
+            )
+            .to(torch.float8_e4m3fn)
+        )
         w13_blockscale_swizzled = swizzle_block_scale(w13_sf)
         w2_blockscale_swizzled = swizzle_block_scale(down_sf)
         w13_layout = "w31" if activation == SWIGLUOAI_UNINTERLEAVE else "w13"
@@ -912,7 +959,9 @@ def make_shape_only_expert_weights(
     if source_format == "fp4_e8m0_k32":
         e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
         if e8m0_dtype is None:
-            raise RuntimeError("shape-only E8M0/K32 scales require torch.float8_e8m0fnu")
+            raise RuntimeError(
+                "shape-only E8M0/K32 scales require torch.float8_e8m0fnu"
+            )
 
     w13_permuted = w13_weight.permute(1, 2, 0)
     down_permuted = w2_weight.permute(1, 2, 0)
@@ -920,8 +969,12 @@ def make_shape_only_expert_weights(
         w13_scale = w13_blockscale_swizzled
         down_scale = w2_blockscale_swizzled
     else:
-        w13_scale = as_grouped_scale_view(w13_blockscale_swizzled.view(torch.uint8), w13_rows, K)
-        down_scale = as_grouped_scale_view(w2_blockscale_swizzled.view(torch.uint8), K, I_tp)
+        w13_scale = as_grouped_scale_view(
+            w13_blockscale_swizzled.view(torch.uint8), w13_rows, K
+        )
+        down_scale = as_grouped_scale_view(
+            w2_blockscale_swizzled.view(torch.uint8), K, I_tp
+        )
 
     w13_input_scale_per_expert = torch.ones(E, dtype=torch.float32, device=device)
     w2_input_scale_per_expert = torch.ones(E, dtype=torch.float32, device=device)
@@ -937,8 +990,12 @@ def make_shape_only_expert_weights(
     g2_alphas = g2_alphas_per_expert
     w13_input_scale_quant = (1.0 / w13_input_scale).to(torch.float32)
     w2_input_scale_quant = (1.0 / w2_input_scale).to(torch.float32)
-    w13_input_scale_quant_per_expert = (1.0 / w13_input_scale_per_expert).to(torch.float32).contiguous()
-    w2_input_scale_quant_per_expert = (1.0 / w2_input_scale_per_expert).to(torch.float32).contiguous()
+    w13_input_scale_quant_per_expert = (
+        (1.0 / w13_input_scale_per_expert).to(torch.float32).contiguous()
+    )
+    w2_input_scale_quant_per_expert = (
+        (1.0 / w2_input_scale_per_expert).to(torch.float32).contiguous()
+    )
     print(" done.")
 
     return ExpertWeights(
@@ -969,27 +1026,52 @@ def make_shape_only_expert_weights(
     )
 
 
-def load_iq2_xs_expert_weights(model_path, spec, *, layer_idx, activation, device="cuda") -> ExpertWeights:
+def load_iq2_xs_expert_weights(
+    model_path, spec, *, layer_idx, activation, device="cuda"
+) -> ExpertWeights:
     """Keep CPU source blocks for the oracle and prepare compact device storage."""
     from benchmarks.experimental.b12x.iq2_xs_checkpoint import load_iq2_xs_layer
 
-    layer = load_iq2_xs_layer(model_path, layer=layer_idx, tp_size=spec.tp_size, tp_rank=spec.tp_rank)
+    layer = load_iq2_xs_layer(
+        model_path, layer=layer_idx, tp_size=spec.tp_size, tp_rank=spec.tp_rank
+    )
     if activation != layer.activation:
         raise ValueError(f"the IQ2_XS checkpoint requires {layer.activation}")
-    if (layer.hidden_size, layer.intermediate_size, layer.route_num_experts, layer.top_k) != (spec.hidden_size, spec.I_tp, spec.num_experts, spec.top_k):
-        raise ValueError("IQ2_XS checkpoint geometry differs from the benchmark specification")
+    if (
+        layer.hidden_size,
+        layer.intermediate_size,
+        layer.route_num_experts,
+        layer.top_k,
+    ) != (spec.hidden_size, spec.I_tp, spec.num_experts, spec.top_k):
+        raise ValueError(
+            "IQ2_XS checkpoint geometry differs from the benchmark specification"
+        )
     unit = torch.ones(spec.num_experts, device=device, dtype=torch.float32)
     return ExpertWeights(
-        layer_idx=layer_idx, spec=spec,
-        w13_permuted=None, w13_scale=None, down_permuted=None, down_scale=None,
-        w13_weight=layer.weights.w13, w2_weight=layer.weights.w2,
-        w13_blockscale_swizzled=None, w2_blockscale_swizzled=None,
-        w13_input_scale=unit[:1], w2_input_scale=unit[:1],
-        w13_input_scale_quant=unit[:1], w2_input_scale_quant=unit[:1],
-        w13_input_scale_per_expert=unit, w2_input_scale_per_expert=unit,
-        w13_input_scale_quant_per_expert=unit, w2_input_scale_quant_per_expert=unit,
-        g1_alphas=unit, g2_alphas=unit, g1_alphas_per_expert=unit, g2_alphas_per_expert=unit,
-        source_format=layer.weights.codec, w13_layout="w31",
+        layer_idx=layer_idx,
+        spec=spec,
+        w13_permuted=None,
+        w13_scale=None,
+        down_permuted=None,
+        down_scale=None,
+        w13_weight=layer.weights.w13,
+        w2_weight=layer.weights.w2,
+        w13_blockscale_swizzled=None,
+        w2_blockscale_swizzled=None,
+        w13_input_scale=unit[:1],
+        w2_input_scale=unit[:1],
+        w13_input_scale_quant=unit[:1],
+        w2_input_scale_quant=unit[:1],
+        w13_input_scale_per_expert=unit,
+        w2_input_scale_per_expert=unit,
+        w13_input_scale_quant_per_expert=unit,
+        w2_input_scale_quant_per_expert=unit,
+        g1_alphas=unit,
+        g2_alphas=unit,
+        g1_alphas_per_expert=unit,
+        g2_alphas_per_expert=unit,
+        source_format=layer.weights.codec,
+        w13_layout="w31",
     )
 
 
@@ -1004,7 +1086,9 @@ def load_expert_weights(
     activation = normalize_moe_activation(activation)
 
     if checkpoint_family in {"qwen_iq2_xs", "puzzle3_iq2_xs"}:
-        return load_iq2_xs_expert_weights(model_path, spec, layer_idx=layer_idx, activation=activation)
+        return load_iq2_xs_expert_weights(
+            model_path, spec, layer_idx=layer_idx, activation=activation
+        )
 
     device = torch.device("cuda")
     E = spec.num_experts
@@ -1063,9 +1147,13 @@ def load_expert_weights(
             checkpoint_family in {"glm", "glm53_flash", "minimax_m2"}
             and activation != "silu"
         ):
-            raise ValueError(f"{checkpoint_family} FP4 benchmark only supports silu experts")
+            raise ValueError(
+                f"{checkpoint_family} FP4 benchmark only supports silu experts"
+            )
         if checkpoint_family == "minimax_m3" and activation != SWIGLUOAI_UNINTERLEAVE:
-            raise ValueError("minimax_m3 FP4 benchmark expects swigluoai_uninterleave experts")
+            raise ValueError(
+                "minimax_m3 FP4 benchmark expects swigluoai_uninterleave experts"
+            )
         if checkpoint_family == "qwen":
             cfg_num_experts = cfg["num_experts"]
             cfg_intermediate_size = cfg["moe_intermediate_size"]
@@ -1102,9 +1190,13 @@ def load_expert_weights(
         up_w = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
         down_w = torch.empty(E, K, I_tp // 2, dtype=torch.uint8, device=device)
 
-        gate_sf = torch.empty(E, I_tp, K // 16, dtype=torch.float8_e4m3fn, device=device)
+        gate_sf = torch.empty(
+            E, I_tp, K // 16, dtype=torch.float8_e4m3fn, device=device
+        )
         up_sf = torch.empty(E, I_tp, K // 16, dtype=torch.float8_e4m3fn, device=device)
-        down_sf = torch.empty(E, K, I_tp // 16, dtype=torch.float8_e4m3fn, device=device)
+        down_sf = torch.empty(
+            E, K, I_tp // 16, dtype=torch.float8_e4m3fn, device=device
+        )
 
         gate_gs = torch.empty(E, dtype=torch.float32, device=device)
         down_gs = torch.empty(E, dtype=torch.float32, device=device)
@@ -1119,22 +1211,46 @@ def load_expert_weights(
             tp_sf_cols = I_tp // 16
             tp_sf_off = spec.tp_rank * tp_sf_cols
 
-            gate_w[eid] = loader.get_tensor(f"{ep}.{gate_proj}.weight").narrow(0, tp_off, I_tp).to(device)
-            gate_sf[eid] = loader.get_tensor(f"{ep}.{gate_proj}.weight_scale").narrow(0, tp_off, I_tp).to(device)
-            gate_gs[eid] = loader.get_tensor(f"{ep}.{gate_proj}.weight_scale_2").to(device)
-            gate_is[eid] = loader.get_tensor(
-                f"{ep}.{gate_proj}.input_scale"
-            ).to(device)
+            gate_w[eid] = (
+                loader.get_tensor(f"{ep}.{gate_proj}.weight")
+                .narrow(0, tp_off, I_tp)
+                .to(device)
+            )
+            gate_sf[eid] = (
+                loader.get_tensor(f"{ep}.{gate_proj}.weight_scale")
+                .narrow(0, tp_off, I_tp)
+                .to(device)
+            )
+            gate_gs[eid] = loader.get_tensor(f"{ep}.{gate_proj}.weight_scale_2").to(
+                device
+            )
+            gate_is[eid] = loader.get_tensor(f"{ep}.{gate_proj}.input_scale").to(device)
 
-            up_w[eid] = loader.get_tensor(f"{ep}.{up_proj}.weight").narrow(0, tp_off, I_tp).to(device)
-            up_sf[eid] = loader.get_tensor(f"{ep}.{up_proj}.weight_scale").narrow(0, tp_off, I_tp).to(device)
+            up_w[eid] = (
+                loader.get_tensor(f"{ep}.{up_proj}.weight")
+                .narrow(0, tp_off, I_tp)
+                .to(device)
+            )
+            up_sf[eid] = (
+                loader.get_tensor(f"{ep}.{up_proj}.weight_scale")
+                .narrow(0, tp_off, I_tp)
+                .to(device)
+            )
 
-            down_w[eid] = loader.get_tensor(f"{ep}.{down_proj}.weight").narrow(1, tp_off_packed, I_tp // 2).to(device)
-            down_sf[eid] = loader.get_tensor(f"{ep}.{down_proj}.weight_scale").narrow(1, tp_sf_off, tp_sf_cols).to(device)
-            down_gs[eid] = loader.get_tensor(f"{ep}.{down_proj}.weight_scale_2").to(device)
-            down_is[eid] = loader.get_tensor(
-                f"{ep}.{down_proj}.input_scale"
-            ).to(device)
+            down_w[eid] = (
+                loader.get_tensor(f"{ep}.{down_proj}.weight")
+                .narrow(1, tp_off_packed, I_tp // 2)
+                .to(device)
+            )
+            down_sf[eid] = (
+                loader.get_tensor(f"{ep}.{down_proj}.weight_scale")
+                .narrow(1, tp_sf_off, tp_sf_cols)
+                .to(device)
+            )
+            down_gs[eid] = loader.get_tensor(f"{ep}.{down_proj}.weight_scale_2").to(
+                device
+            )
+            down_is[eid] = loader.get_tensor(f"{ep}.{down_proj}.input_scale").to(device)
         print(" done.")
 
         if checkpoint_family == "minimax_m3":
@@ -1150,9 +1266,13 @@ def load_expert_weights(
         w2_blockscale_swizzled = swizzle_block_scale(down_sf)
 
         w13_permuted = w13_weight.permute(1, 2, 0)
-        w13_scale = as_grouped_scale_view(w13_blockscale_swizzled.view(torch.uint8), 2 * I_tp, K)
+        w13_scale = as_grouped_scale_view(
+            w13_blockscale_swizzled.view(torch.uint8), 2 * I_tp, K
+        )
         down_permuted = w2_weight.permute(1, 2, 0)
-        down_scale = as_grouped_scale_view(w2_blockscale_swizzled.view(torch.uint8), K, I_tp)
+        down_scale = as_grouped_scale_view(
+            w2_blockscale_swizzled.view(torch.uint8), K, I_tp
+        )
 
         w13_input_scale = gate_is.max()
         w2_input_scale = down_is.max()
@@ -1172,7 +1292,9 @@ def load_expert_weights(
         down_w = torch.empty(E, K, I_tp // 2, dtype=torch.uint8, device=device)
 
         up_sf = torch.empty(E, I_tp, K // 16, dtype=torch.float8_e4m3fn, device=device)
-        down_sf = torch.empty(E, K, I_tp // 16, dtype=torch.float8_e4m3fn, device=device)
+        down_sf = torch.empty(
+            E, K, I_tp // 16, dtype=torch.float8_e4m3fn, device=device
+        )
 
         up_gs = torch.empty(E, dtype=torch.float32, device=device)
         down_gs = torch.empty(E, dtype=torch.float32, device=device)
@@ -1188,18 +1310,38 @@ def load_expert_weights(
             tp_sf_off = spec.tp_rank * tp_sf_cols
 
             if spec.tp_size > 1:
-                up_w[eid] = loader.get_tensor(f"{ep}.up_proj.weight").narrow(0, tp_off, I_tp).to(device)
-                up_sf[eid] = loader.get_tensor(f"{ep}.up_proj.weight_scale").narrow(0, tp_off, I_tp).to(device)
-                down_w[eid] = loader.get_tensor(f"{ep}.down_proj.weight").narrow(1, tp_off_packed, I_tp // 2).to(device)
-                down_sf[eid] = loader.get_tensor(f"{ep}.down_proj.weight_scale").narrow(1, tp_sf_off, tp_sf_cols).to(device)
+                up_w[eid] = (
+                    loader.get_tensor(f"{ep}.up_proj.weight")
+                    .narrow(0, tp_off, I_tp)
+                    .to(device)
+                )
+                up_sf[eid] = (
+                    loader.get_tensor(f"{ep}.up_proj.weight_scale")
+                    .narrow(0, tp_off, I_tp)
+                    .to(device)
+                )
+                down_w[eid] = (
+                    loader.get_tensor(f"{ep}.down_proj.weight")
+                    .narrow(1, tp_off_packed, I_tp // 2)
+                    .to(device)
+                )
+                down_sf[eid] = (
+                    loader.get_tensor(f"{ep}.down_proj.weight_scale")
+                    .narrow(1, tp_sf_off, tp_sf_cols)
+                    .to(device)
+                )
             else:
                 up_w[eid] = loader.get_tensor(f"{ep}.up_proj.weight").to(device)
                 up_sf[eid] = loader.get_tensor(f"{ep}.up_proj.weight_scale").to(device)
                 down_w[eid] = loader.get_tensor(f"{ep}.down_proj.weight").to(device)
-                down_sf[eid] = loader.get_tensor(f"{ep}.down_proj.weight_scale").to(device)
+                down_sf[eid] = loader.get_tensor(f"{ep}.down_proj.weight_scale").to(
+                    device
+                )
             up_gs[eid] = loader.get_tensor(f"{ep}.up_proj.weight_scale_2").to(device)
             up_is[eid] = loader.get_tensor(f"{ep}.up_proj.input_scale").to(device)
-            down_gs[eid] = loader.get_tensor(f"{ep}.down_proj.weight_scale_2").to(device)
+            down_gs[eid] = loader.get_tensor(f"{ep}.down_proj.weight_scale_2").to(
+                device
+            )
             down_is[eid] = loader.get_tensor(f"{ep}.down_proj.input_scale").to(device)
         print(" done.")
 
@@ -1210,9 +1352,13 @@ def load_expert_weights(
         w2_blockscale_swizzled = swizzle_block_scale(down_sf)
 
         w13_permuted = w13_weight.permute(1, 2, 0)
-        w13_scale = as_grouped_scale_view(w13_blockscale_swizzled.view(torch.uint8), I_tp, K)
+        w13_scale = as_grouped_scale_view(
+            w13_blockscale_swizzled.view(torch.uint8), I_tp, K
+        )
         down_permuted = w2_weight.permute(1, 2, 0)
-        down_scale = as_grouped_scale_view(w2_blockscale_swizzled.view(torch.uint8), K, I_tp)
+        down_scale = as_grouped_scale_view(
+            w2_blockscale_swizzled.view(torch.uint8), K, I_tp
+        )
 
         w13_input_scale = up_is.max()
         w2_input_scale = down_is.max()
@@ -1232,7 +1378,9 @@ def load_expert_weights(
         down_w = torch.empty(E, K, I_tp // 2, dtype=torch.uint8, device=device)
 
         up_sf = torch.empty(E, I_tp, K // 16, dtype=torch.float8_e4m3fn, device=device)
-        down_sf = torch.empty(E, K, I_tp // 16, dtype=torch.float8_e4m3fn, device=device)
+        down_sf = torch.empty(
+            E, K, I_tp // 16, dtype=torch.float8_e4m3fn, device=device
+        )
 
         up_weight_global_scale = torch.empty(E, dtype=torch.float32, device=device)
         down_weight_global_scale = torch.empty(E, dtype=torch.float32, device=device)
@@ -1245,13 +1393,33 @@ def load_expert_weights(
             tp_sf_cols = I_tp // 16
             tp_sf_off = spec.tp_rank * tp_sf_cols
 
-            up_w[eid] = loader.get_tensor(f"{ep}.up_proj.weight_packed").narrow(0, tp_off, I_tp).to(device)
-            up_sf[eid] = loader.get_tensor(f"{ep}.up_proj.weight_scale").narrow(0, tp_off, I_tp).to(device)
-            up_weight_global_scale[eid] = loader.get_tensor(f"{ep}.up_proj.weight_global_scale").to(device)
+            up_w[eid] = (
+                loader.get_tensor(f"{ep}.up_proj.weight_packed")
+                .narrow(0, tp_off, I_tp)
+                .to(device)
+            )
+            up_sf[eid] = (
+                loader.get_tensor(f"{ep}.up_proj.weight_scale")
+                .narrow(0, tp_off, I_tp)
+                .to(device)
+            )
+            up_weight_global_scale[eid] = loader.get_tensor(
+                f"{ep}.up_proj.weight_global_scale"
+            ).to(device)
 
-            down_w[eid] = loader.get_tensor(f"{ep}.down_proj.weight_packed").narrow(1, tp_off_packed, I_tp // 2).to(device)
-            down_sf[eid] = loader.get_tensor(f"{ep}.down_proj.weight_scale").narrow(1, tp_sf_off, tp_sf_cols).to(device)
-            down_weight_global_scale[eid] = loader.get_tensor(f"{ep}.down_proj.weight_global_scale").to(device)
+            down_w[eid] = (
+                loader.get_tensor(f"{ep}.down_proj.weight_packed")
+                .narrow(1, tp_off_packed, I_tp // 2)
+                .to(device)
+            )
+            down_sf[eid] = (
+                loader.get_tensor(f"{ep}.down_proj.weight_scale")
+                .narrow(1, tp_sf_off, tp_sf_cols)
+                .to(device)
+            )
+            down_weight_global_scale[eid] = loader.get_tensor(
+                f"{ep}.down_proj.weight_global_scale"
+            ).to(device)
         print(" done.")
 
         # The compressed-tensors W4A16 checkpoint stores per-tensor global
@@ -1259,11 +1427,15 @@ def load_expert_weights(
         # 1 / weight_global_scale into the FP4 block scales and launch with
         # unit alphas so the benchmark exercises the same model contract.
         up_sf = (
-            up_sf.float() * (1.0 / up_weight_global_scale).view(E, 1, 1)
-        ).to(torch.float8_e4m3fn).contiguous()
+            (up_sf.float() * (1.0 / up_weight_global_scale).view(E, 1, 1))
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+        )
         down_sf = (
-            down_sf.float() * (1.0 / down_weight_global_scale).view(E, 1, 1)
-        ).to(torch.float8_e4m3fn).contiguous()
+            (down_sf.float() * (1.0 / down_weight_global_scale).view(E, 1, 1))
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+        )
 
         w13_weight = up_w.contiguous()
         w13_sf = up_sf
@@ -1272,9 +1444,13 @@ def load_expert_weights(
         w2_blockscale_swizzled = swizzle_block_scale(down_sf)
 
         w13_permuted = w13_weight.permute(1, 2, 0)
-        w13_scale = as_grouped_scale_view(w13_blockscale_swizzled.view(torch.uint8), I_tp, K)
+        w13_scale = as_grouped_scale_view(
+            w13_blockscale_swizzled.view(torch.uint8), I_tp, K
+        )
         down_permuted = w2_weight.permute(1, 2, 0)
-        down_scale = as_grouped_scale_view(w2_blockscale_swizzled.view(torch.uint8), K, I_tp)
+        down_scale = as_grouped_scale_view(
+            w2_blockscale_swizzled.view(torch.uint8), K, I_tp
+        )
 
         ones = torch.ones(E, dtype=torch.float32, device=device)
         w13_input_scale = torch.ones((), dtype=torch.float32, device=device)
@@ -1287,12 +1463,16 @@ def load_expert_weights(
         g1_alphas_per_expert = ones
     elif checkpoint_family in {"deepseek_v4_flash", "deepseek_v41_flash"}:
         uses_v41_checkpoint_layout = checkpoint_family == "deepseek_v41_flash"
-        family_label = "DeepSeek V4.1 Flash" if uses_v41_checkpoint_layout else "DeepSeek V4 Flash"
+        family_label = (
+            "DeepSeek V4.1 Flash" if uses_v41_checkpoint_layout else "DeepSeek V4 Flash"
+        )
         if uses_v41_checkpoint_layout:
             if cfg.get("model_type") != "deepseek_v41_text":
                 raise ValueError("V4.1 requires a V4.1 checkpoint")
             if not 0 <= layer_idx < cfg["num_hidden_layers"]:
-                raise ValueError("V4.1 Flash profile requires a target-model layer, not DSpark")
+                raise ValueError(
+                    "V4.1 Flash profile requires a target-model layer, not DSpark"
+                )
         if activation != "silu":
             raise ValueError(f"{family_label} FP4 benchmark expects silu experts")
         if spec.hidden_size % 32 != 0 or spec.I_tp % 32 != 0:
@@ -1316,7 +1496,9 @@ def load_expert_weights(
         down_proj = "w2"
         e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
         if e8m0_dtype is None:
-            raise RuntimeError(f"{family_label} FP4 scales require torch.float8_e8m0fnu")
+            raise RuntimeError(
+                f"{family_label} FP4 scales require torch.float8_e8m0fnu"
+            )
 
         gate_w = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
         up_w = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
@@ -1326,6 +1508,7 @@ def load_expert_weights(
         up_sf = torch.empty(E, I_tp, K // 32, dtype=e8m0_dtype, device=device)
         down_sf = torch.empty(E, K, I_tp // 32, dtype=e8m0_dtype, device=device)
         if uses_v41_checkpoint_layout:
+
             def shard(
                 tensor: torch.Tensor,
                 dimension: int,
@@ -1339,27 +1522,32 @@ def load_expert_weights(
                     packing=packing,
                 )
 
-
         print(f"  Loading {E} {family_label} FP4 experts...", end="", flush=True)
         for eid in range(E):
             ep = f"{prefix}.{eid}"
             if uses_v41_checkpoint_layout:
                 gate_w[eid] = shard(
-                    _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{gate_proj}.weight")),
+                    _fp4_checkpoint_bytes(
+                        loader.get_tensor(f"{ep}.{gate_proj}.weight")
+                    ),
                     0,
                 ).to(device)
                 gate_sf[eid] = shard(
-                    loader.get_tensor(f"{ep}.{gate_proj}.scale"), 0,
+                    loader.get_tensor(f"{ep}.{gate_proj}.scale"),
+                    0,
                 ).to(device)
                 up_w[eid] = shard(
                     _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{up_proj}.weight")),
                     0,
                 ).to(device)
                 up_sf[eid] = shard(
-                    loader.get_tensor(f"{ep}.{up_proj}.scale"), 0,
+                    loader.get_tensor(f"{ep}.{up_proj}.scale"),
+                    0,
                 ).to(device)
                 down_w[eid] = shard(
-                    _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{down_proj}.weight")),
+                    _fp4_checkpoint_bytes(
+                        loader.get_tensor(f"{ep}.{down_proj}.weight")
+                    ),
                     1,
                     packing=2,
                 ).to(device)
@@ -1373,24 +1561,36 @@ def load_expert_weights(
                 tp_off_packed = tp_off // 2
                 tp_sf_cols = I_tp // 32
                 tp_sf_off = tp_off // 32
-                gate_w[eid] = _fp4_checkpoint_bytes(
-                    loader.get_tensor(f"{ep}.{gate_proj}.weight")
-                ).narrow(0, tp_off, I_tp).to(device)
-                gate_sf[eid] = loader.get_tensor(
-                    f"{ep}.{gate_proj}.scale"
-                ).narrow(0, tp_off, I_tp).to(device)
-                up_w[eid] = _fp4_checkpoint_bytes(
-                    loader.get_tensor(f"{ep}.{up_proj}.weight")
-                ).narrow(0, tp_off, I_tp).to(device)
-                up_sf[eid] = loader.get_tensor(
-                    f"{ep}.{up_proj}.scale"
-                ).narrow(0, tp_off, I_tp).to(device)
-                down_w[eid] = _fp4_checkpoint_bytes(
-                    loader.get_tensor(f"{ep}.{down_proj}.weight")
-                ).narrow(1, tp_off_packed, I_tp // 2).to(device)
-                down_sf[eid] = loader.get_tensor(
-                    f"{ep}.{down_proj}.scale"
-                ).narrow(1, tp_sf_off, tp_sf_cols).to(device)
+                gate_w[eid] = (
+                    _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{gate_proj}.weight"))
+                    .narrow(0, tp_off, I_tp)
+                    .to(device)
+                )
+                gate_sf[eid] = (
+                    loader.get_tensor(f"{ep}.{gate_proj}.scale")
+                    .narrow(0, tp_off, I_tp)
+                    .to(device)
+                )
+                up_w[eid] = (
+                    _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{up_proj}.weight"))
+                    .narrow(0, tp_off, I_tp)
+                    .to(device)
+                )
+                up_sf[eid] = (
+                    loader.get_tensor(f"{ep}.{up_proj}.scale")
+                    .narrow(0, tp_off, I_tp)
+                    .to(device)
+                )
+                down_w[eid] = (
+                    _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{down_proj}.weight"))
+                    .narrow(1, tp_off_packed, I_tp // 2)
+                    .to(device)
+                )
+                down_sf[eid] = (
+                    loader.get_tensor(f"{ep}.{down_proj}.scale")
+                    .narrow(1, tp_sf_off, tp_sf_cols)
+                    .to(device)
+                )
         print(" done.")
 
         # Match vLLM FusedMoE loading for the B12X backend: native DeepSeek V4
@@ -1420,7 +1620,9 @@ def load_expert_weights(
         g1_alphas_per_expert = ones
 
         gate_prefix = f"layers.{layer_idx}.ffn.gate"
-        gate_weight = loader.get_tensor(f"{gate_prefix}.weight").to(device=device).contiguous()
+        gate_weight = (
+            loader.get_tensor(f"{gate_prefix}.weight").to(device=device).contiguous()
+        )
         bias_key = f"{gate_prefix}.bias"
         if bias_key in loader.weight_map:
             gate_bias = loader.get_tensor(bias_key).to(device=device).contiguous()
@@ -1436,7 +1638,9 @@ def load_expert_weights(
     g2_alphas_per_expert = (down_is * down_gs).to(torch.float32)
     w13_input_scale_quant = (1.0 / w13_input_scale).to(torch.float32)
     w2_input_scale_quant = (1.0 / w2_input_scale).to(torch.float32)
-    w13_input_scale_quant_per_expert = (1.0 / w13_input_scale_per_expert).to(torch.float32).contiguous()
+    w13_input_scale_quant_per_expert = (
+        (1.0 / w13_input_scale_per_expert).to(torch.float32).contiguous()
+    )
     w2_input_scale_quant_per_expert = (1.0 / down_is).to(torch.float32).contiguous()
 
     return ExpertWeights(
@@ -1475,7 +1679,6 @@ def load_expert_weights(
         oracle_w13_scale=oracle_w13_scale,
         oracle_w2_weight=oracle_w2_weight,
         oracle_w2_scale=oracle_w2_scale,
-
         w13_layout=w13_layout,
     )
 
@@ -1496,7 +1699,6 @@ def load_expert_weight_stack(
             layer_idx=layer_start + layer_offset,
             activation=activation,
             checkpoint_family=checkpoint_family,
-
         )
         for layer_offset in range(num_layers)
     ]
@@ -1604,13 +1806,15 @@ def compute_model_gate_routing(
         selection_scores = original_scores
         if weights.gate_bias is not None:
             selection_scores = selection_scores + weights.gate_bias.to(device=x.device)
-        _topk_scores, topk_ids = torch.topk(selection_scores, weights.spec.top_k, dim=-1)
+        _topk_scores, topk_ids = torch.topk(
+            selection_scores, weights.spec.top_k, dim=-1
+        )
 
     topk_weights = original_scores.gather(1, topk_ids)
     if score_func != "softmax" and weights.gate_norm_topk_prob:
-        topk_weights = topk_weights / topk_weights.sum(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-20)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+            1e-20
+        )
     topk_weights = topk_weights * weights.gate_route_scale
     return normalize_kernel_routing(topk_ids, topk_weights)
 
@@ -1655,13 +1859,21 @@ def make_benchmark_case(
         from b12x.moe.fused_moe.workloads import make_routing_ids
 
         topk_ids = make_routing_ids(
-            m, spec.top_k, spec.num_experts,
-            workload=routing_workload, seed=seed + 1, device=device,
+            m,
+            spec.top_k,
+            spec.num_experts,
+            workload=routing_workload,
+            seed=seed + 1,
+            device=device,
         )
-        topk_weights = torch.softmax(
-            torch.arange(spec.top_k, dtype=torch.float32, device=device) * .125,
-            dim=-1,
-        ).expand(m, -1).contiguous()
+        topk_weights = (
+            torch.softmax(
+                torch.arange(spec.top_k, dtype=torch.float32, device=device) * 0.125,
+                dim=-1,
+            )
+            .expand(m, -1)
+            .contiguous()
+        )
         topk_weights.mul_(getattr(weights, "gate_route_scale", 1.0))
         return x, topk_ids, topk_weights, None
     if profile.default_routing == "model":
@@ -1710,9 +1922,7 @@ def repeat_routing_pattern(
         raise ValueError(f"topk tensors must be rank 2, got rank {topk_ids.dim()}")
     tokens = int(topk_ids.shape[0])
     if period > tokens:
-        raise ValueError(
-            f"routing repeat period {period} exceeds token count {tokens}"
-        )
+        raise ValueError(f"routing repeat period {period} exceeds token count {tokens}")
     repeats = (tokens + period - 1) // period
     return (
         topk_ids[:period].repeat((repeats, 1))[:tokens].contiguous(),
@@ -1754,7 +1964,7 @@ def _make_structured_routing_ids(
         if cursor + top_k > pool_size:
             pool = pool[torch.randperm(pool_size, generator=generator)]
             cursor = 0
-        ids[token_idx] = pool[cursor:cursor + top_k]
+        ids[token_idx] = pool[cursor : cursor + top_k]
         cursor += top_k
     return ids
 
@@ -1779,13 +1989,17 @@ def make_multilayer_routing_case(
         ).to(device=device, dtype=torch.int32)
         weight_generator = torch.Generator(device="cpu")
         weight_generator.manual_seed(seed + layer_idx * 1009 + 7)
-        topk_logits = torch.randn(m, spec.top_k, generator=weight_generator, dtype=torch.float32)
+        topk_logits = torch.randn(
+            m, spec.top_k, generator=weight_generator, dtype=torch.float32
+        )
         topk_weights = torch.softmax(topk_logits, dim=-1).to(device=device)
         routing_case.append((topk_ids, topk_weights))
     return routing_case
 
 
-def get_scale_contract_params(weights: ExpertWeights, scale_contract: str) -> ScaleContractParams:
+def get_scale_contract_params(
+    weights: ExpertWeights, scale_contract: str
+) -> ScaleContractParams:
     if scale_contract == "per-expert":
         return ScaleContractParams(
             a1_gscale=weights.w13_input_scale_quant_per_expert,
@@ -1821,8 +2035,12 @@ def get_quant_mode_params(
         return ScaleContractParams(
             a1_gscale=params.a1_gscale,
             a2_gscale=params.a2_gscale,
-            g1_alphas=(params.g1_alphas * params.a1_gscale).to(torch.float32).contiguous(),
-            g2_alphas=(params.g2_alphas * params.a2_gscale).to(torch.float32).contiguous(),
+            g1_alphas=(params.g1_alphas * params.a1_gscale)
+            .to(torch.float32)
+            .contiguous(),
+            g2_alphas=(params.g2_alphas * params.a2_gscale)
+            .to(torch.float32)
+            .contiguous(),
         )
     raise ValueError(f"Unsupported quant mode: {quant_mode}")
 
@@ -1832,8 +2050,13 @@ def get_w4a16_prepare_scales(
     params: ScaleContractParams,
 ) -> tuple[torch.Tensor, torch.Tensor, str]:
     if weights.source_format == "compressed_tensors":
-        if weights.w4a16_w13_global_scale is None or weights.w4a16_w2_global_scale is None:
-            raise ValueError("compressed_tensors W4A16 weights require raw global scales")
+        if (
+            weights.w4a16_w13_global_scale is None
+            or weights.w4a16_w2_global_scale is None
+        ):
+            raise ValueError(
+                "compressed_tensors W4A16 weights require raw global scales"
+            )
         return (
             weights.w4a16_w13_global_scale,
             weights.w4a16_w2_global_scale,
@@ -1864,7 +2087,8 @@ def plan_b12x_benchmark_weights(
         raise ValueError(f"unsupported benchmark quant mode {quant_mode!r}") from exc
     return fused_moe.plan_weights(
         source=fused_moe.PackedSource(
-            format=weights.source_format, w13_layout=weights.w13_layout,
+            format=weights.source_format,
+            w13_layout=weights.w13_layout,
         ),
         geometry=fused_moe.MoEGeometry(
             num_experts=weights.spec.num_experts,
@@ -1885,6 +2109,7 @@ def plan_b12x_benchmark_weights(
             ),
         ),
     )
+
 
 def prepare_b12x_benchmark_weights(
     weights: ExpertWeights,
@@ -1965,8 +2190,6 @@ def get_w4a16_oracle_params(
     )
 
 
-
-
 def _dequant_mxfp4_expert(
     packed: torch.Tensor,
     scales: torch.Tensor,
@@ -1997,12 +2220,12 @@ def _dequant_mxfp4_expert(
     lo = fp4_lut[(packed_u8 & 0x0F).to(torch.int64)]
     hi = fp4_lut[((packed_u8 >> 4) & 0x0F).to(torch.int64)]
     raw = torch.stack((lo, hi), dim=-1).reshape(rows, cols)
-    block_scales = torch.exp2(
-        scale_bytes[:, : cols // 32].to(torch.float32) - 127.0
-    )
+    block_scales = torch.exp2(scale_bytes[:, : cols // 32].to(torch.float32) - 127.0)
     return (
-        raw.view(rows, cols // 32, 32) * block_scales.unsqueeze(-1)
-    ).reshape(rows, cols).to(torch.bfloat16)
+        (raw.view(rows, cols // 32, 32) * block_scales.unsqueeze(-1))
+        .reshape(rows, cols)
+        .to(torch.bfloat16)
+    )
 
 
 def _dequant_nvfp4_expert(
@@ -2034,14 +2257,12 @@ def _dequant_nvfp4_expert(
         rows,
         cols // 16,
     )
-    logical = (
-        raw.view(rows, cols // 16, 16) * block_scales.unsqueeze(-1)
-    ).reshape(rows, cols)
+    logical = (raw.view(rows, cols // 16, 16) * block_scales.unsqueeze(-1)).reshape(
+        rows, cols
+    )
     return (logical * torch.as_tensor(global_scale, device=packed.device)).to(
         torch.bfloat16
     )
-
-
 
 
 def force_convert_nvfp4_weights_to_mxfp4(
@@ -2153,14 +2374,7 @@ def force_convert_nvfp4_weights_to_mxfp4(
         oracle_w13_scale=None,
         oracle_w2_weight=None,
         oracle_w2_scale=None,
-
     )
-
-
-
-
-
-
 
 
 def make_oracle_reference(
@@ -2185,11 +2399,19 @@ def make_oracle_reference(
 
         if quant_mode != "w4a16" or oracle_mode != "w4a16":
             raise ValueError("IQ2_XS requires the independent W4A16 block oracle")
-        if activation_params.swiglu_alpha is not None or activation_params.swiglu_beta is not None:
+        if (
+            activation_params.swiglu_alpha is not None
+            or activation_params.swiglu_beta is not None
+        ):
             raise ValueError("IQ2_XS oracle supports SiLU without alpha/beta overrides")
         return moe_reference_iq2_xs(
-            x, weights.w13_weight, weights.w2_weight, topk_ids, topk_weights,
-            activation=activation, w13_layout=weights.w13_layout,
+            x,
+            weights.w13_weight,
+            weights.w2_weight,
+            topk_ids,
+            topk_weights,
+            activation=activation,
+            w13_layout=weights.w13_layout,
             swiglu_limit=activation_params.swiglu_limit,
         )
     if quant_mode == "w4a16":
@@ -2296,12 +2518,8 @@ def make_oracle_reference(
                     for eid in range(spec.num_experts)
                 ]
             )
-            w13_mx, w13_residual = decompose_nvfp4_scales_to_mx_residual(
-                w13_scales
-            )
-            w2_mx, w2_residual = decompose_nvfp4_scales_to_mx_residual(
-                w2_scales
-            )
+            w13_mx, w13_residual = decompose_nvfp4_scales_to_mx_residual(w13_scales)
+            w2_mx, w2_residual = decompose_nvfp4_scales_to_mx_residual(w2_scales)
             alpha1 = params.g1_alphas * params.a1_gscale
             alpha2 = params.g2_alphas * params.a2_gscale
         return moe_reference_w4a8_mx(
@@ -2446,11 +2664,12 @@ def check_oracle_metrics(
         "mean_abs": metrics.mean_abs,
         "cos": metrics.cos,
     }
-    nonfinite = [name for name, value in metric_values.items() if not math.isfinite(value)]
+    nonfinite = [
+        name for name, value in metric_values.items() if not math.isfinite(value)
+    ]
     if nonfinite:
         failures.append(
-            f"  bs={batch_size} {label}: non-finite metrics "
-            f"{', '.join(nonfinite)}"
+            f"  bs={batch_size} {label}: non-finite metrics {', '.join(nonfinite)}"
         )
         return failures
     if oracle_mode in {"w4a16"}:
@@ -2460,16 +2679,20 @@ def check_oracle_metrics(
     else:
         tol = ORACLE_TOLERANCES[activation]
     if tol["max_abs"] is not None and metrics.max_abs > tol["max_abs"]:
-        failures.append(f"  bs={batch_size} {label}: max_abs={metrics.max_abs:.5f} > {tol['max_abs']}")
+        failures.append(
+            f"  bs={batch_size} {label}: max_abs={metrics.max_abs:.5f} > {tol['max_abs']}"
+        )
     if tol["rmse"] is not None and metrics.rmse > tol["rmse"]:
-        failures.append(f"  bs={batch_size} {label}: rmse={metrics.rmse:.5f} > {tol['rmse']}")
+        failures.append(
+            f"  bs={batch_size} {label}: rmse={metrics.rmse:.5f} > {tol['rmse']}"
+        )
     if tol["mean_abs"] is not None and metrics.mean_abs > tol["mean_abs"]:
-        failures.append(f"  bs={batch_size} {label}: mean_abs={metrics.mean_abs:.5f} > {tol['mean_abs']}")
+        failures.append(
+            f"  bs={batch_size} {label}: mean_abs={metrics.mean_abs:.5f} > {tol['mean_abs']}"
+        )
     cos_min = tol["cos_min"] if min_cosine is None else float(min_cosine)
     if metrics.cos < cos_min:
-        failures.append(
-            f"  bs={batch_size} {label}: cos={metrics.cos:.6f} < {cos_min}"
-        )
+        failures.append(f"  bs={batch_size} {label}: cos={metrics.cos:.6f} < {cos_min}")
     return failures
 
 
@@ -2482,8 +2705,6 @@ def _clear_b12x_caches() -> None:
     except ImportError:
         return
     clear_w4a16_kernel_cache()
-
-
 
 
 GRAPH_REPLAY_TOLERANCES = {
@@ -2503,7 +2724,10 @@ def bench_repeated(
     l2_flush: Callable[[], None] | None = None,
 ) -> TimingStats:
     return summarize_timing_runs(
-        [bench_events(fn, warmup=warmup, iters=iters, l2_flush=l2_flush) for _ in range(repeats)]
+        [
+            bench_events(fn, warmup=warmup, iters=iters, l2_flush=l2_flush)
+            for _ in range(repeats)
+        ]
     )
 
 
@@ -2569,25 +2793,29 @@ def prepare_moe_execution(
         )
         for m in getattr(declaration, "token_counts", (capacity.max_tokens,))
     }
+
     def race_call(state, *, tokens):
         call = calls[tokens](state)
         source = inputs[tokens][0].clone()
         return replace(
-            call, produce=lambda: inputs[tokens][0].copy_(source),
+            call,
+            produce=lambda: inputs[tokens][0].copy_(source),
             owners=(*call.owners, source),
         )
 
     benchmark_calls = {
         m: (lambda state, m=m: race_call(state, tokens=m)) for m in calls
     }
-    session.prepare((
-        request_for_capacity(
-            declaration,
-            name=name,
-            calls=calls,
-            benchmark_calls=benchmark_calls,
-        ),
-    ))
+    session.prepare(
+        (
+            request_for_capacity(
+                declaration,
+                name=name,
+                calls=calls,
+                benchmark_calls=benchmark_calls,
+            ),
+        )
+    )
     execution = declaration
     selection = execution.selection
     if selection is None:
@@ -2638,7 +2866,9 @@ def run_moe_layer_chain(
     output_buffers: Sequence[torch.Tensor] | None = None,
 ) -> list[torch.Tensor]:
     if not (
-        len(executions) == len(experts_stack) == len(topk_ids_per_layer)
+        len(executions)
+        == len(experts_stack)
+        == len(topk_ids_per_layer)
         == len(topk_weights_per_layer)
     ):
         raise ValueError("layer-chain inputs must all have the same length")
@@ -2648,7 +2878,13 @@ def run_moe_layer_chain(
     layer_outputs: list[torch.Tensor] = []
     current = x
     for layer_idx, (execution, experts, topk_ids, topk_weights) in enumerate(
-        zip(executions, experts_stack, topk_ids_per_layer, topk_weights_per_layer, strict=True)
+        zip(
+            executions,
+            experts_stack,
+            topk_ids_per_layer,
+            topk_weights_per_layer,
+            strict=True,
+        )
     ):
         output = None if output_buffers is None else output_buffers[layer_idx]
         if output is None:
@@ -2717,7 +2953,9 @@ def bench_multilayer_graph_mode(
     activation_params = args.activation_params
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     if graph_num_layers < 2:
-        raise ValueError("--graph-num-layers must be at least 2 in multi-layer graph mode")
+        raise ValueError(
+            "--graph-num-layers must be at least 2 in multi-layer graph mode"
+        )
 
     layer_start = args.graph_layer_start
     if profile.shape is None:
@@ -2750,7 +2988,6 @@ def bench_multilayer_graph_mode(
         num_layers=graph_num_layers,
         activation=args.activation,
         checkpoint_family=profile.checkpoint_family,
-
     )
     experts_stack: list[object] = []
     for weights in weights_stack:
@@ -2805,7 +3042,13 @@ def bench_multilayer_graph_mode(
                 name=f"layer-chain-{batch_size}-{layer_idx}",
                 experts=experts,
                 top_k=spec.top_k,
-                inputs={batch_size: (x_buf, topk_ids_bufs[layer_idx], topk_weights_bufs[layer_idx])},
+                inputs={
+                    batch_size: (
+                        x_buf,
+                        topk_ids_bufs[layer_idx],
+                        topk_weights_bufs[layer_idx],
+                    )
+                },
                 outputs={batch_size: graph_output_bufs[layer_idx]},
             )
             for layer_idx, experts in enumerate(experts_stack)
@@ -2868,15 +3111,23 @@ def bench_multilayer_graph_mode(
             torch.cuda.synchronize()
             eager_outputs = [buf.clone() for buf in eager_output_bufs]
 
-            final_metrics = compare_graph_replay_outputs(graph_outputs[-1], eager_outputs[-1])
+            final_metrics = compare_graph_replay_outputs(
+                graph_outputs[-1], eager_outputs[-1]
+            )
             layer_metrics = [
                 compare_graph_replay_outputs(graph_out, eager_out)
-                for graph_out, eager_out in zip(graph_outputs, eager_outputs, strict=True)
+                for graph_out, eager_out in zip(
+                    graph_outputs, eager_outputs, strict=True
+                )
             ]
             graph_stats = bench_repeated(
                 lambda: run_moe_layer_chain(
-                    layer_executions, experts_stack, x_buf, topk_ids_bufs,
-                    topk_weights_bufs, output_buffers=graph_output_bufs,
+                    layer_executions,
+                    experts_stack,
+                    x_buf,
+                    topk_ids_bufs,
+                    topk_weights_bufs,
+                    output_buffers=graph_output_bufs,
                 ),
                 warmup=args.warmup,
                 iters=args.iters,
@@ -2940,19 +3191,30 @@ def bench_e2e() -> None:
 
     quant_mode_default = default_moe_quant_mode()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", type=int, default=None, help="Assigned CUDA ordinal within the existing visibility mask")
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=None,
+        help="Assigned CUDA ordinal within the existing visibility mask",
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument(
-        "--timing-backend", choices=("stream-gated",), default="stream-gated",
+        "--timing-backend",
+        choices=("stream-gated",),
+        default="stream-gated",
         help="CUPTI sums GPU kernel durations; events include graph gaps.",
     )
     parser.add_argument("--output-json", type=pathlib.Path, default=None)
     parser.add_argument(
-        "--autotune", action=argparse.BooleanOptionalAction, default=True,
+        "--autotune",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     parser.add_argument(
-        "--moe-config", type=json.loads, default=None,
+        "--moe-config",
+        type=json.loads,
+        default=None,
         help="JSON MoeDecodeConfig override for controlled single-op experiments.",
     )
     parser.add_argument(
@@ -2961,15 +3223,20 @@ def bench_e2e() -> None:
         default=5,
         help="Repeat the timed measurement this many times per batch size and aggregate the results.",
     )
-    parser.add_argument("--batch-size-profile", choices=sorted(BATCH_SIZE_PROFILES), default="micro")
+    parser.add_argument(
+        "--batch-size-profile", choices=sorted(BATCH_SIZE_PROFILES), default="micro"
+    )
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=None)
     parser.add_argument("--raw-samples-jsonl", type=pathlib.Path)
     parser.add_argument(
-        "--torch-trace-dir", type=pathlib.Path,
+        "--torch-trace-dir",
+        type=pathlib.Path,
         help="Save one untimed graph replay per case for launch/resource comparison.",
     )
     parser.add_argument(
-        "--routing-workload", choices=("default", *ROUTING_WORKLOADS), default="default",
+        "--routing-workload",
+        choices=("default", *ROUTING_WORKLOADS),
+        default="default",
         help="shared_N reuses about N%% of token/expert assignments across the batch.",
     )
     parser.add_argument(
@@ -2982,23 +3249,37 @@ def bench_e2e() -> None:
             "0 keeps the generated routing unchanged."
         ),
     )
-    parser.add_argument("--model-profile", choices=sorted(MODEL_PROFILES), default="qwen397b")
+    parser.add_argument(
+        "--model-profile", choices=sorted(MODEL_PROFILES), default="qwen397b"
+    )
     parser.add_argument(
         "--top-k",
         type=int,
         default=None,
         help="Override top-k for a synthetic shape-only model profile.",
     )
-    parser.add_argument("--tp-size", type=int, default=None, help="Override TP size from model profile")
-    parser.add_argument("--tp-rank", type=int, default=0, help="Rank slice to benchmark (default: 0)")
     parser.add_argument(
-        "--intermediate-size", type=int, default=None,
+        "--tp-size", type=int, default=None, help="Override TP size from model profile"
+    )
+    parser.add_argument(
+        "--tp-rank", type=int, default=0, help="Rank slice to benchmark (default: 0)"
+    )
+    parser.add_argument(
+        "--intermediate-size",
+        type=int,
+        default=None,
         help="Override the global expert width of a shape-only profile (before TP).",
     )
-    parser.add_argument("--tp-parallel", action="store_true", help="Load all TP rank slices and replay per-rank CUDA graphs in parallel streams")
+    parser.add_argument(
+        "--tp-parallel",
+        action="store_true",
+        help="Load all TP rank slices and replay per-rank CUDA graphs in parallel streams",
+    )
     parser.add_argument("--model-path", type=pathlib.Path, default=None)
     parser.add_argument("--layer-idx", type=int, default=None)
-    parser.add_argument("--activation", choices=BENCHMARK_ACTIVATION_CHOICES, default=None)
+    parser.add_argument(
+        "--activation", choices=BENCHMARK_ACTIVATION_CHOICES, default=None
+    )
     parser.add_argument(
         "--swiglu-limit",
         type=float,
@@ -3037,10 +3318,14 @@ def bench_e2e() -> None:
             "MXFP4 E8M0/K32 before preparing --quant-mode w4a8_mx."
         ),
     )
-    parser.add_argument("--graph-mode", choices=["single-op", "multi-layer"], default="single-op")
+    parser.add_argument(
+        "--graph-mode", choices=["single-op", "multi-layer"], default="single-op"
+    )
     parser.add_argument("--graph-num-layers", type=int, default=4)
     parser.add_argument("--graph-layer-start", type=int, default=0)
-    parser.add_argument("--scale-contract", choices=["shared", "per-expert"], default=None)
+    parser.add_argument(
+        "--scale-contract", choices=["shared", "per-expert"], default=None
+    )
     parser.add_argument(
         "--w4a16-native",
         action="store_true",
@@ -3055,8 +3340,7 @@ def bench_e2e() -> None:
         choices=["auto", "direct", "packed"],
         default="auto",
         help=(
-            "Override direct TC-decode versus expert-packed routing for planner "
-            "sweeps."
+            "Override direct TC-decode versus expert-packed routing for planner sweeps."
         ),
     )
     parser.add_argument(
@@ -3119,7 +3403,8 @@ def bench_e2e() -> None:
         default="none",
     )
     parser.add_argument(
-        "--profile-graphs", action="store_true",
+        "--profile-graphs",
+        action="store_true",
         help="Expose one cold-L2 CUDA graph replay per case to CUDA profiling.",
     )
     parser.add_argument(
@@ -3141,20 +3426,31 @@ def bench_e2e() -> None:
     )
     args = parser.parse_args()
 
-    if args.torch_trace_dir is not None and (not args.graph_only or not args.cuda_graph or args.graph_mode != "single-op" or args.tp_parallel):
+    if args.torch_trace_dir is not None and (
+        not args.graph_only
+        or not args.cuda_graph
+        or args.graph_mode != "single-op"
+        or args.tp_parallel
+    ):
         parser.error("--torch-trace-dir requires single-op, single-rank --graph-only")
     if args.profile_graphs and (
-        not args.graph_only or not args.cuda_graph or args.graph_mode != "single-op"
-        or args.profile_once != "none" or not args.flush_l2
+        not args.graph_only
+        or not args.cuda_graph
+        or args.graph_mode != "single-op"
+        or args.profile_once != "none"
+        or not args.flush_l2
     ):
-        parser.error("--profile-graphs requires cold-L2 single-op --graph-only execution")
+        parser.error(
+            "--profile-graphs requires cold-L2 single-op --graph-only execution"
+        )
     if (args.moe_config is not None or args.output_json is not None) and (
         args.graph_mode != "single-op" or args.tp_parallel
     ):
         parser.error("--moe-config/--output-json require single-op and one rank")
     config_override = (
         fused_moe.MoeDecodeConfig(**args.moe_config)
-        if args.moe_config is not None else None
+        if args.moe_config is not None
+        else None
     )
     model_profile = MODEL_PROFILES[args.model_profile]
     if args.activation is None:
@@ -3166,9 +3462,21 @@ def bench_e2e() -> None:
         args.scale_contract = model_profile.default_scale_contract
     use_w4a16 = args.quant_mode == "w4a16"
     use_w4a8 = args.quant_mode in {"w4a8_mx", "w4a8_nvfp4"}
-    swiglu_limit = args.swiglu_limit if args.swiglu_limit is not None else model_profile.default_swiglu_limit
-    swiglu_alpha = args.swiglu_alpha if args.swiglu_alpha is not None else model_profile.default_swiglu_alpha
-    swiglu_beta = args.swiglu_beta if args.swiglu_beta is not None else model_profile.default_swiglu_beta
+    swiglu_limit = (
+        args.swiglu_limit
+        if args.swiglu_limit is not None
+        else model_profile.default_swiglu_limit
+    )
+    swiglu_alpha = (
+        args.swiglu_alpha
+        if args.swiglu_alpha is not None
+        else model_profile.default_swiglu_alpha
+    )
+    swiglu_beta = (
+        args.swiglu_beta
+        if args.swiglu_beta is not None
+        else model_profile.default_swiglu_beta
+    )
     activation_params = ActivationParams(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
@@ -3189,11 +3497,15 @@ def bench_e2e() -> None:
         else BATCH_SIZE_PROFILES[args.batch_size_profile]
     )
     model_path = resolve_model_path(model_profile, args.model_path)
-    layer_idx = model_profile.default_layer_idx if args.layer_idx is None else args.layer_idx
+    layer_idx = (
+        model_profile.default_layer_idx if args.layer_idx is None else args.layer_idx
+    )
 
     if model_profile.checkpoint_family in {"qwen_iq2_xs", "puzzle3_iq2_xs"}:
         if args.quant_mode != "w4a16" or args.oracle_mode != "w4a16":
-            raise ValueError("IQ2_XS requires W4A16 with its block oracle and no FP4 external reference")
+            raise ValueError(
+                "IQ2_XS requires W4A16 with its block oracle and no FP4 external reference"
+            )
         if args.w4a16_native or args.force_mxfp4:
             raise ValueError("IQ2_XS uses compact descriptor preparation")
 
@@ -3218,7 +3530,9 @@ def bench_e2e() -> None:
     if args.graph_only and not args.cuda_graph:
         raise ValueError("--graph-only requires --cuda-graph")
     if args.routing_workload != "default" and (
-        args.include_routing or args.routing_repeat_period or args.tp_parallel
+        args.include_routing
+        or args.routing_repeat_period
+        or args.tp_parallel
         or args.graph_mode != "single-op"
     ):
         raise ValueError(
@@ -3240,10 +3554,7 @@ def bench_e2e() -> None:
     require_sm120()
     torch.empty(1, device="cuda")
     device = torch.device("cuda", torch.cuda.current_device())
-    if (
-        args.w4a16_route_policy != "auto"
-        or args.w4a16_tile_config is not None
-    ):
+    if args.w4a16_route_policy != "auto" or args.w4a16_tile_config is not None:
         from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
 
         if args.w4a16_route_policy != "auto":
@@ -3267,7 +3578,11 @@ def bench_e2e() -> None:
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
 
     spec = build_model_spec(
-        model_path, model_profile, tp_size_override=args.tp_size, tp_rank=args.tp_rank, layer_idx=layer_idx,
+        model_path,
+        model_profile,
+        tp_size_override=args.tp_size,
+        tp_rank=args.tp_rank,
+        layer_idx=layer_idx,
     )
     if args.intermediate_size is not None:
         if model_profile.shape is None:
@@ -3284,7 +3599,9 @@ def bench_e2e() -> None:
             )
         spec = replace(spec, top_k=args.top_k)
 
-    benchmark_scope = "Routing + MoE kernel" if args.include_routing else "Pre-routed MoE kernel only"
+    benchmark_scope = (
+        "Routing + MoE kernel" if args.include_routing else "Pre-routed MoE kernel only"
+    )
     print(f"MoE benchmark ({benchmark_scope})")
     print(
         f"{model_profile.label}  TP={spec.tp_size}, K={spec.hidden_size}, I_tp={spec.I_tp}, "
@@ -3304,7 +3621,8 @@ def bench_e2e() -> None:
     print(f"Quant mode: {args.quant_mode}")
     routing_source = (
         model_profile.default_routing
-        if args.routing_workload == "default" else "synthetic"
+        if args.routing_workload == "default"
+        else "synthetic"
     )
     print(f"Routing source: {routing_source}")
     print(f"Routing workload: {args.routing_workload}")
@@ -3350,7 +3668,9 @@ def bench_e2e() -> None:
     if args.graph_mode == "multi-layer":
         if args.raw_samples_jsonl is not None:
             raise ValueError("raw sample evidence currently requires single-op graphs")
-        bench_multilayer_graph_mode(args, model_path, model_profile, spec, batch_sizes, device)
+        bench_multilayer_graph_mode(
+            args, model_path, model_profile, spec, batch_sizes, device
+        )
         return
 
     weights = load_expert_weights(
@@ -3359,7 +3679,6 @@ def bench_e2e() -> None:
         layer_idx=layer_idx,
         activation=args.activation,
         checkpoint_family=model_profile.checkpoint_family,
-
     )
     if args.raw_samples_jsonl is not None:
         from b12x._lib.compiler import b12x_package_fingerprint
@@ -3369,19 +3688,38 @@ def bench_e2e() -> None:
         if weights.source_format in IQ2_CODECS:
             payload_hashes = {
                 name: hashlib.sha256(memoryview(tensor.numpy())).hexdigest()
-                for name, tensor in (("w13", weights.w13_weight), ("w2", weights.w2_weight))
+                for name, tensor in (
+                    ("w13", weights.w13_weight),
+                    ("w2", weights.w2_weight),
+                )
             }
         with args.raw_samples_jsonl.open("x") as handle:
-            handle.write(json.dumps(dict(
-                kind="manifest", command=sys.argv, model=str(model_path), layer=layer_idx,
-                spec=vars(spec), options=vars(args), torch=torch.__version__,
-                source_fingerprint=b12x_package_fingerprint(), payload_sha256=payload_hashes,
-                benchmark_sha256=hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),
-                device=nvidia_smi_gpu_mode_snapshot(),
-                metric="cold-L2 graph replay microseconds; lower is better",
-            ), default=str) + "\n")
+            handle.write(
+                json.dumps(
+                    dict(
+                        kind="manifest",
+                        command=sys.argv,
+                        model=str(model_path),
+                        layer=layer_idx,
+                        spec=vars(spec),
+                        options=vars(args),
+                        torch=torch.__version__,
+                        source_fingerprint=b12x_package_fingerprint(),
+                        payload_sha256=payload_hashes,
+                        benchmark_sha256=hashlib.sha256(
+                            pathlib.Path(__file__).read_bytes()
+                        ).hexdigest(),
+                        device=nvidia_smi_gpu_mode_snapshot(),
+                        metric="cold-L2 graph replay microseconds; lower is better",
+                    ),
+                    default=str,
+                )
+                + "\n"
+            )
     if args.force_mxfp4:
-        source_params = get_quant_mode_params(weights, args.scale_contract, "w4a8_nvfp4")
+        source_params = get_quant_mode_params(
+            weights, args.scale_contract, "w4a8_nvfp4"
+        )
         weights = force_convert_nvfp4_weights_to_mxfp4(
             weights,
             source_params,
@@ -3399,8 +3737,7 @@ def bench_e2e() -> None:
     precomputed_oracles: dict[int, torch.Tensor] = {}
     if args.validate == "oracle":
         print(
-            "  Precomputing oracle outputs before destructive weight "
-            "preparation...",
+            "  Precomputing oracle outputs before destructive weight preparation...",
             end="",
             flush=True,
         )
@@ -3456,7 +3793,12 @@ def bench_e2e() -> None:
     b12x_session = PreparationSession(device=device, autotune=args.autotune)
     print("  Preparing b12x declarations...", end="", flush=True)
     x_warm, topk_ids_w, topk_weights_w = make_profile_routed_inputs(
-        model_profile, weights, spec, 1, 42, device,
+        model_profile,
+        weights,
+        spec,
+        1,
+        42,
+        device,
     )
     warmup_output = torch.empty_like(x_warm)
     warmup_execution = prepare_moe_execution(
@@ -3486,10 +3828,19 @@ def bench_e2e() -> None:
     if args.tp_parallel and spec.tp_size > 1:
         print("  Loading TP-parallel ranks...", end="", flush=True)
         for r in range(spec.tp_size):
-            rspec = build_model_spec(model_path, model_profile, tp_size_override=args.tp_size, tp_rank=r, layer_idx=layer_idx)
+            rspec = build_model_spec(
+                model_path,
+                model_profile,
+                tp_size_override=args.tp_size,
+                tp_rank=r,
+                layer_idx=layer_idx,
+            )
             rw = load_expert_weights(
-                model_path, rspec, layer_idx=layer_idx,
-                activation=args.activation, checkpoint_family=model_profile.checkpoint_family,
+                model_path,
+                rspec,
+                layer_idx=layer_idx,
+                activation=args.activation,
+                checkpoint_family=model_profile.checkpoint_family,
             )
             rp = get_quant_mode_params(rw, args.scale_contract, args.quant_mode)
             rexperts, _ = prepare_b12x_benchmark_weights(
@@ -3500,7 +3851,9 @@ def bench_e2e() -> None:
                 activation_params=activation_params,
             )
             x_r = torch.randn(1, rspec.hidden_size, dtype=torch.bfloat16, device=device)
-            rk_warm = torch.randn(1, rspec.num_experts, dtype=torch.float32, device=device)
+            rk_warm = torch.randn(
+                1, rspec.num_experts, dtype=torch.float32, device=device
+            )
             rk_logits, rk_ids = torch.topk(rk_warm, rspec.top_k, dim=-1)
             rk_weights = torch.softmax(rk_logits, dim=-1)
             rk_ids, rk_weights = normalize_kernel_routing(rk_ids, rk_weights)
@@ -3514,8 +3867,12 @@ def bench_e2e() -> None:
                 outputs={1: output_r},
             )
             binding_r = bind_prepared_moe(
-                execution_r, a=x_r, experts=rexperts, topk_ids=rk_ids,
-                topk_weights=rk_weights, output=output_r,
+                execution_r,
+                a=x_r,
+                experts=rexperts,
+                topk_ids=rk_ids,
+                topk_weights=rk_weights,
+                output=output_r,
             )
             fused_moe.run(binding=binding_r)
             tp_parallel_ranks.append((rspec, rexperts, execution_r))
@@ -3527,7 +3884,9 @@ def bench_e2e() -> None:
     evidence: list[dict] = []
     for batch_size in batch_sizes:
         print(f"\n{'=' * 70}")
-        print(f"  batch_size={batch_size}  (tokens*top_k = {batch_size * spec.top_k} expert calls)")
+        print(
+            f"  batch_size={batch_size}  (tokens*top_k = {batch_size * spec.top_k} expert calls)"
+        )
         print(f"{'=' * 70}")
 
         x, topk_ids, topk_weights, routing_logits = make_benchmark_case(
@@ -3547,8 +3906,12 @@ def bench_e2e() -> None:
         local_routes = topk_ids >= 0
         active_experts = int(torch.unique(topk_ids[local_routes]).numel())
         packed_expert_bytes = (
-            sum(t[0].numel() * t.element_size() for t in (weights.w13_weight, weights.w2_weight))
-            if weights.source_format in IQ2_CODECS else None
+            sum(
+                t[0].numel() * t.element_size()
+                for t in (weights.w13_weight, weights.w2_weight)
+            )
+            if weights.source_format in IQ2_CODECS
+            else None
         )
         active_density = int(local_routes.sum().item()) / max(active_experts, 1)
         print(
@@ -3571,7 +3934,9 @@ def bench_e2e() -> None:
                     timed_topk_ids, timed_topk_weights
                 )
             return repeat_routing_pattern(
-                timed_topk_ids, timed_topk_weights, args.routing_repeat_period,
+                timed_topk_ids,
+                timed_topk_weights,
+                args.routing_repeat_period,
             )
 
         backend_output = torch.empty_like(x)
@@ -3596,7 +3961,8 @@ def bench_e2e() -> None:
 
         def make_backend_e2e() -> Callable[[], torch.Tensor]:
             def impl_launch(
-                topk_ids_local: torch.Tensor, topk_weights_local: torch.Tensor,
+                topk_ids_local: torch.Tensor,
+                topk_weights_local: torch.Tensor,
             ) -> torch.Tensor:
                 if topk_ids_local is not backend_binding.topk_ids:
                     backend_binding.topk_ids.copy_(topk_ids_local)
@@ -3623,7 +3989,6 @@ def bench_e2e() -> None:
                 f"max={oracle_ref.float().abs().max().item():.5f}",
             )
 
-
         backend_out = backend_e2e().clone()
         torch.cuda.synchronize()
         if not torch.isfinite(backend_out).all() or (
@@ -3632,13 +3997,16 @@ def bench_e2e() -> None:
             raise RuntimeError(f"M={batch_size}: nonfinite or all-zero MoE output")
         backend_metrics = None
 
-
         if oracle_ref is not None:
             backend_metrics = compare_to_reference(backend_out, oracle_ref)
-            print(f"  {format_oracle_metrics(f'{backend_label} vs oracle', backend_metrics)}")
+            print(
+                f"  {format_oracle_metrics(f'{backend_label} vs oracle', backend_metrics)}"
+            )
             accuracy_failures.extend(
                 check_oracle_metrics(
-                    f"{backend_label} vs oracle", backend_metrics, batch_size,
+                    f"{backend_label} vs oracle",
+                    backend_metrics,
+                    batch_size,
                     activation=args.activation,
                     oracle_mode=args.oracle_mode,
                     min_cosine=args.min_cosine,
@@ -3646,21 +4014,38 @@ def bench_e2e() -> None:
             )
             if weights.source_format in IQ2_CODECS:
                 reference_norm = oracle_ref.float().norm().item()
-                relative_l2 = (backend_out.float() - oracle_ref.float()).norm().item() / max(reference_norm, 1e-30)
-                if not torch.isfinite(backend_out).all() or not torch.count_nonzero(backend_out) or reference_norm == 0 or backend_metrics.cos < 0.999 or relative_l2 > 0.01:
-                    accuracy_failures.append(f"  bs={batch_size} IQ2_XS: finite/nonzero/cosine/relative-L2 gate failed ({relative_l2=:.6f})")
+                relative_l2 = (
+                    backend_out.float() - oracle_ref.float()
+                ).norm().item() / max(reference_norm, 1e-30)
+                if (
+                    not torch.isfinite(backend_out).all()
+                    or not torch.count_nonzero(backend_out)
+                    or reference_norm == 0
+                    or backend_metrics.cos < 0.999
+                    or relative_l2 > 0.01
+                ):
+                    accuracy_failures.append(
+                        f"  bs={batch_size} IQ2_XS: finite/nonzero/cosine/relative-L2 gate failed ({relative_l2=:.6f})"
+                    )
 
         if accuracy_failures:
-            raise RuntimeError("Oracle failed before timing: " + "; ".join(accuracy_failures))
-        exact = getattr(backend_execution, "variants", {}).get(batch_size, backend_execution)
+            raise RuntimeError(
+                "Oracle failed before timing: " + "; ".join(accuracy_failures)
+            )
+        exact = getattr(backend_execution, "variants", {}).get(
+            batch_size, backend_execution
+        )
         record = {
             "tokens": batch_size,
             "active_experts": active_experts,
             "expert_row_counts": sorted(
                 topk_ids[local_routes].unique(return_counts=True)[1].cpu().tolist()
             ),
-            "logical_weight_bytes": active_experts * logical_expert_bytes(
-                spec, activation=args.activation, quant_mode=args.quant_mode,
+            "logical_weight_bytes": active_experts
+            * logical_expert_bytes(
+                spec,
+                activation=args.activation,
+                quant_mode=args.quant_mode,
                 source_format=weights.source_format,
             ),
             "selection": {
@@ -3701,7 +4086,6 @@ def bench_e2e() -> None:
 
             backend_stats = summarize_timing_runs(backend_runs_ms)
 
-
             print(f"  {backend_label} (no graph):".ljust(28), end="", flush=True)
             print(f" {fmt_timing_stats(backend_stats)}")
 
@@ -3731,41 +4115,66 @@ def bench_e2e() -> None:
                         if not torch.isfinite(backend_output).all() or (
                             active_experts and not torch.count_nonzero(backend_output)
                         ):
-                            raise RuntimeError("Graph replay produced invalid MoE output")
+                            raise RuntimeError(
+                                "Graph replay produced invalid MoE output"
+                            )
                         graph_metrics = compare_to_reference(backend_output, oracle_ref)
                         failures = check_oracle_metrics(
-                            f"{backend_label} graph vs oracle", graph_metrics, batch_size,
-                            activation=args.activation, oracle_mode=args.oracle_mode,
+                            f"{backend_label} graph vs oracle",
+                            graph_metrics,
+                            batch_size,
+                            activation=args.activation,
+                            oracle_mode=args.oracle_mode,
                             min_cosine=args.min_cosine,
                         )
                         if failures:
-                            raise RuntimeError("Graph oracle failed: " + "; ".join(failures))
+                            raise RuntimeError(
+                                "Graph oracle failed: " + "; ".join(failures)
+                            )
                         record["graph_oracle"] = asdict(graph_metrics)
 
                     # Time the prepared invocation after graph correctness qualification.
-                    device_before = nvidia_smi_gpu_mode_snapshot() if args.raw_samples_jsonl is not None else None
+                    device_before = (
+                        nvidia_smi_gpu_mode_snapshot()
+                        if args.raw_samples_jsonl is not None
+                        else None
+                    )
                     graph_runs = [
-                        bench_events(fn, warmup=args.warmup, iters=args.iters,
-                                     l2_flush=l2_flush)
+                        bench_events(
+                            fn, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush
+                        )
                         for _ in range(args.repeats)
                     ]
                     record["graph_samples_ms"][name] = graph_runs
                     stats = summarize_timing_runs(graph_runs)
                     if args.raw_samples_jsonl is not None:
                         with args.raw_samples_jsonl.open("a") as handle:
-                            handle.write(json.dumps(dict(
-                                kind="case", rows=batch_size, backend=name,
-                                active_experts=active_experts,
-                                topk_ids=topk_ids.cpu().tolist(),
-                                packed_expert_bytes=packed_expert_bytes,
-                                unique_packed_weight_bytes=(
-                                    active_experts * packed_expert_bytes
-                                    if packed_expert_bytes is not None else None
-                                ),
-                                samples_us=[[sample * 1000 for sample in run] for run in graph_runs],
-                                device_before=device_before, device_after=nvidia_smi_gpu_mode_snapshot(),
-                                validation=args.validate, accuracy_failures=list(accuracy_failures),
-                            )) + "\n")
+                            handle.write(
+                                json.dumps(
+                                    dict(
+                                        kind="case",
+                                        rows=batch_size,
+                                        backend=name,
+                                        active_experts=active_experts,
+                                        topk_ids=topk_ids.cpu().tolist(),
+                                        packed_expert_bytes=packed_expert_bytes,
+                                        unique_packed_weight_bytes=(
+                                            active_experts * packed_expert_bytes
+                                            if packed_expert_bytes is not None
+                                            else None
+                                        ),
+                                        samples_us=[
+                                            [sample * 1000 for sample in run]
+                                            for run in graph_runs
+                                        ],
+                                        device_before=device_before,
+                                        device_after=nvidia_smi_gpu_mode_snapshot(),
+                                        validation=args.validate,
+                                        accuracy_failures=list(accuracy_failures),
+                                    )
+                                )
+                                + "\n"
+                            )
                     graph_stats_by_name[name] = stats
                     print(f" {fmt_timing_stats(stats)}")
                     if args.torch_trace_dir is not None:
@@ -3773,13 +4182,17 @@ def bench_e2e() -> None:
                         if l2_flush is not None:
                             l2_flush()
                         torch.cuda.synchronize()
-                        with torch.profiler.profile(activities=[
-                            torch.profiler.ProfilerActivity.CPU,
-                            torch.profiler.ProfilerActivity.CUDA,
-                        ]) as profiler:
+                        with torch.profiler.profile(
+                            activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA,
+                            ]
+                        ) as profiler:
                             graph.replay()
                             torch.cuda.synchronize()
-                        trace_path = args.torch_trace_dir / f"m{batch_size}-{name}.trace.json"
+                        trace_path = (
+                            args.torch_trace_dir / f"m{batch_size}-{name}.trace.json"
+                        )
                         profiler.export_chrome_trace(str(trace_path))
                     if args.profile_graphs:
                         if accuracy_failures:
@@ -3793,7 +4206,9 @@ def bench_e2e() -> None:
                         finally:
                             torch.cuda.profiler.stop()
                     if name == backend_label:
-                        bandwidth = record["logical_weight_bytes"] / stats.median_us / 1000
+                        bandwidth = (
+                            record["logical_weight_bytes"] / stats.median_us / 1000
+                        )
                         record["useful_weight_GBps"] = bandwidth
                         record["median_us"] = stats.median_us
                         print(f"    useful weight bandwidth: {bandwidth:.1f} GB/s")
@@ -3815,16 +4230,22 @@ def bench_e2e() -> None:
             try:
                 # Per-rank inputs, outputs, workspaces
                 tp_x = [
-                    torch.randn(batch_size, rs.hidden_size, dtype=torch.bfloat16, device=device)
+                    torch.randn(
+                        batch_size, rs.hidden_size, dtype=torch.bfloat16, device=device
+                    )
                     for rs, _, _ in tp_parallel_ranks
                 ]
                 tp_routing = [
-                    torch.randn(batch_size, rs.num_experts, dtype=torch.float32, device=device)
+                    torch.randn(
+                        batch_size, rs.num_experts, dtype=torch.float32, device=device
+                    )
                     for rs, _, _ in tp_parallel_ranks
                 ]
                 tp_topk_ids: list[torch.Tensor] = []
                 tp_topk_weights: list[torch.Tensor] = []
-                for r_routing, (rspec, _, _) in zip(tp_routing, tp_parallel_ranks, strict=True):
+                for r_routing, (rspec, _, _) in zip(
+                    tp_routing, tp_parallel_ranks, strict=True
+                ):
                     r_logits, r_ids = torch.topk(r_routing, rspec.top_k, dim=-1)
                     tp_topk_ids.append(r_ids)
                     tp_topk_weights.append(torch.softmax(r_logits, dim=-1))
@@ -3837,17 +4258,21 @@ def bench_e2e() -> None:
                         name=f"benchmark-moe-tp-{r}-m{batch_size}",
                         experts=rexperts,
                         top_k=rspec.top_k,
-                        inputs={batch_size: (tp_x[r], tp_topk_ids[r], tp_topk_weights[r])},
+                        inputs={
+                            batch_size: (tp_x[r], tp_topk_ids[r], tp_topk_weights[r])
+                        },
                         outputs={batch_size: tp_outputs[r]},
                     )
-                    tp_bindings.append(bind_prepared_moe(
-                        execution,
-                        a=tp_x[r],
-                        experts=rexperts,
-                        topk_ids=tp_topk_ids[r],
-                        topk_weights=tp_topk_weights[r],
-                        output=tp_outputs[r],
-                    ))
+                    tp_bindings.append(
+                        bind_prepared_moe(
+                            execution,
+                            a=tp_x[r],
+                            experts=rexperts,
+                            topk_ids=tp_topk_ids[r],
+                            topk_weights=tp_topk_weights[r],
+                            output=tp_outputs[r],
+                        )
+                    )
 
                 def launch_tp_rank(r: int) -> None:
                     fused_moe.run(binding=tp_bindings[r])
@@ -3863,7 +4288,9 @@ def bench_e2e() -> None:
                 tp_graphs: list[torch.cuda.CUDAGraph] = []
                 for r, stream in enumerate(tp_streams):
                     graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph, stream=stream, capture_error_mode="relaxed"):
+                    with torch.cuda.graph(
+                        graph, stream=stream, capture_error_mode="relaxed"
+                    ):
                         launch_tp_rank(r)
                     tp_graphs.append(graph)
                 torch.cuda.synchronize()
@@ -3895,7 +4322,10 @@ def bench_e2e() -> None:
                         timing_stream.wait_stream(stream)
 
                 tp_times = bench_events(
-                    tp_launch, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush,
+                    tp_launch,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    l2_flush=l2_flush,
                 )
                 print(f" {fmt_us(tp_times)}")
             except Exception as exc:
@@ -3912,26 +4342,35 @@ def bench_e2e() -> None:
 
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
-        args.output_json.write_text(json.dumps({
-            "command": sys.argv,
-            "gpu": torch.cuda.get_device_name(),
-            "gpu_uuid": str(torch.cuda.get_device_properties(device).uuid),
-            "model_profile": args.model_profile,
-            "geometry": asdict(spec),
-            "quant_mode": args.quant_mode,
-            "source_format": weights.source_format,
-            "weight_storage": "pytorch",
-            "scale_contract": args.scale_contract,
-            "routing_workload": args.routing_workload,
-            "timing_backend": args.timing_backend,
-            "cold_l2": args.flush_l2,
-            "validation": args.validate,
-            "oracle_quant_scale_math": args.oracle_quant_scale_math,
-            "cases": evidence,
-        }, indent=2, default=str) + "\n")
+        args.output_json.write_text(
+            json.dumps(
+                {
+                    "command": sys.argv,
+                    "gpu": torch.cuda.get_device_name(),
+                    "gpu_uuid": str(torch.cuda.get_device_properties(device).uuid),
+                    "model_profile": args.model_profile,
+                    "geometry": asdict(spec),
+                    "quant_mode": args.quant_mode,
+                    "source_format": weights.source_format,
+                    "weight_storage": "pytorch",
+                    "scale_contract": args.scale_contract,
+                    "routing_workload": args.routing_workload,
+                    "timing_backend": args.timing_backend,
+                    "cold_l2": args.flush_l2,
+                    "validation": args.validate,
+                    "oracle_quant_scale_math": args.oracle_quant_scale_math,
+                    "cases": evidence,
+                },
+                indent=2,
+                default=str,
+            )
+            + "\n"
+        )
 
     for batch_size, result in sorted(batch_results.items()):
-        print(f"M={batch_size}: {backend_label} {result.backend_stats.median_us:.1f} us")
+        print(
+            f"M={batch_size}: {backend_label} {result.backend_stats.median_us:.1f} us"
+        )
 
     if accuracy_failures:
         print(f"\n\033[1;31m{'=' * 70}")

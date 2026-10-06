@@ -13,22 +13,36 @@ from ._tuning import EmbeddingQuery, TUNING
 
 def query_from_call(weight, ids, *, out, num_rows=None):
     from .api import _check_tensors, _weight_width
+
     _check_tensors(weight, ids, out, num_rows)
     return EmbeddingQuery(
-        max_rows=ids.numel(), table_rows=weight.shape[0], width=_weight_width(weight),
-        row_stride=weight.stride(0), weight_dtype=str(weight.dtype).removeprefix("torch."),
-        id_dtype=str(ids.dtype).removeprefix("torch."), device_count=num_rows is not None,
+        max_rows=ids.numel(),
+        table_rows=weight.shape[0],
+        width=_weight_width(weight),
+        row_stride=weight.stride(0),
+        weight_dtype=str(weight.dtype).removeprefix("torch."),
+        id_dtype=str(ids.dtype).removeprefix("torch."),
+        device_count=num_rows is not None,
     )
 
 
 @program_cache(scope="preparation")
 def compile_lookup(payload, ordinal):
     from ._kernel import compile_embedding
+
     query = EmbeddingQuery(**dict(payload))
     compiled = compile_embedding(
-        query.width, getattr(torch, query.weight_dtype), getattr(torch, query.id_dtype), ordinal,
+        query.width,
+        getattr(torch, query.weight_dtype),
+        getattr(torch, query.id_dtype),
+        ordinal,
     )
-    return attach_programs(_EmbeddingState(query, torch.device("cuda", ordinal), compiled.raw, compiled.types), compiled.raw)
+    return attach_programs(
+        _EmbeddingState(
+            query, torch.device("cuda", ordinal), compiled.raw, compiled.types
+        ),
+        compiled.raw,
+    )
 
 
 @dataclass(frozen=True)
@@ -41,12 +55,18 @@ class _EmbeddingState:
     def run(self, weight, ids, *, out, num_rows=None):
         from .api import _check_tensors, _weight_width
         from ._kernel import launch
+
         _check_tensors(weight, ids, out, num_rows)
         q = self.query
-        if (weight.device != self.device or (weight.shape[0] > q.table_rows or _weight_width(weight) != q.width)
-                or weight.stride(0) != q.row_stride or ids.numel() > q.max_rows
-                or weight.dtype != getattr(torch, q.weight_dtype) or ids.dtype != getattr(torch, q.id_dtype)
-                or (num_rows is not None) != q.device_count):
+        if (
+            weight.device != self.device
+            or (weight.shape[0] > q.table_rows or _weight_width(weight) != q.width)
+            or weight.stride(0) != q.row_stride
+            or ids.numel() > q.max_rows
+            or weight.dtype != getattr(torch, q.weight_dtype)
+            or ids.dtype != getattr(torch, q.id_dtype)
+            or (num_rows is not None) != q.device_count
+        ):
             raise ValueError(
                 f"embedding tensors differ from prepared query {q}: "
                 f"weight={tuple(weight.shape)}/{weight.stride()}/{weight.dtype}/{weight.device}, "
@@ -61,10 +81,13 @@ def plan(query: EmbeddingQuery, *, device, invocation=FrozenMapping(), override=
         raise ValueError("embedding invocation is fully described by EmbeddingQuery")
 
     def jobs(config, detected):
-        return (CompileJob.create(
-            "b12x.sequence.embedding._preparation:compile_lookup",
-            TUNING.encode_query(query), detected.ordinal,
-        ),)
+        return (
+            CompileJob.create(
+                "b12x.sequence.embedding._preparation:compile_lookup",
+                TUNING.encode_query(query),
+                detected.ordinal,
+            ),
+        )
 
     def materialize(selection, detected):
         state = compile_lookup(TUNING.encode_query(query), detected.ordinal)
@@ -72,7 +95,12 @@ def plan(query: EmbeddingQuery, *, device, invocation=FrozenMapping(), override=
         return state
 
     return Plan(
-        contract=TUNING, query=query, override=override, _device=device, shared=True,
-        _compile_jobs=jobs, _memory_requirements=lambda config, detected: MemoryRequirements(),
+        contract=TUNING,
+        query=query,
+        override=override,
+        _device=device,
+        shared=True,
+        _compile_jobs=jobs,
+        _memory_requirements=lambda config, detected: MemoryRequirements(),
         _materialize=materialize,
     )

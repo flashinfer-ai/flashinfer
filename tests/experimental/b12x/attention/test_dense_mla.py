@@ -18,9 +18,9 @@ QK_DIM = 576
 VALUE_DIM = 512
 
 
-_PREPARED: ContextVar[
-    list[tuple[object, object]] | None
-] = ContextVar("dense_mla_prepared", default=None)
+_PREPARED: ContextVar[list[tuple[object, object]] | None] = ContextVar(
+    "dense_mla_prepared", default=None
+)
 
 
 @contextmanager
@@ -48,6 +48,7 @@ def _prepared_scope():
 def _prepared_dense_mla():
     with _prepared_scope():
         yield
+
 
 def _scratch(spec: object) -> torch.Tensor:
     """Allocate caller-owned scratch from session-provided metadata."""
@@ -82,12 +83,14 @@ def _prepare(
         autotune=False,
     )
     try:
-        result = session.prepare((
-            declaration.request(
-                name=name,
-                prepare_call=prepare_call,
-            ),
-        ))
+        result = session.prepare(
+            (
+                declaration.request(
+                    name=name,
+                    prepare_call=prepare_call,
+                ),
+            )
+        )
     except BaseException:
         session.close()
         raise
@@ -112,9 +115,7 @@ def _bind(declaration: dense_mla.Plan, **binding_kwargs) -> dense_mla.Binding:
         name=f"dense-mla-{binding_kwargs['q'].data_ptr():x}",
         **binding_kwargs,
     )
-    return dense_mla.bind(
-        plan, scratch=_scratch(scratch_spec), **binding_kwargs
-    )
+    return dense_mla.bind(plan, scratch=_scratch(scratch_spec), **binding_kwargs)
 
 
 def _guarded_scratch(
@@ -157,10 +158,6 @@ def _assert_matches(
         atol=5e-4,
     )
     torch.testing.assert_close(lse, reference_lse, rtol=2e-5, atol=2e-5)
-
-
-
-
 
 
 @torch.inference_mode()
@@ -209,14 +206,17 @@ def test_fp8_physical_record_stride_ignores_padding() -> None:
     cache_seqlens = torch.tensor([64, 65], dtype=torch.int32, device=device)
     cu_seqlens_q = torch.arange(rows + 1, dtype=torch.int32, device=device)
     output = torch.empty(rows, heads, VALUE_DIM, dtype=torch.bfloat16, device=device)
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,
-    kv_scale=kv_scale,
-    q_scale=q_scale,)
+    binding = _bind(
+        plan,
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        kv_scale=kv_scale,
+        q_scale=q_scale,
+    )
     actual, actual_lse = dense_mla.run(binding=binding)
     expected, expected_lse = dense_mla.reference(
         q,
@@ -228,8 +228,6 @@ def test_fp8_physical_record_stride_ignores_padding() -> None:
         q_scale=q_scale,
     )
     _assert_matches(actual, actual_lse, expected, expected_lse)
-
-
 
 
 @pytest.mark.parametrize("heads", [8, 12])
@@ -295,16 +293,19 @@ def test_bf16_multi_request_decode_matches_reference(heads: int) -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    small_binding = _bind(plan, q=q[:1],
-    kv_cache=cache,
-    output=small_output,
-    page_table=page_table[:1],
-    cache_seqlens=cache_seqlens[:1],
-    cu_seqlens_q=torch.tensor(
-        [0, 1],
-        dtype=torch.int32,
-        device=device,
-    ),)
+    small_binding = _bind(
+        plan,
+        q=q[:1],
+        kv_cache=cache,
+        output=small_output,
+        page_table=page_table[:1],
+        cache_seqlens=cache_seqlens[:1],
+        cu_seqlens_q=torch.tensor(
+            [0, 1],
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
     small_actual, small_lse = dense_mla.run(binding=small_binding)
     small_expected, small_expected_lse = dense_mla.reference(
         small_binding.q,
@@ -320,12 +321,15 @@ def test_bf16_multi_request_decode_matches_reference(heads: int) -> None:
         small_expected_lse,
     )
 
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,)
+    binding = _bind(
+        plan,
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
 
     actual_output, actual_lse = dense_mla.run(binding=binding)
     expected_output, expected_lse = dense_mla.reference(
@@ -389,14 +393,17 @@ def test_fp8_query_tiled_causal_extend_matches_reference(heads: int) -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,
-    q_scale=q_scale,
-    kv_scale=kv_scale,)
+    binding = _bind(
+        plan,
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
     actual_output, actual_lse = dense_mla.run(binding=binding)
     expected_output, expected_lse = dense_mla.reference(
         q,
@@ -458,12 +465,15 @@ def test_bf16_query_tiled_causal_extend_matches_reference() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,)
+    binding = _bind(
+        plan,
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
     actual_output, actual_lse = dense_mla.run(binding=binding)
     expected_output, expected_lse = dense_mla.reference(
         q,
@@ -538,12 +548,15 @@ def test_padded_page_stride_matches_reference() -> None:
             cu_seqlens_q=cu_seqlens_q,
         ),
     )
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,)
+    binding = _bind(
+        plan,
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
     q_before = q.clone()
     cache_before = cache.clone()
     page_table_before = page_table.clone()
@@ -605,12 +618,15 @@ def test_cuda_graph_replay_is_allocation_stable_and_reads_live_inputs() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,)
+    binding = _bind(
+        plan,
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
 
     dense_mla.run(binding=binding)
     torch.cuda.synchronize()
@@ -832,12 +848,15 @@ def test_page_ids_past_int32_scaled_offset_match_reference() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,)
+    binding = _bind(
+        plan,
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
     actual_output, actual_lse = dense_mla.run(binding=binding)
     expected_output, expected_lse = dense_mla.reference(
         q,
@@ -925,14 +944,17 @@ def test_fp8_page_ids_past_int32_scaled_offset_match_reference() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,
-    q_scale=q_scale,
-    kv_scale=kv_scale,)
+    binding = _bind(
+        plan,
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
     actual_output, actual_lse = dense_mla.run(binding=binding)
     expected_output, expected_lse = dense_mla.reference(
         q,

@@ -1,4 +1,5 @@
 """Public prepared API for :mod:`b12x.gemm.trellis_linear`."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -34,8 +35,14 @@ def prepare_weight(
 ) -> PreparedWeight:
     """Validate one native EXL3 dense weight and retain zero-copy views."""
     return prepare_trellis256_dense_weight(
-        trellis, suh, svh, mcg=mcg, mul1_e4m3=mul1_e4m3, codebook=codebook,
-        params_dtype=params_dtype, dummy_scale=dummy_scale,
+        trellis,
+        suh,
+        svh,
+        mcg=mcg,
+        mul1_e4m3=mul1_e4m3,
+        codebook=codebook,
+        params_dtype=params_dtype,
+        dummy_scale=dummy_scale,
     )
 
 
@@ -54,8 +61,15 @@ def prepare_pair_weight(
 ) -> PreparedWeight:
     """Prepare one compact TP12 P24/P33 pair for the SM12x decoder."""
     return prepare_trellis256_pair_dense_weight(
-        payload, suh, svh, pair_kind=pair_kind, rate_axis=rate_axis, mcg=mcg,
-        mul1_e4m3=mul1_e4m3, codebook=codebook, params_dtype=params_dtype,
+        payload,
+        suh,
+        svh,
+        pair_kind=pair_kind,
+        rate_axis=rate_axis,
+        mcg=mcg,
+        mul1_e4m3=mul1_e4m3,
+        codebook=codebook,
+        params_dtype=params_dtype,
         dummy_scale=dummy_scale,
     )
 
@@ -75,9 +89,14 @@ def run(
     """Run a session-prepared exact-M Trellis declaration."""
     state = require_prepared(plan, "gemm.trellis_linear", x.device)
     return state.run(
-        x, output=output, gemm_output=gemm_output, input_f16=input_f16,
-        rotated_f16=rotated_f16, rotated_compute=rotated_compute,
-        gemm_output_f16=gemm_output_f16, output_f16=output_f16,
+        x,
+        output=output,
+        gemm_output=gemm_output,
+        input_f16=input_f16,
+        rotated_f16=rotated_f16,
+        rotated_compute=rotated_compute,
+        gemm_output_f16=gemm_output_f16,
+        output_f16=output_f16,
     )
 
 

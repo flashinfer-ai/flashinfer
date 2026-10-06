@@ -4,6 +4,7 @@ Only static channel/head geometry enters compilation. Image dimensions and live
 rows are launch scalars; all outputs, including attention metadata, are owned by
 the caller. Spatial merge follows channel-major torch.unfold, not pixel shuffle.
 """
+
 from functools import cache
 
 import cuda.bindings.driver as cuda
@@ -23,17 +24,36 @@ class _Vision:
         self.heads, self.ratio = heads, ratio
 
     @cute.jit
-    def __call__(self, x: cute.Pointer, out: cute.Pointer, k: cute.Pointer,
-                 v: cute.Pointer, inv: cute.Pointer, cu: cute.Pointer,
-                 rows: Int32, height: Int32, width: Int32,
-                 stream: cuda.CUstream):
+    def __call__(
+        self,
+        x: cute.Pointer,
+        out: cute.Pointer,
+        k: cute.Pointer,
+        v: cute.Pointer,
+        inv: cute.Pointer,
+        cu: cute.Pointer,
+        rows: Int32,
+        height: Int32,
+        width: Int32,
+        stream: cuda.CUstream,
+    ):
         self.kernel(x, out, k, v, inv, cu, rows, height, width).launch(
-            grid=(rows, 1, 1), block=(128, 1, 1), stream=stream)
+            grid=(rows, 1, 1), block=(128, 1, 1), stream=stream
+        )
 
     @cute.kernel
-    def kernel(self, x: cute.Pointer, out: cute.Pointer, k: cute.Pointer,
-               v: cute.Pointer, inv: cute.Pointer, cu: cute.Pointer,
-               rows: Int32, height: Int32, width: Int32):
+    def kernel(
+        self,
+        x: cute.Pointer,
+        out: cute.Pointer,
+        k: cute.Pointer,
+        v: cute.Pointer,
+        inv: cute.Pointer,
+        cu: cute.Pointer,
+        rows: Int32,
+        height: Int32,
+        width: Int32,
+    ):
         row, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         if cutlass.const_expr(self.operation == "rope"):
@@ -59,7 +79,10 @@ class _Vision:
                         sign = Float32(1.0)
                     base = Int64(row) * Int64(3 * self.width)
                     dst = Int64(row) * Int64(self.width) + Int64(col)
-                    q0, q1 = Float32(x[base + Int64(col)]), Float32(x[base + Int64(partner)])
+                    q0, q1 = (
+                        Float32(x[base + Int64(col)]),
+                        Float32(x[base + Int64(partner)]),
+                    )
                     k0 = Float32(x[base + Int64(self.width + col)])
                     k1 = Float32(x[base + Int64(self.width + partner)])
                     out[dst] = BFloat16(q0 * cosine + sign * q1 * sine)
@@ -76,7 +99,9 @@ class _Vision:
                     iw = (row % merged_width) * r + col % r
                     value = BFloat16(0.0)
                     if ih < height and iw < width:
-                        src = (Int64(ih) * Int64(width) + Int64(iw)) * Int64(self.width) + Int64(channel)
+                        src = (Int64(ih) * Int64(width) + Int64(iw)) * Int64(
+                            self.width
+                        ) + Int64(channel)
                         value = x[src]
                     out[Int64(row) * Int64(self.width * r * r) + Int64(col)] = value
         else:
@@ -85,8 +110,14 @@ class _Vision:
                 if col < self.width:
                     index = Int64(row) * Int64(self.width) + Int64(col)
                     value = Float32(x[index])
-                    out[index] = BFloat16(Float32(0.5) * value * (
-                        Float32(1.0) + cute.math.erf(value * Float32(0.7071067811865476))))
+                    out[index] = BFloat16(
+                        Float32(0.5)
+                        * value
+                        * (
+                            Float32(1.0)
+                            + cute.math.erf(value * Float32(0.7071067811865476))
+                        )
+                    )
 
 
 @cache
@@ -95,9 +126,20 @@ def _compile(operation, width, heads, ratio, device):
     entry = _Vision(operation, width, heads, ratio)
     raise_if_kernel_resolution_frozen("cute.compile", target=entry, cache_key=key)
     types = (BFloat16, BFloat16, BFloat16, BFloat16, Float32, Int32)
-    pointers = tuple(make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=t.width // 8) for t in types)
+    pointers = tuple(
+        make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=t.width // 8)
+        for t in types
+    )
     with torch.cuda.device(device):
-        compiled = compile_cute(entry, *pointers, Int32(1), Int32(1), Int32(1), current_cuda_stream(), compile_spec=KernelCompileSpec.from_key("norm.vision." + operation, 1, key))
+        compiled = compile_cute(
+            entry,
+            *pointers,
+            Int32(1),
+            Int32(1),
+            Int32(1),
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key("norm.vision." + operation, 1, key),
+        )
     return compiled, types
 
 
@@ -108,7 +150,9 @@ def _check(x, out):
         raise ValueError("vision input/output must be contiguous on the same device")
 
 
-def _run_state(state, x, out, rows, height=1, width=1, k=None, v=None, inv=None, cu=None):
+def _run_state(
+    state, x, out, rows, height=1, width=1, k=None, v=None, inv=None, cu=None
+):
     """Launch an already-resolved vision specialization."""
     if rows == 0:
         return out
@@ -117,14 +161,32 @@ def _run_state(state, x, out, rows, height=1, width=1, k=None, v=None, inv=None,
     if query.channels != channels:
         raise ValueError("prepared vision plan has incompatible channel geometry")
     tensors = (x, out, k, v, inv, cu)
-    pointers = tuple(make_ptr(t, (tensor if tensor is not None else x).data_ptr(), cute.AddressSpace.gmem, assumed_align=t.width // 8) for t, tensor in zip(state.types, tensors, strict=True))
+    pointers = tuple(
+        make_ptr(
+            t,
+            (tensor if tensor is not None else x).data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=t.width // 8,
+        )
+        for t, tensor in zip(state.types, tensors, strict=True)
+    )
     with torch.cuda.device(x.device):
-        run_compiled(state.compiled, (*pointers, Int32(rows), Int32(height), Int32(width), current_cuda_stream()))
+        run_compiled(
+            state.compiled,
+            (
+                *pointers,
+                Int32(rows),
+                Int32(height),
+                Int32(width),
+                current_cuda_stream(),
+            ),
+        )
     return out
 
 
 def run_gelu(x, *, out, plan):
     from b12x.preparation.types import require_prepared
+
     _check(x, out)
     if x.ndim != 2 or out.shape != x.shape:
         raise ValueError("GELU requires matching [rows, channels] tensors")
@@ -136,6 +198,7 @@ def run_gelu(x, *, out, plan):
 
 def run_spatial_merge(x, height, width, *, ratio=3, out, plan):
     from b12x.preparation.types import require_prepared
+
     _check(x, out)
     if height <= 0 or width <= 0 or ratio <= 0 or x.ndim != 2:
         raise ValueError("spatial merge requires positive image dimensions and ratio")
@@ -152,18 +215,33 @@ def run_spatial_merge(x, height, width, *, ratio=3, out, plan):
 
 def run_rope_qkv(qkv, height, width, inv_freq, *, q, k, v, cu_seqlens, plan):
     from b12x.preparation.types import require_prepared
+
     _check(qkv, q)
     for tensor in (k, v):
         _check(qkv, tensor)
-    if height <= 0 or width <= 0 or q.ndim != 3 or q.shape != k.shape or q.shape != v.shape:
+    if (
+        height <= 0
+        or width <= 0
+        or q.ndim != 3
+        or q.shape != k.shape
+        or q.shape != v.shape
+    ):
         raise ValueError("invalid image dimensions or Q/K/V capacities")
     heads, dim = q.shape[1:]
     rows = height * width
     if dim % 4 or q.shape[0] < rows or qkv.shape != (rows, 3 * heads * dim):
         raise ValueError("QKV shape or rotary dimension mismatch")
-    if inv_freq.shape != (dim // 4,) or inv_freq.dtype != torch.float32 or not inv_freq.is_contiguous():
+    if (
+        inv_freq.shape != (dim // 4,)
+        or inv_freq.dtype != torch.float32
+        or not inv_freq.is_contiguous()
+    ):
         raise ValueError("inv_freq must be contiguous FP32[head_dim/4]")
-    if cu_seqlens.shape != (2,) or cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_contiguous():
+    if (
+        cu_seqlens.shape != (2,)
+        or cu_seqlens.dtype != torch.int32
+        or not cu_seqlens.is_contiguous()
+    ):
         raise ValueError("cu_seqlens must be contiguous int32[2]")
     if inv_freq.device != q.device or cu_seqlens.device != q.device:
         raise ValueError("vision metadata must share the QKV device")
@@ -172,7 +250,9 @@ def run_rope_qkv(qkv, height, width, inv_freq, *, q, k, v, cu_seqlens, plan):
     state = require_prepared(plan, "norm.vision", qkv.device)
     if state.query.operation != "rope" or state.query.heads != heads:
         raise ValueError("prepared rotary plan has incompatible geometry")
-    return _run_state(state, qkv, q, rows, height, width, k=k, v=v, inv=inv_freq, cu=cu_seqlens)
+    return _run_state(
+        state, qkv, q, rows, height, width, k=k, v=v, inv=inv_freq, cu=cu_seqlens
+    )
 
 
 # Declarations stay separate from this kernel implementation so constructing a
@@ -180,6 +260,11 @@ def run_rope_qkv(qkv, height, width, inv_freq, *, q, k, v, cu_seqlens, plan):
 from ._vision_preparation import TUNING, VisionQuery, VisionState, plan
 
 __all__ = [
-    "VisionQuery", "VisionState", "TUNING", "plan", "run_gelu",
-    "run_spatial_merge", "run_rope_qkv",
+    "VisionQuery",
+    "VisionState",
+    "TUNING",
+    "plan",
+    "run_gelu",
+    "run_spatial_merge",
+    "run_rope_qkv",
 ]

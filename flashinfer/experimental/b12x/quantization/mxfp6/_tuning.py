@@ -1,4 +1,5 @@
 """Fixed preparation contract for native MX-FP6 dense execution."""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -27,9 +28,14 @@ class Mxfp6DenseConfig:
 def _validate_query(query: Mxfp6DenseQuery, _device) -> None:
     if not isinstance(query, Mxfp6DenseQuery):
         raise TypeError("query must be Mxfp6DenseQuery")
-    if any(type(value) is not int or value <= 0 for value in (
-        query.max_tokens, query.in_features, query.out_features,
-    )):
+    if any(
+        type(value) is not int or value <= 0
+        for value in (
+            query.max_tokens,
+            query.in_features,
+            query.out_features,
+        )
+    ):
         raise ValueError("MX-FP6 geometry must contain positive integers")
     if query.in_features % 128:
         raise ValueError("MX-FP6 in_features must be a multiple of 128")

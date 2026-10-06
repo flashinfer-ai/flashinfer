@@ -102,8 +102,13 @@ def test_compressed_sparse_mla_scratch_plan_exposes_one_opaque_scratch_spec() ->
 def test_compressed_sparse_mla_bind_is_views_only(monkeypatch, cache_format) -> None:
     plan = plan_compressed_sparse_mla_scratch(
         B12XCompressedSparseMLAScratchCaps(
-            device="cpu", num_q_heads=8, max_q_rows=4, max_width=8,
-            swa_width=4, indexed_width=4, max_page_table_width=2,
+            device="cpu",
+            num_q_heads=8,
+            max_q_rows=4,
+            max_width=8,
+            swa_width=4,
+            indexed_width=4,
+            max_page_table_width=2,
             cache_format=cache_format,
         )
     )
@@ -122,8 +127,13 @@ def test_compressed_sparse_mla_bind_is_views_only(monkeypatch, cache_format) -> 
         guarded.setattr(torch, "zeros", reject_allocation)
         guarded.setattr(torch, "full", reject_allocation)
         binding = plan.bind(
-            scratch=scratch, q=q, swa_indices=indices, swa_lengths=lengths,
-            indexed_indices=indices, indexed_lengths=lengths, indexed_page_table=page_table,
+            scratch=scratch,
+            q=q,
+            swa_indices=indices,
+            swa_lengths=lengths,
+            indexed_indices=indices,
+            indexed_lengths=lengths,
+            indexed_page_table=page_table,
         )
     assert torch.all(scratch == 165)
     # Mutation through the consumer-visible final LSE is within caller storage.

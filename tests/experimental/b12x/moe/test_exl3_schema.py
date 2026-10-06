@@ -93,7 +93,9 @@ def test_canonical_weight_plan_preserves_exl3_transform_and_rate(bits: int) -> N
     plan = fused_moe.plan_weights(
         source=source,
         activation=fused_moe.ActivationSpec(
-            mode="a16", nonlinearity="silu", io_dtype=torch.bfloat16,
+            mode="a16",
+            nonlinearity="silu",
+            io_dtype=torch.bfloat16,
             rotation_dtype=torch.float16,
         ),
         geometry=fused_moe.MoEGeometry(
@@ -201,9 +203,7 @@ def test_lut_bit_ranges_fail_closed() -> None:
     with pytest.raises(ValueError, match="lut_e4m3"):
         Exl3Manifest.from_dict(_uniform_manifest_dict(bits=5))
     with pytest.raises(ValueError, match="lut_fp16"):
-        Exl3Manifest.from_dict(
-            _uniform_manifest_dict(codebook="lut_fp16", bits=3)
-        )
+        Exl3Manifest.from_dict(_uniform_manifest_dict(codebook="lut_fp16", bits=3))
     Exl3Manifest.from_dict(_uniform_manifest_dict(codebook="lut_fp16", bits=6))
 
 
@@ -219,7 +219,9 @@ def test_per_expert_rates_fail_closed() -> None:
 
 
 def test_intermediate_hadamard_manifest_block_rules() -> None:
-    manifest = Exl3Manifest.from_dict(_uniform_manifest_dict(intermediate_hadamard=True))
+    manifest = Exl3Manifest.from_dict(
+        _uniform_manifest_dict(intermediate_hadamard=True)
+    )
     assert manifest.hadamard.pre_block == 512
     assert manifest.hadamard.post_block == 128
     data = _uniform_manifest_dict(intermediate_hadamard=True)
@@ -279,9 +281,7 @@ def test_synth_rows_are_expert_major_and_zero_padded() -> None:
     assert codes.dtype == torch.uint8
     assert codes.shape[0] == config.num_slots
     assert codes.shape[1] % config.row_alignment == 0
-    per_bundle = bundle_bytes(
-        config.hidden_size, rate_code(2, 2), rate_code(2, 2)
-    )
+    per_bundle = bundle_bytes(config.hidden_size, rate_code(2, 2), rate_code(2, 2))
     payload = per_bundle * config.num_experts
     assert bool(torch.all(codes[:, payload:] == 0))
     # Expert 1's gate low plane sits after expert 0's complete bundle.
@@ -331,15 +331,22 @@ def test_write_exl3_checkpoint_intermediate_hadamard_and_per_expert(tmp_path) ->
     assert manifest.rates.pair_kinds == frozenset({"P33", "P43"})
 
     intermediate_hadamard = _small_config(
-        intermediate_hadamard=True, pre_block=512, post_block=128, seed=9, hidden_size=512
+        intermediate_hadamard=True,
+        pre_block=512,
+        post_block=128,
+        seed=9,
+        hidden_size=512,
     )
-    manifest = write_exl3_checkpoint(tmp_path / "intermediate_hadamard", intermediate_hadamard)
+    manifest = write_exl3_checkpoint(
+        tmp_path / "intermediate_hadamard", intermediate_hadamard
+    )
     assert manifest.hadamard.intermediate_hadamard
 
     from safetensors import safe_open
 
     with safe_open(
-        str(tmp_path / "intermediate_hadamard" / manifest.layers[1].file), framework="pt"
+        str(tmp_path / "intermediate_hadamard" / manifest.layers[1].file),
+        framework="pt",
     ) as handle:
         assert "sign_pattern" in set(handle.keys())
 

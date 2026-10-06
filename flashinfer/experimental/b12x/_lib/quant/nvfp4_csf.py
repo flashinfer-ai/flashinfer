@@ -601,7 +601,15 @@ def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False):
 
 
 def decode_nvfp4_csf_pair(
-    first, second, ids, out13, out2, *, mode=0, program=None, barriers=None,
+    first,
+    second,
+    ids,
+    out13,
+    out2,
+    *,
+    mode=0,
+    program=None,
+    barriers=None,
     indexed_scales=None,
 ):
     """Launch the precompiled pair into caller-owned native NVFP4 scale grids."""
@@ -656,7 +664,9 @@ def decode_nvfp4_csf_pair(
         )
     if program is None:
         program = compile_nvfp4_csf_pair(
-            first.geometry, second.geometry, ids.dtype == torch.int64,
+            first.geometry,
+            second.geometry,
+            ids.dtype == torch.int64,
             indexed_scales is not None,
         )
 
@@ -670,8 +680,11 @@ def decode_nvfp4_csf_pair(
         args.extend(
             (
                 device_ptr(
-                    batch.fixed if indexed_scales is None else indexed_scales[index].storage,
-                    cutlass.Uint8, 16,
+                    batch.fixed
+                    if indexed_scales is None
+                    else indexed_scales[index].storage,
+                    cutlass.Uint8,
+                    16,
                 ),
                 device_ptr(batch.exceptions, cutlass.Uint8, 16),
                 device_ptr(batch.task_offsets, cutlass.Int64, 8),
@@ -744,7 +757,8 @@ class Nvfp4CsfDecoder:
             raise ValueError("NVFP4-CSF projections must be on one CUDA device")
         if (
             out13.data_ptr() < out2.data_ptr() + out2.numel() * out2.element_size()
-            and out2.data_ptr() < out13.data_ptr() + out13.numel() * out13.element_size()
+            and out2.data_ptr()
+            < out13.data_ptr() + out13.numel() * out13.element_size()
         ):
             raise ValueError("NVFP4-CSF output buffers must not overlap")
         programs = tuple(
@@ -764,14 +778,21 @@ class Nvfp4CsfDecoder:
                 tuple(
                     compile_nvfp4_csf_pair(first.geometry, second.geometry, ids64, True)
                     for ids64 in (False, True)
-                ) if inline_scales is not None else None
+                )
+                if inline_scales is not None
+                else None
             ),
         )
 
     def decode_all(self, out13, out2):
         """Expand every expert on the current stream, as long prefills do."""
         decode_nvfp4_csf_pair(
-            self.first, self.second, self.active, out13, out2, mode=3,
+            self.first,
+            self.second,
+            self.active,
+            out13,
+            out2,
+            mode=3,
             program=self.programs[0],
         )
 

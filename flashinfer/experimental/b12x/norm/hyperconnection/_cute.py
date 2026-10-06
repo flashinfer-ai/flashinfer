@@ -66,9 +66,7 @@ def _block_sum(value: Float32, reduction: cute.Tensor) -> Float32:
 @dsl_user_op
 def _float_bits(value: Float32, *, loc=None, ip=None) -> Uint32:
     return Uint32(
-        llvm.bitcast(
-            T.i32(), Float32(value).ir_value(loc=loc, ip=ip), loc=loc, ip=ip
-        )
+        llvm.bitcast(T.i32(), Float32(value).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
     )
 
 
@@ -173,9 +171,7 @@ class _EngramMix:
         rows: Int32,
         stream: cuda.CUstream,
     ) -> None:
-        self.kernel(
-            state, projected_kv, norm_weights, token_mask, output, eps
-        ).launch(
+        self.kernel(state, projected_kv, norm_weights, token_mask, output, eps).launch(
             grid=(rows * Int32(self.streams), 1, 1),
             block=(_THREADS, 1, 1),
             stream=stream,
@@ -196,13 +192,11 @@ class _EngramMix:
         token = Int64(row) // Int64(self.streams)
         stream_id = Int64(row) % Int64(self.streams)
         base = Int64(row) * Int64(self.hidden_size)
-        key_base = (
-            token * Int64((self.streams + 1) * self.hidden_size)
-            + stream_id * Int64(self.hidden_size)
-        )
-        value_base = (
-            token * Int64((self.streams + 1) * self.hidden_size)
-            + Int64(self.streams * self.hidden_size)
+        key_base = token * Int64(
+            (self.streams + 1) * self.hidden_size
+        ) + stream_id * Int64(self.hidden_size)
+        value_base = token * Int64((self.streams + 1) * self.hidden_size) + Int64(
+            self.streams * self.hidden_size
         )
         weight_base = stream_id * Int64(self.hidden_size)
         values = cute.make_rmem_tensor((self.items,), Float32)
@@ -246,7 +240,7 @@ class _EngramMix:
             ) * cute.math.rsqrt(
                 k_total / Float32(self.hidden_size) + eps, fastmath=True
             )
-            dot = dot_total * rstd * Float32(self.hidden_size ** -0.5)
+            dot = dot_total * rstd * Float32(self.hidden_size**-0.5)
             magnitude = cute.math.sqrt(
                 fmax_f32(fabs_f32(dot), Float32(1.0e-6)), fastmath=True
             )
@@ -314,8 +308,12 @@ class _Pointwise:
     """Unscaled activation/residual tails with one final destination cast."""
 
     def __init__(
-        self, operation: str, output_dtype: type, width: int = 1,
-        limit: float = float("inf"), round_silu: bool = False,
+        self,
+        operation: str,
+        output_dtype: type,
+        width: int = 1,
+        limit: float = float("inf"),
+        round_silu: bool = False,
     ) -> None:
         self.operation = operation
         self.output_dtype = output_dtype
@@ -325,17 +323,25 @@ class _Pointwise:
 
     @cute.jit
     def __call__(
-        self, left: cute.Pointer, right: cute.Pointer, output: cute.Pointer,
-        elements: Int64, stream: cuda.CUstream,
+        self,
+        left: cute.Pointer,
+        right: cute.Pointer,
+        output: cute.Pointer,
+        elements: Int64,
+        stream: cuda.CUstream,
     ) -> None:
         self.kernel(left, right, output, elements).launch(
             grid=((elements + Int64(_THREADS - 1)) // Int64(_THREADS), 1, 1),
-            block=(_THREADS, 1, 1), stream=stream,
+            block=(_THREADS, 1, 1),
+            stream=stream,
         )
 
     @cute.kernel
     def kernel(
-        self, left: cute.Pointer, right: cute.Pointer, output: cute.Pointer,
+        self,
+        left: cute.Pointer,
+        right: cute.Pointer,
+        output: cute.Pointer,
         elements: Int64,
     ) -> None:
         block, _, _ = cute.arch.block_idx()
@@ -784,9 +790,7 @@ def _compile(
             )
             args: list[object] = [
                 _fake_pointer(dtype)
-                for dtype in (
-                    pointer_dtypes or (torch.bfloat16,) * argument_count
-                )
+                for dtype in (pointer_dtypes or (torch.bfloat16,) * argument_count)
             ]
             if has_eps:
                 args.append(Float32(1.0e-6))
@@ -1012,8 +1016,14 @@ def pointwise(
     round_silu: bool = False,
 ) -> None:
     key = (
-        operation, _device_index(left), str(left.dtype), str(right.dtype), str(output.dtype),
-        int(width), None if limit == float("inf") else float(limit), bool(round_silu),
+        operation,
+        _device_index(left),
+        str(left.dtype),
+        str(right.dtype),
+        str(output.dtype),
+        int(width),
+        None if limit == float("inf") else float(limit),
+        bool(round_silu),
     )
     _run(
         key,

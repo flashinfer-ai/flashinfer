@@ -19,6 +19,10 @@ from b12x.moe._shared.kernels.w4a16.host import (
 )
 from b12x.testing.reference.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
 
+swizzle_block_scale = (
+    None  # placeholder: undefined in the b12x migration; set the real value
+)
+
 
 def _weight_plan(*, local_experts: int = 4, dtype: torch.dtype = torch.bfloat16):
     return plan_b12x_fp4_moe_weights(
@@ -231,14 +235,20 @@ def _run_ep_rank(
     )
     output = torch.empty_like(a)
     caps = EPMoEScratchCaps(
-        max_tokens=int(a.shape[0]), num_topk=int(topk_ids.shape[1]),
-        global_num_experts=int(expert_map.numel()), device=a.device,
+        max_tokens=int(a.shape[0]),
+        num_topk=int(topk_ids.shape[1]),
+        global_num_experts=int(expert_map.numel()),
+        device=a.device,
         weight_plan=experts.plan,
     )
     declaration = public_ep_moe.plan(
-        caps, expert_map=prepared_map,
+        caps,
+        expert_map=prepared_map,
         invocation=public_ep_moe.invocation_from_tensors(
-            a=a, topk_ids=topk_ids, topk_weights=topk_weights, output=output,
+            a=a,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            output=output,
             expert_map=prepared_map,
         ),
     )
@@ -248,22 +258,33 @@ def _run_ep_rank(
         spec = state.layout.scratch_specs()[0]
         scratch["value"] = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
         binding = state.bind(
-            scratch=scratch["value"], a=a, experts=experts,
-            topk_weights=topk_weights, topk_ids=topk_ids, output=output,
+            scratch=scratch["value"],
+            a=a,
+            experts=experts,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
         )
         return PreparedCall(run=lambda: state.run(binding))
 
     session = PreparationSession(device=a.device, autotune=False, compile_workers=2)
-    session.prepare((
-        declaration.request(
-            name=f"ep-{prepared_map.tensor.data_ptr()}",
-            prepare_call=prepare_call,
-        ),
-    ))
+    session.prepare(
+        (
+            declaration.request(
+                name=f"ep-{prepared_map.tensor.data_ptr()}",
+                prepare_call=prepare_call,
+            ),
+        )
+    )
     plan = declaration
     binding = public_ep_moe.bind(
-        plan, scratch=scratch["value"], a=a, experts=experts,
-        topk_weights=topk_weights, topk_ids=topk_ids, output=output,
+        plan,
+        scratch=scratch["value"],
+        a=a,
+        experts=experts,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        output=output,
     )
     return public_ep_moe.run(binding=binding), binding
 
