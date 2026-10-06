@@ -540,7 +540,13 @@ class CakeSSDCombined:
     accessor; nothing on the hot path reads it).  On a flagged call the
     outputs of the offending tokens are undefined (they are skipped or folded
     into a neighbouring range) and so is every sequence whose range they
-    touch; the other in-range sequences are still correct.
+    touch; the other in-range sequences are still correct.  The preprocess
+    reads ``seq_idx`` only when it derives ``seq_chunk_cumsum``
+    (``seq_chunk_cumsum=None``, or a caller buffer with
+    ``update_seq_chunk_cumsum=True``).  A caller-supplied table with
+    ``update_seq_chunk_cumsum=False`` is trusted as the sequence boundaries:
+    no kernel reads ``seq_idx`` on that call, so :meth:`seq_idx_status`
+    cannot report ids the caller already consumed when building the table.
     """
 
     def __init__(
@@ -624,8 +630,11 @@ class CakeSSDCombined:
 
         Returns 1 when any call on ``device`` (default: the current CUDA
         device) since the last reset met a packed-sequence id outside
-        ``[0, num_sequences)`` or below its predecessor, else 0.  With
-        ``reset=True`` the word is cleared after reading.  The read is a
+        ``[0, num_sequences)`` or below its predecessor, else 0.  Only calls
+        on which the preprocess derives ``seq_chunk_cumsum`` read ``seq_idx``;
+        a precomputed table (``update_seq_chunk_cumsum=False``) is trusted and
+        leaves the word untouched.  With ``reset=True`` the word is cleared
+        after reading.  The read is a
         device-to-host copy, so this is for tests and diagnostics only;
         ``run`` never reads the word.
         """
@@ -837,6 +846,11 @@ class CakeSSDCombined:
         cu_seqlens: Optional[torch.Tensor] = None,
     ):
         batch, seqlen, nheads, headdim = x.shape
+        if batch <= 0 or seqlen <= 0:
+            raise ValueError(
+                "x must have a positive batch and sequence length "
+                f"(got batch={batch}, seqlen={seqlen})"
+            )
         if (nheads, headdim) != (self.nheads, _HEADDIM):
             raise ValueError(f"x must have shape [batch, seqlen, {self.nheads}, 64]")
         if tuple(B.shape) != (batch, seqlen, self.ngroups, _DSTATE):

@@ -574,7 +574,10 @@ class SSDCombined:
                 varlen segment.
             seq_chunk_cumsum: Optional int32 tensor of shape [num_seqs + 1].
                 If provided with update_seq_chunk_cumsum=False (default), treated
-                as pre-computed and the internal computation is skipped.
+                as pre-computed and the internal computation is skipped (the
+                Cake backend then trusts the table as the sequence boundaries
+                and does not read ``seq_idx``, so ``seq_idx_status()`` does not
+                cover that call).
                 If provided with update_seq_chunk_cumsum=True, used as the output
                 buffer and filled by the internal computation.
                 If None, an internal buffer is allocated and computed.  The

@@ -3191,6 +3191,20 @@ def test_source_public_cake_dt_bias_validation_without_gpu(monkeypatch, invalid)
         runner.run(*tensors, dt_bias=dt_bias)
 
 
+@pytest.mark.parametrize("empty", ("tokens", "batch"))
+def test_source_cake_rejects_zero_token_calls_without_gpu(empty):
+    """A zero-token or zero-batch call has no chunk to run (``nchunks == 0``
+    would reach the workspace's integer division); it is rejected before any
+    workspace or metadata is built."""
+    runner = _source_cake_runner_without_constructor()
+    x, dt, A, B, C = _cpu_public_run_inputs(batch=0 if empty == "batch" else 1)
+    if empty == "tokens":
+        x, dt, B, C = (value[:, :0] for value in (x, dt, B, C))
+
+    with pytest.raises(ValueError, match="positive batch and sequence length"):
+        runner.run(x, dt, A, B, C)
+
+
 def test_source_public_cake_rejects_non_cuda_inputs_without_gpu(monkeypatch):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
