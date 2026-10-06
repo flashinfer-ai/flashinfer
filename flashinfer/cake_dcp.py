@@ -419,6 +419,8 @@ def dcp_balanced_program(
     num_kv_heads: int,
     max_pages_per_seq: int,
     sm_count: int,
+    arch: Optional[str] = None,
+    n_rows: Optional[int] = None,
 ) -> Optional[int]:
     """The traced program a balanced family's launch runs, or ``None`` for a one-program family.
 
@@ -440,8 +442,15 @@ def dcp_balanced_program(
     static program (one ticket per (request, KV head) tile, no device planner,
     no partials; the planner itself plans whole tiles for every length within
     that bound, so the output is bitwise the planner program's), every other
-    launch the planner program.  Mirrors the manifest's ``program_variants``
-    rule from host metadata only.
+    launch the planner program.  Where the regime names a ``swapped`` form, a
+    whole-tile launch on one of its architectures (``arch``: the compile
+    target's architecture key, ``sm_100a`` / ``sm_103a``) with one of its
+    packed-row instances (``n_rows``) runs that program instead: the
+    swapped-QK whole-tile program (S^T = K Q^T with the keys on M, lane-per-key
+    softmax, two P^T staging buffers; bitwise the whole-tile program's
+    output).  An unknown architecture or instance keeps the whole-tile
+    program.  Mirrors the manifest's ``program_variants`` rule from host
+    metadata only.
     """
 
     _check_dcp_balanced_kind(kind)
@@ -482,6 +491,14 @@ def dcp_balanced_program(
             and limit is not None
             and int(max_pages_per_seq) <= int(limit)
         ):
+            swapped = regime.get("swapped")
+            if (
+                swapped is not None
+                and arch in swapped["arches"]
+                and n_rows is not None
+                and int(n_rows) in [int(value) for value in swapped["n_rows"]]
+            ):
+                return int(swapped["program"])
             return int(variants["static_one_wave"])
         return int(variants["below_grid"])
     n_max = -(
@@ -751,16 +768,19 @@ def _run_dcp_spec_balanced(
 
     _check_workspace_buffer_alignment(workspace_buffer, "workspace_buffer")
     _check_workspace_buffer_alignment(completion_buffer, "multi_ctas_kv_counter_buffer")
+    n_rows = dcp_balanced_n_rows(kind, q_len_per_req)
     module = load_dcp_spec_balanced_module(
         _DCP_BALANCED_FAMILY[kind],
         target,
-        dcp_balanced_n_rows(kind, q_len_per_req),
+        n_rows,
         dcp_balanced_program(
             kind,
             batch_size=batch_size,
             num_kv_heads=num_kv_heads,
             max_pages_per_seq=int(block_tables.shape[1]),
             sm_count=sm_count,
+            arch=_DCP_BALANCED_ARCH.get(target, target),
+            n_rows=n_rows,
         ),
     )
     if kind == "bf16_p16":

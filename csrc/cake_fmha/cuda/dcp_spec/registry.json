@@ -99,17 +99,27 @@
         "below_grid": 1,
         "bodies": {
           "1": "cake_fmha_dcp_spec_bf16_balanced_program1.cu",
-          "2": "cake_fmha_dcp_spec_bf16_balanced_program2.cu"
+          "2": "cake_fmha_dcp_spec_bf16_balanced_program2.cu",
+          "3": "cake_fmha_dcp_spec_bf16_balanced_program3.cu"
         },
         "default": 1,
         "items_lower_bound": "batch_size * num_kv_heads",
         "key": "program",
-        "rule": "program = static_one_wave when batch_size == 1, num_kv_heads < grid (sm_count) and max_pages_per_seq <= whole_pages_max[sm_count][num_kv_heads] (the planner plans whole tiles for every rank-local length within that page-table bound, so the static program issues each (request, KV head) tile whole from its CTA index: no planner, no partials, no reduce tickets, bitwise the planner program's result); else below_grid (= at_or_above_grid: the family keeps one planner body)",
+        "rule": "program = static_one_wave when batch_size == 1, num_kv_heads < grid (sm_count) and max_pages_per_seq <= whole_pages_max[sm_count][num_kv_heads] (the planner plans whole tiles for every rank-local length within that page-table bound, so the static program issues each (request, KV head) tile whole from its CTA index: no planner, no partials, no reduce tickets, bitwise the planner program's result) -- in its swapped-QK form swapped.program when the launch's architecture is in swapped.arches and its packed-row instance n_rows in swapped.n_rows (S^T = K Q^T with the keys on M, lane-per-key softmax, two P^T staging buffers; bitwise the whole-tile program's result); else below_grid (= at_or_above_grid: the family keeps one planner body)",
         "static_one_wave": 2,
         "static_one_wave_regime": {
           "form": "whole_tiles",
           "one_request": 1,
           "page_size": 16,
+          "swapped": {
+            "arches": [
+              "sm_100a"
+            ],
+            "n_rows": [
+              32
+            ],
+            "program": 3
+          },
           "whole_pages_max": {
             "148": {
               "1": 112,
@@ -149,7 +159,8 @@
         },
         "values": [
           1,
-          2
+          2,
+          3
         ]
       },
       "public_name": "cake_fmha_dcp_spec_bf16_balanced",
@@ -719,6 +730,32 @@
           "sources": {
             "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program2.cu",
             "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program2.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 32
+          },
+          "selector": {
+            "n_rows": 32,
+            "program": 3
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program3.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program3.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 64
+          },
+          "selector": {
+            "n_rows": 64,
+            "program": 3
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program3.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program3.cu"
           }
         }
       ],

@@ -792,19 +792,22 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
             int(variants["at_or_above_grid"]),
             int(variants["static_one_wave"]),
         )
-        # the rule's programs cover the family's values (the BF16 family runs one program below and at or above the grid)
-        assert sorted({below, above, static}) == sorted(
-            int(v) for v in variants["values"]
-        )
         regime = variants["static_one_wave_regime"]
+        # the rule's programs cover the family's values (the BF16 family runs one program below and at or above the grid
+        # and the swapped-QK whole-tile program on the regime's architectures / packed-row instances)
+        rule_values = {below, above, static}
+        if "swapped" in regime:
+            rule_values.add(int(regime["swapped"]["program"]))
+        assert sorted(rule_values) == sorted(int(v) for v in variants["values"])
 
-        def program(batch, hkv, pages, sm):
+        def program(batch, hkv, pages, sm, **selection):
             return dcp_balanced_program(
                 kind,
                 batch_size=batch,
                 num_kv_heads=hkv,
                 max_pages_per_seq=pages,
                 sm_count=sm,
+                **selection,
             )
 
         if regime.get("form") == "whole_tiles":
@@ -826,6 +829,26 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
                 assert program(-(-sm // 8), 8, 65, sm) == above == below
             # an SM count outside the table keeps the planner program
             assert program(1, 8, 65, 160) == below
+            # unit 81 lever A'': the swapped-QK whole-tile program on sm_100a for the 32-row instance only; the 64-row
+            # instance, sm_103a, the SM107 family target and unknown selection keep the whole-tile program
+            swapped = regime["swapped"]
+            assert swapped == {"program": 3, "arches": ["sm_100a"], "n_rows": [32]}
+            for sm in (148, 152):
+                assert (
+                    program(1, 8, 65, sm, arch="sm_100a", n_rows=32)
+                    == swapped["program"]
+                )
+                assert (
+                    program(1, 8, 112, sm, arch="sm_100a", n_rows=32)
+                    == swapped["program"]
+                )
+                assert program(1, 8, 113, sm, arch="sm_100a", n_rows=32) == below
+                assert program(2, 8, 65, sm, arch="sm_100a", n_rows=32) == below
+                assert program(1, 8, 65, sm, arch="sm_100a", n_rows=64) == static
+                assert program(1, 8, 65, sm, arch="sm_103a", n_rows=32) == static
+                assert program(1, 8, 65, sm, arch="sm107a", n_rows=32) == static
+                assert program(1, 8, 65, sm, n_rows=32) == static
+                assert program(1, 8, 65, sm, arch="sm_100a") == static
             continue
         assert regime == {
             "page_size": 64,
@@ -917,27 +940,31 @@ def test_bf16_program_row_selection(monkeypatch) -> None:
     variants = dcp_balanced_program_variants("dcp_spec_bf16_balanced")
     if variants is None:
         pytest.skip("the shipped BF16 head_dim-128 family has one program")
-    calls, _launches = _patch_loaders(monkeypatch)
-    for batch, prefix, route, n_rows, expected in (
-        (1, 4096, "balanced", 32, variants["static_one_wave"]),
-        (8, 4096, "auto", 32, variants["below_grid"]),
-        (1, 16384, "balanced", 32, variants["below_grid"]),
+    swapped = variants["static_one_wave_regime"]["swapped"]
+    for target, batch, prefix, route, q_len, n_rows, expected in (
+        # unit 81 lever A'': on sm_100a the 32-row whole-tile launch runs the swapped-QK program (3); the 64-row instance
+        # (q_len 8) and sm_103a run the whole-tile program (2)
+        ("sm100a", 1, 4096, "balanced", 4, 32, swapped["program"]),
+        ("sm100a", 1, 4096, "balanced", 8, 64, variants["static_one_wave"]),
+        ("sm103a", 1, 4096, "balanced", 4, 32, variants["static_one_wave"]),
+        ("sm100a", 8, 4096, "auto", 4, 32, variants["below_grid"]),
+        ("sm100a", 1, 16384, "balanced", 4, 32, variants["below_grid"]),
     ):
-        calls["balanced"].clear()
-        calls["static"].clear()
+        calls, _launches = _patch_loaders(monkeypatch, target=target)
         inputs = _rank_inputs(
             "bf16_p16",
             batch=batch,
-            q_len=4,
+            q_len=q_len,
             prefixes=[prefix] * batch,
             cp_world=4,
             cp_rank=0,
         )
         run_dcp_spec_decode(**inputs, route=route)
         assert calls["balanced"] == [
-            ("dcp_spec_bf16_balanced", "sm100a", n_rows, int(expected))
-        ], (batch, prefix, route)
+            ("dcp_spec_bf16_balanced", target, n_rows, int(expected))
+        ], (target, batch, prefix, route, q_len)
         assert not calls["static"]
+    calls, _launches = _patch_loaders(monkeypatch)
     # ``auto`` routes the one-wave b1 row to the static specialization (band reason ``one_wave``).
     calls["balanced"].clear()
     calls["static"].clear()
@@ -1351,9 +1378,10 @@ def test_forced_balanced_route_serves_a_row_outside_the_band(monkeypatch) -> Non
         == "static"
     )
     run_dcp_spec_decode(**inputs, route="balanced")
-    # one request of 65 pages on 148 SMs is inside the whole-tile regime (whole_pages_max 112): program 2
+    # one request of 65 pages on 148 SMs is inside the whole-tile regime (whole_pages_max 112): the swapped
+    # whole-tile program (3) on sm100a (sm103a keeps program 2)
     assert (
-        calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, 2)]
+        calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, 3)]
         and len(launches["balanced"]) == 1
     )
 
