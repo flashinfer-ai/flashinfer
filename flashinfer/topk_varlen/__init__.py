@@ -21,9 +21,22 @@ The CuTe-DSL kernel source (GVR and radix Top-K for Blackwell sm_100+) lives in
 backend's per-device caches (default workspace slabs). ``warmup_prefill``
 compiles and first-launches the windowed (prefill) engine set before serving
 and ``prefill_ready`` reports whether a windowed geometry would launch without
-compiling, so a serving framework can prepare CUDA-graph capture.
+compiling, so a serving framework can prepare CUDA-graph capture; both are
+resolved lazily on first access so that importing this package never loads the
+CuTe-DSL host module (``release_gvr2_resources`` relies on that to stay a
+no-op in a process that never ran ``gvr_2``).
 """
 
-from .kernels.gvr2_topk_host import prefill_ready as prefill_ready
-from .kernels.gvr2_topk_host import warmup_prefill as warmup_prefill
 from .topk_varlen import release_gvr2_resources as release_gvr2_resources
+
+_LAZY_HOST_EXPORTS = ("warmup_prefill", "prefill_ready")
+
+__all__ = ["release_gvr2_resources", *_LAZY_HOST_EXPORTS]
+
+
+def __getattr__(name: str):
+    if name in _LAZY_HOST_EXPORTS:
+        from .kernels import gvr2_topk_host
+
+        return getattr(gvr2_topk_host, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
