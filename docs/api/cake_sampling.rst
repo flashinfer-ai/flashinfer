@@ -101,8 +101,10 @@ R200; other devices use the nearest measured table).  On the 212-SM table a smal
 at most 64 or unknown) ept-32 streaming pick whose grid and the cluster-8 grid both fit one wave is
 re-picked to the cluster-8 ept-16 stream (measured 8-15 % faster on R200 at batch <= 16; multi-wave
 grids, large k and the other tables keep the ranked pick).  On the 132-SM table a small-k cluster-2
-ept-32 pick on rows of at least 16 register chunks per CTA (V262144) from batch 64 is re-picked to the
-cluster-1 ept-32 stream when both grids run in one wave (measured 5-7 % faster on H100).  ``renorm_out``
+ept-32 pick on rows of at least 16 register chunks for a single CTA (V262144: eight per CTA under the
+cluster-2 pick, sixteen under the cluster-1 replacement) from batch 64 is re-picked to the cluster-1 ept-32
+stream when both grids run in one wave (measured 1.4-1.9 % faster on H100 with both arms carrying the
+round-11 kernels; 5-7 % against round 10 including E1).  ``renorm_out``
 and ``workspace`` expose the
 sorted slab of a call.
 
