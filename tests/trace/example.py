@@ -15,12 +15,17 @@ Requires a CUDA-capable GPU.
 Results:
 - We would get these example json files under fi_trace_out directory:
 alphamoe_fused_router_e512_k8_bm16_shared0.json
+alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_hnd_ps8.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
 dsv41_fp4_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
 dsv41_fp4_quantize_append_sparse_mla_cache_2d_nhd_ps8.json
+dsv41_fp8_quantize_pack_sparse_mla_cache_3d_hnd_ps8.json
+dsv41_fp8_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
+dsv41_fp8_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
+dsv41_fp8_quantize_append_sparse_mla_cache_2d_nhd_ps8.json
 fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
 fmha_v2_prefill_sm120_h4_d128.json
@@ -60,6 +65,7 @@ merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
 minimax_h3_mxfp8_pre_attention_p8_hdst7_d128.json
 minimax_h3_nvfp4_pre_attention_p8_hdst7_d128.json
+minimax_h3_qkv_quantize_pack_p8_hdst7_d128_pk64.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
@@ -98,8 +104,12 @@ msa_topk_select_h4_topk16.json
 mxfp8_grouped_quantize_k4096.json
 nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
 nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
+pcie_ipc_all_gather_tp4_h6144.json
+pcie_ipc_reduce_scatter_tp4_h6144.json
 prims_ts_block_sparse_h8_kv8_d128_qb64_kb64.json
+prims_ts_block_sparse_dense_h8_kv8_d128_qb64_kb64.json
 prims_ts_block_sparse_wrapper_h8_kv8_d128.json
+prims_ts_block_sparse_wrapper_dense_h8_kv8_d128.json
 prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_wrapper_combined_h8_kv8_d128_ps64.json
@@ -128,7 +138,8 @@ top_k_top_p_sampling calls top_p_sampling internally.
 FP4 MoE files are only generated on Blackwell (SM100+) GPUs with fp4_quantize available.
 GDN prefill files require SM90+ (Hopper) GPU.
 MSA (msa_*) files require SM120/SM121 (consumer Blackwell) GPUs.
-dsv41_fp4_quantize_*_sparse_mla_cache_*.json are only generated on SM120/SM121 GPUs.
+dsv41_fp4_quantize_*_sparse_mla_cache_*.json and dsv41_fp8_quantize_*_sparse_mla_cache_*.json
+are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
 """
@@ -150,36 +161,56 @@ SAVE_DIR = Path(os.environ["FLASHINFER_TRACE_DUMP_DIR"])
 import torch
 
 import flashinfer
-import flashinfer.norm
-import flashinfer.sampling
-import flashinfer.gemm
-import flashinfer.gdn_decode
-import flashinfer.kda_decode
-import flashinfer.fused_moe
 import flashinfer.activation
 import flashinfer.cascade
-from flashinfer.jit.cpp_ext import is_cuda_version_at_least
-from flashinfer.utils import is_sm100a_supported
-from flashinfer.cake_minimax_h3 import (
-    MiniMaxH3Mxfp8PreAttention,
-    MiniMaxH3Nvfp4PreAttention,
-)
+import flashinfer.fused_moe
+import flashinfer.gdn_decode
+import flashinfer.gemm
+import flashinfer.kda_decode
+import flashinfer.norm
+import flashinfer.sampling
 from flashinfer.attention.prims_ts.block_sparse import (
     BlockSparsePagedTSWrapper,
     BlockSparseTSWrapper,
     block_sparse_attention,
     block_sparse_attention_with_paged_kv_cache,
 )
+from flashinfer.cake_minimax_h3 import (
+    MiniMaxH3Mxfp8PreAttention,
+    MiniMaxH3Nvfp4PreAttention,
+    MiniMaxH3QkvQuantizePack,
+)
+from flashinfer.comm import (
+    PcieIpcAllGatherWorkspace,
+    PcieIpcReduceScatterWorkspace,
+)
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
+from flashinfer.fi_trace import fi_trace
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+from flashinfer.mla import BatchMLAPagedAttentionWrapper
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
     fmha_v2_prefill_sm120,
 )
-from flashinfer.mla import BatchMLAPagedAttentionWrapper
+from flashinfer.utils import is_sm100a_supported
 
 device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
+
+# PCIe traces need only world_size and tensor metadata, not an IPC allocation
+# or peer GPUs. Real collective execution must construct the workspace normally.
+for _workspace_type, _collective, _input_rows in (
+    (PcieIpcAllGatherWorkspace, "all_gather", 8),
+    (PcieIpcReduceScatterWorkspace, "reduce_scatter", 32),
+):
+    _workspace = object.__new__(_workspace_type)
+    _workspace._world_size = 4
+    fi_trace(
+        getattr(_workspace, _collective),
+        inp=torch.empty((_input_rows, 6144), dtype=torch.bfloat16, device="meta"),
+        save_dir=SAVE_DIR,
+    )
 
 # MiniMax-H3 uses a prepared, caller-owned API. Emit its definition from meta
 # tensors so generating the trace fixture does not compile all exact-shape CUDA
@@ -225,6 +256,22 @@ MiniMaxH3Nvfp4PreAttention.run.fi_trace(
     q_norm_weight=torch.empty((128,), dtype=torch.bfloat16, device="meta"),
     k_norm_weight=torch.empty((128,), dtype=torch.bfloat16, device="meta"),
     rope_cos_sin=torch.empty((_mh_M, 96), dtype=torch.bfloat16, device="meta"),
+    out_global_scale=torch.empty((1,), dtype=torch.float32, device="meta"),
+    out_q=torch.empty(
+        (_mh_P, _mh_M, 56 // _mh_P, 3, 128 // 2),
+        dtype=torch.uint8,
+        device="meta",
+    ),
+    out_sf=torch.empty((_mh_P, 1024), dtype=torch.uint8, device="meta"),
+)
+
+# One-pass QKV quantize-and-pack helper (issue #4532 candidate 7): the NVFP4
+# send-buffer layout of the sibling above, produced directly from BF16 Q/K/V.
+MiniMaxH3QkvQuantizePack.run.fi_trace(
+    save_dir=SAVE_DIR,
+    q=torch.empty((_mh_M, 56, 128), dtype=torch.bfloat16, device="meta"),
+    k=torch.empty((_mh_M, 56, 128), dtype=torch.bfloat16, device="meta"),
+    v=torch.empty((_mh_M, 56, 128), dtype=torch.bfloat16, device="meta"),
     out_global_scale=torch.empty((1,), dtype=torch.float32, device="meta"),
     out_q=torch.empty(
         (_mh_P, _mh_M, 56 // _mh_P, 3, 128 // 2),
@@ -372,13 +419,35 @@ def example_dsv41_fp4_cache():
 example_dsv41_fp4_cache()
 
 
+def example_dsv41_fp8_cache():
+    from flashinfer.mla import (
+        dsv41_fp8_quantize_append_sparse_mla_cache,
+        dsv41_fp8_quantize_pack_sparse_mla_cache,
+    )
+    from flashinfer.utils import get_compute_capability
+
+    if get_compute_capability(torch.device(device)) not in ((12, 0), (12, 1)):
+        print("Skipping DSV4.1 FP8 cache examples: requires SM120/SM121")
+        return
+    latent = torch.randn(4, 8, 512, dtype=torch.bfloat16, device=device)
+    for layout in ("HND", "NHD"):
+        cache = dsv41_fp8_quantize_pack_sparse_mla_cache(latent, kv_layout=layout)
+        slots = torch.tensor([0, 9, 9, -1, 32], dtype=torch.int64, device=device)
+        dsv41_fp8_quantize_append_sparse_mla_cache(
+            latent.reshape(-1, 512)[:5], slots, cache
+        )
+
+
+example_dsv41_fp8_cache()
+
+
 # ── Quantization (FP4 / NVFP4 / MXFP4 / MXFP8, SM100+) ────────────────────────
 # Kernels are SM100+ only; trace is dumped before kernel launch so JSONs are
 # generated on any GPU — runtime failures are suppressed.
 from flashinfer.quantization.fp4_quantization import (
     fp4_quantize,
-    nvfp4_kv_dequantize_paged,
     mxfp4_quantize,
+    nvfp4_kv_dequantize_paged,
     nvfp4_quantize,
     silu_and_mul_nvfp4_quantize,
 )
@@ -811,6 +880,20 @@ block_sparse_attention.fi_trace(
     mask_type="dense",
     out=bs_out,
 )
+# The dense mode of the same API attends over the whole K/V sequence.
+block_sparse_attention.fi_trace(
+    save_dir=SAVE_DIR,
+    q=bs_q,
+    k=bs_k,
+    v=bs_v,
+    block_indptr=None,
+    block_indices=None,
+    q_block_size=bs_q_block,
+    kv_block_size=bs_kv_block,
+    use_block_sparse=False,
+    mask_type="dense",
+    out=bs_out,
+)
 
 # ── PrimTS paged block-sparse (both public cache forms) ──────────────────
 bs_page_size = 64
@@ -880,6 +963,22 @@ with contextlib.suppress(Exception):
         kv_valid_bits=bs_valid_bits,
         out=bs_out,
     )
+
+with contextlib.suppress(Exception):
+    bs_dense_wrapper = BlockSparseTSWrapper()
+    bs_dense_wrapper.plan(
+        bs_B,
+        bs_Sq,
+        bs_Skv,
+        bs_H,
+        bs_H,
+        bs_D,
+        bs_q_block,
+        bs_kv_block,
+        device=device,
+        use_block_sparse=False,
+    )
+    bs_dense_wrapper.run(bs_q, bs_k, bs_v, out=bs_out)
 
 
 with contextlib.suppress(Exception):
@@ -1062,6 +1161,57 @@ flashinfer.recurrent_kda(
     initial_state_indices=rk_source_indices,
     beta_is_logit=True,
 )
+
+# ── AlphaMoE NVFP4 (SM100/SM103, pre-aligned route plan) ────────────────────
+# The trace is emitted before validation/JIT, so unsupported GPUs still dump
+# the definition while the actual call is suppressed.
+with contextlib.suppress(Exception):
+    _am_M, _am_N, _am_K, _am_E, _am_topk, _am_bm = 8, 256, 256, 4, 2, 8
+    _am_x = torch.zeros(_am_M, _am_K // 2, dtype=torch.uint8, device=device)
+    _am_x_sf = torch.ones(_am_M, _am_K // 16, dtype=torch.float8_e4m3fn, device=device)
+    _am_w1 = torch.zeros(_am_E, _am_N, _am_K // 2, dtype=torch.uint8, device=device)
+    _am_w1_sf = torch.ones(
+        _am_E,
+        _am_N,
+        _am_K // 16,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    _am_w2 = torch.zeros(_am_E, _am_K, _am_N // 4, dtype=torch.uint8, device=device)
+    _am_w2_sf = torch.ones(
+        _am_E,
+        _am_K,
+        _am_N // 32,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    _am_sorted = torch.zeros(48, dtype=torch.int32, device=device)
+    _am_experts = torch.zeros(6, dtype=torch.int32, device=device)
+    _am_gate_scale = torch.ones(_am_E, dtype=torch.float32, device=device)
+    _am_up_scale = torch.ones(_am_E, dtype=torch.float32, device=device)
+    _am_down_scale = torch.ones(_am_E, dtype=torch.float32, device=device)
+    _am_extent = torch.zeros(1, dtype=torch.int32, device=device)
+    _am_weights = torch.zeros(_am_M, _am_topk, dtype=torch.float32, device=device)
+    _am_out = torch.zeros(_am_M, _am_K, dtype=torch.bfloat16, device=device)
+    flashinfer.fused_moe.alphamoe_nvfp4_aligned_moe(
+        _am_x,
+        _am_x_sf,
+        _am_w1,
+        _am_w1_sf,
+        _am_w2,
+        _am_w2_sf,
+        _am_gate_scale,
+        _am_up_scale,
+        _am_down_scale,
+        _am_sorted,
+        _am_experts,
+        _am_extent,
+        _am_weights,
+        _am_out,
+        _am_topk,
+        _am_bm,
+        2.5,
+    )
 
 # ── serving-native packed Kimi K3 KDA decode ────────────────────────────────
 # The trace is emitted before the exact-SM kernel is loaded, so suppressing an
@@ -2207,7 +2357,11 @@ for _pts_semantic_PS in (32, 4):
     with contextlib.suppress(Exception):
         from flashinfer.attention.prims_ts.decode import (
             BatchDecodePagedTSWrapper as _PrimTSDecodeWrapper,
+        )
+        from flashinfer.attention.prims_ts.decode import (
             batch_decode_with_paged_kv_cache as _attention_ts_decode,
+        )
+        from flashinfer.attention.prims_ts.decode import (
             get_prims_ts_batch_decode_workspace_size as _prims_ts_fmha_ws_size,
         )
 
@@ -2313,7 +2467,11 @@ for _pts_semantic_PS in (32, 4):
 with contextlib.suppress(Exception):
     from flashinfer.attention.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper as _PrimTSMLADecodeWrapper,
+    )
+    from flashinfer.attention.prims_ts.mla_decode import (
         batch_mla_decode_with_paged_kv_cache as _attention_ts_mla_decode,
+    )
+    from flashinfer.attention.prims_ts.mla_decode import (
         get_prims_ts_batch_mla_decode_workspace_size as _prims_ts_mla_ws_size,
     )
 
@@ -2443,6 +2601,7 @@ with contextlib.suppress(Exception):
 # xqa_batch_decode_with_kv_cache (SM100+ XQA decode wrapper, NHD 5-D cache).
 with contextlib.suppress(Exception):
     import math as _math2
+
     from flashinfer.decode import xqa_batch_decode_with_kv_cache as _xqa_dec
 
     _xqa_B, _xqa_Hq, _xqa_Hk, _xqa_D, _xqa_PS = 2, 8, 2, 128, 16
@@ -2473,6 +2632,7 @@ with contextlib.suppress(Exception):
 # xqa_batch_decode_with_kv_cache_mla (SM120/121 XQA MLA decode, FP8).
 with contextlib.suppress(Exception):
     import math as _math3
+
     from flashinfer.mla import (
         xqa_batch_decode_with_kv_cache_mla as _xmla_mla_dec,
     )

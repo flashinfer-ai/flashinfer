@@ -1,6 +1,10 @@
 import pytest
 import torch
 from tests.test_helpers.sink_attention_reference import sink_attention_unified
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 import flashinfer
 from flashinfer import SfLayout
@@ -389,43 +393,46 @@ def generate_spec_dec_mask(
     get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
     reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
 )
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size,head_dim",
-    [
-        (4, 4, 64, 4, 2, 128),
-        (4, 2, 16, 2, 4, 128),
-        (4, 3, 32, 2, 6, 128),
-        (4, 1, 16, 2, 1, 128),
-        (4, 1, 32, 2, 5, 128),
-        (128, 1, 64, 2, 6, 128),
-        (256, 1, 64, 4, 8, 128),
-        # 32 q heads / 2 kv heads (group ratio 16)
-        (4, 1, 32, 2, 16, 128),
-        (4, 4, 32, 2, 16, 128),
-        # head_dim 512 (Gemma-style GQA), decode only (no spec dec)
-        (4, 1, 32, 2, 4, 512),
-        (4, 1, 32, 2, 5, 512),
-        (16, 1, 64, 2, 8, 512),
-        (4, 1, 16, 2, 16, 512),
-    ],
+@parametrize_product(
+    {
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size,head_dim,spec_dec_mask_mode": [
+            (*shape, mask_mode)
+            for shape in [
+                (4, 4, 64, 4, 2, 128),
+                (4, 2, 16, 2, 4, 128),
+                (4, 3, 32, 2, 6, 128),
+                (4, 1, 16, 2, 1, 128),
+                (4, 1, 32, 2, 5, 128),
+                (128, 1, 64, 2, 6, 128),
+                (256, 1, 64, 4, 8, 128),
+                # 32 q heads / 2 kv heads (group ratio 16)
+                (4, 1, 32, 2, 16, 128),
+                (4, 4, 32, 2, 16, 128),
+                # head_dim 512 (Gemma-style GQA), decode only (no spec dec)
+                (4, 1, 32, 2, 4, 512),
+                (4, 1, 32, 2, 5, 512),
+                (16, 1, 64, 2, 8, 512),
+                (4, 1, 16, 2, 16, 512),
+            ]
+            for mask_mode in ["causal", "full"]
+            if shape[1] > 1 or mask_mode == "causal"
+        ],
+        "window_left": [-1, 127],
+        "q_dtype,kv_dtype,o_dtype": [
+            ("bf16", "bf16", "bf16"),
+            ("fp16", "fp16", "fp16"),
+            ("bf16", "fp8", "bf16"),
+            ("fp16", "fp8", "fp16"),
+            ("bf16", "fp8", "fp8"),
+            ("fp16", "fp8", "fp8"),
+        ],
+        "enable_pdl": [True, False, None],
+        "enable_sink": [True, False],
+        "max_in_kv_len": [110],
+        "kv_layout": ["NHD", "HND"],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("window_left", [-1, 127])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("bf16", "fp8", "bf16"),
-        ("fp16", "fp8", "fp16"),
-        ("bf16", "fp8", "fp8"),
-        ("fp16", "fp8", "fp8"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [True, False, None])
-@pytest.mark.parametrize("enable_sink", [True, False])
-@pytest.mark.parametrize("max_in_kv_len", [110])
-@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
-@pytest.mark.parametrize("spec_dec_mask_mode", ["causal", "full"])
 def test_xqa_batch_decode(
     batch_size,
     q_len_per_req,
@@ -444,9 +451,6 @@ def test_xqa_batch_decode(
     spec_dec_mask_mode,
 ):
     """Test xqa_batch_decode_with_kv_cache across layouts and mask modes."""
-    if q_len_per_req == 1 and spec_dec_mask_mode == "full":
-        pytest.skip("Mask is unused for q_len_per_req == 1")
-
     # Set up test parameters
     torch.manual_seed(0)
 

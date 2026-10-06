@@ -19,8 +19,10 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import logging
 import os
+import random
 import re
 import shutil
+import threading
 import time
 from typing import Generator
 
@@ -140,7 +142,7 @@ class ArtifactPath:
     # publish carries the Blackwell (sm100f/sm103a) and Rubin (sm107a) cubins.
     TRTLLM_GEN_FMHA: str = "2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "1d145b82ac60add55ea213863523f12d63005651/batched_gemm-09795a1-31ee4e5/"
+        "4e73ccb74f333ecfebeac52abf3ebe1fa2dd34b3/batched_gemm-b738138-6923fec/"
     )
     TRTLLM_GEN_GEMM: str = (
         "7b1fc253cd6237950e76310873f4acf4d97a3904/gemm-b738138-25754e6/"
@@ -168,7 +170,7 @@ class CheckSumHash:
         "d79b5c51fc8597fac57dae0da4afa114fb2014575e4ec3df099ad856d97cabc3"
     )
     TRTLLM_GEN_BMM: str = (
-        "e071273ce357ee3e8d40ce905dac03d2a6078f6c5869ca3b7d1f1d146643f009"
+        "8190fcb70b7661bf11cc5247b98d7fc55153386f969175c196a9e29d5801c7a1"
     )
     DEEPGEMM: str = "09e961d4e3852a6cf81b3482d0604c09dcb1f69c1b7936f535c9ee2f53335184"
     TRTLLM_GEN_GEMM: str = (
@@ -295,14 +297,37 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
             yield (full_path, checksums[full_path])
 
 
+# Outer retry-loop backoff bounds. ``download_file`` already spends its own
+# exponentially-backed-off budget per call, so this loop only paces re-entry
+# into it. Equal jitter (uniform[cap, 2*cap]) mirrors the inner loop's shape
+# and decorrelates the download threads -- and the many CI runners -- hitting
+# the same CDN edge. The cap is what keeps a long window (a nightly may allow
+# 24h) from degrading into a sustained poll of an endpoint we already know is
+# congested: in steady state each artifact re-attempts every 2.5-5 minutes, so
+# a 24h window costs ~350 requests per artifact rather than ~86k.
+_RETRY_BACKOFF_BASE_SECONDS = 5.0
+_RETRY_BACKOFF_CAP_SECONDS = 150.0
+
+
 def download_artifacts() -> None:
     from tqdm.contrib.logging import tqdm_logging_redirect
 
-    # use a shared session to make use of HTTP keep-alive and reuse of
-    # HTTPS connections.
-    session = requests.Session()
     cubin_files = list[tuple[str, str]](get_subdir_file_list())
     num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
+
+    retry_window_env = os.environ.get("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "0")
+    try:
+        retry_window_seconds = int(retry_window_env)
+    except ValueError as e:
+        raise RuntimeError(
+            "Invalid FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS value:"
+            f" {retry_window_env!r}. Expected an integer >= 0."
+        ) from e
+    if retry_window_seconds < 0:
+        raise RuntimeError(
+            "Invalid FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS value:"
+            f" {retry_window_env!r}. Expected an integer >= 0."
+        )
 
     cached_files: set[str] = set()
     files_to_download: list[tuple[str, str]] = []
@@ -328,27 +353,96 @@ def download_artifacts() -> None:
     ) as pbar:
         pbar.update(len(cached_files))
 
+        # requests.Session is not thread-safe, so hand each pool thread its own
+        # rather than sharing one; they are still long-lived enough for HTTP
+        # keep-alive to do its job across a thread's artifacts.
+        thread_state = threading.local()
+        sessions: list[requests.Session] = []
+        sessions_lock = threading.Lock()
+
+        # One window for the whole download, started when the first request goes
+        # out. A per-artifact window would multiply the worst case by the number
+        # of artifacts.
+        retry_deadline = time.monotonic() + retry_window_seconds
+
         def update_pbar_cb(_) -> None:
             pbar.update(1)
 
-        with ThreadPoolExecutor(num_threads) as pool:
-            futures = []
-            for name, _ in files_to_download:
-                source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
-                local_path = FLASHINFER_CUBIN_DIR / name
-                # Ensure parent directory exists
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-                fut = pool.submit(
-                    download_file, source, str(local_path), session=session
+        def thread_session() -> requests.Session:
+            session = getattr(thread_state, "session", None)
+            if session is None:
+                session = requests.Session()
+                thread_state.session = session
+                with sessions_lock:
+                    sessions.append(session)
+            return session
+
+        def download_within_retry_window(
+            source_path: str, destination_path: str, artifact_name: str
+        ) -> bool:
+            backoff_cap = _RETRY_BACKOFF_BASE_SECONDS
+            while True:
+                if download_file(
+                    source_path, destination_path, session=thread_session()
+                ):
+                    return True
+                remaining = retry_deadline - time.monotonic()
+                if remaining <= 0:
+                    if retry_window_seconds > 0:
+                        logger.error(
+                            "Retry window (%ds) exhausted for %s",
+                            retry_window_seconds,
+                            artifact_name,
+                        )
+                    return False
+                backoff = min(backoff_cap + random.uniform(0, backoff_cap), remaining)  # noqa: S311
+                logger.warning(
+                    "Download failed for %s; retrying in %.1fs"
+                    " (%.0fs left in retry window)",
+                    artifact_name,
+                    backoff,
+                    remaining,
                 )
-                fut.add_done_callback(update_pbar_cb)
-                futures.append(fut)
+                time.sleep(backoff)
+                backoff_cap = min(backoff_cap * 2, _RETRY_BACKOFF_CAP_SECONDS)
 
-            results = [fut.result() for fut in as_completed(futures)]
+        failed_artifacts: list[str] = []
+        try:
+            with ThreadPoolExecutor(num_threads) as pool:
+                future_to_name = {}
+                for name, _ in files_to_download:
+                    source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
+                    local_path = FLASHINFER_CUBIN_DIR / name
+                    # Ensure parent directory exists
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    fut = pool.submit(
+                        download_within_retry_window, source, str(local_path), name
+                    )
+                    fut.add_done_callback(update_pbar_cb)
+                    future_to_name[fut] = name
 
-    all_success = all(results)
-    if not all_success:
-        raise RuntimeError("Failed to download cubins")
+                for fut in as_completed(future_to_name):
+                    artifact_name = future_to_name[fut]
+                    try:
+                        if not fut.result():
+                            failed_artifacts.append(artifact_name)
+                    except Exception as e:
+                        logger.exception(
+                            "Unexpected exception in cubin download task for %s",
+                            artifact_name,
+                        )
+                        failed_artifacts.append(
+                            f"{artifact_name} ({type(e).__name__}: {e})"
+                        )
+        finally:
+            for session in sessions:
+                session.close()
+
+    if failed_artifacts:
+        failed_preview = ", ".join(failed_artifacts[:5])
+        remainder = len(failed_artifacts) - 5
+        extra = f" (+{remainder} more)" if remainder > 0 else ""
+        raise RuntimeError(f"Failed to download cubins: {failed_preview}{extra}")
 
     # Cached artifacts were verified before they were skipped. Verify each file
     # fetched in this invocation before allowing it into the wheel.

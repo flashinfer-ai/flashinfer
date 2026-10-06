@@ -343,14 +343,6 @@ def get_trtllm_comm_module():
     )
 
 
-@functools.cache
-def get_cake_moe_allreduce_module(device_index: int):
-    """Load the isolated SM100/SM103 MoE all-reduce module."""
-    from ..jit.cake_trtllm_moe_allreduce import load
-
-    return load(device_index)
-
-
 _symm_workspace_refs: dict[int, list[object]] = {}
 
 
@@ -598,7 +590,6 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     workspace_tensor = torch.tensor(
         workspace, dtype=torch.int64, device=torch.device("cuda")
     )
-
     if use_symm_dev_mem:
         torch.cuda.synchronize()
         comm_backend.barrier()  # must sync after create_workspace
@@ -1085,13 +1076,17 @@ def trtllm_moe_allreduce_fusion(
                    None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
     - backend: ``"trtllm"`` (default) or the constrained ``"cake"`` SM100/SM103
-      backend. The public Python API has 22 parameters; the isolated source
-      module's ``run_reduction`` entry has an exact 18-argument FFI ABI.
-      The optional backend supports contiguous FP16/BF16 tensors, world sizes 2, 4,
-      and 8, hidden_dim=7168, token payloads within the existing Lamport
-      ``MAX_COMM_SIZE`` byte limit, and residual plus norm outputs. It does not
-      support quantization. ``weight_bias`` remains a runtime value; ``None`` is
-      passed to the kernel as 0.0.
+      backend. The optional backend supports contiguous FP16/BF16 tensors, world
+      sizes 2, 4 and 8, hidden_dim=7168, token payloads within the existing
+      Lamport ``MAX_COMM_SIZE`` byte limit, and residual plus norm outputs. It
+      does not support quantization. ``weight_bias`` remains a runtime value;
+      ``None`` is passed to the kernel as 0.0. ``"cake"`` runs the verified
+      source export of the Cake all-reduce union
+      (``flashinfer.jit.cake_trtllm_moe_allreduce_union``); the route binds the
+      workspace pointer table the way
+      ``trtllm_create_ipc_workspace_for_all_reduce_fusion`` registers it and
+      needs no device readback. ``moe_allreduce_out=None`` is served by the same
+      kernels writing into a scratch tensor the union loader owns.
     """
 
     _check_cake_moe_allreduce_backend(backend)
@@ -1105,7 +1100,7 @@ def trtllm_moe_allreduce_fusion(
         )
 
     if backend == "cake":
-        device_index = _validate_cake_moe_allreduce(
+        _validate_cake_moe_allreduce(
             world_size=world_size,
             world_rank=world_rank,
             token_num=token_num,
@@ -1124,25 +1119,28 @@ def trtllm_moe_allreduce_fusion(
             quant_out=quant_out,
             scale_out=scale_out,
         )
-        get_cake_moe_allreduce_module(device_index).run_reduction(
-            world_size,
-            world_rank,
-            token_num,
-            hidden_dim,
-            workspace_ptrs,
-            launch_with_pdl,
-            residual_in,
-            rms_gamma,
-            rms_eps,
-            scale_factor,
-            moe_reduction_device_num_experts,
-            moe_reduction_scale_input,
-            moe_reduction_active_experts_token_input,
-            moe_reduction_token_input,
-            moe_allreduce_out,
-            residual_out,
-            norm_out,
-            weight_bias,
+        from ..jit.cake_trtllm_moe_allreduce_union import run_cake_moe_allreduce_union
+
+        run_cake_moe_allreduce_union(
+            backend="cake",
+            world_size=world_size,
+            world_rank=world_rank,
+            token_num=token_num,
+            hidden_dim=hidden_dim,
+            workspace_ptrs=workspace_ptrs,
+            launch_with_pdl=launch_with_pdl,
+            residual_in=residual_in,
+            rms_gamma=rms_gamma,
+            rms_eps=rms_eps,
+            scale_factor=scale_factor,
+            moe_reduction_device_num_experts=moe_reduction_device_num_experts,
+            moe_reduction_scale_input=moe_reduction_scale_input,
+            moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
+            moe_reduction_token_input=moe_reduction_token_input,
+            moe_allreduce_out=moe_allreduce_out,
+            residual_out=residual_out,
+            norm_out=norm_out,
+            weight_bias=weight_bias,
         )
         return
 
@@ -1203,8 +1201,10 @@ def trtllm_moe_finalize_allreduce_fusion(
     - expanded_idx_to_permuted_idx: the expanded index to permuted index tensor. [token_num, top_k]
     - norm_out: the norm output tensor. [token_num, hidden_dim]
     - residual_out: the residual output tensor. [token_num, hidden_dim]
-    - quant_out: the quant output tensor. [token_num // 4, hidden_dim], fp16/bf16 -> fp4
-    - scale_out: the scale output tensor. [token_num // SF_VEC_SIZE, hidden_dim], fp16/bf16 -> fp4
+    - quant_out: the packed FP4 output buffer, token_num * hidden_dim // 2 bytes
+      (any element type; the Cake backend checks the byte size).
+    - scale_out: the E4M3 scale output buffer in SWIZZLED_128x4 layout,
+      round_up(token_num, 128) * round_up(hidden_dim // 16, 4) bytes.
     - workspace_ptrs: the workspace pointers.
     - launch_with_pdl: whether to launch with pdl.
     - world_rank: the rank of the current process.
@@ -1240,7 +1240,6 @@ def trtllm_moe_finalize_allreduce_fusion(
         from ..jit.cake_moe_finalize_comm import run_cake_moe_finalize
 
         run_cake_moe_finalize(
-            backend="cake",
             allreduce_in=allreduce_in,
             residual_in=residual_in,
             norm_weight=norm_weight,

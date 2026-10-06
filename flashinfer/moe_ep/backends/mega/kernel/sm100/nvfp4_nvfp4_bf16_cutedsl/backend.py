@@ -135,6 +135,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             swiglu_alpha=k.swiglu_alpha,
             swiglu_beta=k.swiglu_beta,
             activation_clamp=k.activation_clamp,
+            activation=k.activation,
+            situ_beta=k.situ_beta,
+            situ_linear_beta=k.situ_linear_beta,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             defer_topk_reduce=self._uses_native_topk_reduce(fleet_params),
@@ -146,11 +149,16 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _uses_native_topk_reduce(self, fleet_params: FleetParams) -> bool:
-        """Whether this exact workspace can use the frozen SM100a reducer."""
+        """Whether this exact workspace can use the frozen Cake reducer.
+
+        The reducer is published for the datacenter-Blackwell targets that
+        also run this CuTeDSL megakernel (sm_100a on B200, sm_103a on B300).
+        """
+        from flashinfer.jit.cake_megamoe_topk_reduce import supports_device
 
         k = self._kernel_config
         return (
-            torch.cuda.get_device_capability(torch.cuda.current_device()) == (10, 0)
+            supports_device()
             and fleet_params.max_tokens_per_rank in (256, 4096)
             and fleet_params.token_hidden_size == 4096
             and k.top_k == 6
@@ -403,7 +411,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             )
 
             reducer_state = (
-                get_cake_megamoe_topk_reduce_module(),
+                get_cake_megamoe_topk_reduce_module(partials.device),
                 partials,
                 workspace_root,
                 key[3],
@@ -445,6 +453,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             _resolve_gate_up_clamp(k),
             k.swiglu_alpha,
             k.swiglu_beta,
+            k.activation,
+            k.situ_beta,
+            k.situ_linear_beta,
             k.apply_topk_in_fc1,
             k.enable_in_kernel_fc2_reduce,
             self._uses_native_topk_reduce(fleet_params),

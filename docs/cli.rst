@@ -158,6 +158,9 @@ environment. This combines ``install-cubin-wheel`` and
    # Override CUDA version detection for the jit-cache wheel
    flashinfer download-kernels --cuda-version 12.9
 
+   # Install only the jit-cache provider compatible with SM90a
+   flashinfer download-kernels --sm sm90a
+
    # Use nightly wheel indexes
    flashinfer download-kernels --nightly
 
@@ -166,6 +169,10 @@ environment. This combines ``install-cubin-wheel`` and
 
 ``flashinfer-cubin`` is installed from the flat FlashInfer wheel index, while
 ``flashinfer-jit-cache`` is installed from the CUDA-specific wheel index.
+Passing ``--sm`` installs the shim and only the best compatible jit-cache
+provider for that architecture; it may be repeated for heterogeneous targets.
+The ``flashinfer-cubin`` wheel is a shared multi-architecture package and is
+still installed unchanged.
 If one wheel install fails, the command still attempts the other install and
 reports any failures at the end.
 
