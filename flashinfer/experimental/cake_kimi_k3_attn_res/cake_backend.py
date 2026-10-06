@@ -43,15 +43,16 @@ belongs to the caller).  ``prefix`` (and ``blocks`` when a snapshot is written)
 are mutated in place on every launch, as in the model.
 """
 
+import functools
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Optional
-
-import functools
 
 import torch
 import tvm_ffi
 
 from .cake_jit import (
+    KERNELS,
     MODULES,
     kernel_module_name,
     load_cake_kimi_k3_attn_res_module,
@@ -81,6 +82,7 @@ _SM103_EARLY_CONSUMED_RELEASE_CELLS = frozenset(
         (512, 4),
         (512, 8),
         (1024, 1),
+        (1024, 4),
         (1024, 8),
         (2048, 1),
         (2048, 4),
@@ -98,10 +100,24 @@ _SM103_EARLY_CONSUMED_RELEASE_CELLS = frozenset(
         (16384, 8),
     }
 )
-_SM100_K1_NC2_M = frozenset({1024, 2048, 8192})
+_SM100_K1_NC2_M = frozenset({512, 1024, 2048, 8192})
 _SM103_K1_NC2_M = frozenset({256})
 _SM103_K5_NC4_DEPTH_M = {4096: 3}
-_SM100_RELAXED_PRODUCER_WAIT_CELLS = frozenset({(512, 1)})
+# Cells (M, K) that run three sources per chunk with a depth-3 pipeline.
+_NC3_D3_CELLS = {
+    "sm_100a": frozenset(
+        {(2048, 4), (4096, 4), (8192, 4), (16384, 4), (4096, 3), (4096, 5)}
+    ),
+    "sm_103a": frozenset({(1024, 4), (2048, 4), (4096, 4)}),
+}
+# sm_100a dense cells that hold the consumed-stage release through the output stats.
+_SM100_HELD_CONSUMED_RELEASE_CELLS = frozenset({(4096, 5)})
+# K = 0 TMA route: grid multiple of the SM count on the promoted mid-M cells.
+_K0_TMA_GRID_MULTIPLIER_M = {
+    "sm_100a": {256: 2, 512: 2, 1024: 3},
+    "sm_103a": {256: 2, 512: 3, 1024: 3},
+}
+_SM100_RELAXED_PRODUCER_WAIT_CELLS: frozenset[tuple[int, int]] = frozenset()
 _SM103_RELAXED_PRODUCER_WAIT_CELLS = frozenset({(4096, 5)})
 _NATIVE_ROUTES = (
     # name, {arch: routed M}, num_blocks, PDL modes, consumed-release policy
@@ -116,7 +132,7 @@ _NATIVE_ROUTES = (
         "m128",
         {
             "sm_100a": frozenset({1, 2, 4, 8, 16, 32, 64, 128, 1024}),
-            "sm_103a": frozenset({1, 2, 4, 8, 16, 32, 64, 128, 256, 1024}),
+            "sm_103a": frozenset({1, 2, 4, 8, 16, 32, 64, 128, 256}),
         },
         4,
         (False, True),
@@ -131,26 +147,79 @@ _NATIVE_ROUTES = (
     ),
     (
         "k7",
-        {"sm_100a": frozenset({1}), "sm_103a": frozenset()},
+        {"sm_100a": frozenset({1}), "sm_103a": frozenset({1})},
         7,
         (False,),
         "native_all_reader_nofence_before_wait_st",
     ),
     (
         "k8",
-        {"sm_100a": frozenset({1, 2, 4, 8, 32}), "sm_103a": frozenset({256})},
+        {
+            "sm_100a": frozenset({1, 2, 4, 8, 32, 256}),
+            "sm_103a": frozenset({1, 8, 256}),
+        },
         8,
         (False, True),
         "native_all_reader_nofence_before_wait_st",
     ),
 )
 _NATIVE_K8_SM100_PDL_ONLY_M = frozenset({16})
+# Small-M direct kernel: one token per 256-thread CTA, every source register-resident,
+# selected ahead of every other dense program for M <= max_m (per architecture and K).
+_SMALL_M_DIRECT_MAX_M = {
+    "sm_100a": {0: 256, 1: 512, 2: 256, 3: 256, 4: 128, 5: 128, 6: 128, 7: 128, 8: 64},
+    "sm_103a": {0: 512, 1: 512, 2: 256, 3: 256, 4: 128, 5: 128, 6: 128, 7: 128, 8: 64},
+}
+# Cluster split of the small-M kernel: K -> ((max_m, cluster), ...) bands in ascending max_m; the
+# first band with max_m >= M gives the CTAs per token (2 or 4). K absent or M above the last band
+# -> one CTA per token.
+_SMALL_M_CLUSTER: dict[str, dict[int, tuple[tuple[int, int], ...]]] = {
+    "sm_100a": {
+        4: ((4, 4), (16, 2)),
+        5: ((4, 4), (16, 2)),
+        6: ((4, 4), (32, 2)),
+        7: ((4, 4), (64, 2)),
+        8: ((16, 4), (64, 2)),
+    },
+    "sm_103a": {
+        4: ((16, 2),),
+        5: ((32, 2),),
+        6: ((32, 2),),
+        7: ((32, 2),),
+        8: ((64, 2),),
+    },
+}
+
+
+def _small_m_cluster(arch: str, M: int, K: int) -> int:
+    for max_m, cluster in _SMALL_M_CLUSTER[arch].get(K, ()):
+        if max_m >= M:
+            return int(cluster)
+    return 1
+
+
+# Online-softmax chunk size of the small-M programs: K -> ((max_m, sources_per_chunk), ...) bands in
+# ascending max_m; the first band with max_m >= M applies, K absent or M above the last band -> the
+# program default (nc4 for K <= 3, nc3 for K >= 4). The mid-M cells mirror the chunking of the
+# persistent program they replace (nc4), so their results are bit-identical to it.
+_SMALL_M_CHUNK_BANDS: dict[str, dict[int, tuple[tuple[int, int], ...]]] = {
+    "sm_100a": {5: ((16, 3), (128, 4)), 6: ((16, 3), (128, 4)), 7: ((16, 3), (128, 4))},
+    "sm_103a": {5: ((16, 3), (128, 4)), 6: ((16, 3), (128, 4)), 7: ((16, 3), (128, 4))},
+}
+
+
+def _small_m_sources_per_chunk(arch: str, M: int, K: int) -> int | None:
+    default = 4 if K <= 3 else 3
+    for max_m, sources_per_chunk in _SMALL_M_CHUNK_BANDS[arch].get(K, ()):
+        if max_m >= M:
+            return None if int(sources_per_chunk) == default else int(sources_per_chunk)
+    return None
 
 
 class RoutePlan(NamedTuple):
     """The generated program one call launches and its launch geometry."""
 
-    kind: str  # "direct" | "native" | "k0_tma" | "persistent"
+    kind: str  # "direct" | "small_m" | "native" | "k0_tma" | "persistent"
     kernel_key: str
     grid_x: int
     threads: int
@@ -158,6 +227,9 @@ class RoutePlan(NamedTuple):
     route_id: str
     arch: Optional[str]
     use_pdl: bool
+    # Exact (table) key when this plan runs a registered variant of the same program family
+    # instead, because the checkout does not register the exact variant; None for exact plans.
+    fallback_from: Optional[str] = None
 
 
 @functools.lru_cache(maxsize=None)
@@ -195,6 +267,8 @@ def _wait_policy(arch: str) -> bool:
 
 def _schedule(arch: str, M: int, K: int) -> tuple[int, int]:
     """``(sources_per_chunk, chunk_depth)`` of the persistent common path."""
+    if (M, K) in _NC3_D3_CELLS[arch]:
+        return 3, 3
     if arch == "sm_100a":
         if K == 0 and M in {1, 2, 16, 32, 64, 512, 2048, 4096, 8192, 16384}:
             return 1, PERSISTENT_CHUNK_DEPTH
@@ -230,7 +304,7 @@ def _grid(M: int, num_sms: int, sources_per_chunk: int) -> tuple[int, str]:
 
 def _early_consumed_release(arch: str, M: int, K: int, grid_x: int) -> bool:
     if arch == "sm_100a":
-        return K > 0 and grid_x < M
+        return K > 0 and grid_x < M and (M, K) not in _SM100_HELD_CONSUMED_RELEASE_CELLS
     return K > 0 and grid_x < M and (M, K) in _SM103_EARLY_CONSUMED_RELEASE_CELLS
 
 
@@ -258,6 +332,151 @@ def _native_route(arch: str, num_sms: int, M: int, K: int, use_pdl: bool):
     return None
 
 
+# Flag positions of the persistent key's ``f<bits>`` field (see ``_plan_route_exact``).
+_PERSISTENT_FLAG_ECR = 0
+_PERSISTENT_FLAG_PWA = 1
+_PERSISTENT_FLAG_PREFIX_BF16_ADD = 2
+_PERSISTENT_FLAG_PREFIX_ROUND_ONCE = 3
+_PERSISTENT_FLAG_ONE_TOKEN_PER_CTA = 4
+_PERSISTENT_KEY = re.compile(r"^persistent:k(\d+)_nc(\d+)_d(\d+)_f([01]+)$")
+_SMALL_M_KEY = re.compile(r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?$")
+
+
+def _persistent_schedule_id(nc: int, depth: int, bits: str) -> str:
+    schedule_id = f"trtllm_persistent_ws288_nc{nc}_d{depth}_vec128_fp32x2"
+    if bits[_PERSISTENT_FLAG_ECR] == "1":
+        schedule_id += "_early_consume"
+    if bits[_PERSISTENT_FLAG_PWA] == "0":
+        schedule_id += "_relaxed_producer_wait"
+    if bits[_PERSISTENT_FLAG_PREFIX_BF16_ADD] == "1":
+        schedule_id += "_prefix_bf16_add_packed_inputs_prefix_shared_addr"
+    if bits[_PERSISTENT_FLAG_PREFIX_ROUND_ONCE] == "1":
+        schedule_id += "_prefix_round_once"
+    if bits[_PERSISTENT_FLAG_ONE_TOKEN_PER_CTA] == "1":
+        schedule_id += "_one_token_per_cta"
+    return schedule_id
+
+
+def _small_m_plan(
+    arch: str, M: int, K: int, use_pdl: bool, cluster: int, exact_key: Optional[str]
+) -> RoutePlan:
+    threads = DIRECT_THREADS // cluster
+    if cluster == 1:
+        schedule_id = "small_m_direct_cta256_regres_fp32x2"
+        grid_policy = "one_token_per_cta"
+        kernel_key = f"small_m_direct:k{K}"
+    else:
+        schedule_id = f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2"
+        grid_policy = f"one_token_per_cluster{cluster}"
+        kernel_key = f"small_m_cluster{cluster}:k{K}"
+    route_id = (
+        f"{schedule_id}.{arch}.none_k{K}.k{K}.delta1.write0.norm1."
+        f"pdl{int(use_pdl)}.{grid_policy}.registered_fallback"
+    )
+    return RoutePlan(
+        "small_m",
+        kernel_key,
+        M * cluster,
+        threads,
+        schedule_id,
+        route_id,
+        arch,
+        use_pdl,
+        exact_key,
+    )
+
+
+def _persistent_fallback(
+    plan: RoutePlan, table: dict[str, str], num_sms: int, M: int, K: int, exact_key: str
+) -> Optional[RoutePlan]:
+    """The registered persistent variant of block count ``K`` closest to the exact plan."""
+    exact = (
+        _PERSISTENT_KEY.match(plan.kernel_key) if plan.kind == "persistent" else None
+    )
+    want_nc, want_depth, want_bits = (
+        (int(exact.group(2)), int(exact.group(3)), exact.group(4))
+        if exact
+        else (None, None, None)
+    )
+    candidates = []
+    for key in table:
+        match = _PERSISTENT_KEY.match(key)
+        if match is None or int(match.group(1)) != K:
+            continue
+        nc, depth, bits = int(match.group(2)), int(match.group(3)), match.group(4)
+        score = (
+            nc != want_nc,
+            depth != want_depth,
+            want_bits is None
+            or bits[_PERSISTENT_FLAG_ECR] != want_bits[_PERSISTENT_FLAG_ECR],
+            want_bits is None
+            or bits[_PERSISTENT_FLAG_PWA] != want_bits[_PERSISTENT_FLAG_PWA],
+            want_bits is None
+            or sum(a != b for a, b in zip(bits, want_bits, strict=False)),
+            key,
+        )
+        candidates.append((score, key, nc, depth, bits))
+    if not candidates:
+        return None
+    _score, key, nc, depth, bits = min(candidates)
+    if bits[_PERSISTENT_FLAG_ONE_TOKEN_PER_CTA] == "1":
+        grid_x, grid_policy = M, "one_token_per_cta"
+    else:
+        grid_x, grid_policy = _grid(M, num_sms, nc)
+    schedule_id = _persistent_schedule_id(nc, depth, bits)
+    wait_policy = "deferred_wait_st" if _wait_policy(plan.arch) else "control_wait_st"
+    route_id = (
+        f"{schedule_id}.{plan.arch}.{wait_policy}.k{K}.delta1.write0.norm1."
+        f"pdl{int(plan.use_pdl)}.{grid_policy}.registered_fallback"
+    )
+    return RoutePlan(
+        "persistent",
+        key,
+        grid_x,
+        PERSISTENT_THREADS,
+        schedule_id,
+        route_id,
+        plan.arch,
+        plan.use_pdl,
+        exact_key,
+    )
+
+
+def _resolve_registered(plan: RoutePlan, num_sms: int, M: int) -> RoutePlan:
+    """``plan`` itself when its program is registered (or no registry exists for the
+    architecture); otherwise the closest registered variant of the same family and block
+    count.  Bootstrap ``direct`` variants encode semantics in their key and never substitute."""
+    if plan.arch is None or plan.kind == "direct":
+        return plan
+    table = KERNELS.get(plan.arch)
+    if not table or plan.kernel_key in table:
+        return plan
+    exact_key = plan.kernel_key
+    if plan.kind == "small_m":
+        match = _SMALL_M_KEY.match(exact_key)
+        if match is None:
+            return plan
+        K = int(match.group(3))
+        same_cluster = int(match.group(2)) if match.group(2) else 1
+        for cluster in (same_cluster, 2, 4, 1):
+            if (
+                f"small_m_{'direct' if cluster == 1 else f'cluster{cluster}'}:k{K}"
+                in table
+            ):
+                return _small_m_plan(plan.arch, M, K, plan.use_pdl, cluster, exact_key)
+        fallback = _persistent_fallback(plan, table, num_sms, M, K, exact_key)
+        return fallback if fallback is not None else plan
+    if plan.kind == "persistent":
+        match = _PERSISTENT_KEY.match(exact_key)
+        if match is None:
+            return plan
+        fallback = _persistent_fallback(
+            plan, table, num_sms, M, int(match.group(1)), exact_key
+        )
+        return fallback if fallback is not None else plan
+    return plan
+
+
 def plan_route(
     arch: Optional[str],
     num_sms: int,
@@ -270,7 +489,42 @@ def plan_route(
     apply_output_norm: bool = True,
     common_path: bool = True,
 ) -> RoutePlan:
-    """Select the generated program for one call from host-known facts only."""
+    """Select the generated program for one call from host-known facts only.
+
+    The route tables name the schedule variant measured for every cell of the evaluation
+    grid.  Cells outside that grid (token counts that are not powers of two, block counts
+    5-7 at mid token counts, ...) may name a variant this checkout does not register; such a
+    plan is resolved to a registered variant of the same program family and block count
+    (``fallback_from`` records the exact key), so every dense call has a program.  Measured
+    cells always run their exact program.
+    """
+    plan = _plan_route_exact(
+        arch,
+        num_sms,
+        M,
+        num_blocks,
+        use_pdl,
+        has_delta=has_delta,
+        block_write_idx=block_write_idx,
+        apply_output_norm=apply_output_norm,
+        common_path=common_path,
+    )
+    return _resolve_registered(plan, num_sms, M)
+
+
+def _plan_route_exact(
+    arch: Optional[str],
+    num_sms: int,
+    M: int,
+    num_blocks: int,
+    use_pdl: bool,
+    *,
+    has_delta: bool = True,
+    block_write_idx: int = -1,
+    apply_output_norm: bool = True,
+    common_path: bool = True,
+) -> RoutePlan:
+    """The table-exact plan (the schedule variant named by the route tables)."""
     M = int(M)
     K = int(num_blocks)
     use_pdl = bool(use_pdl)
@@ -294,6 +548,36 @@ def plan_route(
     num_sms = int(num_sms)
     if num_sms <= 0:
         raise ValueError(f"invalid persistent launch geometry M={M}, num_sms={num_sms}")
+    max_m = _SMALL_M_DIRECT_MAX_M[arch].get(K)
+    if max_m is not None and max_m >= M:
+        cluster = _small_m_cluster(arch, M, K)
+        threads = DIRECT_THREADS // cluster
+        sources_per_chunk = _small_m_sources_per_chunk(arch, M, K)
+        nc_suffix = "" if sources_per_chunk is None else f"_nc{sources_per_chunk}"
+        if cluster == 1:
+            schedule_id = f"small_m_direct_cta256_regres_fp32x2{nc_suffix}"
+            grid_policy = "one_token_per_cta"
+            kernel_key = f"small_m_direct:k{K}{nc_suffix}"
+        else:
+            schedule_id = (
+                f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2{nc_suffix}"
+            )
+            grid_policy = f"one_token_per_cluster{cluster}"
+            kernel_key = f"small_m_cluster{cluster}:k{K}{nc_suffix}"
+        route_id = (
+            f"{schedule_id}.{arch}.none_k{K}.k{K}.delta1.write0.norm1."
+            f"pdl{int(use_pdl)}.{grid_policy}"
+        )
+        return RoutePlan(
+            "small_m",
+            kernel_key,
+            M * cluster,
+            threads,
+            schedule_id,
+            route_id,
+            arch,
+            use_pdl,
+        )
     native = _native_route(arch, num_sms, M, K, use_pdl)
     if native is not None:
         name, _release = native
@@ -310,9 +594,13 @@ def plan_route(
             use_pdl,
         )
     if K == 0:
-        grid_x = min(M, num_sms)
+        multiplier = _K0_TMA_GRID_MULTIPLIER_M[arch].get(M)
+        if multiplier is None:
+            grid_x, grid_policy = min(M, num_sms), "token_or_full_sm"
+        else:
+            grid_x, grid_policy = multiplier * num_sms, f"full_sm_x{multiplier}"
         schedule_id = "k0_tma_persistent_ws288_vec128_fp32x2"
-        route_id = f"{schedule_id}.{arch}.none_k0.k0.delta1.write0.norm1.pdl{int(use_pdl)}.token_or_full_sm"
+        route_id = f"{schedule_id}.{arch}.none_k0.k0.delta1.write0.norm1.pdl{int(use_pdl)}.{grid_policy}"
         return RoutePlan(
             "k0_tma",
             "k0_tma",
@@ -414,17 +702,7 @@ def plan_route(
     )
     bits = "".join("1" if flag else "0" for flag in flags)
     key = f"persistent:k{K}_nc{nc}_d{depth}_f{bits}"
-    schedule_id = f"trtllm_persistent_ws288_nc{nc}_d{depth}_vec128_fp32x2"
-    if ecr:
-        schedule_id += "_early_consume"
-    if not pwa:
-        schedule_id += "_relaxed_producer_wait"
-    if prefix_bf16_add:
-        schedule_id += "_prefix_bf16_add_packed_inputs_prefix_shared_addr"
-    if prefix_round_once:
-        schedule_id += "_prefix_round_once"
-    if one_token_per_cta:
-        schedule_id += "_one_token_per_cta"
+    schedule_id = _persistent_schedule_id(nc, depth, bits)
     wait_policy = "deferred_wait_st" if defer else "control_wait_st"
     route_id = f"{schedule_id}.{arch}.{wait_policy}.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.{grid_policy}"
     return RoutePlan(

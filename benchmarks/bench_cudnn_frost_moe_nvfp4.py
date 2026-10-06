@@ -44,14 +44,14 @@ from pathlib import Path
 
 import torch
 
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+from flashinfer.fused_moe.backends.cudnn_frost import (
     runtime,
 )
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.activations import (
+from flashinfer.fused_moe.backends.cudnn_frost.activations import (
     ACTIVATIONS,
     is_gated,
 )
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
+from flashinfer.fused_moe.backends.cudnn_frost.nvfp4 import (
     runtime as nvfp4,
 )
 
@@ -146,7 +146,7 @@ def routing_offsets(tokens, experts, top_k, routing):
         logits[: tokens // 2, 0] += 2
     ids = logits.topk(top_k, dim=-1).indices
     counts = torch.bincount(ids.flatten(), minlength=experts)
-    offsets = (counts.cumsum(0) - counts).to(torch.int32)
+    offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(torch.int32)
     return offsets, counts.tolist()
 
 
@@ -522,6 +522,9 @@ def discover_original(arch, quant, activation):
 
     eligible, audit = {}, []
     for cfg_cls, runner_cls in _BACKEND_RUNNERS.items():
+        # Frost is measured separately against the competing backend pool.
+        if runner_cls.backend_key.startswith("cudnn_frost_"):
+            continue
         supported_acts = (
             runner_cls.supported_activation_classes_by_quant.get(quant.pair, ())
             if runner_cls.supported_activation_classes_by_quant
@@ -984,7 +987,7 @@ def benchmark(args):
         output = args.output.open("x")
     try:
         if args.artifacts is not None:
-            from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
+            from flashinfer.fused_moe.backends.cudnn_frost.nvfp4 import (
                 moe,
             )
 

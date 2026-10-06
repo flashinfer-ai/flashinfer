@@ -28,7 +28,6 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
 
    tutorials/recursive_attention
    tutorials/kv_layout
-   mxfp4_situ_moe
    tutorials/generated/jax_tvm_ffi/index
 
 .. toctree::
@@ -39,6 +38,7 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
    api/attn_scores
    api/cake_fmha
    api/cake_moe_grouped_gemm
+   api/cake_mxfp4_situ_moe
    api/cake_sampling
    api/gemm
    api/grouped_mm

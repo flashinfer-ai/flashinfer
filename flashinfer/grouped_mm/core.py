@@ -165,7 +165,7 @@ def grouped_mm_bf16(
 # =========================================================================
 
 
-@supported_compute_capability([89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
 def _check_grouped_mm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -299,7 +299,7 @@ def grouped_mm_fp8(
 # =========================================================================
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _check_grouped_mm_mxfp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -440,7 +440,7 @@ def grouped_mm_mxfp8(
 # =========================================================================
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _check_grouped_mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,

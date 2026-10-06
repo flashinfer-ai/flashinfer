@@ -252,6 +252,17 @@ from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
+from .cake_rmsnorm_train import CakeRMSNormFunction as CakeRMSNormFunction
+from .cake_rmsnorm_train import cake_rmsnorm as cake_rmsnorm
+from .cake_rmsnorm_train import (
+    cake_rmsnorm_train_backward as cake_rmsnorm_train_backward,
+)
+from .cake_rmsnorm_train import (
+    cake_rmsnorm_train_backward_workspace_bytes as cake_rmsnorm_train_backward_workspace_bytes,
+)
+from .cake_rmsnorm_train import (
+    cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
+)
 from . import nvfp4_attention_sm120 as nvfp4_attention_sm120
 from .nvfp4_attention_sm120 import (
     nvfp4_attention_sm120_fwd as nvfp4_attention_sm120_fwd,

@@ -44,39 +44,22 @@ PRIMARY_K = (0, 1, 4, 8)
 # Representative cells of the measured policy per architecture:
 # (arch, M, K, pdl) -> (kind, schedule_id, grid_x)
 POLICY_ROWS = [
-    ("sm_100a", 1, 0, False, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 1),
-    ("sm_100a", 256, 0, True, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 148),
-    ("sm_100a", 1, 5, False, "native", "native_k5_nc3_d2_ws288_grid148", NATIVE_GRID),
-    ("sm_100a", 64, 4, True, "native", "native_m128_nc3_d2_ws288_grid148", NATIVE_GRID),
-    ("sm_100a", 1, 7, False, "native", "native_k7_nc3_d2_ws288_grid148", NATIVE_GRID),
-    (
-        "sm_100a",
-        1,
-        7,
-        True,
-        "persistent",
-        "trtllm_persistent_ws288_nc4_d2_vec128_fp32x2_prefix_bf16_add_packed_inputs_prefix_shared_addr",
-        1,
-    ),
-    ("sm_100a", 16, 8, True, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE_GRID),
-    (
-        "sm_100a",
-        16,
-        8,
-        False,
-        "persistent",
-        "trtllm_persistent_ws288_nc3_d2_vec128_fp32x2_prefix_bf16_add_packed_inputs_prefix_shared_addr_prefix_round_once",
-        16,
-    ),
-    (
-        "sm_100a",
-        512,
-        1,
-        False,
-        "persistent",
-        "trtllm_persistent_ws288_nc4_d2_vec128_fp32x2_early_consume_relaxed_producer_wait",
-        128,
-    ),
+    ("sm_100a", 1, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 1),
+    ("sm_100a", 16, 0, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 16),
+    ("sm_100a", 32, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 32),
+    ("sm_100a", 8, 1, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 8),
+    ("sm_100a", 16, 4, True, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 32),
+    ("sm_100a", 256, 0, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 256),
+    ("sm_100a", 1024, 0, False, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 444),
+    ("sm_100a", 2048, 0, True, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 148),
+    ("sm_100a", 256, 8, False, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE_GRID),
+    ("sm_100a", 1, 5, False, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 4),
+    ("sm_100a", 64, 4, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 64),
+    ("sm_100a", 1, 7, False, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 4),
+    ("sm_100a", 1, 7, True, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 4),
+    ("sm_100a", 16, 8, True, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 64),
+    ("sm_100a", 16, 8, False, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 64),
+    ("sm_100a", 512, 1, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 512),
     (
         "sm_100a",
         1024,
@@ -92,10 +75,51 @@ POLICY_ROWS = [
         4,
         False,
         "persistent",
-        "trtllm_persistent_ws288_nc5_d2_vec128_fp32x2_early_consume",
+        "trtllm_persistent_ws288_nc3_d3_vec128_fp32x2_early_consume",
         148,
     ),
-    ("sm_103a", 4, 0, False, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 4),
+    (
+        "sm_100a",
+        4096,
+        5,
+        True,
+        "persistent",
+        "trtllm_persistent_ws288_nc3_d3_vec128_fp32x2",
+        148,
+    ),
+    (
+        "sm_100a",
+        1024,
+        4,
+        False,
+        "native",
+        "native_m128_nc3_d2_ws288_grid148",
+        NATIVE_GRID,
+    ),
+    ("sm_103a", 4, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 4),
+    ("sm_103a", 32, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 32),
+    ("sm_103a", 1, 3, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 1),
+    ("sm_103a", 16, 4, False, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 32),
+    (
+        "sm_103a",
+        1024,
+        0,
+        False,
+        "k0_tma",
+        "k0_tma_persistent_ws288_vec128_fp32x2",
+        3 * SM_COUNT,
+    ),
+    ("sm_103a", 1, 7, False, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 2),
+    ("sm_103a", 8, 8, True, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 16),
+    (
+        "sm_103a",
+        1024,
+        4,
+        False,
+        "persistent",
+        "trtllm_persistent_ws288_nc3_d3_vec128_fp32x2_early_consume",
+        148,
+    ),
     (
         "sm_103a",
         256,
@@ -106,15 +130,7 @@ POLICY_ROWS = [
         NATIVE_GRID,
     ),
     ("sm_103a", 256, 8, True, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE_GRID),
-    (
-        "sm_103a",
-        1,
-        7,
-        False,
-        "persistent",
-        "trtllm_persistent_ws288_nc4_d2_vec128_fp32x2",
-        1,
-    ),
+    ("sm_103a", 1, 7, True, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 2),
     (
         "sm_103a",
         4096,
@@ -124,15 +140,9 @@ POLICY_ROWS = [
         "trtllm_persistent_ws288_nc4_d3_vec128_fp32x2_early_consume_relaxed_producer_wait",
         148,
     ),
-    (
-        "sm_103a",
-        256,
-        1,
-        False,
-        "persistent",
-        "trtllm_persistent_ws288_nc2_d2_vec128_fp32x2",
-        128,
-    ),
+    ("sm_103a", 256, 1, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 256),
+    ("sm_103a", 512, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 512),
+    ("sm_103a", 512, 1, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 512),
     (
         "sm_103a",
         512,
@@ -190,14 +200,59 @@ def test_plan_route_rejects_bad_shapes():
 
 
 def test_native_ports_require_148_sms():
-    plan = plan_route("sm_100a", 132, 1, 5, False)
+    # M = 256 / K = 8 is a native_k8 cell on 148 SMs (M = 1 belongs to the small-M direct kernel)
+    assert plan_route("sm_100a", SM_COUNT, 256, 8, False).kind == "native"
+    plan = plan_route("sm_100a", 132, 256, 8, False)
     assert plan.kind == "persistent"
-    assert plan.grid_x == 1
+    assert plan.grid_x <= 132
+
+
+def test_small_m_table_boundary():
+    for arch in ("sm_100a", "sm_103a"):
+        for K in range(MAX_BLOCKS + 1):
+            max_m = cb._SMALL_M_DIRECT_MAX_M[arch].get(K)
+            if max_m is None:
+                assert plan_route(arch, SM_COUNT, 1, K, False).kind != "small_m"
+                continue
+            bands = cb._SMALL_M_CLUSTER[arch].get(K, ())
+            assert list(bands) == sorted(bands)
+            assert all(cs in (2, 4) and 1 <= mm <= max_m for mm, cs in bands)
+            chunk_bands = cb._SMALL_M_CHUNK_BANDS[arch].get(K, ())
+            assert list(chunk_bands) == sorted(chunk_bands)
+            assert all(1 <= nc <= 8 and 1 <= mm <= max_m for mm, nc in chunk_bands)
+            edges = {mm for mm, _cs in bands} | {
+                mm + 1 for mm, _cs in bands if mm < max_m
+            }
+            edges |= {mm for mm, _nc in chunk_bands} | {
+                mm + 1 for mm, _nc in chunk_bands if mm < max_m
+            }
+            for m in sorted({1, max_m} | edges):
+                at = cb._plan_route_exact(arch, SM_COUNT, m, K, False)
+                cluster = cb._small_m_cluster(arch, m, K)
+                nc = cb._small_m_sources_per_chunk(arch, m, K)
+                suffix = "" if nc is None else f"_nc{nc}"
+                key = (
+                    f"small_m_direct:k{K}{suffix}"
+                    if cluster == 1
+                    else f"small_m_cluster{cluster}:k{K}{suffix}"
+                )
+                assert at.schedule_id.endswith(suffix)
+                assert (at.kind, at.kernel_key, at.grid_x, at.threads) == (
+                    "small_m",
+                    key,
+                    m * cluster,
+                    cb.DIRECT_THREADS // cluster,
+                )
+            at = plan_route(arch, SM_COUNT, max_m, K, False)
+            # the direct kernel is SM-count agnostic and PDL only changes the launch argument
+            assert plan_route(arch, 132, max_m, K, True).kernel_key == at.kernel_key
+            assert plan_route(arch, SM_COUNT, max_m + 1, K, False).kind != "small_m"
 
 
 def test_persistent_key_is_the_complete_flag_tuple():
-    a = plan_route("sm_103a", SM_COUNT, 1, 1, True)
-    b = plan_route("sm_103a", SM_COUNT, 1, 1, False)
+    # M 1024 is the first K1 token count above the small-M table on both architectures
+    a = plan_route("sm_103a", SM_COUNT, 1024, 1, True)
+    b = plan_route("sm_103a", SM_COUNT, 1024, 1, False)
     for plan in (a, b):
         assert plan.kind == "persistent"
         assert re.fullmatch(r"persistent:k1_nc\d_d\d_f[01]{15}", plan.kernel_key)
@@ -233,6 +288,73 @@ def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch):
     for record in MODULES.values():
         assert record["tma_workspace_bytes"] == 0
         assert record["arches"] and set(record["arches"]) <= set(ARCHES)
+
+
+# Every token count a decoder step can present in the small / mid range, plus the measured
+# powers of two and a few large non-powers of two.
+DENSE_TOKEN_COUNTS = (
+    tuple(range(1, 601))
+    + TOKEN_COUNTS[10:]
+    + (
+        1000,
+        1536,
+        3000,
+        6144,
+        10000,
+        16383,
+    )
+)
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_every_common_path_route_resolves_to_a_registered_program(arch):
+    if not MODULES:
+        pytest.skip("no generated programs registered in this checkout")
+    registered = KERNELS[arch]
+    for pdl in (False, True):
+        for K in range(MAX_BLOCKS + 1):
+            for M in DENSE_TOKEN_COUNTS:
+                exact = cb._plan_route_exact(arch, SM_COUNT, M, K, pdl)
+                plan = plan_route(arch, SM_COUNT, M, K, pdl)
+                cell = (arch, M, K, pdl, exact.kernel_key, plan.kernel_key)
+                assert plan.kernel_key in registered, cell
+                assert plan.kind in ("small_m", "native", "k0_tma", "persistent"), cell
+                if exact.kernel_key in registered:
+                    # a registered variant always runs exactly as the tables say
+                    assert plan == exact and plan.fallback_from is None, cell
+                    continue
+                assert plan.fallback_from == exact.kernel_key, cell
+                assert plan.route_id.endswith(".registered_fallback"), cell
+                assert plan.kind in ("small_m", "persistent"), cell
+                assert plan.kernel_key.split(":k", 1)[1].split("_", 1)[0] == str(K), (
+                    cell
+                )
+                assert (plan.arch, plan.use_pdl) == (arch, pdl), cell
+                if plan.kind == "small_m":
+                    cluster = cb.DIRECT_THREADS // plan.threads
+                    assert cluster in (1, 2, 4), cell
+                    assert plan.kernel_key.startswith(
+                        "small_m_direct:"
+                        if cluster == 1
+                        else f"small_m_cluster{cluster}:"
+                    ), cell
+                    assert plan.grid_x == M * cluster, cell
+                elif plan.schedule_id.endswith("_one_token_per_cta"):
+                    assert (plan.grid_x, plan.threads) == (M, cb.PERSISTENT_THREADS), (
+                        cell
+                    )
+                else:
+                    assert plan.threads == cb.PERSISTENT_THREADS and plan.grid_x >= 1, (
+                        cell
+                    )
+    # The measured cells never substitute.
+    for row_arch, M, K, pdl, _kind, _schedule_id, _grid_x in POLICY_ROWS:
+        if row_arch == arch:
+            assert plan_route(arch, SM_COUNT, M, K, pdl).fallback_from is None, (
+                M,
+                K,
+                pdl,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +452,17 @@ GPU_ROWS = [
     (256, 8),
     (512, 1),
     (1024, 4),
+    # table variants this checkout does not register (registered-variant fallback)
+    (7, 5),
+    (17, 5),
+    (64, 6),
+    (128, 7),
+    (140, 4),
+    (200, 8),
+    (300, 3),
+    (300, 5),
+    (1000, 1),
+    (1000, 2),
     (4096, 5),
     (16384, 8),
 ]
@@ -355,7 +488,10 @@ def test_matches_reference(M, K, pdl):
         num_blocks=K,
         enable_pdl=pdl,
     )
-    assert runner.plan.kind in ("native", "k0_tma", "persistent")
+    assert runner.plan.kind in ("small_m", "native", "k0_tma", "persistent")
+    assert runner.plan.kernel_key in KERNELS[arch]
+    if runner.plan.fallback_from is not None:
+        assert runner.plan.fallback_from not in KERNELS[arch]
     assert runner.launch() is inputs["out"]
     torch.cuda.synchronize()
     _check(inputs, expected)

@@ -829,6 +829,73 @@ def test_download_kernels_cmd_mocked(monkeypatch):
     ]
 
 
+def test_download_kernels_cmd_sm_installs_only_compatible_provider(monkeypatch):
+    recorded = []
+
+    def mock_run(cmd, check=False):
+        recorded.append((cmd, check))
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", mock_run)
+    _mock_jit_cache_provider_inventory(monkeypatch, "sm80", "sm89")
+
+    out = _test_cmd_helper(
+        [
+            "download-kernels",
+            "--cuda-version",
+            "12.9",
+            "--flashinfer-version",
+            "0.4.1",
+            "--sm",
+            "sm86",
+        ]
+    )
+
+    _assert_output_contains_all(
+        out,
+        "=== Cubin Wheel Install ===",
+        "=== JIT Cache Wheel Install ===",
+        "Install mode: minimal",
+        "Providers: sm80",
+        "flashinfer-jit-cache-sm80==0.4.1+cu129",
+    )
+    assert recorded == [
+        (
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--no-deps",
+                "--index-url",
+                "https://flashinfer.ai/whl",
+                "flashinfer-cubin==0.4.1",
+            ],
+            False,
+        ),
+        (
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--no-deps",
+                "--index-url",
+                "https://flashinfer.ai/whl/cu129",
+                "flashinfer-jit-cache==0.4.1+cu129",
+                "flashinfer-jit-cache-sm80==0.4.1+cu129",
+            ],
+            False,
+        ),
+    ]
+
+
 def test_download_kernels_cmd_allows_local_flashinfer_version(monkeypatch):
     def fail_run(*_args, **_kwargs):
         raise AssertionError("subprocess.run should not be called for dry-run")

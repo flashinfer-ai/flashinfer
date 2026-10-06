@@ -106,12 +106,14 @@ def test_mla_lse_base_public_forwarding(monkeypatch, entrypoint, return_lse, sel
 
 
 def _require_trtllm_gen(device: torch.device) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("trtllm-gen requires CUDA")
     major, minor = get_compute_capability(device)
-    # SM100 (B200) and SM103 (B300) only; an SM101/SM102 part would otherwise
+    # SM100, SM103, and SM107 only; an SM101/SM102 part would otherwise
     # fall through to an unsupported launch instead of skipping.
-    if (major, minor) not in ((10, 0), (10, 3)):
+    if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip(
-            "trtllm-gen requires SM100/SM103, got "
+            "trtllm-gen requires SM100/SM103/SM107, got "
             f"sm{major}{minor}; the LSE base is kernel-side and cannot be checked here"
         )
 
@@ -368,7 +370,6 @@ def test_planned_monolithic_launch_lse_scale():
     assert args[16] == math.log(2.0)
 
 
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("backend", ["trtllm-gen", "cute-dsl-monolithic"])
 @pytest.mark.parametrize("dtype", _MLA_DTYPES)
 @pytest.mark.parametrize("return_lse", [False, True])
@@ -377,6 +378,16 @@ def test_planned_mla_preserves_lse_base(backend, dtype, return_lse, seq_len):
     """Planned adapters retain their native LSE units after the ABI expansion."""
     device = torch.device("cuda")
     _require_trtllm_gen(device)
+    if backend.startswith("cute-dsl"):
+        from flashinfer.cute_dsl.availability import (
+            is_cute_dsl_arch_supported,
+            is_cute_dsl_available,
+        )
+
+        if not is_cute_dsl_available():
+            pytest.skip("CuTe DSL is unavailable")
+        if not is_cute_dsl_arch_supported(*get_compute_capability(device)):
+            pytest.skip("installed CuTe DSL does not support this GPU architecture")
     query, kv_cache, block_tables, seq_lens = _mla_decode_inputs(
         device, dtype, seq_len=seq_len
     )

@@ -146,7 +146,7 @@ class TestSplitKernelRegistry:
 @pytest.fixture
 def capturing_stub_fleet():
     """Stub fleet that records tensors at dispatch and combine boundaries."""
-    from flashinfer.moe_ep.core.comm.fleet import _BACKEND_REGISTRY
+    from flashinfer.moe_ep.core.comm.fleet import _FLEET_REGISTRY
 
     captured: dict[str, object] = {}
 
@@ -187,14 +187,14 @@ def capturing_stub_fleet():
 
     from unittest import mock
 
-    saved = _BACKEND_REGISTRY.get("nccl_ep")
-    _BACKEND_REGISTRY["nccl_ep"] = _StubFleet
+    saved = _FLEET_REGISTRY.get("nccl_ep")
+    _FLEET_REGISTRY["nccl_ep"] = _StubFleet
     with mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"):
         yield captured
     if saved is not None:
-        _BACKEND_REGISTRY["nccl_ep"] = saved
+        _FLEET_REGISTRY["nccl_ep"] = saved
     else:
-        _BACKEND_REGISTRY.pop("nccl_ep", None)
+        _FLEET_REGISTRY.pop("nccl_ep", None)
 
 
 @pytest.fixture

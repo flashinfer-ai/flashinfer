@@ -30,8 +30,8 @@ Two frozen kernels per row of probabilities:
    prologue overlaps the tail of stage 1.
 
 Semantics follow :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs` with
-``filter_apply_order="top_k_first"`` (same support, same Philox stream advancement) with these
-guarantees on top:
+``filter_apply_order="top_k_first"`` (same support, same Philox stream advancement outside
+CUDA-graph capture) with these guarantees on top:
 
 * **Strict determinism.** Ties at the top-k boundary are resolved toward the lower vocabulary
   index (the support is exactly the first ``k`` entries of ``lexsort(-prob, index)``), every
@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import Optional, TypeAlias, Union
+from typing import NamedTuple, Optional, TypeAlias, Union
 
 import torch
 
@@ -63,6 +63,7 @@ from .api_logging import flashinfer_api
 from .jit.cake_sampling import (
     load_cake_sampling_module,
     load_manifest,
+    stage23_flags_by_capability,
     supported_capability,
 )
 from .sampling import get_seed_and_offset
@@ -251,10 +252,47 @@ _RAGGED_CHUNK_FILL = 0.75
 _WORKSPACES: dict[
     tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ] = {}
+# (device index, id(generator)) -> next Philox offset handed to a call captured into a CUDA graph.
+_CAPTURE_PHILOX_OFFSETS: dict[tuple[int, int], int] = {}
+
+
+def _device_index(device: torch.device) -> int:
+    return torch.cuda.current_device() if device.index is None else int(device.index)
+
+
+def _philox_params(
+    batch: int,
+    generator: Optional[torch.Generator],
+    device: torch.device,
+    philox_seed: Optional[int],
+    philox_offset: Optional[int],
+) -> tuple[int, int]:
+    """Philox ``(seed, offset)`` for one call (32 reserved draws per row, the ``top_k_first`` stride).
+
+    Outside CUDA-graph capture the generator is read and advanced exactly like
+    :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs`, so a generator shared with the
+    ``top_k_first`` route stays in lockstep.  Inside capture the generator is never touched: reading
+    its state there makes PyTorch register it with the graph, and every replay then runs two
+    ``FillFunctor`` kernels that refresh device-side seed/offset words the Cake kernels do not read
+    (both routes take the Philox parameters by value, so a replay reproduces the captured draws
+    either way; measured +46 us per replay on GB300).  The capture path uses the generator's
+    initial seed and a host-side per-(device, generator) offset counter, so distinct captures draw
+    from distinct Philox streams while replays stay bitwise reproducible.
+    """
+    if philox_seed is not None:
+        return int(philox_seed), int(philox_offset)
+    if not torch.cuda.is_current_stream_capturing():
+        return get_seed_and_offset(batch * 32, generator, device)
+    index = _device_index(device)
+    gen = generator if generator is not None else torch.cuda.default_generators[index]
+    key = (index, id(gen))
+    offset = _CAPTURE_PHILOX_OFFSETS.get(key, 0)
+    _CAPTURE_PHILOX_OFFSETS[key] = offset + (batch * 32 + 3) // 4 * 4
+    return int(gen.initial_seed()), offset
 
 
 def _capability(device: torch.device) -> Optional[tuple[int, int]]:
-    return supported_capability(torch.cuda.get_device_capability(device))
+    return supported_capability(_device_capability(_device_index(device)))
 
 
 def _stage1_variants(smem_limit: Optional[int] = None) -> list[tuple[int, int, bool]]:
@@ -287,23 +325,15 @@ def _stage23_variants() -> tuple[tuple[int, int], ...]:
 #                           +1..+3 % on B200 / H100 / R200 (the integer precompute chain adds latency).
 #   one_cmp_select (bit 1)  one 64-bit compare + select per bitonic exchange: B200 / H100 / B300 -16..-19 % of the
 #                           kernel (sort stage 4.0 -> 2.7 us), R200 +0..+2 %.
+# The capability -> form table is the manifest's (``capabilities`` of each stage-2/3 row; the frozen source compiles a
+# form only for the targets that dispatch it), read once per process.
 STAGE23_FEATURE_BITS = {"int_tests": 1, "one_cmp_select": 2}
-_STAGE23_FLAGS_BY_CAPABILITY = {
-    (9, 0): STAGE23_FEATURE_BITS["one_cmp_select"],
-    (10, 0): STAGE23_FEATURE_BITS["one_cmp_select"],
-    (10, 3): STAGE23_FEATURE_BITS["int_tests"] | STAGE23_FEATURE_BITS["one_cmp_select"],
-}
 
 
 @functools.cache
 def _stage23_variant_flags(device_index: int) -> int:
-    cc = tuple(torch.cuda.get_device_capability(device_index))
-    flags = _STAGE23_FLAGS_BY_CAPABILITY.get(cc, 0)
-    if flags not in {v["variant_flags"] for v in load_manifest()["stage23"]}:
-        raise RuntimeError(
-            f"frozen bundle lacks stage-2/3 variant_flags={flags} for compute capability {cc}"
-        )
-    return flags
+    table = stage23_flags_by_capability()
+    return table.get(_device_capability(device_index), table[None])
 
 
 def stage23_variant_flags(device: torch.device | int | None = None) -> int:
@@ -365,15 +395,19 @@ def _stage1_has_fused_block_tail(cluster: int, ept: int, stream: bool) -> bool:
 # (the eager span of the two-launch chain includes the host gap between its launches and is not the measure) the in-CTA
 # tail loses to the chain on every resident (B200 1.20-1.54, GB300 1.40-1.84) and on every stream at k <= 750; the
 # cluster-8 streams at k = 1000 win on both (B200 0.89-0.94, GB300 0.89-0.97), so ``_fuse_block_tail`` takes the twin
-# only for a cluster-8 stream with top_k_max > _BLOCK_TAIL_MIN_K on a one-wave grid.  H100 / R200 keep the chain (no
-# graph-replay A/B recorded for them in round 7).
-_BLOCK_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
+# only for a cluster-8 stream with top_k_max > _BLOCK_TAIL_MIN_K on a one-wave grid.  Round 8 adds H100: under graph
+# replay the twin runs 0.93-0.97 of the chain at V = 151936 and 0.96-0.99 at V = 262144 (B = 1-8, k = 800 / 1000, bitwise
+# identical; eager 0.93-0.98).  R200 keeps the chain (no graph-replay A/B recorded for it).
+_BLOCK_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
+    {(9, 0), (10, 0), (10, 3)}
+)
 _BLOCK_TAIL_MIN_CLUSTER = 8
 _BLOCK_TAIL_MIN_K = 768
 # Largest row the whole-CTA tail serves per capability (None: any).  GB300 round-7 matrices: the cluster-8 streams at
 # V = 151936 run 3-11 % faster fused, at V = 262144 3-7 % slower eager (a cold-L2 stage 1 is hidden by the chain's
 # host-bound launch gap there) and even under graph replay, so GB300 keeps the chain above this vocabulary.
 _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY: dict[tuple[int, int], Optional[int]] = {
+    (9, 0): None,
     (10, 0): None,
     (10, 3): 196608,
 }
@@ -391,7 +425,7 @@ def _device_capability(device_index: int) -> tuple[int, int]:
 
 @functools.cache
 def _block_tail_enabled(device_index: int) -> bool:
-    return _block_tail_for_capability(torch.cuda.get_device_capability(device_index))
+    return _block_tail_for_capability(_device_capability(device_index))
 
 
 def _fuse_block_tail(
@@ -459,6 +493,76 @@ _FLAG_ROW_SPAN_DIET = 32
 _ROW_SPAN_DIET_MIN_CLUSTER = 8
 _ROW_SPAN_DIET_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
 _FLAG_SPEC_SAMPLE = 64
+# Launch flag bit 7 (round 8, lever L-B): the slab-tail form of the speculative-sample build.  The selected pairs of a
+# fused launch are pushed into rank 0's shared-memory slab (DSM stores) and the two-warp tail reads them there instead
+# of re-reading the global slab row; every output is bit-identical.  The coarse-sample build carries the slab tail
+# without a bit (it only serves fused launches); the default build never does (the k > 64 chains keep binaries without
+# the slab code, which moved them by 1-14 % when compiled in).  Taken on the capabilities where the paired
+# perturbed-process A/Bs won on every served fused cell (B200 0.948-0.993, GB300 0.959-0.992, 4/4 processes); Hopper
+# measured 1.003-1.047 with it and keeps the plain speculative build.  Only rows of at most `_SLAB_TAIL_MAX_CHUNKS`
+# register chunks per CTA take it: the round-8 matrices and same-node in-process A/Bs on B200 / GB300 put the 8-chunk
+# `_cs` rows at 1.000-1.015, the 10-chunk rows at 1.012-1.020 and the 16-chunk `_sp` row at 0.997-1.014 (the slab's
+# fixed saving does not grow with the row while its per-chunk bookkeeping does), and every served 1-5-chunk row at
+# 0.93-0.99.
+_FLAG_SLAB_TAIL = 128
+_SLAB_TAIL_SPEC_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
+_SLAB_TAIL_MAX_CHUNKS = 5
+# Stage-1 launch_flags bit 8: the pushed-coarse-sums form of the default build (`_lg` twin; round 8 lever L-G(d)): each
+# CTA stores its coarse histogram sums into every CTA's shared memory so the two-level cluster select reads them locally.
+# A two-launch chain on a streaming variant with the two-level select takes it on these capabilities (GB300 cluster-8
+# chains 0.985-0.987, H100 0.992-0.994, medians over four perturbed processes); B200 keeps the plain build (+0.9..+1.7 %).
+# Only the ept-32 build (`_COARSE_PUSH_MIN_EPT`) takes it: those gates ran the two-chunk ept-32 cluster-8 chains, and the
+# GB300 round-8 matrix put the served four-chunk ept-16 chains (V = 262144, B = 1-8, k = 1000) at 1.014-1.052 in both
+# tree orders with same-node in-process A/Bs of 1.022-1.056 (the pushed stores grow with the chunk count, the two
+# dependent select round trips they replace do not).
+_FLAG_COARSE_PUSH = 256
+# Stage-1 launch_flags bit 9 (round 9, lever L-P): the leader-push exchange form of the default or sample build of a
+# multi-CTA streaming variant (`_lp` / `_cs_lp` / `_sp_lp` twins).  Every CTA stores its compacted candidate list straight
+# into rank 0's receive buffer (one st.shared::cluster.v2.b32 per pair) and its length into every CTA before the single
+# exchange barrier; rank 0 gathers locally, so the pull form's DSM read rounds and exit rendezvous disappear.  Taken on
+# the capabilities in _LEADER_PUSH_CAPABILITIES for any ept-16 stream and for an ept-32 (_LEADER_PUSH_WIDE_EPT) stream only
+# when the row is at most _LEADER_PUSH_WIDE_MAX_CHUNKS register chunks per CTA (round-9 ledger: R200 ept-16 `_cs` cells
+# 0.88-0.94, H100 c8 e16 `_cs` 0.82-0.86 / `_sp` 0.92-0.96, B200 `_sp` 0.89-0.97, GB300 ept-16 `_sp` cells 0.96-0.99 against the slab form; the two-chunk and longer ept-32 rows 1.02-1.31 on
+# R200).  It displaces the slab tail (bit 7) and the pushed coarse sums (bit 8) where both would apply; never with bit 3.
+_FLAG_LEADER_PUSH = 512
+_LEADER_PUSH_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
+    {(9, 0), (10, 0), (10, 3), (10, 7)}
+)
+_LEADER_PUSH_WIDE_EPT = 32
+_LEADER_PUSH_WIDE_MAX_CHUNKS = 1
+# Stage-1 launch_flags bit 10 (round 10, lever L1): the CTA-local select form of a leader-push sample build (`_cs_lp_l1` /
+# `_sp_lp_l1` twins).  Each CTA picks its filter bucket from its own sample (sampled mass >= k) instead of the cluster-wide
+# coarse histogram, so that DSM round disappears and the leader push is the only cluster round; the row's exact top-k lies
+# in the union of the per-CTA lists and every output is bit-identical.  The per-CTA lists grow with k, so a fused
+# leader-push launch takes it only when its largest top-k is at most the capability's cap (round-10 ledger, perturbed-
+# process medians at the served cluster-8 ept-32 picks: GB300 k = 10 / 20 / 32 0.90-0.97 on every served cell, k = 50
+# mixed; B200 k = 10 / 20 0.93-0.98, k = 32 mixed; H100 served c8 e16 `_cs_lp` cells k = 10 0.943-0.965, whose k = 50 rows
+# overflow the coarse-sample lists into the exact fallback -> cap 10).  R200 (mixed by vocabulary) and RTX PRO keep the plain
+# leader-push / pull form.
+_FLAG_LOCAL_SELECT = 1024
+_LOCAL_SELECT_MAX_K_BY_CAPABILITY: dict[tuple[int, int], int] = {
+    (9, 0): 10,
+    (10, 0): 20,
+    (10, 3): 32,
+}
+# Reach of the CTA-local select onto the rows the leader-push chunk rule excludes (an ept-32 stream whose rows take two
+# register chunks per CTA): with the local select the pushed lists stay small, so the one-round form beats the served
+# slab-tail pull form there too -- when the second chunk is full or the batch is at least the capability's minimum in
+# _LOCAL_SELECT_WIDE_MIN_BATCH_BY_CAPABILITY (10.3: a 16-75 % filled last chunk loses at B <= 2 -> 4; 10.0: wins at every
+# batch -> 1).  A capability absent from the table keeps the chunk rule.  Measured per capability (round-10 ledger).
+_LOCAL_SELECT_WIDE_MIN_BATCH_BY_CAPABILITY: dict[tuple[int, int], int] = {
+    (10, 0): 1,
+    (10, 3): 4,
+}
+_LOCAL_SELECT_WIDE_MAX_CHUNKS = 2
+# Stage-1 launch_flags bit 11 (round 10, lever L3-T): the integer-tested form of a streaming variant's whole-CTA tail
+# build (`_bt_tia` twin).  The tail's f64 target product, cut tests and sample tests run as the stage-2/3 `int_tests`
+# integer emulation, bit-identical; it pays only where the FP64 pipe is slow (GB300 served cluster-8 ept-16 k = 1000 / 200
+# cells 0.916-0.955); B200's full-rate FP64 loses 3-7 % with it and keeps the f64 `_bt` twin.
+_FLAG_INT_TAIL = 2048
+_INT_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 3)})
+_COARSE_PUSH_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(9, 0), (10, 3)})
+_COARSE_PUSH_MIN_EPT = 32
 _SPEC_SAMPLE_WIDE_EPT = 32
 _SPEC_SAMPLE_WIDE_TWO_CHUNK_CLUSTER = 8
 _SPEC_SAMPLE_WIDE_MIN_CHUNKS = 16
@@ -613,6 +717,292 @@ def _spec_sample_flag(
     return _FLAG_SPEC_SAMPLE if _stage1_has_spec_sample(cluster, ept, True) else 0
 
 
+@functools.cache
+def _stage1_has_slab_tail(cluster: int, ept: int, stream: bool, coarse: bool) -> bool:
+    """Whether the frozen variant ships the slab-tail form of its coarse-sample (``coarse``) or speculative-sample build
+    (a manifest entry with ``slab_tail`` and the matching sample flag): the kernel taken by launch_flags bit 7 together
+    with bit 0 and bit 4 / 6.  Every output is bit-identical to the plain sample build."""
+    found = False
+    for v in load_manifest()["stage1"]:
+        if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
+            found = True
+            if v["slab_tail"] and (v["coarse_sample"] if coarse else v["spec_sample"]):
+                return True
+    if not found:
+        raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
+    return False
+
+
+def _slab_tail_flag(
+    cluster: int,
+    ept: int,
+    stream: bool,
+    sample_flag: int,
+    vocab: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> int:
+    """Stage-1 ``launch_flags`` bit 7 for a fused launch that takes a sample build (bit 4 or bit 6 in ``sample_flag``):
+    the slab-tail twin of that build on the capabilities in ``_SLAB_TAIL_SPEC_CAPABILITIES`` when the variant ships it
+    and the row is at most ``_SLAB_TAIL_MAX_CHUNKS`` register chunks per CTA.  Default-build and non-fused launches
+    never take it; Hopper / Rubin and the long cluster-1 / cluster-2 rows keep the plain sample builds."""
+    flag = int(sample_flag) & (_FLAG_SPEC_SAMPLE | _FLAG_COARSE_SAMPLE)
+    if not stream or not flag:
+        return 0
+    if (
+        capability is None
+        or (int(capability[0]), int(capability[1])) not in _SLAB_TAIL_SPEC_CAPABILITIES
+    ):
+        return 0
+    if (
+        math.ceil(int(vocab) / (_THREADS * int(ept) * int(cluster)))
+        > _SLAB_TAIL_MAX_CHUNKS
+    ):
+        return 0
+    coarse = bool(flag & _FLAG_COARSE_SAMPLE)
+    return _FLAG_SLAB_TAIL if _stage1_has_slab_tail(cluster, ept, True, coarse) else 0
+
+
+@functools.cache
+def _stage1_has_coarse_push(cluster: int, ept: int, stream: bool) -> bool:
+    """Whether the frozen variant ships the pushed-coarse-sums form of its default build (a manifest entry with
+    ``coarse_push``): the kernel taken by launch_flags bit 8 on a two-launch chain.  Every output is bit-identical to the
+    default build."""
+    found = False
+    for v in load_manifest()["stage1"]:
+        if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
+            found = True
+            if v["coarse_push"]:
+                return True
+    if not found:
+        raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
+    return False
+
+
+def _coarse_push_flag(
+    cluster: int,
+    ept: int,
+    stream: bool,
+    chain_flags: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> int:
+    """Stage-1 ``launch_flags`` bit 8 for a two-launch chain (``chain_flags``: the chain's flags so far; a sample build in
+    them, bit 4 / 6, keeps the plain build): the pushed-coarse-sums twin of the default build on the capabilities in
+    ``_COARSE_PUSH_CAPABILITIES`` when the variant ships it and the build is at least ``_COARSE_PUSH_MIN_EPT`` elements
+    per thread.  Fused launches never take it; B200 / Rubin and the ept-16 chains keep the plain default build."""
+    if (
+        not stream
+        or int(ept) < _COARSE_PUSH_MIN_EPT
+        or int(chain_flags)
+        & (
+            _FLAG_FUSE_TAIL
+            | _FLAG_FUSE_BLOCK_TAIL
+            | _FLAG_COARSE_SAMPLE
+            | _FLAG_SPEC_SAMPLE
+            | _FLAG_SLAB_TAIL
+        )
+    ):
+        return 0
+    if (
+        capability is None
+        or (int(capability[0]), int(capability[1])) not in _COARSE_PUSH_CAPABILITIES
+    ):
+        return 0
+    return _FLAG_COARSE_PUSH if _stage1_has_coarse_push(cluster, ept, True) else 0
+
+
+@functools.cache
+def _stage1_has_leader_push(
+    cluster: int, ept: int, stream: bool, coarse: bool, spec: bool
+) -> bool:
+    """Whether the frozen variant ships the leader-push exchange form of its default (neither flag), coarse-sample
+    (``coarse``) or speculative-sample (``spec``) build (a manifest entry with ``leader_push`` and the matching sample
+    flags): the kernel taken by launch_flags bit 9.  Every output is bit-identical to the pull form."""
+    found = False
+    for v in load_manifest()["stage1"]:
+        if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
+            found = True
+            if (
+                v.get("leader_push", False)
+                and bool(v["coarse_sample"]) == bool(coarse)
+                and bool(v["spec_sample"]) == bool(spec)
+            ):
+                return True
+    if not found:
+        raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
+    return False
+
+
+def _leader_push_flag(
+    cluster: int,
+    ept: int,
+    stream: bool,
+    launch_flags: int,
+    vocab: int,
+    capability: Optional[tuple[int, int]] = None,
+    local_select_reach: bool = False,
+) -> int:
+    """Stage-1 ``launch_flags`` bit 9 for a launch whose other bits are ``launch_flags``: the leader-push exchange form
+    of the build the sample bits select, on a multi-CTA streaming variant that ships it, on the capabilities in
+    ``_LEADER_PUSH_CAPABILITIES`` (``capability`` None: every capability), for any row on an ept-16 stream and for a
+    row of at most ``_LEADER_PUSH_WIDE_MAX_CHUNKS`` register chunks per CTA on an ept-``_LEADER_PUSH_WIDE_EPT`` stream.
+    Never with the whole-CTA tail (bit 3); the caller drops the slab tail (bit 7) and the pushed coarse sums (bit 8)
+    when this bit is taken."""
+    if not stream or int(cluster) < 2 or (launch_flags & _FLAG_FUSE_BLOCK_TAIL) != 0:
+        return 0
+    if (
+        capability is not None
+        and (int(capability[0]), int(capability[1])) not in _LEADER_PUSH_CAPABILITIES
+    ):
+        return 0
+    if int(ept) >= _LEADER_PUSH_WIDE_EPT:
+        chunks = -(-int(vocab) // (_THREADS * int(ept) * int(cluster)))
+        if chunks > _LEADER_PUSH_WIDE_MAX_CHUNKS and not (
+            local_select_reach and chunks <= _LOCAL_SELECT_WIDE_MAX_CHUNKS
+        ):
+            return 0
+    coarse = (launch_flags & _FLAG_COARSE_SAMPLE) != 0
+    spec = (launch_flags & _FLAG_SPEC_SAMPLE) != 0
+    return (
+        _FLAG_LEADER_PUSH
+        if _stage1_has_leader_push(cluster, ept, True, coarse, spec)
+        else 0
+    )
+
+
+def _stage1_has_local_select(
+    cluster: int, ept: int, stream: bool, coarse: bool, spec: bool
+) -> bool:
+    """Whether the frozen variant ships the CTA-local select form of its leader-push coarse-sample (``coarse``) or
+    speculative-sample (``spec``) build (a manifest entry with ``local_select`` and the matching sample flag): the kernel
+    taken by launch_flags bit 10.  Every output is bit-identical to the cluster-wide select."""
+    found = False
+    for v in load_manifest()["stage1"]:
+        if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
+            found = True
+            if (
+                v.get("local_select", False)
+                and bool(v["coarse_sample"]) == bool(coarse)
+                and bool(v["spec_sample"]) == bool(spec)
+            ):
+                return True
+    if not found:
+        raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
+    return False
+
+
+def _local_select_reach(
+    cluster: int,
+    ept: int,
+    stream: bool,
+    launch_flags: int,
+    top_k_max: Optional[int],
+    vocab: int,
+    batch: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> bool:
+    """Whether a fused sample-build launch (``launch_flags`` with bit 0 and bit 4 or 6) reaches past the leader-push chunk
+    rule because the CTA-local select form (bit 10) would ride on it: a variant that ships the form, on a capability in
+    ``_LOCAL_SELECT_WIDE_MIN_BATCH_BY_CAPABILITY`` (None: taken at any batch), ``top_k_max`` at most that capability's
+    local-select cap, an ept-``_LEADER_PUSH_WIDE_EPT`` stream whose rows take exactly ``_LOCAL_SELECT_WIDE_MAX_CHUNKS``
+    register chunks per CTA, and either a full last chunk or ``batch`` at least the capability's minimum batch.  The
+    caller then passes it to ``_leader_push_flag`` and ``_local_select_flag`` follows."""
+    if not stream or top_k_max is None or (launch_flags & _FLAG_FUSE_TAIL) == 0:
+        return False
+    coarse = (launch_flags & _FLAG_COARSE_SAMPLE) != 0
+    spec = (launch_flags & _FLAG_SPEC_SAMPLE) != 0
+    if not (coarse or spec) or not _stage1_has_local_select(
+        cluster, ept, True, coarse, spec
+    ):
+        return False
+    if int(ept) < _LEADER_PUSH_WIDE_EPT:
+        return False
+    if capability is None:
+        cap = max(_LOCAL_SELECT_MAX_K_BY_CAPABILITY.values())
+        min_batch = min(_LOCAL_SELECT_WIDE_MIN_BATCH_BY_CAPABILITY.values())
+    else:
+        cc = (int(capability[0]), int(capability[1]))
+        if cc not in _LOCAL_SELECT_WIDE_MIN_BATCH_BY_CAPABILITY:
+            return False
+        cap = _LOCAL_SELECT_MAX_K_BY_CAPABILITY.get(cc, 0)
+        min_batch = _LOCAL_SELECT_WIDE_MIN_BATCH_BY_CAPABILITY[cc]
+    if int(top_k_max) > cap:
+        return False
+    span = _THREADS * int(ept) * int(cluster)
+    chunks = -(-int(vocab) // span)
+    if chunks <= _LEADER_PUSH_WIDE_MAX_CHUNKS or chunks > _LOCAL_SELECT_WIDE_MAX_CHUNKS:
+        return False
+    return int(vocab) % span == 0 or int(batch) >= min_batch
+
+
+def _local_select_flag(
+    cluster: int,
+    ept: int,
+    stream: bool,
+    launch_flags: int,
+    top_k_max: Optional[int],
+    capability: Optional[tuple[int, int]] = None,
+) -> int:
+    """Stage-1 ``launch_flags`` bit 10 for a fused launch whose other bits are ``launch_flags``: the CTA-local select
+    form of the leader-push sample build those bits select (bit 0 with bit 9 and bit 4 or 6), on a variant that ships it,
+    when the largest top-k is at most ``_LOCAL_SELECT_MAX_K_BY_CAPABILITY`` for ``capability`` (None: the largest cap of
+    the table).  Never on a chain, the whole-CTA tail or the pull form."""
+    if not stream or top_k_max is None:
+        return 0
+    if (launch_flags & _FLAG_FUSE_TAIL) == 0 or (launch_flags & _FLAG_LEADER_PUSH) == 0:
+        return 0
+    coarse = (launch_flags & _FLAG_COARSE_SAMPLE) != 0
+    spec = (launch_flags & _FLAG_SPEC_SAMPLE) != 0
+    if not (coarse or spec):
+        return 0
+    if capability is None:
+        cap = max(_LOCAL_SELECT_MAX_K_BY_CAPABILITY.values())
+    else:
+        cap = _LOCAL_SELECT_MAX_K_BY_CAPABILITY.get(
+            (int(capability[0]), int(capability[1])), 0
+        )
+    if int(top_k_max) > cap:
+        return 0
+    return (
+        _FLAG_LOCAL_SELECT
+        if _stage1_has_local_select(cluster, ept, True, coarse, spec)
+        else 0
+    )
+
+
+def _stage1_has_int_tail(cluster: int, ept: int, stream: bool) -> bool:
+    """Whether the frozen variant ships the integer-tested form of its whole-CTA tail build (a manifest entry with
+    ``int_tail``): the kernel taken by launch_flags bit 11 with bit 3.  Every output is bit-identical to the f64 tail."""
+    found = False
+    for v in load_manifest()["stage1"]:
+        if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
+            found = True
+            if v.get("int_tail", False):
+                return True
+    if not found:
+        raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
+    return False
+
+
+def _int_tail_flag(
+    cluster: int,
+    ept: int,
+    stream: bool,
+    launch_flags: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> int:
+    """Stage-1 ``launch_flags`` bit 11 for a whole-CTA-tail launch (``launch_flags`` carries bit 3): the integer-tested
+    tail of a streaming variant that ships it, on the capabilities in ``_INT_TAIL_CAPABILITIES`` (``capability`` None:
+    taken)."""
+    if not stream or (launch_flags & _FLAG_FUSE_BLOCK_TAIL) == 0:
+        return 0
+    if (
+        capability is not None
+        and (int(capability[0]), int(capability[1])) not in _INT_TAIL_CAPABILITIES
+    ):
+        return 0
+    return _FLAG_INT_TAIL if _stage1_has_int_tail(cluster, ept, True) else 0
+
+
 def _sample_build_flag(
     cluster: int,
     ept: int,
@@ -630,11 +1020,9 @@ def _sample_build_flag(
 
 
 @functools.cache
+@functools.cache
 def _row_span_diet_capability(device_index: int) -> bool:
-    return (
-        tuple(torch.cuda.get_device_capability(device_index))
-        in _ROW_SPAN_DIET_CAPABILITIES
-    )
+    return _device_capability(device_index) in _ROW_SPAN_DIET_CAPABILITIES
 
 
 def _row_span_diet_flag(
@@ -671,10 +1059,10 @@ def _stream_prepass_flag(device_index: int) -> int:
     one-wave large-k cells 0.5-1 us of dependent launch latency on Blackwell and Rubin but costs
     Hopper 1.4-1.9 us (the dependent's launch contends with the row read), so it is set for compute
     capability >= 10 only.  Ignored by the register-resident variants and without the early trigger."""
-    major, _minor = torch.cuda.get_device_capability(device_index)
-    return _FLAG_STREAM_PREPASS if major >= 10 else 0
+    return _FLAG_STREAM_PREPASS if _device_capability(device_index)[0] >= 10 else 0
 
 
+@functools.cache
 @functools.cache
 def _sm_count(device_index: int) -> int:
     return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
@@ -752,6 +1140,41 @@ def _ragged_last_chunk(vocab: int, cluster: int, ept: int) -> bool:
     exact = vocab / (cluster * _THREADS * ept)
     frac = exact - math.floor(exact)
     return frac > 0.0 and frac < _RAGGED_CHUNK_FILL
+
+
+# Round-10 lever L6 on R200 (sm 212, compute capability 10.7): with the leader-push builds the cluster-8 ept-16 stream
+# (`_cs_lp`, launch flags 529) runs the small-k rows the cost table hands to a cluster-4 / cluster-8 ept-32 stream 8-15 %
+# faster while both grids fit one wave (V128256 / V151936 B1 / B8 / B16 k10 / k50 0.85-0.91, V262144 0.914-0.919; two
+# perturbed processes, eager and graph, bitwise) and 1.5x slower once the cluster-8 grid needs two waves (B32).  The 212
+# table cannot express that ordering without flipping unmeasured or k > 64 picks, so the measured rule is applied after the
+# ranking (round-10 ledger; mirrored by cake `one_wave_e16_repick`).
+_ONE_WAVE_E16_REPICK_SM_COUNTS: frozenset[int] = frozenset({212})
+
+
+def _one_wave_e16_repick(
+    batch: int,
+    best: tuple[int, int],
+    streaming: list[tuple[int, int]],
+    sm_count: int,
+    large_k: bool,
+) -> tuple[int, int]:
+    """``best`` is the ranked streaming ``(cluster, ept)``; the cluster-8 ept-16 stream replaces a small-k ept-32 pick
+    when both grids run in one wave of the ``sm_count`` table (see ``_ONE_WAVE_E16_REPICK_SM_COUNTS``)."""
+    if (
+        _nearest_table(int(sm_count)) not in _ONE_WAVE_E16_REPICK_SM_COUNTS
+        or large_k
+        or best[1] < 32
+    ):
+        return best
+    if (8, 16) not in streaming:
+        return best
+    wave_ctas = _wave_ctas(int(sm_count))
+    if (
+        -(-(batch * best[0]) // wave_ctas[best[0]]) != 1
+        or -(-(batch * 8) // wave_ctas[8]) != 1
+    ):
+        return best
+    return (8, 16)
 
 
 @functools.lru_cache(maxsize=8192)
@@ -920,6 +1343,7 @@ def _choose_stage1_resolved(
         )
         if resident_cost <= stream_cost(best):
             return resident[0], resident[1], False
+    best = _one_wave_e16_repick(batch, best, streaming, int(sm_count), large_k > 0.0)
     return best[0], best[1], True
 
 
@@ -930,6 +1354,128 @@ def choose_stage23(top_k_max: int) -> tuple[int, int]:
         if threads * items >= top_k_max:
             return threads, items
     raise ValueError(f"top_k_max={top_k_max} exceeds the frozen stage-2/3 capacity")
+
+
+class _LaunchPlan(NamedTuple):
+    """Every dispatch decision of one pipeline call: the stage-1 variant, the stage-2/3 slab, the stage-1
+    ``launch_flags`` and whether stage 2/3 runs inside the stage-1 kernel (one launch)."""
+
+    cluster: int
+    ept: int
+    stream: bool
+    threads: int
+    items: int
+    launch_flags: int
+    one_launch: bool
+    stage23_flags: int
+
+
+@functools.lru_cache(maxsize=8192)
+def _launch_plan(
+    device_index: int, batch: int, vocab: int, top_k_max: int
+) -> _LaunchPlan:
+    """The dispatch of ``top_k_top_p_sampling_from_probs`` for ``batch`` rows of ``vocab`` entries with largest
+    top-k ``top_k_max`` on device ``device_index``: a pure function of these four values and the frozen bundle, so
+    it is computed once per distinct call shape (the route check and the launch share it).  Raises ``ValueError``
+    when no frozen stage-1 variant covers ``vocab``."""
+    sm_count = _sm_count(device_index)
+    capability = _device_capability(device_index)
+    two_launch = _launch_is_two_kernels(top_k_max, device_index)
+    cluster, ept, stream = _choose_stage1_resolved(
+        batch, vocab, sm_count, _smem_optin(device_index), top_k_max, two_launch
+    )
+    threads, items = choose_stage23(top_k_max)
+    # Small top-k: stage 2/3 runs inside the stage-1 kernel (same outputs, one launch).
+    fused = top_k_max <= _fused_tail_kcap() and _stage1_has_fused_tail(
+        cluster, ept, stream
+    )
+    # Larger top-k up to the slab: the whole-CTA tail, on the capabilities where it beats the chain, for a
+    # one-wave stage-1 grid.
+    fused_block = not fused and _fuse_block_tail(
+        batch,
+        cluster,
+        ept,
+        stream,
+        sm_count,
+        top_k_max,
+        not _block_tail_enabled(device_index),
+        vocab,
+        capability,
+    )
+    if fused:
+        sample_flag = _sample_build_flag(
+            cluster, ept, stream, top_k_max, vocab, batch, capability
+        )
+        launch_flags = _FLAG_FUSE_TAIL | sample_flag
+        leader = _leader_push_flag(
+            cluster,
+            ept,
+            stream,
+            launch_flags,
+            vocab,
+            capability,
+            _local_select_reach(
+                cluster, ept, stream, launch_flags, top_k_max, vocab, batch, capability
+            ),
+        )
+        launch_flags |= leader or _slab_tail_flag(
+            cluster, ept, stream, sample_flag, vocab, capability
+        )
+        launch_flags |= _local_select_flag(
+            cluster, ept, stream, launch_flags, top_k_max, capability
+        )
+    elif fused_block:
+        launch_flags = _FLAG_FUSE_BLOCK_TAIL
+        launch_flags |= _int_tail_flag(cluster, ept, stream, launch_flags, capability)
+    else:
+        # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave; a
+        # streaming variant triggers before its first pass on Blackwell / Rubin, after its filter pass on Hopper.
+        launch_flags = _early_trigger_flag(batch, cluster, sm_count)
+        if stream:
+            launch_flags |= _stream_prepass_flag(device_index)
+            launch_flags |= _row_span_diet_flag(cluster, True, top_k_max, device_index)
+            launch_flags |= _spec_sample_flag(
+                cluster, ept, True, vocab, top_k_max, batch, capability
+            )
+            leader = _leader_push_flag(
+                cluster, ept, True, launch_flags, vocab, capability
+            )
+            launch_flags |= leader or _coarse_push_flag(
+                cluster, ept, True, launch_flags, capability
+            )
+    return _LaunchPlan(
+        cluster,
+        ept,
+        stream,
+        threads,
+        items,
+        launch_flags,
+        fused or fused_block,
+        _stage23_variant_flags(device_index),
+    )
+
+
+@functools.lru_cache(maxsize=8192)
+def _slab_plan(
+    device_index: int, batch: int, vocab: int, top_k_max: int
+) -> tuple[int, int, bool, int]:
+    """Stage-1 variant and ``launch_flags`` of :func:`top_k_probs_to_slab` (no tail, no PDL dependent): the
+    speculative- or coarse-sample build on a stream, the row-span filter arm for a large top-k on a cluster-8
+    stream."""
+    cluster, ept, stream = _choose_stage1_resolved(
+        batch,
+        vocab,
+        _sm_count(device_index),
+        _smem_optin(device_index),
+        top_k_max,
+        _launch_is_two_kernels(top_k_max, device_index),
+    )
+    capability = _device_capability(device_index)
+    flags = _sample_build_flag(
+        cluster, ept, stream, top_k_max, vocab, batch, capability
+    ) | _row_span_diet_flag(cluster, stream, top_k_max, device_index)
+    flags |= _leader_push_flag(cluster, ept, stream, flags, vocab, capability)
+    return cluster, ept, stream, flags
 
 
 def cake_sampling_route(
@@ -961,7 +1507,7 @@ def cake_sampling_route(
     if kmax > _slab():
         return "fallback:top_k_gt_slab"
     try:
-        choose_stage1(batch, vocab, top_k_max=kmax)
+        _launch_plan(_device_index(probs.device), int(batch), int(vocab), int(kmax))
     except ValueError:
         return "fallback:vocab_too_large"
     return "pipeline"
@@ -1026,7 +1572,10 @@ def top_k_top_p_sampling_from_probs(
         Upper bound of ``top_k`` when it is a tensor (avoids a device synchronization).
     generator: Optional[torch.Generator]
         Source of the Philox seed/offset (default CUDA generator when omitted), advanced exactly
-        like :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs`.
+        like :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs`.  While a CUDA graph is
+        being captured the generator is not read or advanced (that would register it with the
+        graph and add two fill kernels to every replay); the captured launch uses the generator's
+        initial seed with a host-side offset that differs between captures.
     philox_seed, philox_offset: Optional[int]
         Explicit Philox parameters (both required together); ``generator`` is then not touched.
     out: Optional[torch.Tensor]
@@ -1083,20 +1632,16 @@ def top_k_top_p_sampling_from_probs(
         if isinstance(top_k, int)
         else (int(top_k_max) if top_k_max is not None else int(top_k.max().item()))
     )
-    cluster, ept, stream_variant = choose_stage1(batch, vocab, top_k_max=kmax)
-    threads, items = choose_stage23(kmax)
+    plan = _launch_plan(_device_index(probs.device), int(batch), int(vocab), int(kmax))
     slab = _slab()
     vals, idxs, cnt = (
         workspace if workspace is not None else _workspace(batch, slab, probs.device)
     )
     if out is None:
         out = torch.empty(batch, device=probs.device, dtype=torch.int32)
-    if philox_seed is None:
-        # Same stride as top_p_sampling_from_probs (32 reserved draws per row): a generator shared with
-        # the top_k_first route stays in lockstep.
-        philox_seed, philox_offset = get_seed_and_offset(
-            batch * 32, generator, probs.device
-        )
+    philox_seed, philox_offset = _philox_params(
+        batch, generator, probs.device, philox_seed, philox_offset
+    )
     if isinstance(top_k, int):
         k_arr, k_scalar, k_kind = cnt, int(top_k), _TOPK_SCALAR
     else:
@@ -1108,56 +1653,7 @@ def top_k_top_p_sampling_from_probs(
     renorm = renorm_out if renorm_out is not None else vals
     module = load_cake_sampling_module()
     stream = torch.cuda.current_stream(device=probs.device).cuda_stream
-    # Small top-k: stage 2/3 runs inside the stage-1 kernel (same outputs, one launch).
-    fused = kmax <= _fused_tail_kcap() and _stage1_has_fused_tail(
-        cluster, ept, bool(stream_variant)
-    )
-    # Larger top-k up to the slab: the whole-CTA tail, on the capabilities where it beats the chain, for a
-    # one-wave stage-1 grid.
-    fused_block = not fused and _fuse_block_tail(
-        batch,
-        cluster,
-        ept,
-        bool(stream_variant),
-        _sm_count(probs.device.index or 0),
-        kmax,
-        not _block_tail_enabled(probs.device.index or 0),
-        vocab,
-        _device_capability(probs.device.index or 0),
-    )
-    # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave; a
-    # streaming variant triggers before its first pass on Blackwell / Rubin, after its filter pass on Hopper.
-    if fused:
-        launch_flags = _FLAG_FUSE_TAIL | _sample_build_flag(
-            cluster,
-            ept,
-            bool(stream_variant),
-            kmax,
-            vocab,
-            batch,
-            _device_capability(probs.device.index or 0),
-        )
-    elif fused_block:
-        launch_flags = _FLAG_FUSE_BLOCK_TAIL
-    else:
-        launch_flags = _early_trigger_flag(
-            batch, cluster, _sm_count(probs.device.index)
-        )
-        if stream_variant:
-            launch_flags |= _stream_prepass_flag(probs.device.index)
-            launch_flags |= _row_span_diet_flag(
-                cluster, True, kmax, probs.device.index or 0
-            )
-            launch_flags |= _spec_sample_flag(
-                cluster,
-                ept,
-                True,
-                vocab,
-                kmax,
-                batch,
-                _device_capability(probs.device.index or 0),
-            )
-    module.radix_topk(
+    stage1_args = (
         probs,
         k_arr,
         k_scalar,
@@ -1165,9 +1661,9 @@ def top_k_top_p_sampling_from_probs(
         vals,
         idxs,
         cnt,
-        cluster,
-        ept,
-        1 if stream_variant else 0,
+        plan.cluster,
+        plan.ept,
+        1 if plan.stream else 0,
         p_arr,
         p_scalar,
         p_kind,
@@ -1176,10 +1672,10 @@ def top_k_top_p_sampling_from_probs(
         int(philox_seed) & 0xFFFFFFFFFFFFFFFF,
         int(philox_offset) & 0xFFFFFFFFFFFFFFFF,
         1 if renorm_out is not None else 0,
-        launch_flags,
-        stream,
+        plan.launch_flags,
     )
-    if fused or fused_block:
+    module.radix_topk(*stage1_args, stream)
+    if plan.one_launch:
         return out
     module.sparse_topp_sample(
         vals,
@@ -1193,9 +1689,9 @@ def top_k_top_p_sampling_from_probs(
         int(philox_seed) & 0xFFFFFFFFFFFFFFFF,
         int(philox_offset) & 0xFFFFFFFFFFFFFFFF,
         1 if renorm_out is not None else 0,
-        threads,
-        items,
-        stage23_variant_flags(probs.device),
+        plan.threads,
+        plan.items,
+        plan.stage23_flags,
         1 if enable_pdl else 0,
         stream,
     )
@@ -1250,7 +1746,9 @@ def top_k_probs_to_slab(
         if isinstance(top_k, int)
         else (int(top_k_max) if top_k_max is not None else int(top_k.max().item()))
     )
-    cluster, ept, stream_variant = choose_stage1(batch, vocab, top_k_max=kmax)
+    cluster, ept, stream_variant, launch_flags = _slab_plan(
+        _device_index(probs.device), int(batch), int(vocab), int(kmax)
+    )
     vals = (
         out_vals
         if out_vals is not None
@@ -1290,20 +1788,7 @@ def top_k_probs_to_slab(
         0,
         0,
         0,
-        # no fused tail, no PDL dependent follows; the speculative- or coarse-sample build on a stream,
-        # the row-span filter arm for a large top-k on a cluster-8 stream
-        _sample_build_flag(
-            cluster,
-            ept,
-            bool(stream_variant),
-            kmax,
-            vocab,
-            batch,
-            _device_capability(probs.device.index or 0),
-        )
-        | _row_span_diet_flag(
-            cluster, bool(stream_variant), kmax, probs.device.index or 0
-        ),
+        launch_flags,  # no fused tail, no PDL dependent follows (see _slab_plan)
         stream,
     )
     return vals, idxs, cnt
