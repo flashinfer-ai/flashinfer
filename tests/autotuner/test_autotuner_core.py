@@ -1,4 +1,5 @@
 import gc
+import json
 import random
 import tracemalloc
 import weakref
@@ -743,13 +744,93 @@ def test_rank_tactics_records_winner_policy(monkeypatch):
     with autotune(tune_mode=True):
         tuner.rank_tactics("dummy_rank", [runner], cold, inputs, k=2)
     (key,) = tuner.profiling_cache
-    assert tuner._profiling_cache_policies[key] == tuner._profiling_policy(cold)
+    assert tuner._profiling_cache_policies[(None, key)] == tuner._profiling_policy(cold)
 
     # Re-rank the same key under hot L2: the stale cold label must be replaced.
-    tuner._ranked_tactics_cache.clear()
+    # The policy change alone invalidates the cold shortlist.
     with autotune(tune_mode=True):
         tuner.rank_tactics("dummy_rank", [runner], hot, inputs, k=2)
-    assert tuner._profiling_cache_policies[key] == tuner._profiling_policy(hot)
+    assert tuner._profiling_cache_policies[(None, key)] == tuner._profiling_policy(hot)
+
+
+@pytest.mark.parametrize("tune_with", ["choose_one", "rank_tactics"])
+def test_tuned_cold_policy_survives_save_and_load(monkeypatch, tmp_path, tune_with):
+    """A winner tuned under cold L2 is saved with that policy and reused by a
+    fresh process tuning under the same policy, whichever API tuned it."""
+    import flashinfer.autotuner.autotuner as autotuner_module
+
+    monkeypatch.setattr(
+        autotuner_module, "_collect_metadata", lambda: {"gpu": "test-gpu"}
+    )
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    cold = TuningConfig(use_cold_l2_cache=True)
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        if tune_with == "choose_one":
+            assert tuner.choose_one("dummy_save", [runner], cold, inputs)[1] == 1
+        else:
+            assert tuner.rank_tactics("dummy_save", [runner], cold, inputs, k=2) == [
+                1,
+                2,
+            ]
+        # Same process, same policy: served from memory without profiling.
+        profile_calls.clear()
+        assert tuner.choose_one("dummy_save", [runner], cold, inputs)[1] == 1
+        assert profile_calls == []
+
+    path = str(tmp_path / "cold.json")
+    tuner.save_configs(path)
+    saved = json.loads((tmp_path / "cold.json").read_text())
+    (record,) = [v for k, v in saved.items() if not k.startswith("_")]
+    assert tuple(record[2]) == tuner._profiling_policy(cold)
+
+    fresh = reset_autotuner()
+    assert fresh.load_configs(path)
+    fresh.is_tuning_mode = True
+    shapes = ((16, 32),)
+    assert fresh.search_cache("dummy_save", [runner], shapes, cold, inputs)[:3] == (
+        True,
+        0,
+        1,
+    )
+    assert not fresh.search_cache(
+        "dummy_save", [runner], shapes, TuningConfig(), inputs
+    )[0]
+
+
+def test_cold_rank_tactics_winner_does_not_satisfy_hot_choose_one(monkeypatch):
+    """A cold-L2 rank_tactics winner must not be reused by a hot choose_one in
+    the same tuning session: it re-profiles and picks the hot winner."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    hot = TuningConfig()
+    cold = TuningConfig(use_cold_l2_cache=True)
+    times = {"hot": {0: 5.0, 1: 1.0, 2: 3.0}, "cold": {0: 1.0, 1: 5.0, 2: 3.0}}
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return times["cold" if tuning_config.use_cold_l2_cache else "hot"][tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        assert tuner.rank_tactics("dummy_ranked", [runner], cold, inputs, k=2) == [0, 2]
+        num_calls = len(profile_calls)
+        assert tuner.choose_one("dummy_ranked", [runner], hot, inputs)[1] == 1
+    assert len(profile_calls) > num_calls
 
 
 def test_rank_tactics_rebuilds_shortlist_from_winner_only_cache(monkeypatch):
