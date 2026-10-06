@@ -859,13 +859,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_batched(const __grid_constant__ CUtensorMap x
                                     : "r"((smem_b_addr + input_stage_4 * 32768 + (unsigned int)(b_state_base / 64 * 16384 + col * 128 + b_state_base % 64 * 2 ^ (b_state_base / 64 * 16384 + col * 128 + b_state_base % 64 * 2 >> 7 & 7) << 4))));
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 4; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        "shl.b32 %0, %2, 16;\n\t"
-                                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                                        "}\n"
-                                        : "=f"((&scaled_b_values[_pair * 2])[0]), "=f"((&scaled_b_values[_pair * 2])[1])
-                                        : "r"(b_packed[_pair]));
+                                    (&scaled_b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_packed[_pair]) << 16);
+                                    (&scaled_b_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(b_packed[_pair]) & 0xffff0000u);
                                 }
                                 float _exp2_1 = approx_exp2((last_cumsum - smem_cumsum_all[input_stage_4 * 128 + (unsigned int)col]) * 1.4426950408889634f);
                                 float b_scale = _exp2_1;
@@ -1185,13 +1180,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_batched(const __grid_constant__ CUtensorMap x
                                 float x_packed_f32[8];
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 4; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        "shl.b32 %0, %2, 16;\n\t"
-                                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                                        "}\n"
-                                        : "=f"((&x_packed_f32[_pair * 2])[0]), "=f"((&x_packed_f32[_pair * 2])[1])
-                                        : "r"(x_packed[_pair]));
+                                    (&x_packed_f32[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(x_packed[_pair]) << 16);
+                                    (&x_packed_f32[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(x_packed[_pair]) & 0xffff0000u);
                                 }
                                 float d_values[8];
                                 #pragma unroll
@@ -1208,13 +1198,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_batched(const __grid_constant__ CUtensorMap x
                                             uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
                                             #pragma unroll
                                             for (int _pair = 0; _pair < 4; _pair++) {
-                                                asm volatile(
-                                                    "{\n\t"
-                                                    "shl.b32 %0, %2, 16;\n\t"
-                                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                                    "}\n"
-                                                    : "=f"((&d_values[0 + _blk * 8 + _pair * 2])[0]), "=f"((&d_values[0 + _blk * 8 + _pair * 2])[1])
-                                                    : "r"(_vpairs_0[_pair]));
+                                                (&d_values[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                                                (&d_values[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
                                             }
                                         }
                                     }
@@ -1230,13 +1215,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_batched(const __grid_constant__ CUtensorMap x
                                             uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
                                             #pragma unroll
                                             for (int _pair = 0; _pair < 4; _pair++) {
-                                                asm volatile(
-                                                    "{\n\t"
-                                                    "shl.b32 %0, %2, 16;\n\t"
-                                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                                    "}\n"
-                                                    : "=f"((&z_scale[0 + _blk * 8 + _pair * 2])[0]), "=f"((&z_scale[0 + _blk * 8 + _pair * 2])[1])
-                                                    : "r"(_vpairs_1[_pair]));
+                                                (&z_scale[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
+                                                (&z_scale[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
                                             }
                                         }
                                     }
