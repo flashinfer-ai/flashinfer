@@ -185,6 +185,8 @@ class SmemDeepSeekSfAbResource(MemoryResource):
             t2r_rmem_1 = cutlass.vector.full([1], 0.0, cutlass.Float32)
             dsfp8_acc_rmem = cutlass.vector.full([epi_t2r_repx], 0.0, cutlass.Float32)
             dsfp8_acc_rmem_1 = cutlass.vector.full([1], 0.0, cutlass.Float32)
+        self.dsfp8_acc_rmem_state = dsfp8_acc_rmem
+        self.dsfp8_acc_rmem_1_state = dsfp8_acc_rmem_1
         return {
             "dsfp8_act_stage_ptr": Int64(0),
             "dsfp8_wt_stage_ptr": Int64(0),
@@ -204,18 +206,11 @@ class SmemDeepSeekSfAbResource(MemoryResource):
     @cute.jit
     def init_epilogue_state(self, stage_info: StageInfo) -> None:
         self.create_function_variables(stage_info.context)
-        # The accumulators are epilogue-only state: set them on the epilogue
-        # warps' path, never on the producer's, so every read is covered.
-        self._zero_dequant_accumulator()
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def reset_dequant_accumulator(self, stage_info: StageInfo) -> None:
         """Reset the epilogue-local DeepSeek FP8 accumulator for this C tile."""
-        self._zero_dequant_accumulator()
-
-    @cute.jit
-    def _zero_dequant_accumulator(self) -> None:
         if cutlass.const_expr(self.cfg.is_swap_ab):
             swap_t2r_repx = max(1, self.cfg.epi_tile_n // 8)
             self.dsfp8_acc_rmem_state = cutlass.vector.full(
