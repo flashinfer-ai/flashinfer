@@ -3141,14 +3141,18 @@ def _bind_workspace(
 def _tensor_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
     start = tensor.data_ptr()
     if tensor.is_contiguous():
-        span = tensor.numel()
-    else:
-        span = 1 + sum(
-            (size - 1) * stride
-            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
-            if size > 0
-        )
+        return start, start + tensor.nbytes
+    span = 1 + sum(
+        (size - 1) * stride
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+        if size > 0
+    )
     return start, start + span * tensor.element_size()
+
+
+def _overlaps_range(start: int, end: int, tensor: torch.Tensor) -> bool:
+    other_start, other_end = _tensor_byte_range(tensor)
+    return start < other_end and other_start < end
 
 
 def _storage_ranges_overlap(
@@ -3158,13 +3162,11 @@ def _storage_ranges_overlap(
     if left.device != right.device or left.numel() == 0 or right.numel() == 0:
         return False
 
-    left_start, left_end = _tensor_byte_range(left)
-    right_start, right_end = _tensor_byte_range(right)
-    return left_start < right_end and right_start < left_end
+    return _overlaps_range(*_tensor_byte_range(left), right)
 
 
 def _check_output_does_not_overlap_inputs(
-    output: torch.Tensor,
+    output: Optional[torch.Tensor],
     *,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3173,7 +3175,7 @@ def _check_output_does_not_overlap_inputs(
     beta: torch.Tensor,
     initial_state: Optional[torch.Tensor],
 ) -> None:
-    if output.numel() == 0:
+    if output is None or output.numel() == 0:
         return
     output_device = output.device
     output_start, output_end = _tensor_byte_range(output)
@@ -3187,8 +3189,7 @@ def _check_output_does_not_overlap_inputs(
     ):
         if tensor is None or tensor.device != output_device or tensor.numel() == 0:
             continue
-        start, end = _tensor_byte_range(tensor)
-        if output_start < end and start < output_end:
+        if _overlaps_range(output_start, output_end, tensor):
             raise ValueError(
                 f"output must not overlap {name} for frozen recurrent_kda prefill"
             )
@@ -6189,7 +6190,7 @@ def _run_flash_kda_prefill(
     else:
         out_buf = output
     _check_output_does_not_overlap_inputs(
-        out_buf,
+        output,
         q=q,
         k=k,
         v=v,

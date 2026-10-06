@@ -5269,7 +5269,7 @@ def test_frozen_route_rejects_output_overlap(cuda_device, monkeypatch):
 @pytest.mark.parametrize("name", ["q", "k", "v", "g", "beta", "initial_state"])
 @pytest.mark.parametrize("layout", ["contiguous", "transposed", "gapped", "expanded"])
 def test_output_overlap_checks_current_storage(cuda_device, name, layout):
-    storage = torch.empty(64, device=cuda_device)
+    storage = torch.empty(64, device=cuda_device, dtype=torch.bfloat16)
     output = storage[16:32].view(4, 4)
     if layout == "transposed":
         output = output.T
@@ -5288,9 +5288,24 @@ def test_output_overlap_checks_current_storage(cuda_device, name, layout):
     inputs[name] = storage[16:17].view(torch.uint8)[1:2]
     with pytest.raises(ValueError, match=f"output must not overlap {name}"):
         kda_prefill_api._check_output_does_not_overlap_inputs(output, **inputs)
+    inputs[name] = storage[30:31] if layout == "gapped" else storage[16:17]
+    with pytest.raises(ValueError, match=f"output must not overlap {name}"):
+        kda_prefill_api._check_output_does_not_overlap_inputs(output, **inputs)
+    if layout == "expanded":
+        inputs[name] = storage[17:18]
+        kda_prefill_api._check_output_does_not_overlap_inputs(output, **inputs)
     inputs[name] = storage[16:16]
     kda_prefill_api._check_output_does_not_overlap_inputs(output, **inputs)
     kda_prefill_api._check_output_does_not_overlap_inputs(output[:0], **inputs)
+
+
+def test_allocated_output_needs_no_overlap_check(monkeypatch):
+    def unexpected_range(tensor):
+        raise AssertionError("Fresh output cannot overlap live input storage")
+
+    monkeypatch.setattr(kda_prefill_api, "_tensor_byte_range", unexpected_range)
+    inputs = dict.fromkeys(("q", "k", "v", "g", "beta", "initial_state"))
+    kda_prefill_api._check_output_does_not_overlap_inputs(None, **inputs)
 
 
 def test_initial_state_is_updated_in_place(cuda_device, monkeypatch):
