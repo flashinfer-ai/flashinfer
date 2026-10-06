@@ -26,6 +26,7 @@ import torch
 from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
+from b12x._lib.program_cache import program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
@@ -998,7 +999,7 @@ def _compiled_x4t_scatter(
     )
 
 
-@functools.cache
+@program_cache
 def _compiled_x4t_tp12_w4a16(
     w13_row_rotation: int,
     use_expert_map: bool,

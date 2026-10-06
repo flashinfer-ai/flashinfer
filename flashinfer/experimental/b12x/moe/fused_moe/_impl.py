@@ -6771,6 +6771,33 @@ def prepare_b12x_fp4_moe_weights(
     )
 
 
+def prepare_b12x_x4t_weights(*, plan, weights) -> B12XFP4ExpertWeights:
+    """Keep exact nibbles and compressed scale planes in the expert owner."""
+    from b12x.moe._shared.kernels.w4a16.prepare import prepare_w4a16_x4t_weights
+
+    unit = torch.ones(plan.num_experts, dtype=torch.float32, device=weights.w13.device)
+    native = WeightPreparationTransform.W4A16_NATIVE in plan.transforms
+    value = prepare_w4a16_x4t_weights(
+        weights.w13, weights.w13_scales, unit,
+        weights.w2, weights.w2_scales, unit,
+        weights.w13_scale_scratch, weights.w2_scale_scratch,
+        activation=plan.activation, params_dtype=getattr(torch, plan.io_dtype),
+        w13_layout=plan.w13_layout,
+        weight_layout="modelopt" if native else "packed",
+    )
+    return B12XFP4ExpertWeights(
+        plan=plan, a1_gscale=unit, a2_gscale=unit,
+        w1_fp4=value.w13, w2_fp4=value.w2,
+        w1_blockscale=value.w13_scale, w2_blockscale=value.w2_scale,
+        w1_alphas=value.w13_global_scale, w2_alphas=value.w2_global_scale,
+        representation=_PreparedWeightRepresentation(
+            quant_mode="w4a16",
+            layout=PreparedWeightLayout.SOURCE_NATIVE if native else PreparedWeightLayout.MMA_PACKED,
+            value=value,
+        ),
+    )
+
+
 def prepare_b12x_iq2_xs_weights(*, plan, weights) -> B12XFP4ExpertWeights:
     """Own compact IQ2_XS planes through the canonical expert package."""
     from b12x.moe._shared.kernels.w4a16.iq2_xs import prepare_iq2_xs_moe_weights

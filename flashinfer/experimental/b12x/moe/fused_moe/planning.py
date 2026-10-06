@@ -16,12 +16,14 @@ from ._impl import (
     prepare_b12x_fp4_moe_weights,
     prepare_b12x_trellis_v2_weights,
     prepare_b12x_iq2_xs_weights,
+    prepare_b12x_x4t_weights,
 )
 from .config import TrellisConfig
 from .source import PackedSource, TrellisSource, WeightSource
 from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
+    X4TWeights,
     IQ2XSWeights,
     PreparedExperts,
     PreparedWeightFormat,
@@ -351,7 +353,7 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights | IQ2XSWeights,
+    weights: PackedWeights | TrellisWeights | IQ2XSWeights | X4TWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
 ) -> PreparedExperts:
@@ -361,7 +363,18 @@ def prepare_weights(
         raise TypeError("plan must be a WeightPlan")
     if (device is not None or staging is not None) and not isinstance(plan.source, TrellisSource):
         raise ValueError("device and staging are only supported for trellis preparation")
-    if isinstance(plan.source, PackedSource) and plan.source.format.value in BLOCK_CODECS:
+    if isinstance(weights, X4TWeights):
+        if (
+            not isinstance(plan.source, PackedSource)
+            or plan.source.format.value != "fp4_e8m0_k32"
+            or plan.activation.mode is not ActivationMode.A16
+            or plan.prepared_format.packing not in {
+                WeightPacking.MMA_PACKED, WeightPacking.SOURCE_NATIVE
+            }
+        ):
+            raise ValueError("X4T requires native or MMA-packed MXFP4 A16 weights")
+        prepared = prepare_b12x_x4t_weights(plan=plan._impl, weights=weights)
+    elif isinstance(plan.source, PackedSource) and plan.source.format.value in BLOCK_CODECS:
         if not isinstance(weights, IQ2XSWeights) or weights.codec != plan.source.format.value:
             raise TypeError(f"{plan.source.format.value} preparation requires matching BlockQuantWeights")
         prepared = prepare_b12x_iq2_xs_weights(plan=plan._impl, weights=weights)

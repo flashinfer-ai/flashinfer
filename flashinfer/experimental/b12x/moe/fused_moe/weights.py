@@ -188,6 +188,22 @@ class PackedWeights:
                 raise TypeError(f"PackedWeights.{name} must be a tensor or None")
 
 
+@dataclass(frozen=True)
+class X4TWeights:
+    """Exact MXFP4 nibbles, compressed scales and caller-owned expansion buffers.
+
+    Buffers may be shared only by serialized layer executions on one CUDA
+    stream. Concurrent model execution lanes require separate buffers.
+    """
+
+    w13: torch.Tensor
+    w2: torch.Tensor
+    w13_scales: object
+    w2_scales: object
+    w13_scale_scratch: torch.Tensor
+    w2_scale_scratch: torch.Tensor
+
+
 @dataclass(frozen=True, kw_only=True)
 class PreparedExperts:
     """Prepared expert tensors owned by a canonical weight plan."""
@@ -224,6 +240,7 @@ class PreparedExperts:
 
 
 __all__ = [
+    "X4TWeights",
     "PackedWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",

@@ -706,6 +706,49 @@ class _FusedMoePrograms:
     launchers: tuple
 
 
+def _x4t_scale_program_payload(experts):
+    """Describe compressed-scale decoders without retaining weight tensors."""
+    representation = experts._impl.representation
+    weights = None if representation is None else representation.value
+    first = getattr(weights, "x4t_w13_scale", None)
+    if first is None:
+        return ()
+    if weights.x4t_packed_pair_programs is None:
+        return ("tp12", int(weights.x4t_w13_row_rotation))
+    return ("packed_pair", tuple(
+        (plane.rows, plane.columns, plane.exception_task_rows,
+         plane.exception_row_rotation)
+        for plane in (first, weights.x4t_w2_scale)
+    ))
+
+
+@program_cache(scope="preparation")
+def compile_x4t_scale_programs(payload, ordinal):
+    """Declare every route ABI consumed by compressed-scale W4A16 weights."""
+    with torch.cuda.device(ordinal):
+        if payload[0] == "packed_pair":
+            from b12x._lib.quant.x4t_packed_scales import _compiled_packed_scale_pair
+
+            return tuple(
+                _compiled_packed_scale_pair(*tuple(
+                    (*plane, True, False, counts, ids64, sorted_ids)
+                    for plane in payload[1]
+                ))
+                for counts, ids64, sorted_ids in (
+                    (False, False, False), (True, False, False),
+                    (False, True, False), (False, False, True),
+                )
+            )
+        if payload[0] == "tp12":
+            from b12x._lib.quant.x4t_scales import _compiled_x4t_tp12_w4a16
+
+            return tuple(
+                _compiled_x4t_tp12_w4a16(payload[1], mapped, unique)
+                for mapped in (False, True) for unique in (False, True)
+            )
+        raise ValueError(f"unsupported X4T scale program layout: {payload[0]!r}")
+
+
 @program_cache(scope="preparation")
 def compile_fused_moe(
     query_payload, config_payload, weight_payload, scale_counts, ordinal
@@ -852,6 +895,7 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
         int(experts._impl.a1_gscale.numel()),
         int(experts._impl.a2_gscale.numel()),
     )
+    x4t_payload = _x4t_scale_program_payload(experts)
 
     def child(tokens):
         query = _query(experts, capacity, tokens, routing, controls, invocation)
@@ -863,6 +907,7 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
                 "collect_activation_amax": query.collect_activation_amax,
                 "deterministic_output": query.deterministic_output,
             }), "controls": controls,
+            **({"x4t_scale_programs": x4t_payload} if x4t_payload else {}),
         })
 
         def caps_for(config, device):
@@ -882,6 +927,10 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
                     "b12x.moe.fused_moe._preparation:compile_route_topk",
                     ROUTE_TUNING.encode_query(route_query), device.ordinal,
                 ),
+                *((CompileJob.create(
+                    "b12x.moe.fused_moe._preparation:compile_x4t_scale_programs",
+                    x4t_payload, device.ordinal,
+                ),) if x4t_payload else ()),
                 *(
                     CompileJob.create(
                         "b12x.moe.fused_moe._preparation:compile_dynamic_route_plan",
@@ -909,6 +958,8 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
                 _prewarmed_route_pack_launches=programs.route_pack_launches,
             )
             launchers = list(programs.launchers)
+            if x4t_payload:
+                launchers.extend(compile_x4t_scale_programs(x4t_payload, device.ordinal))
             route_query = _route_query_from_moe(query, routing)
             route_launcher = compile_route_topk(
                 ROUTE_TUNING.encode_query(route_query), device.ordinal
