@@ -34,7 +34,11 @@ from .flashinfer_benchmark_utils import (
     enum_type,
     get_device,
     print_perf_metrics,
+    print_autotune_choices,
+    probe_autotune_choices,
+    set_autotune_columns,
     filter_backends_by_compute_capability,
+    warn_if_autotune_unsupported,
     warn_if_pdl_unsupported,
 )
 from .moe_utils import (
@@ -76,6 +80,31 @@ def _activation_kwarg(fn, activation_type: ActivationType) -> dict:
             )
         return {"gated_act_type": _ACTIVATION_TO_GATED_ACT[activation_type]}
     return {}
+
+
+def _trtllm_autotune_warmup(args, run_fn, input_args, description):
+    """Tune ``run_fn`` under ``autotune(True)`` when --autotune is set.
+
+    Mirrors the trtllm_fp4_block_scale_moe flow: tune with ``autotune(True)``
+    and time outside it so the timed run reads the tuned cache. Without
+    --autotune, a given --autotune_cache is loaded for the timed run.
+    Returns whether a tuning context ran.
+    """
+    cache_path = getattr(args, "autotune_cache", None)
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        if args.verbose >= 1:
+            print(f"[INFO] Autotune warmup for {description}: {warmup_iters} iters")
+        with autotune(True, cache=cache_path):
+            for _ in range(warmup_iters):
+                run_fn(*input_args)
+        return True
+    if cache_path:
+        with autotune(False, cache=cache_path):
+            pass
+    return False
 
 
 def run_moe_test(args):
@@ -237,7 +266,9 @@ def parse_moe_args(line, parser):
         action="store_true",
         default=False,
         help=(
-            "Enable autotuner warmup for supported routines (trtllm_fp4_block_scale_moe and cutlass_fused_moe)."
+            "Enable autotuner warmup for supported routines (trtllm_fp4_block_scale_moe, "
+            "trtllm_fp8_block_scale_moe, trtllm_fp8_per_tensor_scale_moe, cutlass_fused_moe, "
+            "cute_dsl_fp4_block_scale_moe, cute_dsl_bf16_moe, b12x_fused_moe)."
         ),
     )
     parser.add_argument(
@@ -778,6 +809,24 @@ def testTrtllmFp4BlockScaleMoe(args):
         with autotune(False, cache=cache_path):
             pass
 
+    fp4_moe_args = (
+        routing_logits,
+        routing_bias,
+        hidden_states_fp4,
+        hidden_states_scale_linear_fp4,
+        gemm1_weights_fp4,
+        gemm1_weights_scale,
+        gemm2_weights_fp4,
+        gemm2_weights_scale,
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
+        output2_scale_scalar,
+    )
+    autotuned = backend == "trtllm_autotune"
+    autotune_choices = (
+        probe_autotune_choices(run_fp4_moe, *fp4_moe_args) if autotuned else {}
+    )
+
     # Benchmark timing
     times = bench_gpu_time(
         fn=run_fp4_moe,
@@ -787,19 +836,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
         cold_l2_cache=True,
-        input_args=(
-            routing_logits,
-            routing_bias,
-            hidden_states_fp4,
-            hidden_states_scale_linear_fp4,
-            gemm1_weights_fp4,
-            gemm1_weights_scale,
-            gemm2_weights_fp4,
-            gemm2_weights_scale,
-            output1_scale_scalar,
-            output1_scale_gate_scalar,
-            output2_scale_scalar,
-        ),
+        input_args=fp4_moe_args,
     )
 
     # Compute performance metrics
@@ -836,6 +873,8 @@ def testTrtllmFp4BlockScaleMoe(args):
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+    if args.verbose >= 1:
+        print_autotune_choices(backend, autotune_choices)
 
     if args.output_path is not None:
         cur_res = defaultdict(str)
@@ -845,6 +884,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         cur_res["tflops"] = tflops
         cur_res["tb_per_sec"] = tb_per_sec
         cur_res["backend"] = backend
+        set_autotune_columns(cur_res, autotuned, autotune_choices)
         cur_res["num_tokens"] = num_tokens
         cur_res["hidden_size"] = hidden_size
         cur_res["intermediate_size"] = intermediate_size
@@ -1182,6 +1222,11 @@ def testCutlassFusedMoe(args):
         with autotune(False, cache=cache_path):
             pass
 
+    autotuned = backend.endswith("_autotune")
+    autotune_choices = (
+        probe_autotune_choices(run_cutlass, *input_args_for_bench) if autotuned else {}
+    )
+
     # Measure
     times = bench_gpu_time(
         fn=run_cutlass,
@@ -1223,6 +1268,8 @@ def testCutlassFusedMoe(args):
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+    if args.verbose >= 1:
+        print_autotune_choices(backend, autotune_choices)
 
     if args.output_path is not None:
         cur_res = defaultdict(str)
@@ -1232,6 +1279,7 @@ def testCutlassFusedMoe(args):
         cur_res["tflops"] = tflops
         cur_res["tb_per_sec"] = tb_per_sec
         cur_res["backend"] = backend
+        set_autotune_columns(cur_res, autotuned, autotune_choices)
         cur_res["num_tokens"] = num_tokens
         cur_res["hidden_size"] = hidden_size
         cur_res["intermediate_size"] = intermediate_size
@@ -1675,6 +1723,7 @@ def _alphamoe_nvfp4_reference(data: dict) -> torch.Tensor:
 
 def testAlphaMoeNvfp4AlignedMoe(args):
     """Benchmark the frozen SM100/SM103 AlphaMoE NVFP4 megakernel."""
+    warn_if_autotune_unsupported(args, args.routine)
 
     if args.verbose >= 1:
         print("[INFO] Running testAlphaMoeNvfp4AlignedMoe")
@@ -2033,6 +2082,11 @@ def testCuteDslFp4BlockScaleMoe(args):
                 run_cute_dsl_moe(*autotune_args)
         del autotune_args
 
+    autotuned = backend.endswith("_autotune")
+    autotune_choices = (
+        probe_autotune_choices(run_cute_dsl_moe, *input_args) if autotuned else {}
+    )
+
     # Benchmark timing
     times = bench_gpu_time(
         fn=run_cute_dsl_moe,
@@ -2075,6 +2129,8 @@ def testCuteDslFp4BlockScaleMoe(args):
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+    if args.verbose >= 1:
+        print_autotune_choices(backend, autotune_choices)
 
     if args.output_path is not None:
         cur_res = defaultdict(str)
@@ -2084,6 +2140,7 @@ def testCuteDslFp4BlockScaleMoe(args):
         cur_res["tflops"] = tflops
         cur_res["tb_per_sec"] = tb_per_sec
         cur_res["backend"] = backend
+        set_autotune_columns(cur_res, autotuned, autotune_choices)
         cur_res["num_tokens"] = num_tokens
         cur_res["hidden_size"] = hidden_size
         cur_res["intermediate_size"] = intermediate_size
@@ -2312,6 +2369,11 @@ def testCuteDslBf16Moe(args):
         with autotune(False, cache=cache_path):
             pass
 
+    autotuned = backend.endswith("_autotune")
+    autotune_choices = (
+        probe_autotune_choices(run_cute_dsl_bf16_moe, *input_args) if autotuned else {}
+    )
+
     # Benchmark timing
     times = bench_gpu_time(
         fn=run_cute_dsl_bf16_moe,
@@ -2354,6 +2416,8 @@ def testCuteDslBf16Moe(args):
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+    if args.verbose >= 1:
+        print_autotune_choices(backend, autotune_choices)
 
     if args.output_path is not None:
         cur_res = defaultdict(str)
@@ -2363,6 +2427,7 @@ def testCuteDslBf16Moe(args):
         cur_res["tflops"] = tflops
         cur_res["tb_per_sec"] = tb_per_sec
         cur_res["backend"] = backend
+        set_autotune_columns(cur_res, autotuned, autotune_choices)
         cur_res["num_tokens"] = num_tokens
         cur_res["hidden_size"] = hidden_size
         cur_res["intermediate_size"] = intermediate_size
@@ -2583,6 +2648,11 @@ def testB12xFusedMoe(args):
                 run_b12x_moe(*autotune_args)
         del autotune_args
 
+    autotuned = backend.endswith("_autotune")
+    autotune_choices = (
+        probe_autotune_choices(run_b12x_moe, *input_args) if autotuned else {}
+    )
+
     # Cold-L2 rotation clones the weights inside CUDA-graph capture, but
     # W4A16 packs weights on first use and cannot pack during capture.
     # Keep L2 warm for that combination.
@@ -2636,6 +2706,8 @@ def testB12xFusedMoe(args):
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+    if args.verbose >= 1:
+        print_autotune_choices(backend, autotune_choices)
 
     if args.output_path is not None:
         cur_res = defaultdict(str)
@@ -2645,6 +2717,7 @@ def testB12xFusedMoe(args):
         cur_res["tflops"] = tflops
         cur_res["tb_per_sec"] = tb_per_sec
         cur_res["backend"] = backend
+        set_autotune_columns(cur_res, autotuned, autotune_choices)
         cur_res["num_tokens"] = num_tokens
         cur_res["hidden_size"] = hidden_size
         cur_res["intermediate_size"] = intermediate_size
@@ -2848,6 +2921,26 @@ def testTrtllmFp8BlockScaleMoe(args):
             enable_pdl=args.enable_pdl,
         )
 
+    run_fp8_block_moe_args = (
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        kernel_gemm1_weights,
+        gemm1_weights_scale,
+        kernel_gemm2_weights,
+        gemm2_weights_scale,
+    )
+    autotuned = _trtllm_autotune_warmup(
+        args, run_fp8_block_moe, run_fp8_block_moe_args, "FP8 block scale MoE"
+    )
+    backend = "trtllm_autotune" if autotuned else "trtllm"
+    autotune_choices = (
+        probe_autotune_choices(run_fp8_block_moe, *run_fp8_block_moe_args)
+        if autotuned
+        else {}
+    )
+
     # Benchmark timing
     times = bench_gpu_time(
         fn=run_fp8_block_moe,
@@ -2857,16 +2950,7 @@ def testTrtllmFp8BlockScaleMoe(args):
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
         cold_l2_cache=True,
-        input_args=(
-            routing_logits,
-            routing_bias,
-            hidden_states,
-            hidden_states_scale,
-            kernel_gemm1_weights,
-            gemm1_weights_scale,
-            kernel_gemm2_weights,
-            gemm2_weights_scale,
-        ),
+        input_args=run_fp8_block_moe_args,
     )
 
     # Compute performance metrics
@@ -2897,8 +2981,9 @@ def testTrtllmFp8BlockScaleMoe(args):
         verbose=args.verbose,
     )
 
-    backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+    if args.verbose >= 1:
+        print_autotune_choices(backend, autotune_choices)
 
     if args.output_path is not None:
         cur_res = defaultdict(str)
@@ -2908,6 +2993,7 @@ def testTrtllmFp8BlockScaleMoe(args):
         cur_res["tflops"] = tflops
         cur_res["tb_per_sec"] = tb_per_sec
         cur_res["backend"] = backend
+        set_autotune_columns(cur_res, autotuned, autotune_choices)
         cur_res["num_tokens"] = num_tokens
         cur_res["hidden_size"] = hidden_size
         cur_res["intermediate_size"] = intermediate_size
@@ -3083,6 +3169,30 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             **_activation_kwarg(trtllm_fp8_per_tensor_scale_moe, activation_type),
         )
 
+    run_fp8_per_tensor_moe_args = (
+        routing_logits,
+        routing_bias,
+        hidden_states_fp8,
+        gemm1_weights_fp8,
+        output1_scales_scalar,
+        output1_scales_gate_scalar,
+        gemm2_weights_fp8,
+        output2_scales_scalar,
+        args.activation_type,
+    )
+    autotuned = _trtllm_autotune_warmup(
+        args,
+        run_fp8_per_tensor_moe,
+        run_fp8_per_tensor_moe_args,
+        "FP8 per-tensor scale MoE",
+    )
+    backend = "trtllm_autotune" if autotuned else "trtllm"
+    autotune_choices = (
+        probe_autotune_choices(run_fp8_per_tensor_moe, *run_fp8_per_tensor_moe_args)
+        if autotuned
+        else {}
+    )
+
     # Benchmark timing
     times = bench_gpu_time(
         fn=run_fp8_per_tensor_moe,
@@ -3092,17 +3202,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
         cold_l2_cache=True,
-        input_args=(
-            routing_logits,
-            routing_bias,
-            hidden_states_fp8,
-            gemm1_weights_fp8,
-            output1_scales_scalar,
-            output1_scales_gate_scalar,
-            gemm2_weights_fp8,
-            output2_scales_scalar,
-            args.activation_type,
-        ),
+        input_args=run_fp8_per_tensor_moe_args,
     )
 
     # Compute performance metrics
@@ -3133,8 +3233,9 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         verbose=args.verbose,
     )
 
-    backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+    if args.verbose >= 1:
+        print_autotune_choices(backend, autotune_choices)
 
     if args.output_path is not None:
         cur_res = defaultdict(str)
@@ -3144,6 +3245,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         cur_res["tflops"] = tflops
         cur_res["tb_per_sec"] = tb_per_sec
         cur_res["backend"] = backend
+        set_autotune_columns(cur_res, autotuned, autotune_choices)
         cur_res["num_tokens"] = num_tokens
         cur_res["hidden_size"] = hidden_size
         cur_res["intermediate_size"] = intermediate_size
@@ -3402,6 +3504,10 @@ def testUnifiedNvfp4Moe(args):
                 **launch_kwargs,
             )
 
+        autotune_choices = {
+            f"moe_{runner.backend_key}": (type(runner).__name__, tactic)
+        }
+
         def _call(r=runner, i=inputs, t=tactic, kw=launch_kwargs):
             return r.forward(i, tactic=t, **kw)
 
@@ -3447,6 +3553,8 @@ def testUnifiedNvfp4Moe(args):
         is_winner = runner.backend_key == winner_key
         backend_label = f"unified/{runner.backend_key}" + ("*" if is_winner else "")
         print_perf_metrics(backend_label, median_time, std_time, tflops, tb_per_sec)
+        if args.verbose >= 1:
+            print_autotune_choices(backend_label, autotune_choices)
 
         # Shared-reference accuracy check for this candidate (CR10/CR11).
         refcheck_passed = None
@@ -3472,6 +3580,7 @@ def testUnifiedNvfp4Moe(args):
             cur_res["tflops"] = tflops
             cur_res["tb_per_sec"] = tb_per_sec
             cur_res["backend"] = backend_label
+            set_autotune_columns(cur_res, True, autotune_choices)
             cur_res["refcheck_passed"] = refcheck_passed
             cur_res["num_tokens"] = num_tokens
             cur_res["hidden_size"] = hidden_size
@@ -3502,6 +3611,7 @@ def testBgmvMoe(args):
     Returns:
         list: List of dictionaries containing performance results
     """
+    warn_if_autotune_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testBgmvMoe")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")

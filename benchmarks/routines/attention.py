@@ -40,9 +40,14 @@ from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
     get_device,
     print_perf_metrics,
+    print_autotune_choices,
+    probe_autotune_choices,
+    resolve_backend_from_choices,
+    set_autotune_columns,
     is_close_stats,
     filter_backends_by_compute_capability,
     to_float8,
+    warn_if_autotune_unsupported,
 )
 
 TRTLLM_RAGGED_ROW_ACTIVITY_MODES = (
@@ -685,6 +690,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_autotune_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testBatchDecodeWithPagedKVCacheWrapper")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -1474,6 +1480,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     Returns:
         dict: Dictionary containing performance results
     """
+    warn_if_autotune_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testBatchPrefillWithPagedKVCacheWrapper")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -2412,6 +2419,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     Returns:
         dict: Dictionary containing performance results
     """
+    warn_if_autotune_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testBatchPrefillWithRaggedKVCacheWrapper")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -3292,6 +3300,20 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     return res
 
 
+_MLA_RUNNER_BACKENDS = {
+    "TrtllmGenMlaDecodeRunner": "trtllm-gen",
+    "CuteDslMlaDecodeRunner": "cute-dsl",
+}
+
+
+def _mla_resolved_backend(choices):
+    """Backend that MLA ``backend="auto"`` resolved to, or "" if unknown."""
+    backends = {_MLA_RUNNER_BACKENDS.get(runner) for runner, _ in choices.values()}
+    if len(backends) == 1 and None not in backends:
+        return backends.pop()
+    return resolve_backend_from_choices(choices)
+
+
 def testBatchMLAPagedAttentionWrapper(args):
     """
     Test BatchMLAPagedAttentionWrapper and equivalent APIs.
@@ -3838,6 +3860,7 @@ def testBatchMLAPagedAttentionWrapper(args):
 
     has_reference_output = False
     reference_backend = None
+    autotune_choices = {}
     # Iterate over each backend:
     for cur_backend in backends:
         # Clear workspace buffer to prevent unexpected interactions between backends.
@@ -3906,6 +3929,19 @@ def testBatchMLAPagedAttentionWrapper(args):
                 out_arg,
             )
 
+        bench_args = (
+            runtime_q_nope,
+            runtime_q_pe,
+            runtime_ckv_cache,
+            runtime_kpe_cache,
+            runtime_q,
+            runtime_kv_cache,
+            runtime_out,
+        )
+        if cur_backend in autotune_supported_backends:
+            autotune_choices[cur_backend] = probe_autotune_choices(
+                run_timed_backend, *bench_args
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_timed_backend,
             dry_run_iters=args.dry_run_iters,
@@ -3914,15 +3950,7 @@ def testBatchMLAPagedAttentionWrapper(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
             cold_l2_cache=True,
-            input_args=(
-                runtime_q_nope,
-                runtime_q_pe,
-                runtime_ckv_cache,
-                runtime_kpe_cache,
-                runtime_q,
-                runtime_kv_cache,
-                runtime_out,
-            ),
+            input_args=bench_args,
         )
 
     # Perform reference check
@@ -4020,6 +4048,12 @@ def testBatchMLAPagedAttentionWrapper(args):
             tflops = (tflops_total / (median_time * 1e9)).item()
 
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+            autotuned = (
+                getattr(args, "autotune", False)
+                and backend in autotune_supported_backends
+            )
+            if args.verbose >= 1:
+                print_autotune_choices(backend, autotune_choices.get(backend, {}))
 
             # TO-Do:
             if args.output_path is not None:
@@ -4030,6 +4064,11 @@ def testBatchMLAPagedAttentionWrapper(args):
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["backend"] = backend
+                set_autotune_columns(cur_res, autotuned, autotune_choices.get(backend))
+                if backend == "auto":
+                    cur_res["resolved_backend"] = _mla_resolved_backend(
+                        autotune_choices.get(backend, {})
+                    )
                 cur_res["page_size"] = page_size
                 cur_res["batch_size"] = batch_size
                 cur_res["s_qo"] = s_qo
@@ -4228,6 +4267,7 @@ def _validate_dsv4_sparse_mla_samples(
 
 def testTrtllmBatchDecodeSparseMlaDsv4(args):
     """Benchmark the public DSV4 sparse-MLA API on SM100/SM103."""
+    warn_if_autotune_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testTrtllmBatchDecodeSparseMlaDsv4")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")

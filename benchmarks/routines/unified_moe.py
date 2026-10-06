@@ -67,6 +67,7 @@ from .flashinfer_benchmark_utils import (
     enum_type,
     get_device,
     print_perf_metrics,
+    set_autotune_columns,
 )
 from .moe_utils import (
     add_common_moe_args,
@@ -717,6 +718,11 @@ def run_unified_moe_test(args):
             cold_l2_cache=True,
             prequantized_median_time=prequantized_median,
             prequantized_std_time=prequantized_std,
+        )
+        set_autotune_columns(
+            current,
+            args.autotune,
+            {f"moe_{runner.backend_key}": (type(runner).__name__, tactic)},
         )
         results.append(current)
 

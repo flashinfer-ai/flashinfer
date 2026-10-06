@@ -18,8 +18,13 @@ from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
     get_device,
     print_perf_metrics,
+    print_autotune_choices,
+    probe_autotune_choices,
+    resolve_backend_from_choices,
+    set_autotune_columns,
     is_close_stats,
     filter_backends_by_compute_capability,
+    warn_if_autotune_unsupported,
     warn_if_pdl_unsupported,
 )
 
@@ -179,7 +184,7 @@ def parse_gemm_args(line, parser):
         action="store_true",
         default=False,
         help=(
-            "Enable autotuner warmup for supported routines (mm_fp4, bmm_fp8, mm_fp8, bmm_mxfp8, mm_mxfp8, mm_bf16, bmm_bf16)."
+            "Enable autotuner warmup for supported routines (mm_fp4, bmm_fp8, mm_fp8, bmm_mxfp8, mm_mxfp8, mm_bf16, mm_bf16_fp4, bmm_bf16)."
         ),
     )
     parser.add_argument(
@@ -246,6 +251,7 @@ def testGemmFp8NtGroupwise(args):
         dict: List of dictionaries containing performance results
     """
     warn_if_pdl_unsupported(args, args.routine)
+    warn_if_autotune_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testGemmFp8NtGroupwise")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -446,6 +452,7 @@ def testGroupGemmFp8NtGroupwise(args):
         dict: List of dictionaries containing performance results
     """
     warn_if_pdl_unsupported(args, args.routine)
+    warn_if_autotune_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testGroupGemmFp8NtGroupwise")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -770,12 +777,21 @@ def testBmmFp8(args):
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
+    autotune_choices = {}
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(
                 cur_backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s
             ).detach()
+        bench_args = (cur_backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s)
+        if cur_backend == "auto" or (
+            getattr(args, "autotune", False)
+            and cur_backend in autotune_supported_backends
+        ):
+            autotune_choices[cur_backend] = probe_autotune_choices(
+                run_backend, *bench_args
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -784,7 +800,7 @@ def testBmmFp8(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s),
+            input_args=bench_args,
         )
 
     tested_backends = list(outputs.keys())
@@ -833,6 +849,8 @@ def testBmmFp8(args):
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
             print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+            if args.verbose >= 1:
+                print_autotune_choices(backend_name, autotune_choices.get(backend, {}))
 
             if args.output_path is not None:
                 cur_res = defaultdict(str)
@@ -849,6 +867,15 @@ def testBmmFp8(args):
                 cur_res["mat2_dtype"] = mat2_dtype
                 cur_res["out_dtype"] = res_dtype
                 cur_res["backend"] = backend_name
+                set_autotune_columns(
+                    cur_res,
+                    backend_name.endswith("_autotune"),
+                    autotune_choices.get(backend),
+                )
+                if backend == "auto":
+                    cur_res["resolved_backend"] = resolve_backend_from_choices(
+                        autotune_choices.get(backend, {})
+                    )
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
@@ -1000,12 +1027,21 @@ def testMmFp8(args):
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
+    autotune_choices = {}
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(
                 cur_backend, input_fp8, mat2_prepared, alpha
             ).detach()
+        bench_args = (cur_backend, input_fp8, mat2_prepared, alpha)
+        if cur_backend == "auto" or (
+            getattr(args, "autotune", False)
+            and cur_backend in autotune_supported_backends
+        ):
+            autotune_choices[cur_backend] = probe_autotune_choices(
+                run_backend, *bench_args
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1014,7 +1050,7 @@ def testMmFp8(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, input_fp8, mat2_prepared, alpha),
+            input_args=bench_args,
         )
 
     tested_backends = list(outputs.keys())
@@ -1057,6 +1093,8 @@ def testMmFp8(args):
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
             print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+            if args.verbose >= 1:
+                print_autotune_choices(backend_name, autotune_choices.get(backend, {}))
 
             if args.output_path is not None:
                 cur_res = defaultdict(str)
@@ -1073,6 +1111,15 @@ def testMmFp8(args):
                 cur_res["mat2_dtype"] = mat2_dtype
                 cur_res["out_dtype"] = res_dtype
                 cur_res["backend"] = backend_name
+                set_autotune_columns(
+                    cur_res,
+                    backend_name.endswith("_autotune"),
+                    autotune_choices.get(backend),
+                )
+                if backend == "auto":
+                    cur_res["resolved_backend"] = resolve_backend_from_choices(
+                        autotune_choices.get(backend, {})
+                    )
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
@@ -1209,12 +1256,21 @@ def testBmmMxfp8(args):
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
+    autotune_choices = {}
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(
                 cur_backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale
             ).detach()
+        bench_args = (cur_backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale)
+        if cur_backend == "auto" or (
+            getattr(args, "autotune", False)
+            and cur_backend in autotune_supported_backends
+        ):
+            autotune_choices[cur_backend] = probe_autotune_choices(
+                run_backend, *bench_args
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1223,7 +1279,7 @@ def testBmmMxfp8(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale),
+            input_args=bench_args,
         )
 
     min_cos_sim = 0.9  # TODO: check if can be increased
@@ -1270,6 +1326,8 @@ def testBmmMxfp8(args):
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
             print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+            if args.verbose >= 1:
+                print_autotune_choices(backend_name, autotune_choices.get(backend, {}))
 
             if args.output_path is not None:
                 cur_res = defaultdict(str)
@@ -1284,6 +1342,15 @@ def testBmmMxfp8(args):
                 cur_res["k"] = k
                 cur_res["out_dtype"] = res_dtype
                 cur_res["backend"] = backend_name
+                set_autotune_columns(
+                    cur_res,
+                    backend_name.endswith("_autotune"),
+                    autotune_choices.get(backend),
+                )
+                if backend == "auto":
+                    cur_res["resolved_backend"] = resolve_backend_from_choices(
+                        autotune_choices.get(backend, {})
+                    )
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
@@ -1503,6 +1570,7 @@ def testMmFp4(args):
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
+    autotune_choices = {}
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
@@ -1515,6 +1583,22 @@ def testMmFp4(args):
                 mat2_inv_s,
                 mat2_inv_s_trtllm,
             ).detach()
+        bench_args = (
+            cur_backend,
+            input_fp4,
+            mat2_fp4,
+            mat2_fp4_trtllm,
+            input_inv_s,
+            mat2_inv_s,
+            mat2_inv_s_trtllm,
+        )
+        if cur_backend == "auto" or (
+            getattr(args, "autotune", False)
+            and cur_backend in autotune_supported_backends
+        ):
+            autotune_choices[cur_backend] = probe_autotune_choices(
+                run_backend, *bench_args
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1523,15 +1607,7 @@ def testMmFp4(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(
-                cur_backend,
-                input_fp4,
-                mat2_fp4,
-                mat2_fp4_trtllm,
-                input_inv_s,
-                mat2_inv_s,
-                mat2_inv_s_trtllm,
-            ),
+            input_args=bench_args,
         )
 
     tested_backends = list(outputs.keys())
@@ -1572,6 +1648,8 @@ def testMmFp4(args):
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
             print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+            if args.verbose >= 1:
+                print_autotune_choices(backend_name, autotune_choices.get(backend, {}))
 
             if args.output_path is not None:
                 cur_res = defaultdict(str)
@@ -1586,6 +1664,15 @@ def testMmFp4(args):
                 cur_res["out_dtype"] = res_dtype
                 cur_res["use_128x4_sf_layout"] = use_128x4_sf_layout
                 cur_res["backend"] = backend_name
+                set_autotune_columns(
+                    cur_res,
+                    backend_name.endswith("_autotune"),
+                    autotune_choices.get(backend),
+                )
+                if backend == "auto":
+                    cur_res["resolved_backend"] = resolve_backend_from_choices(
+                        autotune_choices.get(backend, {})
+                    )
                 cur_res["use_nvfp4"] = use_nvfp4
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
@@ -1776,6 +1863,10 @@ def testMmBf16Fp4(args):
                 else:
                     raise
 
+        autotuned = (
+            getattr(args, "autotune", False) and backend in autotune_supported_backends
+        )
+        autotune_choices = probe_autotune_choices(runner, a) if autotuned else {}
         timing = bench_gpu_time(
             fn=runner,
             dry_run_iters=args.dry_run_iters,
@@ -1790,16 +1881,13 @@ def testMmBf16Fp4(args):
         std_time = float(np.std(timing))
         tflops = flops / median_time / 1e9
         tb_per_sec = bytes_accessed / median_time / 1e9
-        backend_name = backend + (
-            "_autotune"
-            if (
-                getattr(args, "autotune", False)
-                and backend in autotune_supported_backends
-            )
-            else ""
-        )
+        backend_name = backend + ("_autotune" if autotuned else "")
         print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
-        res.append(
+        if args.verbose >= 1:
+            print_autotune_choices(backend_name, autotune_choices)
+        cur_res = defaultdict(str)
+        set_autotune_columns(cur_res, autotuned, autotune_choices)
+        cur_res.update(
             {
                 "routine": args.routine,
                 "median_time": median_time,
@@ -1816,6 +1904,7 @@ def testMmBf16Fp4(args):
                 "case_tag": args.case_tag,
             }
         )
+        res.append(cur_res)
     return res
 
 
@@ -1974,12 +2063,21 @@ def testMmMxfp8(args):
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
+    autotune_choices = {}
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(
                 cur_backend, inputs[cur_backend]
             ).detach()
+        bench_args = (cur_backend, inputs[cur_backend])
+        if cur_backend == "auto" or (
+            getattr(args, "autotune", False)
+            and cur_backend in autotune_supported_backends
+        ):
+            autotune_choices[cur_backend] = probe_autotune_choices(
+                run_backend, *bench_args
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1988,7 +2086,7 @@ def testMmMxfp8(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, inputs[cur_backend]),
+            input_args=bench_args,
         )
 
     # Minimum cosine similarity for swizzled layout
@@ -2039,6 +2137,8 @@ def testMmMxfp8(args):
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
             print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+            if args.verbose >= 1:
+                print_autotune_choices(backend_name, autotune_choices.get(backend, {}))
 
             if args.output_path is not None:
                 cur_res = defaultdict(str)
@@ -2052,6 +2152,15 @@ def testMmMxfp8(args):
                 cur_res["k"] = k
                 cur_res["out_dtype"] = res_dtype
                 cur_res["backend"] = backend_name
+                set_autotune_columns(
+                    cur_res,
+                    backend_name.endswith("_autotune"),
+                    autotune_choices.get(backend),
+                )
+                if backend == "auto":
+                    cur_res["resolved_backend"] = resolve_backend_from_choices(
+                        autotune_choices.get(backend, {})
+                    )
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
@@ -2210,12 +2319,21 @@ def testMmBf16(args):
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
+    autotune_choices = {}
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(
                 cur_backend, a, b, bias, use_pdl, out_dtype
             ).detach()
+        bench_args = (cur_backend, a, b, bias, use_pdl, out_dtype)
+        if cur_backend == "auto" or (
+            getattr(args, "autotune", False)
+            and cur_backend in autotune_supported_backends
+        ):
+            autotune_choices[cur_backend] = probe_autotune_choices(
+                run_backend, *bench_args
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -2224,7 +2342,7 @@ def testMmBf16(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, a, b, bias, use_pdl, out_dtype),
+            input_args=bench_args,
         )
 
     tested_backends = list(outputs.keys())
@@ -2287,6 +2405,8 @@ def testMmBf16(args):
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
             print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+            if args.verbose >= 1:
+                print_autotune_choices(backend_name, autotune_choices.get(backend, {}))
 
             if args.output_path is not None:
                 cur_res = defaultdict(str)
@@ -2300,6 +2420,15 @@ def testMmBf16(args):
                 cur_res["k"] = k
                 cur_res["out_dtype"] = str(out_dtype)
                 cur_res["backend"] = backend_name
+                set_autotune_columns(
+                    cur_res,
+                    backend_name.endswith("_autotune"),
+                    autotune_choices.get(backend),
+                )
+                if backend == "auto":
+                    cur_res["resolved_backend"] = resolve_backend_from_choices(
+                        autotune_choices.get(backend, {})
+                    )
                 cur_res["bias"] = use_bias
                 cur_res["enable_pdl"] = use_pdl
                 cur_res["case_tag"] = args.case_tag
@@ -2323,6 +2452,7 @@ def testTinygemmBf16(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_autotune_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testTinygemmBf16")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -2614,10 +2744,19 @@ def testBmmBf16(args):
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
+    autotune_choices = {}
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(cur_backend, A, B, out_dtype).detach()
+        bench_args = (cur_backend, A, B, out_dtype)
+        if cur_backend == "auto" or (
+            getattr(args, "autotune", False)
+            and cur_backend in autotune_supported_backends
+        ):
+            autotune_choices[cur_backend] = probe_autotune_choices(
+                run_backend, *bench_args
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -2626,7 +2765,7 @@ def testBmmBf16(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, A, B, out_dtype),
+            input_args=bench_args,
         )
 
     tested_backends = list(outputs.keys())
@@ -2669,6 +2808,8 @@ def testBmmBf16(args):
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
             print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+            if args.verbose >= 1:
+                print_autotune_choices(backend_name, autotune_choices.get(backend, {}))
 
             if args.output_path is not None:
                 cur_res = defaultdict(str)
@@ -2683,6 +2824,15 @@ def testBmmBf16(args):
                 cur_res["k"] = k
                 cur_res["out_dtype"] = str(out_dtype)
                 cur_res["backend"] = backend_name
+                set_autotune_columns(
+                    cur_res,
+                    backend_name.endswith("_autotune"),
+                    autotune_choices.get(backend),
+                )
+                if backend == "auto":
+                    cur_res["resolved_backend"] = resolve_backend_from_choices(
+                        autotune_choices.get(backend, {})
+                    )
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
