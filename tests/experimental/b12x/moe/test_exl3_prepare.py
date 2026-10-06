@@ -473,11 +473,14 @@ def test_canonical_exl3_preparation_preserves_source_extent(
         session.prepare((request,))
         state = require_prepared(request.plan, "moe.decode")
         scratch = allocate(state)
+        route_pack_launches = state.scratch._prewarmed_route_pack_launches
+        assert route_pack_launches is not None
         pointers = tuple(t.data_ptr() for t in (*scratch, output))
         for rows in sorted({1, min(8, capacity), capacity, min(17, capacity)}):
             reference = oracle(rows)
             with kernel_resolution_guard("EXL3 source extent"):
                 binding = bind(state, scratch, rows)
+                assert binding.route_pack_launches is route_pack_launches
                 result = state.run(binding)
             assert result.data_ptr() == output.data_ptr()
             assert torch.isfinite(result).all() and torch.count_nonzero(result)

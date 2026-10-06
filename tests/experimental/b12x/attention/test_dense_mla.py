@@ -949,3 +949,92 @@ def test_fp8_page_ids_past_int32_scaled_offset_match_reference() -> None:
         expected_output,
         expected_lse,
     )
+
+
+def test_partial_dtype_accepts_only_bf16_and_fp32() -> None:
+    device = require_b12x()
+    common = dict(
+        device=device,
+        mode="decode",
+        kv_dtype=FP8,
+        num_q_heads=HEADS,
+        page_size=64,
+        max_total_q=1,
+        max_batch=1,
+        max_cache_tokens=4096,
+        max_page_table_width=64,
+        num_cache_pages=64,
+    )
+    assert dense_mla.Caps(**common).partial_dtype == torch.bfloat16
+    assert (
+        dense_mla.Caps(**common, partial_dtype=torch.float32).partial_dtype
+        == torch.float32
+    )
+    with pytest.raises(TypeError, match="partial_dtype"):
+        dense_mla.Caps(**common, partial_dtype=torch.float16)
+
+
+@pytest.mark.parametrize("live_tokens", [2_817, 10_240, 40_960])
+def test_fp32_split_partials_reduce_error_against_reference(live_tokens: int) -> None:
+    """Float32 partials remove the BF16 rounding between split and merge."""
+    device = require_b12x()
+    torch.manual_seed(20260924)
+    heads, page_size, max_tokens = 16, 64, 65_536
+    width = max_tokens // page_size
+    q_float = torch.randn(1, heads, QK_DIM, device=device) * 0.3
+    cache_float = torch.randn(width, page_size, QK_DIM, device=device) * 0.3
+    q_scale = (q_float.abs().max() / 400).reshape(1).float()
+    kv_scale = (cache_float.abs().max() / 400).reshape(1).float()
+    q = (q_float / q_scale).to(FP8)
+    cache = (cache_float / kv_scale).to(FP8)
+    page_table = torch.randperm(width, device=device).to(torch.int32).reshape(1, width)
+    cache_seqlens = torch.tensor([live_tokens], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    expected, expected_lse = dense_mla.reference(
+        q,
+        cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
+    errors = {}
+    for partial_dtype in (torch.bfloat16, torch.float32):
+        plan = dense_mla.plan(
+            dense_mla.Caps(
+                device=device,
+                mode="decode",
+                kv_dtype=FP8,
+                num_q_heads=heads,
+                page_size=page_size,
+                max_total_q=1,
+                max_batch=1,
+                max_cache_tokens=max_tokens,
+                max_page_table_width=width,
+                num_cache_pages=width,
+                use_cuda_graph=True,
+                partial_dtype=partial_dtype,
+            )
+        )
+        output = torch.empty(1, heads, VALUE_DIM, dtype=torch.bfloat16, device=device)
+        binding = _bind(
+            plan,
+            q=q,
+            kv_cache=cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+        )
+        assert binding.scratch.num_splits > 1
+        assert binding.scratch.partial_output.dtype == partial_dtype
+        actual, lse = dense_mla.run(binding=binding)
+        _assert_matches(actual, lse, expected, expected_lse)
+        errors[partial_dtype] = float(
+            ((actual.float() - expected).norm() / expected.norm()).item()
+        )
+    print(f"live {live_tokens}: relative L2 error {errors}")
+    assert errors[torch.float32] < errors[torch.bfloat16]

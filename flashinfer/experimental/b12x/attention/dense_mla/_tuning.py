@@ -37,6 +37,7 @@ class DenseMlaQuery:
     max_page_table_width: int
     num_cache_pages: int
     abi: FrozenMapping
+    partial_dtype: str = "bfloat16"
     exhaustive: bool = field(default_factory=capture_exhaustive_search)
 
     def to_dict(self) -> dict[str, object]:
@@ -57,6 +58,7 @@ class DenseMlaQuery:
             "max_page_table_width": self.max_page_table_width,
             "num_cache_pages": self.num_cache_pages,
             "abi": self.abi.to_dict(),
+            "partial_dtype": self.partial_dtype,
             "exhaustive": self.exhaustive,
         }
 
@@ -151,7 +153,7 @@ def _tuning_parameters(query: DenseMlaQuery, device: DeviceIdentity | None):
 
 TUNING = TuningContract(
     component_id="attention.mla",
-    query_schema_version=5,
+    query_schema_version=6,
     config_schema_version=1,
     query_fields=frozenset(
         {
@@ -171,6 +173,7 @@ TUNING = TuningContract(
             "max_page_table_width",
             "num_cache_pages",
             "abi",
+            "partial_dtype",
             "exhaustive",
         }
     ),

@@ -72,6 +72,7 @@ from b12x._lib.intrinsics import (
     packed_decode_lut_fp16_to_bfloat2x4,
     packed_decode_lut_fp16_to_half2x4,
     packed_decode_lut_e4m3_to_e4m3x8,
+    packed_decode_lut_e4m3_direct_to_e4m3x8,
     ld_global_nc_v4_u32,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
@@ -95,7 +96,10 @@ from b12x._lib.intrinsics import (
     warp_reduce,
 )
 from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
-from b12x._lib.quant.lut_e4m3 import lut_e4m3_value_table
+from b12x._lib.quant.lut_e4m3 import (
+    lut_e4m3_direct_table,
+    lut_e4m3_value_table,
+)
 from b12x.moe._shared.kernels.trellis_ring import (
     trellis256_lane_geom_bits as _trellis_ring_lane_geom_bits,
 )
@@ -298,10 +302,12 @@ def _gather_native_scale_bytes(a: Uint32, b: Uint32, c: Uint32, d: Uint32, byte:
 
 
 def _trellis256_execution_lut(
-    device: torch.device | str, codebook: str
+    device: torch.device | str, codebook: str, *, direct_lut: bool = False
 ) -> torch.Tensor:
     if codebook == LUT_FP16:
         return lut_fp16_segment_table(device)
+    if direct_lut:
+        return lut_e4m3_direct_table(device)
     return lut_e4m3_value_table(device)
 
 # TC-decode runs on the packed W4A16 object and folds the top-k sum into the FC2
@@ -884,6 +890,7 @@ class W4A16FusedMoeCompileResult:
     shared_memory_bytes: int = -1
     broadcast_suh: bool = False
     small_m_direct_launches: tuple[_W4A16SmallMDirectLaunch, ...] = ()
+    trellis_direct_lut: bool = False
 
 
 @dataclass(frozen=True)
@@ -1220,6 +1227,7 @@ class W4A16GemmKernel:
             static_pair_rates.get(trellis_pair_kind, (3, 3))
         )
         self.lut_e4m3_smem = False
+        self.trellis_direct_lut = False
         # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
         # so decode-heavy small-M phases spread each mn-tile's K range across
         # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
@@ -1347,6 +1355,7 @@ class W4A16GemmKernel:
         else:
             self.sms = 120
             max_shared_mem = _DEFAULT_MAX_SHARED_MEM
+        self.max_shared_mem = max_shared_mem
         self.blocks_per_sm = _determine_blocks_per_sm(
             problem_m=self.size_m,
             problem_n=self.covered_size_n,
@@ -1509,6 +1518,7 @@ class W4A16GemmKernel:
             self.schedule_whole_tiles,
             self.schedule_route_block_factor,
             self.lut_e4m3_smem,
+            self.trellis_direct_lut,
             self.small_m_splitk,
         )
 
@@ -4101,13 +4111,19 @@ class W4A16GemmKernel:
                     win_a, win_b, trellis_lut_addr, int(bits)
                 )
         else:
-            e_lo, e_hi = packed_decode_lut_e4m3_to_e4m3x8(
-                win_a,
-                win_b,
-                trellis_lut_addr,
-                int(bits),
-                value_table_in_shared=self.lut_e4m3_smem,
-            )
+            if cutlass.const_expr(self.trellis_direct_lut):
+                e_lo, e_hi = packed_decode_lut_e4m3_direct_to_e4m3x8(
+                    win_a, win_b, trellis_lut_addr, int(bits),
+                    in_shared=self.lut_e4m3_smem,
+                )
+            else:
+                e_lo, e_hi = packed_decode_lut_e4m3_to_e4m3x8(
+                    win_a,
+                    win_b,
+                    trellis_lut_addr,
+                    int(bits),
+                    value_table_in_shared=self.lut_e4m3_smem,
+                )
             if cutlass.const_expr(self.is_fp16):
                 o0, o1 = fp8x4_e4m3_to_half2x2(e_lo)
                 o2, o3 = fp8x4_e4m3_to_half2x2(e_hi)
@@ -6292,6 +6308,7 @@ class W4A16FusedMoeKernel:
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
         pipeline_stages: int | None = None,
+        trellis_decode_table: str = "auto",
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6603,10 +6620,38 @@ class W4A16FusedMoeKernel:
             self.shared_words += self.iq2_lut_bytes // 4
             self.fc1.iq2_xs_smem_lut = True
             self.fc2.iq2_xs_smem_lut = True
-        self.lut_e4m3_smem = (
+        if trellis_decode_table not in {"auto", "compact", "full"}:
+            raise ValueError("trellis decode table must be auto, compact, or full")
+        compact_smem = (
+            self.trellis_codebook == LUT_E4M3
+            and _lut_e4m3_smem_enabled()
+        )
+        lut_offset = (self.shared_words * 4 + 15) // 16 * 16
+        # The cooperative grid must retain its occupancy contract. A direct
+        # table is eligible only when it fits without reducing resident CTAs.
+        direct_eligible = (
             self.weight_layout == "trellis_t256"
             and self.trellis_codebook == LUT_E4M3
-            and _lut_e4m3_smem_enabled()
+            and self.intermediate_hadamard
+            and self.trellis_bits == 2
+            and self.fc1_trellis_pair_kind is None
+            and self.fc2_trellis_pair_kind is None
+            and self.blocks_per_sm == 1
+            and lut_offset + 65536 <= self.fc1.max_shared_mem
+        )
+        if trellis_decode_table == "full" and not direct_eligible:
+            raise ValueError(
+                "full trellis decode table is incompatible with the planned kernel geometry"
+            )
+        self.trellis_direct_lut = direct_eligible and (
+            trellis_decode_table == "full"
+            or (trellis_decode_table == "auto" and compact_smem and size_m <= 16)
+        )
+        self.fc1.trellis_direct_lut = self.trellis_direct_lut
+        self.fc2.trellis_direct_lut = self.trellis_direct_lut
+        self.lut_e4m3_smem = compact_smem or self.trellis_direct_lut
+        self.trellis_lut_smem_bytes = (
+            65536 if self.trellis_direct_lut else _LUT_E4M3_SMEM_REGION_BYTES
         )
         self.lut_e4m3_smem_off = 0
         if self.lut_e4m3_smem:
@@ -6615,8 +6660,10 @@ class W4A16FusedMoeKernel:
             ) // 16 * 16
             self.shared_words = (
                 self.lut_e4m3_smem_off
-                + _LUT_E4M3_SMEM_REGION_BYTES
+                + self.trellis_lut_smem_bytes
             ) // 4
+            if self.shared_words * 4 > self.fc1.max_shared_mem:
+                raise ValueError(f"full trellis decode table requires {self.shared_words * 4} bytes")
             self.fc1.lut_e4m3_smem = True
             self.fc2.lut_e4m3_smem = True
         self.barrier_count_off = self.sms * 4
@@ -6660,6 +6707,7 @@ class W4A16FusedMoeKernel:
             self.broadcast_suh,
             self.rotation_input_dtype,
             self.lut_e4m3_smem,
+            self.trellis_direct_lut,
             self.small_m_splitk,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -7051,8 +7099,8 @@ class W4A16FusedMoeKernel:
         fc1_trellis_lut_addr = get_ptr_as_int64(fc1_trellis_lut_flat, Int32(0))
         fc2_trellis_lut_addr = get_ptr_as_int64(fc2_trellis_lut_flat, Int32(0))
 
-        # The emit hooks receive the staged value table's shared byte offset
-        # through the LUT ABI slot.
+        # The LUT ABI slot carries the shared byte offset for either the
+        # compact value table or the complete 2-bit direct table.
         fc1_phase_lut_addr = fc1_trellis_lut_addr
         fc2_phase_lut_addr = fc2_trellis_lut_addr
         if cutlass.const_expr(self.weight_layout in IQ2_CODECS):
@@ -7073,7 +7121,7 @@ class W4A16FusedMoeKernel:
             self._lut_smem_copy(
                 fc1_trellis_lut_addr,
                 smem_base + Int32(self.lut_e4m3_smem_off),
-                _LUT_E4M3_SMEM_REGION_BYTES,
+                self.trellis_lut_smem_bytes,
                 tid,
             )
             cute.arch.sync_threads()
@@ -9785,6 +9833,7 @@ def compile_w4a16_fused_moe(
     intermediate_hadamard: bool = False,
     rotation_input_dtype: str | None = None,
     broadcast_suh: bool = False,
+    trellis_decode_table: str = "auto",
     _require_cached: bool = False,
 ) -> W4A16FusedMoeCompileResult:
     scale_format = _normalize_scale_format(scale_format)
@@ -10180,6 +10229,7 @@ def compile_w4a16_fused_moe(
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
         pipeline_stages=pipeline_stages,
+        trellis_decode_table=trellis_decode_table,
     )
     cache_key = (
         "w4a16_fused_moe",
@@ -10462,6 +10512,7 @@ def compile_w4a16_fused_moe(
         shared_memory_bytes=kernel.shared_words * 4,
         broadcast_suh=bool(broadcast_suh),
         small_m_direct_launches=tuple(small_m_direct_launches),
+        trellis_direct_lut=kernel.trellis_direct_lut,
     )
     attach_programs(result, compiled, *(launch.compiled for launch in small_m_direct_launches))
     _FUSED_CACHE[cache_key] = result
@@ -11169,7 +11220,7 @@ def _w4a16_fused_moe_launch_flat(
         fc2_trellis_lut_addr = iq2_lut.data_ptr()
     elif weight_layout == "trellis_t256" and trellis_codebook != "mcg":
         trellis_rank_lut = _trellis256_execution_lut(
-            a_input.device, trellis_codebook
+            a_input.device, trellis_codebook, direct_lut=fused.trellis_direct_lut
         )
         fc1_trellis_lut_addr = trellis_rank_lut.data_ptr()
         fc2_trellis_lut_addr = trellis_rank_lut.data_ptr()

@@ -1,4 +1,9 @@
-"""Base-2 split reduction for standalone dense MLA."""
+"""Base-2 split reduction for standalone dense MLA.
+
+Split partials are normalized per split and stored as BF16 (two roundings
+between the FP32 accumulators and the merged BF16 output) or as FP32 (one
+rounding, at the merged output).
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ from b12x._lib.intrinsics import (
     bfloat2_to_float2_scaled,
     get_ptr_as_int64,
     ld_global_v2_u32,
+    ld_global_v4_f32,
     pack_f32x2_to_bfloat2,
     st_global_v2_u32,
 )
@@ -19,11 +25,12 @@ from ._math import exp2_approx, log2_approx
 
 
 class DenseMlaMergeKernel:
-    """Merge normalized BF16 split partials and emit natural-log LSE."""
+    """Merge normalized split partials and emit natural-log LSE."""
 
-    def __init__(self, num_splits: int, value_dim: int):
+    def __init__(self, num_splits: int, value_dim: int, *, partial_fp32: bool = False):
         self.num_splits = int(num_splits)
         self.value_dim = int(value_dim)
+        self.partial_fp32 = bool(partial_fp32)
 
     def _get_shared_storage_cls(self):
         """Return the per-CTA split-weight storage.
@@ -166,21 +173,30 @@ class DenseMlaMergeKernel:
                         * Int64(self.num_splits)
                         + Int64(split)
                     ) * Int64(self.value_dim) + Int64(dimension)
-                    packed0, packed1 = ld_global_v2_u32(
-                        get_ptr_as_int64(partial_output, partial_offset)
-                    )
-                    value0, value1 = bfloat2_to_float2_scaled(
-                        packed0,
-                        weight,
-                    )
-                    value2, value3 = bfloat2_to_float2_scaled(
-                        packed1,
-                        weight,
-                    )
-                    accumulator[0] += value0
-                    accumulator[1] += value1
-                    accumulator[2] += value2
-                    accumulator[3] += value3
+                    if cutlass.const_expr(self.partial_fp32):
+                        value0, value1, value2, value3 = ld_global_v4_f32(
+                            get_ptr_as_int64(partial_output, partial_offset)
+                        )
+                        accumulator[0] += value0 * weight
+                        accumulator[1] += value1 * weight
+                        accumulator[2] += value2 * weight
+                        accumulator[3] += value3 * weight
+                    else:
+                        packed0, packed1 = ld_global_v2_u32(
+                            get_ptr_as_int64(partial_output, partial_offset)
+                        )
+                        value0, value1 = bfloat2_to_float2_scaled(
+                            packed0,
+                            weight,
+                        )
+                        value2, value3 = bfloat2_to_float2_scaled(
+                            packed1,
+                            weight,
+                        )
+                        accumulator[0] += value0
+                        accumulator[1] += value1
+                        accumulator[2] += value2
+                        accumulator[3] += value3
                 split += Int32(1)
 
             inverse = Float32(inverse_storage[0])

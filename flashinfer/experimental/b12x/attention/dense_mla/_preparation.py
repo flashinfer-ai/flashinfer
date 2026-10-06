@@ -289,6 +289,7 @@ def _query(caps: Caps, abi: FrozenMapping) -> DenseMlaQuery:
         window_size=caps.window_size, use_cuda_graph=caps.use_cuda_graph,
         max_page_table_width=caps.max_page_table_width,
         num_cache_pages=caps.num_cache_pages, abi=abi,
+        partial_dtype=str(caps.partial_dtype).removeprefix("torch."),
     )
 
 
@@ -303,6 +304,7 @@ def _caps(query: DenseMlaQuery, config: DenseMlaConfig, device: torch.device) ->
         head_dim=query.qk_head_dim, v_head_dim=query.v_head_dim,
         physical_record_width=query.physical_record_width,
         window_size=query.window_size, use_cuda_graph=query.use_cuda_graph,
+        partial_dtype=_dtype(query.partial_dtype),
         budget=__import__("b12x.attention.dense_mla.planner", fromlist=["Budget"]).Budget(max_splits=config.max_splits),
     )
 

@@ -95,12 +95,13 @@ def _control_snapshot() -> FrozenMapping:
     """Capture host controls once while declaring the immutable query."""
     from . import _impl
     from b12x.moe._shared.kernels.w4a16.host import (
-        prefill_fused_sum_enabled,
+        prefill_fused_sum_enabled, trellis_decode_table,
     )
 
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
     return FrozenMapping({
+        "trellis_decode_table": trellis_decode_table(),
         "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
         "dynamic_nvfp4_materialized": (
             None if raw_materialized is None else raw_materialized not in ("", "0", "false", "False")
@@ -262,6 +263,7 @@ def _lower_caps(
         w4a16_prefill_fused_sum=bool(
             query.controls.get("w4a16_prefill_fused_sum", False)
         ),
+        trellis_decode_table=str(query.controls.get("trellis_decode_table", "auto")),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
     )
 
@@ -688,6 +690,7 @@ class _FusedMoePrograms:
     fused_launches: tuple
     topk_sum_launches: tuple
     mixed_trellis_launches: tuple
+    route_pack_launches: object | None
     w4a16: _W4A16PrimaryLaunches | None
     compact: object | None
     launchers: tuple
@@ -719,7 +722,8 @@ def compile_fused_moe(
     return attach_programs(
         _FusedMoePrograms(
             scratch._prewarmed_fused_launches, scratch._prewarmed_topk_sum_launches,
-            scratch._mixed_trellis_launches, w4a16, compact, launchers,
+            scratch._mixed_trellis_launches, scratch._prewarmed_route_pack_launches,
+            w4a16, compact, launchers,
         ),
         *launchers, compact,
     )
@@ -892,6 +896,7 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
                 _prewarmed_fused_launches=programs.fused_launches,
                 _prewarmed_topk_sum_launches=programs.topk_sum_launches,
                 _mixed_trellis_launches=programs.mixed_trellis_launches,
+                _prewarmed_route_pack_launches=programs.route_pack_launches,
             )
             launchers = list(programs.launchers)
             route_query = _route_query_from_moe(query, routing)

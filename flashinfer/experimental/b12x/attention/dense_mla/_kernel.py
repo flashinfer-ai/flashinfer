@@ -104,6 +104,7 @@ def _signature(binding: Binding) -> tuple[object, ...]:
         scratch.head_dim,
         scratch.v_head_dim,
         scratch.window_size,
+        str(scratch.partial_dtype),
         tuple(int(value) for value in binding.q.stride()),
         tuple(int(value) for value in binding.kv_cache.stride()),
         tuple(int(value) for value in binding.output.stride()),
@@ -113,6 +114,24 @@ def _signature(binding: Binding) -> tuple[object, ...]:
             else ()
         ),
     )
+
+
+def _partial_fp32(scratch) -> bool:
+    return scratch.partial_output is not None and scratch.partial_dtype == torch.float32
+
+
+def _partial_cute_dtype(scratch):
+    """Element type of the split-partial operand handed to the kernels.
+
+    A one-split plan has no partial buffer; the forward kernel then receives
+    the BF16 output as a never-written placeholder.
+    """
+    return cutlass.Float32 if _partial_fp32(scratch) else cutlass.BFloat16
+
+
+def _partial_key_fields(scratch) -> tuple[object, ...]:
+    # BF16 partials keep the established compile keys.
+    return (key_field("partial_dtype", "fp32"),) if _partial_fp32(scratch) else ()
 
 
 @dataclass(frozen=True)
@@ -203,7 +222,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
             dynamic_layout=True,
         ),
         _to_cute(final_lse, cutlass.Float32, align=4),
-        _to_cute(partial_output, cutlass.BFloat16, align=16),
+        _to_cute(partial_output, _partial_cute_dtype(scratch), align=16),
         _to_cute(partial_lse, cutlass.Float32, align=4),
         _to_cute(kv_scale, cutlass.Float32, align=4),
         _to_cute(q_scale, cutlass.Float32, align=4),
@@ -234,6 +253,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         key_field("v_head_dim", scratch.v_head_dim),
         key_field("window_size", scratch.window_size),
         key_field("record_stride_bytes", layout.record_stride_bytes),
+        *_partial_key_fields(scratch),
         tensor_key(
             "q",
             binding.q,
@@ -271,12 +291,16 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
         return None
     assert scratch.partial_output is not None
     assert scratch.partial_lse is not None
-    entry = DenseMlaMergeKernel(scratch.num_splits, scratch.v_head_dim)
+    entry = DenseMlaMergeKernel(
+        scratch.num_splits,
+        scratch.v_head_dim,
+        partial_fp32=_partial_fp32(scratch),
+    )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     args = (
         _to_cute(
             scratch.partial_output,
-            cutlass.BFloat16,
+            _partial_cute_dtype(scratch),
             align=16,
         ),
         _to_cute(scratch.partial_lse, cutlass.Float32, align=4),
@@ -296,6 +320,7 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
         key_field("num_splits", scratch.num_splits),
         key_field("heads", scratch.num_q_heads),
         key_field("v_head_dim", scratch.v_head_dim),
+        *_partial_key_fields(scratch),
         tensor_key(
             "partial_output",
             scratch.partial_output,

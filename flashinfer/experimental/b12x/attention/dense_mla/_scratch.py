@@ -76,9 +76,16 @@ class Caps:
     window_size: int | None = None
     use_cuda_graph: bool = False
     budget: Budget | None = None
+    # FP32 storage avoids BF16 rounding of normalized split partials before
+    # the merge. The merged output retains its BF16 dtype.
+    partial_dtype: torch.dtype = torch.bfloat16
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
+        if self.partial_dtype not in (torch.bfloat16, torch.float32):
+            raise TypeError(
+                "dense MLA partial_dtype must be torch.bfloat16 or torch.float32"
+            )
         if self.mode not in ("decode", "extend", "verify"):
             raise ValueError(f"unsupported dense MLA mode {self.mode!r}")
         if self.dtype != torch.bfloat16:
@@ -214,7 +221,7 @@ def _dense_mla_scratch_layout(
             * caps.num_q_heads
             * num_splits
             * caps.v_head_dim
-            * dtype_nbytes(torch.bfloat16)
+            * dtype_nbytes(caps.partial_dtype)
         )
         cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
         partial_lse_offset_bytes = cursor
@@ -269,6 +276,7 @@ class Scratch:
     chunks_per_split: int
     query_tile: int
     use_cuda_graph: bool
+    partial_dtype: torch.dtype
     partial_output: torch.Tensor | None
     partial_lse: torch.Tensor | None
     final_lse: torch.Tensor
@@ -550,7 +558,7 @@ def _materialize(
                 layout.num_splits,
                 caps.v_head_dim,
             ),
-            dtype=torch.bfloat16,
+            dtype=caps.partial_dtype,
         )
         partial_lse, _ = materialize_scratch_view(
             scratch_storage,
@@ -594,6 +602,7 @@ def _materialize(
         chunks_per_split=layout.chunks_per_split,
         query_tile=query_tile,
         use_cuda_graph=caps.use_cuda_graph,
+        partial_dtype=caps.partial_dtype,
         partial_output=partial_output,
         partial_lse=partial_lse,
         final_lse=final_lse,

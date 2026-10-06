@@ -21,6 +21,14 @@ _ROUTED_SIZE_TARGET_FILL = 0.9
 _SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
 
 
+def trellis_decode_table() -> str:
+    """Read the plan-time trellis decode-table selection; replay never reads it."""
+    value = os.environ.get("B12X_TRELLIS_DECODE_TABLE", "auto")
+    if value not in {"auto", "compact", "full"}:
+        raise ValueError("B12X_TRELLIS_DECODE_TABLE must be auto, compact, or full")
+    return value
+
+
 def prefill_fused_sum_enabled() -> bool:
     """Enable direct FP32 route reduction for large-M W4A16 launches.
 
