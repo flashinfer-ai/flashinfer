@@ -391,7 +391,12 @@ def test_decode_config_rules(arch):
         assert (f"_pf{cfg.pf}" in cfg.kernel_key) == (cfg.pf > 0)
         assert (f"_px{cfg.pfx}" in cfg.kernel_key) == (cfg.pfx > 0)
         assert (f"_pi{cfg.pfi}" in cfg.kernel_key) == (cfg.pfi > 0)
-        core_key = re.sub(r"(_mc\d+)?(_pf\d+)?(_px\d+)?(_pi\d+)?$", "", cfg.kernel_key)
+        # Round 7 (lever XP): the parallel-issue DSM exchange closes the key; cluster split-K rows only.
+        assert ("_xp" in cfg.kernel_key) == cfg.xp
+        assert cfg.xp == (bool(entry.get("xp", False)) and cfg.csplit > 1)
+        core_key = re.sub(
+            r"(_mc\d+)?(_pf\d+)?(_px\d+)?(_pi\d+)?(_xp)?$", "", cfg.kernel_key
+        )
         # Round-3 fused knobs: a decoupled ring only for fused, non-resident rows; narrow units divide evenly.
         if entry.get("xb_stages"):
             assert (
@@ -406,10 +411,25 @@ def test_decode_config_rules(arch):
             # Round-6 continuation 10 (lever QER): the early half-slot release is a table key of xbh rows only (``_qe`` after ``_xh``).
             assert cfg.qer == (bool(entry.get("qer", False)) and cfg.xbh)
             assert ("_xh_qe" in cfg.kernel_key) == cfg.qer
+            # Round 4 lever F (adopted in round 7 on the t16 cs4 M = 256 cells): the FP8 token ring is a table key of
+            # BF16-ring rows (``_x<N>`` after the ring fields, before ``_q``); the three rings + the epilogue chunk fit the pool.
+            if entry.get("xq_stages"):
+                assert 1 <= cfg.xq_stages <= cb.DEC_XQ_MAX_STAGES
+                assert f"_x{cfg.xq_stages}" in cfg.kernel_key
+                assert (
+                    cfg.module_stages * (cb.DEC_W_BYTES + 1024)
+                    + cfg.xq_stages * (cfg.tok_rows * cb.BLOCK_K + 1024)
+                    + cfg.xb_stages * cfg.tok * 512
+                    + min(cfg.epi_chunk, cfg.tok) * 128 * 4
+                    <= cb.DEC_SMEM_CAP
+                )
+            else:
+                assert cfg.xq_stages == 0 and not re.search(r"_x\d", cfg.kernel_key)
         else:
             assert cfg.xb_stages == 0 and not re.search(r"_r\d", cfg.kernel_key)
             assert not cfg.xbh and "_xh" not in cfg.kernel_key
             assert not cfg.qer and "_qe" not in cfg.kernel_key
+            assert cfg.xq_stages == 0 and not re.search(r"_x\d", cfg.kernel_key)
         assert cfg.qlanes in (4, 8, 16)
         assert (2 * cfg.tok) % (cfg.qwarps * (32 // cfg.qlanes)) == 0
         if not (cfg.fused and not cfg.resident) or "qlanes" not in entry:
@@ -462,7 +482,11 @@ def test_decode_config_round3_fused_rows(arch):
         False,
         True,
     )
-    assert cfg.kernel_key == "decode:t16_p4_fused_cs4"
+    # Round 7 (CAKE-1079, lever XR): the 4-slot BF16 ring and the 4-slot FP8 token ring run next to the 4-stage W ring of
+    # this instance (4 x 33792 + 4 x 9216 + 4 x 8192 B + the 8 KB epilogue chunk; the 7-line cluster inbox fits beside them);
+    # 1.015-1.022x on both GPUs in 7 own-process rounds, bit-exact.
+    assert (cfg.xb_stages, cfg.xq_stages, cfg.module_stages) == (4, 4, 4)
+    assert cfg.kernel_key == "decode:t16_p4_fused_r4_x4_cs4"
 
 
 @pytest.mark.parametrize("arch", ARCHES)
@@ -537,11 +561,12 @@ def test_decode_config_round6_continuation_rules(arch):
             continue
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
         cfg = decode_config(bucket, n_tiles128, num_k_iters, arch, SM_COUNT)
+        # round 7 (lever XP): `_xp` closes the key after `_px1` on the 14-CTA cells that adopted the parallel-issue exchange
         assert (
             cfg.fused
             and not cfg.resident
             and cfg.pfx == 1
-            and cfg.kernel_key.endswith("_px1")
+            and re.search(r"_px1(_xp)?$", cfg.kernel_key)
         )
         n_pfx += 1
     assert n_pfx == 8
@@ -577,9 +602,11 @@ def test_decode_config_round6_continuation_rules(arch):
         # the small-inbox exchange of a 7..16-wide cluster gives up one t16 stage (2C - 1 inbox lines next to the ring)
         assert cfg.module_stages == (3 if c >= 7 else 4), cfg
         # round-6 next loop (lever PX): the M = 8 buckets of this family carry the `_px1` suffix
+        # round 7 (lever XP): the 14-CTA cells 1,28,1 / 1,28,64 / 5,28,1 close the key with `_xp` (parallel-issue DSM exchange)
         assert cfg.kernel_key == f"decode:t16_p{cfg.module_stages}_fused_cs{c}" + (
             f"_px{cfg.pfx}" if cfg.pfx else ""
-        )
+        ) + ("_xp" if cfg.xp else "")
+        assert cfg.xp == ((n_tiles, M) in ((1, 1), (1, 64), (5, 1)))
     assert (
         cb.decode_cluster_capacity(arch, 14) == 7
         and cb.decode_cluster_capacity(arch, 9) == 15
@@ -589,7 +616,8 @@ def test_decode_config_round6_continuation_rules(arch):
     assert {
         "decode:t128_p3",
         "decode:t128_p3_tso",
-        "decode:t16_p3_fused_cs14",
+        "decode:t16_p3_fused_cs14_xp",
+        "decode:t16_p3_fused_cs14_px1",
         "decode:t16_p3_fused_cs7",
     } <= required
     assert not {
