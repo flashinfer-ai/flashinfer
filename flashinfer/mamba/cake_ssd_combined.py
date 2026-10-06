@@ -79,14 +79,14 @@ class _Program:
 # the single place the Cake export refreshes; every program binding below
 # derives from it.  One kernel family ships: the exact scan x {bf16, f16, f32
 # state} x {batched, varlen}, plus one preprocess.
-_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_c17ae00890"
+_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_bca791ba55"
 _SCAN_MODULES = {
-    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_fed5db2873",
-    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_d9b831a363",
-    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_6b6da3e81c",
-    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_f36146a571",
-    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_dce3118998",
-    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_80c5a77ef9",
+    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_f6e14be186",
+    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_132f3e9876",
+    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_5bc566ce01",
+    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_f395c76ab1",
+    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_772e1b7788",
+    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_11f691d286",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -135,7 +135,10 @@ def _program_name(state_dtype: torch.dtype, mode_varlen: bool) -> str:
 # Positional launcher ABI shared by every program: preprocess arguments, its
 # grid, main arguments, its grid, then the explicit CUDA stream.  The
 # preprocess also derives ``seq_chunk_cumsum`` from the packed-varlen metadata
-# (``write_seq_chunk_cumsum``), so one launcher call covers the whole forward.
+# (``write_seq_chunk_cumsum``), so one launcher call covers the whole forward;
+# ``preprocess_status`` is the runner-owned int32 word it sets to 1 when a
+# packed-sequence id is out of range or non-monotonic (CAKE-990).  The order
+# is the kernel's parameter order (``preprocess_arg_plan`` of the export).
 _PREPROCESS_ARGS = (
     "dt",
     "A",
@@ -159,6 +162,7 @@ _PREPROCESS_ARGS = (
     "seq_chunk_cumsum",
     "num_sequences",
     "write_seq_chunk_cumsum",
+    "preprocess_status",
 )
 _MAIN_ARGS = (
     "x_map",
@@ -229,6 +233,7 @@ def _direct_preprocess_inputs(
     seq_chunk_cumsum: object,
     num_sequences: int,
     write_seq_chunk_cumsum: bool,
+    preprocess_status: object,
 ) -> tuple[dict[str, object], tuple[int, int, int]]:
     """Build the metadata-fused preprocess values and launch grid."""
 
@@ -258,6 +263,7 @@ def _direct_preprocess_inputs(
         "seq_chunk_cumsum": seq_chunk_cumsum,
         "num_sequences": num_sequences,
         "write_seq_chunk_cumsum": int(write_seq_chunk_cumsum),
+        "preprocess_status": preprocess_status,
     }
     total_tiles = num_segments * nheads
     return values, ((total_tiles + threads - 1) // threads, 1, 1)
@@ -471,6 +477,19 @@ class CakeSSDCombined:
     Every call issues one launcher call: the preprocess (which also derives
     ``seq_chunk_cumsum`` from the packed-varlen metadata unless the caller
     supplies a precomputed vector) followed by the scan.
+
+    Packed-varlen ``seq_idx`` contract (CAKE-990): ids must be non-decreasing
+    along the packed token axis.  An id in ``[0, num_sequences)`` without
+    tokens is allowed: the preprocess gives it an empty chunk range and the
+    scan writes its final state as ``initial_states[id]`` (zero when there
+    are no initial states).  An id outside ``[0, num_sequences)`` or below
+    its predecessor never writes outside the ``[num_sequences + 1]`` boundary
+    table; the preprocess flags it in the runner-owned ``preprocess_status``
+    word instead (read with :meth:`seq_idx_status`, a synchronizing debug
+    accessor; nothing on the hot path reads it).  On a flagged call the
+    outputs of the offending tokens are undefined (they are skipped or folded
+    into a neighbouring range) and so is every sequence whose range they
+    touch; the other in-range sequences are still correct.
     """
 
     def __init__(
@@ -523,6 +542,42 @@ class CakeSSDCombined:
         self._dummy_cache: dict[Tuple[Optional[int], torch.dtype], torch.Tensor] = {}
         self._seq_cumsum_key: Optional[Tuple[Optional[int], int]] = None
         self._seq_cumsum_buf: Optional[torch.Tensor] = None
+        self._preprocess_status: dict[Optional[int], torch.Tensor] = {}
+
+    def _preprocess_status_buffer(self, device: torch.device) -> torch.Tensor:
+        """The runner-owned ``preprocess_status`` word (one int32 per device).
+
+        The preprocess stores 1 into it when a packed-sequence id is out of
+        range or non-monotonic (see the class docstring); it is allocated
+        zeroed once per device and never read on the launch path.
+        """
+
+        status = self._preprocess_status.get(device.index)
+        if status is None:
+            status = torch.zeros(1, dtype=torch.int32, device=device)
+            self._preprocess_status[device.index] = status
+        return status
+
+    def seq_idx_status(
+        self, reset: bool = False, *, device: Optional[torch.device] = None
+    ) -> int:
+        """Debug read of the ``seq_idx`` status word (synchronizes the device).
+
+        Returns 1 when any call on ``device`` (default: the current CUDA
+        device) since the last reset met a packed-sequence id outside
+        ``[0, num_sequences)`` or below its predecessor, else 0.  With
+        ``reset=True`` the word is cleared after reading.  The read is a
+        device-to-host copy, so this is for tests and diagnostics only;
+        ``run`` never reads the word.
+        """
+
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        status = self._preprocess_status_buffer(device)
+        value = int(status.item())
+        if reset:
+            status.zero_()
+        return value
 
     def _dummy(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         key = (device.index, dtype)
@@ -1030,6 +1085,7 @@ class CakeSSDCombined:
             seq_chunk_cumsum=cumsum_arg,
             num_sequences=num_sequences,
             write_seq_chunk_cumsum=write_seq_chunk_cumsum,
+            preprocess_status=self._preprocess_status_buffer(x.device),
         )
         grid = _persistent_grid_size(
             total_work=num_sequences * self.nheads,

@@ -65,7 +65,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* __restrict__ A, float* __restrict__ dt_bias, int* __restrict__ segment_starts, int* __restrict__ segment_lengths, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, __half* __restrict__ delta, float* __restrict__ cumsum, int num_segments, int nheads, int seqlen, int direct_varlen_metadata, int dt_softplus, float dt_min, float dt_max, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int seq_idx_int64, int* __restrict__ seq_chunk_cumsum, int num_sequences, int write_seq_chunk_cumsum)
+kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* __restrict__ A, float* __restrict__ dt_bias, int* __restrict__ segment_starts, int* __restrict__ segment_lengths, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, __half* __restrict__ delta, float* __restrict__ cumsum, int num_segments, int nheads, int seqlen, int direct_varlen_metadata, int dt_softplus, float dt_min, float dt_max, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int seq_idx_int64, int* __restrict__ seq_chunk_cumsum, int num_sequences, int write_seq_chunk_cumsum, int* __restrict__ preprocess_status)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -118,29 +118,66 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
             length = segment_lengths[segment];
             physical_start = start;
         }
-        if (write_seq_chunk_cumsum != 0 && head == 0) {
-            int sequence = 0;
-            if (seq_idx_int64 != 0) {
-                sequence = (int)seq_idx_i64[start];
-            } else {
-                sequence = seq_idx_i32[start];
-            }
-            if (segment == 0) {
-                seq_chunk_cumsum[sequence] = 0;
-            } else {
-                int previous_start = chunk_indices[segment - 1] * 128 + chunk_offsets[segment - 1];
-                int previous_sequence = 0;
+        if (write_seq_chunk_cumsum != 0) {
+            if (head == 0) {
+                int sequence = 0;
                 if (seq_idx_int64 != 0) {
-                    previous_sequence = (int)seq_idx_i64[previous_start];
+                    long long raw_sequence = seq_idx_i64[start];
+                    sequence = (int)raw_sequence;
+                    if (raw_sequence < 0) {
+                        sequence = -1;
+                    }
+                    if (raw_sequence >= (long long)num_sequences) {
+                        sequence = num_sequences;
+                    }
                 } else {
-                    previous_sequence = seq_idx_i32[previous_start];
+                    sequence = seq_idx_i32[start];
                 }
-                if (sequence != previous_sequence) {
-                    seq_chunk_cumsum[sequence] = segment;
+                int _max_0 = ((sequence) > (-1) ? (sequence) : (-1));
+                int _min_0 = ((_max_0) < (num_sequences) ? (_max_0) : (num_sequences));
+                sequence = _min_0;
+                int previous_sequence = -1;
+                if (segment != 0) {
+                    int previous_start = chunk_indices[segment - 1] * 128 + chunk_offsets[segment - 1];
+                    if (seq_idx_int64 != 0) {
+                        long long raw_previous = seq_idx_i64[previous_start];
+                        previous_sequence = (int)raw_previous;
+                        if (raw_previous < 0) {
+                            previous_sequence = -1;
+                        }
+                        if (raw_previous >= (long long)num_sequences) {
+                            previous_sequence = num_sequences;
+                        }
+                    } else {
+                        previous_sequence = seq_idx_i32[previous_start];
+                    }
+                    int _max_1 = ((previous_sequence) > (-1) ? (previous_sequence) : (-1));
+                    int _min_1 = ((_max_1) < (num_sequences) ? (_max_1) : (num_sequences));
+                    previous_sequence = _min_1;
                 }
-            }
-            if (segment == num_segments - 1) {
-                seq_chunk_cumsum[num_sequences] = num_segments;
+                int flagged = 0;
+                if (sequence < 0) {
+                    flagged = 1;
+                }
+                if (sequence >= num_sequences) {
+                    flagged = 1;
+                }
+                if (sequence < previous_sequence) {
+                    flagged = 1;
+                }
+                if (flagged != 0) {
+                    preprocess_status[0] = 1;
+                }
+                #pragma unroll 1
+                for (int opened_id = previous_sequence + 1; opened_id < sequence + 1; opened_id++) {
+                    seq_chunk_cumsum[opened_id] = segment;
+                }
+                if (segment == num_segments - 1) {
+                    #pragma unroll 1
+                    for (int closed_id = sequence + 1; closed_id < num_sequences + 1; closed_id++) {
+                        seq_chunk_cumsum[closed_id] = num_segments;
+                    }
+                }
             }
         }
         float a_value = A[head];
@@ -162,10 +199,10 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
         float group_scan_4[4];
         #pragma unroll
         for (int local = 0; local < 16; local++) {
-            int _min_0 = ((last_token) < (local) ? (last_token) : (local));
-            next_raw[local] = dt[(physical_start + _min_0) * nheads + head];
-            int _min_1 = ((last_token) < (16 + local) ? (last_token) : (16 + local));
-            after_raw[local] = dt[(physical_start + _min_1) * nheads + head];
+            int _min_2 = ((last_token) < (local) ? (last_token) : (local));
+            next_raw[local] = dt[(physical_start + _min_2) * nheads + head];
+            int _min_3 = ((last_token) < (16 + local) ? (last_token) : (16 + local));
+            after_raw[local] = dt[(physical_start + _min_3) * nheads + head];
         }
         if (nheads >= 16) {
             #pragma unroll 1
@@ -178,8 +215,8 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                 if (group_start + 32 < 128) {
                     #pragma unroll
                     for (int local_2 = 0; local_2 < 16; local_2++) {
-                        int _min_2 = ((last_token) < (group_start + 32 + local_2) ? (last_token) : (group_start + 32 + local_2));
-                        int load_token = _min_2;
+                        int _min_4 = ((last_token) < (group_start + 32 + local_2) ? (last_token) : (group_start + 32 + local_2));
+                        int load_token = _min_4;
                         after_raw[local_2] = dt[(physical_start + load_token) * nheads + head];
                     }
                 }
@@ -208,9 +245,9 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                     group_product[local_3] = transformed * a_value;
                     if (physical_token >= segment_offset && physical_token < segment_offset + length) {
                         int local_token = physical_token - segment_offset;
-                        float _max_0 = max_noftz(transformed, -65504.0f);
-                        float _min_3 = fminf(_max_0, 65504.0f);
-                        smem_delta[slot_base_delta + local_token] = (__half)_min_3;
+                        float _max_2 = max_noftz(transformed, -65504.0f);
+                        float _min_5 = fminf(_max_2, 65504.0f);
+                        smem_delta[slot_base_delta + local_token] = (__half)_min_5;
                     }
                 }
                 scan_offset_1[0] = group_product[0];
@@ -275,8 +312,8 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                 if (block_start + 32 < 128) {
                     #pragma unroll
                     for (int local_10 = 0; local_10 < 16; local_10++) {
-                        int _min_4 = ((last_token) < (block_start + 32 + local_10) ? (last_token) : (block_start + 32 + local_10));
-                        int load_token_1 = _min_4;
+                        int _min_6 = ((last_token) < (block_start + 32 + local_10) ? (last_token) : (block_start + 32 + local_10));
+                        int load_token_1 = _min_6;
                         after_raw[local_10] = dt[(physical_start + load_token_1) * nheads + head];
                     }
                 }
@@ -308,9 +345,9 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                         group_product_4[local_11] = transformed_1 * a_value;
                         if (physical_token_2 >= segment_offset && physical_token_2 < segment_offset + length) {
                             int local_token_2 = physical_token_2 - segment_offset;
-                            float _max_1 = max_noftz(transformed_1, -65504.0f);
-                            float _min_5 = fminf(_max_1, 65504.0f);
-                            smem_delta[slot_base_delta + local_token_2] = (__half)_min_5;
+                            float _max_3 = max_noftz(transformed_1, -65504.0f);
+                            float _min_7 = fminf(_max_3, 65504.0f);
+                            smem_delta[slot_base_delta + local_token_2] = (__half)_min_7;
                         }
                     }
                     group_scan_4[0] = group_product_4[0];
