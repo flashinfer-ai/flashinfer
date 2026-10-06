@@ -42,6 +42,8 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
     - `gemm_fp8_nt_blockscaled` - GEMM with FP8 data types using 128x128 block scaling for both operands (`m`, `n`, `k` must be multiples of 128).
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
+    - `group_deepgemm_fp8_nt_groupwise` - Contiguous grouped FP8 GEMM using the DeepGEMM backend (`--group_size` groups of `--m` rows each; `m`, `n`, `k` must be multiples of 128).
+    - `batch_deepgemm_fp8_nt_groupwise` - Masked batched FP8 GEMM using the DeepGEMM (`deepgemm`) or generated Cake (`cake`, SM10.0/SM10.3) backend (`--batch_size` batches, every batch fully populated with `--m` rows; `m`, `n`, `k` must be multiples of 128).
     - `bmm_fp8` - Batched matrix multiplication with FP8 inputs.
     - `mm_mxfp8` - Dense MXFP8 matrix multiplication.
     - `mm_fp8` - Matrix multiplication with FP8 inputs using the trtllm-gen low-latency GEMM (Blackwell SM10.0+, small-M optimized, pre-shuffled weights).
@@ -575,6 +577,8 @@ Legend:
 | **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **gemm_fp8_nt_blockscaled** |  |  |  |  |  | cutlass | cutlass |  |
 | **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
+| **group_deepgemm_fp8_nt_groupwise** |  |  |  |  |  | deepgemm | deepgemm |  |
+| **batch_deepgemm_fp8_nt_groupwise** |  |  |  |  |  | deepgemm, cake | deepgemm, cake |  |
 | **bmm_fp8** |  |  |  | cudnn, cublas | cudnn, cublas | cudnn, cublas, cutlass | cudnn, cublas, cutlass | cudnn, cublas |
 | **mm_fp8** |  |  |  |  |  | trtllm_low_latency | trtllm_low_latency |  |
 | **mm_fp4** |  |  |  |  |  | cudnn, trtllm, cutlass | cudnn, trtllm, cutlass | cudnn |

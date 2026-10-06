@@ -251,6 +251,8 @@ benchmark_apis = {
         "gemm_fp8_nt_groupwise",
         "gemm_fp8_nt_blockscaled",
         "group_gemm_fp8_nt_groupwise",
+        "group_deepgemm_fp8_nt_groupwise",
+        "batch_deepgemm_fp8_nt_groupwise",
         "bmm_fp8",
         "mm_fp8",
         "bmm_mxfp8",
@@ -609,6 +611,13 @@ routine_backend_to_library_api = {
     },
     "group_gemm_fp8_nt_groupwise": {
         "cutlass": ("flashinfer.gemm", "group_gemm_fp8_nt_groupwise", None),
+    },
+    "group_deepgemm_fp8_nt_groupwise": {
+        "deepgemm": ("flashinfer.gemm", "group_deepgemm_fp8_nt_groupwise", None),
+    },
+    "batch_deepgemm_fp8_nt_groupwise": {
+        "deepgemm": ("flashinfer.gemm", "batch_deepgemm_fp8_nt_groupwise", "deepgemm"),
+        "cake": ("flashinfer.gemm", "batch_deepgemm_fp8_nt_groupwise", "cake"),
     },
     "bmm_mxfp8": {
         "cudnn": ("flashinfer.gemm", "bmm_mxfp8", "cudnn"),
