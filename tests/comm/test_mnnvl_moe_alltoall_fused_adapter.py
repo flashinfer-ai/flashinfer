@@ -10,13 +10,14 @@ import pytest
 import torch
 
 from flashinfer import mxfp4_quantize, nvfp4_quantize
-from flashinfer.comm import MoeAlltoAll, moe_a2a_active_rank_mask
+from flashinfer.comm import moe_a2a_active_rank_mask
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlMemory
 from flashinfer.tllm_enums import SfLayout
 from tests.utils_fp8 import mxfp8_quantize_reference
 
 from .conftest import mnnvl_available
+from .moe_a2a_driver import MoeA2ADriver, workspace_bytes_per_rank
 
 
 def test_fused_module_keeps_the_public_python_contract():
@@ -128,7 +129,7 @@ def test_fused_module_keeps_the_public_python_contract():
             "backend": "trtllm",
         },
     }
-    assert set(api.__all__) == {"MoeAlltoAll", *expected_module_parameters}
+    assert set(api.__all__) == set(expected_module_parameters)
     for name, expected_parameters in expected_module_parameters.items():
         assert getattr(public_api, name) is getattr(api, name)
         signature = inspect.signature(getattr(api, name))
@@ -143,128 +144,11 @@ def test_fused_module_keeps_the_public_python_contract():
                 signature.parameters["backend"].kind is inspect.Parameter.KEYWORD_ONLY
             )
 
-    assert public_api.MoeAlltoAll is api.MoeAlltoAll
-    expected_class_parameters = {
-        "__init__": (
-            "self",
-            "mapping",
-            "max_num_tokens",
-            "top_k",
-            "num_experts",
-            "workspace_size_per_rank",
-            "hidden_size",
-            "mnnvl_config",
-            "eplb_stats_num_experts",
-            "enable_rank_mask",
-            "backend",
-        ),
-        "get_workspace": (
-            "workspace_size_per_rank",
-            "ep_rank",
-            "ep_size",
-            "max_num_tokens",
-            "mapping",
-            "eplb_stats_num_experts",
-            "backend",
-        ),
-        "get_moe_workspace_size_per_rank": (
-            "ep_size",
-            "top_k",
-            "max_num_tokens",
-            "hidden_size",
-            "extra_payload_bytes_per_token",
-            "eplb_stats_num_experts",
-            "backend",
-        ),
-        "checkpoint_prepare": ("self",),
-        "checkpoint_restore": ("self", "comm_backend"),
-        "dispatch": (
-            "self",
-            "token_selected_experts",
-            "input_payloads",
-            "runtime_max_tokens_per_rank",
-            "invalid_token_expert_id",
-            "expert_id_payload_index",
-            "eplb_local_stats",
-            "active_rank_mask",
-        ),
-        "combine": (
-            "self",
-            "payload",
-            "runtime_max_tokens_per_rank",
-            "payload_in_workspace",
-            "output_dtype",
-            "output_scales",
-            "output_scalar_scale",
-            "sf_layout",
-            "output",
-            "use_low_precision",
-            "active_rank_mask",
-        ),
-        "get_combine_payload_tensor_in_workspace": (
-            "self",
-            "runtime_max_tokens_per_rank",
-            "hidden_size",
-            "dtype",
-        ),
-    }
-    expected_class_defaults = {
-        "__init__": {
-            "workspace_size_per_rank": None,
-            "hidden_size": None,
-            "mnnvl_config": None,
-            "eplb_stats_num_experts": 0,
-            "enable_rank_mask": False,
-            "backend": "trtllm",
-        },
-        "get_workspace": {"eplb_stats_num_experts": 0, "backend": "trtllm"},
-        "get_moe_workspace_size_per_rank": {
-            "extra_payload_bytes_per_token": 0,
-            "eplb_stats_num_experts": 0,
-            "backend": "trtllm",
-        },
-        "checkpoint_prepare": {},
-        "checkpoint_restore": {},
-        "dispatch": {
-            "invalid_token_expert_id": None,
-            "expert_id_payload_index": None,
-            "eplb_local_stats": None,
-            "active_rank_mask": None,
-        },
-        "combine": {
-            "payload_in_workspace": False,
-            "output_dtype": None,
-            "output_scales": None,
-            "output_scalar_scale": 1.0,
-            "sf_layout": SfLayout.layout_linear,
-            "output": None,
-            "use_low_precision": False,
-            "active_rank_mask": None,
-        },
-        "get_combine_payload_tensor_in_workspace": {},
-    }
-    for name, expected_parameters in expected_class_parameters.items():
-        signature = inspect.signature(getattr(api.MoeAlltoAll, name))
-        assert tuple(signature.parameters) == expected_parameters
-        assert {
-            parameter_name: parameter.default
-            for parameter_name, parameter in signature.parameters.items()
-            if parameter.default is not inspect.Parameter.empty
-        } == expected_class_defaults[name]
-        if "backend" in signature.parameters:
-            assert (
-                signature.parameters["backend"].kind is inspect.Parameter.KEYWORD_ONLY
-            )
-
     combine = inspect.signature(api.moe_a2a_combine)
     assert (
         combine.parameters["use_low_precision"].kind is inspect.Parameter.KEYWORD_ONLY
     )
-    class_combine = inspect.signature(api.MoeAlltoAll.combine)
-    assert (
-        class_combine.parameters["use_low_precision"].kind
-        is inspect.Parameter.KEYWORD_ONLY
-    )
+    assert not hasattr(public_api, "MoeAlltoAll")
 
 
 def test_active_rank_mask_preserves_upper_u64_bits_in_dispatch():
@@ -700,78 +584,6 @@ def test_kernel_preload_cache_is_per_kernel_and_device_without_global_tree():
     assert "std::set<" not in launcher_source
 
 
-def test_workspace_initialization_rendezvous_is_ordered_and_cached_per_backend(
-    monkeypatch,
-):
-    import flashinfer.comm.trtllm_moe_alltoall as api
-
-    events = []
-    workspaces = []
-    metainfo_by_backend = {"trtllm": object(), "cake": object()}
-
-    class FakeComm:
-        def barrier(self):
-            events.append("barrier")
-
-    class FakeMnnvlMemory:
-        allocated_map = {}
-
-        def __init__(self, mapping, size):
-            assert mapping is fake_mapping
-            assert size == 4096
-            events.append("allocate")
-            self.ptr = 17 + len(self.allocated_map)
-            self.workspace = object()
-            workspaces.append(self.workspace)
-            self.allocated_map[self.ptr] = SimpleNamespace(comm=FakeComm())
-
-        def as_torch_strided_tensor(self, dtype):
-            assert dtype is torch.uint8
-            events.append("view")
-            return self.workspace
-
-    def initialize(
-        actual_workspace, ep_rank, ep_size, max_num_tokens, eplb_width, *, backend
-    ):
-        assert actual_workspace is workspaces[-1]
-        assert (ep_rank, ep_size, max_num_tokens, eplb_width) == (0, 2, 16, 5)
-        events.append(f"initialize:{backend}")
-        return metainfo_by_backend[backend]
-
-    fake_mapping = object()
-    monkeypatch.setattr(api, "MnnvlMemory", FakeMnnvlMemory)
-    monkeypatch.setattr(api, "moe_a2a_initialize", initialize)
-    monkeypatch.setattr(api.MoeAlltoAll, "_WORKSPACE_CACHE", {})
-
-    first = api.MoeAlltoAll.get_workspace(4096, 0, 2, 16, fake_mapping, 5)
-    second = api.MoeAlltoAll.get_workspace(
-        4096, 0, 2, 16, fake_mapping, 5, backend="trtllm"
-    )
-    cake = api.MoeAlltoAll.get_workspace(
-        4096, 0, 2, 16, fake_mapping, 5, backend="cake"
-    )
-
-    assert first is second
-    assert cake is api.MoeAlltoAll.get_workspace(
-        4096, 0, 2, 16, fake_mapping, 5, backend="cake"
-    )
-    assert first["workspace"] is workspaces[0]
-    assert cake["workspace"] is workspaces[1]
-    assert first["workspace"] is not cake["workspace"]
-    assert first["metainfo"] is metainfo_by_backend["trtllm"]
-    assert cake["metainfo"] is metainfo_by_backend["cake"]
-    assert events == [
-        "allocate",
-        "view",
-        "initialize:trtllm",
-        "barrier",
-        "allocate",
-        "view",
-        "initialize:cake",
-        "barrier",
-    ]
-
-
 _HIDDEN_SIZE = 128
 _ROUTES_BY_RANK = (
     ((0, 3), (4, 4), (2, 1)),
@@ -1111,7 +923,7 @@ def _run_public_mpi2_cycle(backend):
     max_tokens = routes.shape[0]
     top_k = routes.shape[1]
     extra_payload_bytes = 4 + _HIDDEN_SIZE + _HIDDEN_SIZE // 2
-    workspace_size = MoeAlltoAll.get_moe_workspace_size_per_rank(
+    workspace_size = workspace_bytes_per_rank(
         2,
         top_k,
         max_tokens,
@@ -1121,7 +933,7 @@ def _run_public_mpi2_cycle(backend):
         backend=backend,
     )
     mapping = Mapping(rank=rank, moe_ep_size=2, tp_size=2, world_size=2)
-    collective = MoeAlltoAll(
+    collective = MoeA2ADriver(
         mapping,
         max_num_tokens=max_tokens,
         top_k=top_k,
@@ -1158,7 +970,7 @@ def _run_public_mpi2_cycle(backend):
         _TOPK8_ROUTES_BY_RANK[rank], dtype=torch.int32, device="cuda"
     )
     topk8_payloads = _payloads(rank, topk8_routes)
-    topk8_workspace_size = MoeAlltoAll.get_moe_workspace_size_per_rank(
+    topk8_workspace_size = workspace_bytes_per_rank(
         2,
         8,
         max_tokens,
@@ -1166,7 +978,7 @@ def _run_public_mpi2_cycle(backend):
         extra_payload_bytes_per_token=extra_payload_bytes,
         backend=backend,
     )
-    topk8_collective = MoeAlltoAll(
+    topk8_collective = MoeA2ADriver(
         mapping,
         max_num_tokens=max_tokens,
         top_k=8,

@@ -17,7 +17,7 @@
 MoE Communication Benchmark Routine
 
 This module provides benchmarking for MoE All-to-All communication operations
-using FlashInfer's MoeAlltoAll interface. Designed to run with mpirun for
+using FlashInfer's functional moe_a2a_* ops. Designed to run with mpirun for
 multi-GPU benchmarking.
 
 Launch examples:
@@ -78,7 +78,13 @@ import torch
 
 from mpi4py import MPI
 
-from flashinfer.comm import MoeAlltoAll
+from flashinfer.comm import (
+    moe_a2a_combine,
+    moe_a2a_dispatch,
+    moe_a2a_get_workspace_size_per_rank,
+    moe_a2a_initialize,
+    moe_a2a_wrap_payload_tensor_in_workspace,
+)
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlMemory
 from flashinfer.fused_moe import (
@@ -112,6 +118,92 @@ from .moe_utils import (
 # Number of distinct LoRA adapter IDs when --use_lora is enabled.
 # Matches issue #3109's "up to 8 concurrent adapter IDs" target.
 NUM_LORA_ADAPTERS = 8
+
+
+class _MoeA2A:
+    """Dispatch and combine with the functional moe_a2a_* ops on one MNNVL
+    workspace, keeping the round state that combine needs from dispatch."""
+
+    def __init__(
+        self,
+        mapping: Mapping,
+        max_num_tokens: int,
+        top_k: int,
+        num_experts: int,
+        workspace_size_per_rank: int,
+    ):
+        MnnvlMemory.initialize()
+        self.ep_rank = mapping.moe_ep_rank
+        self.ep_size = mapping.moe_ep_size
+        self.top_k = top_k
+        self.num_experts = num_experts
+        self._memory = MnnvlMemory(mapping, workspace_size_per_rank)
+        self.workspace = self._memory.as_torch_strided_tensor(torch.uint8)
+        self.metainfo = moe_a2a_initialize(
+            self.workspace, self.ep_rank, self.ep_size, max_num_tokens
+        )
+        # No peer may publish into this workspace until every rank has cleared
+        # its own slice.
+        MnnvlMemory.allocated_map[self._memory.ptr].comm.barrier()
+        self._recv_view_cache: dict = {}
+        self._local_num_tokens = 0
+        self._combine_offset = 0
+
+    def dispatch(
+        self,
+        token_selected_experts: torch.Tensor,
+        input_payloads: List[torch.Tensor],
+        runtime_max_tokens_per_rank: int,
+    ) -> List[torch.Tensor]:
+        recv, self._combine_offset, _ = moe_a2a_dispatch(
+            token_selected_experts,
+            input_payloads,
+            self.workspace,
+            self.metainfo,
+            runtime_max_tokens_per_rank,
+            self.ep_rank,
+            self.ep_size,
+            self.top_k,
+            self.num_experts,
+            recv_view_cache=self._recv_view_cache,
+        )
+        self._local_num_tokens = token_selected_experts.size(0)
+        return recv
+
+    def get_combine_payload_tensor_in_workspace(
+        self, runtime_max_tokens_per_rank: int, hidden_size: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        start = self._combine_offset
+        end = (
+            start
+            + self.ep_size * runtime_max_tokens_per_rank * hidden_size * dtype.itemsize
+        )
+        return moe_a2a_wrap_payload_tensor_in_workspace(
+            self.workspace[self.ep_rank, :],
+            [self.ep_size, runtime_max_tokens_per_rank],
+            start,
+            end,
+            dtype,
+        )
+
+    def combine(
+        self,
+        payload: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        payload_in_workspace: bool = False,
+    ) -> torch.Tensor:
+        return moe_a2a_combine(
+            payload,
+            self._local_num_tokens,
+            self.workspace,
+            self.metainfo,
+            runtime_max_tokens_per_rank,
+            self.ep_rank,
+            self.ep_size,
+            self.top_k,
+            self._combine_offset,
+            payload_in_workspace,
+        )
 
 
 @contextmanager
@@ -844,7 +936,7 @@ def fake_moe(
 
 
 def _validate_moe_a2a(
-    moe_a2a: MoeAlltoAll,
+    moe_a2a: "_MoeA2A",
     hidden_states: torch.Tensor,
     hidden_states_original: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -868,7 +960,7 @@ def _validate_moe_a2a(
     Runs dispatch -> fake_moe -> combine and compares with local reference.
 
     Args:
-        moe_a2a: MoeAlltoAll instance
+        moe_a2a: all-to-all over the benchmark's workspace
         hidden_states: Original hidden states (before quantization)
         token_selected_experts: Expert assignments
         token_final_scales: Routing weights
@@ -1136,22 +1228,17 @@ def test_moe_a2a_dispatch_combine(args):
         world_size=world_size,
     )
 
-    # Create MoeAlltoAll instance — when use_lora, size workspace with an extra
-    # int32 per token for the LoRA ID payload.
+    # Size the workspace for 16-bit hidden states, int32 expert ids and FP32
+    # weights; when use_lora, add an int32 per token for the LoRA ID payload.
     extra_payload_bytes = 4 if use_lora else 0
-    workspace_size_per_rank = MoeAlltoAll.get_moe_workspace_size_per_rank(
+    workspace_size_per_rank = moe_a2a_get_workspace_size_per_rank(
         ep_size,
-        top_k,
         max_num_tokens,
-        hidden_size,
-        extra_payload_bytes_per_token=extra_payload_bytes,
+        hidden_size * 2 + top_k * 4 + top_k * 4 + extra_payload_bytes,
+        hidden_size * 2,
     )
-    moe_a2a = MoeAlltoAll(
-        mapping=mapping,
-        max_num_tokens=max_num_tokens,
-        top_k=top_k,
-        num_experts=num_experts,
-        workspace_size_per_rank=workspace_size_per_rank,
+    moe_a2a = _MoeA2A(
+        mapping, max_num_tokens, top_k, num_experts, workspace_size_per_rank
     )
 
     # Synchronize all_num_tokens across ranks

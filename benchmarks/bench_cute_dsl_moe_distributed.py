@@ -949,9 +949,13 @@ def _benchmark_distributed_ep(
     import torch.distributed as dist
 
     from flashinfer.autotuner import autotune
-    from flashinfer.comm import MoeAlltoAll
-    from flashinfer.comm.mapping import Mapping
-    from flashinfer.comm.mnnvl import MnnvlConfig, TorchDistBackend
+    from flashinfer.comm.mnnvl import TorchDistBackend
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        MoEEpCommParams,
+        NVLinkOneSidedConfig,
+        create_communication,
+    )
     from flashinfer.quantization.nvfp4_quantization_utils import (
         current_nvfp4_4over6_config,
         make_nvfp4_global_scale,
@@ -987,30 +991,20 @@ def _benchmark_distributed_ep(
             prepared_weights=prepared_weights,
         ),
     )
-    mapping = Mapping(
-        rank=rank,
-        tp_size=world_size,
-        moe_ep_size=world_size,
-        world_size=world_size,
-        gpus_per_node=world_size,
-        pp_size=1,
-        cp_size=1,
-    )
-    workspace_size_per_rank = MoeAlltoAll.get_moe_workspace_size_per_rank(
-        world_size,
-        CFG.top_k,
-        max_tokens_per_rank_budget,
-        CFG.hidden_size,
-    )
-    moe_a2a = run_setup_phase(
-        "MoeAlltoAll construction",
-        lambda: MoeAlltoAll(
-            mapping=mapping,
-            max_num_tokens=max_tokens_per_rank_budget,
-            top_k=CFG.top_k,
-            num_experts=CFG.num_experts,
-            workspace_size_per_rank=workspace_size_per_rank,
-            mnnvl_config=MnnvlConfig(comm_backend=TorchDistBackend(dist.group.WORLD)),
+    communication = run_setup_phase(
+        "NVLinkOneSidedAlltoAll construction",
+        lambda: create_communication(
+            BootstrapConfig(
+                world_size=world_size, rank=rank, device=torch.cuda.current_device()
+            ),
+            MoEEpCommParams(
+                num_experts=CFG.num_experts,
+                top_k=CFG.top_k,
+                max_tokens_per_rank=max_tokens_per_rank_budget,
+                hidden_size=CFG.hidden_size,
+                invalid_expert_id=CFG.num_experts,
+            ),
+            NVLinkOneSidedConfig(comm_backend=TorchDistBackend(dist.group.WORLD)),
         ),
     )
     hidden_states, router_logits, _, routing_bias = _create_distributed_inputs(
@@ -1033,21 +1027,15 @@ def _benchmark_distributed_ep(
     l2_flush = torch.empty(2 * get_l2_cache_size(), dtype=torch.int8, device=device)
 
     def dispatch():
-        # Match SGLang's FlashInfer dispatcher: send BF16 activations with the
-        # routing payloads, then sanitize routes this rank does not own.
-        recv_hidden_states, recv_topk_indices, recv_topk_values = moe_a2a.dispatch(
+        # Send BF16 activations with the routing payloads; received rows past
+        # a source rank's token count route to num_experts, which no rank owns.
+        received = communication.dispatch(
+            hidden_states,
             topk_indices,
-            [hidden_states, topk_indices, topk_values],
-            runtime_max_tokens_per_rank,
-            invalid_token_expert_id=CFG.num_experts,
-            expert_id_payload_index=1,
+            topk_values,
+            max_tokens_per_rank=runtime_max_tokens_per_rank,
         )
-        num_received_tokens = world_size * runtime_max_tokens_per_rank
-        return (
-            recv_hidden_states.view(num_received_tokens, CFG.hidden_size),
-            recv_topk_indices.view(num_received_tokens, CFG.top_k),
-            recv_topk_values.view(num_received_tokens, CFG.top_k),
-        )
+        return received.hidden_states, received.topk_ids, received.topk_weights
 
     def compute(recv_hidden_states, recv_topk_indices, recv_topk_values):
         activation_pack = _make_distributed_activation_pack(
@@ -1063,10 +1051,7 @@ def _benchmark_distributed_ep(
     def combine(local_output):
         # SGLang's CuTe DSL runner does not write into the A2A workspace, so
         # combine stages the local output before returning it to source ranks.
-        return moe_a2a.combine(
-            local_output.view(world_size, runtime_max_tokens_per_rank, CFG.hidden_size),
-            runtime_max_tokens_per_rank,
-        )
+        return communication.combine(local_output)
 
     def route():
         _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
