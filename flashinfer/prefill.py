@@ -2528,9 +2528,11 @@ def _blackwell_ragged_auto_upgrade(
                 and (head_dim_qk, head_dim_vo) in _CUTLASS_RAGGED_AUTO_HEAD_DIMS
                 and cutlass_work_items <= _CUTLASS_PLAN_WORK_CAPACITY
                 # `fmha_varlen_plan` allocates fresh work-index buffers on every
-                # call, so a re-plan silently leaves a captured graph pointing at
-                # the previous allocation. Until those buffers are updated in
-                # place, CUTLASS is not graph-safe and `auto` stays away.
+                # call, so a re-plan leaves a captured graph pointing at the
+                # previous allocation. An explicit `cutlass` wrapper may plan
+                # once before capture, but `auto` is re-resolved on every plan()
+                # and graph-mode callers re-plan before each replay, so `auto`
+                # stays away until those buffers are updated in place.
                 and not cuda_graph_enabled
             ):
                 return backend
@@ -3791,9 +3793,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # Without an explicit maximum, KV lengths were already staged
             # above to compute _max_kv_len. With one, still update the captured
             # buffer on every plan; the bound does not replace actual lengths.
+            # Supplied lengths are copied straight from their own device into
+            # the wrapper-owned buffers (stream-ordered, cast on copy); reading
+            # them back to the host would block plan() on all queued GPU work.
             if max_sequence_kv is not None:
-                kv_host = (
-                    seq_lens.cpu().flatten()
+                kv_lengths = (
+                    seq_lens.flatten()
                     if seq_lens is not None
                     else get_seq_lens(
                         paged_kv_indptr.to("cpu"),
@@ -3806,7 +3811,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         batch_size, dtype=torch.int32, device=self.device
                     )
                 self._kv_lens_buffer[:batch_size].copy_(
-                    kv_host, non_blocking=non_blocking
+                    kv_lengths, non_blocking=non_blocking
                 )
             self._seq_lens_kv = self._kv_lens_buffer[:batch_size].view(
                 batch_size, 1, 1, 1
@@ -3818,13 +3823,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._cudnn_q_lens_buffer = torch.empty(
                     batch_size, dtype=torch.int32, device=self.device
                 )
-            q_host = (
-                seq_lens_q.cpu().flatten()
+            q_lengths = (
+                seq_lens_q.flatten()
                 if seq_lens_q is not None
                 else qo_indptr_host[1:] - qo_indptr_host[:-1]
             )
             self._cudnn_q_lens_buffer[:batch_size].copy_(
-                q_host, non_blocking=non_blocking
+                q_lengths, non_blocking=non_blocking
             )
             self._seq_lens_q = self._cudnn_q_lens_buffer[:batch_size].view(
                 batch_size, 1, 1, 1
@@ -4895,6 +4900,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             device="cpu",
         )
         self._use_cuda_graph = use_cuda_graph
+        # Set once an explicit-CUTLASS plan exists: `fmha_varlen_plan` allocates
+        # fresh work-index buffers per call, so in CUDA-graph mode the first
+        # plan is safe (nothing captured yet) but a re-plan is not.
+        self._cutlass_graph_planned = False
         if use_cuda_graph:
             if not torch.is_tensor(qo_indptr_buf):
                 raise ValueError(
@@ -5176,6 +5185,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 custom_mask.contiguous().view(-1),
                 mask_indptr.to(custom_mask.device),
                 bitorder="little",
+            )
+
+        if (
+            self.is_cuda_graph_enabled
+            and self._requested_backend == "cutlass"
+            and self._cutlass_graph_planned
+        ):
+            # Reject before updating cached plan state or registered buffers
+            # so the original plan remains usable after a refused re-plan.
+            raise ValueError(
+                "the cutlass backend allocates fresh plan buffers on every "
+                "plan() call, so re-planning in CUDA-graph mode would leave "
+                "a captured graph pointing at the previous ones; plan once "
+                "before capture, or use backend='auto' or an explicit "
+                "'cudnn'/'fa2' if you need to re-plan"
             )
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
@@ -5675,17 +5699,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
 
         if self._backend == "cutlass":
-            if self.is_cuda_graph_enabled:
-                # `fmha_varlen_plan` allocates new work-index buffers per call,
-                # so a captured graph keeps pointing at the previous ones. The
-                # fix is to update them in place; until then, refuse rather than
-                # replay against a stale plan. `auto` never lands here -- it
-                # treats graph mode as CUTLASS-ineligible and routes elsewhere.
-                raise ValueError(
-                    "the cutlass backend allocates its plan buffers per plan() "
-                    "call and is not CUDA-graph safe; use backend='auto' to get "
-                    "a graph-safe backend, or an explicit 'cudnn'/'fa2'"
-                )
+            # In CUDA-graph mode only the first plan reaches here: a re-plan is
+            # refused above, before the indptr copies, because the captured
+            # graph would keep the previous work-index buffers and max_qo_len.
+            # `auto` never lands here in graph mode -- it re-resolves on every
+            # plan(), so it treats graph mode as CUTLASS-ineligible.
             # Device mirrors, not the caller's tensors: in CUDA-graph mode the
             # kernel reads the registered buffers, and a host-side indptr would
             # otherwise be planned against.
@@ -5699,6 +5717,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._max_qo_len = torch.max(
                 self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
             ).item()
+            self._cutlass_graph_planned = True
         elif self._backend == "fmha_v2":
             # fmha_v2 handles planning internally — no JIT module plan needed
             pass
@@ -7656,8 +7675,6 @@ def trtllm_batch_context_with_kv_cache(
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
     if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
-        if get_compute_capability(query.device) == (10, 7):
-            raise ValueError("KV Cache NVFP4 is not supported on SM107")
         if kv_cache_sf is None:
             raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
     key_block_scales, value_block_scales = (
@@ -8549,11 +8566,12 @@ def trtllm_fmha_v2_prefill(
 
 
 @flashinfer_experimental_api
-def prepare_nvfp4_attention(q, k, v, out, *, causal=False, backend="cake"):
-    """Prepare NVFP4 attention from contiguous BF16 [B,H,S,128] tensors.
+def prepare_nvfp4_attention(q, k, v, out, *, backend="cake"):
+    """Prepare NVFP4 attention from BF16 [B,H,S,128] tensors.
 
     The experimental Cake backend requires SM103 and noncausal S divisible
-    by 512. Preparation quantizes Q/K/V to block-scaled E2M1 and returns an
+    by 512. ``q``, ``k`` and ``v`` may have any strides; ``out`` is contiguous.
+    Preparation quantizes Q/K/V to block-scaled E2M1 and returns an
     NVFP4AttentionRunner. Calling the runner executes QK, softmax and PV
     attention and writes the caller-owned BF16 output without CUDA allocation.
     Prepare a new runner after changing input values or bindings. CUDA Graph
@@ -8565,7 +8583,7 @@ def prepare_nvfp4_attention(q, k, v, out, *, causal=False, backend="cake"):
         prepare_nvfp4_attention as prepare,
     )
 
-    return prepare(q, k, v, out, causal=causal, backend="cake")
+    return prepare(q, k, v, out, backend="cake")
 
 
 @flashinfer_experimental_api(feature="MiniMax-H3 packed-varlen BF16 attention")
@@ -8592,7 +8610,16 @@ def minimax_h3_varlen_attention(
     Parameters
     ----------
     query, key, value : torch.Tensor
-        Contiguous BF16 ``[T, H, 128]`` packed THD tensors on one CUDA device.
+        BF16 ``[T, H, 128]`` packed THD tensors on one CUDA device.  Any
+        token-major view with ``stride(2) == 1``, a head stride ``stride(1)``
+        of at least 128 elements, a token stride ``stride(0)`` of at least
+        ``H * stride(1)`` elements (both multiples of 8 elements = 16 bytes)
+        and a 16-byte-aligned data pointer is consumed in place; the
+        kernel's tensor maps and ragged-tail path take the strides as
+        arguments.  This covers the engine's column chunks of the fused QKV
+        projection ``[T, 3 * H * 128]`` (strides ``(3 * H * 128, 128, 1)``)
+        and the kind slices of the Cake pre-attention pack ``[T, H, 3, 128]``
+        (strides ``(H * 384, 384, 1)``), as well as contiguous tensors.
     cu_seqlens : torch.Tensor
         int32 ``[B + 1]`` segment bounds on the same device with
         ``cu_seqlens[0] == 0``, non-decreasing entries and ``cu_seqlens[B] == T``.
@@ -8600,7 +8627,7 @@ def minimax_h3_varlen_attention(
     softmax_scale : Optional[float]
         Defaults to ``1 / sqrt(128)``.
     out : Optional[torch.Tensor]
-        Optional caller-owned BF16 ``[T, H, 128]`` output.
+        Optional caller-owned contiguous BF16 ``[T, H, 128]`` output.
     cu_seqlens_host : Optional[Sequence[int]]
         Host copy of ``cu_seqlens``; when omitted the values are read back
         from the device once to build the segment plan.
@@ -8610,8 +8637,8 @@ def minimax_h3_varlen_attention(
     Returns
     -------
     torch.Tensor
-        The BF16 ``[T, H, 128]`` output (``out`` when given).  For repeated
-        launches or CUDA Graph capture use
+        The contiguous BF16 ``[T, H, 128]`` output (``out`` when given).  For
+        repeated launches or CUDA Graph capture use
         ``flashinfer.experimental.minimax_h3_varlen_attention.cake_backend.prepare_minimax_h3_varlen_attention``,
         whose runner launches with no allocation or synchronization.  See
         ``flashinfer/experimental/minimax_h3_varlen_attention/README.md``.

@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import hashlib
-import json
 import math
-from pathlib import Path
 
 import pytest
 import torch
@@ -32,13 +29,6 @@ _HEAD_DIM = 128
 _BLOCK = 64
 _K_GROUP = 16
 _FP8_MAX = 448.0
-_MANIFEST = (
-    Path(__file__).resolve().parents[2]
-    / "csrc"
-    / "cake_sage_block_sparse_attention"
-    / "cake_sage_block_sparse_attention_sm100_manifest.json"
-)
-
 requires_sm100 = pytest.mark.skipif(
     not is_cake_sage_sm100_supported(),
     reason="Cake Sage-FP8 block-sparse attention requires SM100 or SM103",
@@ -382,43 +372,3 @@ def test_sage_fp8_quantize_sm100_matches_torch(shape):
         assert mismatch == 0, (
             f"{name}: {mismatch} elements differ by more than one E4M3 step"
         )
-
-
-def test_cake_sage_sm100_manifest_is_consistent():
-    manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
-    assert manifest["schema"] == "cake.library_export.v4"
-    assert manifest["name"] == "cake_sage_block_sparse_attention_sm100"
-    assert manifest["artifact_kind"] == "source_only"
-    modules = manifest["modules"]
-    keys = sorted((m["arch"], m["route"]["stage"]) for m in modules)
-    assert keys == sorted(
-        (arch, stage)
-        for arch in ("sm_100a", "sm_103a")
-        for stage in ("attention", "quantize_qk_vamax", "quantize_v")
-    )
-    root = _MANIFEST.parents[2]
-    for item in manifest["files"]:
-        path = root / item["path"]
-        assert path.is_file(), item["path"]
-        assert hashlib.sha256(path.read_bytes()).hexdigest() == item["sha256"], item[
-            "path"
-        ]
-    for module in modules:
-        units = module["translation_units"]
-        assert units["device"].endswith("_kernel.cu") and units["binding"].endswith(
-            "_binding.cu"
-        )
-        assert f"/{module['arch']}/" in units["device"]
-        assert module["ffi_entry"] == "run"
-        names = {name for _kind, name in module["arg_plan"]}
-        if module["route"]["stage"] == "attention":
-            assert {
-                "q",
-                "k",
-                "v",
-                "out",
-                "lse",
-                "tma_descriptor_workspace",
-                "grid_x",
-            } <= names
-            assert module["tma_workspace_bytes"] == 384

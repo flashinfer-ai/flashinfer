@@ -43,6 +43,7 @@ def chunked_lm_head_loss(
     deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
+    fuse_dw_cast: Optional[bool] = None,
 ):
     r"""Differentiable chunked LM-head projection + loss with a memory-bounded
     backward, SM100 / SM103 only.
@@ -111,6 +112,42 @@ def chunked_lm_head_loss(
         ``None`` (default) reads ``FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS``
         (on unless set to ``0``).  Compaction costs two device
         synchronizations per call.
+    fuse_dw_cast : bool, optional
+        Run the last chunk's weight-gradient GEMM in the backward, where the
+        upstream scalar gradient is known, with the scale and the output cast
+        fused into its epilogue: the forward accumulates the chunks before it
+        in FP32 (no accumulator at all for a one-chunk call), the backward
+        writes ``dW = cast(g * (dW_acc + dz_c^T @ X_c))`` straight from the
+        GEMM and the separate pass over the ``[V, H]`` accumulator disappears.
+        The same FP32 operations in the same order: ``dW`` is bitwise the
+        unfused result.  The last chunk's BF16 ``dlogits`` rows and a view of
+        its rows of ``X`` are saved for the backward (an in-place write to
+        ``X`` between the forward and the backward raises PyTorch's
+        saved-tensor version error).  ``None`` (default) reads
+        ``FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST`` (on unless set to ``0``).
+
+    The fused dX finalize (``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE``, on
+    unless set to ``0``) adds the K-slice slabs of a sliced ``dX`` GEMM with one
+    fixed-order kernel and, with ``compact_rows``, writes the ``[T, H]`` ``dX`` in
+    one pass (``bf16(g * dX_acc)`` on the valid rows, exact zeros elsewhere)
+    instead of casting, zero-filling and scattering the compact rows; the same
+    FP32 operations in the same order, so ``dX`` is bitwise the same.
+
+    The dW side stream (``FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM``: ``auto``
+    (default) for calls of three or more chunks, ``1`` for every multi-chunk
+    call, ``0`` never) launches each chunk's weight-gradient accumulate GEMM on
+    a per-device side stream, forked after the chunk's row gradients and joined
+    before the chunk buffer is reused and before the call returns, so it overlaps
+    the tail of the chunk's ``dX`` GEMM; the same kernels in the same order per
+    kernel, so every output is bitwise the same.
+
+    The hidden valid-row count (``FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT``,
+    on unless set to ``0``) forms a compacted call's valid-row index on the
+    device and queues chunk 0's row gather and logits GEMM (its device-count
+    form, bounded by the count read from device memory) before the count
+    reaches the host through a pinned cell and a CUDA event, instead of
+    counting and indexing on the host before the first launch; the same
+    kernels per row, so every output is bitwise the same.
 
     Returns
     -------
@@ -156,6 +193,7 @@ def chunked_lm_head_loss(
         deterministic=deterministic,
         backend="cake",
         compact_rows=compact_rows,
+        fuse_dw_cast=fuse_dw_cast,
     )
 
 
@@ -169,6 +207,7 @@ def chunked_lm_head_logprob(
     deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
+    fuse_dw_cast: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Differentiable chunked selected-token log-probability, SM100 / SM103 only.
 
@@ -178,8 +217,10 @@ def chunked_lm_head_logprob(
     ``dlogp`` arrives from autograd.  The forward saves only FP32 row
     statistics (the log-sum-exp and the selected logit); the backward
     recomputes each chunk's logits (four GEMMs per chunk) and produces BF16
-    ``dX`` and ``dW`` through FP32 accumulators with one cast each.  Arguments
-    as in :func:`chunked_lm_head_loss`; ``dW`` is returned in BF16.
+    ``dX`` and ``dW`` through FP32 accumulators with one cast each (with
+    ``fuse_dw_cast`` the last chunk's weight-gradient GEMM writes the BF16
+    ``dW`` from its epilogue).  Arguments as in :func:`chunked_lm_head_loss`;
+    ``dW`` is returned in BF16.
     """
     if backend != "cake":
         raise ValueError(
@@ -195,4 +236,5 @@ def chunked_lm_head_logprob(
         deterministic=deterministic,
         backend="cake",
         compact_rows=compact_rows,
+        fuse_dw_cast=fuse_dw_cast,
     )

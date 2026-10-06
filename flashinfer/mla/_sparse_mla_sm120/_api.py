@@ -62,16 +62,12 @@ from typing import Optional
 
 import torch
 
-from ._execution import (
-    get_sparse_mla_sm120_module as _get_sparse_mla_sm120_decode_module,
-    normalize_kv_scale_format as _normalize_kv_scale_format,
-    resolve_model_type as _resolve_model_type,
-    KV_SCALE_FORMATS as _KV_SCALE_FORMATS,  # noqa: F401
-)
 from ...api_logging import flashinfer_api
 from ...trace.templates.quantize import (
     dsv41_fp4_quantize_append_sparse_mla_cache_trace,
     dsv41_fp4_quantize_pack_sparse_mla_cache_trace,
+    dsv41_fp8_quantize_append_sparse_mla_cache_trace,
+    dsv41_fp8_quantize_pack_sparse_mla_cache_trace,
 )
 from ...utils import (
     register_custom_op,
@@ -79,42 +75,54 @@ from ...utils import (
     supported_compute_capability,
 )
 
+# Public calibration API, re-exported for the flashinfer.mla lazy export.
+from ._calibration import (  # noqa: E402
+    SparseMLASm120CalibrationReport,  # noqa: F401  (lazy re-export)
+    calibrate_sparse_mla_sm120,  # noqa: F401  (lazy re-export)
+)
+from ._execution import (
+    KV_SCALE_FORMATS as _KV_SCALE_FORMATS,  # noqa: F401
+)
+from ._execution import (
+    get_sparse_mla_sm120_module as _get_sparse_mla_sm120_decode_module,
+)
+from ._execution import (
+    normalize_kv_scale_format as _normalize_kv_scale_format,
+)
+from ._execution import (
+    resolve_model_type as _resolve_model_type,
+)
+
 # Package-root compatibility exports also expose the decode capability probes.
 from ._policy import (
     _BI,  # noqa: F401 (compatibility export)
-    _DECODE_DSV3_2_DISPATCH,  # noqa: F401  (vLLM probe surface)
-    _DECODE_DSV4_DISPATCH,  # noqa: F401  (vLLM probe surface)
-    _DECODE_DSV4_1_DISPATCH,  # noqa: F401  (vLLM probe surface)
-    _DECODE_MAX_TOKENS,
-    _DECODE_DSV3_2_TOPKS,
-    _DECODE_DSV4_TOPKS,
-    _DECODE_DSV4_1_TOPK,
+    _D_V,
+    _D_V_BY_MODEL_TYPE,
     _DECODE_DOTS3_SWA_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_DOTS3_SWA_TOPK,
+    _DECODE_DSV3_2_DISPATCH,  # noqa: F401  (vLLM probe surface)
+    _DECODE_DSV3_2_TOPKS,
+    _DECODE_DSV4_1_DISPATCH,  # noqa: F401  (vLLM probe surface)
+    _DECODE_DSV4_1_TOPK,
+    _DECODE_DSV4_DISPATCH,  # noqa: F401  (vLLM probe surface)
+    _DECODE_DSV4_TOPKS,
+    _DECODE_GLM53_NOPE_DISPATCH,  # noqa: F401  (vLLM probe surface)
+    _DECODE_GLM53_NOPE_TOPK,
+    _DECODE_MAX_TOKENS,
+    _MODEL_TYPE_DOTS3_SWA,
     _MODEL_TYPE_DSV3_2,
     _MODEL_TYPE_DSV4,
     _MODEL_TYPE_DSV4_1,
     _MODEL_TYPE_GLM53_NOPE,  # noqa: F401 (compatibility export)
     _MODEL_TYPE_GLM_NSA,  # noqa: F401 (compatibility export)
-    _MODEL_TYPE_DOTS3_SWA,
-    _DECODE_GLM53_NOPE_DISPATCH,  # noqa: F401  (vLLM probe surface)
-    _DECODE_GLM53_NOPE_TOPK,
-    _D_V_BY_MODEL_TYPE,
-    _decode_chunk_width,
-    _decode_scratch_heads,
     _MODEL_TYPE_TO_FAMILY,
     _STATIC_DECODE_ENVELOPE,
-    _D_V,
     KernelVariant,  # noqa: F401 (compatibility export)
+    _decode_chunk_width,
+    _decode_scratch_heads,
     _normalize_prefill_impl,
     _resolve_cpb,  # noqa: F401 (compatibility export)
     plan,  # noqa: F401 (compatibility export)
-)
-
-# Public calibration API, re-exported for the flashinfer.mla lazy export.
-from ._calibration import (  # noqa: E402
-    SparseMLASm120CalibrationReport,  # noqa: F401  (lazy re-export)
-    calibrate_sparse_mla_sm120,  # noqa: F401  (lazy re-export)
 )
 
 logger = logging.getLogger(__name__)
@@ -622,6 +630,8 @@ def get_sparse_mla_sm120_module():
         paged_attention=_paged_attention,
         sparse_mla_sm120_dsv41_fp4_quantize_pack=module.sparse_mla_sm120_dsv41_fp4_quantize_pack,
         sparse_mla_sm120_dsv41_fp4_quantize_append=module.sparse_mla_sm120_dsv41_fp4_quantize_append,
+        sparse_mla_sm120_dsv41_fp8_quantize_pack=module.sparse_mla_sm120_dsv41_fp8_quantize_pack,
+        sparse_mla_sm120_dsv41_fp8_quantize_append=module.sparse_mla_sm120_dsv41_fp8_quantize_append,
     )
 
 
@@ -869,7 +879,7 @@ class _SparseMLAPagedAttentionRunner:
         Allocation target. Defaults to the current CUDA device.
     backend : str
         ``"auto"`` / ``"sparse"`` run the hand-written SM120 kernels.
-        ``"cake"`` (``kv_cache_format="nvfp4"`` only) runs the Cake SM120
+        ``"cake"`` with ``kv_cache_format="nvfp4"`` runs the Cake SM120
         NVFP4 sparse-MLA kernels with their own planners: any positive main
         / extra page size (16-byte multiple page stride), 8, 16, 32, 48, 64,
         80, 96, 112 or 128 query heads, the ``run()`` contract below, and
@@ -881,6 +891,16 @@ class _SparseMLAPagedAttentionRunner:
         candidates, no scratch) from the measured crossover of the two
         sm_120a SKUs; ``prefill_impl`` is accepted for API parity and does
         not change that choice.
+        ``"cake"`` with ``kv_cache_format="fp8"``,
+        ``kv_scale_format="ue8m0_g32"`` and ``extra_kv_fp4=True`` runs the
+        Cake SM120 DeepSeek-V4.1 mixed-cache decode (528-byte FP8 main cache,
+        optional 288-byte V41_FP4 extra cache, independent positive runtime
+        page sizes, decode only) with ``compute_precision`` fixed at
+        construction: ``"default"`` and ``"bf16"`` select the BF16 numerics
+        route (BF16 query, exact on-chip dequantization of both caches, fp32
+        accumulation / softmax / split merge), ``"fp8"`` the separately
+        validated FP8 QK route when the generated family exports it;
+        ``"nvfp4"`` is rejected for this storage.
 
     Example
     -------
@@ -905,11 +925,6 @@ class _SparseMLAPagedAttentionRunner:
         if backend not in ("auto", "sparse", "cake"):
             raise ValueError(
                 f"backend must be 'auto', 'sparse', or 'cake', got {backend!r}"
-            )
-        if backend == "cake" and kv_cache_format != "nvfp4":
-            raise ValueError(
-                "backend='cake' serves the DSV4 NVFP4 cache only; pass "
-                "kv_cache_format='nvfp4'"
             )
         self._backend = backend
         if (max_num_tokens is None) != (max_num_heads is None):
@@ -960,6 +975,23 @@ class _SparseMLAPagedAttentionRunner:
                 "and kv_scale_format='ue8m0_g32' (a DSV4_1 main cache)"
             )
         self._extra_kv_fp4 = extra_kv_fp4
+        # backend="cake": the DSv4 NVFP4 route (kv_cache_format="nvfp4") or the DeepSeek-V4.1
+        # mixed-cache route (kv_cache_format="fp8" + ue8m0_g32 + extra_kv_fp4), whose numerics
+        # route is fixed here: "default" and "bf16" select the BF16 route (the only one exported).
+        self._cake_compute_precision: Optional[str] = None
+        if backend == "cake" and kv_cache_format == "fp8":
+            if self._kv_scale_format != "ue8m0_g32" or not extra_kv_fp4 or d_v != 512:
+                raise ValueError(
+                    "backend='cake' with kv_cache_format='fp8' serves the DeepSeek-V4.1 "
+                    "mixed cache only (528-byte FP8 main cache + 288-byte V41_FP4 extra "
+                    "cache): pass kv_scale_format='ue8m0_g32', extra_kv_fp4=True and "
+                    "d_v=512; the DSV4 NVFP4 cache needs kv_cache_format='nvfp4'"
+                )
+            from .cake_dsv41_mixed import normalize_compute_precision
+
+            self._cake_compute_precision = normalize_compute_precision(
+                compute_precision
+            )
 
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -1031,6 +1063,29 @@ class _SparseMLAPagedAttentionRunner:
         ``[num_tokens, topk]`` or ``[num_tokens, 1, topk]``; the singleton
         query axis is normalized before planning and launch.
         """
+        if self._backend == "cake" and self._kv_cache_format == "fp8":
+            from .cake_dsv41_mixed import wrapper_run as cake_dsv41_wrapper_run
+
+            return cake_dsv41_wrapper_run(
+                self,
+                q,
+                kv_cache,
+                indices,
+                output,
+                sm_scale,
+                topk_length=topk_length,
+                attn_sink=attn_sink,
+                extra_kv_cache=extra_kv_cache,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_topk_length,
+                out_lse=out_lse,
+                mid_out=mid_out,
+                mid_lse=mid_lse,
+                prefill_impl=prefill_impl,
+                return_lse=return_lse,
+                lse_scale=lse_scale,
+                compute_precision=self._cake_compute_precision,
+            )
         if self._backend == "cake":
             from ._cake_dsv4_nvfp4 import wrapper_run as cake_wrapper_run
 
@@ -1470,5 +1525,148 @@ def dsv41_fp4_quantize_append_sparse_mla_cache(
             "latent_kv, slot_mapping, and cache must be on the same device"
         )
     get_sparse_mla_sm120_module().sparse_mla_sm120_dsv41_fp4_quantize_append(
+        latent_kv, slot_mapping, cache
+    )
+
+
+def _dsv41_pack_cache_shape(
+    latent_kv: torch.Tensor, kv_layout: str, bytes_per_token: int
+) -> tuple[int, int, tuple[int, ...]]:
+    """Resolve ``(num_pages, page_size, cache_shape)`` of a full-page DSv4.1 pack."""
+    if kv_layout not in ("HND", "NHD"):
+        raise ValueError(f"kv_layout must be 'HND' or 'NHD', got {kv_layout!r}")
+    if latent_kv.ndim == 2:
+        raise ValueError(
+            "full-page pack requires a page dimension; use shape "
+            "[num_pages, page_size, 512]"
+        )
+    if latent_kv.ndim == 3:
+        num_pages, page_size = latent_kv.shape[:2]
+    elif latent_kv.ndim == 4 and latent_kv.shape[1] == 1:
+        num_pages, page_size = latent_kv.shape[0], latent_kv.shape[2]
+    elif latent_kv.ndim == 4 and latent_kv.shape[2] == 1:
+        num_pages, page_size = latent_kv.shape[0], latent_kv.shape[1]
+    else:
+        raise ValueError(
+            "latent_kv must be [num_pages, page_size, 512] with an optional "
+            "singleton latent-head axis (HND or NHD)"
+        )
+    cache_shape = (
+        (num_pages, 1, page_size, bytes_per_token)
+        if kv_layout == "HND"
+        else (num_pages, page_size, 1, bytes_per_token)
+    )
+    return int(num_pages), int(page_size), cache_shape
+
+
+def _check_dsv41_append_arguments(
+    latent_kv: torch.Tensor, slot_mapping: torch.Tensor, cache: torch.Tensor
+) -> None:
+    if not slot_mapping.is_cuda:
+        raise ValueError(
+            f"slot_mapping must be a CUDA tensor, got {slot_mapping.device}"
+        )
+    if slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            "slot_mapping must have dtype torch.int32 or torch.int64, got "
+            f"{slot_mapping.dtype}"
+        )
+    if slot_mapping.ndim != 1 or not slot_mapping.is_contiguous():
+        raise ValueError("slot_mapping must be a contiguous 1D tensor")
+    if latent_kv.device != cache.device or slot_mapping.device != cache.device:
+        raise ValueError(
+            "latent_kv, slot_mapping, and cache must be on the same device"
+        )
+
+
+@supported_compute_capability([120, 121])
+@flashinfer_api(trace=dsv41_fp8_quantize_pack_sparse_mla_cache_trace)
+def dsv41_fp8_quantize_pack_sparse_mla_cache(
+    latent_kv: torch.Tensor,
+    *,
+    kv_layout: str = "HND",
+) -> torch.Tensor:
+    r"""Quantize complete DeepSeek-V4.1 latent-KV pages to the 528-byte DSV4_1 FP8 ABI.
+
+    This is the device writer for the main (SWA) cache of the DeepSeek-V4.1
+    formats (``kv_cache_format="fp8_dsv41"`` / ``"fp8_dsv41_fp4_ca"`` and
+    ``SparseMLASm120Wrapper(kv_scale_format="ue8m0_g32")``); the companion
+    :func:`dsv41_fp4_quantize_pack_sparse_mla_cache` writes the 288-byte
+    compressed (extra) cache.
+
+    Parameters
+    ----------
+    latent_kv : torch.Tensor
+        Contiguous CUDA BF16/FP16 tensor with shape
+        ``[num_pages, page_size, 512]``. A singleton latent-head axis is also
+        accepted in HND or NHD position. All 512 values per token (RoPE dims
+        included) are quantized in groups of 32 to E4M3 with one UE8M0
+        (power-of-two) scale per group: ``scale = 2**ceil(log2(max(amax /
+        448, 1e-4)))`` with ``amax`` clamped at ``1e-4``, values divided by
+        the scale and rounded to nearest-even E4M3 saturating at 448 (the
+        FlashMLA FP8 FOOTER trajectory; bit-identical to the torch reference
+        quantizer used by the FlashInfer tests). A NaN in a group writes a
+        ``0xFF`` scale byte and ``0x7F`` codes; an infinite group writes a
+        ``0xFF`` scale byte, ``0x7F`` for the infinite values and signed zero
+        codes for the finite ones.
+    kv_layout : str
+        Output layout, either ``"HND"`` or ``"NHD"``.
+
+    Returns
+    -------
+    torch.Tensor
+        Opaque uint8 paged cache with logical shape
+        ``[num_pages, 1, page_size, 528]`` for HND or
+        ``[num_pages, page_size, 1, 528]`` for NHD. Within each physical page
+        it stores ``page_size * 512`` E4M3 data bytes followed by
+        ``page_size * 16`` UE8M0 scale bytes. Consumers must not interpret the
+        last dimension as a contiguous per-token record.
+    """
+    from ._execution import format_info
+
+    bytes_per_token = format_info(_MODEL_TYPE_DSV4_1)["bytes_per_token"]
+    num_pages, page_size, cache_shape = _dsv41_pack_cache_shape(
+        latent_kv, kv_layout, bytes_per_token
+    )
+    cache = torch.empty(cache_shape, dtype=torch.uint8, device=latent_kv.device)
+    if num_pages == 0 or page_size == 0:
+        return cache
+    get_sparse_mla_sm120_module().sparse_mla_sm120_dsv41_fp8_quantize_pack(
+        latent_kv, cache
+    )
+    return cache
+
+
+@supported_compute_capability([120, 121])
+@flashinfer_api(trace=dsv41_fp8_quantize_append_sparse_mla_cache_trace)
+def dsv41_fp8_quantize_append_sparse_mla_cache(
+    latent_kv: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    cache: torch.Tensor,
+) -> None:
+    r"""Quantize and append DeepSeek-V4.1 latent KV by physical slot into a 528-byte FP8 cache.
+
+    Parameters
+    ----------
+    latent_kv : torch.Tensor
+        Contiguous CUDA BF16/FP16 tensor with one 512-element latent-KV row
+        per entry in ``slot_mapping``.
+    slot_mapping : torch.Tensor
+        Contiguous 1D CUDA int32 or int64 tensor. ``slot_mapping[i]`` is
+        ``page_id * page_size + entry_id``. Negative and out-of-range slots
+        are padding and are ignored. If a valid slot occurs more than once,
+        the lowest-index input row is written deterministically.
+    cache : torch.Tensor
+        Destination opaque uint8 paged cache (2D ``[num_pages, page_bytes]``
+        with ``page_bytes`` a multiple of 528, 3D ``[num_pages, page_size,
+        528]``, or the 4D HND/NHD forms). Page-strided views may place the
+        cache inside vLLM's packed physical block allocation (16-byte multiple
+        page stride; rows inside a page stay packed). Only addressed data rows
+        and scale slots are written, so prefill history is reused directly by
+        decode. The conversion is the one documented for
+        :func:`dsv41_fp8_quantize_pack_sparse_mla_cache`.
+    """
+    _check_dsv41_append_arguments(latent_kv, slot_mapping, cache)
+    get_sparse_mla_sm120_module().sparse_mla_sm120_dsv41_fp8_quantize_append(
         latent_kv, slot_mapping, cache
     )

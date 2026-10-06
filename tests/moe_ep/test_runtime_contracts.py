@@ -1,6 +1,9 @@
 """Host regressions for runtime ownership and non-global EP groups."""
 
+import os
+import subprocess
 import sys
+import textwrap
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
@@ -11,6 +14,49 @@ import torch.distributed as dist
 from flashinfer.moe_ep import BootstrapConfig
 from flashinfer.moe_ep.core import bootstrap_utils
 from flashinfer.moe_ep.core.runtime import bootstrap as runtime
+
+
+def test_standalone_ep1_bootstrap_does_not_use_tcp_rendezvous():
+    code = textwrap.dedent("""
+        import errno
+        import torch
+        import torch.distributed as dist
+
+        from flashinfer.moe_ep import BootstrapConfig
+        from flashinfer.moe_ep.core import bootstrap_utils
+        from flashinfer.moe_ep.core.runtime import bootstrap as runtime
+
+        def occupied_port(*args, **kwargs):
+            raise OSError(errno.EADDRINUSE, "Address already in use")
+
+        dist.distributed_c10d.rendezvous = occupied_port
+        bootstrap = BootstrapConfig(rank=0, world_size=1)
+        handle = runtime.bootstrap_moe_ep_runtime(
+            bootstrap, frozenset({runtime.TORCH_DIST})
+        )
+        try:
+            assert dist.get_rank() == 0 and dist.get_world_size() == 1
+            value = torch.tensor([3.0])
+            dist.all_reduce(value)
+            assert value.item() == 3.0
+            store = bootstrap_utils.resolve_rendezvous_store(bootstrap, subsystem="test")
+            store.set("key", "value")
+            assert store.get("key") == b"value"
+        finally:
+            runtime.finalize_moe_ep_runtime(handle)
+        assert not dist.is_initialized()
+    """)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+    for key in ("RANK", "WORLD_SIZE"):
+        env.pop(key, None)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.fixture

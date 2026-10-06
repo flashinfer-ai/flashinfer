@@ -384,8 +384,13 @@ name the mechanism they share rather than introducing a general backend layer.
 Construction validates the requested backend; selection and preparation happen
 in `plan()`. An explicit request evaluates only that backend. For `backend="auto"`,
 [`_auto_policy.py`](../../flashinfer/mla/_batch_mla/_auto_policy.py) applies a
-request-based preference policy on SM100 and the legacy FA2/FA3 architecture
-selection elsewhere. Backend support checks determine eligibility.
+request-based preference policy on exact SM100 and SM103. Exact SM107 has its
+own `_ordered_sm107_backends` entry point, which delegates to the SM100 rules.
+These rules perform well in the measured SM107 cases; further investigation may
+identify useful SM107-specific ordering. SM80, supported SM90, and supported
+SM12x use their architecture policies; other devices use the default order.
+Every order includes all concrete backends exactly once, with support checks
+determining eligibility.
 
 The wrapper owns the planner registry, shared preparation and plan publication.
 Automatic selection and the `cute-dsl` family alias both return a concrete
@@ -400,7 +405,7 @@ contract; callers that previously caught them as `RuntimeError` must catch
 fallback. Failed preparation restores shared buffers before fallback or returning
 control to the caller. Experimental auto candidates require
 `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`; explicit selection is an opt-in.
-The legacy FA2/FA3 selection produces one candidate without additional fallback.
+Architecture preferences retain fallback to the remaining concrete candidates.
 
 `backend="cute-dsl"` tries monolithic CuTe followed by modular CuTe using the
 same preparation and fallback rules. Both currently reject `use_sinks=True`.
@@ -557,7 +562,7 @@ errors, allowing automatic selection to try another backend.
 
 ### CUTLASS
 
-CUTLASS supports explicit selection and SM100 auto. It requires:
+CUTLASS supports explicit selection and automatic fallback. It requires:
 
 - Compute capability major version 10 or 11.
 - One query per request and exactly 128 query heads; causal and noncausal masks agree.
@@ -577,17 +582,21 @@ the plan.
 ### cuTile
 
 cuTile is experimental: explicit selection opts in and emits a warning, while
-SM100 auto considers it only with `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`,
+automatic selection considers it only with `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`,
 including when earlier candidates reject the request. Planning requires
 `cuda-tile>=1.4` and an available compiler; unsupported versions produce a typed
 rejection so auto can continue to the next eligible backend. Native execution supports
-SM100, SM103, SM120 and SM121 with matching FP16/BF16 query/KV/output,
+SM100, SM103, SM107, SM120 and SM121 with matching FP16/BF16 query/KV/output,
 256 or 512 compressed dimensions, 64 positional dimensions, one query per
 request, positive query-head counts and power-of-two pages from 1 through 128.
 Packed storage, adjacent split views and compact independent split allocations
 are zero-copy inputs. `max_q_len` may overestimate the actual single query.
 Causal and noncausal single-query masks are equivalent; multi-query attention,
 LSE, profiling, output/KV scaling and sinks remain unsupported.
+SM107 requires a complete cuTile compiler/toolkit installation that supports
+that target; the minimum package version alone does not establish target support.
+Explicit cuTile selection remains experimental on SM107, and automatic
+selection still requires `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`.
 
 Planning prepares the cuTile AOT kernels, driver entry points and private scratch.
 Normal execution uses that prepared state without autotuning or specialization.
@@ -596,8 +605,8 @@ the same wrapper is rejected.
 
 ### TRTLLM-GEN
 
-The planned TRTLLM-GEN backend accepts explicit selection and SM100 auto.
-It requires SM100 or SM103, dense metadata, packed query and KV-cache tensors,
+The planned TRTLLM-GEN backend accepts explicit selection and automatic selection.
+It requires SM100, SM103 or SM107, dense metadata, packed query and KV-cache tensors,
 BF16 output, scalar BMM scales, and supported compressed and positional
 dimensions. Multi-query attention is bottom-right causal; noncausal attention
 is supported only for one query per request. Uniform and compact ragged queries
@@ -607,10 +616,12 @@ authoritative; no separate non-positional Q/K width is needed by the planned
 backend. It may plan PDL, variable query metadata, sinks, skip-softmax, and base-2
 LSE, but rejects tensor BMM scales and sparse/DCP behavior outside this dense
 planned contract.
+SM107 uses the existing SM100-family kernels. Matching BF16 or FP8 E4M3
+query/KV inputs are supported; FP16 inputs remain unsupported.
 
 ### XQA
 
-The planned XQA backend is selected only by `backend="xqa"`. It requires SM120
+The planned XQA backend supports explicit selection and automatic fallback. It requires SM120
 with CUDA 12.8 or later, or SM12x minor versions 1 or greater with CUDA 12.9 or
 later. Non-graph plans may stage CPU metadata or derive aligned dense tables
 from CSR; CUDA Graph plans require caller-owned dense metadata on the wrapper
@@ -622,9 +633,9 @@ shape are not part of this backend.
 
 ### CuTe DSL
 
-The concrete CuTe DSL backends support explicit selection and SM100 auto;
+The concrete CuTe DSL backends support explicit and automatic selection;
 `backend="cute-dsl"` retains its family-alias policy across eager replans.
-Both require SM100 or SM103, dense device metadata, packed (or adjacent split)
+Both require SM100, SM103 or SM107, dense device metadata, packed (or adjacent split)
 query and KV storage, FP16/BF16 output, matching FP16/BF16/FP8 E4M3 inputs,
 and scalar BMM scales. Monolithic supports causal multi-query attention,
 compact ragged queries, base-e LSE and first-plan graph capture, but no sinks.
@@ -632,6 +643,21 @@ Modular supports uniform noncausal queries (up to the native four-query limit),
 but rejects sinks, causal multi-query attention, ragged queries, LSE and
 graph planning. For one query, causal and noncausal masks are equivalent.
 DCP, sparse, HCA and DSV4 remain outside this wrapper.
+
+On SM107, an installed CuTe DSL that lacks a native SM107 target must support
+the family target and start with `CUTE_DSL_ARCH=sm_100f` set **before importing
+Cutlass/CuTe DSL**. Setting it after import cannot retarget the captured DSL.
+The wrapper checks the existing target availability guard and does not mutate
+global compiler settings. An unavailable target produces a typed plan rejection
+so selectors can try their next eligible backend; explicit selection reports
+the rejection. Modular graph planning remains unsupported.
+
+For matching FP8 E4M3 query/KV inputs on SM100, SM103 and SM107, the default
+scale contract remains `default`; mixed-precision KV-only FP8 continues to use
+`kv-per-tensor`. Explicit scale contracts are preserved. Architecture eligibility
+does not determine automatic preference order. SM100 and SM103 share their
+ranking rules, and the SM107 policy currently delegates to those same rules.
+The SM107 entry point leaves room for future architecture-specific ordering.
 
 Callers do not declare sequence variability to the planned wrapper.
 TRTLLM-GEN derives compact query variability from `cum_seq_lens_q`; CuTe derives

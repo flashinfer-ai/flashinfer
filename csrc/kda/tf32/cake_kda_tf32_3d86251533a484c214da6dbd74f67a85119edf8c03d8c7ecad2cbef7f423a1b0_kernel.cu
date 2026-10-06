@@ -1075,8 +1075,12 @@ kernel_cake_kda_tf32_3d86251533a484c214da6dbd74f67a85119edf8c03d8c7ecad2cbef7f42
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
+#else
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define pair_done_addr (mbar_base + 0)
@@ -1786,24 +1790,45 @@ kernel_cake_kda_tf32_3d86251533a484c214da6dbd74f67a85119edf8c03d8c7ecad2cbef7f42
                                             }
                                         }
                                         #pragma unroll
+#if __CUDA_ARCH__ == 1000
                                         for (int word_pair = 0; word_pair < 8; word_pair++) {
                                             int word_2 = word_pair * 2;
+#else
+                                        for (int word_2 = 0; word_2 < 16; word_2++) {
+#endif
                                             int row_4 = (unsigned int)(prep_warp * 16) + lane / 4 + (unsigned int)(word_2 % 4 / 2 * 8);
                                             int col_0 = lane % 4 * 2 + (unsigned int)(word_2 % 2) + (unsigned int)(word_2 / 4 * 8);
+#if __CUDA_ARCH__ == 1000
                                             float value_lo = 0.0f;
                                             float value_hi = 0.0f;
+#else
+                                            float value = 0.0f;
+#endif
                                             if (row_4 >= col_0) {
+#if __CUDA_ARCH__ == 1000
                                                 value_lo = reinterpret_cast<float*>(pair_rounded)[word_2];
+#else
+                                                value = reinterpret_cast<float*>(pair_rounded)[word_2];
+#endif
                                             }
+#if __CUDA_ARCH__ == 1000
                                             if (row_4 >= col_0 + 1) {
                                                 value_hi = reinterpret_cast<float*>(pair_rounded)[word_2 + 1];
+#else
+                                            {
+                                                value = value * 1.8446744073709552e+19f;
+#endif
                                             }
+#if __CUDA_ARCH__ == 1000
                                             float2 value_pair = mul_f32x2_rn_ftz(
                                                 make_float2(value_lo, value_hi),
                                                 make_float2(1.8446744073709552e+19f, 1.8446744073709552e+19f));
                                             smem_qk_plain[(col_0 / 16 * 2048 + row_4 * 64 + col_0 % 16 * 4 ^ (col_0 / 16 * 2048 + row_4 * 64 + col_0 % 16 * 4 >> 7 & 3) << 4) / 4] = value_pair.x;
                                             int col_hi = col_0 + 1;
                                             smem_qk_plain[(col_hi / 16 * 2048 + row_4 * 64 + col_hi % 16 * 4 ^ (col_hi / 16 * 2048 + row_4 * 64 + col_hi % 16 * 4 >> 7 & 3) << 4) / 4] = value_pair.y;
+#else
+                                            smem_qk_plain[(col_0 / 16 * 2048 + row_4 * 64 + col_0 % 16 * 4 ^ (col_0 / 16 * 2048 + row_4 * 64 + col_0 % 16 * 4 >> 7 & 3) << 4) / 4] = value;
+#endif
                                         }
                                     } else {
                                         #pragma unroll
