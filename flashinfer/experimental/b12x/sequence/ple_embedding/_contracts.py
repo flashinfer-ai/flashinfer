@@ -26,7 +26,7 @@ from ._tuning import PleEmbeddingConfig
 
 if TYPE_CHECKING:
     from ._disk import DiskTable
-    from ._storage import TableStorage
+    from ._storage import HostAllocator, TableStorage
 
 
 _SIGNED_INT64_MAX = (1 << 63) - 1
@@ -301,11 +301,16 @@ class TableLayout:
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
         return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
 
-    def allocate_storage(self) -> TableStorage:
-        """Allocate persistent table tensors according to ``caps.table_memory``."""
+    def allocate_storage(
+        self, *, host_allocator: HostAllocator | None = None
+    ) -> TableStorage:
+        """Allocate persistent table tensors according to ``caps.table_memory``.
+
+        See :func:`allocate_storage` for ``host_allocator``.
+        """
         from ._storage import allocate_storage
 
-        return allocate_storage(self)
+        return allocate_storage(self, host_allocator=host_allocator)
 
 
 @dataclass(frozen=True, kw_only=True)

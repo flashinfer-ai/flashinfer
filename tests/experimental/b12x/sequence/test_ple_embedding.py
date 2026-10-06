@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import ctypes
+import math
+import mmap
+import os
+import shutil
+import tempfile
 from contextlib import ExitStack
 from dataclasses import replace
 
@@ -9,6 +15,7 @@ import torch
 from b12x.preparation import PreparedCall, PreparationSession
 from b12x.preparation.types import require_prepared
 from b12x.sequence import ple_embedding
+from b12x.sequence._shared.disk_table import MappedHostAllocation, _tensor_from_pointer
 from b12x.sequence.ple_embedding import reference
 from b12x.sequence.ple_hash.reference import nth_prime_after, ple_hash_packed_reference
 
@@ -272,6 +279,165 @@ def test_cuda_prepared_execution_matches_reference_and_preserves_read_only_tenso
     assert torch.count_nonzero(actual[4]).item() == 0
     for name, value in before.items():
         torch.testing.assert_close(getattr(binding, name), value, rtol=0, atol=0)
+
+
+class _TmpfsTableRegion:
+    """A ``MAP_SHARED`` tmpfs file registered with CUDA, as a shared table is."""
+
+    def __init__(self, path, shape, dtype, device):
+        from cuda.bindings import runtime as cudart
+
+        self.nbytes = math.prod(shape) * dtype.itemsize
+        self.closed = 0
+        self._libc = ctypes.CDLL(None, use_errno=True)
+        self._libc.mmap.restype = ctypes.c_void_p
+        self._libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        self._libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        self._fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        os.posix_fallocate(self._fd, 0, self.nbytes)
+        self._pointer = self._libc.mmap(None, self.nbytes, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, self._fd, 0)
+        with torch.cuda.device(device):
+            (error,) = cudart.cudaHostRegister(self._pointer, self.nbytes, cudart.cudaHostRegisterMapped)
+            assert error == cudart.cudaError_t.cudaSuccess, error
+            error, device_pointer = cudart.cudaHostGetDevicePointer(self._pointer, 0)
+            assert error == cudart.cudaError_t.cudaSuccess, error
+        self.host_view = _tensor_from_pointer(self._pointer, shape=shape, dtype=dtype, device=torch.device("cpu"), nbytes=self.nbytes)
+        self.device_view = _tensor_from_pointer(int(device_pointer), shape=shape, dtype=dtype, device=device, nbytes=self.nbytes)
+
+    def close(self):
+        from cuda.bindings import runtime as cudart
+
+        self.closed += 1
+        if self.closed == 1:
+            torch.cuda.synchronize()
+            cudart.cudaHostUnregister(self._pointer)
+            self._libc.munmap(self._pointer, self.nbytes)
+            os.close(self._fd)
+
+
+@torch.inference_mode()
+def test_cuda_storage_runs_from_caller_registered_tmpfs_regions(resources):
+    """Caller-provided mapped-host bytes, such as a table file shared between
+    processes, serve the kernel exactly like the private allocation."""
+    if not os.path.isdir("/dev/shm"):
+        pytest.skip("requires a /dev/shm tmpfs")
+    directory = tempfile.mkdtemp(dir="/dev/shm")
+    resources.callback(shutil.rmtree, directory, ignore_errors=True)
+    caps = _small_caps(require_b12x(), quant_mode="nvfp4_group16", table_memory="mapped_host")
+    device = caps.device
+    geometry = _small_geometry(caps)
+    layout = ple_embedding.storage_layout(caps, geometry=geometry)
+    regions = {}
+
+    def host_allocator(name, shape, dtype):
+        regions[name] = _TmpfsTableRegion(os.path.join(directory, name), shape, dtype, device)
+        return regions[name]
+
+    storage = layout.allocate_storage(host_allocator=host_allocator)
+    assert list(regions) == ["weight", "weight_scale"]
+    assert storage.weight.data_ptr() == regions["weight"].device_view.data_ptr()
+    assert storage.weight_scale.data_ptr() == regions["weight_scale"].device_view.data_ptr()
+    weight, weight_scale, weight_scale_2 = _storage(layout)
+    storage.weight_load_view.copy_(weight.cpu())
+    storage.weight_scale_load_view.copy_(weight_scale.cpu())
+    storage.weight_scale_2_load_view.copy_(weight_scale_2)
+    tensors = _tensors(layout, ple_embedding.allocate_geometry(geometry, device=device))
+    tensors.update(weight=storage.weight, weight_scale=storage.weight_scale, weight_scale_2=storage.weight_scale_2)
+    binding, _, _, _, _ = _prepared_binding(resources, caps, tensors=tensors)
+
+    actual = ple_embedding.run(binding)
+    torch.cuda.synchronize(device)
+
+    torch.testing.assert_close(actual, _reference(binding), rtol=0, atol=0)
+    storage.close()
+    assert [region.closed for region in regions.values()] == [1, 1]
+
+
+def test_host_allocator_requires_mapped_host_tables():
+    caps = _small_caps("cpu", quant_mode="nvfp4_group16")
+    layout = ple_embedding.storage_layout(caps, geometry=_small_geometry(caps))
+
+    with pytest.raises(ValueError, match="host_allocator requires table_memory='mapped_host'"):
+        layout.allocate_storage(host_allocator=lambda *_: pytest.fail("allocator called"))
+
+
+class _TrackedAllocation:
+    def __init__(self, allocation):
+        self._allocation = allocation
+        self.host_view, self.device_view = allocation.host_view, allocation.device_view
+        self.nbytes = allocation.nbytes
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+        self._allocation.close()
+
+
+def test_cuda_storage_rejects_and_closes_a_mismatched_region():
+    caps = _small_caps(require_b12x(), quant_mode="bf16", table_memory="mapped_host")
+    layout = ple_embedding.storage_layout(caps, geometry=_small_geometry(caps))
+    region = _TrackedAllocation(MappedHostAllocation((1, layout.weight_shape[1]), layout.weight_dtype, caps.device))
+
+    with pytest.raises(ValueError, match="host_allocator returned weight"):
+        layout.allocate_storage(host_allocator=lambda *_: region)
+    assert region.closed == 1
+
+
+@pytest.mark.parametrize("failure", ["allocate", "validate", "cleanup"])
+def test_cuda_storage_closes_all_regions_after_allocation_failure(failure):
+    caps = _small_caps(require_b12x(), quant_mode="nvfp4_group16", table_memory="mapped_host")
+    layout = ple_embedding.storage_layout(caps, geometry=_small_geometry(caps))
+    regions = []
+
+    def allocate(name, shape, dtype):
+        if name == "weight_scale" and failure == "allocate":
+            raise OSError("scale allocation failed")
+        region = _TrackedAllocation(MappedHostAllocation(shape, dtype, caps.device))
+        regions.append(region)
+        if name == "weight_scale":
+            region.host_view = region.host_view.reshape(-1)[:1]
+            if failure == "cleanup":
+                close = region.close
+
+                def failing_close():
+                    close()
+                    raise OSError("scale cleanup failed")
+
+                region.close = failing_close
+        return region
+
+    expected = OSError if failure == "allocate" else ValueError
+    with pytest.raises(expected, match="scale allocation failed|host_allocator returned weight_scale") as info:
+        layout.allocate_storage(host_allocator=allocate)
+    assert all(region.closed == 1 for region in regions)
+    if failure == "cleanup":
+        assert any("scale cleanup failed" in note for note in info.value.__notes__)
+
+
+def test_cuda_storage_close_attempts_every_region_once():
+    caps = _small_caps(require_b12x(), quant_mode="nvfp4_group16", table_memory="mapped_host")
+    layout = ple_embedding.storage_layout(caps, geometry=_small_geometry(caps))
+    regions = []
+
+    def allocate(name, shape, dtype):
+        region = _TrackedAllocation(MappedHostAllocation(shape, dtype, caps.device))
+        regions.append(region)
+        if name == "weight_scale":
+            close = region.close
+
+            def failing_close():
+                close()
+                raise OSError("scale cleanup failed")
+
+            region.close = failing_close
+        return region
+
+    storage = layout.allocate_storage(host_allocator=allocate)
+    with pytest.raises(OSError, match="scale cleanup failed"):
+        storage.close()
+    assert [region.closed for region in regions] == [1, 1]
+    storage.close()
+    assert [region.closed for region in regions] == [1, 1]
 
 
 @torch.inference_mode()

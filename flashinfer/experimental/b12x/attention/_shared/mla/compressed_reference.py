@@ -323,7 +323,9 @@ def pack_deepseek_v41_cache_reference(
     else:
         scales_fp8 = (maximum.clamp_min(6 * 2**-9) / 6.0).clamp(max=448).to(torch.float8_e4m3fn)
         scale_f32 = scales_fp8.float().unsqueeze(-1)
-        normalized = grouped * scale_f32.reciprocal()
+        # DeepSeek-V4.1 fp4_quant_kernel divides; a rounded reciprocal would move
+        # exact E2M1 midpoints off their ties-to-even.
+        normalized = grouped / scale_f32
         magnitude = normalized.abs().contiguous()
         boundaries = torch.tensor(
             [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],

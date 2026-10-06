@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import logging
 import gc
+import math
 import os
 import threading
 import time
-from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -122,8 +122,45 @@ class _Trial:
 # pending compilation always return control before more work is admitted.
 _ADVANCE_SECONDS = 0.1
 
+# Cross-rank priming assumes co-scheduled ranks: a collective authorization is
+# consumed in the round after the exchange, and the local work before the launch
+# (autotune rounds) is unbounded, so the barrier converts the shared
+# authorization into a launch lockstep. Generous by default: it only ever waits
+# during preparation, and must cover the slowest rank's pre-launch round.
+def _barrier_timeout_seconds():
+    """Return the finite positive collective-barrier deadline from the environment."""
+    try:
+        timeout = float(os.environ.get("B12X_COLLECTIVE_BARRIER_TIMEOUT", "120"))
+    except ValueError as error:
+        raise ValueError("B12X_COLLECTIVE_BARRIER_TIMEOUT must be a finite positive number of seconds") from error
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("B12X_COLLECTIVE_BARRIER_TIMEOUT must be a finite positive number of seconds")
+    return timeout
+
+
+class CollectiveBarrierTimeout(RuntimeError):
+    """A collective barrier callback exceeded its deadline."""
+
+    def __init__(self, key: str, ranks: tuple[int, ...], arrived: tuple[int, ...] | None = None, *, timeout: float = 120.0):
+        """Record verified arrivals when the barrier backend supplies them."""
+        if arrived is None:
+            message = f"collective barrier callback timed out for {key!r} after {timeout:g}s"
+        else:
+            waiting = tuple(sorted(set(ranks) - set(arrived)))
+            message = (
+                f"collective barrier timed out for {key!r} after "
+                f"{timeout:g}s: ranks {waiting} never entered "
+                f"(arrived: {tuple(sorted(arrived))})"
+            )
+        super().__init__(message)
+        self.key = key
+        self.ranks = ranks
+        self.arrived = None if arrived is None else tuple(sorted(arrived))
+        self.timeout = timeout
+
 
 def _declaration_key(plan):
+    """Return the immutable declaration identity used to coalesce requests."""
     if isinstance(plan, _CompositePlan):
         return (
             plan.component_id, plan.composite_semantic_version, plan.capacity_metadata,
@@ -225,6 +262,7 @@ def _coalesce_requests(requests):
 
 
 def _plans_of(request):
+    """Return a request plan and every child plan of a composite request."""
     plan = request.plan
     if isinstance(plan, _CompositePlan):
         return (plan, *plan.variants.values())
@@ -245,8 +283,14 @@ class PreparationSession:
     def __init__(
         self, *, device=None, autotune=True, cache_dir=None, namespace=None,
         compile_workers=None, rounds=SURVIVOR_ROUNDS, samples=DEFAULT_SAMPLES, cache_only=False,
-        race_batch=32, race_budget=None,
+        race_batch=32, race_budget=None, collective_barrier=None,
     ):
+        """Initialize planning resources and an optional collective entry barrier.
+
+        ``collective_barrier(key, ranks)`` runs in a daemon thread and must be
+        safe to call there. A timeout does not cancel that callback; another
+        preparation job cannot begin until the callback exits.
+        """
         self.device = device if isinstance(device, DetectedDevice) else detect_device(device)
         if compile_workers is None:
             compile_workers = _default_compile_workers(self.device)
@@ -265,6 +309,12 @@ class PreparationSession:
         self.compile_workers, self.rounds, self.samples = compile_workers, rounds, samples
         self.race_batch, self.race_budget = race_batch, race_budget
         self.namespace = FrozenMapping(namespace or {})
+        if collective_barrier is not None and not callable(collective_barrier):
+            raise TypeError("collective_barrier must be callable")
+        self.collective_barrier = collective_barrier
+        self._barrier_timeout = (
+            _barrier_timeout_seconds() if collective_barrier is not None else 120.0
+        )
         self.cache_dir = None if cache_dir is None else Path(cache_dir)
         self._cache = None
         self._stop = threading.Event()
@@ -273,6 +323,7 @@ class PreparationSession:
         self._thread = threading.get_ident()
         self._pool = None
         self._job = None
+        self._pending_collective_barrier = None
         self._plans = []
         self._shared = {}
         self._guard = None
@@ -314,12 +365,14 @@ class PreparationSession:
         self._tuning_cache_synchronized = False
 
     def _check_thread(self):
+        """Reject use from another thread or after the session closes."""
         if threading.get_ident() != self._thread:
             raise RuntimeError("only cancel_tuning may run on another thread")
         if self.state == "CLOSED":
             raise RuntimeError("preparation session is closed")
 
     def _selection_cache(self):
+        """Return the session selection cache, creating it for CUDA devices."""
         if self._cache is None:
             if self.device.ordinal is None:
                 raise RuntimeError("selection caching requires a CUDA device")
@@ -331,23 +384,27 @@ class PreparationSession:
         return self._cache
 
     def _gpu_scope(self):
+        """Return the CUDA device context for preparation operations."""
         if self.device.ordinal is None:
             return nullcontext()
         import torch
         return torch.cuda.device(self.device.ordinal)
 
     def _synchronize(self):
+        """Synchronize the preparation device when it is CUDA-backed."""
         if self.device.ordinal is not None:
             import torch
             torch.cuda.synchronize(self.device.ordinal)
 
     def _allocated(self):
+        """Return bytes currently allocated on the preparation device."""
         if self.device.ordinal is None:
             return 0
         import torch
         return torch.cuda.memory_allocated(self.device.ordinal)
 
     def _race_budget(self):
+        """Return the configured or device-derived autotuning memory budget."""
         if self.race_budget is not None:
             return self.race_budget
         if self.device.ordinal is None:
@@ -357,9 +414,15 @@ class PreparationSession:
         return max(int(free) // 2, 1)
 
     def begin(self, requests, *, autotune=None):
+        """Start one preparation job after the prior collective barrier drains."""
         self._check_thread()
         if self._job is not None:
             raise RuntimeError("one preparation job may be active")
+        pending = self._pending_collective_barrier
+        if pending is not None:
+            if not pending.is_set():
+                raise RuntimeError("previous collective barrier is still running")
+            self._pending_collective_barrier = None
         if autotune is not None and type(autotune) is not bool:
             raise TypeError("job autotune override must be boolean or None")
         requests = tuple(requests)
@@ -557,6 +620,7 @@ class PreparationSession:
             yield
 
     def freeze(self):
+        """Forbid later kernel resolution after all preparation work drains."""
         self._check_thread()
         if self._job is not None or self._pool is not None:
             raise RuntimeError("freeze requires drained preparation")
@@ -566,6 +630,7 @@ class PreparationSession:
         self.state = "FROZEN"
 
     def close(self):
+        """Release preparation resources and mark the session closed."""
         if self.state == "CLOSED":
             return
         self._check_thread()
@@ -593,10 +658,12 @@ class PreparationSession:
             _close_all((self._reclaim_programs,))
 
     def __enter__(self):
+        """Enter the session after validating the owning thread."""
         self._check_thread()
         return self
 
     def __exit__(self, kind, value, traceback):
+        """Close session resources and preserve a body exception if cleanup fails."""
         try:
             self.close()
         except BaseException as error:
@@ -607,6 +674,7 @@ class PreparationSession:
 
 class PreparationJob:
     def __init__(self, session, requests, *, autotune):
+        """Initialize state for one bounded sequence of preparation requests."""
         self.session, self.requests = session, requests
         self.autotune = autotune
         self._steps = self._run()
@@ -657,6 +725,7 @@ class PreparationJob:
         ready_tuning=(),
         ready_cache=None,
     ):
+        """Build a preparation progress snapshot from the live job state."""
         active_compilations = 0
         if self.session._pool is not None:
             summary = self.session._pool.summary()
@@ -689,7 +758,51 @@ class PreparationJob:
             ready_cache=ready_cache,
         )
 
+    def _collective_barrier(self, requirement: CollectiveRequirement) -> None:
+        """Convert a shared collective authorization into a launch lockstep.
+
+        All participant ranks were authorized for the same requirement in the
+        same exchange round, but the local work before any rank launches is
+        unbounded (autotune races). The embedder-supplied barrier waits for
+        every participant rank to enter before this rank proceeds to the
+        launch, so the kernel-side spin window only covers launch jitter.
+        """
+        barrier = self.session.collective_barrier
+        completed = threading.Event()
+        errors = []
+
+        def wait_for_peers():
+            """Run the embedder barrier and publish its terminal state."""
+            try:
+                barrier(requirement.key, requirement.ranks)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                completed.set()
+
+        try:
+            thread = threading.Thread(target=wait_for_peers, daemon=True)
+            self.session._pending_collective_barrier = completed
+            try:
+                thread.start()
+            except BaseException:
+                self.session._pending_collective_barrier = None
+                raise
+            if not completed.wait(self.session._barrier_timeout):
+                raise CollectiveBarrierTimeout(
+                    requirement.key, requirement.ranks, timeout=self.session._barrier_timeout,
+                )
+            if errors:
+                raise errors[0]
+        except CollectiveBarrierTimeout:
+            raise
+        except Exception as error:
+            raise RuntimeError(
+                f"collective barrier for {requirement.key!r} failed: {error}"
+            ) from error
+
     def advance(self, *, collective_key=None, tuning=None, cache=None):
+        """Advance preparation until work completes or reaches a readiness boundary."""
         started = time.perf_counter()
         if self._last_advance_end is not None:
             self._timing.add("between_advances", started - self._last_advance_end)
@@ -710,6 +823,7 @@ class PreparationJob:
             self._last_advance_end = time.perf_counter()
 
     def _advance(self, *, collective_key=None, tuning=None, cache=None):
+        """Run work until it reaches a readiness boundary or time slice."""
         self.session._check_thread()
         if self._error is not None:
             raise self._error
@@ -740,6 +854,16 @@ class PreparationJob:
         elif isinstance(self._blocked, CollectiveRequirement):
             if collective_key != self._blocked.key:
                 return self._progress(False, False, (self._blocked,), False)
+            if self.session.collective_barrier is not None:
+                try:
+                    self._collective_barrier(self._blocked)
+                except BaseException as error:
+                    self._error = error
+                    try:
+                        self.close()
+                    except BaseException as cleanup:
+                        error.add_note(f"job cleanup failed: {cleanup!r}")
+                    raise
             self._blocked = None
         elif isinstance(self._blocked, _TuningBatch):
             required = self._blocked.contributions

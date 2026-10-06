@@ -89,12 +89,14 @@ from b12x._lib.intrinsics import (
     cvt_e4m3_to_f32_via_f16,
     cvt_f32_to_e4m3,
     cvt_f32x4_to_e4m3x4,
+    div_rn_f32,
     f16x2_to_f32x2,
     fabs_f32,
     fmax_f32,
     get_ptr_as_int64,
     max_abs_16,
     pow2_ceil_ue8m0,
+    quantize_and_pack_16_div_rn,
     quantize_and_pack_16_fast,
     rcp_approx_ftz,
     st_global_f32,
@@ -361,8 +363,9 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
                     # hardware-exact decode of that byte (what the reader
                     # multiplies back), then satfinite E2M1.
                     if cutlass.const_expr(self.dsv41):
+                        # DeepSeek-V4.1 reference fp4_quant_kernel: IEEE amax/6.
                         group_amax = fmax_f32(group_amax, Float32(6.0 * 2.0**-9))
-                        scale_f32 = group_amax / Float32(6.0)
+                        scale_f32 = div_rn_f32(group_amax, Float32(6.0))
                     else:
                         scale_f32 = group_amax * rcp_approx_ftz(Float32(6.0))
                     scale_u32 = cvt_f32_to_e4m3(scale_f32)
@@ -370,10 +373,12 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
                     packed64 = Uint64(0)
                     if decoded_scale != Float32(0.0):
                         if cutlass.const_expr(self.dsv41):
-                            inv_scale = Float32(1.0) / decoded_scale
+                            # x / s, not x * (1/s): the rounded reciprocal moves
+                            # exact E2M1 midpoints off their ties-to-even.
+                            packed64 = quantize_and_pack_16_div_rn(vals, decoded_scale)
                         else:
                             inv_scale = rcp_approx_ftz(decoded_scale)
-                        packed64 = quantize_and_pack_16_fast(vals, inv_scale)
+                            packed64 = quantize_and_pack_16_fast(vals, inv_scale)
                     st_global_u64(dst + tid.to(Int64) * Int64(8), packed64)
                     st_global_u8(
                         dst + Int64(_NOPE_BYTES) + tid.to(Int64),

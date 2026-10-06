@@ -1,6 +1,6 @@
 """Declarative configuration and session-prepared plans."""
 from .device import DetectedDevice, detect_device
-from .session import PreparationJob, PreparationSession
+from .session import CollectiveBarrierTimeout, PreparationJob, PreparationSession
 from .session import prepare_default
 from ._progress import PreparationDisplay
 from .tuning import (
@@ -16,7 +16,7 @@ from .types import (
 
 __all__ = [
     "prepare_default",
-    "BackendConfig", "CollectiveRequirement", "DetectedDevice", "DeviceIdentity",
+    "BackendConfig", "CollectiveBarrierTimeout", "CollectiveRequirement", "DetectedDevice", "DeviceIdentity",
     "EligiblePlan", "FrozenMapping", "Knob", "MemoryRequirements", "ParameterBinding",
     "ParameterSpace", "PersistentMemory", "Plan", "PreparationProgress",
     "PreparationJob", "PreparationSession", "PreparationDisplay",

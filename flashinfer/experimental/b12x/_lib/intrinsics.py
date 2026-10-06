@@ -6110,6 +6110,25 @@ def quantize_and_pack_16_fast(y_f32: cute.Tensor, inv_scale: Float32) -> Uint64:
 
 
 @cute.jit
+def quantize_and_pack_16_div_rn(y_f32: cute.Tensor, scale: Float32) -> Uint64:
+    """FP4 quantize/pack of 16 float32 values by IEEE division, ``e2m1(x / scale)``.
+
+    Bit-exact with DeepSeek-V4.1's reference ``fp4_quant_kernel``: each value is
+    divided (``div.rn.f32``, not multiplied by a rounded reciprocal, which moves
+    exact E2M1 midpoints off their ties) and converted with
+    ``cvt.rn.satfinite.e2m1x2`` (round-to-nearest-even, saturating at +-6 like
+    the reference's clamp).
+    """
+    q = cute.make_rmem_tensor((16,), Float32)
+    for i in cutlass.range_constexpr(16):
+        q[i] = div_rn_f32(y_f32[i], scale)
+
+    packed_lo = cvt_e2m1x8_f32(q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7])
+    packed_hi = cvt_e2m1x8_f32(q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15])
+    return (Uint64(packed_hi) << Uint64(32)) | Uint64(packed_lo)
+
+
+@cute.jit
 def quantize_block_fp4(
     values: cute.Tensor,
     max_abs: Float32,

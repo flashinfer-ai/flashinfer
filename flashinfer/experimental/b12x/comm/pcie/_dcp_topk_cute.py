@@ -5,6 +5,7 @@ from __future__ import annotations
 from b12x._lib.program_cache import program_cache
 from collections.abc import Callable, Sequence
 
+from b12x._lib.compile_plan import attach_programs
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -272,6 +273,7 @@ def _get_compiled_topk_stage(
     topk: int,
     threads: int,
 ) -> Callable:
+    """Compile and retain one owner top-k staging launcher specialization."""
     launch = _TopKOwnerStageLaunch(world_size, rank, topk, threads)
     key = (int(world_size), int(rank), int(topk), int(threads))
     raise_if_kernel_resolution_frozen(
@@ -313,6 +315,7 @@ def _get_compiled_topk_stage(
         blocks: int,
         wait_for_prior_consumer: bool,
     ) -> None:
+        """Launch the compiled owner top-k staging kernel with runtime arguments."""
         candidates = _pad_ptrs(candidate_ptrs, world_size)
         signals = _pad_ptrs(signal_ptrs, world_size)
         raw(
@@ -353,4 +356,4 @@ def _get_compiled_topk_stage(
             current_cuda_stream(),
         )
 
-    return run
+    return attach_programs(run, raw)

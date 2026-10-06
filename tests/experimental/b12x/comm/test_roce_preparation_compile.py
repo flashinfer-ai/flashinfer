@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from b12x.comm.roce._preparation import compile_roce
+from b12x.comm.roce._oneshot_cute import get_launcher
 from b12x.comm.roce._tuning import RoceQuery, TUNING
 from b12x.preparation import FrozenMapping
 from b12x._lib.compile_pool import CompileJob, describe_compilation, compile_in_process
@@ -75,3 +76,11 @@ def test_materialization_does_not_consume_a_shared_program_dictionary(monkeypatc
     assert states[0].gather_launcher is states[1].gather_launcher
     assert states[0].reduce_launchers is not states[1].reduce_launchers
     assert states[0].runtime is runtimes[0] and states[1].runtime is runtimes[1]
+
+
+def test_unsupported_dtype_fails_alike_whatever_the_spelling():
+    """The launcher boundary raises one ValueError for a torch.dtype or a name."""
+    with pytest.raises(ValueError, match="unsupported RoCE one-shot dtype"):
+        get_launcher(torch.float8_e4m3fn, 2, 0, 32, 4, 4, 1, 0)
+    with pytest.raises(ValueError, match="unsupported RoCE one-shot dtype"):
+        get_launcher("float8_e4m3fn", 2, 0, 32, 4, 4, 1, 0)

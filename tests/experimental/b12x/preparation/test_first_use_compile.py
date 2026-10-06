@@ -168,6 +168,7 @@ def test_compressed_mla_materialization_shares_launches_not_scratch_plans(monkey
 
 
 def test_evict_planning_artifacts_drops_unresolved_deferred_programs_only(monkeypatch):
+    """Planning eviction drops only unresolved deferred compiler artifacts."""
     planned = DeferredCuTeKernel(ProgramKey("cute", "a" * 64, "k"), memory_key=("m",))
     resolved = DeferredCuTeKernel(ProgramKey("cute", "b" * 64, "k"), memory_key=("n",))
     resolved._resolved = object()
@@ -197,6 +198,7 @@ def test_evict_planning_artifacts_drops_unresolved_deferred_programs_only(monkey
 
 
 def test_program_keys_skip_torch_scalars_inside_launch_records():
+    """Program discovery ignores Torch metadata alongside compiled kernels."""
     import torch
     from typing import NamedTuple
 
@@ -209,7 +211,24 @@ def test_program_keys_skip_torch_scalars_inside_launch_records():
     assert compile_plan.program_keys(Launch(kernel, torch.int32, torch.zeros(1))) == kernel.__b12x_programs__
 
 
+def test_program_keys_accept_plain_functions_without_triton(monkeypatch):
+    """Host closures without retained programs do not import optional Triton."""
+    import builtins
+
+    original_import = builtins.__import__
+
+    def reject_triton(name, *args, **kwargs):
+        """Fail if program-key discovery imports the optional Triton package."""
+        if name == "triton.compiler.compiler":
+            raise AssertionError("program_keys imported Triton for a plain function")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_triton)
+    assert compile_plan.program_keys(lambda: None) == ()
+
+
 def test_first_use_evicts_deferred_launchers_from_decorated_kernel_memos(monkeypatch):
+    """Deferred launchers are evicted while resolved launcher memo entries remain."""
     planned = DeferredCuTeKernel(ProgramKey("cute", "f" * 64, "planned"), memory_key=("p",))
     resolved = DeferredCuTeKernel(ProgramKey("cute", "1" * 64, "resolved"), memory_key=("r",))
     resolved._resolved = object()
@@ -234,6 +253,7 @@ def test_first_use_evicts_deferred_launchers_from_decorated_kernel_memos(monkeyp
 
 
 def test_mhc_program_bundle_reuse_obeys_deferred_and_resident_reclamation(monkeypatch):
+    """MHC program bundles preserve resolved entries across planning eviction."""
     from b12x.norm.mhc import _preparation as mhc
     from b12x.preparation import FrozenMapping
 

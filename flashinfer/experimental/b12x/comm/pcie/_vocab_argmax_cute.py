@@ -598,6 +598,7 @@ def get_vocab_argmax_launcher(
         bias_row_stride: int,
         batch: int,
     ) -> None:
+        """Launch the compiled vocabulary argmax kernel with runtime arguments."""
         if len(slab_addresses) != world_size:
             raise ValueError(
                 f"expected {world_size} slab addresses, got {len(slab_addresses)}"

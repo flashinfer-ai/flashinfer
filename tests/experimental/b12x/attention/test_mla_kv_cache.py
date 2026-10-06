@@ -7,6 +7,7 @@ from b12x.preparation import PreparationSession, PreparedCall
 from b12x.attention.compressed_sparse_mla import cache_writer
 from b12x.attention import compressed_sparse_mla
 from b12x.attention._shared.mla.compressed_reference import (
+    _decode_deepseek_v41_records,
     pack_deepseek_v41_cache_reference,
 )
 from b12x.attention._shared.mla.kernel import (
@@ -675,3 +676,47 @@ def test_v41_writer_prepared_dynamic_rows_and_graph_replay(cache_kind: str) -> N
         expected.view(-1, records.shape[1])[:5].copy_(records)
         torch.testing.assert_close(cache, expected, rtol=0, atol=0)
         graph.reset()
+
+
+@torch.inference_mode()
+def test_v41_indexed_writer_rounds_exact_e2m1_midpoints_to_even() -> None:
+    """DeepSeek-V4.1's fp4_quant_kernel computes e2m1(x / s) with an IEEE
+    division. Values that sit exactly on an E2M1 midpoint must round to the even
+    code; multiplying by a rounded reciprocal of s moves them off the tie for
+    scales whose reciprocal is inexact."""
+    device = require_sm120()
+    # E4M3 scales with inexact reciprocals; each 16-value group holds 6*s (the
+    # amax, so the stored scale is exactly s), both signs of the seven E2M1
+    # midpoints times s, and one zero.
+    mantissas = torch.tensor([9, 10, 11, 12, 13, 14, 15]) / 8
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+    even = torch.tensor([0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0])
+    values = torch.zeros(2, 512)
+    expected = torch.zeros(2, 512)
+    for group in range(64):
+        scale = mantissas[group % 7] * (2.0 ** (group // 7 - 6))
+        row, base = divmod(group * 16, 512)
+        block = torch.cat((torch.tensor([6.0]), midpoints, -midpoints)) * scale
+        values[row, base:base + 15] = block
+        expected[row, base:base + 15] = torch.cat((torch.tensor([6.0]), even, -even)) * scale
+    kv = values.to(device=device, dtype=torch.bfloat16)
+    assert torch.equal(kv.float().cpu(), values), "test values must be exact in BF16"
+    cache = torch.full((1, 2 * 288), _SENTINEL, dtype=torch.uint8, device=device)
+    slots = torch.arange(2, dtype=torch.int64, device=device)
+    plan = cache_writer.plan(cache_writer.CacheWriterQuery(
+        max_rows=2, page_size=2, cache_kind="indexed"), device=kv.device)
+    def prepare(state):
+        saved = cache.clone()
+        return PreparedCall(run=lambda: state.run(kv, cache, slots),
+                            restore=lambda: cache.copy_(saved), owners=(saved,))
+    with PreparationSession(device=kv.device, autotune=False, compile_workers=2) as session:
+        session.prepare((plan.request(name="cache-writer", prepare_call=prepare),))
+        session.freeze()
+        compressed_sparse_mla.write_cache(
+            kv, cache, slots, page_size=2, cache_kind="indexed", plan=plan
+        )
+    torch.cuda.synchronize(device)
+    decoded = _decode_deepseek_v41_records(cache.view(-1, 288), cache_kind="indexed").cpu()
+    torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
+    reference = pack_deepseek_v41_cache_reference(kv, page_size=1, cache_kind="indexed")
+    torch.testing.assert_close(cache.view(-1, 288), reference, rtol=0, atol=0)

@@ -16,6 +16,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
+from types import FunctionType
 
 
 @dataclass(frozen=True)
@@ -203,10 +204,12 @@ def launch_triton(kernel, grid, *args, **kwargs):
 
 
 def planning() -> bool:
+    """Report whether the caller is collecting compiler program identities."""
     return _PLANNING.get() is not None
 
 
 def record_program(program: ProgramKey, owner: Any = None) -> None:
+    """Record a compiled program identity for active planning observers."""
     captured = _PLANNING.get()
     if captured is not None:
         captured.add(program)
@@ -219,6 +222,7 @@ def record_program(program: ProgramKey, owner: Any = None) -> None:
 
 
 def program_keys(value: Any) -> tuple[ProgramKey, ...]:
+    """Return compiler program identities retained by ``value``."""
     if value is None or isinstance(value, (str, int, float, bool)) or type(value).__module__ == "torch":
         return ()
     if isinstance(value, Mapping):
@@ -228,6 +232,11 @@ def program_keys(value: Any) -> tuple[ProgramKey, ...]:
     keys = getattr(value, "__b12x_programs__", None)
     if keys is not None:
         return tuple(keys)
+    if isinstance(value, FunctionType):
+        # A launch closure produced outside a compile factory carries no
+        # program identity of its own; retain it rather than failing an
+        # unrelated sweep.
+        return ()
     from triton.compiler.compiler import CompiledKernel
     if isinstance(value, CompiledKernel):
         return (ProgramKey("triton", value.hash, value.name),)

@@ -21,6 +21,7 @@ from cutlass._mlir.dialects import llvm
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.intrinsics import (
     cvt_e4m3x4_to_f32x4,
     ld_global_nc_f32,
@@ -746,6 +747,7 @@ def get_twoshot_launcher(
     row_elems: int,
     device_index: int,
 ) -> Callable[..., None]:
+    """Compile and retain one static two-shot launcher specialization."""
     process_key = _twoshot_process_key(
         operation,
         world_size,
@@ -756,8 +758,6 @@ def get_twoshot_launcher(
         row_elems,
         device_index,
     )
-    """Compile and return one static world/operation/thread specialization."""
-
     del device_index  # part of the process-local cache key
     if world_size not in (2, 4, 8):
         raise ValueError(f"unsupported world size {world_size}")
@@ -844,6 +844,7 @@ def get_twoshot_launcher(
         row_elems: int,
         grid_x: int,
     ) -> None:
+        """Launch the compiled two-shot collective with runtime arguments."""
         if len(staging_addresses) != 8 or len(signal_addresses) != 8:
             raise ValueError("two-shot scalar pointer ABI requires eight peers")
         raw_args = (
@@ -895,6 +896,6 @@ def get_twoshot_launcher(
         )
         raw(*raw_args)
 
-    return run
+    return attach_programs(run, raw)
 
 __all__ = ["get_twoshot_launcher"]
