@@ -3456,8 +3456,10 @@ def test_local_select_build_matches_leader_push_build():
         == cs._FLAG_LOCAL_SELECT
     )
     assert cs._local_select_flag(8, 32, True, fused_sp, 64, None, 262144) == 0
-    for cap in ((10, 7), (12, 0)):
-        assert cs._local_select_flag(8, 32, True, fused_sp, 10, cap) == 0
+    assert cs._local_select_flag(8, 32, True, fused_sp, 10, (12, 0)) == 0
+    # round 11 (lever M4): R200 takes it up to k 20 on every leader-push sample cell (cliff into the fallback from k 24)
+    assert cs._local_select_flag(8, 16, True, fused_cs, 20, (10, 7)) == cs._FLAG_LOCAL_SELECT
+    assert cs._local_select_flag(8, 16, True, fused_cs, 21, (10, 7)) == 0
     assert cs._local_select_flag(8, 16, True, fused_cs, 11, (9, 0)) == 0
     # never without bit 9, without a sample bit, without bit 0, with the whole-CTA tail, or on a single CTA / resident
     assert (
