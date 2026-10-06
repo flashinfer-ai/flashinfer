@@ -127,14 +127,15 @@ struct PreparedLaunch {
   void* p_seq_chunk_cumsum = nullptr;
   int32_t v_num_sequences{};
   int32_t v_write_seq_chunk_cumsum{};
+  void* p_preprocess_status = nullptr;
   decltype(&Kernel()) kernel = nullptr;
   tvm::ffi::dim3 grid;
   tvm::ffi::dim3 block;
-  void* kargs[22] = {};
+  void* kargs[23] = {};
   std::vector<TensorView> retained;
 };
 
-inline void Prepare(PreparedLaunch& prepared, TensorView arg_dt, TensorView arg_A, TensorView arg_dt_bias, TensorView arg_segment_starts, TensorView arg_segment_lengths, TensorView arg_chunk_indices, TensorView arg_chunk_offsets, TensorView arg_delta, TensorView arg_cumsum, int64_t arg_num_segments, int64_t arg_nheads, int64_t arg_seqlen, int64_t arg_direct_varlen_metadata, int64_t arg_dt_softplus, double arg_dt_min, double arg_dt_max, TensorView arg_seq_idx_i32, TensorView arg_seq_idx_i64, int64_t arg_seq_idx_int64, TensorView arg_seq_chunk_cumsum, int64_t arg_num_sequences, int64_t arg_write_seq_chunk_cumsum, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
+inline void Prepare(PreparedLaunch& prepared, TensorView arg_dt, TensorView arg_A, TensorView arg_dt_bias, TensorView arg_segment_starts, TensorView arg_segment_lengths, TensorView arg_chunk_indices, TensorView arg_chunk_offsets, TensorView arg_delta, TensorView arg_cumsum, int64_t arg_num_segments, int64_t arg_nheads, int64_t arg_seqlen, int64_t arg_direct_varlen_metadata, int64_t arg_dt_softplus, double arg_dt_min, double arg_dt_max, TensorView arg_seq_idx_i32, TensorView arg_seq_idx_i64, int64_t arg_seq_idx_int64, TensorView arg_seq_chunk_cumsum, int64_t arg_num_sequences, int64_t arg_write_seq_chunk_cumsum, TensorView arg_preprocess_status, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
   check_cuda_tensor(arg_dt, "dt");
   check_dtype(arg_dt, DLDataType{kDLFloat, 32, 1}, "dt");
   check_contiguous(arg_dt, "dt");
@@ -195,6 +196,9 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_dt, TensorView arg_
   TVM_FFI_CHECK(arg_write_seq_chunk_cumsum >= -2147483648LL && arg_write_seq_chunk_cumsum <= 2147483647LL, ValueError)
       << "scalar 'write_seq_chunk_cumsum' value " << arg_write_seq_chunk_cumsum
       << " is outside i32 range [-2147483648, 2147483647]";
+  check_cuda_tensor(arg_preprocess_status, "preprocess_status");
+  check_dtype(arg_preprocess_status, DLDataType{kDLInt, 32, 1}, "preprocess_status");
+  check_contiguous(arg_preprocess_status, "preprocess_status");
   check_same_device(arg_A, arg_dt, "A", "dt");
   check_same_device(arg_dt_bias, arg_dt, "dt_bias", "dt");
   check_same_device(arg_segment_starts, arg_dt, "segment_starts", "dt");
@@ -206,12 +210,13 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_dt, TensorView arg_
   check_same_device(arg_seq_idx_i32, arg_dt, "seq_idx_i32", "dt");
   check_same_device(arg_seq_idx_i64, arg_dt, "seq_idx_i64", "dt");
   check_same_device(arg_seq_chunk_cumsum, arg_dt, "seq_chunk_cumsum", "dt");
+  check_same_device(arg_preprocess_status, arg_dt, "preprocess_status", "dt");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
 
   prepared.retained.clear();
-  prepared.retained.reserve(12);
+  prepared.retained.reserve(13);
   prepared.retained.push_back(arg_dt);
   prepared.retained.push_back(arg_A);
   prepared.retained.push_back(arg_dt_bias);
@@ -224,6 +229,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_dt, TensorView arg_
   prepared.retained.push_back(arg_seq_idx_i32);
   prepared.retained.push_back(arg_seq_idx_i64);
   prepared.retained.push_back(arg_seq_chunk_cumsum);
+  prepared.retained.push_back(arg_preprocess_status);
   prepared.kernel = &Kernel();
 
   prepared.p_dt = arg_dt.data_ptr();
@@ -248,6 +254,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_dt, TensorView arg_
   prepared.p_seq_chunk_cumsum = arg_seq_chunk_cumsum.data_ptr();
   prepared.v_num_sequences = (int32_t)arg_num_sequences;
   prepared.v_write_seq_chunk_cumsum = (int32_t)arg_write_seq_chunk_cumsum;
+  prepared.p_preprocess_status = arg_preprocess_status.data_ptr();
   prepared.grid = tvm::ffi::dim3((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   prepared.block = tvm::ffi::dim3(CAKE_SSD_PREPROCESS_THREADSu, 1u, 1u);
   prepared.kargs[0] = &prepared.p_dt;
@@ -272,6 +279,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_dt, TensorView arg_
   prepared.kargs[19] = &prepared.p_seq_chunk_cumsum;
   prepared.kargs[20] = &prepared.v_num_sequences;
   prepared.kargs[21] = &prepared.v_write_seq_chunk_cumsum;
+  prepared.kargs[22] = &prepared.p_preprocess_status;
 
 }
 
@@ -887,7 +895,7 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
 }
 }  // namespace stage_main
 
-void Run(TensorView preprocess_arg_dt, TensorView preprocess_arg_A, TensorView preprocess_arg_dt_bias, TensorView preprocess_arg_segment_starts, TensorView preprocess_arg_segment_lengths, TensorView preprocess_arg_chunk_indices, TensorView preprocess_arg_chunk_offsets, TensorView preprocess_arg_delta, TensorView preprocess_arg_cumsum, int64_t preprocess_arg_num_segments, int64_t preprocess_arg_nheads, int64_t preprocess_arg_seqlen, int64_t preprocess_arg_direct_varlen_metadata, int64_t preprocess_arg_dt_softplus, double preprocess_arg_dt_min, double preprocess_arg_dt_max, TensorView preprocess_arg_seq_idx_i32, TensorView preprocess_arg_seq_idx_i64, int64_t preprocess_arg_seq_idx_int64, TensorView preprocess_arg_seq_chunk_cumsum, int64_t preprocess_arg_num_sequences, int64_t preprocess_arg_write_seq_chunk_cumsum, int64_t preprocess_grid_x, int64_t preprocess_grid_y, int64_t preprocess_grid_z, TensorView main_arg_x_map, TensorView main_arg_b_map, TensorView main_arg_c_map, TensorView main_arg_out_map, TensorView main_arg_x, TensorView main_arg_dt, TensorView main_arg_delta_precomputed, TensorView main_arg_cumsum_precomputed, TensorView main_arg_A, TensorView main_arg_B_tensor, TensorView main_arg_C, TensorView main_arg_D, TensorView main_arg_z, TensorView main_arg_dt_bias, TensorView main_arg_initial_states, TensorView main_arg_final_states, TensorView main_arg_checkpoint_states, TensorView main_arg_checkpoint_token_indices, TensorView main_arg_checkpoint_state_slots, TensorView main_arg_seq_idx_i32, TensorView main_arg_seq_idx_i64, TensorView main_arg_chunk_indices, TensorView main_arg_chunk_offsets, TensorView main_arg_seq_chunk_cumsum, TensorView main_arg_out_native, int64_t main_arg_nheads, int64_t main_arg_ngroups, int64_t main_arg_batch, int64_t main_arg_seqlen, int64_t main_arg_nchunks, int64_t main_arg_sequence_count, int64_t main_arg_num_logical_chunks, int64_t main_arg_mode_varlen, int64_t main_arg_D_mode, int64_t main_arg_has_z, int64_t main_arg_has_initial, int64_t main_arg_dt_softplus, double main_arg_dt_min, double main_arg_dt_max, int64_t main_arg_write_final_states, int64_t main_arg_checkpoint_state_count, int64_t main_grid_x, int64_t main_grid_y, int64_t main_grid_z, int64_t cuda_stream_ptr) {
+void Run(TensorView preprocess_arg_dt, TensorView preprocess_arg_A, TensorView preprocess_arg_dt_bias, TensorView preprocess_arg_segment_starts, TensorView preprocess_arg_segment_lengths, TensorView preprocess_arg_chunk_indices, TensorView preprocess_arg_chunk_offsets, TensorView preprocess_arg_delta, TensorView preprocess_arg_cumsum, int64_t preprocess_arg_num_segments, int64_t preprocess_arg_nheads, int64_t preprocess_arg_seqlen, int64_t preprocess_arg_direct_varlen_metadata, int64_t preprocess_arg_dt_softplus, double preprocess_arg_dt_min, double preprocess_arg_dt_max, TensorView preprocess_arg_seq_idx_i32, TensorView preprocess_arg_seq_idx_i64, int64_t preprocess_arg_seq_idx_int64, TensorView preprocess_arg_seq_chunk_cumsum, int64_t preprocess_arg_num_sequences, int64_t preprocess_arg_write_seq_chunk_cumsum, TensorView preprocess_arg_preprocess_status, int64_t preprocess_grid_x, int64_t preprocess_grid_y, int64_t preprocess_grid_z, TensorView main_arg_x_map, TensorView main_arg_b_map, TensorView main_arg_c_map, TensorView main_arg_out_map, TensorView main_arg_x, TensorView main_arg_dt, TensorView main_arg_delta_precomputed, TensorView main_arg_cumsum_precomputed, TensorView main_arg_A, TensorView main_arg_B_tensor, TensorView main_arg_C, TensorView main_arg_D, TensorView main_arg_z, TensorView main_arg_dt_bias, TensorView main_arg_initial_states, TensorView main_arg_final_states, TensorView main_arg_checkpoint_states, TensorView main_arg_checkpoint_token_indices, TensorView main_arg_checkpoint_state_slots, TensorView main_arg_seq_idx_i32, TensorView main_arg_seq_idx_i64, TensorView main_arg_chunk_indices, TensorView main_arg_chunk_offsets, TensorView main_arg_seq_chunk_cumsum, TensorView main_arg_out_native, int64_t main_arg_nheads, int64_t main_arg_ngroups, int64_t main_arg_batch, int64_t main_arg_seqlen, int64_t main_arg_nchunks, int64_t main_arg_sequence_count, int64_t main_arg_num_logical_chunks, int64_t main_arg_mode_varlen, int64_t main_arg_D_mode, int64_t main_arg_has_z, int64_t main_arg_has_initial, int64_t main_arg_dt_softplus, double main_arg_dt_min, double main_arg_dt_max, int64_t main_arg_write_final_states, int64_t main_arg_checkpoint_state_count, int64_t main_grid_x, int64_t main_grid_y, int64_t main_grid_z, int64_t cuda_stream_ptr) {
 
   DLDevice dev = preprocess_arg_dt.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
@@ -903,7 +911,7 @@ void Run(TensorView preprocess_arg_dt, TensorView preprocess_arg_A, TensorView p
   check_same_device(main_arg_x_map, preprocess_arg_dt, "x_map", "preprocess.dt");
   stage_preprocess::PreparedLaunch prepared_preprocess;
   stage_main::PreparedLaunch prepared_main;
-  stage_preprocess::Prepare(prepared_preprocess, preprocess_arg_dt, preprocess_arg_A, preprocess_arg_dt_bias, preprocess_arg_segment_starts, preprocess_arg_segment_lengths, preprocess_arg_chunk_indices, preprocess_arg_chunk_offsets, preprocess_arg_delta, preprocess_arg_cumsum, preprocess_arg_num_segments, preprocess_arg_nheads, preprocess_arg_seqlen, preprocess_arg_direct_varlen_metadata, preprocess_arg_dt_softplus, preprocess_arg_dt_min, preprocess_arg_dt_max, preprocess_arg_seq_idx_i32, preprocess_arg_seq_idx_i64, preprocess_arg_seq_idx_int64, preprocess_arg_seq_chunk_cumsum, preprocess_arg_num_sequences, preprocess_arg_write_seq_chunk_cumsum, preprocess_grid_x, preprocess_grid_y, preprocess_grid_z, stream);
+  stage_preprocess::Prepare(prepared_preprocess, preprocess_arg_dt, preprocess_arg_A, preprocess_arg_dt_bias, preprocess_arg_segment_starts, preprocess_arg_segment_lengths, preprocess_arg_chunk_indices, preprocess_arg_chunk_offsets, preprocess_arg_delta, preprocess_arg_cumsum, preprocess_arg_num_segments, preprocess_arg_nheads, preprocess_arg_seqlen, preprocess_arg_direct_varlen_metadata, preprocess_arg_dt_softplus, preprocess_arg_dt_min, preprocess_arg_dt_max, preprocess_arg_seq_idx_i32, preprocess_arg_seq_idx_i64, preprocess_arg_seq_idx_int64, preprocess_arg_seq_chunk_cumsum, preprocess_arg_num_sequences, preprocess_arg_write_seq_chunk_cumsum, preprocess_arg_preprocess_status, preprocess_grid_x, preprocess_grid_y, preprocess_grid_z, stream);
   stage_main::Prepare(prepared_main, main_arg_x_map, main_arg_b_map, main_arg_c_map, main_arg_out_map, main_arg_x, main_arg_dt, main_arg_delta_precomputed, main_arg_cumsum_precomputed, main_arg_A, main_arg_B_tensor, main_arg_C, main_arg_D, main_arg_z, main_arg_dt_bias, main_arg_initial_states, main_arg_final_states, main_arg_checkpoint_states, main_arg_checkpoint_token_indices, main_arg_checkpoint_state_slots, main_arg_seq_idx_i32, main_arg_seq_idx_i64, main_arg_chunk_indices, main_arg_chunk_offsets, main_arg_seq_chunk_cumsum, main_arg_out_native, main_arg_nheads, main_arg_ngroups, main_arg_batch, main_arg_seqlen, main_arg_nchunks, main_arg_sequence_count, main_arg_num_logical_chunks, main_arg_mode_varlen, main_arg_D_mode, main_arg_has_z, main_arg_has_initial, main_arg_dt_softplus, main_arg_dt_min, main_arg_dt_max, main_arg_write_final_states, main_arg_checkpoint_state_count, main_grid_x, main_grid_y, main_grid_z, stream);
   stage_preprocess::Submit(prepared_preprocess, stream);
   stage_main::Submit(prepared_main, stream);
