@@ -280,7 +280,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
     ) -> bool:
         """Pre-sync flashinfer signature; delegates to _can_implement_impl.
 
-        ``mma_tiler_k`` is 256 for FP4 and 128 for MXF8.
+        ``mma_tiler_k`` is 256 for FP4 and 128 for MXFP8.
         """
         return Sm107BlockScaledPersistentDenseGemmKernel._can_implement_impl(
             (m, n, k, l),
@@ -319,7 +319,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
         Extracts problem dims and raw pointers from the A/B and C tensors, then
         delegates to the TRT-LLM pointer-based wrapper_ptrs. A/B are either
-        FP4 packed as uint8 (2 values per byte) or MXF8 as float8.
+        FP4 packed as uint8 (2 values per byte) or MXFP8 as float8.
         C is compact (c_ld=0 derives the contiguous leading dimension).
         """
         m = cute.size(mA, mode=[0])
@@ -334,7 +334,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         elif cutlass.const_expr(mA.element_type != mB.element_type):
             raise TypeError(
                 "Unsupported mixed input dtypes for block-scaled GEMM: "
-                "mA and mB must both be Uint8 (FP4) or both FP8 (MXF8)."
+                "mA and mB must both be Uint8 (FP4) or both FP8 (MXFP8)."
             )
         else:
             k = k_raw

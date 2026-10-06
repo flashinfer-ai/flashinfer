@@ -359,8 +359,12 @@ def test_mm_mxfp8_cute_dsl_offers_sm107_tactics():
     assert {t[2] for t in tactics} == {False, True}
     # On SM107 the SM100 kernels are not autotuned when the SM107 kernel fits.
     assert len(tactics) == len(_mxfp8_cute_dsl_tactics(256, 1536, 6144))
-    # The SM107 kernel's swap-AB path needs M % 8 == 0.
-    assert not any(t[2] for t in _sm107_mxfp8_cute_dsl_tactics(100, 1536, 6144))
+    # Swap-AB puts M on the kernel's N axis, but the output's contiguous dimension
+    # is still N, so it does not need M % 8 == 0.
+    assert {t[2] for t in _sm107_mxfp8_cute_dsl_tactics(100, 1536, 6144)} == {
+        False,
+        True,
+    }
 
 
 @pytest.mark.parametrize("m,n,k", [(256, 1536, 6144), (1000, 4096, 1024)])
@@ -400,7 +404,7 @@ def test_mm_mxfp8_cute_dsl_sm107_tactics(m, n, k):
 
 @pytest.mark.parametrize("m", [1, 100, 256, 4096])
 def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m):
-    """Without autotuning, SM107 runs the SM107 kernel, never swap-AB at M % 8 != 0."""
+    """Without autotuning, SM107 runs the SM107 kernel."""
     n, k = 1536, 1024
     _sm107_mxfp8_cute_dsl_tactics(m, n, k)
     from flashinfer.gemm.kernels.utils import _select_sm107_mm_mxfp8_cute_dsl_tactic
@@ -410,7 +414,6 @@ def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m):
         m, n, k, get_device_sm_count(torch.device("cuda"))
     )
     assert tactic is not None and isinstance(tactic[4], tuple), tactic
-    assert m % 8 == 0 or not tactic[2], tactic
 
     cached = set(gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE)  # pyright: ignore[reportPrivateUsage]
     _run_mm_mxfp8(
@@ -427,9 +430,10 @@ def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m):
     assert all(isinstance(key[1][-1], tuple) for key in launched), launched
 
 
-def test_mm_mxfp8_cute_dsl_stale_sm107_swap_ab_tactic_falls_back():
-    """A swap-AB SM107 tactic replayed at an M that is not a multiple of 8."""
-    m, n, k = 100, 1536, 1024
+@pytest.mark.parametrize("m", [1, 3, 100, 129])
+def test_mm_mxfp8_cute_dsl_sm107_swap_ab_any_m(m):
+    """Swap-AB SM107 tactics run at any M, including M % 8 != 0."""
+    n, k = 1536, 1024
     _sm107_mxfp8_cute_dsl_tactics(m, n, k)
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
@@ -453,7 +457,6 @@ def test_mm_mxfp8_cute_dsl_stale_sm107_swap_ab_tactic_falls_back():
             out,
             workspace,
         ],
-        # Valid for M % 8 == 0, but not for the runtime M=100 above.
         tactic=((128, 128), (1, 1), True, False, (128,)),
     )
 
