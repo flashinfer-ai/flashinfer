@@ -16,6 +16,7 @@
 
 import pytest
 import torch
+import tvm_ffi
 
 from flashinfer.fused_moe import (
     QuantConfig,
@@ -27,6 +28,15 @@ from flashinfer.fused_moe import (
     cutlass_fused_moe_workspace_size,
     trtllm_fp4_block_scale_routed_moe,
 )
+from flashinfer.fused_moe.cake_kimi_k3_situ import (
+    _cake_situ_flat_args,
+    _cake_situ_stage_bindings,
+    _cake_situ_workspace_views,
+    _geometry,
+    _prepared,
+    _workspace_layout,
+)
+from flashinfer.jit.cake_kimi_k3_situ import PROGRAMS, ROUTES, get_cake_situ_module
 from flashinfer.tllm_enums import ActivationType, RoutingMethodType
 from flashinfer.utils import device_support_pdl
 
@@ -78,6 +88,22 @@ def test_cake_situ_workspace_size_holds_every_smaller_shape():
         assert size == running_max
     assert _workspace_size(max_num_tokens=40) >= _workspace_size(max_num_tokens=32)
     assert _workspace_size(max_num_tokens=100) >= _workspace_size(max_num_tokens=64)
+
+
+def test_cake_situ_workspace_layout_adds_pre_shuffled_scale_factors():
+    # The 16384-token layout appends the pre-shuffled FC1 scale-factor images
+    # (one 4096-byte image per N-tile and 512-element K-step) as its last
+    # field; every other token count keeps its previous layout.
+    tile_n, _, max_tiles = _geometry(16384)
+    assert (tile_n, max_tiles) == (128, 2937)
+    layout, nbytes = _workspace_layout(16384)
+    offset, size, dtype, shape = layout["sfb_shuffled"]
+    assert size == max_tiles * (HIDDEN // 512) * 4096 == 84_209_664
+    assert dtype == torch.uint8 and shape == (size,)
+    assert offset == max(start for start, _, _, _ in layout.values())
+    assert nbytes >= offset + size
+    assert "sfb_shuffled" not in _workspace_layout(8192)[0]
+    assert "sfb_shuffled" not in _workspace_layout(2048)[0]
 
 
 @pytest.fixture(scope="module")
@@ -136,8 +162,13 @@ def cake_situ_weights(cake_situ_device):
 
 @pytest.fixture(scope="module")
 def cake_situ_workspace(cake_situ_device):
-    # A single maximum-size allocation is reused across all four token sizes.
-    return torch.empty(_workspace_size(), dtype=torch.uint8, device=cake_situ_device)
+    # A single maximum-size allocation is reused across all parametrized token
+    # sizes; the 16384-token shape needs the largest layout.
+    return torch.empty(
+        _workspace_size(max_num_tokens=16384),
+        dtype=torch.uint8,
+        device=cake_situ_device,
+    )
 
 
 @pytest.mark.parametrize(
@@ -217,8 +248,8 @@ def _trtllm_reference(x, ids, route_weights, prepared):
 
 @pytest.mark.parametrize(
     "num_tokens",
-    [64, 256, 512, 2048],
-    ids=["n8", "n16", "n32", "n128"],
+    [64, 256, 512, 2048, 16384],
+    ids=["n8", "n16", "n32", "n128", "m16384"],
 )
 def test_cake_situ_output_workspace_and_external_graph(
     num_tokens,
@@ -338,3 +369,300 @@ def test_cake_situ_output_workspace_and_external_graph(
     torch.testing.assert_close(output, default_parameters_output, atol=0.0, rtol=0.0)
     assert output.data_ptr() == output_ptr
     assert workspace.data_ptr() == workspace_ptr
+
+
+def _arch(device):
+    return {(10, 0): "sm_100a", (10, 3): "sm_103a"}[
+        torch.cuda.get_device_capability(device)
+    ]
+
+
+def _uniform_routing(num_tokens, device):
+    slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
+    tokens = torch.arange(num_tokens, dtype=torch.int32, device=device)
+    return ((tokens[:, None] * TOP_K + slots[None, :]) % EXPERTS).contiguous()
+
+
+def _skewed_routing(num_tokens, device):
+    # Sixteen experts receive almost every token (127 full tiles plus one
+    # partial tile each). The last 96 tokens spread their 1536 pairs over the
+    # other 880 experts, so most of those experts own a tile with one or two
+    # valid rows, and the routed tile count stays below the maximum.
+    slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
+    tokens = torch.arange(num_tokens, dtype=torch.int32, device=device)
+    ids = slots[None, :].expand(num_tokens, TOP_K).clone()
+    tail = tokens >= num_tokens - 96
+    ids[tail] = TOP_K + (tokens[tail, None] * TOP_K + slots[None, :]) % (
+        EXPERTS - TOP_K
+    )
+    return ids.contiguous()
+
+
+def _submit_large_route(num_tokens, routing, device, prepared, workspace):
+    """Prepare and submit one complete call; return the inputs and the
+    option dictionary the stage bindings consume for direct-launch checks."""
+    generator = torch.Generator(device=device).manual_seed(7000 + num_tokens)
+    x = torch.randn(
+        num_tokens,
+        HIDDEN,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    ids = routing(num_tokens, device)
+    route_weights = (
+        torch.randn(
+            num_tokens,
+            TOP_K,
+            device=device,
+            generator=generator,
+        )
+        .softmax(dim=-1)
+        .to(torch.bfloat16)
+    )
+    output = torch.full_like(x, float("nan"))
+    quant_scales = [
+        torch.ones(1, device=device, dtype=torch.float32),
+        prepared["gemm1_weights_scale"],
+        prepared["output1_scale_gate_scalar"],
+        prepared["output1_scale_scalar"],
+        prepared["gemm2_weights_scale"],
+        prepared["output2_scale_scalar"],
+    ]
+    cake_fused_moe_prepare_workspace(
+        workspace,
+        num_tokens,
+        backend="cake",
+        weight_layout="trtllm_shuffled_nvfp4_group16",
+    )
+    assert (
+        cutlass_fused_moe(
+            x,
+            ids,
+            route_weights,
+            prepared["gemm1_weights"],
+            prepared["gemm2_weights"],
+            torch.bfloat16,
+            quant_scales,
+            activation_type=ActivationType.Situ,
+            tp_size=8,
+            backend="cake",
+            output=output,
+            workspace_buffer=workspace,
+        )
+        is output
+    )
+    torch.cuda.synchronize(device)
+    options = dict(
+        input=x,
+        workspace_buffer=workspace,
+        token_selected_experts=ids,
+        token_final_scales=route_weights,
+        fc1_expert_weights=prepared["gemm1_weights"],
+        fc2_expert_weights=prepared["gemm2_weights"],
+        output=output,
+        quant_scales=quant_scales,
+        situ_beta=None,
+        situ_linear_beta=None,
+    )
+    return x, ids, route_weights, output, options
+
+
+def _fc1_scales_by_row(views, max_tiles):
+    # FC1 stores its output scale factors in the tile layout FC2 loads: per
+    # tile and per 64 elements of the intermediate size one 512-byte block
+    # whose word (row % 32, row // 32) holds the row's four scale bytes.
+    blocks = views["intermediate_scales"].view(max_tiles, INTERMEDIATE // 64, 32, 4, 4)
+    return blocks.permute(0, 3, 2, 1, 4).reshape(max_tiles * 128, INTERMEDIATE // 16)
+
+
+def _per_pair_scratch(views, max_tiles):
+    # The routing scatter assigns each (token, expert-slot) pair a row inside
+    # its expert's tiles; that position is not deterministic from call to
+    # call, so the per-row scratch is compared in pair order through
+    # token_to_permuted (the map finalization uses), never by row index.
+    permuted = views["token_to_permuted"].long()
+    return {
+        "intermediate_packed": views["intermediate_packed"][permuted].clone(),
+        "intermediate_scales": _fc1_scales_by_row(views, max_tiles)[permuted].clone(),
+        "expert_output": views["expert_output"][permuted].clone(),
+    }
+
+
+def _launch_program(program_key, args):
+    module = get_cake_situ_module(program_key)
+    entry = getattr(module, PROGRAMS[program_key]["ffi_entry"])
+    with tvm_ffi.use_torch_stream():
+        entry(*args)
+
+
+def _module_args(program_key, stage):
+    # A single-kernel module takes the stage's bindings with unqualified names.
+    return [
+        stage["grid"][("grid_x", "grid_y", "grid_z").index(name)]
+        if kind == "grid"
+        else stage[name]
+        for kind, name in PROGRAMS[program_key]["arg_plan"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "routing", [_uniform_routing, _skewed_routing], ids=["uniform", "skewed"]
+)
+def test_cake_situ_m16384_pre_shuffled_route_matches_previous_fc1_program(
+    routing,
+    cake_situ_device,
+    cake_situ_weights,
+    cake_situ_workspace,
+):
+    # The 16384-token route runs the scale-factor writer and the FC1 program
+    # that loads the pre-shuffled images. Its FC1 outputs (per routed pair),
+    # the FC2 outputs and the complete call must be bitwise identical to the
+    # previous FC1 program, which gathers and shuffles the scale factors
+    # itself. That program is still shipped as the tile-N128 sequence, so it
+    # runs here on the same workspace, inputs and stage bindings.
+    num_tokens = 16384
+    device, weights, workspace = (
+        cake_situ_device,
+        cake_situ_weights,
+        cake_situ_workspace,
+    )
+    x, ids, route_weights, output, options = _submit_large_route(
+        num_tokens, routing, device, weights, workspace
+    )
+    expected = _trtllm_reference(x, ids, route_weights, weights)
+    assert expected.abs().max() > 2.0
+    torch.testing.assert_close(output, expected, atol=1.0, rtol=0.1)
+
+    prepared = _prepared(workspace, num_tokens)
+    arch = _arch(device)
+    assert prepared["large_c7"]
+    assert prepared["program_key"] == ROUTES[(arch, "large_c7")]
+    previous_key = ROUTES[(arch, 128)]
+    assert previous_key != prepared["program_key"]
+    previous_names = {name for _, name in PROGRAMS[previous_key]["arg_plan"]}
+    assert "fc1.SFB" in previous_names and "fc1.SFBS" not in previous_names
+    assert not any(name.startswith("sfb_shuffle.") for name in previous_names)
+
+    views = _cake_situ_workspace_views(workspace, num_tokens)
+    total_tiles = int(views["total_tiles"].item())
+    assert 0 < total_tiles < prepared["max_tiles"]
+    pre_shuffled = _per_pair_scratch(views, prepared["max_tiles"])
+    pre_shuffled_output = output.clone()
+    for name in ("intermediate_packed", "intermediate_scales"):
+        views[name].zero_()
+    views["expert_output"].fill_(float("nan"))
+    output.fill_(float("nan"))
+
+    stages = _cake_situ_stage_bindings(options, prepared)
+    _launch_program(previous_key, _cake_situ_flat_args(stages, previous_key))
+    torch.cuda.synchronize(device)
+    assert int(views["total_tiles"].item()) == total_tiles
+    for name, tensor in _per_pair_scratch(views, prepared["max_tiles"]).items():
+        assert torch.equal(tensor, pre_shuffled[name]), name
+    assert torch.equal(output, pre_shuffled_output)
+
+
+_WRITER_ARGUMENTS = [
+    "SFB",
+    "route_map",
+    "tile_mn_limit",
+    "total_tiles",
+    "SFBS",
+    "K",
+    "K_tiles",
+    "grid_n",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+]
+
+
+def _writer_program_key(arch):
+    keys = [
+        key
+        for key, record in PROGRAMS.items()
+        if record["arch"] == arch
+        and [name for _, name in record["arg_plan"]] == _WRITER_ARGUMENTS
+    ]
+    assert len(keys) == 1, keys
+    return keys[0]
+
+
+def _reference_sfb_shuffle(x_scales, route_map, tile_mn_limit, total_tiles):
+    # Image (tile, k) is the 128 x 32-byte block of routed scale factors for
+    # K-step k, stored word by word (one word = the four 16-element groups of
+    # 64 elements of K) at word index j * 128 + (row % 32) * 4 + row // 32.
+    # Rows past the tile's valid row count are zero.
+    device = x_scales.device
+    k_tiles = x_scales.shape[1] // 32
+    rows = torch.arange(total_tiles * 128, device=device)
+    tile, row = rows // 128, rows % 128
+    valid = rows < tile_mn_limit.long()[tile]
+    tokens = route_map.long()[rows[valid]]
+    image = torch.zeros(
+        total_tiles, k_tiles, 8, 32, 4, 4, dtype=torch.uint8, device=device
+    )
+    image[tile[valid], :, :, row[valid] % 32, row[valid] // 32, :] = x_scales[
+        tokens
+    ].view(-1, k_tiles, 8, 4)
+    return image.view(total_tiles, k_tiles * 4096)
+
+
+@pytest.mark.parametrize(
+    "routing", [_uniform_routing, _skewed_routing], ids=["uniform", "skewed"]
+)
+def test_cake_situ_sfb_shuffle_writer_matches_reference(
+    routing,
+    cake_situ_device,
+    cake_situ_weights,
+    cake_situ_workspace,
+):
+    # Launch the scale-factor writer alone, on the routing tables and
+    # quantized scale factors the complete call left in the workspace, and
+    # compare its images with a Python shuffle. A sentinel fill shows that
+    # padding tiles past the routed tile count are never written and that
+    # padding rows of a partial tile are written as zeros.
+    num_tokens = 16384
+    device, weights, workspace = (
+        cake_situ_device,
+        cake_situ_weights,
+        cake_situ_workspace,
+    )
+    _, _, _, _, options = _submit_large_route(
+        num_tokens, routing, device, weights, workspace
+    )
+    prepared = _prepared(workspace, num_tokens)
+    assert prepared["large_c7"]
+    views = _cake_situ_workspace_views(workspace, num_tokens)
+    stages = _cake_situ_stage_bindings(options, prepared)
+    stage = stages["sfb_shuffle"]
+    max_tiles = prepared["max_tiles"]
+    assert stage["grid"] == (max_tiles, 1, 1) and stage["grid_n"] == max_tiles
+    total_tiles = int(views["total_tiles"].item())
+    assert 0 < total_tiles < max_tiles
+    rows_in_tile = views["tile_mn_limit"][:total_tiles].long() - 128 * torch.arange(
+        total_tiles, device=device
+    )
+    assert rows_in_tile.min() >= 1 and rows_in_tile.max() <= 128
+    assert (rows_in_tile < 128).any()
+    if routing is _skewed_routing:
+        assert (rows_in_tile <= 2).sum() >= 400
+
+    sentinel = 0xFF
+    images = views["sfb_shuffled"].view(max_tiles, -1)
+    images.fill_(sentinel)
+    key = _writer_program_key(_arch(device))
+    _launch_program(key, _module_args(key, stage))
+    torch.cuda.synchronize(device)
+    expected = _reference_sfb_shuffle(
+        views["x_scales"], views["route_map"], views["tile_mn_limit"], total_tiles
+    )
+    assert torch.equal(images[:total_tiles], expected)
+    assert (images[total_tiles:] == sentinel).all()
+    # FC1 consumes the same bytes through its 4-D TMA view: one 512-byte
+    # (2 x 256) block per 64 elements of K for every tile.
+    fc1_images = stages["fc1"]["SFBS"]
+    assert fc1_images.data_ptr() == images.data_ptr()
+    assert tuple(fc1_images.shape) == (max_tiles, HIDDEN // 64, 2, 256)
+    assert fc1_images.numel() == images.numel()
