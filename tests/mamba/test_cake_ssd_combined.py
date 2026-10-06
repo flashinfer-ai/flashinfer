@@ -48,15 +48,29 @@ _ATOL = _RTOL = 1e-2
 _MAX_OUTSIDE_FRACTION = 0.01
 
 
+def _declared_num_seqs(arguments):
+    """The packed-sequence count a varlen call declares, in the runner's
+    precedence: ``initial_states`` rows, ``seq_chunk_cumsum`` entries - 1,
+    ``num_seqs``."""
+
+    initial_states = arguments.get("initial_states")
+    if initial_states is not None:
+        return int(initial_states.shape[0])
+    seq_chunk_cumsum = arguments.get("seq_chunk_cumsum")
+    if seq_chunk_cumsum is not None:
+        return int(seq_chunk_cumsum.numel()) - 1
+    return int(arguments["num_seqs"])
+
+
 def _sequence_lengths(constructor, tensors, arguments):
-    """Per-sequence token counts: from ``seq_idx`` in packed-varlen mode,
-    ``seqlen`` per batch element otherwise."""
+    """Per-sequence token counts: from ``seq_idx`` in packed-varlen mode (an
+    id without tokens counts zero), ``seqlen`` per batch element otherwise."""
 
     x = tensors[0]
     if not constructor["has_varlen"]:
         return [x.shape[1]] * x.shape[0]
     seq_idx = arguments["seq_idx"].reshape(-1).to(torch.int64)
-    return torch.bincount(seq_idx).tolist()
+    return torch.bincount(seq_idx, minlength=_declared_num_seqs(arguments)).tolist()
 
 
 def _fp64_reference(constructor, tensors, arguments, *, delta_dtype=None):
@@ -271,15 +285,42 @@ def _varlen_metadata(lengths, dtype):
 
 
 def _seq_chunk_cumsum(lengths):
-    """Exclusive prefix sum of per-sequence logical chunk counts."""
+    """Exclusive prefix sum of per-sequence logical chunk counts (a sequence
+    without tokens owns no logical chunk)."""
 
     cumsum = [0]
     start = 0
     for length in lengths:
         end = start + length
-        cumsum.append(cumsum[-1] + (-(-end // 128) - start // 128))
+        chunks = (-(-end // 128) - start // 128) if length else 0
+        cumsum.append(cumsum[-1] + chunks)
         start = end
     return torch.tensor(cumsum, dtype=torch.int32, device="cuda")
+
+
+def _without_empty_sequences(constructor, arguments, lengths):
+    """The same packed problem restricted to the ids that own tokens (the CuTe
+    backend requires every id to own one): ids renumbered densely, metadata
+    rebuilt, ``initial_states`` rows of the empty ids dropped.  Returns the
+    dense arguments, the dense lengths and the kept (non-empty) ids."""
+
+    kept = [sequence for sequence, length in enumerate(lengths) if length]
+    dense_lengths = [lengths[sequence] for sequence in kept]
+    seq_idx, chunk_indices, chunk_offsets = _varlen_metadata(
+        dense_lengths, constructor["seq_idx_dtype"]
+    )
+    dense = {
+        **arguments,
+        "seq_idx": seq_idx,
+        "chunk_indices": chunk_indices,
+        "chunk_offsets": chunk_offsets,
+        "seq_chunk_cumsum": _seq_chunk_cumsum(dense_lengths),
+    }
+    if arguments.get("initial_states") is not None:
+        dense["initial_states"] = arguments["initial_states"][kept].contiguous()
+    if arguments.get("num_seqs") is not None:
+        dense["num_seqs"] = len(kept)
+    return dense, dense_lengths, kept
 
 
 def _case(
@@ -900,6 +941,137 @@ def test_cake_ssd_combined_varlen_without_initial_states_needs_a_count():
 
     with pytest.raises(ValueError, match="requires seq_chunk_cumsum or num_seqs"):
         SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
+
+
+@pytest.mark.parametrize("table_source", ("preprocess", "caller"))
+@pytest.mark.parametrize("initial_states", (True, False), ids=("initial", "zero"))
+@pytest.mark.parametrize(
+    "lengths,seq_idx_dtype",
+    [
+        ((128, 0, 200), torch.int32),
+        ((0, 300, 0), torch.int32),
+        ((100, 0, 0, 156), torch.int64),
+    ],
+    ids=("empty-middle", "empty-first-and-last", "two-empty-i64"),
+)
+def test_cake_ssd_combined_varlen_empty_sequences(
+    lengths, seq_idx_dtype, initial_states, table_source
+):
+    """CAKE-990: a packed-sequence id without tokens is part of the contract.
+    The preprocess (or the caller's table) gives it an empty chunk range; its
+    final state is ``initial_states[id]`` (zero without initial states); the
+    sequences that own tokens match the CuTe reference of the dense problem
+    and the fp64 recurrence; the status word stays clear."""
+
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    constructor, tensors, arguments = _case(
+        varlen=True,
+        lengths=lengths,
+        seq_idx_dtype=seq_idx_dtype,
+        initial_states=initial_states,
+    )
+    if table_source == "preprocess":
+        arguments["seq_chunk_cumsum"] = None
+        if not initial_states:
+            arguments["num_seqs"] = len(lengths)
+    dense_arguments, dense_lengths, kept = _without_empty_sequences(
+        constructor, arguments, lengths
+    )
+    assert len(kept) < len(lengths)
+    expected = _cute_padded_reference(constructor, tensors, dense_arguments, dense_lengths)
+    runner = SSDCombined(**constructor, backend="cake")
+    runner._cake_runner.seq_idx_status(reset=True)
+
+    out, final = runner.run(*tensors, **arguments)
+
+    assert runner._cake_runner.seq_idx_status(reset=True) == 0
+    assert tuple(final.shape) == (len(lengths), 8, 64, 128)
+    _assert_cake_accuracy(
+        (out, final[kept]), expected, constructor, tensors, dense_arguments
+    )
+    for sequence, length in enumerate(lengths):
+        if length:
+            continue
+        if initial_states:
+            assert torch.equal(final[sequence], arguments["initial_states"][sequence])
+        else:
+            assert not final[sequence].to(torch.float32).any()
+
+
+@pytest.mark.parametrize(
+    "lengths,tail,seq_idx_dtype",
+    [
+        ((100, 150), 70, torch.int32),
+        ((128, 128), 64, torch.int32),
+        ((100, 150), 70, torch.int64),
+    ],
+    ids=("tail-shares-chunk", "tail-opens-chunk", "tail-shares-chunk-i64"),
+)
+def test_cake_ssd_combined_flags_out_of_range_seq_idx(lengths, tail, seq_idx_dtype):
+    """CAKE-990: ``seq_idx`` ids ``0 .. num_seqs`` with ``num_seqs`` declared
+    sequences (the trailing id is out of range).  No out-of-bounds write
+    (the caller's ``[num_seqs + 1]`` table receives exactly the in-range
+    boundaries), the status word is set, the in-range sequences are bitwise
+    those of the clean problem and correct against CuTe / fp64, and a clean
+    call afterwards leaves the reset word at 0."""
+
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    num_seqs = len(lengths)
+    total = sum(lengths)
+    constructor, tensors, arguments = _case(
+        varlen=True, lengths=(*lengths, tail), seq_idx_dtype=seq_idx_dtype
+    )
+    x, dt, A, B, C = tensors
+    table = torch.full((num_seqs + 1,), -7, dtype=torch.int32, device="cuda")
+    flagged_arguments = {
+        **arguments,
+        "initial_states": arguments["initial_states"][:num_seqs].contiguous(),
+        "seq_chunk_cumsum": table,
+        "update_seq_chunk_cumsum": True,
+    }
+    clean_tensors = tuple(
+        value[:, :total].contiguous() if value.ndim >= 2 and value.shape[1] == total + tail else value
+        for value in tensors
+    )
+    seq_idx, chunk_indices, chunk_offsets = _varlen_metadata(lengths, seq_idx_dtype)
+    clean_arguments = {
+        **flagged_arguments,
+        "z": arguments["z"][:, :total].contiguous(),
+        "seq_idx": seq_idx,
+        "chunk_indices": chunk_indices,
+        "chunk_offsets": chunk_offsets,
+        "seq_chunk_cumsum": None,
+        "update_seq_chunk_cumsum": False,
+    }
+    expected = _cute_padded_reference(constructor, clean_tensors, clean_arguments, lengths)
+    runner = SSDCombined(**constructor, backend="cake")
+    cake = runner._cake_runner
+    cake.seq_idx_status(reset=True)
+    clean_out, clean_final = runner.run(*clean_tensors, **clean_arguments)
+    assert cake.seq_idx_status() == 0
+
+    out, final = runner.run(*tensors, **flagged_arguments)
+
+    assert cake.seq_idx_status(reset=True) == 1
+    # The out-of-range id closes the in-range ranges and opens none of its
+    # own: table[num_seqs] is the first segment of the out-of-range tail.
+    expected_table = _seq_chunk_cumsum(lengths).tolist()
+    expected_table[-1] = int(_seq_chunk_cumsum((*lengths, tail))[num_seqs])
+    assert table.tolist() == expected_table
+    assert tuple(final.shape) == (num_seqs, 8, 64, 128)
+    assert torch.equal(out[:, :total], clean_out)
+    assert torch.equal(final, clean_final)
+    _assert_cake_accuracy(
+        (out[:, :total], final), expected, constructor, clean_tensors, clean_arguments
+    )
+    runner.run(*clean_tensors, **clean_arguments)
+    assert cake.seq_idx_status(reset=True) == 0
 
 
 def _realistic_decay_inputs(lengths, seed, *, nheads=128, ngroups=8, varlen=True):
@@ -2500,6 +2672,7 @@ def test_source_direct_preprocess_and_sequence_argument_order():
             "seq_idx_i32",
             "seq_idx_i64",
             "seq_chunk_cumsum",
+            "preprocess_status",
         )
     }
     preprocess, preprocess_grid = module._direct_preprocess_inputs(
@@ -2525,6 +2698,7 @@ def test_source_direct_preprocess_and_sequence_argument_order():
         seq_chunk_cumsum=sentinels["seq_chunk_cumsum"],
         num_sequences=2,
         write_seq_chunk_cumsum=True,
+        preprocess_status=sentinels["preprocess_status"],
     )
     main = {name: object() for name in module._MAIN_ARGS}
 
@@ -2546,15 +2720,17 @@ def test_source_direct_preprocess_and_sequence_argument_order():
     assert preprocess["seq_chunk_cumsum"] is sentinels["seq_chunk_cumsum"]
     assert preprocess["num_sequences"] == 2
     assert preprocess["write_seq_chunk_cumsum"] == 1
+    assert preprocess["preprocess_status"] is sentinels["preprocess_status"]
     assert preprocess_grid == (12, 1, 1)
     assert set(preprocess) == set(module._PREPROCESS_ARGS)
-    assert module._PREPROCESS_ARGS[-6:] == (
+    assert module._PREPROCESS_ARGS[-7:] == (
         "seq_idx_i32",
         "seq_idx_i64",
         "seq_idx_int64",
         "seq_chunk_cumsum",
         "num_sequences",
         "write_seq_chunk_cumsum",
+        "preprocess_status",
     )
     assert bound == (
         *(preprocess[name] for name in module._PREPROCESS_ARGS),
@@ -2567,11 +2743,83 @@ def test_source_direct_preprocess_and_sequence_argument_order():
         1,
         0x1234,
     )
-    assert len(bound) == 22 + 3 + 41 + 3 + 1
+    assert len(bound) == 23 + 3 + 41 + 3 + 1
 
     assert module._persistent_grid_size(total_work=256, sm_count=148) == 128
     assert module._persistent_grid_size(total_work=384, sm_count=148) == 128
     assert module._persistent_grid_size(total_work=129, sm_count=148) == 129
+
+
+def _host_prepare_arguments(template, stage):
+    """``arg_<name>`` parameters of ``stage_<stage>::Prepare`` in the generated
+    host template, in declaration order."""
+
+    namespace = template.index(f"namespace stage_{stage} {{")
+    start = template.index("inline void Prepare(PreparedLaunch& prepared, ", namespace)
+    return tuple(re.findall(r"\barg_(\w+)", template[start : template.index(")", start)]))
+
+
+def _host_run_arguments(template, stage):
+    """``<stage>_arg_<name>`` parameters of the host ``Run`` entry, in order."""
+
+    start = template.index("\nvoid Run(")
+    signature = template[start : template.index(")", start)]
+    return tuple(re.findall(rf"\b{stage}_arg_(\w+)", signature))
+
+
+def test_source_host_template_binds_stage_arguments_in_loader_order():
+    """The generated host launcher's positional ABI (``Prepare`` of both
+    stages and the ``Run`` entry) must list exactly the loader's
+    ``_PREPROCESS_ARGS`` / ``_MAIN_ARGS`` in order; ``preprocess_status`` is
+    the last preprocess tensor (CAKE-990)."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    template = (module._source_dir() / module._HOST_TEMPLATE).read_text(encoding="utf-8")
+
+    assert _host_prepare_arguments(template, "preprocess") == module._PREPROCESS_ARGS
+    assert _host_prepare_arguments(template, "main") == module._MAIN_ARGS
+    assert _host_run_arguments(template, "preprocess") == module._PREPROCESS_ARGS
+    assert _host_run_arguments(template, "main") == module._MAIN_ARGS
+    assert module._PREPROCESS_ARGS[-1] == "preprocess_status"
+    assert 'check_dtype(arg_preprocess_status, DLDataType{kDLInt, 32, 1}, "preprocess_status");' in template
+    assert "prepared.kargs[22] = &prepared.p_preprocess_status;" in template
+
+
+def test_source_runner_binds_preprocess_status_without_gpu(monkeypatch):
+    """The runner owns one zeroed int32 status word per device, binds it as
+    ``preprocess_status`` on every call and exposes it through the
+    synchronizing debug accessor ``seq_idx_status``."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(module, monkeypatch, calls, has_varlen=True)
+    seqlen = 300
+    x = torch.empty((1, seqlen, 1, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 1), dtype=torch.float32)
+    A = torch.empty((1,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 1, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {
+        "seq_idx": torch.zeros((1, seqlen), dtype=torch.int32),
+        "chunk_indices": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "chunk_offsets": torch.tensor([0, 0, 0], dtype=torch.int32),
+        "num_seqs": 1,
+    }
+    cpu = torch.device("cpu")
+
+    runner.run(x, dt, A, B, C, **kwargs)
+    runner.run(x, dt, A, B, C, **kwargs)
+
+    (first, second) = (launch["preprocess"]["preprocess_status"] for _, launch in calls)
+    assert first is second
+    assert first.dtype == torch.int32 and tuple(first.shape) == (1,)
+    assert first.device == cpu and int(first.item()) == 0
+    assert runner.seq_idx_status(device=cpu) == 0
+    first[0] = 1
+    assert runner.seq_idx_status(device=cpu) == 1
+    assert runner.seq_idx_status(reset=True, device=cpu) == 1
+    assert runner.seq_idx_status(device=cpu) == 0
+    assert int(first.item()) == 0
 
 
 def test_source_sequence_arguments_fail_closed_on_missing_values():
