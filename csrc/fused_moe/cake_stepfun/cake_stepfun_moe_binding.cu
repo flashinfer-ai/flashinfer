@@ -359,7 +359,10 @@ String cake_stepfun_fc2_activation_sf_layout(String const& family, int64_t tile_
  * block scales, ``gemm2_weights`` the trtllm-prepared weights with optional block scales,
  * ``output2_scale_scalar`` the optional per-expert FP32 output scales and ``per_token_scale``
  * the fp32 per-token scales of the ``nvfp4_bf16tok`` family. ``gemm2_output`` receives bf16
- * rows in permuted order ([max_padded_tokens, hidden_size]).
+ * rows in permuted order ([max_padded_tokens, hidden_size]). ``pad_routing_tail`` has the meaning
+ * of cake_stepfun_fc1's flag; ``false`` is valid because every exported FC2 kernel consumes
+ * ``num_non_exiting_ctas`` exactly like the native kernels (surplus CTAs exit), so routing arrays
+ * that already carry the benign tail need no tail kernel.
  */
 void cake_stepfun_fc2(
     String const& family, TensorView const& gemm2_input,

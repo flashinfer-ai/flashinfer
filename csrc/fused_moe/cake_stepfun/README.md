@@ -228,7 +228,9 @@ the stages of the build in pipeline order and `cake_stepfun_full_path()` tells t
 variant. On the full path the module adds `cake_stepfun_routing_inputs()`,
 `cake_stepfun_finalize_weight_dtypes()`, `cake_stepfun_fc2_tiles(family)`,
 `cake_stepfun_fc2_activation_sf_layout(family, tile)`, `cake_stepfun_fc2(...)` (same
-`pad_routing_tail` flag as `cake_stepfun_fc1`), `cake_stepfun_requant(...)`,
+`pad_routing_tail` flag as `cake_stepfun_fc1`; `false` is valid only because every exported
+FC2 kernel consumes `num_non_exiting_ctas` exactly like the native kernels, so a caller whose
+routing arrays already carry the benign tail launches no tail kernel), `cake_stepfun_requant(...)`,
 `cake_stepfun_finalize(...)` and
 `cake_stepfun_routing(...)` (the router on caller-owned tables, both input
 kinds); routing is also reachable through the module's `trtllm_moe_run_routing*`
