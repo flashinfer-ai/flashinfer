@@ -35,6 +35,24 @@ from flashinfer.utils import get_compute_capability
 
 pytestmark = pytest.mark.solo
 
+# cuTile shape grids. The cuTile kernels bake M/N/K (and TOTAL_M/Q for the group
+# kernel) in as ct.Constant, so every distinct shape is a fresh tileiras JIT, and
+# the dense path also runs a 24-config exhaustive_search per shape. On the full
+# cutlass/trtllm grids that is ~9 s/case (dense) and ~4 s/case (group), i.e.
+# ~60 min per file on SM100/SM103 once CUDA 13 CI images ship tileiras (#4939).
+# Keep a representative subset that still covers: a single K tile, multi K tile,
+# small/large M (swap_ab / BLOCK_M pruning), and both group-config branches
+# (avg_m < 256 -> swap_ab BLOCK_M=64; avg_m >= 256 -> BLOCK_M=128).
+_CUTILE_GEMM_SHAPES = {
+    (m, n, k) for m in (128, 512, 8192) for n in (256, 4096) for k in (128, 8192)
+}
+_CUTILE_GROUP_GEMM_SHAPES = {
+    (m, n, k, g)
+    for m in (4, 128, 512, 4096)
+    for (n, k) in ((128, 128), (4096, 8192))
+    for g in (1, 8)
+}
+
 
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
@@ -113,6 +131,8 @@ def test_fp8_groupwise_gemm(
             pytest.skip(
                 "cuda-tile / tileiras compiler not available in this environment."
             )
+        if (m, n, k) not in _CUTILE_GEMM_SHAPES:
+            pytest.skip("cuTile: reduced shape grid (one tileiras JIT per shape)")
     torch.random.manual_seed(0)
     tile_size = 128
     out_dtype = torch.bfloat16
@@ -239,6 +259,8 @@ def test_fp8_groupwise_group_gemm(
             pytest.skip(
                 "cuda-tile / tileiras compiler not available in this environment."
             )
+        if (m, n, k, group_size) not in _CUTILE_GROUP_GEMM_SHAPES:
+            pytest.skip("cuTile: reduced shape grid (one tileiras JIT per shape)")
     torch.random.manual_seed(0)
     tile_size = 128
 
