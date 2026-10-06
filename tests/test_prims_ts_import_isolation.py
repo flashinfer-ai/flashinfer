@@ -93,10 +93,19 @@ assert hasattr(nested, "_tile_idx")
 assert isinstance(nested.tile_idx[2], tuple)
 assert len(nested.tile_idx[2]) == 2
 
+# CUTLASS DSL 4.7 patches the shared WorkTileInfo class when Task Scheduling
+# is imported; later wheels ship a Task Scheduling subclass and leave it alone.
+from cutlass.experimental.task_scheduling import resources as ts_resources
+
+patches_shared_class = ts_resources.WorkTileInfo is WorkTileInfo
+
 with task_scheduling_scope():
-    assert WorkTileInfo.__init__ is not original_init
-    task_tile = WorkTileInfo((Int32(1), Int32(0), Int32(2)), Boolean(True))
-    assert not hasattr(task_tile, "_tile_idx")
+    if patches_shared_class:
+        assert WorkTileInfo.__init__ is not original_init
+        task_tile = WorkTileInfo((Int32(1), Int32(0), Int32(2)), Boolean(True))
+        assert not hasattr(task_tile, "_tile_idx")
+    else:
+        assert WorkTileInfo.__init__ is original_init
 
 assert WorkTileInfo.__init__ is original_init
 
