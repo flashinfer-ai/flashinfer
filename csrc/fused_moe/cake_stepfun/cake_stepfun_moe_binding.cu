@@ -361,17 +361,15 @@ String cake_stepfun_fc2_activation_sf_layout(String const& family, int64_t tile_
  * the fp32 per-token scales of the ``nvfp4_bf16tok`` family. ``gemm2_output`` receives bf16
  * rows in permuted order ([max_padded_tokens, hidden_size]).
  */
-void cake_stepfun_fc2(String const& family, TensorView const& gemm2_input,
-                      Optional<TensorView> const& gemm2_input_scale,
-                      TensorView const& gemm2_weights,
-                      Optional<TensorView> const& gemm2_weights_scale,
-                      Optional<TensorView> const& output2_scale_scalar,
-                      Optional<TensorView> const& per_token_scale,
-                      TensorView const& cta_idx_xy_to_batch_idx,
-                      TensorView const& cta_idx_xy_to_mn_limit,
-                      TensorView const& num_non_exiting_ctas,
-                      TensorView const& total_num_padded_tokens, TensorView const& gemm2_output,
-                      int64_t num_tokens, int64_t top_k, int64_t tile_tokens_dim, bool enable_pdl) {
+void cake_stepfun_fc2(
+    String const& family, TensorView const& gemm2_input,
+    Optional<TensorView> const& gemm2_input_scale, TensorView const& gemm2_weights,
+    Optional<TensorView> const& gemm2_weights_scale,
+    Optional<TensorView> const& output2_scale_scalar, Optional<TensorView> const& per_token_scale,
+    TensorView const& cta_idx_xy_to_batch_idx, TensorView const& cta_idx_xy_to_mn_limit,
+    TensorView const& num_non_exiting_ctas, TensorView const& total_num_padded_tokens,
+    TensorView const& gemm2_output, int64_t num_tokens, int64_t top_k, int64_t tile_tokens_dim,
+    bool enable_pdl, bool pad_routing_tail) {
   FamilySpec const& spec = familySpec(family);
   DLDevice const device = gemm2_input.device();
   TVM_FFI_ICHECK(device.device_type == kDLCUDA)
@@ -434,6 +432,7 @@ void cake_stepfun_fc2(String const& family, TensorView const& gemm2_input,
   TVM_FFI_ICHECK(runner.hasKernels())
       << "cake_stepfun_fc2: no exported Cake " << spec.name << " FC2 kernel serves tile_tokens_dim "
       << tile_tokens_dim << ".";
+  runner.setRoutingTailPadding(pad_routing_tail);
   int32_t const config_index = runner.getDefaultValidConfigIndex(
       static_cast<int32_t>(top_k), static_cast<int32_t>(hidden_size),
       static_cast<int32_t>(intermediate_size), static_cast<int32_t>(num_experts),
@@ -526,18 +525,15 @@ Array<String> cake_stepfun_routing_inputs() {
  * (>= Routing::getMaxNumCtasInBatchDim), ``num_non_exiting_ctas`` [1] and the optional
  * ``num_tokens_per_expert`` [num_experts].
  */
-void cake_stepfun_routing(Optional<TensorView> const& routing_logits,
-                          Optional<TensorView> const& topk_ids, TensorView const& topk_packed,
-                          TensorView const& topk_weights, TensorView const& expert_count_histogram,
-                          TensorView const& total_num_padded_tokens,
-                          TensorView const& expanded_idx_to_permuted_idx,
-                          TensorView const& permuted_idx_to_token_idx,
-                          TensorView const& cta_idx_xy_to_batch_idx,
-                          TensorView const& cta_idx_xy_to_mn_limit,
-                          TensorView const& num_non_exiting_ctas,
-                          Optional<TensorView> const& num_tokens_per_expert, int64_t num_experts,
-                          int64_t top_k, int64_t local_expert_offset, int64_t local_num_experts,
-                          int64_t tile_tokens_dim, bool enable_pdl) {
+void cake_stepfun_routing(
+    Optional<TensorView> const& routing_logits, Optional<TensorView> const& topk_ids,
+    TensorView const& topk_packed, TensorView const& topk_weights,
+    TensorView const& expert_count_histogram, TensorView const& total_num_padded_tokens,
+    TensorView const& expanded_idx_to_permuted_idx, TensorView const& permuted_idx_to_token_idx,
+    TensorView const& cta_idx_xy_to_batch_idx, TensorView const& cta_idx_xy_to_mn_limit,
+    TensorView const& num_non_exiting_ctas, Optional<TensorView> const& num_tokens_per_expert,
+    int64_t num_experts, int64_t top_k, int64_t local_expert_offset, int64_t local_num_experts,
+    int64_t tile_tokens_dim, bool enable_pdl) {
   TVM_FFI_ICHECK(routing_logits.has_value() != topk_ids.has_value())
       << "cake_stepfun_routing: pass exactly one of routing_logits (scores path) or topk_ids "
          "(pre-computed path).";
@@ -559,7 +555,8 @@ void cake_stepfun_routing(Optional<TensorView> const& routing_logits,
     TensorView const& ids = topk_ids.value();
     checkTensor(ids, "topk_ids", 2, device);
     checkDtype(ids, "topk_ids", dl_int32);
-    TVM_FFI_ICHECK_EQ(ids.size(1), top_k) << "cake_stepfun_routing: topk_ids columns must equal top_k.";
+    TVM_FFI_ICHECK_EQ(ids.size(1), top_k)
+        << "cake_stepfun_routing: topk_ids columns must equal top_k.";
     num_tokens = ids.size(0);
   }
   TVM_FFI_ICHECK(num_tokens > 0) << "cake_stepfun_routing: num_tokens must be positive.";
@@ -568,7 +565,8 @@ void cake_stepfun_routing(Optional<TensorView> const& routing_logits,
   TVM_FFI_ICHECK(local_num_experts > 0 && local_expert_offset >= 0 &&
                  local_expert_offset + local_num_experts <= num_experts)
       << "cake_stepfun_routing: the local expert range must lie within num_experts.";
-  TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "cake_stepfun_routing: tile_tokens_dim must be positive.";
+  TVM_FFI_ICHECK_GT(tile_tokens_dim, 0)
+      << "cake_stepfun_routing: tile_tokens_dim must be positive.";
   checkTensor(topk_packed, "topk_packed", 2, device);
   checkDtype(topk_packed, "topk_packed", dl_int32);
   TVM_FFI_ICHECK(topk_packed.size(0) == num_tokens && topk_packed.size(1) == top_k)
@@ -598,10 +596,10 @@ void cake_stepfun_routing(Optional<TensorView> const& routing_logits,
       {&num_non_exiting_ctas, "num_non_exiting_ctas", 1},
   };
   for (Table const& table : tables) {
-    TVM_FFI_ICHECK(table.tensor->IsContiguous() &&
-                   table.tensor->device().device_type == kDLCUDA &&
+    TVM_FFI_ICHECK(table.tensor->IsContiguous() && table.tensor->device().device_type == kDLCUDA &&
                    table.tensor->device().device_id == device.device_id)
-        << "cake_stepfun_routing: " << table.name << " must be a contiguous tensor on the launch device.";
+        << "cake_stepfun_routing: " << table.name
+        << " must be a contiguous tensor on the launch device.";
     checkDtype(*table.tensor, table.name, dl_int32);
     TVM_FFI_ICHECK_GE(table.tensor->numel(), table.min_size)
         << "cake_stepfun_routing: " << table.name << " must hold at least " << table.min_size

@@ -59,8 +59,8 @@ generated::TensorLayout denseLayout(void const* data, std::initializer_list<int6
 
 // Block-scale operands are read through tensor maps over the trtllm-gen swizzled block view that
 // Fc2KernelSpec::sf_layout_a names, not the row-major [rows, cols] view: r8c4 packs 8 rows x 4
-// scale columns into 32 contiguous bytes ([rows / 8, cols / 4, 32]), r128c4 128 rows x 4 columns
-// into 512 bytes ([rows / 128, cols / 4, 512]).
+// scale columns into 32 contiguous bytes ([rows / 8, cols / 4, 32]); r128c4 is the view family of
+// the weight scales ([rows / 128, cols / 4, 2, 256], 128 rows x 4 columns per 512-byte block).
 generated::TensorLayout blockScaleLayout(void const* data, int64_t rows, int64_t cols,
                                          generated::SfLayout layout, char const* what) {
   switch (layout) {
@@ -73,7 +73,7 @@ generated::TensorLayout blockScaleLayout(void const* data, int64_t rows, int64_t
     case generated::SfLayout::kR128c4:
       FLASHINFER_CHECK(rows % 128 == 0 && cols % 4 == 0, "Cake StepFun FC2: the ", what,
                        " r128c4 block scales need rows % 128 == 0 and scale columns % 4 == 0");
-      return denseLayout(data, {rows / 128, cols / 4, int64_t{512}});
+      return denseLayout(data, {rows / 128, cols / 4, int64_t{2}, int64_t{256}});
     default:
       FLASHINFER_CHECK(false, "Cake StepFun FC2: the ", what, " operand has no block-scale layout");
   }
@@ -544,7 +544,7 @@ void Fc2Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, v
 
   configureSmem(spec, mSmemConfigured, static_cast<size_t>(configIndex), "FC2");
 
-  if (!spec.bounds_acquired_tiles && !routingWritesBenignTail()) {
+  if (mPadRoutingTail && !spec.bounds_acquired_tiles && !routingWritesBenignTail()) {
     cudaError_t const padded =
         launchRoutingTail(ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, /*routeMap=*/nullptr,
                           ptrNumNonExitingCtas, gridN, mTileTokensDim, enable_pdl, stream);
