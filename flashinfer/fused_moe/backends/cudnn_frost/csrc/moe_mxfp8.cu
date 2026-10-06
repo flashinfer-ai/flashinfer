@@ -1,7 +1,6 @@
 // Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
 // Routing, block-scale packing, frozen Frost GEMMs, and weighted finalization.
 #include <cuda_bf16.h>
-#include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <tvm/ffi/container/array.h>
@@ -19,7 +18,7 @@ using tvm::ffi::Module;
 using tvm::ffi::Optional;
 
 namespace {
-constexpr DLDataType dl_fp4{kDLFloat4_e2m1fn, 4, 2};
+constexpr DLDataType dl_e8m0{kDLFloat8_e8m0fnu, 8, 1};
 size_t align128(size_t n) { return (n + 127) / 128 * 128; }
 void checked(cudaError_t err) { TVM_FFI_ICHECK_EQ(err, cudaSuccess) << cudaGetErrorString(err); }
 
@@ -114,15 +113,15 @@ __global__ void gather(const uint8_t* x, const uint8_t* input_sf, const int32_t*
       row_experts[dest] = e;
     }
     __syncthreads();
-    auto source = reinterpret_cast<const int4*>(x) + (r / topk) * (hidden / 32);
-    auto target = reinterpret_cast<int4*>(grouped) + int64_t(dest) * (hidden / 32);
-    for (int h = threadIdx.x; h < hidden / 32; h += blockDim.x)
+    auto source = reinterpret_cast<const int4*>(x) + (r / topk) * (hidden / 16);
+    auto target = reinterpret_cast<int4*>(grouped) + int64_t(dest) * (hidden / 16);
+    for (int h = threadIdx.x; h < hidden / 16; h += blockDim.x)
       target[h] = valid ? source[h] : make_int4(0, 0, 0, 0);
-    int cols = hidden / 16;
+    int cols = hidden / 32;
     for (int col = threadIdx.x; col < cols; col += blockDim.x) {
       int64_t src = swizzled ? sf_index(r / topk, col, cols) : (r / topk) * cols + col;
       int64_t dst = int64_t(sf_offsets[e]) * cols + sf_index(dest - offsets[e], col, cols);
-      sf[dst] = valid ? input_sf[src] : 0;
+      sf[dst] = valid ? input_sf[src] : 127;
     }
     __syncthreads();
   }
@@ -182,32 +181,41 @@ __global__ void route_small(const uint8_t* x, const uint8_t* input_sf, const int
   }
   __syncthreads();
   if (active) {
-    auto source = reinterpret_cast<const int4*>(x) + (r / topk) * (hidden / 32);
-    auto target = reinterpret_cast<int4*>(grouped) + int64_t(destination) * (hidden / 32);
-    for (int h = threadIdx.x; h < hidden / 32; h += blockDim.x)
+    auto source = reinterpret_cast<const int4*>(x) + (r / topk) * (hidden / 16);
+    auto target = reinterpret_cast<int4*>(grouped) + int64_t(destination) * (hidden / 16);
+    for (int h = threadIdx.x; h < hidden / 16; h += blockDim.x)
       target[h] = valid ? source[h] : make_int4(0, 0, 0, 0);
-    const int cols = hidden / 16;
+    const int cols = hidden / 32;
     for (int col = threadIdx.x; col < cols; col += blockDim.x) {
       int64_t src = swizzled ? sf_index(r / topk, col, cols) : (r / topk) * cols + col;
       int64_t dst = int64_t(row_sf_begin) * cols + sf_index(destination - row_begin, col, cols);
-      sf[dst] = valid ? input_sf[src] : 0;
+      sf[dst] = valid ? input_sf[src] : 127;
     }
   }
+}
+
+// E8M0's minimum scale is the FP32 subnormal 2^-127. Keep scale
+// generation and normalization independent of the module's fast-math FTZ.
+__device__ __forceinline__ float multiply_no_ftz(float a, float b) {
+  float result;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
+  return result;
 }
 
 template <bool SplitColumns = false>
 __global__ void requantize(const __nv_bfloat16* input, const int32_t* row_experts,
                            const int32_t* offsets, const int32_t* sf_offsets, uint8_t* output,
-                           uint8_t* scales, const float* global_scale, int rows, int width) {
+                           uint8_t* scales, int rows, int width) {
   union InputPack {
     int4 words;
     __nv_bfloat16 values[8];
   };
   union OutputPack {
-    uint32_t words;
-    uint8_t values[4];
+    uint64_t words;
+    uint8_t values[8];
   };
-  // Column tiles contain whole 16-element blocks, preserving scale reductions.
+  // Column tiles contain whole 32-element blocks, preserving lane reductions
+  // and the original quantization rounding for small batches.
   const int tiles = SplitColumns ? (width + 1023) / 1024 : 1;
   for (int64_t task = blockIdx.x; task < int64_t(rows) * tiles; task += gridDim.x) {
     const int64_t row = task / tiles;
@@ -223,34 +231,37 @@ __global__ void requantize(const __nv_bfloat16* input, const int32_t* row_expert
         values[j] = __bfloat162float(in.values[j]);
         maximum = fmaxf(maximum, fabsf(values[j]));
       }
-      // Two adjacent lanes own one 16-element NVFP4 block. FC1 already
-      // rounded its activated output to BF16, matching CUTLASS's quantizer.
+      // Four adjacent lanes own one 32-element microscaling block.
       auto mask = __activemask();
       maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, 1));
-      __nv_fp8_e4m3 sf(maximum * (1.f / 6.f) * global_scale[0]);
-      float scale = static_cast<float>(sf);
-      float inverse = maximum == 0.f ? 0.f : global_scale[0] / scale;
-      if (threadIdx.x % 2 == 0) {
-        int cols = width / 16;
-        scales[int64_t(sf_offsets[e]) * cols + sf_index(row - offsets[e], col / 16, cols)] = sf.__x;
+      maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, 2));
+      __nv_fp8_e8m0 sf;
+      sf.__x = __nv_cvt_float_to_e8m0(multiply_no_ftz(maximum, 1.f / 448.f), __NV_SATFINITE,
+                                      cudaRoundPosInf);
+      // Reciprocal of 2^(byte-127), including byte 254 (2^-127) and NaN.
+      uint32_t inverse_bits = (254u - sf.__x) << 23;
+      if (sf.__x >= 254) inverse_bits |= 1u << 22;
+      float inverse = __uint_as_float(inverse_bits);
+      if (threadIdx.x % 4 == 0) {
+        int cols = width / 32;
+        scales[int64_t(sf_offsets[e]) * cols + sf_index(row - offsets[e], col / 32, cols)] = sf.__x;
       }
       OutputPack out;
 #pragma unroll
-      for (int j = 0; j < 4; ++j)
-        out.values[j] = __nv_cvt_float2_to_fp4x2(
-            make_float2(values[2 * j] * inverse, values[2 * j + 1] * inverse), __NV_E2M1,
-            cudaRoundNearest);
-      reinterpret_cast<uint32_t*>(output)[(row * width + col) / 8] = out.words;
+      for (int j = 0; j < 8; ++j)
+        out.values[j] =
+            __nv_cvt_float_to_fp8(multiply_no_ftz(values[j], inverse), __NV_SATFINITE, __NV_E4M3);
+      reinterpret_cast<uint64_t*>(output)[(row * width + col) / 8] = out.words;
     }
   }
 }
 
-class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
+class CudnnFrostMxfp8MoePlan final : public tvm::ffi::ModuleObj {
  public:
-  CudnnFrostNvfp4MoePlan(Function fc1, Function fc2, int64_t tokens, int64_t hidden,
+  CudnnFrostMxfp8MoePlan(Function fc1, Function fc2, int64_t tokens, int64_t hidden,
                          int64_t intermediate, int64_t experts, int64_t topk, int device,
-                         size_t scratch1, size_t scratch2, bool gated, Array<int64_t> tail1,
-                         Array<int64_t> tail2, bool swap1, bool swap2, bool swizzled, bool fma)
+                         size_t scratch1, size_t scratch2, bool gated, Array<int64_t> tail,
+                         bool swap1, bool swap2, bool swizzled, bool fma)
       : fc1_(std::move(fc1)),
         fc2_(std::move(fc2)),
         t_(tokens),
@@ -263,16 +274,14 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
         scratch1_(scratch1),
         scratch2_(scratch2),
         gated_(gated),
-        tail1_(std::move(tail1)),
-        tail2_(std::move(tail2)),
-        quantized_(fma || std::find(tail1_.begin(), tail1_.end(), 6) != tail1_.end()),
+        tail_(std::move(tail)),
         swap1_(swap1),
         swap2_(swap2),
         swizzled_(swizzled),
         fma_(fma) {
+    quantized_ = fma_ || std::find(tail_.begin(), tail_.end(), 3) != tail_.end();
     int64_t active = std::min(s_, e_);
-    // FMA keeps routes in token/slot order, with one scale segment per route.
-    sf_rows_ = fma_ ? 128 * s_ : 128 * (active + (s_ - active) / 128);
+    sf_rows_ = fma_ ? s_ : 128 * (active + (s_ - active) / 128);
     size_t pos = 0;
     auto reserve = [&](size_t bytes) {
       size_t start = pos;
@@ -281,10 +290,10 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
     };
     // FC2 can overwrite the grouped input after FC1 has consumed it.
     x_pos_ = reserve(fma_ ? 0 : s_ * h_ * 2);
-    mid_pos_ = reserve(quantized_ ? 0 : s_ * i_ * 2);
-    qmid_pos_ = reserve(s_ * i_ / 2);
-    sf1_pos_ = reserve(fma_ ? 0 : sf_rows_ * h_ / 16);
-    sf2_pos_ = reserve(sf_rows_ * i_ / 16);
+    mid_pos_ = quantized_ ? 0 : reserve(s_ * i_ * 2);
+    qmid_pos_ = reserve(s_ * i_);
+    sf1_pos_ = reserve(fma_ ? 0 : sf_rows_ * h_ / 32);
+    sf2_pos_ = reserve(sf_rows_ * i_ / 32);
     counts_pos_ = reserve(fma_ ? 0 : e_ * 4);
     offsets_pos_ = reserve(fma_ ? 0 : (e_ + 1) * 4);
     sf_offsets_pos_ = reserve(fma_ ? 0 : e_ * 4);
@@ -298,26 +307,26 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
     auto problem = [&](int64_t n, int64_t k, bool swap, bool gated, bool quantized = false) {
       Array<int64_t> shape{swap ? n : s_, swap ? s_ : n, k, e_, e_};
       auto token = [&]() {
-        shape.push_back(k / 2);
+        shape.push_back(k);
         shape.push_back(1);
-        shape.push_back(s_ * k / 2);
+        shape.push_back(s_ * k);
       };
       auto weight = [&]() {
-        shape.push_back(k / 2);
+        shape.push_back(k);
         shape.push_back(1);
-        shape.push_back((gated ? 2 : 1) * n * k / 2);
+        shape.push_back((gated ? 2 : 1) * n * k);
       };
       if (!swap) token();
       weight();
       if (gated) weight();
       if (swap) token();
-      shape.push_back(swap ? 1 : (quantized ? n / 2 : n));
+      shape.push_back(swap ? 1 : n);
       shape.push_back(swap ? n : 1);
-      shape.push_back(s_ * n / (quantized ? 2 : 1));
+      shape.push_back(s_ * n);
       if (quantized) {
-        shape.push_back(n / 16);
+        shape.push_back(n / 32);
         shape.push_back(1);
-        shape.push_back(sf_rows_ * n / 16);
+        shape.push_back(sf_rows_ * n / 32);
       }
       return shape;
     };
@@ -325,7 +334,7 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
     problem2_ = problem(h_, i_, swap2_, false);
   }
 
-  const char* kind() const final { return "cudnn_frost_nvfp4_moe_plan"; }
+  const char* kind() const final { return "cudnn_frost_mxfp8_moe_plan"; }
   Optional<Function> GetFunction(const tvm::ffi::String& name) final {
     if (name == "workspace_size")
       return Function::FromTyped([this]() { return int64_t(workspace_size_); });
@@ -340,59 +349,54 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
                               int64_t(offsets_pos_),
                               sf_rows_};
       });
-    if (name == "run" || name == "prepare_stages") {
-      bool stages = name == "prepare_stages";
-      return Function::FromTyped(
-          [this, stages](TensorView out, TensorView x, TensorView ids, TensorView scores,
-                         TensorView w1, TensorView w2, TensorView sf1, TensorView sf2,
-                         TensorView xsf, TensorView global1, TensorView alpha1, TensorView global2,
-                         TensorView alpha2, TensorView workspace) {
-            run(out, x, ids, scores, w1, w2, sf1, sf2, xsf, global1, alpha1, global2, alpha2,
-                workspace, stages);
-          });
+    // Stage-only entry points require prepare_stages on the same workspace.
+    // Modes: 0 = complete pipeline, 1 = prepare, 2 = FC1 + quantize, 3 = FC2.
+    if (name == "run" || name == "prepare_stages" || name == "run_fc1" || name == "run_fc2") {
+      int mode =
+          name == "prepare_stages" ? 1 : (name == "run_fc1" ? 2 : (name == "run_fc2" ? 3 : 0));
+      return Function::FromTyped([this, mode](TensorView out, TensorView x, TensorView ids,
+                                              TensorView scores, TensorView w1, TensorView w2,
+                                              TensorView sf1, TensorView sf2, TensorView xsf,
+                                              TensorView workspace) {
+        run(out, x, ids, scores, w1, w2, sf1, sf2, xsf, workspace, mode);
+      });
     }
     return Function(nullptr);
   }
 
  private:
   void run(TensorView out, TensorView x, TensorView ids, TensorView scores, TensorView w1,
-           TensorView w2, TensorView sf1, TensorView sf2, TensorView xsf, TensorView global1,
-           TensorView alpha1, TensorView global2, TensorView alpha2, TensorView workspace,
-           bool stages) const {
+           TensorView w2, TensorView sf1, TensorView sf2, TensorView xsf, TensorView workspace,
+           int mode) const {
     tensor(out, device_, dl_bfloat16, {t_, h_});
-    tensor(x, device_, dl_uint8, {t_, h_ / 2});
+    tensor(x, device_, dl_float8_e4m3fn, {t_, h_});
     tensor(ids, device_, dl_int32, {t_, k_}, 4);
     tensor(scores, device_, dl_float32, {t_, k_}, 4);
-    tensor(w1, device_, dl_uint8, {e_, (gated_ ? 2 : 1) * i_, h_ / 2});
-    tensor(w2, device_, dl_uint8, {e_, h_, i_ / 2});
-    tensor(sf1, device_, dl_uint8, {(gated_ ? 2 : 1), e_, i_, h_ / 16});
-    tensor(sf2, device_, dl_uint8, {e_, h_, i_ / 16});
-    tensor(global1, device_, dl_float32, {1}, 4);
-    tensor(global2, device_, dl_float32, {1}, 4);
-    tensor(alpha1, device_, dl_float32, {e_}, 4);
-    tensor(alpha2, device_, dl_float32, {e_}, 4);
+    tensor(w1, device_, dl_float8_e4m3fn, {e_, (gated_ ? 2 : 1) * i_, h_});
+    tensor(w2, device_, dl_float8_e4m3fn, {e_, h_, i_});
+    tensor(sf1, device_, dl_int32, {(gated_ ? 2 : 1), e_, i_, h_ / 128});
+    tensor(sf2, device_, dl_int32, {e_, h_, i_ / 128});
     if (swizzled_)
-      tensor(xsf, device_, dl_uint8, {(t_ + 127) / 128 * 128 * h_ / 16});
+      tensor(xsf, device_, dl_uint8, {(t_ + 127) / 128 * 128 * h_ / 32});
     else
-      tensor(xsf, device_, dl_uint8, {t_, h_ / 16});
+      tensor(xsf, device_, dl_uint8, {t_, h_ / 32});
     tensor(workspace, device_, dl_uint8, {workspace.numel()}, 128);
     TVM_FFI_ICHECK_GE(workspace.numel(), workspace_size_);
     ffi::CUDADeviceGuard guard(device_.device_id);
     auto stream = get_stream(device_);
     auto base = static_cast<char*>(workspace.data_ptr());
     if (fma_) {
-      TVM_FFI_ICHECK(!stages) << "FMA plans do not materialize grouped stage inputs";
-      int64_t qshape[]{s_ * i_ / 2}, sfshape[]{sf_rows_ * i_ / 16}, unit[]{1};
-      int64_t xshape[]{swizzled_ ? 1 : t_, swizzled_ ? 128 * h_ / 16 : h_ / 16};
+      TVM_FFI_ICHECK_EQ(mode, 0) << "FMA plans do not materialize grouped stage inputs";
+      int64_t mshape[]{s_, i_}, mstride[]{i_, 1};
+      int64_t sfshape[]{s_, i_ / 32}, sfstride[]{i_ / 32, 1};
+      int64_t xshape[]{swizzled_ ? 1 : t_, swizzled_ ? 128 * h_ / 32 : h_ / 32};
       int64_t xstride[]{xshape[1], 1};
-      DLTensor qm{base + qmid_pos_, device_, 1, dl_uint8, qshape, unit, 0};
-      DLTensor sfm{base + sf2_pos_, device_, 1, dl_uint8, sfshape, unit, 0};
+      DLTensor mid{base + qmid_pos_, device_, 2, dl_float8_e4m3fn, mshape, mstride, 0};
+      DLTensor sfm{base + sf2_pos_, device_, 2, dl_uint8, sfshape, sfstride, 0};
       DLTensor sx{xsf.data_ptr(), device_, 2, dl_uint8, xshape, xstride, 0};
-      // Both functions consume current bindings. The plan owns their compiled
-      // modules, and graph retention keeps the plan and scratch alive on replay.
-      fc1_(x, TensorView(&sx), w1, sf1, alpha1, ids, TensorView(&qm), TensorView(&sfm), global2,
+      fc1_(x, TensorView(&sx), w1, sf1, ids, TensorView(&mid), TensorView(&sfm),
            static_cast<void*>(stream));
-      fc2_(TensorView(&qm), TensorView(&sfm), w2, sf2, alpha2, ids, scores, out,
+      fc2_(TensorView(&mid), TensorView(&sfm), w2, sf2, ids, scores, out,
            static_cast<void*>(stream));
       checked(cudaGetLastError());
       return;
@@ -412,123 +416,108 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
     auto scale = reinterpret_cast<float*>(base + scale_pos_);
     auto scratch = reinterpret_cast<int64_t*>(base + scratch_pos_);
     auto expert_ids = static_cast<int32_t*>(ids.data_ptr());
-    if (s_ <= 512 && e_ <= 256) {
-      route_small<<<std::max(s_, e_), 128, 0, stream>>>(
-          static_cast<const uint8_t*>(x.data_ptr()), static_cast<const uint8_t*>(xsf.data_ptr()),
-          expert_ids, offsets, sf_offsets, mapping, row_experts, gx, sfx, scale, s_, h_, k_, e_,
-          swizzled_);
-    } else {
-      checked(cudaMemsetAsync(counts, 0, e_ * 4, stream));
-      histogram<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts,
-                                                                               s_, e_);
-      prefix<<<1, 1, 0, stream>>>(counts, offsets, cursors, sf_offsets, e_, scale);
-      gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
-          static_cast<uint8_t*>(x.data_ptr()), static_cast<uint8_t*>(xsf.data_ptr()), expert_ids,
-          offsets, sf_offsets, cursors, mapping, row_experts, gx, sfx, s_, h_, k_, e_, swizzled_);
+    if (mode < 2) {
+      if (s_ <= 512 && e_ <= 256) {
+        route_small<<<std::max(s_, e_), 128, 0, stream>>>(
+            static_cast<const uint8_t*>(x.data_ptr()), static_cast<const uint8_t*>(xsf.data_ptr()),
+            expert_ids, offsets, sf_offsets, mapping, row_experts, gx, sfx, scale, s_, h_, k_, e_,
+            swizzled_);
+      } else {
+        checked(cudaMemsetAsync(counts, 0, e_ * 4, stream));
+        histogram<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts,
+                                                                                 s_, e_);
+        prefix<<<1, 1, 0, stream>>>(counts, offsets, cursors, sf_offsets, e_, scale);
+        gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
+            static_cast<uint8_t*>(x.data_ptr()), static_cast<uint8_t*>(xsf.data_ptr()), expert_ids,
+            offsets, sf_offsets, cursors, mapping, row_experts, gx, sfx, s_, h_, k_, e_, swizzled_);
+      }
+      checked(cudaGetLastError());
     }
-    checked(cudaGetLastError());
 
-    int64_t xshape[]{s_, h_ / 2, 1}, qshape[]{s_, i_ / 2, 1};
-    int64_t xstride[]{h_ / 2, 1, s_ * h_ / 2}, qstride[]{i_ / 2, 1, s_ * i_ / 2};
-    int64_t mshape[]{s_, i_, 1}, mstride[]{i_, 1, s_ * i_};
-    int64_t yshape[]{s_, h_, 1}, ystride[]{h_, 1, s_ * h_};
-    int64_t w1shape[]{i_, h_ / 2, e_}, w1stride[]{h_ / 2, 1, (gated_ ? 2 : 1) * i_ * h_ / 2};
-    int64_t w2shape[]{h_, i_ / 2, e_}, w2stride[]{i_ / 2, 1, h_ * i_ / 2};
-    int64_t sf1shape[]{i_ * h_ / 16, 1, e_}, sf1stride[]{1, 1, i_ * h_ / 16};
-    int64_t sf2shape[]{h_ * i_ / 16, 1, e_}, sf2stride[]{1, 1, h_ * i_ / 16};
-    int64_t sfxshape[]{sf_rows_ * h_ / 16, 1, 1}, sfxstride[]{1, 1, 1};
-    int64_t sfmshape[]{sf_rows_ * i_ / 16, 1, 1};
+    int64_t xshape[]{s_, h_, 1}, mshape[]{s_, i_, 1};
+    int64_t xstride[]{h_, 1, s_ * h_}, mstride[]{i_, 1, s_ * i_};
+    int64_t w1shape[]{i_, h_, e_}, w1stride[]{h_, 1, (gated_ ? 2 : 1) * i_ * h_};
+    int64_t w2shape[]{h_, i_, e_}, w2stride[]{i_, 1, h_ * i_};
+    int64_t sf1shape[]{i_ * h_ / 32, 1, e_}, sf1stride[]{1, 1, i_ * h_ / 32};
+    int64_t sf2shape[]{h_ * i_ / 32, 1, e_}, sf2stride[]{1, 1, h_ * i_ / 32};
+    int64_t sfxshape[]{sf_rows_ * h_ / 32, 1, 1}, sfxstride[]{1, 1, 1};
+    int64_t sfmshape[]{sf_rows_ * i_ / 32, 1, 1};
+    int64_t sfoutshape[]{sf_rows_, i_ / 32, 1}, sfoutstride[]{i_ / 32, 1, sf_rows_ * i_ / 32};
     int64_t eshape[]{e_ + 1}, dshape[]{int64_t(scratch1_ / 8)}, unit[]{1};
     int64_t scalar_shape[]{1, 1, 1}, scalar_stride[]{1, 1, 1};
-    DLTensor tx{gx, device_, 3, dl_fp4, xshape, xstride, 0};
+    DLTensor tx{gx, device_, 3, dl_float8_e4m3fn, xshape, xstride, 0};
     DLTensor tm{mid, device_, 3, dl_bfloat16, mshape, mstride, 0};
-    DLTensor tqm{qm, device_, 3, dl_fp4, qshape, qstride, 0};
-    DLTensor quantized_mid{qm, device_, 3, dl_int8, qshape, qstride, 0};
-    DLTensor ty{gy, device_, 3, dl_bfloat16, yshape, ystride, 0};
-    DLTensor up{w1.data_ptr(), device_, 3, dl_fp4, w1shape, w1stride, 0};
+    DLTensor tqm{qm, device_, 3, dl_float8_e4m3fn, mshape, mstride, 0};
+    DLTensor ty{gy, device_, 3, dl_bfloat16, xshape, xstride, 0};
+    DLTensor up{w1.data_ptr(), device_, 3, dl_float8_e4m3fn, w1shape, w1stride, 0};
     DLTensor gate = up;
-    gate.data = static_cast<uint8_t*>(w1.data_ptr()) + (gated_ ? i_ * h_ / 2 : 0);
-    DLTensor down{w2.data_ptr(), device_, 3, dl_fp4, w2shape, w2stride, 0};
-    DLTensor sf_up{sf1.data_ptr(), device_, 3, dl_float8_e4m3fn, sf1shape, sf1stride, 0};
+    gate.data = static_cast<uint8_t*>(w1.data_ptr()) + (gated_ ? i_ * h_ : 0);
+    DLTensor down{w2.data_ptr(), device_, 3, dl_float8_e4m3fn, w2shape, w2stride, 0};
+    DLTensor sf_up{sf1.data_ptr(), device_, 3, dl_e8m0, sf1shape, sf1stride, 0};
     DLTensor sf_gate = sf_up;
-    sf_gate.data = static_cast<uint8_t*>(sf1.data_ptr()) + (gated_ ? e_ * i_ * h_ / 16 : 0);
-    DLTensor sf_down{sf2.data_ptr(), device_, 3, dl_float8_e4m3fn, sf2shape, sf2stride, 0};
-    DLTensor sf_x{sfx, device_, 3, dl_float8_e4m3fn, sfxshape, sfxstride, 0};
-    DLTensor sf_mid{sfm, device_, 3, dl_float8_e4m3fn, sfmshape, sfxstride, 0};
-    int64_t sf_out_shape[]{sf_rows_, i_ / 16, 1};
-    int64_t sf_out_stride[]{i_ / 16, 1, sf_rows_ * i_ / 16};
-    DLTensor sf_out{sfm, device_, 3, dl_float8_e4m3fn, sf_out_shape, sf_out_stride, 0};
-    DLTensor quant_scale{global2.data_ptr(), device_,       3, dl_float32,
-                         scalar_shape,       scalar_stride, 0};
+    sf_gate.data = static_cast<uint8_t*>(sf1.data_ptr()) + (gated_ ? e_ * i_ * h_ / 32 : 0);
+    DLTensor sf_down{sf2.data_ptr(), device_, 3, dl_e8m0, sf2shape, sf2stride, 0};
+    DLTensor sf_x{sfx, device_, 3, dl_e8m0, sfxshape, sfxstride, 0};
+    DLTensor sf_mid{sfm, device_, 3, dl_e8m0, sfmshape, sfxstride, 0};
+    DLTensor sf_out{sfm, device_, 3, dl_e8m0, sfoutshape, sfoutstride, 0};
     DLTensor first{offsets, device_, 1, dl_int32, eshape, unit, 0};
     DLTensor desc{scratch, device_, 1, dl_int64, dshape, unit, 0};
     DLTensor factors[3];
     for (int j = 0; j < 3; ++j)
       factors[j] = DLTensor{scale + j, device_, 3, dl_float32, scalar_shape, scalar_stride, 0};
-    int64_t group_shape[]{e_, 1, 1};
-    DLTensor alpha_first{alpha1.data_ptr(), device_, 3, dl_float32, group_shape, scalar_stride, 0};
-    DLTensor alpha_second{alpha2.data_ptr(), device_, 3, dl_float32, group_shape, scalar_stride, 0};
     int64_t mshape_sw[]{i_, s_, 1}, mstride_sw[]{1, i_, s_ * i_};
     int64_t yshape_sw[]{h_, s_, 1}, ystride_sw[]{1, h_, s_ * h_};
     DLTensor tm_sw{mid, device_, 3, dl_bfloat16, mshape_sw, mstride_sw, 0};
     DLTensor ty_sw{gy, device_, 3, dl_bfloat16, yshape_sw, ystride_sw, 0};
-    // The frozen host resets its scheduler counter on every invocation, and
-    // the kernel initializes operand/scale/output descriptors before use.
+    // The frozen host resets its scheduler counter on every invocation.
+    // Its kernels populate descriptor storage before consuming it.
     // Own the TensorView descriptors until the borrowed AnyView arguments return.
-    std::array<TensorView, 16> tensors{
-        TensorView(&first),
-        TensorView(&desc),
-        TensorView(swap1_ ? &gate : &tx),
-        TensorView(swap1_ ? (gated_ ? &up : &tx) : &gate),
-        TensorView(swap1_ ? &tx : &up),
-        TensorView(swap1_ ? &sf_gate : &sf_x),
-        TensorView(swap1_ ? (gated_ ? &sf_up : &sf_x) : &sf_gate),
-        TensorView(swap1_ ? &sf_x : &sf_up),
-        TensorView(quantized_ ? &quantized_mid : (swap1_ ? &tm_sw : &tm)),
-        TensorView(&factors[0]),
-        TensorView(&factors[1]),
-        TensorView(&factors[2]),
-        TensorView(&alpha_first),
-        TensorView(&alpha_first),
-        TensorView(&sf_out),
-        TensorView(&quant_scale)};
-    tvm::ffi::AnyView args[19];
+    std::array<TensorView, 13> tensors{TensorView(&first),
+                                       TensorView(&desc),
+                                       TensorView(swap1_ ? &gate : &tx),
+                                       TensorView(swap1_ ? (gated_ ? &up : &tx) : &gate),
+                                       TensorView(swap1_ ? &tx : &up),
+                                       TensorView(swap1_ ? &sf_gate : &sf_x),
+                                       TensorView(swap1_ ? (gated_ ? &sf_up : &sf_x) : &sf_gate),
+                                       TensorView(swap1_ ? &sf_x : &sf_up),
+                                       TensorView(quantized_ ? &tqm : (swap1_ ? &tm_sw : &tm)),
+                                       TensorView(&factors[0]),
+                                       TensorView(&factors[1]),
+                                       TensorView(&factors[2]),
+                                       TensorView(&sf_out)};
+    tvm::ffi::AnyView args[16];
     int argc = 0;
     args[argc++] = problem1_;
     args[argc++] = tensors[0];
     args[argc++] = tensors[1];
     for (int j = 0; j < (gated_ ? 3 : 2); ++j) args[argc++] = tensors[j + 2];
     for (int j = 0; j < (gated_ ? 3 : 2); ++j) args[argc++] = tensors[j + 5];
-    for (auto slot : tail1_) args[argc++] = tensors[slot + 8];
+    for (auto slot : tail_) args[argc++] = tensors[slot + 9];
     args[argc++] = static_cast<void*>(stream);
     tvm::ffi::Any result;
-    fc1_.CallPacked(args, argc, &result);
-    if (!quantized_ && s_ <= 8) {
-      requantize<true><<<std::min<int64_t>(s_ * ((i_ + 1023) / 1024), 4096), 128, 0, stream>>>(
-          mid, row_experts, offsets, sf_offsets, qm, sfm, static_cast<float*>(global2.data_ptr()),
-          s_, i_);
-    } else if (!quantized_) {
-      requantize<false><<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
-          mid, row_experts, offsets, sf_offsets, qm, sfm, static_cast<float*>(global2.data_ptr()),
-          s_, i_);
+    if (mode != 3) {
+      fc1_.CallPacked(args, argc, &result);
+      if (!quantized_) {
+        if (s_ <= 8) {
+          requantize<true><<<std::min<int64_t>(s_ * ((i_ + 1023) / 1024), 4096), 128, 0, stream>>>(
+              mid, row_experts, offsets, sf_offsets, qm, sfm, s_, i_);
+        } else {
+          requantize<false><<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
+              mid, row_experts, offsets, sf_offsets, qm, sfm, s_, i_);
+        }
+      }
+      checked(cudaGetLastError());
     }
-    checked(cudaGetLastError());
-    if (stages) return;
+    if (mode == 1 || mode == 2) return;
     dshape[0] = scratch2_ / 8;
-    std::array<TensorView, 8> second{TensorView(&first),
-                                     TensorView(&desc),
-                                     TensorView(swap2_ ? &down : &tqm),
-                                     TensorView(swap2_ ? &tqm : &down),
-                                     TensorView(swap2_ ? &sf_down : &sf_mid),
-                                     TensorView(swap2_ ? &sf_mid : &sf_down),
-                                     TensorView(swap2_ ? &ty_sw : &ty),
-                                     TensorView(&alpha_second)};
-    argc = 0;
-    args[argc++] = problem2_;
-    for (int j = 0; j < 6; ++j) args[argc++] = second[j];
-    for (auto slot : tail2_) args[argc++] = second[slot == 0 ? 6 : 7];
-    args[argc++] = static_cast<void*>(stream);
-    fc2_.CallPacked(args, argc, &result);
+    fc2_(problem2_, TensorView(&first), TensorView(&desc), TensorView(swap2_ ? &down : &tqm),
+         TensorView(swap2_ ? &tqm : &down), TensorView(swap2_ ? &sf_down : &sf_mid),
+         TensorView(swap2_ ? &sf_mid : &sf_down), TensorView(swap2_ ? &ty_sw : &ty),
+         static_cast<void*>(stream));
+    if (mode == 3) {
+      checked(cudaGetLastError());
+      return;
+    }
     if (t_ <= 8) {
       finalize<true><<<std::min<int64_t>(t_ * ((h_ / 8 + 127) / 128), 4096), 128, 0, stream>>>(
           gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
@@ -546,8 +535,8 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
   DLDevice device_;
   size_t scratch1_, scratch2_;
   bool gated_;
-  Array<int64_t> tail1_, tail2_;
-  bool quantized_, swap1_, swap2_, swizzled_, fma_;
+  Array<int64_t> tail_;
+  bool swap1_, swap2_, swizzled_, quantized_, fma_;
   Array<int64_t> problem1_, problem2_;
   size_t x_pos_, mid_pos_, qmid_pos_, sf1_pos_, sf2_pos_, counts_pos_, offsets_pos_,
       sf_offsets_pos_, cursors_pos_, mapping_pos_, row_experts_pos_, scale_pos_, scratch_pos_,
@@ -556,8 +545,7 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
 
 Module make_plan(Function fc1, Function fc2, int64_t tokens, int64_t hidden, int64_t intermediate,
                  int64_t experts, int64_t topk, int64_t device, int64_t scratch1, int64_t scratch2,
-                 bool gated, Array<int64_t> tail1, Array<int64_t> tail2, bool swap1, bool swap2,
-                 bool swizzled, bool fma) {
+                 bool gated, Array<int64_t> tail, bool swap1, bool swap2, bool swizzled, bool fma) {
   constexpr int64_t max_dim = 1 << 20;
   TVM_FFI_ICHECK(tokens > 0 && tokens <= max_dim && hidden > 0 && hidden <= max_dim &&
                  intermediate > 0 && intermediate <= max_dim && experts > 0 && experts <= 1024 &&
@@ -566,34 +554,26 @@ Module make_plan(Function fc1, Function fc2, int64_t tokens, int64_t hidden, int
   TVM_FFI_ICHECK_EQ(hidden % 128, 0);
   TVM_FFI_ICHECK_EQ(intermediate % 128, 0);
   if (fma) {
-    TVM_FFI_ICHECK(!swap1 && !swap2 && scratch1 == 0 && scratch2 == 0 && tail1.empty() &&
-                   tail2.empty());
+    TVM_FFI_ICHECK(!swap1 && !swap2 && scratch1 == 0 && scratch2 == 0 && tail.empty());
     TVM_FFI_ICHECK(
         (experts == 64 && hidden == 2048 && intermediate == 1408 && topk == 6 && tokens <= 4) ||
         (experts == 12 && hidden == 7168 && intermediate == 3072 && topk == 2 && tokens == 1));
-    return Module(tvm::ffi::make_object<CudnnFrostNvfp4MoePlan>(
-        std::move(fc1), std::move(fc2), tokens, hidden, intermediate, experts, topk, device,
-        scratch1, scratch2, gated, std::move(tail1), std::move(tail2), swap1, swap2, swizzled,
-        true));
+  } else {
+    TVM_FFI_ICHECK(scratch1 > 0 && scratch1 % 128 == 0 && scratch2 > 0 && scratch2 % 128 == 0);
+    int mask = 0;
+    for (auto slot : tail) {
+      TVM_FFI_ICHECK(slot >= -1 && slot <= 3);
+      TVM_FFI_ICHECK_EQ(mask & (1 << (slot + 1)), 0);
+      mask |= 1 << (slot + 1);
+    }
+    bool quantized = mask & 16;
+    TVM_FFI_ICHECK(!quantized || !swap1);
+    int required = quantized ? 19 : 3;
+    TVM_FFI_ICHECK(mask == required || mask == (required | 12));
   }
-  TVM_FFI_ICHECK(scratch1 > 0 && scratch1 % 128 == 0 && scratch2 > 0 && scratch2 % 128 == 0);
-  int mask = 0;
-  for (auto slot : tail1) {
-    TVM_FFI_ICHECK(slot >= 0 && slot <= 7);
-    TVM_FFI_ICHECK_EQ(mask & (1 << slot), 0);
-    mask |= 1 << slot;
-  }
-  int required = 3 | (1 << 4) | (gated ? (1 << 5) : 0);
-  if (mask & (1 << 6)) {
-    required |= (1 << 6) | (1 << 7);
-    TVM_FFI_ICHECK(!swap1);
-  }
-  TVM_FFI_ICHECK(mask == required || mask == (required | 12));
-  TVM_FFI_ICHECK(tail2.size() == 2 &&
-                 ((tail2[0] == 0 && tail2[1] == 4) || (tail2[0] == 4 && tail2[1] == 0)));
-  return Module(tvm::ffi::make_object<CudnnFrostNvfp4MoePlan>(
+  return Module(tvm::ffi::make_object<CudnnFrostMxfp8MoePlan>(
       std::move(fc1), std::move(fc2), tokens, hidden, intermediate, experts, topk, device, scratch1,
-      scratch2, gated, std::move(tail1), std::move(tail2), swap1, swap2, swizzled, false));
+      scratch2, gated, std::move(tail), swap1, swap2, swizzled, fma));
 }
 }  // namespace
 
