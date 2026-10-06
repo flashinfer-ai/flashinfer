@@ -2175,7 +2175,7 @@ class _LaunchTemplate:
 @dataclass
 class _WorkspaceState:
     workspace: ProjectionWorkspace
-    bindings: dict[str, Any]
+    bindings: dict[tuple[str, ...], dict[str, Any]]
     pinned: bool = False
 
 
