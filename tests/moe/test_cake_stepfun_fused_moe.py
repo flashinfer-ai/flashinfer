@@ -28,8 +28,10 @@ the native FC1 bitwise, require the native outputs byte for byte.
 import json
 import math
 import os
+import re
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1181,6 +1183,19 @@ def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
             continue
         output = _forward(cake, cake_packed, cake_kwargs, tactic)
         check_accuracy(reference, output.float(), **tolerances)
+        if cake.full_path:
+            _assert_full_path_kernel_set(
+                cake,
+                cake_packed,
+                cake_kwargs,
+                tactic,
+                family="nvfp4_bf16tok",
+                num_tokens=num_tokens,
+                routing_input="scores",
+                logits_dtype="bfloat16",
+                expert_weights_dtype="bfloat16",
+                context=f"nvfp4_bf16tok T={num_tokens} tactic {tactic}",
+            )
         checked += 1
     assert checked, (
         f"no per-token Cake tactic at T={num_tokens}: {cake_tactics} vs {sorted(per_token_tiles)}"
@@ -1775,36 +1790,202 @@ def test_full_path_requant_matches_native_kernel(num_tokens, cache_permute_indic
     assert checked
 
 
-@pytest.mark.parametrize("precision", list(PRECISIONS))
-def test_full_path_launches_only_cake_kernels(precision, cache_permute_indices):
-    """A full-path forward launches Cake kernels only (no trtllm-gen routing, GEMM or finalize)."""
-    device = _require_full_path()
-    case = _build_case(
-        cache_permute_indices,
-        precision=precision,
-        num_tokens=64,
-        limits=_limits("mixed"),
-        logits=_routing_logits(64, "ragged"),
+_CAKE_KERNEL_SYMBOL = re.compile(
+    r"\b(kernel_cake_stepfun_moe_[0-9a-f]+|cake_stepfun_routing_tail_kernel)\b"
+)
+
+
+def _inventory_records(target: str) -> list[dict]:
+    from flashinfer.jit.cake_stepfun_moe import load_cake_stepfun_inventory
+
+    inventory = load_cake_stepfun_inventory()
+    records = json.loads(inventory.path.read_text(encoding="utf-8"))["kernels"]
+    return [record for record in records if record["arch"] == target]
+
+
+def _expected_full_path_kernels(
+    moe_op,
+    target: str,
+    *,
+    family: str,
+    tile: int,
+    num_tokens: int,
+    routing_input: str,
+    logits_dtype: str,
+    expert_weights_dtype: str,
+) -> dict[str, list[str]]:
+    """The exact Cake kernel set of one full-path forward, per stage, resolved from the
+    inventory the way the host runners resolve it (``cake_stepfun_stages.cu``): the first
+    routing record (table order) of the input kind / logits dtype whose token range covers
+    ``num_tokens`` plus its leading histogram kernel, the ``(family, tile)`` FC1 and FC2 units,
+    the requantization unit of the FC2 unit's activation scale layout (per-token family) and
+    the finalize variant of the native dispatcher's CTA-count rule for the expert-weight dtype."""
+    records = _inventory_records(target)
+
+    def one(stage: str, **match) -> dict:
+        found = [
+            record
+            for record in records
+            if record["stage"] == stage
+            and all(record.get(key) == value for key, value in match.items())
+        ]
+        assert len(found) == 1, (stage, match, [r["kernel_symbol"] for r in found])
+        return found[0]
+
+    routing = next(
+        (
+            record
+            for record in records
+            if record["stage"] == "routing"
+            and record["input"] == routing_input
+            and (routing_input != "scores" or record["logits_dtype"] == logits_dtype)
+            and record["min_tokens"] <= num_tokens <= record["max_tokens"]
+        ),
+        None,
     )
-    _, runner, packed, kwargs, tactics = _cake_runner(case, device)
-    tactic = tactics[0]
-    _forward(runner, packed, kwargs, tactic)
+    assert routing is not None, (target, routing_input, logits_dtype, num_tokens)
+    expected = {"routing": []}
+    if routing.get("pre_kernel"):
+        expected["routing"].append(routing["pre_kernel"]["kernel_symbol"])
+    expected["routing"].append(routing["kernel_symbol"])
+    expected["fc1"] = [one("fc1", family=family, tile_n=tile)["kernel_symbol"]]
+    if family == "nvfp4_bf16tok":
+        layout = str(moe_op.cake_stepfun_fc2_activation_sf_layout(family, tile))
+        expected["requant"] = [one("requant", sf_layout=layout)["kernel_symbol"]]
+    expected["fc2"] = [one("fc2", family=family, tile_n=tile)["kernel_symbol"]]
+    # Same variant rule as the native finalize dispatcher (and Cake's host): the scalar kernel
+    # below 1184 CTAs of (ceil(H / 256) x min(8192, T)), the vector-load kernel otherwise.
+    blocks = ((HIDDEN_SIZE - 1 + 256) // 256) * min(8192, num_tokens)
+    variant = "scalar" if blocks < 1184 else "vector"
+    expected["finalize"] = [
+        one(
+            "finalize",
+            kernel_variant=variant,
+            expert_weights_dtype=expert_weights_dtype,
+        )["kernel_symbol"]
+    ]
+    return expected
+
+
+def _profiled_kernel_names(runner, packed, kwargs, tactic) -> list[str]:
+    """CUDA kernel names of one forward (memcpy / memset activities excluded)."""
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA]
     ) as profile:
         runner.forward(packed, tactic=tactic, **kwargs)
         torch.cuda.synchronize()
-    names = sorted(
-        {
-            event.name
-            for event in profile.events()
-            if event.device_type == torch.autograd.DeviceType.CUDA
-            and not event.name.startswith(("Memcpy", "Memset"))
-        }
+    return [
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+        and not event.name.startswith(("Memcpy", "Memset"))
+    ]
+
+
+def _assert_full_path_kernel_set(
+    runner,
+    packed,
+    kwargs,
+    tactic,
+    *,
+    family: str,
+    num_tokens: int,
+    routing_input: str,
+    logits_dtype: str,
+    expert_weights_dtype: str,
+    context: str,
+) -> dict[str, list[str]]:
+    """One forward of ``tactic`` launches exactly the Cake kernels of its stages, each once:
+    no trtllm-gen symbol and no routing-tail padding kernel (every exported FC1 / FC2 kernel
+    consumes ``num_non_exiting_ctas`` like the native kernels, so the runners pad no tail)."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    expected = _expected_full_path_kernels(
+        runner._module.moe_op,
+        _target(device),
+        family=family,
+        tile=int(tactic[0]),
+        num_tokens=num_tokens,
+        routing_input=routing_input,
+        logits_dtype=logits_dtype,
+        expert_weights_dtype=expert_weights_dtype,
     )
-    assert names, "the profiler captured no kernels"
-    offenders = [name for name in names if "cake_stepfun" not in name]
-    assert not offenders, f"non-Cake kernels in a Cake full-path forward: {offenders}"
+    names = _profiled_kernel_names(runner, packed, kwargs, tactic)
+    assert names, f"{context}: the profiler captured no kernels"
+    symbols: list[str] = []
+    offenders: list[str] = []
+    for name in names:
+        match = _CAKE_KERNEL_SYMBOL.search(name)
+        if match is None:
+            offenders.append(name)
+        else:
+            symbols.append(match.group(1))
+    assert not offenders, (
+        f"{context}: non-Cake kernels in a Cake full-path forward: {sorted(set(offenders))}"
+    )
+    want = [symbol for stage in expected.values() for symbol in stage]
+    assert Counter(symbols) == Counter(want), (
+        f"{context}: kernel set {sorted(symbols)} != the expected per-stage set {expected} "
+        "(an extra cake_stepfun_routing_tail_kernel means a runner padded the routing tail)"
+    )
+    return expected
+
+
+@pytest.mark.parametrize("routing_input", ("scores", "topk_ids"))
+@pytest.mark.parametrize("num_tokens", TOKENS)
+@pytest.mark.parametrize("precision", list(PRECISIONS))
+def test_full_path_launches_only_cake_kernels(
+    precision, num_tokens, routing_input, cache_permute_indices
+):
+    """A full-path forward launches exactly the Cake kernels of its stages -- the routing
+    kernel(s) of the token count and input kind, the FC1 unit of the tactic's tile, the FC2
+    unit and the finalize variant -- and nothing else: no trtllm-gen routing, GEMM or finalize
+    kernel and no routing-tail padding kernel, for every Cake tactic of every (precision, T)."""
+    device = _require_full_path()
+    spec = PRECISIONS[precision]
+    logits = _routing_logits(num_tokens, "ragged")
+    case = _build_case(
+        cache_permute_indices,
+        precision=precision,
+        num_tokens=num_tokens,
+        limits=_limits("mixed"),
+        logits=logits,
+    )
+    if routing_input == "topk_ids":
+        from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+
+        _require_routing_input(device, "topk_ids")
+        topk_ids, topk_weights = _precomputed_routing(
+            get_trtllm_moe_sm100_module().moe_op, case, num_tokens, logits
+        )
+        act = _precomputed_pack(case, topk_ids, topk_weights)
+        _, runner, packed, kwargs, tactics = _layer_runner(
+            case.config, device, spec.runner_cls, act, case.weights
+        )
+    else:
+        _, runner, packed, kwargs, tactics = _cake_runner(case, device)
+    assert runner.full_path
+    cake_tiles = _cake_tiles(runner, spec.family)
+    checked = []
+    for tactic in tactics:
+        assert tactic[0] in cake_tiles, (tactic, sorted(cake_tiles))
+        _forward(
+            runner, packed, kwargs, tactic
+        )  # module load / lazy state before profiling
+        checked.append(
+            _assert_full_path_kernel_set(
+                runner,
+                packed,
+                kwargs,
+                tactic,
+                family=spec.family,
+                num_tokens=num_tokens,
+                routing_input=routing_input,
+                logits_dtype="bfloat16",
+                expert_weights_dtype="bfloat16",
+                context=f"{precision} T={num_tokens} {routing_input} tactic {tactic}",
+            )
+        )
+    assert len(checked) == len(tactics)
 
 
 def _first_replay_probe(precision: str, num_tokens: int, tactic_index: int) -> dict:
