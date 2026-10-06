@@ -103,6 +103,9 @@ def _control_snapshot() -> FrozenMapping:
     return FrozenMapping({
         "trellis_decode_table": trellis_decode_table(),
         "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
+        "w4a16_skip_empty_m_blocks": _impl.os.environ.get(
+            "B12X_W4A16_SKIP_EMPTY_M_BLOCKS", "1"
+        ) == "1",
         "dynamic_nvfp4_materialized": (
             None if raw_materialized is None else raw_materialized not in ("", "0", "false", "False")
         ),
@@ -276,6 +279,7 @@ def _lower_caps(
             query.controls.get("w4a16_prefill_fused_sum", False)
         ),
         trellis_decode_table=str(query.controls.get("trellis_decode_table", "auto")),
+        w4a16_skip_empty_m_blocks=bool(query.controls.get("w4a16_skip_empty_m_blocks", True)),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
     )
 
@@ -415,6 +419,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             scale_format=scale_format, w13_layout=w13_layout,
             force_tile_config=caps.decode_config.w4a16_tile_config,
             pipeline_stages=caps.decode_config.w4a16_pipeline_stages,
+            skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
         )
         packed = compile_w4a16_fused_moe(
             **compiler_args, zero_fc2_output=False, max_m_blocks=packed_blocks,

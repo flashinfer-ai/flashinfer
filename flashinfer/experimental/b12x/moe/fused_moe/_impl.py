@@ -842,6 +842,7 @@ class TPMoEScratchCaps:
     w4a16_fast_math: bool = True
     w4a16_prefill_fused_sum: bool | None = None
     trellis_decode_table: str = "auto"
+    w4a16_skip_empty_m_blocks: bool = True
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -8160,6 +8161,7 @@ def _plan_full_rotation_w4a16_launches(
                 trellis_bits=core_plan.trellis_bits,
                 trellis_codebook=core_plan.trellis_codebook or LUT_E4M3,
                 trellis_decode_table=caps.trellis_decode_table,
+                skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
                 force_tile_config=core_plan.trellis_tile_config,
                 intermediate_rotation=True,
                 full_rotation=True,
