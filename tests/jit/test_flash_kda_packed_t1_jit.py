@@ -89,7 +89,7 @@ def test_flash_kda_packed_t1_jit_spec_and_frozen_body(
     assert spec.sources[0].is_file()
     assert expected_flag in spec.extra_cuda_cflags
     assert (
-        f"-DFLASHINFER_FLASH_KDA_PACKED_T1_TARGET_KIND={target_kind}"
+        f"-DFLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND={target_kind}"
         in spec.extra_cuda_cflags
     )
     assert "-use_fast_math" in spec.extra_cuda_cflags
@@ -111,15 +111,19 @@ def test_flash_kda_packed_t1_jit_spec_and_frozen_body(
 
     binding_text = spec.sources[0].read_text()
     assert (
-        f'#define FLASHKDA_PACKED_T1_BODY_FILE "cake_flashkda_packed_t1_{variant}.cu"'
+        f'#define CAKE_KDA_PACKED_T1_BODY_FILE "cake_flashkda_packed_t1_{variant}.cu"'
         in binding_text
     )
-    assert f"#define FLASHKDA_PACKED_T1_KERNEL {metadata.symbol}" in binding_text
+    assert f"#define CAKE_KDA_PACKED_T1_KERNEL {metadata.symbol}" in binding_text
     assert (
-        f"#define FLASHKDA_PACKED_T1_VALUE_SPLITS {metadata.value_splits}"
+        f"#define CAKE_KDA_PACKED_T1_VALUE_TILES {metadata.value_splits}"
         in binding_text
     )
-    assert '#include "cake_flashkda_packed_t1_binding.cuh"' in binding_text
+    assert "#define CAKE_KDA_PACKED_T1_THREADS 32" in binding_text
+    assert "#define CAKE_KDA_PACKED_T1_SMEM_BYTES 0" in binding_text
+    assert "#define CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 0" in binding_text
+    assert "#define CAKE_KDA_PACKED_T1_LEGACY_ABI 1" in binding_text
+    assert '#include "cake_kda_packed_t1_binding.cuh"' in binding_text
     flash_kda_packed_t1.gen_flash_kda_packed_t1_module.cache_clear()
 
 
@@ -173,10 +177,13 @@ def test_flash_kda_packed_t1_variant_validation_and_getter(monkeypatch):
 
 def test_flash_kda_packed_t1_binding_contract():
     binding = (
-        flash_kda_packed_t1._get_csrc_dir() / "cake_flashkda_packed_t1_binding.cuh"
+        flash_kda_packed_t1._get_csrc_dir() / "cake_kda_packed_t1_binding.cuh"
     ).read_text()
 
-    assert "#include FLASHKDA_PACKED_T1_BODY_FILE" in binding
+    assert "#include CAKE_KDA_PACKED_T1_BODY_FILE" in binding
+    assert "#ifndef CAKE_KDA_PACKED_T1_LEGACY_ABI" in binding
+    assert "#define CAKE_KDA_PACKED_T1_LEGACY_ABI 0" in binding
+    assert "#if CAKE_KDA_PACKED_T1_LEGACY_ABI" in binding
     assert "kHeads = 12" in binding
     assert "kHeadDim = 128" in binding
     assert "kTargetFamily = 100" in binding
@@ -186,6 +193,7 @@ def test_flash_kda_packed_t1_binding_contract():
     assert "CHECK_INPUT_TYPE(mixed_qkv, dl_bfloat16)" in binding
     assert "mixed_qkv must have shape [B," in binding
     assert "state must have compact [H,V,K] blocks" in binding
+    assert "state indexed extent overflows int64" in binding
     assert "state_indices must have shape [B]" in binding
     assert 'CheckNoOverlap(state, "state", out, "output")' in binding
     assert "state_base_mod8" in binding

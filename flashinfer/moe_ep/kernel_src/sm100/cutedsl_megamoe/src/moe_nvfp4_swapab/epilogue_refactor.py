@@ -1013,6 +1013,8 @@ class SwapABSwigluFp4Epilogue:
         ] = None,  # [expert, intermediate, hidden]
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         gate_up_clamp: Optional[float] = None,  # Swiglu style only
         epi_flag_batch: Optional[Tuple[int, int]] = (
             1,
@@ -1047,6 +1049,8 @@ class SwapABSwigluFp4Epilogue:
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         self.swiglu_alpha = None if swiglu_alpha is None else float(swiglu_alpha)
         self.swiglu_beta = None if swiglu_beta is None else float(swiglu_beta)
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         # SwiGLU gate/up clamp limit; None disables clamping.
         self.gate_up_clamp = gate_up_clamp
         # Done-counter publish batch granularity
@@ -1809,12 +1813,32 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 cute.arch.rcp_approx(one_plus_exp[0]),
                 cute.arch.rcp_approx(one_plus_exp[1]),
             )
-            out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
+            if cutlass.const_expr(self.situ_beta is not None):
+                # SiTU: beta * tanh(gate / beta) * sigmoid(gate).
+                b = cutlass.Float32(self.situ_beta)
+                inv_b = cutlass.Float32(1.0 / self.situ_beta)
+                g0 = b * self._tanh(g0 * inv_b) * sigmoid_pair[0]
+                g1 = b * self._tanh(g1 * inv_b) * sigmoid_pair[1]
+                if cutlass.const_expr(self.situ_linear_beta is not None):
+                    lb = cutlass.Float32(self.situ_linear_beta)
+                    inv_lb = cutlass.Float32(1.0 / self.situ_linear_beta)
+                    u0 = lb * self._tanh(u0 * inv_lb)
+                    u1 = lb * self._tanh(u1 * inv_lb)
+                out_pair = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
+            else:
+                out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
 
             out[i] = out_pair[0]
             out[i + 1] = out_pair[1]
 
         return out
+
+    @cute.jit
+    def _tanh(self, x: cutlass.Float32) -> cutlass.Float32:
+        exp = cute.math.exp2(x * cutlass.Float32(-2.8853900817779268), fastmath=True)
+        return cutlass.Float32(2.0) * cute.arch.rcp_approx(
+            cutlass.Float32(1.0) + exp
+        ) - cutlass.Float32(1.0)
 
     @cute.jit
     def nvfp4_quant(

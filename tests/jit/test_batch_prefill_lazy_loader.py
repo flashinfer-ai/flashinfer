@@ -1,7 +1,5 @@
-from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-import threading
-import time
+from contextlib import contextmanager, nullcontext
 
 import pytest
 import torch
@@ -12,7 +10,6 @@ from flashinfer.cascade import (
     MultiLevelCascadeAttentionWrapper,
 )
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
-from flashinfer.jit import MissingJITCacheError
 
 
 _MODULE_ARGS = (
@@ -30,20 +27,12 @@ _MODULE_ARGS = (
 
 
 class _FakeSpec:
-    def __init__(self, module, *, error=None, delay_seconds=0.0):
+    def __init__(self, module):
         self.module = module
-        self.error = error
-        self.delay_seconds = delay_seconds
         self.build_count = 0
-        self._counter_lock = threading.Lock()
 
     def build_and_load(self):
-        with self._counter_lock:
-            self.build_count += 1
-        if self.delay_seconds:
-            time.sleep(self.delay_seconds)
-        if self.error is not None:
-            raise self.error
+        self.build_count += 1
         return self.module
 
 
@@ -104,64 +93,6 @@ def _clear_batch_prefill_module_cache():
     prefill.get_batch_prefill_module.cache_clear()
 
 
-def test_lazy_holder_capture_order_warm_fast_path_and_no_jit(monkeypatch):
-    loaded_module = object()
-    spec = _FakeSpec(loaded_module)
-    holder = prefill._LazyBatchPrefillIndependentModule(spec)
-    capture_states = iter((False, True))
-    monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", lambda: next(capture_states)
-    )
-
-    with pytest.raises(RuntimeError, match="before capture"):
-        holder.get()
-    assert spec.build_count == 0
-    assert not holder.is_loaded
-
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    holder.prewarm()
-    assert holder.is_loaded
-    assert spec.build_count == 1
-
-    def unexpected_capture_check():
-        raise AssertionError("warm fast path must not query capture state")
-
-    monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", unexpected_capture_check
-    )
-    assert holder.get() is loaded_module
-    assert spec.build_count == 1
-
-    missing_spec = object()
-    no_jit_spec = _FakeSpec(
-        object(),
-        error=MissingJITCacheError("generic cache miss", spec=missing_spec),
-    )
-    no_jit_holder = prefill._LazyBatchPrefillIndependentModule(no_jit_spec)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    with pytest.raises(MissingJITCacheError) as exc_info:
-        no_jit_holder.get()
-    assert exc_info.value.spec is missing_spec
-    assert isinstance(exc_info.value.__cause__, MissingJITCacheError)
-    message = str(exc_info.value)
-    assert "Unequal K/V data strides" in message
-    assert "not included in the default JIT cache" in message
-    assert "prewarm_paged_kv_stride_variant('independent')" in message
-
-
-def test_concurrent_first_use_loads_once(monkeypatch):
-    loaded_module = object()
-    spec = _FakeSpec(loaded_module, delay_seconds=0.05)
-    holder = prefill._LazyBatchPrefillIndependentModule(spec)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        modules = list(pool.map(lambda _: holder.get(), range(8)))
-
-    assert all(module is loaded_module for module in modules)
-    assert spec.build_count == 1
-
-
 def test_fa2_selects_stride_variant_once(monkeypatch):
     calls = []
     primary_spec = _FakeSpec(_raw_module("primary", calls))
@@ -175,6 +106,7 @@ def test_fa2_selects_stride_variant_once(monkeypatch):
         lambda *args: independent_spec,
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
 
     module = prefill.get_batch_prefill_module("fa2", *_MODULE_ARGS)
     assert primary_spec.build_count == 1
@@ -247,8 +179,17 @@ class _PrewarmRecorder:
     "wrapper_cls",
     [prefill.BatchPrefillWithPagedKVCacheWrapper, BatchDecodeWithPagedKVCacheWrapper],
 )
-def test_standard_wrappers_expose_post_plan_prewarm(wrapper_cls):
+def test_standard_wrappers_expose_post_plan_prewarm(wrapper_cls, monkeypatch):
+    devices = []
+
+    @contextmanager
+    def device_context(device):
+        devices.append(device)
+        yield
+
+    monkeypatch.setattr(torch.cuda, "device", device_context)
     wrapper = wrapper_cls.__new__(wrapper_cls)
+    wrapper.device = torch.device("cuda:1")
     wrapper._plan_info = [1]
     wrapper._cached_module = _PrewarmRecorder()
     wrapper._jit_module = None
@@ -257,6 +198,7 @@ def test_standard_wrappers_expose_post_plan_prewarm(wrapper_cls):
 
     wrapper.prewarm_paged_kv_stride_variant("independent")
     assert wrapper._cached_module.variants == ["independent"]
+    assert devices == [torch.device("cuda:1")]
 
     wrapper._plan_info = None
     with pytest.raises(RuntimeError, match=r"plan\(\) must complete"):

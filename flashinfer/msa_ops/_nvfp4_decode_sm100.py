@@ -179,7 +179,11 @@ _PAGE_BYTES = _TP1_LAYOUT["page_bytes"]
 # other width is served, just by the parametric family instead.
 _PINNED_MAX_BLOCKS = 128
 
-_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm100a", (10, 3): "sm103a"}
+_SUPPORTED_COMPUTE_CAPABILITIES = {
+    (10, 0): "sm100a",
+    (10, 3): "sm103a",
+    (10, 7): "sm107a",
+}
 
 # e2m1 value table indexed by the 4-bit code; even elements occupy the low
 # nibble of each packed byte.
@@ -578,7 +582,7 @@ def check_surface(
         if tensor.device != q.device:
             return _reject(f"{name} must be on the same device as q")
     if _target_for(q.device) is None:
-        return _reject("this route requires compute capability 10.0 or 10.3")
+        return _reject("this route requires compute capability 10.0, 10.3 or 10.7")
     return None
 
 
@@ -1419,7 +1423,7 @@ def run(
     capturing = _is_capturing()
     if not capturing:
         logger.info_once(
-            "FlashInfer NVFP4 MSA decode kernel active on compute capability 10.0/10.3"
+            "FlashInfer NVFP4 MSA decode kernel active on compute capability 10.0/10.3/10.7"
         )
 
     # ---- internal route selection -----------------------------------------
