@@ -127,6 +127,57 @@ def _base():
         {"logits_soft_cap": None},
         {"frontend_serves_frost_decode": False, "override": "1"},  # forced
         {"override": "true"},
+        {"replay_hint": True},  # the hint changes nothing at d128
+        # single-token d256: the decode tile's unit band
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+        },  # 128 CTAs
+        {
+            "head_dim": 256,
+            "num_qo_heads": 64,
+            "num_kv_heads": 8,
+            "q_len_per_req": 1,
+            "batch_size": 12,
+        },  # 96
+        {
+            "head_dim": 256,
+            "num_qo_heads": 16,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "batch_size": 64,
+        },  # 256
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 2,
+            "q_len_per_req": 1,
+            "batch_size": 64,
+        },  # group 16
+        {
+            "head_dim": 256,
+            "num_qo_heads": 8,
+            "num_kv_heads": 1,
+            "q_len_per_req": 1,
+            "batch_size": 128,
+        },
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "batch_size": 16,
+            "replay_hint": True,
+        },  # 64 CTAs, split
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "page_size": 64,
+        },
     ],
 )
 def test_auto_prefers_cudnn_inside_the_envelope(changes):
@@ -162,8 +213,121 @@ def test_auto_prefers_cudnn_inside_the_envelope(changes):
         {"o_data_type": torch.float16},  # mixed output dtype
         {"head_dim": 64},
         {"head_dim": 192},
-        {"head_dim": 256, "num_qo_heads": 32, "num_kv_heads": 2},
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 2,
+        },  # multi-token d256: prefill tile
         {"head_dim": 512},
+        # single-token d256 outside the band
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "batch_size": 16,
+        },  # 64 CTAs unsplit
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "batch_size": 8,
+        },  # 32 CTAs
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "batch_size": 8,
+            "replay_hint": True,
+        },
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "batch_size": 128,
+        },  # 512 CTAs
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "batch_size": 128,
+            "replay_hint": True,
+        },
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 16,
+            "q_len_per_req": 1,
+        },  # group 2
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 32,
+            "q_len_per_req": 1,
+        },  # MHA
+        {
+            "head_dim": 256,
+            "num_qo_heads": 64,
+            "num_kv_heads": 2,
+            "q_len_per_req": 1,
+            "batch_size": 64,
+        },  # group 32: prefill tile
+        {
+            "head_dim": 256,
+            "num_qo_heads": 96,
+            "num_kv_heads": 8,
+            "q_len_per_req": 1,
+            "batch_size": 16,
+        },  # group 12
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 2,
+        },  # two rows: prefill tile
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "window_left": 128,
+        },
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "page_size": 24,
+        },
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "kv_data_type": torch.float8_e4m3fn,
+        },
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "compute_capability": (9, 0),
+        },
+        {
+            "head_dim": 256,
+            "num_qo_heads": 32,
+            "num_kv_heads": 4,
+            "q_len_per_req": 1,
+            "frontend_serves_frost_decode": False,
+        },
+        {
+            "replay_hint": True,
+            "batch_size": 8,
+        },  # the hint does not widen the d128 envelope
         {"num_qo_heads": 96, "num_kv_heads": 8},  # GLM-4.5: group 12
         {"num_qo_heads": 40, "num_kv_heads": 8},  # group 5
         {"num_qo_heads": 48, "num_kv_heads": 8},  # group 6
@@ -236,3 +400,60 @@ def test_auto_reads_the_override_from_the_environment(clean_env):
     assert _auto_decode_prefers_cudnn(**old) is True
     clean_env.delenv(_DECODE_AUTO_CUDNN_ENV)
     assert _auto_decode_prefers_cudnn(**old) is False
+
+
+# -------------------------------------------------------------- replay hint probe
+
+
+class _PygraphWithHint:
+    def __init__(
+        self, io_data_type=None, *, is_cuda_graph_replay_expected=False, **kwargs
+    ):
+        pass
+
+
+class _PygraphWithoutHint:
+    def __init__(self, io_data_type=None, **kwargs):
+        pass
+
+
+def _graph_forwarding(handle, name="g", **graph_kwargs):
+    pass
+
+
+def _graph_fixed(handle, name="g"):
+    pass
+
+
+@pytest.mark.parametrize(
+    "pygraph,graph,expected",
+    [
+        (_PygraphWithHint, _graph_forwarding, True),
+        (_PygraphWithoutHint, _graph_forwarding, False),  # 1.30: no such keyword
+        (_PygraphWithHint, _graph_fixed, False),  # the helper would reject the keyword
+        (None, _graph_forwarding, False),  # no pygraph class at all
+    ],
+)
+def test_cudnn_frontend_accepts_cuda_graph_replay_hint(
+    clean_env, pygraph, graph, expected
+):
+    """The probe reads the signatures: the pygraph constructor must take the
+    keyword and the cudnn.graph helper must forward graph keywords."""
+    mod = _fake_cudnn(clean_env, "1.31.0")
+    if pygraph is not None:
+        mod.pygraph = pygraph
+    mod.graph = graph
+    cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint.cache_clear()
+    try:
+        assert cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint() is expected
+    finally:
+        cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint.cache_clear()
+
+
+def test_cudnn_frontend_accepts_cuda_graph_replay_hint_without_package(clean_env):
+    clean_env.setitem(sys.modules, "cudnn", None)  # makes `import cudnn` fail
+    cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint.cache_clear()
+    try:
+        assert cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint() is False
+    finally:
+        cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint.cache_clear()

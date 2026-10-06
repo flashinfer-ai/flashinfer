@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import inspect
 import threading
 import weakref
 from typing import Optional, Tuple
@@ -105,3 +106,30 @@ def cudnn_frontend_serves_frost_decode(compute_capability: Tuple[int, int]) -> b
     if (tuple(version) + (0, 0, 0))[:3] < CUDNN_FRONTEND_FROST_DECODE_MIN_VERSION:
         return False
     return tuple(compute_capability) in ((10, 0), (10, 3))
+
+
+@functools.cache
+def cudnn_frontend_accepts_cuda_graph_replay_hint() -> bool:
+    """Whether the installed cudnn-frontend's ``pygraph`` takes the keyword-only
+    ``is_cuda_graph_replay_expected`` hint and its ``cudnn.graph`` helper
+    forwards graph keywords to it (1.31+).
+
+    The hint tells the frontend's heuristics that the graph's ``execute`` is
+    captured into a CUDA graph and replayed, so a plan's per-execute host
+    cost is paid once; the d256 decode tile then leads with its split-KV
+    plan. Probed from the signatures rather than the version so a frontend
+    without the keyword (or the compiled ``pygraph`` of 1.29 and older,
+    which has no Python signature) is simply not given it.
+    """
+    try:
+        import cudnn  # noqa: PLC0415 -- optional dependency, imported lazily
+    except Exception:  # noqa: BLE001 -- any import failure means "not available"
+        return False
+    try:
+        ctor = inspect.signature(cudnn.pygraph.__init__).parameters
+        helper = inspect.signature(cudnn.graph).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return "is_cuda_graph_replay_expected" in ctor and any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in helper.values()
+    )

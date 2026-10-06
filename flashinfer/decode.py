@@ -41,7 +41,10 @@ from .mla import (
 from .xqa import xqa, xqa_mla as xqa_mla
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .cudnn.decode import CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE
-from .cudnn.utils import cudnn_frontend_serves_frost_decode
+from .cudnn.utils import (
+    cudnn_frontend_accepts_cuda_graph_replay_hint,
+    cudnn_frontend_serves_frost_decode,
+)
 from .cudnn.decode import CudnnDecodeGraph, prepare_cudnn_batch_decode
 from .jit import (
     gen_batch_decode_module,
@@ -657,6 +660,17 @@ _AUTO_CUDNN_MIN_ROWS = 32
 _AUTO_CUDNN_MAX_ROWS = 128
 _AUTO_CUDNN_MIN_UNITS = 64
 
+# Single-token d256 (B200 grids in _auto_decode_prefers_cudnn): cuDNN's d256
+# decode tile runs one CTA per (batch, KV head) unit with the group's rows
+# packed and does not split KV unless the frontend was told the graph is
+# replayed under a CUDA graph. Its envelope is a band of units: below it the
+# one-CTA-per-unit kernel idles most of the GPU while fa2 fills it, above
+# about 1.7 waves the second wave's tail and fa2's own scheduling even out.
+_AUTO_CUDNN_D256_MIN_UNITS = 96
+_AUTO_CUDNN_D256_MIN_UNITS_REPLAY = 64
+_AUTO_CUDNN_D256_MAX_UNITS = 256
+_AUTO_CUDNN_D256_GROUPS = (4, 8, 16)
+
 
 def _auto_decode_prefers_cudnn(
     *,
@@ -676,6 +690,7 @@ def _auto_decode_prefers_cudnn(
     logits_soft_cap: float,
     q_len_per_req: int,
     fa2_available: bool = True,
+    replay_hint: bool = False,
     override: Optional[str] = None,
 ) -> bool:
     """Whether ``backend="auto"`` should run this decode plan on cuDNN.
@@ -703,6 +718,28 @@ def _auto_decode_prefers_cudnn(
     (the tile's window path is unmeasured), RoPE / soft-cap (the cudnn path
     does not apply them), and more than 128 rows per CTA, where cuDNN serves
     the graph with its prefill tile.
+
+    Single-token decode of fp16 / bf16 head_dim-256 GQA models (groups 4, 8
+    and 16, the rows the d256 decode tile packs into one CTA) also goes to
+    cuDNN, in a band of ``batch_size * num_kv_heads`` units: 96 to 256 CTAs,
+    and from 64 CTAs when ``replay_hint`` says the wrapper tells the frontend
+    the graph is replayed under a CUDA graph (cudnn-frontend 1.31+), where
+    the tile splits KV below one wave instead of leaving most SMs idle.
+    Measured on B200 (148 SMs, clocks capped at 1155 MHz; cudnn-frontend
+    develop at 1.31 with the hint, default placement; cuDNN 9.26; bf16, page
+    16, CUDA-graph replay, kernel time, 1k / 4k / 16k caches; cuDNN vs fa2's
+    tensor-core decode, whose CUDA-core kernel is 1.5-9x slower still): at
+    128 CTAs 0.50-0.88x at 1k / 4k for 16/4, 32/4, 64/8, 8/1, 64/4 and 32/2,
+    0.57-1.09x at 16k; at 96 CTAs 0.50-0.76x at 1k, 0.96-1.0x at 4k, 0.70-
+    0.98x at 16k; at 148-256 CTAs 0.5-0.96x with a few parity cells at 16k.
+    At 64 CTAs the unsplit tile loses at 4k (1.13-1.25x; 0.88-0.94x at 1k,
+    0.64-0.96x at 16k) while the hinted split-2 plan wins everywhere (0.78-
+    0.93x at 4k, 0.59-0.99x at 16k). Outside the band: 32 CTAs 1.1-1.85x
+    unsplit and mixed (0.60-1.20x) with the hinted split-4 plan; 512 and
+    1024 CTAs mixed (0.47-1.33x). Multi-token d256 rows ride cuDNN's prefill
+    tile (the 32-row decode tile is not routed) and measure mixed, so they
+    stay on fa2; groups of 1, 2 and 32 and the non-dividing groups are
+    unmeasured or run the prefill tile and stay on fa2 as well.
 
     ``fa2_available=False`` says the plan has no fa2 kernel at all (multi-token
     rows without tensor cores: the CUDA-core decode kernel is single-token);
@@ -739,20 +776,35 @@ def _auto_decode_prefers_cudnn(
         # Nothing else can run these rows: take cudnn wherever its decode
         # path serves the plan (window included), envelope or not.
         return q_len_per_req >= 2 and head_dim in (128, 256)
-    if head_dim != 128:
+    if head_dim not in (128, 256):
         return False
     group = num_qo_heads // num_kv_heads
-    if group > 128 or 128 % group != 0:
-        return False
     if page_size <= 0 or page_size % 8 != 0:
         return False
     if not (128 % page_size == 0 or page_size % 128 == 0):
         return False
     if window_left >= 0:
         return False
-    # Multi-token rows only: single-token decode is served by cuDNN's backend
-    # decode engine (the frontend ranks it ahead of the FROST tile), whose
-    # standing against fa2 is mixed; see the docstring.
+    units = batch_size * num_kv_heads
+    if head_dim == 256:
+        # Single-token rows only: multi-token d256 rows ride cuDNN's prefill
+        # tile (the 32-row decode tile is not routed) and measure mixed. The
+        # d256 decode tile packs the whole group into one CTA per unit, so
+        # its envelope is a band of units; a wrapper that declares CUDA-graph
+        # replay gets the split-KV plan and wins from 64 units (docstring).
+        if q_len_per_req != 1 or group not in _AUTO_CUDNN_D256_GROUPS:
+            return False
+        lower = (
+            _AUTO_CUDNN_D256_MIN_UNITS_REPLAY
+            if replay_hint
+            else _AUTO_CUDNN_D256_MIN_UNITS
+        )
+        return lower <= units <= _AUTO_CUDNN_D256_MAX_UNITS
+    if group > 128 or 128 % group != 0:
+        return False
+    # Multi-token rows only at d128: single-token decode is served by cuDNN's
+    # backend decode engine (the frontend ranks it ahead of the FROST tile),
+    # whose standing against fa2 is mixed; see the docstring.
     if not 2 <= q_len_per_req <= 4:
         return False
     # The FROST decode tile has to be the kernel that serves the graph (it
@@ -761,7 +813,7 @@ def _auto_decode_prefers_cudnn(
     rows = q_len_per_req * group
     if not _AUTO_CUDNN_MIN_ROWS <= rows <= _AUTO_CUDNN_MAX_ROWS:
         return False
-    return batch_size * num_kv_heads >= _AUTO_CUDNN_MIN_UNITS
+    return units >= _AUTO_CUDNN_MIN_UNITS
 
 
 _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES = {
@@ -1219,7 +1271,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             decode tile and that tile has enough work: ``q_len_per_req * group`` in
             [32, 128] rows per CTA and ``batch_size * num_kv_heads >= 64`` CTAs, where it
             measures at 0.35-0.95x fa2 (see ``_auto_decode_prefers_cudnn``); single-token
-            decode stays on fa2. Multi-token rows without tensor cores have no fa2 kernel,
+            decode stays on fa2, except head_dim-256 GQA models (groups 4, 8, 16) with
+            ``batch_size * num_kv_heads`` in [96, 256], where cuDNN's d256 decode tile
+            measures at 0.5-0.95x fa2 (from 64 under ``use_cuda_graph=True`` on
+            cudnn-frontend 1.31+, which is told the graph is replayed and splits KV).
+            Multi-token rows without tensor cores have no fa2 kernel,
             so there ``auto`` takes ``cudnn`` for every plan its decode path can run (such a
             plan used to raise). ``resolved_backend`` reports the choice after :meth:`plan`.
             ``FLASHINFER_DECODE_AUTO_CUDNN=0`` keeps fa2, ``=1`` applies the rule on an older
@@ -1425,6 +1481,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # The CUDA-core decode kernel is single-token: multi-token rows
             # without tensor cores have no fa2 kernel to compare against.
             fa2_available=self.use_tensor_cores or q_len_per_req <= 1,
+            # A CUDA-graph wrapper tells cudnn-frontend 1.31+ the graph is
+            # replayed (prepare_cudnn_batch_decode); its d256 decode tile
+            # then splits KV, which widens the single-token d256 band.
+            replay_hint=self.is_cuda_graph_enabled
+            and cudnn_frontend_accepts_cuda_graph_replay_hint(),
         )
 
     @property
@@ -3025,6 +3086,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     out=out,
                     lse=lse,
                     sinks=sinks,
+                    is_cuda_graph_compatible=self.is_cuda_graph_enabled,
                     **signature,
                 ):
                     prepared = self._cudnn_prepared = prepare_cudnn_batch_decode(
@@ -3036,6 +3098,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         lse=lse,
                         sinks=sinks,
                         actual_seq_lens_q=self._cudnn_q_lens_view,
+                        # Under use_cuda_graph the caller captures run(): the
+                        # frontend's replay hint (1.31+) leads with the plan that
+                        # is fastest on the GPU alone.
+                        is_cuda_graph_compatible=self.is_cuda_graph_enabled,
                         **signature,
                     )
                 prepared.run(

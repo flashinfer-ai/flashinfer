@@ -23,10 +23,16 @@ installed, the decode wrapper's ``backend="auto"`` resolves to ``cudnn`` on
 SM100 / SM103 for the multi-token rows (``2 <= q_len_per_req <= 4``) of fp16/bf16
 head_dim-128 GQA models when that tile has at least 32 packed rows per CTA and 64
 CTAs, where it measures at 0.35-0.95x fa2 (multi-token rows without tensor cores,
-which have no fa2 kernel, take cuDNN whenever its decode path can run them);
-``FLASHINFER_DECODE_AUTO_CUDNN`` overrides the choice. Under CUDA graphs ``auto``
-takes cuDNN only with a caller-owned ``block_tables`` (the auto-built table cannot
-grow once captured), and the resolution is frozen after the first plan.
+which have no fa2 kernel, take cuDNN whenever its decode path can run them), and
+for single-token decode of fp16/bf16 head_dim-256 GQA models (groups 4, 8 and 16)
+with 96 to 256 (batch x KV heads) CTAs, where the d256 decode tile measures at
+0.5-0.95x fa2; ``FLASHINFER_DECODE_AUTO_CUDNN`` overrides the choice. Under CUDA
+graphs ``auto`` takes cuDNN only with a caller-owned ``block_tables`` (the
+auto-built table cannot grow once captured), and the resolution is frozen after
+the first plan. A CUDA-graph wrapper also tells cudnn-frontend 1.31+ that the
+graph is replayed (``pygraph(is_cuda_graph_replay_expected=True)``), so the d256
+decode tile leads with its split-KV plan, and the single-token d256 band then
+starts at 64 CTAs.
 
 Compatible decode runs and replans retain the prepared cuDNN graph. Planning
 still stages changing KV lengths and, unless the caller supplies a dense GPU
