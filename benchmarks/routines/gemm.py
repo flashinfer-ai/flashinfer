@@ -41,6 +41,8 @@ def run_gemm_test(args):
     """
     if args.routine == "gemm_fp8_nt_groupwise":
         return testGemmFp8NtGroupwise(args)
+    elif args.routine == "gemm_fp8_nt_blockscaled":
+        return testGemmFp8NtBlockscaled(args)
     elif args.routine == "group_gemm_fp8_nt_groupwise":
         return testGroupGemmFp8NtGroupwise(args)
     elif args.routine == "bmm_fp8":
@@ -224,6 +226,9 @@ def parse_gemm_args(line, parser):
     if args.routine == "mm_fp8":
         if not has_backends_arg:
             args.backends = ["trtllm_low_latency"]
+    if args.routine == "gemm_fp8_nt_blockscaled":
+        if not has_backends_arg:
+            args.backends = ["cutlass"]
     if args.routine == "router_gemm":
         if not has_backends_arg:
             args.backends = ["auto"]
@@ -445,6 +450,182 @@ def testGemmFp8NtGroupwise(args):
             cur_res["backend"] = backend
             cur_res["case_tag"] = args.case_tag
             res.append(cur_res)
+    return res
+
+
+def testGemmFp8NtBlockscaled(args):
+    """
+    Test gemm_fp8_nt_blockscaled API.
+
+    This test:
+    1. Generates random input tensors
+    2. Quantizes input tensors to FP8 with 128x128 block scales
+    3. Runs gemm_fp8_nt_blockscaled
+    4. Runs reference check
+    5. Measures performance metrics (TFLOPS, TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    warn_if_pdl_unsupported(args, args.routine)
+    if args.verbose >= 1:
+        print("[INFO] Running testGemmFp8NtBlockscaled")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends
+    m = args.m
+    n = args.n
+    k = args.k
+    block_size = 128
+    scale_major_mode = args.scale_major_mode
+    mma_sm = args.mma_sm
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    if out_dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(f"Unsupported output dtype: {args.out_dtype}")
+    if m % block_size != 0 or n % block_size != 0 or k % block_size != 0:
+        raise ValueError(
+            f"gemm_fp8_nt_blockscaled uses {block_size}x{block_size} scale blocks; "
+            f"m, n and k must be multiples of {block_size} (got m={m}, n={n}, k={k})."
+        )
+    ## Done parsing input arguments
+
+    ## Prepare input tensors
+    a_val = torch.randn((m, k), dtype=torch.float, device=device)
+    b_val = torch.randn((n, k), dtype=torch.float, device=device) / np.sqrt(k)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {a_val.shape = }")
+        print(f"[VVERBOSE] {b_val.shape = }")
+
+    if scale_major_mode == "K":
+        a_scale_shape = (m // block_size, k // block_size)
+        b_scale_shape = (n // block_size, k // block_size)
+    else:
+        a_scale_shape = (k // block_size, m // block_size)
+        b_scale_shape = (k // block_size, n // block_size)
+
+    tile_shape = (block_size, block_size)
+
+    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, tile_shape, scale_major_mode)
+    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, tile_shape, scale_major_mode)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {a_fp8.shape = }")
+        print(f"[VVERBOSE] {b_fp8.shape = }")
+        print(f"[VVERBOSE] {a_scale.shape = }")
+        print(f"[VVERBOSE] {b_scale.shape = }")
+
+    a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+
+    def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale):
+        if backend == "cutlass":
+            return flashinfer.gemm.gemm_fp8_nt_blockscaled(
+                a=a_fp8,
+                b=b_fp8,
+                a_scale=a_scale,
+                b_scale=b_scale,
+                scale_major_mode=scale_major_mode,
+                mma_sm=mma_sm,
+                out_dtype=out_dtype,
+            )
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    has_reference_output = False
+    if run_refcheck:
+        reference_output = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)
+        has_reference_output = True
+
+    # Storage for timing results and outputs
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(
+                cur_backend, a_fp8, b_fp8, a_scale, b_scale
+            ).detach()
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            cold_l2_cache=True,
+            input_args=(cur_backend, a_fp8, b_fp8, a_scale, b_scale),
+        )
+
+    tested_backends = list(outputs.keys())
+    tested_outputs = list(outputs.values())
+    if len(tested_backends) > 0:
+        if run_refcheck and has_reference_output:
+            for i in range(len(tested_backends)):
+                (
+                    num_different_elements,
+                    num_elements,
+                    num_different_elements_percentage,
+                ) = is_close_stats(
+                    reference_output, tested_outputs[i], rtol=1e-2, atol=1e-2
+                )
+                if num_different_elements > 0:
+                    print(
+                        f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}"
+                    )
+                    if not args.allow_output_mismatch:
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
+                        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            problem_flops = 2 * m * n * k
+            problem_bytes = (m * k + n * k) * torch.float8_e4m3fn.itemsize + (
+                m * n
+            ) * out_dtype.itemsize
+            tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["m"] = m
+                cur_res["n"] = n
+                cur_res["k"] = k
+                cur_res["tile_size"] = block_size
+                cur_res["scale_major_mode"] = scale_major_mode
+                cur_res["out_dtype"] = out_dtype
+                cur_res["mma_sm"] = mma_sm
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
     return res
 
 

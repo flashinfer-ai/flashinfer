@@ -249,6 +249,7 @@ benchmark_apis = {
     ],
     "gemm": [
         "gemm_fp8_nt_groupwise",
+        "gemm_fp8_nt_blockscaled",
         "group_gemm_fp8_nt_groupwise",
         "bmm_fp8",
         "mm_fp8",
@@ -602,6 +603,9 @@ routine_backend_to_library_api = {
         "cutlass": ("flashinfer.gemm", "gemm_fp8_nt_groupwise", "cutlass"),
         "trtllm": ("flashinfer.gemm", "gemm_fp8_nt_groupwise", "trtllm"),
         "cutile": ("flashinfer.gemm", "gemm_fp8_nt_groupwise", "cutile"),
+    },
+    "gemm_fp8_nt_blockscaled": {
+        "cutlass": ("flashinfer.gemm", "gemm_fp8_nt_blockscaled", None),
     },
     "group_gemm_fp8_nt_groupwise": {
         "cutlass": ("flashinfer.gemm", "group_gemm_fp8_nt_groupwise", None),
