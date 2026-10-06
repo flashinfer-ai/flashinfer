@@ -56,16 +56,52 @@ def test_route_table_covers_every_world_size_dtype_layout_and_phase():
     assert set(loader.ROUTES.values()) == set(loader.PROGRAMS)
 
 
-def test_every_program_lists_one_device_and_one_binding_source():
+def test_every_program_lists_its_device_source_only():
     for program, row in loader.PROGRAMS.items():
-        assert len(row["sources"]) == 2, program
-        assert all(
-            source.startswith("csrc/cake_all_gather_matmul/")
-            for source in row["sources"]
-        )
+        assert len(row["sources"]) == 1, program
+        assert row["sources"][0].startswith("csrc/cake_all_gather_matmul/")
+        assert row["sources"][0].endswith("_kernel.cu")
         assert len(row["block"]) == 3 and row["block"][0] > 0
         assert row["dynamic_smem_bytes"] >= 0
         assert row["arches"] and set(row["arches"]) <= set(loader.ARCH_FLAGS), program
+
+
+def test_every_route_has_one_host_sequence_per_architecture():
+    expected = set()
+    for arch in loader.ARCH_FLAGS:
+        for world_size, dtype_name, b_layout in _main_programs():
+            name = loader.sequence_name(world_size, dtype_name, b_layout, arch)
+            expected.add(name)
+            row = loader.SEQUENCES[name]
+            assert row["arches"] == [arch]
+            assert (row["world_size"], row["dtype"], row["b_layout"]) == (
+                world_size,
+                dtype_name,
+                b_layout,
+            )
+            programs = loader.sequence_programs(name)
+            # The sequence compiles the route's device units (one each) with
+            # its launcher; the compile order carries no meaning.
+            assert len(row["sources"]) == len(programs) + 1
+            assert set(row["sources"][:-1]) == {
+                loader.PROGRAMS[program]["sources"][0] for program in programs
+            }
+            assert row["sources"][-1].startswith(
+                "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_"
+            )
+            assert row["sources"][-1].endswith(f"{name}.cu")
+            # The fused SM copy kernel travels only with the route that launches it.
+            assert row["fused"] == loader.uses_fused_peer_copy(
+                arch=arch,
+                dtype_name=dtype_name,
+                world_size=world_size,
+                rows=512,
+                n=1280,
+            )
+            assert (loader.fused_peer_copy_program() in programs) == row["fused"]
+    assert set(loader.SEQUENCES) == expected
+    with pytest.raises(ValueError, match="host sequence"):
+        loader.sequence_name(16, "bfloat16", "n_major", "sm_100a")
 
 
 def test_fused_copy_program_is_delivered_for_its_routed_architecture_only():
@@ -80,10 +116,18 @@ def test_fused_copy_program_is_delivered_for_its_routed_architecture_only():
         assert loader.PROGRAMS[loader.main_program(world_size, dtype_name, b_layout)][
             "arches"
         ] == ["sm_100a", "sm_103a"]
+    fused_sequence = loader.sequence_name(8, "bfloat16", "n_major", "sm_103a")
+    assert loader.SEQUENCES[fused_sequence]["fused"] is True
+    assert (
+        loader.SEQUENCES[loader.sequence_name(8, "bfloat16", "n_major", "sm_100a")][
+            "fused"
+        ]
+        is False
+    )
     loader.spec.cache_clear()
     try:
         with pytest.raises(ValueError, match="sm_100a"):
-            loader.spec(fused, "sm_100a")
+            loader.spec(fused_sequence, "sm_100a")
     finally:
         loader.spec.cache_clear()
 
@@ -237,12 +281,19 @@ def test_spec_names_carry_the_exact_architecture(monkeypatch):
     monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a")
     loader.spec.cache_clear()
     try:
-        program = loader.main_program(2, "bfloat16", "n_major")
-        for arch in loader.PROGRAMS[program]["arches"]:
-            spec = loader.spec(program, arch)
-            assert spec.name == f"{program}_{arch}"
+        specs = {}
+        for arch in ("sm_100a", "sm_103a"):
+            sequence = loader.sequence_name(2, "bfloat16", "n_major", arch)
+            spec = loader.spec(sequence, arch)
+            assert spec.name == f"{loader.SOURCE_PACKAGE}_sequence_{sequence}"
+            assert sequence.endswith(arch)
             assert loader.ARCH_FLAGS[arch][0] in spec.extra_cuda_cflags
-        assert loader.spec(program, "sm_100a") is not loader.spec(program, "sm_103a")
+            assert [str(path).split("/")[-1] for path in spec.sources] == [
+                source.split("/")[-1]
+                for source in loader.SEQUENCES[sequence]["sources"]
+            ]
+            specs[arch] = spec
+        assert specs["sm_100a"] is not specs["sm_103a"]
     finally:
         loader.spec.cache_clear()
 
@@ -328,6 +379,19 @@ class _CudaLike:
 
     def is_contiguous(self):
         return self._contiguous
+
+    def t(self):
+        return _CudaLike(
+            self._shape[::-1],
+            self.dtype,
+            contiguous=self._contiguous and self.ndim < 2,
+            index=self.device.index,
+            stride=self._stride[::-1],
+        )
+
+    def view(self, *shape):
+        # Metadata-only reshape of a dense (possibly transposed-to-dense) view.
+        return _CudaLike(shape, self.dtype, index=self.device.index)
 
 
 def _k_major_weight(n, dtype=torch.bfloat16):
@@ -516,6 +580,9 @@ def test_prepared_launcher_serves_every_row_count_up_to_its_capacity(monkeypatch
         state=state,
         workspace=workspace,
     )
+    # The frozen launcher resolves the weight's tensor-map source view once.
+    assert launcher.weight_source is not None
+    assert tuple(launcher.weight_source.shape) == (1, 1280, 8192)
     for rows in (1, 125, 512, 1025, 2048):
         bound = launcher._validate_input(_CudaLike((rows, 8192), torch.bfloat16))
         assert (bound.rows, bound.n, bound.b_layout) == (rows, 1280, "k_major")
@@ -545,7 +612,7 @@ def test_launch_refuses_a_workspace_smaller_than_the_padded_rows():
     assert state.poisoned is False
 
 
-def test_cross_stream_join_records_a_fresh_event_and_skips_capture():
+def test_cross_stream_join_records_a_fresh_event_and_skips_capture(monkeypatch):
     """The join must never reuse an event that a CUDA graph capture re-recorded."""
 
     assert not hasattr(backend._LaunchState, "tail_event")
@@ -558,66 +625,160 @@ def test_cross_stream_join_records_a_fresh_event_and_skips_capture():
         def wait_stream(self, other):
             self.joined.append(other)
 
-    state = backend._LaunchState(rank=0, world_size=2)
     first, second, third = _Stream(11), _Stream(22), _Stream(33)
-    assert backend._join_previous_tail(state, first, capturing=False) is False
-    state.tail_stream = first
-    assert backend._join_previous_tail(state, first, capturing=False) is False
-    assert backend._join_previous_tail(state, second, capturing=True) is False
-    assert backend._join_previous_tail(state, second, capturing=False) is True
+    current = {11: first, 22: second, 33: third}
+    monkeypatch.setattr(
+        backend.torch.cuda, "current_stream", lambda index: current[handles[-1]]
+    )
+    handles = [11]
+    state = backend._LaunchState(rank=0, world_size=2)
+    assert backend._join_previous_tail(state, 11, 0, capturing=False) is False
+    backend._remember_tail(state, 11, 0)
+    assert state.tail_stream is first and state.tail_handle == 11
+    assert backend._join_previous_tail(state, 11, 0, capturing=False) is False
+    handles.append(22)
+    assert backend._join_previous_tail(state, 22, 0, capturing=True) is False
+    assert backend._join_previous_tail(state, 22, 0, capturing=False) is True
     assert second.joined == [first] and first.joined == []
-    state.tail_stream = second
-    assert backend._join_previous_tail(state, third, capturing=True) is False
+    backend._remember_tail(state, 22, 0)
+    assert state.tail_stream is second
+    handles.append(33)
+    assert backend._join_previous_tail(state, 33, 0, capturing=True) is False
     assert third.joined == []
+    # Re-remembering the same stream keeps the cached torch stream object.
+    backend._remember_tail(state, 22, 0)
+    assert state.tail_stream is second
 
 
-def test_barrier_launches_inside_the_main_stream_binding_of_the_call_device(
-    monkeypatch,
-):
-    """The tensor-less barrier launcher gets no stream from its arguments; the backend binds one."""
+class _Recording:
+    def __init__(self, *, index=0):
+        self.device = torch.device("cuda", index)
+        self.streams = []
 
-    bindings = []
+    def record_stream(self, stream):
+        self.streams.append(stream)
 
-    class _Binding:
-        def __init__(self, device, stream):
-            self.device, self.stream, self.active = device, stream, False
 
-        def __enter__(self):
-            self.active = True
-            bindings.append(self)
-            return self
+def _launch_fixture(monkeypatch, *, rows, n, world_size, arch, b_layout="n_major"):
+    call = backend._Call(0, 1, world_size, "g", "bfloat16", arch, rows, n, b_layout)
+    state = backend._LaunchState(rank=1, world_size=world_size, flag_peers=("flags",))
+    workspace = backend._Workspace(
+        dtype=torch.bfloat16,
+        rank=1,
+        world_size=world_size,
+        device_index=0,
+        pitch=max(2048, backend.loader.padded_rows(rows)),
+    )
+    workspace.scratch = "scratch"
+    workspace.signal_pad = "signal_pad"
+    workspace.comm_stream = "comm_stream"
+    workspace.comm_handle = 77
+    workspace.peer_scratch_ptrs = ("peer_scratch",)
+    workspace.peer_signal_ptrs = ("peer_signals",)
+    workspace.fused_buffers = ("payload", "signals", "counters")
 
-        def __exit__(self, *exc):
-            self.active = False
-            return False
-
-    class _Barrier:
+    class _Sequence:
         def __init__(self):
-            self.runs = []
+            self.calls = []
 
         def run(self, *args):
-            self.runs.append((args, [binding.active for binding in bindings]))
+            self.calls.append(("run", args))
 
+        def run_fused(self, *args):
+            self.calls.append(("run_fused", args))
+
+    sequence = _Sequence()
+    workspace.sequences = {b_layout: sequence}
+    monkeypatch.setattr(backend, "_current_stream_handle", lambda index: 4242)
     monkeypatch.setattr(
-        backend.tvm_ffi,
-        "use_raw_stream",
-        lambda device, stream: _Binding(device, stream),
+        backend.torch.cuda, "is_current_stream_capturing", lambda: False
     )
-    call = backend._Call(
-        device_index=1,
-        rank=1,
-        world_size=2,
-        group_name="g",
-        dtype_name="bfloat16",
-        arch="sm_100a",
-        rows=256,
-        n=2048,
-        b_layout="n_major",
+    monkeypatch.setattr(backend, "_remember_tail", lambda state, handle, index: None)
+    return call, state, workspace, sequence
+
+
+def test_launch_is_one_host_sequence_call_with_the_workspace_tables(monkeypatch):
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=1025, n=2048, world_size=4, arch="sm_100a"
     )
-    state = backend._LaunchState(rank=1, world_size=2, flag_peers=("peer-table",))
-    barrier = _Barrier()
-    backend._run_barrier(barrier, call, SimpleNamespace(cuda_stream=4242), state)
-    assert barrier.runs == [((1, 2, 1, ("peer-table",), 1, 1, 1), [True])]
-    assert [
-        (binding.device, binding.stream, binding.active) for binding in bindings
-    ] == [(backend.tvm_ffi.device("cuda", 1), 4242, False)]
+    inp = _Recording()
+    backend._launch(state, workspace, call, inp, "w_source", "out")
+    grid = backend.loader.main_grid(
+        1025,
+        2048,
+        peer_partitions=backend.loader.peer_partitions(
+            arch="sm_100a",
+            dtype_name="bfloat16",
+            world_size=4,
+            rows=1025,
+            n=2048,
+            fused=False,
+        ),
+    )
+    assert sequence.calls == [
+        (
+            "run",
+            (
+                inp,
+                "scratch",
+                "w_source",
+                "out",
+                "signal_pad",
+                ("flags",),
+                ("peer_scratch",),
+                ("peer_signals",),
+                1,
+                1025,
+                workspace.pitch,
+                0,
+                1,
+                *grid,
+                4242,
+                77,
+            ),
+        )
+    ]
+    # The pushes read ``inp`` on the communication stream.
+    assert inp.streams == ["comm_stream"]
+    assert (state.next_phase, state.ready_epoch) == (1, 1)
+    backend._launch(state, workspace, call, inp, "w_source", "out")
+    assert sequence.calls[-1][1][11:13] == (1, 2)
+    assert (state.next_phase, state.ready_epoch) == (0, 2)
+    assert state.poisoned is False
+
+
+def test_fused_route_uses_the_fused_sequence_entry_and_keeps_its_phase(monkeypatch):
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=512, n=1280, world_size=8, arch="sm_103a"
+    )
+    backend._launch(state, workspace, call, _Recording(), "w_source", "out")
+    (entry, args) = sequence.calls[0]
+    assert entry == "run_fused"
+    assert args[6:9] == ("payload", "signals", "counters")
+    assert args[12:14] == (0, 1)
+    # The fused route consumed both barrier phases in one call.
+    assert state.next_phase == 0 and state.ready_epoch == 1
+
+
+def test_launch_refuses_an_unprepared_layout_without_poisoning(monkeypatch):
+    call, state, workspace, _sequence = _launch_fixture(
+        monkeypatch, rows=256, n=2048, world_size=2, arch="sm_100a"
+    )
+    workspace.sequences = {}
+    with pytest.raises(RuntimeError, match="host sequence"):
+        backend._launch(state, workspace, call, _Recording(), "w_source", "out")
+    assert state.poisoned is False
+
+
+def test_sequence_failure_poisons_the_launch_state(monkeypatch):
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=256, n=2048, world_size=2, arch="sm_100a"
+    )
+
+    def failing(*args):
+        raise RuntimeError("boom")
+
+    sequence.run = failing
+    with pytest.raises(RuntimeError, match="boom"):
+        backend._launch(state, workspace, call, _Recording(), "w_source", "out")
+    assert state.poisoned is True
