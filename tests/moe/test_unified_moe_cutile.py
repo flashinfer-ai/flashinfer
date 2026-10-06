@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import ast
+from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -49,6 +52,8 @@ from flashinfer.fused_moe import (
     ReLU,
     ReLU2,
     RoutingConfig,
+    SM12xNvfp4Bf16Config,
+    SM12xNvfp4Bf16Runner,
     SiLU,
     SiTU,
     SwiGLU,
@@ -293,6 +298,71 @@ def _config(
     )
     values.update(overrides)
     return MoEConfig(**values)
+
+
+@pytest.mark.parametrize("precompile_fails", (False, True))
+def test_cutile_single_runner_precompiles_bucket_before_caching(
+    monkeypatch, precompile_fails
+):
+    from flashinfer.testing import utils as testing_utils
+
+    inputs = [torch.empty((17, 128), dtype=torch.bfloat16)]
+    tactic = (32, 1, 128, 64, 2, 128, 64, 2)
+    output = object()
+    launch_kwargs = {"enable_pdl": False}
+    tuning_config = object()
+    runner = SimpleNamespace(
+        backend_key=CuTileBf16Runner.backend_key,
+        supported_routing_modes=("pre_routed",),
+        pack_inputs=Mock(return_value=inputs),
+        launch_kwargs_for=Mock(return_value=launch_kwargs),
+        tuning_config_for=Mock(return_value=tuning_config),
+        forward=Mock(return_value=output),
+    )
+    layer = MoELayer.__new__(MoELayer)
+    layer.config = _config()
+    layer.runners = [runner]
+    layer.tuner = SimpleNamespace(choose_one=Mock(return_value=(runner, tactic)))
+    layer._winners = OrderedDict()
+    monkeypatch.setattr(layer, "_additional_candidates", lambda *_: [])
+
+    def precompile(packed_inputs, selected_tactic):
+        assert packed_inputs is inputs
+        assert selected_tactic is tactic
+        assert not layer._winners
+        if precompile_fails:
+            raise RuntimeError("bucket compilation failed")
+
+    runner._precompile_bucket_variants = Mock(side_effect=precompile)
+    benchmark = Mock(
+        side_effect=AssertionError("single runner must not be benchmarked")
+    )
+    monkeypatch.setattr(testing_utils, "bench_gpu_time", benchmark)
+    activations = SimpleNamespace(num_tokens=17, routing_input_mode="pre_routed")
+    weights = object()
+
+    if precompile_fails:
+        with pytest.raises(RuntimeError, match="bucket compilation failed"):
+            layer(activations, weights)
+        assert not layer._winners
+        runner.forward.assert_not_called()
+    else:
+        assert layer(activations, weights) is output
+        assert list(layer._winners.values()) == [(runner, tactic)]
+        # Reusing the winner must not repeat either tuning or compilation.
+        assert layer(activations, weights) is output
+        assert runner.forward.call_count == 2
+        runner.forward.assert_called_with(inputs, tactic=tactic, **launch_kwargs)
+
+    runner._precompile_bucket_variants.assert_called_once_with(inputs, tactic)
+    layer.tuner.choose_one.assert_called_once_with(
+        custom_op=f"moe_{runner.backend_key}",
+        runners=[runner],
+        tuning_config=tuning_config,
+        inputs=inputs,
+        **launch_kwargs,
+    )
+    benchmark.assert_not_called()
 
 
 @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
@@ -2369,3 +2439,468 @@ def test_cutile_fp8_prepare_rejects_invalid_weights():
             )
         with pytest.raises(ValueError, match="scale must have shape"):
             config_type.prepare_weights(weight, scales[:2], weight, scales, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# SM12x CuTe-DSL NVFP4 x BF16 over the shared cuTile NVFP4 weight view
+# ---------------------------------------------------------------------------
+
+
+def _sm12x_nvfp4_bf16_is_supported() -> bool:
+    if not torch.cuda.is_available() or torch.version.cuda is None:
+        return False
+    from flashinfer.cute_dsl import is_cute_dsl_available
+    from flashinfer.jit.cpp_ext import get_cuda_version
+
+    major, minor = torch.cuda.get_device_capability()
+    return (
+        SM12xNvfp4Bf16Config.supported(major * 10 + minor)
+        and get_cuda_version().major >= 13
+        and is_cute_dsl_available()
+    )
+
+
+sm12x_nvfp4_bf16_required = pytest.mark.skipif(
+    not _sm12x_nvfp4_bf16_is_supported(),
+    reason="requires SM120/SM121, CUDA 13 and the CuTe DSL package",
+)
+
+
+def _make_sm12x_nvfp4_bf16_case(
+    activation: ActivationConfig,
+    *,
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    top_k: int,
+    seed: int = 0,
+):
+    """Random routing and weights; the reference uses the dequantized weights."""
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    w1_rows = intermediate_size * (2 if activation.is_gated else 1)
+    global_scales = []
+    dequantized = []
+    packed = []
+    for rows, cols in ((w1_rows, hidden_size), (hidden_size, intermediate_size)):
+        weight = torch.randn(
+            num_experts, rows, cols, dtype=torch.bfloat16, device=device
+        )
+        weight /= cols**0.5
+        q, scale, dequant = _quantize_weights(weight)
+        del weight
+        global_scale = torch.rand(num_experts, device=device) + 0.5
+        packed.append((q, scale))
+        global_scales.append(global_scale)
+        dequantized.append(dequant * global_scale.to(dequant.dtype)[:, None, None])
+    view = SM12xNvfp4Bf16Config.prepare_weights(
+        packed[0][0],
+        packed[0][1],
+        global_scales[0],
+        packed[1][0],
+        packed[1][1],
+        global_scales[1],
+        num_local_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+
+    def make_activations(step: int) -> MoEActivationPack:
+        gen = torch.Generator(device=device).manual_seed(seed + 1000 * step)
+        hidden_states = torch.randn(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=device, generator=gen
+        )
+        logits = torch.rand(num_tokens, num_experts, device=device, generator=gen)
+        top = torch.topk(logits, top_k, dim=-1)
+        return MoEActivationPack(
+            hidden_states,
+            None,
+            top.indices.to(torch.int32),
+            torch.softmax(top.values, dim=-1),
+        )
+
+    def reference(act: MoEActivationPack) -> torch.Tensor:
+        return compute_reference_moe(
+            act.hidden_states_q,
+            act.topk_ids,
+            act.topk_weights,
+            dequantized[0],
+            dequantized[1],
+            activation,
+        )
+
+    return view, make_activations, reference
+
+
+def _sm12x_nvfp4_bf16_config(
+    activation: ActivationConfig,
+    *,
+    num_experts: int,
+    top_k: int,
+    intermediate_size: int,
+    max_num_tokens: int,
+    backends: tuple = (SM12xNvfp4Bf16Config(),),
+) -> MoEConfig:
+    return MoEConfig(
+        routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        experts=ExpertConfig(intermediate_size=intermediate_size),
+        activation=activation,
+        backend=BackendOptions(backends),
+        finalize=MoEFinalizeConfig(do_finalize=True),
+        execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=max_num_tokens),
+    )
+
+
+def _assert_moe_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    # The kernel keeps GEMM1 and the per-expert GEMM2 results in FP32 where the
+    # reference rounds them to BF16; the gap is a few BF16 ulps of the output.
+    torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
+
+
+def test_sm12x_nvfp4_bf16_rejects_non_default_swiglu():
+    config = _sm12x_nvfp4_bf16_config(
+        SwiGLU(limit=7.0),
+        num_experts=4,
+        top_k=2,
+        intermediate_size=128,
+        max_num_tokens=8,
+    )
+    runner = SM12xNvfp4Bf16Runner(config, torch.device("cpu"))
+    with pytest.raises(NotImplementedError, match="default SwiGLU"):
+        runner._check_activation_parameters()
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+def test_sm12x_nvfp4_bf16_reads_the_shared_cutile_view(activation):
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=4,
+        hidden_size=256,
+        intermediate_size=192,
+        num_experts=8,
+        top_k=2,
+    )
+    weights = MoEWeightPack()
+    # Registered only under the cuTile key: the view is shared, not copied.
+    weights.prepare_for(CuTileNvfp4Runner.backend_key, view)
+    config = _sm12x_nvfp4_bf16_config(
+        activation, num_experts=8, top_k=2, intermediate_size=192, max_num_tokens=8
+    )
+    runner = SM12xNvfp4Bf16Runner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    act = make_activations(0)
+    inputs = runner.pack_inputs(act, weights)
+    for tensor, key in zip(
+        inputs[4:],
+        ("w1", "w1_scale", "w1_global_scale", "w2", "w2_scale", "w2_global_scale"),
+        strict=True,
+    ):
+        assert tensor.data_ptr() == view[key].data_ptr(), key
+    _assert_moe_close(runner.forward(inputs), reference(act))
+
+
+_SM12X_NVFP4_BF16_GEOMETRIES = (
+    # (case, num_tokens, hidden, intermediate, experts, top_k, activation)
+    ("qwen3.8_flash_next_t1", 1, 2560, 640, 512, 10, SwiGLU()),
+    ("qwen3.8_flash_next_t3", 3, 2560, 640, 512, 10, SwiGLU()),
+    ("qwen3.8_flash_next_t16", 16, 2560, 640, 512, 10, SwiGLU()),
+    ("qwen3.8_flash_next_t128", 128, 2560, 640, 512, 10, SwiGLU()),
+    # MoE geometries of benchmarks/samples/sample_testlist.txt
+    ("trtllm_e256_k8", 1024, 1024, 1024, 256, 8, SwiGLU()),
+    ("trtllm_e128_k8", 1024, 1024, 1024, 128, 8, SwiGLU()),
+    ("trtllm_e128_k1", 1024, 1024, 1024, 128, 1, SwiGLU()),
+    ("cutlass_e2_k2", 32, 128, 128, 2, 2, SwiGLU()),
+    ("cutlass_e8_k2", 32, 128, 128, 8, 2, SwiGLU()),
+    ("qwen3.6_35b_a3b_t8", 8, 2048, 512, 256, 8, SwiGLU()),
+    ("qwen3.6_35b_a3b_t128", 128, 2048, 512, 256, 8, SwiGLU()),
+    ("nemotron_3.5_relu2_t8", 8, 2688, 1856, 128, 6, ReLU2()),
+    ("nemotron_3.5_relu2_t128", 128, 2688, 1856, 128, 6, ReLU2()),
+    ("cute_dsl_large", 1024, 7168, 2048, 256, 8, SwiGLU()),
+    ("cute_dsl_small", 256, 1024, 512, 256, 2, SwiGLU()),
+    ("qwen3_30b_decode", 1, 2048, 768, 128, 8, SwiGLU()),
+    ("qwen3_30b_prefill", 4096, 2048, 768, 128, 8, SwiGLU()),
+    ("qwen3_235b_tp4", 256, 4096, 384, 128, 8, SwiGLU()),
+    ("qwen3_next_e512_k10", 1024, 2048, 512, 512, 10, SwiGLU()),
+    ("mixtral_8x7b", 256, 4096, 14336, 8, 2, SwiGLU()),
+    ("b12x_swiglu_k22", 1024, 1024, 2688, 512, 22, SwiGLU()),
+    ("b12x_relu2_k22", 1, 1024, 2688, 512, 22, ReLU2()),
+)
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size,intermediate_size,num_experts,top_k,activation",
+    [case[1:] for case in _SM12X_NVFP4_BF16_GEOMETRIES],
+    ids=[case[0] for case in _SM12X_NVFP4_BF16_GEOMETRIES],
+)
+def test_sm12x_nvfp4_bf16_matches_reference(
+    num_tokens, hidden_size, intermediate_size, num_experts, top_k, activation
+):
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+    layer = MoELayer(
+        _sm12x_nvfp4_bf16_config(
+            activation,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+            max_num_tokens=max(8, num_tokens),
+        ),
+        torch.device("cuda"),
+    )
+    act = make_activations(0)
+    actual = layer(act, weights)
+    assert actual.shape == (num_tokens, hidden_size)
+    assert layer.winner_backend == SM12xNvfp4Bf16Runner.backend_key
+    _assert_moe_close(actual, reference(act))
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize("num_tokens", (1, 4, 16, 128))
+def test_sm12x_nvfp4_bf16_ignores_out_of_range_expert_ids(num_tokens):
+    # Serving frameworks route padding rows to expert -1 and expert-parallel
+    # non-local slots to num_experts; such slots contribute nothing. With one
+    # token, every row is padding, as in a CUDA-graph warmup forward.
+    activation = SwiGLU()
+    num_experts, top_k = 128, 8
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=num_tokens,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+    layer = MoELayer(
+        _sm12x_nvfp4_bf16_config(
+            activation,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=768,
+            max_num_tokens=num_tokens,
+        ),
+        torch.device("cuda"),
+    )
+    act = make_activations(0)
+    num_valid = num_tokens // 2
+    act.topk_ids[num_valid:] = -1
+    act.topk_ids[:num_valid, -1] = num_experts
+
+    actual = layer(act, weights)
+    torch.cuda.synchronize()
+
+    assert torch.count_nonzero(actual[num_valid:]) == 0
+    if num_valid:
+        ids = act.topk_ids[:num_valid].clone()
+        ids[:, -1] = 0
+        topk_weights = act.topk_weights[:num_valid].clone()
+        topk_weights[:, -1] = 0
+        expected = reference(
+            MoEActivationPack(act.hidden_states_q[:num_valid], None, ids, topk_weights)
+        )
+        _assert_moe_close(actual[:num_valid], expected)
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize("num_tokens", (1, 16, 128))
+def test_sm12x_nvfp4_bf16_dead_slots_stay_finite_on_overflowing_fallback(num_tokens):
+    # Dead slots run expert 0 under a zero weight. With expert 0 overflowing the
+    # FP16 activation, multiplying its inf partial by zero would write NaN; so
+    # would a non-finite router weight left on a dead slot.
+    activation = ReLU2()
+    num_experts, top_k = 64, 4
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=num_tokens,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    view["w1_global_scale"][0] = 1.0e4
+    weights = MoEWeightPack()
+    weights.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+    layer = MoELayer(
+        _sm12x_nvfp4_bf16_config(
+            activation,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=768,
+            max_num_tokens=num_tokens,
+        ),
+        torch.device("cuda"),
+    )
+    act = make_activations(0)
+    logits = torch.rand(num_tokens, num_experts - 1, device="cuda")
+    act.topk_ids.copy_(torch.topk(logits, top_k, dim=-1).indices.to(torch.int32) + 1)
+    num_valid = num_tokens // 2
+    act.topk_ids[num_valid:] = -1
+    act.topk_ids[:num_valid, -1] = num_experts
+    act.topk_weights[num_valid:] = float("nan")
+    act.topk_weights[:num_valid, -1] = float("inf")
+
+    actual = layer(act, weights)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[num_valid:]) == 0
+    if num_valid:
+        ids = act.topk_ids[:num_valid].clone()
+        ids[:, -1] = 1
+        topk_weights = act.topk_weights[:num_valid].clone()
+        topk_weights[:, -1] = 0
+        expected = reference(
+            MoEActivationPack(act.hidden_states_q[:num_valid], None, ids, topk_weights)
+        )
+        _assert_moe_close(actual[:num_valid], expected)
+
+
+@sm12x_nvfp4_bf16_required
+def test_sm12x_nvfp4_bf16_layers_do_not_share_scratch():
+    # Two layers of the same geometry interleaved on two streams must not race
+    # on routing lists or persistent-kernel counters.
+    activation = SwiGLU()
+    num_experts, top_k, num_tokens = 128, 8, 4
+    cases = [
+        _make_sm12x_nvfp4_bf16_case(
+            activation,
+            num_tokens=num_tokens,
+            hidden_size=2048,
+            intermediate_size=768,
+            num_experts=num_experts,
+            top_k=top_k,
+            seed=seed,
+        )
+        for seed in (0, 1)
+    ]
+    layers, packs = [], []
+    for view, _, _ in cases:
+        pack = MoEWeightPack()
+        pack.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+        packs.append(pack)
+        layers.append(
+            MoELayer(
+                _sm12x_nvfp4_bf16_config(
+                    activation,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    intermediate_size=768,
+                    max_num_tokens=num_tokens,
+                ),
+                torch.device("cuda"),
+            )
+        )
+    acts = [make(step) for step, (_, make, _) in enumerate(cases)]
+    for layer, act, pack in zip(layers, acts, packs, strict=True):
+        layer(act, pack)
+    torch.cuda.synchronize()
+
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    outs: list[list[torch.Tensor]] = [[], []]
+    for _ in range(20):
+        for i, stream in enumerate(streams):
+            with torch.cuda.stream(stream):
+                outs[i].append(layers[i](acts[i], packs[i]).clone())
+    torch.cuda.synchronize()
+
+    for i, (_, _, reference) in enumerate(cases):
+        expected = reference(acts[i])
+        for actual in outs[i]:
+            _assert_moe_close(actual, expected)
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size,intermediate_size,num_experts,top_k,activation",
+    (
+        (4, 2560, 640, 512, 10, SwiGLU()),
+        (64, 2048, 512, 256, 8, SwiGLU()),
+        (8, 2688, 1856, 128, 6, ReLU2()),
+    ),
+)
+def test_sm12x_nvfp4_bf16_cuda_graph_replays_new_inputs_and_routing(
+    num_tokens, hidden_size, intermediate_size, num_experts, top_k, activation
+):
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+    layer = MoELayer(
+        _sm12x_nvfp4_bf16_config(
+            activation,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+            max_num_tokens=num_tokens,
+        ),
+        torch.device("cuda"),
+    )
+    act = make_activations(0)
+    _assert_moe_close(layer(act, weights), reference(act))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = layer(act, weights)
+    for step in (1, 2):
+        update = make_activations(step)
+        act.hidden_states_q.copy_(update.hidden_states_q)
+        act.topk_ids.copy_(update.topk_ids)
+        act.topk_weights.copy_(update.topk_weights)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_moe_close(captured, reference(update))
+
+
+@sm12x_nvfp4_bf16_required
+def test_sm12x_nvfp4_bf16_competes_with_cutile_in_one_layer():
+    if not _cutile_nvfp4_is_supported():
+        pytest.skip("requires a working cuTile toolchain")
+    activation = SwiGLU()
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=4,
+        hidden_size=2560,
+        intermediate_size=640,
+        num_experts=512,
+        top_k=10,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(CuTileNvfp4Bf16Runner.backend_key, view)
+    layer = MoELayer(
+        _sm12x_nvfp4_bf16_config(
+            activation,
+            num_experts=512,
+            top_k=10,
+            intermediate_size=640,
+            max_num_tokens=16,
+            backends=(CuTileNvfp4Bf16Config(), SM12xNvfp4Bf16Config()),
+        ),
+        torch.device("cuda"),
+    )
+    assert {r.backend_key for r in layer.runners} == {
+        CuTileNvfp4Bf16Runner.backend_key,
+        SM12xNvfp4Bf16Runner.backend_key,
+    }
+    act = make_activations(0)
+    _assert_moe_close(layer(act, weights), reference(act))

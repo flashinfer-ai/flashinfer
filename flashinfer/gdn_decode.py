@@ -1186,11 +1186,11 @@ def gated_delta_rule_mtp(
         If ``True``, the initial state is not updated.  Currently defaults
         to ``True``; pass this argument explicitly to silence the
         deprecation warning - the default will change to ``False`` in
-        FlashInfer 0.7.0.
+        FlashInfer 0.8.0.
 
         .. deprecated::
             The implicit default of ``True`` is deprecated and will change
-            to ``False`` in version 0.7.0.  Pass
+            to ``False`` in version 0.8.0.  Pass
             ``disable_state_update=True`` or ``disable_state_update=False``
             explicitly to silence the warning.
     use_qk_l2norm : bool
@@ -1221,7 +1221,7 @@ def gated_delta_rule_mtp(
         logger.warning_once(
             "gated_delta_rule_mtp(): the 'disable_state_update' parameter currently "
             "defaults to True, but this default will change to False in FlashInfer "
-            "0.7.0. Please pass disable_state_update=True or "
+            "0.8.0. Please pass disable_state_update=True or "
             "disable_state_update=False explicitly to suppress this warning."
         )
         disable_state_update = True

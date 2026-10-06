@@ -41,6 +41,7 @@ Single-rank smoke (no NVSHMEM)::
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -108,6 +109,9 @@ class MegaMoENvfp4Config:
     ] = "epi_warps"
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16"
     apply_topk_in_fc1: bool = True
+    activation: Literal["swiglu", "situ"] = "swiglu"
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[float] = None
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
     swiglu_alpha: Optional[float] = None
@@ -156,6 +160,27 @@ class MegaMoENvfp4Config:
                 f"combine_dtype must be 'bf16', 'mxfp8', or 'nvfp4'; "
                 f"got {self.combine_dtype!r}."
             )
+        if self.activation not in ("swiglu", "situ"):
+            raise ValueError(
+                f"activation must be 'swiglu' or 'situ', got {self.activation!r}."
+            )
+        if self.activation == "situ":
+            if self.swiglu_alpha is not None:
+                raise ValueError("SwiGLU parameters are not supported with SiTU.")
+            if self.situ_beta is None:
+                raise ValueError("activation='situ' requires situ_beta.")
+            if not math.isfinite(self.situ_beta) or self.situ_beta <= 0:
+                raise ValueError("situ_beta must be positive and finite.")
+            if self.situ_linear_beta is not None and (
+                not math.isfinite(self.situ_linear_beta) or self.situ_linear_beta <= 0
+            ):
+                raise ValueError(
+                    "situ_linear_beta must be positive and finite when set."
+                )
+            if self.gate_up_clamp is not None:
+                raise ValueError("gate_up_clamp is not supported with SiTU.")
+        elif self.situ_beta is not None or self.situ_linear_beta is not None:
+            raise ValueError("SiTU parameters require activation='situ'.")
         if self.combine_dtype != "bf16":
             if self.in_kernel_fc2_reduce:
                 raise ValueError(
@@ -500,6 +525,9 @@ class MegaMoENvfp4Frontend:
             c.token_back_mode,
             c.combine_dtype,
             c.apply_topk_in_fc1,
+            c.activation,
+            c.situ_beta,
+            c.situ_linear_beta,
             self._gate_up_clamp,
             c.swiglu_alpha,
             c.swiglu_beta,
@@ -565,6 +593,8 @@ class MegaMoENvfp4Frontend:
             gate_up_clamp=self._gate_up_clamp,
             swiglu_alpha=c.swiglu_alpha,
             swiglu_beta=c.swiglu_beta,
+            situ_beta=c.situ_beta,
+            situ_linear_beta=c.situ_linear_beta,
             flag_batch=c.flag_batch,
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
@@ -1066,6 +1096,9 @@ def get_symm_buffer_for_mega_moe(
     swiglu_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
+    activation: Literal["swiglu", "situ"] = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     apply_topk_in_fc1: bool = True,
     enable_in_kernel_fc2_reduce: bool = False,
     defer_topk_reduce: bool = False,
@@ -1088,6 +1121,9 @@ def get_symm_buffer_for_mega_moe(
     constants: ``(up + beta) * gate * sigmoid(alpha * gate)`` after clamping.
     Set both or neither; None/None keeps standard SwiGLU. MiniMax-M3 uses
     ``1.702`` / ``1.0``. These are distinct from the dequant ``fc1_alpha``.
+    ``activation="situ"`` selects the Kimi SiTU gate and requires
+    ``situ_beta``. ``situ_linear_beta`` optionally bounds the up branch with
+    ``linear_beta * tanh(up / linear_beta)``.
 
     ``apply_topk_in_fc1`` mirrors ``mega_runner``'s
     ``ref_compute_graph == "deepgemm"`` behaviour when ``True`` (default).
@@ -1159,6 +1195,9 @@ def get_symm_buffer_for_mega_moe(
         gate_up_clamp=clamp,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         apply_topk_in_fc1=apply_topk_in_fc1,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         defer_topk_reduce=defer_topk_reduce,
@@ -1526,6 +1565,9 @@ def create_dummy_inputs(
     swiglu_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
+    activation: Literal["swiglu", "situ"] = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
     fc1_alpha: Optional[PerExpertEpilogue] = None,
@@ -1577,6 +1619,9 @@ def create_dummy_inputs(
         gate_up_clamp=clamp,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         combine_dtype=combine_dtype,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         fc1_alpha=fc1_alpha,

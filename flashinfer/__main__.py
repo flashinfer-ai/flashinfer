@@ -483,6 +483,7 @@ def _install_kernel_wheels(
     jit_cache_index_url: str | None,
     nightly: bool,
     dry_run: bool,
+    sm_architectures: tuple[str, ...] = (),
 ) -> None:
     failures = []
     installers = [
@@ -495,7 +496,13 @@ def _install_kernel_wheels(
         (
             "flashinfer-jit-cache",
             lambda: _install_jit_cache_wheel(
-                cuda_version, flashinfer_version, jit_cache_index_url, nightly, dry_run
+                cuda_version,
+                flashinfer_version,
+                jit_cache_index_url,
+                nightly,
+                dry_run,
+                mode="minimal" if sm_architectures else "all",
+                sm_architectures=sm_architectures,
             ),
         ),
     ]
@@ -813,6 +820,15 @@ cli.add_command(download_jit_cache_cmd, "download-jit-cache")
     help="Explicit flashinfer-jit-cache wheel index URL.",
 )
 @click.option(
+    "--sm",
+    "sm_architectures",
+    multiple=True,
+    help=(
+        "Install only the jit-cache provider compatible with this CUDA "
+        "architecture, such as sm80, sm90a, or sm120f. May be repeated."
+    ),
+)
+@click.option(
     "--nightly",
     is_flag=True,
     help="Install from nightly wheel indexes instead of release indexes.",
@@ -827,6 +843,7 @@ def download_kernels_cmd(
     flashinfer_version,
     cubin_index_url,
     jit_cache_index_url,
+    sm_architectures,
     nightly,
     dry_run,
 ):
@@ -838,6 +855,7 @@ def download_kernels_cmd(
         jit_cache_index_url,
         nightly,
         dry_run,
+        sm_architectures,
     )
 
 
