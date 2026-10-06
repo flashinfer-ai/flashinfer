@@ -181,6 +181,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SKIP_EPISTS 0
 #define EPI_DIRECT 0
 #define TRACE 0
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -369,8 +370,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(512) __cluster_dims__(2,1,1) void
-kernel_cake_nvfp4_mla_decode_3927fc8775af1fb052ad(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap QS, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KVS, const __grid_constant__ CUtensorMap OT, const __grid_constant__ CUtensorMap PO, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, __nv_bfloat16* __restrict__ partial_o, float* __restrict__ partial_lse, int* __restrict__ work_table, int* __restrict__ unit_first, int* __restrict__ page_table, int* __restrict__ seq_lens, int* __restrict__ q_indptr, float* __restrict__ sinks, int rows_total, int num_heads, int q_len, int max_pages, int max_splits, float scale_log2)
+__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
+kernel_cake_nvfp4_mla_decode_bc60071d5e5ff6d89cd9(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap QS, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KVS, const __grid_constant__ CUtensorMap OT, const __grid_constant__ CUtensorMap PO, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, __nv_bfloat16* __restrict__ partial_o, float* __restrict__ partial_lse, int* __restrict__ work_table, int* __restrict__ unit_first, int* __restrict__ page_table, int* __restrict__ seq_lens, int* __restrict__ q_indptr, float* __restrict__ sinks, int rows_total, int num_heads, int q_len, int max_pages, int max_splits, float scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
