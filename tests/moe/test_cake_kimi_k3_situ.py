@@ -922,11 +922,15 @@ _WRITER_ARGUMENTS = [
 
 
 def _writer_program_key(arch):
+    # The retained 16384-token copy writer shares this argument plan; select
+    # the writer kernel the routed ``large_c7`` sequence is built from.
+    routed_sources = set(PROGRAMS[ROUTES[(arch, "large_c7")]]["sources"])
     keys = [
         key
         for key, record in PROGRAMS.items()
         if record["arch"] == arch
         and [name for _, name in record["arg_plan"]] == _WRITER_ARGUMENTS
+        and any(source in routed_sources for source in record["sources"])
     ]
     assert len(keys) == 1, keys
     return keys[0]
