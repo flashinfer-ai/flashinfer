@@ -38,13 +38,19 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
+#define SMEM_SMEM_SEQUENCE_EXCL_OFF 99328
+#define SMEM_SMEM_SEQUENCE_EXCL_STAGE_BYTES 516
+#define SMEM_SMEM_SEQUENCE_EXCL_STRIDE 516
+#define SMEM_SMEM_WARP_TOTALS_OFF 99856
+#define SMEM_SMEM_WARP_TOTALS_STAGE_BYTES 16
+#define SMEM_SMEM_WARP_TOTALS_STRIDE 16
 #define SMEM_SMEM_CUMSUM_OFF 0
 #define SMEM_SMEM_CUMSUM_STAGE_BYTES 66048
 #define SMEM_SMEM_CUMSUM_STRIDE 66048
 #define SMEM_SMEM_DELTA_OFF 66048
 #define SMEM_SMEM_DELTA_STAGE_BYTES 33280
 #define SMEM_SMEM_DELTA_STRIDE 33280
-#define SMEM_TOTAL 99328
+#define SMEM_TOTAL 99968
 #define THREADS 128
 
 #include <math_constants.h>
@@ -65,7 +71,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* __restrict__ A, float* __restrict__ dt_bias, int* __restrict__ segment_starts, int* __restrict__ segment_lengths, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, __half* __restrict__ delta, float* __restrict__ cumsum, int num_segments, int nheads, int seqlen, int direct_varlen_metadata, int dt_softplus, float dt_min, float dt_max, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int seq_idx_int64, int* __restrict__ seq_chunk_cumsum, int num_sequences, int write_seq_chunk_cumsum, int* __restrict__ preprocess_status)
+kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* __restrict__ A, float* __restrict__ dt_bias, int* __restrict__ segment_starts, int* __restrict__ segment_lengths, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, __half* __restrict__ delta, float* __restrict__ cumsum, int num_segments, int nheads, int seqlen, int direct_varlen_metadata, int dt_softplus, float dt_min, float dt_max, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int seq_idx_int64, int* __restrict__ seq_chunk_cumsum, int num_sequences, int write_seq_chunk_cumsum, int* __restrict__ cu_seqlens, int* __restrict__ checkpoint_token_indices, int metadata_from_cu_seqlens, int checkpoint_state_count, int* __restrict__ preprocess_status)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -86,6 +92,10 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
     const int cta_rank = 0;
 
     // Kernel setup ops
+    int* smem_sequence_excl = reinterpret_cast<int*>(smem_raw + 99328);
+    const int smem_sequence_excl_addr = smem + 99328;
+    int* smem_warp_totals = reinterpret_cast<int*>(smem_raw + 99856);
+    const int smem_warp_totals_addr = smem + 99856;
     float* smem_cumsum = reinterpret_cast<float*>(smem_raw + 0);
     const int smem_cumsum_addr = smem + 0;
     __half* smem_delta = reinterpret_cast<__half*>(smem_raw + 66048);
@@ -93,18 +103,220 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
 
     // === Task calls (dependency order) ===
     int tile = bid * 128 + tid;
-    int total_tiles = num_segments * nheads;
+    int segment = tile / nheads;
+    int head = tile % nheads;
+    int segment_count = num_segments;
+    int derived_start = 0;
+    int derived_end = 0;
     int slot_base_cumsum = tid * 129;
     int slot_base_delta = tid * 130;
     __half zero_half = (__half)0.0f;
+    if (metadata_from_cu_seqlens != 0) {
+        int segment_bound = num_segments;
+        int warp_1 = tid / 32;
+        int lane_0 = lane;
+        int flagged_cu = 0;
+        int carry = 0;
+        int found = 0;
+        #pragma unroll 1
+        for (int block_base = 0; block_base < num_sequences; block_base += 128) {
+            int sequence_slot = block_base + tid;
+            int count = 0;
+            if (sequence_slot < num_sequences) {
+                int raw_lo = cu_seqlens[sequence_slot];
+                int raw_hi = cu_seqlens[sequence_slot + 1];
+                if (sequence_slot == 0) {
+                    if (raw_lo != 0) {
+                        flagged_cu = 1;
+                    }
+                }
+                if (sequence_slot == num_sequences - 1) {
+                    if (raw_hi != seqlen) {
+                        flagged_cu = 1;
+                    }
+                }
+                if (raw_hi < raw_lo) {
+                    flagged_cu = 1;
+                }
+                if (raw_lo < 0) {
+                    flagged_cu = 1;
+                }
+                if (raw_hi > seqlen) {
+                    flagged_cu = 1;
+                }
+                int _max_0 = ((raw_lo) > (0) ? (raw_lo) : (0));
+                int _min_0 = ((_max_0) < (seqlen) ? (_max_0) : (seqlen));
+                int lo = _min_0;
+                int _max_1 = ((raw_hi) > (0) ? (raw_hi) : (0));
+                int _min_1 = ((_max_1) < (seqlen) ? (_max_1) : (seqlen));
+                int hi = _min_1;
+                if (hi > lo) {
+                    count = (hi + 127) / 128 - lo / 128;
+                    if (checkpoint_state_count > 0) {
+                        int checkpoint = checkpoint_token_indices[sequence_slot];
+                        if (checkpoint > lo && checkpoint < hi && checkpoint % 128 != 0) {
+                            count = count + 1;
+                        }
+                    }
+                }
+            }
+            int inclusive = count;
+            int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, inclusive, 1, 32);
+            int shifted = _shfl_up_0;
+            if (lane_0 >= 1) {
+                inclusive = inclusive + shifted;
+            }
+            int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, inclusive, 2, 32);
+            shifted = _shfl_up_1;
+            if (lane_0 >= 2) {
+                inclusive = inclusive + shifted;
+            }
+            int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, inclusive, 4, 32);
+            shifted = _shfl_up_2;
+            if (lane_0 >= 4) {
+                inclusive = inclusive + shifted;
+            }
+            int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, inclusive, 8, 32);
+            shifted = _shfl_up_3;
+            if (lane_0 >= 8) {
+                inclusive = inclusive + shifted;
+            }
+            int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, inclusive, 16, 32);
+            shifted = _shfl_up_4;
+            if (lane_0 >= 16) {
+                inclusive = inclusive + shifted;
+            }
+            if (lane_0 == 31) {
+                smem_warp_totals[warp_1] = inclusive;
+            }
+            asm volatile("barrier.sync 8, 128;" ::: "memory");
+            int warp_prefix = 0;
+            int block_total = 0;
+            #pragma unroll
+            for (int other_warp = 0; other_warp < 4; other_warp++) {
+                int other_total = smem_warp_totals[other_warp];
+                block_total = block_total + other_total;
+                if (warp_1 > other_warp) {
+                    warp_prefix = warp_prefix + other_total;
+                }
+            }
+            int exclusive = carry + warp_prefix + inclusive - count;
+            smem_sequence_excl[tid] = exclusive;
+            if (tid == 0) {
+                smem_sequence_excl[128] = carry + block_total;
+            }
+            if (bid == 0) {
+                if (sequence_slot < num_sequences) {
+                    int _min_2 = ((exclusive) < (segment_bound) ? (exclusive) : (segment_bound));
+                    seq_chunk_cumsum[sequence_slot] = _min_2;
+                }
+                if (tid == 0) {
+                    if (block_base + 128 >= num_sequences) {
+                        int _min_3 = ((carry + block_total) < (segment_bound) ? (carry + block_total) : (segment_bound));
+                        seq_chunk_cumsum[num_sequences] = _min_3;
+                    }
+                }
+            }
+            asm volatile("barrier.sync 8, 128;" ::: "memory");
+            if (found == 0) {
+                if (segment >= carry && segment < carry + block_total) {
+                    int owner_slot = 0;
+                    int low = 0;
+                    int high = 127;
+                    #pragma unroll
+                    for (int probe = 0; probe < 7; probe++) {
+                        int middle = (low + high + 1) / 2;
+                        if (segment >= smem_sequence_excl[middle]) {
+                            low = middle;
+                        } else {
+                            high = middle - 1;
+                        }
+                    }
+                    owner_slot = low;
+                    int owner = block_base + owner_slot;
+                    int _max_2 = ((cu_seqlens[owner]) > (0) ? (cu_seqlens[owner]) : (0));
+                    int _min_4 = ((_max_2) < (seqlen) ? (_max_2) : (seqlen));
+                    int owner_lo = _min_4;
+                    int _max_3 = ((cu_seqlens[owner + 1]) > (0) ? (cu_seqlens[owner + 1]) : (0));
+                    int _min_5 = ((_max_3) < (seqlen) ? (_max_3) : (seqlen));
+                    int owner_hi = _min_5;
+                    int owner_count = (owner_hi + 127) / 128 - owner_lo / 128;
+                    int owner_first_chunk = owner_lo / 128;
+                    int owner_checkpoint = -1;
+                    int checkpoint_rank = 0;
+                    if (checkpoint_state_count > 0) {
+                        int candidate_checkpoint = checkpoint_token_indices[owner];
+                        if (candidate_checkpoint > owner_lo && candidate_checkpoint < owner_hi && candidate_checkpoint % 128 != 0) {
+                            owner_checkpoint = candidate_checkpoint;
+                            owner_count = owner_count + 1;
+                            checkpoint_rank = candidate_checkpoint / 128 - owner_first_chunk + 1;
+                        }
+                    }
+                    int ordinal = segment - smem_sequence_excl[owner_slot];
+                    derived_start = (owner_first_chunk + ordinal) * 128;
+                    if (ordinal == 0) {
+                        derived_start = owner_lo;
+                    }
+                    if (owner_checkpoint >= 0) {
+                        if (ordinal == checkpoint_rank) {
+                            derived_start = owner_checkpoint;
+                        }
+                        if (ordinal > checkpoint_rank) {
+                            derived_start = (owner_first_chunk + ordinal - 1) * 128;
+                        }
+                    }
+                    int next_ordinal = ordinal + 1;
+                    derived_end = owner_hi;
+                    if (next_ordinal < owner_count) {
+                        derived_end = (owner_first_chunk + next_ordinal) * 128;
+                        if (owner_checkpoint >= 0) {
+                            if (next_ordinal == checkpoint_rank) {
+                                derived_end = owner_checkpoint;
+                            }
+                            if (next_ordinal > checkpoint_rank) {
+                                derived_end = (owner_first_chunk + next_ordinal - 1) * 128;
+                            }
+                        }
+                    }
+                    found = 1;
+                }
+            }
+            carry = carry + block_total;
+            asm volatile("barrier.sync 8, 128;" ::: "memory");
+        }
+        segment_count = carry;
+        if (segment_count > segment_bound) {
+            flagged_cu = 1;
+            segment_count = segment_bound;
+        }
+        if (flagged_cu != 0) {
+            preprocess_status[0] = 1;
+        }
+        if (tile == 0) {
+            if (segment_count == 0) {
+                chunk_indices[0] = -1;
+            }
+        }
+    }
+    int total_tiles = segment_count * nheads;
     if (tile < total_tiles) {
-        int segment = tile / nheads;
-        int head = tile % nheads;
         int start = 0;
         int length = 128;
         int physical_start = 0;
         int segment_offset = 0;
-        if (direct_varlen_metadata != 0) {
+        if (metadata_from_cu_seqlens != 0) {
+            start = derived_start;
+            length = derived_end - derived_start;
+            physical_start = start / 128 * 128;
+            segment_offset = start - physical_start;
+            if (head == 0) {
+                chunk_indices[segment] = start / 128;
+                chunk_offsets[segment] = segment_offset;
+                if (segment == segment_count - 1) {
+                    chunk_indices[segment_count] = -1;
+                }
+            }
+        } else if (direct_varlen_metadata != 0) {
             start = chunk_indices[segment] * 128 + chunk_offsets[segment];
             int end = seqlen;
             if (segment + 1 < num_segments) {
@@ -133,9 +345,9 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                 } else {
                     sequence = seq_idx_i32[start];
                 }
-                int _max_0 = ((sequence) > (-1) ? (sequence) : (-1));
-                int _min_0 = ((_max_0) < (num_sequences) ? (_max_0) : (num_sequences));
-                sequence = _min_0;
+                int _max_4 = ((sequence) > (-1) ? (sequence) : (-1));
+                int _min_6 = ((_max_4) < (num_sequences) ? (_max_4) : (num_sequences));
+                sequence = _min_6;
                 int previous_sequence = -1;
                 if (segment != 0) {
                     int previous_start = chunk_indices[segment - 1] * 128 + chunk_offsets[segment - 1];
@@ -151,9 +363,9 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                     } else {
                         previous_sequence = seq_idx_i32[previous_start];
                     }
-                    int _max_1 = ((previous_sequence) > (-1) ? (previous_sequence) : (-1));
-                    int _min_1 = ((_max_1) < (num_sequences) ? (_max_1) : (num_sequences));
-                    previous_sequence = _min_1;
+                    int _max_5 = ((previous_sequence) > (-1) ? (previous_sequence) : (-1));
+                    int _min_7 = ((_max_5) < (num_sequences) ? (_max_5) : (num_sequences));
+                    previous_sequence = _min_7;
                 }
                 int flagged = 0;
                 if (sequence < 0) {
@@ -199,10 +411,10 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
         float group_scan_4[4];
         #pragma unroll
         for (int local = 0; local < 16; local++) {
-            int _min_2 = ((last_token) < (local) ? (last_token) : (local));
-            next_raw[local] = dt[(physical_start + _min_2) * nheads + head];
-            int _min_3 = ((last_token) < (16 + local) ? (last_token) : (16 + local));
-            after_raw[local] = dt[(physical_start + _min_3) * nheads + head];
+            int _min_8 = ((last_token) < (local) ? (last_token) : (local));
+            next_raw[local] = dt[(physical_start + _min_8) * nheads + head];
+            int _min_9 = ((last_token) < (16 + local) ? (last_token) : (16 + local));
+            after_raw[local] = dt[(physical_start + _min_9) * nheads + head];
         }
         if (nheads >= 16) {
             #pragma unroll 1
@@ -215,8 +427,8 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                 if (group_start + 32 < 128) {
                     #pragma unroll
                     for (int local_2 = 0; local_2 < 16; local_2++) {
-                        int _min_4 = ((last_token) < (group_start + 32 + local_2) ? (last_token) : (group_start + 32 + local_2));
-                        int load_token = _min_4;
+                        int _min_10 = ((last_token) < (group_start + 32 + local_2) ? (last_token) : (group_start + 32 + local_2));
+                        int load_token = _min_10;
                         after_raw[local_2] = dt[(physical_start + load_token) * nheads + head];
                     }
                 }
@@ -245,9 +457,9 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                     group_product[local_3] = transformed * a_value;
                     if (physical_token >= segment_offset && physical_token < segment_offset + length) {
                         int local_token = physical_token - segment_offset;
-                        float _max_2 = max_noftz(transformed, -65504.0f);
-                        float _min_5 = fminf(_max_2, 65504.0f);
-                        smem_delta[slot_base_delta + local_token] = (__half)_min_5;
+                        float _max_6 = max_noftz(transformed, -65504.0f);
+                        float _min_11 = fminf(_max_6, 65504.0f);
+                        smem_delta[slot_base_delta + local_token] = (__half)_min_11;
                     }
                 }
                 scan_offset_1[0] = group_product[0];
@@ -312,8 +524,8 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                 if (block_start + 32 < 128) {
                     #pragma unroll
                     for (int local_10 = 0; local_10 < 16; local_10++) {
-                        int _min_6 = ((last_token) < (block_start + 32 + local_10) ? (last_token) : (block_start + 32 + local_10));
-                        int load_token_1 = _min_6;
+                        int _min_12 = ((last_token) < (block_start + 32 + local_10) ? (last_token) : (block_start + 32 + local_10));
+                        int load_token_1 = _min_12;
                         after_raw[local_10] = dt[(physical_start + load_token_1) * nheads + head];
                     }
                 }
@@ -345,9 +557,9 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                         group_product_4[local_11] = transformed_1 * a_value;
                         if (physical_token_2 >= segment_offset && physical_token_2 < segment_offset + length) {
                             int local_token_2 = physical_token_2 - segment_offset;
-                            float _max_3 = max_noftz(transformed_1, -65504.0f);
-                            float _min_7 = fminf(_max_3, 65504.0f);
-                            smem_delta[slot_base_delta + local_token_2] = (__half)_min_7;
+                            float _max_7 = max_noftz(transformed_1, -65504.0f);
+                            float _min_13 = fminf(_max_7, 65504.0f);
+                            smem_delta[slot_base_delta + local_token_2] = (__half)_min_13;
                         }
                     }
                     group_scan_4[0] = group_product_4[0];

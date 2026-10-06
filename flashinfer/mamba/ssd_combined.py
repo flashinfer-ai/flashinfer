@@ -270,9 +270,13 @@ class SSDCombined:
     ``[batch, seqlen, nheads, headdim]`` buffer directly and return it.  The
     Cake backend also accepts any positive ``seqlen``, including fewer than
     ``chunk_size`` tokens per call (the host zero-pads x/B/C to one chunk and
-    stages the output; the kernels are unchanged), and, in varlen mode,
-    ``initial_states=None`` with the sequence count from ``seq_chunk_cumsum``
-    or ``num_seqs``.
+    stages the output; the kernels are unchanged), any positive ``chunk_size``
+    (a caller convention: the Cake programs tile 128 tokens internally and the
+    results are chunk-size independent up to rounding), the packed-varlen
+    ``cu_seqlens`` form (the kernels derive the segment metadata on the
+    device; the ``seq_idx`` / ``chunk_indices`` / ``chunk_offsets`` triple is
+    the chunk-128 form) and, in varlen mode, ``initial_states=None`` with the
+    sequence count from ``cu_seqlens``, ``seq_chunk_cumsum`` or ``num_seqs``.
 
     Usage::
 
@@ -522,6 +526,7 @@ class SSDCombined:
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
         num_seqs: Optional[int] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run SSD combined forward pass.
 
@@ -602,6 +607,25 @@ class SSDCombined:
                 ``seq_chunk_cumsum``.  Rejected by the CuTe backend.  Every
                 ``seq_idx`` ID must lie in ``[0, num_seqs)``; IDs without
                 tokens are allowed (see ``seq_idx``).
+            cu_seqlens: Optional int32 cumulative token offsets
+                ``[num_seqs + 1]`` on the device (``cu_seqlens[0] == 0``,
+                non-decreasing, ``cu_seqlens[-1] == seqlen``, ``batch == 1``):
+                the packed-varlen form of the Cake backend that works with any
+                ``chunk_size``.  The Cake preprocess derives the 128-token
+                segment tables, the sequence prefix sum and a sentinel on the
+                device, so no ``chunk_indices`` / ``chunk_offsets`` may be
+                given (``seq_idx`` is optional and never read), the sequence
+                count is ``cu_seqlens.numel() - 1`` (it must agree with
+                ``initial_states`` / ``seq_chunk_cumsum`` / ``num_seqs`` when
+                those are given) and chunk-unaligned
+                ``checkpoint_token_indices`` are inserted as segment
+                boundaries automatically.  ``seq_chunk_cumsum`` may only be
+                passed as an output buffer (``update_seq_chunk_cumsum=True``).
+                An invalid ``cu_seqlens`` is memory-safe: it is flagged in the
+                runner's status word (``CakeSSDCombined.seq_idx_status``), the
+                untouched sequences stay exact and the offending tokens'
+                outputs are undefined.  Rejected by the CuTe backend, which
+                takes the ``seq_idx`` triple.
 
         Returns:
             A pair containing token-major output with shape
@@ -724,6 +748,7 @@ class SSDCombined:
                 out=out,
                 return_final_states=return_final_states,
                 num_seqs=num_seqs,
+                cu_seqlens=cu_seqlens,
             )
 
         if any(
@@ -741,6 +766,11 @@ class SSDCombined:
             raise ValueError(
                 "num_seqs requires SSDCombined backend='cake'; the CuTe backend "
                 "takes the sequence count from initial_states"
+            )
+        if cu_seqlens is not None:
+            raise ValueError(
+                "cu_seqlens requires SSDCombined backend='cake'; the CuTe backend "
+                "takes the seq_idx / chunk_indices / chunk_offsets varlen form"
             )
 
         _, _, ngroups, dstate = B.shape
@@ -965,6 +995,7 @@ def ssd_combined_fwd(
     out: Optional[torch.Tensor] = None,
     return_final_states: bool = True,
     num_seqs: Optional[int] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the source-built Cake SSDCombined backend.
 
@@ -1021,6 +1052,11 @@ def ssd_combined_fwd(
             element or packed sequence.
         num_seqs: Optional packed-sequence count for varlen mode without
             ``initial_states`` and without ``seq_chunk_cumsum``.
+        cu_seqlens: Optional int32 cumulative token offsets ``[num_seqs + 1]``
+            on the device: the packed-varlen form in which the kernels derive
+            the segment metadata themselves (no ``chunk_indices`` /
+            ``chunk_offsets``; ``seq_idx`` optional).  See
+            :meth:`SSDCombined.run`.
 
     Returns:
         A pair containing the token-major output ``out`` with shape
@@ -1049,7 +1085,7 @@ def ssd_combined_fwd(
         has_d=D is not None,
         d_has_hdim=D is not None and D.ndim == 2,
         has_initial_states=initial_states is not None,
-        has_varlen=seq_idx is not None,
+        has_varlen=seq_idx is not None or cu_seqlens is not None,
         has_z=z is not None,
         seq_idx_dtype=seq_idx.dtype if seq_idx is not None else torch.int64,
         backend="cake",
@@ -1083,4 +1119,5 @@ def ssd_combined_fwd(
         out=out,
         return_final_states=return_final_states,
         num_seqs=num_seqs,
+        cu_seqlens=cu_seqlens,
     )
