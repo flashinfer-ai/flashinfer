@@ -10,8 +10,24 @@ import torch
 
 import flashinfer
 from flashinfer import mla_kv_pack
+from flashinfer.utils import get_compute_capability
 
 NOPE, ROPE, V = 128, 64, 128
+
+
+def _fused_kernel_dispatches_here() -> bool:
+    """The shipped allowlist dispatches the fused kernel on CC 10.0+ only; older
+    GPUs take the PyTorch fallback (covered by the fallback tests below)."""
+    return torch.cuda.is_available() and get_compute_capability(
+        torch.device("cuda")
+    ) >= (10, 0)
+
+
+requires_fused_dispatch = pytest.mark.skipif(
+    not _fused_kernel_dispatches_here(),
+    reason="fused concat_mla_kv_quant_fp8 kernel dispatches on compute capability "
+    "10.0+ only; this GPU takes the fallback path",
+)
 
 
 def _sat_e4m3_bytes(x: torch.Tensor) -> torch.Tensor:
@@ -100,6 +116,7 @@ def _assert_fused_byte_exact(T, H):
     assert stats["specialized_dispatches"] == before + 1, stats
 
 
+@requires_fused_dispatch
 @pytest.mark.parametrize("T", [1, 7, 1536, 66038, 66048])
 @pytest.mark.parametrize("H", [12, 8])
 def test_byte_exact(T, H):
@@ -107,6 +124,7 @@ def test_byte_exact(T, H):
     _assert_fused_byte_exact(T, H)
 
 
+@requires_fused_dispatch
 @pytest.mark.parametrize("T,H", [(129, 1), (127, 3), (1536, 13), (2048, 128)])
 def test_byte_exact_odd_head_counts(T, H):
     """Runtime head count: heads below the 2-way / 4-way lane strides and the
@@ -256,6 +274,7 @@ def test_pre_blackwell_device_takes_fallback(monkeypatch):
         assert torch.equal(value.view(torch.uint8), ref_value)
 
 
+@requires_fused_dispatch
 def test_stats_hook_reports_compile_footprint():
     flashinfer.concat_mla_kv_quant_fp8(*_inputs(64, 12))
     stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
@@ -271,6 +290,7 @@ def test_zero_tokens():
     assert key.shape == (0, 12, NOPE + ROPE) and value.shape == (0, 12, V)
 
 
+@requires_fused_dispatch
 def test_cuda_graph_capture_after_warmup():
     kv, pe = _inputs(1024, 12)
     flashinfer.concat_mla_kv_quant_fp8(kv, pe)  # builds/loads the module
