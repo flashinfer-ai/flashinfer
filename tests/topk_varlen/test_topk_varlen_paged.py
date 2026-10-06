@@ -288,3 +288,44 @@ def test_paged_api_validation():
         flashinfer.top_k_varlen(
             lg, lens, k, backend="radix", page_table=pt, page_size=64
         )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_paged_on_non_current_device():
+    """logits, lengths and page table on a device that is not the current one:
+    the host re-enters itself under that device and must forward page_table
+    and page_size, otherwise the call silently returns raw columns."""
+    other = torch.device("cuda:1")
+    cc = get_compute_capability(other)
+    if not flashinfer.top_k_varlen.is_backend_supported("gvr_2", cc[0] * 10 + cc[1]):
+        pytest.skip("gvr_2 unsupported on cuda:1")
+    torch.cuda.set_device(0)
+    rows, ncols, top_k, page_size = 8, 4096, 512, 64
+    gen = torch.Generator(device=other).manual_seed(9)
+    lg = torch.randn((rows, ncols), generator=gen, dtype=torch.float32, device=other)
+    lens = torch.randint(top_k + 1, ncols + 1, (rows,), generator=gen, device=other).to(
+        torch.int32
+    )
+    pages = (ncols + page_size - 1) // page_size
+    pt = torch.stack(
+        [
+            torch.randperm(4 * pages + 7, generator=gen, device=other)[:pages]
+            for _ in range(rows)
+        ]
+    ).to(torch.int32)
+    loc, _ = flashinfer.top_k_varlen(lg, lens, top_k, backend="gvr_2")
+    pg, _ = flashinfer.top_k_varlen(
+        lg, lens, top_k, backend="gvr_2", page_table=pt, page_size=page_size
+    )
+    torch.cuda.synchronize(other)
+    assert pg.device == other and loc.device == other
+    shift = page_size.bit_length() - 1
+    l64 = loc.to(torch.int64)
+    phys = (
+        pt.to(torch.int64)[
+            torch.arange(rows, device=other).unsqueeze(1), (l64 >> shift).clamp_min(0)
+        ]
+        << shift
+    ) | (l64 & (page_size - 1))
+    expected = torch.where(loc >= 0, phys.to(torch.int32), loc)
+    assert torch.equal(torch.sort(pg, dim=1).values, torch.sort(expected, dim=1).values)

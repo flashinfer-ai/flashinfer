@@ -2290,6 +2290,8 @@ def run_varlen(
                 top_k=top_k,
                 row_starts=row_starts,
                 absolute_indices=absolute_indices,
+                page_table=page_table,
+                page_size=page_size,
             )
     if logits.dtype is not torch.float32:
         raise RuntimeError(
