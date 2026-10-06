@@ -482,6 +482,40 @@ def test_cudnn_block_scale_check_support_requires_cudnn_9_22_on_sm12x(monkeypatc
         runner._check_support()
 
 
+@pytest.mark.skipif(not _cudnn_moe_available(), reason="requires cuDNN >= 9.21")
+def test_cudnn_check_support_requires_triton(monkeypatch):
+    """Without Triton the activation kernel is missing: the backend is rejected at
+    selection instead of failing in build."""
+    import importlib.util
+
+    find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *args, **kwargs: (
+            None if name == "triton" else find_spec(name, *args, **kwargs)
+        ),
+    )
+    for key in _FAMILY_KEYS:
+        with pytest.raises(RuntimeError, match="requires Triton"):
+            _detached_runner(key, _config(key))._check_support()
+
+
+def test_cudnn_build_falls_back_to_torch_when_moe_utils_fail_to_load(monkeypatch):
+    """Any failure to load the moe_utils kernels (e.g. a missing downloaded header)
+    leaves the torch permute and finalize path in use."""
+    import flashinfer.fused_moe.cute_dsl.moe_utils as moe_utils
+
+    def unavailable():
+        raise AssertionError("trtllmGen_bmm_export header not found")
+
+    monkeypatch.setattr(moe_utils, "_get_moe_utils_module", unavailable)
+    runner = _detached_runner(_BF16_KEY, _config(_BF16_KEY), use_moe_utils=True)
+    with pytest.warns(UserWarning, match="moe_utils kernels are unavailable"):
+        runner._build()
+    assert runner._use_moe_utils is False
+
+
 @pytest.mark.parametrize("key", _FAMILY_KEYS)
 def test_cudnn_prepare_weights_rejects_invalid_inputs(key):
     family = _FAMILIES[key]
@@ -1037,6 +1071,23 @@ def _autotune_and_graph(runner, case: _Case, *, cache_name: str):
     torch.cuda.synchronize()
     _assert_matches_reference(_combine(captured, num_tokens, top_k), case)
     return tactic
+
+
+@pytest.mark.parametrize("key", _FAMILY_PARAMS)
+def test_cudnn_plan_ranking_keeps_caller_inputs(key):
+    """Ranking rewrites the routing and activation scales on its own copies only."""
+    family = _FAMILIES[key]
+    torch.manual_seed(12)
+    case = _make_case(family, 24, 8, 2, 256, 256)
+    runner = _layer(case).runners[0]
+    inputs = runner.pack_inputs(case.act, case.weights)
+    as_bytes = lambda t: t.view(torch.uint8) if t.element_size() == 1 else t  # noqa: E731
+    before = [as_bytes(t).clone() for t in inputs]
+    AutoTuner.get().clear_cache()
+    with autotune(True):
+        runner.get_valid_tactics(inputs, None)
+    for expected, tensor in zip(before, inputs, strict=True):
+        assert torch.equal(as_bytes(tensor), expected)
 
 
 @pytest.mark.parametrize("key", _FAMILY_PARAMS)

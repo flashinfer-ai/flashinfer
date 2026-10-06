@@ -1437,8 +1437,9 @@ class CudnnGroupedGemmBf16Config:
     on every architecture; ``MoEFinalizeConfig(do_finalize=False)`` returns the
     unfinalized ``[gemm2_out, expert_weights, token_to_row]`` for the caller to
     combine instead. Supports expert parallelism (assignments to non-local
-    experts are masked out) and unpacked BF16 routing weights. Not part of the
-    default backend list: cuDNN builds one execution plan per token bucket, so
+    experts are masked out) and unpacked BF16 routing weights; each token's
+    ``topk_ids`` must name distinct experts. Not part of the default backend
+    list: cuDNN builds one execution plan per token bucket, so
     add it explicitly with ``BackendOptions((CudnnGroupedGemmBf16Config(),))``.
     """
 
@@ -1496,8 +1497,8 @@ class CudnnGroupedGemmFp8PerTensorConfig:
     SM100, SM103 and SM107, and with torch ops elsewhere;
     ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
     ``[gemm2_out, expert_weights, token_to_row]`` instead.
-    Supports expert parallelism and unpacked routing weights. Not part of the
-    default backend list.
+    Supports expert parallelism and unpacked routing weights; each token's
+    ``topk_ids`` must name distinct experts. Not part of the default backend list.
     """
 
     @classmethod
@@ -1559,12 +1560,12 @@ class CudnnGroupedGemmMxfp8Config:
     :meth:`prepare_weights`). ``hidden_size`` and ``intermediate_size`` must be
     multiples of 128.
 
-    Finalizes (``do_finalize=True``) with the ``moe_utils`` kernel on SM90,
-    SM100, SM103 and SM107, and with torch ops elsewhere;
+    Finalizes (``do_finalize=True``) with the ``moe_utils`` kernel on SM100,
+    SM103 and SM107, and with torch ops elsewhere;
     ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
     ``[gemm2_out, expert_weights, token_to_row]`` instead.
-    Supports expert parallelism and unpacked routing weights. Not part of the
-    default backend list.
+    Supports expert parallelism and unpacked routing weights; each token's
+    ``topk_ids`` must name distinct experts. Not part of the default backend list.
     """
 
     @classmethod
@@ -1636,12 +1637,12 @@ class CudnnGroupedGemmNvfp4Config:
     rows).
     ``hidden_size`` and ``intermediate_size`` must be multiples of 128.
 
-    Finalizes (``do_finalize=True``) with the ``moe_utils`` kernel on SM90,
-    SM100, SM103 and SM107, and with torch ops elsewhere;
+    Finalizes (``do_finalize=True``) with the ``moe_utils`` kernel on SM100,
+    SM103 and SM107, and with torch ops elsewhere;
     ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
     ``[gemm2_out, expert_weights, token_to_row]`` instead.
-    Supports expert parallelism and unpacked routing weights. Not part of the
-    default backend list.
+    Supports expert parallelism and unpacked routing weights; each token's
+    ``topk_ids`` must name distinct experts. Not part of the default backend list.
     """
 
     @classmethod

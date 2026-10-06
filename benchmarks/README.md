@@ -139,10 +139,10 @@ that input conversion. Per-tensor CUTLASS uses its fixed GEMM2 activation scale,
 whereas cuTile dynamically scales GEMM2 input; equal precision pairs do not imply
 identical quantization policies. CUTLASS `mxfp4_w4a8` requires hidden and
 intermediate sizes divisible by 128; unsupported shapes are skipped.
-The cuDNN grouped-GEMM `fp8`, `mxfp8` and `nvfp4` runners take the pre-quantized
+The cuDNN grouped-GEMM `mxfp8` and `nvfp4` runners take the pre-quantized
 activation pack of their config's `prepare_activations`, built once outside the
-timed region like CUTLASS NVFP4; their block-scaled formats require hidden and
-intermediate sizes divisible by 128.
+timed region; these block-scaled formats require hidden and intermediate sizes
+divisible by 128.
 On SM120/SM121, `--backends b12x cutile` also compares NVFP4 W4A4 (`nvfp4`)
 and W4A16 (`nvfp4_w4a16`). The b12x runner exposes a single heuristic tactic;
 `--autotune` does not expand its search space. MXFP4 is not supported by b12x.

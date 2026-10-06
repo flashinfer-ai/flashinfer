@@ -24,6 +24,7 @@ fragile backend-specific kernel-launch code lives in exactly one place.
 from __future__ import annotations
 
 import functools
+import importlib.util
 import warnings
 import weakref
 from collections import OrderedDict
@@ -8454,7 +8455,6 @@ class _GroupedGemmLayout:
     m_indptr: torch.Tensor  # [E_local + 1] int32 segment offsets for grouped_mm_*
     token_to_row: torch.Tensor  # [T, k] int32 row of every assignment, -1 if non-local
     row_expert: torch.Tensor  # [rows] int32 local expert per row (padding: last)
-    num_rows: int
     # [rows] int64 source token of every row (padding -> 0); torch permute path only.
     row_to_token: Optional[torch.Tensor] = None
 
@@ -8509,7 +8509,6 @@ def _layout_from_topk(
         m_indptr=m_indptr.to(torch.int32),
         token_to_row=token_to_row.to(torch.int32).view(num_tokens, top_k),
         row_expert=row_expert.clamp_(max=num_local_experts - 1).to(torch.int32),
-        num_rows=num_rows,
         row_to_token=row_to_token[:num_rows],
     )
 
@@ -8590,7 +8589,10 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
     -> finalize (``moe_unpermute`` or fallback to torch ops).
 
     Every expert segment is padded to ``_segment_alignment`` rows; padding rows
-    are computed but never read back.
+    are computed but never read back. Stage buffers hold the token bucket's
+    worst-case row count and every stage covers all of it: cuDNN's grouped GEMM
+    takes segment starts only, so the last expert's segment runs to the end of
+    the buffer.
     """
 
     supported_routing_modes = (
@@ -8654,6 +8656,10 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
         from ..grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION, _check_cudnn_version
 
         _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, f"{self.backend_key} MoE")
+        if importlib.util.find_spec("triton") is None:
+            raise RuntimeError(
+                f"{type(self).__name__} requires Triton for its silu_and_mul kernel."
+            )
 
     def _check_activation_parameters(self) -> None:
         activation = self.config.activation
@@ -8678,7 +8684,7 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
 
         try:
             _get_moe_utils_module()
-        except (RuntimeError, OSError) as exc:
+        except Exception as exc:  # any load failure leaves the torch path usable
             warnings.warn(
                 f"{type(self).__name__}: the moe_utils kernels are unavailable "
                 f"({exc}); using the torch permute and finalize path.",
@@ -9001,13 +9007,13 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
         row_expert = tile_expert.clamp(max=num_local_experts - 1).repeat_interleave(
             tile
         )
+        token_to_row = token_to_row[: topk_ids.shape[0]]
+        if not self.config.finalize.do_finalize:
+            # The sort buffer is rewritten by the next call while the returned
+            # unfinalized triple stays with the caller.
+            token_to_row = token_to_row.clone()
         return _GroupedGemmLayout(
-            m_indptr=m_indptr,
-            # A copy: the sort buffer is rewritten by the next call while the
-            # returned unfinalized triple stays with the caller.
-            token_to_row=token_to_row[: topk_ids.shape[0]].clone(),
-            row_expert=row_expert,
-            num_rows=workspace.num_rows,
+            m_indptr=m_indptr, token_to_row=token_to_row, row_expert=row_expert
         )
 
     def _permute(
@@ -9220,6 +9226,11 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
         """
         self._require_built()
         self._validate_input_count(inputs)
+        # The tuning hook rewrites the routing and activation scales; rank on
+        # copies so the caller's tensors stay untouched.
+        inputs = list(inputs)
+        for index in (1, 2, *self._token_sized_extra_inputs()):
+            inputs[index] = inputs[index].clone()
         tuner = AutoTuner.get()
         tuning_config = TuningConfig(
             use_cuda_graph=True, inputs_pre_hook=self._prepare_tuning_inputs
