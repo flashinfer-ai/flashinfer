@@ -768,6 +768,13 @@ class Nvfp4CsfDecoder:
             ),
         )
 
+    def decode_all(self, out13, out2):
+        """Expand every expert on the current stream, as long prefills do."""
+        decode_nvfp4_csf_pair(
+            self.first, self.second, self.active, out13, out2, mode=3,
+            program=self.programs[0],
+        )
+
     def decode(self, ids, out13, out2, *, barriers=None):
         from b12x._lib.quant.csf_routing import mark_active_experts
 
