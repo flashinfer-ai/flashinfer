@@ -451,6 +451,8 @@ def _cute_padded_reference(constructor, tensors, arguments, lengths):
         "chunk_offsets": chunk_offsets,
         "seq_chunk_cumsum": _seq_chunk_cumsum(padded_lengths),
     }
+    # The CuTe backend takes the sequence count from ``initial_states``.
+    cute_arguments.pop("num_seqs", None)
     out, final = SSDCombined(**cute_constructor, backend="cute").run(
         stream(x), stream(dt), A, stream(B), stream(C), **cute_arguments
     )
