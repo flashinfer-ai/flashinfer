@@ -712,6 +712,30 @@ def kda_decode_bytes(num_rows: int, num_heads: int, state_dtype: torch.dtype) ->
     return state + conv + activations
 
 
+def _decode_cache_views(pages, num_heads, state_dtype):
+    """Convolution-cache and recurrent-state views into one page per slot.
+
+    ``pages`` is a ``[num_slots, page_bytes]`` uint8 buffer; each page holds
+    the slot's convolution history (sequence-major, channels contiguous)
+    followed by its compact ``[H, 128, 128]`` recurrent state.
+    """
+    num_slots, page_bytes = pages.shape
+    hidden = num_heads * HEAD_DIM
+    conv_slot_bytes = 3 * hidden * _DECODE_CONV_HISTORY * 2
+    conv_state = torch.as_strided(
+        pages.view(torch.bfloat16),
+        (num_slots, 3 * hidden, _DECODE_CONV_HISTORY),
+        (page_bytes // 2, 1, 3 * hidden),
+    )
+    state = torch.as_strided(
+        pages.view(state_dtype),
+        (num_slots, num_heads, HEAD_DIM, HEAD_DIM),
+        (page_bytes // state_dtype.itemsize, HEAD_DIM * HEAD_DIM, HEAD_DIM, 1),
+        conv_slot_bytes // state_dtype.itemsize,
+    )
+    return conv_state, state
+
+
 def _make_decode_inputs(args, device):
     """Inputs matching the fused_kda_decode contract.
 
@@ -733,25 +757,16 @@ def _make_decode_inputs(args, device):
     def randn(shape, dtype=torch.float32):
         return torch.randn(shape, dtype=torch.float32, device=device).to(dtype)
 
-    conv_state = torch.empty_strided(
-        (num_slots, 3 * hidden, _DECODE_CONV_HISTORY),
-        (page_bytes // 2, 1, 3 * hidden),
-        dtype=torch.bfloat16,
-        device=device,
-    )
+    pages = torch.empty((num_slots, page_bytes), dtype=torch.uint8, device=device)
+    conv_state, state = _decode_cache_views(pages, num_heads, state_dtype)
     conv_state.copy_(
         0.1 * randn((num_slots, 3 * hidden, _DECODE_CONV_HISTORY), torch.bfloat16)
-    )
-    state = torch.empty_strided(
-        (num_slots, num_heads, HEAD_DIM, HEAD_DIM),
-        (page_bytes // state_dtype.itemsize, HEAD_DIM * HEAD_DIM, HEAD_DIM, 1),
-        dtype=state_dtype,
-        device=device,
     )
     state.copy_(0.01 * randn((num_slots, num_heads, HEAD_DIM, HEAD_DIM)))
     return {
         "x": randn((num_rows, 3 * hidden), torch.bfloat16),
         "weight": 0.1 * randn((3, 4, hidden)),
+        "pages": pages,
         "conv_state": conv_state,
         "raw_gate": randn((1, num_rows, num_heads, HEAD_DIM), torch.bfloat16),
         "raw_beta": randn((1, num_rows, num_heads), torch.bfloat16),
@@ -807,14 +822,6 @@ def _reference_decode(inputs, conv_state, state, lower_bound):
     return output.unsqueeze(0).to(torch.bfloat16)
 
 
-def _clone_strided(tensor):
-    clone = torch.empty_strided(
-        tensor.shape, tensor.stride(), dtype=tensor.dtype, device=tensor.device
-    )
-    clone.copy_(tensor)
-    return clone
-
-
 def testFusedKDADecode(args):
     """Time the fused Kimi KDA decode (``flashinfer.kda_decode.fused_kda_decode``).
 
@@ -859,19 +866,16 @@ def testFusedKDADecode(args):
     output = torch.empty(
         (1, num_rows, num_heads, HEAD_DIM), dtype=torch.bfloat16, device=device
     )
-    conv_snapshot = _clone_strided(inputs["conv_state"])
-    state_snapshot = _clone_strided(inputs["state"])
+    pages_snapshot = inputs["pages"].clone()
 
     def restore_caches():
-        inputs["conv_state"].copy_(conv_snapshot)
-        inputs["state"].copy_(state_snapshot)
+        inputs["pages"].copy_(pages_snapshot)
 
     reference_output = None
     if args.refcheck:
         reference_output = _reference_decode(
             inputs,
-            _clone_strided(conv_snapshot),
-            _clone_strided(state_snapshot),
+            *_decode_cache_views(pages_snapshot.clone(), num_heads, state_dtype),
             args.lower_bound,
         )
 
