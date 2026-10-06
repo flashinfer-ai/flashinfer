@@ -39,6 +39,7 @@ output_column_dict = {
         "timing_metric",
         "row_activity_mode",
         "calls_per_sample",
+        "use_tensor_cores",
     ],
     "dsv4_sparse_mla": [
         "swa_topk",
@@ -724,12 +725,13 @@ routine_cc_to_supported_backends = {
         # NOTE: trtllm-fmha-v2 calls trtllm_fmha_v2_prefill
         # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
         "7.5": [],
-        "8.0": ["fa2", "cudnn", "cudnn-native"],
-        "8.6": ["fa2", "cudnn", "cudnn-native"],
-        "8.9": ["fa2", "cudnn", "cudnn-native"],
-        "9.0": ["fa2", "fa3", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
+        "8.0": ["fa2", "auto", "cudnn", "cudnn-native"],
+        "8.6": ["fa2", "auto", "cudnn", "cudnn-native"],
+        "8.9": ["fa2", "auto", "cudnn", "cudnn-native"],
+        "9.0": ["fa2", "auto", "fa3", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
         "10.0": [
             "fa2",
+            "auto",
             "cudnn",
             "cudnn-native",
             "cutlass",
@@ -739,6 +741,7 @@ routine_cc_to_supported_backends = {
         ],
         "10.3": [
             "fa2",
+            "auto",
             "cudnn",
             "cudnn-native",
             "cutlass",
@@ -748,6 +751,7 @@ routine_cc_to_supported_backends = {
         ],
         "10.7": [
             "fa2",
+            "auto",
             "cudnn",
             "cudnn-native",
             "cutlass",
@@ -757,12 +761,13 @@ routine_cc_to_supported_backends = {
         ],
         "12.0": [
             "fa2",
+            "auto",
             "cudnn",
             "cudnn-native",
             "trtllm-fmha-v2",
             "cute-dsl-prims",
         ],
-        "12.1": ["fa2", "cudnn", "cudnn-native"],
+        "12.1": ["fa2", "auto", "cudnn", "cudnn-native"],
     },
     "BatchMLAPagedAttentionWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache_mla(backend="trtllm-gen")

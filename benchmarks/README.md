@@ -234,6 +234,8 @@ The output CSV will contain detailed metrics including:
 - Standard deviation
 - TFLOPS/sec
 - Memory throughput (TB/sec)
+- `resolved_backend`: the backend that actually ran. For attention wrappers this is the library backend after `plan()`, so `auto` rows show what `auto` selected (e.g. `fa2`, `fa3`, `cudnn`, `cutlass`, `trtllm-gen`)
+- `use_tensor_cores` (`BatchDecodeWithPagedKVCacheWrapper` FA2 rows only): `True` for the FA2 prefill (tensor-core) kernel, `False` for the CUDA-core decode kernel
 - Input flags
 - Reproducer commands if `--generate_repro_command` is provided
 
@@ -254,7 +256,7 @@ The output CSV will contain detailed metrics including:
 | `--verbose`, `-v`        | Print additional information (can be used multiple times for more verbosity, e.g. `-vv`)                   |
 | `--case_tag`              | Optional tag for the test case, useful for annotating or filtering results in the output CSV.              |
 | `--generate_repro_command`| If set, prints a reproducer command for the test case and stores it in the output CSV.                     |
-| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, auto, cudnn, cudnn-native, cutlass, trtllm, trtllm-gen, trtllm-native, prims-ts, cute-dsl, cute-dsl-prims, cublas, trtllm_low_latency. (`prims_ts` aliases `prims-ts`; `auto` support is routine-dependent.)|
+| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, auto, cudnn, cudnn-native, cutlass, trtllm, trtllm-gen, trtllm-native, prims-ts, cute-dsl, cute-dsl-prims, cublas, trtllm_low_latency. (`prims_ts` aliases `prims-ts`; `fa2_tc` is the decode alias for `fa2` with `use_tensor_cores=True`; `auto` support is routine-dependent.)|
 
 ### Attention Flags
 | Flag                     | Description                                                                                                 |
@@ -551,7 +553,7 @@ Each column represents a compute capability. Backends inside cells represent sup
 <!--
 Legend:
 - fa2: FlashAttention-2
-- fa2_tc: FlashAttention-2 (Tensor Core)
+- fa2_tc: FlashAttention-2, decode via the tensor-core prefill kernel (use_tensor_cores=True)
 - fa3: FlashAttention-3
 - cudnn: cuDNN (via wrapper API)
 - cudnn-native: cuDNN (direct API call)
@@ -626,7 +628,7 @@ Legend:
 
 Backend Legend:
 - fa2: FlashAttention2
-- fa2_tc: FlashAttention2 (with Tensor Cores for `BatchDecodeWithPagedKVCacheWrapper`)
+- fa2_tc: `BatchDecodeWithPagedKVCacheWrapper` only. Alias for `backend="fa2"` with `use_tensor_cores=True`, which reuses the FA2 prefill (tensor-core) kernel for decode; plain `fa2` uses the dedicated CUDA-core decode kernel. Output rows keep `backend=fa2_tc` and report `resolved_backend=fa2`, `use_tensor_cores=True`.
 - fa3: FlashAttention-3
 - cublas: cuBLAS
 - cudnn: cuDNN (via wrapper API)

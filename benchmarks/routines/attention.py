@@ -371,7 +371,7 @@ def parse_attention_args(line, parser):
             "prims_ts",  # Accepted alias for the Python module spelling.
             "cute-dsl-prims",
         ],
-        help="Kernel backends to test. Default: fa2, except DSV4 sparse MLA defaults to trtllm-gen. prims-ts selects the experimental task-scheduled Blackwell backend for the wrapper attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
+        help="Kernel backends to test. Default: fa2, except DSV4 sparse MLA defaults to trtllm-gen. prims-ts selects the experimental task-scheduled Blackwell backend for the wrapper attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, BatchPrefillWithRaggedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl); the backend the library selects is reported in the resolved_backend output column. fa2_tc (BatchDecodeWithPagedKVCacheWrapper only) is an alias for backend=fa2 with use_tensor_cores=True, i.e. the FA2 prefill kernel reused for decode; plain fa2 uses the dedicated CUDA-core decode kernel. Decode rows report the choice in the use_tensor_cores output column.",
     )
     parser.add_argument(
         "--page_size",
@@ -1053,8 +1053,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             plan_kv_indptr = (
                 kv_indptr.clone().detach() if backend == "trtllm-gen" else kv_indptr
             )
-            # Map fa2_tc to fa2 for the actual backend parameter
-            # fa2_tc is a benchmark-specific name meaning "fa2 with tensor cores"
+            # fa2_tc is a benchmark-only alias for backend="fa2" with
+            # use_tensor_cores=True (the FA2 prefill kernel reused for decode).
             actual_backend = "fa2" if backend == "fa2_tc" else backend
             backend_wrappers[backend] = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer,
@@ -1420,14 +1420,14 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             )
             resolved_backend = resolved_backends.get(backend, backend)
             wrapper = backend_wrappers.get(backend)
-            if (
-                wrapper is not None
-                and resolved_backend == "fa2"
-                and wrapper.use_tensor_cores
-            ):
-                resolved_backend = "fa2_tc"
+            use_tensor_cores = (
+                wrapper.use_tensor_cores
+                if wrapper is not None and resolved_backend == "fa2"
+                else None
+            )
+            display_name = "fa2_tc" if use_tensor_cores else resolved_backend
             display_backend = (
-                f"auto({resolved_backend})" if backend == "auto" else resolved_backend
+                f"auto({display_name})" if backend == "auto" else display_name
             )
             print_perf_metrics(
                 display_backend, median_time, std_time, tflops, tb_per_sec
@@ -1442,6 +1442,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["backend"] = backend
                 cur_res["resolved_backend"] = resolved_backend
+                if use_tensor_cores is not None:
+                    cur_res["use_tensor_cores"] = use_tensor_cores
                 cur_res["page_size"] = page_size
                 cur_res["batch_size"] = batch_size
                 cur_res["s_qo"] = s_qo
@@ -2404,8 +2406,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 def testBatchPrefillWithRaggedKVCacheWrapper(args):
     """
     Test BatchPrefillWithRaggedKVCacheWrapper API and equivalent cuDNN API.
-    Supports fa2, fa3, cutlass, cudnn, trtllm-native, trtllm-fmha-v2, and
-    prims-ts backends.
+    Supports fa2, fa3, auto, cutlass, cudnn, trtllm-native, trtllm-fmha-v2,
+    and prims-ts backends.
 
     This test:
     1. Creates ragged KV cache and query tensors for prefill
@@ -2784,11 +2786,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
 
     # Prepare wrappers
     backend_wrappers = {}
+    resolved_backends = {}
     for backend in backends:
         if backend in [
             "cutlass",
             "fa2",
             "fa3",
+            "auto",
             "trtllm-gen",
             "cute-dsl-prims",
         ]:
@@ -2816,6 +2820,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 kv_data_type=kv_dtype,
                 o_data_type=out_dtype,
             )
+            resolved_backends[backend] = backend_wrappers[backend]._backend
         elif backend == "cudnn":
             # cuDNN uses NHD layout and the wrapper API
             backend_wrappers[backend] = (
@@ -2842,6 +2847,9 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 max_token_per_sequence=s_qo,
                 max_sequence_kv=s_kv,
             )
+            resolved_backends[backend] = backend_wrappers[backend]._backend
+        else:
+            resolved_backends[backend] = backend
 
     q_scale, k_scale, v_scale = None, None, None
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
@@ -2932,7 +2940,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         kv_indptr,
         out,
     ):
-        if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
+        if backend in ["cutlass", "fa2", "fa3", "auto", "trtllm-gen"]:
             return backend_wrappers[backend].run_return_lse(
                 q, k, v, enable_pdl=args.enable_pdl, out=out
             )[0]
@@ -3267,7 +3275,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 o_dtype=out_dtype,
             )
 
-            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+            resolved_backend = resolved_backends.get(backend, backend)
+            display_backend = (
+                f"auto({resolved_backend})" if backend == "auto" else backend
+            )
+            print_perf_metrics(
+                display_backend, median_time, std_time, tflops, tb_per_sec
+            )
 
             if args.output_path is not None:
                 cur_res = defaultdict(str)
@@ -3277,6 +3291,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["backend"] = backend
+                cur_res["resolved_backend"] = resolved_backend
                 cur_res["page_size"] = 0  # No page size for ragged
                 cur_res["batch_size"] = batch_size
                 cur_res["s_qo"] = s_qo
@@ -4069,6 +4084,8 @@ def testBatchMLAPagedAttentionWrapper(args):
                     cur_res["resolved_backend"] = _mla_resolved_backend(
                         autotune_choices.get(backend, {})
                     )
+                else:
+                    cur_res["resolved_backend"] = backend
                 cur_res["page_size"] = page_size
                 cur_res["batch_size"] = batch_size
                 cur_res["s_qo"] = s_qo
