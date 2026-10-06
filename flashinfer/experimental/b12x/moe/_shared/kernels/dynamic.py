@@ -5453,13 +5453,16 @@ class MoEDynamicKernelBackend:
                             _pk = ml_pipeline.consumer_try_wait(cons_state)
                             ml_pipeline.consumer_wait(cons_state, _pk)
                             if cutlass.const_expr(self.nvfp4_inline_scales):
-                                self.csf_w13_reader.expand_shared(
-                                    compressed_w13, num_experts, storage.sSFB.data_ptr(),
-                                    cons_state.index, self.num_mma_warps * 32, self.epilog_sync_barrier,
-                                )
                                 if cutlass.const_expr(self.swap_ab and gate_lo_sub > 0):
                                     self.csf_w13_reader.expand_shared(
-                                        compressed_w13, num_experts, storage.sSFB_up.data_ptr(),
+                                        compressed_w13, num_experts, storage.sSFB.data_ptr(),
+                                        cons_state.index, self.num_mma_warps * 32, self.epilog_sync_barrier,
+                                        storage.sSFB_up.data_ptr(), cons_state.index,
+                                        row_half=1, second_row_half=0,
+                                    )
+                                else:
+                                    self.csf_w13_reader.expand_shared(
+                                        compressed_w13, num_experts, storage.sSFB.data_ptr(),
                                         cons_state.index, self.num_mma_warps * 32, self.epilog_sync_barrier,
                                     )
                             _i = cons_state.index
@@ -6902,17 +6905,19 @@ class MoEDynamicKernelBackend:
                         if cutlass.const_expr(self.w4a4_fc1_fused):
                             up_peek = up_pipeline.consumer_try_wait(up_cons_state)
                         ml_pipeline.consumer_wait(cons_state, peek)
-                        if cutlass.const_expr(self.nvfp4_inline_scales):
-                            self.csf_w13_reader.expand_shared(
-                                compressed_w13, num_experts, storage.sSFB.data_ptr(),
-                                cons_state.index, self.num_mma_warps * 32, self.epilog_sync_barrier,
-                            )
                         if cutlass.const_expr(self.w4a4_fc1_fused):
                             up_pipeline.consumer_wait(up_cons_state, up_peek)
-                            if cutlass.const_expr(self.nvfp4_inline_scales):
+                        if cutlass.const_expr(self.nvfp4_inline_scales):
+                            if cutlass.const_expr(self.w4a4_fc1_fused):
                                 self.csf_w13_reader.expand_shared(
-                                    compressed_w13, num_experts, storage.sSFB_up.data_ptr(),
-                                    up_cons_state.index, self.num_mma_warps * 32, self.epilog_sync_barrier,
+                                    compressed_w13, num_experts, storage.sSFB.data_ptr(),
+                                    cons_state.index, self.num_mma_warps * 32, self.epilog_sync_barrier,
+                                    storage.sSFB_up.data_ptr(), up_cons_state.index,
+                                )
+                            else:
+                                self.csf_w13_reader.expand_shared(
+                                    compressed_w13, num_experts, storage.sSFB.data_ptr(),
+                                    cons_state.index, self.num_mma_warps * 32, self.epilog_sync_barrier,
                                 )
                         if cutlass.const_expr(self.is_w6a8):
                             # Expand the TMA-staged 3:4-packed FP6 B tile in
@@ -7021,19 +7026,21 @@ class MoEDynamicKernelBackend:
                                             csSFB_up_p
                                         )
                                     ml_pipeline.consumer_wait(cons_state, peek)
-                                    if cutlass.const_expr(self.nvfp4_inline_scales):
-                                        self.csf_w13_reader.expand_shared(
-                                            compressed_w13, num_experts, storage.sSFB.data_ptr(),
-                                            cons_state.index, self.num_mma_warps * 32, self.epilog_sync_barrier,
-                                        )
                                     if cutlass.const_expr(self.w4a4_fc1_fused):
                                         up_pipeline.consumer_wait(
                                             up_cons_state, up_peek
                                         )
-                                        if cutlass.const_expr(self.nvfp4_inline_scales):
+                                    if cutlass.const_expr(self.nvfp4_inline_scales):
+                                        if cutlass.const_expr(self.w4a4_fc1_fused):
                                             self.csf_w13_reader.expand_shared(
-                                                compressed_w13, num_experts, storage.sSFB_up.data_ptr(),
-                                                up_cons_state.index, self.num_mma_warps * 32, self.epilog_sync_barrier,
+                                                compressed_w13, num_experts, storage.sSFB.data_ptr(),
+                                                cons_state.index, self.num_mma_warps * 32, self.epilog_sync_barrier,
+                                                storage.sSFB_up.data_ptr(), up_cons_state.index,
+                                            )
+                                        else:
+                                            self.csf_w13_reader.expand_shared(
+                                                compressed_w13, num_experts, storage.sSFB.data_ptr(),
+                                                cons_state.index, self.num_mma_warps * 32, self.epilog_sync_barrier,
                                             )
                                     if cutlass.const_expr(self.is_w6a8):
                                         # The stage just became full (packed

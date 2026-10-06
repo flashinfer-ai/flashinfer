@@ -10943,7 +10943,7 @@ def _get_dynamic_kernel(
         bool(materialize_intermediate),
         int(trellis_bits),
         bool(trellis_intermediate_hadamard),
-        *(("nvfp4_inline_scales_v1",) if nvfp4_inline_scales else ()),
+        *(("nvfp4_inline_scales_v2",) if nvfp4_inline_scales else ()),
     )
     reuse_compiled = _first_env(
         "B12X_DYNAMIC_REUSE_COMPILED",
