@@ -246,6 +246,13 @@ def msa_sparse_attention(
                 "SM90 msa_sparse_attention handles softmax_scale and v_global_scale, "
                 "but not per-tensor k_scale/v_scale/k_global_scale"
             )
+        if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+            # _views() builds the paged pointers as e4m3; any other dtype is read
+            # with the wrong element stride and returns silent garbage.
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention requires an fp8 e4m3 KV cache, "
+                f"got k={k.dtype} v={v.dtype}"
+            )
         from ._sm90_dispatch import sparse_prefill_sm90
 
         out = torch.zeros(

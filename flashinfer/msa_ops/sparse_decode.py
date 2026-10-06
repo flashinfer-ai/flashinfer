@@ -409,6 +409,14 @@ def msa_sparse_decode_attention(
                 "SM90 msa_sparse_decode_attention handles softmax_scale and "
                 "v_global_scale, but not per-tensor k_scale/v_scale/k_global_scale"
             )
+        if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+            # The SM90 decode schedule views the cache as raw bytes and declares
+            # them e4m3, so any other dtype is read with both the wrong values and
+            # the wrong element stride -- silent garbage rather than a failure.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention requires an fp8 e4m3 KV cache, "
+                f"got k={k.dtype} v={v.dtype}"
+            )
         from ._sm90_dispatch import sparse_decode_sm90
 
         out = torch.empty(
