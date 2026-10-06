@@ -105,6 +105,7 @@ def _control_snapshot() -> FrozenMapping:
     return FrozenMapping({
         "trellis_decode_table": trellis_decode_table(),
         "w4a16_small_m_occupancy": _w4a16_small_m_occupancy(),
+        "w4a8_csf_inline_max_tokens": _impl.W4A8_CSF_INLINE_MAX_TOKENS,
         "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
         "w4a16_csf_stage_max_tokens": _impl.W4A16_CSF_STAGE_MAX_TOKENS,
         "w4a16_skip_empty_m_blocks": _impl.os.environ.get(
@@ -208,6 +209,7 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
         "quant_modes": tuple(plan.quant_modes), "source_format": plan.source_format,
         "nvfp4_inline_scales": plan.nvfp4_inline_scales,
         "w4a16_compressed_scales": plan.w4a16_compressed_scales,
+        "w4a8_csf_inline": plan.w4a8_csf_inline,
         "activation": plan.activation, "params_dtype": plan.io_dtype,
         "num_experts": plan.num_experts, "hidden_size": plan.hidden_size,
         "intermediate_size": plan.intermediate_size, "w13_layout": plan.w13_layout,
@@ -286,6 +288,12 @@ def _lower_caps(
                             if config.w4a16_block_size_m is not None
                             else query.w4a16_block_size_m),
         w4a16_fast_math=query.fast_math,
+        w4a8_csf_inline=bool(
+            weight_plan.w4a8_csf_inline
+            and (config.backend != "dynamic" or query.num_tokens <= int(
+                query.controls.get("w4a8_csf_inline_max_tokens", 1536)
+            ))
+        ),
         w4a16_prefill_fused_sum=bool(
             query.controls.get("w4a16_prefill_fused_sum", False)
         ),
@@ -583,6 +591,10 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
             and quant_mode == "nvfp4"
             and plan.decode_config.nvfp4_inline_scales
         ),
+        "w4a8_csf_inline": bool(
+            n64_repacked
+            and caps.w4a8_csf_inline
+        ),
     }
 
 
@@ -591,6 +603,8 @@ class _CompactLaunches:
     kernels: object
     quantize: object
     topk_sum: object
+    # The kernels read inline MXFP4-CSF scale storage (mxfp4_csf_inline).
+    csf_inline: bool = False
 
 
 def _compact_launches(plan, caps):
@@ -611,15 +625,19 @@ def _compact_launches(plan, caps):
     quantize = _get_compiled_mxfp8_rows_quant(
         plan.k, torch.bfloat16, subgroup, threads, "linear", device_ordinal=ordinal, sm_count=sms,
     )
+    csf_inline = bool(getattr(caps.weight_plan, "w4a8_csf_inline", False))
     kernels = {
         dtype: _compiled_direct_w4a8_compact(
             ordinal, m, plan.num_topk, plan.k, plan.n, plan.weight_E, dtype,
             plan.weight_E, plan.weight_E, plan.swiglu_limit, caps.w4a16_fast_math,
+            csf_inline,
         ) for dtype in (torch.int32, torch.int64)
     }
     topk_sum = compile_w4a16_topk_sum(m=m, topk=plan.num_topk, hidden_size=plan.k)
-    return attach_programs(_CompactLaunches(MappingProxyType(kernels), quantize, topk_sum),
-                           tuple(kernels.values()), quantize, topk_sum)
+    return attach_programs(
+        _CompactLaunches(MappingProxyType(kernels), quantize, topk_sum, csf_inline),
+        tuple(kernels.values()), quantize, topk_sum,
+    )
 
 
 def _program_carriers(
@@ -717,6 +735,7 @@ def _program_carriers(
                 swiglu_beta=plan.swiglu_beta, trellis_bits=caps.weight_plan.trellis_bits or 0,
                 trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                 planned_tile_m=dynamic["planned_tile_m"],
+                w4a8_csf_inline=dynamic["w4a8_csf_inline"],
             )
             launches.append(launch)
         if plan.deterministic_output:
@@ -965,6 +984,7 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
     )
     mx_csf = experts._impl.mxfp4_csf
     mx_payload = () if mx_csf is None else (mx_csf.first.geometry, mx_csf.second.geometry)
+    mx_inline = experts._impl.mxfp4_csf_inline
 
     def child(tokens):
         query = _query(experts, capacity, tokens, routing, controls, invocation)
@@ -1018,6 +1038,13 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
                     )
                     for payload in _dynamic_route_plan_payloads(launch_plan, caps)
                 ),
+                *(
+                    CompileJob.create(
+                        "b12x.moe.fused_moe._preparation:compile_inline_scale_expansion",
+                        payload, device.ordinal,
+                    )
+                    for payload in _inline_expansion_payloads(launch_plan, mx_inline, caps)
+                ),
             )
 
         def memory(config, device):
@@ -1052,6 +1079,10 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
             launchers.extend(
                 compile_dynamic_route_plan(payload, device.ordinal)
                 for payload in _dynamic_route_plan_payloads(scratch.launch_plan, caps)
+            )
+            launchers.extend(
+                compile_inline_scale_expansion(payload, device.ordinal)
+                for payload in _inline_expansion_payloads(scratch.launch_plan, mx_inline, caps)
             )
             launchers = tuple(launchers)
             carrier_tree = attach_programs(scratch, *launchers)
@@ -1116,6 +1147,28 @@ def _dynamic_route_plan_payloads(plan, caps):
         {"num_experts": int(plan.weight_E), "tile_m": tile, "ids_dtype": ids_dtype}
         for tile in tiles for ids_dtype in ("int32", "int64")
     )
+
+
+def _inline_expansion_payloads(plan, inline, caps):
+    """Inline MXFP4-CSF plane expansions a launch plan above the inline limit runs."""
+    if (
+        inline is None
+        or plan.implementation != "dynamic"
+        or caps.w4a8_csf_inline
+    ):
+        return ()
+    from b12x._lib.quant.mxfp4_csf_inline import expansion_payload
+
+    return tuple(expansion_payload(plane) for plane in inline)
+
+
+@program_cache(scope="preparation")
+def compile_inline_scale_expansion(payload, ordinal):
+    """Compile the Triton expansion of one inline MXFP4-CSF plane geometry."""
+    from b12x._lib.quant.mxfp4_csf_inline import compile_expansion
+
+    with torch.cuda.device(ordinal):
+        return compile_expansion(payload)
 
 
 @program_cache(scope="preparation")

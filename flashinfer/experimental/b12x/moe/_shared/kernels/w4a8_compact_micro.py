@@ -92,6 +92,7 @@ class _DirectW4A8CompactLaunch:
         down_scale_count: int,
         swiglu_limit: float | None,
         fast_math: bool,
+        csf_inline: bool = False,
     ):
         self.capacity = max_tokens
         self.topk = num_topk
@@ -100,7 +101,11 @@ class _DirectW4A8CompactLaunch:
         self.experts = experts
         self.input_scale_count = input_scale_count
         self.down_scale_count = down_scale_count
-        self.projection = W4A8CompactMicroProjectionKernel(k, n, num_topk)
+        # Inline MXFP4-CSF: both scale operands are compressed inline storage.
+        self.csf_inline = bool(csf_inline)
+        self.projection = W4A8CompactMicroProjectionKernel(
+            k, n, num_topk, csf_inline=self.csf_inline
+        )
         self.activation = W4A8CompactMicroActivationKernel(
             n,
             experts,
@@ -113,6 +118,7 @@ class _DirectW4A8CompactLaunch:
             direct_routes=True,
             n64_repacked=self.n % 128 == 64,
             n64_tail=self.n % 128 == 64,
+            csf_inline=self.csf_inline,
         )
 
     @cute.jit
@@ -242,6 +248,7 @@ def _compiled_direct_w4a8_compact(
     down_scale_count: int,
     swiglu_limit: float | None,
     fast_math: bool,
+    csf_inline: bool = False,
 ):
     launch = _DirectW4A8CompactLaunch(
         max_tokens=max_tokens,
@@ -253,6 +260,7 @@ def _compiled_direct_w4a8_compact(
         down_scale_count=down_scale_count,
         swiglu_limit=swiglu_limit,
         fast_math=fast_math,
+        csf_inline=csf_inline,
     )
     ids_type = cutlass.Int32 if ids_dtype == torch.int32 else cutlass.Int64
 
@@ -274,6 +282,7 @@ def _compiled_direct_w4a8_compact(
             down_scale_count,
             swiglu_limit,
             fast_math,
+            *(("csf_inline",) if csf_inline else ()),
         ),
     )
     return b12x_compile(
@@ -311,6 +320,7 @@ def _compiled_direct_w4a8_compact(
                 down_scale_count,
                 swiglu_limit,
                 fast_math,
+                *(("csf_inline",) if csf_inline else ()),
             ),
         ),
     )
@@ -345,6 +355,7 @@ def launch_w4a8_compact_micro(
     _prepared_kernel=None,
     _prepared_quantize=None,
     max_active_clusters: int | None = None,
+    csf_inline: bool = False,
 ) -> torch.Tensor:
     """Run quantized projections, routed activation, and direct FC2 from fixed scratch."""
     if max_active_clusters is not None and max_active_clusters <= 0:
@@ -403,6 +414,7 @@ def launch_w4a8_compact_micro(
         down_scale.numel(),
         swiglu_limit,
         fast_math,
+        csf_inline,
     )
     ids = topk_ids.reshape(-1)
     weights = topk_weights.reshape(-1)

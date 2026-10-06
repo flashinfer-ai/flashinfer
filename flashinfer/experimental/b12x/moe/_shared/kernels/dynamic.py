@@ -827,6 +827,7 @@ class MoEDynamicKernelBackend:
         trellis_bits: int | None = None,
         trellis_intermediate_hadamard: bool = False,
         trellis_direct_lut: bool = False,
+        w4a8_csf_inline: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         if quant_recipe not in {
@@ -1030,6 +1031,18 @@ class MoEDynamicKernelBackend:
         self.external_materialized_fc1 = bool(
             self.w4a8_split_materialized or self.nvfp4_split_materialized
         )
+        # Inline MXFP4-CSF scales: the split phase kernels read compressed scale
+        # storage from the w13/down SFB operands. Only they read weight scales.
+        self.w4a8_csf_inline = bool(w4a8_csf_inline)
+        if self.w4a8_csf_inline and not (
+            self.w4a8_n64_repacked
+            and self.w4a8_split_materialized
+            and not self.w4a8_trellis
+        ):
+            raise ValueError(
+                "inline MXFP4-CSF scales require the split-materialized compact "
+                "N64 W4A8 kernels"
+            )
         self.external_materialized_fc2 = self.external_materialized_fc1
         if int(num_topk) <= 0:
             raise ValueError(f"num_topk must be positive, got {num_topk}")
@@ -1068,6 +1081,7 @@ class MoEDynamicKernelBackend:
                 num_topk=self.num_topk,
                 n64_repacked=self.w4a8_n64_repacked,
                 n64_tail=self.w4a8_n64_tail,
+                csf_inline=bool(w4a8_csf_inline),
                 trellis_bits=(
                     trellis_bits
                     if self.w4a8_trellis and self.w4a8_split_materialized
@@ -1093,6 +1107,7 @@ class MoEDynamicKernelBackend:
                 deterministic_output=bool(deterministic_output),
                 n64_repacked=self.w4a8_n64_repacked,
                 n64_tail=self.w4a8_n64_tail,
+                csf_inline=bool(w4a8_csf_inline),
                 trellis_bits=(
                     trellis_bits
                     if self.w4a8_trellis and self.w4a8_split_materialized

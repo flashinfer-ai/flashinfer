@@ -242,6 +242,10 @@ class Mxfp4CsfWeights:
     Scale planes may be canonical CPU tensors or a prepared device batch.
     Buffers may be shared only by serialized layer executions on one CUDA
     stream. Concurrent model execution lanes require separate buffers.
+    Compact W4A8 preparation (intermediate size 64 mod 128) uses the buffers
+    once to build inline storage. Plans above the inline capacity expand into
+    those buffers before each call; smaller plans read inline storage directly.
+    B12X_W4A8_CSF_INLINE=0 keeps routed-expert expansion at all capacities.
     """
 
     w13: torch.Tensor

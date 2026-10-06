@@ -312,6 +312,11 @@ class MoEWeightPreparationPlan:
     # storage. Kernels rebuild each pipeline stage from it; calls planned above
     # the stage-read token limit expand their routed experts into scratch first.
     w4a16_compressed_scales: bool = False
+    # Compact (N64) W4A8 experts prepared from MXFP4-CSF checkpoints keep their
+    # E8M0 scales as inline storage (b12x._lib.quant.mxfp4_csf_inline). Every
+    # compact W4A8 launch within the inline capacity rebuilds its scale words;
+    # larger capacities expand into scratch before execution.
+    w4a8_csf_inline: bool = False
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)

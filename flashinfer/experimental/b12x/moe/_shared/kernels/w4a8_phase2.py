@@ -35,6 +35,13 @@ from b12x._lib.intrinsics import (
     mxfp8_mma_m16n8k32_f32_e4m3,
     st_shared_u32,
 )
+from b12x._lib.quant.mxfp4_csf_inline import (
+    BASE_BYTES as _CSF_BASE_BYTES,
+    TILE_BYTES as _CSF_TILE_BYTES,
+    inline_row_bases,
+    inline_scale_words,
+    stage_inline_tile,
+)
 from b12x.moe._shared.kernels.w4a8_trellis_decode import (
     _w4a8_stage_trellis_b_tile,
     _w4a8_trellis_lane_geom,
@@ -78,9 +85,15 @@ class W4A8MaterializedPhase2Kernel:
         n64_repacked: bool = False,
         n64_tail: bool = False,
         direct_routes: bool = False,
+        csf_inline: bool = False,
     ):
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
+        # The SFB operand is inline MXFP4-CSF storage (mxfp4_csf_inline): stages
+        # copy compressed tile blocks and each thread rebuilds its scale words.
+        self.csf_inline = bool(csf_inline)
+        if self.csf_inline and (not self.n64_repacked or trellis_bits is not None):
+            raise ValueError("inline MXFP4-CSF scales require compact N64 W4A8 weights")
         self.direct_routes = bool(direct_routes)
         if self.direct_routes:
             if source_tile_m != 1:
@@ -394,16 +407,30 @@ class W4A8MaterializedPhase2Kernel:
                 total_k32,
                 tid,
             )
-            self._stage_n64_sfb(
-                down_sfb_rp,
-                sfb_base,
-                expert_idx,
-                output_tile,
-                intermediate_slice,
-                total_output_tiles,
-                total_k32,
-                tid,
-            )
+            if cutlass.const_expr(self.csf_inline):
+                stage_inline_tile(
+                    get_ptr_as_int64(down_sfb_rp, Int32(0)),
+                    (
+                        Int64(expert_idx) * Int64(total_output_tiles)
+                        + Int64(output_tile)
+                    )
+                    * Int64(intermediate_tiles)
+                    + Int64(intermediate_slice),
+                    sfb_base,
+                    tid,
+                    0,
+                )
+            else:
+                self._stage_n64_sfb(
+                    down_sfb_rp,
+                    sfb_base,
+                    expert_idx,
+                    output_tile,
+                    intermediate_slice,
+                    total_output_tiles,
+                    total_k32,
+                    tid,
+                )
         else:
             # Prepared weights remain N256 tile-major. Compact this CTA's
             # consecutive N32 chunks into its shared tile.
@@ -490,6 +517,29 @@ class W4A8MaterializedPhase2Kernel:
             if cutlass.const_expr(self.trellis_direct_lut):
                 trellis_lut_addr = trellis_lut.iterator.toint()
 
+        if cutlass.const_expr(self.csf_inline):
+            # Row bases are constant over the K sweep: load them once per task.
+            csf_storage = get_ptr_as_int64(down_sfb_rp, Int32(0))
+            csf_blocks = Int64(packed_output_tiles * Int32(2))
+            csf_tiles_bytes = (
+                Int64(down_alpha.shape[0])
+                * csf_blocks
+                * Int64(intermediate_tiles)
+                * Int64(_CSF_TILE_BYTES)
+            )
+            csf_raw = (
+                csf_storage
+                + csf_tiles_bytes
+                + Int64(down_alpha.shape[0]) * csf_blocks * Int64(_CSF_BASE_BYTES)
+            )
+            csf_slot = warp_idx * Int32(32) + q * Int32(4)
+            csf_bases = inline_row_bases(
+                csf_storage,
+                csf_tiles_bytes,
+                Int64(expert_idx) * csf_blocks + Int64(output_tile),
+                csf_slot,
+            )
+
         # Keep enough groups in flight to hide global-memory latency while the
         # current K128 slice is consumed. Each preload gets its own group,
         # including the guarded-empty tail groups, so wait_group below retains
@@ -565,6 +615,19 @@ class W4A8MaterializedPhase2Kernel:
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
 
+            if cutlass.const_expr(self.csf_inline):
+                csf_scales = inline_scale_words(sfb_base, csf_bases, csf_slot, csf_raw)
+                csf_mask = Uint32(0xFFFFFFFF)
+                if cutlass.const_expr(self.n64_tail):
+                    # The K tail tile holds two K32 columns; the native stage
+                    # writes zero scale bytes for the other two.
+                    csf_mask = Uint32(
+                        cutlass.select_(
+                            intermediate_slice == intermediate_tiles - Int32(1),
+                            Uint32(0xFFFF),
+                            csf_mask,
+                        )
+                    )
             asc = cute.make_rmem_tensor((m_blocks,), Uint32)
             for blk in cutlass.range_constexpr(m_blocks):
                 if cutlass.const_expr(self.direct_routes):
@@ -647,7 +710,9 @@ class W4A8MaterializedPhase2Kernel:
                     b0 = dn_b0[nt]
                     b1 = dn_b1[nt]
                     sfb_word = Uint32(0x7F7F7F7F)
-                    if cutlass.const_expr(not self.w4a8_trellis):
+                    if cutlass.const_expr(self.csf_inline):
+                        sfb_word = csf_scales[nt] & csf_mask
+                    elif cutlass.const_expr(not self.w4a8_trellis):
                         sfb_word = ld_shared_u32(
                             sfb_base + ((n8 * Int32(8) + q) << Int32(2))
                         )

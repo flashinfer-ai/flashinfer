@@ -98,6 +98,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         swiglu_beta: float | None = None,
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
+        w4a8_csf_inline: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -126,6 +127,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             swiglu_beta=swiglu_beta,
             mxfp6_fmt_a=mxfp6_fmt_a,
             mxfp6_fmt_b=mxfp6_fmt_b,
+            w4a8_csf_inline=w4a8_csf_inline,
         )
 
 

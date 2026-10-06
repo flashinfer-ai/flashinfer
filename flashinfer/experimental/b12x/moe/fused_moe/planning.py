@@ -687,6 +687,32 @@ def prepare_weights(
                     w2_blockscale=outputs[1],
                 ),
             )
+            if _w4a8_csf_inline(plan):
+                # The scratch now holds every expert's native scales. Keep them
+                # as inline storage that the compact W4A8 kernels read per
+                # pipeline stage. Larger planned capacities expand this storage
+                # into the shared scratch before execution.
+                from b12x._lib.quant.mxfp4_csf_inline import build_mxfp4_csf_inline
+
+                inline = tuple(
+                    build_mxfp4_csf_inline(
+                        output.view(torch.uint8).view(e, -1),
+                        rows=rows,
+                        columns=columns,
+                        group_rows=group,
+                    )
+                    for output, rows, columns, group in (
+                        (outputs[0], 2 * n, h // 32, n),
+                        (outputs[1], h, n // 32, h),
+                    )
+                )
+                plan = replace(plan, _impl=replace(plan._impl, w4a8_csf_inline=True))
+                return PreparedExperts(
+                    plan=plan,
+                    _impl=replace(
+                        prepared._impl, plan=plan._impl, mxfp4_csf_inline=inline
+                    ),
+                )
             rotation = n if plan.source.w13_layout.value == "w31" else 0
             native_planes = tuple(
                 repack_mxfp4_csf_batch(
@@ -787,6 +813,20 @@ def prepare_weights(
             a2_gscale=intermediate_scale,
         )
     return PreparedExperts(plan=plan, _impl=prepared)
+
+
+def _w4a8_csf_inline(plan: WeightPlan) -> bool:
+    """Whether compact W4A8 experts read MXFP4-CSF scales inline.
+
+    Compact (N64) W4A8 execution runs the compact micro and split M16 kernels
+    only; all of them read inline storage. B12X_W4A8_CSF_INLINE=0 keeps the
+    per-call expansion of the routed experts' scales into scratch.
+    """
+    return (
+        os.environ.get("B12X_W4A8_CSF_INLINE", "1") != "0"
+        and plan.activation.nonlinearity == "silu"
+        and plan.geometry.intermediate_size % 128 == 64
+    )
 
 
 def _w4a16_stage_scales(geometry) -> bool:

@@ -37,6 +37,13 @@ from b12x._lib.intrinsics import (
     shared_ptr_to_u32,
     st_shared_u32,
 )
+from b12x._lib.quant.mxfp4_csf_inline import (
+    BASE_BYTES as _CSF_BASE_BYTES,
+    TILE_BYTES as _CSF_TILE_BYTES,
+    inline_row_bases,
+    inline_scale_words,
+    stage_inline_tile,
+)
 from b12x.moe._shared.kernels.w4a8_trellis_decode import (
     _w4a8_had128_quad,
     _w4a8_stage_trellis_b_tile,
@@ -75,12 +82,18 @@ class W4A8MaterializedPhase1Kernel:
         trellis_direct_lut: bool = False,
         n64_repacked: bool = False,
         n64_tail: bool = False,
+        csf_inline: bool = False,
     ):
         self.fast_math = bool(fast_math)
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
+        # The SFB operand is inline MXFP4-CSF storage (mxfp4_csf_inline): stages
+        # copy compressed tile blocks and each thread rebuilds its scale words.
+        self.csf_inline = bool(csf_inline)
+        if self.csf_inline and (not self.n64_repacked or trellis_bits is not None):
+            raise ValueError("inline MXFP4-CSF scales require compact N64 W4A8 weights")
         if source_tile_m not in (16, 64, 128):
             raise ValueError(
                 "materialized phase 1 source_tile_m must be 16, 64, or 128, "
@@ -500,28 +513,50 @@ class W4A8MaterializedPhase1Kernel:
                 total_k32,
                 tid,
             )
-            self._stage_n64_sfb(
-                w13_sfb_rp,
-                gate_sfb_base,
-                expert_idx,
-                Int32(1),
-                output_tile,
-                k128_slice,
-                intermediate_tiles,
-                total_k32,
-                tid,
-            )
-            self._stage_n64_sfb(
-                w13_sfb_rp,
-                up_sfb_base,
-                expert_idx,
-                Int32(0),
-                output_tile,
-                k128_slice,
-                intermediate_tiles,
-                total_k32,
-                tid,
-            )
+            if cutlass.const_expr(self.csf_inline):
+                # Row blocks of a gated projection: up tiles, then gate tiles.
+                csf_storage = get_ptr_as_int64(w13_sfb_rp, Int32(0))
+                csf_block = Int64(expert_idx) * Int64(
+                    intermediate_tiles * Int32(2)
+                ) + Int64(output_tile)
+                stage_inline_tile(
+                    csf_storage,
+                    (csf_block + Int64(intermediate_tiles)) * Int64(input_k128_tiles)
+                    + Int64(k128_slice),
+                    gate_sfb_base,
+                    tid,
+                    0,
+                )
+                stage_inline_tile(
+                    csf_storage,
+                    csf_block * Int64(input_k128_tiles) + Int64(k128_slice),
+                    up_sfb_base,
+                    tid,
+                    32,
+                )
+            else:
+                self._stage_n64_sfb(
+                    w13_sfb_rp,
+                    gate_sfb_base,
+                    expert_idx,
+                    Int32(1),
+                    output_tile,
+                    k128_slice,
+                    intermediate_tiles,
+                    total_k32,
+                    tid,
+                )
+                self._stage_n64_sfb(
+                    w13_sfb_rp,
+                    up_sfb_base,
+                    expert_idx,
+                    Int32(0),
+                    output_tile,
+                    k128_slice,
+                    intermediate_tiles,
+                    total_k32,
+                    tid,
+                )
         else:
             self._stage_b_half_k64(
                 w13_rp,
@@ -625,6 +660,31 @@ class W4A8MaterializedPhase1Kernel:
             if cutlass.const_expr(self.trellis_direct_lut):
                 trellis_lut_addr = trellis_lut.iterator.toint()
 
+        if cutlass.const_expr(self.csf_inline):
+            # Row bases are constant over the K sweep: load them once per task.
+            csf_storage = get_ptr_as_int64(w13_sfb_rp, Int32(0))
+            csf_blocks = Int64(intermediate_tiles * Int32(2))
+            csf_tiles_bytes = (
+                Int64(alpha.shape[0])
+                * csf_blocks
+                * Int64(input_k128_tiles)
+                * Int64(_CSF_TILE_BYTES)
+            )
+            csf_raw = csf_storage + csf_tiles_bytes + Int64(alpha.shape[0]) * csf_blocks * Int64(
+                _CSF_BASE_BYTES
+            )
+            csf_slot = warp_idx * Int32(32) + q * Int32(4)
+            csf_block = Int64(expert_idx) * csf_blocks + Int64(output_tile)
+            up_bases = inline_row_bases(
+                csf_storage, csf_tiles_bytes, csf_block, csf_slot
+            )
+            gate_bases = inline_row_bases(
+                csf_storage,
+                csf_tiles_bytes,
+                csf_block + Int64(intermediate_tiles),
+                csf_slot,
+            )
+
         input_k64_tiles = input_k128_tiles * Int32(2)
         for preload_slice in cutlass.range_constexpr(self.stages - 1):
             k64_slice = Int32(preload_slice)
@@ -709,6 +769,11 @@ class W4A8MaterializedPhase1Kernel:
             cute.arch.sync_threads()
 
             scale_shift = Uint32(k64_slice & Int32(1)) * Uint32(16)
+            if cutlass.const_expr(self.csf_inline):
+                gate_scales = inline_scale_words(
+                    gate_sfb_base, gate_bases, csf_slot, csf_raw
+                )
+                up_scales = inline_scale_words(up_sfb_base, up_bases, csf_slot, csf_raw)
             asc = cute.make_rmem_tensor((self.tile_m // 16,), Uint32)
             for blk in cutlass.range_constexpr(self.tile_m // 16):
                 sf_row = Int32(blk * 16) + q + ((lane & Int32(1)) << Int32(3))
@@ -802,7 +867,10 @@ class W4A8MaterializedPhase1Kernel:
                     ub1 = up_b1[nt]
                     gate_sfb = Uint32(0x7F7F7F7F)
                     up_sfb = Uint32(0x7F7F7F7F)
-                    if cutlass.const_expr(not self.w4a8_trellis):
+                    if cutlass.const_expr(self.csf_inline):
+                        gate_sfb = gate_scales[nt] >> scale_shift
+                        up_sfb = up_scales[nt] >> scale_shift
+                    elif cutlass.const_expr(not self.w4a8_trellis):
                         gate_sfb = (
                             ld_shared_u32(
                                 gate_sfb_base + ((n8 * Int32(8) + q) << Int32(2))
