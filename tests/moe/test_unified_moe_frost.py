@@ -200,9 +200,14 @@ def test_explicit_frost_filters_calls_and_separates_exact_shapes(monkeypatch):
 @pytest.mark.parametrize(
     "version,accepted",
     [
-        ("release 13.4, V13.4.91", False),
+        ("release 12.9, V12.9.86", False),
+        ("release 13.3, V13.3.59", False),
+        ("release 13.4", True),
+        ("release 13.4, V13.4.59", True),
+        ("release 13.4, V13.4.91", True),
         ("release 13.4, V13.4.92", True),
         ("release 13.5, V13.5.23", True),
+        ("release 14.0, V14.0.1", True),
         ("unknown", False),
     ],
 )
@@ -218,23 +223,35 @@ def test_selected_external_assembler_release(version, accepted, monkeypatch):
     if accepted:
         compiler.require_moe_assembler()
     else:
-        with pytest.raises(NotImplementedError, match="CUDA 13.5"):
+        with pytest.raises(NotImplementedError, match="CUDA 13.4"):
             compiler.require_moe_assembler()
 
 
-def test_bundled_assembler_is_independent_of_cuda_home(monkeypatch):
+@pytest.mark.parametrize(
+    "version,accepted",
+    [
+        ((12, 9), False),
+        ((13, 3), False),
+        ((13, 4), True),
+        ((13, 5), True),
+        ((14, 0), True),
+    ],
+)
+def test_bundled_assembler_is_independent_of_cuda_home(version, accepted, monkeypatch):
     cutlass = pytest.importorskip("cutlass")
     monkeypatch.setattr(compiler, "compiler_identity", lambda: dict(backend="bundled"))
     monkeypatch.setattr(
-        cutlass, "CUDA_VERSION", SimpleNamespace(major=13, minor=4), raising=False
+        cutlass,
+        "CUDA_VERSION",
+        SimpleNamespace(major=version[0], minor=version[1]),
+        raising=False,
     )
-    monkeypatch.setenv("CUDA_HOME", "/unused/cuda-13.5")
-    with pytest.raises(
-        NotImplementedError, match="selected bundled assembler is CUDA 13.4"
-    ):
+    monkeypatch.setenv("CUDA_HOME", "/unused/cuda-14.0")
+    if accepted:
         compiler.require_moe_assembler()
-    monkeypatch.setattr(cutlass, "CUDA_VERSION", SimpleNamespace(major=13, minor=5))
-    compiler.require_moe_assembler()
+    else:
+        with pytest.raises(NotImplementedError, match="CUDA 13.4"):
+            compiler.require_moe_assembler()
 
 
 @pytest.mark.parametrize(
@@ -261,12 +278,12 @@ def test_existing_runner_rechecks_selected_assembler(dtype, name, monkeypatch):
     monkeypatch.setattr(
         compiler,
         "compiler_identity",
-        lambda: dict(backend="external_ptxas", version="release 13.4"),
+        lambda: dict(backend="external_ptxas", version="release 13.3"),
     )
     # Reusing a constructed runner must not bypass the compiler gate. No tensor
     # access or kernel compilation may happen on this rejected path.
     assert runner.accepts(None, None) is False
-    with pytest.raises(NotImplementedError, match="CUDA 13.5"):
+    with pytest.raises(NotImplementedError, match="CUDA 13.4"):
         runner._validate_pack(None, None)
 
 

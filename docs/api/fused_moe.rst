@@ -149,9 +149,9 @@ assembler. ``CUDA_HOME`` alone does not replace that assembler. Unqualified
 assemblers are rejected before kernel execution, including when reusing a cached
 automatic runner. Automatic selection skips unavailable Frost candidates;
 explicit selection reports the missing requirement.
-External PTXAS must be at least 13.4.92. Without an external override, the
-bundled assembler must report CUDA 13.5 or newer: the DSL's bundled CUDA 13.4
-assembler exposes no patch level and has a known tensor-map update issue.
+Both external PTXAS and the bundled assembler must report CUDA 13.4 or newer.
+Admission checks the release version without imposing a patch-level minimum.
+Use the latest assembler patch release for SM107 tensor-map updates.
 SM120 BF16 kernels do not update tensor maps and retain capability-based compiler
 admission without this SM107-specific assembler minimum.
 

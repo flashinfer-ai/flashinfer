@@ -96,11 +96,11 @@ path, version and SHA-256 participate in memory, disk and tactic cache identitie
 Disabled disk caching and failed persistence also execute the external binary.
 
 SM107 validation covers public external PTXAS 13.4.92 and CUDA 13.5 PTXAS.
-The DSL's bundled CUDA 13.4 assembler produced incorrect dynamic tensor-map
-dimension updates in the original MXFP8 kernels; it exposes no patch level.
-SM107 MoELayer admission therefore requires external PTXAS 13.4.92 or newer, or a
-bundled CUDA 13.5 or newer assembler. Setting `CUDA_HOME` alone does not select
-the external assembler. Older or unidentified assemblers are rejected,
+SM107 MoELayer admission requires CUDA 13.4 or newer for both external PTXAS
+and the bundled assembler, without a patch-level minimum. Use the latest
+assembler patch release for SM107 tensor-map updates.
+Setting `CUDA_HOME` alone does not select the external assembler.
+Older or unidentified assemblers are rejected,
 including on cached runners. Explicit use reports the requirement; automatic
 selection retains the other candidates. SM120 BF16 sources do not patch tensor
 maps and retain capability-based admission without this SM107 assembler minimum.

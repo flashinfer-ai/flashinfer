@@ -68,11 +68,10 @@ def identity_key() -> str:
 
 
 def require_moe_assembler() -> None:
-    """Reject unqualified assemblers before admitting a MoELayer candidate.
+    """Require CUDA 13.4 or newer before admitting a MoELayer candidate.
 
-    The DSL's CUDA 13.4 bundled assembler miscompiles dynamic tensor-map
-    updates; external PTXAS 13.4.92 passes qualification. The bundled version
-    exposes no patch level, so require 13.5 there. CUDA_HOME does not select it.
+    External and bundled assemblers use the same release minimum. CUDA_HOME
+    does not select the assembler; FLASHINFER_CUDNN_FROST_PTXAS does.
     Check the actual selected stack on each admission, including cached runners.
     """
     try:
@@ -82,16 +81,11 @@ def require_moe_assembler() -> None:
             if match is None:
                 raise ValueError("cannot identify the selected PTXAS release")
             version = tuple(map(int, match.groups()))
-            build = re.search(r"\bV(\d+)\.(\d+)\.(\d+)\b", identity["version"])
-            if version == (13, 4) and build is not None:
-                build_version = tuple(map(int, build.groups()))
-                if build_version[:2] == version and build_version[2] >= 92:
-                    return
         else:
             from cutlass import CUDA_VERSION
 
             version = (int(CUDA_VERSION.major), int(CUDA_VERSION.minor))
-        if version >= (13, 5):
+        if version >= (13, 4):
             return
         reason = f"selected {identity['backend']} assembler is CUDA {version[0]}.{version[1]}"
     except (
@@ -104,10 +98,9 @@ def require_moe_assembler() -> None:
     ) as exc:
         reason = str(exc)
     raise NotImplementedError(
-        "cuDNN Frost MoELayer requires external PTXAS 13.4.92 or newer, "
-        "or a bundled CUDA 13.5 or newer assembler; "
+        "cuDNN Frost MoELayer requires PTXAS from CUDA 13.4 or newer; "
         f"{reason}. Set FLASHINFER_CUDNN_FROST_PTXAS to a compatible ptxas "
-        "executable, or install a CuTe DSL stack bundling CUDA 13.5 or newer. "
+        "executable, or install a CuTe DSL stack bundling CUDA 13.4 or newer. "
         "Setting CUDA_HOME alone does not select the assembler."
     )
 
