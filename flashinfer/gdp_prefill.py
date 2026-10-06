@@ -40,7 +40,8 @@ def chunk_gated_delta_product(
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["auto", "cudnn"] = "auto",
+    backend: Literal["auto", "cudnn", "flashinfer"] = "auto",
+    state_indices: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated DeltaProduct (GDP) attention for prefill.
 
@@ -112,10 +113,18 @@ def chunk_gated_delta_product(
         not alias ``initial_state``; the kernel splits one sequence across
         CTAs, so the CTA reading the incoming state would race the one writing
         the outgoing state.
-    backend : Literal["auto", "cudnn"], optional
-        FlashInfer carries no GDP kernel of its own, so ``"auto"`` (default)
-        and ``"cudnn"`` both run cuDNN's fused SM100 linear-attention engine
-        through :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_product`.
+    backend : Literal["auto", "cudnn", "flashinfer"], optional
+        ``"auto"`` (default) and ``"cudnn"`` both run cuDNN's fused SM100
+        linear-attention engine through
+        :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_product`.
+        ``"flashinfer"`` runs the CuTe-DSL GDN prefill kernel over the expanded
+        sub-token timeline; it is the only backend that implements
+        ``state_indices``, and it is opt-in until automatic dispatch has a
+        performance-qualified domain.
+    state_indices : torch.Tensor, optional
+        Rows of ``initial_state`` / ``output_state`` to read and write, as in
+        :func:`flashinfer.chunk_gated_delta_rule`. ``backend="flashinfer"``
+        only.
 
     Returns
     -------
@@ -124,19 +133,51 @@ def chunk_gated_delta_product(
 
     Note
     ----
-    Requires an SM100-family (Blackwell) device and cudnn-frontend 1.29+ with
-    the ``cutedsl`` extra (``pip install 'nvidia-cudnn-frontend[cutedsl]'``).
+    The cuDNN backends require an SM100-family (Blackwell) device and
+    cudnn-frontend 1.29+ with the ``cutedsl`` extra (``pip install 'nvidia-cudnn-frontend[cutedsl]'``).
     Everything finer -- head dims, input dtypes, head-count relations -- is the
     engine's call: a graph it cannot serve is declined by cuDNN (the per-engine
     reason lands in the frontend's log).
     """
-    if backend not in ("auto", "cudnn"):
-        raise ValueError(f'backend must be "auto" or "cudnn", got {backend!r}')
+    if backend not in ("auto", "cudnn", "flashinfer"):
+        raise ValueError(
+            f'backend must be "auto", "cudnn" or "flashinfer", got {backend!r}'
+        )
     if cu_seqlens is None:
         raise ValueError("cu_seqlens is required for varlen mode")
     if cu_seqlens.dtype not in _CU_SEQLENS_DTYPES:
         raise ValueError(
             f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
+        )
+
+    if backend == "flashinfer":
+        from .gdn_prefill import chunk_gated_delta_rule
+
+        # Only cu_seqlens is scaled: q, g and output stay at real-token rows and
+        # the kernel indexes them directly. CP scheduling runs on the expanded
+        # timeline and is not validated for that layout.
+        return chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            cu_seqlens * num_householder,
+            use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            state_indices=state_indices,
+            use_cp=False,
+            num_householder=num_householder,
+        )
+
+    if state_indices is not None:
+        raise NotImplementedError(
+            f'chunk_gated_delta_product(backend="{backend}") does not support '
+            "state_indices"
         )
 
     from .cudnn import cudnn_chunk_gated_delta_product

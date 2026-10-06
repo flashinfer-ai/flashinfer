@@ -22,7 +22,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from .gdn_prefill import chunk_gated_delta_rule
+from .gdp_prefill import chunk_gated_delta_product as _gdp_prefill
 
 
 def chunk_gated_delta_product(
@@ -42,9 +42,11 @@ def chunk_gated_delta_product(
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated DeltaProduct attention for prefill.
 
-    Mirrors :func:`flashinfer.gdn_prefill.chunk_gated_delta_rule`, with a
-    householder axis added to ``k``, ``v`` and ``beta``. At ``n_h == 1`` this
-    delegates straight through and is bit-identical to the GDN entry point.
+    The expanded-axis view of :func:`flashinfer.chunk_gated_delta_product`:
+    ``k``, ``v`` and ``beta`` carry the householder axis next to the token axis
+    instead of folded into it, and ``n_h`` comes from the shape rather than an
+    argument. Dispatches to ``backend="flashinfer"``. At ``n_h == 1`` this is
+    bit-identical to :func:`flashinfer.chunk_gated_delta_rule`.
 
     Parameters
     ----------
@@ -122,26 +124,6 @@ def chunk_gated_delta_product(
     if cu_seqlens is None:
         raise ValueError("cu_seqlens is required (varlen mode), as for GDN")
 
-    # n_h == 1 is plain GDN. Delegate to the non-CP implementation because
-    # GDP does not expose or validate CP scheduling.
-    if num_householder == 1:
-        return chunk_gated_delta_rule(
-            q,
-            k.squeeze(1),
-            v.squeeze(1),
-            g,
-            beta.squeeze(1) if beta is not None else None,
-            scale,
-            initial_state,
-            output_final_state,
-            cu_seqlens,
-            use_qk_l2norm_in_kernel,
-            output=output,
-            output_state=output_state,
-            state_indices=state_indices,
-            use_cp=False,
-        )
-
     # GDP = GDN with a sequence n_h times longer
     k = torch.flatten(k, start_dim=0, end_dim=1)
     v = torch.flatten(v, start_dim=0, end_dim=1)
@@ -159,8 +141,7 @@ def chunk_gated_delta_product(
 
     # k / v / beta already carry the householder axis next to the token axis, so
     # the micro-step view above is a free reshape.  q / g / output stay per REAL
-    # token: the kernel indexes them directly, so GDP needs no expansion scratch
-    # at all.  cu_seqlens is the only thing still scaled, and it is [N+1] ints.
+    # token, so GDP needs no expansion scratch at all.
     if output is None:
         output = torch.empty(
             total_tokens,
@@ -170,24 +151,22 @@ def chunk_gated_delta_product(
             device=q.device,
         )
 
-    out = chunk_gated_delta_rule(
+    out = _gdp_prefill(
         q,
         k,
         v,
         g,
         beta,
+        num_householder,
         scale,
-        initial_state,
-        output_final_state,
-        cu_seqlens * num_householder,
-        use_qk_l2norm_in_kernel,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         output=output,
         output_state=output_state,
+        backend="flashinfer",
         state_indices=state_indices,
-        # CP scheduling operates on the expanded micro-step sequence and is
-        # not validated for GDP's sparse Q / neutral-gate layout.
-        use_cp=False,
-        num_householder=num_householder,
     )
 
     if output_final_state:
