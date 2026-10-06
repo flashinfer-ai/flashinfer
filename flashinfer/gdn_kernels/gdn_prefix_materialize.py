@@ -116,6 +116,9 @@ from cutlass.cute.typing import Int32, Int64
 # code and can be reviewed and merged on its own.  STP is still served -- the
 # two rings differ ONLY in depth, which is a runtime argument here, and the fork
 # left the fold machinery and element layouts untouched.
+# Device-target pinning (GDN-H3): the DSL would otherwise resolve GPUArch from
+# CUTE_DSL_ARCH or device 0, building the kernel for someone else's GPU.
+from .device_target import gdn_compile_options, gdn_device_target
 from .gdn_decode_bf16_wy_ucache_flush import (
     K_DIM,
     K_HALF,
@@ -753,8 +756,8 @@ def gdn_prefix_materialize(
         # An empty batch is a no-op, not an error: grid=(0,1,1) would fail
         # with an invalid launch configuration.
         return state
-    sms = torch.cuda.get_device_properties(device).multi_processor_count
-    grid_ctas = min(B * HV, sms * 8)
+    target = gdn_device_target(device)
+    grid_ctas = min(B * HV, target.num_sms * 8)
 
     # Paged serving pools (vLLM-style) are strided VIEWS: inner dims dense but
     # the dim-0 slot stride padded up to a page. The kernel supports exactly
@@ -849,7 +852,10 @@ def gdn_prefix_materialize(
     # even with a correct mask. Keying on the depth gives one specialization per
     # ring, chosen automatically; MTP and STP callers each get the right one.
     cache_key = (
-        str(device),
+        # (device_index, arch): same-arch devices must not share an entry, and
+        # an index-less torch.device("cuda") must resolve to the current device
+        # rather than collapsing every device onto one string.
+        target.compile_key,
         int(HV),
         int(H),
         int(V_dim),
@@ -872,7 +878,7 @@ def gdn_prefix_materialize(
         ),
     )
     if cache_key not in _CACHE:
-        _CACHE[cache_key] = cute.compile(
+        _CACHE[cache_key] = cute.compile[gdn_compile_options(device)](
             GdnPrefixMaterializeKernel(min_blocks_per_mp=min_blocks_per_mp),
             *args,
         )
