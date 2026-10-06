@@ -76,7 +76,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_kimi_k3_mla_fp8_paged_attention_977c0b337b3f4232a99f(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale, int m_tiles, int n_full_items, int tile_rows)
+kernel_cake_kimi_k3_mla_fp8_paged_attention_ab133c42d484f9421945(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale, int m_tiles, int n_full_items, int tile_rows)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -129,13 +129,8 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_977c0b337b3f4232a99f(__nv_bfloat16* 
                         uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&pf[j * 16 + _blk * 8 + _pair * 2])[0]), "=f"((&pf[j * 16 + _blk * 8 + _pair * 2])[1])
-                                : "r"(_vpairs_0[_pair]));
+                            (&pf[j * 16 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                            (&pf[j * 16 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
                         }
                     }
                 }
@@ -148,13 +143,8 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_977c0b337b3f4232a99f(__nv_bfloat16* 
                         uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&pf[j * 16 + 8 + _blk * 8 + _pair * 2])[0]), "=f"((&pf[j * 16 + 8 + _blk * 8 + _pair * 2])[1])
-                                : "r"(_vpairs_1[_pair]));
+                            (&pf[j * 16 + 8 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
+                            (&pf[j * 16 + 8 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
                         }
                     }
                 }
@@ -191,8 +181,7 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_977c0b337b3f4232a99f(__nv_bfloat16* 
         }
         #pragma unroll
         for (int j_1 = 0; j_1 < 4; j_1++) {
-            float _shfl_0;
-            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_0) : "f"(w_s), "r"(j_1));
+            float _shfl_0 = __shfl_sync(0xFFFFFFFF, w_s, j_1);
             float w_j = _shfl_0;
             #pragma unroll
             for (int e_1 = 0; e_1 < 16; e_1++) {
@@ -203,8 +192,7 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_977c0b337b3f4232a99f(__nv_bfloat16* 
         }
         #pragma unroll 4
         for (int k = 4; k < num_split; k++) {
-            float _shfl_1;
-            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_1) : "f"(w_s), "r"(k));
+            float _shfl_1 = __shfl_sync(0xFFFFFFFF, w_s, k);
             float w_k = _shfl_1;
             int src = (stat_base + k) * 512 + d0;
             float _vec_load_0[8];
@@ -217,13 +205,8 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_977c0b337b3f4232a99f(__nv_bfloat16* 
                     uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_2[_pair]));
+                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
+                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
                     }
                 }
             }
@@ -237,13 +220,8 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_977c0b337b3f4232a99f(__nv_bfloat16* 
                     uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_3[_pair]));
+                        (&_vec_load_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
+                        (&_vec_load_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
                     }
                 }
             }
