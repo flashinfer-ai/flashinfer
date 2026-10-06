@@ -919,7 +919,9 @@ class CakeSSDCombined:
                 counts.append(("cu_seqlens", int(cu_seqlens.numel()) - 1))
             if initial_states is not None:
                 counts.append(("initial_states", int(initial_states.shape[0])))
-            if seq_chunk_cumsum is not None:
+            if not counts and seq_chunk_cumsum is not None:
+                # The caller's vector names the count only when nothing else
+                # does; otherwise its shape is validated against the count.
                 counts.append(("seq_chunk_cumsum", int(seq_chunk_cumsum.numel()) - 1))
             if num_seqs is not None:
                 counts.append(("num_seqs", int(num_seqs)))

@@ -1607,9 +1607,19 @@ def test_cake_ssd_combined_cu_seqlens_checkpoint_at_unaligned_sequence_start(
     assert torch.equal(out, out_triple) and torch.equal(final, final_triple)
     assert torch.equal(checkpoint_states[2], triple_states[2])
     assert torch.isnan(checkpoint_states[:2]).all()
-    # The whole result against CuTe / fp64 (the exposed boundary changes nothing).
-    expected = _cute_padded_reference(constructor, tensors, arguments, lengths)
-    _assert_cake_accuracy((out, final), expected, constructor, tensors, arguments)
+    # The whole result against CuTe / fp64 (the exposed boundary changes
+    # nothing); CuTe has no f32 state, so that row goes to the recurrence alone.
+    if state_dtype == torch.float32:
+        reference_out, reference_final = _fp64_reference(constructor, tensors, arguments)
+        for label, value, expected_value in (
+            ("out", out, reference_out),
+            ("final_states", final, reference_final),
+        ):
+            outside = int(_outside_tolerance(value, expected_value).sum())
+            assert outside <= _MAX_OUTSIDE_FRACTION * expected_value.numel(), label
+    else:
+        expected = _cute_padded_reference(constructor, tensors, arguments, lengths)
+        _assert_cake_accuracy((out, final), expected, constructor, tensors, arguments)
     # The checkpoint against the fp64 recurrence over sequence 1's first 256
     # tokens from its initial state (a batched single-sequence problem).
     x, dt, A, B, C = tensors
@@ -1650,8 +1660,13 @@ def test_cake_ssd_combined_flags_invalid_cu_seqlens(case):
     entry, ``cu[-1] != total`` and more segments than the bound set the
     status word; every write stays inside the ``[bound + 1]`` tables (the
     read-back matches the host mirror, the sentinel sits at the clamped
-    count); the sequences whose clamped ranges are intact keep their correct
-    results; a clean call afterwards leaves the reset word at 0."""
+    count); the sequences whose derived ranges are not touched by the
+    damage keep their correct results.  The main kernel ends a segment at
+    the next segment of the same physical chunk, else at the chunk end
+    (segments partition the stream): a sequence whose range another
+    sequence starts inside is cut there, and the last sequence absorbs
+    trailing unclaimed tokens -- both documented in D12, both flagged.  A
+    clean call afterwards leaves the reset word at 0."""
 
     _skip_unless_cake_arch()
     f32 = torch.float32
@@ -1660,12 +1675,13 @@ def test_cake_ssd_combined_flags_invalid_cu_seqlens(case):
         cu, total, initial = [10, 100, 250], 250, True
         constructor, tensors, arguments = _case(varlen=True, lengths=(90, 160))
     elif case == "decreasing":
-        # [0, 100), an empty id (100 > 60 clamps to nothing) and [60, 250):
-        # tokens [60, 100) are claimed twice (their rows are not compared).
-        cu, total, initial = [0, 100, 60, 250], 250, True
-        constructor, tensors, arguments = _case(varlen=True, lengths=(60, 40, 150))
+        # [0, 100), an empty id (100 > 60 clamps to nothing), [60, 100) (starts
+        # inside sequence 0, which the main kernel therefore cuts at 60) and
+        # a clean [100, 250).
+        cu, total, initial = [0, 100, 60, 100, 250], 250, True
+        constructor, tensors, arguments = _case(varlen=True, lengths=(60, 40, 50, 100))
     elif case == "total":
-        # Tokens [200, 250) belong to no sequence.
+        # Tokens [200, 250) belong to no sequence: the last sequence absorbs them.
         cu, total, initial = [0, 100, 200], 250, True
         constructor, tensors, arguments = _case(varlen=True, lengths=(100, 150))
     else:
@@ -1724,6 +1740,7 @@ def test_cake_ssd_combined_flags_invalid_cu_seqlens(case):
         oracle_arguments = {
             **clean_arguments,
             "seq_idx": _varlen_metadata(lengths, torch.int32)[0],
+            "num_seqs": len(lengths),
         }
         return result, _fp64_reference(constructor, clean_tensors, oracle_arguments)
 
@@ -1748,24 +1765,26 @@ def test_cake_ssd_combined_flags_invalid_cu_seqlens(case):
         within_oracle("cu0", (out[:, 10:], final), oracle)
         valid_lengths = (90, 160)
     elif case == "decreasing":
+        # Sequence 3 ([100, 250)) is untouched: bitwise the clean problem with
+        # the same absolute chunk alignment; sequence 0's rows before the
+        # intruding start are its own; the empty id passes its state through.
+        states = arguments["initial_states"]
         (clean_out, clean_final), _ = clean_run(
-            slice(0, 100), (100,), arguments["initial_states"][0:1].contiguous()
+            slice(0, 250), (100, 150), states[[0, 3]].contiguous()
         )
         assert torch.equal(out[:, :60], clean_out[:, :60])
-        assert torch.equal(final[0], clean_final[0])
-        assert torch.equal(final[1], arguments["initial_states"][1])
-        _, oracle = clean_run(
-            slice(60, 250), (190,), arguments["initial_states"][2:3].contiguous()
-        )
-        within_oracle(
-            "decreasing.seq2", (out[:, 100:], final[2:3]), (oracle[0][:, 40:], oracle[1])
-        )
-        valid_lengths = (60, 40, 150)
+        assert torch.equal(out[:, 100:], clean_out[:, 100:])
+        assert torch.equal(final[3], clean_final[1])
+        assert torch.equal(final[1], states[1])
+        assert torch.isfinite(out.to(f32)).all() and torch.isfinite(final.to(f32)).all()
+        valid_lengths = (60, 40, 50, 100)
     elif case == "total":
+        # Sequence 0 is bitwise the clean problem; sequence 1 absorbs the
+        # unclaimed tail, i.e. equals the clean problem [0, 100) + [100, 250).
         (clean_out, clean_final), _ = clean_run(
-            slice(0, 200), (100, 100), arguments["initial_states"]
+            slice(0, 250), (100, 150), arguments["initial_states"]
         )
-        assert torch.equal(out[:, :200], clean_out)
+        assert torch.equal(out, clean_out)
         assert torch.equal(final, clean_final)
         valid_lengths = (100, 150)
     else:
@@ -2184,7 +2203,8 @@ def test_ssd_combined_fwd_caches_by_device_stream_and_config(monkeypatch, reques
         "seq_idx_dtype": torch.int32,
         "backend": "cake",
     }
-    assert runners[0].run_calls == [(positional, optional), (positional, optional)]
+    forwarded = {**optional, "cu_seqlens": None}
+    assert runners[0].run_calls == [(positional, forwarded), (positional, forwarded)]
     assert runners[-1].run_calls[0][1]["dt_softplus"] is False
 
 
@@ -2422,9 +2442,9 @@ def test_source_public_cake_constructor_rejects_non_exported_arch_without_gpu(
     (
         ("cute", "io_dtype", AssertionError, "io_dtype must be bfloat16"),
         ("cute", "state_dtype", AssertionError, "state_dtype must be one of"),
-        ("cake", "chunk_size", ValueError, "requires chunk_size=128"),
-        ("cake", "headdim", ValueError, "requires chunk_size=128"),
-        ("cake", "dstate", ValueError, "requires chunk_size=128"),
+        ("cake", "chunk_size", ValueError, "chunk_size must be a positive int"),
+        ("cake", "headdim", ValueError, "requires headdim=64 and dstate=128"),
+        ("cake", "dstate", ValueError, "requires headdim=64 and dstate=128"),
         ("cake", "nheads", ValueError, "requires positive nheads"),
         ("cake", "ngroups", ValueError, "requires positive nheads"),
         ("cake", "head_group_ratio", ValueError, "requires positive nheads"),
@@ -2451,7 +2471,8 @@ def test_source_public_backend_constructor_validation_without_gpu(
         "backend": backend,
     }
     replacements = {
-        "chunk_size": 64,
+        # Any positive chunk size is a valid caller convention (CAKE-934 item 2).
+        "chunk_size": 0,
         "headdim": 32,
         "dstate": 64,
         "nheads": 0,
@@ -2905,6 +2926,43 @@ def test_source_public_cake_domain_validation_without_gpu(invalid, match):
             (2, 127, 2, 64) if invalid == "z_shape" else tensors[0].shape,
             dtype=torch.bfloat16 if invalid == "z_shape" else torch.float16,
         )
+    elif invalid == "batched_cu_seqlens":
+        kwargs["cu_seqlens"] = cu_seqlens
+    elif invalid == "cu_seqlens_with_triple":
+        kwargs.update(
+            cu_seqlens=cu_seqlens,
+            chunk_indices=torch.zeros(2, dtype=torch.int32),
+            chunk_offsets=torch.zeros(2, dtype=torch.int32),
+        )
+    elif invalid == "cu_seqlens_dtype":
+        kwargs["cu_seqlens"] = cu_seqlens.to(torch.int64)
+    elif invalid == "cu_seqlens_ndim":
+        kwargs["cu_seqlens"] = cu_seqlens.reshape(1, 3)
+    elif invalid == "cu_seqlens_short":
+        kwargs["cu_seqlens"] = torch.zeros(1, dtype=torch.int32)
+    elif invalid == "cu_seqlens_batch":
+        kwargs["cu_seqlens"] = torch.tensor([0, 256], dtype=torch.int32)
+    elif invalid == "cu_seqlens_precomputed_cumsum":
+        kwargs.update(
+            cu_seqlens=cu_seqlens,
+            seq_chunk_cumsum=torch.zeros(3, dtype=torch.int32),
+        )
+    elif invalid == "cu_seqlens_count_conflict":
+        kwargs.update(cu_seqlens=cu_seqlens, num_seqs=3)
+    elif invalid == "cu_seqlens_initial_conflict":
+        cake_runner.has_initial_states = True
+        kwargs.update(
+            cu_seqlens=cu_seqlens,
+            initial_states=torch.empty((3, 2, 64, 128), dtype=torch.bfloat16),
+        )
+    elif invalid == "triple_at_chunk_256":
+        cake_runner.chunk_size = 256
+        kwargs.update(
+            seq_idx=torch.zeros((1, 128), dtype=torch.int32),
+            chunk_indices=torch.zeros(1, dtype=torch.int32),
+            chunk_offsets=torch.zeros(1, dtype=torch.int32),
+            num_seqs=1,
+        )
     else:
         kwargs.update(_source_cake_varlen_arguments(cake_runner, tensors))
         if invalid == "initial_shape":
@@ -2927,54 +2985,6 @@ def test_source_public_cake_domain_validation_without_gpu(invalid, match):
             kwargs["seq_chunk_cumsum"] = torch.empty(2, dtype=torch.int32)
         elif invalid == "seq_cumsum_dtype":
             kwargs["seq_chunk_cumsum"] = torch.empty(3, dtype=torch.int64)
-        elif invalid == "batched_cu_seqlens":
-            kwargs.clear()
-            cake_runner.has_varlen = False
-            kwargs["cu_seqlens"] = cu_seqlens
-        elif invalid == "cu_seqlens_with_triple":
-            kwargs.clear()
-            kwargs.update(
-                cu_seqlens=cu_seqlens,
-                chunk_indices=torch.zeros(2, dtype=torch.int32),
-                chunk_offsets=torch.zeros(2, dtype=torch.int32),
-            )
-        elif invalid == "cu_seqlens_dtype":
-            kwargs.clear()
-            kwargs["cu_seqlens"] = cu_seqlens.to(torch.int64)
-        elif invalid == "cu_seqlens_ndim":
-            kwargs.clear()
-            kwargs["cu_seqlens"] = cu_seqlens.reshape(1, 3)
-        elif invalid == "cu_seqlens_short":
-            kwargs.clear()
-            kwargs["cu_seqlens"] = torch.zeros(1, dtype=torch.int32)
-        elif invalid == "cu_seqlens_batch":
-            kwargs.clear()
-            kwargs["cu_seqlens"] = torch.tensor([0, 256], dtype=torch.int32)
-        elif invalid == "cu_seqlens_precomputed_cumsum":
-            kwargs.clear()
-            kwargs.update(
-                cu_seqlens=cu_seqlens,
-                seq_chunk_cumsum=torch.zeros(3, dtype=torch.int32),
-            )
-        elif invalid == "cu_seqlens_count_conflict":
-            kwargs.clear()
-            kwargs.update(cu_seqlens=cu_seqlens, num_seqs=3)
-        elif invalid == "cu_seqlens_initial_conflict":
-            kwargs.clear()
-            cake_runner.has_initial_states = True
-            kwargs.update(
-                cu_seqlens=cu_seqlens,
-                initial_states=torch.empty((3, 2, 64, 128), dtype=torch.bfloat16),
-            )
-        elif invalid == "triple_at_chunk_256":
-            kwargs.clear()
-            cake_runner.chunk_size = 256
-            kwargs.update(
-                seq_idx=torch.zeros((1, 128), dtype=torch.int32),
-                chunk_indices=torch.zeros(1, dtype=torch.int32),
-                chunk_offsets=torch.zeros(1, dtype=torch.int32),
-                num_seqs=1,
-            )
 
     with pytest.raises(ValueError, match=match):
         cake_runner.run(*tensors, **kwargs)
@@ -3812,8 +3822,12 @@ def test_source_host_template_binds_stage_arguments_in_loader_order():
         '"checkpoint_token_indices");'
     ) in template
     assert 'check_dtype(arg_preprocess_status, DLDataType{kDLInt, 32, 1}, "preprocess_status");' in template
-    assert "prepared.kargs[26] = &prepared.p_preprocess_status;" in template
-    assert "prepared.kargs[27]" not in template
+    preprocess_stage = template[
+        template.index("namespace stage_preprocess {") : template.index("namespace stage_main {")
+    ]
+    assert "void* kargs[27] = {};" in preprocess_stage
+    assert "prepared.kargs[26] = &prepared.p_preprocess_status;" in preprocess_stage
+    assert "prepared.kargs[27]" not in preprocess_stage
 
 
 def test_source_runner_binds_preprocess_status_without_gpu(monkeypatch):
