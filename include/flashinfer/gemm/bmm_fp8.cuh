@@ -20,10 +20,15 @@
 #include <cuda_fp8.h>
 
 #include <array>
+#include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <type_traits>
+#include <unordered_map>
 
 #include "../exception.h"
 
@@ -142,11 +147,111 @@ cudaDataType_t get_cuda_data_type() {
 static constexpr int kMaxFp8Algorithms = 100;
 static constexpr size_t kAlgoBytes = sizeof(cublasLtMatmulAlgo_t);
 
+// Leading key field that keeps the problems of different GEMM entry points apart.
+static constexpr int64_t kFp8ProblemTag = 1;
+static constexpr int64_t kBf16ProblemTag = 2;
+
+/*! \brief The algorithm chosen to run one problem, and whether it is the caller's descriptor. */
+struct ResolvedAlgo {
+  cublasLtMatmulAlgo_t algo;
+  bool from_descriptor;
+};
+
+/*!
+ * \brief Choose the algorithm that runs a problem.
+ *
+ * A caller-provided descriptor (kAlgoBytes of a serialized cublasLtMatmulAlgo_t, e.g. one
+ * the heuristic returned for another M) runs when cublasLtMatmulAlgoCheck accepts it for
+ * this problem and its workspace requirement fits in \p workspace_size_in_bytes. Otherwise,
+ * or when \p algo_desc is null, the heuristic's top algorithm for this problem runs.
+ */
+inline cublasStatus_t resolve_algo(cublasLtHandle_t lt_handle, cublasLtMatmulDesc_t matmul_desc,
+                                   cublasLtMatrixLayout_t a_layout, cublasLtMatrixLayout_t b_layout,
+                                   cublasLtMatrixLayout_t d_layout, size_t workspace_size_in_bytes,
+                                   const void* algo_desc, ResolvedAlgo* resolved) {
+  if (algo_desc != nullptr) {
+    std::memcpy(&resolved->algo, algo_desc, kAlgoBytes);
+    cublasLtMatmulHeuristicResult_t check = {};
+    if (cublasLtMatmulAlgoCheck(lt_handle, matmul_desc, a_layout, b_layout, d_layout, d_layout,
+                                &resolved->algo, &check) == CUBLAS_STATUS_SUCCESS &&
+        check.state == CUBLAS_STATUS_SUCCESS && check.workspaceSize <= workspace_size_in_bytes) {
+      resolved->from_descriptor = true;
+      return CUBLAS_STATUS_SUCCESS;
+    }
+  }
+
+  CuBlasLtMatmulPreference preference;
+  preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, workspace_size_in_bytes);
+  cublasLtMatmulHeuristicResult_t heuristic_result = {};
+  int returned_result = 0;
+  FLASHINFER_CUBLAS_CALL(cublasLtMatmulAlgoGetHeuristic(lt_handle, matmul_desc, a_layout, b_layout,
+                                                        d_layout, d_layout, preference.descriptor(),
+                                                        1, &heuristic_result, &returned_result));
+  if (returned_result == 0) {
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  }
+  resolved->algo = heuristic_result.algo;
+  resolved->from_descriptor = false;
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+/*!
+ * \brief Memo of resolve_algo() per (descriptor, exact problem).
+ *
+ * Keeps cublasLtMatmulAlgoCheck and the heuristic query off the steady-state path: after
+ * the first call for a problem, a lookup returns the algorithm to run.
+ */
+class ResolvedAlgoCache {
+ public:
+  // The key is the problem fields followed by the descriptor bytes (none for the heuristic
+  // default); the caller lists every field that affects the algorithm's validity.
+  static std::string make_key(const void* algo_desc, std::initializer_list<int64_t> problem) {
+    std::string key;
+    key.reserve(problem.size() * sizeof(int64_t) + kAlgoBytes);
+    for (int64_t field : problem) {
+      key.append(reinterpret_cast<const char*>(&field), sizeof(field));
+    }
+    if (algo_desc != nullptr) {
+      key.append(static_cast<const char*>(algo_desc), kAlgoBytes);
+    }
+    return key;
+  }
+
+  cublasStatus_t resolve(const std::string& key, cublasLtHandle_t lt_handle,
+                         cublasLtMatmulDesc_t matmul_desc, cublasLtMatrixLayout_t a_layout,
+                         cublasLtMatrixLayout_t b_layout, cublasLtMatrixLayout_t d_layout,
+                         size_t workspace_size_in_bytes, const void* algo_desc,
+                         ResolvedAlgo* resolved) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = entries_.find(key);
+      if (it != entries_.end()) {
+        *resolved = it->second;
+        return CUBLAS_STATUS_SUCCESS;
+      }
+    }
+    FLASHINFER_CUBLAS_CALL(resolve_algo(lt_handle, matmul_desc, a_layout, b_layout, d_layout,
+                                        workspace_size_in_bytes, algo_desc, resolved));
+    std::lock_guard<std::mutex> lock(mutex_);
+    entries_.emplace(key, *resolved);
+    return CUBLAS_STATUS_SUCCESS;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::unordered_map<std::string, ResolvedAlgo> entries_;
+};
+
+inline ResolvedAlgoCache& resolved_algo_cache() {
+  static ResolvedAlgoCache cache;
+  return cache;
+}
+
 /*!
  * \brief Set up cuBLASLt descriptors for FP8 BMM.
  *
- * Factors out the common descriptor creation shared by heuristic query,
- * run, and run_with_algo paths.
+ * Factors out the common descriptor creation shared by the heuristic query
+ * and run_with_descriptor paths.
  */
 template <typename AT, typename BT, typename DT>
 struct Fp8GemmDescriptors {
@@ -218,25 +323,37 @@ int get_fp8_algorithms(int batch_size, int m, int n, int k, const float* A_scale
 }
 
 /*!
- * \brief Run FP8 BMM using a pre-resolved algorithm — zero heuristic overhead.
+ * \brief Run FP8 BMM with a caller-provided cuBLASLt algorithm descriptor.
+ *
+ * See resolve_algo() for how \p algo_desc is validated and when the heuristic
+ * default runs instead; \p used_descriptor reports which one ran.
  */
 template <typename AT, typename BT, typename DT>
-cublasStatus_t bmm_fp8_run_with_algo(void* workspace, size_t workspace_size_in_bytes, const AT* A,
-                                     const BT* B, DT* D, int batch_size, int m, int n, int k,
-                                     const float* A_scale, const float* B_scale,
-                                     cublasLtHandle_t lt_handle, cudaStream_t stream,
-                                     const void* algo_buf, int algo_idx) {
+cublasStatus_t bmm_fp8_run_with_descriptor(void* workspace, size_t workspace_size_in_bytes,
+                                           const AT* A, const BT* B, DT* D, int batch_size, int m,
+                                           int n, int k, const float* A_scale, const float* B_scale,
+                                           cublasLtHandle_t lt_handle, cudaStream_t stream,
+                                           int device_id, const void* algo_desc,
+                                           bool* used_descriptor) {
   Fp8GemmDescriptors<AT, BT, DT> desc(batch_size, m, n, k, A_scale, B_scale);
 
-  cublasLtMatmulAlgo_t algo;
-  std::memcpy(&algo, static_cast<const uint8_t*>(algo_buf) + algo_idx * kAlgoBytes, kAlgoBytes);
+  const std::string key = ResolvedAlgoCache::make_key(
+      algo_desc, {kFp8ProblemTag, device_id, batch_size, m, n, k, get_cuda_data_type<AT>(),
+                  get_cuda_data_type<BT>(), get_cuda_data_type<DT>(),
+                  static_cast<int64_t>(workspace_size_in_bytes)});
+  ResolvedAlgo resolved;
+  FLASHINFER_CUBLAS_CALL(resolved_algo_cache().resolve(
+      key, lt_handle, desc.matmul_desc.descriptor(), desc.a_layout.descriptor(),
+      desc.b_layout.descriptor(), desc.d_layout.descriptor(), workspace_size_in_bytes, algo_desc,
+      &resolved));
+  *used_descriptor = resolved.from_descriptor;
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
   FLASHINFER_CUBLAS_CALL(cublasLtMatmul(
       lt_handle, desc.matmul_desc.descriptor(), &alpha, A, desc.a_layout.descriptor(), B,
       desc.b_layout.descriptor(), &beta, nullptr, desc.d_layout.descriptor(), D,
-      desc.d_layout.descriptor(), &algo, workspace, workspace_size_in_bytes, stream));
+      desc.d_layout.descriptor(), &resolved.algo, workspace, workspace_size_in_bytes, stream));
   return CUBLAS_STATUS_SUCCESS;
 }
 

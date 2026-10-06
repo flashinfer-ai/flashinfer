@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 import logging
 import os
+import struct
 import warnings
 from dataclasses import astuple, replace
 from enum import Enum
@@ -51,6 +52,7 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
+    is_in_profile_measurement,
 )
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
@@ -195,6 +197,61 @@ def _gemm_workspace_at_least(workspace: torch.Tensor, size: int) -> torch.Tensor
 # Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
 _CUBLASLT_ALGO_BYTES = 64
 _CUBLASLT_MAX_ALGOS = 100
+_CUBLASLT_ALGO_FORMAT = "8Q"
+
+
+def _cublaslt_algos_to_tactics(algo_buf: torch.Tensor, count: int) -> List[tuple]:
+    """Split ``count`` serialized ``cublasLtMatmulAlgo_t`` into tactics.
+
+    A cuBLASLt tactic is the algorithm descriptor itself, as a tuple of its
+    eight uint64 words. Unlike a position in the heuristic's list, which is
+    ranked per problem, it names the same algorithm at every M and survives
+    the JSON round-trip of the autotune caches.
+    """
+    raw = algo_buf[: count * _CUBLASLT_ALGO_BYTES].numpy().tobytes()
+    return list(struct.iter_unpack(_CUBLASLT_ALGO_FORMAT, raw))
+
+
+def _is_cublaslt_algo_tactic(tactic) -> bool:
+    return (
+        isinstance(tactic, tuple)
+        and len(tactic) == 8
+        and all(isinstance(word, int) and 0 <= word < 1 << 64 for word in tactic)
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _cublaslt_algo_tensor(tactic: tuple) -> torch.Tensor:
+    """The CPU byte buffer the cuBLASLt ``run_with_descriptor`` entry points take."""
+    return torch.frombuffer(
+        bytearray(struct.pack(_CUBLASLT_ALGO_FORMAT, *tactic)), dtype=torch.uint8
+    )
+
+
+def _cublaslt_algo_arg(tactic) -> Optional[torch.Tensor]:
+    """Map a cuBLASLt tactic to the descriptor argument; ``None`` runs the heuristic default."""
+    if tactic == -1:
+        return None
+    if not _is_cublaslt_algo_tactic(tactic):
+        raise ValueError(
+            "cuBLASLt tactics are -1 or a cublasLtMatmulAlgo_t descriptor "
+            f"(a tuple of eight uint64 words), got {tactic!r}."
+        )
+    return _cublaslt_algo_tensor(tactic)
+
+
+def _check_cublaslt_descriptor_ran(used_descriptor: int, tactic) -> None:
+    """Disqualify a profiled descriptor that does not apply to the profiled problem.
+
+    Outside profiling, a descriptor that cuBLASLt rejects for the actual
+    problem (e.g. tuned at another M of the bucket, or persisted by another
+    cuBLASLt version) runs the heuristic default instead.
+    """
+    if not used_descriptor and is_in_profile_measurement():
+        raise RuntimeError(
+            f"cuBLASLt algorithm {tactic!r} does not apply to the profiled problem."
+        )
+
 
 # Error messages
 CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR = "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120/SM121 with cuDNN backend version < 9.14.0."
@@ -210,29 +267,40 @@ def _match_sm_version(device: torch.device, sm_version: list[str]):
 def get_gemm_module():
     module = gen_gemm_module().build_and_load()
 
+    # Shared by every CublasFp8GemmRunner instance: candidate descriptors per
+    # bucketed problem.
+    algo_cache: dict = {}
+
     def cublas_fp8_gemm_runner():
         class CublasFp8GemmRunner(TunableRunner):
-            def __init__(self):
-                self._algo_cache: dict = {}
-
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-                # Must be synthesis-invariant: including a.shape (dynamic M)
-                # makes the runtime key miss the bucketed profile key, so the
-                # tuned tactic is dropped for tactic=-1. Shapes are already in
-                # the autotuner's input_shapes; add only dtypes.
+                # Must be synthesis-invariant: shapes are already in the
+                # autotuner's input_shapes, with M bucketed; add only dtypes.
                 a, b, _, _, out, _ = inputs
                 return (a.dtype, b.dtype, out.dtype)
 
-            def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
-                # Internal cuBLASLt algo-enumeration cache: this one is
-                # shape-specific, so key on full shapes (incl. M).
-                a, b, _, _, out, _ = inputs
-                return (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
+            def validate_tactic(self, inputs: List[torch.Tensor], tactic) -> bool:
+                return tactic == -1 or _is_cublaslt_algo_tactic(tactic)
 
-            def _get_algos(self, inputs):
+            def _get_algos(self, inputs) -> List[tuple]:
+                # Enumerate at the bucketed M that keys the tuned tactic, so the
+                # candidates are the same for every M of the bucket.
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                key = self._algo_cache_key(inputs)
-                cached = self._algo_cache.get(key)
+                bucket_m = AutoTuner.get().get_effective_map_to_tuning_buckets(
+                    _FP8_GEMM_SM100_TUNING_CONFIG
+                )(a.shape[-2])
+                key = (
+                    a.device,
+                    a.shape[0],
+                    bucket_m,
+                    b.shape[-1],
+                    a.shape[-1],
+                    a.dtype,
+                    b.dtype,
+                    out.dtype,
+                    workspace_buffer.numel(),
+                )
+                cached = algo_cache.get(key)
                 if cached is not None:
                     return cached
                 algo_buf = torch.empty(
@@ -248,46 +316,40 @@ def get_gemm_module():
                     scale_b,
                     workspace_buffer,
                     algo_buf,
+                    bucket_m,
                 )
-                result = (algo_buf, count)
-                self._algo_cache[key] = result
-                return result
+                tactics = _cublaslt_algos_to_tactics(algo_buf, count)
+                algo_cache[key] = tactics
+                return tactics
 
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
-            ) -> List[int]:
-                _, count = self._get_algos(inputs)
-                return list(range(count))
+            ) -> List[tuple]:
+                return self._get_algos(inputs)
 
             def forward(
                 self,
                 inputs: List[torch.Tensor],
-                tactic: int = -1,
+                tactic=-1,
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                # The cuBLASLt algo list is enumerated per-shape, so a tactic
-                # tuned at a different (bucketed) M may be out of range here.
-                # Fall back to the heuristic default (the tactic==-1 path) on an
-                # out-of-range or empty algo list rather than raising.
-                if tactic >= 0:
-                    algo_buf, count = self._get_algos(inputs)
-                    if 0 <= tactic < count:
-                        module.bmm_fp8_run_with_algo(
-                            a,
-                            b,
-                            out,
-                            scale_a,
-                            scale_b,
-                            workspace_buffer,
-                            algo_buf,
-                            tactic,
-                        )
-                        return out
-                module.bmm_fp8(a, b, out, scale_a, scale_b, workspace_buffer)
+                if tactic == -1:
+                    module.bmm_fp8(a, b, out, scale_a, scale_b, workspace_buffer)
+                    return out
+                used_descriptor = module.bmm_fp8_run_with_descriptor(
+                    a,
+                    b,
+                    out,
+                    scale_a,
+                    scale_b,
+                    workspace_buffer,
+                    _cublaslt_algo_arg(tactic),
+                )
+                _check_cublaslt_descriptor_ran(used_descriptor, tactic)
                 return out
 
         return CublasFp8GemmRunner()
@@ -1987,20 +2049,24 @@ def get_gemm_sm100_module_cutlass_bf16():
 def get_mm_bf16_cublaslt_module():
     module = gen_mm_bf16_cublaslt_module().build_and_load()
 
+    # Shared by every CublasltBf16GemmRunner instance: candidate descriptors
+    # per bucketed problem.
+    algo_cache: dict = {}
+
     def cublaslt_bf16_gemm_runner():
         class CublasltBf16GemmRunner(TunableRunner):
-            def __init__(self):
-                self._algo_cache: dict = {}
-
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-                a, b, bias, _, out, _ = inputs
+                # N and K are in the autotuner's input_shapes and M is bucketed
+                # there, so no shape belongs here (an exact M would never match
+                # the synthesized bucket inputs the tactic was stored under).
+                _, _, bias, _, out, _ = inputs
                 return (
-                    a.shape[0],
-                    b.shape[1],
-                    a.shape[1],
                     self._compute_dtype(out.dtype),
                     self._pointer_alignment(bias),
                 )
+
+            def validate_tactic(self, inputs: List[torch.Tensor], tactic) -> bool:
+                return tactic == -1 or _is_cublaslt_algo_tactic(tactic)
 
             @staticmethod
             def _pointer_alignment(tensor):
@@ -2018,11 +2084,24 @@ def get_mm_bf16_cublaslt_module():
                     return torch.float32
                 return out_dtype
 
-            def _get_algos(self, inputs):
+            def _get_algos(self, inputs) -> List[tuple]:
+                # Enumerate at the bucketed M that keys the tuned tactic, so the
+                # candidates are the same for every M of the bucket.
                 a, b, bias, _, out, workspace_buffer = inputs
                 compute_dt = self._compute_dtype(out.dtype)
-                key = self.get_cache_key_extras(inputs)
-                cached = self._algo_cache.get(key)
+                bucket_m = AutoTuner.get().get_effective_map_to_tuning_buckets(
+                    _BF16_GEMM_SM100_TUNING_CONFIG
+                )(a.shape[0])
+                key = (
+                    a.device,
+                    bucket_m,
+                    b.shape[1],
+                    a.shape[1],
+                    compute_dt,
+                    self._pointer_alignment(bias),
+                    workspace_buffer.numel(),
+                )
+                cached = algo_cache.get(key)
                 if cached is not None:
                     return cached
                 algo_buf = torch.empty(
@@ -2045,27 +2124,28 @@ def get_mm_bf16_cublaslt_module():
                     workspace_buffer,
                     cublas_handle,
                     algo_buf,
+                    bucket_m,
                 )
-                result = (algo_buf, count)
-                self._algo_cache[key] = result
-                return result
+                tactics = _cublaslt_algos_to_tactics(algo_buf, count)
+                algo_cache[key] = tactics
+                return tactics
 
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
-            ) -> List[int]:
-                _, count = self._get_algos(inputs)
-                return list(range(count))
+            ) -> List[tuple]:
+                return self._get_algos(inputs)
 
             def forward(
                 self,
                 inputs: List[torch.Tensor],
-                tactic: int = -1,
+                tactic=-1,
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, bias, _, out, workspace_buffer = inputs
+                algo_desc = _cublaslt_algo_arg(tactic)
                 with torch.cuda.device(a.device):
                     cublas_handle = torch.cuda.current_blas_handle()
                 b_t = b.transpose(-2, -1)
@@ -2077,32 +2157,16 @@ def get_mm_bf16_cublaslt_module():
                 else:
                     compute_out = out
 
-                algo_buf, count = self._get_algos(inputs)
-                if count == 0:
-                    raise RuntimeError(
-                        "cuBLASLt heuristic returned zero algorithms for "
-                        f"M={a.shape[0]}, N={b.shape[1]}, K={a.shape[1]}, "
-                        f"dtype={compute_out.dtype}. "
-                        "This shape/dtype combination may not be supported."
-                    )
-                if tactic >= count:
-                    raise ValueError(
-                        f"Requested tactic {tactic} but only {count} algorithms "
-                        f"available for M={a.shape[0]}, N={b.shape[1]}, K={a.shape[1]}, "
-                        f"dtype={compute_out.dtype}."
-                    )
-                if tactic < 0:
-                    tactic = 0
-                module.mm_bf16_cublaslt_run_with_algo(
+                used_descriptor = module.mm_bf16_cublaslt_run_with_descriptor(
                     a,
                     b_t,
                     bias,
                     compute_out,
                     workspace_buffer,
                     cublas_handle,
-                    algo_buf,
-                    tactic,
+                    algo_desc,
                 )
+                _check_cublaslt_descriptor_ran(used_descriptor, tactic)
                 if need_cast:
                     out.copy_(compute_out)
                 return out
@@ -2495,9 +2559,8 @@ def _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability: int):
         """cuBLASLt for M > _CUTE_DSL_BF16_MAX_M inside ``backend="cute-dsl"``.
 
         A distinct class, so its records never mix with ``backend="cublaslt"``
-        tuning. The cache-key extras stay cuBLASLt's (exact shape, compute
-        dtype, bias alignment) because a tactic indexes the heuristic's
-        algorithm list for that exact shape; pdl is ignored, as in cuBLASLt.
+        tuning. Cache-key extras, tactics (cuBLASLt algorithm descriptors) and
+        their validation are cuBLASLt's; pdl is ignored, as in cuBLASLt.
         """
 
         def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
@@ -2507,9 +2570,12 @@ def _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability: int):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             return cublaslt_runner.get_cache_key_extras(inputs)
 
+        def validate_tactic(self, inputs: List[torch.Tensor], tactic) -> bool:
+            return cublaslt_runner.validate_tactic(inputs, tactic)
+
         def get_valid_tactics(
             self, inputs: List[torch.Tensor], profile: OptimizationProfile
-        ) -> List[int]:
+        ) -> List[tuple]:
             if not self.supports_inputs(inputs):
                 return []
             return cublaslt_runner.get_valid_tactics(inputs, profile)
