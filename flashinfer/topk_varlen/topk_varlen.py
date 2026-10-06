@@ -168,9 +168,9 @@ def _radix_cutlass_top_k_varlen_check(
     row_starts=None,
     max_seq_len=None,
     absolute_indices=False,
-    pre_idx=None,
     compress_ratio=1,
     next_n=1,
+    pre_idx=None,
     return_values=False,
     out_indices=None,
     out_values=None,
@@ -229,9 +229,9 @@ def _gvr_top_k_varlen_check(
     row_starts=None,
     max_seq_len=None,
     absolute_indices=False,
-    pre_idx=None,
     compress_ratio=1,
     next_n=1,
+    pre_idx=None,
     return_values=False,
     out_indices=None,
     out_values=None,
@@ -280,9 +280,9 @@ def _gvr2_top_k_varlen_check(
     row_starts=None,
     max_seq_len=None,
     absolute_indices=False,
-    pre_idx=None,
     compress_ratio=1,
     next_n=1,
+    pre_idx=None,
     return_values=False,
     out_indices=None,
     out_values=None,
@@ -343,9 +343,9 @@ def _top_k_varlen_heuristic(
     row_starts=None,
     max_seq_len=None,
     absolute_indices=False,
-    pre_idx=None,
     compress_ratio: int = 1,
     next_n: int = 1,
+    pre_idx=None,
     return_values: bool = False,
     out_indices=None,
     out_values=None,
@@ -1291,9 +1291,9 @@ def _radix_top_k_varlen_check(
     row_starts=None,
     max_seq_len=None,
     absolute_indices=False,
-    pre_idx=None,
     compress_ratio=1,
     next_n=1,
+    pre_idx=None,
     return_values=False,
     out_indices=None,
     out_values=None,
@@ -1436,9 +1436,9 @@ def _radix_filter_top_k_varlen_check(
     row_starts=None,
     max_seq_len=None,
     absolute_indices=False,
-    pre_idx=None,
     compress_ratio=1,
     next_n=1,
+    pre_idx=None,
     return_values=False,
     out_indices=None,
     out_values=None,
@@ -1568,9 +1568,9 @@ def top_k_varlen(
     row_starts: Optional[torch.Tensor] = None,
     max_seq_len: Optional[int] = None,
     absolute_indices: bool = False,
-    pre_idx: Optional[torch.Tensor] = None,
     compress_ratio: int = 1,
     next_n: int = 1,
+    pre_idx: Optional[torch.Tensor] = None,
     return_values: bool = False,
     out_indices: Optional[torch.Tensor] = None,
     out_values: Optional[torch.Tensor] = None,
@@ -1716,6 +1716,15 @@ def top_k_varlen(
         (no extra memory traffic); a distinct compiled variant, so warm up with
         the same value (``warmup_prefill(..., absolute_indices=True)``).
         Default ``False``.
+    compress_ratio : int, optional
+        KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4): every
+        logit column stands for ``compress_ratio`` consecutive KV tokens.
+        ``seq_lens`` stay in KV-token units; the kernels derive each row's
+        valid column count as
+        ``max(0, (seq_len - next_n + t + 1) // compress_ratio)`` (see
+        ``seq_lens``). Default ``1``.
+    next_n : int, optional
+        Speculative-decode temporal stride.  Default ``1``.
     pre_idx : torch.Tensor, optional
         ``int32[num_rows // next_n, top_k]`` — top-K KV-cache indices
         selected by **this same layer** at the **previous token's decode
@@ -1732,15 +1741,6 @@ def top_k_varlen(
         that violates this is **discarded with a RuntimeWarning** and the
         call runs hint-free (``gvr_2`` with its hint-free engines; an explicit
         ``"gvr"`` request is refused).
-    compress_ratio : int, optional
-        KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4): every
-        logit column stands for ``compress_ratio`` consecutive KV tokens.
-        ``seq_lens`` stay in KV-token units; the kernels derive each row's
-        valid column count as
-        ``max(0, (seq_len - next_n + t + 1) // compress_ratio)`` (see
-        ``seq_lens``). Default ``1``.
-    next_n : int, optional
-        Speculative-decode temporal stride.  Default ``1``.
     return_values : bool, optional
         When ``True`` also return the selected logit values (in windowed mode
         the values at the selected window columns, whichever index frame was
