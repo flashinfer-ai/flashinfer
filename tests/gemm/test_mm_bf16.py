@@ -205,7 +205,7 @@ def test_mm_bf16_cutile_repeat_uses_tune_cache():
 
 
 def test_cublaslt_bf16_runner_zero_algos():
-    """CublasltBf16GemmRunner.forward() must raise when heuristic returns 0 algorithms."""
+    """No candidate algorithms means nothing to profile; the default still runs."""
     from flashinfer.gemm.gemm_base import get_mm_bf16_cublaslt_module
     from flashinfer.utils import get_compute_capability
 
@@ -223,14 +223,11 @@ def test_cublaslt_bf16_runner_zero_algos():
     workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     inputs = [a, b, None, None, out, workspace]
 
-    zero_algo_buf = torch.empty(0, dtype=torch.uint8, device="cpu")
-    original_get_algos = runner._get_algos
-    runner._get_algos = lambda _inputs: (zero_algo_buf, 0)
-    try:
-        with pytest.raises(RuntimeError, match="zero algorithms"):
-            runner.forward(inputs)
-    finally:
-        runner._get_algos = original_get_algos
+    runner._get_algos = lambda _inputs: []
+    assert runner.get_valid_tactics(inputs, None) == []
+    runner.forward(inputs)
+    cos_sim = F.cosine_similarity((a @ b).reshape(-1), out.reshape(-1), dim=0)
+    assert cos_sim > 0.99
 
 
 @pytest.mark.parametrize("pdl", [False, True])
