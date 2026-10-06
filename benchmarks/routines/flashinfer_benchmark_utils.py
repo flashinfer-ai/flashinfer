@@ -1,4 +1,6 @@
 import argparse
+import importlib
+
 import torch
 
 from flashinfer.testing.utils import set_seed
@@ -426,6 +428,60 @@ def dtype_str_to_torch_dtype(dtype_str):
         raise ValueError(f"Unsupported dtype: {dtype_str}")
 
 
+# Maps each benchmark backend name of a routine to the FlashInfer API that
+# carries the support metadata for it (``@backend_requirement`` or
+# ``@supported_compute_capability``) as (module, attribute, library backend).
+# The library backend is the name passed to ``<api>.is_backend_supported``;
+# ``None`` means the API has a single implicit backend and is checked with
+# ``<api>.is_compute_capability_supported``, as is ``"auto"`` (supported when
+# any of the API's backends supports the compute capability). A benchmark
+# backend that is not
+# listed for a routine here is not implemented by the benchmark harness.
+routine_backend_to_library_api = {
+    # GEMM
+    "gemm_fp8_nt_groupwise": {
+        "cutlass": ("flashinfer.gemm", "gemm_fp8_nt_groupwise", "cutlass"),
+        "trtllm": ("flashinfer.gemm", "gemm_fp8_nt_groupwise", "trtllm"),
+        "cutile": ("flashinfer.gemm", "gemm_fp8_nt_groupwise", "cutile"),
+    },
+    "group_gemm_fp8_nt_groupwise": {
+        "cutlass": ("flashinfer.gemm", "group_gemm_fp8_nt_groupwise", None),
+    },
+    "bmm_mxfp8": {
+        "cudnn": ("flashinfer.gemm", "bmm_mxfp8", "cudnn"),
+    },
+    "mm_mxfp8": {
+        "cutlass": ("flashinfer.gemm", "mm_mxfp8", "cutlass"),
+        "cute-dsl": ("flashinfer.gemm", "mm_mxfp8", "cute-dsl"),
+        "trtllm": ("flashinfer.gemm", "mm_mxfp8", "trtllm"),
+        "cudnn": ("flashinfer.gemm", "mm_mxfp8", "cudnn"),
+        "auto": ("flashinfer.gemm", "mm_mxfp8", "auto"),
+    },
+    "tinygemm_bf16": {
+        "tinygemm": ("flashinfer.gemm", "tinygemm_bf16", None),
+    },
+    # MOE
+    "cute_dsl_fp4_block_scale_moe": {
+        "cute-dsl": ("flashinfer", "cute_dsl_fused_moe", None),
+    },
+    "cute_dsl_bf16_moe": {
+        "cute-dsl": ("flashinfer", "cute_dsl_fused_moe_bf16", None),
+    },
+    "b12x_fused_moe": {
+        "b12x": ("flashinfer", "b12x_fused_moe", None),
+    },
+    "alphamoe_nvfp4_aligned_moe": {
+        "alphamoe": ("flashinfer.fused_moe", "alphamoe_nvfp4_aligned_moe", None),
+    },
+}
+
+# Fallback for routines whose FlashInfer API does not expose support metadata.
+# Only routines missing from routine_backend_to_library_api belong here; once
+# the library API gains ``@backend_requirement`` /
+# ``@supported_compute_capability``, move the routine to
+# routine_backend_to_library_api and delete its rows. Routines that query the
+# library directly in their benchmark (bmm_fp8, mm_fp8, mm_fp4, mm_bf16,
+# bmm_bf16, fused_qk_rmsnorm_rope, top_k_varlen) are listed in neither.
 routine_cc_to_supported_backends = {
     # ATTENTION
     "BatchDecodeWithPagedKVCacheWrapper": {
@@ -579,70 +635,6 @@ routine_cc_to_supported_backends = {
         "12.0": [],
         "12.1": [],
     },
-    # GEMM
-    "gemm_fp8_nt_groupwise": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": [],
-        "10.0": ["cutlass"],
-        "10.3": ["cutlass"],
-        "10.7": ["cutlass"],
-        "12.0": [],
-        "12.1": [],
-    },
-    "group_gemm_fp8_nt_groupwise": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": [],
-        "10.0": ["cutlass"],
-        "10.3": ["cutlass"],
-        "10.7": ["cutlass"],
-        "12.0": [],
-        "12.1": [],
-    },
-    "bmm_mxfp8": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": [],
-        "10.0": ["cudnn"],
-        "10.3": ["cudnn"],
-        "10.7": ["cudnn"],
-        "12.0": ["cudnn"],
-        "12.1": ["cudnn"],
-    },
-    "mm_mxfp8": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": [],
-        "10.0": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
-        "10.3": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
-        "10.7": ["cutlass", "cute-dsl", "trtllm"],
-        "11.0": ["cutlass", "cudnn"],
-        "12.0": ["cutlass", "cudnn"],
-        "12.1": ["cutlass", "cudnn"],
-    },
-    "tinygemm_bf16": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": ["tinygemm"],
-        "10.0": ["tinygemm"],
-        "10.3": ["tinygemm"],
-        "10.7": ["tinygemm"],
-        "11.0": ["tinygemm"],
-        "12.0": ["tinygemm"],
-        "12.1": ["tinygemm"],
-    },
-    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, bmm_bf16, and top_k_varlen use support checkers to filter backends, so they are not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],
@@ -691,44 +683,6 @@ routine_cc_to_supported_backends = {
         "10.7": ["cutlass"],
         "12.0": ["cutlass"],
         "12.1": ["cutlass"],
-    },
-    "cute_dsl_fp4_block_scale_moe": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": [],
-        "10.0": ["cute-dsl"],
-        "10.3": ["cute-dsl"],
-        "10.7": ["cute-dsl"],
-        "12.0": [],
-        "12.1": [],
-    },
-    "cute_dsl_bf16_moe": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": ["cute-dsl"],
-        "10.0": [],
-        "10.3": [],
-        "12.0": [],
-        "12.1": [],
-    },
-    "b12x_fused_moe": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": [],
-        "10.0": [],
-        "10.3": [],
-        "12.0": ["b12x"],
-        "12.1": ["b12x"],
-    },
-    "alphamoe_nvfp4_aligned_moe": {
-        "10.0": ["alphamoe"],
-        "10.3": ["alphamoe"],
     },
     # MoELayer cross-backend NVFP4: intersection of CuteDSL + TRTLLM FP4 support.
     # SM100 only (Blackwell); unlisted archs fall through to [] (skipped).
@@ -1257,24 +1211,87 @@ routine_cc_to_supported_backends = {
 }
 
 
-def filter_backends_by_compute_capability(backends, routine, device):
-    # FlashInfer currently does not have an isSupported() function that checks support.
-    # WAR: Use helper function to check support.
-    major, minor = get_compute_capability(device)
-    compute_capability = f"{major}.{minor}"
+def _resolve_library_api(module_name, attr):
+    api = importlib.import_module(module_name)
+    for part in attr.split("."):
+        api = getattr(api, part)
+    return api
 
-    # If the compute capability is not supported, return an empty list.
-    cc_to_supported_backends = routine_cc_to_supported_backends[routine]
-    supported_backends = cc_to_supported_backends.get(compute_capability, [])
-    backends_to_remove = []
-    for backend in backends:
-        if backend not in supported_backends:
-            backends_to_remove.append(backend)
-    for backend in backends_to_remove:
-        backends.remove(backend)
-        print(
-            f"[WARNING] {backend} for routine {routine} is not supported on compute capability {compute_capability}. Skipping."
+
+def get_backend_support(routine, backend, cc):
+    """Return whether ``backend`` of ``routine`` can run on compute capability ``cc``.
+
+    ``cc`` is an int encoded as ``major * 10 + minor`` (e.g. 107 for SM 10.7),
+    matching what FlashInfer's support metadata expects. Returns a tuple
+    ``(supported, message)``. ``message`` names the source of a negative
+    answer (FlashInfer's support metadata, the benchmark harness, or the
+    fallback table); for a positive answer it is ``None`` unless there is
+    something to report.
+    """
+    cc_str = f"{cc // 10}.{cc % 10}"
+    if routine in routine_backend_to_library_api:
+        api_spec = routine_backend_to_library_api[routine].get(backend)
+        if api_spec is None:
+            return (
+                False,
+                f"{backend} for routine {routine} is not implemented by the benchmark harness",
+            )
+        module_name, attr, lib_backend = api_spec
+        api_name = f"{module_name}.{attr}"
+        try:
+            api = _resolve_library_api(module_name, attr)
+        except (ImportError, AttributeError) as e:
+            return (
+                False,
+                f"{backend} for routine {routine} cannot be checked: {api_name} is unavailable ({type(e).__name__}: {e})",
+            )
+        if lib_backend is None or lib_backend == "auto":
+            check = getattr(api, "is_compute_capability_supported", None)
+            query = f"{api_name}.is_compute_capability_supported({cc})"
+            args = (cc,)
+        else:
+            check = getattr(api, "is_backend_supported", None)
+            query = f"{api_name}.is_backend_supported({lib_backend!r}, {cc})"
+            args = (lib_backend, cc)
+        if check is None:
+            return (
+                True,
+                f"{api_name} exposes no support metadata; {backend} for routine {routine} is not filtered by compute capability",
+            )
+        if check(*args):
+            return True, None
+        return (
+            False,
+            f"FlashInfer reports {backend} for routine {routine} as unsupported on compute capability {cc_str} ({query} is False)",
         )
+
+    cc_to_supported_backends = routine_cc_to_supported_backends[routine]
+    if cc_str not in cc_to_supported_backends:
+        return (
+            False,
+            f"{backend} for routine {routine} is not supported on compute capability {cc_str}: the benchmark's fallback support table has no entry for it",
+        )
+    if backend not in cc_to_supported_backends[cc_str]:
+        return (
+            False,
+            f"{backend} for routine {routine} is not listed for compute capability {cc_str} in the benchmark's fallback support table",
+        )
+    return True, None
+
+
+def filter_backends_by_compute_capability(backends, routine, device):
+    major, minor = get_compute_capability(device)
+    cc = major * 10 + minor
+    supported_backends = []
+    for backend in backends:
+        supported, message = get_backend_support(routine, backend, cc)
+        if supported:
+            supported_backends.append(backend)
+            if message:
+                print(f"[INFO] {message}.")
+        else:
+            print(f"[WARNING] {message}. Skipping.")
+    backends[:] = supported_backends
     return backends
 
 
