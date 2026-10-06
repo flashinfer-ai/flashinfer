@@ -46,6 +46,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     instance_key,
     instance_symbol,
     sk_exact_plan,
+    sk_sync_plan,
     operand_view,
     plan_dense_projection_gemm,
     plan_router_fp32_gemm,
@@ -1100,7 +1101,7 @@ def test_round13_w3_knobs():
     # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
     key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
     assert (
-        len(key) == 25
+        len(key) == 26
         and key[18] == 64
         and key[19] is False
         and key[20] == 0
@@ -1162,7 +1163,7 @@ def test_round15_store_hint_knob():
     key = instance_key(
         a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_last"
     )
-    assert len(key) == 25 and key[22] == "evict_last"
+    assert len(key) == 26 and key[22] == "evict_last"
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma1_sol"
     assert (
         instance_key(a_mn=False, b_mn=True, epi="reg", store_hint="evict_last")[22]
@@ -1200,13 +1201,13 @@ def test_round15_store_hint_knob():
 
 
 def test_round15_pd_sh_knobs():
-    # fields 23 / 24 of the 25-field key (round 15, Cake W1): the pipelined TMEM drain form of the 128-row single-pass
+    # fields 23 / 24 of the 26-field key (round 15, Cake W1): the pipelined TMEM drain form of the 128-row single-pass
     # family (1 = in-tile chunk pipelining, 2 = cross-tile prefetch, 3 = both chunks in flight; ``_pd<n>``) and the
     # suspend-time hint of the free-running waits in ns (``_sh<n>``); both 0 when off, validated like the Cake kernel
     key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2)
-    assert len(key) == 25 and key[23] == 2 and key[24] == 0
+    assert len(key) == 26 and key[23] == 2 and key[24] == 0
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma2_pd2"
-    assert instance_key(a_mn=False, b_mn=True)[23:] == (0, 0)
+    assert instance_key(a_mn=False, b_mn=True)[23:] == (0, 0, False)  # ... followed by the round-18 sk_sync flag
     assert (
         instance_symbol(
             instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2, sh=1000)
@@ -1269,12 +1270,36 @@ def test_sk_exact_plan_mirrors_cake():
     )  # ... one more K block and the tenth part is non-empty
 
 
+def test_sk_sync_plan_mirrors_cake():
+    # round 18 (Cake W2): the synchronised stream-K plan (num_full, tail, tail + collectors, s, collectors) with the
+    # balanced main length s = ceil(q K / (q + 1)) and the rule's margin m: s = ceil((q K + m) / (q + 1)).  kv_a weight
+    # gradient on 106 pairs: 72 tail tiles, 34 collectors of up to q = 3 leftovers over K = 254 steps -> s 191 balanced,
+    # 200 with the rule's m = 38; the 1.81-wave 6144 x 2048 rows: 192 tiles -> 86 tails, 20 collectors (q = 5), s 212 /
+    # 216 (m = 26); the tall 64-tile B200 indexer_q row on 74 pairs: 10 collectors of 7 leftovers, s 223
+    assert sk_sync_plan(72, 254, 106) == (0, 72, 106, 191, 34)
+    assert sk_sync_plan(72, 254, 106, None, 38) == (0, 72, 106, 200, 34)
+    assert sk_sync_plan(192, 254, 106) == (106, 86, 106, 212, 20)
+    assert sk_sync_plan(192, 254, 106, None, 26) == (106, 86, 106, 216, 20)
+    assert sk_sync_plan(64, 254, 74) == (0, 64, 74, 223, 10)
+    assert sk_sync_plan(72, 254, 106, 173) == (0, 72, 106, 173, 34)  # an explicit s (sweeps only)
+    assert sk_sync_plan(212, 254, 106) is None  # no tail
+    assert sk_sync_plan(106, 254, 106) is None  # a full wave: no collector
+    assert sk_sync_plan(72, 254, 74) is None  # 2 collectors x 36 leftovers: K - s = 6 < SK_MIN_ITERS
+    # the short-K rows admit the plan arithmetically (W3's q_a fwd observation: 1536 tiles on 106 pairs, 52 tails,
+    # q = 1, s = 16) - the rules never ask for it there (the fixup costs more than the 16-step unit)
+    assert sk_sync_plan(1536, 32, 106) == (1484, 52, 104, 16, 52)
+    assert sk_sync_plan(52, 32, 74) == (0, 52, 74, 24, 22)
+    assert sk_sync_plan(52, 30, 74) is None  # q = 3: s = 23 leaves 7 steps < SK_MIN_ITERS
+    with_margin = sk_sync_plan(72, 254, 106, None, 400)
+    assert with_margin is None  # a margin that leaves the collectors under SK_MIN_ITERS steps is refused
+
+
 def test_round13_knob_normalisation():
     # the 20-field key carries park / ovl / htail at fields 15 / 16 / 17; ovl is a 256-row x 256-column tall-tile
     # knob (narrower or shorter tiles raise), htail needs the 256-row family or (round 16, Cake W2) the 128-row standard
     # family with the 256-column row-major tile and the plain drain, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(key) == 25 and key[15] is False and key[16] is True and key[17] is True
+    assert len(key) == 26 and key[15] is False and key[16] is True and key[17] is True
     assert (
         instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15]
         is False
@@ -1493,8 +1518,9 @@ def test_instance_key_rejects_bad_configurations():
         instance_key(a_mn=False, b_mn=False, pf=17)
     key = instance_key(a_mn=False, b_mn=False)
     # 20 fields since round 13 (the raster group width and the TMA L2 promotion left the key for the launch
-    # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group, store_ef
-    assert len(key) == 25 and key[11:] == (
+    # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group, store_ef,
+    # store_hint, pd, sh, sk_sync (26 fields since round 18)
+    assert len(key) == 26 and key[11:] == (
         0,
         ("none", "none"),
         False,
@@ -1509,6 +1535,7 @@ def test_instance_key_rejects_bad_configurations():
         "none",
         0,
         0,
+        False,
     )
     # the promotion is validated where it is resolved, by the planner
     v = _views("proj", "o_proj", "fwd", "bf16", 257)
@@ -1872,6 +1899,19 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     if exact
                     else None
                 )
+                # round 18 (Cake W2): the synchronised stream-K plan of an ``sk_sync`` rule (main units + collectors, the
+                # rule's margin ``sk_sync_m``) yields to ``sk_exact`` and pre-empts ``htail`` / ``sk_parts``
+                sync_plan = (
+                    sk_sync_plan(
+                        plan.pair_tiles,
+                        plan.k_blocks,
+                        plan.sm_pairs,
+                        None,
+                        int(rule.get("sk_sync_m", 0)),
+                    )
+                    if rule.get("sk_sync") and exact_plan is None
+                    else None
+                )
                 htail = (
                     bool(rule.get("htail"))
                     and (
@@ -1885,9 +1925,10 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         )
                     )
                     and exact_plan is None
+                    and sync_plan is None
                     and 0 < 2 * tail <= plan.sm_pairs
                 )
-                parts = rule.get("sk_parts")
+                parts = rule.get("sk_parts") if sync_plan is None else None
                 sk_rule = (
                     sk_parts_plan(plan.pair_tiles, plan.k_blocks, plan.sm_pairs, parts)
                     if parts and exact_plan is None
@@ -1895,6 +1936,8 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 )
                 assert plan.sk_exact == (exact if exact_plan is not None else 0)
                 assert plan.htail == htail
+                assert plan.sk_sync == (sync_plan is not None)
+                assert ("_sks" in plan.template) == plan.sk_sync
                 if exact_plan is not None:
                     assert (
                         plan.num_full,
@@ -1916,6 +1959,34 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     )
                     assert (exact - 1) * plan.iters_per_unit < plan.k_blocks
                     assert plan.sk_iters == exact
+                elif sync_plan is not None:
+                    # n_t main units over [0, s) + C = min(pairs - n_t, n_t) collectors over the leftovers [s, K): one
+                    # wave of n_t + C units after the whole tiles, both parts at least SK_MIN_ITERS steps, one slab per
+                    # tail tile, s in iters_per_unit and n_t in sk_iters
+                    assert (
+                        plan.num_full,
+                        plan.tail_tiles,
+                        plan.sk_units,
+                        plan.iters_per_unit,
+                        plan.sk_collectors,
+                    ) == sync_plan
+                    assert (plan.num_full, plan.tail_tiles) == (plan.pair_tiles - tail, tail)
+                    assert plan.sk_collectors == min(plan.sm_pairs - tail, tail) >= 1
+                    assert plan.sk_units == tail + plan.sk_collectors <= plan.sm_pairs
+                    q = -(-tail // plan.sk_collectors)
+                    assert plan.iters_per_unit == -(
+                        -(q * plan.k_blocks + int(rule.get("sk_sync_m", 0))) // (q + 1)
+                    )
+                    assert (
+                        SK_MIN_ITERS
+                        <= plan.iters_per_unit
+                        <= plan.k_blocks - SK_MIN_ITERS
+                    )
+                    assert plan.sk_iters == tail
+                    assert (
+                        plan.ws_f32_elems
+                        == tail * 2 * plan.cta_rows * plan.block_n
+                    )
                 elif htail:
                     # 2 x tail half-height items of whole K: no partial slabs, no fixup, no counters in use beyond
                     # the tail tiles; the tall tile may exceed one wave of pairs
@@ -1962,7 +2033,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         2 * plan.pair_tiles,
                     )
                     assert plan.iters_per_unit == -(-plan.k_blocks // 2)
-                if plan.sk_units and not htail:
+                if plan.sk_units and not htail and sync_plan is None:
                     assert (
                         plan.ws_f32_elems
                         == (plan.sk_units + plan.tail_tiles)

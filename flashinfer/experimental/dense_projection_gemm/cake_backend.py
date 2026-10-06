@@ -451,13 +451,14 @@ def instance_key(
     store_hint: str = "none",
     pd: int = 0,
     sh: int = 0,
+    sk_sync: bool = False,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
     hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact)`` (round 13: ``park`` = parked tall epilogue, ``ovl`` =
     overlapped single-TMEM-buffer tall epilogue, ``htail`` = deterministic half-height tail wave, ``b_swz`` = MN-major B
     panel width in bytes (128 / 64 / 32; K-major B instances always keep 128), ``sk_exact`` = exact p-way stream-K
-    split, ``_skx`` symbols); the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11.  ``smem_limit`` (bytes; default = the largest
+    split, ``_skx`` symbols; round 18 (Cake W2): ``sk_sync`` = synchronised stream-K tail, field 26 = LAST, ``_sks`` symbols); the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11.  ``smem_limit`` (bytes; default = the largest
     architecture limit, ``smem_limit_for(None)``) only bounds the stage count - it is not part of
     the key, so an instance has one symbol on every architecture (the planner passes
     ``smem_limit_for(arch)`` like the Cake launcher).  Diagnostic (attribution) instances are not
@@ -569,6 +570,18 @@ def instance_key(
         raise ValueError(
             "htail (half-height tail wave) and sk_exact (exact p-way tail split) are two tail policies - choose one per instance"
         )
+    sk_sync = bool(sk_sync)
+    if sk_sync and (htail or sk_exact):
+        raise ValueError(
+            "sk_sync (synchronised stream-K) excludes htail and sk_exact - one tail policy per instance"
+        )
+    if sk_sync and (ovl or park or int(pd) or "a_mcast" in diag):
+        # round 18 (Cake W2): the synchronised plan's two-partial fixup closes a unit's single-pass or serialised tall
+        # epilogue; the overlapped / parked tall forms, the pipelined drain and the A multicast are excluded  [Cake instance_key]
+        raise ValueError(
+            f"sk_sync needs the single-pass or the serialised tall epilogue (no ovl / park / pd / a_mcast; got ovl={ovl}, "
+            f"park={park}, pd={pd}, diag={diag})"
+        )
     # L1::no_allocate.L2::evict_first on the fp32 v8 stores: only that store form carries the hint  [Cake instance_key]
     store_ef = bool(store_ef) and f32_v8
     store_hint = str(store_hint)
@@ -628,6 +641,7 @@ def instance_key(
         store_hint,
         pd,
         sh,
+        sk_sync,
     )
 
 
@@ -667,6 +681,7 @@ def instance_symbol(key: tuple) -> str:
         store_hint,
         pd,
         sh,
+        sk_sync,
     ) = key
     so = {
         "evict_first": "f",
@@ -699,6 +714,7 @@ def instance_symbol(key: tuple) -> str:
         )
         + (f"_box{box_rows}" if box_rows else "")
         + ("_skx" if sk_exact else "")
+        + ("_sks" if sk_sync else "")
         + (
             "_bf"
             if batch_group == 1
@@ -803,12 +819,13 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, True, False, False, 12288, 6144, None): {"cta_rows": 256},
     ('sm_107a', False, True, True, False, False, 16384, 6144, None): {"cta_rows": 256},
     ('sm_107a', True, True, False, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "group_m": 4, "sk_parts": 2, "b_swz": 64},
+    ('sm_107a', True, True, False, False, False, 6144, None, 2048): {"sk_sync": True, "sk_sync_m": 26},
     ('sm_107a', True, True, False, False, False, 6144, None, 12288): {"cta_rows": 256, "sk_parts": 2},
     ('sm_107a', True, True, False, False, False, 12288, None, 6144): {"sk_parts": 3},
     ('sm_107a', True, True, False, False, False, 16384, None, 6144): {"cta_rows": 256, "sk_parts": 3},
     ('sm_107a', True, True, False, True, False, 32, None, 6144): {"block_n": 128, "sk_exact": 3},
     ('sm_107a', True, True, False, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64, "sk_exact": 2},
-    ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first'), "b_swz": 64},
+    ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first'), "b_swz": 64, "sk_sync": True, "sk_sync_m": 38},
     ('sm_107a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma', "stages": 6, "b_swz": 64},
     ('sm_107a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma', "stages": 6},
     ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "epi": 'reg', "sk_parts": 3, "b_swz": 64, "f32_v8": True, "store_ef": True},
@@ -819,7 +836,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, True, False, False, 16384, None, 6144): {"cta_rows": 256},
     ('sm_107a', True, True, True, True, False, 32, None, 6144): {"block_n": 128, "sk_exact": 3},
     ('sm_107a', True, True, True, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64, "sk_exact": 2},
-    ('sm_107a', True, True, True, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first'), "b_swz": 64},
+    ('sm_107a', True, True, True, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first'), "b_swz": 64, "sk_sync": True, "sk_sync_m": 38},
 }
 # fmt: on
 
@@ -1016,6 +1033,39 @@ def stream_k_plan(
     return pair_tiles - tail, tail, units, iters_per_unit
 
 
+def sk_sync_plan(
+    pair_tiles: int,
+    k_blocks: int,
+    pairs: int,
+    s_override: Optional[int] = None,
+    margin: int = 0,
+) -> Optional[tuple[int, int, int, int, int]]:
+    """``(num_full, tail_tiles, sk_units, s, collectors)`` of the synchronised stream-K plan (round 18, Cake W2) - pure
+    integer arithmetic mirrored from the Cake launcher's ``sk_sync_plan``.  The tail tiles (all of them when there are
+    fewer tiles than pairs) each get one MAIN unit over K steps [0, s) and ``collectors`` = min(pairs - tail, tail)
+    COLLECTOR units own the leftovers [s, k_blocks) of tail tiles c, c + collectors, c + 2 collectors, ... (one segment
+    per leftover, at most q = ceil(tail / collectors) per collector).  With one atomic segment per leftover the makespan
+    is max(s, q (k_blocks - s)), balanced at s = ceil(q k_blocks / (q + 1)); ``margin`` m (K steps, rule key
+    ``sk_sync_m``) lengthens the mains to s = ceil((q k_blocks + m) / (q + 1)) so the collectors finish m steps early;
+    ``s_override`` replaces s (sweeps only).  ``sk_units`` = tail + collectors.  ``None`` when not admissible: no tail,
+    no collector, or a part under ``SK_MIN_ITERS`` (the row keeps its other policy)."""
+    tail = pair_tiles % pairs if pair_tiles > pairs else pair_tiles
+    if tail == 0:
+        return None
+    collectors = min(pairs - tail, tail)
+    if collectors < 1:
+        return None
+    q = _ceil_div(tail, collectors)
+    s = (
+        _ceil_div(q * k_blocks + int(margin), q + 1)
+        if s_override is None
+        else int(s_override)
+    )
+    if s < SK_MIN_ITERS or k_blocks - s < SK_MIN_ITERS:
+        return None
+    return pair_tiles - tail, tail, tail + collectors, s, collectors
+
+
 # ---------------------------------------------------------------------------
 # K1 view validation and planning
 # ---------------------------------------------------------------------------
@@ -1115,6 +1165,10 @@ class GemmPlan:
     # round 15 (Cake W1): pipelined TMEM drain form (field 23) and suspend-time hint in ns (field 24) of the planned instance
     pd: int = 0
     sh: int = 0
+    # round 18 (Cake W2): synchronised stream-K tail of the planned instance (instance_key field 25 = the 26th and LAST
+    # field, ``_sks`` symbols): ``tail_tiles`` main units over K steps [0, iters_per_unit) + ``sk_units - tail_tiles``
+    # collector units over the leftovers, two partials and one slab per tail tile, deterministic two-addend fixup
+    sk_sync: bool = False
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -1137,6 +1191,9 @@ class GemmPlan:
         under the half-height tail wave (its items are whole-K tiles: no partial slabs, no fixup)."""
         if not self.sk_units or self.htail:
             return 0
+        if self.sk_sync:
+            # one slab per tail tile (the first arriver of a tile stores its partial, the second adds it)  [Cake launcher]
+            return self.tail_tiles * 2 * self.cta_rows * self.block_n
         return (self.sk_units + self.tail_tiles) * 2 * self.cta_rows * self.block_n
 
     @property
@@ -1157,7 +1214,16 @@ class GemmPlan:
         exact split (``_skx`` instances) passes the part count p in this slot."""
         if self.sk_exact:
             return int(self.sk_exact)
+        if self.sk_sync:
+            # the ``_sks`` instance reads the main-unit count n_t here (s in ``iters_per_unit``; collectors =
+            # num_cluster_tiles - num_full - n_t)  [Cake launcher]
+            return int(self.tail_tiles)
         return (self.sk_units if self.htail else self.tail_tiles) * self.k_blocks
+
+    @property
+    def sk_collectors(self) -> int:
+        """Collector units of the synchronised stream-K plan (0 for every other plan)."""
+        return self.sk_units - self.tail_tiles if self.sk_sync else 0
 
     @property
     def tma_out(self) -> bool:
@@ -1196,6 +1262,8 @@ def plan_dense_projection_gemm(
     store_hint: Optional[str] = None,
     pd: Optional[int] = None,
     sh: Optional[int] = None,
+    sk_sync: Optional[bool] = None,
+    sk_sync_m: Optional[int] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -1245,6 +1313,8 @@ def plan_dense_projection_gemm(
         store_hint=store_hint,
         pd=pd,
         sh=sh,
+        sk_sync=sk_sync,
+        sk_sync_m=sk_sync_m,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -1335,6 +1405,16 @@ def plan_dense_projection_gemm(
         b_swz = rule.get("b_swz", 128)
     if sk_exact is None:
         sk_exact = rule.get("sk_exact")
+    if sk_sync is None:
+        # round 18 (Cake W2): synchronised stream-K tail (main units + collectors) of the row's rule
+        sk_sync = rule.get("sk_sync", False)
+    elif sk_sync:
+        # a caller-forced synchronised plan replaces the row's other tail policies (the registrations of the ``_sks``
+        # programs)  [Cake launcher]
+        sk_exact, htail = None, False
+    if sk_sync_m is None:
+        # round 18 (Cake W2): main-unit margin in K steps (the collectors finish early; rule key ``sk_sync_m``)
+        sk_sync_m = int(rule.get("sk_sync_m", 0))
     if batch_group is None:
         batch_group = rule.get("batch_group", 0)
     # the raster knob only exists for batched rows (one batch entry: identical raster)  [Cake launcher]
@@ -1371,7 +1451,17 @@ def plan_dense_projection_gemm(
         if (sk_exact and sk == "auto" and sk_max_units is None)
         else None
     )
+    # Round 18 (Cake W2): synchronised stream-K - n_t main units (K steps [0, s) of every tail tile) + C collector units
+    # (the leftovers [s, k_blocks) of tail tiles c, c + C, ...), two partials and one slab per tail tile; admitted when
+    # the plan is (``sk_sync_plan``, host arithmetic); it disables ``sk_parts`` and ``htail`` and yields to ``sk_exact``.
+    sync_plan = (
+        sk_sync_plan(pair_tiles, k_blocks, pairs, None, int(sk_sync_m))
+        if (sk_sync and sk == "auto" and sk_max_units is None and exact_plan is None)
+        else None
+    )
     parts = rule.get("sk_parts") if sk_parts is None else int(sk_parts)
+    if sync_plan is not None:
+        parts = None
     if sk == "auto" and sk_max_units is None and parts and exact_plan is None:
         # Measured per-row p-way split of the tail wave (Cake round 4, L20); a caller ``sk_parts`` wins over the
         # rule's.  [Cake L1296-L1301]
@@ -1379,7 +1469,12 @@ def plan_dense_projection_gemm(
     # Round 13 (Cake W1): deterministic half-height tail wave of the tall family - the tail tiles become 2 x tail
     # standard-geometry items of full K (no partial slabs, no fixup), only when there is a tail and its half items fit
     # the CTA pairs; otherwise the plain plan / stream-K policy of the row applies.  [Cake launcher]
-    htail = bool(htail) and int(cta_rows) in (128, 256) and exact_plan is None
+    htail = (
+        bool(htail)
+        and int(cta_rows) in (128, 256)
+        and exact_plan is None
+        and sync_plan is None
+    )
     if htail and int(cta_rows) == 128:
         # round 16 (Cake W2): the half-height tail wave on the standard family needs the 256-column row-major tile without the
         # pipelined drain / prefetch; the planner never emits box_rows or diag probes, so the launcher's remaining conditions
@@ -1396,6 +1491,9 @@ def plan_dense_projection_gemm(
         htail = bool(tail_h) and 2 * tail_h <= pairs
     if exact_plan is not None:
         num_full, tail_tiles, sk_units, iters_per_unit = exact_plan
+    elif sync_plan is not None:
+        # the ``_sks`` instance reads s in iters_per_unit and n_t in sk_iters; collectors = num_cluster_tiles - num_full - n_t
+        num_full, tail_tiles, sk_units, iters_per_unit, _collectors = sync_plan
     elif htail:
         num_full, tail_tiles, sk_units, iters_per_unit = (
             pair_tiles - tail_h,
@@ -1466,6 +1564,7 @@ def plan_dense_projection_gemm(
         store_hint=str(store_hint),
         pd=int(pd),
         sh=int(sh),
+        sk_sync=sync_plan is not None,
     )
     plan = GemmPlan(
         L=L,
@@ -1508,6 +1607,7 @@ def plan_dense_projection_gemm(
         store_hint=str(key[22]),
         pd=int(key[23]),
         sh=int(key[24]),
+        sk_sync=bool(key[25]),
     )
     if _fallback and plan.template not in KERNELS.get(arch, {}):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
@@ -1747,6 +1847,8 @@ def prepare_dense_projection_gemm(
     store_hint: Optional[str] = None,
     pd: Optional[int] = None,
     sh: Optional[int] = None,
+    sk_sync: Optional[bool] = None,
+    sk_sync_m: Optional[int] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
@@ -1790,6 +1892,8 @@ def prepare_dense_projection_gemm(
         store_hint=store_hint,
         pd=pd,
         sh=sh,
+        sk_sync=sk_sync,
+        sk_sync_m=sk_sync_m,
         arch=arch,
     )
     module_name = select_module(arch, plan.template)
