@@ -467,12 +467,13 @@ def _format_tactic(tactic):
 def format_autotune_choices(choices):
     """Return ``(autotune_winner, autotune_tactic)`` column strings.
 
-    ``autotune_winner`` is ``op:RunnerClass`` and ``autotune_tactic`` is
-    ``op:tactic``, one entry per op, ``;``-separated.
+    ``autotune_winner`` is ``op=RunnerClass`` and ``autotune_tactic`` is
+    ``op=tactic``, one entry per op, ``;``-separated (op names may contain
+    ``::``).
     """
     ops = sorted(choices)
-    winner = ";".join(f"{op}:{choices[op][0]}" for op in ops)
-    tactic = ";".join(f"{op}:{_format_tactic(choices[op][1])}" for op in ops)
+    winner = ";".join(f"{op}={choices[op][0]}" for op in ops)
+    tactic = ";".join(f"{op}={_format_tactic(choices[op][1])}" for op in ops)
     return winner, tactic
 
 
@@ -524,7 +525,7 @@ def print_autotune_choices(backend, choices):
     for op in sorted(choices):
         runner, tactic = choices[op]
         print(
-            f"[INFO] {backend} autotune choice: {op}:{runner}:tactic={_format_tactic(tactic)}"
+            f"[INFO] {backend} autotune choice: op={op} runner={runner} tactic={_format_tactic(tactic)}"
         )
 
 
