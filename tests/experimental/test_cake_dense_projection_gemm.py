@@ -1415,6 +1415,36 @@ def test_default_stages_by_tile_shape():
     assert instance_key(a_mn=False, b_mn=True, block_n=192, cta_rows=64)[5] == 9
 
 
+def test_sk_sync_rule_yields_to_caller_forced_forms():
+    # round 18 (Cake launcher parity): the sm_107a 6144 x 2048 weight-gradient rule (q_a / shared_gate_up) plans the
+    # synchronised stream-K tail of the 128-row family (192 pair tiles on 106 pairs -> 86 tails, 20 collectors, s = 216
+    # with the rule's margin 26).  The plan is admitted per family and needs the single-pass / serialised tall epilogue,
+    # so a caller-forced tall tile or epilogue form on the row gets that form with the plain plan (the Cake e2e
+    # registrations of the ``_m256`` / ``_ov`` programs), while a caller-forced ``sk_sync`` keeps raising on the conflict
+    v = _views("proj", "q_a", "wgrad", "bf16", 16231)
+    kw = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
+    rule, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+    assert rule.sk_sync and rule.cta_rows == 128 and rule.template.endswith("_sks")
+    assert (rule.num_full, rule.tail_tiles, rule.sk_units, rule.iters_per_unit) == (
+        106,
+        86,
+        106,
+        216,
+    )
+    assert rule.sk_iters == 86 and rule.sk_collectors == 20
+    tall, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta_rows=256, **kw)
+    assert not tall.sk_sync and tall.cta_rows == 256 and "_sks" not in tall.template
+    assert tall.sk_iters == tall.tail_tiles and tall.sk_collectors == 0
+    ov, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], cta_rows=256, ovl=True, **kw
+    )
+    assert not ov.sk_sync and ov.ovl and "_ov" in ov.template
+    with pytest.raises(ValueError, match="sk_sync needs the single-pass"):
+        plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], cta_rows=256, ovl=True, sk_sync=True, **kw
+        )
+
+
 def test_wave_working_set_and_hint_rule():
     # o_proj forward at T = 16231 (m_tiles = 128, n_tiles = 24, K = 16384) on 74 pairs: a raster band of
     # 8 pair rows x 24 column tiles exceeds the wave, so the wave covers 8 pair-row panels and

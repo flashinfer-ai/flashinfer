@@ -1374,12 +1374,25 @@ def plan_dense_projection_gemm(
     elif int(cta_rows) != rule.get("cta_rows", default_cta_rows(M, N, K)):
         # A caller-forced tile family (sweeps, the registrations of the tall / 64-row families): the rule's knobs
         # that belong to its own family (tile width, stage count, staging slots, epilogue mode) do not carry over
-        # (a 160-column rule of the 256-row family is not a valid 64-row tile).  [Cake L1271-L1279]
+        # (a 160-column rule of the 256-row family is not a valid 64-row tile); the synchronised stream-K plan (round 18) is
+        # admitted per family too (its unit arithmetic counts the family's pair tiles), so it does not carry over either.
+        # [Cake launcher]
         rule = {
             k: v
             for k, v in rule.items()
             if k
-            not in ("block_n", "stages", "slots", "epi", "ovl", "htail", "b_swz", "pd")
+            not in (
+                "block_n",
+                "stages",
+                "slots",
+                "epi",
+                "ovl",
+                "htail",
+                "b_swz",
+                "pd",
+                "sk_sync",
+                "sk_sync_m",
+            )
         }
     if block_n is None:
         block_n = rule.get("block_n", default_block_n(N, b_mn))
@@ -1405,6 +1418,7 @@ def plan_dense_projection_gemm(
         b_swz = rule.get("b_swz", 128)
     if sk_exact is None:
         sk_exact = rule.get("sk_exact")
+    rule_sk_sync = sk_sync is None
     if sk_sync is None:
         # round 18 (Cake W2): synchronised stream-K tail (main units + collectors) of the row's rule
         sk_sync = rule.get("sk_sync", False)
@@ -1438,6 +1452,12 @@ def plan_dense_projection_gemm(
         # the overlapped epilogue is built for the 256-column tall tile; a narrower tall tile keeps the serialized
         # tall epilogue  [Cake launcher]
         ovl = False
+    if sk_sync and rule_sk_sync and (ovl or park or int(pd) or htail or sk_exact):
+        # The row's synchronised plan needs the single-pass or the serialised tall epilogue and is the row's only tail
+        # policy (instance_key); a caller that forces another form on the row gets that form with the plain plan - the
+        # rule's tail policy does not carry over (the Cake launcher also yields to its ``a_mcast`` attribution probe, which
+        # the planner does not expose).  A caller-forced ``sk_sync`` keeps raising on such a conflict.  [Cake launcher]
+        sk_sync = False
     m_tiles = _ceil_div(M, cta_rows)
     m_tiles += m_tiles % CTA_GROUP
     n_tiles = _ceil_div(N, block_n)
