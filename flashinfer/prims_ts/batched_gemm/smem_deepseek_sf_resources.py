@@ -185,8 +185,6 @@ class SmemDeepSeekSfAbResource(MemoryResource):
             t2r_rmem_1 = cutlass.vector.full([1], 0.0, cutlass.Float32)
             dsfp8_acc_rmem = cutlass.vector.full([epi_t2r_repx], 0.0, cutlass.Float32)
             dsfp8_acc_rmem_1 = cutlass.vector.full([1], 0.0, cutlass.Float32)
-        self.dsfp8_acc_rmem_state = dsfp8_acc_rmem
-        self.dsfp8_acc_rmem_1_state = dsfp8_acc_rmem_1
         return {
             "dsfp8_act_stage_ptr": Int64(0),
             "dsfp8_wt_stage_ptr": Int64(0),
@@ -206,11 +204,19 @@ class SmemDeepSeekSfAbResource(MemoryResource):
     @cute.jit
     def init_epilogue_state(self, stage_info: StageInfo) -> None:
         self.create_function_variables(stage_info.context)
+        self._reset_acc_state()
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def reset_dequant_accumulator(self, stage_info: StageInfo) -> None:
         """Reset the epilogue-local DeepSeek FP8 accumulator for this C tile."""
+        self._reset_acc_state()
+
+    @cute.jit
+    def _reset_acc_state(self) -> None:
+        # Epilogue-only state. Binding it from the load warps' init as well
+        # makes CuTe DSL 4.8 reject the epilogue's rebind: the load branch's
+        # vector SSA does not dominate the epilogue branch (SCOPE_READ_NEVER_SET).
         if cutlass.const_expr(self.cfg.is_swap_ab):
             swap_t2r_repx = max(1, self.cfg.epi_tile_n // 8)
             self.dsfp8_acc_rmem_state = cutlass.vector.full(
