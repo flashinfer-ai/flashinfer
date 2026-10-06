@@ -1117,7 +1117,9 @@ def test_cake_ssd_combined_varlen_empty_sequences(
         constructor, arguments, lengths
     )
     assert len(kept) < len(lengths)
-    expected = _cute_padded_reference(constructor, tensors, dense_arguments, dense_lengths)
+    expected = _cute_padded_reference(
+        constructor, tensors, dense_arguments, dense_lengths
+    )
     runner = SSDCombined(**constructor, backend="cake")
     runner._cake_runner.seq_idx_status(reset=True)
 
@@ -1172,7 +1174,9 @@ def test_cake_ssd_combined_flags_out_of_range_seq_idx(lengths, tail, seq_idx_dty
         "update_seq_chunk_cumsum": True,
     }
     clean_tensors = tuple(
-        value[:, :total].contiguous() if value.ndim >= 2 and value.shape[1] == total + tail else value
+        value[:, :total].contiguous()
+        if value.ndim >= 2 and value.shape[1] == total + tail
+        else value
         for value in tensors
     )
     seq_idx, chunk_indices, chunk_offsets = _varlen_metadata(lengths, seq_idx_dtype)
@@ -1185,7 +1189,9 @@ def test_cake_ssd_combined_flags_out_of_range_seq_idx(lengths, tail, seq_idx_dty
         "seq_chunk_cumsum": None,
         "update_seq_chunk_cumsum": False,
     }
-    expected = _cute_padded_reference(constructor, clean_tensors, clean_arguments, lengths)
+    expected = _cute_padded_reference(
+        constructor, clean_tensors, clean_arguments, lengths
+    )
     runner = SSDCombined(**constructor, backend="cake")
     cake = runner._cake_runner
     cake.seq_idx_status(reset=True)
@@ -1374,7 +1380,9 @@ def _skip_unless_cake_arch():
 @pytest.mark.parametrize(
     "lengths",
     _CU_SEQLENS_LENGTHS,
-    ids=["x".join(str(length) for length in lengths) for lengths in _CU_SEQLENS_LENGTHS],
+    ids=[
+        "x".join(str(length) for length in lengths) for lengths in _CU_SEQLENS_LENGTHS
+    ],
 )
 def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     lengths, state_dtype, initial_states
@@ -1464,14 +1472,19 @@ def test_cake_ssd_combined_cu_seqlens_publishes_the_derived_metadata(
     cu_arguments = _cu_seqlens_arguments(arguments, lengths)
     cu_arguments.update(seq_chunk_cumsum=table, update_seq_chunk_cumsum=True)
     if checkpoints is not None:
-        slots = [index if value is not None else -1 for index, value in enumerate(checkpoints)]
+        slots = [
+            index if value is not None else -1
+            for index, value in enumerate(checkpoints)
+        ]
         cu_arguments.update(
             checkpoint_token_indices=torch.tensor(
                 [-1 if value is None else value for value in checkpoints],
                 dtype=torch.int32,
                 device="cuda",
             ),
-            checkpoint_state_slots=torch.tensor(slots, dtype=torch.int32, device="cuda"),
+            checkpoint_state_slots=torch.tensor(
+                slots, dtype=torch.int32, device="cuda"
+            ),
             checkpoint_states=torch.full(
                 (num_seqs, 8, 64, 128), torch.nan, dtype=torch.bfloat16, device="cuda"
             ),
@@ -1483,17 +1496,29 @@ def test_cake_ssd_combined_cu_seqlens_publishes_the_derived_metadata(
     out, final = runner.run(*tensors, **cu_arguments)
 
     assert cake.seq_idx_status(reset=True) == 0
-    expected = _host_cu_seqlens_metadata(_cu_seqlens(lengths).tolist(), total, checkpoints)
+    expected = _host_cu_seqlens_metadata(
+        _cu_seqlens(lengths).tolist(), total, checkpoints
+    )
     assert not expected["flagged"]
     bound, num_segments = expected["bound"], expected["num_segments"]
-    assert bound == module._segment_bound(total, num_seqs) == -(-total // 128) + 2 * num_seqs
+    assert (
+        bound
+        == module._segment_bound(total, num_seqs)
+        == -(-total // 128) + 2 * num_seqs
+    )
     assert num_segments <= bound - 1  # room for the sentinel on valid input
     chunk_indices = cake._workspace["chunk_indices"]
     chunk_offsets = cake._workspace["chunk_offsets"]
     assert chunk_indices.dtype == chunk_offsets.dtype == torch.int32
     assert chunk_indices.numel() == chunk_offsets.numel() == bound + 1
-    assert chunk_indices[:num_segments].tolist() == expected["chunk_indices"][:num_segments]
-    assert chunk_offsets[:num_segments].tolist() == expected["chunk_offsets"][:num_segments]
+    assert (
+        chunk_indices[:num_segments].tolist()
+        == expected["chunk_indices"][:num_segments]
+    )
+    assert (
+        chunk_offsets[:num_segments].tolist()
+        == expected["chunk_offsets"][:num_segments]
+    )
     assert int(chunk_indices[num_segments]) == -1
     assert table.tolist() == expected["seq_chunk_cumsum"]
     if checkpoints is None:
@@ -1574,7 +1599,9 @@ def test_cake_ssd_combined_cu_seqlens_checkpoint_at_unaligned_sequence_start(
         (3, 8, 64, 128), torch.nan, dtype=state_dtype, device="cuda"
     )
     checkpoint = dict(
-        checkpoint_token_indices=torch.tensor([-1, boundary], dtype=torch.int32, device="cuda"),
+        checkpoint_token_indices=torch.tensor(
+            [-1, boundary], dtype=torch.int32, device="cuda"
+        ),
         checkpoint_state_slots=torch.tensor([-1, 2], dtype=torch.int32, device="cuda"),
     )
     runner = SSDCombined(**constructor, backend="cake")
@@ -1610,7 +1637,9 @@ def test_cake_ssd_combined_cu_seqlens_checkpoint_at_unaligned_sequence_start(
     # The whole result against CuTe / fp64 (the exposed boundary changes
     # nothing); CuTe has no f32 state, so that row goes to the recurrence alone.
     if state_dtype == torch.float32:
-        reference_out, reference_final = _fp64_reference(constructor, tensors, arguments)
+        reference_out, reference_final = _fp64_reference(
+            constructor, tensors, arguments
+        )
         for label, value, expected_value in (
             ("out", out, reference_out),
             ("final_states", final, reference_final),
@@ -1653,7 +1682,8 @@ def test_cake_ssd_combined_cu_seqlens_checkpoint_at_unaligned_sequence_start(
 
 
 @pytest.mark.parametrize(
-    "case", ("cu0", "decreasing", "total", "too_many"),
+    "case",
+    ("cu0", "decreasing", "total", "too_many"),
 )
 def test_cake_ssd_combined_flags_invalid_cu_seqlens(case):
     """CAKE-990 rules on the cu_seqlens form: ``cu[0] != 0``, a decreasing
@@ -1673,23 +1703,23 @@ def test_cake_ssd_combined_flags_invalid_cu_seqlens(case):
     f32 = torch.float32
     if case == "cu0":
         # Tokens [0, 10) belong to no sequence; [10, 100) and [100, 250) do.
-        cu, total, initial = [10, 100, 250], 250, True
+        cu, total = [10, 100, 250], 250
         constructor, tensors, arguments = _case(varlen=True, lengths=(90, 160))
     elif case == "decreasing":
         # [0, 100), an empty id (100 > 60 clamps to nothing), [60, 100) (starts
         # inside sequence 0, which the main kernel therefore cuts at 60) and
         # a clean [100, 250).
-        cu, total, initial = [0, 100, 60, 100, 250], 250, True
+        cu, total = [0, 100, 60, 100, 250], 250
         constructor, tensors, arguments = _case(varlen=True, lengths=(60, 40, 50, 100))
     elif case == "total":
         # Tokens [200, 250) belong to no sequence: the last sequence absorbs them.
-        cu, total, initial = [0, 100, 200], 250, True
+        cu, total = [0, 100, 200], 250
         constructor, tensors, arguments = _case(varlen=True, lengths=(100, 150))
     else:
         # 8 + 0 + 8 segments against a bound of 8 + 2 * 3 = 14: the last two
         # segments of sequence 2 are dropped (its state is not compared); both
         # full sequences start from zero, so their shared rows agree.
-        cu, total, initial = [0, 1024, 0, 1024], 1024, False
+        cu, total = [0, 1024, 0, 1024], 1024
         constructor, tensors, arguments = _case(
             varlen=True, lengths=(512, 256, 256), initial_states=False
         )
@@ -1716,8 +1746,14 @@ def test_cake_ssd_combined_flags_invalid_cu_seqlens(case):
     chunk_indices = cake._workspace["chunk_indices"]
     chunk_offsets = cake._workspace["chunk_offsets"]
     assert chunk_indices.numel() == chunk_offsets.numel() == bound + 1
-    assert chunk_indices[:num_segments].tolist() == expected["chunk_indices"][:num_segments]
-    assert chunk_offsets[:num_segments].tolist() == expected["chunk_offsets"][:num_segments]
+    assert (
+        chunk_indices[:num_segments].tolist()
+        == expected["chunk_indices"][:num_segments]
+    )
+    assert (
+        chunk_offsets[:num_segments].tolist()
+        == expected["chunk_offsets"][:num_segments]
+    )
     assert int(chunk_indices[num_segments]) == -1
     assert table.tolist() == expected["seq_chunk_cumsum"]
     assert tuple(final.shape) == (num_seqs, 8, 64, 128)
@@ -1727,7 +1763,9 @@ def test_cake_ssd_combined_flags_invalid_cu_seqlens(case):
         and the fp64 recurrence over the window (``seq_idx`` names the
         sequences for the oracle only)."""
         clean_tensors = tuple(
-            value[:, window].contiguous() if value.ndim >= 2 and value.shape[1] == total else value
+            value[:, window].contiguous()
+            if value.ndim >= 2 and value.shape[1] == total
+            else value
             for value in tensors
         )
         clean_arguments = {
@@ -2934,7 +2972,9 @@ def test_source_public_cake_domain_validation_without_gpu(invalid, match):
             kwargs["D"] = torch.empty(cake_runner.nheads + 4, dtype=torch.bfloat16)[4:]
         else:
             cake_runner.has_z = True
-            kwargs["z"] = torch.empty(tensors[0].numel() + 4, dtype=torch.bfloat16)[4:].view(tensors[0].shape)
+            kwargs["z"] = torch.empty(tensors[0].numel() + 4, dtype=torch.bfloat16)[
+                4:
+            ].view(tensors[0].shape)
     elif invalid in {"z_shape", "z_dtype"}:
         cake_runner.has_z = True
         kwargs["z"] = torch.empty(
@@ -3431,7 +3471,13 @@ def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case):
 
 @pytest.mark.parametrize(
     "case",
-    ("runner_buffer", "update_caller_buffer", "zero_state", "seq_idx_rides_along", "chunk_256"),
+    (
+        "runner_buffer",
+        "update_caller_buffer",
+        "zero_state",
+        "seq_idx_rides_along",
+        "chunk_256",
+    ),
 )
 def test_source_cu_seqlens_binding_without_gpu(monkeypatch, case):
     """The cu_seqlens form binds ``metadata_from_cu_seqlens=1``, the caller's
@@ -3466,7 +3512,9 @@ def test_source_cu_seqlens_binding_without_gpu(monkeypatch, case):
     if case == "seq_idx_rides_along":
         kwargs["seq_idx"] = torch.zeros((1, seqlen), dtype=torch.int32)
     if has_initial_states:
-        kwargs["initial_states"] = torch.empty((num_seqs, 1, 64, 128), dtype=torch.bfloat16)
+        kwargs["initial_states"] = torch.empty(
+            (num_seqs, 1, 64, 128), dtype=torch.bfloat16
+        )
 
     out, final = runner.run(x, dt, A, B, C, **kwargs)
 
@@ -3516,8 +3564,13 @@ def test_source_cu_seqlens_binding_without_gpu(monkeypatch, case):
     runner.run(x, dt, A, B, C, **kwargs, **checkpoints)
     preprocess = calls[-1][1]["preprocess"]
     assert preprocess["checkpoint_state_count"] == 1
-    assert preprocess["checkpoint_token_indices"] is checkpoints["checkpoint_token_indices"]
-    assert preprocess["num_segments"] == bound  # the bound already holds one per sequence
+    assert (
+        preprocess["checkpoint_token_indices"]
+        is checkpoints["checkpoint_token_indices"]
+    )
+    assert (
+        preprocess["num_segments"] == bound
+    )  # the bound already holds one per sequence
 
 
 def test_source_chunk_size_is_a_caller_convention_without_gpu(monkeypatch):
@@ -3527,7 +3580,9 @@ def test_source_chunk_size_is_a_caller_convention_without_gpu(monkeypatch):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     calls = []
     for chunk_size in (64, 256, 512):
-        runner = _cpu_forwarding_runner(module, monkeypatch, calls, chunk_size=chunk_size)
+        runner = _cpu_forwarding_runner(
+            module, monkeypatch, calls, chunk_size=chunk_size
+        )
         assert runner.chunk_size == chunk_size
         x = torch.empty((2, 256, 1, 64), dtype=torch.bfloat16)
         dt = torch.empty((2, 256, 1), dtype=torch.float32)
@@ -3805,7 +3860,9 @@ def _host_prepare_arguments(template, stage):
 
     namespace = template.index(f"namespace stage_{stage} {{")
     start = template.index("inline void Prepare(PreparedLaunch& prepared, ", namespace)
-    return tuple(re.findall(r"\barg_(\w+)", template[start : template.index(")", start)]))
+    return tuple(
+        re.findall(r"\barg_(\w+)", template[start : template.index(")", start)])
+    )
 
 
 def _host_run_arguments(template, stage):
@@ -3823,7 +3880,9 @@ def test_source_host_template_binds_stage_arguments_in_loader_order():
     the last preprocess tensor (CAKE-990)."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    template = (module._source_dir() / module._HOST_TEMPLATE).read_text(encoding="utf-8")
+    template = (module._source_dir() / module._HOST_TEMPLATE).read_text(
+        encoding="utf-8"
+    )
 
     assert _host_prepare_arguments(template, "preprocess") == module._PREPROCESS_ARGS
     assert _host_prepare_arguments(template, "main") == module._MAIN_ARGS
@@ -3831,14 +3890,22 @@ def test_source_host_template_binds_stage_arguments_in_loader_order():
     assert _host_run_arguments(template, "main") == module._MAIN_ARGS
     assert module._PREPROCESS_ARGS[-1] == "preprocess_status"
     assert len(module._PREPROCESS_ARGS) == 27
-    assert 'check_dtype(arg_cu_seqlens, DLDataType{kDLInt, 32, 1}, "cu_seqlens");' in template
     assert (
-        'check_dtype(arg_checkpoint_token_indices, DLDataType{kDLInt, 32, 1}, '
+        'check_dtype(arg_cu_seqlens, DLDataType{kDLInt, 32, 1}, "cu_seqlens");'
+        in template
+    )
+    assert (
+        "check_dtype(arg_checkpoint_token_indices, DLDataType{kDLInt, 32, 1}, "
         '"checkpoint_token_indices");'
     ) in template
-    assert 'check_dtype(arg_preprocess_status, DLDataType{kDLInt, 32, 1}, "preprocess_status");' in template
+    assert (
+        'check_dtype(arg_preprocess_status, DLDataType{kDLInt, 32, 1}, "preprocess_status");'
+        in template
+    )
     preprocess_stage = template[
-        template.index("namespace stage_preprocess {") : template.index("namespace stage_main {")
+        template.index("namespace stage_preprocess {") : template.index(
+            "namespace stage_main {"
+        )
     ]
     assert "void* kargs[27] = {};" in preprocess_stage
     assert "prepared.kargs[26] = &prepared.p_preprocess_status;" in preprocess_stage

@@ -562,7 +562,11 @@ class CakeSSDCombined:
     ) -> None:
         if headdim != _HEADDIM or dstate != _DSTATE:
             raise ValueError("Cake SSDCombined requires headdim=64 and dstate=128")
-        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
+        if (
+            not isinstance(chunk_size, int)
+            or isinstance(chunk_size, bool)
+            or chunk_size <= 0
+        ):
             raise ValueError(
                 "Cake SSDCombined chunk_size must be a positive int (a caller "
                 "convention; the kernels tile 128 tokens internally)"
@@ -591,7 +595,7 @@ class CakeSSDCombined:
         self.has_z = bool(has_z)
         self.seq_idx_dtype = seq_idx_dtype
         self._workspace_key: Optional[
-            Tuple[Optional[int], int, int, int, int, int, torch.dtype]
+            Tuple[Optional[int], int, int, int, int, int, torch.dtype, bool]
         ] = None
         self._workspace: Optional[dict[str, torch.Tensor]] = None
         self._dummy_cache: dict[Tuple[Optional[int], torch.dtype], torch.Tensor] = {}
