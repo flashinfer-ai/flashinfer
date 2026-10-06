@@ -21,7 +21,9 @@ import tvm_ffi
 
 from ..jit.cake_kimi_k3_situ import (
     PROGRAMS,
-    cake_situ_sequence,
+    PROGRAM_FLAGS,
+    ROUTES,
+    cake_situ_selector,
     get_cake_situ_module,
 )
 from ..utils import get_compute_capability
@@ -36,8 +38,8 @@ _N32_CLAIM8_ARCHES = ("sm_100a", "sm_103a")
 # cluster of this many CTAs (the kernel declares the matching cluster size).
 _ROUTE_MC_CLUSTER = 8
 _M256_C12_ARCHES = ("sm_100a",)
-_LARGE_C7_ARCHES = ("sm_103a", "sm_100a")
-_LARGE_C7_TOKENS = (16384,)
+_LARGE_C7_TOKENS = (8192, 16384)
+_LARGE_C7_TOKENS_BY_ARCH = {"sm_103a": _LARGE_C7_TOKENS, "sm_100a": _LARGE_C7_TOKENS}
 # Pre-shuffled FC1 scale factors (the ``large_c7`` route). The tile-N128 FC1
 # consumes K in steps of 512 elements. For every (N-tile, K-step) the
 # scale-factor writer emits the 4096-byte shared-memory image FC1 expects
@@ -88,8 +90,66 @@ def _geometry(num_tokens, arch=None):
     return tile_n, total_pairs, max_tiles
 
 
+def _large_c7(arch, num_tokens):
+    # The pre-shuffled scale-factor route; ``arch is None`` (the size query) covers
+    # every architecture's token counts.
+    return int(num_tokens) in (
+        _LARGE_C7_TOKENS if arch is None else _LARGE_C7_TOKENS_BY_ARCH.get(arch, ())
+    )
+
+
 def _sfb_shuffled_bytes(max_tiles):
     return max_tiles * _FC1_K_TILES * _SFB_IMAGE_BYTES
+
+
+def _route_flags(arch, num_tokens):
+    """The static (device-free) route selection for ``(arch, num_tokens)``: the
+    program key and every selector flag the runtime binds. ``prepare_workspace``
+    checks its own selection against this and against the exporter's static
+    per-program facts; the tests re-derive the route table from it."""
+    m64_claim8 = arch in ("sm_100a", "sm_103a") and num_tokens in (32, 64, 128, 256)
+    mid_work5fd = arch in ("sm_100a", "sm_103a") and num_tokens in (2048, 4096)
+    n32_claim8 = arch in _N32_CLAIM8_ARCHES and num_tokens in (512, 1024)
+    m256_c12 = arch in _M256_C12_ARCHES and num_tokens == 256
+    large_c7 = _large_c7(arch, num_tokens)
+    n8_w2a_m16 = arch in _N8_W2A_M16_ARCHES and num_tokens in _N8_W2A_M16_TOKENS
+    tile_n = _geometry(num_tokens, arch)[0]
+    feature_finalize = num_tokens in (1, 8, 16) or m64_claim8
+    selector = cake_situ_selector(
+        arch,
+        tile_n,
+        num_tokens == 1,
+        feature_finalize,
+        m64_claim8,
+        mid_work5fd,
+        n32_claim8,
+        m256_c12,
+        large_c7,
+        n8_w2a_m16,
+    )
+    program_key = ROUTES[(arch, selector)]
+    # The fused quantization + router programs declare the stage in their
+    # argument plan; resolve that once here rather than on every call.
+    fused_quant_route = any(
+        name == "quant_route.s2b_num_tokens"
+        for _, name in PROGRAMS[program_key]["arg_plan"]
+    )
+    return {
+        "program_key": program_key,
+        "selector": selector,
+        "tile_n": tile_n,
+        "single_token": num_tokens == 1,
+        "feature_finalize": feature_finalize,
+        "m64_claim8": m64_claim8,
+        "mid_work5fd": mid_work5fd,
+        "n32_claim8": n32_claim8,
+        "m256_c12": m256_c12,
+        "large_c7": large_c7,
+        "n8_w2a_m16": n8_w2a_m16,
+        "fused_quant_route": fused_quant_route,
+        "fc2_device_workfeed": num_tokens in (8, 16) or m64_claim8 or n32_claim8,
+        "stages": PROGRAM_FLAGS[program_key]["stages"],
+    }
 
 
 def _workspace_layout(num_tokens, arch=None):
@@ -119,7 +179,7 @@ def _workspace_layout(num_tokens, arch=None):
         or (num_tokens in (512, 1024) and arch in (None, *_N32_CLAIM8_ARCHES))
     ):
         fields += (("fc2_work_counter", torch.int32, (1,), 4),)
-    if num_tokens in _LARGE_C7_TOKENS and arch in (None, *_LARGE_C7_ARCHES):
+    if _large_c7(arch, num_tokens):
         # One image per (N-tile, K-step). For 16384 tokens (2937 tiles) this
         # adds 2937 * 7 * 4096 = 84,209,664 bytes (80.3 MiB) to the layout.
         fields += (("sfb_shuffled", torch.uint8, (_sfb_shuffled_bytes(max_tiles),), 1),)
@@ -198,11 +258,14 @@ def _cake_situ_workspace_size(options):
     max_tokens = options["max_num_tokens"]
     # ``_workspace_layout`` is not monotonic in ``num_tokens``: the token counts
     # that force tile-N16 (32 and 64) need more scratch rows than the tile-N8
-    # counts that follow them, so a maximum-size buffer must cover every forced
-    # count at or below ``max_num_tokens`` as well as ``max_num_tokens`` itself.
+    # counts that follow them, and the pre-shuffled scale-factor route carries
+    # ``sfb_shuffled`` (the 8192-token layout is larger than the ordinary layout
+    # up to 8647 tokens), so a maximum-size buffer must cover every forced and
+    # pre-shuffled count at or below ``max_num_tokens`` as well as
+    # ``max_num_tokens`` itself.
     return max(
         _workspace_layout(num_tokens)[1]
-        for num_tokens in (max_tokens, *_FORCED_TILE_N16_TOKENS)
+        for num_tokens in (max_tokens, *_FORCED_TILE_N16_TOKENS, *_LARGE_C7_TOKENS)
         if num_tokens <= max_tokens
     )
 
@@ -289,14 +352,21 @@ def cake_fused_moe_prepare_workspace(
         # These two fixed-prefix regions are shared by all prepared shapes.
         views["situ_beta"].fill_(4.0)
         views["situ_linear_beta"].fill_(25.0)
-        m64_claim8 = arch in ("sm_100a", "sm_103a") and num_tokens in (32, 64, 128, 256)
-        mid_work5fd = arch in ("sm_100a", "sm_103a") and num_tokens in (2048, 4096)
-        n32_claim8 = arch in _N32_CLAIM8_ARCHES and num_tokens in (512, 1024)
-        m256_c12 = arch in _M256_C12_ARCHES and num_tokens == 256
-        large_c7 = arch in _LARGE_C7_ARCHES and num_tokens in _LARGE_C7_TOKENS
-        n8_w2a_m16 = arch in _N8_W2A_M16_ARCHES and num_tokens in _N8_W2A_M16_TOKENS
+        # One static (device-free) route selection; the device-dependent FC2 grid
+        # is derived below from the flags it carries.
+        route = _route_flags(arch, num_tokens)
+        program_key = route["program_key"]
+        selector = route["selector"]
+        feature_finalize = route["feature_finalize"]
+        m64_claim8 = route["m64_claim8"]
+        mid_work5fd = route["mid_work5fd"]
+        n32_claim8 = route["n32_claim8"]
+        m256_c12 = route["m256_c12"]
+        large_c7 = route["large_c7"]
+        n8_w2a_m16 = route["n8_w2a_m16"]
+        fused_quant_route = route["fused_quant_route"]
+        fc2_device_workfeed = route["fc2_device_workfeed"]
         tile_n, total_pairs, max_tiles = _geometry(num_tokens, arch)
-        fc2_device_workfeed = num_tokens in (8, 16) or m64_claim8 or n32_claim8
         fc2_grid_n = max_tiles
         if fc2_device_workfeed:
             sm_count = torch.cuda.get_device_properties(
@@ -304,8 +374,8 @@ def cake_fused_moe_prepare_workspace(
             ).multi_processor_count
             fc2_grid_n = min(max_tiles, max(1, sm_count // (_H // 128)))
             if m64_claim8:
-                # The 32- to 256-token routes measured best with a six-row
-                # pool: 6 * 28 = 168 FC2 CTAs on the 148-SM B200 and B300.
+                # Six FC2 CTAs per N-tile for the 32- to 256-token rows of both
+                # architectures: 168 CTAs on the 148-SM B200 and B300.
                 fc2_grid_n = min(max_tiles, 6)
                 if arch in ("sm_100a", "sm_103a"):
                     fc2_grid_n = min(
@@ -324,26 +394,57 @@ def cake_fused_moe_prepare_workspace(
                 # The 512- and 1024-token routes measured best with a seven-row
                 # pool: 7 * 28 = 196 FC2 CTAs on the 148-SM B200 and B300.
                 fc2_grid_n = min(max_tiles, 7)
-        feature_finalize = num_tokens in (1, 8, 16) or m64_claim8
-        program_key = cake_situ_sequence(
-            arch,
-            tile_n,
-            single_token=num_tokens == 1,
-            feature_finalize=feature_finalize,
-            m64_claim8=m64_claim8,
-            mid_work5fd=mid_work5fd,
-            n32_claim8=n32_claim8,
-            m256_c12=m256_c12,
-            large_c7=large_c7,
-            n8_w2a_m16=n8_w2a_m16,
-        )
+        # The exporter emits static per-program facts next to the tables; the
+        # selection must agree with them.
+        flags = PROGRAM_FLAGS[program_key]
+        if selector not in flags["selectors"]:
+            # A program may be bound by several selectors; the bound one must be
+            # among them.
+            raise ValueError(
+                f"Cake SiTU program {program_key} is not bound by selector "
+                f"{selector!r} (exported selectors: {flags['selectors']})"
+            )
+        exported_tokens = {
+            t
+            for f in PROGRAM_FLAGS.values()
+            if f["arch"] == arch
+            for t in f["num_tokens"]
+        }
+        if flags["formal"] and num_tokens not in flags["num_tokens"]:
+            # A program exported for specific token counts must not be bound for
+            # another one.
+            raise ValueError(
+                f"Cake SiTU program {program_key} was not exported for "
+                f"num_tokens={num_tokens} (exported token counts: "
+                f"{flags['num_tokens']})"
+            )
+        if not flags["formal"] and num_tokens in exported_tokens:
+            # An exported token count must never fall onto a retained tile-size
+            # program.
+            raise ValueError(
+                f"Cake SiTU retained program {program_key} was bound for "
+                f"num_tokens={num_tokens}, an exported token count of {arch} "
+                f"(exported: {sorted(exported_tokens)})"
+            )
+        disagreeing = {
+            name: (flags[name], route[name])
+            for name in (
+                "tile_n",
+                "single_token",
+                "feature_finalize",
+                "fc2_device_workfeed",
+                "stages",
+            )
+            if flags[name] != route[name]
+        }
+        if disagreeing:
+            # Internal invariant between the exported facts and the host-side
+            # selection, not a caller error.
+            raise RuntimeError(
+                f"Cake SiTU internal error: program {program_key}: the exported "
+                f"static facts disagree with the host selection on {disagreeing}"
+            )
         module = get_cake_situ_module(program_key)
-        # The fused quantization + router programs declare the stage in their
-        # argument plan; resolve that once here rather than on every call.
-        fused_quant_route = any(
-            name == "quant_route.s2b_num_tokens"
-            for _, name in PROGRAMS[program_key]["arg_plan"]
-        )
         state["shapes"][num_tokens] = {
             "views": views,
             "tile_n": tile_n,
