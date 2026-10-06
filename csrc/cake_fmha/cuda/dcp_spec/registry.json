@@ -251,16 +251,25 @@
         "at_or_above_grid": 0,
         "below_grid": 1,
         "bodies": {
-          "0": "cake_fmha_dcp_spec_bf16_fp8_balanced_eight_slice_fold0.cu",
-          "1": "cake_fmha_dcp_spec_bf16_fp8_balanced_eight_slice_fold1.cu"
+          "0": "cake_fmha_dcp_spec_bf16_fp8_balanced_program0.cu",
+          "1": "cake_fmha_dcp_spec_bf16_fp8_balanced_program1.cu",
+          "2": "cake_fmha_dcp_spec_bf16_fp8_balanced_program2.cu"
         },
         "default": 1,
         "items_lower_bound": "batch_size * num_kv_heads",
-        "key": "eight_slice_fold",
-        "rule": "eight_slice_fold = below_grid when batch_size * num_kv_heads < grid (sm_count: one persistent CTA per multiprocessor), else at_or_above_grid: the idle-CTA eight-slice fold needs chunk tickets + 8 reduce tickets per split tile <= grid and every (request, KV head) is at least one chunk ticket; the program without it has the same plan and fold order",
+        "key": "program",
+        "rule": "program = at_or_above_grid when batch_size * num_kv_heads >= grid (sm_count: one persistent CTA per multiprocessor; the idle-CTA eight-slice fold needs chunk tickets + 8 reduce tickets per split tile <= grid and every (request, KV head) is at least one chunk ticket, so the program without that fold body has the same plan and fold order); else static_one_wave when n_max = ceil(max_pages_per_seq * page_size / chunk_tokens) >= min_chunks and batch_size * num_kv_heads * (n_max + reduce_tickets_per_tile) <= grid (the plan-free static ticket assignment, ticket = CTA index, same chunk and fold order as the planner's one-wave plan); else below_grid",
+        "static_one_wave": 2,
+        "static_one_wave_regime": {
+          "chunk_tokens": 256,
+          "min_chunks": 3,
+          "page_size": 64,
+          "reduce_tickets_per_tile": 8
+        },
         "values": [
           0,
-          1
+          1,
+          2
         ]
       },
       "public_name": "cake_fmha_dcp_spec_bf16_fp8_balanced",
@@ -750,12 +759,12 @@
             "N_ROWS": 32
           },
           "selector": {
-            "eight_slice_fold": 0,
-            "n_rows": 32
+            "n_rows": 32,
+            "program": 0
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_program0.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_program0.cu"
           }
         },
         {
@@ -763,12 +772,12 @@
             "N_ROWS": 64
           },
           "selector": {
-            "eight_slice_fold": 0,
-            "n_rows": 64
+            "n_rows": 64,
+            "program": 0
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_program0.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_program0.cu"
           }
         },
         {
@@ -776,12 +785,12 @@
             "N_ROWS": 32
           },
           "selector": {
-            "eight_slice_fold": 1,
-            "n_rows": 32
+            "n_rows": 32,
+            "program": 1
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_program1.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_program1.cu"
           }
         },
         {
@@ -789,12 +798,38 @@
             "N_ROWS": 64
           },
           "selector": {
-            "eight_slice_fold": 1,
-            "n_rows": 64
+            "n_rows": 64,
+            "program": 1
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_program1.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_program1.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 32
+          },
+          "selector": {
+            "n_rows": 32,
+            "program": 2
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_program2.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_program2.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 64
+          },
+          "selector": {
+            "n_rows": 64,
+            "program": 2
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_program2.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_program2.cu"
           }
         }
       ],

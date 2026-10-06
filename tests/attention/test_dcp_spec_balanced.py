@@ -767,82 +767,102 @@ def test_balanced_uri_names_the_family_instance_and_pins() -> None:
 
 
 def test_balanced_program_rule_mirrors_the_manifest() -> None:
-    """A family without program variants launches ``None``; one with them follows the items lower bound against the grid."""
+    """A family without program variants launches ``None``; one with them follows the manifest rule: the items lower
+    bound against the grid, then the static one-wave regime from the page-table width."""
 
     for kind in DCP_BALANCED_KINDS:
         variants = dcp_balanced_program_variants(_KIND_FAMILY[kind])
         if variants is None:
-            assert (
-                dcp_balanced_program(kind, batch_size=1, num_kv_heads=8, sm_count=148)
-                is None
-            )
-            assert (
-                dcp_balanced_program(kind, batch_size=256, num_kv_heads=8, sm_count=148)
-                is None
-            )
+            for batch in (1, 256):
+                assert (
+                    dcp_balanced_program(
+                        kind,
+                        batch_size=batch,
+                        num_kv_heads=8,
+                        max_pages_per_seq=36,
+                        sm_count=148,
+                    )
+                    is None
+                )
             continue
         assert variants["items_lower_bound"] == "batch_size * num_kv_heads"
-        below, above = int(variants["below_grid"]), int(variants["at_or_above_grid"])
-        assert {below, above} == set(
+        below, above, static = (
+            int(variants["below_grid"]),
+            int(variants["at_or_above_grid"]),
+            int(variants["static_one_wave"]),
+        )
+        assert sorted((below, above, static)) == sorted(
             int(v) for v in variants["values"]
-        ) and below != above
+        )
+        regime = variants["static_one_wave_regime"]
+        assert regime == {
+            "page_size": 64,
+            "chunk_tokens": 256,
+            "min_chunks": 3,
+            "reduce_tickets_per_tile": 8,
+        }
+
+        def program(batch, hkv, pages, sm):
+            return dcp_balanced_program(
+                kind,
+                batch_size=batch,
+                num_kv_heads=hkv,
+                max_pages_per_seq=pages,
+                sm_count=sm,
+            )
+
         for sm in (148, 152):
-            # fewer request-head pairs than CTAs: the idle-CTA eight-slice fold can be taken
-            assert (
-                dcp_balanced_program(kind, batch_size=1, num_kv_heads=8, sm_count=sm)
-                == below
-            )
-            assert (
-                dcp_balanced_program(kind, batch_size=8, num_kv_heads=8, sm_count=sm)
-                == below
-            )
-            assert (
-                dcp_balanced_program(
-                    kind, batch_size=(sm - 1) // 8, num_kv_heads=8, sm_count=sm
-                )
-                == below
-            )
+            # the b1 s8192 cp4 row (36 pages -> 9 chunks per pair; 8 x (9 + 8) = 136 tickets) is the static regime
+            assert program(1, 8, 36, sm) == static
+            # the regime bound: 8 pairs x (n_max + 8) <= grid
+            n_edge = sm // 8 - 8
+            assert program(1, 8, 4 * n_edge, sm) == static
+            assert program(1, 8, 4 * (n_edge + 1), sm) == below
+            # fewer than three chunks per pair: the planner's whole / two-chunk plans
+            assert program(1, 8, 8, sm) == below and program(1, 8, 9, sm) == static
+            # cp1_peer_b1 (132 pages), b2 at 36 pages and b8 at any width: planner program with the fold
+            assert program(1, 8, 132, sm) == below
+            assert program(2, 8, 36, sm) == below
+            assert program(8, 8, 36, sm) == below
+            assert program(8, 8, 20, sm) == below
+            assert program((sm - 1) // 8, 8, 36, sm) == below
             # at least one chunk ticket per pair fills the grid: the fold can never be taken
-            assert (
-                dcp_balanced_program(
-                    kind, batch_size=-(-sm // 8), num_kv_heads=8, sm_count=sm
-                )
-                == above
-            )
-            assert (
-                dcp_balanced_program(kind, batch_size=64, num_kv_heads=8, sm_count=sm)
-                == above
-            )
-            assert (
-                dcp_balanced_program(kind, batch_size=256, num_kv_heads=8, sm_count=sm)
-                == above
-            )
-        assert (
-            dcp_balanced_program(kind, batch_size=37, num_kv_heads=4, sm_count=148)
-            == above
-        )
-        assert (
-            dcp_balanced_program(kind, batch_size=36, num_kv_heads=4, sm_count=148)
-            == below
-        )
+            assert program(-(-sm // 8), 8, 36, sm) == above
+            assert program(64, 8, 36, sm) == above
+            assert program(256, 8, 36, sm) == above
+        assert program(37, 4, 36, 148) == above and program(36, 4, 36, 148) == below
+        # single KV head: nine requests of seven chunks fit (9 x 15 = 135), ten do not
+        assert program(9, 1, 25, 148) == static and program(10, 1, 25, 148) == below
     with pytest.raises(ValueError, match="sm_count"):
-        dcp_balanced_program("fp8_p64", batch_size=1, num_kv_heads=8, sm_count=0)
+        dcp_balanced_program(
+            "fp8_p64", batch_size=1, num_kv_heads=8, max_pages_per_seq=36, sm_count=0
+        )
+    with pytest.raises(ValueError, match="max_pages_per_seq"):
+        dcp_balanced_program(
+            "fp8_p64", batch_size=1, num_kv_heads=8, max_pages_per_seq=0, sm_count=148
+        )
     with pytest.raises(ValueError, match="kind"):
-        dcp_balanced_program("bf16_p64", batch_size=1, num_kv_heads=8, sm_count=148)
+        dcp_balanced_program(
+            "bf16_p64", batch_size=1, num_kv_heads=8, max_pages_per_seq=36, sm_count=148
+        )
 
 
 def test_fp8_program_row_selection(monkeypatch) -> None:
-    """The multi-wave uniform rows run the E4M3 head_dim-128 program without the eight-slice fold when it ships."""
+    """The b1 one-wave row runs the static one-wave program when the caller forces the balanced route (the
+    ``auto`` band keeps that one-wave row on the static specialization), b8 the planner with the eight-slice
+    fold and the multi-wave uniform rows the planner without that fold body."""
 
     variants = dcp_balanced_program_variants("dcp_spec_bf16_fp8_balanced")
     if variants is None:
         pytest.skip("the shipped E4M3 head_dim-128 family has one program")
     calls, _launches = _patch_loaders(monkeypatch)
-    for batch, expected in (
-        (8, variants["below_grid"]),
-        (64, variants["at_or_above_grid"]),
+    for batch, route, expected in (
+        (1, "balanced", variants["static_one_wave"]),
+        (8, "auto", variants["below_grid"]),
+        (64, "auto", variants["at_or_above_grid"]),
     ):
         calls["balanced"].clear()
+        calls["static"].clear()
         inputs = _rank_inputs(
             "fp8_p64",
             batch=batch,
@@ -851,10 +871,19 @@ def test_fp8_program_row_selection(monkeypatch) -> None:
             cp_world=4,
             cp_rank=0,
         )
-        run_dcp_spec_decode(**inputs)
+        run_dcp_spec_decode(**inputs, route=route)
         assert calls["balanced"] == [
             ("dcp_spec_bf16_fp8_balanced", "sm100a", 32, int(expected))
         ]
+        assert not calls["static"]
+    # ``auto`` routes the one-wave b1 row to the static specialization (band reason ``one_wave``).
+    calls["balanced"].clear()
+    calls["static"].clear()
+    inputs = _rank_inputs(
+        "fp8_p64", batch=1, q_len=4, prefixes=[8192], cp_world=4, cp_rank=0
+    )
+    run_dcp_spec_decode(**inputs)
+    assert not calls["balanced"] and len(calls["static"]) == 1
 
 
 # Launch resources and argument order the export pins per family
@@ -1161,7 +1190,13 @@ def test_bf16_band_row_launches_the_balanced_program(monkeypatch) -> None:
     run_dcp_spec_decode(**inputs)
     assert calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, None)]
     assert (
-        dcp_balanced_program("bf16_p16", batch_size=8, num_kv_heads=8, sm_count=148)
+        dcp_balanced_program(
+            "bf16_p16",
+            batch_size=8,
+            num_kv_heads=8,
+            max_pages_per_seq=int(inputs["block_tables"].shape[1]),
+            sm_count=148,
+        )
         is None
     )
     assert not calls["static"]
@@ -1281,7 +1316,13 @@ def test_fp8_band_row_launches_the_e4m3_program_with_both_scales(monkeypatch) ->
             "dcp_spec_bf16_fp8_balanced",
             "sm100a",
             32,
-            dcp_balanced_program("fp8_p64", batch_size=8, num_kv_heads=8, sm_count=148),
+            dcp_balanced_program(
+                "fp8_p64",
+                batch_size=8,
+                num_kv_heads=8,
+                max_pages_per_seq=int(inputs["block_tables"].shape[1]),
+                sm_count=148,
+            ),
         )
     ]
     assert not calls["static"]
@@ -1310,7 +1351,11 @@ def test_fp8_two_wave_row_follows_the_architecture_floor(monkeypatch) -> None:
                 "sm100a",
                 32,
                 dcp_balanced_program(
-                    "fp8_p64", batch_size=8, num_kv_heads=8, sm_count=148
+                    "fp8_p64",
+                    batch_size=8,
+                    num_kv_heads=8,
+                    max_pages_per_seq=int(inputs["block_tables"].shape[1]),
+                    sm_count=148,
                 ),
             )
         ]
@@ -1335,7 +1380,11 @@ def test_fp8_two_wave_row_follows_the_architecture_floor(monkeypatch) -> None:
                 "sm103a",
                 32,
                 dcp_balanced_program(
-                    "fp8_p64", batch_size=8, num_kv_heads=8, sm_count=152
+                    "fp8_p64",
+                    batch_size=8,
+                    num_kv_heads=8,
+                    max_pages_per_seq=int(inputs["block_tables"].shape[1]),
+                    sm_count=152,
                 ),
             )
         ]
@@ -1356,7 +1405,11 @@ def test_d256_band_row_launches_the_gqa16_program(monkeypatch) -> None:
             "sm100a",
             64,
             dcp_balanced_program(
-                "fp8_p64_d256", batch_size=64, num_kv_heads=1, sm_count=148
+                "fp8_p64_d256",
+                batch_size=64,
+                num_kv_heads=1,
+                max_pages_per_seq=int(inputs["block_tables"].shape[1]),
+                sm_count=148,
             ),
         )
     ]
