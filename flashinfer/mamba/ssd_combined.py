@@ -546,14 +546,20 @@ class SSDCombined:
                 it is omitted and takes the count from ``seq_chunk_cumsum``
                 or ``num_seqs``.
             seq_idx: Optional int32/int64 packed-sequence IDs of shape
-                ``[batch, seqlen]``.  Precondition for both backends (not
-                checked on the device-side hot path): every ID lies in
-                ``[0, num_seqs)``, IDs are non-decreasing along the packed
-                token axis, and every ID in that range owns at least one
-                token.  An out-of-range ID indexes ``initial_states`` /
-                the ``[num_seqs + 1]`` chunk-boundary table out of bounds,
-                and an ID without tokens leaves its boundary entry
-                undefined for the Cake backend.
+                ``[batch, seqlen]``.  IDs must be non-decreasing along the
+                packed token axis and lie in ``[0, num_seqs)``; neither is
+                checked on the host (that would need a device sync on the
+                hot path).  CuTe backend: every ID in that range must also
+                own at least one token, and an out-of-range ID indexes
+                ``initial_states`` / the ``[num_seqs + 1]`` chunk-boundary
+                table out of bounds.  Cake backend: an ID without tokens is
+                allowed (empty chunk range; its final state is the initial
+                state or zero), and an out-of-range or non-monotonic ID is
+                memory-safe: it is flagged in a runner-owned status word
+                (``CakeSSDCombined.seq_idx_status``, a synchronizing debug
+                read for tests), the offending tokens' outputs are
+                undefined and the in-range sequences they do not touch stay
+                correct.
             chunk_indices: Optional int32 physical-chunk index for every logical
                 varlen segment.
             chunk_offsets: Optional int32 in-chunk start offset for every logical
@@ -590,9 +596,9 @@ class SSDCombined:
                 batch element or packed sequence.
             num_seqs: Optional packed-sequence count for the Cake backend when
                 varlen mode runs without ``initial_states`` and without
-                ``seq_chunk_cumsum``.  Rejected by the CuTe backend.  Must
-                equal the number of distinct IDs in ``seq_idx`` (see the
-                ``seq_idx`` precondition).
+                ``seq_chunk_cumsum``.  Rejected by the CuTe backend.  Every
+                ``seq_idx`` ID must lie in ``[0, num_seqs)``; IDs without
+                tokens are allowed (see ``seq_idx``).
 
         Returns:
             A pair containing token-major output with shape
