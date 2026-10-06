@@ -2722,6 +2722,20 @@ def test_find_nearest_profile_cache_dedups_mla_decode_config():
         _mla_decode_tuning_config.cache_clear()
 
 
+def test_mla_decode_tuning_config_cache_is_bounded():
+    """Unexpected key dimensions must not cause unbounded host retention."""
+    _mla_decode_tuning_config.cache_clear()
+    try:
+        for profile_seq_len in range(1, 1025):
+            _mla_decode_tuning_config((1, 2, 4), 128, profile_seq_len)
+
+        cache_info = _mla_decode_tuning_config.cache_info()
+        assert cache_info.maxsize == 256
+        assert cache_info.currsize == cache_info.maxsize
+    finally:
+        _mla_decode_tuning_config.cache_clear()
+
+
 def _cute_dsl_runner_cache_extras(max_seq_len: int, workspace_bytes: int):
     runner = object.__new__(CuteDslMlaDecodeRunner)
     runner.kv_cache = torch.empty((1, 32, 576), dtype=torch.bfloat16)
