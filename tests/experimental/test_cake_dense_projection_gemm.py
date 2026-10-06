@@ -2347,11 +2347,15 @@ def test_sk_parts_rule(pairs):
     assert ROW_RULES[
         ("sm_107a", True, True, False, False, False, 2048, None, 4096)
     ] == {"block_n": 160, "cta_rows": 256, "group_m": 4, "sk_parts": 2, "b_swz": 64}
+    # round 17 (L61): the fp32 weight gradient leaves through the evict-first 8-wide register stores
     assert ROW_RULES[("sm_107a", True, True, True, False, False, 2048, None, 4096)] == {
         "block_n": 160,
         "cta_rows": 256,
+        "epi": "reg",
         "sk_parts": 3,
         "b_swz": 64,
+        "f32_v8": True,
+        "store_ef": True,
     }
     for f32 in (False, True):
         assert ROW_RULES[("sm_107a", True, True, f32, True, False, 32, None, 6144)] == {
