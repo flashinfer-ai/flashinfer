@@ -25,7 +25,12 @@ from .....core.comm.communication import (
     MoEEpDispatchResult,
     register_communication,
 )
-from ..nvlink_common import mnnvl_mapping_and_config, nvlink_platform_supported
+from ..nvlink_common import (
+    mnnvl_mapping_and_config,
+    nvlink_platform_supported,
+    remap_mnnvl_memory,
+    unmap_mnnvl_memory,
+)
 from .config import NVLinkOneSidedConfig
 from .kernels import get_nvlink_one_sided_module, layout_constants
 
@@ -268,10 +273,6 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
 
         Collective over the EP group; every rank returns the same result.
         """
-        import torch
-
-        from ......comm.mnnvl import all_ranks_agree
-
         cls = type(self)
         if cls._CFT_WORKSPACE_KEY is not None:
             logger.info(
@@ -279,6 +280,32 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
                 "of this process; this one uses the fence path"
             )
             return False
+        if not self._create_cft_endpoints(comm, mnnvl_mem, workspace, size):
+            logger.warning(
+                "NVLink one-sided CFT counted writes disabled: creating the logical "
+                "endpoints failed on at least one EP rank"
+            )
+            return False
+        cls._CFT_WORKSPACE_KEY = key
+        return True
+
+    def _create_cft_endpoints(
+        self,
+        comm: "CommBackend",
+        mnnvl_mem: Any,
+        workspace: "torch.Tensor",
+        size: int,
+    ) -> bool:
+        """Create this rank's logical endpoint on its workspace slice and
+        import every peer's.
+
+        Collective over the EP group; every rank returns the same result and
+        a failure leaves no endpoint behind.
+        """
+        import torch
+
+        from ......comm.mnnvl import all_ranks_agree
+
         module = self._module
         handle = torch.empty(module.moe_a2a_cft_handle_bytes(), dtype=torch.uint8)
         created = module.moe_a2a_cft_create_endpoint(
@@ -303,14 +330,17 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             )
         if not bound:
             module.moe_a2a_cft_destroy(workspace, self.ep_rank)
-            logger.warning(
-                "NVLink one-sided CFT counted writes disabled: creating the logical "
-                "endpoints failed on at least one EP rank"
-            )
             return False
         comm.barrier()
-        cls._CFT_WORKSPACE_KEY = key
         return True
+
+    def _cft_endpoint_ids(self) -> "torch.Tensor":
+        """Logical-endpoint ID per peer rank that CFT launches bake in."""
+        import torch
+
+        ids = torch.empty(self.ep_size, dtype=torch.int64)
+        self._module.moe_a2a_cft_endpoint_ids(self.workspace, self.ep_rank, ids)
+        return ids
 
     @classmethod
     def is_platform_supported(cls) -> bool:
@@ -564,6 +594,73 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         )
         self._round = None
         return output
+
+    def checkpoint_prepare(self) -> None:
+        """Release the workspace's physical memory and CFT endpoints, e.g. so
+        that the process can be checkpointed.
+
+        The virtual addresses stay reserved: CUDA graphs captured on the
+        workspace replay correctly after :meth:`checkpoint_restore`. Collective
+        over the EP group and only valid between rounds. Instances sharing the
+        workspace may call it again, which does nothing.
+        """
+        state = self._state
+        if state is None:
+            raise RuntimeError("NVLinkOneSidedAlltoAll has been destroyed")
+        if self._round is not None:
+            raise RuntimeError("checkpoint_prepare called between dispatch and combine")
+
+        def release_cft() -> None:
+            # Keep the endpoint IDs reserved: captured launches use them.
+            if state["cft_ready"]:
+                state["cft_endpoint_ids"] = self._cft_endpoint_ids()
+                self._module.moe_a2a_cft_release_endpoints(self.workspace, self.ep_rank)
+
+        unmap_mnnvl_memory(state["mnnvl_mem"], release_cft)
+
+    def checkpoint_restore(self, comm_backend: "CommBackend") -> None:
+        """Back the workspace with new memory after :meth:`checkpoint_prepare`
+        and recreate its CFT endpoints.
+
+        Collective over ``comm_backend``, which must span the EP group with
+        the original ranks. Does nothing when the workspace is mapped. The CFT
+        endpoints are recreated under the IDs they had, which CUDA graphs
+        captured before the checkpoint use; raises if that is not possible.
+        """
+        from ......comm.mnnvl import all_ranks_agree
+
+        state = self._state
+        if state is None:
+            raise RuntimeError("NVLinkOneSidedAlltoAll has been destroyed")
+        if not remap_mnnvl_memory(state["mnnvl_mem"], comm_backend):
+            return
+        self._module.moe_a2a_initialize(
+            self.workspace, self.metainfo, self.ep_rank, self.ep_size
+        )
+        # No peer may publish into this workspace until every rank has
+        # cleared its own slice.
+        comm_backend.barrier()
+        self._round = None
+        if not state["cft_ready"]:
+            return
+        previous_ids = state.pop("cft_endpoint_ids")
+        size = int(self.metainfo[self._index.WORKSPACE_SIZE_INDEX])
+        if not self._create_cft_endpoints(
+            comm_backend, state["mnnvl_mem"], self.workspace, size
+        ):
+            state["cft_ready"] = False
+            type(self)._CFT_WORKSPACE_KEY = None
+            raise RuntimeError(
+                "Could not recreate the NVLink one-sided CFT logical endpoints after "
+                "the checkpoint; CUDA graphs that use CFT are not safe to replay"
+            )
+        if not all_ranks_agree(
+            comm_backend, bool((self._cft_endpoint_ids() == previous_ids).all())
+        ):
+            raise RuntimeError(
+                "NVLink one-sided CFT logical-endpoint IDs changed across the "
+                "checkpoint; CUDA graphs captured before it are not safe to replay"
+            )
 
     def destroy(self) -> None:
         """Release this instance's share of the workspace.

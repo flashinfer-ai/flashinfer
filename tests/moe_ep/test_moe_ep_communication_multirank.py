@@ -382,3 +382,104 @@ def test_nvlink_one_sided_low_precision_eplb_and_rank_mask(mode):
     finally:
         dist.barrier()
         comm.destroy()
+
+
+@pytest.mark.gpu_2
+@pytest.mark.parametrize(
+    "backend", ["nvlink_one_sided:fence", "nvlink_one_sided:cft", "cake"]
+)
+def test_checkpoint_restore_keeps_captured_graph_valid(backend):
+    """A graph captured before checkpoint_prepare/checkpoint_restore replays
+    correctly afterwards; repeated calls do nothing."""
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.comm.mnnvl import MnnvlMemory, TorchDistBackend
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
+        FleetParams,
+        IdentityConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        SplitConfig,
+        dummy_moe_weights,
+    )
+
+    rank, world_size = _init_dist()
+    config = _backend_config(backend)
+    num_tokens, hidden, top_k = 16, 1024, 4
+    num_experts = 4 * world_size
+    generator = torch.Generator().manual_seed(11 + rank)
+    t = MoEEpTensors(
+        hidden_states=torch.empty(
+            num_tokens, hidden, dtype=torch.bfloat16, device="cuda"
+        ),
+        topk_ids=torch.empty(num_tokens, top_k, dtype=torch.int64, device="cuda"),
+        topk_weights=torch.empty(num_tokens, top_k, dtype=torch.float32, device="cuda"),
+    )
+
+    def load_next_step():
+        topk_ids, topk_weights = _random_routing(
+            num_tokens, num_experts, top_k, generator
+        )
+        t.hidden_states.copy_(torch.randn(num_tokens, hidden, generator=generator))
+        t.topk_ids.copy_(topk_ids)
+        t.topk_weights.copy_(topk_weights)
+
+    def replay_and_check(graph, out):
+        load_next_step()
+        graph.replay()
+        torch.cuda.synchronize()
+        # Up to top_k BF16 copies are summed, so compare at BF16 precision.
+        torch.testing.assert_close(
+            out.float(),
+            _identity_round_trip_reference(t.hidden_states, t.topk_ids, world_size, 4),
+            rtol=2e-2,
+            atol=5e-2,
+        )
+
+    layer = MoEEpLayer(
+        BootstrapConfig(world_size=world_size, rank=rank),
+        FleetParams(
+            num_experts=num_experts,
+            max_tokens_per_rank=num_tokens,
+            token_hidden_size=hidden,
+            algorithm=EpAlgorithm.LOW_LATENCY,
+            layout=EpLayout.RANK_MAJOR,
+        ),
+        dummy_moe_weights(num_local_experts=4, hidden=hidden),
+        backend=SplitConfig(comm=config, kernel=IdentityConfig()),
+    )
+    try:
+        load_next_step()
+        state = layer.create_graph_state(t)
+        comm = layer._communication
+        if backend.endswith(":cft") and not comm.cft_enabled:
+            pytest.skip("CFT counted writes are not available on this machine")
+        layer.forward(t, graph_state=state)  # eager warmup
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = layer.forward(t, graph_state=state)
+        replay_and_check(graph, out)
+
+        memory = comm._state["mnnvl_mem"]
+        comm.checkpoint_prepare()
+        comm.checkpoint_prepare()
+        assert not MnnvlMemory.allocated_map[memory.ptr].mapped
+        fresh_backend = TorchDistBackend()
+        comm.checkpoint_restore(fresh_backend)
+        comm.checkpoint_restore(fresh_backend)
+        assert MnnvlMemory.allocated_map[memory.ptr].mapped
+        if backend.endswith(":cft"):
+            assert comm.cft_enabled
+
+        for _ in range(2):
+            replay_and_check(graph, out)
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        layer.destroy()

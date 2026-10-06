@@ -435,6 +435,23 @@ def test_cake_payload_plumbing(fake_cake) -> None:
         comm.dispatch(hidden, ids, weights)
 
 
+def test_cake_checkpoint_needs_an_idle_live_instance(fake_cake) -> None:
+    comm = create_communication(
+        BootstrapConfig(world_size=2, rank=0), _params(), "cake"
+    )
+    comm.dispatch(
+        torch.ones(2, 8, dtype=torch.bfloat16), torch.tensor([[0, 3], [1, 2]])
+    )
+    with pytest.raises(RuntimeError, match="between dispatch and combine"):
+        comm.checkpoint_prepare()
+    comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
+    comm.destroy()
+    with pytest.raises(RuntimeError, match="destroyed"):
+        comm.checkpoint_prepare()
+    with pytest.raises(RuntimeError, match="destroyed"):
+        comm.checkpoint_restore(None)
+
+
 def test_cake_needs_compute_capability_10_0_or_10_3(monkeypatch) -> None:
     from flashinfer.moe_ep.backends.split.comm.cake import communication as cake
 
@@ -591,6 +608,24 @@ def test_nvlink_one_sided_cft_selection(fake_one_sided) -> None:
     assert fake_one_sided.module.calls["layout"][5] == 6 * 8
     assert comm._use_cft(2, 2) and not comm._use_cft(3, 2)
     assert _one_sided(cft=True)._use_cft(3, 2)
+
+
+def test_nvlink_one_sided_checkpoint_needs_an_idle_live_instance(
+    fake_one_sided, monkeypatch
+) -> None:
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+    comm = _one_sided(cft=False)
+    comm.dispatch(
+        torch.ones(2, 8, dtype=torch.bfloat16), torch.tensor([[0, 3], [1, 2]])
+    )
+    with pytest.raises(RuntimeError, match="between dispatch and combine"):
+        comm.checkpoint_prepare()
+    comm._round = None
+    comm.destroy()
+    with pytest.raises(RuntimeError, match="destroyed"):
+        comm.checkpoint_prepare()
+    with pytest.raises(RuntimeError, match="destroyed"):
+        comm.checkpoint_restore(None)
 
 
 def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
