@@ -589,6 +589,13 @@ def parse_attention_args(line, parser):
 
     # Normalize backend names (handle deprecated names)
     args.backends = normalize_backends(args.backends)
+    if args.routine == "fp8_paged_mqa_logits" and args.backends != ["cute-dsl"]:
+        # flashinfer.fp8_paged_mqa_logits has a single implementation and no
+        # backend argument, so any other backend name would mislabel its row.
+        raise ValueError(
+            "fp8_paged_mqa_logits has a single backend: pass --backends cute-dsl "
+            f"(got {args.backends})"
+        )
     if args.calls_per_sample < 1:
         raise ValueError("--calls_per_sample must be positive")
     if args.row_activity_mode is None and args.calls_per_sample != 1:
