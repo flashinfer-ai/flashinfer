@@ -38,6 +38,11 @@ _BLK64_BALANCED_PROFILE = "blk64_balanced"
 # The balanced block-64 profile reorders the persistent tile stream on device;
 # it needs at least this many full waves (MB * heads >= waves * SM count).
 _BLK64_BALANCED_MIN_WAVES = 2
+# Per-arch upper bound on the selected blocks per row for the balanced profile.
+# On sm_100a the queue-ordered tile stream loses to the static stripe once rows
+# select more than 64 blocks (k = 96..192 read 0.93..0.99 of the weight-stationary
+# profile); sm_103a gains across the measured band (k = 28..192: 1.06..1.33).
+_BLK64_BALANCED_MAX_SELECTED_BLOCKS = {"sm_100a": 64}
 _FP16_DIRECT_Q_TILE = 256
 
 
@@ -434,12 +439,22 @@ def plan_cake_vsa(
             else "blk64_persistent"
         )
     shared_indptr = shared_indices = None
-    if blk64_profile == _BLK64_WS_PROFILE and mb * num_qo_heads >= (
-        _BLK64_BALANCED_MIN_WAVES * _sm_count(_device_index(device))
+    balanced_max_blocks = _BLK64_BALANCED_MAX_SELECTED_BLOCKS.get(
+        _arch_for_device(device)
+    )
+    if (
+        blk64_profile == _BLK64_WS_PROFILE
+        and mb * num_qo_heads
+        >= _BLK64_BALANCED_MIN_WAVES * _sm_count(_device_index(device))
+        and (
+            balanced_max_blocks is None
+            or int(row_counts.max().item()) <= balanced_max_blocks
+        )
     ):
         # Inside the weight-stationary band (full groups, more than 24 selected
-        # blocks per row on average), a selection shared by every head over at
-        # least two persistent waves runs the balanced profile: the same M64N256
+        # blocks per row on average, at most the per-arch bound), a selection
+        # shared by every head over at least two persistent waves runs the
+        # balanced profile: the same M64N256
         # datapath with an on-device ticket queue that hands the tiles out in
         # descending size order.  Host metadata only, so the choice and the
         # launch below are CUDA-graph safe.

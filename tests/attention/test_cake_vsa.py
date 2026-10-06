@@ -459,6 +459,50 @@ def _balanced_blk64_case(device):
     return block_size, heads, mb, nb, M, N, mask
 
 
+def _dense_shared_blk64_case(device, nb=128, selected=96):
+    """A shared selection above the sm_100a selected-blocks bound (full groups, two waves)."""
+
+    block_size, heads = 64, 8
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    mb = -(-2 * sm_count // heads)
+    M, N = mb * block_size, nb * block_size
+    mask = torch.zeros((heads, mb, nb), dtype=torch.bool, device=device)
+    for row in range(mb):
+        mask[:, row, (torch.arange(selected, device=device) * 5 + row) % nb] = True
+    return block_size, heads, mb, nb, M, N, mask
+
+
+def test_cake_vsa_blk64_balanced_band_upper_bound():
+    """Rows above the per-arch selected-blocks bound keep the weight-stationary profile."""
+
+    device = torch.device("cuda")
+    block_size, heads, mb, nb, M, N, mask = _dense_shared_blk64_case(device)
+    workspace = torch.empty((128 * 1024 * 1024,), dtype=torch.uint8, device=device)
+    wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
+    _plan(
+        wrapper,
+        M,
+        N,
+        block_size,
+        heads,
+        heads,
+        128,
+        torch.bfloat16,
+        block_mask=mask,
+    )
+    plan = wrapper._cake_vsa_plan
+    assert plan is not None
+    bound = cake_vsa._BLK64_BALANCED_MAX_SELECTED_BLOCKS.get(
+        cake_vsa._arch_for_device(device)
+    )
+    expected = (
+        "blk64_balanced"
+        if bound is None or bound >= 96
+        else "blk64_persistent_ws_m64n256"
+    )
+    assert plan["blk64_profile"] == expected
+
+
 def _assert_blk64_queue_counters_reset(plan):
     torch.cuda.synchronize()
     assert plan["workspace"]["blk64_queue_counters"].tolist() == [0, 0, 0, 0]
