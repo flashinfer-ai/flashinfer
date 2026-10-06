@@ -84,6 +84,7 @@ See ``README.md`` in this package and flashinfer-ai/flashinfer#4532.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence, Union
@@ -347,9 +348,22 @@ class BF16SegmentPlan:
     max_kv_splits: int
 
 
+@functools.cache
+def _device_facts(index: int) -> tuple[int, tuple[int, int]]:
+    """``(multi_processor_count, compute capability)`` of CUDA device ``index``, read once."""
+    props = torch.cuda.get_device_properties(index)
+    return int(props.multi_processor_count), (int(props.major), int(props.minor))
+
+
+def _device_index(device: torch.device) -> int:
+    if device.type != "cuda":
+        raise ValueError(f"expected a CUDA device, got {device}")
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
 def bf16_grid_clusters(device: torch.device) -> int:
     """Persistent-grid capacity of ``device`` in 2-CTA clusters (``num_SMs / 2``)."""
-    return max(1, torch.cuda.get_device_properties(device).multi_processor_count // 2)
+    return max(1, _device_facts(_device_index(device))[0] // 2)
 
 
 def assign_unit_slots(unit_costs: Sequence[float], num_clusters: int) -> list[int]:
@@ -782,10 +796,18 @@ def build_tile_tables(
     if num_clusters is None:
         num_clusters = bf16_grid_clusters(device)
     segments = sorted(range(plan.num_segments), key=lambda s: -plan.seg_len[s])
-    cl = {
-        name: getattr(plan, name).tolist()
-        for name in ("cl_seg_begin", "cl_seg_len", "cl_kv_base", "cl_q_block")
+    cl: dict[str, list[int]] = {
+        "cl_seg_begin": [],
+        "cl_seg_len": [],
+        "cl_kv_base": [],
+        "cl_q_block": [],
     }
+    for s in range(plan.num_segments):
+        for c in range(plan.cluster_off[s + 1] - plan.cluster_off[s]):
+            cl["cl_seg_begin"].append(plan.seg_begin[s])
+            cl["cl_seg_len"].append(plan.seg_len[s])
+            cl["cl_kv_base"].append(plan.seg_tile_base[s])
+            cl["cl_q_block"].append(CLUSTER_Q_BLOCKS * c)
     seg_blocks = [(length + BLOCK_N - 1) // BLOCK_N for length in plan.seg_len]
     unit_blocks = [
         seg_blocks[s]
@@ -949,7 +971,7 @@ def amax_kwargs(
 
 
 def _arch_for(device: torch.device) -> str:
-    capability = torch.cuda.get_device_capability(device)
+    capability = _device_facts(_device_index(device))[1]
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
     if arch is None:
         raise ValueError(
@@ -961,14 +983,14 @@ def _arch_for(device: torch.device) -> str:
 
 def generated_program_available(device: torch.device, variant: str = "bf16") -> bool:
     """True when this checkout registers ``variant`` for ``device``."""
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
+    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(_device_facts(_device_index(device))[1])
     return arch is not None and route_available(variant, arch)
 
 
 def _bind_stage(
-    module_name: str, kwargs: dict[str, Any]
+    module_name: str, arch: str, kwargs: dict[str, Any]
 ) -> tuple[Callable[..., Any], tuple]:
-    """Order ``kwargs`` by the generated argument plan of ``module_name``."""
+    """Order ``kwargs`` by the generated argument plan of ``module_name`` built for ``arch``."""
     record = MODULES[module_name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
     arguments = []
@@ -982,18 +1004,23 @@ def _bind_stage(
                 f"generated module {module_name!r} expects argument {name!r} "
                 f"({kind}); host binding provides {sorted(kwargs)}"
             )
-    module = load_cake_minimax_h3_varlen_attention_module(module_name)
+    module = load_cake_minimax_h3_varlen_attention_module(module_name, arch)
     return getattr(module, record["ffi_entry"]), tuple(arguments)
 
 
 def _persistent_grid(
     device: torch.device, total_tiles: int, *, at_least_one: bool
 ) -> tuple[int, int, int]:
-    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    num_sms = _device_facts(_device_index(device))[0]
     pairs = min(num_sms // 2, total_tiles)
     if at_least_one:
         pairs = max(1, pairs)
     return (2 * pairs, 1, 1)
+
+
+# Element multiple that keeps a BF16 stride 16-byte aligned (TMA global
+# strides and the BF16 kernel's 16-byte ragged-tail copies).
+THD_STRIDE_ALIGN = 16 // 2
 
 
 def _check_thd(
@@ -1002,7 +1029,19 @@ def _check_thd(
     total_tokens: int,
     num_heads: int,
     device: torch.device,
+    *,
+    contiguous: bool,
 ) -> None:
+    """Validate one ``[T, H, 128]`` BF16 operand.
+
+    ``contiguous=False`` accepts any view with unit innermost stride, a head
+    stride that is a 16-byte multiple of at least 128 elements, a token
+    stride that is a 16-byte multiple of at least ``H * head_stride`` and a
+    16-byte-aligned base: contiguous tensors, the column slices of a fused
+    ``[T, 3 * H * 128]`` QKV projection (strides ``(3 * H * 128, 128, 1)``)
+    and the slices of a ``[T, H, 3, 128]`` pack (strides ``(H * 384, 384,
+    1)``).  ``contiguous=True`` additionally requires a contiguous tensor.
+    """
     if not tensor.is_cuda or tensor.device != device:
         raise ValueError(f"{name} must live on {device}")
     if tensor.dtype != torch.bfloat16:
@@ -1012,8 +1051,27 @@ def _check_thd(
             f"{name} must be [T, H, {HEAD_DIM}] = {(total_tokens, num_heads, HEAD_DIM)}, "
             f"got {tuple(tensor.shape)}"
         )
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
+    row_stride, head_stride, elem_stride = (int(s) for s in tensor.stride())
+    if elem_stride != 1:
+        raise ValueError(
+            f"{name} must have a unit innermost stride, got stride(2)={elem_stride}"
+        )
+    if head_stride < HEAD_DIM or head_stride % THD_STRIDE_ALIGN:
+        raise ValueError(
+            f"{name} head stride must be a 16-byte multiple of at least {HEAD_DIM} "
+            f"elements, got {head_stride}"
+        )
+    if row_stride < num_heads * head_stride or row_stride % THD_STRIDE_ALIGN:
+        raise ValueError(
+            f"{name} token stride must be a 16-byte multiple of at least "
+            f"H * head_stride = {num_heads * head_stride} elements, got {row_stride}"
+        )
+    if tensor.data_ptr() % 16:
+        raise ValueError(f"{name} base address must be 16-byte aligned")
+    if contiguous and not tensor.is_contiguous():
+        raise ValueError(
+            f"{name} must be contiguous, got strides {tuple(tensor.stride())}"
+        )
 
 
 def validate_minimax_h3_varlen_inputs(
@@ -1021,10 +1079,16 @@ def validate_minimax_h3_varlen_inputs(
     key: torch.Tensor,
     value: torch.Tensor,
     out: Optional[torch.Tensor],
+    *,
+    strided_qkv: bool,
 ) -> tuple[int, int, torch.device]:
     """Shape / dtype / device validation shared by both families.
 
-    Returns ``(total_tokens, num_heads, device)``.
+    ``strided_qkv=True`` (the BF16 route) accepts strided ``[T, H, 128]``
+    views for ``query`` / ``key`` / ``value`` (see ``_check_thd``; the three
+    may differ in strides); ``False`` (the NVFP4 routes, whose quantizers
+    read contiguous THD) requires contiguous tensors.  ``out`` is always
+    contiguous.  Returns ``(total_tokens, num_heads, device)``.
     """
     if query.ndim != 3:
         raise ValueError(f"query must be THD [T, H, {HEAD_DIM}]")
@@ -1033,9 +1097,11 @@ def validate_minimax_h3_varlen_inputs(
         raise ValueError("query must have at least one head")
     device = query.device
     for name, tensor in (("query", query), ("key", key), ("value", value)):
-        _check_thd(name, tensor, total_tokens, num_heads, device)
+        _check_thd(
+            name, tensor, total_tokens, num_heads, device, contiguous=not strided_qkv
+        )
     if out is not None:
-        _check_thd("out", out, total_tokens, num_heads, device)
+        _check_thd("out", out, total_tokens, num_heads, device, contiguous=True)
     return total_tokens, num_heads, device
 
 
@@ -1212,13 +1278,18 @@ def prepare_minimax_h3_varlen_attention(
 ) -> MiniMaxH3VarlenAttentionRunner:
     """Validate, plan and bind one BF16 packed-varlen attention problem.
 
-    Every allocation happens here (only the optional output and the small
-    int32 plan tables); the returned runner launches with none.
+    ``query`` / ``key`` / ``value`` may be strided ``[T, H, 128]`` views (unit
+    innermost stride, 16-byte-aligned head and token strides and base; for
+    example the column slices of a fused QKV projection or the slices of a
+    ``[T, H, 3, 128]`` pack): the kernel reads them in place, no copies are
+    made.  ``out`` is contiguous.  Every allocation happens here (only the
+    optional output and the small int32 plan tables); the returned runner
+    launches with none.
     """
     if backend != "cake":
         raise ValueError("MiniMax-H3 varlen attention supports backend='cake'")
     total_tokens, num_heads, device = validate_minimax_h3_varlen_inputs(
-        query, key, value, out
+        query, key, value, out, strided_qkv=True
     )
     if isinstance(cu_seqlens, torch.Tensor) and (
         not cu_seqlens.is_cuda or cu_seqlens.device != device
@@ -1259,10 +1330,11 @@ def prepare_minimax_h3_varlen_attention(
     combine_entry: Optional[Callable[..., Any]] = None
     combine_arguments: tuple = ()
     if total_tiles > 0:
-        entry, arguments = _bind_stage(route["modules"]["attention"], main_kwargs)
+        entry, arguments = _bind_stage(route["modules"]["attention"], arch, main_kwargs)
         if plan.num_combine_units > 0:
             combine_entry, combine_arguments = _bind_stage(
                 route["modules"]["combine"],
+                arch,
                 combine_kwargs(
                     plan.partial_O,
                     plan.partial_ML,
@@ -1312,7 +1384,7 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         raise ValueError(f"pv_mode must be one of {PV_MODES}, got {pv_mode!r}")
     variant = NVFP4_VARIANT[pv_mode]
     total_tokens, num_heads, device = validate_minimax_h3_varlen_inputs(
-        query, key, value, out
+        query, key, value, out, strided_qkv=False
     )
     if isinstance(cu_seqlens, torch.Tensor) and (
         not cu_seqlens.is_cuda or cu_seqlens.device != device
@@ -1467,7 +1539,9 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         if skipped:
             stages.append((stage, None, ()))
             continue
-        entry, arguments = _bind_stage(route["modules"][stage], stage_kwargs[stage])
+        entry, arguments = _bind_stage(
+            route["modules"][stage], arch, stage_kwargs[stage]
+        )
         stages.append((stage, entry, arguments))
     return MiniMaxH3VarlenNVFP4AttentionRunner(
         variant,
@@ -1499,6 +1573,15 @@ def minimax_h3_varlen_attention(
     cu_seqlens_host: Optional[Sequence[int]] = None,
     backend: str = "cake",
 ) -> torch.Tensor:
+    """BF16 packed-varlen attention in one call: plan, bind and launch.
+
+    Every call plans from ``cu_seqlens``.  Without ``cu_seqlens_host`` the
+    int32 CUDA tensor is read back to the host first (one stream
+    synchronization); pass ``cu_seqlens_host`` (the same offsets as a
+    Python sequence) to plan without any device synchronization.  For
+    repeated launches of one problem or CUDA Graph capture prepare once
+    with :func:`prepare_minimax_h3_varlen_attention` and call the runner.
+    """
     runner = prepare_minimax_h3_varlen_attention(
         query,
         key,
@@ -1524,6 +1607,16 @@ def minimax_h3_varlen_nvfp4_attention(
     cu_seqlens_host: Optional[Sequence[int]] = None,
     backend: str = "cake",
 ) -> torch.Tensor:
+    """NVFP4 packed-varlen attention in one call: plan, quantize, attend.
+
+    Every call plans from ``cu_seqlens`` and allocates the packed operand
+    workspace.  Without ``cu_seqlens_host`` the int32 CUDA tensor is read
+    back to the host first (one stream synchronization); pass
+    ``cu_seqlens_host`` to plan without any device synchronization.  For
+    repeated launches of one problem or CUDA Graph capture prepare once
+    with :func:`prepare_minimax_h3_varlen_nvfp4_attention` (optionally
+    with a caller-owned ``workspace``) and call the runner.
+    """
     runner = prepare_minimax_h3_varlen_nvfp4_attention(
         query,
         key,

@@ -2,8 +2,10 @@
 #include "batch_attention_config.inc"
 
 namespace flashinfer {
+{% for equal_kv_strides in equal_kv_strides_values %}
 template cudaError_t BatchPagedAttentionPersistent<
     /*CTA_TILE_Q_1=*/128, /*CTA_TILE_Q_2=*/16, {{head_dim_qk}}, {{head_dim_vo}}, {{mask_mode}},
-    {{ variant_name }}, PersistentParams>(const PersistentParams params_1, const PersistentParams params_2,
+    /*EQUAL_KV_STRIDES=*/{{ equal_kv_strides }}, {{ variant_name }}, PersistentParams>(const PersistentParams params_1, const PersistentParams params_2,
     const uint32_t num_blks_x, const uint32_t num_blks_y, const cudaStream_t stream);
+{% endfor %}
 };  // namespace flashinfer

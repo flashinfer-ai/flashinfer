@@ -275,9 +275,9 @@ class BatchMLAPagedAttentionWrapper:
             Caller-reserved ``int32`` buffer of shape ``[batch_size]`` for CSR
             KV lengths. Used only with CUDA graphs.
         backend : {"auto", "fa2", "fa3", "cutlass", "cutile", "trtllm-gen", "xqa", "cute-dsl", "cute-dsl-monolithic", "cute-dsl-modular"}
-            Requested policy or concrete backend. ``"auto"`` is resolved in
-            :meth:`plan`: SM100 orders supported backends using request facts;
-            other architectures use :func:`flashinfer.utils.determine_mla_backend`.
+            Requested policy or concrete backend. ``"auto"`` selects a backend
+            in :meth:`plan` based on architecture and request facts.
+            See ``_auto_policy.py``.
             Explicit requests remain strict; ``"cute-dsl"`` is a family alias.
             Compilation and selection finish before normal execution or capture.
             Canonical dense or CSR metadata is accepted; independent split query
@@ -622,7 +622,7 @@ class BatchMLAPagedAttentionWrapper:
             and scale_mode == "default"
             and not (
                 q_data_type == torch.float8_e4m3fn
-                and _get_compute_capability(self.device) == (10, 0)
+                and _get_compute_capability(self.device) in ((10, 0), (10, 3), (10, 7))
             )
         ):
             # Existing FP8 callers always supply CKV/KPE scales at run time.

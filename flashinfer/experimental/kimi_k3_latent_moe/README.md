@@ -32,18 +32,24 @@ passed as one `[2 * 6144/TP, 7168]` concatenation) + `RowParallel`
 | stage | tokens | program | launches |
 | --- | --- | --- | --- |
 | front | `T <= 128` | weight-streaming swapped-AB tcgen05 kernel (`decode:*`): 128-row weight tiles are the MMA A operand, the tokens the padded B operand (N in {8, 16, 32, 64, 128}), router / latent / shared SiTU tiles in one unified tile space; aligned 2-CTA cluster pairs when `2 x tiles` fits one wave (TP8), one CTA per tile otherwise (TP1) | 1 |
-| front | `T > 128` | persistent 2-CTA tcgen05 GEMM (`front:i<6144/TP>`), 256x256 pair tiles over the K-concatenated `[gate; down; shared_gate; shared_up]` rows with class-specific epilogues | 1 |
+| front | `T > 128` | persistent 2-CTA tcgen05 GEMM (`front:i<6144/TP>[e1]`; the `e1` instance streams the weights `evict_first` for `T <= 512`), 256x256 pair tiles over the K-concatenated `[gate; down; shared_gate; shared_up]` rows with class-specific epilogues; the trailing wave's tiles run as two aligned K halves with fp32 partials and a fixed-order fix-up when that fits one wave (`front_split_plan`) | 1 |
 | tail | `T <= 128` | the same streaming kernel with the KimiRMSNorm fused into the launch (`decode:*_f*`): the epilogue warps normalise the routed rows while the TMA warp streams the shared-down segment; for the smallest T the normalised rows are written straight into a resident smem B operand (`_sb`, staged rows `_rs`), larger T use the global `y_workspace` protocol | 1 |
 | tail | `T > 128` | one-pass RMSNorm kernel (`tail_norm:e<0|1>`, late / early PDL trigger chosen from the GEMM grid) + persistent 2-CTA GEMM (`tail_gemm:tp<1|8>`) over `[up slice | shared down]` with trailing-wave stream-K, launched programmatic-dependent | 2 |
 
 The host planner (`cake_backend.decode_front_plan`, `decode_tail_plan`,
-`prefill_tail_plan`, `split_plan`) is the Cake planner re-implemented; every
+`prefill_front_plan`, `front_split_plan`, `prefill_tail_plan`, `split_plan`) is the Cake planner re-implemented; every
 plan names its physical kernel through a logical key registered in
-`cake_jit.KERNELS[arch]`.  The plans were frozen for 148-SM devices (B200 /
-B300); `prepare_*` refuses other SM counts.  Nothing is planned per launch
-and nothing is allocated at launch (per-device scratch buffers are created at
-preparation), so a prepared runner (or a CUDA Graph capturing it) replays for
-new values written into the bound buffers.
+`cake_jit.KERNELS` (one program per key, compiled for both SM100a and SM103a
+from the same source; `cake_jit.SPECIALIZATIONS` adds the compile-line
+constants of keys that share a program, e.g. the TP1 / TP8 front and tail
+GEMMs).  Every token count from 1 to 16384, both tensor-parallel degrees and
+any number of routed partials resolve to a registered program.  The decode
+grids and stream-K plans are compiled for 148-SM devices (B200 / B300);
+`prepare_*` raises `NotImplementedError` for other SM counts.  Plans are
+memoised per shape, nothing is planned per launch and nothing is allocated at
+launch (per-device scratch buffers are created at preparation), so a prepared
+runner (or a CUDA Graph capturing it) replays for new values written into the
+bound buffers.
 
 ```python
 import torch

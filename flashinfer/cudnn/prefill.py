@@ -605,10 +605,11 @@ if CUDNN_AVAILABLE:
                 cudnn_cu_seq_lens_q.set_uid(UIDs.ACTUAL_SEQ_LENS_Q_UID.value)
 
                 padding_mask = True
-                # These kwargs need a newer cudnn-frontend than the declared
-                # >=1.13 floor (cu_seq_len_*: 1.25+; implementation /
-                # attention_implementation: 1.14+), so they are only mentioned
-                # on this path, which _cudnn_supports_direct_seqlens guards.
+                # These kwargs postdate cudnn-frontend 1.13 (cu_seq_len_*:
+                # 1.25+; implementation / attention_implementation: 1.14+). The
+                # declared >=1.30 floor covers both, but the runtime cuDNN
+                # backend version still gates this path, so they stay confined
+                # to it, which _cudnn_supports_direct_seqlens guards.
                 seq_len_kwargs = {
                     "cu_seq_len_q": cudnn_cu_seq_lens_q,
                     # cu_seq_lens are unified-engine-only; pin the

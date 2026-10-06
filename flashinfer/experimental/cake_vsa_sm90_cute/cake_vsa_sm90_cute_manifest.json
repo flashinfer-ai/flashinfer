@@ -326,6 +326,301 @@
           "O"
         ],
         [
+          "buffer",
+          "meta"
+        ],
+        [
+          "slots",
+          "hdr"
+        ],
+        [
+          "scalar",
+          "tile_stride"
+        ],
+        [
+          "scalar",
+          "seqlen_q"
+        ],
+        [
+          "scalar",
+          "seqlen_k"
+        ],
+        [
+          "scalar",
+          "scale_log2"
+        ],
+        [
+          "buffer",
+          "dbg"
+        ],
+        [
+          "buffer",
+          "tl"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "cluster_dims": [
+        1,
+        1,
+        1
+      ],
+      "compile_factory": "compile_program",
+      "dynamic_smem_bytes": 232192,
+      "entry": "launch_vsa_sm90_bf16_fwd",
+      "min_blocks": 1,
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
+        "hdr": {
+          "dtype": "i16",
+          "length": 1728,
+          "slots": 432
+        }
+      },
+      "path": "flashinfer/experimental/cake_vsa_sm90_cute/attention_queue.py",
+      "scalar_dtypes": {
+        "scale_log2": "float32",
+        "seqlen_k": "int32",
+        "seqlen_q": "int32",
+        "tile_stride": "int32"
+      },
+      "source_bytes": 738573,
+      "source_sha256": "7432909052738912dae75bf4a81e87f40bafd0549808705da229b5030f2ae0a0",
+      "stage": "attention_queue",
+      "symbol": "vsa_sm90_bf16_fwd",
+      "template": "vsa_sm90_bf16_fwd_queue",
+      "threads": 384,
+      "tma": {
+        "K": {
+          "allow_oob_box": [],
+          "box_shape": [
+            64,
+            64,
+            1
+          ],
+          "checks": [
+            {
+              "a": {
+                "a": {
+                  "index": -1,
+                  "leaf": "axis"
+                },
+                "b": 64,
+                "op": "floormod"
+              },
+              "b": 0,
+              "op": "eq"
+            }
+          ],
+          "dtype": "bfloat16",
+          "element_bits": 16,
+          "global_dim": [
+            64,
+            {
+              "index": 1,
+              "leaf": "outer"
+            },
+            {
+              "a": {
+                "index": -1,
+                "leaf": "axis"
+              },
+              "b": 64,
+              "op": "floordiv"
+            }
+          ],
+          "global_dim_text": [
+            "64",
+            "t.axis.outer(1)",
+            "t.axis[-1] // 64"
+          ],
+          "global_strides": [
+            {
+              "index": -2,
+              "leaf": "stride"
+            },
+            64
+          ],
+          "global_strides_text": [
+            "t.stride[-2]",
+            "64"
+          ],
+          "min_source_rank": 2,
+          "ndim": 3
+        },
+        "Q": {
+          "allow_oob_box": [],
+          "box_shape": [
+            64,
+            64,
+            2
+          ],
+          "checks": [
+            {
+              "a": {
+                "a": {
+                  "index": -1,
+                  "leaf": "axis"
+                },
+                "b": 64,
+                "op": "floormod"
+              },
+              "b": 0,
+              "op": "eq"
+            }
+          ],
+          "dtype": "bfloat16",
+          "element_bits": 16,
+          "global_dim": [
+            64,
+            {
+              "index": 1,
+              "leaf": "outer"
+            },
+            {
+              "a": {
+                "index": -1,
+                "leaf": "axis"
+              },
+              "b": 64,
+              "op": "floordiv"
+            }
+          ],
+          "global_dim_text": [
+            "64",
+            "t.axis.outer(1)",
+            "t.axis[-1] // 64"
+          ],
+          "global_strides": [
+            {
+              "index": -2,
+              "leaf": "stride"
+            },
+            64
+          ],
+          "global_strides_text": [
+            "t.stride[-2]",
+            "64"
+          ],
+          "min_source_rank": 2,
+          "ndim": 3
+        },
+        "Vt": {
+          "allow_oob_box": [],
+          "box_shape": [
+            64,
+            8,
+            8,
+            2
+          ],
+          "checks": [
+            {
+              "a": {
+                "a": {
+                  "index": 1,
+                  "leaf": "outer"
+                },
+                "b": 8,
+                "op": "floormod"
+              },
+              "b": 0,
+              "op": "eq"
+            },
+            {
+              "a": {
+                "a": {
+                  "index": -1,
+                  "leaf": "axis"
+                },
+                "b": 64,
+                "op": "floormod"
+              },
+              "b": 0,
+              "op": "eq"
+            }
+          ],
+          "dtype": "bfloat16",
+          "element_bits": 16,
+          "global_dim": [
+            64,
+            8,
+            {
+              "a": {
+                "index": 1,
+                "leaf": "outer"
+              },
+              "b": 8,
+              "op": "floordiv"
+            },
+            {
+              "a": {
+                "index": -1,
+                "leaf": "axis"
+              },
+              "b": 64,
+              "op": "floordiv"
+            }
+          ],
+          "global_dim_text": [
+            "64",
+            "8",
+            "t.axis.outer(1) // 8",
+            "t.axis[-1] // 64"
+          ],
+          "global_strides": [
+            {
+              "index": -2,
+              "leaf": "stride"
+            },
+            {
+              "a": {
+                "index": -2,
+                "leaf": "stride"
+              },
+              "b": 8,
+              "op": "mul"
+            },
+            64
+          ],
+          "global_strides_text": [
+            "t.stride[-2]",
+            "t.stride[-2] * 8",
+            "64"
+          ],
+          "min_source_rank": 2,
+          "ndim": 4
+        }
+      }
+    },
+    {
+      "arg_plan": [
+        [
+          "buffer",
+          "Q"
+        ],
+        [
+          "buffer",
+          "K"
+        ],
+        [
+          "buffer",
+          "Vt"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
           "slots",
           "plan"
         ],

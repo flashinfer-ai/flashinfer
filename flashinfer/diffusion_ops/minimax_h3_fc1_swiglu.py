@@ -34,9 +34,17 @@ from .cake_minimax_h3_sm120_quant_fc1_swiglu import (
 MINIMAX_H3_HIDDEN = 5376
 MINIMAX_H3_FFN = 14336
 MINIMAX_H3_FC1_ROWS = 2 * MINIMAX_H3_FFN  # [gate rows; up rows]
+# Production default AdaLN table row count (3 modulation rows x 3 timestep groups) used by the
+# tests and benchmarks.  It is NOT a validation bound: the operators accept ``[rows, 5376]``
+# tables with any ``rows >= 1`` and read the row count and row stride from the tensor.
 MINIMAX_H3_ADALN_ROWS = 9
+# Default RMSNorm epsilon of the checkpoint; ``eps`` is a runtime argument of the kernels.
 MINIMAX_H3_EPS = 1.0e-5
 MINIMAX_H3_MAX_ROWS = 1 << 24
+# AdaLN / gate tables are read with 16-byte vector loads: the row pitch must be a multiple of
+# 8 BF16 elements and the base pointer 16-byte aligned.
+_TABLE_ALIGN_ELEMENTS = 8
+_TABLE_ALIGN_BYTES = 16
 
 # GEMM tiling facts the host-side workspace sizing depends on.
 _BLOCK_M = 128
@@ -136,6 +144,45 @@ def _check_tensor(
         raise ValueError(f"{name} must be contiguous")
 
 
+def _check_table(value: torch.Tensor, name: str, device: torch.device) -> None:
+    """BF16 ``[rows, 5376]`` AdaLN / gate table with any ``rows >= 1`` and a 16-byte row pitch.
+
+    Column chunks of a wider projection (``stride(0) > 5376``) are accepted as they are; the
+    kernels read the row count and the row stride from the tensor."""
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if value.dtype != torch.bfloat16:
+        raise ValueError(f"{name} must be {torch.bfloat16}, got {value.dtype}")
+    if value.ndim != 2 or value.shape[1] != MINIMAX_H3_HIDDEN or value.shape[0] < 1:
+        raise ValueError(
+            f"{name} must have shape [rows >= 1, {MINIMAX_H3_HIDDEN}], got {tuple(value.shape)}"
+        )
+    if not value.is_cuda or value.device != device:
+        raise ValueError(f"{name} must be a CUDA tensor on {device}")
+    if value.stride(1) != 1:
+        raise ValueError(
+            f"{name} must have a unit last stride (stride(1) == 1), got strides "
+            f"{tuple(value.stride())}"
+        )
+    if value.stride(0) % _TABLE_ALIGN_ELEMENTS != 0:
+        raise ValueError(
+            f"{name} row pitch stride(0) = {value.stride(0)} elements must be a multiple of "
+            f"{_TABLE_ALIGN_ELEMENTS} elements ({_TABLE_ALIGN_BYTES} bytes)"
+        )
+    if value.data_ptr() % _TABLE_ALIGN_BYTES != 0:
+        raise ValueError(
+            f"{name} data pointer must be {_TABLE_ALIGN_BYTES}-byte aligned"
+        )
+
+
+def _check_index(
+    value: torch.Tensor, name: str, rows: int, device: torch.device
+) -> None:
+    """Contiguous int64 ``[M]`` table row per activation row (any int64 value is accepted; rows
+    with an index outside ``[0, table rows)`` are guarded on the device)."""
+    _check_tensor(value, name, (rows,), torch.int64, device)
+
+
 def _check_rows(x: torch.Tensor) -> int:
     if not isinstance(x, torch.Tensor) or x.ndim != 2:
         raise ValueError(f"x must be a rank-2 tensor [M, {MINIMAX_H3_HIDDEN}]")
@@ -154,25 +201,15 @@ def _check_norm_inputs(
     _check_tensor(
         x_norm_weight, "x_norm_weight", (MINIMAX_H3_HIDDEN,), torch.bfloat16, device
     )
-    _check_tensor(
-        adaln_scale,
-        "adaln_scale",
-        (MINIMAX_H3_ADALN_ROWS, MINIMAX_H3_HIDDEN),
-        torch.bfloat16,
-        device,
-    )
-    _check_tensor(
-        adaln_shift,
-        "adaln_shift",
-        (MINIMAX_H3_ADALN_ROWS, MINIMAX_H3_HIDDEN),
-        torch.bfloat16,
-        device,
-    )
-    _check_tensor(adaln_index, "adaln_index", (rows,), torch.int32, device)
-    if float(eps) != MINIMAX_H3_EPS:
+    _check_table(adaln_scale, "adaln_scale", device)
+    _check_table(adaln_shift, "adaln_shift", device)
+    if adaln_scale.shape[0] != adaln_shift.shape[0]:
         raise ValueError(
-            f"eps must be {MINIMAX_H3_EPS} (the validated MiniMax-H3 contract), got {eps}"
+            f"adaln_scale and adaln_shift must have the same row count, got "
+            f"{adaln_scale.shape[0]} and {adaln_shift.shape[0]}"
         )
+    _check_index(adaln_index, "adaln_index", rows, device)
+    float(eps)
     return rows, device
 
 
@@ -598,14 +635,15 @@ def minimax_h3_fc1_swiglu(
 
         n = BF16(RMSNorm_fp32(x, x_norm_weight, eps))                     # FP32 sum of squares, rsqrt
         a = BF16(n * BF16(1 + adaln_scale[idx]) + adaln_shift[idx])       # idx = adaln_index[row]
-        a[idx outside [0, 9)] = 0                                          # device-side guard
+        a[idx outside [0, rows)] = 0                                       # device-side guard
         h = BF16(a @ fc1_weight^T)                                         # FP32 accumulation
         y = BF16(BF16(silu(h[:, :14336])) * h[:, 14336:])
 
     ``fc1_weight`` is ``[28672, 5376]`` with the **gate rows first** (``[0, 14336)``) and the up
     rows second (``[14336, 28672)``).  Two kernels run on the current stream: a one-warp-per-row
     norm kernel that writes ``a`` into ``workspace`` and a persistent 2-CTA tcgen05 GEMM with the
-    fused SwiGLU epilogue.
+    fused SwiGLU epilogue.  The AdaLN operands are the engine's own tensors (column-chunk table
+    views, int64 indices); nothing is copied on the host.
 
     Parameters
     ----------
@@ -614,9 +652,14 @@ def minimax_h3_fc1_swiglu(
     x_norm_weight : torch.Tensor
         ``bfloat16`` ``[5376]`` RMSNorm weight.
     adaln_scale, adaln_shift : torch.Tensor
-        ``bfloat16`` ``[9, 5376]`` AdaLN tables.
+        ``bfloat16`` ``[rows, 5376]`` AdaLN tables with the same ``rows >= 1``.  ``stride(1)``
+        must be ``1``; ``stride(0)`` may exceed ``5376`` (for example ``6 * 5376`` for a column
+        chunk of the engine's ``[rows, 6 * 5376]`` modulation projection) and must be a multiple
+        of 8 elements (16 bytes); the data pointer must be 16-byte aligned.  The tensors are
+        passed to the kernel as they are, with their row count and row stride.
     adaln_index : torch.Tensor
-        ``int32`` ``[M]`` table row per activation row.
+        Contiguous ``int64`` ``[M]`` table row per activation row.  Values in ``[0, rows)``
+        select a table row; any other int64 value makes the modulated activation row zero.
     fc1_weight : torch.Tensor
         Contiguous ``bfloat16`` ``[28672, 5376]`` fused FC1 weight (gate rows then up rows).
     out : Optional[torch.Tensor]
@@ -625,7 +668,7 @@ def minimax_h3_fc1_swiglu(
         Optional caller-owned ``bfloat16`` ``[M, 5376]`` scratch that receives ``a`` (allocated
         when omitted).
     eps : float
-        RMSNorm epsilon; must equal ``1e-5`` (the validated contract).
+        RMSNorm epsilon (runtime argument).
 
     Returns
     -------
@@ -786,8 +829,8 @@ def minimax_h3_fc1_swiglu_nvfp4(
     so ``fc1_weight_q`` / ``fc1_scale_tiles`` must come from :func:`prepare_minimax_h3_fc1_weight_nvfp4`
     run on the same device architecture.  On SM120 ``workspace_sf`` receives dense row-major
     ``[M, 336]`` scales in its first ``M * 336`` bytes (a buffer sized by
-    :func:`nvfp4_activation_scale_workspace_bytes` is always large enough) and ``eps`` may be any
-    positive value.
+    :func:`nvfp4_activation_scale_workspace_bytes` is always large enough); the SM120 route keeps
+    its own operand contract (``[9, 5376]`` contiguous tables, ``int32`` indices).
 
     The norm kernel computes the BF16 modulated activation ``a`` and quantizes it with FlashInfer's
     :func:`~flashinfer.nvfp4_quantize` recipe (``cvt_warp_fp16_to_fp4``): per 16 consecutive K

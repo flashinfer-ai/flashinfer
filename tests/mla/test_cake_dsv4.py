@@ -123,7 +123,7 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
         pytest.param(
             torch.float8_e4m3fn, 64, 3, 5, True, 260, 2, "fp8_lowhead_h64", id="case-08"
         ),
-        # CAKE-624 W14: FP8/H64 rows admitted to the persistent body with >= 128
+        # FP8/H64 rows admitted to the persistent body with >= 128
         # tokens (dense 2 x 64) run the single-CTA M64 program; 127 tokens keep
         # the FP8/H128 persistent program.
         pytest.param(
@@ -134,7 +134,7 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             False,
             260,
             2,
-            "fp8_h64_prefill_source_persistent_m64",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
             id="w14-h64-w260-128tok",
         ),
         pytest.param(
@@ -1025,9 +1025,9 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
         ),
         # FP8/H64 many-token rows (dense 3 x 64 = 192 query tokens) with
         # >= 2 complete sparse tiles take the persistent FP8 body on both
-        # targets (CAKE-624 W10: the cluster producers sat at 0.19-0.79x
+        # targets (the cluster producers sat at 0.19-0.79x
         # vs trtllm-gen from 64 tokens on); from 128 tokens the H64-specific
-        # single-CTA M64 program (CAKE-624 W14).
+        # single-CTA M64 program.
         pytest.param(
             torch.float8_e4m3fn,
             64,
@@ -1036,7 +1036,7 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             False,
             640,
             64,
-            "fp8_h64_prefill_source_persistent_m64",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
             id="h64-w640-192tok",
         ),
         pytest.param(
@@ -1047,11 +1047,11 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             False,
             388,
             2,
-            "fp8_h64_prefill_source_persistent_m64",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
             id="h64-w388-192tok",
         ),
-        # Off-contract low-head width beyond three sparse tiles keeps the
-        # two-partition producer + reducer path.
+        # Off-contract low-head width beyond the three sparse tiles one
+        # producer partition owns: no kernel is exported, rejected up front.
         pytest.param(
             torch.float8_e4m3fn,
             32,
@@ -1060,26 +1060,43 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             True,
             640,
             64,
-            "fp8_lowhead_split",
-            id="lowhead-w640-split",
+            ValueError,
+            id="lowhead-w640-rejected",
+        ),
+        # BF16 H8/H16 rows with a compressed cache outside the source-exact
+        # shape lock have no kernel either.
+        pytest.param(
+            torch.bfloat16,
+            16,
+            8,
+            8,
+            True,
+            260,
+            2,
+            ValueError,
+            id="bf16-h16-compressed-rejected",
         ),
     ],
 )
 def test_cake_dsv4_semantic_routes(
     dtype, num_heads, batch_size, max_q_len, ragged, sparse_topk, page_size, expected
 ):
-    for arch in ("sm_100a", "sm_103a"):
-        assert _route(
-            arch=arch,
-            dtype=dtype,
-            num_heads=num_heads,
-            batch_size=batch_size,
-            max_q_len=max_q_len,
-            ragged=ragged,
-            sparse_topk=sparse_topk,
-            compressed_page_size=page_size,
-            num_query_tokens=_canonical_query_tokens(batch_size, max_q_len, ragged),
-        ) == (expected[arch] if isinstance(expected, dict) else expected)
+    kwargs = dict(
+        dtype=dtype,
+        num_heads=num_heads,
+        batch_size=batch_size,
+        max_q_len=max_q_len,
+        ragged=ragged,
+        sparse_topk=sparse_topk,
+        compressed_page_size=page_size,
+        num_query_tokens=_canonical_query_tokens(batch_size, max_q_len, ragged),
+    )
+    if expected is ValueError:
+        # Shapes without an exported kernel are rejected before any launch.
+        with pytest.raises(ValueError, match="has no .* kernel"):
+            _route(**kwargs)
+    else:
+        assert _route(**kwargs) == expected
 
 
 @pytest.mark.parametrize(
@@ -1093,7 +1110,8 @@ def test_cake_dsv4_semantic_routes(
         (512, 128, None, "bf16_h128_prefill_v42"),  # hardening-000035
         # topk4x rows: split5 / single owner at 12 tokens, persistent prefill body from 64 tokens.
         (12, 1152, 64, "bf16_h128_topk4x_v52"),
-        (12, 640, 64, "bf16_h128_topk128x"),
+        # Width 640 below the token bound has no H128 kernel: rejected up front.
+        (12, 640, 64, ValueError),
         (64, 640, 64, "bf16_h128_prefill_v42"),  # hardening-000021
         (512, 640, 64, "bf16_h128_prefill_v42"),  # hardening-000037
         # topk128x rows keep their own rule (W12), whatever the token count.
@@ -1103,21 +1121,21 @@ def test_cake_dsv4_semantic_routes(
 def test_bf16_h128_swa_and_topk4x_rows_use_the_persistent_prefill_body_from_64_tokens(
     num_query_tokens, sparse_topk, page_size, expected
 ):
-    for arch in ("sm_100a", "sm_103a"):
-        assert (
-            _route(
-                arch=arch,
-                dtype=torch.bfloat16,
-                num_heads=128,
-                batch_size=64,
-                max_q_len=8,
-                ragged=True,
-                sparse_topk=sparse_topk,
-                compressed_page_size=page_size,
-                num_query_tokens=num_query_tokens,
-            )
-            == expected
-        )
+    kwargs = dict(
+        dtype=torch.bfloat16,
+        num_heads=128,
+        batch_size=64,
+        max_q_len=8,
+        ragged=True,
+        sparse_topk=sparse_topk,
+        compressed_page_size=page_size,
+        num_query_tokens=num_query_tokens,
+    )
+    if expected is ValueError:
+        with pytest.raises(ValueError, match="has no BF16 H128 kernel"):
+            _route(**kwargs)
+    else:
+        assert _route(**kwargs) == expected
 
 
 @pytest.mark.parametrize(
@@ -1139,21 +1157,19 @@ def test_bf16_h128_swa_and_topk4x_rows_use_the_persistent_prefill_body_from_64_t
 def test_fp8_h128_rows_all_use_the_persistent_body(
     num_query_tokens, page_size, sparse_topk, expected
 ):
-    for arch in ("sm_100a", "sm_103a"):
-        assert (
-            _route(
-                arch=arch,
-                dtype=torch.float8_e4m3fn,
-                num_heads=128,
-                batch_size=8,
-                max_q_len=8,
-                ragged=True,
-                sparse_topk=sparse_topk,
-                compressed_page_size=page_size,
-                num_query_tokens=num_query_tokens,
-            )
-            == expected
+    assert (
+        _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=128,
+            batch_size=8,
+            max_q_len=8,
+            ragged=True,
+            sparse_topk=sparse_topk,
+            compressed_page_size=page_size,
+            num_query_tokens=num_query_tokens,
         )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -1174,21 +1190,19 @@ def test_fp8_h128_rows_all_use_the_persistent_body(
 def test_bf16_h64_compressed_rows_use_the_prefill_body_from_24_tokens(
     num_query_tokens, page_size, sparse_topk, expected
 ):
-    for arch in ("sm_100a", "sm_103a"):
-        assert (
-            _route(
-                arch=arch,
-                dtype=torch.bfloat16,
-                num_heads=64,
-                batch_size=8,
-                max_q_len=8,
-                ragged=True,
-                sparse_topk=sparse_topk,
-                compressed_page_size=page_size,
-                num_query_tokens=num_query_tokens,
-            )
-            == expected
+    assert (
+        _route(
+            dtype=torch.bfloat16,
+            num_heads=64,
+            batch_size=8,
+            max_q_len=8,
+            ragged=True,
+            sparse_topk=sparse_topk,
+            compressed_page_size=page_size,
+            num_query_tokens=num_query_tokens,
         )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -1206,21 +1220,19 @@ def test_bf16_h64_compressed_rows_use_the_prefill_body_from_24_tokens(
 def test_fp8_prefill_keeps_batch_and_cache_layout_predicates(
     num_heads, batch_size, page_size, expected
 ):
-    for arch in ("sm_100a", "sm_103a"):
-        assert (
-            _route(
-                arch=arch,
-                dtype=torch.float8_e4m3fn,
-                num_heads=num_heads,
-                batch_size=batch_size,
-                max_q_len=257,
-                ragged=True,
-                sparse_topk=640 if num_heads == 64 else 1152,
-                compressed_page_size=page_size,
-                num_query_tokens=batch_size * 257,
-            )
-            == expected
+    assert (
+        _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=num_heads,
+            batch_size=batch_size,
+            max_q_len=257,
+            ragged=True,
+            sparse_topk=640 if num_heads == 64 else 1152,
+            compressed_page_size=page_size,
+            num_query_tokens=batch_size * 257,
         )
+        == expected
+    )
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
@@ -1253,13 +1265,23 @@ def _combined_metadata(rows: int, compressed: int, *, value_base: int = 0):
     return table, lens
 
 
+# Tensors run_cake_dsv4 places in the host value table that a generated TMA
+# descriptor may alias (see cake._TMA_SOURCE_ALIASES).
+_HOST_TMA_SOURCE_TENSORS = frozenset({"Q", "SWA_cache", "compressed_KV_cache", "O"})
+
+
 @pytest.mark.parametrize("arch", _ARCHES)
 def test_registered_arg_plans_use_known_names(arch):
     """Every generated argument is either bindable by name or a documented retired name."""
     unknown = []
+    unaliased_tma = []
     for variant, spec in _ARCH_REGISTRATIONS[arch]["variants"].items():
         for kind, name in spec["arg_plan"]:
             canonical = cake.canonical_arg_name(kind, name)
+            if kind == "tma_buffer" and canonical not in _HOST_TMA_SOURCE_TENSORS:
+                # A descriptor name the host binds only by vocabulary would still
+                # fail at launch: ``_bind_argument`` needs a tensor value for it.
+                unaliased_tma.append((variant, name, canonical))
             if (
                 cake.is_bindable_arg(kind, name)
                 or canonical in cake._RETIRED_ARG_REASONS
@@ -1267,6 +1289,7 @@ def test_registered_arg_plans_use_known_names(arch):
                 continue
             unknown.append((variant, kind, name))
     assert unknown == []
+    assert unaliased_tma == []
 
 
 _PUBLIC_COMPILE_FLAGS = {
@@ -1301,27 +1324,17 @@ def test_registered_compile_flags_are_public(arch):
             assert pin not in flags, variant
 
 
-@pytest.mark.parametrize("arch", _ARCHES)
-def test_program_signatures_use_known_names(arch):
-    unknown = []
-    for program_id, spec in _ARCH_REGISTRATIONS[arch]["programs"].items():
-        signature = spec["signature"]
-        for kind, names in (
-            ("buffer", signature["tensor_keys"]),
-            ("workspace", signature["workspace_keys"]),
-            ("parameter", signature["scalar_names"]),
-        ):
-            for name in names:
-                if not cake.is_bindable_arg(kind, name):
-                    unknown.append((program_id, kind, name))
-    assert unknown == []
-
-
 def test_metadata_param_vocabulary_is_bindable():
     for name in KERNEL_METADATA_PARAMS:
         kind = "buffer" if name.endswith(("indices", "lens")) else "parameter"
         assert cake.is_bindable_arg(kind, name), name
-    for tma_name in ("tmap_q", "tmap_swa_k", "tmap_swa_kv", "tmap_compressed_v"):
+    for tma_name in (
+        "tmap_q",
+        "tmap_swa_k",
+        "tmap_swa_kv",
+        "tmap_compressed_v",
+        "tmap_o",
+    ):
         assert cake.is_bindable_arg("tma_buffer", tma_name)
     assert cake.canonical_arg_name("parameter", "num_q_heads") == "num_heads"
     assert cake.canonical_arg_name("parameter", "num_split") == "num_splits"
@@ -1376,8 +1389,20 @@ def _install_fake_variants(monkeypatch, plans, *, tma_bytes=384):
             else 0,
         }
 
+    class _Sequence:
+        """Stand-in for the run_sequence host helper: calls each launcher in order."""
+
+        @staticmethod
+        def run_sequence(*flat):
+            i = 0
+            while i < len(flat):
+                fn, count = flat[i], flat[i + 1]
+                fn(*flat[i + 2 : i + 2 + count])
+                i += 2 + count
+
     monkeypatch.setattr(jit, "get_cake_dsv4_spec", fake_spec)
     monkeypatch.setattr(cake, "_variant_module", lambda variant, *, arch: recorder)
+    monkeypatch.setattr(cake, "_sequence_module", lambda: _Sequence)
     return recorder
 
 
@@ -1399,9 +1424,7 @@ def test_launch_variant_binds_by_name_with_fake_arg_plan(monkeypatch):
         "num_heads": 64,
         **meta.kernel_kwargs(),
     }
-    cake._launch_variant(
-        "fake", arch="sm_103a", grid=(7, 2, 1), workspace_raw=raw, values=values
-    )
+    cake._launch_variant("fake", arch="sm_103a", grid=(7, 2, 1), values=values)
     (args,) = recorder.calls
     assert len(args) == len(_FAKE_PLAN)
     bound = dict(zip((name for _, name in _FAKE_PLAN), args, strict=True))
@@ -1420,10 +1443,90 @@ def test_launch_variant_binds_by_name_with_fake_arg_plan(monkeypatch):
     assert bound["num_q_heads"] == 64
     assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (7, 2, 1)
     slab = bound["tma_descriptor_workspace"]
-    assert slab.data_ptr() == raw.data_ptr()
     assert slab.numel() == cake._DESCRIPTOR_SLAB_BYTES
     assert slab.data_ptr() % 128 == 0
     assert all(isinstance(bound[n], int) for n in ("sparse_topk", "grid_x"))
+    # Descriptor storage follows the TMA source geometry: the same tensors reuse
+    # it, another KV cache of the same shape gets its own, and the storage is
+    # private (not carved from the caller's workspace).
+    assert not (raw.data_ptr() <= slab.data_ptr() < raw.data_ptr() + raw.numel())
+    cake._launch_variant("fake", arch="sm_103a", grid=(7, 2, 1), values=values)
+    assert recorder.calls[-1][11] is slab
+    other = torch.empty((32, 512), dtype=torch.bfloat16)
+    cake._launch_variant(
+        "fake",
+        arch="sm_103a",
+        grid=(7, 2, 1),
+        values={**values, "compressed_KV_cache": other},
+    )
+    assert recorder.calls[-1][11] is not slab
+
+
+def test_descriptor_storage_pool_is_bounded_and_capture_safe(monkeypatch):
+    """Eager descriptor sets share a bounded pool; captured sets are retained."""
+    recorder = _install_fake_variants(monkeypatch, {"fake": _FAKE_PLAN})
+    rows, compressed = 3, 132
+    table, lens = _combined_metadata(rows, compressed)
+    meta = resolve_cake_dsv4_sparse_metadata(table, lens, query_rows=rows)
+    q = torch.empty((rows, 64, 512), dtype=torch.bfloat16)
+    swa = torch.empty((16, 512), dtype=torch.bfloat16)
+    base_values = {
+        "Q": q,
+        "SWA_cache": swa,
+        "O": torch.empty((rows, 64, 512), dtype=torch.bfloat16),
+        "num_heads": 64,
+        **meta.kernel_kwargs(),
+    }
+    caches = [torch.empty((32, 512), dtype=torch.bfloat16) for _ in range(5)]
+    pool_key = ("fake", "sm_103a", q.device)
+    cake._descriptor_pools.pop(pool_key, None)
+    monkeypatch.setattr(cake, "_DESCRIPTOR_POOL_CAPACITY", 2)
+    monkeypatch.setattr(cake, "_is_capturing", lambda device: False)
+
+    def launch(cache):
+        cake._launch_variant(
+            "fake",
+            arch="sm_103a",
+            grid=(7, 2, 1),
+            values={**base_values, "compressed_KV_cache": cache},
+        )
+        return recorder.calls[-1][11]
+
+    s0, s1 = launch(caches[0]), launch(caches[1])
+    assert s0.data_ptr() != s1.data_ptr()
+    assert launch(caches[0]) is s0  # hit: no reassignment
+    s2 = launch(
+        caches[2]
+    )  # pool full: the least recently used storage (s1) is reassigned
+    assert s2 is s1
+    assert launch(caches[0]) is s0
+    assert launch(caches[1]) is s2  # cache 2 was least recently used
+    pool = cake._descriptor_pools[pool_key]
+    assert len(pool.live) == 2 and not pool.captured
+    distinct = {s.tensor.data_ptr() for s in pool.live.values()}
+    assert distinct == {s0.data_ptr(), s1.data_ptr()}
+
+    # Capture: a resident set is retained for the process lifetime, a new one is
+    # refused before any allocation or binding call.
+    monkeypatch.setattr(cake, "_is_capturing", lambda device: True)
+    calls = len(recorder.calls)
+    with pytest.raises(RuntimeError, match="before capture"):
+        launch(caches[3])
+    assert len(recorder.calls) == calls and len(pool.live) == 2
+    assert launch(caches[0]) is s0
+    assert set(pool.captured) and len(pool.live) == 1
+    monkeypatch.setattr(cake, "_is_capturing", lambda device: False)
+    churned = {launch(c).data_ptr() for c in caches[1:] for _ in range(2)}
+    assert s0.data_ptr() not in churned  # the captured storage is never reassigned
+    assert len(pool.live) <= 2 and len(pool.captured) == 1
+    assert launch(caches[0]) is s0
+    # The pool allocated exactly capacity + captured storages.
+    all_storages = {s.tensor.data_ptr() for s in pool.live.values()}
+    all_storages |= {s.tensor.data_ptr() for s in pool.captured.values()}
+    all_storages |= {s.tensor.data_ptr() for s in pool.spare}
+    assert len(all_storages) == 3
+    cake._descriptor_pools.pop(pool_key, None)
+    assert recorder.calls[-1][11].numel() == cake._DESCRIPTOR_SLAB_BYTES
 
 
 def test_launch_variant_reports_unknown_retired_and_unavailable_names(monkeypatch):
@@ -1460,7 +1563,6 @@ def test_launch_variant_reports_unknown_retired_and_unavailable_names(monkeypatc
         ],
     }
     recorder = _install_fake_variants(monkeypatch, plans, tma_bytes=4096)
-    raw = _aligned_u8(cake._PARTIAL_OFFSET)
     table, lens = _combined_metadata(2, 4)
     combined = resolve_cake_dsv4_sparse_metadata(table, lens, query_rows=2)
     separate = resolve_cake_dsv4_sparse_metadata(
@@ -1471,9 +1573,7 @@ def test_launch_variant_reports_unknown_retired_and_unavailable_names(monkeypatc
     )
 
     def launch(variant, **values):
-        cake._launch_variant(
-            variant, arch="sm_103a", grid=(1, 1, 1), workspace_raw=raw, values=values
-        )
+        cake._launch_variant(variant, arch="sm_103a", grid=(1, 1, 1), values=values)
 
     with pytest.raises(ValueError, match="retired argument 'completion_base'"):
         launch("retired", completion_base=0)
@@ -1498,11 +1598,7 @@ def test_launch_variant_reports_unknown_retired_and_unavailable_names(monkeypatc
         )
     with pytest.raises(ValueError, match="three positive ints"):
         cake._launch_variant(
-            "legacy",
-            arch="sm_103a",
-            grid=(0, 1, 1),
-            workspace_raw=raw,
-            values={"sparse_indices": table},
+            "legacy", arch="sm_103a", grid=(0, 1, 1), values={"sparse_indices": table}
         )
 
 
@@ -1551,7 +1647,6 @@ def _run_fake_dense_h64(monkeypatch, *, query_rows, metadata, workspace, out=Non
         },
     )
     monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
-    monkeypatch.setattr(cake, "_stream_ptr", lambda device: 0)
     num_heads = 64
     query = torch.zeros((query_rows, num_heads, 512), dtype=torch.bfloat16)
     if out is None:
@@ -1613,8 +1708,14 @@ def test_run_cake_dsv4_binds_uniform_metadata_and_prefix_views(monkeypatch):
     # Grids derive from metadata rows, not query rows.
     assert (m["grid_x"], m["grid_y"], m["grid_z"]) == (rows * num_splits * 2, 1, 1)
     assert (r["grid_x"], r["grid_y"], r["grid_z"]) == (rows, 64, 1)
-    # Workspace carve at the documented offsets.
-    assert m["tma_descriptor_workspace"].data_ptr() == workspace.data_ptr()
+    # Private descriptor storage; partial buffers carved at the documented offsets.
+    slab = m["tma_descriptor_workspace"]
+    assert slab.numel() == cake._DESCRIPTOR_SLAB_BYTES and slab.data_ptr() % 128 == 0
+    assert not (
+        workspace.data_ptr()
+        <= slab.data_ptr()
+        < workspace.data_ptr() + workspace.numel()
+    )
     assert m["partial_O"].data_ptr() == workspace.data_ptr() + layout.partial_o[0]
     assert m["partial_O"].dtype == torch.bfloat16
     assert m["partial_O"].numel() == rows * 64 * num_splits * 512
@@ -1770,7 +1871,7 @@ def test_counter_initialisation_refused_during_capture(monkeypatch):
     workspace = _aligned_u8(cake._PARTIAL_OFFSET)
     workspace.fill_(0xAB)
     launcher = cake._Launcher(
-        arch="sm_103a", workspace=workspace, raw=workspace, stream=0, values={}
+        arch="sm_103a", workspace=workspace, raw=workspace, values={}
     )
     monkeypatch.setattr(cake, "_is_capturing", lambda device: True)
     with pytest.raises(RuntimeError, match="cake_dsv4_workspace_reset"):
@@ -1784,7 +1885,6 @@ def test_counter_initialisation_refused_during_capture(monkeypatch):
         arch="sm_103a",
         workspace=_aligned_u8(cake._PARTIAL_OFFSET),
         raw=None,
-        stream=0,
         values={},
     )
     eager.raw = eager.workspace
@@ -2000,7 +2100,6 @@ def _run_fake_persistent_fp8_h128(monkeypatch, *, cum_seq_lens_q, max_q_len):
         monkeypatch, {"fp8_h128_prefill_source_persistent_uniform": _PERSISTENT_PLAN}
     )
     monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
-    monkeypatch.setattr(cake, "_stream_ptr", lambda device: 0)
     rows, compressed = 6, 512
     table, lens = _combined_metadata(rows, compressed)
     workspace = _aligned_u8(
@@ -2050,129 +2149,61 @@ def test_persistent_route_synthesizes_dense_query_offsets(monkeypatch):
     assert torch.equal(ragged["cum_seq_lens_q"], indptr) and ragged["max_q_len"] == 3
 
 
-_FP8_SPLIT_PRODUCER_PLAN = _plan(
-    ("tma_buffer", "tmap_q"),
-    ("tma_buffer", "tmap_swa_kv"),
-    ("tma_buffer", "tmap_compressed_kv"),
-    ("buffer", "O"),
-    ("buffer", "partial_lse"),
-    ("buffer", "swa_indices"),
-    ("buffer", "compressed_indices"),
-    ("buffer", "sparse_topk_lens"),
-    ("buffer", "sinks"),
-    ("buffer", "bmm1_scale"),
-    ("buffer", "bmm2_scale"),
-    ("parameter", "num_heads"),
-    ("parameter", "swa_index_stride"),
-    ("parameter", "compressed_index_stride"),
-    ("parameter", "sparse_topk_lens_offset"),
-    ("parameter", "num_query_tokens"),
-    ("parameter", "sparse_topk"),
-    ("parameter", "has_sinks"),
-    ("parameter", "total_work_items"),
-)
-_FP8_SPLIT_REDUCE_PLAN = _plan(
-    ("buffer", "partial_O"),
-    ("buffer", "partial_lse"),
-    ("buffer", "O"),
-    ("parameter", "num_q_heads"),
-    ("parameter", "num_split"),
-)
-
-
-def test_fp8_split_producer_writes_partials_through_o(monkeypatch):
-    """fp8_lowhead_split's ``O`` is the [tokens, heads, 2, 512] partial buffer."""
-    recorder = _install_fake_variants(
-        monkeypatch,
-        {
-            "fp8_lowhead_split": _FP8_SPLIT_PRODUCER_PLAN,
-            "split_reduce": _FP8_SPLIT_REDUCE_PLAN,
-        },
-    )
-    monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
-    monkeypatch.setattr(cake, "_stream_ptr", lambda device: 0)
-    # Width 128 + 512 = 640 = 5 sparse tiles: beyond the three tiles one
-    # partition owns, so the two-partition producer + reducer path is taken.
-    rows, compressed, heads = 4, 512, 32
-    table, lens = _combined_metadata(rows, compressed)
-    workspace = _aligned_u8(
-        get_cake_dsv4_workspace_bytes(
-            rows, heads, 128 + compressed, torch.float8_e4m3fn
-        )
-    )
-    out = torch.zeros((rows, heads, 512), dtype=torch.bfloat16)
-    cake.run_cake_dsv4(
-        query=torch.zeros((rows, heads, 512), dtype=torch.float8_e4m3fn),
-        swa_kv_cache=torch.zeros((4, 1, 256, 512), dtype=torch.float8_e4m3fn),
-        compressed_kv_cache=torch.zeros((8, 1, 64, 512), dtype=torch.float8_e4m3fn),
-        workspace_buffer=workspace,
-        out=out,
-        bmm1_scale=0.5,
-        bmm2_scale=1.0,
-        sinks=None,
-        max_q_len=2,
-        cum_seq_lens_q=None,
-        seq_lens=torch.full((2,), 1000, dtype=torch.int32),
-        backend="cake",
-        sparse_indices=table,
-        sparse_topk_lens=lens,
-    )
-    producer, reduce = recorder.calls
-    m = dict(zip((name for _, name in _FP8_SPLIT_PRODUCER_PLAN), producer, strict=True))
-    r = dict(zip((name for _, name in _FP8_SPLIT_REDUCE_PLAN), reduce, strict=True))
-    layout = cake_dsv4_workspace_layout(rows, heads, 2)
-    assert m["O"].data_ptr() == workspace.data_ptr() + layout.partial_o[0]
-    assert m["O"].numel() == rows * heads * 2 * 512 and m["O"].dtype == torch.bfloat16
-    assert m["partial_lse"].data_ptr() == workspace.data_ptr() + layout.partial_lse[0]
-    assert m["total_work_items"] == rows * 2
-    assert (m["grid_x"], m["grid_y"], m["grid_z"]) == (rows * 2 * 2, 1, 1)
-    assert r["partial_O"].data_ptr() == m["O"].data_ptr()
-    assert r["partial_lse"].data_ptr() == m["partial_lse"].data_ptr()
-    assert r["O"].data_ptr() == out.data_ptr() and r["O"].numel() == out.numel()
-    assert r["num_split"] == 2 and r["num_q_heads"] == heads
-    assert (r["grid_x"], r["grid_y"], r["grid_z"]) == (rows, heads, 1)
-
-
 class _RecordingLauncher:
-    """Minimal stand-in for ``_Launcher`` that records program/variant selections."""
+    """Minimal stand-in for ``_Launcher`` that records the launched variants."""
 
     def __init__(self, arch: str, **values):
         self.arch = arch
         self.values = values
-        self.calls: list[tuple[str, str, dict]] = []
+        self.calls: list[tuple[str, dict]] = []
 
     def variant(self, name, *, grid, **overrides):
-        self.calls.append(("variant", name, {"grid": grid, **overrides}))
+        return (name, {"grid": grid, **overrides})
 
-    def program(self, name, **overrides):
-        self.calls.append(("program", name, overrides))
+    def run(self, *launches):
+        # Launches are recorded in the order the dispatcher issues them.
+        self.calls.extend(launches)
 
     def partials(self, num_splits):
-        return {"num_splits": num_splits}
+        return {
+            "partial_O": f"partial_O[{num_splits}]",
+            "partial_lse": f"partial_lse[{num_splits}]",
+            "num_splits": num_splits,
+        }
+
+    def counters(self, merge_groups):
+        return f"counters[{merge_groups}]"
+
+    def reduce(self, reducer, **overrides):
+        tokens = self.values["num_query_tokens"]
+        heads = self.values["num_heads"]
+        return self.variant(reducer, grid=(tokens, heads, 1), **overrides)
 
 
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("arch", _ARCHES)
 @pytest.mark.parametrize(
-    "num_query_tokens,sparse_topk,expected_program,expected_splits",
+    "num_query_tokens,sparse_topk,expected_producer,expected_splits",
     [
-        # Three live KV tiles run the four-owner program (fourth tile fully
+        # Three live KV tiles run the four-owner producer (fourth tile fully
         # masked): 14.8 -> 12.7 us on GB300, 15.7 -> 13.6 us on B200.
         (12, 260, "bf16_h128_topk128x_split4_sm100", 4),
         (16, 260, "bf16_h128_topk128x_split4_sm100", 4),
         (12, 388, "bf16_h128_topk128x_split4_sm100", 4),
         (16, 388, "bf16_h128_topk128x_split4_sm100", 4),
-        # CAKE-624 W12: above the token bound one row-first owner per token.
-        (17, 260, "bf16_h128_topk128x_row_first", 1),
-        (32, 260, "bf16_h128_topk128x_row_first", 1),  # hardening-000025
+        # Above the token bound one row-first owner per token; up to 37
+        # tokens the owner runs in the V-half split form (two 2-CTA clusters
+        # per token = grid 4 * tokens, identical bits).
+        (17, 260, "bf16_h128_topk128x_row_first_vsplit", 1),
+        (32, 260, "bf16_h128_topk128x_row_first_vsplit", 1),  # hardening-000025
+        (37, 260, "bf16_h128_topk128x_row_first_vsplit", 1),
+        (38, 260, "bf16_h128_topk128x_row_first", 1),
         (64, 260, "bf16_h128_topk128x_row_first", 1),  # hardening-000031
-        (32, 388, "bf16_h128_topk128x_row_first", 1),
+        (32, 388, "bf16_h128_topk128x_row_first_vsplit", 1),
         (64, 388, "bf16_h128_topk128x_row_first", 1),
-        (12, 640, "bf16_h128_topk128x", 1),
-        (64, 512, "bf16_h128_topk128x", 1),
     ],
 )
-def test_bf16_h128_topk128x_split_programs_dispatch_on_both_targets(
-    arch, num_query_tokens, sparse_topk, expected_program, expected_splits
+def test_bf16_h128_topk128x_launches_split4_or_row_first_owners(
+    arch, num_query_tokens, sparse_topk, expected_producer, expected_splits
 ):
     L = _RecordingLauncher(
         arch,
@@ -2181,16 +2212,127 @@ def test_bf16_h128_topk128x_split_programs_dispatch_on_both_targets(
         sparse_topk=sparse_topk,
     )
     cake._dispatch_route("bf16_h128_topk128x", L)
+    parts = L.partials(expected_splits)
+    if expected_splits == 1:
+        # The V-half split program runs two 2-CTA clusters per token; the
+        # plain row-first owner one.  total_work_items stays the token count.
+        ctas_per_token = 4 if expected_producer.endswith("_vsplit") else 2
+        assert L.calls == [
+            (
+                expected_producer,
+                {
+                    "grid": (ctas_per_token * num_query_tokens, 1, 1),
+                    "total_work_items": num_query_tokens,
+                    **parts,
+                },
+            )
+        ]
+        return
+    work_items = num_query_tokens * expected_splits
     assert L.calls == [
         (
-            "program",
-            expected_program,
+            expected_producer,
             {
-                "total_work_items": num_query_tokens * expected_splits,
-                "num_splits": expected_splits,
+                "grid": (2 * work_items, 1, 1),
+                "total_work_items": work_items,
+                **parts,
+                "O": parts["partial_O"],
             },
-        )
+        ),
+        ("split_reduce", {"grid": (num_query_tokens, 128, 1), **parts}),
     ]
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
+def test_bf16_h128_topk4x_launches_five_owners_and_the_split5_reducer(arch):
+    tokens = 12
+    L = _RecordingLauncher(
+        arch, num_query_tokens=tokens, num_heads=128, sparse_topk=1152
+    )
+    cake._dispatch_route("bf16_h128_topk4x_v52", L)
+    parts = L.partials(5)
+    assert L.calls == [
+        (
+            "bf16_h128_topk4x_v52",
+            {
+                "grid": (2 * tokens * 5, 1, 1),
+                "total_work_items": tokens * 5,
+                **parts,
+                "O": parts["partial_O"],
+            },
+        ),
+        # The sm_103a split-5 reducer launches one CTA per four heads, the
+        # sm_100a one per head (their former family libraries' grids).
+        (
+            "bf16_h128_split5_reduce",
+            {"grid": (tokens, 32 if arch == "sm_103a" else 128, 1), **parts},
+        ),
+    ]
+
+
+_SWEEP_WIDTHS = (
+    (128, 1),
+    (192, 64),
+    (256, 64),
+    (260, 2),
+    (384, 64),
+    (388, 2),
+    (512, 64),
+    (640, 64),
+    (1152, 64),
+)
+# (batch_size, max_q_len, ragged): decode, prefill, dense and ragged MTP rows.
+_SWEEP_QUERIES = (
+    (3, 5, True),
+    (2, 257, True),
+    (8, 8, True),
+    (1, 64, False),
+    (4, 128, False),
+    (1, 512, False),
+)
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
+def test_every_route_result_has_a_registered_kernel(monkeypatch, arch):
+    """``_route`` rejects a shape up front or dispatches only registered kernels."""
+    monkeypatch.setattr(cake, "_bf16_h128_prefill_num_clusters", lambda device: 74)
+    registered = set(_ARCH_REGISTRATIONS[arch]["variants"])
+    routed = rejected = 0
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        for num_heads in (8, 16, 32, 64, 128):
+            for sparse_topk, page_size in _SWEEP_WIDTHS:
+                for batch_size, max_q_len, ragged in _SWEEP_QUERIES:
+                    tokens = _canonical_query_tokens(batch_size, max_q_len, ragged)
+                    try:
+                        route = _route(
+                            dtype=dtype,
+                            num_heads=num_heads,
+                            max_q_len=max_q_len,
+                            ragged=ragged,
+                            sparse_topk=sparse_topk,
+                            batch_size=batch_size,
+                            compressed_page_size=page_size,
+                            num_query_tokens=tokens,
+                        )
+                    except ValueError:
+                        rejected += 1
+                        continue
+                    L = _RecordingLauncher(
+                        arch,
+                        Q=torch.empty(0),
+                        num_query_tokens=tokens,
+                        num_heads=num_heads,
+                        sparse_topk=sparse_topk,
+                        max_q_len=max_q_len,
+                        batch_size=batch_size,
+                    )
+                    cake._dispatch_route(route, L)
+                    launched = [name for name, _ in L.calls]
+                    assert launched, (arch, route)
+                    missing = [name for name in launched if name not in registered]
+                    assert missing == [], (arch, route, missing)
+                    routed += 1
+    assert routed > 0 and rejected > 0
 
 
 @pytest.mark.parametrize("clusters", [74, 76])
@@ -2210,7 +2352,7 @@ def test_bf16_h128_topk128x_split_programs_dispatch_on_both_targets(
 def test_bf16_h128_prefill_snake_feed_predicate(
     clusters, num_query_tokens, sparse_topk, expected
 ):
-    # CAKE-624 W17: mirrors the Cake seed's bf16_h128_prefill_uses_snake_feed.
+    # Mirrors the Cake seed's bf16_h128_prefill_uses_snake_feed.
     assert (
         cake._bf16_h128_prefill_uses_snake_feed(num_query_tokens, sparse_topk, clusters)
         is expected
@@ -2222,7 +2364,7 @@ def test_bf16_h128_prefill_snake_feed_predicate_full_rounds(clusters):
     assert cake._bf16_h128_prefill_uses_snake_feed(8 * clusters, 640, clusters) is False
 
 
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("arch", _ARCHES)
 @pytest.mark.parametrize(
     "num_query_tokens,sparse_topk,expected_program",
     [
@@ -2233,11 +2375,12 @@ def test_bf16_h128_prefill_snake_feed_predicate_full_rounds(clusters):
         (386, 1152, "bf16_h128_prefill_v42"),  # prefill-style-000088/92
     ],
 )
-def test_bf16_h128_prefill_launches_the_snake_program_for_tail_majority_rows(
+def test_bf16_h128_prefill_launches_the_snake_body_for_tail_majority_rows(
     monkeypatch, arch, num_query_tokens, sparse_topk, expected_program
 ):
-    # CAKE-624 W17: the route id stays bf16_h128_prefill_v42; only the launched
-    # program alias changes.  74 clusters = B200 (148 SMs).
+    # The route id stays bf16_h128_prefill_v42; only the launched body changes.
+    # 74 clusters = B200 (148 SMs); the persistent grid is one two-CTA cluster
+    # per item, at most one cluster per SM pair.
     monkeypatch.setattr(cake, "_bf16_h128_prefill_num_clusters", lambda device: 74)
     L = _RecordingLauncher(
         arch,
@@ -2249,9 +2392,12 @@ def test_bf16_h128_prefill_launches_the_snake_program_for_tail_majority_rows(
     cake._dispatch_route("bf16_h128_prefill_v42", L)
     assert L.calls == [
         (
-            "program",
             expected_program,
-            {"total_work_items": num_query_tokens, "num_splits": 1},
+            {
+                "grid": (min(2 * num_query_tokens, 148), 1, 1),
+                "total_work_items": num_query_tokens,
+                **L.partials(1),
+            },
         )
     ]
 
@@ -2272,14 +2418,14 @@ def test_bf16_h128_prefill_launches_the_snake_program_for_tail_majority_rows(
             128,
             2,
             260,
-            "fp8_h64_prefill_source_persistent_m64",
-        ),  # hardening-000022 (W14)
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        ),  # hardening-000022 (W14; multi-tile program)
         (
             512,
             2,
             260,
-            "fp8_h64_prefill_source_persistent_m64",
-        ),  # hardening-000034 (W14)
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        ),  # hardening-000034 (W14; multi-tile program)
         (
             64,
             None,
@@ -2304,18 +2450,69 @@ def test_bf16_h128_prefill_launches_the_snake_program_for_tail_majority_rows(
 def test_fp8_h64_rows_follow_the_persistent_body_rule(
     num_query_tokens, page_size, sparse_topk, expected
 ):
-    for arch in ("sm_100a", "sm_103a"):
-        assert (
-            _route(
-                arch=arch,
-                dtype=torch.float8_e4m3fn,
-                num_heads=64,
-                batch_size=8,
-                max_q_len=8,
-                ragged=True,
-                sparse_topk=sparse_topk,
-                compressed_page_size=page_size,
-                num_query_tokens=num_query_tokens,
-            )
-            == expected
+    assert (
+        _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=64,
+            batch_size=8,
+            max_q_len=8,
+            ragged=True,
+            sparse_topk=sparse_topk,
+            compressed_page_size=page_size,
+            num_query_tokens=num_query_tokens,
         )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("num_query_tokens", [128, 256, 512])
+@pytest.mark.parametrize(
+    "sparse_topk,page_size,expected",
+    [
+        # The M64 body is two exported programs selected by the item width:
+        # the box-K-gather program for single-tile items (the SWA tile is the
+        # whole item: hardening-000026 / 000032), the program without the box
+        # block for every wider item (hardening-000022 / 000028 / 000034 /
+        # 000038).  Same ABI, same bits.
+        (128, None, "fp8_h64_prefill_source_persistent_m64"),
+        (260, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (388, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (640, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (1152, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+    ],
+)
+def test_fp8_h64_m64_program_is_selected_by_the_item_width(
+    num_query_tokens, sparse_topk, page_size, expected
+):
+    assert (
+        _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=64,
+            batch_size=8,
+            max_q_len=8,
+            ragged=True,
+            sparse_topk=sparse_topk,
+            compressed_page_size=page_size,
+            num_query_tokens=num_query_tokens,
+        )
+        == expected
+    )
+    # Both M64 programs are ragged-only persistent routes with one CTA per token.
+    assert expected in cake._RAGGED_ONLY_ROUTES
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
+@pytest.mark.parametrize(
+    "route",
+    [
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile",
+    ],
+)
+def test_fp8_h64_m64_programs_launch_one_cta_per_token(arch, route):
+    tokens = 192
+    L = _RecordingLauncher(arch, num_query_tokens=tokens, num_heads=64, sparse_topk=388)
+    cake._dispatch_route(route, L)
+    assert L.calls == [
+        (route, {"grid": (tokens, 1, 1), "total_work_items": tokens, **L.partials(1)})
+    ]
