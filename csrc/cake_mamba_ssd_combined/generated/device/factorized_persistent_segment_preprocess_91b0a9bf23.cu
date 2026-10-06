@@ -298,6 +298,8 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
             }
         }
     }
+    int _shfl_0 = __shfl_sync(0xFFFFFFFF, segment_count, 0);
+    segment_count = _shfl_0;
     int total_tiles = segment_count * nheads;
     if (tile < total_tiles) {
         int start = 0;
