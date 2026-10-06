@@ -1484,6 +1484,16 @@ __device__ __forceinline__ void tmem_st16(int addr, const float (&v)[16]) {
 
 __device__ __forceinline__ void tmem_wait_st() { asm volatile("tcgen05.wait::st.sync.aligned;"); }
 
+// Generic-proxy st.shared (the staged Q, K/V tiles and P) is read by
+// tcgen05.mma through the async proxy, which a CTA barrier alone does not
+// order; each writer fences before the barrier that hands its tile to the
+// MMA issuer.  Without it, repeated split-1 calls at seq 8192 disagree with
+// the first in 51 / 96 of 3,000 (batch 64 / 128) on GR100 and 3 / 19 on B200;
+// with it, 0 of 3,000 on both.
+__device__ __forceinline__ void fence_proxy_async_smem() {
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
 __device__ __forceinline__ float ex2(float x) { return exp2f(x); }
 
 __device__ __forceinline__ float warp_max(float x) {
@@ -1869,6 +1879,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
     for (int i = 0; i < kHalf; ++i)
       if (!kTailAware || i < nsecond)
         load_raw<false>(k_data, k_scale, sPageOff[p0 + kHalf + i], addr, rk[i]);
+    fence_proxy_async_smem();
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
     if (warp == 0 && elect_sync()) {
@@ -1890,6 +1901,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
 #pragma unroll
     for (int i = 0; i < kHalf; ++i)
       if (!kTailAware || i < nfirst) load_raw<true>(v_data, v_scale, sPageOff[p0 + i], addr, rv[i]);
+    fence_proxy_async_smem();
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
     if ((!kTailAware || nsecond > 0) && warp == 0 && elect_sync()) {
@@ -2002,6 +2014,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
       }
       if (lane == 0 && c != 0) sAlpha[shead] = alpha;
     }
+    fence_proxy_async_smem();
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
@@ -2055,6 +2068,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
       mbarrier_wait(mbarA, phaseA);
       phaseA ^= 1;
     }
+    fence_proxy_async_smem();
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
