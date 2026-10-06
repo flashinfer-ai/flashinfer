@@ -290,6 +290,11 @@ def testGemmFp8NtGroupwise(args):
             remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm")
+    if "cutile" in backends and scale_major_mode != "K":
+        print(
+            "[INFO] cutile only supports K scale_major_mode, removing cutile from backends"
+        )
+        backends.remove("cutile")
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -324,6 +329,11 @@ def testGemmFp8NtGroupwise(args):
 
     a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
     b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+    # The trtllm backend takes the b scale transposed relative to cutlass.
+    b_scales = {
+        backend: b_scale.t().contiguous() if backend == "trtllm" else b_scale
+        for backend in backends
+    }
 
     def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale):
         if backend in ["cutlass", "trtllm", "cutile"]:
@@ -351,7 +361,7 @@ def testGemmFp8NtGroupwise(args):
     for cur_backend in backends:
         if run_refcheck:
             outputs[cur_backend] = run_backend(
-                cur_backend, a_fp8, b_fp8, a_scale, b_scale
+                cur_backend, a_fp8, b_fp8, a_scale, b_scales[cur_backend]
             ).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
@@ -361,7 +371,7 @@ def testGemmFp8NtGroupwise(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, a_fp8, b_fp8, a_scale, b_scale),
+            input_args=(cur_backend, a_fp8, b_fp8, a_scale, b_scales[cur_backend]),
         )
 
     tested_backends = list(outputs.keys())
