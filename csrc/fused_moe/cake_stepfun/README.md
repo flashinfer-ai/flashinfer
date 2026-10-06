@@ -195,11 +195,11 @@ GEMM2 over the permuted FC1 output, bf16 output in permuted order
 
 | family | weights `A` | weight scales `SFA` | activations `B` | activation scales `SFB` | extra |
 |---|---|---|---|---|---|
-| `nvfp4` | `[E, H, I/2]` | `[E * grid_m, I/64, 2, 256]` | `[max_padded, I/2]` | `[max_padded, I/16]` (`sf_layout_a`) | `scale_c` per expert |
+| `nvfp4` | `[E, H, I/2]` | `[E * grid_m, I/64, 2, 256]` | `[max_padded, I/2]` | `[max_padded, I/16]` in `sf_layout_a` (`r8c4`: viewed `[max_padded/8, I/64, 32]`) | `scale_c` per expert |
 | `nvfp4_bf16tok` | as `nvfp4` | as `nvfp4` | requantized rows | requantized scales (`sf_layout_a`) | `scale_c`, `per_token_scale[max_padded]` |
 | `bf16` | `[E, I/64, H, 64]` | - | `[max_padded, I]` | - | - |
 | `fp8` | `[E, H, I]` | - | `[max_padded, I]` | - | `scale_c` per expert |
-| `mxfp8` | `[E, H, I]` | `[E * grid_m, I/128, 2, 256]` | `[max_padded, I]` | `[max_padded, I/32]` | - |
+| `mxfp8` | `[E, H, I]` | `[E * grid_m, I/128, 2, 256]` | `[max_padded, I]` | `[max_padded, I/32]` in `sf_layout_a` (`r8c4`: viewed `[max_padded/8, I/128, 32]`) | - |
 
 Grid `(grid_m = H / output_rows_per_cta, grid_n = max_ctas, split_k)`; routing arrays
 `tile_expert`, `tile_mn_limit`, `total_tiles = num_non_exiting_ctas`,

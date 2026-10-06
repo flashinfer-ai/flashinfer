@@ -57,6 +57,29 @@ generated::TensorLayout denseLayout(void const* data, std::initializer_list<int6
   return layout;
 }
 
+// Block-scale operands are read through tensor maps over the trtllm-gen swizzled block view that
+// Fc2KernelSpec::sf_layout_a names, not the row-major [rows, cols] view: r8c4 packs 8 rows x 4
+// scale columns into 32 contiguous bytes ([rows / 8, cols / 4, 32]), r128c4 128 rows x 4 columns
+// into 512 bytes ([rows / 128, cols / 4, 512]).
+generated::TensorLayout blockScaleLayout(void const* data, int64_t rows, int64_t cols,
+                                         generated::SfLayout layout, char const* what) {
+  switch (layout) {
+    case generated::SfLayout::kLinear:
+      return denseLayout(data, {rows, cols});
+    case generated::SfLayout::kR8c4:
+      FLASHINFER_CHECK(rows % 8 == 0 && cols % 4 == 0, "Cake StepFun FC2: the ", what,
+                       " r8c4 block scales need rows % 8 == 0 and scale columns % 4 == 0");
+      return denseLayout(data, {rows / 8, cols / 4, int64_t{32}});
+    case generated::SfLayout::kR128c4:
+      FLASHINFER_CHECK(rows % 128 == 0 && cols % 4 == 0, "Cake StepFun FC2: the ", what,
+                       " r128c4 block scales need rows % 128 == 0 and scale columns % 4 == 0");
+      return denseLayout(data, {rows / 128, cols / 4, int64_t{512}});
+    default:
+      FLASHINFER_CHECK(false, "Cake StepFun FC2: the ", what, " operand has no block-scale layout");
+  }
+  return generated::TensorLayout{};
+}
+
 cudaLaunchAttribute pdlAttribute() {
   cudaLaunchAttribute attribute{};
   attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -463,7 +486,8 @@ void Fc2Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, v
       weightLayout = denseLayout(weight, {E, H, I / 2});
       weightScaleLayout = denseLayout(weightScale, {E * gridM, I / 64, int64_t{2}, int64_t{256}});
       activationLayout = denseLayout(permutedHiddenState, {maxPaddedTokens, I / 2});
-      activationScaleLayout = denseLayout(permutedHiddenStateScale, {maxPaddedTokens, I / 16});
+      activationScaleLayout = blockScaleLayout(permutedHiddenStateScale, maxPaddedTokens, I / 16,
+                                               spec.sf_layout_a, "activation");
       break;
     case generated::kFc2Bf16:
       weightLayout = denseLayout(weight, {E, I / 64, H, int64_t{64}});
@@ -477,7 +501,8 @@ void Fc2Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, v
       weightLayout = denseLayout(weight, {E, H, I});
       weightScaleLayout = denseLayout(weightScale, {E * gridM, I / 128, int64_t{2}, int64_t{256}});
       activationLayout = denseLayout(permutedHiddenState, {maxPaddedTokens, I});
-      activationScaleLayout = denseLayout(permutedHiddenStateScale, {maxPaddedTokens, I / 32});
+      activationScaleLayout = blockScaleLayout(permutedHiddenStateScale, maxPaddedTokens, I / 32,
+                                               spec.sf_layout_a, "activation");
       break;
     default:
       FLASHINFER_CHECK(false, "Cake StepFun FC2: unknown family ", mFamily);
