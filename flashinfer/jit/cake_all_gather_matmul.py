@@ -15,12 +15,17 @@ limitations under the License.
 
 JIT loader of the Cake Blackwell all-gather matmul (SM100 / SM103).
 
-Every program is one generated CUDA device translation unit plus one tvm-ffi
-launcher, shared by both architectures. The main kernels are tcgen05 code, so
-each program is compiled once per exact architecture (``sm_100a`` or
-``sm_103a``) into a library named ``<program>_<arch>``. ``PROGRAMS``,
-``ROUTES`` and ``COMPILE_FLAGS`` are filled by the exporter from the program
-bundle; the loader never hashes sources or interprets argument plans.
+Every program is one generated CUDA device translation unit shared by both
+architectures (``PROGRAMS`` records its launch block and dynamic shared memory;
+``ROUTES`` maps the stage keys to programs). The target compiles one host
+sequence module per (world size, dtype, weight layout, architecture)
+(``SEQUENCES``): the route's device units together with the rendered one-call
+launcher ``run`` (barrier, bridge event, copy-engine pushes with their
+readiness epochs, main kernel with cached tensor maps) and, on the routes with
+a fused SM copy shape, ``run_fused``. The main kernels are tcgen05 code, so a
+sequence is compiled for its exact architecture (``sm_100a`` or ``sm_103a``).
+The tables are filled by the exporter from the program bundle; the loader never
+hashes sources or interprets argument plans.
 """
 
 from __future__ import annotations
@@ -39,7 +44,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_05d590fb05d9692b74a8": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_05d590fb05d9692b74a8_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_05d590fb05d9692b74a8_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -48,7 +52,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_0a7520d9a4cae8d18425": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0a7520d9a4cae8d18425_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0a7520d9a4cae8d18425_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -57,7 +60,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_1371696ea325f44809f3": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1371696ea325f44809f3_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1371696ea325f44809f3_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -66,7 +68,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_2e04a762811cd00a1cd5": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [32, 1, 1],
@@ -75,7 +76,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_43e256e956ee81d48de7": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [32, 1, 1],
@@ -84,7 +84,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_567bafbe34f78949b4bf": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_567bafbe34f78949b4bf_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_567bafbe34f78949b4bf_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -93,7 +92,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_775065698a2a5e33aece": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_775065698a2a5e33aece_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_775065698a2a5e33aece_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -102,7 +100,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_a90116586399c59ba880": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a90116586399c59ba880_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a90116586399c59ba880_binding.cu",
         ],
         "arches": ["sm_103a"],
         "block": [128, 1, 1],
@@ -111,7 +108,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_ac7f1bb1b739b6d1f547": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ac7f1bb1b739b6d1f547_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ac7f1bb1b739b6d1f547_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -120,7 +116,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_da440c509191f6e0d261": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_da440c509191f6e0d261_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_da440c509191f6e0d261_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -129,7 +124,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_e4758f4ef9810377a478": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e4758f4ef9810377a478_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e4758f4ef9810377a478_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -138,7 +132,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_e8d8dfcb549a27f6f839": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e8d8dfcb549a27f6f839_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e8d8dfcb549a27f6f839_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -147,7 +140,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_f3155f0ac3f178ded967": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f3155f0ac3f178ded967_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f3155f0ac3f178ded967_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -156,7 +148,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_f85d24d083dd2de99b4a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f85d24d083dd2de99b4a_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f85d24d083dd2de99b4a_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -165,7 +156,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_all_gather_matmul_fe8067061d4e5933b221": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fe8067061d4e5933b221_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fe8067061d4e5933b221_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -188,6 +178,322 @@ ROUTES: dict[str, str] = {
     "main_float16_ws4_n_major": "cake_all_gather_matmul_f85d24d083dd2de99b4a",
     "main_float16_ws8_k_major": "cake_all_gather_matmul_05d590fb05d9692b74a8",
     "main_float16_ws8_n_major": "cake_all_gather_matmul_f3155f0ac3f178ded967",
+}
+SEQUENCES: dict[str, dict[str, Any]] = {
+    "bfloat16_ws2_k_major_sm_100a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1371696ea325f44809f3_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_100a.cu",
+        ],
+        "arches": ["sm_100a"],
+        "world_size": 2,
+        "dtype": "bfloat16",
+        "b_layout": "k_major",
+        "fused": False,
+    },
+    "bfloat16_ws2_k_major_sm_103a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1371696ea325f44809f3_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_103a.cu",
+        ],
+        "arches": ["sm_103a"],
+        "world_size": 2,
+        "dtype": "bfloat16",
+        "b_layout": "k_major",
+        "fused": False,
+    },
+    "bfloat16_ws2_n_major_sm_100a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_567bafbe34f78949b4bf_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_100a.cu",
+        ],
+        "arches": ["sm_100a"],
+        "world_size": 2,
+        "dtype": "bfloat16",
+        "b_layout": "n_major",
+        "fused": False,
+    },
+    "bfloat16_ws2_n_major_sm_103a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_567bafbe34f78949b4bf_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_103a.cu",
+        ],
+        "arches": ["sm_103a"],
+        "world_size": 2,
+        "dtype": "bfloat16",
+        "b_layout": "n_major",
+        "fused": False,
+    },
+    "bfloat16_ws4_k_major_sm_100a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e4758f4ef9810377a478_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_k_major_sm_100a.cu",
+        ],
+        "arches": ["sm_100a"],
+        "world_size": 4,
+        "dtype": "bfloat16",
+        "b_layout": "k_major",
+        "fused": False,
+    },
+    "bfloat16_ws4_k_major_sm_103a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e4758f4ef9810377a478_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_k_major_sm_103a.cu",
+        ],
+        "arches": ["sm_103a"],
+        "world_size": 4,
+        "dtype": "bfloat16",
+        "b_layout": "k_major",
+        "fused": False,
+    },
+    "bfloat16_ws4_n_major_sm_100a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_775065698a2a5e33aece_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_n_major_sm_100a.cu",
+        ],
+        "arches": ["sm_100a"],
+        "world_size": 4,
+        "dtype": "bfloat16",
+        "b_layout": "n_major",
+        "fused": False,
+    },
+    "bfloat16_ws4_n_major_sm_103a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_775065698a2a5e33aece_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_n_major_sm_103a.cu",
+        ],
+        "arches": ["sm_103a"],
+        "world_size": 4,
+        "dtype": "bfloat16",
+        "b_layout": "n_major",
+        "fused": False,
+    },
+    "bfloat16_ws8_k_major_sm_100a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fe8067061d4e5933b221_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_k_major_sm_100a.cu",
+        ],
+        "arches": ["sm_100a"],
+        "world_size": 8,
+        "dtype": "bfloat16",
+        "b_layout": "k_major",
+        "fused": False,
+    },
+    "bfloat16_ws8_k_major_sm_103a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fe8067061d4e5933b221_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a90116586399c59ba880_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_k_major_sm_103a.cu",
+        ],
+        "arches": ["sm_103a"],
+        "world_size": 8,
+        "dtype": "bfloat16",
+        "b_layout": "k_major",
+        "fused": True,
+    },
+    "bfloat16_ws8_n_major_sm_100a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_da440c509191f6e0d261_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_n_major_sm_100a.cu",
+        ],
+        "arches": ["sm_100a"],
+        "world_size": 8,
+        "dtype": "bfloat16",
+        "b_layout": "n_major",
+        "fused": False,
+    },
+    "bfloat16_ws8_n_major_sm_103a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_da440c509191f6e0d261_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a90116586399c59ba880_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_n_major_sm_103a.cu",
+        ],
+        "arches": ["sm_103a"],
+        "world_size": 8,
+        "dtype": "bfloat16",
+        "b_layout": "n_major",
+        "fused": True,
+    },
+    "float16_ws2_k_major_sm_100a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0a7520d9a4cae8d18425_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_100a.cu",
+        ],
+        "arches": ["sm_100a"],
+        "world_size": 2,
+        "dtype": "float16",
+        "b_layout": "k_major",
+        "fused": False,
+    },
+    "float16_ws2_k_major_sm_103a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0a7520d9a4cae8d18425_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_103a.cu",
+        ],
+        "arches": ["sm_103a"],
+        "world_size": 2,
+        "dtype": "float16",
+        "b_layout": "k_major",
+        "fused": False,
+    },
+    "float16_ws2_n_major_sm_100a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ac7f1bb1b739b6d1f547_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_100a.cu",
+        ],
+        "arches": ["sm_100a"],
+        "world_size": 2,
+        "dtype": "float16",
+        "b_layout": "n_major",
+        "fused": False,
+    },
+    "float16_ws2_n_major_sm_103a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ac7f1bb1b739b6d1f547_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_103a.cu",
+        ],
+        "arches": ["sm_103a"],
+        "world_size": 2,
+        "dtype": "float16",
+        "b_layout": "n_major",
+        "fused": False,
+    },
+    "float16_ws4_k_major_sm_100a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e8d8dfcb549a27f6f839_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_100a.cu",
+        ],
+        "arches": ["sm_100a"],
+        "world_size": 4,
+        "dtype": "float16",
+        "b_layout": "k_major",
+        "fused": False,
+    },
+    "float16_ws4_k_major_sm_103a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e8d8dfcb549a27f6f839_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_103a.cu",
+        ],
+        "arches": ["sm_103a"],
+        "world_size": 4,
+        "dtype": "float16",
+        "b_layout": "k_major",
+        "fused": False,
+    },
+    "float16_ws4_n_major_sm_100a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f85d24d083dd2de99b4a_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_n_major_sm_100a.cu",
+        ],
+        "arches": ["sm_100a"],
+        "world_size": 4,
+        "dtype": "float16",
+        "b_layout": "n_major",
+        "fused": False,
+    },
+    "float16_ws4_n_major_sm_103a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f85d24d083dd2de99b4a_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_n_major_sm_103a.cu",
+        ],
+        "arches": ["sm_103a"],
+        "world_size": 4,
+        "dtype": "float16",
+        "b_layout": "n_major",
+        "fused": False,
+    },
+    "float16_ws8_k_major_sm_100a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_05d590fb05d9692b74a8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_k_major_sm_100a.cu",
+        ],
+        "arches": ["sm_100a"],
+        "world_size": 8,
+        "dtype": "float16",
+        "b_layout": "k_major",
+        "fused": False,
+    },
+    "float16_ws8_k_major_sm_103a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_05d590fb05d9692b74a8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_k_major_sm_103a.cu",
+        ],
+        "arches": ["sm_103a"],
+        "world_size": 8,
+        "dtype": "float16",
+        "b_layout": "k_major",
+        "fused": False,
+    },
+    "float16_ws8_n_major_sm_100a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f3155f0ac3f178ded967_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_n_major_sm_100a.cu",
+        ],
+        "arches": ["sm_100a"],
+        "world_size": 8,
+        "dtype": "float16",
+        "b_layout": "n_major",
+        "fused": False,
+    },
+    "float16_ws8_n_major_sm_103a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f3155f0ac3f178ded967_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_n_major_sm_103a.cu",
+        ],
+        "arches": ["sm_103a"],
+        "world_size": 8,
+        "dtype": "float16",
+        "b_layout": "n_major",
+        "fused": False,
+    },
 }
 COMPILE_FLAGS: list[str] = ["--use_fast_math"]
 
@@ -374,17 +680,39 @@ def _source_path(relative: str) -> Path:
     return _source_dir() / parts[2]
 
 
-@functools.cache
-def spec(program: str, arch: str) -> JitSpec:
-    """Build specification of one program for one exact architecture."""
+def sequence_name(world_size: int, dtype_name: str, b_layout: str, arch: str) -> str:
+    """The host-sequence module of one route: its device units compiled with the one-call launcher."""
 
-    row = PROGRAMS[program]
+    key = f"{dtype_name}_ws{int(world_size)}_{b_layout}_{arch}"
+    if key not in SEQUENCES:
+        raise ValueError(f"no all-gather matmul host sequence is delivered for {key!r}")
+    return key
+
+
+def sequence_programs(sequence: str) -> tuple[str, ...]:
+    """Programs whose device units the sequence module compiles (route order)."""
+
+    row = SEQUENCES[sequence]
+    names = [ROUTES["barrier_p0"], ROUTES["barrier_p1"]]
+    if row["fused"]:
+        names.append(ROUTES["fused_peer_copy"])
+    names.append(
+        ROUTES[f"main_{row['dtype']}_ws{int(row['world_size'])}_{row['b_layout']}"]
+    )
+    return tuple(names)
+
+
+@functools.cache
+def spec(sequence: str, arch: str) -> JitSpec:
+    """Build specification of one host-sequence module for one exact architecture."""
+
+    row = SEQUENCES[sequence]
     if arch not in row["arches"]:
         raise ValueError(
-            f"program {program!r} is delivered for {row['arches']}, not {arch!r}"
+            f"sequence {sequence!r} is delivered for {row['arches']}, not {arch!r}"
         )
     return gen_jit_spec(
-        name=f"{program}_{arch}",
+        name=f"{SOURCE_PACKAGE}_sequence_{sequence}",
         sources=[_source_path(relative) for relative in row["sources"]],
         extra_cuda_cflags=[*ARCH_FLAGS[arch], *COMPILE_FLAGS],
         extra_include_paths=[_source_dir().parent],
@@ -395,8 +723,8 @@ def spec(program: str, arch: str) -> JitSpec:
 
 
 @functools.cache
-def load(program: str, arch: str):
-    return spec(program, arch).build_and_load()
+def load(sequence: str, arch: str):
+    return spec(sequence, arch).build_and_load()
 
 
 def launch_block(program: str) -> tuple[int, int, int]:
@@ -423,6 +751,7 @@ __all__ = [
     "MAIN_THREADS",
     "PROGRAMS",
     "ROUTES",
+    "SEQUENCES",
     "SUPPORTED_DTYPES",
     "SUPPORTED_WORLD_SIZES",
     "DeviceFacts",
@@ -438,6 +767,8 @@ __all__ = [
     "main_program",
     "padded_rows",
     "peer_partitions",
+    "sequence_name",
+    "sequence_programs",
     "spec",
     "uses_fused_peer_copy",
     "weight_layout",

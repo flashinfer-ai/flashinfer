@@ -28,11 +28,16 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.moe_layer import moe_layer_trace
 from ..autotuner import AutoTuner
 from ..quantization.nvfp4_quantization_utils import _UNSET
 from ..utils import get_compute_capability
 from .api import (
     BackendOptions,
+    CudnnFrostBf16Config,
+    CudnnFrostMxfp8Config,
+    CudnnFrostNvfp4Config,
+    CudnnFrostMxfp8Mxfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
     CakeStepFunConfig,
@@ -105,12 +110,20 @@ from .runners import (
     TrtllmFp8PerTensorRunner,
     TrtllmMxInt4RoutedRunner,
 )
+from .backends.cudnn_frost.bf16.moe import CudnnFrostBf16MoeRunner
+from .backends.cudnn_frost.mxfp8.moe import CudnnFrostMxfp8MoeRunner
+from .backends.cudnn_frost.nvfp4.moe import CudnnFrostNvfp4MoeRunner
+from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
 from .utils import map_to_hybrid_bucket
 
-# Concrete configured runners; automatic implementations are loaded lazily
-# through the registration contract, without naming them in this module.
+# Concrete host runners for explicit configs. Additional candidates use the
+# auto_candidates registration contract; device kernel loading stays deferred.
 _RunnerT = Union[
     CakeStepFunRunner,
+    CudnnFrostBf16MoeRunner,
+    CudnnFrostMxfp8MoeRunner,
+    CudnnFrostNvfp4MoeRunner,
+    CudnnFrostMxfp8Mxfp4MoeRunner,
     CakeWarpDecodeRunner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
@@ -148,6 +161,10 @@ _RunnerT = Union[
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CakeStepFunConfig: CakeStepFunRunner,
+    CudnnFrostBf16Config: CudnnFrostBf16MoeRunner,
+    CudnnFrostMxfp8Config: CudnnFrostMxfp8MoeRunner,
+    CudnnFrostNvfp4Config: CudnnFrostNvfp4MoeRunner,
+    CudnnFrostMxfp8Mxfp4Config: CudnnFrostMxfp8Mxfp4MoeRunner,
     CakeWarpDecodeConfig: CakeWarpDecodeRunner,
     CutlassBf16Config: CutlassBf16Runner,
     CutlassFp8BlockConfig: CutlassFp8BlockRunner,
@@ -341,7 +358,7 @@ class MoELayer:
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
 
-    @flashinfer_api
+    @flashinfer_api(trace=moe_layer_trace)
     def __call__(
         self,
         act_pack: MoEActivationPack,
@@ -390,21 +407,33 @@ class MoELayer:
         # here nor via a winner cached under the other mode, hence the
         # mode-qualified cache key below.
         mode = act_pack.routing_input_mode
-        runners = [r for r in self.runners if mode in r.supported_routing_modes]
+        exact_shape = any(
+            getattr(r, "requires_exact_shape", False) for r in self.runners
+        )
+        configured = [
+            (index, r)
+            for index, r in enumerate(self.runners)
+            if mode in r.supported_routing_modes
+            and (
+                not getattr(r, "requires_exact_shape", False)
+                or r.accepts(act_pack, weight_pack)
+            )
+        ]
+        runners = [r for _, r in configured]
         additional = self._additional_candidates(act_pack, weight_pack)
         runners.extend(additional)
         if not runners:
             raise NotImplementedError(
                 f"MoELayer: none of the usable backends "
                 f"{[r.backend_key for r in self.runners]} support "
-                f"routing_input_mode={mode!r}."
+                f"routing_input_mode={mode!r} with these input/weight packs."
             )
 
         bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
         # Optional plans can have exact geometry. Qualify their cache by both
         # shape and eligible candidate set; rejected per-call layouts must not
         # reuse a winner from a different set. Original bucket keys stay intact.
-        winner_key = (
+        winner_key: tuple[Any, ...] = (
             (
                 bucket,
                 mode,
@@ -415,6 +444,17 @@ class MoELayer:
             if additional
             else (bucket, mode)
         )
+        if exact_shape:
+            # Include configured positions so filtering one of two exact-shape
+            # runners with the same key cannot reuse the other's cached winner.
+            winner_key = (
+                bucket,
+                mode,
+                "exact",
+                tuple(index for index, _ in configured),
+                tuple(r.backend_key for r in additional),
+                tuple(act_pack.hidden_states_q.shape),
+            )
         winner = self._winners.get(winner_key)
         if winner is None:
             winner = self._select_winner(act_pack, weight_pack, runners)
@@ -426,9 +466,11 @@ class MoELayer:
         runner, tactic = winner
         self._last_winner_backend = runner.backend_key
         if any(runner is candidate for candidate in additional):
+            from .auto_candidates import is_experimental_candidate
             from ..api_logging import warn_experimental_backend_once
 
-            warn_experimental_backend_once("MoELayer", runner.backend_key)
+            if is_experimental_candidate(runner.backend_key):
+                warn_experimental_backend_once("MoELayer", runner.backend_key)
 
         inputs = runner.pack_inputs(act_pack, weight_pack)
         return runner.forward(
@@ -448,6 +490,7 @@ class MoELayer:
             weight_pack,
             tuning=self.tuner.is_tuning_mode,
             cache=getattr(self, "_automatic_runners", {}),
+            exclude={r.backend_key for r in self.runners},
         )
 
     def _select_winner(

@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 import threading
 import weakref
+from typing import Optional, Tuple
 
 import torch
 
@@ -53,3 +54,54 @@ def get_cudnn_fmha_gen_module():
     for library_path in mod.get_library_paths():
         setup_cubin_loader(library_path)
     return op
+
+
+# cudnn-frontend 1.30.0 is the first release whose DEFAULT SM100 f16/bf16 SDPA
+# forward engine (the CuTe-DSL "FROST" row) serves paged decode: multi-token rows
+# ride its decode tile, and an attention sink at q_len_per_req == 1, which the
+# classic backend engine declines, falls through to it at plan time. Older
+# frontends serve FlashInfer's decode graphs with the backend engine only.
+CUDNN_FRONTEND_FROST_DECODE_MIN_VERSION: Tuple[int, int, int] = (1, 30, 0)
+
+
+def cudnn_frontend_version() -> Optional[Tuple[int, ...]]:
+    """The installed cudnn-frontend python package's version, or ``None``.
+
+    ``"1.31.0.dev123"`` parses to ``(1, 31, 0)``; a missing package or a
+    version string without a numeric prefix gives ``None``.
+    """
+    try:
+        import cudnn  # noqa: PLC0415 -- optional dependency, imported lazily
+    except Exception:  # noqa: BLE001 -- any import failure means "not available"
+        return None
+    raw = getattr(cudnn, "__version__", None)
+    if not raw:
+        return None
+    parts = []
+    for piece in str(raw).split("+")[0].split("."):
+        digits = ""
+        for ch in piece:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) if parts else None
+
+
+def cudnn_frontend_serves_frost_decode(compute_capability: Tuple[int, int]) -> bool:
+    """Whether cuDNN's FROST SDPA decode paths serve this device by default.
+
+    True on SM100 / SM103 (the Blackwell parts with the decode tile; Rubin's
+    row has none yet) with cudnn-frontend at least
+    :data:`CUDNN_FRONTEND_FROST_DECODE_MIN_VERSION`. No environment variable is
+    involved: the row is a default engine of the frontend.
+    """
+    version = cudnn_frontend_version()
+    if version is None:
+        return False
+    # "1.30" parses to (1, 30): pad before comparing so it is not short of 1.30.0.
+    if (tuple(version) + (0, 0, 0))[:3] < CUDNN_FRONTEND_FROST_DECODE_MIN_VERSION:
+        return False
+    return tuple(compute_capability) in ((10, 0), (10, 3))

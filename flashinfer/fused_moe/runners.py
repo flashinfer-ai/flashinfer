@@ -633,6 +633,10 @@ class MoERunner(TunableRunner):
         self._check_support()
         self._support_checked = True
 
+    def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
+        """Return per-call eligibility; override for input-dependent constraints."""
+        return True
+
     def _check_support(self) -> None:
         """Raise if the initialized runner cannot execute its configuration."""
         quant = self.config.quant
@@ -806,9 +810,14 @@ class MoERunner(TunableRunner):
     def __hash__(self) -> int:
         return hash(self._cache_key_extras())
 
+    def _input_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        """Optional tactic-pool identity, stable for packed and profiling inputs."""
+        return ()
+
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        # Configuration-only, so synthesized profiling inputs use the same key.
-        return self._cache_key_extras()
+        # Keep the runner hash configuration-only. Backends with input-specific
+        # tactic pools can additionally distinguish their persisted tuning keys.
+        return self._cache_key_extras() + self._input_cache_key_extras(inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +857,11 @@ class CakeWarpDecodeRunner(MoERunner):
         (SwiGLU(), 3072, 1536, 256, 8),
         (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 3072, 128, 4),
         (SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 3072, 896, 16),
+        # Sharded per-partition slices (tensor-parallel expert shards).
+        (SwiGLU(), 4096, 512, 512, 10),
+        (SwiGLU(), 4096, 256, 512, 10),
+        (SwiGLU(), 3072, 768, 256, 8),
+        (SwiGLU(), 3072, 384, 256, 8),
     }
     _REQUIRED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = (
         "gemm1_weights",
