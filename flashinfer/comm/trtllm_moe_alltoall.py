@@ -1335,6 +1335,7 @@ class MoeAlltoAll:
         expert_id_payload_index: Optional[int] = None,
         eplb_local_stats: Optional[torch.Tensor] = None,
         active_rank_mask: Optional[torch.Tensor] = None,
+        enable_pdl: Optional[bool] = None,
     ) -> list[torch.Tensor]:
         r"""Run the MoE all-to-all dispatch phase.
 
@@ -1365,6 +1366,8 @@ class MoeAlltoAll:
             :func:`moe_a2a_active_rank_mask`).  Tokens routed to a masked-off rank are
             dropped instead of hanging the collective.  Requires the instance to have
             been constructed with ``enable_rank_mask=True``.
+        enable_pdl : bool, optional
+            Whether to use programmatic dependent launch. ``None`` uses the default.
 
         Returns
         -------
@@ -1408,6 +1411,7 @@ class MoeAlltoAll:
             active_rank_mask=active_rank_mask,
             backend=self._backend,
             recv_view_cache=self._recv_view_cache,
+            enable_pdl=enable_pdl,
         )
 
         # Update state
@@ -1447,6 +1451,7 @@ class MoeAlltoAll:
         *,
         use_low_precision: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
         r"""Run the MoE all-to-all combine phase.
 
@@ -1484,6 +1489,8 @@ class MoeAlltoAll:
             CPU ``uint64`` tensor of shape ``[MOE_A2A_RANK_MASK_WORDS]``. Should match the
             mask passed to the preceding :meth:`dispatch` call (or be omitted from both).
             Requires the instance to have been constructed with ``enable_rank_mask=True``.
+        enable_pdl : bool, optional
+            Whether to use programmatic dependent launch. ``None`` uses the default.
 
         Returns
         -------
@@ -1520,6 +1527,7 @@ class MoeAlltoAll:
             output_scalar_scale,
             sf_layout,
             use_low_precision=use_low_precision,
+            enable_pdl=enable_pdl,
             enable_rank_mask=self.enable_rank_mask,
             active_rank_mask=active_rank_mask,
             output=output,
