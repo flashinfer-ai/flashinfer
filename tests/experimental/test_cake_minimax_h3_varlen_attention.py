@@ -35,6 +35,7 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
     SUPPORTED_COMPUTE_CAPABILITIES,
     TileTables,
     assign_unit_slots,
+    bf16_unit_cost,
     build_bf16_segment_plan,
     choose_kv_splits,
     split_chunks,
@@ -113,18 +114,27 @@ def test_assign_unit_slots_lpt():
 def _decode_unit_table(plan):
     """``(segment, head, cluster, kv_begin, kv_blocks, slot)`` per scheduled unit."""
     table = plan.unit_table.tolist()
-    assert len(table) == UNIT_WORDS * plan.total_tiles
-    return [
-        (
-            table[UNIT_WORDS * u],
-            table[UNIT_WORDS * u + 1] >> 16,
-            table[UNIT_WORDS * u + 1] & 0xFFFF,
-            table[UNIT_WORDS * u + 2] >> 16,
-            table[UNIT_WORDS * u + 2] & 0xFFFF,
-            table[UNIT_WORDS * u + 3],
+    # ``num_clusters`` zero records of padding follow the scheduled units.
+    assert len(table) == UNIT_WORDS * (plan.total_tiles + plan.num_clusters)
+    assert table[UNIT_WORDS * plan.total_tiles :] == [0] * (UNIT_WORDS * plan.num_clusters)
+    begins = plan.seg_begin.tolist()
+    lens = plan.seg_len.tolist()
+    decoded = []
+    for u in range(plan.total_tiles):
+        record = table[UNIT_WORDS * u : UNIT_WORDS * (u + 1)]
+        seg = begins.index(record[0])
+        assert record[1] == lens[seg] and record[5:] == [0, 0, 0]
+        decoded.append(
+            (
+                seg,
+                record[2] >> 16,
+                record[2] & 0xFFFF,
+                record[3] >> 16,
+                record[3] & 0xFFFF,
+                record[4],
+            )
         )
-        for u in range(plan.total_tiles)
-    ]
+    return decoded
 
 
 def _check_split_units(units, combine, blocks_of, num_partial_slots, num_combine_units):
@@ -241,14 +251,18 @@ def test_bf16_segment_plan(label, cu, heads, grid_clusters, kv_splits):
         for k, (s, h, c) in zip(split_of, expected, strict=True)
         for b, n in split_chunks(blocks[s], k)
     ]
-    cost = [n + BF16_UNIT_OVERHEAD_BLOCKS for _key, _b, n in ranges]
+    # Units with at most 256 valid Q rows run one Q stage at a discounted cost.
+    cost = [
+        bf16_unit_cost(n, lengths[s] - c * CLUSTER_Q_ROWS <= CLUSTER_Q_ROWS // 2)
+        for (s, _h, c), _b, n in ranges
+    ]
     slots = assign_unit_slots(cost, plan.num_clusters)
     assert [((s, h, c), b, n) for s, h, c, b, n, _ in decoded] == [
         ranges[u] for u in slots
     ]
     G = plan.num_clusters
     for k in range(plan.total_tiles // G):
-        round_costs = [decoded[k * G + i][4] for i in range(G)]
+        round_costs = [cost[slots[k * G + i]] for i in range(G)]
         assert round_costs == sorted(round_costs)
 
 

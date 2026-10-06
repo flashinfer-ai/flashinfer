@@ -93,8 +93,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "999efcaef27e28bc22ce68607182e950c4d973d9bb83ff5cc21be9a1877cb61b",
-            "sm_103a": "49227e4573e90476b7557a53a3399ed16af8a7e592fce6bd37afb12cc16d994c",
+            "sm_100a": "0bf03ea23d1a255f58296fd338f1422bcaa0197f7ec19952bb30b7efba5fab3d",
+            "sm_103a": "efa021e8e01e0ccfc6649a6bc821768e484474f2a3b2540b1688a121669002cb",
         },
     },
     "cake_minimax_h3_varlen_attention_14cc208e0531054e28fc": {
@@ -128,8 +128,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "a6f67aaad1ebef30b2b262c6204501ff19722422f7fcee2f52bad9f4bf48996a",
-            "sm_103a": "39b66e975f2a65ccd16da9d45f464fa8fd45cc4f627300093613a308af026f59",
+            "sm_100a": "1b1822451a3332fb6784c0bd20df2a0932148b02c63c22bcad2750eac3883783",
+            "sm_103a": "8c1821e65e84d351798d96cd92f086722bb51405a073d5878ec7157b1dbfe5f7",
         },
     },
     "cake_minimax_h3_varlen_attention_998a9624b757b0a48881": {
@@ -169,27 +169,25 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "b40148517386fddef5d21d2bc53faecc9e7caa4c0ffe5c67323bafaf35194d59",
-            "sm_103a": "3d11d34bbcf2486892b036216525a12cff184fb1af6bd6a2ff6482b9483e45c9",
+            "sm_100a": "19604b64527baf31a95957e6f9398d4efbb5c08b494164f761a47a705367337c",
+            "sm_103a": "444c3c0e4543b89d775d42f449d783270b641871f7cb464e1b2ac45758d7aa7c",
         },
     },
-    "cake_minimax_h3_varlen_attention_b98bfa76b68c7ab7c0e5": {
+    "cake_minimax_h3_varlen_attention_a239de72ad5397da8676": {
         "arches": ["sm_100a", "sm_103a"],
         "role": "kernel",
         "sources": [
-            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_b98bfa76b68c7ab7c0e5_kernel.cu",
-            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_b98bfa76b68c7ab7c0e5_binding.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_a239de72ad5397da8676_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_a239de72ad5397da8676_binding.cu",
         ],
         "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "Q"],
-            ["buffer", "Q_raw"],
             ["tma_buffer", "K"],
             ["tma_buffer", "V"],
-            ["buffer", "O"],
-            ["buffer", "seg_begin"],
-            ["buffer", "seg_len"],
+            ["tma_buffer", "O"],
+            ["buffer", "O_raw"],
             ["buffer", "unit_table"],
             ["buffer", "partial_O"],
             ["buffer", "partial_ML"],
@@ -201,8 +199,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "4791087ee8c8dd6d96cbcfe90973bff9dcde7bf425563bd0a384703171571b4a",
-            "sm_103a": "09ce3d83d35ea8419d8cd7aa7e2514c74d5a439084fb20dac463e6e28e66ddd6",
+            "sm_100a": "daf87a134f8d1589bcf3b907053b8d70d07a61fc17b2734ba433b8c4858a4987",
+            "sm_103a": "896f936b34f72df51899718deeec2ab8cfe17d7fa23357b5c5b955a2a991f307",
         },
     },
     "cake_minimax_h3_varlen_attention_d0676c68ea89faded6b6": {
@@ -237,8 +235,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "ef5d43ce03ee51477ae2f986548ddf224c06ac075bd7d1d3caac2491990253b3",
-            "sm_103a": "cbb7724e9e6023ba786fce762780d702b04c17a02872f198f6225ff5332151b0",
+            "sm_100a": "c7fc5cda7db4151350e9a1e6822b295572fce4bd8b74720cefc0a4f87c6bcdfc",
+            "sm_103a": "b18003f835d2314df41541517f54a52702b9c1380419f5fbc5053df28de65c2a",
         },
     },
     "cake_minimax_h3_varlen_attention_d18ed0a702ce625d75a8": {
@@ -270,8 +268,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "5ab6ef5f5229a56e38e0f07466c92ab375209911f05c456480f0ccc1c10b9dec",
-            "sm_103a": "e1fb843a7179bc3baa929b943035fa3d61945a19ede91f7db353801c0e4e26fa",
+            "sm_100a": "7781593e72bf188beabf3d16cb935363f7734f36aae25e47ba8049e449a0db0f",
+            "sm_103a": "68e5757439f7a35bda1de8f4e0440960702a641589ffc525c8e5644222335023",
         },
     },
     "cake_minimax_h3_varlen_attention_d685cb8f9d9ceebf67f6": {
@@ -303,8 +301,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "bc2acf90870768042707d0ba43f6efc8a684036a54b6727c30520f8cf6b0116d",
-            "sm_103a": "62fb4aa46042c077ba0245de7ea8dd5ce414bf03819757ef58ab8ee9c5059c6c",
+            "sm_100a": "7335a0bc7db0f1b533a091442ef4c9513fd24c98e4927f187669521930841aa6",
+            "sm_103a": "c2af3dc62a7af657bca199ee2cd0e66e85f87a3dffc404bb6b5a514a6ab773c6",
         },
     },
     "cake_minimax_h3_varlen_attention_fbf0a620ff74617e2a6a": {
@@ -326,8 +324,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "44602ac300c499dadf4f3ffd081fb7fe571a0ef229b0ec3ac85fcdfe86f106fd",
-            "sm_103a": "9e210c98bd91fe5124b2f78692acab8f5a81ded48e5586c5a2e67873a5cc391c",
+            "sm_100a": "b4b8cb3de1cd2041c9403bbd3b9905f836ce318d1c88c3bcbe65534a7e9e4f65",
+            "sm_103a": "c97556c789b8e281b4ac564ff02b2bac3c6c1129392879bf36a191b80eb525af",
         },
     },
     "cake_minimax_h3_varlen_attention_ff9654b6e96277c07d5e": {
@@ -352,8 +350,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "5d45afa0978e08e02ae67af3e54cd464343421e8b437b1f1d2bf5e841ed1f2ff",
-            "sm_103a": "eabd89fc01a5f5726c971d5a64666344069c1d6e2c181a18ff2e907b96cc58c9",
+            "sm_100a": "53d2bb7afbc03004717aeda331e5180378f588b9aef52472d17f546ff6c525e2",
+            "sm_103a": "6386589c7168890cd3b90958f177e36e9d7027e53ed22ff438d412d6e696d64e",
         },
     },
 }
@@ -363,7 +361,7 @@ ROUTES: dict[str, dict[str, Any]] = {
         "variant": "bf16",
         "stages": ["attention", "combine"],
         "modules": {
-            "attention": "cake_minimax_h3_varlen_attention_b98bfa76b68c7ab7c0e5",
+            "attention": "cake_minimax_h3_varlen_attention_a239de72ad5397da8676",
             "combine": "cake_minimax_h3_varlen_attention_ff9654b6e96277c07d5e",
         },
     },
@@ -372,7 +370,7 @@ ROUTES: dict[str, dict[str, Any]] = {
         "variant": "bf16",
         "stages": ["attention", "combine"],
         "modules": {
-            "attention": "cake_minimax_h3_varlen_attention_b98bfa76b68c7ab7c0e5",
+            "attention": "cake_minimax_h3_varlen_attention_a239de72ad5397da8676",
             "combine": "cake_minimax_h3_varlen_attention_ff9654b6e96277c07d5e",
         },
     },

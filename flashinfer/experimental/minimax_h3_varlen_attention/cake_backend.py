@@ -120,12 +120,23 @@ BF16_UNIT_OVERHEAD_BLOCKS = 2
 # Bounded: the oldest plan is evicted once the limit is reached, so varying
 # segment layouts cannot grow device memory without bound.
 BF16_PLAN_CACHE_CAPACITY = 256
+# Cost of a single-stage unit (at most 256 valid Q rows: the kernel skips its
+# second Q stage) relative to a two-stage unit, as a fraction NUM / DEN: half
+# the MMA work, but the stage-0 softmax latency is no longer hidden behind
+# the other stage's MMAs.
+BF16_SINGLE_STAGE_COST_NUM = 3
+BF16_SINGLE_STAGE_COST_DEN = 5
 # K/V-split planner (mirrors the Cake production planner ``choose_kv_splits``):
 # a unit is split into at most ``MAX_KV_SPLITS`` near-equal K/V block ranges;
 # the cost model is in K/V-block units (combine launch + per-slot traffic) and
 # a split is only taken below ``KV_SPLIT_MAX_WAVES`` waves when it beats the
 # unsplit makespan by more than ``KV_SPLIT_MIN_GAIN``.
-UNIT_WORDS = 4
+# Eight int32 per unit record: segment token begin, segment length,
+# ``head << 16 | cluster_in_segment``, ``kv_block_begin << 16 | kv_blocks``,
+# partial slot and three reserved words; the table carries ``num_clusters``
+# zero records of padding (every kernel role prefetches the record of its
+# next unit).
+UNIT_WORDS = 8
 COMBINE_WORDS = 4
 PARTIAL_ROWS = CLUSTER_Q_ROWS  # FP16 rows per partial slot (one cluster's Q rows)
 MAX_KV_SPLITS = 8
@@ -186,12 +197,10 @@ PV_MMA_DTYPE = {
 # argument plans); ``grid`` is expanded to ``grid_x/y/z``.
 BF16_ATTENTION_KWARGS = (
     "Q",
-    "Q_raw",
     "K",
     "V",
     "O",
-    "seg_begin",
-    "seg_len",
+    "O_raw",
     "unit_table",
     "partial_O",
     "partial_ML",
@@ -510,6 +519,15 @@ def _partial_workspace(
     )
 
 
+def bf16_unit_cost(blocks: int, single_stage: bool) -> int:
+    """LPT cost of a unit's K/V range in block units (single-stage units are discounted)."""
+    if single_stage:
+        blocks = (
+            blocks * BF16_SINGLE_STAGE_COST_NUM + BF16_SINGLE_STAGE_COST_DEN - 1
+        ) // BF16_SINGLE_STAGE_COST_DEN
+    return blocks + BF16_UNIT_OVERHEAD_BLOCKS
+
+
 def build_bf16_segment_plan(
     cu_seqlens: Union[torch.Tensor, Sequence[int]],
     device: torch.device,
@@ -562,21 +580,25 @@ def build_bf16_segment_plan(
             for c in range(seg_clusters):
                 chunks = split_chunks(blocks[seg], split_of[unit_index])
                 unit_index += 1
+                # Units with at most half a cluster tile of valid rows run one Q stage.
+                single_stage = lens[seg] - c * CLUSTER_Q_ROWS <= CLUSTER_Q_ROWS // 2
                 if len(chunks) == 1:
                     units.append((seg, head, c, 0, blocks[seg], -1))
-                    costs.append(blocks[seg] + BF16_UNIT_OVERHEAD_BLOCKS)
+                    costs.append(bf16_unit_cost(blocks[seg], single_stage))
                     continue
                 combine.extend((seg, (head << 16) | c, partial_slots, len(chunks)))
                 for begin, count in chunks:
                     units.append((seg, head, c, begin, count, partial_slots))
-                    costs.append(count + BF16_UNIT_OVERHEAD_BLOCKS)
+                    costs.append(bf16_unit_cost(count, single_stage))
                     partial_slots += 1
     total_tiles = len(units)
     num_clusters = min(int(num_clusters), max(total_tiles, 1))
     table: list[int] = []
     for unit in assign_unit_slots(costs, num_clusters):
         seg, head, c, begin, count, slot = units[unit]
-        table.extend((seg, (head << 16) | c, (begin << 16) | count, slot))
+        table.extend(
+            (begins[seg], lens[seg], (head << 16) | c, (begin << 16) | count, slot, 0, 0, 0)
+        )
     partial_O, partial_ML = _partial_workspace(partial_slots, device)
     return BF16SegmentPlan(
         cu_seqlens=bounds,
@@ -587,8 +609,12 @@ def build_bf16_segment_plan(
         num_clusters=num_clusters,
         seg_begin=_table(begins, device),
         seg_len=_table(lens, device),
+        # ``num_clusters`` zero records of padding: every kernel role prefetches
+        # the record of its next unit (``tile_idx + num_clusters``).
         unit_table=torch.tensor(
-            table or [0] * UNIT_WORDS, dtype=torch.int32, device=device
+            (table or [0] * UNIT_WORDS) + [0] * (UNIT_WORDS * num_clusters),
+            dtype=torch.int32,
+            device=device,
         ),
         combine_table=torch.tensor(
             combine or [0] * COMBINE_WORDS, dtype=torch.int32, device=device
@@ -1363,12 +1389,10 @@ def prepare_minimax_h3_varlen_attention(
     total_tiles = int(plan.total_tiles)
     main_kwargs = dict(
         Q=query,
-        Q_raw=query,
         K=key,
         V=value,
         O=out,
-        seg_begin=plan.seg_begin,
-        seg_len=plan.seg_len,
+        O_raw=out,
         unit_table=plan.unit_table,
         partial_O=plan.partial_O,
         partial_ML=plan.partial_ML,
