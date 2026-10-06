@@ -1021,8 +1021,15 @@ class Barrier {
       // The slot of this block is written last: the peer only waits on that slot, so its
       // release store must order the stores to the slots of CTAs that are not launched now.
       // Otherwise a later launch with a larger grid can see a slot still holding the flag
-      // from two barriers ago, which also differs from prev_flag, and pass early. The one
-      // release store orders all of them, so the others can be relaxed.
+      // from two barriers ago, which also differs from prev_flag, and pass early.
+      //
+      // The other slots can be relaxed. In a later launch, CTA j waits on slot j until it
+      // differs from prev_flag. Within a launch, slot j is written only by the peer's CTA j
+      // as its own slot, with a release store, so the store that ends the wait always pairs
+      // with the acquire load. The relaxed value backfilled into slot j by an earlier launch
+      // is ordered before that launch's own-slot release, which this rank acquired, and that
+      // launch completes before the later one starts; so the wait cannot observe the older
+      // flag from before the backfill.
       for (int flag_idx = blockIdx.x + gridDim.x; flag_idx < details::kBarrierFlagCount;
            flag_idx += gridDim.x) {
         st_flag_relaxed(m_target_flag + flag_idx * NRanks, m_flag_value);
