@@ -282,16 +282,6 @@ __device__ __forceinline__ void tma_3d_gmem2smem(
 }
 
 
-__device__ __forceinline__ void tma_5d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int z, int w, int v, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.5d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w), "r"(v),
-           "r"(mbar_addr) : "memory");
-}
-
 
 
 
@@ -569,6 +559,7 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
             unsigned int slot_tile_base = work_token_words[base + 8];
             unsigned int counter_idx = work_token_words[base + 9];
             unsigned int chunk = work_token_words[base + 10];
+            unsigned int plan_flags = work_token_words[base + 11];
             mbarrier_arrive(work_empty_addr + (work_stage_s) * 8);
             work_stage_s += 1;
             if (work_stage_s == 4) { work_stage_s = 0; _phase_work_full ^= 1; }
@@ -881,6 +872,7 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
                 unsigned int slot_tile_base_9 = work_token_words[base_0 + 8];
                 unsigned int counter_idx_10 = work_token_words[base_0 + 9];
                 unsigned int chunk_11 = work_token_words[base_0 + 10];
+                unsigned int plan_flags_12 = work_token_words[base_0 + 11];
                 mbarrier_arrive(work_empty_addr + (work_stage_s) * 8);
                 work_stage_s += 1;
                 if (work_stage_s == 4) { work_stage_s = 0; _phase_work_full ^= 1; }
@@ -915,6 +907,7 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
             unsigned int slot_tile_base_1 = work_token_words[base_1 + 8];
             unsigned int counter_idx_1 = work_token_words[base_1 + 9];
             unsigned int chunk_1 = work_token_words[base_1 + 10];
+            unsigned int plan_flags_1 = work_token_words[base_1 + 11];
             mbarrier_arrive(work_empty_addr + (work_stage_c) * 8);
             work_stage_c += 1;
             if (work_stage_c == 4) { work_stage_c = 0; _phase_work_full_1 ^= 1; }
@@ -1287,6 +1280,7 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
                 unsigned int slot_tile_base_9_1 = work_token_words[base_0_1 + 8];
                 unsigned int counter_idx_10_1 = work_token_words[base_0_1 + 9];
                 unsigned int chunk_11_1 = work_token_words[base_0_1 + 10];
+                unsigned int plan_flags_12_1 = work_token_words[base_0_1 + 11];
                 mbarrier_arrive(work_empty_addr + (work_stage_c) * 8);
                 work_stage_c += 1;
                 if (work_stage_c == 4) { work_stage_c = 0; _phase_work_full_1 ^= 1; }
@@ -1322,6 +1316,7 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
             unsigned int slot_tile_base_2 = work_token_words[base_2 + 8];
             unsigned int counter_idx_2 = work_token_words[base_2 + 9];
             unsigned int chunk_2 = work_token_words[base_2 + 10];
+            unsigned int plan_flags_2 = work_token_words[base_2 + 11];
             mbarrier_arrive(work_empty_addr + (work_stage_m) * 8);
             work_stage_m += 1;
             if (work_stage_m == 4) { work_stage_m = 0; _phase_work_full_2 ^= 1; }
@@ -1778,6 +1773,7 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
                 unsigned int slot_tile_base_9_2 = work_token_words[base_0_2 + 8];
                 unsigned int counter_idx_10_2 = work_token_words[base_0_2 + 9];
                 unsigned int chunk_11_2 = work_token_words[base_0_2 + 10];
+                unsigned int plan_flags_12_2 = work_token_words[base_0_2 + 11];
                 mbarrier_arrive(work_empty_addr + (work_stage_m) * 8);
                 work_stage_m += 1;
                 if (work_stage_m == 4) { work_stage_m = 0; _phase_work_full_2 ^= 1; }
@@ -1809,6 +1805,7 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
             unsigned int slot_tile_base_3 = work_token_words[base_3 + 8];
             unsigned int counter_idx_3 = work_token_words[base_3 + 9];
             unsigned int chunk_3 = work_token_words[base_3 + 10];
+            unsigned int plan_flags_3 = work_token_words[base_3 + 11];
             mbarrier_arrive(work_empty_addr + (work_stage_p) * 8);
             work_stage_p += 1;
             if (work_stage_p == 4) { work_stage_p = 0; _phase_work_full_3 ^= 1; }
@@ -1888,6 +1885,7 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
                 unsigned int slot_tile_base_9_3 = work_token_words[base_0_3 + 8];
                 unsigned int counter_idx_10_3 = work_token_words[base_0_3 + 9];
                 unsigned int chunk_11_3 = work_token_words[base_0_3 + 10];
+                unsigned int plan_flags_12_3 = work_token_words[base_0_3 + 11];
                 mbarrier_arrive(work_empty_addr + (work_stage_p) * 8);
                 work_stage_p += 1;
                 if (work_stage_p == 4) { work_stage_p = 0; _phase_work_full_3 ^= 1; }
@@ -1946,6 +1944,10 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
                 uniform_u = 1;
             }
             unsigned int ideal_pairs = (total_work + (unsigned int)num_ctas - 1) / (unsigned int)num_ctas;
+            unsigned int heavy_flags_u = uniform_u;
+            if (ideal_pairs >= 64) {
+                heavy_flags_u = uniform_u + 2;
+            }
             unsigned int balance_k = (ideal_pairs + 64 - 1) / 64;
             if (balance_k < 1) {
                 balance_k = 1;
@@ -2487,6 +2489,7 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
                         work_token_words[token_base + 8] = (unsigned int)slot_tile_base_4;
                         work_token_words[token_base + 9] = (unsigned int)counter_idx_4;
                         work_token_words[token_base + 10] = (unsigned int)chunk_idx;
+                        work_token_words[token_base + 11] = heavy_flags_u;
                     }
                 }
                 if (lane_0 == 0) {
@@ -2566,6 +2569,7 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
             unsigned int slot_tile_base_5 = work_token_words[base_4 + 8];
             unsigned int counter_idx_5 = work_token_words[base_4 + 9];
             unsigned int chunk_4 = work_token_words[base_4 + 10];
+            unsigned int plan_flags_4 = work_token_words[base_4 + 11];
             mbarrier_arrive(work_empty_addr + (work_stage_l) * 8);
             work_stage_l += 1;
             if (work_stage_l == 4) { work_stage_l = 0; _phase_work_full_4 ^= 1; }
@@ -2574,6 +2578,10 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
             int kv_head_idx_1 = (int)kv_head_5;
             int block_begin_l = (int)block_begin_6;
             int block_end_l = (int)block_end_5;
+            int n_chunks_l = (int)n_chunks_4;
+            int uniform_l = (int)plan_flags_4;
+            uniform_l = (int)plan_flags_4 & 1;
+            int heavy_l = (int)plan_flags_4 >> 1 & 1;
             #pragma unroll 1
             for (unsigned int _tile_iter_l = 0; _tile_iter_l < max_items; _tile_iter_l++) {
                 if (valid_l == 0) {
@@ -2581,6 +2589,23 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
                 }
                 int num_n_blocks_total_3 = block_end_l - block_begin_l;
                 int cta_n_blocks_3 = num_n_blocks_total_3 + num_n_blocks_total_3 % 2;
+                int pf_on_l = 0;
+                int ef_on_l = 0;
+                if (n_chunks_l >= 4) {
+                    ef_on_l = 1;
+                }
+                if (cta_n_blocks_3 <= 32) {
+                    ef_on_l = 1;
+                }
+                if (heavy_l == 1) {
+                    if (n_chunks_l < 4) {
+                        ef_on_l = 0;
+                    }
+                }
+                if (uniform_l == 0) {
+                    pf_on_l = 0;
+                    ef_on_l = 0;
+                }
                 mbarrier_wait(q_empty_addr + (q_prod_stage) * 8, q_prod_phase);
                 if (elect_sync()) {
                     int off_qt = (row_tile_l * num_kv_heads + kv_head_idx_1) * TILE_Q;
@@ -2614,13 +2639,18 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
                         for (int pg_i = 0; pg_i < 8; pg_i++) {
                             pg_k[pg_i] = smem_page_offsets[pg_base + pg_i];
                         }
+                        unsigned long long kpol_l = ((ef_on_l == 1) ? 1364590687093260288 : 1152921504606846976);
                         #pragma unroll
                         for (int pg_i_1 = 0; pg_i_1 < 8; pg_i_1++) {
-                            int pg0 = pg_k[pg_i_1];
+                            int pg0e = pg_k[pg_i_1];
                             #pragma unroll
                             for (int hg = 0; hg < 2; hg++) {
-                                int toff = hg * 16384 + pg_i_1 * 2048;
-                                tma_5d_gmem2smem(ldst + toff, (&K), 0, 0, hg, kv_head_idx_1, pg0, kv_full_addr + (kv_stage) * 8);
+                                int toffe = hg * 16384 + pg_i_1 * 2048;
+                                asm volatile(
+                                    "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                    :: "r"(ldst + toffe), "l"((&K)), "r"(0), "r"(0), "r"(hg), "r"(kv_head_idx_1), "r"(pg0e),
+                                       "r"(kv_full_addr + (kv_stage) * 8), "l"(kpol_l) : "memory");
                             }
                         }
                         kv_stage += 1;
@@ -2650,13 +2680,18 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
                             for (int pg_i_2 = 0; pg_i_2 < 8; pg_i_2++) {
                                 pg_nk[pg_i_2] = smem_page_offsets[npg_base + pg_i_2];
                             }
+                            unsigned long long nkpol_l = ((ef_on_l == 1) ? 1364590687093260288 : 1152921504606846976);
                             #pragma unroll
                             for (int pg_i_3 = 0; pg_i_3 < 8; pg_i_3++) {
-                                int npg0 = pg_nk[pg_i_3];
+                                int npg0e = pg_nk[pg_i_3];
                                 #pragma unroll
                                 for (int hg_1 = 0; hg_1 < 2; hg_1++) {
-                                    int ntoff = hg_1 * 16384 + pg_i_3 * 2048;
-                                    tma_5d_gmem2smem(kdst + ntoff, (&K), 0, 0, hg_1, kv_head_idx_1, npg0, kv_full_addr + (k_stage) * 8);
+                                    int ntoffe = hg_1 * 16384 + pg_i_3 * 2048;
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                        :: "r"(kdst + ntoffe), "l"((&K)), "r"(0), "r"(0), "r"(hg_1), "r"(kv_head_idx_1), "r"(npg0e),
+                                           "r"(kv_full_addr + (k_stage) * 8), "l"(nkpol_l) : "memory");
                                 }
                             }
                         }
@@ -2670,13 +2705,18 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
                         for (int pg_i_4 = 0; pg_i_4 < 8; pg_i_4++) {
                             pg_v[pg_i_4] = smem_page_offsets[vpg_base + pg_i_4];
                         }
+                        unsigned long long vpol_l = ((ef_on_l == 1) ? 1364590687093260288 : 1152921504606846976);
                         #pragma unroll
                         for (int pg_i_5 = 0; pg_i_5 < 8; pg_i_5++) {
-                            int vpg0 = pg_v[pg_i_5];
+                            int vpg0e = pg_v[pg_i_5];
                             #pragma unroll
                             for (int hg_2 = 0; hg_2 < 2; hg_2++) {
-                                int vtoff = hg_2 * 16384 + pg_i_5 * 2048;
-                                tma_5d_gmem2smem(vdst + vtoff, (&V), 0, 0, hg_2, kv_head_idx_1, vpg0, kv_full_addr + (stage) * 8);
+                                int vtoffe = hg_2 * 16384 + pg_i_5 * 2048;
+                                asm volatile(
+                                    "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+                                    :: "r"(vdst + vtoffe), "l"((&V)), "r"(0), "r"(0), "r"(hg_2), "r"(kv_head_idx_1), "r"(vpg0e),
+                                       "r"(kv_full_addr + (stage) * 8), "l"(vpol_l) : "memory");
                             }
                         }
                         mbarrier_arrive(page_offsets_empty_addr + (page_cons_stage) * 8);
@@ -2702,6 +2742,7 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
                 unsigned int slot_tile_base_9_4 = work_token_words[base_0_4 + 8];
                 unsigned int counter_idx_10_4 = work_token_words[base_0_4 + 9];
                 unsigned int chunk_11_4 = work_token_words[base_0_4 + 10];
+                unsigned int plan_flags_12_4 = work_token_words[base_0_4 + 11];
                 mbarrier_arrive(work_empty_addr + (work_stage_l) * 8);
                 work_stage_l += 1;
                 if (work_stage_l == 4) { work_stage_l = 0; _phase_work_full_4 ^= 1; }
@@ -2710,6 +2751,8 @@ kernel_cake_fmha_decode_balanced_fp16(const __grid_constant__ CUtensorMap Qt, co
                 kv_head_idx_1 = (int)kv_head_4_4;
                 block_begin_l = (int)block_begin_5_4;
                 block_end_l = (int)block_end_6_4;
+                n_chunks_l = (int)n_chunks_8_4;
+                uniform_l = (int)plan_flags_12_4;
             }
         }
     }
