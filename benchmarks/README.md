@@ -47,6 +47,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
     - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
     - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
+    - `router_gemm` - Fixed-shape MoE router GEMMs (`mm_M1_16_K*_N*`) with BF16 inputs and `1 <= m <= 16`. The kernel is selected from `(--k, --n, --out_dtype)`; supported `(k, n)` are `(7168, 128)`, `(7168, 256)`, `(6144, 256)`, `(7168, 384)`, and `(7168, 896)`. When `--out_dtype` is omitted, `float32` is used where available.
 - MOE:
     - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
@@ -292,7 +293,7 @@ The output CSV will contain detailed metrics including:
 | `--tile_size`            | Tile size for the GEMM operation (affects performance and scaling)                                         |
 | `--group_size`           | Number of groups for group GEMM (batching multiple GEMMs together)                                         |
 | `--scale_major_mode`     | Layout for FP8 scaling: `MN` (per output tile) or `K` (per input tile)                                     |
-| `--out_dtype`            | Output data type: `bfloat16` or `float16`                                                                  |
+| `--out_dtype`            | Output data type: `bfloat16` or `float16` (`router_gemm` also accepts `float32`)                           |
 | `--mma_sm`               | Number of SMs to use for the MMA operation (1 or 2)                                                        |
 | `--input_dtype`          | Data type for input matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                 |
 | `--mat2_dtype`           | Data type for second matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                |
@@ -577,6 +578,7 @@ Legend:
 | **mm_fp4** |  |  |  |  |  | cudnn, trtllm, cutlass | cudnn, trtllm, cutlass | cudnn |
 | **mm_bf16** |  |  |  |  |  | cudnn, cutlass, tgv | cudnn, cutlass, tgv |  |
 | **bmm_bf16** |  |  |  |  |  | cudnn, cutlass | cudnn, cutlass |  |
+| **router_gemm** |  |  |  |  | auto | auto | auto |  |
 | **trtllm_fp4_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |

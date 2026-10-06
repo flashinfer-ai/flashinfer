@@ -61,6 +61,8 @@ def run_gemm_test(args):
         return testBmmBf16(args)
     elif args.routine == "tinygemm_bf16":
         return testTinygemmBf16(args)
+    elif args.routine == "router_gemm":
+        return testRouterGemm(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -204,6 +206,9 @@ def parse_gemm_args(line, parser):
     has_mat2_dtype_arg = any(
         token == "--mat2_dtype" or token.startswith("--mat2_dtype=") for token in line
     )
+    has_out_dtype_arg = any(
+        token == "--out_dtype" or token.startswith("--out_dtype=") for token in line
+    )
     if args.routine == "tinygemm_bf16":
         if not has_backends_arg:
             args.backends = ["tinygemm"]
@@ -219,6 +224,15 @@ def parse_gemm_args(line, parser):
     if args.routine == "mm_fp8":
         if not has_backends_arg:
             args.backends = ["trtllm_low_latency"]
+    if args.routine == "router_gemm":
+        if not has_backends_arg:
+            args.backends = ["auto"]
+        if not has_input_dtype_arg:
+            args.input_dtype = "bfloat16"
+        if not has_mat2_dtype_arg:
+            args.mat2_dtype = "bfloat16"
+        if not has_out_dtype_arg:
+            args.out_dtype = None
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -2833,6 +2847,189 @@ def testBmmBf16(args):
                     cur_res["resolved_backend"] = resolve_backend_from_choices(
                         autotune_choices.get(backend, {})
                     )
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+# Fixed-shape router GEMM kernels keyed by (k, n, out_dtype).
+ROUTER_GEMM_KERNELS = {
+    (7168, 128, torch.bfloat16): "mm_M1_16_K7168_N128",
+    (7168, 256, torch.float32): "mm_M1_16_K7168_N256",
+    (7168, 256, torch.bfloat16): "mm_M1_16_K7168_N256_bf16",
+    (6144, 256, torch.float32): "mm_M1_16_K6144_N256",
+    (7168, 384, torch.float32): "mm_M1_16_K7168_N384",
+    (7168, 384, torch.bfloat16): "mm_M1_16_K7168_N384_bf16",
+    (7168, 896, torch.float32): "mm_M1_16_K7168_N896",
+    (7168, 896, torch.bfloat16): "mm_M1_16_K7168_N896_bf16",
+}
+
+
+def testRouterGemm(args):
+    """
+    Test the fixed-shape router GEMM APIs (mm_M1_16_K*_N*).
+
+    This test:
+    1. Selects the router GEMM kernel matching (k, n, out_dtype)
+    2. Generates random BF16 input tensors (column-major weight)
+    3. Runs the router GEMM
+    4. Runs reference check (FP32 matmul)
+    5. Measures performance metrics (TFLOPS, TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testRouterGemm")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    backends = list(args.backends)
+    m = args.m
+    n = args.n
+    k = args.k
+    use_pdl = getattr(args, "enable_pdl", False)
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    if not 1 <= m <= 16:
+        raise ValueError(f"router_gemm supports 1 <= m <= 16, got m={m}.")
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    mat2_dtype = dtype_str_to_torch_dtype(args.mat2_dtype)
+    if input_dtype != torch.bfloat16 or mat2_dtype != torch.bfloat16:
+        raise ValueError("router_gemm only supports bfloat16 input and weight tensors.")
+
+    available_out_dtypes = [
+        dtype for (kk, nn, dtype) in ROUTER_GEMM_KERNELS if (kk, nn) == (k, n)
+    ]
+    if len(available_out_dtypes) == 0:
+        supported = sorted({(kk, nn) for (kk, nn, _) in ROUTER_GEMM_KERNELS})
+        raise ValueError(
+            f"No router GEMM kernel for (k={k}, n={n}). Supported (k, n): {supported}"
+        )
+    if args.out_dtype is None:
+        out_dtype = (
+            torch.float32
+            if torch.float32 in available_out_dtypes
+            else available_out_dtypes[0]
+        )
+    else:
+        out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    if out_dtype not in available_out_dtypes:
+        raise ValueError(
+            f"No router GEMM kernel for (k={k}, n={n}) with out_dtype={out_dtype}. "
+            f"Available out_dtype: {available_out_dtypes}"
+        )
+    kernel_name = ROUTER_GEMM_KERNELS[(k, n, out_dtype)]
+    router_gemm_fn = getattr(flashinfer.gemm, kernel_name)
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    mat_a = torch.randn([m, k], device=device, dtype=torch.bfloat16)
+    mat_b = torch.randn([n, k], device=device, dtype=torch.bfloat16).t()
+    outs = {
+        backend: torch.empty([m, n], device=device, dtype=out_dtype)
+        for backend in backends
+    }
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {kernel_name = }")
+        print(f"[VVERBOSE] {mat_a.shape = }")
+        print(f"[VVERBOSE] {mat_b.shape = }")
+        print(f"[VVERBOSE] {mat_b.stride() = }")
+        print(f"[VVERBOSE] {out_dtype = }")
+        print(f"[VVERBOSE] {use_pdl = }")
+
+    def run_backend(backend, mat_a, mat_b, out, use_pdl):
+        if backend != "auto":
+            raise ValueError(f"Unsupported backend: {backend}")
+        router_gemm_fn(mat_a, mat_b, out, launch_with_pdl=use_pdl)
+        return out
+
+    has_reference_output = False
+    if run_refcheck:
+        reference_output = mat_a.float() @ mat_b.float()
+        has_reference_output = True
+
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = (
+                run_backend(cur_backend, mat_a, mat_b, outs[cur_backend], use_pdl)
+                .detach()
+                .clone()
+            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=True,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            cold_l2_cache=True,
+            input_args=(cur_backend, mat_a, mat_b, outs[cur_backend], use_pdl),
+        )
+
+    tested_backends = list(outputs.keys())
+    tested_outputs = list(outputs.values())
+    if len(tested_backends) > 0 and run_refcheck and has_reference_output:
+        for i in range(len(tested_backends)):
+            cos_sim = F.cosine_similarity(
+                reference_output.reshape(-1),
+                tested_outputs[i].reshape(-1).float(),
+                dim=0,
+            )
+            if cos_sim < 0.99:
+                print(
+                    f"[ERROR] Output tensor mismatch from backend {tested_backends[i]} with cos_sim={cos_sim}"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(
+                        f"[ERROR] Backend {tested_backends[i]} output mismatch with cos_sim={cos_sim}"
+                    )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+            problem_flops = 2 * m * n * k
+            problem_bytes = (
+                m * k * torch.bfloat16.itemsize
+                + n * k * torch.bfloat16.itemsize
+                + m * n * out_dtype.itemsize
+            )
+            tflops = problem_flops / (10**9 * median_time)
+            tb_per_sec = problem_bytes / (10**9 * median_time)
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["m"] = m
+                cur_res["n"] = n
+                cur_res["k"] = k
+                cur_res["input_dtype"] = input_dtype
+                cur_res["mat2_dtype"] = mat2_dtype
+                cur_res["out_dtype"] = out_dtype
+                cur_res["backend"] = backend
+                cur_res["enable_pdl"] = use_pdl
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res

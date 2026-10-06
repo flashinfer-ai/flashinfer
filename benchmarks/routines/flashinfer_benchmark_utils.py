@@ -259,6 +259,7 @@ benchmark_apis = {
         "mm_bf16",
         "bmm_bf16",
         "tinygemm_bf16",
+        "router_gemm",
     ],
     "moe": [
         "trtllm_fp4_block_scale_moe",
@@ -794,6 +795,19 @@ routine_cc_to_supported_backends = {
         "10.0": ["trtllm-gen"],
         "10.3": ["trtllm-gen"],
         "10.7": [],
+        "12.0": [],
+        "12.1": [],
+    },
+    # GEMM
+    "router_gemm": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["auto"],
+        "10.0": ["auto"],
+        "10.3": ["auto"],
+        "10.7": ["auto"],
         "12.0": [],
         "12.1": [],
     },
