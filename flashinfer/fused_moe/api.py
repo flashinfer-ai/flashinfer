@@ -507,7 +507,7 @@ _TRTLLM_ROUTED_ARCHS = (100, 103, 107)
 
 # The FP8 kernels are validated on the SM100 family only — the outer JIT module
 # compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
-_TRTLLM_ROUTED_FP8_ARCHS = (100, 103)
+_TRTLLM_ROUTED_FP8_ARCHS = (100, 103, 107)
 
 # Prims-TS (CUTLASS primitives + task scheduling) GEMMs are SM100/SM103 only.
 _PRIMS_TS_ARCHS = (100, 103)
