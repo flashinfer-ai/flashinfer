@@ -2953,6 +2953,24 @@ def _quantize_mxfp8_rows(values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     return q, sf.view(torch.uint8).reshape(values.shape[0], values.shape[1] // 32)
 
 
+def _quantize_mxfp8_per_expert(
+    weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8-quantize ``[E, n, k]`` BF16 expert weights.
+
+    :func:`_quantize_mxfp8_rows` runs on the flattened ``[E * n, k]`` tensor;
+    with ``n`` and ``k`` multiples of 128, whole 128-row scale tiles keep each
+    expert's swizzled scales contiguous, so the result equals quantizing every
+    expert on its own. Returns E4M3 ``[E, n, k]`` and ``uint8 [E, n, k // 32]``.
+    """
+    num_experts, rows, k = weight.shape
+    quantized, scale = _quantize_mxfp8_rows(weight.reshape(num_experts * rows, k))
+    return (
+        quantized.reshape(num_experts, rows, k),
+        scale.reshape(num_experts, rows, k // 32),
+    )
+
+
 def prepare_cudnn_grouped_gemm_mxfp8_activations(
     hidden_states_bf16: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -3012,17 +3030,13 @@ def prepare_cudnn_grouped_gemm_mxfp8_weights(
         device=device,
         alignment=128,
     )
-    w1_q, w1_scale = _quantize_mxfp8_experts(w1, num_local_experts)
-    w2_q, w2_scale = _quantize_mxfp8_experts(w2, num_local_experts)
+    w1_q, w1_scale = _quantize_mxfp8_per_expert(w1)
+    w2_q, w2_scale = _quantize_mxfp8_per_expert(w2)
     return {
         "fc1_expert_weights": w1_q,
         "fc2_expert_weights": w2_q,
-        "fc1_weight_scale": w1_scale.view(torch.uint8).reshape(
-            *w1.shape[:2], hidden_size // 32
-        ),
-        "fc2_weight_scale": w2_scale.view(torch.uint8).reshape(
-            *w2.shape[:2], intermediate_size // 32
-        ),
+        "fc1_weight_scale": w1_scale,
+        "fc2_weight_scale": w2_scale,
     }
 
 

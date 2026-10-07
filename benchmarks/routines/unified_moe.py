@@ -671,6 +671,14 @@ def run_unified_moe_test(args):
                     topk_weights=activations.topk_weights,
                 )
             inputs = runner.pack_inputs(backend_activations, weights)
+            hidden_index = 1
+            if input_quantizer is not None:
+                # The packed slot the timed input conversion rewrites.
+                hidden_index = next(
+                    i
+                    for i, tensor in enumerate(inputs)
+                    if tensor is backend_activations.hidden_states_q
+                )
             # Like mm_fp4, execute the fallback once to reject configurations
             # that pass the coarse architecture check but fail at runtime.
             runner.forward(inputs, tactic=-1, do_preparation=True)
@@ -696,11 +704,7 @@ def run_unified_moe_test(args):
             tactic,
             input_quantizer=input_quantizer,
             bf16_input=activations.hidden_states_q,
-            hidden_index=next(
-                i
-                for i, tensor in enumerate(inputs)
-                if tensor is backend_activations.hidden_states_q
-            ),
+            hidden_index=hidden_index,
         )
         backend_label = f"{backend}_autotune" if args.autotune else backend
 

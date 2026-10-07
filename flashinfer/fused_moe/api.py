@@ -1423,24 +1423,21 @@ class CuTileMxfp4Mxfp8Config(CuTileMxfp4Config):
 class CudnnGroupedGemmBf16Config:
     """cuDNN grouped-GEMM BF16 backend (``grouped_mm_bf16``).
 
-    The runner composes :func:`flashinfer.grouped_mm.grouped_mm_bf16` into a
-    full MoE layer: it sorts the pre-routed assignments by expert into a
-    contiguous ``m_indptr`` layout, gathers the activations, runs GEMM1, applies
-    the typed activation and runs GEMM2. Activations are raw ``bfloat16 [M, H]``
-    (``M`` tokens of hidden size ``H``); :meth:`prepare_weights` builds the weight
-    view from the canonical ``[up, gate]`` BF16 weights, storing the fc1 rows as
-    ``[gate, up]``.
-
-    The permutation (expert sort and row gather) and the finalize run
-    FlashInfer's ``moe_utils`` kernels on SM90, SM100, SM103 and SM107, and torch
-    ops elsewhere, so ``do_finalize=True`` returns the finalized ``[M, H]`` output
-    on every architecture; ``MoEFinalizeConfig(do_finalize=False)`` returns the
-    unfinalized ``[gemm2_out, expert_weights, token_to_row]`` for the caller to
-    combine instead. Supports expert parallelism (assignments to non-local
-    experts are masked out) and unpacked BF16 routing weights; each token's
-    ``topk_ids`` must name distinct experts. Not part of the default backend
-    list: cuDNN builds one execution plan per token bucket, so
-    add it explicitly with ``BackendOptions((CudnnGroupedGemmBf16Config(),))``.
+    - Pipeline: sort the pre-routed assignments by expert into a contiguous
+      ``m_indptr`` layout, gather the activations, GEMM1, the typed activation,
+      GEMM2 and the finalize, on :func:`flashinfer.grouped_mm.grouped_mm_bf16`.
+    - Activations: raw ``bfloat16 [M, H]`` (``M`` tokens of hidden size ``H``).
+    - Weights: :meth:`prepare_weights` takes the canonical ``[up, gate]`` BF16
+      weights and stores the fc1 rows as ``[gate, up]``.
+    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM90, SM100,
+      SM103 and SM107, torch ops elsewhere.
+    - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
+      ``[gemm2_out, expert_weights, token_to_row]`` for the caller to combine.
+    - Expert parallelism: assignments to non-local experts are masked out.
+    - Routing weights: packed, or unpacked FP32 / BF16.
+    - Each token's ``topk_ids`` must name distinct experts.
+    - Not in the default backend list, since cuDNN builds one execution plan per
+      token bucket: select it with ``BackendOptions((CudnnGroupedGemmBf16Config(),))``.
     """
 
     @classmethod
@@ -1484,21 +1481,23 @@ class CudnnGroupedGemmBf16Config:
 class CudnnGroupedGemmFp8PerTensorConfig:
     """cuDNN grouped-GEMM FP8 per-tensor backend (``grouped_mm_fp8``).
 
-    The runner builds a full MoE layer on the cuDNN grouped GEMM behind
-    :func:`flashinfer.grouped_mm.grouped_mm_fp8`: permutation into
-    expert-sorted rows, GEMM1, the typed activation and GEMM2. Activations are
-    the canonical per-tensor FP8 pack: E4M3 quantized with the static
-    ``hidden_states_scale_global`` multiplier, ``hidden_states_scale=None``.
-    ``prepare_weights`` takes both static multipliers and folds them into the
-    view. The intermediate is requantized by the fused Triton SwiGLU kernel,
-    so SwiGLU with default scalars is the only supported activation.
-
-    Finalizes (``do_finalize=True``) with the ``moe_utils`` kernel on SM90,
-    SM100, SM103 and SM107, and with torch ops elsewhere;
-    ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
-    ``[gemm2_out, expert_weights, token_to_row]`` instead.
-    Supports expert parallelism and unpacked routing weights; each token's
-    ``topk_ids`` must name distinct experts. Not part of the default backend list.
+    - Pipeline: expert-sorted permutation, GEMM1, the typed activation, GEMM2 and
+      the finalize, on :func:`flashinfer.grouped_mm.grouped_mm_fp8`.
+    - Activations: the canonical per-tensor FP8 pack, E4M3 quantized with the
+      static ``hidden_states_scale_global`` multiplier and
+      ``hidden_states_scale=None``.
+    - Weights: :meth:`prepare_weights` takes both static multipliers and folds
+      them into the view.
+    - The fused Triton SwiGLU kernel requantizes the intermediate, so SwiGLU with
+      default scalars is the only supported activation.
+    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM90, SM100,
+      SM103 and SM107, torch ops elsewhere.
+    - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
+      ``[gemm2_out, expert_weights, token_to_row]``.
+    - Expert parallelism: assignments to non-local experts are masked out.
+    - Routing weights: packed, or unpacked FP32 / BF16.
+    - Each token's ``topk_ids`` must name distinct experts.
+    - Not in the default backend list.
     """
 
     @classmethod
@@ -1547,25 +1546,26 @@ class CudnnGroupedGemmFp8PerTensorConfig:
 class CudnnGroupedGemmMxfp8Config:
     """cuDNN grouped-GEMM MXFP8 backend (``grouped_mm_mxfp8``).
 
-    The runner builds a full MoE layer on the cuDNN grouped GEMM behind
-    :func:`flashinfer.grouped_mm.grouped_mm_mxfp8`: permutation into
-    expert-sorted rows, GEMM1, the typed activation and GEMM2. Activations arrive as
-    the MXFP8 activation pack: E4M3 ``[M, H]`` values (``M`` tokens of hidden
-    size ``H``) with token-major ``uint8 [M, H/32]`` UE8M0 block scales (see
-    :meth:`prepare_activations`); rows and scale rows are permuted into expert
-    order, each expert segment padded to a multiple of 128 rows, and the
-    permuted scale rows are swizzled into the GEMM's block-scale layout. The
-    BF16 intermediate is quantized straight into that layout before GEMM2.
-    Weights are E4M3 with UE8M0 block scales per expert (see
-    :meth:`prepare_weights`). ``hidden_size`` and ``intermediate_size`` must be
-    multiples of 128.
-
-    Finalizes (``do_finalize=True``) with the ``moe_utils`` kernel on SM100,
-    SM103 and SM107, and with torch ops elsewhere;
-    ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
-    ``[gemm2_out, expert_weights, token_to_row]`` instead.
-    Supports expert parallelism and unpacked routing weights; each token's
-    ``topk_ids`` must name distinct experts. Not part of the default backend list.
+    - Pipeline: expert-sorted permutation, GEMM1, the typed activation, GEMM2 and
+      the finalize, on :func:`flashinfer.grouped_mm.grouped_mm_mxfp8`.
+    - Activations: the MXFP8 activation pack, E4M3 ``[M, H]`` values (``M`` tokens
+      of hidden size ``H``) with token-major ``uint8 [M, H/32]`` UE8M0 block
+      scales (see :meth:`prepare_activations`).
+    - Rows and scale rows are permuted into expert order, each expert segment
+      padded to a multiple of 128 rows; the permuted scale rows are swizzled into
+      the GEMM's block-scale layout, and the BF16 intermediate is quantized
+      straight into that layout before GEMM2.
+    - Weights: E4M3 with UE8M0 block scales per expert (see
+      :meth:`prepare_weights`).
+    - ``hidden_size`` and ``intermediate_size`` must be multiples of 128.
+    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM100, SM103 and
+      SM107, torch ops elsewhere.
+    - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
+      ``[gemm2_out, expert_weights, token_to_row]``.
+    - Expert parallelism: assignments to non-local experts are masked out.
+    - Routing weights: packed, or unpacked FP32 / BF16.
+    - Each token's ``topk_ids`` must name distinct experts.
+    - Not in the default backend list.
     """
 
     @classmethod
@@ -1619,30 +1619,30 @@ class CudnnGroupedGemmMxfp8Config:
 class CudnnGroupedGemmNvfp4Config:
     """cuDNN grouped-GEMM NVFP4 backend (``grouped_mm_fp4`` with 16-wide blocks).
 
-    The runner builds a full MoE layer on the cuDNN grouped GEMM behind
-    :func:`flashinfer.grouped_mm.grouped_mm_fp4`: permutation into
-    expert-sorted rows, GEMM1, the typed activation and GEMM2. Activations
-    arrive as the NVFP4 activation pack: packed E2M1 ``uint8 [M, H/2]`` values
-    (``M`` tokens of hidden size ``H``) with token-major
-    ``float8_e4m3fn [M, H/16]`` block scales and a global scale of one (see
-    :meth:`prepare_activations` for the magnitude range that encoding
-    resolves); rows and scale rows are permuted into expert order, each expert
-    segment padded to a multiple of 128 rows, and the permuted scale rows are
-    swizzled into the GEMM's block-scale layout. The BF16 intermediate is
-    quantized to NVFP4 with a global scale of one, straight into that layout,
-    before GEMM2. Weights are packed E2M1 with E4M3
-    block scales and one global scale per expert (see :meth:`prepare_weights`);
-    GEMM1's output rows are multiplied by their expert's global dequant and
-    GEMM2's expert dequant is applied by the finalize (or to the unfinalized
-    rows).
-    ``hidden_size`` and ``intermediate_size`` must be multiples of 128.
-
-    Finalizes (``do_finalize=True``) with the ``moe_utils`` kernel on SM100,
-    SM103 and SM107, and with torch ops elsewhere;
-    ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
-    ``[gemm2_out, expert_weights, token_to_row]`` instead.
-    Supports expert parallelism and unpacked routing weights; each token's
-    ``topk_ids`` must name distinct experts. Not part of the default backend list.
+    - Pipeline: expert-sorted permutation, GEMM1, the typed activation, GEMM2 and
+      the finalize, on :func:`flashinfer.grouped_mm.grouped_mm_fp4`.
+    - Activations: the NVFP4 activation pack, packed E2M1 ``uint8 [M, H/2]``
+      values (``M`` tokens of hidden size ``H``) with token-major
+      ``float8_e4m3fn [M, H/16]`` block scales and a global scale of one (see
+      :meth:`prepare_activations` for the magnitude range that encoding
+      resolves).
+    - Rows and scale rows are permuted into expert order, each expert segment
+      padded to a multiple of 128 rows; the permuted scale rows are swizzled into
+      the GEMM's block-scale layout, and the BF16 intermediate is quantized to
+      NVFP4 with a global scale of one, straight into that layout, before GEMM2.
+    - Weights: packed E2M1 with E4M3 block scales and one global scale per expert
+      (see :meth:`prepare_weights`). GEMM1's output rows are multiplied by their
+      expert's global dequant; GEMM2's is applied by the finalize, or to the
+      unfinalized rows.
+    - ``hidden_size`` and ``intermediate_size`` must be multiples of 128.
+    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM100, SM103 and
+      SM107, torch ops elsewhere.
+    - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
+      ``[gemm2_out, expert_weights, token_to_row]``.
+    - Expert parallelism: assignments to non-local experts are masked out.
+    - Routing weights: packed, or unpacked FP32 / BF16.
+    - Each token's ``topk_ids`` must name distinct experts.
+    - Not in the default backend list.
     """
 
     @classmethod

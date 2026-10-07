@@ -235,7 +235,10 @@ from flashinfer.fused_moe.runners import (
     _TrtllmRunnerBase,
 )
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
-from flashinfer.grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION
+from flashinfer.grouped_mm.cudnn import (
+    _CUDNN_MOE_MIN_VERSION,
+    _cudnn_moe_block_scale_min_version,
+)
 from flashinfer.jit.cpp_ext import get_cuda_version
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.quantization.fp8_quantization import mxfp8_quantize
@@ -2772,15 +2775,14 @@ def _contract_preflight_skip_reason(
     elif cfg.variant in _CUDNN_GROUPED_GEMM_BACKEND_KEYS:
         if not _cudnn_moe_available():
             return f"{cfg.variant} unified MoE {_ENV_NEEDS_CUDNN_MOE}"
-        if cfg.variant in _CUDNN_BLOCK_SCALE_BACKEND_KEYS and sm in (120, 121):
+        if cfg.variant in _CUDNN_BLOCK_SCALE_BACKEND_KEYS and sm is not None:
             import cudnn
 
-            # The flat grouped_mm_mxfp8 / grouped_mm_fp4 list SM120 / SM121, but
-            # cuDNN below 9.22 has no block-scaled MoE grouped-GEMM engine there.
-            if cudnn.backend_version() < 92200:
+            min_version = _cudnn_moe_block_scale_min_version(sm)
+            if cudnn.backend_version() < min_version:
                 return (
-                    f"{cfg.variant} unified MoE on SM{sm} requires cuDNN >= 9.22 "
-                    "(no SM12x engine for the block-scaled MoE grouped GEMM)"
+                    f"{cfg.variant} unified MoE on SM{sm} requires backend "
+                    f"version >= {min_version}"
                 )
     return None
 

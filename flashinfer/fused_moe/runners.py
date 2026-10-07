@@ -8441,8 +8441,6 @@ _BLOCK_SCALE_TILE = 128
 _PLAIN_SEGMENT_ROWS = 16
 # Architectures whose moe_utils kernels sort, permute and finalize.
 _MOE_UTILS_ARCHS: tuple[int, ...] = (90, 100, 103, 107)
-# First cuDNN release with an SM120 / SM121 engine for the block-scaled grouped GEMM.
-_CUDNN_SM12X_BLOCK_SCALE_MIN_VERSION = 92200
 
 # (gemm1, gemm2) plan indices of the fallback tactic
 _FALLBACK_STAGE_TACTIC: tuple[int, int] = (-1, -1)
@@ -8454,9 +8452,21 @@ class _GroupedGemmLayout:
 
     m_indptr: torch.Tensor  # [E_local + 1] int32 segment offsets for grouped_mm_*
     token_to_row: torch.Tensor  # [T, k] int32 row of every assignment, -1 if non-local
-    row_expert: torch.Tensor  # [rows] int32 local expert per row (padding: last)
     # [rows] int64 source token of every row (padding -> 0); torch permute path only.
     row_to_token: Optional[torch.Tensor] = None
+    _row_expert: Optional[torch.Tensor] = None
+
+    def row_expert(self, rows: int) -> torch.Tensor:
+        """``[rows]`` local expert of every row (padding: the last expert), built on
+        first use: only the per-expert dequant of the FP8 and NVFP4 runners reads it."""
+        if self._row_expert is None:
+            row = torch.arange(
+                rows, dtype=self.m_indptr.dtype, device=self.m_indptr.device
+            )
+            self._row_expert = torch.searchsorted(
+                self.m_indptr[1:], row, right=True
+            ).clamp_(max=self.m_indptr.numel() - 2)
+        return self._row_expert
 
 
 def _layout_from_topk(
@@ -8502,13 +8512,9 @@ def _layout_from_topk(
     # Tail entries (non-local assignments) land on the spare slot num_rows.
     row_to_token = torch.zeros(num_rows + 1, dtype=torch.int64, device=device)
     row_to_token[row_of_sorted] = order // top_k
-    row_expert = torch.searchsorted(
-        m_indptr[1:], torch.arange(num_rows, device=device), right=True
-    )
     return _GroupedGemmLayout(
         m_indptr=m_indptr.to(torch.int32),
         token_to_row=token_to_row.to(torch.int32).view(num_tokens, top_k),
-        row_expert=row_expert.clamp_(max=num_local_experts - 1).to(torch.int32),
         row_to_token=row_to_token[:num_rows],
     )
 
@@ -8558,7 +8564,9 @@ def _dequant_rows_by_expert(
     out: torch.Tensor, per_expert: torch.Tensor, layout: _GroupedGemmLayout
 ) -> torch.Tensor:
     """Multiply every GEMM output row by its expert's dequant factor, in place."""
-    return out.mul_(per_expert.index_select(0, layout.row_expert)[:, None])
+    return out.mul_(
+        per_expert.index_select(0, layout.row_expert(out.shape[0]))[:, None]
+    )
 
 
 @dataclass
@@ -8990,7 +8998,7 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
         )
         device = topk_ids.device
         tile_in_use = torch.arange(tile_expert.numel(), device=device) < num_tiles
-        # Unused tiles count for no expert; unused rows name the last expert.
+        # Unused tiles count for no expert.
         tile_expert = torch.where(
             tile_in_use, tile_expert, torch.full_like(tile_expert, num_local_experts)
         )
@@ -9004,17 +9012,12 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
                 * tile,
             )
         )
-        row_expert = tile_expert.clamp(max=num_local_experts - 1).repeat_interleave(
-            tile
-        )
         token_to_row = token_to_row[: topk_ids.shape[0]]
         if not self.config.finalize.do_finalize:
             # The sort buffer is rewritten by the next call while the returned
             # unfinalized triple stays with the caller.
             token_to_row = token_to_row.clone()
-        return _GroupedGemmLayout(
-            m_indptr=m_indptr, token_to_row=token_to_row, row_expert=row_expert
-        )
+        return _GroupedGemmLayout(m_indptr=m_indptr, token_to_row=token_to_row)
 
     def _permute(
         self, inputs: List[torch.Tensor]
@@ -9068,20 +9071,15 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
     ) -> torch.Tensor:
         """``run(tactic)``; a plan index beyond cuDNN's count for this shape runs the heuristic plan."""
         result = run(tactic)
-        if result is None:
-            warnings.warn(
-                f"{self.backend_key} GEMM{stage} tactic {tactic} is not a cuDNN "
-                "execution-plan index for this shape on this device; running the "
-                "heuristic plan instead.",
-                stacklevel=2,
-            )
-            result = run(-1)
-        if result is None:
-            raise RuntimeError(
-                f"{self.backend_key} GEMM{stage} has no cuDNN execution plan for "
-                "this shape."
-            )
-        return result
+        if result is not None:
+            return result
+        warnings.warn(
+            f"{self.backend_key} GEMM{stage} tactic {tactic} is not a cuDNN "
+            "execution-plan index for this shape on this device; running the "
+            "heuristic plan instead.",
+            stacklevel=2,
+        )
+        return run(-1)
 
     def _gemm1(
         self,
@@ -9477,13 +9475,15 @@ class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self._device_arch in (120, 121):
-            from ..grouped_mm.cudnn import _check_cudnn_version
+        from ..grouped_mm.cudnn import (
+            _check_cudnn_version,
+            _cudnn_moe_block_scale_min_version,
+        )
 
-            _check_cudnn_version(
-                _CUDNN_SM12X_BLOCK_SCALE_MIN_VERSION,
-                f"{self.backend_key} MoE on SM{self._device_arch}",
-            )
+        _check_cudnn_version(
+            _cudnn_moe_block_scale_min_version(self._device_arch),
+            f"{self.backend_key} MoE on SM{self._device_arch}",
+        )
         intermediate_size = self.config.experts.intermediate_size
         if intermediate_size % _BLOCK_SCALE_TILE:
             raise NotImplementedError(

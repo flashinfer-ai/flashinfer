@@ -50,18 +50,17 @@ from flashinfer.fused_moe.api import (
     ALL_BACKEND_CONFIGS,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
-from flashinfer.fused_moe.runners import (
-    _CUDNN_SM12X_BLOCK_SCALE_MIN_VERSION,
-    _MOE_UTILS_ARCHS,
-    MoERunner,
-)
+from flashinfer.fused_moe.runners import _MOE_UTILS_ARCHS, MoERunner
 from flashinfer.grouped_mm.core import (
     _check_grouped_mm_bf16,
     _check_grouped_mm_fp4,
     _check_grouped_mm_fp8,
     _check_grouped_mm_mxfp8,
 )
-from flashinfer.grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION
+from flashinfer.grouped_mm.cudnn import (
+    _CUDNN_MOE_MIN_VERSION,
+    _cudnn_moe_block_scale_min_version,
+)
 from flashinfer.quantization.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.quantization.fp8_quantization import mxfp8_dequantize_host
 from flashinfer.utils import get_compute_capability
@@ -202,7 +201,7 @@ def _sm12x_block_scale_unsupported() -> bool:
         return False
     import cudnn
 
-    return cudnn.backend_version() < _CUDNN_SM12X_BLOCK_SCALE_MIN_VERSION
+    return cudnn.backend_version() < _cudnn_moe_block_scale_min_version(_device_arch())
 
 
 def _cudnn_backend_is_supported(key: str) -> bool:
@@ -459,8 +458,8 @@ def test_cudnn_block_scale_check_support_requires_cudnn_9_22_on_sm12x(monkeypatc
     import cudnn
 
     for version, rejected in (
-        (_CUDNN_SM12X_BLOCK_SCALE_MIN_VERSION - 100, True),
-        (_CUDNN_SM12X_BLOCK_SCALE_MIN_VERSION, False),
+        (_cudnn_moe_block_scale_min_version(120) - 100, True),
+        (_cudnn_moe_block_scale_min_version(120), False),
     ):
         monkeypatch.setattr(cudnn, "backend_version", lambda v=version: v)
         for key in _BLOCK_SCALE_KEYS:

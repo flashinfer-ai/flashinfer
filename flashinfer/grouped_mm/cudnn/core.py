@@ -54,6 +54,7 @@ except OSError as e:
 # ---------------------------------------------------------------------------
 
 _CUDNN_MOE_MIN_VERSION = 92100  # 9.21.0
+_CUDNN_MOE_BLOCK_SCALE_SM12X_MIN_VERSION = 92200  # 9.22.0
 
 
 class _CUDNN_UIDs(Enum):
@@ -86,6 +87,13 @@ def _check_cudnn():
             "cuDNN is not available.  Install with: "
             "pip install nvidia-cudnn-cu12 nvidia-cudnn-frontend"
         )
+
+
+def _cudnn_moe_block_scale_min_version(arch: int) -> int:
+    """Minimum cuDNN backend version for the block-scaled MOE grouped GEMM on SM``arch``."""
+    if arch in (120, 121):
+        return _CUDNN_MOE_BLOCK_SCALE_SM12X_MIN_VERSION
+    return _CUDNN_MOE_MIN_VERSION
 
 
 def _check_cudnn_version(min_ver: int, feature: str):
