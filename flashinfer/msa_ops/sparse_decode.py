@@ -341,12 +341,6 @@ def msa_sparse_decode_attention(
             "MSASparseAttentionWorkspace is only used by the compute "
             "capability 10.0/10.3/10.7 backend"
         )
-    if out is not None:
-        raise NotImplementedError(
-            "out= is implemented by the compute capability 10.0/10.3/10.7 "
-            "packed-NVFP4 paged-KV decode route; the SM120/SM121 backend "
-            "allocates its own output"
-        )
     import cutlass
     import cutlass.cute as cute
 
@@ -419,9 +413,19 @@ def msa_sparse_decode_attention(
             )
         from ._sm90_dispatch import sparse_decode_sm90
 
-        out = torch.empty(
-            (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=q.device
-        )
+        if out is None:
+            out = torch.empty(
+                (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=q.device
+            )
+        elif (
+            out.shape != q.shape
+            or out.dtype != compute_dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "out must be a contiguous tensor shaped like q in q's dtype on q's device"
+            )
         return sparse_decode_sm90(
             q,
             k,
@@ -432,6 +436,12 @@ def msa_sparse_decode_attention(
             out,
             softmax_scale=softmax_scale,
             v_global_scale=v_global_scale,
+        )
+    if out is not None:
+        raise NotImplementedError(
+            "out= is implemented by the compute capability 10.0/10.3/10.7 "
+            "packed-NVFP4 paged-KV decode route and on SM90; the SM120/SM121 "
+            "backend allocates its own output"
         )
     topk = q2k_indices.shape[2]
     if topk <= 0:

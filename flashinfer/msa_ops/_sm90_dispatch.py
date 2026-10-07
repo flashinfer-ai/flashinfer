@@ -1,8 +1,13 @@
 """SM90 (Hopper) dispatch for the MSA ops.
 
-Routes to the Hopper CuTe DSL backends in ``cute_dsl/*_sm90.py``. Selection is
-on capability, never on measured shape thresholds: a schedule is chosen only
-where it is the one that can run the shape correctly.
+Routes each operation / shape class to the backend that serves it: the Cake
+programs of ``_hopper_sm90`` (sparse decode; proxy-score decode regime for fp8
+and bf16, Hq and max_seqlen_q in {1, 2, 4}) or the Hopper CuTe DSL backends in
+``cute_dsl/*_sm90.py`` (top-k select, sparse prefill, proxy-score prefill
+regime and the remaining decode coordinates). Selection is on capability,
+never on measured shape thresholds: a schedule is chosen only where it is the
+one that can run the shape correctly, and the surface's raise rules apply
+before any backend is reached.
 """
 
 from typing import Optional
@@ -79,11 +84,37 @@ def proxy_score_sm90(
 
     if decode:
         if kv_fp8:
-            # The fp8 decode schedule indexes a log2 table keyed on Hq.
+            # The fp8 decode schedules index a log2 table keyed on Hq.
             if q.shape[1] not in (1, 2, 4):
                 raise NotImplementedError(
                     f"SM90 fp8 proxy decode supports Hq in (1, 2, 4), got {q.shape[1]}"
                 )
+        from ._hopper_sm90 import (
+            hopper_msa_proxy_score_decode,
+            proxy_decode_route_available,
+        )
+
+        # Cake programs serve fp8 and bf16 decode scoring for Hq in (1, 2, 4) and
+        # max_seqlen_q in (1, 2, 4); max_seqlen_q == 3 and bf16 Hq outside that
+        # set keep the CuTe DSL decode schedules.
+        if proxy_decode_route_available(
+            q_dtype=q.dtype, num_q_heads=q.shape[1], max_seqlen_q=max_seqlen_q
+        ):
+            return hopper_msa_proxy_score_decode(
+                q,
+                k,
+                page_table=pt,
+                seqused_k=sk,
+                per_head=per_head,
+                max_seqlen_q=max_seqlen_q,
+                batch_size=batch_size,
+                q_offset=(
+                    q_offset.to(torch.int32).contiguous()
+                    if q_offset is not None
+                    else None
+                ),
+            )
+        if kv_fp8:
             from .cute_dsl.proxy_score_decode_sm90 import run as _decode
         else:
             from .cute_dsl.proxy_score_decode_bf16_sm90 import run as _decode
@@ -198,18 +229,27 @@ def sparse_decode_sm90(
     softmax_scale: Optional[float] = None,
     v_global_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """MSA sparse decode attention on Hopper. Writes ``out``."""
-    from .cute_dsl.sparse_decode_sm90 import run as _decode
+    """MSA sparse decode attention on Hopper. Writes ``out``.
 
-    kv = _as_packed_kv(k, v)
-    q = _fold_scales(q, v_global_scale, softmax_scale, q.shape[-1])
-    _decode(
+    Served by the Cake Hopper decode program: it takes ``softmax_scale`` as a
+    kernel parameter (no q pre-scaling launch) and reads K and V through their
+    own strides, so the interleaved halves are passed as given once the
+    surface's layout contract (``_as_packed_kv``) has admitted them.
+    """
+    from ._hopper_sm90 import hopper_msa_sparse_decode_attention
+
+    _as_packed_kv(k, v)
+    seqused_k = seqused_k.to(torch.int32).contiguous()
+    hopper_msa_sparse_decode_attention(
         q,
-        kv,
+        k,
+        v,
         q2k_indices.to(torch.int32).contiguous(),
-        page_table.to(torch.int32).contiguous(),
-        seqused_k.to(torch.int32).contiguous(),
-        out,
+        page_table=page_table.to(torch.int32).contiguous(),
+        seqused_k=seqused_k,
+        seqlen_q=q.shape[0] // seqused_k.numel(),
+        softmax_scale=softmax_scale,
+        out=out,
     )
     if v_global_scale is not None and v_global_scale != 1.0:
         out.mul_(v_global_scale)
