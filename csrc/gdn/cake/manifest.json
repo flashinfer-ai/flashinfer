@@ -1,7 +1,8 @@
 {
   "architectures": [
     "sm_100a",
-    "sm_103a"
+    "sm_103a",
+    "sm_107a"
   ],
   "binary_artifacts": false,
   "cuda_headers": [
@@ -23,7 +24,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -44,7 +46,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1.cu"
         }
@@ -62,7 +65,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -83,7 +87,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1.cu"
         }
@@ -101,7 +106,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -124,7 +130,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1_small.cu"
         }
@@ -142,7 +149,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -165,7 +173,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1_small.cu"
         }
@@ -183,7 +192,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -206,7 +216,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1_small.cu"
         }
@@ -224,7 +235,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -243,7 +255,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_mtp_t2_inline_tile8.cu"
         }
@@ -264,7 +277,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -283,7 +297,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_ad39ffcf85b6.cu"
         }
@@ -308,7 +323,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -327,7 +343,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b112c54beb22.cu"
         }
@@ -352,7 +369,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -371,7 +389,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_31df1fb37fcf.cu"
         }
@@ -396,7 +415,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -420,7 +440,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_c613554db331.cu"
         }
@@ -445,7 +466,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -464,7 +486,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_fd3162c4c682.cu"
         }
@@ -489,7 +512,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -513,7 +537,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_c613554db331.cu"
         }
@@ -538,7 +563,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -562,7 +588,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_c613554db331.cu"
         }
@@ -587,7 +614,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -606,7 +634,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_splitv2_tile64.cu"
         }
@@ -630,7 +659,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -649,7 +679,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_splitv8.cu"
         }
@@ -673,7 +704,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -694,7 +726,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_splitv8.cu"
         }
@@ -712,7 +745,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -733,7 +767,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_splitv8.cu"
         }
@@ -751,7 +786,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -770,7 +806,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_t1_bf16state_tile16.cu"
         }
@@ -789,7 +826,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -808,7 +846,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_af14fc2b3244.cu"
         }
@@ -829,7 +868,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -851,7 +891,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_b384fd71263b.cu"
         }
@@ -875,7 +916,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -894,7 +936,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_35a2092bae8d.cu"
         }
@@ -918,7 +961,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -940,7 +984,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_b384fd71263b.cu"
         }
@@ -964,7 +1009,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -987,7 +1033,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_87d61d64810d.cu"
         }
@@ -1011,7 +1058,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1034,7 +1082,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_87d61d64810d.cu"
         }
@@ -1058,7 +1107,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1077,7 +1127,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_0f116667a9ba.cu"
         }
@@ -1101,7 +1152,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1124,7 +1176,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_87d61d64810d.cu"
         }
@@ -1148,7 +1201,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1171,7 +1225,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_87d61d64810d.cu"
         }
@@ -1195,7 +1250,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1218,7 +1274,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_87d61d64810d.cu"
         }
@@ -1242,7 +1299,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1265,7 +1323,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_87d61d64810d.cu"
         }
@@ -1289,7 +1348,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1312,7 +1372,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_87d61d64810d.cu"
         }
@@ -1336,7 +1397,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1359,7 +1421,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_87d61d64810d.cu"
         }
@@ -1383,7 +1446,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1406,7 +1470,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_5543b38a728f.cu"
         }
@@ -1430,7 +1495,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1453,7 +1519,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_5543b38a728f.cu"
         }
@@ -1477,7 +1544,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1496,7 +1564,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_38048814adf7.cu"
         }
@@ -1520,7 +1589,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1543,7 +1613,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_5543b38a728f.cu"
         }
@@ -1567,7 +1638,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1590,7 +1662,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_5543b38a728f.cu"
         }
@@ -1614,7 +1687,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1637,7 +1711,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_5543b38a728f.cu"
         }
@@ -1661,7 +1736,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1684,7 +1760,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_5543b38a728f.cu"
         }
@@ -1708,7 +1785,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1731,7 +1809,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_5543b38a728f.cu"
         }
@@ -1755,7 +1834,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1778,7 +1858,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_5543b38a728f.cu"
         }
@@ -1802,7 +1883,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1824,7 +1906,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_5df752d48551.cu"
         }
@@ -1848,7 +1931,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1870,7 +1954,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_f16io_5df752d48551.cu"
         }
@@ -1894,7 +1979,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1917,7 +2003,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial.cu"
         }
@@ -1941,7 +2028,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -1964,7 +2052,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial.cu"
         }
@@ -1988,7 +2077,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2011,7 +2101,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial.cu"
         }
@@ -2035,7 +2126,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2058,7 +2150,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial.cu"
         }
@@ -2082,7 +2175,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2105,7 +2199,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_97cec4a1bc9a.cu"
         }
@@ -2129,7 +2224,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2148,7 +2244,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_135bfa59984f.cu"
         }
@@ -2172,7 +2269,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2195,7 +2293,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_97cec4a1bc9a.cu"
         }
@@ -2219,7 +2318,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2243,7 +2343,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_6946f33f4285.cu"
         }
@@ -2267,7 +2368,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2291,7 +2393,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_6946f33f4285.cu"
         }
@@ -2315,7 +2418,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2339,7 +2443,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_6946f33f4285.cu"
         }
@@ -2363,7 +2468,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2382,7 +2488,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_d8b5b50285af.cu"
         }
@@ -2406,7 +2513,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2430,7 +2538,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_bf16state_6946f33f4285.cu"
         }
@@ -2454,7 +2563,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2477,7 +2587,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e4m3state.cu"
         }
@@ -2501,7 +2612,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2524,7 +2636,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e4m3state.cu"
         }
@@ -2548,7 +2661,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2571,7 +2685,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e4m3state.cu"
         }
@@ -2595,7 +2710,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2618,7 +2734,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e5m2state.cu"
         }
@@ -2642,7 +2759,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2665,7 +2783,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e5m2state.cu"
         }
@@ -2689,7 +2808,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2712,7 +2832,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_e5m2state.cu"
         }
@@ -2736,7 +2857,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2759,7 +2881,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io.cu"
         }
@@ -2783,7 +2906,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2806,7 +2930,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io.cu"
         }
@@ -2830,7 +2955,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2849,7 +2975,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_f481beb70ea9.cu"
         }
@@ -2873,7 +3000,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2896,7 +3024,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io.cu"
         }
@@ -2920,7 +3049,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2943,7 +3073,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io.cu"
         }
@@ -2967,7 +3098,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -2990,7 +3122,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io.cu"
         }
@@ -3014,7 +3147,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3037,7 +3171,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io.cu"
         }
@@ -3061,7 +3196,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3084,7 +3220,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io.cu"
         }
@@ -3108,7 +3245,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3131,7 +3269,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io.cu"
         }
@@ -3470,7 +3609,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3493,7 +3633,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4.cu"
         }
@@ -3517,7 +3658,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3540,7 +3682,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4.cu"
         }
@@ -3564,7 +3707,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3587,7 +3731,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4.cu"
         }
@@ -3611,7 +3756,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3634,7 +3780,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4.cu"
         }
@@ -3658,7 +3805,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3681,7 +3829,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4.cu"
         }
@@ -3705,7 +3854,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3728,7 +3878,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4.cu"
         }
@@ -3752,7 +3903,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3775,7 +3927,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4.cu"
         }
@@ -3799,7 +3952,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3822,7 +3976,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4.cu"
         }
@@ -3846,7 +4001,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3869,7 +4025,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_gatepipe4.cu"
         }
@@ -3893,7 +4050,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3916,7 +4074,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16state.cu"
         }
@@ -3940,7 +4099,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -3963,7 +4123,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16state.cu"
         }
@@ -3987,7 +4148,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4010,7 +4172,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16state.cu"
         }
@@ -4034,7 +4197,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4053,7 +4217,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_dvsplit_single_chunk.cu"
         }
@@ -4077,7 +4242,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4099,7 +4265,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_f16io_f7acc23187f3.cu"
         }
@@ -4123,7 +4290,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4142,7 +4310,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_f16io_298d0006ef66.cu"
         }
@@ -4166,7 +4335,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4188,7 +4358,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_f16io_f7acc23187f3.cu"
         }
@@ -4212,7 +4383,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4234,7 +4406,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_initial.cu"
         }
@@ -4258,7 +4431,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4280,7 +4454,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_initial.cu"
         }
@@ -4304,7 +4479,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4323,7 +4499,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_bf16state_46c4930cb0fc.cu"
         }
@@ -4347,7 +4524,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4366,7 +4544,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_bf16state_aff5a90f2e2c.cu"
         }
@@ -4390,7 +4569,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4413,7 +4593,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io.cu"
         }
@@ -4437,7 +4618,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4460,7 +4642,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io.cu"
         }
@@ -4484,7 +4667,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4507,7 +4691,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io.cu"
         }
@@ -4531,7 +4716,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4554,7 +4740,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io.cu"
         }
@@ -4578,7 +4765,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4601,7 +4789,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io.cu"
         }
@@ -4625,7 +4814,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4648,7 +4838,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io.cu"
         }
@@ -4672,7 +4863,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4695,7 +4887,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io.cu"
         }
@@ -4719,7 +4912,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4742,7 +4936,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_prefill_initial_f16io.cu"
         }
@@ -4766,7 +4961,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4788,7 +4984,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_c3c933b61749.cu"
         }
@@ -4810,7 +5007,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4832,7 +5030,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_c3c933b61749.cu"
         }
@@ -4854,7 +5053,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4878,7 +5078,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_6d8766dacd0e.cu"
         }
@@ -4903,7 +5104,8 @@
     {
       "architectures": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "compile_options": [
         "--use_fast_math"
@@ -4927,7 +5129,8 @@
         {
           "architectures": [
             "sm_100a",
-            "sm_103a"
+            "sm_103a",
+            "sm_107a"
           ],
           "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_6d8766dacd0e.cu"
         }

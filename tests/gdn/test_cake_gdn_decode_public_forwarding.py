@@ -34,15 +34,12 @@ _PROMOTED_BF16_ROWS = [
     (8, 4, 4, 8, True, True, True, 4),
     (5, 4, 4, 8, False, True, True, 4),
 ]
-
-
-# TODO(CAKE-1096): add sm_107a once the regenerated manifest lands
-@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
 @pytest.mark.parametrize(
     "batch_size,seq_len,num_q_heads,num_v_heads,strided,disable,cache,cache_steps",
     _PROMOTED_BF16_ROWS,
 )
-def test_all_promoted_bf16_rows_resolve_on_both_architectures(
+def test_all_promoted_bf16_rows_resolve_on_every_architecture(
     arch,
     batch_size,
     seq_len,
