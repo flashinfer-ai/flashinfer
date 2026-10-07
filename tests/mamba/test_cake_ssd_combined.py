@@ -3803,7 +3803,7 @@ def test_source_direct_preprocess_and_sequence_argument_order():
         mode_varlen=True,
         dt_softplus=False,
         dt_limit=(0.0, float("inf")),
-        threads=32,
+        tiles_per_block=4,
         seq_idx_i32=sentinels["seq_idx_i32"],
         seq_idx_i64=sentinels["seq_idx_i64"],
         seq_idx_int64=True,
@@ -3843,7 +3843,8 @@ def test_source_direct_preprocess_and_sequence_argument_order():
     assert preprocess["metadata_from_cu_seqlens"] == 0
     assert preprocess["checkpoint_state_count"] == 0
     assert preprocess["preprocess_status"] is sentinels["preprocess_status"]
-    assert preprocess_grid == (12, 1, 1)
+    # 3 segments x 128 heads = 384 (segment, head) tiles, four per CTA
+    assert preprocess_grid == (96, 1, 1)
     assert set(preprocess) == set(module._PREPROCESS_ARGS)
     # CAKE-990 appended ``preprocess_status`` last; CAKE-934 item 2 inserts the
     # cu_seqlens derivation inputs before it (the status word stays last).

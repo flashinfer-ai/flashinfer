@@ -95,6 +95,10 @@ _SEGMENT_PREPROCESS = _Kernel(
     threads=128,
     fast_math=False,
 )
+# (segment, head) tiles one preprocess CTA scans (one warp per tile); the
+# launch grid is ``ceil(num_segments * nheads / tiles_per_block)``.  Refreshed
+# by the Cake export together with the module identities above.
+_SEGMENT_PREPROCESS_TILES_PER_BLOCK = 4
 # DLDataType (code, bits) of the state tensors: kDLFloat=2, kDLBfloat=4.
 _STATE_DTYPE_CODES = {"bf16": (4, 16), "f16": (2, 16), "f32": (2, 32)}
 _STATE_DTYPE_KEYS = {
@@ -235,7 +239,7 @@ def _direct_preprocess_inputs(
     mode_varlen: bool,
     dt_softplus: bool,
     dt_limit: Tuple[float, float],
-    threads: int,
+    tiles_per_block: int,
     seq_idx_i32: object,
     seq_idx_i64: object,
     seq_idx_int64: bool,
@@ -255,8 +259,8 @@ def _direct_preprocess_inputs(
     kernel derives the real count and never reads past its sentinel).
     """
 
-    if threads <= 0:
-        raise ValueError(f"preprocess thread count must be positive, got {threads}")
+    if tiles_per_block <= 0:
+        raise ValueError(f"preprocess tiles per block must be positive, got {tiles_per_block}")
     dt_min, dt_max = (float(value) for value in dt_limit)
     values: dict[str, object] = {
         "dt": dt,
@@ -288,7 +292,7 @@ def _direct_preprocess_inputs(
         "preprocess_status": preprocess_status,
     }
     total_tiles = num_segments * nheads
-    return values, ((total_tiles + threads - 1) // threads, 1, 1)
+    return values, (max(1, (total_tiles + tiles_per_block - 1) // tiles_per_block), 1, 1)
 
 
 def _segment_bound(seqlen: int, num_sequences: int) -> int:
@@ -1239,7 +1243,7 @@ class CakeSSDCombined:
             mode_varlen=mode_varlen,
             dt_softplus=bool(dt_softplus),
             dt_limit=(dt_min, dt_max),
-            threads=program.preprocess.threads,
+            tiles_per_block=_SEGMENT_PREPROCESS_TILES_PER_BLOCK,
             seq_idx_i32=seq_i32,
             seq_idx_i64=seq_i64,
             seq_idx_int64=seq_idx_int64,
