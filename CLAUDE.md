@@ -22,6 +22,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Dump environment report (bug reports) | `python -m flashinfer.collect_env` (or `flashinfer collect-env [--json]`) |
 | Install pre-commit hooks | `pre-commit install` |
 | Clear JIT cache | `rm -rf ~/.cache/flashinfer/` |
+| Inspect devcontainer compiler cache | `sccache --show-stats` |
 | Enable API logging (basic) | `export FLASHINFER_LOGLEVEL=1` |
 | Enable API logging (detailed) | `export FLASHINFER_LOGLEVEL=3` |
 | Enable API logging (with stats) | `export FLASHINFER_LOGLEVEL=5` |
@@ -95,6 +96,28 @@ FlashInfer provides optional pre-compiled packages for users who want faster ini
 - `flashinfer-cubin`: Pre-compiled kernel binaries
 
 **For development, you typically DON'T need these.** JIT compilation is fast enough and gives you live code reload.
+
+### Compiler Caching in Devcontainers
+
+The devcontainers run every nvcc and host C++ compile through
+[sccache](https://github.com/mozilla/sccache) by setting `FLASHINFER_NVCC_LAUNCHER`
+and `FLASHINFER_CXX_LAUNCHER`. Cached objects live in a per-devcontainer Docker
+volume mounted at `~/.cache/sccache`, so they outlive a container rebuild — which
+wipes `~/.cache/flashinfer` and would otherwise force a full recompile.
+
+```bash
+sccache --show-stats                  # hit rate, cache size, uncacheable reasons
+export FLASHINFER_NVCC_LAUNCHER=""    # disable for the current shell
+```
+
+Caveats:
+
+- Toggling a launcher changes the compile commands in `build.ninja`, so the first
+  build after switching it on or off recompiles objects that already exist.
+- Link steps, cubin embedding, and CuTe-DSL kernels never invoke nvcc, so they are
+  not cached.
+- The cache is per-devcontainer by design: sccache's local storage supports a
+  single server at a time, so two containers must not share one cache directory.
 
 ## Testing
 
@@ -613,8 +636,8 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |
 | `FLASHINFER_JIT_PREBUILD_MAX_JOBS` | unset (uses `MAX_JOBS`) | `flashinfer/jit/core.py` | Maximum parallel Ninja jobs for a bulk `build_jit_specs()` prebuild. This does not control ordinary on-demand module builds. The sharded test runner sets it to the host-wide automatic build budget before reducing each worker's `MAX_JOBS`; an explicit value is preserved. |
 | `FLASHINFER_NVCC` | `$cuda_home/bin/nvcc` | `flashinfer/jit/cpp_ext.py` | Override the nvcc binary used by the JIT (useful for sccache wrappers or non-default CUDA installs). |
-| `FLASHINFER_NVCC_LAUNCHER` | `""` | `flashinfer/jit/cpp_ext.py` | Optional launcher prefix for nvcc (e.g. `ccache`, `sccache`). Combined with `FLASHINFER_NVCC`. |
-| `FLASHINFER_CXX_LAUNCHER` | `""` | `flashinfer/jit/cpp_ext.py` | Same idea as `FLASHINFER_NVCC_LAUNCHER` but for the host C++ compiler. |
+| `FLASHINFER_NVCC_LAUNCHER` | `""` (`sccache` in the devcontainers) | `flashinfer/jit/cpp_ext.py` | Optional launcher prefix for nvcc (e.g. `ccache`, `sccache`). Combined with `FLASHINFER_NVCC`. |
+| `FLASHINFER_CXX_LAUNCHER` | `""` (`sccache` in the devcontainers) | `flashinfer/jit/cpp_ext.py` | Same idea as `FLASHINFER_NVCC_LAUNCHER` but for the host C++ compiler. |
 | `FLASHINFER_FMHA_V2_VERBOSE` | unset | `flashinfer/jit/attention/fmha_v2/fmha_library.py` (FMHA v2 codegen, C++ side) | When set, the FMHA-v2 codegen / runtime prints verbose dispatcher diagnostics. Leave unset for normal runs. |
 | `FLASHINFER_EXTRA_CFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to the host C++ compiler. |
 | `FLASHINFER_EXTRA_CUDAFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to `nvcc`. |
