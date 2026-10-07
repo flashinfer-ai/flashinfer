@@ -11,8 +11,38 @@ backend covers fp16/bf16 GQA with ``return_lse``, CUDA graphs, multi-token
 decode (``q_len_per_req > 1``, bottom-right causal), a left sliding window
 (``window_left``) and attention ``sinks``; it does not support RoPE, soft-cap
 or fp8/NVFP4 KV. A sink at ``q_len_per_req == 1`` is served when the cuDNN
-stack's SDPA engines accept it (cudnn-frontend 1.30+ with the FROST engines
-enabled); the backend engine raises a not-supported error at the first run.
+stack's SDPA engines accept it (cudnn-frontend 1.30+, whose default SM100 engine
+takes the graph the backend engine declines); older frontends raise a
+not-supported error at the first run.
+
+cuDNN's CuTe-DSL ("FROST") SDPA engine for SM100 is a default engine of
+cudnn-frontend 1.30+: it serves multi-token decode rows with a decode tile, and
+an attention sink at ``q_len_per_req == 1`` falls through to it when the backend
+engine declines. No environment variable is involved. With that frontend
+installed, the decode wrapper's ``backend="auto"`` resolves to ``cudnn`` on
+SM100 / SM103 for the multi-token rows (``2 <= q_len_per_req <= 4``) of fp16/bf16
+head_dim-128 GQA models when that tile has at least 32 packed rows per CTA and 64
+CTAs, where it measures at 0.35-0.95x fa2 (multi-token rows without tensor cores,
+which have no fa2 kernel, take cuDNN whenever its decode path can run them);
+``FLASHINFER_DECODE_AUTO_CUDNN`` overrides the choice. Under CUDA graphs ``auto``
+takes cuDNN only with a caller-owned ``block_tables`` (the auto-built table cannot
+grow once captured), and the resolution is frozen after the first plan.
+
+Compatible decode runs and replans retain the prepared cuDNN graph. Planning
+still stages changing KV lengths and, unless the caller supplies a dense GPU
+``block_tables``, constructs that table from CSR metadata. CUDA Graph replay
+does not include this host planning work. ``fast_decode_plan`` uses the regular
+cuDNN planner for these updates; its FA2/FA3 copy-elision does not apply to
+cuDNN. ``workspace_size`` currently raises for both explicit and auto-selected
+cuDNN, rather than returning another backend's workspace requirements.
+
+FP16/BF16 graph execution can write base-2 LSE directly, avoiding a separate
+conversion. This requires cuDNN 9.27+ headers and runtime, an FE exposing the
+capability, and backend support for the requested graph. Older or unsupported
+configurations retain natural-log Stats plus conversion; FP8 handling is
+unchanged. Prefill callers requesting ``lse_base="ln"`` still receive the
+natural-log output directly. Each requested LSE base/layout is a graph
+specialization: warm it before CUDA graph capture.
 
 .. currentmodule:: flashinfer.cudnn
 

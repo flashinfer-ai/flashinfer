@@ -7,7 +7,7 @@ import subprocess
 
 import torch
 
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.activations import (
+from flashinfer.fused_moe.backends.cudnn_frost.activations import (
     ACTIVATIONS,
 )
 
