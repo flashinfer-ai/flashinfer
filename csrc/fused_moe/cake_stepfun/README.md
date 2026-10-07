@@ -49,7 +49,7 @@ Hooks outside this directory: `include/flashinfer/trtllm/fused_moe/runner.h`
 routing call sites). Buffer allocation, workspace layout and the FFI surface are
 those of the public module.
 
-## Inventory (`flashinfer.cake_stepfun.inventory.v4`)
+## Inventory (`flashinfer.cake_stepfun.inventory.v5`)
 
 Top-level keys: `schema`, `manifest` (path of the launch manifest), optional
 `stages_manifest` (path of the generated stage-table header, see below), `files`
@@ -61,14 +61,15 @@ separators=(",", ":")) + "\n"`, keys present only when the inventory has them).
 Every `kernels[]` record carries `stage` (`routing`, `fc1`, `requant`, `fc2`,
 `finalize`), `arch` (`sm_100a` / `sm_103a`), `device` (translation unit path),
 `compile_flags`, `kernel_symbol`, `name`, `parameters` (ordered `[type, name]`
-pairs of the kernel signature), `block`, `cluster`, `dynamic_smem_bytes` and
-`min_blocks`. Stage-specific fields:
+pairs of the kernel signature), `block`, `cluster`, `dynamic_smem_bytes`,
+`min_blocks`, `source_symbol` (the Cake kernel module the unit was rendered from)
+and `template` (the exporter's stage template). Stage-specific fields:
 
 | stage | record keys | uniqueness |
 |---|---|---|
-| `fc1`, `fc2` | `family`, `tile_n`, `output_rows_per_cta`, `block_k`; `fc2` adds `sf_layout_a` (`none`, `linear`, `r8c4`, `r128c4`), `split_k` (1, or the cluster split-K factor) and the K-tile geometry its kernel serves, `min_k_tiles` / `k_tiles_multiple` (`1` / `1` for single-slice kernels; a split-K kernel needs `intermediate_size / block_k >= split_k`, and one that slices K into `split_k` equal ranges also `k_tiles_multiple = split_k`) | one record per (arch, stage, family, tile), every tile of the family mapping present |
-| `routing` | `variant`, `input` (`scores` / `topk_ids`), `logits_dtype` (`float32` / `bfloat16`; `none` for `topk_ids`), `min_tokens`, `max_tokens`, `grid_rule` (`fixed` / `token_blocks` / `coop_sms`), `grid`, `tokens_per_cta`, `max_expanded_per_thread`, `cooperative`, optional `pre_kernel` (`{kernel_symbol, device, grid, block, dynamic_smem_bytes}`: the leading kernel of the two-kernel large-token path; its `device` unit is listed in `files` and compiled with the record's `compile_flags`) | one record per (arch, stage, variant) |
-| `requant` | `variant`, `sf_layout`, `rows_per_cta` | one record per (arch, stage, variant) |
+| `fc1`, `fc2` | `family`, `tile_n`, `output_rows_per_cta`, `block_k`, `native_config` (the trtllm-gen configuration the unit twins: on `fc2` the `bmm_*` function name, required -- the full-path tests pair each Cake tactic with it; on `fc1` the metainfo index of the twinned configuration where the module declares one, else `null`); `fc2` adds `sf_layout_a` (`none`, `linear`, `r8c4`, `r128c4`), `split_k` (1, or the cluster split-K factor) and the K-tile geometry its kernel serves, `min_k_tiles` / `k_tiles_multiple` (`1` / `1` for single-slice kernels; a split-K kernel needs `intermediate_size / block_k >= split_k`, and one that slices K into `split_k` equal ranges also `k_tiles_multiple = split_k`) | one record per (arch, stage, family, tile), every tile of the family mapping present |
+| `routing` | `variant`, `kind` (`static_block` / `dyn_block` / `coop` / `cluster`: the kernel's launch structure), `input` (`scores` / `topk_ids`), `logits_dtype` (`float32` / `bfloat16`; `none` for `topk_ids`), `min_tokens`, `max_tokens`, `grid_rule` (`fixed` / `token_blocks` / `coop_sms`), `grid`, `tokens_per_cta`, `max_expanded_per_thread`, `cooperative`, optional `pre_kernel` (`{kernel_symbol, source_symbol, parameters, device, grid, block, dynamic_smem_bytes}`: the leading kernel of the two-kernel large-token path; its `device` unit is listed in `files` and compiled with the record's `compile_flags`) | one record per (arch, stage, variant) |
+| `requant` | `variant`, `sf_layout`, `rows_per_cta`, `e4m3_max` (the FP8 e4m3 saturation bound of the requantization, 448) | one record per (arch, stage, variant) |
 | `finalize` | `variant` (`scalar` / `vector`, unique per dtype, e.g. `scalar_bf16`), `expert_weights_dtype` (`float32` / `bfloat16`), `max_top_k` | one record per (arch, stage, variant) |
 
 A target with any kernel must have `fc1` kernels. The manifest (or the
@@ -101,9 +102,24 @@ is the contract (tables are rendered positionally).
 Shapes: `T` tokens, `E` local experts, `top_k`, `H` hidden size, `I` intermediate
 size, `tile` tokens per CTA. `max_padded = Routing::getMaxPermutedPaddedCount(T,
 top_k, E, tile)`, `max_ctas = Routing::getMaxNumCtasInBatchDim(T, top_k, E, tile)`.
-All launches honour the caller's programmatic-dependent-launch flag; kernels
-wait with `griddepcontrol.wait` before their first global read and trigger
-`griddepcontrol.launch_dependents` after their last global write.
+All launches honour the caller's programmatic-dependent-launch flag. Every
+kernel waits with `griddepcontrol.wait` before its first read of the preceding
+kernel's output (the outputs of earlier stages are visible transitively, because
+every kernel triggers only after its own wait). The routing and requantization
+kernels trigger `griddepcontrol.launch_dependents` after their last global write.
+The GEMM kernels trigger in one of three places. The FC1 kernels of tiles 64 and
+larger, the FP8, MXFP8 and NVFP4 FC2 kernels of every tile and the BF16 FC2
+kernels of tiles 64 and 128 trigger in the activation-loader warps once the load
+loop has issued its last load, which is where their trtllm-gen reference kernels
+trigger. The BF16, MXFP8 and NVFP4 FC1 kernels of tiles 8 to 32 and the BF16 FC2
+kernels of tiles 8 to 32 trigger in the epilogue warps right after the dependency
+wait, and the FP8 FC1 kernels of tiles 8, 16 and 32 trigger at kernel start, in
+every warp right after the kernel-wide wait and the surplus-CTA exit; these two
+early forms are Cake choices (the reference kernels trigger only in their loaders)
+that let the dependent grid launch while the kernel still runs; the dependent
+grid relies on its own `griddepcontrol.wait`. The finalize kernels, like the
+reference finalize kernels, issue no trigger; their dependents launch at grid
+completion.
 
 ### Routing (`RoutingArgs`, `RoutingKernelSpec`)
 

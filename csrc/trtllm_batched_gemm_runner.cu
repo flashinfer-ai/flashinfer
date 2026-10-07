@@ -80,6 +80,17 @@ void checkPassingConfigIndex(std::vector<int64_t> const& passingConfigIndices,
 
 }  // namespace
 
+int64_t getBatchedGemmConfigIndexByName(std::string const& functionName) {
+  auto const bmm = BatchedGemmInterface();
+  auto const configs = bmm.getBatchedGemmConfigs();
+  for (size_t index = 0; index < bmm.getNumBatchedGemmConfigs(); ++index) {
+    if (configs[index].mFunctionName != nullptr && functionName == configs[index].mFunctionName) {
+      return static_cast<int64_t>(index);
+    }
+  }
+  return -1;
+}
+
 std::vector<int64_t> prioritizePredefinedConfigs(
     int m, int n, int k, std::vector<int64_t> const& sortedIndices,
     batchedGemm::batchedGemm::BatchedGemmConfig const* configs) {

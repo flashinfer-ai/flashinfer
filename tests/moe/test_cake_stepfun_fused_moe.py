@@ -1238,10 +1238,37 @@ def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
     assert checked, (
         f"no per-token Cake tactic at T={num_tokens}: {cake_tactics} vs {sorted(per_token_tiles)}"
     )
-    default = _forward(cake, cake_packed, cake_kwargs, -1)
-    assert torch.equal(default, _forward(native, native_packed, native_kwargs, -1)), (
-        f"nvfp4_bf16tok T={num_tokens}: the default Cake tactic differs from the native default"
+    # Tactic ``-1`` runs the Cake default (the smallest exported per-token tile with its first
+    # FC2 configuration, :meth:`CakeStepFunRunner.default_tactic`); its native twin is the
+    # declared (default FC1, declared FC2) pair of that tile, not the native dispatcher's default.
+    default_tactic = [int(v) for v in cake.default_tactic(cake_packed)]
+    assert default_tactic[0] in per_token_tiles, (
+        default_tactic,
+        sorted(per_token_tiles),
     )
+    default = _forward(cake, cake_packed, cake_kwargs, -1)
+    assert torch.equal(
+        default, _forward(cake, cake_packed, cake_kwargs, default_tactic)
+    ), (
+        f"nvfp4_bf16tok T={num_tokens}: tactic -1 does not run the default tactic {default_tactic}"
+    )
+    twin = tuple(
+        _native_twin_tactic(
+            native, native_packed, cake, cake_space, default_tactic, cake.full_path
+        )
+    )
+    if twin not in twin_outputs:
+        twin_outputs[twin] = _forward(native, native_packed, native_kwargs, list(twin))
+    if not torch.equal(default, twin_outputs[twin]):
+        diff = (default.float() - twin_outputs[twin].float()).abs().max().item()
+        matches = _bitwise_matches(
+            native, native_packed, native_kwargs, default_tactic[0], default
+        )
+        pytest.fail(
+            f"nvfp4_bf16tok T={num_tokens}: the default Cake tactic {default_tactic} differs "
+            f"from its native twin {list(twin)} (max |diff| {diff}); native (tactic, FC1, FC2) "
+            f"of tile {default_tactic[0]} matching bitwise: {matches or 'none'}"
+        )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1249,7 +1276,7 @@ def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
 # ---------------------------------------------------------------------------------------------
 
 
-def test_inventory_v4_lists_a_stage_per_kernel():
+def test_inventory_v5_lists_a_stage_per_kernel():
     """Every inventory record names its pipeline stage; fc1 is present for every target."""
     from flashinfer.jit.cake_stepfun_moe import (
         CAKE_STEPFUN_STAGES,
@@ -1263,6 +1290,27 @@ def test_inventory_v4_lists_a_stage_per_kernel():
         if inventory.device_sources[target]:
             assert "fc1" in stages, (target, sorted(stages))
             assert set(inventory.missing_stages(target)).isdisjoint(stages)
+
+
+def test_inventory_rejects_a_stale_schema_id(tmp_path):
+    """A generated tree of a previous schema fails with the schema error before any record is
+    read (the record contract changed under the v4 id twice; v5 makes a stale tree fail loudly)."""
+    from flashinfer.jit.cake_stepfun_moe import load_cake_stepfun_inventory
+
+    csrc_dir = tmp_path / "csrc" / "fused_moe" / "cake_stepfun"
+    (csrc_dir / "generated").mkdir(parents=True)
+    stale = {
+        "schema": "flashinfer.cake_stepfun.inventory.v4",
+        "kernels": [{"stage": "fc1"}],
+        "files": {"csrc/fused_moe/cake_stepfun/generated/x.cu": "0" * 64},
+    }
+    (csrc_dir / "generated" / "cake_stepfun_inventory.json").write_text(
+        json.dumps(stale), encoding="utf-8"
+    )
+    with pytest.raises(
+        ValueError, match=r"schema must be flashinfer\.cake_stepfun\.inventory\.v5"
+    ):
+        load_cake_stepfun_inventory(csrc_dir)
 
 
 def test_inventory_fc2_records_declare_the_k_tile_geometry_they_serve():

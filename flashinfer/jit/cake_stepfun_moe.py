@@ -55,7 +55,7 @@ _MODULE_URI: dict[tuple[CakeStepFunTarget, bool], str] = {
     ("sm_103a", True): "fused_moe_cake_stepfun_full_sm103",
 }
 _INVENTORY = "cake_stepfun_inventory.json"
-_INVENTORY_SCHEMA = "flashinfer.cake_stepfun.inventory.v4"
+_INVENTORY_SCHEMA = "flashinfer.cake_stepfun.inventory.v5"
 _MANIFEST = "cake_stepfun_generated_manifest.cuh"
 _FC1_SOURCE = "cake_stepfun_fc1_runner.cu"
 _FC1_HEADER = "cake_stepfun_fc1_runner.cuh"
@@ -204,7 +204,7 @@ def _pre_kernel_device(kernel: dict, index: int, files: dict) -> str | None:
 def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInventory:
     """Read and validate the generated inventory.
 
-    The inventory (schema ``flashinfer.cake_stepfun.inventory.v4``) lists every
+    The inventory (schema ``flashinfer.cake_stepfun.inventory.v5``) lists every
     exported device translation unit with its ``stage`` (one of
     :data:`CAKE_STEPFUN_STAGES`), ``arch``, ``device`` path, ``compile_flags`` and
     launch metadata. ``fc1`` / ``fc2`` records are ``(family, tile_n)`` pairs declared

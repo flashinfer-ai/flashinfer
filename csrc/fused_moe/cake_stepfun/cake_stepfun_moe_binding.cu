@@ -33,7 +33,6 @@
 #include <string>
 #include <vector>
 
-#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/BatchedGemmInterface.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "generated/cake_stepfun_generated_manifest.cuh"
 #include "tvm_ffi_utils.h"
@@ -144,17 +143,12 @@ Array<int64_t> cake_stepfun_fc1_tiles(String const& family) {
 
 /** Index of the trtllm-gen batched-GEMM configuration named ``function_name`` in the metainfo
  * table this module was built with -- the FC1 / FC2 coordinate space of the native runners'
- * ``trtllm_get_valid_moe_factorizations`` -- or -1 when the artifact has no such kernel. */
+ * ``trtllm_get_valid_moe_factorizations`` -- or -1 when the artifact has no such kernel. The
+ * lookup lives in the batched-GEMM runner translation unit, the one TU of the module that
+ * instantiates the metainfo table. */
 int64_t cake_stepfun_native_bmm_config_index(String const& function_name) {
-  auto const bmm = batchedGemm::batchedGemm::BatchedGemmInterface();
-  auto const configs = bmm.getBatchedGemmConfigs();
   std::string const name(function_name.data(), function_name.size());
-  for (size_t index = 0; index < bmm.getNumBatchedGemmConfigs(); ++index) {
-    if (configs[index].mFunctionName != nullptr && name == configs[index].mFunctionName) {
-      return static_cast<int64_t>(index);
-    }
-  }
-  return -1;
+  return tensorrt_llm::kernels::getBatchedGemmConfigIndexByName(name);
 }
 
 /**
