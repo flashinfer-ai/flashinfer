@@ -37,7 +37,11 @@ def adapter(monkeypatch):
     monkeypatch.setattr(module, "get_device_index", lambda device: 0)
     monkeypatch.setattr(module, "_get_cache_buf", lambda *args: torch.empty(0))
     monkeypatch.setattr(module, "_create_cudnn_handle", lambda stream: stream)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: "cpu-test")
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda *args: SimpleNamespace(cuda_stream=101)
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     return module
 
 
