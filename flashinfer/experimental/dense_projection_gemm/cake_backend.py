@@ -475,6 +475,7 @@ def instance_key(
     sk_sync: bool = False,
     sk_slab: int = 0,
     cta1: bool = False,
+    cgrp: bool = False,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
@@ -482,7 +483,7 @@ def instance_key(
     overlapped single-TMEM-buffer tall epilogue, ``htail`` = deterministic half-height tail wave, ``b_swz`` = MN-major B
     panel width in bytes (128 / 64 / 32; K-major B instances always keep 128), ``sk_exact`` = exact p-way stream-K
     split, ``_skx`` symbols; round 18 (Cake W2): ``sk_sync`` = synchronised stream-K tail, field 26, ``_sks`` symbols;
-    round 19: ``sk_slab`` (Cake W2, field 27, ``_sb{n}``) and ``cta1`` (Cake W3, field 28 = LAST, ``_c1``), see below); the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11.  ``smem_limit`` (bytes; default = the largest
+    round 19: ``sk_slab`` (Cake W2, field 27, ``_sb{n}``) and ``cta1`` (Cake W3, field 28, ``_c1``); round 21: ``cgrp`` (Cake W3, field 29 = LAST, ``_cg``), see below); the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11 (under ``cgrp`` the group counts column tiles).  ``smem_limit`` (bytes; default = the largest
     architecture limit, ``smem_limit_for(None)``) only bounds the stage count - it is not part of
     the key, so an instance has one symbol on every architecture (the planner passes
     ``smem_limit_for(arch)`` like the Cake launcher).  Diagnostic (attribution) instances are not
@@ -498,15 +499,20 @@ def instance_key(
     ``sk_slab`` (round 19, Cake W2, field 27, symbol ``_sb{n}``) selects the slab path of the synchronised stream-K fixup
     (1 early arrival; 2 + the bulk slab read through the dead mainloop stages; 3 + the fp32 output as the slab: fp32
     outputs through the transposed register path or the TMA-store epilogue); it is forced to 0 without ``sk_sync`` so
-    every other instance keeps one key.  ``cta1`` (round 19, Cake W3, field 28 = LAST, symbol ``_c1``) selects the
+    every other instance keeps one key.  ``cta1`` (round 19, Cake W3, field 28, symbol ``_c1``) selects the
     single-CTA form of the 128-row single-pass family: one 128 x BLOCK_N tile per CTA through the cta_group::1 MMA into
     private TMEM, every barrier local, CLC per CTA (cluster dims 1) - no pair handoff; it excludes the pair-only tail
     policies / probes (``htail`` / ``sk_exact`` / ``sk_sync`` / ``a_mcast``), the tall and 64-row families (``ovl`` /
     ``park``) and the batched raster knob.  Its B stage streams the whole BLOCK_N columns per CTA, so the stage
-    geometry (``b_stage_bytes`` / ``default_stages`` / ``box_rows_of``) takes the CTA group."""
+    geometry (``b_stage_bytes`` / ``default_stages`` / ``box_rows_of``) takes the CTA group.
+    ``cgrp`` (round 21, Cake W3, field 29 = LAST, symbol ``_cg``) selects the column-grouped raster: the ``group_m``
+    launch parameter counts COLUMN tiles per raster group (any count >= 1) and consecutive pairs sweep a group's
+    columns of one pair row before the next pair row (a group's B panels stay L2-resident, A streams once per column
+    group); every other field is unchanged and the OFF form renders byte-identical.  [Cake ``instance_key``]"""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf = int(block_n), int(cta_rows), int(pf)
     cta1 = bool(cta1)
+    cgrp = bool(cgrp)
     cg = 1 if cta1 else CTA_GROUP
     hints = (str(hints[0]), str(hints[1]))
     if any(h not in L2_HINTS for h in hints):
@@ -716,6 +722,7 @@ def instance_key(
         sk_sync,
         sk_slab,
         cta1,
+        cgrp,
     )
 
 
@@ -729,8 +736,9 @@ def instance_symbol(key: tuple) -> str:
     epilogue, ``_s<stages>`` for a non-default stage count, ``_box<rows>`` and a trailing ``_skx`` for the exact
     p-way stream-K split (round 13), ``_sks`` for the synchronised stream-K tail (round 18) followed by ``_sb<n>`` for
     its slab path (round 19), ``_so<f|l|n>`` after the batch-raster term for the TMA-store L2 eviction policy,
-    then ``_pd<n>`` / ``_sh<n>`` for the pipelined TMEM drain / suspend-time hint (round 15) and a trailing ``_c1`` for
-    the single-CTA form (round 19; its default stage count is the single-CTA fit)).  [Cake ``instance_symbol``]"""
+    then ``_pd<n>`` / ``_sh<n>`` for the pipelined TMEM drain / suspend-time hint (round 15), ``_c1`` for
+    the single-CTA form (round 19; its default stage count is the single-CTA fit) and a trailing ``_cg`` for the
+    column-grouped raster (round 21)).  [Cake ``instance_symbol``]"""
     (
         a_mn,
         b_mn,
@@ -760,6 +768,7 @@ def instance_symbol(key: tuple) -> str:
         sk_sync,
         sk_slab,
         cta1,
+        cgrp,
     ) = key
     cg = 1 if cta1 else CTA_GROUP
     so = {
@@ -806,6 +815,7 @@ def instance_symbol(key: tuple) -> str:
         + (f"_pd{pd}" if pd else "")
         + (f"_sh{sh}" if sh else "")
         + ("_c1" if cta1 else "")
+        + ("_cg" if cgrp else "")
         + "".join(f"_{d}" for d in diag)
     )
 
@@ -826,7 +836,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 32, 6144, None): {"cta1": True},
     ('sm_100a', False, False, False, False, False, 128, 6144, None): {"cta1": True},
     ('sm_100a', False, False, False, False, False, 576, 6144, None): {"hints": ('evict_first', 'evict_last'), "stages": 8},
-    ('sm_100a', False, False, False, False, False, 2048, 6144, None): {"group_m": 8},
+    ('sm_100a', False, False, False, False, False, 2048, 6144, None): {"group_m": 8, "cgrp": True},
     ('sm_100a', False, False, False, False, False, 6144, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True},
     ('sm_100a', False, False, False, False, False, 6144, 16384, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
     ('sm_100a', False, False, False, False, False, 16384, 2048, None): {"group_m": 32},
@@ -1007,6 +1017,44 @@ def default_hints(
     layout-class rule can be re-added without touching the call site.
     [Cake ``default_hints`` L1204-L1216]"""
     if wave_working_set(m_tiles, n_tiles, k_len, group_m, pairs) <= l2_bytes:
+        return ("none", "none")
+    if n_tiles == 1:
+        return ("evict_first", "none")
+    return ("none", "none")
+
+
+def wave_working_set_cgrp(
+    m_tiles: int, n_tiles: int, k_len: int, group_n: int, pairs: int, elt_bytes: int = 2
+) -> int:
+    """Round 21 (Cake W3): bytes of A and B panels touched by one wave of CTA pairs under the column-grouped
+    raster (``cgrp``): a group of ``group_n`` column panels (K x 256) is swept by consecutive pairs of one pair
+    row, so a wave covers ``cols`` column panels and ``rows`` pair-row panels (256 x K) of one batch entry.
+    [Cake ``wave_working_set_cgrp`` L2515-L2528]"""
+    m_pairs = max(1, m_tiles // CTA_GROUP)
+    g = max(1, min(group_n, n_tiles))
+    band = g * m_pairs  # pair tiles per column group
+    if band >= pairs:
+        cols = g
+        rows = min(m_pairs, _ceil_div(pairs, g))
+    else:
+        cols = min(n_tiles, g * _ceil_div(pairs, band))
+        rows = m_pairs
+    return (rows + cols) * 256 * k_len * elt_bytes
+
+
+def default_hints_cgrp(
+    a_mn: bool,
+    b_mn: bool,
+    m_tiles: int,
+    n_tiles: int,
+    k_len: int,
+    group_n: int,
+    pairs: int,
+    l2_bytes: int,
+) -> tuple[str, str]:
+    """``default_hints`` for the column-grouped raster (round 21, Cake W3): the same policy over the column
+    raster's wave working set.  [Cake ``default_hints_cgrp`` L2531-L2537]"""
+    if wave_working_set_cgrp(m_tiles, n_tiles, k_len, group_n, pairs) <= l2_bytes:
         return ("none", "none")
     if n_tiles == 1:
         return ("evict_first", "none")
@@ -1258,10 +1306,15 @@ class GemmPlan:
     # 1 early arrival, 2 + the bulk slab read through the dead mainloop stages, 3 + the fp32 output as the slab; always 0
     # without ``sk_sync`` (the same synchronised plan arithmetic: ``ws_f32_elems`` keeps one slab per tail tile)
     sk_slab: int = 0
-    # round 19 (Cake W3): the single-CTA form (instance_key field 27 = the 28th and LAST field, ``_c1`` symbols): one
+    # round 19 (Cake W3): the single-CTA form (instance_key field 27 = the 28th field, ``_c1`` symbols): one
     # 128 x BLOCK_N tile per CTA with cluster dims (1, 1, 1), so ``m_tiles`` is not rounded to pairs, ``pair_tiles``
     # counts CTA tiles, ``sm_pairs`` holds the SM count and ``grid`` = ``num_cluster_tiles`` CTAs
     cta1: bool = False
+    # round 21 (Cake W3): the column-grouped raster (instance_key field 28 = the 29th and LAST field, ``_cg`` symbols):
+    # ``group_m`` counts COLUMN tiles per raster group (any count >= 1; the pair invariant is unchanged), consecutive
+    # pairs sweep a group's columns of one pair row before the next pair row, so a group's B panels stay L2-resident
+    # and A streams once per column group; the plan arithmetic (tiles, units, tail policy, grid) is the pair form's
+    cgrp: bool = False
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -1269,8 +1322,9 @@ class GemmPlan:
 
     @property
     def wave_working_set_bytes(self) -> int:
-        """Operand bytes one wave of CTA pairs touches (the hint gate compares it with ``l2_bytes``)."""
-        return wave_working_set(
+        """Operand bytes one wave of CTA pairs touches (the hint gate compares it with ``l2_bytes``): the column
+        raster's working set under ``cgrp`` (``wave_working_set_cgrp``), the row raster's otherwise."""
+        return (wave_working_set_cgrp if self.cgrp else wave_working_set)(
             self.m_tiles, self.n_tiles, self.K, self.group_m, self.sm_pairs
         )
 
@@ -1360,6 +1414,7 @@ def plan_dense_projection_gemm(
     sk_sync_m: Optional[int] = None,
     sk_slab: Optional[int] = None,
     cta1: Optional[bool] = None,
+    cgrp: Optional[bool] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -1377,7 +1432,9 @@ def plan_dense_projection_gemm(
     Round 19: ``cta1`` (Cake W3) selects the single-CTA form - the tile count, the concurrent work items
     (``sm_units``: SMs instead of CTA pairs) and the grid follow the CTA group, and the form carries no tail
     policy; ``sk_slab`` (Cake W2) selects the slab path of a synchronised stream-K plan (the same plan arithmetic),
-    with the launcher's yield rules for a rule-derived value.
+    with the launcher's yield rules for a rule-derived value.  Round 21: ``cgrp`` (Cake W3) selects the
+    column-grouped raster program (``_cg``): ``group_m`` counts column tiles per raster group (any count >= 1) and
+    the hint gate takes the column raster's wave working set (``default_hints_cgrp``); the plan arithmetic is unchanged.
     [Cake ``dense_projection_gemm`` L1234-L1358]
 
     One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
@@ -1417,6 +1474,7 @@ def plan_dense_projection_gemm(
         sk_sync_m=sk_sync_m,
         sk_slab=sk_slab,
         cta1=cta1,
+        cgrp=cgrp,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -1502,6 +1560,10 @@ def plan_dense_projection_gemm(
         # round 19 (Cake W3): the single-CTA form of the 128-row family (no pair handoff)  [Cake launcher]
         cta1 = bool(rule.get("cta1", False))
     cta1 = bool(cta1)
+    if cgrp is None:
+        # round 21 (Cake W3): column-grouped raster (group_m = column tiles per group; B-panel L2 residency)  [Cake launcher]
+        cgrp = rule.get("cgrp", False)
+    cgrp = bool(cgrp)
     # CTAs per work item: the launch grid, the tile count and the scheduler units follow it  [Cake launcher]
     cg = 1 if cta1 else CTA_GROUP
     if cta1 and (
@@ -1710,14 +1772,15 @@ def plan_dense_projection_gemm(
             "group_m", default_group_m(a_mn, b_mn, m_tiles, pair_tiles, units)
         )
     group_m = int(group_m)
-    if group_m < 1 or (cg == 2 and (group_m < 2 or group_m % 2)):
+    if group_m < 1 or (cg == 2 and not cgrp and (group_m < 2 or group_m % 2)):
         raise ValueError(
-            f"dense_projection_gemm: group_m must be an even number >= 2 (CTA pairs are adjacent row tiles; any count >= 1 under cta1), got {group_m}"
+            f"dense_projection_gemm: group_m must be an even number >= 2 (CTA pairs are adjacent row tiles; any count >= 1 under cta1, or under cgrp where it counts column tiles), got {group_m}"
         )
     if hints is None:
+        # round 21 (Cake W3): the hint gate over the column raster's wave working set under cgrp  [Cake launcher]
         hints = rule.get(
             "hints",
-            default_hints(
+            (default_hints_cgrp if cgrp else default_hints)(
                 a_mn, b_mn, m_tiles, n_tiles, K, group_m, units, int(l2_bytes)
             ),
         )
@@ -1751,6 +1814,7 @@ def plan_dense_projection_gemm(
         sk_sync=sync_plan is not None,
         sk_slab=int(sk_slab) if sync_plan is not None else 0,
         cta1=cta1,
+        cgrp=cgrp,
     )
     plan = GemmPlan(
         L=L,
@@ -1796,6 +1860,7 @@ def plan_dense_projection_gemm(
         sk_sync=bool(key[25]),
         sk_slab=int(key[26]),
         cta1=bool(key[27]),
+        cgrp=bool(key[28]),
     )
     if _fallback and plan.template not in KERNELS.get(arch, {}):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
@@ -2039,6 +2104,7 @@ def prepare_dense_projection_gemm(
     sk_sync_m: Optional[int] = None,
     sk_slab: Optional[int] = None,
     cta1: Optional[bool] = None,
+    cgrp: Optional[bool] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
@@ -2086,6 +2152,7 @@ def prepare_dense_projection_gemm(
         sk_sync_m=sk_sync_m,
         sk_slab=sk_slab,
         cta1=cta1,
+        cgrp=cgrp,
         arch=arch,
     )
     module_name = select_module(arch, plan.template)

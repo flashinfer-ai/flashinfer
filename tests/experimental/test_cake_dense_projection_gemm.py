@@ -37,6 +37,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     default_block_n,
     default_group_m,
     default_hints,
+    default_hints_cgrp,
     b_stage_bytes,
     box_rows_of,
     default_stages,
@@ -63,6 +64,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     stream_k_plan,
     swap_small_m,
     wave_working_set,
+    wave_working_set_cgrp,
     wgrad_swapped,
     wgrad_views,
 )
@@ -261,7 +263,12 @@ EXPECTED_TEMPLATES = {
         (2049, 148): 'dense_proj_gemm_nn_n192_hee_f32_t_tma1',
         (2049, 212): 'dense_proj_gemm_nn_n192_bz64_hee_f32_t',
     },
-    ('shared_gate_up', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
+    ('shared_gate_up', 'fwd', 'bf16'): {
+        (1001, 148): 'dense_proj_gemm_kk_n256_cg',
+        (1001, 212): 'dense_proj_gemm_kk_n256',
+        (2049, 148): 'dense_proj_gemm_kk_n256_cg',
+        (2049, 212): 'dense_proj_gemm_kk_n256',
+    },
     ('shared_gate_up', 'dgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_kn_n256',
         (1001, 212): 'dense_proj_gemm_kn_n256',
@@ -569,7 +576,7 @@ ARCH_OF_SM = {148: "sm_100a", 212: "sm_107a"}
 
 
 _TRANSPOSED_STEM = re.compile(
-    r"_t(?:_tma[12])?(?:_s\d+)?(?:_box\d+)?(?:_skx)?(?:_sks)?(?:_sb[123])?(?:_b(?:f|g\d+))?(?:_so[flnd])?(?:_pd\d+)?(?:_sh\d+)?(?:_c1)?$"
+    r"_t(?:_tma[12])?(?:_s\d+)?(?:_box\d+)?(?:_skx)?(?:_sks)?(?:_sb[123])?(?:_b(?:f|g\d+))?(?:_so[flnd])?(?:_pd\d+)?(?:_sh\d+)?(?:_c1)?(?:_cg)?$"
 )
 
 
@@ -577,7 +584,7 @@ def _transposed_template(template: str) -> bool:
     """``_t`` (transposed register epilogue) or ``_t_tma1`` / ``_t_tma2`` (round-14 transposed TMA-store epilogue),
     followed by the knob suffixes ``instance_symbol`` emits after the epilogue term (``_s<stages>``, ``_box<rows>``,
     ``_skx``, ``_sks`` / ``_sb<n>`` (rounds 18 / 19), ``_bf`` / ``_bg<n>``, ``_so<x>``, ``_pd<n>``, ``_sh<n>``, ``_c1``
-    (round 19)) - e.g. the round-16 six-stage swapped MLA weight-gradient templates ``..._hee_t_tma1_s6``."""
+    (round 19), ``_cg`` (round 21)) - e.g. the round-16 six-stage swapped MLA weight-gradient templates ``..._hee_t_tma1_s6``."""
     return _TRANSPOSED_STEM.search(template) is not None
 
 
@@ -1176,7 +1183,7 @@ def test_round13_w3_knobs():
     # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
     key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
     assert (
-        len(key) == 28
+        len(key) == 29
         and key[18] == 64
         and key[19] is False
         and key[20] == 0
@@ -1238,7 +1245,7 @@ def test_round15_store_hint_knob():
     key = instance_key(
         a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_last"
     )
-    assert len(key) == 28 and key[22] == "evict_last"
+    assert len(key) == 29 and key[22] == "evict_last"
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma1_sol"
     assert (
         instance_key(a_mn=False, b_mn=True, epi="reg", store_hint="evict_last")[22]
@@ -1280,7 +1287,7 @@ def test_round15_pd_sh_knobs():
     # family (1 = in-tile chunk pipelining, 2 = cross-tile prefetch, 3 = both chunks in flight; ``_pd<n>``) and the
     # suspend-time hint of the free-running waits in ns (``_sh<n>``); both 0 when off, validated like the Cake kernel
     key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2)
-    assert len(key) == 28 and key[23] == 2 and key[24] == 0
+    assert len(key) == 29 and key[23] == 2 and key[24] == 0
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma2_pd2"
     assert (
         instance_key(a_mn=False, b_mn=True)[23:]
@@ -1290,8 +1297,9 @@ def test_round15_pd_sh_knobs():
             False,
             0,
             False,
+            False,
         )
-    )  # ... followed by the round-18 sk_sync flag and the round-19 sk_slab / cta1 fields
+    )  # ... followed by the round-18 sk_sync flag, the round-19 sk_slab / cta1 fields and the round-21 cgrp flag
     assert (
         instance_symbol(
             instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2, sh=1000)
@@ -1395,7 +1403,7 @@ def test_round13_knob_normalisation():
     # knob (narrower or shorter tiles raise), htail needs the 256-row family or (round 16, Cake W2) the 128-row standard
     # family with the 256-column row-major tile and the plain drain, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(key) == 28 and key[15] is False and key[16] is True and key[17] is True
+    assert len(key) == 29 and key[15] is False and key[16] is True and key[17] is True
     assert (
         instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15]
         is False
@@ -1524,13 +1532,13 @@ def test_sk_sync_rule_yields_to_caller_forced_forms():
 
 
 def test_round19_sk_slab_knob():
-    # field 27 of the 28-field key (round 19, Cake W2): the slab path of the synchronised stream-K fixup (symbol
+    # field 27 of the 29-field key (round 19, Cake W2): the slab path of the synchronised stream-K fixup (symbol
     # ``_sb<n>``: 1 = early arrival, 2 = + the bulk slab read through the dead mainloop stages, 3 = + the fp32 output as
     # the slab).  It exists only on the ``_sks`` programs (forced to 0 without ``sk_sync``, so every other instance keeps
     # one key); 3 needs an fp32 output through the TMA-store or the transposed register epilogue; 2 needs the eight warp
     # slabs (EPI_WARPS x epi_cols x 128 B) to fit the mainloop stage ring
     key = instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_sync=True, sk_slab=2)
-    assert len(key) == 28 and key[25] is True and key[26] == 2 and key[27] is False
+    assert len(key) == 29 and key[25] is True and key[26] == 2 and key[27] is False
     assert instance_symbol(key) == "dense_proj_gemm_nn_n256_m256_sks_sb2"
     assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2)[26] == 0
     assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2) == instance_key(
@@ -1595,13 +1603,13 @@ def test_round19_sk_slab_knob():
 
 
 def test_round19_cta1_knob():
-    # field 28 (LAST) of the 28-field key (round 19, Cake W3): the single-CTA form of the 128-row single-pass family
+    # field 28 of the 29-field key (LAST until round 21's ``cgrp``; round 19, Cake W3): the single-CTA form of the 128-row single-pass family
     # (symbol ``_c1``, cluster dims 1, cta_group::1 MMA into private TMEM, CLC per CTA).  Its B stage streams the whole
     # BLOCK_N columns per CTA (32 KiB stages at BLOCK_N 128, 48 KiB at 256), so the default stage count is the deepest
     # single-CTA fit and ``_s<n>`` is relative to it; it excludes the tall / 64-row families, the pair-level tail
     # policies / probes and the batched raster knob
     key = instance_key(a_mn=False, b_mn=False, block_n=128, cta1=True)
-    assert len(key) == 28 and key[27] is True and key[26] == 0 and key[5] == 7
+    assert len(key) == 29 and key[27] is True and key[26] == 0 and key[5] == 7
     assert instance_symbol(key) == "dense_proj_gemm_kk_n128_c1"
     assert b_stage_bytes(False, 128, 128, 1) == 2 * b_stage_bytes(False, 128) == 16384
     assert b_stage_bytes(True, 256, 128, 1) == 2 * b_stage_bytes(True, 256) == 32768
@@ -1900,6 +1908,173 @@ def test_round21_rules_plan_like_the_cake_launcher(T):
     h = _views("proj", "indexer_hw", "dgrad", "bf16", T)
     ph, *_ = plan_dense_projection_gemm(h["A"], h["B"], h["out"], **kw)
     assert ph.template == "dense_proj_gemm_kn_n256_tma2_pd2"
+    # round 21 (W3, lever B): the sm_100a shared_gate_up forward bf16 (X @ W^T, 2048 x 6144 x T) keeps its raster group 8
+    # and takes the column-grouped raster form (``kk_n256_cg``, instance-key field 29: the group counts column tiles);
+    # sm_107a has no rule on the row and keeps the row-grouped ``kk_n256``
+    assert ROW_RULES[
+        ("sm_100a", False, False, False, False, False, 2048, 6144, None)
+    ] == {
+        "group_m": 8,
+        "cgrp": True,
+    }
+    g = _views("proj", "shared_gate_up", "fwd", "bf16", T)
+    pg, *_ = plan_dense_projection_gemm(g["A"], g["B"], g["out"], **kw)
+    assert pg.cgrp and pg.template == "dense_proj_gemm_kk_n256_cg" and pg.group_m == 8
+    pg107, *_ = plan_dense_projection_gemm(g["A"], g["B"], g["out"], **kw107)
+    assert not pg107.cgrp and pg107.template == "dense_proj_gemm_kk_n256"
+
+
+@pytest.mark.parametrize("T", [16172, 16231])
+def test_round21_cgrp_knob(T):
+    # field 29 (LAST) of the 29-field key (round 21, Cake W3): the column-grouped raster (symbol ``_cg``, after
+    # ``_c1``): the ``group_m`` launch parameter counts COLUMN tiles per raster group (any count >= 1; the pair
+    # invariant - consecutive CTAs are the two row tiles of one column tile - is unchanged) and consecutive pairs sweep
+    # a group's columns of one pair row before the next pair row, so a group's B panels stay L2-resident while A
+    # streams once per column group.  Every other field is unchanged: the OFF form's key is the round-20 key plus a
+    # trailing False and its symbol is the round-20 symbol
+    key = instance_key(
+        a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True, cgrp=True
+    )
+    assert len(key) == 29 and key[28] is True and key[27] is False
+    assert instance_symbol(key) == "dense_proj_gemm_kk_n256_m256_ov_ht_cg"
+    off = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
+    assert len(off) == 29 and off[:28] == key[:28] and off[28] is False
+    assert instance_symbol(off) == "dense_proj_gemm_kk_n256_m256_ov_ht"
+    assert (
+        instance_symbol(instance_key(a_mn=False, b_mn=False, cgrp=True))
+        == "dense_proj_gemm_kk_n256_cg"
+    )
+    default = instance_key(a_mn=False, b_mn=False)
+    assert (
+        default[28] is False and instance_symbol(default) == "dense_proj_gemm_kk_n256"
+    )
+    # ``_cg`` is the last knob term, after ``_c1`` (the symbol grammar only: no rule or registered program combines
+    # the single-CTA form with the column raster)
+    both = instance_key(a_mn=False, b_mn=False, block_n=128, cta1=True, cgrp=True)
+    assert both[27] is True and both[28] is True
+    assert instance_symbol(both) == "dense_proj_gemm_kk_n128_c1_cg"
+    # the hint gate over the column raster's wave working set (Cake ``wave_working_set_cgrp`` / ``default_hints_cgrp``):
+    # a group of g column panels is swept by consecutive pairs of one pair row, so a wave covers g column panels and
+    # ceil(pairs / g) pair rows while the group's band (g x pair rows) holds the wave, else every pair row and
+    # ceil(pairs / band) groups of columns
+    assert wave_working_set_cgrp(64, 24, 12288, 12, 74) == (7 + 12) * 256 * 12288 * 2
+    assert wave_working_set_cgrp(10, 24, 12288, 12, 74) == (5 + 24) * 256 * 12288 * 2
+    assert wave_working_set_cgrp(128, 1, 6144, 16, 74) == (64 + 1) * 256 * 6144 * 2
+    assert (
+        wave_working_set_cgrp(128, 24, 16384, 16, 74, elt_bytes=1)
+        == (5 + 16) * 256 * 16384
+    )
+    assert default_hints_cgrp(False, False, 128, 24, 16384, 16, 74, L2_BYTES) == (
+        "none",
+        "none",
+    )  # o_proj fwd: no hint on a multi-column row
+    assert default_hints_cgrp(False, False, 128, 1, 6144, 16, 74, L2_BYTES) == (
+        "evict_first",
+        "none",
+    )  # a single-use A (one column tile) streams
+    assert default_hints_cgrp(False, False, 128, 1, 6144, 16, 74, 1 << 40) == (
+        "none",
+        "none",
+    )  # fits a huge L2
+    # the two rasters' waves differ, so the gates differ: 100 pair rows x one column tile at K = 3200 - the row
+    # raster's wave spans 10 groups of 8 pair rows (81 panels, over the L2), the column raster's 74 pair rows (75
+    # panels, under it)
+    assert wave_working_set(200, 1, 3200, 16, 74) == 81 * 256 * 3200 * 2 > L2_BYTES
+    assert (
+        wave_working_set_cgrp(200, 1, 3200, 16, 74) == 75 * 256 * 3200 * 2 <= L2_BYTES
+    )
+    assert default_hints(False, False, 200, 1, 3200, 16, 74, L2_BYTES) == (
+        "evict_first",
+        "none",
+    )
+    assert default_hints_cgrp(False, False, 200, 1, 3200, 16, 74, L2_BYTES) == (
+        "none",
+        "none",
+    )
+    # through the planner on the dense_down forward (X @ W^T: 6144 x 12288, the round-21 W3 candidate row; the knob is
+    # caller-forced here - a ``cgrp`` rule arrives through the rule sync): the ``_cg`` program of the row's tall
+    # overlapped half-height-tail family with 12 column tiles per raster group; the plan arithmetic (64 x 24 tiles, 768
+    # pair tiles on 74 pairs, the half-height tail wave) is the pair form's - only the program and the raster differ
+    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
+    v = _views("proj", "dense_down", "fwd", "bf16", T)
+    plan, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], cgrp=True, group_m=12, **kw
+    )
+    assert plan.cgrp and plan.template == "dense_proj_gemm_kk_n256_m256_ov_ht_cg"
+    assert (plan.group_m, plan.cta_rows, plan.block_n) == (12, 256, 256)
+    assert plan.ovl and plan.htail and not plan.cta1
+    assert (plan.m_tiles, plan.n_tiles, plan.pair_tiles, plan.sm_pairs) == (
+        64,
+        24,
+        768,
+        74,
+    )
+    assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (740, 28, 56)
+    assert plan.hints == ("none", "none")
+    assert (
+        plan.wave_working_set_bytes
+        == wave_working_set_cgrp(64, 24, 12288, 12, 74)
+        == 19 * 256 * 12288 * 2
+    )
+    base, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], group_m=12, **kw)
+    assert not base.cgrp and base.template == "dense_proj_gemm_kk_n256_m256_ov_ht"
+    for f in (
+        "m_tiles",
+        "n_tiles",
+        "pair_tiles",
+        "sm_pairs",
+        "num_full",
+        "tail_tiles",
+        "sk_units",
+        "iters_per_unit",
+        "stages",
+        "epi",
+        "slots",
+        "hints",
+        "grid",
+        "ws_f32_elems",
+    ):
+        assert getattr(plan, f) == getattr(base, f), f
+    # the raster width defaults to the row default (16, ``default_group_m``) under cgrp as well, now as column tiles
+    cg16, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cgrp=True, **kw)
+    assert cg16.group_m == 16 and cg16.template == plan.template
+    # the pair invariant holds whatever the column count, so the count has no parity constraint under cgrp: 3 (or 1)
+    # column tiles per group are admitted where the row raster rejects an odd count (CTA pairs are adjacent row
+    # tiles); a count < 1 is rejected on both
+    odd, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], cgrp=True, group_m=3, **kw
+    )
+    assert odd.group_m == 3 and odd.template == plan.template
+    one, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], cgrp=True, group_m=1, **kw
+    )
+    assert one.group_m == 1 and one.template == plan.template
+    with pytest.raises(ValueError, match="group_m must be an even number"):
+        plan_dense_projection_gemm(v["A"], v["B"], v["out"], group_m=3, **kw)
+    with pytest.raises(ValueError, match="group_m must be an even number"):
+        plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], cgrp=False, group_m=1, **kw
+        )
+    with pytest.raises(ValueError, match="group_m must be an even number"):
+        plan_dense_projection_gemm(v["A"], v["B"], v["out"], cgrp=True, group_m=0, **kw)
+    # the planner selects the gate by the raster: one 256-column tile over 25600 rows at K = 3200 (no rule) streams A
+    # evict_first on the row raster (``_hen``) and keeps the hint-free program on the column raster
+    A = torch.empty(25600, 3200, dtype=torch.bfloat16)
+    Bt = torch.empty(256, 3200, dtype=torch.bfloat16).t()
+    out = torch.empty(25600, 256, dtype=torch.bfloat16)
+    row, *_ = plan_dense_projection_gemm(A, Bt, out, **kw)
+    col, *_ = plan_dense_projection_gemm(A, Bt, out, cgrp=True, **kw)
+    assert (row.m_tiles, row.n_tiles, row.group_m, row.sm_pairs) == (200, 1, 16, 74)
+    assert row.template == "dense_proj_gemm_kk_n256_hen" and row.hints == (
+        "evict_first",
+        "none",
+    )
+    assert col.template == "dense_proj_gemm_kk_n256_cg" and col.hints == (
+        "none",
+        "none",
+    )
+    assert row.wave_working_set_bytes > L2_BYTES >= col.wave_working_set_bytes
+    assert (col.m_tiles, col.n_tiles, col.group_m, col.grid) == (200, 1, 16, row.grid)
 
 
 def test_wave_working_set_and_hint_rule():
@@ -2024,8 +2199,9 @@ def test_instance_key_rejects_bad_configurations():
     key = instance_key(a_mn=False, b_mn=False)
     # 20 fields since round 13 (the raster group width and the TMA L2 promotion left the key for the launch
     # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group, store_ef,
-    # store_hint, pd, sh, sk_sync (26 fields since round 18), sk_slab, cta1 (28 fields since round 19)
-    assert len(key) == 28 and key[11:] == (
+    # store_hint, pd, sh, sk_sync (26 fields since round 18), sk_slab, cta1 (28 fields since round 19), cgrp (29 fields
+    # since round 21)
+    assert len(key) == 29 and key[11:] == (
         0,
         ("none", "none"),
         False,
@@ -2042,6 +2218,7 @@ def test_instance_key_rejects_bad_configurations():
         0,
         False,
         0,
+        False,
         False,
     )
     # the promotion is validated where it is resolved, by the planner
@@ -2323,6 +2500,10 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 assert not mirrored or plan.cta_rows == rule.get("cta_rows", 128)
                 assert not mirrored or plan.cta1 == bool(rule.get("cta1", False))
                 assert plan.template.endswith("_c1") == plan.cta1
+                # round 21 (Cake W3): the column-grouped raster of a ``cgrp`` rule (``_cg`` templates; the plan
+                # arithmetic is the pair form's, the hint gate takes the column raster's wave working set)
+                assert not mirrored or plan.cgrp == bool(rule.get("cgrp", False))
+                assert plan.template.endswith("_cg") == plan.cgrp
                 assert not plan.cta1 or plan.cta_rows == 128
                 assert not mirrored or (
                     plan.pf == rule.get("pf", 0)
@@ -2378,13 +2559,13 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         }[(plan.block_n, plan.slots)]
                     )
                 assert plan.l2_bytes == L2_BYTES
-                assert plan.wave_working_set_bytes == wave_working_set(
-                    plan.m_tiles, plan.n_tiles, plan.K, plan.group_m, plan.sm_pairs
-                )
+                assert plan.wave_working_set_bytes == (
+                    wave_working_set_cgrp if plan.cgrp else wave_working_set
+                )(plan.m_tiles, plan.n_tiles, plan.K, plan.group_m, plan.sm_pairs)
                 assert not mirrored or plan.hints == tuple(
                     rule.get(
                         "hints",
-                        default_hints(
+                        (default_hints_cgrp if plan.cgrp else default_hints)(
                             plan.a_mn,
                             plan.b_mn,
                             plan.m_tiles,
