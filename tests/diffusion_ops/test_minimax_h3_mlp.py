@@ -20,7 +20,7 @@ for ``y`` (the fused kernels reuse that FC1 GEMM core), FlashInfer's ``mxfp8_qua
 disabled) rounded to BF16, the indexed gate product rounded to BF16 and the residual sum rounded
 to BF16.
 
-Acceptance rule (CAKE-610 rule, shared by the three variants and by the SM120 out-proj test): the
+Acceptance rule (the MiniMax-H3 out-stage rule, shared by the three variants and by the SM120 out-proj test): the
 operator rounds to BF16 three times after the FC2 accumulation (o, gate * o, residual + p), so two
 correct implementations with different FP32 accumulation orders legitimately disagree by one BF16
 step of ``o``.  Every element must satisfy ``|out - ref| <= atol + rtol * mag + 2 bf16_ulp(mag)``
@@ -36,7 +36,7 @@ the modulated activation and the gate).  The intermediate stages are checked as 
 quantized ``a`` workspaces bit-exactly against FlashInfer's own quantizer of this operator's BF16
 activation (and within the activation budget of the FC1 operator's, which is a fast-math build), and the
 quantized ``y`` written by the FC1 epilogue against FlashInfer's quantizer applied to the FC1
-operator's ``y`` under the CAKE-611 mismatch budgets on the rows whose quantized activation both
+operator's ``y`` under the FC1 operator's mismatch budgets on the rows whose quantized activation both
 operators agree on (a few E4M3 / E2M1 codes may flip where the two FC1 kernels round an FP32
 accumulator differently); the rare rows where they do not are judged against FlashInfer's quantizer
 of the FP32 FC1 oracle on this operator's own quantized activation (the Cake contract's rule).
@@ -104,12 +104,12 @@ RTOL = 1e-2
 Y_RTOL = 1.6e-2
 MAX_VIOLATION_FRACTION = 2.0e-7
 MAX_VIOLATIONS_FLOOR = 4
-# CAKE-611 quantized-activation budgets for the y stage (codes / scale bytes).
+# The FC1 operator's quantized-activation budgets for the y stage (codes / scale bytes).
 MAX_CODE_MISMATCH_FRACTION = 4.0e-6
 MAX_CODE_MISMATCH_FLOOR = 4
 MAX_SCALE_MISMATCH_FRACTION = 1.0e-6
 MAX_SCALE_MISMATCH_FLOOR = 2
-# Rows on which the CAKE-611 FC1 operator (FlashInfer's default fast-math build) quantizes the
+# Rows on which the FC1 operator (FlashInfer's default fast-math build) quantizes the
 # modulated activation differently from this operator's precise build (one-ulp division rounding).
 MAX_FASTMATH_ROW_FRACTION = 4.0e-3
 MAX_FASTMATH_ROW_FLOOR = 4
@@ -350,7 +350,7 @@ def bf16_ulp(x: torch.Tensor) -> torch.Tensor:
 def assert_out_within_rule(
     out: torch.Tensor, ref: torch.Tensor, residual: torch.Tensor, what: str
 ) -> Dict[str, float]:
-    """The out stage's CAKE-610 rule (``test_minimax_h3_sm120_quant_out_proj.assert_matches``):
+    """The out stage's shared MiniMax-H3 rule (``test_minimax_h3_sm120_quant_out_proj.assert_matches``):
     ``|out - ref| <= atol + rtol * mag + 2 * bf16_ulp(mag)`` with ``mag = max(|ref|, |p_ref|)``,
     ``p_ref = ref - residual`` (the gated projection before the residual sum, recovered up to one
     BF16 step).  One BF16 flip of ``o`` (FP32 accumulation order) moves ``gate * o`` by at most two
@@ -492,26 +492,45 @@ def assert_a_stage(
     ref_sf: torch.Tensor,
     fc1_q: torch.Tensor,
     fc1_sf: torch.Tensor,
+    valid_rows: torch.Tensor,
     what: str,
 ) -> torch.Tensor:
     """The a stage is bit-exact against FlashInfer's own quantizer applied to this operator's BF16
     activation (this module is built without ``-use_fast_math``, like the Cake build the contract
-    validated).  The CAKE-611 FC1 operator is FlashInfer's default fast-math build, whose norm
-    differs from the precise one on rare division-rounding elements, so against its quantized
-    activation the a stage is held to the activation budget instead of bit-exactness.  Returns the
-    row mask on which both operators' quantized activations are identical."""
+    validated), and its guard rows (``valid_rows`` false) are all-zero codes and scale bytes.  The
+    FC1 operator is FlashInfer's default fast-math build, whose norm differs from the precise one
+    on rare division-rounding elements, so against its quantized activation the a stage is held to
+    the activation budget instead of bit-exactness.  That comparison covers the valid rows only:
+    the FC1 operator's guard-row workspace bytes are not reliable under CUDA 12.9, whose ptxas
+    folds that kernel's constant-zero FP8 pack into an ``F2FP`` merge with an undefined register
+    and leaves stale bytes in the high half of every zero code word (its scale byte is 0, so its y
+    and out are unaffected).  Returns the valid-row mask on which both operators' quantized
+    activations are identical."""
     assert torch.equal(workspace_a_q.view(torch.uint8), ref_q.view(torch.uint8)), (
         f"{what}: quantized a differs from FlashInfer's quantizer of this operator's activation"
     )
     assert torch.equal(a_sf, ref_sf), (
         f"{what}: a scales differ from FlashInfer's quantizer of this operator's activation"
     )
+    guard = ~valid_rows
+    if bool(guard.any()):
+        assert not bool(workspace_a_q[guard].view(torch.uint8).any()), (
+            f"{what}: guard rows must quantize to all-zero codes"
+        )
+        assert not bool(a_sf[guard].any()), (
+            f"{what}: guard rows must have all-zero scale bytes"
+        )
     assert_quantized_activation_within_budget(
-        workspace_a_q, a_sf, fc1_q, fc1_sf, f"{what} a stage vs the FC1 operator"
+        workspace_a_q[valid_rows],
+        a_sf[valid_rows],
+        fc1_q[valid_rows],
+        fc1_sf[valid_rows],
+        f"{what} a stage vs the FC1 operator (valid rows)",
     )
     same_rows = (workspace_a_q.view(torch.uint8) == fc1_q.view(torch.uint8)).all(dim=1)
     same_rows &= (a_sf == fc1_sf).all(dim=1)
-    rows = int(same_rows.numel())
+    same_rows &= valid_rows
+    rows = int(valid_rows.sum().item())
     budget = max(
         MAX_FASTMATH_ROW_FLOOR, int(math.ceil(MAX_FASTMATH_ROW_FRACTION * rows))
     )
@@ -528,25 +547,55 @@ def assert_y_stage(
     fc1_q: torch.Tensor,
     fc1_sf: torch.Tensor,
     same_rows: torch.Tensor,
+    valid_rows: torch.Tensor,
     what: str,
     oracle_check,
+    guard_check,
 ) -> Dict[str, int]:
-    """Quantized y against FlashInfer's quantizer of the FC1 operator's y under the CAKE-611 code /
+    """Quantized y against FlashInfer's quantizer of the FC1 operator's y under the FC1 operator's code /
     scale budgets on the rows whose quantized activation both operators agree on (same operand,
     same GEMM arithmetic).  On the few rows where the fast-math FC1 norm quantizes the activation
     differently from this operator's precise one the two FC1 inputs differ by a quantization step,
     so no agreement with the FC1 operator's y is expected; ``oracle_check(rows)`` judges those rows
     the way the Cake contract judges every row: the kernel's quantized y against FlashInfer's
     quantizer of the FP32 FC1 oracle evaluated on this operator's own quantized activation, under
-    the same code / scale budgets."""
+    the same code / scale budgets.  Guard rows (``valid_rows`` false) are not compared with the FC1
+    operator (see ``assert_a_stage``); ``guard_check(rows)`` holds the kernel's quantized y on them
+    bit-exact to FlashInfer's quantizer of a zero y."""
     stats = assert_quantized_activation_within_budget(
         y_q[same_rows], y_sf[same_rows], fc1_q[same_rows], fc1_sf[same_rows], what
     )
-    other = ~same_rows
+    other = valid_rows & ~same_rows
     stats["rows_with_differing_activation"] = int(other.sum().item())
     if stats["rows_with_differing_activation"]:
         stats["oracle_rows"] = oracle_check(other)
+    guard = ~valid_rows
+    stats["guard_rows_y"] = int(guard.sum().item())
+    if stats["guard_rows_y"]:
+        guard_check(guard)
     return stats
+
+
+def _valid_rows(idx: torch.Tensor, table_rows: int) -> torch.Tensor:
+    """Row mask of the indices inside ``[0, table_rows)`` (the complement are the guard rows)."""
+    return (idx >= 0) & (idx < table_rows)
+
+
+def _assert_guard_rows_zero_quantized(
+    y_q: torch.Tensor,
+    y_sf: torch.Tensor,
+    guard: torch.Tensor,
+    zero_q: torch.Tensor,
+    zero_sf: torch.Tensor,
+    what: str,
+) -> None:
+    """The kernel's quantized y on the guard rows is bit-exact to FlashInfer's quantizer of zeros."""
+    assert torch.equal(y_q[guard].view(torch.uint8), zero_q.view(torch.uint8)), (
+        f"{what}: guard rows' quantized y must be the quantizer's zero codes"
+    )
+    assert torch.equal(y_sf[guard], zero_sf), (
+        f"{what}: guard rows' y scale bytes must be the quantizer's zero scales"
+    )
 
 
 def _norm_args(model, x, idx):
@@ -645,7 +694,11 @@ def run_mxfp8_case(rows: int, model, prepared, device) -> Dict[str, float]:
     )
     torch.cuda.synchronize()
     what = f"mxfp8 M={rows}"
+    valid_rows = _valid_rows(idx, _table_rows(model))
     a_same = _bf16_activation_from_operator(model, x, idx, residual, device)
+    assert not bool(a_same[~valid_rows].view(torch.int16).any()), (
+        f"{what}: the BF16 operator's guard-row activation must be +0.0"
+    )
     a_ref_q, a_ref_sf = flashinfer_mxfp8_quantize(a_same, MXFP8_A_SF_COLS)
     a_sf = kernel_sf_linear(workspace_a_sf, rows, MXFP8_A_SF_COLS, MXFP8_A_SF_K_TILES)
     same_rows = assert_a_stage(
@@ -655,6 +708,7 @@ def run_mxfp8_case(rows: int, model, prepared, device) -> Dict[str, float]:
         a_ref_sf,
         a_fi_q,
         kernel_sf_linear(a_fi_sf, rows, MXFP8_A_SF_COLS, MXFP8_A_SF_K_TILES),
+        valid_rows,
         what,
     )
     y_sf = kernel_sf_linear(workspace_y_sf, rows, MXFP8_Y_SF_COLS, MXFP8_Y_SF_K_TILES)
@@ -672,8 +726,24 @@ def run_mxfp8_case(rows: int, model, prepared, device) -> Dict[str, float]:
             f"{what} y stage (rows with a differing activation, vs the FC1 oracle on a_q)",
         )
 
+    def guard_check(guard: torch.Tensor) -> None:
+        zero_q, zero_sf = flashinfer_mxfp8_quantize(
+            torch.zeros_like(y_fi[guard]), MXFP8_Y_SF_COLS
+        )
+        _assert_guard_rows_zero_quantized(
+            workspace_y_q, y_sf, guard, zero_q, zero_sf, f"{what} y stage"
+        )
+
     y_stats = assert_y_stage(
-        workspace_y_q, y_sf, y_fi_q, y_fi_sf, same_rows, what, oracle_check
+        workspace_y_q,
+        y_sf,
+        y_fi_q,
+        y_fi_sf,
+        same_rows,
+        valid_rows,
+        what,
+        oracle_check,
+        guard_check,
     )
     ref = _reference_from_operands(
         mxfp8_dequantize(workspace_y_q, y_sf), w2_deq, model["gate"], idx, residual
@@ -743,7 +813,11 @@ def run_nvfp4_case(rows: int, model, prepared, device) -> Dict[str, float]:
     )
     torch.cuda.synchronize()
     what = f"nvfp4 M={rows}"
+    valid_rows = _valid_rows(idx, _table_rows(model))
     a_same = _bf16_activation_from_operator(model, x, idx, residual, device)
+    assert not bool(a_same[~valid_rows].view(torch.int16).any()), (
+        f"{what}: the BF16 operator's guard-row activation must be +0.0"
+    )
     a_ref_q, a_ref_sf = flashinfer_nvfp4_quantize(
         a_same, g_a, NVFP4_A_PACKED_COLS, NVFP4_A_SF_COLS
     )
@@ -755,6 +829,7 @@ def run_nvfp4_case(rows: int, model, prepared, device) -> Dict[str, float]:
         a_ref_sf,
         a_fi_q,
         kernel_sf_linear(a_fi_sf, rows, NVFP4_A_SF_COLS, NVFP4_A_SF_K_TILES),
+        valid_rows,
         what,
     )
     y_sf = kernel_sf_linear(workspace_y_sf, rows, NVFP4_Y_SF_COLS, NVFP4_Y_SF_K_TILES)
@@ -776,8 +851,24 @@ def run_nvfp4_case(rows: int, model, prepared, device) -> Dict[str, float]:
             f"{what} y stage (rows with a differing activation, vs the FC1 oracle on a_q)",
         )
 
+    def guard_check(guard: torch.Tensor) -> None:
+        zero_q, zero_sf = flashinfer_nvfp4_quantize(
+            torch.zeros_like(y_fi[guard]), g_y, NVFP4_Y_PACKED_COLS, NVFP4_Y_SF_COLS
+        )
+        _assert_guard_rows_zero_quantized(
+            workspace_y_q, y_sf, guard, zero_q, zero_sf, f"{what} y stage"
+        )
+
     y_stats = assert_y_stage(
-        workspace_y_q, y_sf, y_fi_q, y_fi_sf, same_rows, what, oracle_check
+        workspace_y_q,
+        y_sf,
+        y_fi_q,
+        y_fi_sf,
+        same_rows,
+        valid_rows,
+        what,
+        oracle_check,
+        guard_check,
     )
     ref = _reference_from_operands(
         nvfp4_dequantize_scaled(workspace_y_q, y_sf),

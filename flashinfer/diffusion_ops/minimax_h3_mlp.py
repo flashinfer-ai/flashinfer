@@ -66,7 +66,7 @@ _FC2_N_TILES = MINIMAX_H3_HIDDEN // _FC2_BLOCK_N  # 21
 # (row % 32) * 16 + (row // 32) * 4 + kblock inside the tile; tiles ordered (row block, K set).
 _SF_TILE_ROWS = 128
 _SF_TILE_BYTES = 512
-# FC1 activation ``a`` (K = 5376): the CAKE-611 norm kernels' layout (see minimax_h3_fc1_swiglu).
+# FC1 activation ``a`` (K = 5376): the FC1 operator's norm kernels' layout (see minimax_h3_fc1_swiglu).
 MXFP8_A_SF_COLS = MINIMAX_H3_HIDDEN // MXFP8_BLOCK  # 168 UE8M0 scales per row
 MXFP8_A_SF_K_TILES = MXFP8_A_SF_COLS // 4  # 42 tiles per 128-row block
 NVFP4_A_PACKED_COLS = NVFP4_PACKED_COLS  # 2688 E2M1 nibble pairs per row

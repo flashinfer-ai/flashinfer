@@ -1904,32 +1904,11 @@ kernel_minimax_h3_norm_adaln_mxfp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
             }
         } else {
             unsigned int zero_byte = 0;
+            unsigned long long zero_word = 0;
             #pragma unroll
             for (int i_2 = 0; i_2 < VECS_PER_LANE; i_2++) {
                 int k_2 = (lane + i_2 * 32) * 8;
-                float zeros[8];
-                #pragma unroll
-                for (int j_3 = 0; j_3 < 8; j_3++) {
-                    zeros[j_3] = 0.0f;
-                }
-                {
-                    unsigned int _fp8_pk[2];
-                    asm("{\n\t"
-                        ".reg .b16 _lo, _hi;\n\t"
-                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                        "mov.b32 %0, {_lo, _hi};\n\t"
-                        "}\n"
-                        : "=r"(_fp8_pk[0]) : "f"(zeros[0 + 0]), "f"(zeros[0 + 1]), "f"(zeros[0 + 2]), "f"(zeros[0 + 3]));
-                    asm("{\n\t"
-                        ".reg .b16 _lo, _hi;\n\t"
-                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                        "mov.b32 %0, {_lo, _hi};\n\t"
-                        "}\n"
-                        : "=r"(_fp8_pk[1]) : "f"(zeros[0 + 4]), "f"(zeros[0 + 5]), "f"(zeros[0 + 6]), "f"(zeros[0 + 7]));
-                    *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(a_q + (row_base + (unsigned long long)k_2)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
-                }
+                *(reinterpret_cast<unsigned long long*>(a_q + (row_base + (unsigned long long)k_2)) + (0)) = zero_word;
                 if (quad_lane == 0) {
                     int block_1 = i_2 * 8 + block_in_vec;
                     int k_tile_1 = block_1 >> 2;
