@@ -139,6 +139,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             activation_clamp=k.activation_clamp,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             use_persistent_finalize_kernel=k.use_persistent_finalize_kernel,
+            num_valid_tokens_tensor=k.num_valid_tokens_tensor,
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
         )
 
@@ -278,7 +279,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             return None
         import torch
 
-        from ......core.kernel.workspace_pool import knobs_pool_key
+        from ......core.kernel.workspace_pool import epilogue_pool_key, knobs_pool_key
 
         fp = fleet_params
         return (
@@ -295,6 +296,8 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             k.kind,
             _resolve_gate_up_clamp(k),
             k.enable_in_kernel_fc2_reduce,
+            k.use_persistent_finalize_kernel,
+            epilogue_pool_key(k.num_valid_tokens_tensor),
             knobs_pool_key(k.knobs),
         )
 

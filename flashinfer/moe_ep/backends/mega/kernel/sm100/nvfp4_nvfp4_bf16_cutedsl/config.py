@@ -48,6 +48,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # Forwards the actual token count to the top-k function to prevent wasted work
     # when max_num_tokens is larger than the actual token count.
     use_persistent_finalize_kernel: bool = False
+    # Caller-owned CUDA int32 (1,) live-token count the reducer reads; the
+    # workspace borrows it and never writes it. Update before every forward.
+    num_valid_tokens_tensor: Optional["torch.Tensor"] = None
     input_norm_const: float = 1.0
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
@@ -87,3 +90,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
                 raise ValueError("activation clamps are not supported with SiTU.")
         elif self.situ_beta is not None or self.situ_linear_beta is not None:
             raise ValueError("SiTU parameters require activation='situ'.")
+        if self.use_persistent_finalize_kernel and self.num_valid_tokens_tensor is None:
+            raise ValueError(
+                "use_persistent_finalize_kernel=True requires "
+                "num_valid_tokens_tensor: a caller-owned CUDA int32 tensor of "
+                "shape (1,) holding the live token count."
+            )

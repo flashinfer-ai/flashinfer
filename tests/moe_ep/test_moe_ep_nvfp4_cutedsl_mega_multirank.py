@@ -1757,6 +1757,8 @@ def test_nvfp4_cutedsl_mega_kernel_is_registered():
 
 def test_nvfp4_cutedsl_config_exposes_reducer_controls():
     """The TRT-LLM-import knobs are plumbed through the FI backend config."""
+    import torch
+
     from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
@@ -1768,12 +1770,21 @@ def test_nvfp4_cutedsl_config_exposes_reducer_controls():
     assert cfg.combine_dtype == "bf16"
     assert create_mega_kernel(cfg).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
+    num_valid_tokens_tensor = torch.zeros(1, dtype=torch.int32)
     persistent_cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
         use_persistent_finalize_kernel=True,
+        num_valid_tokens_tensor=num_valid_tokens_tensor,
     )
     assert persistent_cfg.use_persistent_finalize_kernel
+    assert persistent_cfg.num_valid_tokens_tensor is num_valid_tokens_tensor
+    with pytest.raises(ValueError, match="requires num_valid_tokens_tensor"):
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+            use_persistent_finalize_kernel=True,
+        )
 
     cfg_q = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,

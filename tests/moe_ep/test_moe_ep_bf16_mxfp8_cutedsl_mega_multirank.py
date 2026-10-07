@@ -7,10 +7,14 @@ Launched via torchrun:
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import pytest
 
 from flashinfer.moe_ep.core.validation.common import is_bf16_mxfp8_cutedsl_supported
+
+if TYPE_CHECKING:
+    import torch
 
 cuda_13_required = pytest.mark.skipif(
     not is_bf16_mxfp8_cutedsl_supported(),
@@ -151,11 +155,18 @@ def _public_k_major(t):
     return t.transpose(2, 3).contiguous().transpose(2, 3)
 
 
+def _num_valid_tokens(num_tokens: int):
+    import torch
+
+    return torch.full((1,), num_tokens, dtype=torch.int32, device="cuda")
+
+
 def _megakernel_config(
     problem: dict,
     *,
     in_kernel_fc2_reduce: bool = False,
     use_persistent_finalize_kernel: bool = False,
+    num_valid_tokens_tensor: torch.Tensor | None = None,
     knobs: dict | None = None,
 ):
     from flashinfer.moe_ep import Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
@@ -168,6 +179,7 @@ def _megakernel_config(
         fast_math=problem["fast_math"],
         enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         use_persistent_finalize_kernel=use_persistent_finalize_kernel,
+        num_valid_tokens_tensor=num_valid_tokens_tensor,
         knobs=knobs,
     )
 
@@ -208,6 +220,11 @@ def _reference_mixed_mega_moe(
         gate_up_clamp=problem["gate_up_clamp"],
         enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         use_persistent_finalize_kernel=use_persistent_finalize_kernel,
+        num_valid_tokens_tensor=(
+            _num_valid_tokens(problem["num_tokens"])
+            if use_persistent_finalize_kernel
+            else None
+        ),
         knobs=knobs,
     )
     num_tokens = problem["num_tokens"]
@@ -272,11 +289,17 @@ def _run_mega_layer(
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
     problem = _mega_problem(rank, world_size)
+    num_valid_tokens_tensor = (
+        _num_valid_tokens(problem["num_tokens"])
+        if use_persistent_finalize_kernel
+        else None
+    )
     kernel = create_mega_kernel(
         _megakernel_config(
             problem,
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             use_persistent_finalize_kernel=use_persistent_finalize_kernel,
+            num_valid_tokens_tensor=num_valid_tokens_tensor,
             knobs=knobs,
         )
     )
@@ -299,6 +322,7 @@ def _run_mega_layer(
                     problem,
                     in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                     use_persistent_finalize_kernel=use_persistent_finalize_kernel,
+                    num_valid_tokens_tensor=num_valid_tokens_tensor,
                     knobs=knobs,
                 ),
                 preprocess_weights=True,

@@ -107,6 +107,21 @@ class MegaMoEBf16Mxfp8Config:
         return _KIND_TO_DTYPE[self.kind]
 
 
+def _validate_num_valid_tokens(num_valid_tokens: Optional[torch.Tensor]) -> None:
+    if num_valid_tokens is None:
+        raise ValueError(
+            "use_persistent_finalize_kernel requires a caller-owned "
+            "live-token count; pass num_valid_tokens_tensor= to "
+            "get_symm_buffer_for_bf16_mxfp8_mega_moe()."
+        )
+    if (
+        not num_valid_tokens.is_cuda
+        or num_valid_tokens.dtype != torch.int32
+        or tuple(num_valid_tokens.shape) != (1,)
+    ):
+        raise ValueError("num_valid_tokens must be a CUDA int32 tensor of shape (1,).")
+
+
 @dataclass
 class MegaMoEBf16Mxfp8Inputs:
     activation: torch.Tensor
@@ -117,7 +132,7 @@ class MegaMoEBf16Mxfp8Inputs:
     fc2_weight: torch.Tensor
     fc2_weight_sf: torch.Tensor
     output_activation: torch.Tensor
-    num_valid_tokens: torch.Tensor
+    num_valid_tokens: Optional[torch.Tensor]
 
 
 class MegaMoEBf16Mxfp8Frontend:
@@ -249,14 +264,8 @@ class MegaMoEBf16Mxfp8Frontend:
             raise ValueError(
                 "output_activation has an invalid mixed MegaMoE shape or dtype."
             )
-        if (
-            not inputs.num_valid_tokens.is_cuda
-            or inputs.num_valid_tokens.dtype != torch.int32
-            or tuple(inputs.num_valid_tokens.shape) != (1,)
-        ):
-            raise ValueError(
-                "num_valid_tokens must be a CUDA int32 tensor of shape (1,)."
-            )
+        if c.use_persistent_finalize_kernel and not c.in_kernel_fc2_reduce:
+            _validate_num_valid_tokens(inputs.num_valid_tokens)
 
     def _runtime_kwargs(
         self, inputs: MegaMoEBf16Mxfp8Inputs, mega: _CompiledMega
@@ -395,7 +404,9 @@ class MegaMoEBf16Mxfp8Frontend:
             inputs.fc2_weight.data_ptr(),
             inputs.fc2_weight_sf.data_ptr(),
             inputs.output_activation.data_ptr(),
-            inputs.num_valid_tokens.data_ptr(),
+            None
+            if inputs.num_valid_tokens is None
+            else inputs.num_valid_tokens.data_ptr(),
             torch.cuda.current_stream().cuda_stream,
         )
         if mega.launch_key != key:
@@ -403,11 +414,6 @@ class MegaMoEBf16Mxfp8Frontend:
             mega.launch_key = key
         if self.config.in_kernel_fc2_reduce:
             inputs.output_activation.zero_()
-        if (
-            self.config.use_persistent_finalize_kernel
-            and not self.config.in_kernel_fc2_reduce
-        ):
-            inputs.num_valid_tokens.fill_(n)
         mega.compiled(**mega.launch_kwargs)
         if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
@@ -415,11 +421,6 @@ class MegaMoEBf16Mxfp8Frontend:
 
     def make_launch_thunk(self, inputs: MegaMoEBf16Mxfp8Inputs) -> Callable[[], Any]:
         self._validate(inputs, inputs.activation.shape[0])
-        if (
-            self.config.use_persistent_finalize_kernel
-            and not self.config.in_kernel_fc2_reduce
-        ):
-            inputs.num_valid_tokens.fill_(inputs.activation.shape[0])
         mega = self._ensure_compiled(inputs)
         kwargs = self._runtime_kwargs(inputs, mega)
         if self.config.in_kernel_fc2_reduce:
@@ -440,7 +441,8 @@ class MegaMoEBf16Mxfp8SymmBuffer:
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     output_activation: torch.Tensor
-    num_valid_tokens: torch.Tensor
+    # Borrowed, caller-owned; never written or freed here.
+    num_valid_tokens: Optional[torch.Tensor]
     _frontend: MegaMoEBf16Mxfp8Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
@@ -472,13 +474,24 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
     gate_up_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
     use_persistent_finalize_kernel: bool = False,
+    num_valid_tokens_tensor: Optional[torch.Tensor] = None,
     knobs: Optional[dict] = None,
 ) -> MegaMoEBf16Mxfp8SymmBuffer:
+    """
+    ``use_persistent_finalize_kernel`` forwards the actual token count to the
+    standalone top-k reducer, and requires ``num_valid_tokens_tensor``: a
+    caller-owned CUDA int32 ``(1,)`` tensor holding the live count. It is
+    ignored when that reducer is not used
+    """
     from flashinfer.moe_ep.core.validation.common import (
         validate_bf16_mxfp8_cutedsl_cuda,
     )
 
     validate_bf16_mxfp8_cutedsl_cuda()
+    # Not gated on in_kernel_fc2_reduce: knobs may flip that off later and the
+    # buffer cannot acquire a caller tensor after allocation.
+    if use_persistent_finalize_kernel:
+        _validate_num_valid_tokens(num_valid_tokens_tensor)
     from .knob_cache import resolve_knobs
     from .tuner import (
         describe_invalid_knobs,
@@ -524,9 +537,6 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
     topk_idx.fill_(-1)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
     output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
-    num_valid_tokens = torch.full(
-        (1,), num_max_tokens, dtype=torch.int32, device="cuda"
-    )
     return MegaMoEBf16Mxfp8SymmBuffer(
         num_total_experts,
         num_max_tokens,
@@ -539,7 +549,7 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
         topk_idx,
         topk_weights,
         output_activation,
-        num_valid_tokens,
+        num_valid_tokens_tensor,
         MegaMoEBf16Mxfp8Frontend(config),
         [x, topk_idx, topk_weights, output_activation],
     )

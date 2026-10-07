@@ -253,6 +253,21 @@ class MegaMoENvfp4Config:
         return self.token_back_mode != "epi_warps"
 
 
+def _validate_num_valid_tokens(num_valid_tokens: Optional[torch.Tensor]) -> None:
+    if num_valid_tokens is None:
+        raise ValueError(
+            "use_persistent_finalize_kernel requires a caller-owned "
+            "live-token count; pass num_valid_tokens_tensor= to "
+            "get_symm_buffer_for_mega_moe()."
+        )
+    if (
+        not num_valid_tokens.is_cuda
+        or num_valid_tokens.dtype != torch.int32
+        or tuple(num_valid_tokens.shape) != (1,)
+    ):
+        raise ValueError("num_valid_tokens must be a CUDA int32 tensor of shape (1,).")
+
+
 @dataclasses.dataclass
 class MegaMoENvfp4Inputs:
     """Per-rank tensors for one NVFP4 MegaMoE launch.
@@ -278,7 +293,7 @@ class MegaMoENvfp4Inputs:
     fc2_alpha: torch.Tensor
     fc1_norm_const: torch.Tensor
     output_activation: torch.Tensor
-    num_valid_tokens: torch.Tensor
+    num_valid_tokens: Optional[torch.Tensor]
 
 
 class MegaMoENvfp4Frontend:
@@ -356,7 +371,6 @@ class MegaMoENvfp4Frontend:
         inputs: MegaMoENvfp4Inputs,
         *,
         num_tokens: Optional[int] = None,
-        valid_num_tokens: Optional[int] = None,
         sync: bool = True,
         reset_counters: bool = False,
         reduce_topk: bool = True,
@@ -387,19 +401,8 @@ class MegaMoENvfp4Frontend:
                 "use_custom_finalize=True; use the terminal adapter"
             )
         resolved = self._resolve_num_tokens(inputs, num_tokens)
-        valid = resolved if valid_num_tokens is None else valid_num_tokens
-        if not 0 <= valid <= inputs.activation.shape[0]:
-            raise ValueError(
-                f"valid_num_tokens must be in [0, {inputs.activation.shape[0]}], "
-                f"got {valid}."
-            )
         if resolved == 0:
             return None
-        if (
-            self.config.use_persistent_finalize_kernel
-            and not self.config.in_kernel_fc2_reduce
-        ):
-            inputs.num_valid_tokens.fill_(valid)
         key = self._launch_cache_key(inputs, resolved)
         mega = self._mega
         if mega is None or mega.compiled is None or mega.launch_key != key:
@@ -454,12 +457,6 @@ class MegaMoENvfp4Frontend:
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
             return lambda: None
-        if (
-            self.config.use_persistent_finalize_kernel
-            and not self.config.in_kernel_fc2_reduce
-            and num_tokens is not None
-        ):
-            inputs.num_valid_tokens.fill_(launch_inputs.activation.shape[0])
         mega = self._ensure_mega_compiled(inputs)
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         compiled = mega.compiled
@@ -520,7 +517,7 @@ class MegaMoENvfp4Frontend:
             t.fc2_alpha.data_ptr(),
             t.fc1_norm_const.data_ptr(),
             t.output_activation.data_ptr(),
-            t.num_valid_tokens.data_ptr(),
+            None if t.num_valid_tokens is None else t.num_valid_tokens.data_ptr(),
             num_tokens,
             torch.cuda.current_stream().cuda_stream,
         )
@@ -813,14 +810,8 @@ class MegaMoENvfp4Frontend:
                 "output_activation must be bfloat16, got "
                 f"{inputs.output_activation.dtype}."
             )
-        _require_cuda("num_valid_tokens", inputs.num_valid_tokens)
-        if (
-            inputs.num_valid_tokens.shape != (1,)
-            or inputs.num_valid_tokens.dtype != torch.int32
-        ):
-            raise ValueError(
-                "num_valid_tokens must be a CUDA int32 tensor of shape (1,)."
-            )
+        if c.use_persistent_finalize_kernel and not c.in_kernel_fc2_reduce:
+            _validate_num_valid_tokens(inputs.num_valid_tokens)
         if inputs.topk_idx.shape != (buf_tokens, c.num_topk):
             raise ValueError(
                 f"topk_idx must have shape ({buf_tokens}, {c.num_topk}), "
@@ -1110,7 +1101,8 @@ class MegaMoESymmBuffer:
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     output_activation: torch.Tensor
-    num_valid_tokens: torch.Tensor
+    # Borrowed, caller-owned; never written or freed here.
+    num_valid_tokens: Optional[torch.Tensor]
     fc1_alpha: torch.Tensor
     fc2_alpha: torch.Tensor
     fc1_norm_const: torch.Tensor
@@ -1154,6 +1146,7 @@ def get_symm_buffer_for_mega_moe(
     enable_in_kernel_fc2_reduce: bool = False,
     use_custom_finalize: bool = False,
     use_persistent_finalize_kernel: bool = False,
+    num_valid_tokens_tensor: Optional[torch.Tensor] = None,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
@@ -1189,7 +1182,9 @@ def get_symm_buffer_for_mega_moe(
     bit-exact).
 
     ``use_persistent_finalize_kernel`` forwards the actual token count to the
-    standalone top-k reducer. It is ignored when that reducer is not used.
+    standalone top-k reducer, and requires ``num_valid_tokens_tensor``: a
+    caller-owned CUDA int32 ``(1,)`` tensor holding the live count. It is
+    ignored when that reducer is not used
 
     ``combine_dtype`` selects the cross-rank combine wire format: ``"bf16"``
     (default, exact), ``"mxfp8"`` (fp8+e8m0 SF, 2x less combine traffic), or
@@ -1212,6 +1207,10 @@ def get_symm_buffer_for_mega_moe(
         )
     if num_total_experts % world_size != 0:
         raise ValueError("num_total_experts must be divisible by world_size.")
+    # Not gated on in_kernel_fc2_reduce: knobs may flip that off later and the
+    # buffer cannot acquire a caller tensor after allocation.
+    if use_persistent_finalize_kernel:
+        _validate_num_valid_tokens(num_valid_tokens_tensor)
 
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp,
@@ -1304,9 +1303,6 @@ def get_symm_buffer_for_mega_moe(
     # internal combine staging.
     output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     sym_roots.append(output_activation)
-    num_valid_tokens = torch.full(
-        (1,), num_max_tokens, dtype=torch.int32, device="cuda"
-    )
     fc1_alpha = _resolve_per_expert_epilogue(
         "fc1_alpha",
         fc1_alpha,
@@ -1336,7 +1332,7 @@ def get_symm_buffer_for_mega_moe(
         topk_idx=topk_idx,
         topk_weights=topk_weights,
         output_activation=output_activation,
-        num_valid_tokens=num_valid_tokens,
+        num_valid_tokens=num_valid_tokens_tensor,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,
@@ -1368,6 +1364,9 @@ def nvfp4_mega_moe(
     assembly, not ``deep_gemm.transform_weights_for_mega_moe``).  Weights are
     always caller-supplied here — unlike epilogue scalars in
     :func:`get_symm_buffer_for_mega_moe`, they are not owned by the symm buffer.
+
+    To benefit from ``use_persistent_finalize_kernel`` the caller must have
+    updated the count in ``symm_buffer.num_valid_tokens``
 
     ``y`` receives the top-k-reduced bf16 output for ``[:num_tokens]``.
     ``gate_up_clamp`` updates the kernel clamp for this session when set.
@@ -1463,7 +1462,6 @@ def nvfp4_mega_moe(
     out = symm_buffer._frontend.run(
         inputs,
         num_tokens=None,
-        valid_num_tokens=n,
         sync=False,
     )
     if y is None:
@@ -1745,7 +1743,6 @@ def create_dummy_inputs(
     # launch covers the full buffer and relies on topk_idx[n:] == -1.
     symm_buffer.topk_idx[num_tokens:].fill_(-1)
     symm_buffer.topk_weights[:num_tokens].copy_(topk_weights.to(torch.float32))
-    symm_buffer.num_valid_tokens.fill_(num_tokens)
 
     y = torch.empty(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
     return y, transformed_l1, transformed_l2, symm_buffer
