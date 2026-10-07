@@ -307,8 +307,11 @@ def recurrent_kda(
             through :func:`flashinfer.cudnn.cudnn_recurrent_kda`, and raises
             ``NotImplementedError`` carrying the reason when that engine cannot
             serve the call. It is never selected implicitly, and it covers
-            ordinary multi-token prefill only: no speculative decode, no state
-            pool, no ``initial_state_source``, no state checkpoints.
+            ordinary multi-token prefill only: no speculative decode, no
+            ``initial_state_source``, no state checkpoints. With a cuDNN frontend
+            supporting state pools, ``ssm_state_indices`` reads and updates the
+            selected slots of ``initial_state`` in place. ``output_final_state``
+            returns that pool, not a gathered per-sequence copy.
         qk_l2norm_additive_epsilon (Optional[float]):
             Explicit Q/K normalization denominator ``sqrt(sum(x*x) + epsilon)``.
             Currently supported only by ``backend="cudnn"`` ordinary prefill
@@ -496,7 +499,6 @@ def recurrent_kda(
                 ("initial_state_indices", initial_state_indices is not None),
                 ("seq_order", seq_order is not None),
                 ("prefill_workspace", prefill_workspace is not None),
-                ("ssm_state_indices", ssm_state_indices is not None),
                 ("state_checkpoints", state_checkpoints is not None),
                 ("checkpoint_cu_starts", checkpoint_cu_starts is not None),
                 ("checkpoint_every_n_tokens", checkpoint_every_n_tokens != 0),
@@ -511,6 +513,15 @@ def recurrent_kda(
             raise NotImplementedError(
                 'recurrent_kda(backend="cudnn") does not support '
                 + ", ".join(unsupported)
+            )
+        if (
+            ssm_state_indices is not None
+            and not _kda_prefill._is_plain_multi_token_prefill(
+                q, cu_seqlens, num_spec_tokens
+            )
+        ):
+            raise NotImplementedError(
+                'recurrent_kda(backend="cudnn") state pools require ordinary multi-token prefill'
             )
         return cudnn_recurrent_kda(
             q,
@@ -530,6 +541,7 @@ def recurrent_kda(
             beta_is_logit=beta_is_logit,
             output=output,
             qk_l2norm_additive_epsilon=qk_l2norm_additive_epsilon,
+            state_indices=ssm_state_indices,
         )
     if checkpoint_state_indices is not None and backend == "cake":
         raise ValueError("checkpoint_state_indices is supported only by CuTe DSL")

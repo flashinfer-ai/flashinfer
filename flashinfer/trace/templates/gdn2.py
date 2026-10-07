@@ -15,6 +15,7 @@
 """TraceTemplate for Gated Delta Net 2 (GDN-2) prefill."""
 
 import math
+from copy import deepcopy
 
 import torch
 
@@ -141,7 +142,7 @@ def _gdn2_prefill_init(
     }
 
 
-gdn2_prefill_trace = TraceTemplate(
+_gdn2_prefill_default_trace = TraceTemplate(
     op_type="gdn2",
     name_prefix="gdn2_prefill",
     description=(
@@ -230,3 +231,144 @@ gdn2_prefill_trace = TraceTemplate(
     reference=_gdn2_prefill_reference,
     init=_gdn2_prefill_init,
 )
+
+
+@torch.no_grad()
+def _gdn2_prefill_pool_reference(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    w,
+    initial_state,
+    cu_seqlens,
+    scale,
+    state_indices,
+    output_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+):
+    """Independent compact recurrence, gathering and scattering only pool slots."""
+    dtype = q.dtype
+    heads = max(q.shape[1], v.shape[1])
+    if g is None:
+        g = q.new_zeros(q.shape[0], heads, q.shape[-1])
+    beta = (
+        q.new_ones(q.shape[0], heads, q.shape[-1]) if beta is None else beta.to(dtype)
+    )
+    w = q.new_ones(q.shape[0], heads, v.shape[-1]) if w is None else w.to(dtype)
+    if use_qk_l2norm_in_kernel:
+        q = torch.nn.functional.normalize(q.float(), dim=-1)
+        k = torch.nn.functional.normalize(k.float(), dim=-1)
+    selected = initial_state.index_select(0, state_indices.long())
+    output, final = _gdn2_prefill_reference(
+        q, k, v, g, beta, w, selected, cu_seqlens, scale
+    )
+    output = output.to(dtype)
+    if not output_final_state:
+        return output, None
+    destination = output_state.clone()
+    destination.index_copy_(0, state_indices.long(), final.to(destination.dtype))
+    return output, destination
+
+
+_gdn2_prefill_pool_reference._trace_reference_dependencies = (  # type: ignore[attr-defined]
+    _gdn2_prefill_reference,
+)
+
+
+def _gdn2_prefill_pool_init(
+    *,
+    total_seq_len: int,
+    num_seqs: int = 4,
+    state_pool_rows: int = 0,
+    len_cu_seqlens: int = 0,
+    num_q_heads: int = 4,
+    num_k_heads: int = 4,
+    num_v_heads: int = 8,
+    head_size: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    inputs = _gdn2_prefill_init(
+        total_seq_len=total_seq_len,
+        num_seqs=num_seqs,
+        len_cu_seqlens=len_cu_seqlens,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_size=head_size,
+        device=device,
+        seed=seed,
+    )
+    heads = max(num_q_heads, num_v_heads)
+    rows = state_pool_rows or num_seqs
+    if rows < num_seqs:
+        raise ValueError("state_pool_rows must be at least num_seqs")
+    inputs.update(
+        initial_state=torch.zeros(rows, heads, head_size, head_size, device=device),
+        output_state=torch.zeros(rows, heads, head_size, head_size, device=device),
+        output_final_state=True,
+        state_indices=torch.arange(num_seqs, device=device, dtype=torch.int32),
+    )
+    return inputs
+
+
+_gdn2_prefill_pool_init._trace_init_dependencies = (  # type: ignore[attr-defined]
+    _gdn2_prefill_init,
+)
+_gdn2_prefill_pool_trace = deepcopy(_gdn2_prefill_default_trace)
+_gdn2_prefill_pool_trace.name_prefix = "gdn2_prefill_pool"
+_gdn2_prefill_pool_trace.reference = _gdn2_prefill_pool_reference
+_gdn2_prefill_pool_trace.init = _gdn2_prefill_pool_init
+_gdn2_prefill_pool_trace.axes["state_pool_rows"] = Var(
+    description="Rows in the recurrent state pool."
+)
+_gdn2_prefill_pool_trace.axes["num_q_heads"].abbrev = "q"
+_gdn2_prefill_pool_trace.axes["num_k_heads"].abbrev = "k"
+_gdn2_prefill_pool_trace.axes["num_o_heads"] = Const(
+    description="max(num_q_heads, num_v_heads).", abbrev=""
+)
+# Pool traces cover both grouped-query and grouped-value head layouts.
+for _name, _spec in _gdn2_prefill_pool_trace.inputs.items():
+    if isinstance(_spec, Tensor) and _name not in ("q", "k", "v"):
+        _spec.dim_names = [
+            "num_o_heads" if d == "num_v_heads" else d for d in _spec.dim_names
+        ]
+_gdn2_prefill_pool_trace.inputs["initial_state"].dim_names[0] = "state_pool_rows"
+_gdn2_prefill_pool_trace.inputs.update(
+    state_indices=Tensor(["num_seqs"]),
+    output_state=Tensor(
+        ["state_pool_rows", "num_o_heads", "head_size", "head_size"], optional=True
+    ),
+    output_final_state=Scalar("int32", optional=True),
+    use_qk_l2norm_in_kernel=Scalar("int32", optional=True),
+)
+_gdn2_prefill_pool_trace.outputs["output"].dim_names[1] = "num_o_heads"
+_gdn2_prefill_pool_trace.outputs["final_state"] = Tensor(
+    ["state_pool_rows", "num_o_heads", "head_size", "head_size"],
+    optional=True,
+    dtype_from="output_state",
+    dtype="float32",
+)
+_gdn2_prefill_pool_trace.constraints = [
+    "num_o_heads == max(num_q_heads, num_v_heads)",
+    "num_o_heads % num_q_heads == 0",
+    "num_o_heads % num_v_heads == 0",
+    "num_k_heads in (num_q_heads, num_v_heads)",
+    "len_cu_seqlens == num_seqs + 1",
+    "total_seq_len == cu_seqlens[-1].item()",
+]
+
+
+def gdn2_prefill_trace(**kwargs):
+    if kwargs.get("state_indices") is not None:
+        return _gdn2_prefill_pool_trace
+    return _gdn2_prefill_default_trace
+
+
+gdn2_prefill_trace.templates = [  # type: ignore[attr-defined]
+    _gdn2_prefill_default_trace,
+    _gdn2_prefill_pool_trace,
+]
