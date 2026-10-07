@@ -16,6 +16,7 @@
 
 import math
 from copy import deepcopy
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -641,24 +642,27 @@ _gdn_prefill_gates_trace.axes["state_pool_rows"] = Var(
 _gdn_prefill_gates_trace.axes["num_o_heads"] = Const(
     description="max(num_q_heads, num_v_heads).", abbrev=""
 )
-_gdn_prefill_gates_trace.axes["num_q_heads"].abbrev = "q"
-_gdn_prefill_gates_trace.axes["num_k_heads"].abbrev = "k"
+cast(Const, _gdn_prefill_gates_trace.axes["num_q_heads"]).abbrev = "q"
+cast(Const, _gdn_prefill_gates_trace.axes["num_k_heads"]).abbrev = "k"
 for _name in ("a", "b"):
-    _gdn_prefill_gates_trace.inputs[_name].dim_names = ["total_seq_len", "num_o_heads"]
+    cast(Tensor, _gdn_prefill_gates_trace.inputs[_name]).dim_names = [
+        "total_seq_len",
+        "num_o_heads",
+    ]
 for _name in ("A_log", "dt_bias"):
-    _gdn_prefill_gates_trace.inputs[_name].dim_names = ["num_o_heads"]
-_gdn_prefill_gates_trace.inputs["state"].dim_names = [
+    cast(Tensor, _gdn_prefill_gates_trace.inputs[_name]).dim_names = ["num_o_heads"]
+cast(Tensor, _gdn_prefill_gates_trace.inputs["state"]).dim_names = [
     "state_pool_rows",
     "num_o_heads",
     "head_size",
     "head_size",
 ]
-_gdn_prefill_gates_trace.outputs["output"].dim_names = [
+cast(Tensor, _gdn_prefill_gates_trace.outputs["output"]).dim_names = [
     "total_seq_len",
     "num_o_heads",
     "head_size",
 ]
-_gdn_prefill_gates_trace.outputs["output"].dtype_from = "q"
+cast(Tensor, _gdn_prefill_gates_trace.outputs["output"]).dtype_from = "q"
 _gdn_prefill_gates_trace.outputs["new_state"] = Tensor(
     ["state_pool_rows", "num_o_heads", "head_size", "head_size"],
     optional=True,
