@@ -689,6 +689,7 @@ jobs:
           REPORT=$(python3 scripts/pr_checks/check_skip_all.py \
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
             $SUMMARY_ARGS \
+            --junit-dir junit-h100 \
             --github-actions 2>&1) || true
           echo "$REPORT"
 

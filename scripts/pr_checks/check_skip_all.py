@@ -55,8 +55,10 @@ import json
 import re
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +113,85 @@ class SkipAllFinding:
     path: str
     result: FileResult
     skip_reasons: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Skip reason extraction from JUnit XML
+# ---------------------------------------------------------------------------
+
+def _extract_skip_reasons_from_xml(xml_path: Path, source_file: str) -> list[str]:
+    """Extract distinct skip-reason messages for *source_file* from a JUnit XML.
+
+    Pytest writes ``<skipped message="...">long text</skipped>`` inside each
+    ``<testcase>`` element.  The *message* attribute is the short reason (what
+    ``pytest.skip(reason=...)`` or ``skipIf(reason=...)`` supplied); the element
+    text is the full representation including the file location.
+
+    We key on the ``pytest_nodeid`` property to match nodes to their source
+    file, then collect the *message* attribute (or, if absent, the element
+    text) and de-duplicate.
+    """
+    reasons: set[str] = set()
+    try:
+        root = ET.parse(xml_path).getroot()
+    except (OSError, ET.ParseError):
+        return []
+    # Walk all <testcase> elements regardless of nesting.
+    for testcase in root.iter("testcase"):
+        # Match by source file via the pytest_nodeid property.
+        nodeid = ""
+        props_el = testcase.find("./properties")
+        if props_el is not None:
+            for prop in props_el.findall("property"):
+                if prop.attrib.get("name") == "pytest_nodeid":
+                    nodeid = prop.attrib.get("value", "")
+                    break
+        if not nodeid:
+            # Fall back to classname-based matching.
+            classname = testcase.attrib.get("classname", "")
+            # pytest classnames use dots; source files use slashes.
+            nodeid = classname.replace(".", "/") + ".py"
+        # Check whether this testcase belongs to the source file we care about.
+        if not nodeid.startswith(source_file.rstrip(".py").replace(".py", "")):
+            # More robust: just check the source_file prefix.
+            if not (
+                nodeid.startswith(source_file)
+                or nodeid.startswith(source_file.split("::")[0])
+            ):
+                continue
+        skipped_el = testcase.find("./skipped")
+        if skipped_el is None:
+            continue
+        msg = skipped_el.attrib.get("message", "").strip()
+        if not msg:
+            msg = (skipped_el.text or "").strip()
+        if not msg:
+            msg = "(no reason given)"
+        # Truncate very long reasons (e.g. full tracebacks).
+        if len(msg) > 200:
+            msg = msg[:197] + "..."
+        reasons.add(msg)
+    return sorted(reasons)
+
+
+def _collect_skip_reasons(
+    source_file: str,
+    junit_dirs: list[Path],
+) -> list[str]:
+    """Scan all JUnit XML files under *junit_dirs* for skip reasons.
+
+    The JUnit directory structure written by the test runner is:
+      ``junit/shards/shard-NNNN/units/<unit_id>/batches/<batch_id>.xml``
+    We walk the tree and check every XML file.
+    """
+    all_reasons: set[str] = set()
+    for junit_dir in junit_dirs:
+        if not junit_dir.is_dir():
+            continue
+        for xml_path in junit_dir.rglob("*.xml"):
+            reasons = _extract_skip_reasons_from_xml(xml_path, source_file)
+            all_reasons.update(reasons)
+    return sorted(all_reasons)
 
 
 # ---------------------------------------------------------------------------
@@ -203,10 +284,12 @@ def _aggregate_results(
 def find_skip_all_files(
     changed_files: list[str],
     summary_paths: list[str],
+    junit_dirs: list[Path] | None = None,
 ) -> tuple[list[SkipAllFinding], dict[str, FileResult]]:
     """Return findings for changed test files that were skip-all on every lane.
 
     Also returns the full results dict for reporting purposes.
+    When *junit_dirs* are provided, skip reasons are extracted from JUnit XML.
     """
     results = _aggregate_results(changed_files, summary_paths)
     findings: list[SkipAllFinding] = []
@@ -214,12 +297,14 @@ def find_skip_all_files(
     for path in changed_files:
         fr = results[path]
         if not fr.collected_anywhere:
-            # File wasn't collected at all (maybe not in any lane's scope).
-            # This is a different problem; we report it but don't treat it the
-            # same as skip-all.
             continue
         if not fr.executed_anywhere:
-            findings.append(SkipAllFinding(path=path, result=fr))
+            reasons: list[str] = []
+            if junit_dirs:
+                reasons = _collect_skip_reasons(path, junit_dirs)
+            findings.append(SkipAllFinding(
+                path=path, result=fr, skip_reasons=reasons,
+            ))
 
     return findings, results
 
@@ -280,6 +365,10 @@ def format_report(
                     f"  - {lane_name}: {lr.planned} planned, "
                     f"{lr.skipped} skipped, 0 executed"
                 )
+            if finding.skip_reasons:
+                lines.append("  - Skip reasons:")
+                for reason in finding.skip_reasons:
+                    lines.append(f"    - `{reason}`")
             lines.append("")
         lines.append(
             "> This usually means the tests require hardware not available in CI "
@@ -322,9 +411,12 @@ def emit_annotations(
             f"{name}: {lr.skipped} skipped"
             for name, lr in sorted(fr.lanes.items())
         )
+        reasons_desc = ""
+        if finding.skip_reasons:
+            reasons_desc = " Reasons: " + "; ".join(finding.skip_reasons)
         msg = (
             f"All {fr.total_skipped} test nodes in this file were skipped "
-            f"across all CI lanes ({lanes_desc}). No test actually executed."
+            f"across all CI lanes ({lanes_desc}). No test actually executed.{reasons_desc}"
         )
         print(f"::warning file={finding.path},line=1::{msg}")
 
@@ -398,8 +490,32 @@ def _selftest() -> int:
         with open(summary_path, "w") as fh:
             json.dump(summary, fh)
 
+        # Create a JUnit XML with skip reasons for the GDN file.
+        junit_dir = os.path.join(td, "junit", "shards", "shard-0000",
+                                 "units", "u0", "batches")
+        os.makedirs(junit_dir)
+        xml_path = os.path.join(junit_dir, "b0.xml")
+        root_el = ET.Element("testsuites")
+        suite_el = ET.SubElement(root_el, "testsuite",
+                                 name="tests/gdn/test_foo.py",
+                                 tests="10", skipped="10")
+        for i in range(10):
+            tc = ET.SubElement(suite_el, "testcase",
+                               classname="tests.gdn.test_foo",
+                               name=f"test_something[{i}]", time="0")
+            props = ET.SubElement(tc, "properties")
+            ET.SubElement(props, "property", name="pytest_nodeid",
+                          value=f"tests/gdn/test_foo.py::test_something[{i}]")
+            skip_el = ET.SubElement(tc, "skipped",
+                                    message="ReplaySSM requires SM100/SM103")
+        tree = ET.ElementTree(root_el)
+        tree.write(xml_path, xml_declaration=True)
+
         changed = ["tests/gdn/test_foo.py", "tests/attention/test_ok.py"]
-        findings, results = find_skip_all_files(changed, [summary_path])
+        findings, results = find_skip_all_files(
+            changed, [summary_path],
+            junit_dirs=[Path(td) / "junit"],
+        )
 
         if len(findings) != 1:
             print(f"FAIL: expected 1 finding, got {len(findings)}", file=sys.stderr)
@@ -407,6 +523,15 @@ def _selftest() -> int:
         elif findings[0].path != "tests/gdn/test_foo.py":
             print(f"FAIL: wrong file: {findings[0].path}", file=sys.stderr)
             failures += 1
+        else:
+            # Verify skip reason was extracted.
+            if not findings[0].skip_reasons:
+                print("FAIL: skip_reasons is empty", file=sys.stderr)
+                failures += 1
+            elif "ReplaySSM requires SM100/SM103" not in findings[0].skip_reasons:
+                print(f"FAIL: unexpected reasons: {findings[0].skip_reasons}",
+                      file=sys.stderr)
+                failures += 1
 
         fr_ok = results["tests/attention/test_ok.py"]
         if not fr_ok.executed_anywhere:
@@ -414,14 +539,14 @@ def _selftest() -> int:
             failures += 1
 
         # Test with no changed test files.
-        findings2, _ = find_skip_all_files([], [summary_path])
+        findings2, _ = find_skip_all_files([], [summary_path], junit_dirs=None)
         if findings2:
             print("FAIL: no changed files should produce no findings", file=sys.stderr)
             failures += 1
 
         # Test with a file not in any summary (uncollected).
         findings3, results3 = find_skip_all_files(
-            ["tests/new/test_brand_new.py"], [summary_path]
+            ["tests/new/test_brand_new.py"], [summary_path], junit_dirs=None,
         )
         if findings3:
             print("FAIL: uncollected file should not be a skip-all finding",
@@ -450,6 +575,11 @@ def main() -> int:
         help="Path to run-summary.json (repeatable, one per lane)",
     )
     ap.add_argument(
+        "--junit-dir", action="append", default=[],
+        help="Path to JUnit output directory for skip reason extraction "
+             "(repeatable, one per lane)",
+    )
+    ap.add_argument(
         "--github-actions", action="store_true",
         help="Emit GitHub Actions annotations",
     )
@@ -476,7 +606,10 @@ def main() -> int:
         ap.error("at least one --summary is required")
         return 1
 
-    findings, results = find_skip_all_files(changed, args.summary)
+    junit_dirs = [Path(d) for d in args.junit_dir] if args.junit_dir else None
+    findings, results = find_skip_all_files(
+        changed, args.summary, junit_dirs=junit_dirs,
+    )
 
     # Report.
     report = format_report(findings, results, changed)
