@@ -12,6 +12,11 @@ the frozen checkpoint, plus the tightest available cross-check: the chain
 parent array must reproduce the untouched prefix path.
 """
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -166,3 +171,41 @@ def _run_bad(a, parents):
         backend="wy",
         verify_parents=parents,
     )
+
+
+def _run_child_with_validation(parents):
+    env = dict(os.environ, FLASHINFER_VALIDATE_VERIFY_PARENTS="1")
+    return subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--validate-parents",
+            ",".join(str(p) for p in parents),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        env=env,
+    )
+
+
+def test_validation_flag_accepts_trees_and_rejects_a_forward_parent():
+    """Opt-in device-side check; a device assert is sticky, so run in a child."""
+    good = _run_child_with_validation(TREES["topk4_depth2"])
+    assert good.returncode == 0, good.stdout + good.stderr
+    bad = _run_child_with_validation([-1, 2, 1, 2, 3, 4, 5, 6])
+    combined = bad.stdout + bad.stderr
+    assert bad.returncode != 0, combined
+    assert any(
+        marker in combined
+        for marker in ("device-side assert", "CUDA error", "_assert_async_cuda_kernel")
+    ), combined
+
+
+if (
+    __name__ == "__main__"
+    and len(sys.argv) == 3
+    and sys.argv[1] == "--validate-parents"
+):
+    _run(_inputs(), [int(p) for p in sys.argv[2].split(",")])
+    torch.cuda.synchronize()

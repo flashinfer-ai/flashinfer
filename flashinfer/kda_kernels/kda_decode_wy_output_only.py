@@ -2047,6 +2047,22 @@ _CACHE: dict = {}
 # T in (2, 4]). Measured crossover on B200; override with
 # FLASHINFER_KDA_OO_REC_MAX_BH for tuning.
 _REC_DISPATCH_MAX_BH = int(_os.environ.get("FLASHINFER_KDA_OO_REC_MAX_BH", "192"))
+_VALIDATE_VERIFY_PARENTS = (
+    _os.environ.get("FLASHINFER_VALIDATE_VERIFY_PARENTS", "0") == "1"
+)
+
+
+def _assert_verify_parents(parents: torch.Tensor) -> None:
+    """Device-side ``parent[i] < i`` check; FLASHINFER_VALIDATE_VERIFY_PARENTS=1 only."""
+    if not _VALIDATE_VERIFY_PARENTS:
+        return
+    steps = torch.arange(parents.shape[1], device=parents.device, dtype=parents.dtype)
+    torch._assert_async(
+        ((parents >= -1) & (parents < steps)).all(),
+        "verify_parents[:, i] must be in [-1, i)",
+    )
+
+
 # Cached zero placeholders for the unused A_log/dt_bias kernel args in the
 # precomputed-gate mode (avoids two per-call allocations).
 _DUMMY: dict = {}
@@ -2298,8 +2314,7 @@ def kda_wy_output_only(
             raise ValueError("verify_parents must be on the query device")
         if backend == "recurrent":
             raise ValueError("verify_parents requires the WY backend")
-        # parent[i] < i is a device-side property; checking it here would
-        # sync. Callers must guarantee it (EAGLE's level-by-level layout does).
+        _assert_verify_parents(verify_parents)
 
     _scale = 1 if gate_mode == GATE_PRECOMPUTED else 2
     if T_in == 1:
