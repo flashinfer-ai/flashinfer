@@ -278,13 +278,19 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
         module.use_nvfp4_tmem_overlap = config.tmem_overlap
         module._MMA_K_BYTES = _fp8_mma_k(config)
         module._tile_k_override = config.tile_k
-        if config.nvfp4_mma_k not in (64, 96):
-            raise ValueError("nvfp4_mma_k must be 64 or 96")
+        if config.nvfp4_mma_k not in (64, 96, 128):
+            raise ValueError("nvfp4_mma_k must be 64, 96 or 128")
         if config.nvfp4_mma_k == 96 and (
             config.arch != 103 or config.operand_format != "nvfp4_e2m1"
         ):
             raise ValueError("MMA-K=96 requires SM103 NVFP4 operands")
+        if config.nvfp4_mma_k == 128 and (
+            config.arch != 107 or config.operand_format != "nvfp4_e2m1"
+        ):
+            raise ValueError("MMA-K=128 requires SM107 NVFP4 operands")
         module.nvfp4_mma_k = config.nvfp4_mma_k
+        module.tmem_capacity_cols = 576 if config.arch == 107 else 512
+        module.smem_capacity_bytes = 334848 if config.arch == 107 else None
         module._tile_n_override = config.tile_n
         default_epilogue_warps = (
             8 if config.epilogue != "linear" or config.tmem_overlap else 4
@@ -298,6 +304,10 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
             raise ValueError("epilogue_warps must be 4 or 8")
         if config.epilogue != "linear" and module.num_epilogue_warps != 8:
             raise ValueError("fused epilogues require 8 epilogue warps")
+        # Each 4-warp epilogue group RMS-normalizes the half tile it drains,
+        # so that half must be exactly one head.
+        if config.epilogue == "qkv_qknorm_rope" and config.tile_n != 256:
+            raise ValueError("QK-norm/RoPE epilogue requires tile_n=256")
         module.threads_in_epilogue = module.num_epilogue_warps * 32
         forced_stages = derived_ab_stages(
             config.operand_format,
@@ -910,7 +920,8 @@ def prepare_fp4_linear(
 
     On SM103, ``mma_k=96`` enables 3x NVFP4. ``tile_k=256`` uses separate
     256-element data and 384-element scale pipelines; ``tile_k=768`` selects
-    the large-tile baseline. The default K=64 path remains available on all
+    the large-tile baseline. On SM107, ``mma_k=128`` issues 64-byte
+    instructions. The default K=64 path remains available on all
     supported devices. ``tmem_overlap=True`` uses eight epilogue warps and
     alternating accumulator windows to overlap the next tile's MMA with
     output stores. It requires ``tile_k=256`` and BF16 output and is opt-in.

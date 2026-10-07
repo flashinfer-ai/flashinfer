@@ -168,6 +168,8 @@ _tile_k_override = None
 # MMA instruction N is always equal to tile N. The epilogue drains TMEM
 # in 32-column chunks, so tile N is a power of 2 in [32, 256].
 _tile_n_override = None
+tmem_capacity_cols = 512
+smem_capacity_bytes = None
 _DEFAULT_TILE_N = 256
 _EPILOGUE_TILE_N = 32
 _TILE_N_MIN = 32
@@ -249,6 +251,8 @@ def _refresh_input_dependent_config() -> None:
     k_tile = k_box if _tile_k_override is None else int(_tile_k_override)
     tile_n = _DEFAULT_TILE_N if _tile_n_override is None else int(_tile_n_override)
     nvfp4 = _is_fp4(input_dtype)
+    if nvfp4 and nvfp4_mma_k not in (64, 96, 128):
+        raise ValueError(f"NVFP4 MMA-K must be 64, 96 or 128, got {nvfp4_mma_k}")
     if nvfp4 and nvfp4_mma_k == 96 and k_tile not in (256, 768):
         raise ValueError("NVFP4 MMA-K=96 supports tile_k=256 or tile_k=768")
     if _MMA_K_BYTES not in (32, 64):
@@ -315,13 +319,19 @@ def _refresh_input_dependent_config() -> None:
     # The overlap path uses two physical accumulator windows in one 512-column
     # allocation. It deliberately keeps one logical UMMA pipeline stage so an
     # early consumer release can hand the retired scale-factor regions to MMA.
-    # The regular NVFP4 path leaves TMEM columns for a single accumulator plus
-    # its block scales. FP16/BF16/FP8 retain two ordinary pipeline stages.
-    acc_stage_count = 2 if tmem_overlap or not nvfp4 else 1
-    globals()["acc_stages"] = acc_stage_count
+    # The regular NVFP4 path keeps two accumulators when they fit next to its
+    # block scales, else one. FP16/BF16/FP8 retain two ordinary pipeline stages.
     sf_k_per_tile = sf_tile_k // _SF_VEC_SIZE
     sfa_cols = (mma_tiler_mnk_per_cta[0] * sf_k_per_tile) // 128
     sfb_cols = ((tile_n + 127) // 128) * sf_k_per_tile
+    acc_stage_count = 2
+    if (
+        nvfp4
+        and not tmem_overlap
+        and 2 * tile_n + sfa_cols + sfb_cols > tmem_capacity_cols
+    ):
+        acc_stage_count = 1
+    globals()["acc_stages"] = acc_stage_count
     globals()["sfa_stage_bytes"] = mma_tiler_mnk_per_cta[0] * sf_k_per_tile
     globals()["sfb_stage_bytes"] = ((tile_n + 127) // 128) * 128 * sf_k_per_tile
     globals()["tmem_sfa_cols_per_stage"] = sfa_cols
@@ -329,9 +339,9 @@ def _refresh_input_dependent_config() -> None:
     tmem_cols = tile_n * acc_stage_count
     if nvfp4 and not tmem_overlap:
         tmem_cols += sfa_cols + sfb_cols
-    if tmem_cols > 512:
+    if tmem_cols > tmem_capacity_cols:
         raise ValueError(
-            f"TMEM column count {tmem_cols} exceeds 512 "
+            f"TMEM column count {tmem_cols} exceeds {tmem_capacity_cols} "
             f"(tile_n={tile_n}, acc_stages={acc_stage_count})"
         )
     # tcgen05.alloc can reserve only 32, 64, 128, 256, or 512 columns.
@@ -339,7 +349,10 @@ def _refresh_input_dependent_config() -> None:
     # 256-column tile require 304 columns.  Reserve the next legal physical
     # allocation; TmemAllocator still places the logical resources in their
     # compact 304-column layout.
-    globals()["num_tmem_alloc_cols"] = max(32, 1 << (tmem_cols - 1).bit_length())
+    if tmem_cols > 512:
+        globals()["num_tmem_alloc_cols"] = 576
+    else:
+        globals()["num_tmem_alloc_cols"] = max(32, 1 << (tmem_cols - 1).bit_length())
     # Per-token/per-channel FP8 dequant replaces the single per-tensor scale.
     # NVFP4 keeps that scalar for the product of the two global scales.
     globals()["needs_epilogue_scale"] = not use_per_token_channel_scale and (
@@ -1206,16 +1219,18 @@ class TmemCResource(MemoryResource):
         context = stage_info.context
         # PTX: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instruction-descriptor
         if cutlass.const_expr(use_nvfp4_block_scale):
-            # FP4 format encoding is 1 in both operand fields (E5M2 in the
-            # generic MX builder). Bit 31 selects SM103's dense K=96 mode;
-            # scale_format=0 selects E4M3 block scales.
-            self.idesc = prims.Tcgen05MxInstrDesc.build(
-                a_dtype=cutlass.Float8E5M2,
-                b_dtype=cutlass.Float8E5M2,
+            # The 2-bit K field (bit 3 upper, bit 31 lower) selects dense
+            # K=64 (0), SM103's K=96 (1) or SM107's K=128 (2).
+            # scale_format=0 selects E4M3 block scales; sparsity_version=0
+            # keeps bit 12 clear as in the K=64/96 descriptors.
+            self.idesc = prims.Tcgen05MxOmmaInstrDesc.build(
+                a_dtype=cutlass.Float4E2M1FN,
+                b_dtype=cutlass.Float4E2M1FN,
                 scale_format=0,
                 n_dim=mma_inst_shape_mnk[1],
                 m_dim=mma_inst_shape_mnk[0],
-                k_dim=1 if nvfp4_mma_k == 96 else 0,
+                k_dim={64: 0, 96: 1, 128: 2}[nvfp4_mma_k],
+                sparsity_version=0,
             )
         else:
             self.idesc = prims.Tcgen05InstrDesc.build(
@@ -3668,6 +3683,8 @@ def _create_gemm_pipeline(
         skip_validation=not debug_checks,
         exhaustive_deadlock_race_check=debug_checks,
         verbose=False,
+        smem_capacity_bytes=smem_capacity_bytes,
+        tmem_capacity_columns=tmem_capacity_cols,
     )
     return task_manager, mma_task, store_task
 
@@ -3708,11 +3725,18 @@ def _run_gemm_execution(
     prims.barrier_cluster_wait()
 
     num_tmem_cols = num_tmem_alloc_cols
+    # is_exclusive needs nvidia-cutlass-dsl 4.8; older releases reject the keyword.
+    tmem_alloc_kwargs = {"is_exclusive": True} if num_tmem_cols > 512 else {}
     tmem_bar_id = 2
     tmem_bar_threads = (num_epilogue_warps + num_mma_warps) * 32
 
     if warp_idx == tmem_allocator_warp_id:
-        prims.tcgen05_alloc(tmem_ptr_i32, num_tmem_cols, group="cta_2")
+        prims.tcgen05_alloc(
+            tmem_ptr_i32,
+            num_tmem_cols,
+            group="cta_2",
+            **tmem_alloc_kwargs,
+        )
         prims.tcgen05_relinquish_alloc_permit(group="cta_2")
 
     if store_task.is_selected() or mma_task.is_selected():
@@ -3743,7 +3767,12 @@ def _run_gemm_execution(
         ):
             pass
 
-        prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group="cta_2")
+        prims.tcgen05_dealloc(
+            tmem_ptr,
+            num_tmem_cols,
+            group="cta_2",
+            **tmem_alloc_kwargs,
+        )
 
 
 ########################################################

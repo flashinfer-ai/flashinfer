@@ -33,7 +33,8 @@ class PrimsTsGemmConfig:
     scheduler: str = "clc_dynamic"
     shape_bucket: Optional[tuple[int, int, int]] = None
     has_qkv_scale: bool = False
-    # 96 selects the SM103 NVFP4 instruction; 64 retains the reference path.
+    # 96 selects the SM103 NVFP4 instruction and 128 the SM107 64-byte one;
+    # 64 retains the reference path.
     nvfp4_mma_k: int = 64
     # Dense FP8 MMA instruction K. None picks the arch default (64 on SM107,
     # otherwise 32); 64 requires SM107.

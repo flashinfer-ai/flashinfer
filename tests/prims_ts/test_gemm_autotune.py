@@ -275,6 +275,23 @@ def test_sm107_fp8_tactics_use_deeper_stages_and_wide_clusters():
     assert all((tactic[0], tactic[1]) != (2, 4) for tactic in sm100)
 
 
+@pytest.mark.parametrize(
+    "epilogue,output_format",
+    [
+        ("linear", "bf16"),
+        ("swiglu", "bf16"),
+        ("swiglu", "nvfp4_e2m1"),
+        ("qkv_qknorm_rope", "bf16"),
+    ],
+)
+def test_nvfp4_mma_k128_is_searched_on_sm107_only(epilogue, output_format):
+    sm107 = legal_tactics(107, "nvfp4_e2m1", output_format, epilogue)
+    assert {tactic[6] for tactic in sm107} == {64, 128}
+    for arch, mma_ks in ((100, {64}), (103, {64, 96})):
+        tactics = legal_tactics(arch, "nvfp4_e2m1", output_format, epilogue)
+        assert {tactic[6] for tactic in tactics} <= mma_ks
+
+
 def test_explicit_config_does_not_call_the_tuner(monkeypatch):
     _require_gemm_gpu()
     from flashinfer.gemm import fp8_linear
