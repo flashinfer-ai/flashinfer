@@ -24,6 +24,14 @@ _THREADS = 128
 _MERGE_THREADS = 256
 _LOG2E = 1.4426950408889634
 _NEG = -3.0e38
+# P is stored in pdt (fp16), so the exponent has to stay inside fp16 range, not
+# fp32 range: the offset is one tile lagged, so sv can exceed mnew and a 120.0
+# cap would store inf (fp16 max is 65504 ~ 2^16) and poison the PV matmul with
+# NaN. 2^15 leaves a margin. Capping saturates one tile whose logit jumped more
+# than 2^15 above the previous tile's max; the next tile's offset correction
+# rescales, whereas an inf never recovers.
+_PMAX_LOG2 = 15.0
+
 
 # H100: 132 SMs, 228 KiB of shared memory per SM.
 _NUM_SM = 132
@@ -623,7 +631,7 @@ class MsaSparseDecode:
                 for e in cutlass.range_constexpr(NS):
                     sv = accS[e] * scale2
                     tmax = cute.arch.fmax(tmax, sv)
-                    pv = cute.arch.exp2(cute.arch.fmin(sv - mnew, 120.0))
+                    pv = cute.arch.exp2(cute.arch.fmin(sv - mnew, _PMAX_LOG2))
                     sP_kg[tScS[e]] = pv.to(pdt)
                     lp[e] = lp[e] + pv
             else:
@@ -634,7 +642,7 @@ class MsaSparseDecode:
                         else cutlass.Float32(_NEG)
                     )
                     tmax = cute.arch.fmax(tmax, sv)
-                    pv = cute.arch.exp2(cute.arch.fmin(sv - mnew, 120.0))
+                    pv = cute.arch.exp2(cute.arch.fmin(sv - mnew, _PMAX_LOG2))
                     sP_kg[tScS[e]] = pv.to(pdt)
                     lp[e] = lp[e] + pv
             # A single integer redux replaces five dependent shuffle/fmax
