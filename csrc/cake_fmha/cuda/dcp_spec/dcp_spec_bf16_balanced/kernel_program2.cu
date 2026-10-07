@@ -279,7 +279,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(384) void
+__global__ __launch_bounds__(THREADS) void
 kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ page_table, int* __restrict__ causal_seqlens_kv_global, float* __restrict__ partial_o, float* __restrict__ partial_stats, unsigned int* __restrict__ tile_counters, unsigned int* __restrict__ queue_counters, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads, int batch_size, int q_len, int cp_rank, int cp_world_log2, unsigned int max_items)
 {
     const int tid = threadIdx.x;
@@ -321,32 +321,32 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
     const int cta_rank = 0;
 
     // Kernel setup ops
-    float* smem_xmax = reinterpret_cast<float*>(smem_raw + 1024);
-    const int smem_xmax_addr = smem + 1024;
-    float* smem_sum = reinterpret_cast<float*>(smem_raw + 3072);
-    const int smem_sum_addr = smem + 3072;
-    unsigned int* smem_corr_flag = reinterpret_cast<unsigned int*>(smem_raw + 4608);
-    const int smem_corr_flag_addr = smem + 4608;
-    float* smem_max = reinterpret_cast<float*>(smem_raw + 3584);
-    const int smem_max_addr = smem + 3584;
-    int* smem_page_offsets = reinterpret_cast<int*>(smem_raw + 4096);
-    const int smem_page_offsets_addr = smem + 4096;
-    unsigned int* work_token_words = reinterpret_cast<unsigned int*>(smem_raw + 4352);
-    const int work_token_words_addr = smem + 4352;
-    int* sched_seq_lens = reinterpret_cast<int*>(smem_raw + 5120);
-    const int sched_seq_lens_addr = smem + 5120;
-    int* sched_phase = reinterpret_cast<int*>(smem_raw + 9216);
-    const int sched_phase_addr = smem + 9216;
-    float* rstage_data = reinterpret_cast<float*>(smem_raw + 13312);
-    const int rstage_data_addr = smem + 13312;
-    float* rstage_stats = reinterpret_cast<float*>(smem_raw + 144384);
-    const int rstage_stats_addr = smem + 144384;
-    __nv_bfloat16* smem_qt = reinterpret_cast<__nv_bfloat16*>(smem_raw + 13312);
-    const int smem_qt_addr = smem + 13312;
-    __nv_bfloat16* smem_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 29696);
-    const int smem_k_addr = smem + 29696;
-    __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + 128000);
-    const int smem_v_addr = smem + 128000;
+    float* smem_xmax = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_XMAX_OFF);
+    const int smem_xmax_addr = smem + SMEM_SMEM_XMAX_OFF;
+    float* smem_sum = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_SUM_OFF);
+    const int smem_sum_addr = smem + SMEM_SMEM_SUM_OFF;
+    unsigned int* smem_corr_flag = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SMEM_CORR_FLAG_OFF);
+    const int smem_corr_flag_addr = smem + SMEM_SMEM_CORR_FLAG_OFF;
+    float* smem_max = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_MAX_OFF);
+    const int smem_max_addr = smem + SMEM_SMEM_MAX_OFF;
+    int* smem_page_offsets = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_PAGE_OFFSETS_OFF);
+    const int smem_page_offsets_addr = smem + SMEM_SMEM_PAGE_OFFSETS_OFF;
+    unsigned int* work_token_words = reinterpret_cast<unsigned int*>(smem_raw + SMEM_WORK_TOKEN_WORDS_OFF);
+    const int work_token_words_addr = smem + SMEM_WORK_TOKEN_WORDS_OFF;
+    int* sched_seq_lens = reinterpret_cast<int*>(smem_raw + SMEM_SCHED_SEQ_LENS_OFF);
+    const int sched_seq_lens_addr = smem + SMEM_SCHED_SEQ_LENS_OFF;
+    int* sched_phase = reinterpret_cast<int*>(smem_raw + SMEM_SCHED_PHASE_OFF);
+    const int sched_phase_addr = smem + SMEM_SCHED_PHASE_OFF;
+    float* rstage_data = reinterpret_cast<float*>(smem_raw + SMEM_RSTAGE_DATA_OFF);
+    const int rstage_data_addr = smem + SMEM_RSTAGE_DATA_OFF;
+    float* rstage_stats = reinterpret_cast<float*>(smem_raw + SMEM_RSTAGE_STATS_OFF);
+    const int rstage_stats_addr = smem + SMEM_RSTAGE_STATS_OFF;
+    __nv_bfloat16* smem_qt = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_QT_OFF);
+    const int smem_qt_addr = smem + SMEM_SMEM_QT_OFF;
+    __nv_bfloat16* smem_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_K_OFF);
+    const int smem_k_addr = smem + SMEM_SMEM_K_OFF;
+    __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_V_OFF);
+    const int smem_v_addr = smem + SMEM_SMEM_V_OFF;
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&V))) : "memory");

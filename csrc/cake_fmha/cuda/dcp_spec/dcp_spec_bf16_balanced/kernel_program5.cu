@@ -382,6 +382,64 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&V))) : "memory");
+    unsigned int ei_valid = 0;
+    int ei_batch = 0;
+    int ei_head = 0;
+    int ei_chunk = 0;
+    int ei_len = 0;
+    int ei_cnt = 0;
+    int ei_last = 0;
+    unsigned int ei_row_ok = 0;
+    int ei_row[4];
+    #pragma unroll
+    for (int sl_e = 0; sl_e < 4; sl_e++) {
+        ei_row[sl_e] = 0;
+    }
+    if (warp == 11) {
+        unsigned int ei_ticket = blockIdx.x;
+        unsigned int ei_items = (unsigned int)(batch_size * num_kv_heads);
+        unsigned int ei_tile = ei_ticket;
+        if (ei_ticket < ei_items) {
+            ei_valid = 1;
+            float _rcp_0 = approx_rcp((float)num_kv_heads);
+            unsigned int q = (unsigned int)((float)ei_tile * _rcp_0);
+            if (ei_tile < q * (unsigned int)num_kv_heads) {
+                q = q - 1;
+            }
+            if (ei_tile >= (q + 1) * (unsigned int)num_kv_heads) {
+                q = q + 1;
+            }
+            ei_batch = (int)q;
+            ei_head = (int)(ei_tile - (unsigned int)ei_batch * (unsigned int)num_kv_heads);
+            int ei_lastpos_x = causal_seqlens_kv_global[ei_batch] + (q_len - 1) - cp_rank;
+            int ei_len_x = 0;
+            if (ei_lastpos_x >= 0) {
+                ei_len_x = (ei_lastpos_x >> cp_world_log2) + 1;
+            }
+            int _max_0 = (((ei_len_x + BLOCK_N - 1) / BLOCK_N) > (1) ? ((ei_len_x + BLOCK_N - 1) / BLOCK_N) : (1));
+            int ei_nblk_x = _max_0;
+            int ei_bbeg_x = 0;
+            int ei_bend_x = ei_nblk_x;
+            int ei_cnt_x = ei_bend_x - ei_bbeg_x;
+            int ei_last_x = ei_bend_x - 1;
+            ei_len = ei_len_x;
+            ei_cnt = ei_cnt_x;
+            ei_last = ei_last_x;
+            unsigned int ei_row_ok_x = 0;
+            if (max_pages_per_seq <= 128) {
+                ei_row_ok_x = 1;
+                int ei_pt_base = ei_batch * max_pages_per_seq;
+                #pragma unroll
+                for (int sl_e_1 = 0; sl_e_1 < 4; sl_e_1++) {
+                    int ei_ridx = sl_e_1 * 32 + lane;
+                    if (ei_ridx < max_pages_per_seq) {
+                        ei_row[sl_e_1] = page_table[ei_pt_base + ei_ridx];
+                    }
+                }
+            }
+            ei_row_ok = ei_row_ok_x;
+        }
+    }
 
     // Mbarrier init (20 pipeline groups, 0 ordered-sequence groups, 51 barriers)
     // Mbarriers at smem_raw[0..408)
@@ -510,15 +568,15 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
             int my_s_base = taddr + (unsigned int)(s_warp * 32 << 16);
             int rows_live = ((s_warp * 16 < N_ROWS) ? 1 : 0);
             int row_j = my_row / 8;
-            int _min_0 = ((row_j) < (q_len - 1) ? (row_j) : (q_len - 1));
-            int vis_j = _min_0;
+            int _min_1 = ((row_j) < (q_len - 1) ? (row_j) : (q_len - 1));
+            int vis_j = _min_1;
             unsigned int sm_stage = 0;
             unsigned int sm_phase = 0;
             unsigned int xm_slot_s = 0;
             unsigned int st_stage_s = 0;
             unsigned int st_phase_s = 1;
-            float _rcp_2 = approx_rcp(softmax_scale_log2);
-            float thr_raw = 8.0f * _rcp_2;
+            float _rcp_3 = approx_rcp(softmax_scale_log2);
+            float thr_raw = 8.0f * _rcp_3;
             unsigned int work_stage_s = 0;
             unsigned int _phase_work_full = 0;
             mbarrier_wait(work_full_addr + (work_stage_s) * 8, _phase_work_full);
@@ -566,8 +624,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                     #pragma unroll
                     for (int j = 0; j < 16; j++) {
                         int row_j_v = j / 8;
-                        int _min_1 = ((row_j_v) < (q_len - 1) ? (row_j_v) : (q_len - 1));
-                        int vis_j_v = _min_1;
+                        int _min_2 = ((row_j_v) < (q_len - 1) ? (row_j_v) : (q_len - 1));
+                        int vis_j_v = _min_2;
                         int back_v = q_len - 1 - vis_j_v - phase_s;
                         int vis_v = seqlen_s;
                         if (back_v > 0) {
@@ -575,8 +633,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                         }
                         vis_a[j] = vis_v;
                         int row_j_v_0 = (32 + j) / 8;
-                        int _min_2 = ((row_j_v_0) < (q_len - 1) ? (row_j_v_0) : (q_len - 1));
-                        int vis_j_v_1 = _min_2;
+                        int _min_3 = ((row_j_v_0) < (q_len - 1) ? (row_j_v_0) : (q_len - 1));
+                        int vis_j_v_1 = _min_3;
                         int back_v_2 = q_len - 1 - vis_j_v_1 - phase_s;
                         int vis_v_3 = seqlen_s;
                         if (back_v_2 > 0) {
@@ -731,8 +789,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 float send8 = ((b4 != 0) ? sv_a[i] : sv_a[i + 8]);
                                 float keep8 = ((b4 != 0) ? sv_a[i + 8] : sv_a[i]);
                                 float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, send8, 16);
-                                float _max_3 = max_noftz(keep8, _shfl_xor_0);
-                                w8[i] = _max_3;
+                                float _max_5 = max_noftz(keep8, _shfl_xor_0);
+                                w8[i] = _max_5;
                             }
                             float x4[4];
                             #pragma unroll
@@ -740,8 +798,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 float send4 = ((b3 != 0) ? w8[i_1] : w8[i_1 + 4]);
                                 float keep4 = ((b3 != 0) ? w8[i_1 + 4] : w8[i_1]);
                                 float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, send4, 8);
-                                float _max_4 = max_noftz(keep4, _shfl_xor_1);
-                                x4[i_1] = _max_4;
+                                float _max_6 = max_noftz(keep4, _shfl_xor_1);
+                                x4[i_1] = _max_6;
                             }
                             float y2[2];
                             #pragma unroll
@@ -749,17 +807,17 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 float send2 = ((b2 != 0) ? x4[i_2] : x4[i_2 + 2]);
                                 float keep2 = ((b2 != 0) ? x4[i_2 + 2] : x4[i_2]);
                                 float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, send2, 4);
-                                float _max_5 = max_noftz(keep2, _shfl_xor_2);
-                                y2[i_2] = _max_5;
+                                float _max_7 = max_noftz(keep2, _shfl_xor_2);
+                                y2[i_2] = _max_7;
                             }
                             float send1 = ((b1 != 0) ? y2[0] : y2[1]);
                             float keep1 = ((b1 != 0) ? y2[1] : y2[0]);
                             float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, send1, 2);
-                            float _max_6 = max_noftz(keep1, _shfl_xor_3);
-                            float z = _max_6;
+                            float _max_8 = max_noftz(keep1, _shfl_xor_3);
+                            float z = _max_8;
                             float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, z, 1);
-                            float _max_7 = max_noftz(z, _shfl_xor_4);
-                            z = _max_7;
+                            float _max_9 = max_noftz(z, _shfl_xor_4);
+                            z = _max_9;
                             float zmax = z;
                             if ((lane & 1) == 0) {
                                 swap_part[(lane >> 1 & 15) * 4 + s_warp] = zmax;
@@ -775,8 +833,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                     float send8_1 = ((b4_0 != 0) ? sv_b[i_3] : sv_b[i_3 + 8]);
                                     float keep8_1 = ((b4_0 != 0) ? sv_b[i_3 + 8] : sv_b[i_3]);
                                     float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, send8_1, 16);
-                                    float _max_8 = max_noftz(keep8_1, _shfl_xor_5);
-                                    w8_4[i_3] = _max_8;
+                                    float _max_10 = max_noftz(keep8_1, _shfl_xor_5);
+                                    w8_4[i_3] = _max_10;
                                 }
                                 float x4_5[4];
                                 #pragma unroll
@@ -784,8 +842,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                     float send4_1 = ((b3_1 != 0) ? w8_4[i_4] : w8_4[i_4 + 4]);
                                     float keep4_1 = ((b3_1 != 0) ? w8_4[i_4 + 4] : w8_4[i_4]);
                                     float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, send4_1, 8);
-                                    float _max_9 = max_noftz(keep4_1, _shfl_xor_6);
-                                    x4_5[i_4] = _max_9;
+                                    float _max_11 = max_noftz(keep4_1, _shfl_xor_6);
+                                    x4_5[i_4] = _max_11;
                                 }
                                 float y2_6[2];
                                 #pragma unroll
@@ -793,17 +851,17 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                     float send2_1 = ((b2_2 != 0) ? x4_5[i_5] : x4_5[i_5 + 2]);
                                     float keep2_1 = ((b2_2 != 0) ? x4_5[i_5 + 2] : x4_5[i_5]);
                                     float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, send2_1, 4);
-                                    float _max_10 = max_noftz(keep2_1, _shfl_xor_7);
-                                    y2_6[i_5] = _max_10;
+                                    float _max_12 = max_noftz(keep2_1, _shfl_xor_7);
+                                    y2_6[i_5] = _max_12;
                                 }
                                 float send1_7 = ((b1_3 != 0) ? y2_6[0] : y2_6[1]);
                                 float keep1_8 = ((b1_3 != 0) ? y2_6[1] : y2_6[0]);
                                 float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, send1_7, 2);
-                                float _max_11 = max_noftz(keep1_8, _shfl_xor_8);
-                                float z_9 = _max_11;
+                                float _max_13 = max_noftz(keep1_8, _shfl_xor_8);
+                                float z_9 = _max_13;
                                 float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, z_9, 1);
-                                float _max_12 = max_noftz(z_9, _shfl_xor_9);
-                                z_9 = _max_12;
+                                float _max_14 = max_noftz(z_9, _shfl_xor_9);
+                                z_9 = _max_14;
                                 float zmax_10 = z_9;
                                 if ((lane & 1) == 0) {
                                     swap_part[(16 + (lane >> 1 & 15)) * 4 + s_warp] = zmax_10;
@@ -824,10 +882,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 }
                                 #pragma unroll
                                 for (int j_6 = 0; j_6 < 16; j_6++) {
-                                    float _max_13 = max_noftz(p64s[4 * j_6], p64s[4 * j_6 + 1]);
-                                    float _max_14 = max_noftz(p64s[4 * j_6 + 2], p64s[4 * j_6 + 3]);
-                                    float _max_15 = max_noftz(_max_13, _max_14);
-                                    float bm_sj = _max_15;
+                                    float _max_15 = max_noftz(p64s[4 * j_6], p64s[4 * j_6 + 1]);
+                                    float _max_16 = max_noftz(p64s[4 * j_6 + 2], p64s[4 * j_6 + 3]);
+                                    float _max_17 = max_noftz(_max_15, _max_16);
+                                    float bm_sj = _max_17;
                                     int flagged_sj = fl_w >> (unsigned int)j_6 & 1;
                                     ref_a[j_6] = ((flagged_sj != 0) ? bm_sj : ref_a[j_6]);
                                 }
@@ -841,10 +899,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                     }
                                     #pragma unroll
                                     for (int j_8 = 0; j_8 < 16; j_8++) {
-                                        float _max_16 = max_noftz(p64s_0[4 * j_8], p64s_0[4 * j_8 + 1]);
-                                        float _max_17 = max_noftz(p64s_0[4 * j_8 + 2], p64s_0[4 * j_8 + 3]);
-                                        float _max_18 = max_noftz(_max_16, _max_17);
-                                        float bm_sj_1 = _max_18;
+                                        float _max_18 = max_noftz(p64s_0[4 * j_8], p64s_0[4 * j_8 + 1]);
+                                        float _max_19 = max_noftz(p64s_0[4 * j_8 + 2], p64s_0[4 * j_8 + 3]);
+                                        float _max_20 = max_noftz(_max_18, _max_19);
+                                        float bm_sj_1 = _max_20;
                                         int flagged_sj_1 = fl_w >> (unsigned int)(16 + j_8) & 1;
                                         ref_b[j_8] = ((flagged_sj_1 != 0) ? bm_sj_1 : ref_b[j_8]);
                                     }
@@ -860,10 +918,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 float my_acc = 1.0f;
                                 #pragma unroll
                                 for (int j_10 = 0; j_10 < 16; j_10++) {
-                                    float _max_19 = max_noftz(p64[4 * j_10], p64[4 * j_10 + 1]);
-                                    float _max_20 = max_noftz(p64[4 * j_10 + 2], p64[4 * j_10 + 3]);
-                                    float _max_21 = max_noftz(_max_19, _max_20);
-                                    float bm_j = _max_21;
+                                    float _max_21 = max_noftz(p64[4 * j_10], p64[4 * j_10 + 1]);
+                                    float _max_22 = max_noftz(p64[4 * j_10 + 2], p64[4 * j_10 + 3]);
+                                    float _max_23 = max_noftz(_max_21, _max_22);
+                                    float bm_j = _max_23;
                                     int flagged_j = fl_w >> (unsigned int)j_10 & 1;
                                     float _exp2_0 = approx_exp2(softmax_scale_log2 * (ref_a[j_10] - bm_j));
                                     float e_j = _exp2_0;
@@ -888,10 +946,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                     float my_acc_1 = 1.0f;
                                     #pragma unroll
                                     for (int j_12 = 0; j_12 < 16; j_12++) {
-                                        float _max_22 = max_noftz(p64_0[4 * j_12], p64_0[4 * j_12 + 1]);
-                                        float _max_23 = max_noftz(p64_0[4 * j_12 + 2], p64_0[4 * j_12 + 3]);
-                                        float _max_24 = max_noftz(_max_22, _max_23);
-                                        float bm_j_1 = _max_24;
+                                        float _max_24 = max_noftz(p64_0[4 * j_12], p64_0[4 * j_12 + 1]);
+                                        float _max_25 = max_noftz(p64_0[4 * j_12 + 2], p64_0[4 * j_12 + 3]);
+                                        float _max_26 = max_noftz(_max_24, _max_25);
+                                        float bm_j_1 = _max_26;
                                         int flagged_j_1 = fl_w >> (unsigned int)(16 + j_12) & 1;
                                         float _exp2_1 = approx_exp2(softmax_scale_log2 * (ref_b[j_12] - bm_j_1));
                                         float e_j_1 = _exp2_1;
@@ -972,10 +1030,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 float acc16[16];
                                 #pragma unroll
-                                for (int q = 0; q < 4; q++) {
+                                for (int q_1 = 0; q_1 < 4; q_1++) {
                                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                        : "=r"(*reinterpret_cast<uint32_t*>(&acc16[4 * q])), "=r"(*reinterpret_cast<uint32_t*>(&acc16[(4 * q) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&acc16[(4 * q) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&acc16[(4 * q) + 3]))
-                                        : "r"(swap_acc_addr + (unsigned int)(4 * q * 4)));
+                                        : "=r"(*reinterpret_cast<uint32_t*>(&acc16[4 * q_1])), "=r"(*reinterpret_cast<uint32_t*>(&acc16[(4 * q_1) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&acc16[(4 * q_1) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&acc16[(4 * q_1) + 3]))
+                                        : "r"(swap_acc_addr + (unsigned int)(4 * q_1 * 4)));
                                 }
                                 float _tmem_load_0[16];
                                 tmem_ld_x16(&_tmem_load_0[0], oT_base_w);
@@ -989,10 +1047,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 if (rows_hi != 0) {
                                     float acc16_0[16];
                                     #pragma unroll
-                                    for (int q_1 = 0; q_1 < 4; q_1++) {
+                                    for (int q_2 = 0; q_2 < 4; q_2++) {
                                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                            : "=r"(*reinterpret_cast<uint32_t*>(&acc16_0[4 * q_1])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_0[(4 * q_1) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_0[(4 * q_1) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_0[(4 * q_1) + 3]))
-                                            : "r"(swap_acc_addr + (unsigned int)((32 + 4 * q_1) * 4)));
+                                            : "=r"(*reinterpret_cast<uint32_t*>(&acc16_0[4 * q_2])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_0[(4 * q_2) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_0[(4 * q_2) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_0[(4 * q_2) + 3]))
+                                            : "r"(swap_acc_addr + (unsigned int)((32 + 4 * q_2) * 4)));
                                     }
                                     float _tmem_load_1[16];
                                     tmem_ld_x16(&_tmem_load_1[0], oT_base_w + 32);
@@ -1170,16 +1228,16 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 : "r"(swap_part_addr + (unsigned int)(lane * 16)));
                             float sum_pa = q4[0] + q4[1] + (q4[2] + q4[3]);
                             smem_sum[(int)st_stage_s * 64 + lane] = sum_pa;
-                            float _rcp_3 = approx_rcp(sum_pa);
-                            swap_inv[(int)st_stage_s * 64 + lane] = ((sum_pa > 0.0f) ? _rcp_3 : 0.0f);
+                            float _rcp_4 = approx_rcp(sum_pa);
+                            swap_inv[(int)st_stage_s * 64 + lane] = ((sum_pa > 0.0f) ? _rcp_4 : 0.0f);
                             if (rows_hi_p != 0) {
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q4[0])), "=r"(*reinterpret_cast<uint32_t*>(&q4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q4[(0) + 3]))
                                     : "r"(swap_part_addr + (unsigned int)((16 + lane) * 16)));
                                 float sum_pb = q4[0] + q4[1] + (q4[2] + q4[3]);
                                 smem_sum[(int)st_stage_s * 64 + 32 + lane] = sum_pb;
-                                float _rcp_4 = approx_rcp(sum_pb);
-                                swap_inv[(int)st_stage_s * 64 + 32 + lane] = ((sum_pb > 0.0f) ? _rcp_4 : 0.0f);
+                                float _rcp_5 = approx_rcp(sum_pb);
+                                swap_inv[(int)st_stage_s * 64 + 32 + lane] = ((sum_pb > 0.0f) ? _rcp_5 : 0.0f);
                             }
                         }
                         if (lane == 0) {
@@ -1263,8 +1321,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                         m_k = -1e+30f;
                                         l_k = 0.0f;
                                     }
-                                    float _max_29 = max_noftz(m_f, m_k);
-                                    float m_new = _max_29;
+                                    float _max_31 = max_noftz(m_f, m_k);
+                                    float m_new = _max_31;
                                     float _exp2_6 = approx_exp2((m_f - m_new) * softmax_scale_log2);
                                     float a_k = _exp2_6;
                                     float _exp2_7 = approx_exp2((m_k - m_new) * softmax_scale_log2);
@@ -1286,8 +1344,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                     }
                                     m_f = m_new;
                                 }
-                                float _rcp_7 = approx_rcp(l_f);
-                                float inv_f = ((l_f > 0.0f) ? _rcp_7 : 0.0f);
+                                float _rcp_8 = approx_rcp(l_f);
+                                float inv_f = ((l_f > 0.0f) ? _rcp_8 : 0.0f);
                                 #pragma unroll
                                 for (int k4 = 0; k4 < 4; k4++) {
                                     out4[k4] = acc_f[k4] * inv_f;
@@ -1359,10 +1417,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
             int tok_base_c = half_c * 64 + 32;
             int rows_live_c = ((warp_in_wg_c * 16 < N_ROWS) ? 1 : 0);
             int row_j_c = my_row_c / 8;
-            int _min_7 = ((row_j_c) < (q_len - 1) ? (row_j_c) : (q_len - 1));
-            int vis_j_c = _min_7;
-            float _rcp_8 = approx_rcp(softmax_scale_log2);
-            float thr_raw_c = 8.0f * _rcp_8;
+            int _min_8 = ((row_j_c) < (q_len - 1) ? (row_j_c) : (q_len - 1));
+            int vis_j_c = _min_8;
+            float _rcp_9 = approx_rcp(softmax_scale_log2);
+            float thr_raw_c = 8.0f * _rcp_9;
             int live_rows = q_len * 8;
             unsigned int sm_stage_c = 0;
             unsigned int sm_phase_c = 0;
@@ -1461,8 +1519,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                     #pragma unroll
                     for (int j_20 = 0; j_20 < 16; j_20++) {
                         int row_j_v_1 = (16 + j_20) / 8;
-                        int _min_8 = ((row_j_v_1) < (q_len - 1) ? (row_j_v_1) : (q_len - 1));
-                        int vis_j_v_2 = _min_8;
+                        int _min_9 = ((row_j_v_1) < (q_len - 1) ? (row_j_v_1) : (q_len - 1));
+                        int vis_j_v_2 = _min_9;
                         int back_v_1 = q_len - 1 - vis_j_v_2 - phase_c;
                         int vis_v_1 = seqlen_c;
                         if (back_v_1 > 0) {
@@ -1470,8 +1528,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                         }
                         vis_a_1[j_20] = vis_v_1;
                         int row_j_v_0_1 = (48 + j_20) / 8;
-                        int _min_9 = ((row_j_v_0_1) < (q_len - 1) ? (row_j_v_0_1) : (q_len - 1));
-                        int vis_j_v_1_1 = _min_9;
+                        int _min_10 = ((row_j_v_0_1) < (q_len - 1) ? (row_j_v_0_1) : (q_len - 1));
+                        int vis_j_v_1_1 = _min_10;
                         int back_v_2_1 = q_len - 1 - vis_j_v_1_1 - phase_c;
                         int vis_v_3_1 = seqlen_c;
                         if (back_v_2_1 > 0) {
@@ -1626,8 +1684,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 float send8_4 = ((b4_2 != 0) ? sv_a_1[i_12] : sv_a_1[i_12 + 8]);
                                 float keep8_4 = ((b4_2 != 0) ? sv_a_1[i_12 + 8] : sv_a_1[i_12]);
                                 float _shfl_xor_20 = __shfl_xor_sync(0xFFFFFFFF, send8_4, 16);
-                                float _max_30 = max_noftz(keep8_4, _shfl_xor_20);
-                                w8_2[i_12] = _max_30;
+                                float _max_32 = max_noftz(keep8_4, _shfl_xor_20);
+                                w8_2[i_12] = _max_32;
                             }
                             float x4_2[4];
                             #pragma unroll
@@ -1635,8 +1693,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 float send4_4 = ((b3_3 != 0) ? w8_2[i_13] : w8_2[i_13 + 4]);
                                 float keep4_4 = ((b3_3 != 0) ? w8_2[i_13 + 4] : w8_2[i_13]);
                                 float _shfl_xor_21 = __shfl_xor_sync(0xFFFFFFFF, send4_4, 8);
-                                float _max_31 = max_noftz(keep4_4, _shfl_xor_21);
-                                x4_2[i_13] = _max_31;
+                                float _max_33 = max_noftz(keep4_4, _shfl_xor_21);
+                                x4_2[i_13] = _max_33;
                             }
                             float y2_2[2];
                             #pragma unroll
@@ -1644,17 +1702,17 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 float send2_4 = ((b2_3 != 0) ? x4_2[i_14] : x4_2[i_14 + 2]);
                                 float keep2_4 = ((b2_3 != 0) ? x4_2[i_14 + 2] : x4_2[i_14]);
                                 float _shfl_xor_22 = __shfl_xor_sync(0xFFFFFFFF, send2_4, 4);
-                                float _max_32 = max_noftz(keep2_4, _shfl_xor_22);
-                                y2_2[i_14] = _max_32;
+                                float _max_34 = max_noftz(keep2_4, _shfl_xor_22);
+                                y2_2[i_14] = _max_34;
                             }
                             float send1_2 = ((b1_2 != 0) ? y2_2[0] : y2_2[1]);
                             float keep1_2 = ((b1_2 != 0) ? y2_2[1] : y2_2[0]);
                             float _shfl_xor_23 = __shfl_xor_sync(0xFFFFFFFF, send1_2, 2);
-                            float _max_33 = max_noftz(keep1_2, _shfl_xor_23);
-                            float z_2 = _max_33;
+                            float _max_35 = max_noftz(keep1_2, _shfl_xor_23);
+                            float z_2 = _max_35;
                             float _shfl_xor_24 = __shfl_xor_sync(0xFFFFFFFF, z_2, 1);
-                            float _max_34 = max_noftz(z_2, _shfl_xor_24);
-                            z_2 = _max_34;
+                            float _max_36 = max_noftz(z_2, _shfl_xor_24);
+                            z_2 = _max_36;
                             float zmax_1 = z_2;
                             if ((lane & 1) == 0) {
                                 swap_part[(32 + (lane >> 1 & 15)) * 4 + warp_in_wg_c] = zmax_1;
@@ -1670,8 +1728,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                     float send8_5 = ((b4_0_2 != 0) ? sv_b_1[i_15] : sv_b_1[i_15 + 8]);
                                     float keep8_5 = ((b4_0_2 != 0) ? sv_b_1[i_15 + 8] : sv_b_1[i_15]);
                                     float _shfl_xor_25 = __shfl_xor_sync(0xFFFFFFFF, send8_5, 16);
-                                    float _max_35 = max_noftz(keep8_5, _shfl_xor_25);
-                                    w8_4_2[i_15] = _max_35;
+                                    float _max_37 = max_noftz(keep8_5, _shfl_xor_25);
+                                    w8_4_2[i_15] = _max_37;
                                 }
                                 float x4_5_2[4];
                                 #pragma unroll
@@ -1679,8 +1737,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                     float send4_5 = ((b3_1_2 != 0) ? w8_4_2[i_16] : w8_4_2[i_16 + 4]);
                                     float keep4_5 = ((b3_1_2 != 0) ? w8_4_2[i_16 + 4] : w8_4_2[i_16]);
                                     float _shfl_xor_26 = __shfl_xor_sync(0xFFFFFFFF, send4_5, 8);
-                                    float _max_36 = max_noftz(keep4_5, _shfl_xor_26);
-                                    x4_5_2[i_16] = _max_36;
+                                    float _max_38 = max_noftz(keep4_5, _shfl_xor_26);
+                                    x4_5_2[i_16] = _max_38;
                                 }
                                 float y2_6_2[2];
                                 #pragma unroll
@@ -1688,17 +1746,17 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                     float send2_5 = ((b2_2_2 != 0) ? x4_5_2[i_17] : x4_5_2[i_17 + 2]);
                                     float keep2_5 = ((b2_2_2 != 0) ? x4_5_2[i_17 + 2] : x4_5_2[i_17]);
                                     float _shfl_xor_27 = __shfl_xor_sync(0xFFFFFFFF, send2_5, 4);
-                                    float _max_37 = max_noftz(keep2_5, _shfl_xor_27);
-                                    y2_6_2[i_17] = _max_37;
+                                    float _max_39 = max_noftz(keep2_5, _shfl_xor_27);
+                                    y2_6_2[i_17] = _max_39;
                                 }
                                 float send1_7_2 = ((b1_3_2 != 0) ? y2_6_2[0] : y2_6_2[1]);
                                 float keep1_8_2 = ((b1_3_2 != 0) ? y2_6_2[1] : y2_6_2[0]);
                                 float _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, send1_7_2, 2);
-                                float _max_38 = max_noftz(keep1_8_2, _shfl_xor_28);
-                                float z_9_2 = _max_38;
+                                float _max_40 = max_noftz(keep1_8_2, _shfl_xor_28);
+                                float z_9_2 = _max_40;
                                 float _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, z_9_2, 1);
-                                float _max_39 = max_noftz(z_9_2, _shfl_xor_29);
-                                z_9_2 = _max_39;
+                                float _max_41 = max_noftz(z_9_2, _shfl_xor_29);
+                                z_9_2 = _max_41;
                                 float zmax_10_1 = z_9_2;
                                 if ((lane & 1) == 0) {
                                     swap_part[(48 + (lane >> 1 & 15)) * 4 + warp_in_wg_c] = zmax_10_1;
@@ -1719,10 +1777,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 }
                                 #pragma unroll
                                 for (int j_26 = 0; j_26 < 16; j_26++) {
-                                    float _max_40 = max_noftz(p64s_1[4 * j_26], p64s_1[4 * j_26 + 1]);
-                                    float _max_41 = max_noftz(p64s_1[4 * j_26 + 2], p64s_1[4 * j_26 + 3]);
-                                    float _max_42 = max_noftz(_max_40, _max_41);
-                                    float bm_sj_2 = _max_42;
+                                    float _max_42 = max_noftz(p64s_1[4 * j_26], p64s_1[4 * j_26 + 1]);
+                                    float _max_43 = max_noftz(p64s_1[4 * j_26 + 2], p64s_1[4 * j_26 + 3]);
+                                    float _max_44 = max_noftz(_max_42, _max_43);
+                                    float bm_sj_2 = _max_44;
                                     int flagged_sj_2 = fl_w_1 >> (unsigned int)j_26 & 1;
                                     ref_a_1[j_26] = ((flagged_sj_2 != 0) ? bm_sj_2 : ref_a_1[j_26]);
                                 }
@@ -1736,10 +1794,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                     }
                                     #pragma unroll
                                     for (int j_28 = 0; j_28 < 16; j_28++) {
-                                        float _max_43 = max_noftz(p64s_0_1[4 * j_28], p64s_0_1[4 * j_28 + 1]);
-                                        float _max_44 = max_noftz(p64s_0_1[4 * j_28 + 2], p64s_0_1[4 * j_28 + 3]);
-                                        float _max_45 = max_noftz(_max_43, _max_44);
-                                        float bm_sj_3 = _max_45;
+                                        float _max_45 = max_noftz(p64s_0_1[4 * j_28], p64s_0_1[4 * j_28 + 1]);
+                                        float _max_46 = max_noftz(p64s_0_1[4 * j_28 + 2], p64s_0_1[4 * j_28 + 3]);
+                                        float _max_47 = max_noftz(_max_45, _max_46);
+                                        float bm_sj_3 = _max_47;
                                         int flagged_sj_3 = fl_w_1 >> (unsigned int)(16 + j_28) & 1;
                                         ref_b_1[j_28] = ((flagged_sj_3 != 0) ? bm_sj_3 : ref_b_1[j_28]);
                                     }
@@ -1755,10 +1813,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 float my_acc_2 = 1.0f;
                                 #pragma unroll
                                 for (int j_30 = 0; j_30 < 16; j_30++) {
-                                    float _max_46 = max_noftz(p64_1[4 * j_30], p64_1[4 * j_30 + 1]);
-                                    float _max_47 = max_noftz(p64_1[4 * j_30 + 2], p64_1[4 * j_30 + 3]);
-                                    float _max_48 = max_noftz(_max_46, _max_47);
-                                    float bm_j_2 = _max_48;
+                                    float _max_48 = max_noftz(p64_1[4 * j_30], p64_1[4 * j_30 + 1]);
+                                    float _max_49 = max_noftz(p64_1[4 * j_30 + 2], p64_1[4 * j_30 + 3]);
+                                    float _max_50 = max_noftz(_max_48, _max_49);
+                                    float bm_j_2 = _max_50;
                                     int flagged_j_2 = fl_w_1 >> (unsigned int)j_30 & 1;
                                     float _exp2_8 = approx_exp2(softmax_scale_log2 * (ref_a_1[j_30] - bm_j_2));
                                     float e_j_2 = _exp2_8;
@@ -1783,10 +1841,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                     float my_acc_1_1 = 1.0f;
                                     #pragma unroll
                                     for (int j_32 = 0; j_32 < 16; j_32++) {
-                                        float _max_49 = max_noftz(p64_0_1[4 * j_32], p64_0_1[4 * j_32 + 1]);
-                                        float _max_50 = max_noftz(p64_0_1[4 * j_32 + 2], p64_0_1[4 * j_32 + 3]);
-                                        float _max_51 = max_noftz(_max_49, _max_50);
-                                        float bm_j_3 = _max_51;
+                                        float _max_51 = max_noftz(p64_0_1[4 * j_32], p64_0_1[4 * j_32 + 1]);
+                                        float _max_52 = max_noftz(p64_0_1[4 * j_32 + 2], p64_0_1[4 * j_32 + 3]);
+                                        float _max_53 = max_noftz(_max_51, _max_52);
+                                        float bm_j_3 = _max_53;
                                         int flagged_j_3 = fl_w_1 >> (unsigned int)(16 + j_32) & 1;
                                         float _exp2_9 = approx_exp2(softmax_scale_log2 * (ref_b_1[j_32] - bm_j_3));
                                         float e_j_3 = _exp2_9;
@@ -1867,10 +1925,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 float acc16_1[16];
                                 #pragma unroll
-                                for (int q_2 = 0; q_2 < 4; q_2++) {
+                                for (int q_3 = 0; q_3 < 4; q_3++) {
                                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                        : "=r"(*reinterpret_cast<uint32_t*>(&acc16_1[4 * q_2])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_1[(4 * q_2) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_1[(4 * q_2) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_1[(4 * q_2) + 3]))
-                                        : "r"(swap_acc_addr + (unsigned int)((16 + 4 * q_2) * 4)));
+                                        : "=r"(*reinterpret_cast<uint32_t*>(&acc16_1[4 * q_3])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_1[(4 * q_3) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_1[(4 * q_3) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_1[(4 * q_3) + 3]))
+                                        : "r"(swap_acc_addr + (unsigned int)((16 + 4 * q_3) * 4)));
                                 }
                                 float _tmem_load_2[16];
                                 tmem_ld_x16(&_tmem_load_2[0], oT_base_w_1 + 16);
@@ -1884,10 +1942,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 if (rows_hi_1 != 0) {
                                     float acc16_0_1[16];
                                     #pragma unroll
-                                    for (int q_3 = 0; q_3 < 4; q_3++) {
+                                    for (int q_4 = 0; q_4 < 4; q_4++) {
                                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                            : "=r"(*reinterpret_cast<uint32_t*>(&acc16_0_1[4 * q_3])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_0_1[(4 * q_3) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_0_1[(4 * q_3) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_0_1[(4 * q_3) + 3]))
-                                            : "r"(swap_acc_addr + (unsigned int)((48 + 4 * q_3) * 4)));
+                                            : "=r"(*reinterpret_cast<uint32_t*>(&acc16_0_1[4 * q_4])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_0_1[(4 * q_4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_0_1[(4 * q_4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&acc16_0_1[(4 * q_4) + 3]))
+                                            : "r"(swap_acc_addr + (unsigned int)((48 + 4 * q_4) * 4)));
                                     }
                                     float _tmem_load_3[16];
                                     tmem_ld_x16(&_tmem_load_3[0], oT_base_w_1 + 48);
@@ -2064,16 +2122,16 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 : "r"(swap_part_addr + (unsigned int)((32 + lane) * 16)));
                             float sum_pa_1 = q4_1[0] + q4_1[1] + (q4_1[2] + q4_1[3]);
                             smem_sum[st_off_pub + 16 + lane] = sum_pa_1;
-                            float _rcp_9 = approx_rcp(sum_pa_1);
-                            swap_inv[st_off_pub + 16 + lane] = ((sum_pa_1 > 0.0f) ? _rcp_9 : 0.0f);
+                            float _rcp_10 = approx_rcp(sum_pa_1);
+                            swap_inv[st_off_pub + 16 + lane] = ((sum_pa_1 > 0.0f) ? _rcp_10 : 0.0f);
                             if (rows_hi_p_1 != 0) {
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q4_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q4_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q4_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q4_1[(0) + 3]))
                                     : "r"(swap_part_addr + (unsigned int)((48 + lane) * 16)));
                                 float sum_pb_1 = q4_1[0] + q4_1[1] + (q4_1[2] + q4_1[3]);
                                 smem_sum[st_off_pub + 32 + 16 + lane] = sum_pb_1;
-                                float _rcp_10 = approx_rcp(sum_pb_1);
-                                swap_inv[st_off_pub + 32 + 16 + lane] = ((sum_pb_1 > 0.0f) ? _rcp_10 : 0.0f);
+                                float _rcp_11 = approx_rcp(sum_pb_1);
+                                swap_inv[st_off_pub + 32 + 16 + lane] = ((sum_pb_1 > 0.0f) ? _rcp_11 : 0.0f);
                             }
                         }
                         if (lane == 0) {
@@ -2209,10 +2267,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                         int d_c = wg_tid_c;
                         float inv32[32];
                         #pragma unroll
-                        for (int q_4 = 0; q_4 < 8; q_4++) {
+                        for (int q_5 = 0; q_5 < 8; q_5++) {
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&inv32[4 * q_4])), "=r"(*reinterpret_cast<uint32_t*>(&inv32[(4 * q_4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&inv32[(4 * q_4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&inv32[(4 * q_4) + 3]))
-                                : "r"(swap_inv_addr + (unsigned int)((st_off + 4 * q_4) * 4)));
+                                : "=r"(*reinterpret_cast<uint32_t*>(&inv32[4 * q_5])), "=r"(*reinterpret_cast<uint32_t*>(&inv32[(4 * q_5) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&inv32[(4 * q_5) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&inv32[(4 * q_5) + 3]))
+                                : "r"(swap_inv_addr + (unsigned int)((st_off + 4 * q_5) * 4)));
                         }
                         int row_stride_e = num_q_heads * HEAD_DIM;
                         #pragma unroll
@@ -2229,10 +2287,10 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                         if (rows_hi_c != 0) {
                             float inv32_0[32];
                             #pragma unroll
-                            for (int q_5 = 0; q_5 < 8; q_5++) {
+                            for (int q_6 = 0; q_6 < 8; q_6++) {
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&inv32_0[4 * q_5])), "=r"(*reinterpret_cast<uint32_t*>(&inv32_0[(4 * q_5) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&inv32_0[(4 * q_5) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&inv32_0[(4 * q_5) + 3]))
-                                    : "r"(swap_inv_addr + (unsigned int)((st_off + 32 + 4 * q_5) * 4)));
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&inv32_0[4 * q_6])), "=r"(*reinterpret_cast<uint32_t*>(&inv32_0[(4 * q_6) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&inv32_0[(4 * q_6) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&inv32_0[(4 * q_6) + 3]))
+                                    : "r"(swap_inv_addr + (unsigned int)((st_off + 32 + 4 * q_6) * 4)));
                             }
                             int row_stride_e_1 = num_q_heads * HEAD_DIM;
                             #pragma unroll
@@ -2308,16 +2366,16 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 float l_o = partial_stats[other_slot * 128 + 64 + my_row_c];
                                 float m_s = smem_max[st_off + my_row_c];
                                 float l_s = smem_sum[st_off + my_row_c];
-                                float _max_52 = max_noftz(m_s, m_o);
-                                float m_row_i = _max_52;
+                                float _max_54 = max_noftz(m_s, m_o);
+                                float m_row_i = _max_54;
                                 float _exp2_10 = approx_exp2((m_s - m_row_i) * softmax_scale_log2);
                                 float w_s = _exp2_10;
                                 float _exp2_11 = approx_exp2((m_o - m_row_i) * softmax_scale_log2);
                                 float w_o = _exp2_11;
                                 float _fma_10 = __fmaf_rn(w_s, l_s, w_o * l_o);
                                 float den_i = _fma_10;
-                                float _rcp_11 = approx_rcp(den_i);
-                                float inv_i = ((den_i > 0.0f) ? _rcp_11 : 0.0f);
+                                float _rcp_12 = approx_rcp(den_i);
+                                float inv_i = ((den_i > 0.0f) ? _rcp_12 : 0.0f);
                                 w_s_c = w_s * inv_i;
                                 w_o_c = w_o * inv_i;
                                 if (den_i > 0.0f) {
@@ -2466,8 +2524,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                         m_k_1 = -1e+30f;
                                         l_k_1 = 0.0f;
                                     }
-                                    float _max_57 = max_noftz(m_f_1, m_k_1);
-                                    float m_new_1 = _max_57;
+                                    float _max_59 = max_noftz(m_f_1, m_k_1);
+                                    float m_new_1 = _max_59;
                                     float _exp2_16 = approx_exp2((m_f_1 - m_new_1) * softmax_scale_log2);
                                     float a_k_1 = _exp2_16;
                                     float _exp2_17 = approx_exp2((m_k_1 - m_new_1) * softmax_scale_log2);
@@ -2489,8 +2547,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                     }
                                     m_f_1 = m_new_1;
                                 }
-                                float _rcp_14 = approx_rcp(l_f_1);
-                                float inv_f_1 = ((l_f_1 > 0.0f) ? _rcp_14 : 0.0f);
+                                float _rcp_15 = approx_rcp(l_f_1);
+                                float inv_f_1 = ((l_f_1 > 0.0f) ? _rcp_15 : 0.0f);
                                 #pragma unroll
                                 for (int k4_1 = 0; k4_1 < 4; k4_1++) {
                                     out4_1[k4_1] = acc_f_1[k4_1] * inv_f_1;
@@ -3110,8 +3168,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                 }
                 if (kind_p == 0) {
                     int cta_n_blocks_p = block_end_p - block_begin_p;
-                    int _max_2 = (((seqlen_kv_p + PAGE_SIZE - 1) / PAGE_SIZE - 1) > (0) ? ((seqlen_kv_p + PAGE_SIZE - 1) / PAGE_SIZE - 1) : (0));
-                    int max_pg_p = _max_2;
+                    int _max_3 = (((seqlen_kv_p + PAGE_SIZE - 1) / PAGE_SIZE - 1) > (0) ? ((seqlen_kv_p + PAGE_SIZE - 1) / PAGE_SIZE - 1) : (0));
+                    int max_pg_p = _max_3;
                     int pt_base_p = batch_idx_p * max_pages_per_seq;
                     #pragma unroll 1
                     for (int ni0_p = 0; ni0_p < cta_n_blocks_p; ni0_p += 4) {
@@ -3240,15 +3298,15 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
             unsigned int sow_r = 0;
             if (sow_ticket < sow_total) {
                 if (sow_ticket < sow_chunk_items) {
-                    float _rcp_0 = approx_rcp((float)sow_n_max);
-                    unsigned int q_6 = (unsigned int)((float)sow_ticket * _rcp_0);
-                    if (sow_ticket < q_6 * sow_n_max) {
-                        q_6 = q_6 - 1;
+                    float _rcp_1 = approx_rcp((float)sow_n_max);
+                    unsigned int q_7 = (unsigned int)((float)sow_ticket * _rcp_1);
+                    if (sow_ticket < q_7 * sow_n_max) {
+                        q_7 = q_7 - 1;
                     }
-                    if (sow_ticket >= (q_6 + 1) * sow_n_max) {
-                        q_6 = q_6 + 1;
+                    if (sow_ticket >= (q_7 + 1) * sow_n_max) {
+                        q_7 = q_7 + 1;
                     }
-                    sow_tile = q_6;
+                    sow_tile = q_7;
                     sow_chunk = (int)(sow_ticket - sow_tile * sow_n_max);
                 } else {
                     sow_kind = 1;
@@ -3256,15 +3314,15 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                     sow_tile = sow_r >> sow_shift;
                     sow_slice = sow_r - (sow_tile << sow_shift);
                 }
-                float _rcp_1 = approx_rcp((float)num_kv_heads);
-                unsigned int q_7 = (unsigned int)((float)sow_tile * _rcp_1);
-                if (sow_tile < q_7 * (unsigned int)num_kv_heads) {
-                    q_7 = q_7 - 1;
+                float _rcp_2 = approx_rcp((float)num_kv_heads);
+                unsigned int q_8 = (unsigned int)((float)sow_tile * _rcp_2);
+                if (sow_tile < q_8 * (unsigned int)num_kv_heads) {
+                    q_8 = q_8 - 1;
                 }
-                if (sow_tile >= (q_7 + 1) * (unsigned int)num_kv_heads) {
-                    q_7 = q_7 + 1;
+                if (sow_tile >= (q_8 + 1) * (unsigned int)num_kv_heads) {
+                    q_8 = q_8 + 1;
                 }
-                sow_batch = (int)q_7;
+                sow_batch = (int)q_8;
                 sow_head = (int)(sow_tile - (unsigned int)sow_batch * (unsigned int)num_kv_heads);
                 int sow_last = causal_seqlens_kv_global[sow_batch] + (q_len - 1) - cp_rank;
                 int sow_cp_mask = (1 << cp_world_log2) - 1;
@@ -3272,8 +3330,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                     sow_len = (sow_last >> cp_world_log2) + 1;
                     sow_phase = sow_last & sow_cp_mask;
                 }
-                int _max_0 = ((sow_len) > (1) ? (sow_len) : (1));
-                int sow_pairs = (_max_0 + 255) / 256;
+                int _max_1 = ((sow_len) > (1) ? (sow_len) : (1));
+                int sow_pairs = (_max_1 + 255) / 256;
                 sow_n = sow_pairs + 1 - 1;
                 sow_n = 1;
                 if (sow_n > 1) {
@@ -3285,8 +3343,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                         sow_valid = 1;
                         sow_len_tok = sow_len;
                         sow_phase_tok = sow_phase;
-                        int _max_1 = (((sow_len + BLOCK_N - 1) / BLOCK_N) > (1) ? ((sow_len + BLOCK_N - 1) / BLOCK_N) : (1));
-                        int sow_nblk = _max_1;
+                        int _max_2 = (((sow_len + BLOCK_N - 1) / BLOCK_N) > (1) ? ((sow_len + BLOCK_N - 1) / BLOCK_N) : (1));
+                        int sow_nblk = _max_2;
                         sow_bbeg = 2 * sow_chunk;
                         sow_bend = 2 * (sow_chunk + 1);
                         if (sow_chunk + 1 == sow_n) {
@@ -3388,6 +3446,97 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
             unsigned int k_prod_phase = 1;
             unsigned int v_prod_stage = 0;
             unsigned int v_prod_phase = 1;
+            if (ei_valid != 0) {
+                int _min_0 = ((ei_cnt) < (3) ? (ei_cnt) : (3));
+                int n_pre_e = _min_0;
+                int _max_4 = (((ei_len + PAGE_SIZE - 1) / PAGE_SIZE - 1) > (0) ? ((ei_len + PAGE_SIZE - 1) / PAGE_SIZE - 1) : (0));
+                int ei_max_pg = _max_4;
+                int ei_page = 0;
+                if (ei_row_ok == 0) {
+                    int ei_blk = lane >> 3;
+                    int ei_idx = (ei_last - ei_blk) * 8 + (lane & 7);
+                    if (ei_idx > ei_max_pg) {
+                        ei_idx = ei_max_pg;
+                    }
+                    if (ei_blk < n_pre_e) {
+                        ei_page = page_table[ei_batch * max_pages_per_seq + ei_idx];
+                    }
+                }
+                if (elect_sync()) {
+                    mbarrier_wait(q_empty_addr + (q_prod_stage) * 8, q_prod_phase);
+                    int rows_hi_e = ((N_ROWS > 32) ? 1 : 0);
+                    if (rows_hi_e != 0) {
+                        mbarrier_arrive_expect_tx(q_full_addr + (q_prod_stage) * 8, 64 * HEAD_DIM * 2);
+                    } else {
+                        mbarrier_arrive_expect_tx(q_full_addr + (q_prod_stage) * 8, 32 * HEAD_DIM * 2);
+                    }
+                    tma_4d_gmem2smem(smem_qt_addr + q_prod_stage * 16384, (&Q), 0, ei_head * 8, ei_batch * q_len, 0, q_full_addr + (q_prod_stage) * 8);
+                    if (rows_hi_e != 0) {
+                        tma_4d_gmem2smem(smem_qt_addr + q_prod_stage * 16384 + (unsigned int)(32 * HEAD_DIM * 2), (&Q), 0, ei_head * 8, ei_batch * q_len + 4, 0, q_full_addr + (q_prod_stage) * 8);
+                    }
+                }
+                #pragma unroll 1
+                for (int eb = 0; eb < n_pre_e; eb++) {
+                    int pg_e[8];
+                    if (ei_row_ok != 0) {
+                        #pragma unroll
+                        for (int pg_i = 0; pg_i < 8; pg_i++) {
+                            int ep_e = (ei_last - eb) * 8 + pg_i;
+                            if (ep_e > ei_max_pg) {
+                                ep_e = ei_max_pg;
+                            }
+                            int ep_slot_e = ep_e >> 5;
+                            int ep_val_e = ei_row[0];
+                            #pragma unroll
+                            for (int sl_e_2 = 1; sl_e_2 < 4; sl_e_2++) {
+                                if (ep_slot_e == sl_e_2) {
+                                    ep_val_e = ei_row[sl_e_2];
+                                }
+                            }
+                            int _shfl_1 = __shfl_sync(0xFFFFFFFF, ep_val_e, ep_e & 31);
+                            pg_e[pg_i] = _shfl_1;
+                        }
+                    } else {
+                        #pragma unroll
+                        for (int pg_i_1 = 0; pg_i_1 < 8; pg_i_1++) {
+                            int _shfl_2 = __shfl_sync(0xFFFFFFFF, ei_page, eb * 8 + pg_i_1);
+                            pg_e[pg_i_1] = _shfl_2;
+                        }
+                    }
+                    if (elect_sync()) {
+                        mbarrier_wait(k_empty_addr + (k_prod_stage) * 8, k_prod_phase);
+                        mbarrier_arrive_expect_tx(k_full_addr + (k_prod_stage) * 8, 32768);
+                        int kdst_e = smem_k_addr + k_prod_stage * 32768;
+                        #pragma unroll
+                        for (int pg_i_2 = 0; pg_i_2 < 8; pg_i_2++) {
+                            int kpg_e = pg_e[pg_i_2];
+                            #pragma unroll
+                            for (int hg = 0; hg < 2; hg++) {
+                                int ktoff_e = hg * 16384 + pg_i_2 * 2048;
+                                tma_5d_gmem2smem(kdst_e + ktoff_e, (&K), 0, 0, hg, ei_head, kpg_e, k_full_addr + (k_prod_stage) * 8);
+                            }
+                        }
+                        k_prod_stage += 1;
+                        if (k_prod_stage == 3) { k_prod_stage = 0; k_prod_phase ^= 1; }
+                        if (eb < 2) {
+                            mbarrier_wait(v_empty_addr + (v_prod_stage) * 8, v_prod_phase);
+                            mbarrier_arrive_expect_tx(v_full_addr + (v_prod_stage) * 8, 32768);
+                            int vdst_e = smem_v_addr + v_prod_stage * 32768;
+                            #pragma unroll
+                            for (int pg_i_3 = 0; pg_i_3 < 8; pg_i_3++) {
+                                int vpg_e = pg_e[pg_i_3];
+                                #pragma unroll
+                                for (int hg_1 = 0; hg_1 < 2; hg_1++) {
+                                    int vtoff_e = hg_1 * 16384 + pg_i_3 * 2048;
+                                    tma_5d_gmem2smem(vdst_e + vtoff_e, (&V), 0, 0, hg_1, ei_head, vpg_e, v_full_addr + (v_prod_stage) * 8);
+                                }
+                            }
+                            v_prod_stage += 1;
+                            if (v_prod_stage == 3) { v_prod_stage = 0; v_prod_phase ^= 1; }
+                        }
+                    }
+                }
+            }
             unsigned int work_stage_l = 0;
             unsigned int _phase_work_full_4 = 0;
             mbarrier_wait(work_full_addr + (work_stage_l) * 8, _phase_work_full_4);
@@ -3432,66 +3581,8 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                     }
                     if (elect_sync()) {
                         #pragma unroll 1
-                        for (int ni = 0; ni < n_pre; ni++) {
-                            int pre_stage_u = page_cons_stage + (unsigned int)ni;
-                            int pre_stage = ((pre_stage_u >= 6) ? pre_stage_u - 6 : pre_stage_u);
-                            int pre_phase = ((pre_stage_u >= 6) ? page_cons_phase ^ 1 : page_cons_phase);
-                            int pre_pg_base = pre_stage * 8;
-                            mbarrier_wait(page_offsets_full_addr + (pre_stage) * 8, pre_phase);
-                            int pg_pre[8];
-                            #pragma unroll
-                            for (int pg_i = 0; pg_i < 8; pg_i++) {
-                                pg_pre[pg_i] = smem_page_offsets[pre_pg_base + pg_i];
-                            }
-                            mbarrier_wait(k_empty_addr + (k_prod_stage) * 8, k_prod_phase);
-                            mbarrier_arrive_expect_tx(k_full_addr + (k_prod_stage) * 8, 32768);
-                            int kdst0 = smem_k_addr + k_prod_stage * 32768;
-                            #pragma unroll
-                            for (int pg_i_1 = 0; pg_i_1 < 8; pg_i_1++) {
-                                int kpg0 = pg_pre[pg_i_1];
-                                #pragma unroll
-                                for (int hg = 0; hg < 2; hg++) {
-                                    int ktoff0 = hg * 16384 + pg_i_1 * 2048;
-                                    tma_5d_gmem2smem(kdst0 + ktoff0, (&K), 0, 0, hg, kv_head_idx, kpg0, k_full_addr + (k_prod_stage) * 8);
-                                }
-                            }
-                            k_prod_stage += 1;
-                            if (k_prod_stage == 3) { k_prod_stage = 0; k_prod_phase ^= 1; }
-                            if (ni == 0) {
-                                mbarrier_wait(q_empty_addr + (q_prod_stage) * 8, q_prod_phase);
-                                if (_tile_iter_l == 0) {
-                                }
-                                int rows_hi_l = ((N_ROWS > 32) ? 1 : 0);
-                                if (rows_hi_l != 0) {
-                                    mbarrier_arrive_expect_tx(q_full_addr + (q_prod_stage) * 8, 64 * HEAD_DIM * 2);
-                                } else {
-                                    mbarrier_arrive_expect_tx(q_full_addr + (q_prod_stage) * 8, 32 * HEAD_DIM * 2);
-                                }
-                                tma_4d_gmem2smem(smem_qt_addr + q_prod_stage * 16384, (&Q), 0, kv_head_idx * 8, batch_idx_l * q_len, 0, q_full_addr + (q_prod_stage) * 8);
-                                if (rows_hi_l != 0) {
-                                    tma_4d_gmem2smem(smem_qt_addr + q_prod_stage * 16384 + (unsigned int)(32 * HEAD_DIM * 2), (&Q), 0, kv_head_idx * 8, batch_idx_l * q_len + 4, 0, q_full_addr + (q_prod_stage) * 8);
-                                }
-                            }
-                            if (ni < 2) {
-                                mbarrier_wait(v_empty_addr + (v_prod_stage) * 8, v_prod_phase);
-                                mbarrier_arrive_expect_tx(v_full_addr + (v_prod_stage) * 8, 32768);
-                                int vdst0 = smem_v_addr + v_prod_stage * 32768;
-                                #pragma unroll
-                                for (int pg_i_2 = 0; pg_i_2 < 8; pg_i_2++) {
-                                    int vpg0 = pg_pre[pg_i_2];
-                                    #pragma unroll
-                                    for (int hg_1 = 0; hg_1 < 2; hg_1++) {
-                                        int vtoff0 = hg_1 * 16384 + pg_i_2 * 2048;
-                                        tma_5d_gmem2smem(vdst0 + vtoff0, (&V), 0, 0, hg_1, kv_head_idx, vpg0, v_full_addr + (v_prod_stage) * 8);
-                                    }
-                                }
-                                v_prod_stage += 1;
-                                if (v_prod_stage == 3) { v_prod_stage = 0; v_prod_phase ^= 1; }
-                            }
-                        }
-                        #pragma unroll 1
-                        for (int ni_1 = 0; ni_1 < cta_n_blocks; ni_1++) {
-                            int nk = ni_1 + 3;
+                        for (int ni = 0; ni < cta_n_blocks; ni++) {
+                            int nk = ni + 3;
                             if (nk < cta_n_blocks) {
                                 int k_page_u = page_cons_stage + 3;
                                 int k_page = ((k_page_u >= 6) ? k_page_u - 6 : k_page_u);
@@ -3500,25 +3591,25 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 mbarrier_wait(page_offsets_full_addr + (k_page) * 8, k_page_phase);
                                 int pg_nk[8];
                                 #pragma unroll
-                                for (int pg_i_3 = 0; pg_i_3 < 8; pg_i_3++) {
-                                    pg_nk[pg_i_3] = smem_page_offsets[kpg_base + pg_i_3];
+                                for (int pg_i_4 = 0; pg_i_4 < 8; pg_i_4++) {
+                                    pg_nk[pg_i_4] = smem_page_offsets[kpg_base + pg_i_4];
                                 }
                                 mbarrier_wait(k_empty_addr + (k_prod_stage) * 8, k_prod_phase);
                                 mbarrier_arrive_expect_tx(k_full_addr + (k_prod_stage) * 8, 32768);
                                 int kdst = smem_k_addr + k_prod_stage * 32768;
                                 #pragma unroll
-                                for (int pg_i_4 = 0; pg_i_4 < 8; pg_i_4++) {
-                                    int npg0 = pg_nk[pg_i_4];
+                                for (int pg_i_5 = 0; pg_i_5 < 8; pg_i_5++) {
+                                    int npg0 = pg_nk[pg_i_5];
                                     #pragma unroll
                                     for (int hg_2 = 0; hg_2 < 2; hg_2++) {
-                                        int ntoff = hg_2 * 16384 + pg_i_4 * 2048;
+                                        int ntoff = hg_2 * 16384 + pg_i_5 * 2048;
                                         tma_5d_gmem2smem(kdst + ntoff, (&K), 0, 0, hg_2, kv_head_idx, npg0, k_full_addr + (k_prod_stage) * 8);
                                     }
                                 }
                                 k_prod_stage += 1;
                                 if (k_prod_stage == 3) { k_prod_stage = 0; k_prod_phase ^= 1; }
                             }
-                            int nv = ni_1 + 2;
+                            int nv = ni + 2;
                             if (nv < cta_n_blocks) {
                                 int v_page_u = page_cons_stage + 2;
                                 int v_page = ((v_page_u >= 6) ? v_page_u - 6 : v_page_u);
@@ -3527,28 +3618,31 @@ kernel_cake_fmha_dcp_spec_bf16_balanced(const __grid_constant__ CUtensorMap Q, c
                                 mbarrier_wait(page_offsets_full_addr + (v_page) * 8, v_page_phase);
                                 int pg_nv[8];
                                 #pragma unroll
-                                for (int pg_i_5 = 0; pg_i_5 < 8; pg_i_5++) {
-                                    pg_nv[pg_i_5] = smem_page_offsets[vpg_base + pg_i_5];
+                                for (int pg_i_6 = 0; pg_i_6 < 8; pg_i_6++) {
+                                    pg_nv[pg_i_6] = smem_page_offsets[vpg_base + pg_i_6];
                                 }
                                 mbarrier_wait(v_empty_addr + (v_prod_stage) * 8, v_prod_phase);
                                 mbarrier_arrive_expect_tx(v_full_addr + (v_prod_stage) * 8, 32768);
                                 int vdst = smem_v_addr + v_prod_stage * 32768;
                                 #pragma unroll
-                                for (int pg_i_6 = 0; pg_i_6 < 8; pg_i_6++) {
-                                    int vpg1 = pg_nv[pg_i_6];
+                                for (int pg_i_7 = 0; pg_i_7 < 8; pg_i_7++) {
+                                    int vpg1 = pg_nv[pg_i_7];
                                     #pragma unroll
                                     for (int hg_3 = 0; hg_3 < 2; hg_3++) {
-                                        int vtoff = hg_3 * 16384 + pg_i_6 * 2048;
+                                        int vtoff = hg_3 * 16384 + pg_i_7 * 2048;
                                         tma_5d_gmem2smem(vdst + vtoff, (&V), 0, 0, hg_3, kv_head_idx, vpg1, v_full_addr + (v_prod_stage) * 8);
                                     }
                                 }
                                 v_prod_stage += 1;
                                 if (v_prod_stage == 3) { v_prod_stage = 0; v_prod_phase ^= 1; }
                             }
+                            if (n_pre > ni) {
+                                mbarrier_wait(page_offsets_full_addr + (page_cons_stage) * 8, page_cons_phase);
+                            }
                             mbarrier_arrive(page_offsets_empty_addr + (page_cons_stage) * 8);
                             page_cons_stage += 1;
                             if (page_cons_stage == 6) { page_cons_stage = 0; page_cons_phase ^= 1; }
-                            if (ni_1 == gate_block) {
+                            if (ni == gate_block) {
                                 mbarrier_arrive(claim_gate_addr);
                             }
                         }

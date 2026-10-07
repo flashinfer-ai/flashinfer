@@ -100,14 +100,25 @@
         "bodies": {
           "1": "cake_fmha_dcp_spec_bf16_balanced_program1.cu",
           "2": "cake_fmha_dcp_spec_bf16_balanced_program2.cu",
-          "3": "cake_fmha_dcp_spec_bf16_balanced_program3.cu"
+          "3": "cake_fmha_dcp_spec_bf16_balanced_program3.cu",
+          "4": "cake_fmha_dcp_spec_bf16_balanced_program4.cu",
+          "5": "cake_fmha_dcp_spec_bf16_balanced_program5.cu"
         },
         "default": 1,
         "items_lower_bound": "batch_size * num_kv_heads",
         "key": "program",
-        "rule": "program = static_one_wave when batch_size == 1, num_kv_heads < grid (sm_count) and max_pages_per_seq <= whole_pages_max[sm_count][num_kv_heads] (the planner plans whole tiles for every rank-local length within that page-table bound, so the static program issues each (request, KV head) tile whole from its CTA index: no planner, no partials, no reduce tickets, bitwise the planner program's result) -- in its swapped-QK form swapped.program when the launch's architecture is in swapped.arches and its packed-row instance n_rows in swapped.n_rows (S^T = K Q^T with the keys on M, lane-per-key softmax, two P^T staging buffers; bitwise the whole-tile program's result); else below_grid (= at_or_above_grid: the family keeps one planner body)",
+        "rule": "program = static_one_wave when batch_size == 1, num_kv_heads < grid (sm_count) and max_pages_per_seq <= whole_pages_max[sm_count][num_kv_heads] (the planner plans whole tiles for every rank-local length within that page-table bound, so the static program issues each (request, KV head) tile whole from its CTA index: no planner, no partials, no reduce tickets, bitwise the planner program's result) -- in its swapped-QK form swapped.program when the launch's architecture is in swapped.arches and its packed-row instance n_rows in swapped.n_rows (S^T = K Q^T with the keys on M, lane-per-key softmax, two P^T staging buffers; bitwise the whole-tile program's result) -- and, when the launch's architecture is in early_issue.arches, the early-issue form of that program (early_issue.programs[program]: the loader decodes its own ticket in the kernel prologue and issues the first Q / K / V boxes before the scheduler's token and the page-offset publication; the same boxes into the same stages, bitwise the program's result); else below_grid (= at_or_above_grid: the family keeps one planner body)",
         "static_one_wave": 2,
         "static_one_wave_regime": {
+          "early_issue": {
+            "arches": [
+              "sm_100a"
+            ],
+            "programs": {
+              "2": 4,
+              "3": 5
+            }
+          },
           "form": "whole_tiles",
           "one_request": 1,
           "page_size": 16,
@@ -160,7 +171,9 @@
         "values": [
           1,
           2,
-          3
+          3,
+          4,
+          5
         ]
       },
       "public_name": "cake_fmha_dcp_spec_bf16_balanced",
@@ -756,6 +769,58 @@
           "sources": {
             "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program3.cu",
             "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program3.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 32
+          },
+          "selector": {
+            "n_rows": 32,
+            "program": 4
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program4.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program4.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 64
+          },
+          "selector": {
+            "n_rows": 64,
+            "program": 4
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program4.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program4.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 32
+          },
+          "selector": {
+            "n_rows": 32,
+            "program": 5
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program5.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program5.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 64
+          },
+          "selector": {
+            "n_rows": 64,
+            "program": 5
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program5.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program5.cu"
           }
         }
       ],
