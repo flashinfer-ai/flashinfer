@@ -631,6 +631,83 @@ def _cp_delta_rule_rejection_reason(
     return None
 
 
+@functools.cache
+def _cudnn_gdn_prefill_available() -> bool:
+    from .cudnn.linear_attention import _linear_attention_auto_available
+
+    return _linear_attention_auto_available()
+
+
+def _prefer_cudnn_gdn_prefill(q, v, cu_seqlens) -> bool:
+    # B200 raw-gate measurements include the existing fused-gate native path.
+    # Higher-head GVA was near parity, so retain its native policy for now.
+    return (
+        q.is_cuda
+        and q.shape[1:] == (4, 128)
+        and v.shape[1:] == (8, 128)
+        and 128 <= q.shape[0] <= 8192
+        and 2 <= cu_seqlens.numel() <= 3
+        and get_compute_capability(q.device) == (10, 0)
+    )
+
+
+def _is_cudnn_gdn_auto_eligible(
+    q, k, v, g, beta, A_log, dt_bias, initial_state, output_state, output, cu_seqlens
+) -> bool:
+    """Keep automatic substitution within the measured compact inference contract."""
+    if not q.is_cuda or q.ndim != 3 or v.ndim != 3:
+        return False
+    total, _, dim = q.shape
+    heads = v.shape[1]
+    num_seqs = cu_seqlens.numel() - 1
+    tensors = (
+        (q, q.shape, torch.bfloat16),
+        (k, q.shape, torch.bfloat16),
+        (v, (total, heads, dim), torch.bfloat16),
+        (g, (total, heads), torch.bfloat16),
+        (beta, (total, heads), torch.bfloat16),
+        (A_log, (heads,), torch.float32),
+        (dt_bias, (heads,), torch.float32),
+        (initial_state, (num_seqs, heads, dim, dim), torch.float32),
+        (output_state, (num_seqs, heads, dim, dim), torch.float32),
+        (output, (total, heads, dim), torch.bfloat16),
+        (cu_seqlens, (num_seqs + 1,), torch.int64),
+    )
+    for tensor, shape, dtype in tensors:
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.shape != shape
+            or tensor.dtype != dtype
+            or tensor.device != q.device
+            or not tensor.is_contiguous()
+            or tensor.requires_grad
+        ):
+            return False
+    if not torch.is_inference_mode_enabled() and (
+        output.is_inference() or output_state.is_inference()
+    ):
+        return False
+
+    # Contiguous byte ranges also detect aliases made through independent
+    # DLPack Storage objects. A declined call keeps its existing native route.
+    def span(tensor):
+        begin = tensor.data_ptr()
+        return begin, begin + tensor.numel() * tensor.element_size()
+
+    written = (span(output), span(output_state))
+    read = tuple(
+        span(tensor)
+        for tensor in (q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens)
+    )
+    for i, (begin, end) in enumerate(written):
+        if any(
+            begin < other_end and other_begin < end
+            for other_begin, other_end in (*read, *written[:i])
+        ):
+            return False
+    return True
+
+
 @flashinfer_api(trace=gdn_prefill_trace)
 def chunk_gated_delta_rule(
     q: torch.Tensor,
@@ -680,10 +757,13 @@ def chunk_gated_delta_rule(
     g : torch.Tensor, optional
         Forget gate (alpha) of shape ``[total_seq_len, num_sab_heads]``
         where ``num_sab_heads = max(num_q_heads, num_v_heads)``.  Must be
-        float32.  Defaults to all ones when ``None``.
+        float32 for precomputed alpha; raw gates may also be float16 or
+        bfloat16 when ``use_gate_in_kernel=True``. Defaults to all ones
+        when ``None``.
     beta : torch.Tensor, optional
         Update gate (beta) of shape ``[total_seq_len, num_sab_heads]``.
-        Must be float32.  Defaults to all ones when ``None``.
+        Must be float32 for precomputed beta; logits may also use the Q
+        dtype when ``beta_is_logit=True``. Defaults to all ones when ``None``.
     scale : float, optional
         Scale factor for the attention scores.  Defaults to
         ``1 / sqrt(head_size)`` when ``None``.
@@ -777,8 +857,14 @@ def chunk_gated_delta_rule(
         tuning. ``None`` lets the CP backend select the length automatically;
         an explicit value must be a multiple of 64.
     backend : {"auto", "flashinfer", "cake_gdn", "cudnn"}
-        ``auto`` uses the same SM90/SM100/SM120 kernels and context-parallel
-        routing as ``flashinfer``. Cake kernels require an explicit ``cake_gdn``
+        ``auto`` uses the native SM90/SM100/SM120 kernels and context-parallel
+        routing, and may select cuDNN for measured SM100 raw-gate inference
+        workloads. Automatic cuDNN selection requires both gate-fusion flags,
+        BF16 inputs/gates, caller-normalized Q/K, separate compact float32
+        input/output states with ``output_final_state=True``, and a caller-owned
+        output. Explicit CP, pools and checkpoints retain native
+        routing. Requires cuDNN frontend 1.31 GA and CuTe DSL 4.7 or newer.
+        Cake kernels require an explicit ``cake_gdn``
         request. Use ``backend="cake_gdn", use_cp=True`` for Cake CP on
         SM100/SM103; ``use_cp=False`` or ``"auto"`` retains Cake non-CP.
         Explicit Cake requests fail for unsupported inputs without falling
@@ -917,8 +1003,35 @@ def chunk_gated_delta_rule(
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
 
-    if backend == "cudnn":
+    cudnn_auto = (
+        backend == "auto"
+        and use_gate_in_kernel
+        and beta_is_logit
+        and not use_qk_l2norm_in_kernel
+        and output_final_state
+        and use_cp == "auto"
+        and _cp_chunk_len is None
+        and state_indices is None
+        and checkpoint_every_n_tokens == 0
+        and _prefer_cudnn_gdn_prefill(q, v, cu_seqlens)
+        and _is_cudnn_gdn_auto_eligible(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            initial_state,
+            output_state,
+            output,
+            cu_seqlens,
+        )
+        and _cudnn_gdn_prefill_available()
+    )
+    if backend == "cudnn" or cudnn_auto:
         from .cudnn import cudnn_chunk_gated_delta_rule
+        from .cudnn.linear_attention import _LINEAR_ATTENTION_BUILD_ERRORS
 
         unsupported = [
             name
@@ -933,26 +1046,32 @@ def chunk_gated_delta_rule(
                 'chunk_gated_delta_rule(backend="cudnn") does not support '
                 + ", ".join(unsupported)
             )
-        return cudnn_chunk_gated_delta_rule(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            output=output,
-            output_state=output_state,
-            state_indices=state_indices,
-            gate_domain=gate_domain,
-            use_gate_in_kernel=use_gate_in_kernel,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            beta_is_logit=beta_is_logit,
-        )
+        try:
+            return cudnn_chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                output=output,
+                output_state=output_state,
+                state_indices=state_indices,
+                gate_domain=gate_domain,
+                use_gate_in_kernel=use_gate_in_kernel,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                beta_is_logit=beta_is_logit,
+            )
+        except _LINEAR_ATTENTION_BUILD_ERRORS as exc:
+            # Only graph construction can mark a decline. Retrying execution
+            # could overwrite a caller's output/state after a partial launch.
+            if not cudnn_auto or not getattr(exc, "_fi_la_build_unsupported", False):
+                raise
 
     if gate_domain != "linear" or use_gate_in_kernel or beta_is_logit:
         from .gdn_kernels.gates import materialize_gates

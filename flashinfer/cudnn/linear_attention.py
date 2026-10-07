@@ -56,6 +56,22 @@ _LINEAR_ATTENTION_BUILD_ERRORS = (NotImplementedError, TypeError) + (
 )
 
 
+def _linear_attention_auto_available() -> bool:
+    """Shared optional-runtime floor; callers cache their lazy probe."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    from packaging.version import InvalidVersion, Version
+
+    if not CUDNN_AVAILABLE:
+        return False
+    try:
+        return Version(cudnn.__version__) >= Version("1.31") and (
+            Version(version("nvidia-cutlass-dsl")) >= Version("4.7")
+        )
+    except (AttributeError, InvalidVersion, PackageNotFoundError):
+        return False
+
+
 def _check_cudnn_frontend(feature: str, minimum=_MIN_FRONTEND_VERSION) -> None:
     """Fail fast on a frontend that has no linear-attention graph node."""
     if not CUDNN_AVAILABLE:

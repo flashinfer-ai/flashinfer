@@ -43,20 +43,9 @@ from .utils import get_compute_capability
 @functools.cache
 def _cudnn_kda_prefill_available() -> bool:
     """Probe optional packages once; per-call eligibility stays with native KDA."""
-    from importlib.metadata import PackageNotFoundError, version
+    from .cudnn.linear_attention import _linear_attention_auto_available
 
-    from packaging.version import InvalidVersion, Version
-
-    from .cudnn import linear_attention
-
-    if not linear_attention.CUDNN_AVAILABLE:
-        return False
-    try:
-        return Version(linear_attention.cudnn.__version__) >= Version("1.31") and (
-            Version(version("nvidia-cutlass-dsl")) >= Version("4.7")
-        )
-    except (AttributeError, InvalidVersion, PackageNotFoundError):
-        return False
+    return _linear_attention_auto_available()
 
 
 def _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens) -> bool:
