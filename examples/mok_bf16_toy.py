@@ -29,14 +29,22 @@ RESULT_NAMES = (
 )
 
 
-def expert(x, gate, up, down):
+def expert(x, gate, up, down, swiglu_limit=None):
     a, b = x @ gate.T, x @ up.T
+    a, b = a.float(), b.float()
+    if swiglu_limit is not None:
+        # GLM-5.3-Flash clamp; torch.clamp's inclusive-boundary derivative
+        # matches the kernel's masks.
+        a = torch.clamp(a, max=swiglu_limit)
+        b = torch.clamp(b, min=-swiglu_limit, max=swiglu_limit)
     # Native SwiGLU promotes BF16 inputs to FP32, then rounds the product once.
-    hidden = (torch.nn.functional.silu(a.float()) * b.float()).to(x.dtype)
+    hidden = (torch.nn.functional.silu(a) * b).to(x.dtype)
     return hidden @ down.T
 
 
-def reference(global_data, weights, *, fp32=False, source_counts=None):
+def reference(
+    global_data, weights, *, fp32=False, source_counts=None, swiglu_limit=None
+):
     rank, ep = dist.get_rank(), dist.get_world_size()
     device = weights[0].device
     dtype = torch.float32 if fp32 else torch.bfloat16
@@ -63,7 +71,7 @@ def reference(global_data, weights, *, fp32=False, source_counts=None):
             continue
         xe = x[rows].detach().requires_grad_()
         we = [w[e].detach().to(dtype).requires_grad_() for w in weights[3:]]
-        out = expert(xe, *we)
+        out = expert(xe, *we, swiglu_limit=swiglu_limit)
         # Differentiating already-scaled score inputs; scaling is not repeated.
         se = scores[rows, slots].detach().requires_grad_()
         weighted = out.float() * se[:, None]
@@ -77,7 +85,7 @@ def reference(global_data, weights, *, fp32=False, source_counts=None):
         dist.all_reduce(tensor)
     xs = x[own_rows].detach().requires_grad_()
     ws = [w.detach().to(dtype).requires_grad_() for w in weights[:3]]
-    ys = expert(xs, *ws)
+    ys = expert(xs, *ws, swiglu_limit=swiglu_limit)
     shared_grads = torch.autograd.grad(ys, (xs, *ws), dy[own_rows])
     y = (y_sum[own_rows] + ys.detach().float()).to(dtype)
     dx = (dx_sum[own_rows] + shared_grads[0].float()).to(dtype)
@@ -180,7 +188,20 @@ def error_report(actual, expected, gate):
 
 
 class TrainingIteration:
-    def __init__(self, config, workspace, x, ids, scores, dy, weights, *, functional):
+    def __init__(
+        self,
+        config,
+        workspace,
+        x,
+        ids,
+        scores,
+        dy,
+        weights,
+        *,
+        functional,
+        swiglu_limit=None,
+        recompute=False,
+    ):
         if (
             x.dtype != torch.bfloat16
             or dy.dtype != torch.bfloat16
@@ -207,6 +228,10 @@ class TrainingIteration:
         self.functional = functional
         self.x, self.ids, self.scores, self.dy = x, ids, scores, dy
         self.weights = weights
+        self.swiglu_limit = swiglu_limit
+        # ``recompute``: checkpoint step = forward + recompute_forward_context
+        # + backward from the recomputed context (asserted bitwise equal).
+        self.recompute = bool(recompute)
         self.graph = None
         self.outputs = None
 
@@ -224,16 +249,54 @@ class TrainingIteration:
             self.x,
             self.scores,
             *self.weights,
+            swiglu_limit=self.swiglu_limit,
         )
+        context = self.context
+        if self.recompute:
+            context = self.functional.recompute_forward_context(
+                self.config,
+                self.workspace,
+                self.schedule,
+                self.x,
+                self.weights[0],
+                self.weights[1],
+                self.weights[3],
+                self.weights[4],
+                swiglu_limit=self.swiglu_limit,
+            )
+            if not torch.cuda.is_current_stream_capturing():
+                saved = (
+                    self.context.x_routed,
+                    self.context.gate_shared,
+                    self.context.gate_routed,
+                    self.context.up_shared,
+                    self.context.up_routed,
+                    self.context.hidden_shared,
+                    self.context.hidden_routed,
+                )
+                rebuilt = (
+                    context.x_routed,
+                    context.gate_shared,
+                    context.gate_routed,
+                    context.up_shared,
+                    context.up_routed,
+                    context.hidden_shared,
+                    context.hidden_routed,
+                )
+                if not all(
+                    torch.equal(a, b) for a, b in zip(saved, rebuilt, strict=True)
+                ):
+                    raise RuntimeError("Recomputed context differs from the saved one")
         gradients = self.functional.backward(
             self.config,
             self.workspace,
             self.schedule,
-            self.context,
+            context,
             self.dy,
             self.x,
             self.scores,
             *self.weights,
+            swiglu_limit=self.swiglu_limit,
         )
         self.outputs = (y, *gradients)
         if any(
@@ -393,6 +456,29 @@ def main():
             all(torch.equal(a, b) for a, b in zip(saved[0], other, strict=True))
             for other in saved[1:]
         )
+        # Checkpoint step (forward + recompute_forward_context + backward from
+        # the recomputed context) reproduces the saved-context step bitwise,
+        # eagerly and as a captured graph.
+        checkpoint = TrainingIteration(
+            config,
+            workspace,
+            x,
+            ids,
+            scores,
+            dy,
+            weights,
+            functional=functional,
+            recompute=True,
+        )
+        fill(11, False)
+        for _ in range(2):
+            actual = checkpoint.run()
+            torch.cuda.synchronize()
+            assert all(
+                torch.equal(a, b) for a, b in zip(saved[0], actual, strict=True)
+            ), (rank, hidden, "checkpoint step differs from the saved-context step")
+            if checkpoint.graph is None:
+                checkpoint.capture()
         cases.append(
             dict(
                 hidden=hidden,
@@ -407,6 +493,7 @@ def main():
                 routed_loads=loads,
                 reports=reports,
                 three_graph_replays_bitwise_equal=True,
+                checkpoint_recompute_bitwise_equal=True,
             )
         )
     if rank == 0:

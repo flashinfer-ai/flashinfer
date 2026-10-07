@@ -22,22 +22,44 @@ def _require_gpu():
         pytest.skip("Requires an SM100a-compatible CUDA device")
 
 
-def test_fused_training(monkeypatch):
+@pytest.mark.parametrize("variant", ["base", "ragged", "clamped"])
+def test_fused_training(monkeypatch, variant):
     _require_gpu()
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    _check_fused_training()
+    _check_fused_training(variant)
 
 
-def _check_fused_training():
+# (hidden, intermediate, macrobatch, source tokens, swiglu_limit). ``ragged``
+# uses odd, non-tile-aligned source counts (including one row); ``clamped``
+# uses limits that mask a large share of the gate/up elements.
+GEOMETRIES = {
+    "base": (
+        (256, 256, 768, 512, None),
+        (512, 512, 768, 512, None),
+        (256, 256, 1536, 512, None),
+    ),
+    "ragged": (
+        (256, 256, 768, 501, None),
+        (512, 512, 768, 129, None),
+        (256, 256, 1536, 1, None),
+    ),
+    "clamped": (
+        (256, 256, 768, 512, 0.08),
+        (512, 512, 768, 501, 0.1),
+        (256, 256, 1536, 512, 10.0),
+    ),
+}
+
+
+def _check_fused_training(variant="base"):
     print("build fused backward", flush=True)
     backward = MoKBackward()
     forward = MoKForward()
     assert torch.cuda.get_device_capability() in ((10, 0), (10, 3), (10, 7))
     records = []
     for empty in (False, True):
-        geometries = ((256, 256, 768), (512, 512, 768), (256, 256, 1536))
-        for hidden, intermediate, macro in geometries:
-            tokens, experts, topk, mini, comm = (512, 4, 2, 256, 4)
+        for hidden, intermediate, macro, tokens, swiglu_limit in GEOMETRIES[variant]:
+            experts, topk, mini, comm = (4, 2, 256, 4)
             torch.manual_seed(9173 + hidden)
             options = dict(device="cuda", dtype=torch.bfloat16)
             x = torch.randn(tokens, hidden, **options) * 0.125
@@ -111,7 +133,7 @@ def _check_fused_training():
                     num_tokens,
                     counts,
                     topk,
-                    None,
+                    swiglu_limit,
                     comm,
                     macro,
                     mini,
@@ -133,7 +155,6 @@ def _check_fused_training():
                     shared[2],
                     routed[2],
                     *context[:7],
-                    context[8],
                     x,
                     [x.data_ptr()],
                     peers,
@@ -141,24 +162,37 @@ def _check_fused_training():
                     num_tokens,
                     counts,
                     topk,
-                    None,
+                    swiglu_limit,
                     comm,
                     macro,
                     mini,
                 )
 
-            def mlp_backward(value, gradient, weights):
+            def mlp_backward(value, gradient, weights, score=None):
+                # Independent BF16-rounding-point reference; the clamp follows
+                # MoK: pre-clamp inclusive masks, clamped values in the SiLU.
+                # Routed experts receive the unscaled upstream gradient: the
+                # kernel rounds dh once and applies the route score in FP32.
                 gate = (value.float() @ weights[0].float().T).bfloat16()
                 up = (value.float() @ weights[1].float().T).bfloat16()
-                sigmoid = torch.sigmoid(gate.float())
-                silu = gate.float() * sigmoid
-                activation_unrounded = silu * up.float()
+                gate_f, up_f = gate.float(), up.float()
+                if swiglu_limit is not None:
+                    gate_mask = gate_f <= swiglu_limit
+                    up_mask = (up_f >= -swiglu_limit) & (up_f <= swiglu_limit)
+                    gate_f = torch.clamp(gate_f, max=swiglu_limit)
+                    up_f = torch.clamp(up_f, min=-swiglu_limit, max=swiglu_limit)
+                sigmoid = torch.sigmoid(gate_f)
+                silu = gate_f * sigmoid
+                activation_unrounded = silu * up_f
                 activation = activation_unrounded.bfloat16()
                 dh = (gradient.float() @ weights[2].float()).bfloat16()
-                dg = (
-                    ((1.0 - silu) * sigmoid + silu) * up.float() * dh.float()
-                ).bfloat16()
-                du = (silu * dh.float()).bfloat16()
+                dh_f = dh.float() if score is None else dh.float() * score[:, None]
+                dg_f = ((1.0 - silu) * sigmoid + silu) * up_f * dh_f
+                du_f = silu * dh_f
+                if swiglu_limit is not None:
+                    dg_f = torch.where(gate_mask, dg_f, torch.zeros_like(dg_f))
+                    du_f = torch.where(up_mask, du_f, torch.zeros_like(du_f))
+                dg, du = dg_f.bfloat16(), du_f.bfloat16()
                 dx = (
                     dg.float() @ weights[0].float() + du.float() @ weights[1].float()
                 ).bfloat16()
@@ -182,11 +216,13 @@ def _check_fused_training():
                     if selected.numel():
                         value = x[selected // topk]
                         score = scores.flatten()[selected]
-                        gradient = (
-                            dy[selected // topk].float() * score[:, None]
-                        ).bfloat16()
+                        gradient = dy[selected // topk]
+                        # The down weight gradient uses the BF16 score-scaled dy
+                        # that the backward dispatch publishes alongside the
+                        # unscaled rows.
+                        scaled = (gradient.float() * score[:, None]).bfloat16()
                         rx, rg, ru, rh, rhidden, unrounded = mlp_backward(
-                            value, gradient, [w[expert] for w in routed]
+                            value, gradient, [w[expert] for w in routed], score
                         )
                         y_routed_reference[selected] = (
                             rhidden.float() @ routed[2][expert].float().T
@@ -211,8 +247,7 @@ def _check_fused_training():
                                         ru[lo:hi].float().T @ value[lo:hi].float()
                                     ).bfloat16(),
                                     (
-                                        gradient[lo:hi].float().T
-                                        @ rhidden[lo:hi].float()
+                                        scaled[lo:hi].float().T @ rhidden[lo:hi].float()
                                     ).bfloat16(),
                                 ]
                                 for destination, product in zip(
@@ -286,6 +321,8 @@ def _check_fused_training():
                     hidden=hidden,
                     intermediate=intermediate,
                     macro=macro,
+                    tokens=tokens,
+                    swiglu_limit=swiglu_limit,
                 ),
                 flush=True,
             )
@@ -300,6 +337,70 @@ def _check_fused_training():
                 all(torch.equal(a, b) for a, b in zip(saved[0], values, strict=True))
                 for values in saved[1:]
             )
+            # Context-only recompute (MoK ``recompute_forward_context``): the
+            # rebuilt context and a backward from it are bitwise identical.
+            saved_context = forward_context[0]
+            recomputed = forward(
+                x,
+                [x.data_ptr()],
+                combine,
+                [combine.data_ptr()],
+                shared[0],
+                routed[0],
+                shared[1],
+                routed[1],
+                shared[2],
+                routed[2],
+                peers,
+                schedule,
+                num_tokens,
+                counts,
+                topk,
+                swiglu_limit,
+                comm,
+                macro,
+                mini,
+                recompute_only=True,
+            )
+            assert recomputed[7] is None and recomputed[8] is None
+            assert all(
+                torch.equal(a, b)
+                for a, b in zip(recomputed[:7], saved_context[:7], strict=True)
+            ), "recomputed context differs"
+            result = backward(
+                dy,
+                [dy.data_ptr()],
+                dx_peer,
+                [dx_peer.data_ptr()],
+                scores,
+                [scores.data_ptr()],
+                ds_peer,
+                [ds_peer.data_ptr()],
+                shared[0],
+                routed[0],
+                shared[1],
+                routed[1],
+                shared[2],
+                routed[2],
+                *recomputed[:7],
+                x,
+                [x.data_ptr()],
+                peers,
+                schedule,
+                num_tokens,
+                counts,
+                topk,
+                swiglu_limit,
+                comm,
+                macro,
+                mini,
+            )
+            check(result)
+            values = outputs(result)
+            assert all(
+                torch.equal(a, values[index])
+                for a, index in zip(saved[0], compared, strict=True)
+            ), "recomputed-context backward differs"
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 result = sequence()
@@ -337,6 +438,8 @@ def _check_fused_training():
                 macro=macro,
                 errors=worst,
                 tokens=tokens,
+                swiglu_limit=swiglu_limit,
+                variant=variant,
                 experts=experts,
                 topk=topk,
                 mini=mini,
@@ -345,6 +448,7 @@ def _check_fused_training():
                 capacity=schedule.numel(),
                 three_eager_executions_bitwise_equal=True,
                 three_graph_replays_bitwise_equal=True,
+                recompute_context_and_backward_bitwise_equal=True,
                 router_gradient_independent_of_scores=True,
                 changed_inputs_scores_upstream_gradients=2,
             )

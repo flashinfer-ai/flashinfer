@@ -45,19 +45,28 @@ class MoKSourceSchedule(native.MoKSchedule):
 @dataclass(frozen=True, slots=True)
 class MoKForwardContext(native.MoKForwardContext):
     schedule: native.MoKSchedule
-    y_routed: torch.Tensor
+
+
+# (EP, local experts, top-k) layouts with exported scheduler kernels: the toy
+# layouts of the tests, GLM-5.2 (256 routed experts) and GLM-5.3-Flash (288).
+SUPPORTED_LAYOUTS = (
+    (1, 4, 2),
+    (4, 4, 2),
+    (16, 16, 8),
+    (64, 4, 8),
+    (4, 64, 8),
+    (8, 32, 8),
+    (32, 8, 8),
+    (8, 36, 8),
+    (32, 9, 8),
+)
 
 
 class MoKFunctional:
     """Precompile kernels before capture; retain native function signatures."""
 
     def __init__(self, ep, local_experts, topk):
-        if (ep, local_experts, topk) not in (
-            (1, 4, 2),
-            (4, 4, 2),
-            (16, 16, 8),
-            (64, 4, 8),
-        ):
+        if (ep, local_experts, topk) not in SUPPORTED_LAYOUTS:
             raise ValueError("Unsupported exported (EP, local experts, top-k) layout")
         self.ep, self.local_experts, self.topk = ep, local_experts, topk
         self.device = torch.device("cuda", torch.cuda.current_device())
@@ -122,13 +131,17 @@ class MoKFunctional:
         return workspace, workspace.num_local_tokens
 
     @staticmethod
-    def _copy_source(destination, source, padding):
+    def _copy_source(destination, source):
+        # Only the real rows are staged; peers read routed rows through the
+        # schedule and the fused kernels bound shared work by the row count.
         count = source.shape[0]
-        if count == destination.shape[0]:
-            destination.copy_(source)
-        else:
+        if count:
             destination[:count].copy_(source)
-            destination[count:].fill_(padding)
+
+    @staticmethod
+    def _rows(buffer, count):
+        """A view of the real rows, or a one-row TMA placeholder when empty."""
+        return buffer[: max(count, 1)]
 
     def _check_device(self, workspace):
         if (
@@ -317,13 +330,11 @@ class MoKFunctional:
             routed_up_weights,
             routed_down_weights,
         )
-        self._copy_source(workspace.x_buffer, x, 0)
-        self._copy_source(workspace.router_weight_buffer, router_weights, 1)
-        if source_count < workspace.num_local_tokens:
-            workspace.combine_buffer[source_count * workspace.topk :].zero_()
+        self._copy_source(workspace.x_buffer, x)
+        self._copy_source(workspace.router_weight_buffer, router_weights)
         self._barrier(workspace)
         values = self.forward_kernel(
-            workspace.x_buffer,
+            self._rows(workspace.x_buffer, source_count),
             workspace.x_buffer_ptrs,
             workspace.combine_buffer,
             workspace.combine_buffer_ptrs,
@@ -339,6 +350,7 @@ class MoKFunctional:
             config.fwd_num_comm_sms,
             config.macrobatch_size,
             config.minibatch_size,
+            source_rows=source_count,
         )
         context = MoKForwardContext(
             x_routed=values[0],
@@ -349,13 +361,88 @@ class MoKFunctional:
             hidden_shared=values[5],
             hidden_routed=values[6],
             schedule=schedule,
-            y_routed=values[8],
         )
         self._barrier(workspace)
+        if source_count == 0:
+            return x.new_empty((0, workspace.hidden_size)), context
         output = self.epilogues.forward(
-            values[7], workspace.combine_buffer, workspace.router_weight_buffer
+            values[7][:source_count],
+            workspace.combine_buffer[: source_count * workspace.topk],
+            workspace.router_weight_buffer[:source_count],
         )
-        return output[:source_count], context
+        return output, context
+
+    def recompute_forward_context(
+        self,
+        config,
+        workspace,
+        schedule,
+        x,
+        shared_gate_weights,
+        shared_up_weights,
+        routed_gate_weights,
+        routed_up_weights,
+        swiglu_limit=None,
+    ):
+        """Rebuild the backward context from ``x`` (MoK ``recompute_forward_context``).
+
+        Runs dispatch, both gate/up expert GEMMs and the SwiGLU only: no down
+        projections, no combine, no output. The result is bitwise identical to
+        the context ``forward`` saved for the same inputs and schedule, so a
+        backward from it reproduces the saved-context backward bitwise.
+        """
+        workspace, source_count = self._inputs(config, workspace, schedule, x, None)
+        self._check_device(workspace)
+        # Shape checks reuse the six-weight rule with the gate/up weights
+        # standing in for the unused down projections.
+        self._weights(
+            x,
+            shared_gate_weights,
+            shared_up_weights,
+            shared_gate_weights.transpose(0, 1).contiguous()
+            if shared_gate_weights.ndim == 2
+            else shared_gate_weights,
+            routed_gate_weights,
+            routed_up_weights,
+            routed_gate_weights.transpose(1, 2).contiguous()
+            if routed_gate_weights.ndim == 3
+            else routed_gate_weights,
+        )
+        self._copy_source(workspace.x_buffer, x)
+        self._barrier(workspace)
+        # The down weights are unused placeholders in recompute mode.
+        values = self.forward_kernel(
+            self._rows(workspace.x_buffer, source_count),
+            workspace.x_buffer_ptrs,
+            workspace.combine_buffer,
+            workspace.combine_buffer_ptrs,
+            shared_gate_weights,
+            routed_gate_weights,
+            shared_up_weights,
+            routed_up_weights,
+            shared_gate_weights,
+            routed_gate_weights,
+            *self._schedule(schedule),
+            workspace.topk,
+            swiglu_limit,
+            config.fwd_num_comm_sms,
+            config.macrobatch_size,
+            config.minibatch_size,
+            source_rows=source_count,
+            recompute_only=True,
+        )
+        context = MoKForwardContext(
+            x_routed=values[0],
+            gate_shared=values[1],
+            gate_routed=values[2],
+            up_shared=values[3],
+            up_routed=values[4],
+            hidden_shared=values[5],
+            hidden_routed=values[6],
+            schedule=schedule,
+        )
+        self._barrier(workspace)
+        return context
 
     def backward(
         self,
@@ -394,15 +481,12 @@ class MoKFunctional:
             routed_up_weights,
             routed_down_weights,
         )
-        self._copy_source(workspace.d_y_buffer, grad_output, 0)
-        self._copy_source(workspace.x_buffer, x, 0)
-        self._copy_source(workspace.router_weight_buffer, router_weights, 1)
-        if source_count < workspace.num_local_tokens:
-            workspace.d_x_routed_buffer[source_count * workspace.topk :].zero_()
-            workspace.d_router_weight_buffer[source_count:].zero_()
+        self._copy_source(workspace.d_y_buffer, grad_output)
+        self._copy_source(workspace.x_buffer, x)
+        self._copy_source(workspace.router_weight_buffer, router_weights)
         self._barrier(workspace)
         values = self.backward_kernel(
-            workspace.d_y_buffer,
+            self._rows(workspace.d_y_buffer, source_count),
             workspace.d_y_buffer_ptrs,
             workspace.d_x_routed_buffer,
             workspace.d_x_routed_buffer_ptrs,
@@ -423,8 +507,7 @@ class MoKFunctional:
             forward_context.up_routed,
             forward_context.hidden_shared,
             forward_context.hidden_routed,
-            forward_context.y_routed,
-            workspace.x_buffer,
+            self._rows(workspace.x_buffer, source_count),
             workspace.x_buffer_ptrs,
             *self._schedule(schedule),
             workspace.topk,
@@ -432,12 +515,19 @@ class MoKFunctional:
             config.bwd_num_comm_sms,
             config.macrobatch_size,
             config.minibatch_size,
+            source_rows=source_count,
         )
         self._barrier(workspace)
-        dx = self.epilogues.backward(values[0], workspace.d_x_routed_buffer)
+        if source_count == 0:
+            dx = x.new_empty((0, workspace.hidden_size))
+        else:
+            dx = self.epilogues.backward(
+                values[0][:source_count],
+                workspace.d_x_routed_buffer[: source_count * workspace.topk],
+            )
         dscores = workspace.d_router_weight_buffer[:source_count].clone()
         return (
-            dx[:source_count],
+            dx,
             dscores,
             values[10],
             values[12],
