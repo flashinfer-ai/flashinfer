@@ -1782,11 +1782,16 @@ def gdn_verify_kernel_mtp(
             cute.arch.barrier()  # Ensure all groups finished writing to sOutput
             v_tile_base = i_v * tile_v
             for t_idx in cutlass.range_constexpr(T):
-                # 128 threads, tile_v values to write per timestep
-                if tidx < tile_v:
-                    v_global = v_tile_base + tidx
-                    if v_global < V:
-                        o[(i_n, t_idx // n_h, i_hv, v_global)] = sOutput[(t_idx, tidx)]
+                # only a token's LAST micro-step carries its output; the rest
+                # staged zeros into the same row
+                if cutlass.const_expr(t_idx % n_h == n_h - 1):
+                    # 128 threads, tile_v values to write per timestep
+                    if tidx < tile_v:
+                        v_global = v_tile_base + tidx
+                        if v_global < V:
+                            o[(i_n, t_idx // n_h, i_hv, v_global)] = sOutput[
+                                (t_idx, tidx)
+                            ]
 
 
 @cute.jit
@@ -2742,11 +2747,16 @@ def gdn_verify_kernel_mtp_inline(
             cute.arch.barrier()  # Ensure all groups finished writing to sOutput
             v_tile_base = i_v * tile_v
             for t_idx in cutlass.range_constexpr(T):
-                # 128 threads, tile_v values to write per timestep
-                if tidx < tile_v:
-                    v_global = v_tile_base + tidx
-                    if v_global < V:
-                        o[(i_n, t_idx // n_h, i_hv, v_global)] = sOutput[(t_idx, tidx)]
+                # only a token's LAST micro-step carries its output; the rest
+                # staged zeros into the same row
+                if cutlass.const_expr(t_idx % n_h == n_h - 1):
+                    # 128 threads, tile_v values to write per timestep
+                    if tidx < tile_v:
+                        v_global = v_tile_base + tidx
+                        if v_global < V:
+                            o[(i_n, t_idx // n_h, i_hv, v_global)] = sOutput[
+                                (t_idx, tidx)
+                            ]
 
 
 @cute.jit

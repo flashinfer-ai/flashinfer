@@ -162,6 +162,7 @@ MTP_BASELINE = {
     "use_packed_fma": True,
     "per_token_pool_scatter": False,
     "cache_replayssm": False,
+    "n_h": 1,
 }
 
 PREFILL_BASELINE = {
@@ -374,6 +375,7 @@ def test_pretranspose_name_varies_with_every_argument(param, alternate):
         ("use_packed_fma", False),
         ("per_token_pool_scatter", True),
         ("cache_replayssm", True),
+        ("n_h", 3),
     ],
 )
 def test_mtp_name_varies_with_every_argument(param, alternate):
