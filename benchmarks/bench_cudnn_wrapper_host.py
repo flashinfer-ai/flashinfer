@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """cuDNN wrapper host overhead, separate from graph GPU and cold plan costs.
 
-BF16, Hq/Hkv=32/8, D=128, page size 16, fixed output buffers. Run the same
+BF16, D=128, page size 16, fixed output buffers; Hq/Hkv defaults to 32/8. Run the same
 command on the baseline and candidate checkouts in separate processes:
 
     python benchmarks/bench_cudnn_wrapper_host.py --kind decode --batch 64 --kv 1024 --output decode.json
@@ -61,6 +61,8 @@ def main():
     p.add_argument("--batch", type=int, required=True)
     p.add_argument("--q", type=int, default=1)
     p.add_argument("--kv", type=int, required=True)
+    p.add_argument("--qo-heads", type=int, default=32)
+    p.add_argument("--kv-heads", type=int, default=8)
     p.add_argument("--layout", choices=["HND", "NHD"], default="NHD")
     p.add_argument("--backends", nargs="+", default=["cudnn"])
     p.add_argument("--output", required=True)
@@ -78,8 +80,10 @@ def main():
     a = p.parse_args()
     if a.kind != "ragged" and a.ragged_indptr != "cpu":
         p.error("--ragged-indptr applies only to --kind ragged")
+    if a.kv_heads <= 0 or a.qo_heads <= 0 or a.qo_heads % a.kv_heads:
+        p.error("head counts must be positive with an integral Q/KV ratio")
     torch.manual_seed(42)
-    b, sq, sk, h, hk, d, page = a.batch, a.q, a.kv, 32, 8, 128, 16
+    b, sq, sk, h, hk, d, page = (a.batch, a.q, a.kv, a.qo_heads, a.kv_heads, 128, 16)
     pages = (sk + page - 1) // page
     q = torch.randn(b * sq, h, d, dtype=torch.bfloat16, device="cuda")
     cache_nhd = torch.randn(b * pages, 2, page, hk, d, dtype=q.dtype, device=q.device)
