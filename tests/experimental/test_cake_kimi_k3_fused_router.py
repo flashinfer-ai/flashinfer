@@ -17,19 +17,23 @@ limitations under the License.
 import pytest
 import torch
 
-from flashinfer.experimental.kimi_k3_fused_router import cake_backend
+from flashinfer.experimental.kimi_k3_fused_router import cake_backend, cake_jit
 from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
     ARM_GW_CTAS_PER_SM,
+    ARM_L_FAMILY,
+    ARM_L_MAX_TOKENS,
     ARM_L_MIN_GRID,
     ARM_LC_TOKENS,
+    ARM_M_MAX_TOKENS,
     ARM_Q4S_CLUSTER,
     ARM_Q4S_CTAS_PER_SM,
+    ARM_Q4S_FAMILY,
     BLOCK_M_VALUES,
+    MEASURED_NUM_TOKENS,
     NUM_EXPERTS,
     OWNER_CTAS,
     SHAPE_ROUTES,
     SUPPORTED_COMPUTE_CAPABILITIES,
-    SUPPORTED_NUM_TOKENS,
     TOP_K,
     KimiK3RoutePlan,
     allocate_kimi_k3_route_plan,
@@ -37,6 +41,7 @@ from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
     max_route_blocks,
     persistent_grid_cap,
     route_arm,
+    route_cell,
     validate_kimi_k3_fused_router_inputs,
 )
 from flashinfer.fused_moe import (
@@ -50,8 +55,32 @@ SORTED_POISON = -1_234_567
 EXPERT_POISON = -7_654_321
 WORKSPACE_POISON = -91
 
-# The 28 routed shapes: num_tokens in {1, 2, ..., 8192} x block_m in {8, 16}.
-ROUTED_SHAPES = [(rows, bm) for bm in BLOCK_M_VALUES for rows in SUPPORTED_NUM_TOKENS]
+# The 28 measured cells: num_tokens in {1, 2, ..., 8192} x block_m in {8, 16}.
+MEASURED_SHAPES = [(rows, bm) for bm in BLOCK_M_VALUES for rows in MEASURED_NUM_TOKENS]
+# Token counts between the measured cells, one or two per arm range (including
+# the first count above every cell boundary up to the 8192-token limit).
+ARBITRARY_NUM_TOKENS = (
+    3,
+    5,
+    17,
+    31,
+    33,
+    100,
+    129,
+    200,
+    257,
+    300,
+    1000,
+    1025,
+    2047,
+    2049,
+    3000,
+    4097,
+    8000,
+)
+ARBITRARY_SHAPES = [
+    (rows, bm) for bm in BLOCK_M_VALUES for rows in ARBITRARY_NUM_TOKENS
+]
 
 
 # ---------------------------------------------------------------------------
@@ -241,36 +270,108 @@ def check_route_plan(actual, expected, *, num_tokens, block_m):
 # ---------------------------------------------------------------------------
 
 
-def test_route_tables_cover_the_routed_shapes():
+def test_route_tables_cover_the_measured_cells():
     for arch, table in SHAPE_ROUTES.items():
-        assert sorted(table) == sorted(ROUTED_SHAPES), arch
+        assert sorted(table) == sorted(MEASURED_SHAPES), arch
         assert len(table) == 28
+        assert set(table.values()) == {"L", "LC", "LP", "M", "Q4S", "Q4SP", "GW"}
+    # The two tables differ in exactly two cells of the L / LP family.
+    differing = {
+        key
+        for key in SHAPE_ROUTES["sm_100a"]
+        if SHAPE_ROUTES["sm_100a"][key] != SHAPE_ROUTES["sm_103a"][key]
+    }
+    assert differing == {(64, 16), (128, 8)}
+    assert route_arm("sm_100a", 64, 16) == "LP"
+    assert route_arm("sm_103a", 64, 16) == "L"
+    assert route_arm("sm_100a", 128, 8) == "L"
+    assert route_arm("sm_103a", 128, 8) == "LP"
     for arch in SHAPE_ROUTES:
-        assert {arm for arm in SHAPE_ROUTES[arch].values()} == {
-            "L",
-            "LC",
-            "M",
-            "Q4S",
-            "GW",
+        # Arm LC serves exactly the LC row counts (one kernel per token count).
+        assert set(ARM_LC_TOKENS) == {
+            rows for (rows, _), arm in SHAPE_ROUTES[arch].items() if arm == "LC"
         }
-    assert SHAPE_ROUTES["sm_100a"] == SHAPE_ROUTES["sm_103a"]
-    assert route_arm("sm_100a", 512, 8) == "Q4S"
-    assert route_arm("sm_103a", 512, 8) == "Q4S"
-    for arch in SHAPE_ROUTES:
-        assert route_arm(arch, 1, 16) == "L"
         for rows in ARM_LC_TOKENS:
-            assert route_arm(arch, rows, 8) == "LC"
-            assert route_arm(arch, rows, 16) == "LC"
-        assert route_arm(arch, 16, 8) == "L"
-        assert route_arm(arch, 128, 8) == "L"
+            for bm in BLOCK_M_VALUES:
+                assert route_arm(arch, rows, bm) == "LC"
+        assert {
+            rows for (rows, _), arm in SHAPE_ROUTES[arch].items() if arm in ARM_L_FAMILY
+        } == {32, 64, 128}
+        assert route_arm(arch, 32, 8) == "LP"
+        assert route_arm(arch, 32, 16) == "LP"
+        assert route_arm(arch, 64, 8) == "LP"
+        assert route_arm(arch, 128, 16) == "L"
         assert route_arm(arch, 256, 16) == "M"
-        assert route_arm(arch, 2048, 8) == "Q4S"
+        assert route_arm(arch, 512, 16) == "Q4S"
         assert route_arm(arch, 1024, 16) == "Q4S"
+        assert route_arm(arch, 2048, 8) == "Q4SP"
+        assert route_arm(arch, 2048, 16) == "Q4SP"
         assert route_arm(arch, 8192, 16) == "GW"
-    with pytest.raises(NotImplementedError, match="exactly num_tokens"):
-        route_arm("sm_100a", 3, 8)
-    with pytest.raises(NotImplementedError):
-        route_arm("sm_103a", 16384, 16)
+        # Every measured cell's arm admits its token count on that architecture.
+        for (rows, _bm), arm in SHAPE_ROUTES[arch].items():
+            cc = next(c for c, a in SUPPORTED_COMPUTE_CAPABILITIES.items() if a == arch)
+            launch_grid(
+                arm, rows, compute_capability=cc, sm_count=148, max_active_clusters=1000
+            )
+    with pytest.raises(NotImplementedError, match="registered"):
+        route_arm("sm_90a", 64, 8)
+    with pytest.raises(ValueError, match="block_m"):
+        route_arm("sm_100a", 64, 4)
+
+
+def test_route_cell_and_arbitrary_token_counts():
+    # Measured counts are their own cell; LC counts stay exact.
+    for rows in MEASURED_NUM_TOKENS:
+        assert route_cell(rows) == rows
+    # Counts below 32 that are not an LC row take the 32-token cell (LP).
+    for rows in (3, 5, 6, 7, 9, 15, 17, 31):
+        assert route_cell(rows) == 32
+        for arch in SHAPE_ROUTES:
+            assert route_arm(arch, rows, 8) == "LP"
+    # Every other count takes the next measured cell up.
+    assert route_cell(33) == 64
+    assert route_cell(100) == 128
+    assert route_cell(129) == 256
+    assert route_cell(257) == 512
+    assert route_cell(1025) == 2048
+    assert route_cell(2049) == 4096
+    assert route_cell(4097) == 8192
+    assert route_cell(8000) == 8192
+    # Above the largest measured cell no kernel serves; the route rejects.
+    assert route_cell(8193) is None
+    for arch in SHAPE_ROUTES:
+        assert route_arm(arch, 4097, 8) == "GW"
+        assert route_arm(arch, 8000, 16) == "GW"
+        for rows in (8193, 10000, 1 << 20):
+            with pytest.raises(ValueError, match="8192"):
+                route_arm(arch, rows, 8)
+        assert route_arm(arch, 100, 16) == "L"
+        assert route_arm(arch, 200, 8) == "M"
+        assert route_arm(arch, 300, 8) == "Q4S"
+        assert route_arm(arch, 1000, 16) == "Q4S"
+        assert route_arm(arch, 2047, 8) == "Q4SP"
+        assert route_arm(arch, 3000, 16) == "GW"
+    assert route_arm("sm_100a", 33, 16) == "LP"
+    assert route_arm("sm_103a", 33, 16) == "L"
+    assert route_arm("sm_100a", 100, 8) == "L"
+    assert route_arm("sm_103a", 100, 8) == "LP"
+    # The chosen arm admits every count of its range on its architecture.
+    for arch, cc in (("sm_100a", (10, 0)), ("sm_103a", (10, 3))):
+        for rows in (*ARBITRARY_NUM_TOKENS, *MEASURED_NUM_TOKENS):
+            for bm in BLOCK_M_VALUES:
+                arm = route_arm(arch, rows, bm)
+                grid = launch_grid(
+                    arm,
+                    rows,
+                    compute_capability=cc,
+                    sm_count=148,
+                    max_active_clusters=1000,
+                )
+                assert grid >= 1
+    with pytest.raises(ValueError, match="positive"):
+        route_arm("sm_100a", 0, 8)
+    with pytest.raises(ValueError, match="8192"):
+        route_arm("sm_100a", 8193, 8)
 
 
 def test_persistent_grid_cap():
@@ -285,24 +386,47 @@ def test_persistent_grid_cap():
 def test_launch_grid_rules(compute_capability, sm_count):
     cap = persistent_grid_cap(compute_capability, sm_count)
     kw = dict(compute_capability=compute_capability, sm_count=sm_count)
-    # Arm LC: one cluster of num_tokens CTAs.
+    # Arm LC: one cluster of num_tokens CTAs (a single CTA for one token, a
+    # 16-CTA cluster for sixteen).
     for rows in ARM_LC_TOKENS:
         assert launch_grid("LC", rows, **kw) == rows
-    # Arm L: at least the 128 plan owners, otherwise one CTA per token up to the cap.
+    # Arm L: at least the 128 plan owners, otherwise one CTA per token up to
+    # the cap; admits at most 128 tokens.
+    assert ARM_L_MAX_TOKENS == 128
     assert launch_grid("L", 1, **kw) == ARM_L_MIN_GRID
+    assert launch_grid("L", 3, **kw) == ARM_L_MIN_GRID
     assert launch_grid("L", 16, **kw) == ARM_L_MIN_GRID
+    assert launch_grid("L", 100, **kw) == ARM_L_MIN_GRID
     assert launch_grid("L", 128, **kw) == 128
-    assert launch_grid("L", 512, **kw) == min(512, cap)
+    with pytest.raises(RuntimeError, match="at most"):
+        launch_grid("L", 129, **kw)
+    # Arm LP: the L rule (same kernel family, same admission guard).
+    assert ARM_L_FAMILY == ("L", "LP")
+    for rows in (3, 32, 64, 100, 128):
+        assert launch_grid("LP", rows, **kw) == launch_grid("L", rows, **kw)
+    with pytest.raises(RuntimeError, match="at most"):
+        launch_grid("LP", 1024, **kw)
+    # Arm M: 128 <= num_tokens <= the architecture's owner scratch bound.
+    assert launch_grid("M", 128, **kw) == 128
+    assert launch_grid("M", 200, **kw) == 200
     assert launch_grid("M", 256, **kw) == 256
-    assert launch_grid("M", 2048, **kw) == cap
+    m_max = ARM_M_MAX_TOKENS[compute_capability]
+    assert m_max == (256 if compute_capability == (10, 0) else 2048)
+    assert launch_grid("M", m_max, **kw) == min(m_max, cap)
+    with pytest.raises(RuntimeError, match="admits"):
+        launch_grid("M", m_max + 1, **kw)
+    with pytest.raises(RuntimeError, match="admits"):
+        launch_grid("M", 64, **kw)
     # Arm GW: CTAs-per-SM launch bound of the architecture (four on both).
     gw_ctas = ARM_GW_CTAS_PER_SM[compute_capability] * sm_count
+    assert launch_grid("GW", 300, **kw) == 300
     assert launch_grid("GW", 4096, **kw) == min(4096, gw_ctas)
     assert launch_grid("GW", 8192, **kw) == gw_ctas
     # Arm Q4S: four CTAs per SM regardless of the architecture cap, bounded by
     # whole co-resident clusters, then rounded down to clusters.
     q4s_ctas = ARM_Q4S_CTAS_PER_SM * sm_count
     assert launch_grid("Q4S", 512, max_active_clusters=1000, **kw) == 512
+    assert launch_grid("Q4S", 300, max_active_clusters=1000, **kw) == 300
     assert (
         launch_grid("Q4S", 1024, max_active_clusters=1000, **kw) == (q4s_ctas // 4) * 4
     )
@@ -319,20 +443,60 @@ def test_launch_grid_rules(compute_capability, sm_count):
         )
     with pytest.raises(RuntimeError, match="cluster capacity"):
         launch_grid("Q4S", 1024, **kw)
+    # Arm Q4SP: the Q4S rule (four CTAs per SM, whole co-resident clusters).
+    assert ARM_Q4S_FAMILY == ("Q4S", "Q4SP")
+    assert launch_grid("Q4SP", 2048, max_active_clusters=1000, **kw) == launch_grid(
+        "Q4S", 2048, max_active_clusters=1000, **kw
+    )
+    assert (
+        launch_grid("Q4SP", 2048, max_active_clusters=37, **kw) == 37 * ARM_Q4S_CLUSTER
+    )
+    with pytest.raises(RuntimeError, match="cluster capacity"):
+        launch_grid("Q4SP", 2048, **kw)
     with pytest.raises(RuntimeError):
-        launch_grid("L", 1024, **kw)
+        launch_grid("Q4SP", 2049, max_active_clusters=1000, **kw)
     with pytest.raises(RuntimeError):
-        launch_grid("M", 64, **kw)
+        launch_grid("Q4SP", 64, max_active_clusters=1000, **kw)
     with pytest.raises(RuntimeError):
         launch_grid("Q4S", 64, max_active_clusters=1000, **kw)
     with pytest.raises(RuntimeError, match="exactly num_tokens"):
-        launch_grid("LC", 16, **kw)
+        launch_grid("LC", 32, **kw)
     with pytest.raises(RuntimeError, match="launch bound"):
         launch_grid("GW", 4096, compute_capability=(9, 0), sm_count=132)
     with pytest.raises(ValueError):
         launch_grid("A", 1, **kw)
-    with pytest.raises(ValueError):
-        launch_grid("Z", 8, **kw)
+
+
+def test_registry_keys_are_dispatch_arms():
+    for arch, table in cake_jit.ROUTES.items():
+        assert arch in SHAPE_ROUTES
+        for key, name in table.items():
+            arm, _, rows = key.partition(":")
+            assert arm in cake_jit.ARMS
+            assert (arm == "LC") == bool(rows)
+            if rows:
+                assert int(rows) in ARM_LC_TOKENS
+            record = cake_jit.MODULES[name]
+            assert record["arm"] == arm
+            assert record["num_tokens"] == (int(rows) if rows else None)
+            assert arch in record["arches"]
+            assert record["launch"]["cooperative"] == (arm != "LC")
+            cluster = record["launch"]["cluster"][0]
+            if arm == "LC":
+                assert cluster == int(rows)
+            elif arm in ARM_Q4S_FAMILY:
+                assert cluster == ARM_Q4S_CLUSTER
+            else:
+                assert cluster == 1
+            # The occupancy query ships exactly with the cluster-bounded programs.
+            assert cake_jit.queries_occupancy(name) == (
+                arm in ARM_Q4S_FAMILY or key == "LC:16"
+            )
+            assert ("kernel_declaration" in record) == cake_jit.queries_occupancy(name)
+    with pytest.raises(ValueError, match="per num_tokens"):
+        cake_jit.kernel_key("LC")
+    assert cake_jit.kernel_key("LC", 4) == "LC:4"
+    assert cake_jit.kernel_key("GW") == "GW"
 
 
 def test_max_route_blocks_and_plan_capacity():
@@ -340,6 +504,7 @@ def test_max_route_blocks_and_plan_capacity():
     assert max_route_blocks(1, 16) == 16
     assert max_route_blocks(64, 8) == 896 + (1024 - 896) // 8
     assert max_route_blocks(8192, 16) == 896 + (131072 - 896) // 16
+    assert max_route_blocks(100, 8) == 896 + (1600 - 896) // 8
     plan = allocate_kimi_k3_route_plan(64, 8, torch.device("cpu"))
     assert (
         plan.topk_weights.shape == (64, TOP_K)
@@ -362,6 +527,7 @@ def test_validate_inputs():
     logits = torch.zeros(16, NUM_EXPERTS)
     bias = torch.zeros(NUM_EXPERTS)
     assert validate_kimi_k3_fused_router_inputs(logits, bias, 16) == (16, 16)
+    assert validate_kimi_k3_fused_router_inputs(logits[:3], bias, 8) == (3, 8)
     with pytest.raises(TypeError):
         validate_kimi_k3_fused_router_inputs(logits.half(), bias, 8)
     with pytest.raises(ValueError, match="896"):
@@ -480,9 +646,15 @@ def _run_and_check(num_tokens, block_m, seed):
     return runner, logits, bias, plan
 
 
-@pytest.mark.parametrize("num_tokens,block_m", ROUTED_SHAPES)
+@pytest.mark.parametrize("num_tokens,block_m", MEASURED_SHAPES)
 def test_fused_router_matches_reference(num_tokens, block_m):
     _run_and_check(num_tokens, block_m, seed=4568000 + num_tokens + block_m)
+
+
+@pytest.mark.parametrize("num_tokens,block_m", ARBITRARY_SHAPES)
+def test_fused_router_serves_arbitrary_token_counts(num_tokens, block_m):
+    """Token counts between the measured cells route to an admitting arm."""
+    _run_and_check(num_tokens, block_m, seed=7310000 + num_tokens + block_m)
 
 
 def test_allocating_api_matches_reference():
@@ -503,7 +675,8 @@ def test_allocating_api_matches_reference():
 
 
 @pytest.mark.parametrize(
-    "num_tokens,block_m", [(1, 8), (8, 16), (256, 8), (2048, 16), (4096, 8)]
+    "num_tokens,block_m",
+    [(1, 8), (8, 16), (100, 8), (256, 8), (2048, 16), (3000, 8), (4096, 8)],
 )
 def test_graph_replay_follows_device_inputs(num_tokens, block_m):
     """Capture once, replay with new logits / bias written into the same buffers."""
@@ -541,6 +714,19 @@ def test_launch_makes_no_allocation():
     assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 0
 
 
+def test_prepare_caches_device_facts_and_occupancy():
+    """A second preparation of a cluster-bounded shape performs no device query."""
+    device = _require_program(1024, 8)
+    logits, bias = make_inputs(1024, device, seed=13)
+    first = prepare_kimi_k3_fused_router(logits, bias, block_m=8)
+    facts_before = cake_backend._device_facts.cache_info().hits
+    clusters_before = cake_backend._max_active_clusters.cache_info().hits
+    second = prepare_kimi_k3_fused_router(logits, bias, block_m=8, plan=first.plan)
+    assert second.grid_x == first.grid_x and second.arm in ARM_Q4S_FAMILY
+    assert cake_backend._device_facts.cache_info().hits == facts_before + 1
+    assert cake_backend._max_active_clusters.cache_info().hits == clusters_before + 1
+
+
 def test_prepare_rejects_bad_plan_and_shapes():
     device = _require_program(16, 8)
     logits, bias = make_inputs(16, device, seed=7)
@@ -551,8 +737,6 @@ def test_prepare_rejects_bad_plan_and_shapes():
     aliased = plan._replace(expert_scatter_offsets=plan.expert_counts)
     with pytest.raises(ValueError, match="overlap"):
         prepare_kimi_k3_fused_router(logits, bias, block_m=8, plan=aliased)
-    with pytest.raises(NotImplementedError, match="exactly num_tokens"):
-        prepare_kimi_k3_fused_router(logits[:3].contiguous(), bias, block_m=8)
     with pytest.raises(ValueError, match="one CUDA device"):
         prepare_kimi_k3_fused_router(logits, bias.cpu(), block_m=8)
     with pytest.raises(ValueError, match="backend"):

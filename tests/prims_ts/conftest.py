@@ -92,7 +92,9 @@ def pytest_collection_modifyitems(config, items):
 @pytest.fixture(autouse=True)
 def _scope_exhaustive_schedule_checker(monkeypatch, request):
     test_path = Path(str(request.node.path))
-    if test_path.name.startswith("test_batched_gemm_"):
+    # Dense GEMM (test_gemm_*) and batched GEMM compile TaskManager with
+    # validation and the exhaustive checker. Other Prims-TS tests leave both off.
+    if test_path.name.startswith(("test_batched_gemm_", "test_gemm_")):
         monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "1")
     else:
         monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0")

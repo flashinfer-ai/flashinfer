@@ -271,10 +271,12 @@ def test_choose_kv_splits_policy():
     assert choose_kv_splits([48] * 84, 74, program_cost=1.21) != [1] * 84
     assert choose_kv_splits([66] * 238, 74, program_cost=1.0) != [1] * 238
     assert choose_kv_splits([66] * 238, 74, program_cost=1.21) == [1] * 238
-    # The production sm_103a fp8pv cost keeps the 1.42-wave row (105 units of
-    # 58 blocks) dense and still splits the 1.14-wave row (84 units of 48).
+    # The production sm_103a fp8pv cost (1.01: the split program runs at parity
+    # with the dense program) splits both the 1.42-wave row (105 units of 58
+    # blocks) and the 1.14-wave row (84 units of 48).
     cost = SPLIT_PROGRAM_COST[("fp8", "sm_103a")]
-    assert choose_kv_splits([58] * 105, 74, program_cost=cost) == [1] * 105
+    assert cost <= 1.05
+    assert choose_kv_splits([58] * 105, 74, program_cost=cost) != [1] * 105
     assert choose_kv_splits([48] * 84, 74, program_cost=cost) != [1] * 84
     assert split_chunks(10, 4) == [(0, 3), (3, 3), (6, 2), (8, 2)]
     assert split_chunks(2, 8) == [(0, 1), (1, 1)]
@@ -506,6 +508,47 @@ def _make_inputs(cu, heads, seed, device="cuda"):
     return q, k, v, cu_seqlens
 
 
+def _make_engine_views(cu, heads, seed, layout, device="cuda"):
+    """Q/K/V as the engine's strided ``[T, H, 128]`` views (never copied).
+
+    ``"fused_qkv"``: column chunks of the fused QKV projection ``[T, 3 * H * 128]``
+    (strides ``(3 * H * 128, 128, 1)``).  ``"pack"``: the kind slices of the Cake
+    pre-attention pack ``[T, H, 3, 128]`` (strides ``(H * 384, 384, 1)``).
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    total = cu[-1]
+    if layout == "fused_qkv":
+        qkv = torch.randn(
+            (total, 3 * heads * HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=gen,
+        )
+        width = heads * HEAD_DIM
+        q, k, v = (
+            qkv[:, i * width : (i + 1) * width].view(total, heads, HEAD_DIM)
+            for i in range(3)
+        )
+        expected_strides = (3 * heads * HEAD_DIM, HEAD_DIM, 1)
+    elif layout == "pack":
+        pack = torch.randn(
+            (total, heads, 3, HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=gen,
+        )
+        q, k, v = (pack[:, :, i, :] for i in range(3))
+        expected_strides = (heads * 3 * HEAD_DIM, 3 * HEAD_DIM, 1)
+    else:
+        raise ValueError(layout)
+    for t in (q, k, v):
+        assert tuple(t.shape) == (total, heads, HEAD_DIM)
+        assert t.stride() == expected_strides
+        assert total == 0 or not t.is_contiguous()
+    cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=device)
+    return q, k, v, cu_seqlens
+
+
 def _reference(q, k, v, cu, scale):
     """Per-segment, per-head FP32 oracle with TF32 disabled (chunked rows)."""
     previous = torch.backends.cuda.matmul.allow_tf32
@@ -602,15 +645,61 @@ def test_bf16_zero_tokens():
     assert tuple(out.shape) == (0, 7, HEAD_DIM)
 
 
+ENGINE_VIEW_ROWS = [
+    ("smoke_p8_133_300", [0, 133, 300], 7),
+    ("empty_segments", [0, 0, 640, 640, 1200, 1201], 7),
+    ("seg3_5s_p8", [0, 4310, 4567, 4824], 7),
+    ("seg4_6s_p2", [0, 12285, 16401, 20393, 24384], 28),
+]
+
+
+@pytest.mark.parametrize("layout", ["fused_qkv", "pack"])
+@pytest.mark.parametrize("label,cu,heads", ENGINE_VIEW_ROWS)
+def test_bf16_engine_views_match_fp32_reference(layout, label, cu, heads):
+    """Strided Q/K/V views of the fused QKV projection and of the pre-attention pack are
+    consumed in place (no THD copies) on ragged multi-segment packs."""
+    _require_program("bf16")
+    q, k, v, cu_seqlens = _make_engine_views(cu, heads, seed=6092, layout=layout)
+    out = minimax_h3_varlen_attention(q, k, v, cu_seqlens, cu_seqlens_host=cu)
+    torch.cuda.synchronize()
+    assert out.is_contiguous() and tuple(out.shape) == tuple(q.shape)
+    _check(
+        out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), BF16_ATOL, BF16_RTOL
+    )
+    # The reference on contiguous copies of the same values agrees (the views were read
+    # where they live).
+    contiguous = minimax_h3_varlen_attention(
+        q.contiguous(), k.contiguous(), v.contiguous(), cu_seqlens, cu_seqlens_host=cu
+    )
+    torch.testing.assert_close(out, contiguous, atol=0, rtol=0)
+
+
+def test_bf16_rejects_head_major_view():
+    """``k.transpose(0, 1).contiguous().transpose(0, 1)`` is a head-major ``[T, H, 128]``
+    view with strides ``(128, T * 128, 1)``.  The kernel's operand contract is token-major
+    (token stride at least ``H * head_stride``: the engine's fused-QKV column chunks and
+    pack slices); head-major views are rejected up front rather than encoded into a TMA
+    descriptor with non-ascending strides."""
+    _require_program("bf16")
+    cu, heads = [0, 300], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=3)
+    k_view = k.transpose(0, 1).contiguous().transpose(0, 1)
+    assert k_view.stride() == (HEAD_DIM, cu[-1] * HEAD_DIM, 1)
+    with pytest.raises(ValueError, match="token stride"):
+        minimax_h3_varlen_attention(q, k_view, v, cu_seqlens)
+
+
 def test_bf16_rejects_bad_inputs():
     _require_program("bf16")
     q, k, v, cu_seqlens = _make_inputs([0, 300], 7, seed=3)
     with pytest.raises(ValueError, match="bfloat16"):
         minimax_h3_varlen_attention(q.float(), k, v, cu_seqlens)
-    with pytest.raises(ValueError, match="contiguous"):
-        minimax_h3_varlen_attention(
-            q, k.transpose(0, 1).contiguous().transpose(0, 1), v, cu_seqlens
-        )
+    # A non-unit last stride (every other element of a [T, H, 256] buffer) is rejected.
+    wide = torch.randn((300, 7, 2 * HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    k_strided = wide[:, :, ::2]
+    assert tuple(k_strided.shape) == (300, 7, HEAD_DIM) and k_strided.stride(2) == 2
+    with pytest.raises(ValueError, match=r"stride|contiguous"):
+        minimax_h3_varlen_attention(q, k_strided, v, cu_seqlens)
     with pytest.raises(ValueError, match="token extent"):
         minimax_h3_varlen_attention(
             q, k, v, torch.tensor([0, 299], dtype=torch.int32, device="cuda")

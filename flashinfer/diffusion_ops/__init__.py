@@ -16,6 +16,10 @@ from .minimax_h3_fc1_swiglu import (
 from .cake_minimax_h3_sm120_quant_varlen_attention import (
     minimax_h3_sm120_varlen_attention_fp8,
 )
+from .cake_minimax_h3_sm120_nvfp4_varlen_attention import (
+    minimax_h3_sm120_varlen_attention_nvfp4,
+    minimax_h3_sm120_varlen_attention_nvfp4_nodelta,
+)
 from .minimax_h3_out_proj import (
     minimax_h3_out_proj,
     minimax_h3_out_proj_mxfp8,
@@ -34,6 +38,12 @@ from .cake_minimax_h3_sm120_quant_pre_attention import (
 from .cake_minimax_h3_sm120_quant_fc1_swiglu import (
     minimax_h3_fc1_swiglu_fp8,
     prepare_minimax_h3_fc1_weight_fp8,
+)
+from .cake_minimax_h3_sm120_quant_mlp import (
+    minimax_h3_mlp_fp8_sm120,
+    minimax_h3_mlp_nvfp4_sm120,
+    prepare_minimax_h3_fc2_weight_fp8,
+    prepare_minimax_h3_fc2_weight_nvfp4_sm120,
 )
 
 from .cake_minimax_h3_sm120_quant_out_proj import (
@@ -66,6 +76,10 @@ __all__ = [
     "minimax_h3_fc1_swiglu",
     "minimax_h3_fc1_swiglu_fp8",
     "minimax_h3_fc1_swiglu_mxfp8",
+    "minimax_h3_mlp_fp8_sm120",
+    "minimax_h3_mlp_nvfp4_sm120",
+    "prepare_minimax_h3_fc2_weight_fp8",
+    "prepare_minimax_h3_fc2_weight_nvfp4_sm120",
     "minimax_h3_fc1_swiglu_nvfp4",
     "prepare_minimax_h3_fc1_weight_fp8",
     "prepare_minimax_h3_fc1_weight_mxfp8",
@@ -82,6 +96,8 @@ __all__ = [
     "quantize_minimax_h3_qkv_weight_fp8",
     "quantize_minimax_h3_qkv_weight_nvfp4",
     "minimax_h3_sm120_varlen_attention_fp8",
+    "minimax_h3_sm120_varlen_attention_nvfp4",
+    "minimax_h3_sm120_varlen_attention_nvfp4_nodelta",
     "PreparedMiniMaxH3QkvQuantizePack",
     "minimax_h3_qkv_quantize_pack",
     "prepare_minimax_h3_qkv_quantize_pack",

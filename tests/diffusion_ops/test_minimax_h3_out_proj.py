@@ -73,6 +73,10 @@ MAX_VIOLATIONS_FLOOR = 4
 # production token count of one rank at sequence-parallel degree 8.
 M_VALUES = [1, 129, 257, 4824]
 P_VALUES = list(MINIMAX_H3_SEQUENCE_PARALLEL_DEGREES)
+# Engine modulation projection: the gate table is a column chunk of a [rows, 6 * 5376] buffer
+# with rows = 3 x unique timesteps (3 or 6 in the t2va pipeline); 12 exercises rows above 9.
+ENGINE_TABLE_CHUNKS = 6
+ENGINE_TABLE_ROWS = [3, 6, 12]
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
@@ -104,21 +108,46 @@ def make_model(device: torch.device, seed: int = 4616) -> Dict[str, torch.Tensor
     return {"o_weight": o_weight, "gate": gate}
 
 
-def make_gate_index(rows: int, device: torch.device) -> torch.Tensor:
-    """Nine contiguous segments over the rows, with out-of-range indices planted at a few rows
-    (``-1`` where ``row % 101 == 50``, ``9`` where ``row % 103 == 60``) so the device-side guard
-    (``gate = 0``, i.e. ``out = residual``) is exercised."""
+def make_engine_model(
+    model: Dict[str, torch.Tensor],
+    gate_rows: int,
+    device: torch.device,
+    seed: int = 4617,
+) -> Dict[str, torch.Tensor]:
+    """``model`` with its gate table replaced by column chunk 5 of a ``[gate_rows, 6 * 5376]``
+    modulation projection: row stride ``6 * 5376``, not contiguous."""
+    g = torch.Generator(device=device)
+    g.manual_seed(seed + gate_rows)
+    proj = torch.empty(
+        (gate_rows, ENGINE_TABLE_CHUNKS * MINIMAX_H3_HIDDEN),
+        dtype=torch.bfloat16,
+        device=device,
+    ).uniform_(-1.0, 1.0, generator=g)
+    gate = proj[:, 5 * MINIMAX_H3_HIDDEN :]
+    assert gate.stride() == (ENGINE_TABLE_CHUNKS * MINIMAX_H3_HIDDEN, 1)
+    assert not gate.is_contiguous()
+    return {**model, "gate": gate}
+
+
+def make_gate_index(
+    rows: int, device: torch.device, gate_rows: int = MINIMAX_H3_GATE_ROWS
+) -> torch.Tensor:
+    """``gate_rows`` contiguous segments over the rows (int64), with out-of-range indices planted
+    at a few rows (``-1`` where ``row % 101 == 50``, ``gate_rows`` where ``row % 103 == 60``) so
+    the device-side guard (``gate = 0``, i.e. ``out = residual``) is exercised."""
     r = torch.arange(rows, dtype=torch.int64, device=device)
-    idx = torch.div(r * MINIMAX_H3_GATE_ROWS, rows, rounding_mode="floor").clamp_max(
-        MINIMAX_H3_GATE_ROWS - 1
-    )
+    idx = torch.div(r * gate_rows, rows, rounding_mode="floor").clamp_max(gate_rows - 1)
     idx = torch.where(r % 101 == 50, torch.full_like(idx, -1), idx)
-    idx = torch.where(r % 103 == 60, torch.full_like(idx, MINIMAX_H3_GATE_ROWS), idx)
-    return idx.to(torch.int32)
+    idx = torch.where(r % 103 == 60, torch.full_like(idx, gate_rows), idx)
+    return idx
 
 
 def make_inputs(
-    rows: int, degree: int, device: torch.device, seed: int = 4616
+    rows: int,
+    degree: int,
+    device: torch.device,
+    seed: int = 4616,
+    gate_rows: int = MINIMAX_H3_GATE_ROWS,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(attn_out [P, M, 56 // P, 128], gate_index [M], residual [M, 5376])``."""
     g = torch.Generator(device=device)
@@ -131,7 +160,7 @@ def make_inputs(
     residual = torch.empty(
         (rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device
     ).normal_(0.0, 1.0, generator=g)
-    return attn_out, make_gate_index(rows, device), residual
+    return attn_out, make_gate_index(rows, device, gate_rows), residual
 
 
 # --------------------------------------------------------------------------------------------
@@ -244,8 +273,14 @@ def kernel_nvfp4_activation(
 # --------------------------------------------------------------------------------------------
 
 
+def _gate_rows(model) -> int:
+    return int(model["gate"].shape[0])
+
+
 def run_bf16_case(rows: int, degree: int, model, device) -> Dict[str, float]:
-    attn_out, idx, residual = make_inputs(rows, degree, device)
+    attn_out, idx, residual = make_inputs(
+        rows, degree, device, gate_rows=_gate_rows(model)
+    )
     out = minimax_h3_out_proj(attn_out, model["o_weight"], model["gate"], idx, residual)
     torch.cuda.synchronize()
     ref = minimax_h3_out_proj_reference(
@@ -255,7 +290,9 @@ def run_bf16_case(rows: int, degree: int, model, device) -> Dict[str, float]:
 
 
 def run_mxfp8_case(rows: int, degree: int, model, prepared, device) -> Dict[str, float]:
-    attn_out, idx, residual = make_inputs(rows, degree, device)
+    attn_out, idx, residual = make_inputs(
+        rows, degree, device, gate_rows=_gate_rows(model)
+    )
     w_q, w_tiles, w_deq = prepared
     workspace_q = torch.empty(
         (rows, MINIMAX_H3_ATTN_DIM), dtype=torch.float8_e4m3fn, device=device
@@ -295,7 +332,9 @@ def run_mxfp8_case(rows: int, degree: int, model, prepared, device) -> Dict[str,
 
 
 def run_nvfp4_case(rows: int, degree: int, model, prepared, device) -> Dict[str, float]:
-    attn_out, idx, residual = make_inputs(rows, degree, device)
+    attn_out, idx, residual = make_inputs(
+        rows, degree, device, gate_rows=_gate_rows(model)
+    )
     w_q, w_tiles, w_scaled, g_w = prepared
     a = minimax_h3_unpack_attn_out(attn_out)
     # Static activation global scale calibrated from the activation of this shape.
@@ -451,13 +490,36 @@ def test_minimax_h3_out_proj_nvfp4(rows, degree, model, prepared_nvfp4, device):
 
 
 @requires_blackwell
-def test_minimax_h3_out_proj_invalid_index_rows_pass_residual(model, device):
+@pytest.mark.parametrize("gate_rows", ENGINE_TABLE_ROWS)
+@pytest.mark.parametrize("degree", [1, 8])
+def test_minimax_h3_out_proj_bf16_engine_gate(gate_rows, degree, model, device):
+    engine = make_engine_model(model, gate_rows, device)
+    run_bf16_case(257, degree, engine, device)
+    # The strided view was passed through, not copied.
+    assert engine["gate"].stride(0) == ENGINE_TABLE_CHUNKS * MINIMAX_H3_HIDDEN
+
+
+@requires_blackwell
+def test_minimax_h3_out_proj_mxfp8_engine_gate(model, prepared_mxfp8, device):
+    run_mxfp8_case(257, 2, make_engine_model(model, 6, device), prepared_mxfp8, device)
+
+
+@requires_blackwell
+def test_minimax_h3_out_proj_nvfp4_engine_gate(model, prepared_nvfp4, device):
+    run_nvfp4_case(257, 2, make_engine_model(model, 6, device), prepared_nvfp4, device)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("gate_rows", [3, MINIMAX_H3_GATE_ROWS])
+def test_minimax_h3_out_proj_invalid_index_rows_pass_residual(gate_rows, model, device):
     rows = 300
-    attn_out, idx, residual = make_inputs(rows, 2, device)
+    if gate_rows != MINIMAX_H3_GATE_ROWS:
+        model = make_engine_model(model, gate_rows, device)
+    attn_out, idx, residual = make_inputs(rows, 2, device, gate_rows=gate_rows)
     idx = idx.clone()
-    idx[:3] = torch.tensor(
-        [-1, MINIMAX_H3_GATE_ROWS, -(2**31)], dtype=torch.int32, device=device
-    )
+    int64 = torch.iinfo(torch.int64)
+    bad = [-1, gate_rows, gate_rows + 1, -(2**40), 2**40, int64.min, int64.max]
+    idx[: len(bad)] = torch.tensor(bad, dtype=torch.int64, device=device)
     out = torch.full(
         (rows, MINIMAX_H3_HIDDEN), float("nan"), dtype=torch.bfloat16, device=device
     )
@@ -466,7 +528,8 @@ def test_minimax_h3_out_proj_invalid_index_rows_pass_residual(model, device):
     )
     torch.cuda.synchronize()
     assert returned.data_ptr() == out.data_ptr()
-    assert torch.equal(out[:3], residual[:3])
+    assert torch.equal(out[: len(bad)], residual[: len(bad)])
+    assert not torch.equal(out[len(bad) :], residual[len(bad) :])
     ref = minimax_h3_out_proj_reference(
         attn_out, model["o_weight"], model["gate"], idx, residual
     )
@@ -493,11 +556,43 @@ def test_minimax_h3_out_proj_rejects_bad_inputs(model, device):
         )
     with pytest.raises(ValueError):
         minimax_h3_out_proj(
-            attn_out, model["o_weight"], model["gate"], idx.long(), residual
-        )
-    with pytest.raises(ValueError):
-        minimax_h3_out_proj(
             attn_out,
             *args,
             out=torch.empty((8, 64), dtype=torch.bfloat16, device=device),
         )
+
+    def call(gate=model["gate"], index=idx):
+        minimax_h3_out_proj(attn_out, model["o_weight"], gate, index, residual)
+
+    # int32 indices are no longer part of the contract.
+    with pytest.raises(ValueError, match="gate_index"):
+        call(index=idx.int())
+    with pytest.raises(ValueError, match="gate_index"):
+        call(index=idx[:4])
+    # Gate table: wrong dtype, non-unit last stride, odd row pitch, misaligned base pointer.
+    with pytest.raises(ValueError, match="gate"):
+        call(gate=model["gate"].half())
+    with pytest.raises(ValueError, match="unit last stride"):
+        call(
+            gate=torch.empty(
+                (MINIMAX_H3_HIDDEN, 9), dtype=torch.bfloat16, device=device
+            ).t()
+        )
+    with pytest.raises(ValueError, match="row pitch"):
+        call(
+            gate=torch.empty(
+                (9, MINIMAX_H3_HIDDEN + 4), dtype=torch.bfloat16, device=device
+            )[:, :MINIMAX_H3_HIDDEN]
+        )
+    storage = torch.empty(
+        9 * MINIMAX_H3_HIDDEN + 8, dtype=torch.bfloat16, device=device
+    )
+    misaligned = storage[4 : 4 + 9 * MINIMAX_H3_HIDDEN].view(9, MINIMAX_H3_HIDDEN)
+    assert misaligned.data_ptr() % 16 == 8
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        call(gate=misaligned)
+    # An engine-layout gate table passes the validation layer (no launch here).
+    from flashinfer.diffusion_ops.minimax_h3_out_proj import _check_epilogue_inputs
+
+    engine = make_engine_model(model, 6, device)
+    _check_epilogue_inputs(engine["gate"], idx, residual, 8, device)

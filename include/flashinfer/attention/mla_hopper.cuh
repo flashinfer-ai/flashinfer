@@ -540,7 +540,9 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
   for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
     wgmma::op</*init=*/false>(desc_p, desc_ckv, o_frag);
     desc_p += 2;
-    desc_ckv += 1024;
+    // WGMMA consumes 16 KV rows, and descriptor addresses use 16-byte units.
+    // The descriptor step therefore equals the byte size of one value row.
+    desc_ckv += KTraits::HEAD_DIM_CKV * sizeof(KVDescType);
   }
   warpgroup_commit_batch();
   warpgroup_fence_frag<KTraits::NUM_REGS_O_FRAG>(o_frag);
@@ -762,6 +764,7 @@ __device__ __forceinline__ void write_o(
 
 template <typename Params>
 __device__ __forceinline__ auto get_block_coord(const Params& params, const uint32_t work_idx) {
+  using IdType = typename Params::IdType;
   auto kv_len = params.kv_len[work_idx];
   auto kv_end = params.kv_end[work_idx];
   if (params.device_kv_len != nullptr) {
@@ -775,7 +778,7 @@ __device__ __forceinline__ auto get_block_coord(const Params& params, const uint
         last = mid;
       }
     }
-    kv_len = min(kv_len, max(params.device_kv_len[first], 0));
+    kv_len = min(kv_len, max(params.device_kv_len[first], IdType{0}));
     kv_end = min(kv_end, kv_len);
   }
   return std::tuple(params.q_indptr[work_idx], params.kv_indptr[work_idx],

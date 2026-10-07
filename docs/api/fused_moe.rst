@@ -32,7 +32,10 @@ Unified MoE API
 ---------------
 
 Backend-agnostic configuration and layer types. ``QuantConfig`` carries the MMA
-weight / activation formats and the layer output format as ``QuantFormat`` axes.
+weight / activation formats and the layer output format as ``QuantFormat`` axes,
+plus the NVFP4 4over6 recipe (``nvfp4_4over6``); passing a recipe there is the
+supported alternative to the process-wide ``FLASHINFER_NVFP4_4OVER6*``
+environment variables, described under :ref:`apiquantization`.
 
 .. autosummary::
     :toctree: ../generated
@@ -47,6 +50,10 @@ weight / activation formats and the layer output format as ``QuantFormat`` axes.
     BackendOptions
     MoEActivationPack
     MoEWeightPack
+    CudnnFrostBf16Config
+    CudnnFrostMxfp8Config
+    CudnnFrostNvfp4Config
+    CudnnFrostMxfp8Mxfp4Config
 
 ``MoELayer`` is the official entry point of this API: both its constructor and
 its call operator are decorated with ``@flashinfer_api``, so they participate in
@@ -60,6 +67,109 @@ are designed to co-exist, and neither supersedes the other.
 
     .. automethod:: __init__
     .. automethod:: __call__
+
+cuDNN Frost backend
+~~~~~~~~~~~~~~~~~~~
+
+Frost is a stable ``MoELayer`` backend on SM107a, with additional BF16 support
+on SM120a. It can be selected explicitly
+with ``BackendOptions`` or admitted during autotuning alongside eligible
+backends. It does not require ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS``.
+Cold calls without autotuning use the configured backend pool; automatic Frost
+candidates are first created during autotuning and may be reused afterward.
+
+.. list-table:: Supported configurations
+   :header-rows: 1
+
+   * - Config
+     - Activation / weight format
+     - Native weight-view key
+   * - ``CudnnFrostBf16Config``
+     - BF16 / BF16
+     - ``cudnn_frost_bf16``
+   * - ``CudnnFrostMxfp8Config``
+     - MXFP8 / MXFP8
+     - ``cudnn_frost_mxfp8``
+   * - ``CudnnFrostNvfp4Config``
+     - NVFP4 / NVFP4
+     - ``cudnn_frost_nvfp4``
+   * - ``CudnnFrostMxfp8Mxfp4Config``
+     - MXFP8 / MXFP4
+     - ``cudnn_frost_mxfp8_mxfp4``
+
+Each config exposes ``prepare_weights`` and ``prepare_activations``. Frost also
+accepts the corresponding canonical ``cutlass_*`` weight view without conversion;
+when both exist, the Frost-named view takes precedence. The public API is:
+
+.. code-block:: python
+
+    from flashinfer.fused_moe import (
+        BackendOptions, CudnnFrostNvfp4Config, ExpertConfig, MoEActivationPack,
+        MoEConfig, MoELayer, MoEWeightPack, QuantConfig, QuantFormat, RoutingConfig,
+    )
+
+    backend = CudnnFrostNvfp4Config
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+        experts=ExpertConfig(intermediate_size=intermediate_size),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        backend=BackendOptions((backend(),)),
+    )
+    view = backend.prepare_weights(
+        w1_bf16, w2_bf16, num_local_experts=num_experts,
+        hidden_size=hidden_size, intermediate_size=intermediate_size,
+        activation=config.activation,
+    )
+    weights = MoEWeightPack({"cudnn_frost_nvfp4": view})
+    xq, xsf = backend.prepare_activations(x_bf16, quant=config.quant)
+    activations = MoEActivationPack(xq, xsf, topk_ids, topk_weights)
+    layer = MoELayer(config)
+    output = layer(activations, weights)
+
+The backend requires precomputed routing with contiguous int32 expert IDs and
+FP32 routing weights, and returns finalized BF16 output. It supports the default
+activation contracts; bias, expert parallelism, shared experts, custom activation
+parameters, and routing from logits are unsupported. BF16 uses the measured
+model shortlist. Quantized hidden/intermediate sizes must be divisible by 128;
+artifact and native-plan bounds are checked per call. Configure another backend
+alongside Frost if unsupported calls need a fallback.
+
+The validated SM107 dependency baseline is PyTorch 2.14.1, CuTe DSL 4.8.0, TVM-FFI
+0.1.14.post1, and external PTXAS 13.4.92. CUDA 13.5 PTXAS is also validated.
+Runtime checks additionally require the DSL
+primitives and PyTorch CUDA Graph resource-retention APIs used by the backend.
+Older dependencies remain usable by other FlashInfer backends; these requirements
+do not raise FlashInfer's global dependency floor.
+Native JIT compilation also needs a complete CUDA toolkit for the target GPU, including
+cuBLAS headers used by the shared CUTLASS preparation helpers. A standalone
+PTXAS executable only supplies the assembler for Frost's DSL kernels.
+
+On SM107, set ``FLASHINFER_CUDNN_FROST_PTXAS=/path/to/ptxas`` when the DSL bundles an older
+assembler. ``CUDA_HOME`` alone does not replace that assembler. Unqualified
+assemblers are rejected before kernel execution, including when reusing a cached
+automatic runner. Automatic selection skips unavailable Frost candidates;
+explicit selection reports the missing requirement.
+Both external PTXAS and the bundled assembler must report CUDA 13.4 or newer.
+Admission checks the release version without imposing a patch-level minimum.
+Use the latest assembler patch release for SM107 tensor-map updates.
+SM120 BF16 kernels do not update tensor maps and retain capability-based compiler
+admission without this SM107-specific assembler minimum.
+
+Prepare and optionally autotune before CUDA Graph capture. Frozen device sources
+ship in the wheel and are compiled for the requested geometry into the writable
+FlashInfer cache. The four fixed routing/finalize adapters are also registered
+for SM107 AOT builds, and the BF16 adapter is registered for SM120 AOT builds.
+Geometry-specialized DSL kernels retain source/JIT delivery.
+No runtime cuDNN Frontend installation is required.
+
+Finalized precomputed ``MoELayer`` calls support ``FLASHINFER_TRACE_DUMP=1`` and
+``MoELayer.__call__.fi_trace(self=layer, act_pack=activations, weight_pack=weights)``.
+Traces preserve packed tensor shapes, dtypes, native weight views, and the layer
+configuration. ``FLASHINFER_LOGLEVEL`` continues to control API logging.
+
+The old ``flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm``
+imports are compatibility aliases for one release after graduation. The separate
+``cudnn_frost_grouped_gemm1_swiglu`` API remains experimental.
 
 Utility Functions
 -----------------
@@ -101,12 +211,27 @@ Multi-LoRA MoE (BGMV)
 Batched Gather-Matrix-Vector kernels for serving multiple LoRA adapters on
 top of a Mixture-of-Experts layer (shrink + expand).
 
+:func:`prepare_bgmv_moe` returns a graph-replayable plan. On SM90, SM100 and
+SM103 devices the generated Cake programs serve one LoRA slice with rank 8, 16,
+32 or 64 and any hidden size that is a positive multiple of 8 (hidden 2688 and
+3072 at rank 32 use the specialized measured bodies at up to 2048 tokens, ``plan.variant ==
+"specialized"``; everything else the runtime-hidden generic bundles,
+``plan.variant == "generic"``); the output has one owner per token, so replays
+are bitwise reproducible. Arbitrary pair order (for example expert-sorted
+dispatch) is served through a token->pair route index that the shrink kernels
+publish and the expand kernels read in O(1) per CTA; the generic shrink splits the hidden
+dimension over extra CTAs at small pair counts and reduces the partials in a fixed order.
+Other inputs fall back to the portable
+``bgmv_moe_shrink`` / ``bgmv_moe_expand`` kernels (``plan.backend_used ==
+"portable"``) unless ``fallback=False`` is passed.
+
 .. autosummary::
     :toctree: ../generated
 
     bgmv_moe
     prepare_bgmv_moe
-    BGMVMoEBlackwellPlan
+    BGMVMoECakePlan
+    BGMVMoEPortablePlan
     bgmv_moe_shrink
     bgmv_moe_expand
     bgmv_moe_gemm1_lora_delta
@@ -175,6 +300,177 @@ AlphaMoE FP8 Block-Scaled MoE (SM100/SM103)
     alphamoe_interleave_gated_weights
     alphamoe_fp8_block_scale_aligned_moe
 
+AlphaMoE NVFP4 (SM100/SM103)
+-----------------------------
+
+The AlphaMoE path consumes packed E2M1 activations and weights with linear
+per-16 E4M3 scales. The aligned entry consumes an existing routing plan; the
+routed entry aligns the supplied expert IDs before compute. Shape-selected
+stages perform gate/up projection, SwiGLU, NVFP4 requantization and down
+projection. The aligned path uses FP32 scratch; selected routed paths use
+FP32 or BF16 route storage before finalizing into caller-owned BF16 output.
+Neither entry resets the caller's initial output. Three contiguous FP32
+``[E]`` tensors provide the per-expert static ModelOpt scales: the gate scale
+is applied before SiLU, the up scale before SwiGLU multiplication, and the down
+scale before route weighting.
+
+.. autosummary::
+    :toctree: ../generated
+
+    alphamoe_nvfp4_aligned_moe
+    alphamoe_nvfp4_routed_moe
+    prepare_nvfp4_w1_data
+    prepare_nvfp4_w1_gate_up_data
+    prepare_nvfp4_w1_gate_up_scales
+    prepare_nvfp4_w1_scales
+    prepare_nvfp4_w2_data
+    prepare_nvfp4_w2_data_k256
+    prepare_nvfp4_w2_scales
+    prepare_nvfp4_w2_scales_k256
+
+AlphaMoE NVFP4 prepared weight scales
+-----------------------------------
+
+The aligned entry consumes an existing routing plan. The routed entry also
+aligns raw expert IDs and initializes the accumulation buffer. Both preserve
+caller-owned BF16 output and retain the raw E4M3 scale inputs. Shape-selected
+compute stages perform gate/up projection, SwiGLU, NVFP4 requantization, down
+projection and weighted accumulation.
+
+``prepare_nvfp4_w1_scales`` and ``prepare_nvfp4_w2_scales`` permute existing
+scale bytes into immutable uint8 tensor-map panels. They perform no scale
+arithmetic or requantization. Call them after the final device-local weight
+layout is established and before warmup or graph capture. Keep the raw scale
+tensors and the resulting panels alive for the layer's current weight load.
+A subsequent weight load must replace the panels; they are derived buffers and
+need not be saved in the model checkpoint.
+
+For raw gate/up scales ``[E,N,K/16]``, the prepared shape is
+``[E*(N/128)*(K/256),16,128]``. For raw down scales
+``[E,K,N/32]``, it is ``[E*(K/128)*(N/256),8,128]``. At local dimensions
+``E=256, N=1024, K=6144`` these require an additional 96 MiB and 48 MiB,
+respectively, per weight pair. Preparation and its memory cost are separate
+from repeated-request kernel timing.
+
+Supply the buffers through optional keywords on either entry::
+
+    from flashinfer.fused_moe import (
+        prepare_nvfp4_w1_scales,
+        prepare_nvfp4_w2_scales,
+    )
+
+    # Once, after device-local weight loading:
+    w1_scale_prepared = prepare_nvfp4_w1_scales(gemm1_weights_scale)
+    w2_scale_prepared = prepare_nvfp4_w2_scales(gemm2_weights_scale)
+    prepared_scales = {
+        "w1_scale_prepared": w1_scale_prepared,
+        "w2_scale_prepared": w2_scale_prepared,
+    }
+
+    # Existing aligned or routed call: retain every raw argument and append
+    # **prepared_scales. Reuse these same tensors for subsequent requests.
+
+Omitting optional prepared scale tensors retains the existing scale paths.
+The routed prepared-data paths below use W1 scales; the adjacent gate/up path
+has its own paired scale carrier. Supplied prepared tensors must satisfy the
+API's dtype, device, shape and alignment checks. No weight preparation occurs
+inside a routed request.
+
+AlphaMoE NVFP4 prepared gate/up data
+----------------------------------
+
+``prepare_nvfp4_w1_data`` permutes contiguous uint8 packed W1 weights
+``[E,N,K/2]`` into ``[E*(N/128)*(K/256),128,128]`` panels. It preserves every
+packed byte without dequantization or requantization and requires
+``N % 128 == 0`` and ``K % 256 == 0``. The buffer occupies the same number of
+bytes as raw W1: an additional 768 MiB at ``E=256, N=1024, K=6144``.
+
+With compatible ``w1_scale_prepared`` and ``w1_data_prepared``, the routed
+entry selects prepared-data paths for ``M=8``, ``M=128`` and ``M=512`` at
+exactly ``N=1024, K=6144, E=256, top_k=8, block_m=8``. Other dimensions retain
+their existing selection. Omitting ``w1_data_prepared`` retains the scale-only
+or raw path. These data keywords belong to the routed entry, not the aligned
+entry. The paths preserve caller output and use BF16 expert-route storage.
+The eight-token path also keeps a separate FP32 initial-output seed; the
+128-token and 512-token prepared-data paths finalize directly into caller
+output in route order.
+
+Prepare and pass ordinary data panels to the routed entry::
+
+    from flashinfer.fused_moe import prepare_nvfp4_w1_data
+
+    # Once, after the final device-local weight load:
+    w1_data_prepared = prepare_nvfp4_w1_data(gemm1_weights)
+    prepared_routed = dict(
+        prepared_scales, w1_data_prepared=w1_data_prepared
+    )
+    # Append **prepared_routed to the existing routed call, retaining raw inputs.
+
+AlphaMoE NVFP4 adjacent gate/up panels
+------------------------------------
+
+For the exact 512-token shape above, the routed entry also accepts
+``w1_gate_up_data_prepared`` and ``w1_gate_up_scale_prepared``. These two
+carriers place each gate panel next to its matching up panel. Supply both or
+neither: supplying only one raises ``ValueError``. Both must be contiguous
+uint8 tensors on the raw W1 device, with 16-byte-aligned addresses and these
+shapes, where ``R = E*(N/256)*(K/256)``:
+
+* data: ``[R,256,128]`` from ``prepare_nvfp4_w1_gate_up_data(gemm1_weights)``;
+* scales: ``[R,32,128]`` from ``prepare_nvfp4_w1_gate_up_scales(
+  w1_scale_prepared, gemm1_weights.shape)``.
+
+Here ``N`` counts the combined gate/up rows in raw W1 ``[E,N,K/2]``. The
+preparation requires ``N % 256 == 0`` and ``K % 256 == 0``. The scale helper
+consumes the output of ``prepare_nvfp4_w1_scales``, not raw E4M3 scales. Both
+helpers only permute bytes. At the supported local dimensions, the adjacent
+data and scale buffers add 768 MiB and 96 MiB, respectively. Retaining ordinary
+prepared-data panels as well incurs their separate memory cost.
+
+A valid adjacent pair takes precedence at exactly
+``M=512, N=1024, K=6144, E=256, top_k=8, block_m=8`` with supported route
+metadata and 4-byte-aligned activation, W1 and W2 scale addresses. It does not
+require the separate
+``w1_scale_prepared``, ``w1_data_prepared`` or ``w2_scale_prepared`` arguments
+at call time. Raw weights and raw scales remain required arguments. For other
+shapes the adjacent pair does not select this specialization. Omitting both
+retains the existing prepared-data, scale-only or raw selection. Invalid
+supplied carriers are rejected rather than silently replaced.
+
+Prepare the pair once and reuse it across routed requests::
+
+    from flashinfer.fused_moe import (
+        prepare_nvfp4_w1_scales,
+        prepare_nvfp4_w1_gate_up_data,
+        prepare_nvfp4_w1_gate_up_scales,
+    )
+
+    w1_scales = prepare_nvfp4_w1_scales(gemm1_weights_scale)
+    adjacent_routed = {
+        "w1_gate_up_data_prepared": prepare_nvfp4_w1_gate_up_data(gemm1_weights),
+        "w1_gate_up_scale_prepared": prepare_nvfp4_w1_gate_up_scales(
+            w1_scales, gemm1_weights.shape
+        ),
+    }
+    # Append **adjacent_routed to the existing routed call; retain all raw inputs.
+
+Prepare after the final device-local load or shard layout is established and
+before warmup or CUDA graph capture. Keep the raw tensors and selected panels
+alive and immutable; rebuild the panels whenever those weights or scales are
+replaced. Shape checks cannot establish that a panel belongs to the current
+weight values. The helpers do not maintain an automatic cache or fetch model
+files. Reuse existing read-only model files as loading inputs, and keep any
+optional derived-panel cache separate from the original checkpoint. Reuse
+layer-owned device panels across requests instead of rebuilding them per call.
+Prepared panels are derived buffers and need not be saved in the model
+checkpoint. Preparation time and memory remain outside routed kernel timing.
+
+The aligned entry keeps its existing ``None`` return value. The routed entry
+returns the caller's output tensor. Neither entry resets caller output; provide
+a zeroed output when a fresh result is wanted. The chosen implementation may
+use separate compute launches and scratch storage. It does not promise a
+single-kernel or entirely on-chip intermediate implementation.
+
 Cake NVFP4 Warp Decode (SM100/SM103)
 ------------------------------------
 
@@ -194,8 +490,11 @@ portfolio fails closed outside these contracts:
   ``(SwiGLU(), 2048, 512, 256, 8)``,
   ``(SwiGLU(), 4096, 1024, 512, 10)``,
   ``(SwiGLU(), 3072, 1536, 256, 8)``,
-  ``(SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 3072, 128, 4)``, or
-  ``(SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 3072, 896, 16)``;
+  ``(SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 3072, 128, 4)``,
+  ``(SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 3072, 896, 16)``, or one
+  of the sharded per-partition slices ``(SwiGLU(), 4096, 512, 512, 10)``,
+  ``(SwiGLU(), 4096, 256, 512, 10)``, ``(SwiGLU(), 3072, 768, 256, 8)``,
+  and ``(SwiGLU(), 3072, 384, 256, 8)``;
 * the token count is 1--32, routing is ``UnpackedPrecomputed`` with contiguous
   int32 expert IDs and BF16 routing weights;
 * quantization is NVFP4, finalization and PDL are enabled, and expert
@@ -312,6 +611,52 @@ and other compute capabilities are rejected.
 
     CakeWarpDecodeConfig
     CakeWarpDecodeRunner
+
+Prims-TS Unified MoE (SM100/SM103)
+----------------------------------
+
+The Prims-TS runner is an explicit unified-MoE backend for SM100 and SM103.
+Select it with ``PrimsTsConfig()``; it is not in the default backend list.
+MVP coverage is NVFP4×NVFP4 and BF16×BF16. Routing and finalize stay on the
+TRT-LLM Gen path; only the GEMM middle stage uses Prims-TS. The backend
+reuses the physical layouts prepared by ``TrtllmFp4Config`` (MajorK) and
+``TrtllmBf16Config`` (BlockMajorK), so one view can be registered for both
+keys::
+
+    backend = PrimsTsConfig()
+    quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+    view = backend.prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        quant=quant,
+        num_local_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=SwiGLU(),
+    )
+
+    weights = MoEWeightPack()
+    weights.prepare_for("prims_ts", view)
+    weights.prepare_for("trtllm_fp4_routed", view)
+
+    x_q, x_scale = backend.prepare_activations(x_bf16, quant=quant)
+    activations = MoEActivationPack(x_q, x_scale, topk_ids, topk_weights)
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+        quant=quant,
+        experts=ExpertConfig(intermediate_size=intermediate_size),
+        backend=BackendOptions((backend,)),
+    )
+    output = MoELayer(config)(activations, weights)
+
+``intermediate_size`` must be a multiple of 128. Fused shared experts and
+LoRA are out of scope for this MVP.
+
+.. autosummary::
+    :toctree: ../generated
+
+    PrimsTsConfig
+    PrimsTsRunner
 
 Prims-TS Fused MoE
 ------------------

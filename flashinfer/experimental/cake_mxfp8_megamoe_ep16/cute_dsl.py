@@ -17,14 +17,17 @@ limitations under the License.
 # CuTe-DSL launch adapter for the fixed-shape EP16 session. Imported only for
 # the explicit backend="cute_dsl" choice. Compilation and workspace bindings
 # are prepared during session creation; the session owns validation,
-# collective setup, and the current-stream context.
+# collective setup, and the current-stream context. The generated device
+# sources live beside the CUDA closure under csrc/ and are compiled for the
+# device's exact architecture through FlashInfer's CuTe JIT cache.
 
 from __future__ import annotations
 
 import functools
-import importlib
+import importlib.util
 import os
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import torch
@@ -32,6 +35,7 @@ import torch
 from ...jit import cute_dsl_core
 from ...moe_ep.cake_mxfp8_megamoe_ep16 import CakeMxfp8MegaMoeEp16Weights
 from . import backend as _backend
+from . import jit as _jit
 
 
 def _source_files() -> tuple[str, ...]:
@@ -40,20 +44,15 @@ def _source_files() -> tuple[str, ...]:
     package = Path(__file__).resolve().parent
     flashinfer = package.parent.parent
     paths = [
-        package / "kernels" / "fused_cta0.py",
-        package / "kernels" / "fused_all_ctas.py",
-        package / "kernels" / "topk_reduce.py",
+        _jit.cute_dsl_source("fused"),
+        _jit.cute_dsl_source("topk_reduce"),
         package / "cute_dsl.py",
         package / "backend.py",
+        package / "jit.py",
         package / "__init__.py",
         flashinfer / "moe_ep" / "cake_mxfp8_megamoe_ep16.py",
         Path(cute_dsl_core.__file__).resolve(),
     ]
-    # Namespace packages need no initializer; include one if the distribution
-    # supplies it, since importing a kernel then executes that source too.
-    kernels_init = package / "kernels" / "__init__.py"
-    if kernels_init.is_file():
-        paths.append(kernels_init)
     for path in paths:
         if not path.is_file():
             raise RuntimeError(f"CuTe-DSL kernel source is unavailable: {path.name}")
@@ -61,28 +60,43 @@ def _source_files() -> tuple[str, ...]:
 
 
 @functools.cache
-def _load_kernels(device_index: int, fused_variant: str) -> tuple[Any, Any]:
-    # The generated host functions select sm_103a explicitly. Do not let the
-    # JIT cache label the same object with an incompatible environment target.
-    arch = os.environ.get("CUTE_DSL_ARCH") or "sm_103a"
-    if arch.replace("_", "") != "sm103a":
-        raise ValueError("Cake CuTe-DSL requires CUTE_DSL_ARCH=sm_103a when set")
-    sources = _source_files()
+def _import_source(path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        f"{__name__}._generated_{path.stem}", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@functools.cache
+def _load_kernels(device_index: int, return_all_cta: bool) -> tuple[Any, Any]:
     with torch.cuda.device(device_index):
-        if torch.cuda.get_device_capability() != (10, 3):
-            raise RuntimeError("Cake CuTe-DSL requires compute capability 10.3")
-        kernels = []
-        for name in (fused_variant, "topk_reduce"):
-            module = importlib.import_module(f"{__package__}.kernels.{name}")
-            kernels.append(
-                cute_dsl_core.build_and_load_cute_dsl_kernel(
-                    "cake_mxfp8_megamoe_ep16",
-                    name,
-                    module.compile_program,
-                    extra_key_files=sources,
-                )
+        arch = _jit.device_arch(torch.cuda.get_device_capability())
+        # The generated host functions select the architecture explicitly. Do not
+        # let the JIT cache label the same object with an incompatible target.
+        requested = os.environ.get("CUTE_DSL_ARCH")
+        if requested and requested.replace("_", "") != arch.replace("_", ""):
+            raise ValueError(
+                f"CUTE_DSL_ARCH={requested} does not match the device architecture {arch}"
             )
-    return tuple(kernels)
+        sources = _source_files()
+        fused_module = _import_source(_jit.cute_dsl_source("fused"))
+        reducer_module = _import_source(_jit.cute_dsl_source("topk_reduce"))
+        variant = "fused_all_ctas" if return_all_cta else "fused_cta0"
+        fused = cute_dsl_core.build_and_load_cute_dsl_kernel(
+            "cake_mxfp8_megamoe_ep16",
+            f"{variant}_{arch}",
+            functools.partial(fused_module.compile_program, return_all_cta, arch),
+            extra_key_files=sources,
+        )
+        reducer = cute_dsl_core.build_and_load_cute_dsl_kernel(
+            "cake_mxfp8_megamoe_ep16",
+            f"topk_reduce_{arch}",
+            functools.partial(reducer_module.compile_program, arch),
+            extra_key_files=sources,
+        )
+    return fused, reducer
 
 
 def _flat(tensor: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
@@ -226,8 +240,9 @@ class _Runner:
             1,
             1,
         )
-        variant = "fused_all_ctas" if tokens_per_rank == 32 else "fused_cta0"
-        self._fused, self._reduce = _load_kernels(device.index, variant)
+        # 32 tokens per rank keep the all-CTA return protocol; 16 and 64 use the
+        # CTA-0 coordinator. Both are one generated source behind a compile-time flag.
+        self._fused, self._reduce = _load_kernels(device.index, tokens_per_rank == 32)
         self._input_tensors: tuple[torch.Tensor, ...] = ()
         self._input_views: tuple[torch.Tensor, ...] = ()
         self._input_signature: tuple[Any, ...] = ()
