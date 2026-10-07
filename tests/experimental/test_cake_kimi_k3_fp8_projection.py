@@ -558,7 +558,7 @@ def test_decode_config_round6_continuation_rules(arch):
             assert cfg.kernel_key_for(True) == cfg.kernel_key + "_tso"
         assert cfg.kernel_key_for(False) == cfg.kernel_key
     # Round 8 adopted four more bit-exact tstore cells on sm_100a (18-tile M = 512/1024, 5-/12-tile M = 1024)
-    # and one on sm_103a (18-tile M = 1024); see design_doc/active/CAKE_622_KIMI_K3_FP8_PROJECTION.md R8-3.
+    # and one on sm_103a (18-tile M = 1024); see the Cake design record, round 8 (R8-3, knob-catalog sweep).
     assert n_tstore == {"sm_100a": 21, "sm_103a": 18}[arch]
     # Round-6 next loop (lever PX-S): eight small fused buckets per architecture prefetch their BF16 token tile one stage
     # ahead of its TMA load (``pfx: 1`` -> the ``_px1`` program); a prefetch changes no data path and no launch argument.
