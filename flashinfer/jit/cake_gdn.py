@@ -537,19 +537,24 @@ def select_cake_gdn_prefill_variant(
 # (mirrors the Cake program rule ``select_bf16_t1_route``; calibrated against
 # the FlashInfer BF16 pool kernel on B200/B300).  ``vec8`` is the
 # latency-first instance of the vec8 body (``__launch_bounds__(128, 1)``, every
-# first-block load ahead of the reductions), ``vec8occ`` the occupancy-first
+# first-block load ahead of the reductions), ``vec8r56`` the same schedule under
+# a 56-register cap (``__launch_bounds__(128, 9)``; the sm_103a build spills
+# nothing and reads 1.4-4.3 % faster than ``vec8`` at TILE_V=16 while the
+# sm_100a build is 4-5 % slower, so it is routed per architecture through
+# ``CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES``), ``vec8occ`` the occupancy-first
 # instance (default launch bounds, eight CTAs per SM so the 1024-CTA grids at
 # 256 and 512 state heads run in one wave) and ``wide`` the MTP wide-tile body
 # at ``T_STEPS=1`` (one 128-row CTA per state head) for the bandwidth-bound
 # large pools.  The grid is ``V / TILE_V`` 128-thread CTAs per state head.
-CAKE_GDN_BF16_T1_BODIES = ("vec8", "vec8occ", "wide")
+CAKE_GDN_BF16_T1_BODIES = ("vec8", "vec8r56", "vec8occ", "wide")
 # (largest state-head count of the band or None for the open last band, body, TILE_V)
 CAKE_GDN_BF16_T1_ROUTE_BANDS = (
     (8, "vec8", 32),
-    # 9-192 heads: TILE_V=16.  TILE_V=32 ties it at 192 heads in the calibration
-    # sweeps on both GPUs but its 768-CTA grid is launch-order sensitive on GB300
-    # (the first of two back-to-back launches runs ~7 % slower; export rows b6
-    # H16/HV32 and b24 H4/HV8 failed the directional gate every round).
+    # 9-192 heads: TILE_V=16 (``vec8r56`` on sm_103a).  TILE_V=32 ties it at
+    # 192 heads in the calibration sweeps on both GPUs but its 768-CTA grid is
+    # launch-order sensitive on GB300 (the first of two back-to-back launches
+    # runs ~7 % slower; export rows b6 H16/HV32 and b24 H4/HV8 failed the
+    # directional gate every round).
     (192, "vec8", 16),
     (256, "vec8occ", 32),
     (384, "vec8", 64),
@@ -559,24 +564,40 @@ CAKE_GDN_BF16_T1_ROUTE_BANDS = (
 )
 
 
-def cake_gdn_bf16_t1_route(batch_size: int, num_v_heads: int) -> tuple[str, int]:
-    """``(body, TILE_V)`` of the BF16-state T=1 decode route for ``batch_size * num_v_heads`` state heads."""
+# Per-architecture body overrides of the band rule ({arch: {band upper bound: body}};
+# mirrors Cake's ``BF16_T1_ROUTE_ARCH_BODIES``): GB300 takes the 56-register
+# ``vec8r56`` instance in the 9-192 band, B200 keeps ``vec8``.
+CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES: dict[str, dict[int, str]] = {
+    "sm_103a": {192: "vec8r56"}
+}
+
+
+def cake_gdn_bf16_t1_route(
+    batch_size: int, num_v_heads: int, arch: CakeGDNArch
+) -> tuple[str, int]:
+    """``(body, TILE_V)`` of the BF16-state T=1 decode route for ``batch_size * num_v_heads`` state heads on ``arch``."""
 
     state_heads = int(batch_size) * int(num_v_heads)
     for max_state_heads, body, tile_v in CAKE_GDN_BF16_T1_ROUTE_BANDS:
         if max_state_heads is None or state_heads <= max_state_heads:
-            return body, tile_v
+            return CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES.get(arch, {}).get(
+                max_state_heads, body
+            ), tile_v
     raise AssertionError("CAKE_GDN_BF16_T1_ROUTE_BANDS must end with an open band")
 
 
 def cake_gdn_bf16_route_tile_v(route_id: str) -> int:
-    """The grid tile a BF16 decode route id carries (``.vec8_t<N>``, ``.vec8occ_t<N>``, ``.wide<N>`` or ``.tile16_fullwarp``)."""
+    """The grid tile a BF16 decode route id carries (``.vec8_t<N>``, ``.vec8r56_t<N>``, ``.vec8occ_t<N>``, ``.wide<N>`` or ``.tile16_fullwarp``)."""
 
     if route_id.endswith(".tile16_fullwarp"):
         return 16
-    match = re.fullmatch(r".*\.(?:vec8_t|vec8occ_t|wide)(16|32|64|128)", route_id)
+    match = re.fullmatch(
+        r".*\.(?:vec8_t|vec8r56_t|vec8occ_t|wide)(16|32|64|128)", route_id
+    )
     if match is None:
-        raise CakeGDNUnsupportedError(f"BF16 decode route {route_id!r} carries no grid tile")
+        raise CakeGDNUnsupportedError(
+            f"BF16 decode route {route_id!r} carries no grid tile"
+        )
     return int(match.group(1))
 
 
@@ -638,7 +659,7 @@ def select_cake_gdn_decode_variant(
                 raise CakeGDNUnsupportedError(
                     "BF16 T=1 decode updates the state and caches nothing"
                 )
-            body, tile_v = cake_gdn_bf16_t1_route(batch_size, num_v_heads)
+            body, tile_v = cake_gdn_bf16_t1_route(batch_size, num_v_heads, arch)
             if body == "wide":
                 record = _variant_for(
                     domain="decode",
@@ -657,7 +678,8 @@ def select_cake_gdn_decode_variant(
                     },
                 )
                 return CakeGDNRoute(
-                    f"flashinfer.gdn_decode.indexed_bf16_t1.wide{tile_v}", record["name"]
+                    f"flashinfer.gdn_decode.indexed_bf16_t1.wide{tile_v}",
+                    record["name"],
                 )
             record = _variant_for(
                 domain="decode",
@@ -671,7 +693,8 @@ def select_cake_gdn_decode_variant(
                 },
             )
             return CakeGDNRoute(
-                f"flashinfer.gdn_decode.indexed_bf16_t1.{body}_t{tile_v}", record["name"]
+                f"flashinfer.gdn_decode.indexed_bf16_t1.{body}_t{tile_v}",
+                record["name"],
             )
         promoted = {
             (4, 2, 16, 32, False, True, True, 4),
@@ -752,9 +775,7 @@ def select_cake_gdn_decode_variant(
             specializations = {
                 "H": num_q_heads,
                 "HV": num_v_heads,
-                "INTERMEDIATE_BATCH_STRIDE": (
-                    cache_steps * num_v_heads * 128 * 128
-                ),
+                "INTERMEDIATE_BATCH_STRIDE": (cache_steps * num_v_heads * 128 * 128),
                 "INTERMEDIATE_TOKEN_STRIDE": num_v_heads * 128 * 128,
                 "SCALE": scale,
                 "STRIDED_INPUTS": 1,

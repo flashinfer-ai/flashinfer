@@ -413,6 +413,11 @@ def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
             "indexed_bf16_t1.vec8_t16",
             "t1_bf16state_vec8",
         ),
+        (
+            dict(batch_size=4, seq_len=1, arch="sm_103a"),
+            "indexed_bf16_t1.vec8r56_t16",
+            "t1_bf16state_vec8r56",
+        ),
         *(
             (
                 dict(
@@ -451,7 +456,28 @@ _QWEN35_BF16_T1_GEOMETRIES = (
     (4, 16),
     (2, 8),
 )
-_SGLANG_GRAPH_BATCHES = (1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1000)
+_SGLANG_GRAPH_BATCHES = (
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8,
+    12,
+    16,
+    24,
+    32,
+    48,
+    64,
+    96,
+    128,
+    192,
+    256,
+    384,
+    512,
+    1000,
+)
 
 
 def test_bf16_t1_route_rule_follows_the_state_head_count() -> None:
@@ -462,30 +488,81 @@ def test_bf16_t1_route_rule_follows_the_state_head_count() -> None:
     for _, body, tile_v in bands:
         assert body in cake_gdn.CAKE_GDN_BF16_T1_BODIES and tile_v in (16, 32, 64, 128)
     rule = cake_gdn.cake_gdn_bf16_t1_route
-    previous = 0
-    for max_state_heads, body, tile_v in bands[:-1]:
-        assert rule(1, previous + 1) == (body, tile_v)
-        assert rule(1, max_state_heads) == (body, tile_v)
-        previous = max_state_heads
-    assert rule(1, previous + 1) == bands[-1][1:]
-    assert rule(512, 32) == ("wide", 128)
-    assert rule(1, 32) == ("vec8", 16)
-    assert rule(16, 32) == ("vec8occ", 64)
-    assert rule(24, 32) == ("vec8", 64)
-    assert rule(32, 32) == ("wide", 128)
-    assert cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_bf16_t1.vec8_t16") == 16
-    assert cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_bf16_t1.vec8occ_t64") == 64
-    assert cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_bf16_t1.wide128") == 128
-    assert cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp") == 16
-    assert cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_bf16_verify_t4.wide64") == 64
-    assert cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32") == 32
+    assert set(cake_gdn.CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES) == {"sm_103a"}
+    for arch, overrides in (
+        ("sm_100a", {}),
+        ("sm_103a", cake_gdn.CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES["sm_103a"]),
+    ):
+        previous = 0
+        for max_state_heads, body, tile_v in bands[:-1]:
+            expected = (overrides.get(max_state_heads, body), tile_v)
+            assert expected[0] in cake_gdn.CAKE_GDN_BF16_T1_BODIES
+            assert rule(1, previous + 1, arch) == expected
+            assert rule(1, max_state_heads, arch) == expected
+            previous = max_state_heads
+        assert rule(1, previous + 1, arch) == bands[-1][1:]
+        assert rule(512, 32, arch) == ("wide", 128)
+    assert rule(1, 8, "sm_103a") == ("vec8", 32)
+    assert rule(1, 32, "sm_100a") == ("vec8", 16)
+    assert rule(1, 32, "sm_103a") == ("vec8r56", 16)
+    assert rule(4, 32, "sm_100a") == ("vec8", 16)
+    assert rule(4, 32, "sm_103a") == ("vec8r56", 16)
+    assert rule(16, 32, "sm_103a") == ("vec8occ", 64)
+    assert rule(24, 32, "sm_103a") == ("vec8", 64)
+    assert rule(32, 32, "sm_103a") == ("wide", 128)
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_t1.vec8_t16"
+        )
+        == 16
+    )
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_t1.vec8r56_t16"
+        )
+        == 16
+    )
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_t1.vec8occ_t64"
+        )
+        == 64
+    )
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_t1.wide128"
+        )
+        == 128
+    )
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp"
+        )
+        == 16
+    )
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_verify_t4.wide64"
+        )
+        == 64
+    )
+    assert (
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32"
+        )
+        == 32
+    )
     with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="carries no grid tile"):
-        cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_fp32_t1_splitv8")
+        cake_gdn.cake_gdn_bf16_route_tile_v(
+            "flashinfer.gdn_decode.indexed_fp32_t1_splitv8"
+        )
 
 
 @pytest.mark.parametrize("heads", _QWEN35_BF16_T1_GEOMETRIES)
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
-def test_decode_resolver_admits_every_qwen35_bf16_t1_geometry_at_any_batch(arch, heads) -> None:
+def test_decode_resolver_admits_every_qwen35_bf16_t1_geometry_at_any_batch(
+    arch, heads
+) -> None:
     num_q_heads, num_v_heads = heads
     for batch_size in _SGLANG_GRAPH_BATCHES:
         for strided_inputs in (True, False):
@@ -500,26 +577,43 @@ def test_decode_resolver_admits_every_qwen35_bf16_t1_geometry_at_any_batch(arch,
                 seq_len=1,
                 strided_inputs=strided_inputs,
             )
-            body, tile_v = cake_gdn.cake_gdn_bf16_t1_route(batch_size, num_v_heads)
+            body, tile_v = cake_gdn.cake_gdn_bf16_t1_route(
+                batch_size, num_v_heads, arch
+            )
             if body == "wide":
-                assert route.route_id == f"flashinfer.gdn_decode.indexed_bf16_t1.wide{tile_v}"
+                assert (
+                    route.route_id
+                    == f"flashinfer.gdn_decode.indexed_bf16_t1.wide{tile_v}"
+                )
                 assert "mtp_t4_bf16state_wide128" in route.variant_name
             else:
-                assert route.route_id == f"flashinfer.gdn_decode.indexed_bf16_t1.{body}_t{tile_v}"
+                assert (
+                    route.route_id
+                    == f"flashinfer.gdn_decode.indexed_bf16_t1.{body}_t{tile_v}"
+                )
                 assert f"t1_bf16state_{body}_" in route.variant_name
             assert cake_gdn.cake_gdn_bf16_route_tile_v(route.route_id) == tile_v
             record = cake_gdn._kernel_record(route.variant_name)
             assert record["specializations"]["H"] == num_q_heads
             assert record["specializations"]["HV"] == num_v_heads
             assert record["specializations"]["STRIDED_INPUTS"] == 1
-            assert record["specializations"].get("TILE_V_WIDE", record["specializations"].get("TILE_V")) == tile_v
+            assert (
+                record["specializations"].get(
+                    "TILE_V_WIDE", record["specializations"].get("TILE_V")
+                )
+                == tile_v
+            )
             assert record["specializations"].get("T_STEPS", 1) == 1
             assert record["specializations"].get("UPDATE_STATE", 1) == 1
             assert arch in record["architectures"]
 
 
-def test_decode_resolver_fails_closed_for_unlisted_bf16_t1_geometry_and_controls() -> None:
-    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="no exact frozen Cake GDN variant"):
+def test_decode_resolver_fails_closed_for_unlisted_bf16_t1_geometry_and_controls() -> (
+    None
+):
+    with pytest.raises(
+        cake_gdn.CakeGDNUnsupportedError, match="no exact frozen Cake GDN variant"
+    ):
         _decode(
             state_dtype="bfloat16",
             layout="pretranspose",
@@ -530,7 +624,9 @@ def test_decode_resolver_fails_closed_for_unlisted_bf16_t1_geometry_and_controls
             seq_len=1,
             strided_inputs=True,
         )
-    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="updates the state and caches nothing"):
+    with pytest.raises(
+        cake_gdn.CakeGDNUnsupportedError, match="updates the state and caches nothing"
+    ):
         _decode(
             state_dtype="bfloat16",
             layout="pretranspose",
@@ -540,7 +636,9 @@ def test_decode_resolver_fails_closed_for_unlisted_bf16_t1_geometry_and_controls
             strided_inputs=True,
             disable_state_update=True,
         )
-    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="pretranspose state-pool layout"):
+    with pytest.raises(
+        cake_gdn.CakeGDNUnsupportedError, match="pretranspose state-pool layout"
+    ):
         _decode(
             state_dtype="bfloat16",
             layout="nontranspose",

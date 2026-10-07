@@ -63,7 +63,11 @@ instances of `gdn_decode_pretranspose_t1_bf16state_vec8` -- eight 16-lane
 groups per CTA, one 16-byte load per lane and state row, `TILE_V` 16 / 32 /
 64 -- where the `vec8` instance (`__launch_bounds__(128, 1)`) issues every
 first-block load ahead of the Q/K normalization for the latency-bound small
-pools and the `vec8occ` instance (default launch bounds, eight CTAs per SM)
+pools (on sm_103a the 9-192 state-head band takes the `vec8r56` instance,
+`__launch_bounds__(128, 9)`, a 56-register cap that keeps the hoisted
+schedule at `TILE_V` 16 without spills and runs 1.4-4.3 % faster there, while
+the sm_100a build of the cap is slower and B200 keeps `vec8`), and the
+`vec8occ` instance (default launch bounds, eight CTAs per SM)
 takes the 256- and 512-head bands whose 1024-CTA grids then run in a single
 wave; above 768 state heads the MTP wide-tile body
 `gdn_decode_pretranspose_mtp_t4_bf16state_wide128` at `T_STEPS=1`,
