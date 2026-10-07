@@ -35,6 +35,15 @@ kda = importlib.import_module("flashinfer.kda")
 cudnn_adapter = importlib.import_module("flashinfer.cudnn")
 
 
+@pytest.fixture(autouse=True)
+def clear_auto_declines():
+    linear_attention._la_auto_declines.clear()
+    linear_attention._la_auto_decline_scopes.clear()
+    yield
+    linear_attention._la_auto_declines.clear()
+    linear_attention._la_auto_decline_scopes.clear()
+
+
 def _inputs(device="cpu", state_dtype=torch.bfloat16, seed=31):
     values = packed_prefill_inputs(device, seq_lens=[64], num_heads=4, seed=seed)
     values["initial_state"] = torch.zeros(
@@ -246,6 +255,82 @@ def test_unsupported_build_falls_back_before_mutation(monkeypatch):
     torch.testing.assert_close(
         values["initial_state"], torch.ones_like(values["initial_state"])
     )
+
+
+@pytest.mark.parametrize("error_type", [NotImplementedError, "graph_not_supported"])
+def test_repeated_unsupported_build_keeps_fallback_and_explicit_diagnostics(
+    monkeypatch, error_type
+):
+    seen = []
+    _force_native_route(monkeypatch, "small-bh", seen)
+    monkeypatch.setattr(
+        cudnn_adapter, "cudnn_recurrent_kda", linear_attention.cudnn_recurrent_kda
+    )
+    monkeypatch.setattr(linear_attention, "_check_cudnn_frontend", lambda *args: None)
+    monkeypatch.setattr(linear_attention, "get_device_index", lambda device: 0)
+    monkeypatch.setattr(linear_attention.cudnn, "__version__", "1.31.0")
+    if error_type == "graph_not_supported":
+        error_type = linear_attention.cudnn.cudnnGraphNotSupportedError
+    error = error_type("no supported plan")
+    builds = []
+
+    def decline(*args, **kwargs):
+        builds.append(kwargs.get("overwrite_initial_state", False))
+        raise error
+
+    monkeypatch.setattr(linear_attention, "_create_la_graph", decline)
+    for seed in range(5):
+        # New storage/values reuse the support decision, never live bindings.
+        values = _inputs(seed=seed)
+        out, state = kda.recurrent_kda(**values, backend="auto")
+        torch.testing.assert_close(out, values["q"] + values["v"])
+        torch.testing.assert_close(state, torch.ones_like(state))
+    assert len(builds) == 2  # One overwrite + compatibility attempt total.
+    assert [provider for provider, _ in seen] == ["native"] * 5
+    with pytest.raises(error_type) as caught:
+        kda.recurrent_kda(**_inputs(), backend="cudnn")
+    assert caught.value is error
+    assert len(builds) == 4  # Explicit calls do not consume auto declines.
+
+
+def test_cached_decline_does_not_skip_output_alias_validation(monkeypatch):
+    seen = []
+    _force_native_route(monkeypatch, "small-bh", seen)
+
+    def decline(*args, **kwargs):
+        error = NotImplementedError("no supported plan")
+        error._fi_la_build_unsupported = True
+        raise error
+
+    monkeypatch.setattr(cudnn_adapter, "cudnn_recurrent_kda", decline)
+    values = _inputs()
+    kda.recurrent_kda(**values, backend="auto")
+    values["output"] = values["q"]
+    with pytest.raises(ValueError, match="output must not overlap"):
+        kda.recurrent_kda(**values, backend="auto")
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("option", ["scale", "lower_bound"])
+def test_tensor_scalar_values_do_not_share_decline(monkeypatch, option):
+    seen = []
+    _force_native_route(monkeypatch, "small-bh", seen)
+    calls = []
+
+    def decline(*args, **kwargs):
+        calls.append(kwargs[option])
+        error = NotImplementedError("unsupported scalar option")
+        error._fi_la_build_unsupported = True
+        raise error
+
+    monkeypatch.setattr(cudnn_adapter, "cudnn_recurrent_kda", decline)
+    for value in (-1.0, -2.0, -1.0):
+        values = _inputs()
+        values[option] = torch.tensor(value)
+        kda.recurrent_kda(**values, backend="auto")
+    assert calls == [-1.0, -2.0]
+    assert all(isinstance(value, float) for value in calls)
+    assert len(seen) == 3
 
 
 @pytest.mark.parametrize("unsupported_attribute", [False, True])
