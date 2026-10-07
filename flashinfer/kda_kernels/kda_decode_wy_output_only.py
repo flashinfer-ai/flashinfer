@@ -183,6 +183,7 @@ class KdaDecodeWyOutputOnlyKernel:
         emit_corrections=False,
         vllm_dropin=False,
         null_min=1,
+        has_paths=False,
     ):
         """Bind the compile-time specialization knobs (see class docstring)."""
         self._min_blocks_per_mp = min_blocks_per_mp
@@ -213,6 +214,9 @@ class KdaDecodeWyOutputOnlyKernel:
         # (zero outputs, untouched caches). 1 = vLLM (slot 0 reserved),
         # 0 = flashinfer recurrent_kda (only negative slots are padding).
         self._null_min = int(null_min)
+        # Tree-structured drafts: per-token parent indices instead of a
+        # prefix. Requires parent[i] < i (see the host wrapper).
+        self._has_paths = bool(has_paths)
         if self._dropin:
             self._emit = True
             # beta_is_logit is NOT forced here: the vLLM contract uses beta
@@ -236,6 +240,7 @@ class KdaDecodeWyOutputOnlyKernel:
         gCorr: cute.Tensor,
         gKg: cute.Tensor,
         gQsl: cute.Tensor,
+        gParents: cute.Tensor,
         scale: cutlass.Float32,
         lower_bound: cutlass.Float32,
         s_q_tok: cutlass.Int32,
@@ -307,6 +312,7 @@ class KdaDecodeWyOutputOnlyKernel:
             gCorr,
             gKg,
             gQsl,
+            gParents,
             scale,
             lower_bound,
             s_q_tok,
@@ -351,6 +357,7 @@ class KdaDecodeWyOutputOnlyKernel:
         gCorr: cute.Tensor,
         gKg: cute.Tensor,
         gQsl: cute.Tensor,
+        gParents: cute.Tensor,
         scale: cutlass.Float32,
         lower_bound: cutlass.Float32,
         s_q_tok: cutlass.Int32,
@@ -480,6 +487,9 @@ class KdaDecodeWyOutputOnlyKernel:
             # (vLLM's correction cache is fp32). Collapsed to 8 elems when
             # the drop-in mode is off so other modes keep their occupancy.
             wstage_f32: cute.struct.Align[cute.struct.MemRange[f32, _WSTAGE_N], 128]
+            # (tree) per-token ancestor bitmask, inclusive of the token
+            # itself. Bit s set means s precedes t on its root-to-node path.
+            anc_mask: cute.struct.Align[cute.struct.MemRange[Int32, T], 128]
 
         st = smem.allocate(SS)
         sK = st.khat_buf.get_tensor(
@@ -498,6 +508,7 @@ class KdaDecodeWyOutputOnlyKernel:
         sMat = st.mat_fp32.get_tensor(cute.make_layout((T, T), stride=(T, 1)))
         sNegL = st.scratch_bf.get_tensor(cute.make_layout((T, T), stride=(BF_PAD, 1)))
         sPowk = st.scratch2_bf.get_tensor(cute.make_layout((T, T), stride=(BF_PAD, 1)))
+        sAnc = st.anc_mask.get_tensor(cute.make_layout((T,)))
 
         # mbarrier init for the state TMA load (single arriver + TX bytes).
         mbar_h_ptr = st.h_load_mbar.data_ptr()
@@ -764,6 +775,19 @@ class KdaDecodeWyOutputOnlyKernel:
                     )
         sync_threads()
 
+        # (tree) Inclusive ancestor bitmask per token. Parents precede
+        # children, so one forward pass suffices. Tail rows carry self only.
+        if const_expr(self._has_paths):
+            if tidx == Int32(0):
+                for _at in cutlass.range_constexpr(T):
+                    _m = Int32(1) << Int32(_at)
+                    if const_expr(_at < self._n_valid):
+                        _p = gParents[(pid_b, _at)]
+                        if _p >= Int32(0):
+                            _m = _m | sAnc[_p]
+                    sAnc[_at] = _m
+            sync_threads()
+
         # ============================================================
         # KDA GATE STAGE (replaces GDN's scalar gamma path).
         # Thread tidx owns K-channel c = tidx (THREADS == K_DIM == 128).
@@ -784,6 +808,7 @@ class KdaDecodeWyOutputOnlyKernel:
         if const_expr(self._n_valid < T):
             for _zt in cutlass.range_constexpr(self._n_valid, T):
                 sKtil.iterator[_zt * K_PADDED + tidx] = io(0.0)
+        _glog_arr = [None] * self._n_valid
         for t in cutlass.range_constexpr(self._n_valid):
             _graw = sG.iterator[t * K_DIM + tidx].to(f32)
             _glog = f32(0.0)
@@ -810,18 +835,29 @@ class KdaDecodeWyOutputOnlyKernel:
                 # khat/ktil/qhat rows are zero anyway: k = q = 0 there).
                 if cutlass.Int32(t) >= _seq_len:
                     _glog = f32(0.0)
-            _cum = _cum + _glog
+            _glog_arr[t] = _glog
+            if const_expr(self._emit and not self._dropin):
+                # kg cache row: sK still holds the L2-normalized k here; sG
+                # holds the raw gate. Coalesced 2-byte stores across channels.
+                _kg_off = pid_b * skg_b + t * skg_t + pid_hv * skg_hv + tidx
+                gKg.iterator[_kg_off] = sK.iterator[t * K_PADDED + tidx]
+                gKg.iterator[_kg_off + K_DIM] = sG.iterator[t * K_DIM + tidx]
+        for t in cutlass.range_constexpr(self._n_valid):
+            if const_expr(self._has_paths):
+                # Masked sum over the root-to-node path. Branchless: the
+                # bitmask supplies a 0/1 weight, so bounds stay constexpr.
+                _anc_t = sAnc[t]
+                _cum = f32(0.0)
+                for s in cutlass.range_constexpr(t + 1):
+                    _bit = (_anc_t >> Int32(s)) & Int32(1)
+                    _cum = _cum + _bit.to(f32) * _glog_arr[s]
+            else:
+                _cum = _cum + _glog_arr[t]
             _ep = _exp2_approx_f32(_cum * f32(LOG2_E))
             _en = _exp2_approx_f32((f32(0.0) - _cum) * f32(LOG2_E))
             _koff = t * K_PADDED + tidx
             _kval = sK.iterator[_koff].to(f32)
             _qval = sQ.iterator[_koff].to(f32)
-            if const_expr(self._emit and not self._dropin):
-                # kg cache row: sK still holds the L2-normalized k here; sG
-                # holds the raw gate. Coalesced 2-byte stores across channels.
-                _kg_off = pid_b * skg_b + t * skg_t + pid_hv * skg_hv + tidx
-                gKg.iterator[_kg_off] = sK.iterator[_koff]
-                gKg.iterator[_kg_off + K_DIM] = sG.iterator[t * K_DIM + tidx]
             sK.iterator[_koff] = (_kval * _ep).to(io)
             sKtil.iterator[_koff] = (_kval * _en).to(io)
             sQ.iterator[_koff] = (_qval * _ep).to(io)
@@ -908,9 +944,17 @@ class KdaDecodeWyOutputOnlyKernel:
             r = flat // T
             c = flat % T
             qkt = sNegL.iterator[r * BF_PAD + c].to(f32)
-            sNegL.iterator[r * BF_PAD + c] = qkt.to(io) if r >= c else io(0.0)
+            if const_expr(self._has_paths):
+                # tril -> ancestor set. sAnc is inclusive, so the same bit
+                # test gives both the diagonal-inclusive and strict forms.
+                _keep = ((sAnc[r] >> c) & Int32(1)) != Int32(0)
+                _strict = _keep and (r != c)
+            else:
+                _keep = r >= c
+                _strict = r > c
+            sNegL.iterator[r * BF_PAD + c] = qkt.to(io) if _keep else io(0.0)
             kkt_val = sMat.iterator[_smat_off(r, c)]
-            negL_val = (f32(0.0) - sBeta.iterator[r] * kkt_val) if r > c else f32(0.0)
+            negL_val = (f32(0.0) - sBeta.iterator[r] * kkt_val) if _strict else f32(0.0)
             sTmat.iterator[r * BF_PAD + c] = negL_val.to(io)
         sync_threads()
 
@@ -2066,6 +2110,7 @@ def kda_wy_output_only(
     emit_corrections: bool = False,
     corrections_out: Optional[torch.Tensor] = None,
     kg_cache_out: Optional[torch.Tensor] = None,
+    verify_parents: Optional[torch.Tensor] = None,
 ):
     """Output-only (frozen-state) KDA decode over 1..16 tokens per sequence.
 
@@ -2243,6 +2288,19 @@ def kda_wy_output_only(
     # every crossover toward WY — thresholds are halved there (measured at
     # T=8 where WY already wins at every batch; interior points estimated).
     _bh = B * HV
+    has_paths = verify_parents is not None
+    if has_paths:
+        if verify_parents.shape != (B, T_in):
+            raise ValueError("verify_parents must have shape [B, T]")
+        if verify_parents.dtype != torch.int32:
+            raise ValueError("verify_parents must be int32")
+        if verify_parents.device != q.device:
+            raise ValueError("verify_parents must be on the query device")
+        if backend == "recurrent":
+            raise ValueError("verify_parents requires the WY backend")
+        # parent[i] < i is a device-side property; checking it here would
+        # sync. Callers must guarantee it (EAGLE's level-by-level layout does).
+
     _scale = 1 if gate_mode == GATE_PRECOMPUTED else 2
     if T_in == 1:
         _rec_max = _REC_DISPATCH_MAX_BH // _scale
@@ -2253,6 +2311,8 @@ def kda_wy_output_only(
     else:
         _rec_max = 0
     use_rec = backend == "recurrent" or (backend == "auto" and _bh <= _rec_max)
+    if has_paths:
+        use_rec = False
     if use_rec:
         rec_args = [
             mk_dyn(q),
@@ -2347,6 +2407,7 @@ def kda_wy_output_only(
         HV,
         H,
         V_dim,
+        has_paths,
     )
     args = [
         mk_dyn(q),
@@ -2362,6 +2423,7 @@ def kda_wy_output_only(
         mk_dyn(corr_t),
         mk_dyn(kg_t),
         mk_dyn(_dummy_i32(device)),
+        mk_dyn(verify_parents if has_paths else _dummy_i32(device)),
         float(scale),
         lb,
         0,
@@ -2392,6 +2454,7 @@ def kda_wy_output_only(
             beta_is_logit=beta_is_logit,
             n_valid=T_in,
             emit_corrections=emit_corrections,
+            has_paths=has_paths,
         )
         options = _compile_options(device)
         _CACHE[cache_key] = (
@@ -2606,6 +2669,7 @@ def kda_recoverssm_verify(
         mk_any(correction_cache),
         mk_any(kg_cache),
         mk_dyn(query_start_loc),
+        mk_dyn(_dummy_i32(device)),
         q_scale,
         lb,
         int(q.stride(1)),
