@@ -184,6 +184,13 @@ struct Fc2KernelSpec {
   // Split-K factor: the launch grid is (grid_m, grid_n, split_k); 1 when the kernel does not
   // split K across a cluster.
   int split_k;
+  // Geometry the kernel's K loop serves, in K tiles (K_tiles = intermediate_size / block_k): the
+  // host launches a kernel only when K_tiles >= min_k_tiles and K_tiles % k_tiles_multiple == 0.
+  // 1 / 1 for the single-slice kernels; split-K kernels need at least one K tile per cluster CTA
+  // (min_k_tiles = split_k), and a kernel that slices K into split_k equal ranges also needs
+  // k_tiles_multiple = split_k (the native ceil-sliced kernels keep 1).
+  int min_k_tiles;
+  int k_tiles_multiple;
   // Block-scale layout the kernel reads for its activation operand (the requantization stage must
   // write this layout for kFc2Nvfp4PerToken; the FC1 epilogue writes kR8c4 for kFc2Nvfp4).
   SfLayout sf_layout_a;

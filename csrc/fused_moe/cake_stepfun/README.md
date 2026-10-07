@@ -66,7 +66,7 @@ pairs of the kernel signature), `block`, `cluster`, `dynamic_smem_bytes` and
 
 | stage | record keys | uniqueness |
 |---|---|---|
-| `fc1`, `fc2` | `family`, `tile_n`, `output_rows_per_cta`, `block_k`; `fc2` adds `sf_layout_a` (`none`, `linear`, `r8c4`, `r128c4`) and `split_k` (1, or the cluster split-K factor) | one record per (arch, stage, family, tile), every tile of the family mapping present |
+| `fc1`, `fc2` | `family`, `tile_n`, `output_rows_per_cta`, `block_k`; `fc2` adds `sf_layout_a` (`none`, `linear`, `r8c4`, `r128c4`), `split_k` (1, or the cluster split-K factor) and the K-tile geometry its kernel serves, `min_k_tiles` / `k_tiles_multiple` (`1` / `1` for single-slice kernels; a split-K kernel needs `intermediate_size / block_k >= split_k`, and one that slices K into `split_k` equal ranges also `k_tiles_multiple = split_k`) | one record per (arch, stage, family, tile), every tile of the family mapping present |
 | `routing` | `variant`, `input` (`scores` / `topk_ids`), `logits_dtype` (`float32` / `bfloat16`; `none` for `topk_ids`), `min_tokens`, `max_tokens`, `grid_rule` (`fixed` / `token_blocks` / `coop_sms`), `grid`, `tokens_per_cta`, `max_expanded_per_thread`, `cooperative`, optional `pre_kernel` (`{kernel_symbol, device, grid, block, dynamic_smem_bytes}`: the leading kernel of the two-kernel large-token path; its `device` unit is listed in `files` and compiled with the record's `compile_flags`) | one record per (arch, stage, variant) |
 | `requant` | `variant`, `sf_layout`, `rows_per_cta` | one record per (arch, stage, variant) |
 | `finalize` | `variant` (`scalar` / `vector`, unique per dtype, e.g. `scalar_bf16`), `expert_weights_dtype` (`float32` / `bfloat16`), `max_top_k` | one record per (arch, stage, variant) |
@@ -203,9 +203,15 @@ GEMM2 over the permuted FC1 output, bf16 output in permuted order
 
 Grid `(grid_m = H / output_rows_per_cta, grid_n = max_ctas, split_k)`; routing arrays
 `tile_expert`, `tile_mn_limit`, `total_tiles = num_non_exiting_ctas`,
-`total_num_padded_tokens`; the same bound on acquired tiles as FC1. GEMM2 bias,
-per-channel scales, output scales and valid (unpadded) dimensions smaller than
-`H` / `I` are rejected.
+`total_num_padded_tokens`; the same bound on acquired tiles as FC1. A kernel is
+launched only for a geometry it serves: `H` a multiple of `output_rows_per_cta`
+times the cluster's M extent, `I` a multiple of `block_k`, and `K_tiles = I /
+block_k` at least `min_k_tiles` and a multiple of `k_tiles_multiple` (a split-K
+kernel hands every cluster CTA at least one K tile; a CTA without one would wait
+on the cluster reduction forever). `getDefaultValidConfigIndex` raises with the
+per-tile rules when no exported kernel of the family's tile serves the geometry.
+GEMM2 bias, per-channel scales, output scales and valid (unpadded) dimensions
+smaller than `H` / `I` are rejected.
 
 ### Finalize (`FinalizeArgs`, `FinalizeKernelSpec`)
 

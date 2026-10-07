@@ -95,6 +95,23 @@ std::string tileList(int family) {
   return tiles.empty() ? "none" : tiles;
 }
 
+// Per exported tile of ``family``: the K-tile count (intermediate_size / block_k) its kernel
+// serves.
+std::string kTileRules(int family) {
+  std::string rules;
+  for (size_t index = 0; index < generated::kFc2KernelCount; ++index) {
+    auto const& spec = generated::kFc2Kernels[index];
+    if (spec.family != family) continue;
+    rules +=
+        (rules.empty() ? "" : ", ") + std::string("tile ") + std::to_string(spec.tile_n) +
+        " needs intermediate_size / " + std::to_string(spec.block_k) +
+        " >= " + std::to_string(spec.min_k_tiles) +
+        (spec.k_tiles_multiple > 1 ? " and a multiple of " + std::to_string(spec.k_tiles_multiple)
+                                   : std::string());
+  }
+  return rules.empty() ? "none" : rules;
+}
+
 char const* fc2FamilyName(int family) {
   switch (family) {
     case generated::kFc2Bf16:
@@ -375,8 +392,13 @@ bool Fc2Runner::shapeSupported(int32_t configIndex, int32_t hiddenSize,
   if (std::find(mKernels.begin(), mKernels.end(), configIndex) == mKernels.end()) return false;
   auto const& spec = generated::kFc2Kernels[configIndex];
   int64_t const gridM = hiddenSize / spec.output_rows_per_cta;
+  // K streams in whole BLOCK_K tiles; a split-K kernel distributes the K tiles over its cluster
+  // CTAs and needs the K-tile count its slicing rule serves (min_k_tiles / k_tiles_multiple of the
+  // record), otherwise a cluster CTA owns no K tile and the cluster reduction never completes.
+  int64_t const kTiles = intermediateSize / spec.block_k;
   return intermediateSize > 0 && intermediateSize % spec.block_k == 0 && hiddenSize > 0 &&
-         hiddenSize % spec.output_rows_per_cta == 0 && gridM % spec.cluster[0] == 0;
+         hiddenSize % spec.output_rows_per_cta == 0 && gridM % spec.cluster[0] == 0 &&
+         kTiles >= spec.min_k_tiles && kTiles % spec.k_tiles_multiple == 0;
 }
 
 size_t Fc2Runner::getWorkspaceSizeInBytes(int32_t, int32_t, int32_t, int32_t, int32_t,
@@ -394,7 +416,9 @@ int32_t Fc2Runner::getDefaultValidConfigIndex(int32_t, int32_t hiddenSize, int32
                    ", intermediate_size=", intermediateSize,
                    " (exported tiles for this family: ", tileList(mFamily),
                    "; hidden_size must be a multiple of the kernel's output rows per CTA times "
-                   "its cluster size and intermediate_size a multiple of its K tile).");
+                   "its cluster size and intermediate_size a multiple of its K tile, with at least "
+                   "one K tile per split-K cluster CTA: ",
+                   kTileRules(mFamily), ").");
   return -1;
 }
 

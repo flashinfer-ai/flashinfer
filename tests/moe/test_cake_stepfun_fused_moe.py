@@ -1261,6 +1261,34 @@ def test_inventory_v4_lists_a_stage_per_kernel():
             assert set(inventory.missing_stages(target)).isdisjoint(stages)
 
 
+def test_inventory_fc2_records_declare_the_k_tile_geometry_they_serve():
+    """Every FC2 record carries the K-tile geometry its kernel's K loop serves (the host
+    launch predicate), consistent with its split-K factor, and every exported FC2 tile
+    serves the StepFun geometry (H=4096, I=1536)."""
+    from flashinfer.jit.cake_stepfun_moe import load_cake_stepfun_inventory
+
+    inventory = load_cake_stepfun_inventory()
+    records = [
+        record
+        for record in json.loads(inventory.path.read_text(encoding="utf-8"))["kernels"]
+        if record["stage"] == "fc2"
+    ]
+    assert records
+    for record in records:
+        split_k = int(record["split_k"])
+        min_k_tiles = int(record["min_k_tiles"])
+        k_tiles_multiple = int(record["k_tiles_multiple"])
+        assert split_k >= 1 and min_k_tiles >= split_k, record["kernel_symbol"]
+        assert k_tiles_multiple in {1, split_k}, record["kernel_symbol"]
+        if split_k == 1:
+            assert (min_k_tiles, k_tiles_multiple) == (1, 1), record["kernel_symbol"]
+        k_tiles = INTERMEDIATE_SIZE // int(record["block_k"])
+        assert INTERMEDIATE_SIZE % int(record["block_k"]) == 0, record["kernel_symbol"]
+        assert k_tiles >= min_k_tiles and k_tiles % k_tiles_multiple == 0, record[
+            "kernel_symbol"
+        ]
+
+
 def test_inventory_routing_and_finalize_records_are_typed():
     """Routing records name their input kind (and a listed pre-kernel unit, if any); finalize
     records their expert-weight dtype; the loader's accessors agree with the records."""
