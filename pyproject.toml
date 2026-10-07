@@ -76,6 +76,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.experimental.cake_dsa_train" = ["csrc/**"]
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]
 "flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
 "flashinfer.experimental.cake_lm_head_loss" = ["csrc/**"]
