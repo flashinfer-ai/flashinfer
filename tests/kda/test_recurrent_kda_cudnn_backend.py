@@ -210,6 +210,34 @@ def _serial(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("backend", ["auto", "cudnn"])
+@pytest.mark.parametrize("num_heads", [6, 16])
+@pytest.mark.parametrize("amplitude", [0.0, 1e-6, 1e-4, 1.0])
+def test_kda_additive_normalization_matches_serial(backend, num_heads, amplitude):
+    inputs = _make_inputs([17, 48], num_heads, initial_state=True, seed=11)
+    inputs["q"].mul_(amplitude)
+    inputs["k"].mul_(amplitude)
+    reference = dict(inputs)
+    for name in ("q", "k"):
+        value = inputs[name].float()
+        reference[name] = value * torch.rsqrt(
+            value.square().sum(dim=-1, keepdim=True) + 1e-6
+        )
+    expected_out, expected_state = _serial(reference, l2norm=False)
+    out, state = recurrent_kda(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["g"],
+        inputs["beta"],
+        backend=backend,
+        initial_state=inputs["initial_state"].clone(),
+        **_gate_kwargs(inputs, output_final_state=True),
+    )
+    assert_rel_close("output", out, expected_out, KERNEL_TOLERANCE)
+    assert_rel_close("final_state", state, expected_state, KERNEL_TOLERANCE)
+
+
 @pytest.mark.parametrize("seq_lens", [[512], [256, 320], [64, 1, 1024]])
 @pytest.mark.parametrize("num_heads", [4])
 @pytest.mark.parametrize("use_initial_state", [False, True])
