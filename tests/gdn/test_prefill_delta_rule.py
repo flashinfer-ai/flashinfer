@@ -954,6 +954,7 @@ def _test_checkpoint(
 
 @pytest.mark.parametrize("checkpoint_every_n_tokens", [64, 128])
 @pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("head_size_v", [128, 64], ids=lambda d: f"dv{d}")
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(4, 1, 1), (2, 2, 4)],
