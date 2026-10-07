@@ -27,8 +27,11 @@ Contract (the issue text is authoritative)
   independent query / key segment boundaries on the device; optional
   ``q_causal_offsets [S]`` int64 on the device; ``top_k`` in ``[1, 4096]``
   (default 2048); ``softmax_scale > 0`` (default ``128 ** -0.5``); ``ratio
-  >= 1``; ``max_seqlen_q`` / ``max_seqlen_k`` are accepted host mirrors that
-  no launch decision reads.
+  >= 1``; ``max_seqlen_q`` is an accepted host mirror that no launch decision
+  reads; ``max_seqlen_k`` (the caller's bound on every key segment, optional)
+  sizes the rank finalize's bitmap pool and so selects its program variant
+  (``rank_seg_window``) -- never a result; a value above ``Tkv`` or below
+  ``ceil(Tkv / S)`` is rejected.
 * Outputs ``indices [T, top_k]`` int32 segment-local key ids and ``scores [T,
   top_k]`` FP32, both in ascending id order with the tail padded by ``-1`` /
   ``-inf``; an entirely empty row holds only padding.
@@ -46,42 +49,61 @@ Contract (the issue text is authoritative)
 * Selection: the exact global top ``min(top_k, visible)`` keys per row, ranked
   by score descending then key id descending (``+0.0 == -0.0`` for ranking);
   the returned score bits are the computed FP32 bits.
-* Repeatable: identical inputs give identical ids and score bits; the
-  internal partition knobs (``grid_ctas``, ``candidate_multiplier``,
-  ``check_period``, the sampled-threshold knobs) never change a result.
+* Repeatable: identical inputs give identical ids and score bits; the program
+  the host dispatches (unit geometry, key-range split, CTA pair, unroll, unit
+  order, sampled threshold; the CUB block radix sort or the prefix-popcount
+  rank scatter as the finalize) and the partition knobs (``grid_ctas``,
+  ``candidate_multiplier``, ``check_period``, the sampled-threshold knobs, the
+  finalize program) never change a result.
 * Memory: no ``[T, Tkv]`` score matrix.  The workspace is
-  :func:`dsa_indexer_workspace_size` bytes -- ``grid x queries_per_cta x
-  candidate_capacity(top_k) x entry_bytes`` from the record's gate policy,
-  independent of ``T``, ``Tkv`` and ``S`` -- separate from the inputs and the
-  two outputs; no host synchronization inside the operator.
+  :func:`dsa_indexer_workspace_size` bytes for the call's geometry -- the
+  persistent candidate buffers ``grid x queries_per_unit x
+  candidate_capacity(top_k) x entry_bytes`` plus, when the dispatch splits the
+  key ranges, the staging ``T x n_split x top_k x entry_bytes`` -- separate
+  from the inputs and the two outputs; no host synchronization inside the
+  operator.
 * Non-finite inputs (NaN / inf / overflow) are outside the normal domain: the
-  computed score bits are returned, NaN scores rank below every other score
-  (also below ``-inf``), ``+-inf`` rank by value, and no loop bound depends on
-  a score value, so the kernels cannot hang.
+  operator returns with the output structure intact and no loop bound depends
+  on a score value, so the kernels cannot hang.
 
 Every allocation happens in :func:`prepare_dsa_indexer_topk`; the returned
 runner launches with no CUDA allocation and no host synchronization, so a
 runner (or a CUDA graph capturing it) replays for new values written into the
-bound tensors.  Kernels are reached through the argument plans of the registry
-records in ``cake_jit.MODULES``; the ``abi`` field of a record names the
-keyword set its kernels expect (:data:`ABI_CONTRACT`).
+bound tensors.  The host decides the program from host-known integers only
+(:mod:`cake_policy`, the registry's ``POLICY`` record of the architecture) and
+fails closed when the decided program is not registered for the device's
+architecture.  Kernels are reached through the argument plans of the registry
+(``cake_jit.ARG_PLANS``); ``cake_jit.ABI`` names the keyword set its kernels
+expect (:data:`ABI_CONTRACT`).
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import torch
 import tvm_ffi
 
 from .cake_jit import (
-    FINALIZE_STAGES,
-    MODULES,
-    load_cake_dsa_indexer_module,
-    registered_stages,
-    select_module,
+    ABI,
+    ARG_PLANS,
+    FFI_ENTRY,
+    NUMERICS,
+    POLICY,
+    PROGRAM_KEYS,
+    PROGRAMS,
+    STAGES,
+    TRACKING_ISSUE,
+    load_program,
+)
+from .cake_policy import (
+    MERGE_KEY,
+    DispatchPolicy,
+    ProgramChoice,
+    finalize_grid,
+    select_program,
 )
 
 NUM_HEADS = 32
@@ -102,7 +124,7 @@ SUPPORTED_COMPUTE_CAPABILITIES = {
 # them).  Tensor kinds in the argument plan are ``buffer`` / ``tma_buffer``
 # (the binding encodes the tensor map itself from the view it receives),
 # scalars are ``parameter``; ``grid_x/y/z`` are ``grid``.
-ABI_CONTRACT = "dsa_indexer_v1"
+ABI_CONTRACT = "dsa_indexer_v2"
 SUPPORTED_ABIS = (ABI_CONTRACT,)
 CONTRACT_TENSORS = (
     "Q",  # q viewed as [T * 32, 128] (TMA source)
@@ -113,9 +135,10 @@ CONTRACT_TENSORS = (
     "q_offsets",  # q_causal_offsets, or a never-dereferenced int64 placeholder
     "Indices",
     "Scores",
-    "Cand",  # the workspace viewed as packed int64 candidate entries
+    "Cand",  # the workspace viewed as packed int64 candidate entries (buffers, then the split staging)
+    "Staging",  # the split staging [T, n_split, top_k] behind the candidate buffers (merge stage only)
 )
-CONTRACT_SCALARS = (
+SCAN_SCALARS = (
     "num_segments",
     "top_k",
     "ratio",
@@ -127,7 +150,15 @@ CONTRACT_SCALARS = (
     "check_period",
     "grid_ctas",
     "softmax_scale",
+    "n_split",
 )
+MERGE_SCALARS = ("top_k", "n_split")
+FINALIZE_SCALARS = ("top_k", "key_bits")  # the CUB block radix sort programs
+FINALIZE_RANK_SCALARS = (
+    "top_k",
+    "num_segments",
+)  # the prefix-popcount rank finalize programs (+ cu_seqlens_q / cu_seqlens_k)
+CONTRACT_SCALARS = SCAN_SCALARS + ("key_bits",)
 # Kernel-side spellings of the contract names (a renamed kernel argument
 # resolves through this table; any other name fails closed at bind time).
 CONTRACT_ALIASES = {
@@ -139,6 +170,7 @@ CONTRACT_ALIASES = {
     "cand": "Cand",
     "candidates": "Cand",
     "workspace": "Cand",
+    "staging": "Staging",
     "q_causal_offsets": "q_offsets",
     "offsets": "q_offsets",
     "num_segs": "num_segments",
@@ -146,127 +178,16 @@ CONTRACT_ALIASES = {
     "scale": "softmax_scale",
     "sm_scale": "softmax_scale",
     "grid": "grid_ctas",
+    "num_splits": "n_split",
 }
 
 # Documented zero-sign behaviour of the head reduction (registry field
-# ``numerics["zero_sign_policy"]``): ``positive_accumulator`` -- the FMA chains
+# ``NUMERICS["zero_sign_policy"]``): ``positive_accumulator`` -- the FMA chains
 # start from ``+0.0``, so a row whose head terms are all zero scores ``+0.0``;
 # ``ieee_sum`` -- the sum starts from the ``h = 0`` term, so an all-zero sum is
 # ``-0.0`` iff every term is ``-0.0``.  Either way the computed bits are
 # returned unchanged and ``+0.0 == -0.0`` for ranking.
 ZERO_SIGN_POLICIES = ("positive_accumulator", "ieee_sum")
-
-# ---------------------------------------------------------------------------
-# Candidate-gate policy (host-evaluated; carried by the registry record)
-# ---------------------------------------------------------------------------
-
-GATE_POLICY_FIELDS = (
-    "queries_per_cta",  # queries one persistent CTA scores at a time (one candidate buffer each)
-    "candidate_entry_bytes",  # packed (score bits, key id) entry size
-    "candidate_multiplier",  # default capacity multiplier: cand_cap ~ multiplier * top_k
-    "candidate_slack",  # minimum headroom above top_k before a buffer can be compacted
-    "tile_keys",  # keys per key tile (capacity granule)
-    "check_period_max",  # cap on the selection-trigger check period (tiles)
-    "check_period_cap_divisor",  # default period = cand_cap // divisor (keys; an architecture-specific constant)
-    "sample_tiles_max",  # cap on the sample tiles of the sampled first threshold (0 = none)
-    "sample_shift_permille",  # conservative shift of the sampled rank
-    "finalize_small_max_top_k",  # largest top_k the finalize_small stage sorts
-)
-
-
-@dataclass(frozen=True)
-class GatePolicy:
-    """Candidate-gate constants of a generated program, evaluated on the host.
-
-    ``candidate_capacity(top_k)`` is the per-query candidate buffer (entries),
-    ``check_period(top_k, cap)`` the default tile period between selection
-    checks, ``workspace_bytes(top_k, grid)`` the explicit workspace bound.
-    Every value is a plain integer from the registry record; the host does
-    not guess kernel constants.
-    """
-
-    queries_per_cta: int
-    candidate_entry_bytes: int
-    candidate_multiplier: int
-    candidate_slack: int
-    tile_keys: int
-    check_period_max: int
-    check_period_cap_divisor: int
-    sample_tiles_max: int
-    sample_shift_permille: int
-    finalize_small_max_top_k: int
-
-    @classmethod
-    def from_record(cls, record: dict[str, Any]) -> "GatePolicy":
-        raw = record.get("gate_policy")
-        if not isinstance(raw, dict) or set(raw) != set(GATE_POLICY_FIELDS):
-            raise ValueError(
-                f"registry record declares gate_policy {raw!r}; expected the fields {GATE_POLICY_FIELDS}"
-            )
-        values = {}
-        for name in GATE_POLICY_FIELDS:
-            value = raw[name]
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise ValueError(
-                    f"gate_policy[{name!r}] must be an integer, got {value!r}"
-                )
-            if (
-                name != "sample_shift_permille"
-                and name != "sample_tiles_max"
-                and value <= 0
-            ):
-                raise ValueError(
-                    f"gate_policy[{name!r}] must be positive, got {value!r}"
-                )
-            values[name] = int(value)
-        if values["sample_tiles_max"] < 0:
-            raise ValueError("gate_policy['sample_tiles_max'] must be >= 0")
-        return cls(**values)
-
-    def candidate_capacity(self, top_k: int, multiplier: Optional[int] = None) -> int:
-        """Per-query candidate buffer: ``max(multiplier * top_k, top_k + slack)`` rounded up to whole tiles."""
-        mult = self.candidate_multiplier if multiplier is None else int(multiplier)
-        if mult < 1:
-            raise ValueError("candidate_multiplier must be >= 1")
-        wanted = max(mult * int(top_k), int(top_k) + self.candidate_slack)
-        return -(-wanted // self.tile_keys) * self.tile_keys
-
-    def check_period(self, top_k: int, cand_cap: int) -> int:
-        """Default tiles between two selection-trigger checks (exact for the given capacity).
-
-        The capacity divisor is an architecture-specific constant of the program
-        (the record of each architecture carries its own value).
-        """
-        return max(
-            1,
-            min(
-                self.check_period_max,
-                (int(cand_cap) - int(top_k)) // self.tile_keys,
-                int(cand_cap) // self.check_period_cap_divisor,
-            ),
-        )
-
-    def check_period_limit(self, top_k: int, cand_cap: int) -> int:
-        """Largest ``check_period`` that is still exact for the capacity (the kernel's headroom rule)."""
-        return max(
-            1,
-            min(
-                self.check_period_max,
-                (int(cand_cap) - int(top_k)) // self.tile_keys,
-                int(cand_cap) // (2 * self.tile_keys),
-            ),
-        )
-
-    def workspace_bytes(
-        self, top_k: int, grid: int, multiplier: Optional[int] = None
-    ) -> int:
-        """Explicit workspace bound: ``grid x queries_per_cta x candidate_capacity x entry_bytes``."""
-        return (
-            int(grid)
-            * self.queries_per_cta
-            * self.candidate_capacity(top_k, multiplier)
-            * self.candidate_entry_bytes
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -287,82 +208,68 @@ def default_softmax_scale() -> float:
     return HEAD_DIM**-0.5
 
 
-def record_for(device: Optional[torch.device] = None) -> tuple[str, dict[str, Any]]:
-    """``(module_name, record)`` registered for ``device``; raises when absent."""
-    arch = arch_for(device)
-    if arch is None:
-        raise ValueError(
-            "DSA indexer top-k requires compute capability 10.0, 10.3 or 10.7"
+def registry_abi() -> str:
+    if ABI not in SUPPORTED_ABIS:
+        raise NotImplementedError(
+            f"unsupported host binding profile {ABI!r} (this host binds {SUPPORTED_ABIS})"
         )
-    name = select_module(arch)
-    return name, MODULES[name]
+    return ABI
+
+
+def policy_for(arch: str) -> DispatchPolicy:
+    """The dispatch policy registered for ``arch``; raises when the architecture has no program."""
+    record = POLICY.get(arch)
+    if record is None:
+        raise NotImplementedError(
+            f"The generated DSA indexer top-k programs for {arch} are not registered in this checkout "
+            f"(registered: {sorted(POLICY)}; see {TRACKING_ISSUE})"
+        )
+    return DispatchPolicy.from_record(record)
+
+
+def program_for(arch: str, key: str) -> str:
+    """The registered program of ``key`` on ``arch``; fails closed by name when the dispatch reaches an unshipped form."""
+    programs = PROGRAM_KEYS.get(arch)
+    if programs is None:
+        raise NotImplementedError(
+            f"The generated DSA indexer top-k programs for {arch} are not registered in this checkout "
+            f"(registered: {sorted(PROGRAM_KEYS)}; see {TRACKING_ISSUE})"
+        )
+    name = programs.get(key)
+    if name is None:
+        raise NotImplementedError(
+            f"The host dispatch selected program {key!r} on {arch}, which this checkout does not register "
+            f"(registered on {arch}: {sorted(programs)}; see {TRACKING_ISSUE})"
+        )
+    return name
 
 
 def generated_program_available(device: Optional[torch.device] = None) -> bool:
-    """True when this checkout registers a complete program for ``device``."""
+    """True when this checkout registers programs for ``device`` under the host binding profile this module binds."""
     arch = arch_for(device)
-    if arch is None:
+    if (
+        arch is None
+        or arch not in PROGRAM_KEYS
+        or arch not in POLICY
+        or ABI not in SUPPORTED_ABIS
+    ):
         return False
-    names = [n for n, r in MODULES.items() if r["arch"] == arch]
-    if len(names) != 1:
-        return False
-    stages = registered_stages(names[0])
-    return "scan" in stages and any(s in stages for s in FINALIZE_STAGES)
+    keys = PROGRAM_KEYS[arch]
+    return (
+        any(k.startswith("scan:") for k in keys)
+        and MERGE_KEY in keys
+        and any(k.startswith(("finalize:", "finalize_rank:")) for k in keys)
+    )
 
 
-def record_abi(record: dict[str, Any]) -> str:
-    abi = str(record.get("abi", ABI_CONTRACT))
-    if abi not in SUPPORTED_ABIS:
-        raise NotImplementedError(f"unsupported host binding profile {abi!r}")
-    return abi
-
-
-def record_gate_policy(record: dict[str, Any]) -> GatePolicy:
-    return GatePolicy.from_record(record)
-
-
-def record_zero_sign_policy(record: dict[str, Any]) -> str:
+def record_zero_sign_policy() -> str:
     """The documented zero-sign policy of the program's head reduction."""
-    numerics = record.get("numerics")
-    policy = numerics.get("zero_sign_policy") if isinstance(numerics, dict) else None
+    policy = NUMERICS.get("zero_sign_policy") if isinstance(NUMERICS, dict) else None
     if policy not in ZERO_SIGN_POLICIES:
         raise ValueError(
-            f"registry record declares numerics {numerics!r}; zero_sign_policy must be one of {ZERO_SIGN_POLICIES}"
+            f"registry declares numerics {NUMERICS!r}; zero_sign_policy must be one of {ZERO_SIGN_POLICIES}"
         )
     return str(policy)
-
-
-def finalize_stage_for(
-    stages: tuple[str, ...],
-    policy: GatePolicy,
-    top_k: int,
-    override: Optional[str] = None,
-) -> str:
-    """The finalize stage serving ``top_k``: ``finalize_small`` up to its limit when registered, else ``finalize``."""
-    if override is not None:
-        if override not in FINALIZE_STAGES:
-            raise ValueError(
-                f"finalize_stage must be one of {FINALIZE_STAGES}, got {override!r}"
-            )
-        if override not in stages:
-            raise NotImplementedError(
-                f"the registered program has no {override!r} stage (registered: {stages})"
-            )
-        if (
-            override == "finalize_small"
-            and int(top_k) > policy.finalize_small_max_top_k
-        ):
-            raise ValueError(
-                f"finalize_small sorts at most top_k = {policy.finalize_small_max_top_k}, got {top_k}"
-            )
-        return override
-    if "finalize_small" in stages and int(top_k) <= policy.finalize_small_max_top_k:
-        return "finalize_small"
-    if "finalize" in stages:
-        return "finalize"
-    raise NotImplementedError(
-        f"the registered program has no finalize stage for top_k = {top_k} (registered: {stages})"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +332,16 @@ def _check_int(name: str, value: Any, lo: int, hi: Optional[int] = None) -> int:
         bound = f"in [{lo}, {hi}]" if hi is not None else f">= {lo}"
         raise ValueError(f"{name} must be {bound}, got {value}")
     return int(value)
+
+
+def _check_max_seqlen_k(value: int, num_keys: int, num_segments: int) -> int:
+    """``max_seqlen_k`` as a host bound on every key segment: an int in ``[ceil(Tkv / S), Tkv]``."""
+    v = _check_int("max_seqlen_k", value, 0)
+    if v > int(num_keys) or v * max(1, int(num_segments)) < int(num_keys):
+        raise ValueError(
+            f"max_seqlen_k={v} is not an upper bound of every key segment: {int(num_keys)} keys in {int(num_segments)} segments"
+        )
+    return v
 
 
 def validate_dsa_indexer_inputs(
@@ -499,8 +416,10 @@ def validate_dsa_indexer_inputs(
     _check_int("ratio", ratio, 1)
     if max_seqlen_q is not None:
         _check_int("max_seqlen_q", max_seqlen_q, 0)
-    if max_seqlen_k is not None:
-        _check_int("max_seqlen_k", max_seqlen_k, 0)
+    if (
+        max_seqlen_k is not None
+    ):  # a host bound on every key segment: validated before the device rule, read by the dispatch only
+        _check_max_seqlen_k(max_seqlen_k, int(k.shape[0]), S)
     if isinstance(softmax_scale, bool) or not isinstance(softmax_scale, (int, float)):
         raise ValueError(
             f"softmax_scale must be a positive finite number, got {softmax_scale!r}"
@@ -544,41 +463,151 @@ def _check_output(
 
 
 # ---------------------------------------------------------------------------
-# Workspace bound
+# Program selection and workspace bound
 # ---------------------------------------------------------------------------
 
+_SM_COUNTS: dict[int, int] = {}
 
-def _num_sms(device: torch.device) -> int:
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+def _outputs_aligned(tensors: Iterable[Optional[torch.Tensor]], align: int) -> bool:
+    """True when every given output tensor's address is a multiple of ``align`` bytes (None = allocated here, aligned by the
+    caching allocator): the staged rank finalize's ``cp.async.bulk`` row I/O (lever FRB) needs ``rank_bulk_align_bytes``."""
+    align = int(align)
+    return all(t is None or int(t.data_ptr()) % align == 0 for t in tensors)
+
+
+def _device_index(device: Optional[torch.device]) -> int:
+    if device is None:
+        return int(torch.cuda.current_device())
+    device = torch.device(device)
+    return int(
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+
+
+def _num_sms(device: Optional[torch.device]) -> int:
+    index = _device_index(device)
+    count = _SM_COUNTS.get(index)
+    if count is None:
+        count = _SM_COUNTS[index] = int(
+            torch.cuda.get_device_properties(index).multi_processor_count
+        )
+    return count
+
+
+def plan_dsa_indexer_topk(
+    num_queries: int,
+    num_keys: int,
+    num_segments: int,
+    *,
+    top_k: int = DEFAULT_TOP_K,
+    ratio: int = 1,
+    device: Optional[torch.device] = None,
+    arch: Optional[str] = None,
+    grid_ctas: Optional[int] = None,
+    num_sms: Optional[int] = None,
+    candidate_multiplier: Optional[int] = None,
+    check_period: Optional[int] = None,
+    sample_tiles_max: Optional[int] = None,
+    sample_shift_permille: Optional[int] = None,
+    finalize_threads: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    outputs_aligned: bool = True,
+) -> ProgramChoice:
+    """The host dispatch of a call from host-known integers (no tensor is read).
+
+    ``arch`` defaults to the architecture of ``device`` (the current device) and
+    ``num_sms`` to its SM count; both may be given explicitly for host-only use.
+    The persistent grid is ``grid_ctas`` when given, else the SM count.
+    ``outputs_aligned`` (default True: outputs the backend allocates) says whether
+    the ``indices`` / ``scores`` addresses are multiples of the policy's
+    ``rank_bulk_align_bytes``; the staged rank finalize's bulk row I/O (lever FRB)
+    is dispatched only then, else its plain twin program (same results).
+    """
+    _check_int("num_queries", num_queries, 0)
+    _check_int("num_keys", num_keys, 0)
+    _check_int("num_segments", num_segments, 0)
+    _check_int("top_k", top_k, 1, MAX_TOP_K)
+    _check_int("ratio", ratio, 1)
+    if arch is None:
+        arch = arch_for(device)
+        if arch is None:
+            raise ValueError(
+                "DSA indexer top-k requires compute capability 10.0, 10.3 or 10.7"
+            )
+    policy = policy_for(arch)
+    if grid_ctas is not None:
+        grid = _check_int("grid_ctas", grid_ctas, 1)
+    elif num_sms is not None:
+        grid = _check_int("num_sms", num_sms, 1)
+    else:
+        grid = _num_sms(device)
+    if candidate_multiplier is not None:
+        _check_int("candidate_multiplier", candidate_multiplier, 1)
+    if sample_tiles_max is not None:
+        _check_int("sample_tiles_max", sample_tiles_max, 0, 256)
+    if sample_shift_permille is not None:
+        _check_int("sample_shift_permille", sample_shift_permille, -1000, 10000)
+    if check_period is not None:
+        _check_int("check_period", check_period, 1)
+    if finalize_threads is not None:
+        _check_int("finalize_threads", finalize_threads, 1)
+    if max_seqlen_k is not None:
+        _check_max_seqlen_k(max_seqlen_k, int(num_keys), int(num_segments))
+    return select_program(
+        policy,
+        num_queries=int(num_queries),
+        num_keys=int(num_keys),
+        num_segments=int(num_segments),
+        ratio=int(ratio),
+        top_k=int(top_k),
+        grid=grid,
+        candidate_multiplier=candidate_multiplier,
+        check_period=check_period,
+        sample_tiles_max=sample_tiles_max,
+        sample_shift_permille=sample_shift_permille,
+        finalize_threads=finalize_threads,
+        max_seqlen_k=max_seqlen_k,
+        outputs_aligned=bool(outputs_aligned),
+    )
 
 
 def dsa_indexer_workspace_size(
-    top_k: int,
-    device: Optional[torch.device] = None,
+    num_queries: int,
+    num_keys: int,
+    num_segments: int,
     *,
+    top_k: int = DEFAULT_TOP_K,
+    ratio: int = 1,
+    device: Optional[torch.device] = None,
+    arch: Optional[str] = None,
     grid_ctas: Optional[int] = None,
+    num_sms: Optional[int] = None,
     candidate_multiplier: Optional[int] = None,
-    policy: Optional[GatePolicy] = None,
 ) -> int:
-    """Explicit workspace bound in bytes for ``top_k`` on ``device``.
+    """Explicit workspace bound in bytes of one call's geometry on ``device``.
 
-    ``grid x queries_per_cta x candidate_capacity(top_k) x entry_bytes`` with
-    ``grid`` = the device's SM count (the persistent grid) unless ``grid_ctas``
-    overrides it; independent of ``T``, ``Tkv`` and the segment count.  The
-    gate policy comes from the program registered for ``device`` unless
-    ``policy`` is given explicitly.
+    ``grid_ctas x queries_per_unit x candidate_capacity(top_k) x entry_bytes``
+    for the dispatched unit geometry and capacity multiplier (``grid_ctas`` =
+    the SM count, made even for the CTA-pair program), plus the split staging
+    ``T x n_split x top_k x entry_bytes`` when the dispatch splits the key
+    ranges.  The dispatch, and with it the bound, depends on ``T``, ``Tkv``,
+    ``S``, ``ratio`` and ``top_k``; prepare a call's buffer for its own geometry
+    (or for the largest bound over the geometries it will serve).
     """
-    _check_int("top_k", top_k, 1, MAX_TOP_K)
-    if policy is None:
-        _, record = record_for(device)
-        policy = record_gate_policy(record)
-    if grid_ctas is None:
-        if device is None:
-            device = torch.device("cuda", torch.cuda.current_device())
-        grid = _num_sms(device)
-    else:
-        grid = _check_int("grid_ctas", grid_ctas, 1)
-    return policy.workspace_bytes(top_k, grid, candidate_multiplier)
+    choice = plan_dsa_indexer_topk(
+        num_queries,
+        num_keys,
+        num_segments,
+        top_k=top_k,
+        ratio=ratio,
+        device=device,
+        arch=arch,
+        grid_ctas=grid_ctas,
+        num_sms=num_sms,
+        candidate_multiplier=candidate_multiplier,
+    )
+    return int(choice.workspace_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -586,62 +615,39 @@ def dsa_indexer_workspace_size(
 # ---------------------------------------------------------------------------
 
 
-def grid_dims(rule, scalars: dict[str, Any], num_sms: int) -> tuple[int, int, int]:
-    """Evaluate a registry grid rule.
-
-    Each of the three entries is an integer, ``"sms"``, ``"sms*<n>"`` or
-    ``"<name>[*<a>][/<b>]"``: a scalar name (``"num_queries"``) optionally
-    multiplied by ``a`` and then divided by ``b`` with rounding up.
-    """
-
-    def term(value) -> int:
-        if isinstance(value, bool):
-            raise ValueError("grid rule entries must be integers or expressions")
-        if isinstance(value, int):
-            return int(value)
-        text = str(value)
-        if text == "sms":
-            return int(num_sms)
-        if text.startswith("sms*"):
-            return int(num_sms) * int(text[4:])
-        name, _, divisor = text.partition("/")
-        name, _, factor = name.partition("*")
-        value = int(scalars[name]) * (int(factor) if factor else 1)
-        return -(-value // int(divisor)) if divisor else value
-
-    if len(rule) != 3:
-        raise ValueError("grid rule must have three entries")
-    x, y, z = (term(v) for v in rule)
-    return max(1, x), max(1, y), max(1, z)
-
-
 @dataclass(frozen=True)
 class _Launch:
-    stage: str
-    module: str
+    role: str
+    program: str
     entry: Callable[..., Any] = field(repr=False)
     arguments: tuple = field(repr=False)
     grid: tuple[int, int, int]
-    # Descriptor-preparation entry of a pointer-ABI module (same arguments); the
-    # indexer programs pass their tensor maps by value and have none.
-    prepare: Optional[Callable[..., Any]] = field(default=None, repr=False)
 
     def __call__(self) -> None:
         self.entry(*self.arguments)
 
 
-def bind_stage(
-    module_name: str, stage: str, values: dict[str, Any], grid: tuple[int, int, int]
+def bind_program(
+    program: str,
+    arch: str,
+    role: str,
+    values: dict[str, Any],
+    grid: tuple[int, int, int],
 ) -> _Launch:
-    """Order ``values`` by the generated argument plan of ``stage`` and load its entry.
+    """Order ``values`` by the generated argument plan of ``role`` and load ``program`` for ``arch``.
 
     Fails closed: a keyword the kernel expects that the host does not provide
     raises ``KeyError`` naming both sides.
     """
-    physical = MODULES[module_name][stage]
+    if role not in STAGES:
+        raise ValueError(f"role must be one of {STAGES}, got {role!r}")
+    if PROGRAMS[program]["role"] != role:
+        raise ValueError(
+            f"program {program!r} is a {PROGRAMS[program]['role']} program, not {role!r}"
+        )
     grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
     arguments = []
-    for kind, name in physical["arg_plan"]:
+    for kind, name in ARG_PLANS[role]:
         key = name if name in values else CONTRACT_ALIASES.get(name, name)
         if kind == "grid":
             arguments.append(grid_values[name])
@@ -649,20 +655,11 @@ def bind_stage(
             arguments.append(values[key])
         else:
             raise KeyError(
-                f"generated module {module_name!r} stage {stage!r} expects argument "
-                f"{name!r} ({kind}); the host binding provides {sorted(k for k, v in values.items() if v is not None)}"
+                f"generated program {program!r} ({role}) expects argument {name!r} ({kind}); the host binding "
+                f"provides {sorted(k for k, v in values.items() if v is not None)}"
             )
-    module = load_cake_dsa_indexer_module(module_name, stage)
-    prepare_entry = physical.get("tma_prepare_entry")
-    prepare = getattr(module, prepare_entry) if prepare_entry else None
-    return _Launch(
-        stage,
-        module_name,
-        getattr(module, physical["ffi_entry"]),
-        tuple(arguments),
-        grid,
-        prepare,
-    )
+    entry = getattr(load_program(program, arch), FFI_ENTRY)
+    return _Launch(role, program, entry, tuple(arguments), grid)
 
 
 _FFI_DEVICES: dict[int, Any] = {}
@@ -691,30 +688,29 @@ def _ffi_stream_context(index: int):
 class DSAIndexerRunner:
     """The prepared launches of one tensor binding.
 
-    ``__call__()`` runs the scan and the finalize stage on torch's current
-    stream and returns ``(indices, scores)``.  No launch allocates or
+    ``__call__()`` runs the dispatched scan program, the split merge when the
+    dispatch splits the key ranges, and the finalize program (the CUB block
+    radix sort, or the prefix-popcount rank scatter where the policy's
+    ``finalize_rank_for`` names a bitmap window; stage role ``finalize`` /
+    ``finalize_rank``) on torch's current stream and returns ``(indices,
+    scores)``.  No launch allocates or
     synchronizes; capture into a CUDA graph belongs to the caller.  Prepare a
     new runner when a shape, dtype, stride or tensor binding changes; values
     may change freely.
     """
 
-    module_name: str
+    arch: str
     abi: str
-    num_queries: int
-    num_keys: int
-    num_segments: int
-    top_k: int
-    softmax_scale: float
-    ratio: int
+    choice: ProgramChoice
+    programs: dict[str, str]  # launched role -> registered program name
     tensors: dict[str, torch.Tensor] = field(repr=False)
     scalars: dict[str, Any] = field(repr=False)
     launches: tuple[_Launch, ...] = field(repr=False)
-    stages: tuple[str, ...]
-    device_index: int
-    workspace: torch.Tensor = field(repr=False)
+    stages: tuple[str, ...]  # launched roles in order
+    device_index: int = 0
+    workspace: torch.Tensor = field(default=None, repr=False)
     workspace_bytes: int = 0
     grid: tuple[int, int, int] = (1, 1, 1)
-    _tma_prepared: bool = False
 
     @property
     def indices(self) -> torch.Tensor:
@@ -724,18 +720,19 @@ class DSAIndexerRunner:
     def scores(self) -> torch.Tensor:
         return self.tensors["Scores"]
 
-    def prepare_tma(self) -> None:
-        """Encode the descriptors of pointer-ABI stages once (idempotent; no-op for by-value tensor maps)."""
-        if self._tma_prepared:
-            return
-        with _ffi_stream_context(self.device_index):
-            for launch in self.launches:
-                if launch.prepare is not None:
-                    launch.prepare(*launch.arguments)
-        self._tma_prepared = True
+    @property
+    def num_queries(self) -> int:
+        return self.choice.num_queries
+
+    @property
+    def num_keys(self) -> int:
+        return self.choice.num_keys
+
+    @property
+    def top_k(self) -> int:
+        return self.choice.top_k
 
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
-        self.prepare_tma()
         with _ffi_stream_context(self.device_index):
             for launch in self.launches:
                 launch()
@@ -782,26 +779,28 @@ def prepare_dsa_indexer_topk(
     check_period: Optional[int] = None,
     sample_tiles_max: Optional[int] = None,
     sample_shift_permille: Optional[int] = None,
-    finalize_stage: Optional[str] = None,
+    finalize_threads: Optional[int] = None,
     backend: str = "cake",
 ) -> DSAIndexerRunner:
-    """Validate one binding and prepare its launches.
+    """Validate one binding, decide its programs and prepare its launches.
 
     Missing outputs and the workspace are allocated here (the only allocations
-    of the backend).  Pass ``workspace_buffer`` of
-    :func:`dsa_indexer_workspace_size` bytes (same ``grid_ctas`` /
-    ``candidate_multiplier``) to reuse storage across calls; ``indices`` /
-    ``scores`` may be caller-owned ``[T, top_k]`` int32 / float32 tensors.
+    of the backend).  Pass ``workspace_buffer`` of at least
+    :func:`dsa_indexer_workspace_size` bytes for the call's geometry (same
+    ``grid_ctas`` / ``candidate_multiplier``) to reuse storage across calls;
+    ``indices`` / ``scores`` may be caller-owned ``[T, top_k]`` int32 / float32
+    tensors.
 
     The keyword-only knobs ``grid_ctas`` (persistent CTA count; default: the SM
     count), ``candidate_multiplier`` (candidate buffer per query in multiples
     of ``top_k``), ``check_period`` (key tiles between selection-trigger
     checks), ``sample_tiles_max`` / ``sample_shift_permille`` (sampled first
-    threshold; ``0`` disables sampling) and ``finalize_stage`` change only the
-    internal partition and scheduling of the work: results are bitwise
-    identical for every admissible value.  ``T == 0`` returns a runner whose
-    launches are empty; a call without keys (``Tkv == 0``) fills the outputs
-    with padding instead of launching.
+    threshold; ``0`` disables sampling) and ``finalize_threads`` (an admissible
+    registered finalize program) change only the internal partition and
+    scheduling of the work: results are bitwise identical for every admissible
+    value.  ``T == 0`` returns a runner whose launches are empty; a call
+    without keys (``Tkv == 0``) fills the outputs with padding instead of
+    launching.
     """
     if backend != "cake":
         raise ValueError("DSA indexer top-k supports backend='cake'")
@@ -830,43 +829,44 @@ def prepare_dsa_indexer_topk(
             raise ValueError(f"{name} must be on {device}")
     _check_output(indices, "indices", (num_queries, int(top_k)), torch.int32, device)
     _check_output(scores, "scores", (num_queries, int(top_k)), torch.float32, device)
-    module_name, record = record_for(device)
-    abi = record_abi(record)
-    stages = registered_stages(module_name)
-    if "scan" not in stages:
-        raise NotImplementedError(
-            f"the registered DSA indexer program {module_name!r} has no scan stage (registered: {stages})"
+    arch = arch_for(device)
+    if arch is None:
+        raise ValueError(
+            "DSA indexer top-k requires compute capability 10.0, 10.3 or 10.7"
         )
-    policy = record_gate_policy(record)
-    fin_stage = finalize_stage_for(stages, policy, top_k, finalize_stage)
-    device_index = int(
-        device.index if device.index is not None else torch.cuda.current_device()
+    abi = registry_abi()
+    device_index = _device_index(device)
+    # lever FRB: the staged rank finalize's bulk row I/O needs output addresses on the policy's 16-B granule; caller-owned
+    # outputs may be arbitrary views (the plain twin program is registered alongside), the backend's own allocations are aligned
+    outputs_aligned = _outputs_aligned(
+        (indices, scores), policy_for(arch).rank_bulk_align_bytes
     )
-    num_sms = _num_sms(device)
-
-    scan_physical = record["scan"]
-    if grid_ctas is None:
-        grid = grid_dims(scan_physical.get("grid", ["sms", 1, 1]), {}, num_sms)
-    else:
-        grid = (_check_int("grid_ctas", grid_ctas, 1), 1, 1)
-    cand_cap = policy.candidate_capacity(top_k, candidate_multiplier)
-    period = (
-        policy.check_period(top_k, cand_cap)
-        if check_period is None
-        else int(check_period)
+    choice = plan_dsa_indexer_topk(
+        num_queries,
+        num_keys,
+        num_segments,
+        top_k=top_k,
+        ratio=ratio,
+        device=device,
+        arch=arch,
+        grid_ctas=grid_ctas,
+        candidate_multiplier=candidate_multiplier,
+        check_period=check_period,
+        sample_tiles_max=sample_tiles_max,
+        sample_shift_permille=sample_shift_permille,
+        finalize_threads=finalize_threads,
+        max_seqlen_k=max_seqlen_k,
+        outputs_aligned=outputs_aligned,
     )
-    _check_int("check_period", period, 1, policy.check_period_limit(top_k, cand_cap))
-    tiles_max = (
-        policy.sample_tiles_max
-        if sample_tiles_max is None
-        else _check_int("sample_tiles_max", sample_tiles_max, 0, 256)
-    )
-    shift = (
-        policy.sample_shift_permille
-        if sample_shift_permille is None
-        else _check_int("sample_shift_permille", sample_shift_permille, -1000, 10000)
-    )
-    workspace_bytes = policy.workspace_bytes(top_k, grid[0], candidate_multiplier)
+    # every program of the call must be registered before anything is allocated (fail closed by name)
+    fin_role = choice.finalize_role
+    programs = {
+        "scan": program_for(arch, choice.scan_key),
+        fin_role: program_for(arch, choice.finalize_key),
+    }
+    if choice.merge_key is not None:
+        programs["merge"] = program_for(arch, choice.merge_key)
+    workspace_bytes = int(choice.workspace_bytes)
     if workspace_buffer is None:
         workspace_buffer = torch.empty(
             workspace_bytes, dtype=torch.uint8, device=device
@@ -878,6 +878,7 @@ def prepare_dsa_indexer_topk(
         )
     if flat.data_ptr() % 8:
         raise ValueError("workspace_buffer must be 8-byte aligned")
+    cand = flat[:workspace_bytes].view(torch.int64)
 
     t: dict[str, torch.Tensor] = {
         "Q": q.view(num_queries * NUM_HEADS, HEAD_DIM),
@@ -895,53 +896,63 @@ def prepare_dsa_indexer_topk(
         "Scores": scores
         if scores is not None
         else torch.empty((num_queries, int(top_k)), dtype=torch.float32, device=device),
-        "Cand": flat[:workspace_bytes].view(torch.int64),
+        "Cand": cand,
+        # the split staging [T, n_split, top_k] lives behind the persistent candidate buffers (merge stage only)
+        "Staging": cand[choice.scan_entries :] if choice.split else None,
     }
     scalars: dict[str, Any] = dict(
         num_segments=num_segments,
         top_k=int(top_k),
         ratio=int(ratio),
         has_offsets=int(q_causal_offsets is not None),
-        cand_cap=int(cand_cap),
+        cand_cap=int(choice.cand_cap),
         first_cap=int(
-            cand_cap
+            choice.first_cap
         ),  # regular trigger only: the first selection fires at the capacity rule
-        sample_tiles_max=int(tiles_max),
-        sample_shift_permille=int(shift),
-        check_period=int(period),
-        grid_ctas=int(grid[0]),
+        sample_tiles_max=int(choice.sample_tiles_max),
+        sample_shift_permille=int(choice.sample_shift_permille),
+        check_period=int(choice.check_period),
+        grid_ctas=int(choice.grid_ctas),
         softmax_scale=float(softmax_scale),
+        n_split=int(choice.n_split),
+        key_bits=int(choice.key_bits),
         num_queries=num_queries,
         num_keys=num_keys,
     )
+    grid = (int(choice.grid_ctas), 1, 1)
+    row_grid = (max(1, num_queries), 1, 1)
     launches: list[_Launch] = []
+    stages: list[str] = []
     if num_queries > 0 and num_keys > 0:
         values: dict[str, Any] = dict(t)
         values.update(scalars)
-        launches.append(bind_stage(module_name, "scan", values, grid))
-        fin_physical = record[fin_stage]
-        fin_grid = grid_dims(
-            fin_physical.get("grid", ["num_queries", 1, 1]), scalars, num_sms
+        launches.append(bind_program(programs["scan"], arch, "scan", values, grid))
+        stages.append("scan")
+        if "merge" in programs:
+            launches.append(
+                bind_program(programs["merge"], arch, "merge", values, row_grid)
+            )
+            stages.append("merge")
+        # lever FRP-K: the persistent rank finalize launches min(rows, CTAs per SM x SMs) CTAs, each walking rows bid, bid + grid, ...
+        fin_grid = (finalize_grid(choice, _num_sms(device)), 1, 1)
+        launches.append(
+            bind_program(programs[fin_role], arch, fin_role, values, fin_grid)
         )
-        launches.append(bind_stage(module_name, fin_stage, values, fin_grid))
+        stages.append(fin_role)
     elif num_queries > 0:
         _padded_outputs(num_queries, int(top_k), device, t["Indices"], t["Scores"])
     return DSAIndexerRunner(
-        module_name=module_name,
+        arch=arch,
         abi=abi,
-        num_queries=num_queries,
-        num_keys=num_keys,
-        num_segments=num_segments,
-        top_k=int(top_k),
-        softmax_scale=float(softmax_scale),
-        ratio=int(ratio),
+        choice=choice,
+        programs=programs,
         tensors=t,
         scalars=scalars,
         launches=tuple(launches),
-        stages=("scan", fin_stage),
+        stages=tuple(stages),
         device_index=device_index,
         workspace=flat,
-        workspace_bytes=int(workspace_bytes),
+        workspace_bytes=workspace_bytes,
         grid=grid,
     )
 
@@ -967,7 +978,7 @@ def dsa_indexer_topk(
     check_period: Optional[int] = None,
     sample_tiles_max: Optional[int] = None,
     sample_shift_permille: Optional[int] = None,
-    finalize_stage: Optional[str] = None,
+    finalize_threads: Optional[int] = None,
     backend: str = "cake",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Eager entry point: prepare a binding and run it once; returns ``(indices, scores)``.
@@ -997,7 +1008,7 @@ def dsa_indexer_topk(
         check_period=check_period,
         sample_tiles_max=sample_tiles_max,
         sample_shift_permille=sample_shift_permille,
-        finalize_stage=finalize_stage,
+        finalize_threads=finalize_threads,
         backend=backend,
     )
     return runner.run()
@@ -1009,31 +1020,34 @@ __all__ = [
     "CONTRACT_SCALARS",
     "CONTRACT_TENSORS",
     "DEFAULT_TOP_K",
-    "GATE_POLICY_FIELDS",
+    "FINALIZE_RANK_SCALARS",
+    "FINALIZE_SCALARS",
     "HEAD_DIM",
     "MAX_TOP_K",
+    "MERGE_SCALARS",
     "NUM_HEADS",
     "PAD_ID",
     "PAD_SCORE",
+    "SCAN_SCALARS",
     "SUPPORTED_ABIS",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "ZERO_SIGN_POLICIES",
     "DSAIndexerRunner",
-    "GatePolicy",
+    "DispatchPolicy",
+    "ProgramChoice",
     "arch_for",
-    "bind_stage",
+    "bind_program",
     "default_softmax_scale",
     "dsa_indexer_topk",
     "dsa_indexer_workspace_size",
     "effective_offsets",
-    "finalize_stage_for",
     "generated_program_available",
-    "grid_dims",
+    "plan_dsa_indexer_topk",
+    "policy_for",
     "prepare_dsa_indexer_topk",
-    "record_abi",
-    "record_for",
-    "record_gate_policy",
+    "program_for",
     "record_zero_sign_policy",
+    "registry_abi",
     "validate_dsa_indexer_inputs",
     "visible_key_count",
     "visible_key_counts",

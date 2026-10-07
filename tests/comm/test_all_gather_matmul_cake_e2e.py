@@ -15,11 +15,13 @@ limitations under the License.
 
 Multi-GPU numerical test of the Cake all-gather matmul backend on an NCCL
 subgroup of two, four or eight SM100 / SM103 devices: both weight layouts,
-tail row counts, scratch growth and the capacity-bound prepared launcher.
+tail row counts, scratch growth (including the stale rendezvous-handle guard)
+and the capacity-bound prepared launcher.
 """
 
 import gc
 import random
+import warnings
 import weakref
 
 import pytest
@@ -103,6 +105,22 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
             backend="cake",
         )
 
+    # A foreign symmetric buffer freed right before a growth: torch's
+    # NVSHMEM allocator before pytorch#192579 hands the next allocation at that
+    # address the freed buffer's cached rendezvous handle, and the backend
+    # re-allocates past the undersized handle. The buffer is sized between the
+    # current scratch (512 rows per peer) and the next one (1152 rows), the
+    # issue's pattern; whether the heap reuses the address depends on its
+    # state, so the detections are reported, not asserted.
+    from flashinfer.comm.all_gather_matmul import cake_all_gather_matmul as backend
+
+    foreign = symm_mem.empty(world_size, 640, K, dtype=dtype, device=device)
+    symm_mem.rendezvous(foreign, group=group.group_name)
+    del foreign
+    torch.cuda.synchronize(device)
+    dist.barrier(group=group)
+    retries_before_tail = backend._RENDEZVOUS_STATS["stale_retries"]
+
     # Tail row counts: the output has exactly world_size * M rows and the
     # scratch grows once when a larger M arrives.
     for tail_rows in (125, 1025):
@@ -111,6 +129,60 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
         assert tail_out.shape == (world_size * tail_rows, 2048)
         _check(tail_out, _expected(tail_inp, param.t(), group, world_size))
         del tail_inp, tail_out
+    if rank == 0:
+        print(
+            "[cake all-gather matmul e2e] stale rendezvous handles re-allocated after "
+            f"the foreign free: {backend._RENDEZVOUS_STATS['stale_retries'] - retries_before_tail}",
+            flush=True,
+        )
+
+    # Deterministic stale-handle injection on a real growth (1152 -> 2048 rows
+    # per peer through the prepared path): the first rendezvous of the new
+    # scratch is reported with half its buffer size, the backend parks that
+    # allocation and re-allocates, the parked allocation is released and the
+    # process-wide warning fires on the first detection only.
+    real_rendezvous = symm_mem.rendezvous
+    injected = {}
+
+    class _Undersized:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        @property
+        def buffer_size(self):
+            return int(self._handle.buffer_size) // 2
+
+    def undersized_rendezvous(tensor, group=None):
+        handle = real_rendezvous(tensor, group=group)
+        if "parked" not in injected and tensor.numel() == world_size * 2048 * K:
+            injected["parked"] = weakref.ref(tensor)
+            return _Undersized(handle)
+        return handle
+
+    retries_before = backend._RENDEZVOUS_STATS["stale_retries"]
+    grown_inp = torch.randn(2048, K, dtype=dtype, device=device)
+    symm_mem.rendezvous = undersized_rendezvous
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            grown = prepare_all_gather_matmul(
+                grown_inp, param.t(), group, backend="cake", max_rows=2048
+            )
+    finally:
+        symm_mem.rendezvous = real_rendezvous
+    assert "parked" in injected
+    assert backend._RENDEZVOUS_STATS["stale_retries"] == retries_before + 1
+    warned = any("pytorch#192579" in str(w.message) for w in caught)
+    assert warned == (retries_before == 0)
+    grown_out = grown(grown_inp)
+    _check(grown_out, _expected(grown_inp, param.t(), group, world_size))
+    torch.cuda.synchronize(device)
+    gc.collect()
+    assert injected["parked"]() is None
+    del grown, grown_inp, grown_out
 
     # The backend keeps no reference to the caller's tensors.
     inp_ref = weakref.ref(inp)
