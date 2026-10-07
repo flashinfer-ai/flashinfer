@@ -128,6 +128,9 @@ def _make_inputs(
     }
 
 
+GDP_BACKENDS = ["cudnn", "flashinfer"]
+
+
 def _run(inputs, **kwargs):
     return chunk_gated_delta_product(
         inputs["q"],
@@ -164,12 +167,14 @@ def _serial(inputs, *, scale=None, l2norm=False, initial_state=...):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
 @pytest.mark.parametrize("seq_lens", [[96, 64], [512], [64, 1, 1024]])
 @pytest.mark.parametrize("num_q_heads,num_k_heads,num_v_heads", HEAD_CONFIGS)
 @pytest.mark.parametrize("num_householder", [2, 3])
 @pytest.mark.parametrize("use_initial_state", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gdp_matches_serial_reference(
+    backend,
     seq_lens,
     num_q_heads,
     num_k_heads,
@@ -195,6 +200,7 @@ def test_gdp_matches_serial_reference(
         inputs,
         initial_state=None if state is None else state.clone(),
         output_final_state=True,
+        backend=backend,
     )
     assert out.shape == (sum(seq_lens), max(num_q_heads, num_v_heads), HEAD_DIM)
     assert out.dtype == dtype
