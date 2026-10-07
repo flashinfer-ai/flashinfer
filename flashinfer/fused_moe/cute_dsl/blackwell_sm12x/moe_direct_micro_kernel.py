@@ -319,8 +319,9 @@ class MoEDirectMicroKernel:
     """Decode-focused direct-routed MoE kernel for SM12x.
 
     Scale contract: w1_alphas/input_gs/down_input_scale are per-expert
-    [weight_E] f32 tensors, with input_gs and down_input_scale in multiplier
-    form; reciprocal-form scales must be inverted host-side before launch.
+    [weight_E] f32 tensors, with input_gs and down_input_scale in the same form
+    as for the MMA kernels (input_scales_are_reciprocal); the kernel converts
+    them on load to the multiplier form it uses.
     """
 
     def __init__(
@@ -344,6 +345,7 @@ class MoEDirectMicroKernel:
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
         w13_layout: str = "w13",
+        input_scales_are_reciprocal: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         if int(compile_time_phase) not in {0, 1, 2}:
@@ -368,6 +370,7 @@ class MoEDirectMicroKernel:
         self.e8m0_scale_layout = e8m0_scale_layout
         self.e8m0_scale_layout_logical = e8m0_scale_layout == "logical"
         self.w13_layout = w13_layout
+        self.input_scales_are_reciprocal = bool(input_scales_are_reciprocal)
         # "w31" (gate_up) keeps the gate half first; "w13" (up_gate) keeps up first.
         self.w13_gate_first = w13_layout == "w31"
         self.has_swiglu_limit = swiglu_limit is not None
@@ -415,6 +418,7 @@ class MoEDirectMicroKernel:
             self.scale_format,
             self.e8m0_scale_layout,
             self.w13_layout,
+            self.input_scales_are_reciprocal,
             self.has_swiglu_limit,
             self.swiglu_limit,
             self.swiglu_alpha,
@@ -705,6 +709,15 @@ class MoEDirectMicroKernel:
         self.m1_fc2_rows_per_cta = m1_fc2_rows
         self.launch_block_dim = _K_PER_CTA * 16 if m1_half_cta_fc2 else _BLOCK_DIM
         self.grid_x = grid_x
+
+    @cute.jit
+    def _multiplier_scale(self, value: Float32) -> Float32:
+        """Activation global scale in the multiplier form this kernel uses."""
+        result = Float32(value)
+        if cutlass.const_expr(not self.input_scales_are_reciprocal):
+            if result != Float32(0.0):
+                result = Float32(1.0) / result
+        return result
 
     @cute.jit
     def _resident_grid_barrier(
@@ -2151,7 +2164,7 @@ class MoEDirectMicroKernel:
                 eid_0 = Int32(topk_ids[eid_addr_0])
                 if eid_0 < Int32(0):
                     eid_0 = Int32(0)
-                gs_fc1_0 = input_gs[eid_0]
+                gs_fc1_0 = self._multiplier_scale(input_gs[eid_0])
                 in_blk = tidx
                 while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
                     x_base = t0 * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
@@ -2242,8 +2255,8 @@ class MoEDirectMicroKernel:
                 gs_fc2 = Float32(1.0)
             else:
                 alpha_fc1 = w1_alphas[eid]
-                gs_fc1 = input_gs[eid]
-                gs_fc2 = down_input_scale[eid]
+                gs_fc1 = self._multiplier_scale(input_gs[eid])
+                gs_fc2 = self._multiplier_scale(down_input_scale[eid])
                 if cutlass.const_expr(self.a8_mx_mode):
                     # a8_mx activations are self-ranging: fold the calibrated
                     # input global scale out of the combined nvfp4 alpha.
@@ -4475,7 +4488,7 @@ class MoEDirectMicroKernel:
                     next_eid = Int32(topk_ids[next_eid_addr])
                     if next_eid < Int32(0):
                         next_eid = Int32(0)
-                    gs_fc1_next = input_gs[next_eid]
+                    gs_fc1_next = self._multiplier_scale(input_gs[next_eid])
                     next_buf_base = (Int32(1) - buf_idx) * Int32(cfg.smem_xh_size)
                     in_blk = tidx
                     while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
@@ -5030,6 +5043,7 @@ def build_direct_micro_kernel(
     swiglu_beta: float | None = None,
     max_active_ctas: int | None = None,
     device: torch.device | None = None,
+    input_scales_are_reciprocal: bool = False,
 ) -> MoEDirectMicroKernel:
     """Construct and configure a direct micro kernel for one problem shape.
 
@@ -5056,6 +5070,7 @@ def build_direct_micro_kernel(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
     )
     kernel.configure(
         m, k, n, num_topk, weight_E, max_active_ctas=max_active_ctas, device=device

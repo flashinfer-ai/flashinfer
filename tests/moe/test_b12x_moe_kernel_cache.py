@@ -63,7 +63,6 @@ STATIC_BASELINE = {
     "quant_mode": "nvfp4",
     "state_E": 32,
     "weight_E": 32,
-    "m": 64,
     "k": 2048,
     "n": 1024,
     "num_topk": 4,
@@ -83,7 +82,6 @@ STATIC_PERTURBED = {
     "quant_mode": "mxfp4",
     "state_E": 16,
     "weight_E": 16,
-    "m": 128,
     "k": 4096,
     "n": 2048,
     "num_topk": 2,
@@ -103,13 +101,16 @@ MICRO_BASELINE = {
     k: v for k, v in STATIC_BASELINE.items() if k != "activation_precision"
 }
 MICRO_BASELINE.update(
-    share_input_across_experts=False, share_expert_scales=False, single_token=False
+    m=64,
+    share_input_across_experts=False,
+    share_expert_scales=False,
+    single_token=False,
 )
 MICRO_PERTURBED = {
     k: v for k, v in STATIC_PERTURBED.items() if k != "activation_precision"
 }
 MICRO_PERTURBED.update(
-    share_input_across_experts=True, share_expert_scales=True, single_token=True
+    m=128, share_input_across_experts=True, share_expert_scales=True, single_token=True
 )
 
 DYNAMIC_BASELINE = {
@@ -175,8 +176,9 @@ ADOPTERS = [
 
 # Getter parameters absent from a key function because that kernel genuinely
 # does not specialize on them: the dynamic kernel takes its runtime-shaped
-# operands as pointers, so one artifact serves every m / max_rows.
-KEY_OMISSIONS = {"dynamic": {"m", "max_rows"}}
+# operands as pointers, so one artifact serves every m / max_rows; the static
+# kernel's token dimension is symbolic, so one artifact serves every m.
+KEY_OMISSIONS = {"dynamic": {"m", "max_rows"}, "static": {"m"}}
 
 
 @pytest.mark.parametrize("label,getter,key_fn", [(a[0], a[1], a[2]) for a in ADOPTERS])

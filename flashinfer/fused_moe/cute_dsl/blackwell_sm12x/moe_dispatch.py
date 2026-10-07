@@ -405,8 +405,6 @@ class Sm120StaticMoEWorkspace:
     dm_barrier_count: torch.Tensor | None = None
     dm_barrier_epoch: torch.Tensor | None = None
     dm_intermediate: torch.Tensor | None = None
-    dm_input_gs: torch.Tensor | None = None
-    dm_down_input_scale: torch.Tensor | None = None
 
 
 def _direct_micro_candidate(k: int, n: int, num_topk: int, weight_E: int) -> bool:
@@ -532,12 +530,6 @@ def allocate_sm120_static_workspace(
         )
         workspace.dm_intermediate = torch.empty(
             dm_inter, dtype=torch.float32, device=device
-        )
-        workspace.dm_input_gs = torch.empty(
-            weight_E, dtype=torch.float32, device=device
-        )
-        workspace.dm_down_input_scale = torch.empty(
-            weight_E, dtype=torch.float32, device=device
         )
     return workspace
 
@@ -745,7 +737,6 @@ def _static_kernel_cache_key(
     quant_mode: str,
     state_E: int,
     weight_E: int,
-    m: int,
     k: int,
     n: int,
     num_topk: int,
@@ -771,7 +762,6 @@ def _static_kernel_cache_key(
         quant_mode,
         state_E,
         weight_E,
-        m,
         k,
         n,
         num_topk,
@@ -932,7 +922,6 @@ def _get_static_kernel(
         quant_mode=quant_mode,
         state_E=state_E,
         weight_E=weight_E,
-        m=m,
         k=k,
         n=n,
         num_topk=num_topk,
@@ -976,9 +965,11 @@ def _get_static_kernel(
     cols_pad_k = _align_up(k // sf_vec_size, 4)
 
     # Build fake tensors for compilation
+    sym_tokens = cute.sym_int()
+    sym_pairs = cute.sym_int()
     a_input_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype,
-        (m, k),
+        (sym_tokens, k),
         stride_order=(1, 0),
         assumed_align=16,
     )
@@ -988,12 +979,12 @@ def _get_static_kernel(
     topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
     topk_ids_fake = cute.runtime.make_fake_compact_tensor(
         topk_ids_cutlass_dtype,
-        (m * num_topk,),
+        (sym_pairs,),
         assumed_align=topk_ids_align,
     )
     topk_weights_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (m * num_topk,),
+        (sym_pairs,),
         assumed_align=4,
     )
     packed_a_fake = cute.runtime.make_fake_compact_tensor(
@@ -1084,7 +1075,7 @@ def _get_static_kernel(
     )
     scatter_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype,
-        (m, k),
+        (sym_tokens, k),
         stride_order=(1, 0),
         assumed_align=16,
     )
@@ -1108,7 +1099,7 @@ def _get_static_kernel(
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     compiled = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
-        _disk_kernel_name(f"static_m{m}_k{k}_n{n}_t{num_topk}_r{max_rows}", cache_key),
+        _disk_kernel_name(f"static_k{k}_n{n}_t{num_topk}_r{max_rows}", cache_key),
         lambda: cute.compile(
             kernel,
             a_input_fake,
@@ -1424,6 +1415,7 @@ def _get_direct_micro_kernel(
     swiglu_beta: float = 1.0,
     swiglu_limit: float | None = None,
     device: torch.device | None = None,
+    input_scales_are_reciprocal: bool = False,
 ):
     """Compile (or retrieve cached) the SM120 direct micro MoE kernel.
 
@@ -1451,6 +1443,7 @@ def _get_direct_micro_kernel(
         swiglu_beta,
         swiglu_limit,
         str(_canonical_cuda_device(device)) if device is not None else None,
+        input_scales_are_reciprocal,
     )
     cached = _DIRECT_MICRO_LAUNCH_CACHE.get(launch_key)
     if cached is not None:
@@ -1470,6 +1463,7 @@ def _get_direct_micro_kernel(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         device=device,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
     )
     compile_key = ("direct_micro", kernel.__cache_key__, topk_ids_dtype)
     entry = _DIRECT_MICRO_KERNEL_CACHE.get(compile_key)
@@ -1619,37 +1613,21 @@ def launch_sm120_static_moe(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             device=a.device,
+            input_scales_are_reciprocal=input_scales_are_reciprocal,
         )
         if not block_ok:
             if _FORCED_BACKEND == "direct_micro":
                 raise RuntimeError("compiled direct micro MoE kernel cannot launch")
             use_direct_micro = False
     if use_direct_micro:
-        # The kernel takes multiplier-form scales only; invert reciprocal
-        # inputs into the persistent workspace planes (zeros stay zero,
-        # matching the MMA kernels).
-        if input_scales_are_reciprocal:
-            workspace.dm_input_gs.copy_(
-                torch.where(input_gs != 0, 1.0 / input_gs, input_gs)
-            )
-            workspace.dm_down_input_scale.copy_(
-                torch.where(
-                    down_input_scale != 0, 1.0 / down_input_scale, down_input_scale
-                )
-            )
-            launch_gs = workspace.dm_input_gs
-            launch_down = workspace.dm_down_input_scale
-        else:
-            launch_gs = input_gs
-            launch_down = down_input_scale
         MoEDirectMicroKernel.launch(
             compiled,
             x=a,
             w1_fp4=weights.w1_storage,
             w1_blockscale=weights.w1_scale_storage,
             w1_alphas=weights.w1_alpha,
-            a1_gscale=launch_gs,
-            a2_gscale=launch_down,
+            a1_gscale=input_gs,
+            a2_gscale=down_input_scale,
             inter_fp32=workspace.dm_intermediate,
             w2_fp4=weights.w2_storage,
             w2_blockscale=weights.w2_scale_storage,
@@ -3344,8 +3322,6 @@ def _validate_static_workspace_for_launch(
                 "dm_barrier_count": ((dm_slots,), torch.int32),
                 "dm_barrier_epoch": ((dm_slots,), torch.int32),
                 "dm_intermediate": ((dm_intermediate,), torch.float32),
-                "dm_input_gs": ((weight_E,), torch.float32),
-                "dm_down_input_scale": ((weight_E,), torch.float32),
             }
         )
     for name, (shape, dtype) in tensors.items():
