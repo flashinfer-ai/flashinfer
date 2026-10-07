@@ -33,6 +33,7 @@ output_column_dict = {
         "timing_metric",
         "row_activity_mode",
         "calls_per_sample",
+        "use_fp16_qk_reduction",
     ],
     "dsv4_sparse_mla": [
         "swa_topk",
