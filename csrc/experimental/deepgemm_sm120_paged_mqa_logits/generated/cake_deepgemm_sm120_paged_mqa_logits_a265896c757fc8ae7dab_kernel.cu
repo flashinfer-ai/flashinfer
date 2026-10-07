@@ -17,145 +17,38 @@
 // Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek.
 // DeepGEMM portions are licensed under MIT; see DEEPGEMM_NOTICE.txt in this directory.
 
-typedef signed char int8_t;
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int int32_t;
-typedef short int int16_t;
-struct __align__(64) CakeTensorMap64 {
-  uint64_t opaque[16];
-};
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) {
-  uint64_t opaque[16];
-} CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-  int result;
-  asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;" : "=r"(result) : "r"(x));
-  return result;
-}
+// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
+#include "cake_deepgemm_sm120_paged_mqa_logits_device_common.cuh"
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_Q_PIPE_STAGES 2
 #define NUM_KV_PIPE_STAGES 3
 #define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 8192
-#define SMEM_SMEM_Q_STRIDE 8192
-#define SMEM_SMEM_W_OFF 17408
-#define SMEM_SMEM_W_STAGE_BYTES 256
+#define SMEM_SMEM_Q_STAGE_BYTES 4096
+#define SMEM_SMEM_Q_STRIDE 4096
+#define SMEM_SMEM_W_OFF 9216
+#define SMEM_SMEM_W_STAGE_BYTES 128
 #define SMEM_SMEM_W_STRIDE 1024
-#define SMEM_SMEM_KV_G0_OFF 19456
+#define SMEM_SMEM_KV_G0_OFF 11264
 #define SMEM_SMEM_KV_G0_STAGE_BYTES 8192
 #define SMEM_SMEM_KV_G0_STRIDE 8192
-#define SMEM_SMEM_KV_G1_OFF 44032
+#define SMEM_SMEM_KV_G1_OFF 35840
 #define SMEM_SMEM_KV_G1_STAGE_BYTES 8192
 #define SMEM_SMEM_KV_G1_STRIDE 8192
-#define SMEM_SMEM_SC_G0_OFF 68608
+#define SMEM_SMEM_SC_G0_OFF 60416
 #define SMEM_SMEM_SC_G0_STAGE_BYTES 256
 #define SMEM_SMEM_SC_G0_STRIDE 1024
-#define SMEM_SMEM_SC_G1_OFF 71680
+#define SMEM_SMEM_SC_G1_OFF 63488
 #define SMEM_SMEM_SC_G1_STAGE_BYTES 256
 #define SMEM_SMEM_SC_G1_STRIDE 1024
-#define SMEM_TOTAL 74752
+#define SMEM_TOTAL 66560
 #define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
-
-#include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-  uint32_t pred = 0;
-  asm volatile(
-      "{\n\t"
-      ".reg .pred %%px;\n\t"
-      "elect.sync _|%%px, %1;\n\t"
-      "@%%px mov.s32 %0, 1;\n\t"
-      "}\n"
-      : "+r"(pred)
-      : "r"(0xFFFFFFFF));
-  return pred;
-}
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_addr), "r"(count) : "memory");
-}
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "LAB_WAIT:\n\t"
-      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-      " P1, [%0], %1;\n\t"
-      "@P1 bra.uni DONE;\n\t"
-      "bra.uni LAB_WAIT;\n\t"
-      "DONE:\n\t"
-      "}\n" ::"r"(mbar_addr),
-      "r"(phase)
-      : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::"r"(mbar_addr) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-  asm volatile(
-      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(mbar_addr),
-      "r"(bytes)
-      : "memory");
-}
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-  float c;
-  asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-  return c;
-}
-
-__device__ __forceinline__ void tma_3d_gmem2smem(int dst, const void* tmap_ptr, int x, int y, int z,
-                                                 int mbar_addr) {
-  asm volatile(
-      "cp.async.bulk.tensor.3d.shared::cta.global"
-      ".mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3, %4}], [%5];" ::"r"(dst),
-      "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr)
-      : "memory");
-}
-
-__device__ __forceinline__ void tma_2d_gmem2smem(int dst, const void* tmap_ptr, int x, int y,
-                                                 int mbar_addr) {
-  asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cta.global"
-      ".mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3}], [%4];" ::"r"(dst),
-      "l"(tmap_ptr), "r"(x), "r"(y), "r"(mbar_addr)
-      : "memory");
-}
 
 extern "C" {
 
 __global__
-__launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_mqa_logits_c10a60efca60894691b0(
+__launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_mqa_logits_a265896c757fc8ae7dab(
     const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV,
     const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights,
     float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table,
@@ -182,18 +75,18 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
   const int cta_rank = 0;
 
   // Kernel setup ops
-  uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-  const int smem_q_addr = smem + 1024;
-  float* smem_w = reinterpret_cast<float*>(smem_raw + 17408);
-  const int smem_w_addr = smem + 17408;
-  uint8_t* smem_kv_g0 = reinterpret_cast<uint8_t*>(smem_raw + 19456);
-  const int smem_kv_g0_addr = smem + 19456;
-  uint8_t* smem_kv_g1 = reinterpret_cast<uint8_t*>(smem_raw + 44032);
-  const int smem_kv_g1_addr = smem + 44032;
-  float* smem_sc_g0 = reinterpret_cast<float*>(smem_raw + 68608);
-  const int smem_sc_g0_addr = smem + 68608;
-  float* smem_sc_g1 = reinterpret_cast<float*>(smem_raw + 71680);
-  const int smem_sc_g1_addr = smem + 71680;
+  uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_Q_OFF);
+  const int smem_q_addr = smem + SMEM_SMEM_Q_OFF;
+  float* smem_w = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_W_OFF);
+  const int smem_w_addr = smem + SMEM_SMEM_W_OFF;
+  uint8_t* smem_kv_g0 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_KV_G0_OFF);
+  const int smem_kv_g0_addr = smem + SMEM_SMEM_KV_G0_OFF;
+  uint8_t* smem_kv_g1 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_KV_G1_OFF);
+  const int smem_kv_g1_addr = smem + SMEM_SMEM_KV_G1_OFF;
+  float* smem_sc_g0 = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_SC_G0_OFF);
+  const int smem_sc_g0_addr = smem + SMEM_SMEM_SC_G0_OFF;
+  float* smem_sc_g1 = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_SC_G1_OFF);
+  const int smem_sc_g1_addr = smem + SMEM_SMEM_SC_G1_OFF;
 
   // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 16 barriers)
   // Mbarriers at smem_raw[0..128)
@@ -273,7 +166,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
         int lo = ((q_atom == start_q) ? start_kv : 0);
         int hi = ((q_atom == end_q) ? end_kv : num_kv);
         mbarrier_wait(q_full_addr + (q_stage_m) * 8, q_phase_m);
-        int n_tok = 1;
+        int n_tok_m = 1;
 #pragma unroll 1
         for (int kv_idx = lo; kv_idx < hi; kv_idx += 2) {
           mbarrier_wait(kv_full_g0_addr + (kv_stage_m) * 8, kv_phase_m);
@@ -284,7 +177,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
           float partial0 = 0.0f;
           float partial1 = 0.0f;
 #pragma unroll
-          for (int nt = 0; nt < 8; nt++) {
+          for (int nt = 0; nt < 4; nt++) {
             int b_row = nt * 8 + b_row_lane;
             acc[0] = 0.0f;
             acc[1] = 0.0f;
@@ -299,7 +192,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
                          : "r"(a_addr)
                          : "memory");
             int b_cb = b_col;
-            unsigned int b_addr = smem_q_addr + q_stage_m * 8192 + (unsigned int)(b_row * 128) +
+            unsigned int b_addr = smem_q_addr + q_stage_m * 4096 + (unsigned int)(b_row * 128) +
                                   (unsigned int)(b_cb ^ (b_row & 7) << 4);
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
                          : "=r"(b_frag[0]), "=r"(b_frag[1])
@@ -320,7 +213,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
                          : "r"(a_addr_1)
                          : "memory");
             int b_cb_2 = b_col + 32;
-            unsigned int b_addr_3 = smem_q_addr + q_stage_m * 8192 + (unsigned int)(b_row * 128) +
+            unsigned int b_addr_3 = smem_q_addr + q_stage_m * 4096 + (unsigned int)(b_row * 128) +
                                     (unsigned int)(b_cb_2 ^ (b_row & 7) << 4);
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
                          : "=r"(b_frag[0]), "=r"(b_frag[1])
@@ -341,7 +234,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
                          : "r"(a_addr_5)
                          : "memory");
             int b_cb_6 = b_col + 64;
-            unsigned int b_addr_7 = smem_q_addr + q_stage_m * 8192 + (unsigned int)(b_row * 128) +
+            unsigned int b_addr_7 = smem_q_addr + q_stage_m * 4096 + (unsigned int)(b_row * 128) +
                                     (unsigned int)(b_cb_6 ^ (b_row & 7) << 4);
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
                          : "=r"(b_frag[0]), "=r"(b_frag[1])
@@ -362,7 +255,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
                          : "r"(a_addr_9)
                          : "memory");
             int b_cb_10 = b_col + 96;
-            unsigned int b_addr_11 = smem_q_addr + q_stage_m * 8192 + (unsigned int)(b_row * 128) +
+            unsigned int b_addr_11 = smem_q_addr + q_stage_m * 4096 + (unsigned int)(b_row * 128) +
                                      (unsigned int)(b_cb_10 ^ (b_row & 7) << 4);
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
                          : "=r"(b_frag[0]), "=r"(b_frag[1])
@@ -454,7 +347,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
         int lo_1 = ((q_atom_1 == start_q_1) ? start_kv_1 : 0);
         int hi_1 = ((q_atom_1 == end_q_1) ? end_kv_1 : num_kv_1);
         mbarrier_wait(q_full_addr + (q_stage_m_1) * 8, q_phase_m_1);
-        int n_tok_1 = 1;
+        int n_tok_m_1 = 1;
 #pragma unroll 1
         for (int kv_idx_1 = lo_1; kv_idx_1 < hi_1; kv_idx_1 += 2) {
           mbarrier_wait(kv_full_g1_addr + (kv_stage_m_1) * 8, kv_phase_m_1);
@@ -465,7 +358,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
           float partial0_1 = 0.0f;
           float partial1_1 = 0.0f;
 #pragma unroll
-          for (int nt_1 = 0; nt_1 < 8; nt_1++) {
+          for (int nt_1 = 0; nt_1 < 4; nt_1++) {
             int b_row_1 = nt_1 * 8 + b_row_lane_1;
             acc_1[0] = 0.0f;
             acc_1[1] = 0.0f;
@@ -481,7 +374,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
                          : "r"(a_addr_2)
                          : "memory");
             int b_cb_1 = b_col_1;
-            unsigned int b_addr_1 = smem_q_addr + q_stage_m_1 * 8192 +
+            unsigned int b_addr_1 = smem_q_addr + q_stage_m_1 * 4096 +
                                     (unsigned int)(b_row_1 * 128) +
                                     (unsigned int)(b_cb_1 ^ (b_row_1 & 7) << 4);
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
@@ -504,7 +397,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
                          : "r"(a_addr_1_1)
                          : "memory");
             int b_cb_2_1 = b_col_1 + 32;
-            unsigned int b_addr_3_1 = smem_q_addr + q_stage_m_1 * 8192 +
+            unsigned int b_addr_3_1 = smem_q_addr + q_stage_m_1 * 4096 +
                                       (unsigned int)(b_row_1 * 128) +
                                       (unsigned int)(b_cb_2_1 ^ (b_row_1 & 7) << 4);
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
@@ -527,7 +420,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
                          : "r"(a_addr_5_1)
                          : "memory");
             int b_cb_6_1 = b_col_1 + 64;
-            unsigned int b_addr_7_1 = smem_q_addr + q_stage_m_1 * 8192 +
+            unsigned int b_addr_7_1 = smem_q_addr + q_stage_m_1 * 4096 +
                                       (unsigned int)(b_row_1 * 128) +
                                       (unsigned int)(b_cb_6_1 ^ (b_row_1 & 7) << 4);
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
@@ -550,7 +443,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
                          : "r"(a_addr_9_1)
                          : "memory");
             int b_cb_10_1 = b_col_1 + 96;
-            unsigned int b_addr_11_1 = smem_q_addr + q_stage_m_1 * 8192 +
+            unsigned int b_addr_11_1 = smem_q_addr + q_stage_m_1 * 4096 +
                                        (unsigned int)(b_row_1 * 128) +
                                        (unsigned int)(b_cb_10_1 ^ (b_row_1 & 7) << 4);
             asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
@@ -632,8 +525,8 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
         int hi_2 = ((q_atom_2 == end_q_2) ? end_kv_2 : num_kv_2);
         mbarrier_wait(q_empty_addr + (q_stage) * 8, q_phase);
         if (elect_sync()) {
-          mbarrier_arrive_expect_tx(q_full_addr + (q_stage) * 8, 8448);
-          tma_2d_gmem2smem(smem_q_addr + q_stage * 8192, (&Q), 0, tok_2 * 64,
+          mbarrier_arrive_expect_tx(q_full_addr + (q_stage) * 8, 4224);
+          tma_2d_gmem2smem(smem_q_addr + q_stage * 4096, (&Q), 0, tok_2 * 32,
                            q_full_addr + (q_stage) * 8);
           tma_2d_gmem2smem(smem_w_addr + q_stage * 1024, (&Weights), 0, tok_2,
                            q_full_addr + (q_stage) * 8);
@@ -649,15 +542,15 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
           int tile = kv_idx_2;
           int kv_block = 0;
           if (tile < num_kv_2) {
-            kv_block = block_table[bt_row + tile];
+            kv_block = block_table[bt_row + tile / 2];
           }
-          int page_off = 0;
+          int page_off = tile % 2 * 64;
           mbarrier_wait(kv_empty_g0_addr + (kv_stage) * 8, kv_phase);
           if (elect_sync()) {
             mbarrier_arrive_expect_tx(kv_full_g0_addr + (kv_stage) * 8, 8448);
             tma_3d_gmem2smem(smem_kv_g0_addr + kv_stage * 8192, (&KV), 0, page_off, kv_block,
                              kv_full_g0_addr + (kv_stage) * 8);
-            tma_2d_gmem2smem(smem_sc_g0_addr + kv_stage * 1024, (&KV_scales), 2048 + page_off,
+            tma_2d_gmem2smem(smem_sc_g0_addr + kv_stage * 1024, (&KV_scales), 4096 + page_off,
                              kv_block, kv_full_g0_addr + (kv_stage) * 8);
           }
           kv_stage += 1;
@@ -697,15 +590,15 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
           int tile_1 = kv_idx_3 + 1;
           int kv_block_1 = 0;
           if (tile_1 < num_kv_3) {
-            kv_block_1 = block_table[bt_row_1 + tile_1];
+            kv_block_1 = block_table[bt_row_1 + tile_1 / 2];
           }
-          int page_off_1 = 0;
+          int page_off_1 = tile_1 % 2 * 64;
           mbarrier_wait(kv_empty_g1_addr + (kv_stage_1) * 8, kv_phase_1);
           if (elect_sync()) {
             mbarrier_arrive_expect_tx(kv_full_g1_addr + (kv_stage_1) * 8, 8448);
             tma_3d_gmem2smem(smem_kv_g1_addr + kv_stage_1 * 8192, (&KV), 0, page_off_1, kv_block_1,
                              kv_full_g1_addr + (kv_stage_1) * 8);
-            tma_2d_gmem2smem(smem_sc_g1_addr + kv_stage_1 * 1024, (&KV_scales), 2048 + page_off_1,
+            tma_2d_gmem2smem(smem_sc_g1_addr + kv_stage_1 * 1024, (&KV_scales), 4096 + page_off_1,
                              kv_block_1, kv_full_g1_addr + (kv_stage_1) * 8);
           }
           kv_stage_1 += 1;

@@ -29,16 +29,16 @@
 
 #include "tvm_ffi_utils.h"
 
-extern "C" __global__ void kernel_cake_deepgemm_sm120_paged_mqa_logits_6ce4e8b96cbf92e8e890(
+extern "C" __global__ void kernel_cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7(
     int* __restrict__ context_lens, int* __restrict__ schedule_meta, int batch_size, int next_n,
     int num_next_n_atoms, int split_kv, int num_sms);
-extern "C" __global__ void kernel_cake_deepgemm_sm120_paged_mqa_logits_0a5532076f65c8d54264(
+extern "C" __global__ void kernel_cake_deepgemm_sm120_paged_mqa_logits_4f8d3ee3abd0bb95e5e2(
     const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV,
     const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights,
     float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table,
     int* __restrict__ schedule_meta, int logits_stride, int block_table_stride);
 
-namespace cake_host_shim_94314f247c2d3109 {
+namespace cake_host_shim_1bb0bde6866e6607 {
 
 using tvm::ffi::TensorView;
 
@@ -155,10 +155,10 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   cudaError_t launch_status =
       cudaLaunchKernelExC(&config,
                           reinterpret_cast<const void*>(
-                              kernel_cake_deepgemm_sm120_paged_mqa_logits_6ce4e8b96cbf92e8e890),
+                              kernel_cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7),
                           kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_deepgemm_sm120_paged_mqa_logits_6ce4e8b96cbf92e8e890 "
+      << "cudaLaunchKernelExC for kernel_cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7 "
          "failed: "
       << cudaGetErrorString(launch_status);
 }
@@ -182,7 +182,7 @@ inline CUtensorMap EncodeTma_Q(const TensorView& t) {
   uint64_t global_dim[2] = {(uint64_t)(d1), (uint64_t)(outer1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0, ValueError)
       << "TMA descriptor for 'Q' resolved a non-positive global dim";
-  uint32_t box_dim[2] = {128u, 64u};
+  uint32_t box_dim[2] = {128u, 128u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1]
       << ") exceeds resolved global dims for 'Q'";
@@ -222,7 +222,7 @@ inline CUtensorMap EncodeTma_KV(const TensorView& t) {
   check_dense_leading_dims(t, 1, "KV");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError) << "TMA source 'KV' physical strides must be positive";
-  uint64_t global_dim[3] = {(uint64_t)(128), (uint64_t)(128), (uint64_t)(outer1)};
+  uint64_t global_dim[3] = {(uint64_t)(128), (uint64_t)(64), (uint64_t)(outer1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'KV' resolved a non-positive global dim";
   uint32_t box_dim[3] = {128u, 64u, 1u};
@@ -322,7 +322,7 @@ inline CUtensorMap EncodeTma_Weights(const TensorView& t) {
   uint64_t global_dim[2] = {(uint64_t)(d1), (uint64_t)(outer1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0, ValueError)
       << "TMA descriptor for 'Weights' resolved a non-positive global dim";
-  uint32_t box_dim[2] = {32u, 2u};
+  uint32_t box_dim[2] = {64u, 2u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1]
       << ") exceeds resolved global dims for 'Weights'";
@@ -424,8 +424,8 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_Q, TensorView arg_K
 
   static const bool smem_ready =
       CakeSetMaxDynamicSmem(reinterpret_cast<const void*>(
-                                kernel_cake_deepgemm_sm120_paged_mqa_logits_0a5532076f65c8d54264),
-                            74752);
+                                kernel_cake_deepgemm_sm120_paged_mqa_logits_4f8d3ee3abd0bb95e5e2),
+                            91136);
   (void)smem_ready;
   prepared.p_Q = EncodeTma_Q(arg_Q);
   prepared.p_KV = EncodeTma_KV(arg_KV);
@@ -465,17 +465,17 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 74752u;
+  config.dynamicSmemBytes = 91136u;
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status =
       cudaLaunchKernelExC(&config,
                           reinterpret_cast<const void*>(
-                              kernel_cake_deepgemm_sm120_paged_mqa_logits_0a5532076f65c8d54264),
+                              kernel_cake_deepgemm_sm120_paged_mqa_logits_4f8d3ee3abd0bb95e5e2),
                           kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_deepgemm_sm120_paged_mqa_logits_0a5532076f65c8d54264 "
+      << "cudaLaunchKernelExC for kernel_cake_deepgemm_sm120_paged_mqa_logits_4f8d3ee3abd0bb95e5e2 "
          "failed: "
       << cudaGetErrorString(launch_status);
 }
@@ -513,14 +513,14 @@ void RunPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
   stage_logits::Submit(prepared_logits, stream);
 }
 
-}  // namespace cake_host_shim_94314f247c2d3109
+}  // namespace cake_host_shim_1bb0bde6866e6607
 
 extern "C" {
-TVM_FFI_DLL_EXPORT int __tvm_ffi_cake_deepgemm_sm120_paged_mqa_logits_seq_0ca96224f779402d1277(
+TVM_FFI_DLL_EXPORT int __tvm_ffi_cake_deepgemm_sm120_paged_mqa_logits_seq_b770aa858a3c66456eba(
     void* self, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result) {
   TVM_FFI_SAFE_CALL_BEGIN();
   (void)self;
-  cake_host_shim_94314f247c2d3109::RunPacked(reinterpret_cast<const tvm::ffi::AnyView*>(args),
+  cake_host_shim_1bb0bde6866e6607::RunPacked(reinterpret_cast<const tvm::ffi::AnyView*>(args),
                                              num_args);
   tvm::ffi::TypeTraits<std::nullptr_t>::CopyToAnyView(nullptr, result);
   TVM_FFI_SAFE_CALL_END();

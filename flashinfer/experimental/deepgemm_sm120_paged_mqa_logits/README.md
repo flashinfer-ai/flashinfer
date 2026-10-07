@@ -48,12 +48,16 @@ block_table, max_context_len, *, page_kv=None, schedule_meta=None, output=None,
 sm_count=None)` binds
 
 - `q` E4M3 `[B, next_n, H, 128]`, contiguous;
-- `kv_cache` uint8 `[pages, page_kv, 1, 132]`, contiguous — each page holds
-  `page_kv` FP8 rows of 128 bytes followed by `page_kv` FP32 scales, read in
-  place (the vLLM `indexer_k_store` layout). A vLLM allocation whose physical
-  block stride exceeds `page_kv * 132` is passed as its 2-D
-  `[pages, block_stride_bytes]` view together with `page_kv=`; the stride must
-  be a multiple of 16 bytes and the TMA descriptor takes it from the tensor;
+- `kv_cache` uint8 `[pages, page_kv, 1, 132]` — each page holds `page_kv`
+  FP8 rows of 128 bytes followed by `page_kv` FP32 scales, read in place (the
+  vLLM `indexer_k_store` layout). The token rows must be dense (`stride(3) ==
+  1`, `stride(1) == 132`); the page stride `stride(0)` may exceed
+  `page_kv * 132` — the strided per-layer view of a block-outermost engine
+  layout (every layer's page in one block) and an alignment-padded page are
+  read without a copy. Such an allocation may also be passed as its 2-D
+  `[pages, block_stride_bytes]` view together with `page_kv=`. The block stride
+  must be a multiple of 16 bytes; the TMA descriptor takes it from the tensor
+  and the kernel never reads past the `page_kv * 132` bytes of a page;
 - `weights` FP32 `[B * next_n, H]`, contiguous;
 - `context_lens` int32 `[B, next_n]`, contiguous — the schedule is sized from
   each request's **last** token, every token masks with its own length;
@@ -136,7 +140,9 @@ architecture-target gate. It skips on devices without catalogued programs.
 `routes`. Policy keys: `head_dim`, `fused_row_bytes` (132), `heads`, `page_kv`,
 `next_n`, `split_kv` (128 for every exported program, which is why the metadata
 entry keeps DeepGEMM's head-count-free signature), `next_n_atoms` (the Q-atom
-rule, `ceil(next_n / 2)`), `max_batch` (the scheduler's shared-memory request
+rule: one atom per request for every shipped `next_n` — 1 and 2 pair the
+tokens as DeepGEMM does, 4 scores the whole request from one atom where
+DeepGEMM runs two 2-token atoms), `max_batch` (the scheduler's shared-memory request
 ceiling), `logits_stride_alignment` (`[128, 256]`), `clean_logits` (`"raw"`),
 `metadata_program`, `metadata_route`, `threads` and per-program `programs`
 records (tile size, group count, KV stages, atoms, shared-memory bytes). A

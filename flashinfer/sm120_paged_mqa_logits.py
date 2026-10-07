@@ -44,8 +44,10 @@ def fp8_paged_mqa_logits(
     """Paged FP8 MQA lightning-indexer logits with DeepGEMM's signature (SM120a).
 
     ``q`` E4M3 ``[B, next_n, H, 128]`` (``H`` in the catalog's head counts),
-    fused uint8 ``kv_cache [pages, page_kv, 1, 132]`` read in place (or its
-    padded 2-D ``[pages, block_stride_bytes]`` view with ``page_kv`` given),
+    fused uint8 ``kv_cache [pages, page_kv, 1, 132]`` read in place --
+    contiguous, or the strided per-layer view of a block-outermost engine
+    layout (``stride(0) >= page_kv * 132``) -- or its padded 2-D
+    ``[pages, block_stride_bytes]`` view with ``page_kv`` given,
     FP32 ``weights [B * next_n, H]``, int32 ``context_lens [B, next_n]``, int32
     ``block_table [B, S]`` with unit column stride, ``schedule_meta`` the
     buffer from :func:`get_paged_mqa_logits_metadata` (its first dimension
