@@ -19,7 +19,7 @@ import os
 import struct
 
 import pytest
-from flashinfer.fused_moe.core import ActivationType
+from flashinfer.fused_moe.core import ActivationType, get_cutlass_fused_moe_module
 from flashinfer.tllm_enums import DEFAULT_SITU_BETA, DEFAULT_SITU_LINEAR_BETA
 import torch
 from torch.nn import functional as F
@@ -554,7 +554,7 @@ def test_moe_bf16_clamped_relu2_epilogue_repeated():
                 identity,
                 identity,
                 dtype,
-                swiglu_limit=limit,
+                clamped_relu2_limit=limit,
                 quant_scales=None,
                 activation_type=ActivationType.ClampedRelu2,
                 use_fused_finalize=False,
@@ -609,7 +609,7 @@ def test_moe_bf16_clamped_relu2_epilogue_multi_expert():
         w1,
         w2,
         dtype,
-        swiglu_limit=limit,
+        clamped_relu2_limit=limit,
         quant_scales=None,
         activation_type=ActivationType.ClampedRelu2,
         use_fused_finalize=False,
@@ -643,13 +643,69 @@ def test_moe_clamped_relu2_requires_scalar_limit():
     with pytest.raises(ValueError, match=r"shape \(1,\)"):
         fused_moe.cutlass_fused_moe(
             **kwargs,
-            swiglu_limit=torch.full((e,), 16.0, dtype=torch.float32, device=x.device),
+            clamped_relu2_limit=torch.full(
+                (e,), 16.0, dtype=torch.float32, device=x.device
+            ),
         )
-    with pytest.raises(ValueError, match="does not accept swiglu_alpha"):
+    with pytest.raises(ValueError, match="does not accept SwiGLU"):
         fused_moe.cutlass_fused_moe(
             **kwargs,
-            swiglu_limit=torch.tensor([16.0], dtype=torch.float32, device=x.device),
+            clamped_relu2_limit=torch.tensor(
+                [16.0], dtype=torch.float32, device=x.device
+            ),
             swiglu_alpha=torch.ones(e, dtype=torch.float32, device=x.device),
+        )
+    with pytest.raises(ValueError, match="does not accept SwiGLU"):
+        fused_moe.cutlass_fused_moe(
+            **kwargs,
+            clamped_relu2_limit=torch.tensor(
+                [16.0], dtype=torch.float32, device=x.device
+            ),
+            swiglu_limit=torch.ones(e, dtype=torch.float32, device=x.device),
+        )
+    with pytest.raises(ValueError, match="supported only with"):
+        fused_moe.cutlass_fused_moe(
+            **{**kwargs, "activation_type": ActivationType.Relu2},
+            clamped_relu2_limit=torch.tensor(
+                [16.0], dtype=torch.float32, device=x.device
+            ),
+        )
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] != 9,
+    reason="DeepSeek FP8 block scaling is supported only on SM90",
+)
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_raw_op_rejects_clamped_relu2_on_deepseek_blockscale():
+    """The registered op must reject unsupported activations before kernel dispatch."""
+    m, hidden, inter, e, top_k = 1, 128, 128, 1, 1
+    x = torch.zeros((m, hidden), dtype=torch.bfloat16, device="cuda")
+    selected_experts = torch.zeros((m, top_k), dtype=torch.int32, device="cuda")
+    routing_weights = torch.ones((m, top_k), dtype=torch.float32, device="cuda")
+    w1 = torch.empty((e, inter, hidden), dtype=torch.float8_e4m3fn, device="cuda")
+    w2 = torch.empty((e, hidden, inter), dtype=torch.float8_e4m3fn, device="cuda")
+    w1_scales = torch.ones((e, 1, 1), dtype=torch.float32, device="cuda")
+    w2_scales = torch.ones((e, 1, 1), dtype=torch.float32, device="cuda")
+
+    with pytest.raises(RuntimeError, match="supported only for SM10x"):
+        get_cutlass_fused_moe_module("90").cutlass_fused_moe(
+            output=torch.empty_like(x),
+            input=x,
+            token_selected_experts=selected_experts,
+            token_final_scales=routing_weights,
+            fc1_expert_weights=w1,
+            fc1_expert_biases=None,
+            fc2_expert_weights=w2,
+            fc2_expert_biases=None,
+            output_dtype=torch.bfloat16,
+            quant_scales=[w1_scales, w2_scales],
+            clamped_relu2_limit=torch.tensor(
+                [16.0], dtype=torch.float32, device="cuda"
+            ),
+            use_deepseek_fp8_block_scale=True,
+            activation_type=ActivationType.ClampedRelu2,
+            profile_ids=[-1, -1],
         )
 
 
@@ -2032,7 +2088,7 @@ def test_moe_mxfp8_mxfp8_clamped_relu2_epilogue_identity(otype):
             mxfp8_w1,
             mxfp8_w2,
             otype,
-            swiglu_limit=limits,
+            clamped_relu2_limit=limits,
             quant_scales=[
                 mxfp8_w1_scale_i32,
                 fake_input_scale,

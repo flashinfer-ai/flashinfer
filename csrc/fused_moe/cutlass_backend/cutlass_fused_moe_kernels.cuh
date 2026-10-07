@@ -2302,6 +2302,7 @@ struct SituAdaptor {
 };
 
 __device__ inline bool hasPerExpertActivationParams(ActivationParams const& params) {
+  // clamped_relu2_limit applies model-wide and is consumed only by the fused GEMM1 epilogue.
   return params.swiglu_alpha || params.swiglu_beta || params.swiglu_limit || params.situ_beta ||
          params.situ_linear_beta;
 }
@@ -2725,7 +2726,10 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                               decltype(disableFP4QuantFastMathTag)::value,
                               decltype(nvfp4_4over6_config_tag)>  // Situ
       };
-      return fn_list[static_cast<int>(activation_type.activation_type)];
+      auto const activation_index = static_cast<size_t>(activation_type.activation_type);
+      TLLM_CHECK_WITH_INFO(activation_index < fn_list.size(),
+                           "Unsupported activation type in doActivation");
+      return fn_list[activation_index];
     };
 #ifdef ENABLE_FP4
     auto NVFP4 = tensorrt_llm::common::ConstExprWrapper<
@@ -4635,11 +4639,12 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
         activation_fusion_dtype && gemm1_config_->sm_version >= 100 &&
         gemm1_config_->sm_version < 110 &&
         fc1_activation_type.activation_type == ActivationType::ClampedRelu2 &&
-        fc1_activation_type.swiglu_limit != nullptr && fc1_expert_biases == nullptr && !use_lora &&
-        !gemm1_tma_ws_input.swap_ab;
+        fc1_activation_type.clamped_relu2_limit != nullptr && fc1_expert_biases == nullptr &&
+        !use_lora && !gemm1_tma_ws_input.swap_ab;
     if (use_fused_clamped_relu2) {
       gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION;
-      gemm1_tma_ws_input.fused_activation_epilogue.clamp_limit = fc1_activation_type.swiglu_limit;
+      gemm1_tma_ws_input.fused_activation_epilogue.clamp_limit =
+          fc1_activation_type.clamped_relu2_limit;
       if constexpr (use_mxfp8) {
         // The ordinary MXFP8 path needs a BF16 GEMM1 intermediate. Reverse the
         // two large scratch roles so the fused epilogue can write MXFP8 without
@@ -5581,6 +5586,10 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
                 fused_fc2_fp4_act_scale != nullptr
             ? fused_fc2_fp4_act_scale
             : fp4_act_scale_flat;
+    auto const activation_params =
+        mActivationType == ActivationType::ClampedRelu2
+            ? ActivationParams::ClampedRelu2(swiglu_limit)
+            : ActivationParams(mActivationType, swiglu_alpha, swiglu_beta, swiglu_limit);
     mInterface->gemm1(input,                                             //
                       output,                                            //
                       intermediate,                                      //
@@ -5601,16 +5610,16 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
                       mExpertHiddenSize,                                 //
                       mExpertInterSize,                                  //
                       num_experts_per_node,                              //
-                      ActivationParams(mActivationType, swiglu_alpha, swiglu_beta, swiglu_limit),
-                      alpha_scale_ptr_array,                   //
-                      !mUseLora,                               //
-                      /*use_deepseek_fp8_block_scale=*/false,  //
-                      stream,                                  //
-                      tactic,                                  //
-                      mMinLatencyMode,                         //
-                      num_active_experts_per_node,             //
-                      active_expert_global_ids,                //
-                      enable_pdl);                             //
+                      activation_params,                                 //
+                      alpha_scale_ptr_array,                             //
+                      !mUseLora,                                         //
+                      /*use_deepseek_fp8_block_scale=*/false,            //
+                      stream,                                            //
+                      tactic,                                            //
+                      mMinLatencyMode,                                   //
+                      num_active_experts_per_node,                       //
+                      active_expert_global_ids,                          //
+                      enable_pdl);                                       //
   } else {
     TLLM_CHECK(mGemmToProfile == GemmToProfile::GEMM_2);
     mInterface->gemm2(input,                                           //

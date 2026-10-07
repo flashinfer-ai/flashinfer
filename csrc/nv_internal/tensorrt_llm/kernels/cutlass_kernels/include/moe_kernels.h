@@ -121,6 +121,8 @@ struct ActivationParams {
   // SiTU-GLU per-expert tanh scales; nullptr uses the SituAdaptor compile-time defaults.
   float const* situ_beta = nullptr;
   float const* situ_linear_beta = nullptr;
+  // Model-wide scalar used only by the fused ClampedRelu2 epilogue.
+  float const* clamped_relu2_limit = nullptr;
 
   explicit ActivationParams(ActivationType activation_type) : activation_type(activation_type) {
     TLLM_CHECK_WITH_INFO(
@@ -137,6 +139,12 @@ struct ActivationParams {
         swiglu_limit(swiglu_limit),
         situ_beta(situ_beta),
         situ_linear_beta(situ_linear_beta) {}
+
+  static ActivationParams ClampedRelu2(float const* limit) {
+    ActivationParams params(ActivationType::ClampedRelu2);
+    params.clamped_relu2_limit = limit;
+    return params;
+  }
 
   // TODO Port everything properly and get rid of these implicit conversions
   operator ActivationType() const { return activation_type; }

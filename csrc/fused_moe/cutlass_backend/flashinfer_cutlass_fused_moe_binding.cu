@@ -95,23 +95,24 @@ inline float const* checkedActivationScale(Optional<TensorView> const& scale, in
   return static_cast<float const*>(scale.value().data_ptr());
 }
 
-inline ActivationParams checkedActivationParams(ActivationType activation_type,
-                                                int num_experts_on_rank,
-                                                Optional<TensorView> const& swiglu_alpha,
-                                                Optional<TensorView> const& swiglu_beta,
-                                                Optional<TensorView> const& swiglu_limit,
-                                                Optional<TensorView> const& situ_beta,
-                                                Optional<TensorView> const& situ_linear_beta) {
+inline ActivationParams checkedActivationParams(
+    ActivationType activation_type, int num_experts_on_rank,
+    Optional<TensorView> const& swiglu_alpha, Optional<TensorView> const& swiglu_beta,
+    Optional<TensorView> const& swiglu_limit, Optional<TensorView> const& clamped_relu2_limit,
+    Optional<TensorView> const& situ_beta, Optional<TensorView> const& situ_linear_beta) {
   if (activation_type == ActivationType::ClampedRelu2) {
     TVM_FFI_ICHECK(!swiglu_alpha.has_value() && !swiglu_beta.has_value() &&
-                   !situ_beta.has_value() && !situ_linear_beta.has_value())
-        << "ClampedRelu2 accepts only swiglu_limit.";
-    TVM_FFI_ICHECK(swiglu_limit.has_value())
-        << "ClampedRelu2 requires a model-wide scalar swiglu_limit tensor.";
-    return ActivationParams(activation_type, nullptr, nullptr,
-                            checkedActivationScale(swiglu_limit, 1, "ClampedRelu2 swiglu_limit"),
-                            nullptr, nullptr);
+                   !swiglu_limit.has_value() && !situ_beta.has_value() &&
+                   !situ_linear_beta.has_value())
+        << "ClampedRelu2 accepts only clamped_relu2_limit.";
+    TVM_FFI_ICHECK(clamped_relu2_limit.has_value())
+        << "ClampedRelu2 requires a model-wide scalar clamped_relu2_limit tensor.";
+    return ActivationParams::ClampedRelu2(
+        checkedActivationScale(clamped_relu2_limit, 1, "ClampedRelu2 clamped_relu2_limit"));
   }
+
+  TVM_FFI_ICHECK(!clamped_relu2_limit.has_value())
+      << "clamped_relu2_limit is supported only with ClampedRelu2.";
 
   return ActivationParams(
       activation_type, checkedActivationScale(swiglu_alpha, num_experts_on_rank, "swiglu_alpha"),
@@ -342,10 +343,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
               Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
               Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
               Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
-              Optional<TensorView> situ_beta, Optional<TensorView> situ_linear_beta,
-              bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
-              int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
-              bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+              Optional<TensorView> clamped_relu2_limit, Optional<TensorView> situ_beta,
+              Optional<TensorView> situ_linear_beta, bool swizzled_input_sf, int64_t tp_size,
+              int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
+              int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
+              Optional<Array<int64_t>> profile_ids, bool enable_pdl,
               ActivationType base_activation_type = ActivationType::Swiglu,
               Optional<TensorView> workspace_buffer = Optional<TensorView>{}) {
     std::lock_guard<std::mutex> lock(mMutex);
@@ -444,9 +446,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         (swiglu_alpha.has_value() || swiglu_beta.has_value() || swiglu_limit.has_value())) {
       base_activation_type = ActivationType::SwigluBias;
     }
-    auto activation_params =
-        checkedActivationParams(base_activation_type, num_experts_on_rank, swiglu_alpha,
-                                swiglu_beta, swiglu_limit, situ_beta, situ_linear_beta);
+    auto activation_params = checkedActivationParams(
+        base_activation_type, num_experts_on_rank, swiglu_alpha, swiglu_beta, swiglu_limit,
+        clamped_relu2_limit, situ_beta, situ_linear_beta);
 
     setRunnerProfiles(profile_ids, base_activation_type);
 
@@ -507,7 +509,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          Optional<TensorView> fc2_expert_biases,
                          Optional<Array<Tensor>> quant_scales, Optional<TensorView> input_sf,
                          Optional<TensorView> swiglu_alpha, Optional<TensorView> swiglu_beta,
-                         Optional<TensorView> swiglu_limit, Optional<TensorView> situ_beta,
+                         Optional<TensorView> swiglu_limit,
+                         Optional<TensorView> clamped_relu2_limit, Optional<TensorView> situ_beta,
                          Optional<TensorView> situ_linear_beta, bool swizzled_input_sf,
                          TensorView num_active_experts_per_node, TensorView experts_to_token_score,
                          TensorView active_expert_global_ids, int64_t tp_size, int64_t tp_rank,
@@ -595,9 +598,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         (swiglu_alpha.has_value() || swiglu_beta.has_value() || swiglu_limit.has_value())) {
       base_activation_type = ActivationType::SwigluBias;
     }
-    auto activation_params =
-        checkedActivationParams(base_activation_type, num_experts_on_rank, swiglu_alpha,
-                                swiglu_beta, swiglu_limit, situ_beta, situ_linear_beta);
+    auto activation_params = checkedActivationParams(
+        base_activation_type, num_experts_on_rank, swiglu_alpha, swiglu_beta, swiglu_limit,
+        clamped_relu2_limit, situ_beta, situ_linear_beta);
 
     setRunnerProfiles(profile_ids, base_activation_type);
 
@@ -830,17 +833,18 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
                  Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
                  Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
-                 Optional<TensorView> situ_beta, Optional<TensorView> situ_linear_beta,
-                 bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
-                 int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
-                 bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+                 Optional<TensorView> clamped_relu2_limit, Optional<TensorView> situ_beta,
+                 Optional<TensorView> situ_linear_beta, bool swizzled_input_sf, int64_t tp_size,
+                 int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
+                 int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
+                 Optional<Array<int64_t>> profile_ids, bool enable_pdl,
                  int64_t base_activation_type, Optional<TensorView> workspace_buffer) {
             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
-                   swiglu_alpha, swiglu_beta, swiglu_limit, situ_beta, situ_linear_beta,
-                   swizzled_input_sf, tp_size, tp_rank, ep_size, ep_rank, cluster_size,
-                   cluster_rank, enable_alltoall, min_latency_mode, profile_ids, enable_pdl,
-                   static_cast<ActivationType>(base_activation_type), workspace_buffer);
+                   swiglu_alpha, swiglu_beta, swiglu_limit, clamped_relu2_limit, situ_beta,
+                   situ_linear_beta, swizzled_input_sf, tp_size, tp_rank, ep_size, ep_rank,
+                   cluster_size, cluster_rank, enable_alltoall, min_latency_mode, profile_ids,
+                   enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer);
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(
@@ -850,21 +854,22 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
                  Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
                  Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
-                 Optional<TensorView> situ_beta, Optional<TensorView> situ_linear_beta,
-                 bool swizzled_input_sf, TensorView num_active_experts_per_node,
-                 TensorView experts_to_token_score, TensorView active_expert_global_ids,
-                 int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
-                 int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
-                 bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
-                 int64_t base_activation_type, Optional<TensorView> workspace_buffer) {
+                 Optional<TensorView> clamped_relu2_limit, Optional<TensorView> situ_beta,
+                 Optional<TensorView> situ_linear_beta, bool swizzled_input_sf,
+                 TensorView num_active_experts_per_node, TensorView experts_to_token_score,
+                 TensorView active_expert_global_ids, int64_t tp_size, int64_t tp_rank,
+                 int64_t ep_size, int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank,
+                 bool enable_alltoall, bool min_latency_mode, Optional<Array<int64_t>> profile_ids,
+                 bool enable_pdl, int64_t base_activation_type,
+                 Optional<TensorView> workspace_buffer) {
             runMoeMinLantency(
                 output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                 fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
-                swiglu_alpha, swiglu_beta, swiglu_limit, situ_beta, situ_linear_beta,
-                swizzled_input_sf, num_active_experts_per_node, experts_to_token_score,
-                active_expert_global_ids, tp_size, tp_rank, ep_size, ep_rank, cluster_size,
-                cluster_rank, enable_alltoall, min_latency_mode, profile_ids, enable_pdl,
-                static_cast<ActivationType>(base_activation_type), workspace_buffer);
+                swiglu_alpha, swiglu_beta, swiglu_limit, clamped_relu2_limit, situ_beta,
+                situ_linear_beta, swizzled_input_sf, num_active_experts_per_node,
+                experts_to_token_score, active_expert_global_ids, tp_size, tp_rank, ep_size,
+                ep_rank, cluster_size, cluster_rank, enable_alltoall, min_latency_mode, profile_ids,
+                enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer);
           });
     } else if (name == "get_workspace_size") {
       return Function::FromTyped([this](int64_t num_rows, int64_t hidden_size, int64_t inter_size,
@@ -1051,6 +1056,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   }
 
   void setRunnerProfiles(Optional<Array<int64_t>> profile_ids, ActivationType activation_type) {
+    bool const is_clamped_relu2 = activation_type == ActivationType::ClampedRelu2;
+    bool const requires_activation_fusion_gemm1 = requiresActivationFusionProfile(activation_type);
+    TVM_FFI_ICHECK(!is_clamped_relu2 || requires_activation_fusion_gemm1)
+        << "ClampedRelu2 is supported only for SM10x BF16xBF16 or MXFP8xMXFP8 MoE";
+
     if (mUseDeepSeekFP8BlockScaling) {
       auto config = tensorrt_llm::cutlass_extensions::CutlassGemmConfig(
           tensorrt_llm::cutlass_extensions::CutlassTileConfigSM90::CtaShape128x16x128B,
@@ -1061,10 +1071,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       return;
     }
 
-    bool const is_clamped_relu2 = activation_type == ActivationType::ClampedRelu2;
-    bool const requires_activation_fusion_gemm1 = requiresActivationFusionProfile(activation_type);
-    TVM_FFI_ICHECK(!is_clamped_relu2 || requires_activation_fusion_gemm1)
-        << "ClampedRelu2 is supported only for SM10x BF16xBF16 or MXFP8xMXFP8 MoE";
     auto best_gemm1_profile = mAllProfiles.front();
     if (requires_activation_fusion_gemm1) {
       best_gemm1_profile = defaultActivationFusionProfile();

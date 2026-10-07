@@ -997,6 +997,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        clamped_relu2_limit: Optional[torch.Tensor] = None,
         situ_beta: Optional[torch.Tensor] = None,
         situ_linear_beta: Optional[torch.Tensor] = None,
         swizzled_input_sf: bool = True,
@@ -1130,6 +1131,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            clamped_relu2_limit,
             situ_beta,
             situ_linear_beta,
             swizzled_input_sf,
@@ -1175,6 +1177,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        clamped_relu2_limit: Optional[torch.Tensor] = None,
         situ_beta: Optional[torch.Tensor] = None,
         situ_linear_beta: Optional[torch.Tensor] = None,
         swizzled_input_sf: bool = True,
@@ -1326,6 +1329,7 @@ def cutlass_fused_moe(
     profile_ids: Optional[List[int]] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
     *,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
     situ_beta: Optional[torch.Tensor] = None,
     situ_linear_beta: Optional[torch.Tensor] = None,
     backend: str = "cutlass",
@@ -1399,9 +1403,11 @@ def cutlass_fused_moe(
         Swiglu beta for swiglu activation.
 
     swiglu_limit : Optional[torch.Tensor]
-        Per-expert SwiGLU limits for SwiGLU variants. ``ClampedRelu2`` instead
-        requires a one-element float32 CUDA tensor containing the model-wide
-        positive clamp scale.
+        Per-expert SwiGLU limits for SwiGLU variants.
+
+    clamped_relu2_limit : Optional[torch.Tensor]
+        Model-wide positive clamp scale for ClampedRelu2, provided as a
+        one-element float32 CUDA tensor.
 
     situ_beta : Optional[torch.Tensor]
         Per-expert ``beta`` tanh scale for the ``Situ`` activation (float32,
@@ -1541,25 +1547,31 @@ def cutlass_fused_moe(
         raise ValueError(f"unsupported fused MoE backend: {backend!r}")
     major, minor = get_compute_capability(input.device)
     if int(activation_type) == int(ActivationType.ClampedRelu2):
-        if swiglu_limit is None:
+        if clamped_relu2_limit is None:
             raise ValueError(
-                "ActivationType.ClampedRelu2 requires a one-element swiglu_limit tensor"
+                "ActivationType.ClampedRelu2 requires a one-element "
+                "clamped_relu2_limit tensor"
             )
-        if swiglu_limit.ndim != 1 or swiglu_limit.numel() != 1:
+        if clamped_relu2_limit.ndim != 1 or clamped_relu2_limit.numel() != 1:
             raise ValueError(
-                "ActivationType.ClampedRelu2 requires model-wide swiglu_limit "
-                f"with shape (1,), got {tuple(swiglu_limit.shape)}"
+                "ActivationType.ClampedRelu2 requires model-wide "
+                "clamped_relu2_limit with shape (1,), got "
+                f"{tuple(clamped_relu2_limit.shape)}"
             )
         check_shape_dtype_device(
-            swiglu_limit,
+            clamped_relu2_limit,
             (1,),
             torch.float32,
             input.device,
-            "ClampedRelu2 swiglu_limit",
+            "ClampedRelu2 clamped_relu2_limit",
         )
-        if swiglu_alpha is not None or swiglu_beta is not None:
+        if (
+            swiglu_alpha is not None
+            or swiglu_beta is not None
+            or swiglu_limit is not None
+        ):
             raise ValueError(
-                "ActivationType.ClampedRelu2 does not accept swiglu_alpha or swiglu_beta"
+                "ActivationType.ClampedRelu2 does not accept SwiGLU activation parameters"
             )
         if situ_beta is not None or situ_linear_beta is not None:
             raise ValueError(
@@ -1578,6 +1590,10 @@ def cutlass_fused_moe(
             raise NotImplementedError(
                 "ClampedRelu2 does not support FC1 bias or min-latency mode"
             )
+    elif clamped_relu2_limit is not None:
+        raise ValueError(
+            "clamped_relu2_limit is supported only with ActivationType.ClampedRelu2"
+        )
 
     device_arch = f"{major * 10 + minor}"
 
@@ -1629,6 +1645,7 @@ def cutlass_fused_moe(
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            clamped_relu2_limit,
             situ_beta,
             situ_linear_beta,
             swizzled_input_sf,
