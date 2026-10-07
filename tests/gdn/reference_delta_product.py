@@ -132,23 +132,3 @@ def delta_product(
         kv.append(state_HKV.clone())
 
     return torch.stack(o), torch.stack(kv)
-
-
-def expand_to_flat_sequence(
-    k: torch.Tensor,  # [T, n_h, H, D]
-    v: torch.Tensor,  # [T, n_h, H, D]
-    alpha: torch.Tensor | None,  # [T, H]
-    beta: torch.Tensor | None,  # [T, n_h, H]
-    q: torch.Tensor,  # [T, H, D]
-    cu_seqlens: torch.Tensor,
-):
-    """The Phase-1 expansion: GDP as GDN on a sequence n_h times longer.
-
-    Returns (q, k, v, alpha, beta, cu_seqlens) all on the expanded token axis,
-    ready to hand to ``chunk_gated_delta_rule``. Slice the result with
-    ``out[n_h - 1 :: n_h]`` to recover one row per real token.
-
-    NOTE: flashinfer's ``g`` is MULTIPLICATIVE alpha (neutral value 1.0), not the
-    log-space decay FLA uses (neutral value 0.0).
-    """
-    raise NotImplementedError("step 2 -- write this when you add the wrapper")

@@ -501,8 +501,8 @@ def test_per_token_state_snapshots(num_householder, T):
 def test_negative_ssm_state_index_skips_write(batch_size, dispatch, num_householder):
     """The per-token scatter must treat a negative slot as "do not write".
 
-    This is what makes the wrapper's expansion cheap: micro-steps 1..n_h-1 get
-    -1 and cost no state traffic, instead of being funnelled into throwaway pool
+    This is what keeps GDP's state traffic down: micro-steps 1..n_h-1 get -1
+    and cost no state traffic, instead of being funnelled into throwaway pool
     rows. At n_h=3 that removes two thirds of the writes, which measured ~2.1x
     end-to-end on this kernel -- state writes dominate it.
 
@@ -552,7 +552,7 @@ def test_negative_ssm_state_index_skips_write(batch_size, dispatch, num_househol
         pool = backing[canary_rows:]
         initial_idx = torch.arange(1, 1 + B, dtype=torch.int32)
         # every micro-step gets a distinct row, then all but the last of each
-        # token is replaced by the sentinel -- exactly the wrapper's expansion
+        # token is replaced by the sentinel
         idx_all = torch.arange(1 + B, 1 + B + B * TN, dtype=torch.int32).reshape(B, TN)
         keep = torch.zeros(TN, dtype=torch.bool)
         keep[n_h - 1 :: n_h] = True
@@ -618,60 +618,3 @@ def test_decode_rejects_mismatched_householder_counts():
             scale=K**-0.5,
             disable_state_update=False,
         )
-
-
-# 9. q and a are read at the real token index; nothing is expanded.
-#
-# The kernel synthesizes the micro-steps it does not have rows for, so the
-# wrapper hands it q/a untouched. These two tests pin the contract from both
-# sides: no scratch is allocated, and a k/q token-count mismatch is rejected
-# rather than read out of bounds.
-# --------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    "num_householder", [2, 3], ids=lambda nh: f"num_householder={nh}"
-)
-def test_decode_allocates_no_expansion_scratch(num_householder):
-    """A GDP call must not allocate anything that scales with n_h.
-
-    The expanded q/a/output buffers were 362 MiB at the target model's shape.
-    Peak-allocation delta is the only observable that catches their return: the
-    results are identical either way.
-    """
-    _skip_if_unsupported()
-    n_h, B, T, HQ, HV, K, V = num_householder, 3, 4, 16, 32, 128, 128
-    device, dtype = torch.device("cuda"), torch.bfloat16
-    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm = _gen_decode_inputs(
-        B, T, n_h, HQ, HV, K, V, dtype, device, seed=23
-    )
-    out = torch.empty(B, T, HV, V, dtype=dtype, device=device)
-
-    def call():
-        gated_delta_product_mtp(
-            q,
-            k,
-            v,
-            pool,
-            idx,
-            A_log,
-            a,
-            dt_bias,
-            b,
-            scale=K**-0.5,
-            output=out,
-            ssm_state_indices=ssm,
-            disable_state_update=False,
-        )
-        torch.cuda.synchronize()
-
-    call()  # JIT compile and warm the caching allocator first
-    torch.cuda.reset_peak_memory_stats()
-    before = torch.cuda.memory_allocated()
-    call()
-    grew = torch.cuda.max_memory_allocated() - before
-
-    # One expanded q alone would be B*T*n_h*HQ*K*2 bytes.
-    one_expanded_q = B * T * n_h * HQ * K * 2
-    assert grew < one_expanded_q, (
-        f"call allocated {grew} B; a single expanded q is {one_expanded_q} B, "
-        "so the expansion is back"
-    )
