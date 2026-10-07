@@ -914,15 +914,11 @@ def gen_all_modules(
         )
         if has_sm100a_exact or has_sm103a_exact:
             jit_specs.append(gen_alphamoe_sm100_module())
-        for concat_mla_kv_pack_target, enabled in (
-            ("sm100a", has_sm100a_exact),
-            ("sm103a", has_sm103a_exact),
-        ):
-            if enabled:
-                # Cake fused MLA context K/V pack: one build per (exact target, head group).
-                jit_specs.extend(
-                    gen_concat_mla_kv_quant_fp8_aot_modules(concat_mla_kv_pack_target)
-                )
+        if has_sm100a_exact:
+            # Cake fused MLA context K/V pack: one build per (exact target, head group).
+            jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm100a"))
+        if has_sm103a_exact:
+            jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm103a"))
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
