@@ -24,7 +24,7 @@ import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 from filelock import FileLock
@@ -37,8 +37,18 @@ _HEADDIM = 64
 _DSTATE = 128
 
 _TARGET_ARCHS = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+_ARCH_CAPABILITIES = {arch: capability for capability, arch in _TARGET_ARCHS.items()}
 _DEVICE_DIR = Path("generated") / "device"
+# Prepared two-launch host launchers, one per kernel family: the same nine
+# ``CAKE_SSD_*`` placeholders and namespace scheme; the chunk-parallel main
+# kernel takes four more arguments (``_MAIN_ARGS_CHUNKPAR``).
 _HOST_TEMPLATE = Path("generated") / "host" / "mamba_ssd_combined_sequence.cpp"
+_CHUNKPAR_HOST_TEMPLATE = (
+    Path("generated") / "host" / "mamba_ssd_combined_chunk_parallel_sequence.cpp"
+)
+# Module identities the Cake export has not filled yet carry this token; such
+# a program refuses to build (``_require_exported``).
+_PENDING_EXPORT = "PENDINGEXPORT"
 
 
 @dataclass(frozen=True)
@@ -61,13 +71,22 @@ class _Kernel:
 
 @dataclass(frozen=True)
 class _Program:
-    """A two-launch program: metadata preprocess followed by the scan."""
+    """A two-launch program: metadata preprocess followed by the main kernel.
 
+    ``family`` is ``exact`` (the persistent scan, one CTA per (sequence,
+    head) item) or ``chunkpar`` (the chunk-parallel program, one CTA per
+    (chunk, head) tile); it fixes the host template and the main kernel's
+    argument order.
+    """
+
+    family: str
     preprocess: _Kernel
     main: _Kernel
     state_dtype_code: int
     state_dtype_bits: int
     main_smem_bytes: int
+    host_template: Path
+    main_args: tuple[str, ...]
 
     @property
     def kernels(self) -> tuple[_Kernel, _Kernel]:
@@ -77,28 +96,39 @@ class _Program:
 # Generated-source identities, ``generated/device/<module>.cu``: the Cake
 # kernel symbol followed by the export's module identity hash.  This block is
 # the single place the Cake export refreshes; every program binding below
-# derives from it.  One kernel family ships: the exact scan x {bf16, f16, f32
-# state} x {batched, varlen}, plus one preprocess.
-_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_91b0a9bf23"
+# derives from it.  Two kernel families ship, each x {bf16, f16, f32 state} x
+# {batched, varlen}, plus one preprocess shared by both: the exact scan
+# (``exact_*``) and the chunk-parallel program (``chunkpar_*``).
+_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_95b8cddffd"
 _SCAN_MODULES = {
-    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_0f094af3b9",
-    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_32276b01fe",
-    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_f30e4c3cab",
-    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_a3a7101b1e",
-    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_be2983d3fb",
-    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_f8d7d4295e",
+    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_8033f7fce1",
+    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_931d9e1ef5",
+    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_492a7a1109",
+    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_6b09edb72f",
+    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_d6335c937c",
+    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_2a4bde83c7",
+}
+_CHUNKPAR_MODULES = {
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_4347eec4ce",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_f2907cb882",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_3dcdabfdf3",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_d90ab39833",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_8a72a78990",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_dec819c6c2",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
     _SEGMENT_PREPROCESS_MODULE,
     "kernel_factorized_persistent_segment_preprocess",
-    threads=128,
+    threads=256,
     fast_math=False,
 )
-# (segment, head) tiles one preprocess CTA scans (one warp per tile); the
-# launch grid is ``ceil(num_segments * nheads / tiles_per_block)``.  Refreshed
-# by the Cake export together with the module identities above.
-_SEGMENT_PREPROCESS_TILES_PER_BLOCK = 4
+# (segment, head) tiles one preprocess CTA scans (one warp per tile, so
+# ``threads / 32`` of them); the launch grid is ``ceil(num_segments * nheads
+# / tiles_per_block)``.  Both literals describe the shipped preprocess source
+# above and are refreshed by the Cake export together with its module
+# identity.
+_SEGMENT_PREPROCESS_TILES_PER_BLOCK = 8
 # DLDataType (code, bits) of the state tensors: kDLFloat=2, kDLBfloat=4.
 _STATE_DTYPE_CODES = {"bf16": (4, 16), "f16": (2, 16), "f32": (2, 32)}
 _STATE_DTYPE_KEYS = {
@@ -106,38 +136,14 @@ _STATE_DTYPE_KEYS = {
     torch.float16: "f16",
     torch.float32: "f32",
 }
+# Dynamic shared memory (bytes) of each family's main kernel; refreshed by the
+# Cake export.  0 is the unfilled placeholder: the program refuses to build.
 _EXACT_SMEM_BYTES = 231936
-
-
-def _scan(module: str) -> _Kernel:
-    """The scan kernel of ``generated/device/<module>.cu``."""
-
-    symbol = module.rsplit("_", 1)[0]
-    return _Kernel(module, f"kernel_{symbol}", threads=512, fast_math=True)
-
-
-def _program(name: str, module: str) -> _Program:
-    """Bind program ``exact_<state>_<mode>`` to its generated scan source."""
-
-    _family, state_key, _mode = name.split("_")
-    code, bits = _STATE_DTYPE_CODES[state_key]
-    return _Program(_SEGMENT_PREPROCESS, _scan(module), code, bits, _EXACT_SMEM_BYTES)
-
-
-_PROGRAMS: dict[str, _Program] = {
-    name: _program(name, module) for name, module in _SCAN_MODULES.items()
-}
-
-
-def _program_name(state_dtype: torch.dtype, mode_varlen: bool) -> str:
-    """The program serving a state dtype in batched or packed-varlen mode."""
-
-    mode_key = "varlen" if mode_varlen else "batched"
-    return f"exact_{_STATE_DTYPE_KEYS[state_dtype]}_{mode_key}"
+_CHUNKPAR_SMEM_BYTES = 231936
 
 
 # Positional launcher ABI shared by every program: preprocess arguments, its
-# grid, main arguments, its grid, then the explicit CUDA stream.  The
+# grid, main arguments (the family's order), its grid, then the stream.  The
 # preprocess also derives ``seq_chunk_cumsum`` from the packed-varlen metadata
 # (``write_seq_chunk_cumsum``), so one launcher call covers the whole forward;
 # with ``metadata_from_cu_seqlens`` it derives the whole segment metadata
@@ -147,7 +153,8 @@ def _program_name(state_dtype: torch.dtype, mode_varlen: bool) -> str:
 # ``checkpoint_state_count > 0``; ``preprocess_status`` is the runner-owned
 # int32 word it sets to 1 when a packed-sequence id is out of range or
 # non-monotonic (CAKE-990) or ``cu_seqlens`` is invalid.  The order is the
-# kernel's parameter order (``preprocess_arg_plan`` of the export).
+# kernel's parameter order (``preprocess_arg_plan`` / ``main_arg_plan`` of
+# the export).
 _PREPROCESS_ARGS = (
     "dt",
     "A",
@@ -177,6 +184,7 @@ _PREPROCESS_ARGS = (
     "checkpoint_state_count",
     "preprocess_status",
 )
+# Exact-scan main kernel (the ``exact_*`` programs).
 _MAIN_ARGS = (
     "x_map",
     "b_map",
@@ -220,6 +228,115 @@ _MAIN_ARGS = (
     "write_final_states",
     "checkpoint_state_count",
 )
+# Chunk-parallel main kernel (the ``chunkpar_*`` programs): the exact-scan
+# order with the state-operand tensor map ``h_map`` after ``out_map`` and the
+# workspace pointers ``s_work`` (f32 per-tile state increments), ``h_words``
+# (u32 view of the bf16 state operand behind ``h_map``) and ``grid_barrier``
+# (u32 ``[arrive, generation]``) after ``out_native``.
+_MAIN_ARGS_CHUNKPAR = (
+    "x_map",
+    "b_map",
+    "c_map",
+    "out_map",
+    "h_map",
+    "x",
+    "dt",
+    "delta_precomputed",
+    "cumsum_precomputed",
+    "A",
+    "B_tensor",
+    "C",
+    "D",
+    "z",
+    "dt_bias",
+    "initial_states",
+    "final_states",
+    "checkpoint_states",
+    "checkpoint_token_indices",
+    "checkpoint_state_slots",
+    "seq_idx_i32",
+    "seq_idx_i64",
+    "chunk_indices",
+    "chunk_offsets",
+    "seq_chunk_cumsum",
+    "out_native",
+    "s_work",
+    "h_words",
+    "grid_barrier",
+    "nheads",
+    "ngroups",
+    "batch",
+    "seqlen",
+    "nchunks",
+    "sequence_count",
+    "num_logical_chunks",
+    "mode_varlen",
+    "D_mode",
+    "has_z",
+    "has_initial",
+    "dt_softplus",
+    "dt_min",
+    "dt_max",
+    "write_final_states",
+    "checkpoint_state_count",
+)
+# Per family: host template, main-kernel argument order, main dynamic SMEM.
+_FAMILY_HOST = {
+    "exact": (_HOST_TEMPLATE, _MAIN_ARGS, _EXACT_SMEM_BYTES),
+    "chunkpar": (_CHUNKPAR_HOST_TEMPLATE, _MAIN_ARGS_CHUNKPAR, _CHUNKPAR_SMEM_BYTES),
+}
+
+
+def _scan(module: str) -> _Kernel:
+    """The main kernel of ``generated/device/<module>.cu`` (either family)."""
+
+    symbol = module.rsplit("_", 1)[0]
+    return _Kernel(module, f"kernel_{symbol}", threads=512, fast_math=True)
+
+
+def _program(name: str, module: str) -> _Program:
+    """Bind program ``<family>_<state>_<mode>`` to its generated main source."""
+
+    family, state_key, _mode = name.split("_")
+    code, bits = _STATE_DTYPE_CODES[state_key]
+    host_template, main_args, smem_bytes = _FAMILY_HOST[family]
+    return _Program(
+        family,
+        _SEGMENT_PREPROCESS,
+        _scan(module),
+        code,
+        bits,
+        smem_bytes,
+        host_template,
+        main_args,
+    )
+
+
+_PROGRAMS: dict[str, _Program] = {
+    name: _program(name, module)
+    for name, module in (*_SCAN_MODULES.items(), *_CHUNKPAR_MODULES.items())
+}
+
+
+def _program_name(family: str, state_dtype: torch.dtype, mode_varlen: bool) -> str:
+    """The program of ``family`` serving a state dtype in batched or
+    packed-varlen mode."""
+
+    mode_key = "varlen" if mode_varlen else "batched"
+    return f"{family}_{_STATE_DTYPE_KEYS[state_dtype]}_{mode_key}"
+
+
+def _require_exported(name: str, program: _Program) -> None:
+    """Refuse a program whose table entries the Cake export has not filled."""
+
+    if _PENDING_EXPORT in program.main.module or program.main_smem_bytes <= 0:
+        raise RuntimeError(
+            f"Cake SSDCombined program {name} is not exported yet (main module "
+            f"{program.main.module!r}, main dynamic shared memory "
+            f"{program.main_smem_bytes} bytes): run the Cake export "
+            "(tools/export_cake_mamba_ssd_combined.py with the chunk-parallel "
+            "programs) and fill this loader's program table from its summary"
+        )
 
 
 def _direct_preprocess_inputs(
@@ -260,7 +377,9 @@ def _direct_preprocess_inputs(
     """
 
     if tiles_per_block <= 0:
-        raise ValueError(f"preprocess tiles per block must be positive, got {tiles_per_block}")
+        raise ValueError(
+            f"preprocess tiles per block must be positive, got {tiles_per_block}"
+        )
     dt_min, dt_max = (float(value) for value in dt_limit)
     values: dict[str, object] = {
         "dt": dt,
@@ -292,7 +411,11 @@ def _direct_preprocess_inputs(
         "preprocess_status": preprocess_status,
     }
     total_tiles = num_segments * nheads
-    return values, (max(1, (total_tiles + tiles_per_block - 1) // tiles_per_block), 1, 1)
+    return values, (
+        max(1, (total_tiles + tiles_per_block - 1) // tiles_per_block),
+        1,
+        1,
+    )
 
 
 def _segment_bound(seqlen: int, num_sequences: int) -> int:
@@ -319,19 +442,176 @@ def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
     return full_grid
 
 
+# ---------------------------------------------------------------------------
+# Kernel-family selection.  The constants below are the calibrated main-kernel
+# cost model of the Cake chunk-parallel seed module
+# (``CHUNK_PARALLEL_COST_MODEL_US`` and the ``CHUNK_PARALLEL_*`` rule constants
+# of loom/examples/weave/
+# flashinfer_blackwell_mamba_ssd_combined_chunk_parallel_seed_v1.py), copied
+# verbatim: both copies must be refreshed together whenever the seed is
+# recalibrated.  Least-squares fits of the main-kernel time in microseconds:
+#   exact scan     = serial_fixed + per_chunk(work_items) * chunks
+#     per_chunk is flat up to 32 concurrent (sequence, head) items and larger
+#     at 128 items (128 CTAs streaming x/B/C through L2); item counts in
+#     between interpolate linearly, above 128 use the large value.
+#   chunk-parallel = cp_fixed + cp_per_tile * max(0, tiles - sm_count)
+#     the first wave of sm_count tiles and the grid-barrier-separated phases
+#     are inside cp_fixed; each further (chunk, head) tile costs cp_per_tile.
+_CHUNK_PARALLEL_COST_MODEL_US = {
+    # (major, minor) compute capability -> calibrated constants.
+    (10, 0): {  # B200, sm_100a
+        "serial_fixed": 5.4,
+        "serial_per_chunk_small": 2.68,
+        "serial_per_chunk_large": 4.58,
+        "cp_fixed": 29.9,
+        "cp_per_tile": 0.0627,
+    },
+    (10, 3): {  # B300 / GB300, sm_103a
+        "serial_fixed": 5.2,
+        "serial_per_chunk_small": 2.59,
+        "serial_per_chunk_large": 4.16,
+        "cp_fixed": 28.8,
+        "cp_per_tile": 0.0595,
+    },
+}
+# Unmeasured capabilities use the B200 constants.
+_CHUNK_PARALLEL_COST_MODEL_DEFAULT = (10, 0)
+_CHUNK_PARALLEL_SMALL_ITEMS = 32
+_CHUNK_PARALLEL_LARGE_ITEMS = 128
+_CHUNK_PARALLEL_SELECTION_MARGIN = 1.05
+_CHUNK_PARALLEL_WORKSPACE_CAP_BYTES = 256 << 20
+# Chunk-parallel workspace per (chunk, head) tile: the f32 [64, 128] state
+# increments (32 KB) plus the bf16 [64, 128] state operand (16 KB).
+_CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE = _HEADDIM * _DSTATE * (4 + 2)
+# Grid barrier state: u32 ``[arrive, generation]``.
+_CHUNK_PARALLEL_GRID_BARRIER_WORDS = 2
+# ``auto`` applies the rule; ``always`` / ``never`` force the family.  Read on
+# every call.
+_CHUNK_PARALLEL_ENV = "FLASHINFER_CAKE_SSD_CHUNK_PARALLEL"
+_CHUNK_PARALLEL_MODES = ("auto", "always", "never")
+
+
+def _chunk_parallel_mode() -> str:
+    """The ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` override of the current call."""
+
+    value = os.environ.get(_CHUNK_PARALLEL_ENV, "auto")
+    mode = value.strip().lower()
+    if mode not in _CHUNK_PARALLEL_MODES:
+        raise ValueError(
+            f"{_CHUNK_PARALLEL_ENV} must be auto, always or never; got {value!r}"
+        )
+    return mode
+
+
+def selection_quantities(
+    *,
+    nheads: int,
+    num_sequences: int,
+    num_segments: int,
+    nchunks: int,
+    mode_varlen: bool,
+    sm_count: int,
+    capability: tuple[int, int],
+) -> dict[str, Any]:
+    """The quantities the family rule reads and both programs' predicted
+    main-kernel times (microseconds) for one call.
+
+    ``work_items`` is the exact scan's concurrency (one CTA per (sequence,
+    head) item); ``tiles`` the chunk-parallel tile bound (``num_segments *
+    nheads``, the preprocess row count; the cu_seqlens form passes its host
+    segment bound); ``chunks`` the serial chunk count per item: ``nchunks``
+    when batched, the mean logical-chunk count per packed sequence when varlen
+    (the per-sequence counts live on the device).
+    """
+
+    model = _CHUNK_PARALLEL_COST_MODEL_US.get(
+        (int(capability[0]), int(capability[1])),
+        _CHUNK_PARALLEL_COST_MODEL_US[_CHUNK_PARALLEL_COST_MODEL_DEFAULT],
+    )
+    work_items = int(num_sequences) * int(nheads)
+    tiles = int(num_segments) * int(nheads)
+    if mode_varlen:
+        chunks = -(-int(num_segments) // max(1, int(num_sequences)))
+    else:
+        chunks = int(nchunks)
+    span = _CHUNK_PARALLEL_LARGE_ITEMS - _CHUNK_PARALLEL_SMALL_ITEMS
+    weight = min(1.0, max(0.0, (work_items - _CHUNK_PARALLEL_SMALL_ITEMS) / span))
+    per_chunk = model["serial_per_chunk_small"] + weight * (
+        model["serial_per_chunk_large"] - model["serial_per_chunk_small"]
+    )
+    return {
+        "work_items": work_items,
+        "sm_count": int(sm_count),
+        "capability": (int(capability[0]), int(capability[1])),
+        "chunks": chunks,
+        "tiles": tiles,
+        "workspace_bytes": tiles * _CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE,
+        "predicted_us": {
+            "exact_scan": model["serial_fixed"] + per_chunk * chunks,
+            "chunk_parallel": model["cp_fixed"]
+            + model["cp_per_tile"] * max(0, tiles - int(sm_count)),
+        },
+    }
+
+
+def chunk_parallel_selected(
+    *,
+    nheads: int,
+    num_sequences: int,
+    num_segments: int,
+    nchunks: int,
+    mode_varlen: bool,
+    sm_count: int,
+    capability: tuple[int, int],
+    mode: str,
+) -> bool:
+    """Family rule: chunk-parallel iff fewer work items than SMs, the S/H
+    workspace fits the cap, and its predicted main-kernel time times the
+    selection margin still beats the exact scan's.  ``mode`` is the
+    environment override: ``always`` / ``never`` force the answer, ``auto``
+    applies the rule."""
+
+    if mode not in _CHUNK_PARALLEL_MODES:
+        raise ValueError(
+            f"chunk-parallel mode must be auto, always or never; got {mode!r}"
+        )
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    quantities = selection_quantities(
+        nheads=nheads,
+        num_sequences=num_sequences,
+        num_segments=num_segments,
+        nchunks=nchunks,
+        mode_varlen=mode_varlen,
+        sm_count=sm_count,
+        capability=capability,
+    )
+    predicted = quantities["predicted_us"]
+    return (
+        quantities["work_items"] < quantities["sm_count"]
+        and quantities["workspace_bytes"] <= _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES
+        and predicted["chunk_parallel"] * _CHUNK_PARALLEL_SELECTION_MARGIN
+        <= predicted["exact_scan"]
+    )
+
+
 def _sequence_arguments(
+    main_args: tuple[str, ...],
     preprocess: Mapping[str, object],
     preprocess_grid: tuple[int, int, int],
     main: Mapping[str, object],
     main_grid: tuple[int, int, int],
     cuda_stream: int,
 ) -> tuple[object, ...]:
-    """Order the name-keyed stage values into the launcher's positional ABI."""
+    """Order the name-keyed stage values into the launcher's positional ABI;
+    ``main_args`` is the program's main-kernel argument order."""
 
     return (
         *(preprocess[name] for name in _PREPROCESS_ARGS),
         *preprocess_grid,
-        *(main[name] for name in _MAIN_ARGS),
+        *(main[name] for name in main_args),
         *main_grid,
         cuda_stream,
     )
@@ -347,10 +627,17 @@ def _launch_program(
     main_grid: tuple[int, int, int],
     cuda_stream: int,
 ) -> None:
-    """Launch one program's preprocess and scan on the explicit stream."""
+    """Launch one program's preprocess and main kernel on the explicit stream."""
 
     _load_generated_program(name, arch).run(
-        *_sequence_arguments(preprocess, preprocess_grid, main, main_grid, cuda_stream)
+        *_sequence_arguments(
+            _PROGRAMS[name].main_args,
+            preprocess,
+            preprocess_grid,
+            main,
+            main_grid,
+            cuda_stream,
+        )
     )
 
 
@@ -433,9 +720,12 @@ def _load_generated_program(name: str, arch: str):
     """Build one program for ``arch``; the loaded module serves every device."""
 
     program = _PROGRAMS[name]
+    _require_exported(name, program)
     source_dir = _source_dir()
     host_source = _render_host_source(
-        (source_dir / _HOST_TEMPLATE).read_text(encoding="utf-8"), name, program
+        (source_dir / program.host_template).read_text(encoding="utf-8"),
+        name,
+        program,
     )
     nvcc = _nvcc()
     digest = hashlib.sha256()
@@ -518,6 +808,26 @@ class CakeSSDCombined:
     ``seq_chunk_cumsum`` from the packed-varlen metadata unless the caller
     supplies a precomputed vector) followed by the scan.
 
+    Two kernel families serve every call and are selected per call.  The
+    exact scan (``exact_*`` programs) runs one persistent CTA per (sequence,
+    head) item over its chunks in order.  The chunk-parallel program
+    (``chunkpar_*``) computes the same arithmetic in a different schedule --
+    one CTA per (chunk, head) tile, at most one per SM, with the inter-chunk
+    state recurrence resolved across a grid barrier -- and its output and
+    final states are bitwise identical to the exact scan's.  It is selected
+    by a calibrated cost rule (:func:`chunk_parallel_selected`: fewer
+    (sequence, head) items than SMs, the per-tile workspace within 256 MiB,
+    and a predicted main-kernel time that beats the exact scan's by the
+    selection margin), so it serves long prefills with few heads (one
+    sequence of 32768 tokens with 8 heads runs about four times faster) and
+    never 128-head calls.  The environment variable
+    ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` (``auto``, the default;
+    ``always``; ``never``), read on every call, forces either family; any
+    other value is rejected.  The chunk-parallel workspace (32 KB f32 + 16 KB
+    bf16 per tile, grown only when a call needs more tiles, plus a two-word
+    grid-barrier state zeroed once per device) is owned by the runner.
+    :attr:`last_program_name` names the program of the most recent call.
+
     Packed varlen has two forms.  ``cu_seqlens`` (int32 ``[num_seqs + 1]``,
     ``cu[0] == 0``, non-decreasing, ``cu[-1] == seqlen``, ``batch == 1``):
     the preprocess derives the 128-granularity segment tables, the sequence
@@ -552,6 +862,10 @@ class CakeSSDCombined:
     no kernel reads ``seq_idx`` on that call, so :meth:`seq_idx_status`
     cannot report ids the caller already consumed when building the table.
     """
+
+    #: Program of the most recent :meth:`run` (``exact_*`` or
+    #: ``chunkpar_*``); ``None`` before the first call.
+    last_program_name: Optional[str] = None
 
     def __init__(
         self,
@@ -605,13 +919,18 @@ class CakeSSDCombined:
         self.has_z = bool(has_z)
         self.seq_idx_dtype = seq_idx_dtype
         self._workspace_key: Optional[
-            Tuple[Optional[int], int, int, int, int, int, torch.dtype, bool]
+            Tuple[Optional[int], int, int, int, int, int, torch.dtype, bool, str]
         ] = None
-        self._workspace: Optional[dict[str, torch.Tensor]] = None
+        self._workspace: Optional[dict[str, Any]] = None
         self._dummy_cache: dict[Tuple[Optional[int], torch.dtype], torch.Tensor] = {}
         self._seq_cumsum_key: Optional[Tuple[Optional[int], int]] = None
         self._seq_cumsum_buf: Optional[torch.Tensor] = None
         self._preprocess_status: dict[Optional[int], torch.Tensor] = {}
+        # Chunk-parallel main-kernel buffers per device (grow-only) and the
+        # grid-barrier words per device (zeroed once); see
+        # ``_chunk_parallel_workspace``.
+        self._chunk_parallel_buffers: dict[Optional[int], dict[str, torch.Tensor]] = {}
+        self._grid_barriers: dict[Optional[int], torch.Tensor] = {}
 
     def _preprocess_status_buffer(self, device: torch.device) -> torch.Tensor:
         """The runner-owned ``preprocess_status`` word (one int32 per device).
@@ -661,7 +980,7 @@ class CakeSSDCombined:
 
     @staticmethod
     def _contiguous_input(
-        workspace: dict[str, torch.Tensor],
+        workspace: dict[str, Any],
         name: str,
         value: Optional[torch.Tensor],
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -699,7 +1018,19 @@ class CakeSSDCombined:
         num_segments: int,
         num_sequences: int,
         from_cu_seqlens: bool = False,
-    ):
+        sm_count: int,
+        capability: tuple[int, int],
+        chunk_parallel_mode: str,
+    ) -> dict[str, Any]:
+        """The per-call-shape workspace, with the kernel family of the call.
+
+        The family (``workspace["program"]``) is a function of the key, the
+        device's SM count and capability (fixed per ``device.index``) and the
+        per-call ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` override, which is
+        therefore part of the key; the chunk-parallel buffers are bound only
+        when that family is selected.
+        """
+
         key = (
             device.index,
             batch,
@@ -709,6 +1040,7 @@ class CakeSSDCombined:
             num_sequences,
             self.state_dtype,
             from_cu_seqlens,
+            chunk_parallel_mode,
         )
         if self._workspace_key != key:
             ids = torch.arange(num_segments, dtype=torch.int32, device=device)
@@ -722,7 +1054,22 @@ class CakeSSDCombined:
                 * nchunks
             )
             tile_count = num_segments * self.nheads
+            chunk_parallel = chunk_parallel_selected(
+                nheads=self.nheads,
+                num_sequences=num_sequences,
+                num_segments=num_segments,
+                nchunks=nchunks,
+                mode_varlen=self.has_varlen,
+                sm_count=sm_count,
+                capability=capability,
+                mode=chunk_parallel_mode,
+            )
             self._workspace = {
+                "program": _program_name(
+                    "chunkpar" if chunk_parallel else "exact",
+                    self.state_dtype,
+                    self.has_varlen,
+                ),
                 "starts": starts,
                 "lengths": lengths,
                 "sequence_offsets": sequence_offsets,
@@ -804,10 +1151,48 @@ class CakeSSDCombined:
                         device=device,
                     ),
                 )
+            if chunk_parallel:
+                self._workspace.update(
+                    self._chunk_parallel_workspace(device, tile_count)
+                )
             self._workspace_key = key
         workspace = self._workspace
         assert workspace is not None
         return workspace
+
+    def _chunk_parallel_workspace(
+        self, device: torch.device, tiles_bound: int
+    ) -> dict[str, torch.Tensor]:
+        """The chunk-parallel main kernel's workspace on ``device``.
+
+        ``s_work`` (f32 ``[tiles, 64, 128]``, the per-tile state increments,
+        32 KB per tile) and ``h_work`` (bf16 ``[tiles, 64, 128]``, the state
+        operand entering each tile, 16 KB per tile; bound as the ``h_map``
+        tensor map and, through ``h_words``, as its u32 view) grow only: a
+        call whose tile bound exceeds the allocation replaces them, smaller
+        calls reuse them (the kernel addresses tiles below the call's bound
+        only).  ``grid_barrier`` (u32 ``[arrive, generation]``) is allocated
+        zeroed once per device and never re-zeroed: the kernel's arrive
+        counter self-resets and its generation word is free-running.
+        """
+
+        buffers = self._chunk_parallel_buffers.get(device.index)
+        if buffers is None or buffers["h_work"].shape[0] < tiles_bound:
+            shape = (tiles_bound, _HEADDIM, _DSTATE)
+            h_work = torch.empty(shape, dtype=torch.bfloat16, device=device)
+            buffers = {
+                "s_work": torch.empty(shape, dtype=torch.float32, device=device),
+                "h_work": h_work,
+                "h_words": h_work.view(torch.uint32),
+            }
+            self._chunk_parallel_buffers[device.index] = buffers
+        grid_barrier = self._grid_barriers.get(device.index)
+        if grid_barrier is None:
+            grid_barrier = torch.zeros(
+                _CHUNK_PARALLEL_GRID_BARRIER_WORDS, dtype=torch.uint32, device=device
+            )
+            self._grid_barriers[device.index] = grid_barrier
+        return {**buffers, "grid_barrier": grid_barrier}
 
     def _seq_chunk_cumsum_buffer(
         self, device: torch.device, num_sequences: int
@@ -1080,6 +1465,12 @@ class CakeSSDCombined:
             # Match SSDCombined's ownership contract: each allocation-returning
             # call owns fresh output storage that later calls cannot overwrite.
             out = torch.empty(expected_out, dtype=torch.bfloat16, device=x.device)
+        # The kernel family is chosen with the workspace: it depends on the
+        # workspace key, the device (SM count, capability) and the per-call
+        # environment override.
+        device_index = _cuda_device_index(x)
+        arch = _target_arch(device_index)
+        sm_count = _sm_count(device_index)
         workspace = self._get_workspace(
             device=x.device,
             batch=batch,
@@ -1088,7 +1479,13 @@ class CakeSSDCombined:
             num_segments=num_segments,
             num_sequences=num_sequences,
             from_cu_seqlens=from_cu_seqlens,
+            sm_count=sm_count,
+            capability=_ARCH_CAPABILITIES[arch],
+            chunk_parallel_mode=_chunk_parallel_mode(),
         )
+        program_name = workspace["program"]
+        program = _PROGRAMS[program_name]
+        self.last_program_name = program_name
         # The kernel needs valid storage even when final states are disabled.
         # When they are returned, allocate caller-owned storage up front so
         # repeated cached-runner calls do not alias and no post-kernel device
@@ -1157,8 +1554,6 @@ class CakeSSDCombined:
             staged_out = workspace["padded_out"]
         assert x is not None and dt is not None and A is not None
         assert B is not None and C is not None
-        device_index = _cuda_device_index(x)
-        arch = _target_arch(device_index)
         seq_idx_int64 = seq_idx is not None and seq_idx.dtype == torch.int64
         seq_i32 = (
             seq_idx
@@ -1225,8 +1620,6 @@ class CakeSSDCombined:
         else:
             dt_bias_float = workspace["dt_bias_float"]
             pending_copies.append((dt_bias_float, dt_bias))
-        program_name = _program_name(self.state_dtype, mode_varlen)
-        program = _PROGRAMS[program_name]
         preprocess_values, preprocess_grid = _direct_preprocess_inputs(
             dt=dt_float,
             A=A,
@@ -1256,10 +1649,17 @@ class CakeSSDCombined:
             checkpoint_state_count=checkpoint_state_count,
             preprocess_status=self._preprocess_status_buffer(x.device),
         )
-        grid = _persistent_grid_size(
-            total_work=num_sequences * self.nheads,
-            sm_count=_sm_count(device_index),
-        )
+        if program.family == "chunkpar":
+            # One CTA per (chunk, head) tile, at most one per SM (SMEM, TMEM
+            # and registers allow one CTA per SM), so every CTA is co-resident
+            # for the grid barrier.  The tile bound counts workspace rows the
+            # cu_seqlens form may never address; the kernel reads the real
+            # tile count from ``seq_chunk_cumsum[sequence_count]``.
+            grid = max(1, min(num_segments * self.nheads, sm_count))
+        else:
+            grid = _persistent_grid_size(
+                total_work=num_sequences * self.nheads, sm_count=sm_count
+            )
 
         d_arg = D if D is not None else self._dummy(x.device, torch.bfloat16)
         if D is not None and D.ndim == 2 and not self.d_has_hdim:
@@ -1341,6 +1741,17 @@ class CakeSSDCombined:
             "write_final_states": int(return_final_states),
             "checkpoint_state_count": checkpoint_state_count,
         }
+        if program.family == "chunkpar":
+            # The state operand workspace is bound twice: as the ``h_map``
+            # tensor map (the host builds the TMA descriptor from the bf16
+            # [tiles, 64, 128] tensor) and as the u32 word view the phase-2
+            # chains store through.
+            main_values.update(
+                h_map=workspace["h_work"],
+                s_work=workspace["s_work"],
+                h_words=workspace["h_words"],
+                grid_barrier=workspace["grid_barrier"],
+            )
         # Every host-side decision is made; from here on only device work is
         # issued: the packed-input copies, then the single launcher call that
         # runs the preprocess and the scan, then (calls shorter than one
