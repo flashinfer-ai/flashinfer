@@ -44,6 +44,10 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_TOTAL 256
 #define THREADS 224
 
+template <typename F, size_t... _i> __device__ __forceinline__ void poll_expand(F&& f, std::index_sequence<_i...>) {
+    (f(std::integral_constant<int, static_cast<int>(_i)>{}), ...);
+}
+
 #include <math_constants.h>
 
 __device__ __forceinline__ float approx_rcp(float x) {
@@ -442,26 +446,11 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
     for (int token_1 = token_begin; token_1 < token_end; token_1 += token_stride) {
         uint32_t _sysv_poll_group_0[4 * WS];
         do {
-            if constexpr (WS == 2) {
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[0]), "=r"(_sysv_poll_group_0[1]), "=r"(_sysv_poll_group_0[2]), "=r"(_sysv_poll_group_0[3]) : "l"(workspace_local + (data_base + (long long)(access_1 * 8))) : "memory");
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[4]), "=r"(_sysv_poll_group_0[5]), "=r"(_sysv_poll_group_0[6]), "=r"(_sysv_poll_group_0[7]) : "l"(workspace_local + (data_base + (long long)(total_access * 8) + (long long)(access_1 * 8))) : "memory");
-            }
-            if constexpr (WS == 4) {
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[0]), "=r"(_sysv_poll_group_0[1]), "=r"(_sysv_poll_group_0[2]), "=r"(_sysv_poll_group_0[3]) : "l"(workspace_local + (data_base + (long long)(access_1 * 8))) : "memory");
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[4]), "=r"(_sysv_poll_group_0[5]), "=r"(_sysv_poll_group_0[6]), "=r"(_sysv_poll_group_0[7]) : "l"(workspace_local + (data_base + (long long)(total_access * 8) + (long long)(access_1 * 8))) : "memory");
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[8]), "=r"(_sysv_poll_group_0[9]), "=r"(_sysv_poll_group_0[10]), "=r"(_sysv_poll_group_0[11]) : "l"(workspace_local + (data_base + (long long)(2 * total_access * 8) + (long long)(access_1 * 8))) : "memory");
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[12]), "=r"(_sysv_poll_group_0[13]), "=r"(_sysv_poll_group_0[14]), "=r"(_sysv_poll_group_0[15]) : "l"(workspace_local + (data_base + (long long)(3 * total_access * 8) + (long long)(access_1 * 8))) : "memory");
-            }
-            if constexpr (WS == 8) {
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[0]), "=r"(_sysv_poll_group_0[1]), "=r"(_sysv_poll_group_0[2]), "=r"(_sysv_poll_group_0[3]) : "l"(peer[0] + (access_1 * 8)) : "memory");
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[4]), "=r"(_sysv_poll_group_0[5]), "=r"(_sysv_poll_group_0[6]), "=r"(_sysv_poll_group_0[7]) : "l"(peer[1] + (total_access * 8 + access_1 * 8)) : "memory");
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[8]), "=r"(_sysv_poll_group_0[9]), "=r"(_sysv_poll_group_0[10]), "=r"(_sysv_poll_group_0[11]) : "l"(peer[2] + (2 * total_access * 8 + access_1 * 8)) : "memory");
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[12]), "=r"(_sysv_poll_group_0[13]), "=r"(_sysv_poll_group_0[14]), "=r"(_sysv_poll_group_0[15]) : "l"(peer[3] + (3 * total_access * 8 + access_1 * 8)) : "memory");
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[16]), "=r"(_sysv_poll_group_0[17]), "=r"(_sysv_poll_group_0[18]), "=r"(_sysv_poll_group_0[19]) : "l"(peer[4] + (4 * total_access * 8 + access_1 * 8)) : "memory");
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[20]), "=r"(_sysv_poll_group_0[21]), "=r"(_sysv_poll_group_0[22]), "=r"(_sysv_poll_group_0[23]) : "l"(peer[5] + (5 * total_access * 8 + access_1 * 8)) : "memory");
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[24]), "=r"(_sysv_poll_group_0[25]), "=r"(_sysv_poll_group_0[26]), "=r"(_sysv_poll_group_0[27]) : "l"(peer[6] + (6 * total_access * 8 + access_1 * 8)) : "memory");
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[28]), "=r"(_sysv_poll_group_0[29]), "=r"(_sysv_poll_group_0[30]), "=r"(_sysv_poll_group_0[31]) : "l"(peer[7] + (7 * total_access * 8 + access_1 * 8)) : "memory");
-            }
+            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[0]), "=r"(_sysv_poll_group_0[1]), "=r"(_sysv_poll_group_0[2]), "=r"(_sysv_poll_group_0[3]) : "l"(workspace_local + (data_base + (long long)(access_1 * 8))) : "memory");
+            poll_expand([&](auto _pc) {
+                constexpr int p = 1 + decltype(_pc)::value;
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[4 * p]), "=r"(_sysv_poll_group_0[(4 * p + 1)]), "=r"(_sysv_poll_group_0[(4 * p + 2)]), "=r"(_sysv_poll_group_0[(4 * p + 3)]) : "l"(workspace_local + (data_base + (long long)(p * total_access * 8) + (long long)(access_1 * 8))) : "memory");
+            }, std::make_index_sequence<WS - 1>{});
         } while (poll_any_0(_sysv_poll_group_0, std::make_index_sequence<4 * WS>{}));
         float _sysv_poll_group_0_f32[8];
         #pragma unroll
@@ -652,10 +641,10 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
             float _fp8_rt_0;
             uint16_t _e4m3x2_8;
             uint32_t _f16x2_8;
-            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_8) : "f"(0.0f), "f"(sf_value));
-            asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_8) : "h"(_e4m3x2_8));
+            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_8) : "f"(0.0f), "f"(sf_value));
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_8) : "h"(_e4m3x2_8));
             uint16_t _fp8_h0_8 = (uint16_t)(_f16x2_8 & 0xFFFFu);
-            asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_8));
+            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_8));
             float sf_rounded = _fp8_rt_0;
             float _rcp_1 = approx_rcp(scale_factor);
             float _rcp_2 = approx_rcp(sf_rounded * _rcp_1);
