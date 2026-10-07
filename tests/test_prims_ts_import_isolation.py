@@ -84,9 +84,7 @@ from flashinfer.prims_ts.cutlass_dsl import (
 original_init = WorkTileInfo.__init__
 require_cutlass_dsl_experimental()
 assert WorkTileInfo.__init__ is original_init
-# CUTLASS DSL 4.7 patches WorkTileInfo when Task Scheduling is imported, so
-# the scope must swap that patch in. 4.8 ships its own subclass instead and
-# leaves the base class alone, so there is nothing to swap.
+# Only DSL 4.7 patches WorkTileInfo; 4.8 ships its own subclass.
 dsl_patches_work_tile_info = (
     cutlass_dsl._TASK_SCHEDULING_WORK_TILE_INFO
     != cutlass_dsl._ORIGINAL_WORK_TILE_INFO

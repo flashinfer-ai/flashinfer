@@ -2429,11 +2429,7 @@ def batched_gemm_kernel_bf16(
             token_cta_idx = block_n
         else:
             token_cta_idx = block_m
-        # Exit inactive CTAs instead of nesting the body under this runtime
-        # branch: the body builds its SMEM/TMEM allocators by appending to
-        # Python lists, which CuTe DSL 4.8 rejects inside a runtime `if`
-        # (CONTAINER_LIST_SHAPE_MUTATED). The predicate is CTA-uniform and no
-        # barrier has been touched yet, so the whole CTA leaves together.
+        # Early exit: DSL 4.8 rejects allocator list appends under a runtime `if`.
         if token_cta_idx >= num_non_exiting_ctas:
             prims.exit()
     _batched_gemm_kernel_bf16_body(

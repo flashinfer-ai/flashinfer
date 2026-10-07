@@ -214,9 +214,7 @@ class SmemDeepSeekSfAbResource(MemoryResource):
 
     @cute.jit
     def _reset_acc_state(self) -> None:
-        # Epilogue-only state. Binding it from the load warps' init as well
-        # makes CuTe DSL 4.8 reject the epilogue's rebind: the load branch's
-        # vector SSA does not dominate the epilogue branch (SCOPE_READ_NEVER_SET).
+        # Epilogue-only: load-warp binding trips DSL 4.8 SCOPE_READ_NEVER_SET.
         if cutlass.const_expr(self.cfg.is_swap_ab):
             swap_t2r_repx = max(1, self.cfg.epi_tile_n // 8)
             self.dsfp8_acc_rmem_state = cutlass.vector.full(
