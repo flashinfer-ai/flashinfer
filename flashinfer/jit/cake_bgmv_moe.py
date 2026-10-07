@@ -28,11 +28,12 @@ from .core import (
     sm90a_nvcc_flags,
     sm100a_nvcc_flags,
     sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
 )
 from .utils import write_if_different
 
 CakeBGMVMoEDType = Literal["bfloat16", "float16"]
-CakeBGMVMoEArch = Literal["sm90a", "sm100a", "sm103a"]
+CakeBGMVMoEArch = Literal["sm90a", "sm100a", "sm103a", "sm107a"]
 CakeBGMVMoESchedule = Literal[
     "token_owned_t64",
     "token_owned",
@@ -374,13 +375,14 @@ class CakeBGMVMoEArchTarget(NamedTuple):
 
 
 # The generated programs use cp.async, warp shuffles and FMA only, so one
-# source body serves Hopper and both Blackwell data-center targets; each
-# target gets its own cubin and module so the binding can fail closed on a
-# mismatched device.
+# source body serves Hopper, both Blackwell data-center targets and Rubin;
+# each target gets its own cubin and module so the binding can fail closed on
+# a mismatched device.
 CAKE_BGMV_MOE_ARCH_TARGETS: dict[CakeBGMVMoEArch, CakeBGMVMoEArchTarget] = {
     "sm90a": CakeBGMVMoEArchTarget("sm90a", (9, 0), tuple(sm90a_nvcc_flags)),
     "sm100a": CakeBGMVMoEArchTarget("sm100a", (10, 0), tuple(sm100a_nvcc_flags)),
     "sm103a": CakeBGMVMoEArchTarget("sm103a", (10, 3), tuple(sm103a_nvcc_flags)),
+    "sm107a": CakeBGMVMoEArchTarget("sm107a", (10, 7), tuple(sm107a_nvcc_flags)),
 }
 CAKE_BGMV_MOE_ARCHES: tuple[CakeBGMVMoEArch, ...] = tuple(CAKE_BGMV_MOE_ARCH_TARGETS)
 
@@ -505,6 +507,8 @@ CAKE_BGMV_MOE_SPECIALIZED_TOKEN_WINDOW: Dict[
     "sm90a": None,
     "sm100a": (32, 1024),
     "sm103a": (32, 1024),
+    # Rubin: inherits the Blackwell window pending R200 measurement (CAKE-1096)
+    "sm107a": (32, 1024),
 }
 
 # Programmatic dependent launch (PDL) of the per-route expand behind the shrink.
@@ -520,6 +524,8 @@ CAKE_BGMV_MOE_PDL_SMALL_EXPAND_CTAS_PER_SM: Dict[CakeBGMVMoEArch, int] = {
     "sm90a": 12,
     "sm100a": 8,
     "sm103a": 8,
+    # Rubin: inherits the Blackwell window pending R200 measurement (CAKE-1096)
+    "sm107a": 8,
 }
 CAKE_BGMV_MOE_PDL_EXPAND_COLS_NOMINAL = 128
 
@@ -545,7 +551,7 @@ def cake_bgmv_moe_pdl_mode(
     expand_ctas = int(num_tokens) * ((int(hidden_size) + cols - 1) // cols)
     per_sm = CAKE_BGMV_MOE_PDL_SMALL_EXPAND_CTAS_PER_SM.get(arch, 0)
     small = expand_ctas <= per_sm * int(sm_count)
-    if arch in ("sm100a", "sm103a"):
+    if arch in ("sm100a", "sm103a", "sm107a"):
         return 1 if small else 2
     if arch == "sm90a":
         return 1 if small else 0
@@ -710,7 +716,8 @@ def select_cake_bgmv_moe_schedule(
 ) -> CakeBGMVMoESchedule:
     """Return the measured selector for the supported rank-32 portfolio.
 
-    The table was measured on B200 (SM100, 148 SMs); all targets share it.
+    The table was measured on B200 (SM100, 148 SMs); all targets share it;
+    Rubin (SM107, 212 SMs) inherits it pending measurement.
     Sweeping the three expand schedules over the serving shapes (hidden
     2688/3072, 1..1024 tokens, BF16, CUPTI cold-L2) puts them within 1.2 % of
     each other on B200 and within 3.5 % on H100 (SM90), where
@@ -823,7 +830,10 @@ def _generic_binding_source(
     # weights-only-ring grouped shrink wherever the ring form is selected (bitwise identical rows;
     # the instruction exists from sm_100 on, fp16 rows keep the widened chain).
     group_shrink_mixed = (
-        1 if target.arch in ("sm100a", "sm103a") and input_dtype == "dl_bfloat16" else 0
+        1
+        if target.arch in ("sm100a", "sm103a", "sm107a")
+        and input_dtype == "dl_bfloat16"
+        else 0
     )
     return f"""\
 /*

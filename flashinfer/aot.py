@@ -833,6 +833,7 @@ def gen_all_modules(
             ("sm90a", "sm90a_exact"),
             ("sm100a", "sm100a_exact"),
             ("sm103a", "sm103a_exact"),
+            ("sm107a", "sm107a_exact"),
         ):
             if sm_capabilities.get(cake_bgmv_flag, False):
                 jit_specs.extend(
@@ -1452,6 +1453,8 @@ def detect_sm_capabilities():
         "sm103": has_sm("compute_103", "12.9"),
         "sm103a_exact": (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
         and cuda_version >= Version("12.9"),
+        "sm107a_exact": (10, "7a") in compilation_context.TARGET_CUDA_ARCHS
+        and cuda_version >= Version("13.0"),
         "sm107": has_sm("compute_107", "12.9"),
         "sm110": has_sm("compute_110", "13.0"),
         "sm120": has_sm("compute_120", "12.8"),
