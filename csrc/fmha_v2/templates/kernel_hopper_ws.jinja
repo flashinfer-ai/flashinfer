@@ -407,6 +407,10 @@ void {{ launcher_name }}(
 {% endif %} // custom mask
     }
 
+    if( Ktraits::SCHEDULING_MODE > 0 ) {
+        // XQA reuses this workspace and requires its semaphores to start at zero.
+        FMHA_CHECK_CUDA(cudaMemsetAsync(params.tile_id_counter_ptr, 0, sizeof(uint32_t), stream));
+    }
 }
 
 #endif
