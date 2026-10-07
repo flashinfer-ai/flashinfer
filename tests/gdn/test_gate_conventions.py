@@ -1,0 +1,369 @@
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+from pathlib import Path
+
+import pytest
+import torch
+from types import SimpleNamespace
+
+from flashinfer.gdn_kernels.gates import materialize_gates, validate_gate_inputs
+from flashinfer.gdn_prefill import chunk_gated_delta_rule
+from flashinfer.trace.templates.gdn import gdn_prefill_trace
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_raw_gates_preserve_beta_storage_rounding(dtype):
+    g = torch.tensor([[-20.0, 0.0, 20.0], [0.2, -0.7, 0.4]], dtype=dtype)
+    beta = torch.tensor([[0.1, 0.3, 0.7], [-0.1, -0.3, -0.7]], dtype=dtype)
+    a_log = torch.tensor([-1.0, 0.0, 1.0])
+    bias = torch.tensor([0.3, -0.2, 0.1])
+    alpha, actual_beta = materialize_gates(g, beta, "linear", True, a_log, bias, True)
+    expected = (
+        (
+            -a_log.double().exp()
+            * torch.nn.functional.softplus(g.double() + bias.double())
+        )
+        .exp()
+        .float()
+    )
+    torch.testing.assert_close(alpha, expected, atol=1e-7, rtol=2e-6)
+    torch.testing.assert_close(
+        actual_beta, beta.float().sigmoid().to(dtype).float(), rtol=0, atol=0
+    )
+    log_alpha, _ = materialize_gates(
+        expected.log(), beta, "log", False, None, None, False
+    )
+    torch.testing.assert_close(log_alpha, expected)
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "domain",
+        "missing_gate",
+        "missing_bias",
+        "unused_parameter",
+        "beta_none",
+        "beta_dtype",
+        "gate_shape",
+        "parameter_shape",
+    ],
+)
+def test_invalid_gate_metadata(problem):
+    q = torch.empty(3, 2, 8)
+    v = torch.empty(3, 4, 8)
+    g, beta = torch.empty(3, 4), torch.empty(3, 4)
+    a_log, bias = torch.empty(4), torch.empty(4)
+    domain, raw, logits = "linear", True, True
+    if problem == "domain":
+        domain = "raw"
+    elif problem == "missing_gate":
+        g = None
+    elif problem == "missing_bias":
+        bias = None
+    elif problem == "unused_parameter":
+        raw = False
+    elif problem == "beta_none":
+        beta = None
+    elif problem == "beta_dtype":
+        beta = beta.long()
+    elif problem == "gate_shape":
+        g = g[:, :2]
+    elif problem == "parameter_shape":
+        bias = bias[None]
+    with pytest.raises(ValueError):
+        validate_gate_inputs(q, v, g, beta, domain, raw, a_log, bias, logits)
+
+
+def test_transformed_trace_preserves_default_definition_and_runs_standalone():
+    default = gdn_prefill_trace()
+    transformed = gdn_prefill_trace(use_gate_in_kernel=True)
+    assert default.name_prefix == "gdn_prefill"
+    assert "gate_domain" not in default.inputs
+    assert transformed.name_prefix == "gdn_prefill_gates"
+    assert gdn_prefill_trace(gate_domain="log") is transformed
+    assert gdn_prefill_trace(beta_is_logit=True) is transformed
+    args = transformed.init(
+        total_seq_len=4,
+        num_seqs=2,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=4,
+        head_size=8,
+        device="cpu",
+    )
+    definition = chunk_gated_delta_rule.fi_trace(**args)
+    namespace = {}
+    exec(definition["reference"], namespace)
+    output, state = namespace["_gdn_prefill_gates_reference"](
+        args["q"],
+        args["k"],
+        args["v"],
+        None,
+        args["A_log"],
+        args["g"],
+        args["dt_bias"],
+        args["beta"],
+        args["cu_seqlens"],
+        None,
+        use_gate_in_kernel=True,
+        beta_is_logit=True,
+        output_final_state=True,
+    )
+    assert output.shape == args["v"].shape
+    assert state.shape == (2, 4, 8, 8)
+    assert torch.isfinite(output).all() and torch.isfinite(state).all()
+    init_namespace = {}
+    exec(definition["init"], init_namespace)
+    replay = init_namespace["_gdn_prefill_gates_init"](
+        total_seq_len=4,
+        num_seqs=2,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=4,
+        head_size=8,
+        device="cpu",
+    )
+    assert replay["use_gate_in_kernel"] and replay["beta_is_logit"]
+
+
+@pytest.mark.parametrize("definition_source", ["generated", "checked_in"])
+def test_gate_trace_requires_beta_for_logit_transform(definition_source):
+    if definition_source == "generated":
+        args = gdn_prefill_trace(beta_is_logit=True).init(
+            total_seq_len=1, num_seqs=1, head_size=8, device="cpu"
+        )
+        definition = chunk_gated_delta_rule.fi_trace(**args)
+    else:
+        definition = json.loads(
+            (
+                Path(__file__).parents[1]
+                / "trace/fi_trace_out/gdn_prefill_gates_q4_k4_v8_d128.json"
+            ).read_text()
+        )
+    namespace = {}
+    exec(definition["reference"], namespace)
+    reference = namespace["_gdn_prefill_gates_reference"]
+    q = torch.ones(1, 1, 1)
+    cu = torch.tensor([0, 1], dtype=torch.int64)
+    args = (q, q, q, None, None, None, None, None, cu, None)
+    # Omitted precomputed beta still means one; omitted logits are invalid.
+    output, _ = reference(*args)
+    torch.testing.assert_close(output, torch.ones_like(output), rtol=0, atol=0)
+    with pytest.raises(ValueError, match="beta_is_logit requires beta"):
+        reference(*args, beta_is_logit=True)
+    with pytest.raises(ValueError, match="beta_is_logit requires beta"):
+        validate_gate_inputs(q, q, None, None, "linear", False, None, None, True)
+
+
+@pytest.mark.parametrize("heads", [(4, 2, 2), (2, 2, 4)])
+@pytest.mark.parametrize("empty_sequence", [False, True])
+def test_gate_trace_reference_grouping_and_state_pool(heads, empty_sequence):
+    from tests.test_helpers.cudnn_linear_attention import serial_delta_rule
+
+    hq, hk, hv = heads
+    template = gdn_prefill_trace(use_gate_in_kernel=True)
+    args = template.init(
+        total_seq_len=4,
+        num_seqs=2,
+        state_pool_rows=6,
+        num_q_heads=hq,
+        num_k_heads=hk,
+        num_v_heads=hv,
+        head_size=8,
+        device="cpu",
+    )
+    args["initial_state"].normal_(0, 0.01)
+    args["output_state"].fill_(17)
+    args["state_indices"] = torch.tensor([5, 1], dtype=torch.int32)
+    args["cu_seqlens"] = torch.tensor(
+        [0, 0 if empty_sequence else 1, 4], dtype=torch.int64
+    )
+    definition = chunk_gated_delta_rule.fi_trace(**args)
+    assert "state_indices" in definition["inputs"]
+    assert definition["inputs"]["state"]["shape"][0] == "state_pool_rows"
+    namespace = {}
+    exec(definition["reference"], namespace)
+    actual, pool = namespace["_gdn_prefill_gates_reference"](
+        args["q"],
+        args["k"],
+        args["v"],
+        args["initial_state"],
+        args["A_log"],
+        args["g"],
+        args["dt_bias"],
+        args["beta"],
+        args["cu_seqlens"],
+        None,
+        use_gate_in_kernel=True,
+        beta_is_logit=True,
+        output_final_state=True,
+        state_indices=args["state_indices"],
+        output_state=args["output_state"],
+    )
+    alpha = (
+        -args["A_log"].exp() * torch.nn.functional.softplus(args["g"] + args["dt_bias"])
+    ).exp()
+    beta = args["beta"].float().sigmoid().to(args["beta"].dtype).float()
+    expected, state = serial_delta_rule(
+        args["q"],
+        args["k"],
+        args["v"],
+        args["cu_seqlens"],
+        alpha=alpha,
+        beta=beta,
+        initial_state=args["initial_state"][args["state_indices"]],
+        scale=8**-0.5,
+    )
+    torch.testing.assert_close(actual, expected.to(actual.dtype), rtol=0, atol=0)
+    torch.testing.assert_close(pool[args["state_indices"]], state)
+    assert torch.equal(pool[[0, 2, 3, 4]], args["output_state"][[0, 2, 3, 4]])
+
+
+def test_pool_only_trace_selects_slot_aware_schema_and_reference():
+    from tests.test_helpers.cudnn_linear_attention import serial_delta_rule
+
+    indices = torch.tensor([5, 1], dtype=torch.int32)
+    template = gdn_prefill_trace(state_indices=indices)
+    assert template is not gdn_prefill_trace()
+    args = template.init(
+        total_seq_len=4,
+        num_seqs=2,
+        state_pool_rows=6,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=4,
+        head_size=8,
+        device="cpu",
+    )
+    args.update(
+        state_indices=indices,
+        use_gate_in_kernel=False,
+        beta_is_logit=False,
+        A_log=None,
+        dt_bias=None,
+    )
+    args["g"].fill_(0.9)
+    args["beta"].fill_(0.5)
+    args["initial_state"].normal_(0, 0.01)
+    args["output_state"].fill_(17)
+    definition = chunk_gated_delta_rule.fi_trace(**args)
+    assert "state_indices" in definition["inputs"]
+    assert definition["inputs"]["state"]["shape"][0] == "state_pool_rows"
+    namespace = {}
+    exec(definition["reference"], namespace)
+    actual, pool = namespace["_gdn_prefill_gates_reference"](
+        args["q"],
+        args["k"],
+        args["v"],
+        args["initial_state"],
+        None,
+        args["g"],
+        None,
+        args["beta"],
+        args["cu_seqlens"],
+        None,
+        output_final_state=True,
+        state_indices=indices,
+        output_state=args["output_state"],
+    )
+    expected, state = serial_delta_rule(
+        args["q"],
+        args["k"],
+        args["v"],
+        args["cu_seqlens"],
+        alpha=args["g"],
+        beta=args["beta"],
+        initial_state=args["initial_state"][indices],
+        scale=8**-0.5,
+    )
+    torch.testing.assert_close(actual, expected.to(actual.dtype), rtol=0, atol=0)
+    torch.testing.assert_close(pool[indices], state)
+    torch.testing.assert_close(pool[[0, 2, 3, 4]], args["output_state"][[0, 2, 3, 4]])
+
+
+def test_auto_fallback_signal_is_limited_to_plan_build(monkeypatch):
+    from flashinfer.cudnn import linear_attention as adapter
+
+    if not adapter.CUDNN_AVAILABLE:
+        pytest.skip("requires the cuDNN Python package")
+    q, g = torch.ones(2, 1, 4), torch.ones(2, 1)
+    cu = torch.tensor([0, 2], dtype=torch.int32)
+
+    def run(epsilon=None):
+        return adapter._run_la_graph(
+            "gdn",
+            q,
+            q,
+            q,
+            g,
+            g,
+            cu,
+            torch.empty_like(q),
+            scale=0.5,
+            use_qk_l2norm=False,
+            use_beta_sigmoid=False,
+            safe_gate=False,
+            gate_lower_bound=None,
+            batch_invariant=False,
+            qk_l2norm_additive_epsilon=epsilon,
+        )
+
+    for error_type in (NotImplementedError, adapter.cudnn.cudnnGraphNotSupportedError):
+        original = error_type("unsupported plan")
+
+        def rejected(*args, **kwargs):
+            raise original
+
+        monkeypatch.setattr(adapter, "_build_la_graph", rejected)
+        with pytest.raises(error_type) as caught:
+            run()
+        assert caught.value is original
+        assert type(caught.value) is error_type
+        assert caught.value._fi_la_build_unsupported
+
+    def old_builder(*args, **kwargs):
+        raise TypeError("got unexpected arguments ['qk_l2norm_additive_epsilon']")
+
+    monkeypatch.setattr(adapter, "_build_la_graph", old_builder)
+    with pytest.raises(TypeError) as attribute:
+        run(epsilon=1e-6)
+    assert type(attribute.value) is TypeError
+    assert attribute.value._fi_la_build_unsupported
+    with pytest.raises(TypeError) as unrelated:
+        run()
+    assert not getattr(unrelated.value, "_fi_la_build_unsupported", False)
+
+    def failed_execute(*args, **kwargs):
+        raise NotImplementedError("execution failed")
+
+    graph = SimpleNamespace(
+        _fi_la_workspace_size=1,
+        _fi_la_ordered=True,
+        _fi_la_uids=(1, 2, 3, 10, 11, 100, 1000),
+        execute=failed_execute,
+    )
+    monkeypatch.setattr(adapter, "_build_la_graph", lambda *args, **kwargs: (graph, ()))
+    monkeypatch.setattr(adapter, "_get_cache_buf", lambda *args: torch.empty(1))
+    monkeypatch.setattr(adapter, "_create_cudnn_handle", lambda *args: 0)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda *args: SimpleNamespace(cuda_stream=1)
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    with pytest.raises(NotImplementedError, match="execution failed") as caught:
+        run()
+    assert not getattr(caught.value, "_fi_la_build_unsupported", False)
