@@ -51,8 +51,8 @@ BACKEND_CP_HEAD_CASES = (
 def _skip_if_not_supported(backend, use_cp):
     device = torch.device("cuda")
     major, minor = get_compute_capability(device)
-    if backend == "cake_gdn" and (major, minor) not in ((10, 0), (10, 3)):
-        pytest.skip("cake_gdn prefill requires SM100 or SM103")
+    if backend == "cake_gdn" and (major, minor) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("cake_gdn prefill requires SM100, SM103 or SM107")
     if major not in (9, 10, 12):
         pytest.skip("state_indices GDN prefill path requires SM90, SM100, or SM120")
     cuda_version = tuple(
