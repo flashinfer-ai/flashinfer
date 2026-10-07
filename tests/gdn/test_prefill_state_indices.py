@@ -738,12 +738,13 @@ def _run_invalid_slot_child(case_name):
     perm = [1]
     pool = _make_pool(init_state, perm, 3, 0, torch.float32, device)
     idx = torch.tensor(perm, dtype=torch.int32, device=device)
-    idx[0] = -1 if case_name == "negative" else int(pool.shape[0])
-    _run(q, k, v, g, beta, cu_seqlens, pool, pool, idx, False, "flashinfer")
+    idx[0] = -1 if case_name.endswith("negative") else int(pool.shape[0])
+    use_cp = case_name.startswith("cp_")
+    _run(q, k, v, g, beta, cu_seqlens, pool, pool, idx, use_cp, "flashinfer")
     torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("case_name", ("negative", "upper"))
+@pytest.mark.parametrize("case_name", ("negative", "upper", "cp_negative", "cp_upper"))
 def test_prefill_state_indices_out_of_pool_fails_in_isolated_process(case_name):
     """An id outside [0, N_pool) must be caught, not read past the pool.
 

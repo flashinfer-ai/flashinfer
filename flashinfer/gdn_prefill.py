@@ -1202,10 +1202,11 @@ def chunk_gated_delta_rule(
         # uniqueness stays a documented caller precondition because checking it
         # would need one. output_final_state does not gate the final-state
         # write, so output_state is part of the check whenever it is given.
+        # The cake_gdn non-CP route checks the same ids itself.
         indexed_pools = tuple(
             tensor for tensor in (initial_state, output_state) if tensor is not None
         )
-        if indexed_pools:
+        if indexed_pools and (backend != "cake_gdn" or will_use_cp):
             _cake_gdn_assert_state_slots(
                 state_indices,
                 min(int(tensor.shape[0]) for tensor in indexed_pools),
