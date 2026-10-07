@@ -512,6 +512,7 @@ class DeepEPImpl:
             self.utils = None
         # MoK #17 pads MXFP8 expert groups to 128 rows (scaled grouped GEMM alignment).
         self.pad = 128 if self.precision == "mxfp8" else None
+        self._padded_counts = None
         free_before = torch.cuda.mem_get_info(device)[0]
         self.buffer = deep_ep.HybridEPBuffer(
             dist.group.WORLD,
@@ -582,6 +583,11 @@ class DeepEPImpl:
         permuted, probs, _, padded_counts, handle = self.buffer.dispatch_with_permute(
             **kwargs
         )
+        if padded_counts is None:
+            # Cached-handle dispatches return no counts: reuse the first dispatch's.
+            padded_counts = self._padded_counts
+        else:
+            self._padded_counts = padded_counts
         self.num_permuted = permuted.shape[0]
         if self.pad is not None:
             # Padding rows hold no token: zero them so the weight gradients (K =
