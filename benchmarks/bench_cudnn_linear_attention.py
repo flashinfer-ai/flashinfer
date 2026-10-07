@@ -431,9 +431,6 @@ def prepare_arm(args, data, backend, references, norm):
     actual, route = observe_route(arm["run"])
     check_route(backend, route)
     torch.cuda.synchronize()
-    if args.family == "gdn" and backend in ("native-auto", "cudnn"):
-        if bool(route["frontend_plans"]) != (backend == "cudnn"):
-            raise AssertionError(f"{backend} selected the wrong provider: {route}")
     choices = {key: errors(args, actual, value) for key, value in references.items()}
     matching = [
         key for key, value in choices.items() if max(value.values()) <= args.tolerance

@@ -20,6 +20,7 @@ require changing assertions about shapes or architecture thresholds.
 
 import importlib
 import importlib.metadata
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +35,15 @@ from tests.test_helpers.cudnn_linear_attention import (
 
 gdn = importlib.import_module("flashinfer.gdn_prefill")
 cudnn_adapter = importlib.import_module("flashinfer.cudnn")
+
+
+@pytest.fixture(autouse=True)
+def clear_auto_declines():
+    linear_attention._la_auto_declines.clear()
+    linear_attention._la_auto_decline_scopes.clear()
+    yield
+    linear_attention._la_auto_declines.clear()
+    linear_attention._la_auto_decline_scopes.clear()
 
 
 def _inputs(device="cpu", lengths=(3, 5), dim=128, seed=71):
@@ -66,6 +76,8 @@ def _inputs(device="cpu", lengths=(3, 5), dim=128, seed=71):
 @pytest.fixture
 def routes(monkeypatch):
     seen = []
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(gdn, "_prefer_cudnn_gdn_prefill", lambda *args: True)
     monkeypatch.setattr(gdn, "_cudnn_gdn_prefill_available", lambda: True)
     # Only CUDA metadata is emulated; all shape/dtype/layout/alias admission
@@ -369,6 +381,53 @@ def test_real_build_failure_falls_back_only_before_execution(
         assert caught.value is original and not routes
         assert torch.all(values["output_state"] == -11)
     torch.testing.assert_close(values["initial_state"], initial)
+
+
+def test_repeated_build_declines_keep_fresh_fallback_and_explicit_error(
+    routes, monkeypatch
+):
+    monkeypatch.setattr(
+        cudnn_adapter,
+        "cudnn_chunk_gated_delta_rule",
+        linear_attention.cudnn_chunk_gated_delta_rule,
+    )
+    monkeypatch.setattr(linear_attention, "_check_cudnn_frontend", lambda *args: None)
+    monkeypatch.setattr(linear_attention, "get_device_index", lambda device: 0)
+    error = NotImplementedError("unsupported raw gates")
+    builds = []
+
+    def decline(*args, **kwargs):
+        builds.append(1)
+        raise error
+
+    monkeypatch.setattr(linear_attention, "_create_la_graph", decline)
+    for seed in range(5):
+        values = _inputs(seed=seed)
+        out, final = gdn.chunk_gated_delta_rule(**values)
+        torch.testing.assert_close(out, values["v"])
+        torch.testing.assert_close(final, values["initial_state"] + 1)
+    assert builds == [1]
+    assert [provider for provider, _ in routes] == ["native"] * 5
+    with pytest.raises(NotImplementedError) as caught:
+        gdn.chunk_gated_delta_rule(**_inputs(), backend="cudnn")
+    assert caught.value is error and builds == [1, 1]
+
+
+def test_tensor_scale_values_have_distinct_support_decisions(routes, monkeypatch):
+    calls = []
+
+    def decline(q, k, v, g, beta, scale, **kwargs):
+        calls.append(scale)
+        error = NotImplementedError("unsupported scale")
+        error._fi_la_build_unsupported = True
+        raise error
+
+    monkeypatch.setattr(cudnn_adapter, "cudnn_chunk_gated_delta_rule", decline)
+    for value in (1.0, 2.0, 1.0):
+        gdn.chunk_gated_delta_rule(**_inputs(), scale=torch.tensor(value))
+    assert calls == [1.0, 2.0]
+    assert all(isinstance(value, float) for value in calls)
+    assert len(routes) == 3
 
 
 @pytest.mark.parametrize(
