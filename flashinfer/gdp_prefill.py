@@ -40,7 +40,7 @@ def chunk_gated_delta_product(
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["auto", "cudnn"] = "auto",
+    backend: Literal["auto", "cudnn", "flashinfer"] = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated DeltaProduct (GDP) attention for prefill.
 
@@ -130,13 +130,39 @@ def chunk_gated_delta_product(
     engine's call: a graph it cannot serve is declined by cuDNN (the per-engine
     reason lands in the frontend's log).
     """
-    if backend not in ("auto", "cudnn"):
-        raise ValueError(f'backend must be "auto" or "cudnn", got {backend!r}')
+    if backend not in ("auto", "cudnn", "flashinfer"):
+        raise ValueError(
+            f'backend must be "auto", "cudnn" or "flashinfer", got {backend!r}'
+        )
     if cu_seqlens is None:
         raise ValueError("cu_seqlens is required for varlen mode")
     if cu_seqlens.dtype not in _CU_SEQLENS_DTYPES:
         raise ValueError(
             f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
+        )
+
+    if backend == "flashinfer":
+        from .gdn_prefill import chunk_gated_delta_rule
+
+        # GDP is GDN over the expanded sub-token timeline: only cu_seqlens is
+        # scaled.  q, the forget gate and the output stay at real-token rows and
+        # the kernel indexes them directly, so nothing is materialised.  CP
+        # schedules on the expanded timeline and is not validated for it.
+        return chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            cu_seqlens * num_householder,
+            use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            use_cp=False,
+            num_householder=num_householder,
         )
 
     from .cudnn import cudnn_chunk_gated_delta_product
