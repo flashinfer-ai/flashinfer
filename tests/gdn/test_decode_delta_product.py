@@ -35,7 +35,7 @@ from flashinfer.utils import (
     is_sm100a_supported,
     is_sm12x_supported,
 )
-from flashinfer.gdp_decode import GATE_NEUTRAL_A_SENTINEL, gated_delta_product_mtp
+from flashinfer.gdp_decode import gated_delta_product_mtp
 
 from .reference_delta_product import delta_product
 
@@ -166,33 +166,6 @@ def _reference(q, k, v, A_log, a, dt_bias, b, pool, idx, scale=1.0, use_l2_norm=
     return o.reshape(B, T, *o.shape[1:]), state
 
 
-# --------------------------------------------------------------------------
-# 1. The sentinel. Pure arithmetic -- no kernel, no GPU arch requirement.
-# --------------------------------------------------------------------------
-@pytest.mark.parametrize("A_log_val", [-2.0, 0.0, 3.0], ids=lambda x: f"A_log={x}")
-@pytest.mark.parametrize("dt_bias_val", [-5.0, 0.0, 10.0], ids=lambda x: f"dt_bias={x}")
-def test_gate_sentinel_is_exactly_neutral(A_log_val, dt_bias_val):
-    """alpha must be EXACTLY 1.0 at the sentinel, for any A_log / dt_bias.
-
-    Not approximately: a micro-step that decays by even one ULP compounds over
-    n_h steps per token and over the whole sequence. -30 (the value the plan
-    originally suggested) fails this by one ULP once exp(A_log)*softplus()
-    exceeds 2^-24.
-    """
-    A_log = torch.tensor([A_log_val], dtype=torch.float32)
-    dt_bias = torch.tensor([dt_bias_val], dtype=torch.float32)
-    a = torch.tensor([[[GATE_NEUTRAL_A_SENTINEL]]], dtype=torch.float32)
-    b = torch.zeros_like(a)
-
-    alpha, _ = gates_from_logits(A_log, a, dt_bias, b)
-    assert (alpha == 1.0).all(), (
-        f"sentinel {GATE_NEUTRAL_A_SENTINEL} gave alpha={alpha.item():.10f} "
-        f"at A_log={A_log_val}, dt_bias={dt_bias_val}; must be exactly 1.0"
-    )
-    assert torch.isfinite(alpha).all(), "sentinel produced a non-finite gate"
-
-
-# --------------------------------------------------------------------------
 # 2. n_h == 1 must be the GDN MTP kernel, untouched.
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize("T", [2, 4], ids=lambda t: f"T={t}")
@@ -664,6 +637,7 @@ def test_decode_allocates_no_expansion_scratch(num_householder):
     Peak-allocation delta is the only observable that catches their return: the
     results are identical either way.
     """
+    _skip_if_unsupported()
     n_h, B, T, HQ, HV, K, V = num_householder, 3, 4, 16, 32, 128, 128
     device, dtype = torch.device("cuda"), torch.bfloat16
     q, k, v, A_log, a, dt_bias, b, pool, idx, ssm = _gen_decode_inputs(

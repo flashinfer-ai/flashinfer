@@ -1229,6 +1229,11 @@ def gated_delta_rule_mtp(
     replayssm_beta : torch.Tensor, optional
         FP32 sigmoid-beta window of shape ``[pool_size, HV, T]``.
 
+    num_householder : int
+        Householder updates per real token (Gated DeltaProduct).  ``k``, ``v``
+        and ``b`` carry ``T * num_householder`` rows while ``q``, ``a`` and the
+        output carry one per real token.  Default 1, which is plain GDN.
+
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor]

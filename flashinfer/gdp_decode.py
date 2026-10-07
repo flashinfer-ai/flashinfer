@@ -23,9 +23,6 @@ import torch
 from .gdn_decode import gated_delta_rule_mtp
 
 
-GATE_NEUTRAL_A_SENTINEL = -1.0e4
-
-
 def gated_delta_product_mtp(
     q: torch.Tensor,  # [B, T,      num_q_heads, K]
     k: torch.Tensor,  # [B, T, n_h, num_k_heads, K]
@@ -42,19 +39,22 @@ def gated_delta_product_mtp(
     disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
     output_state_indices: Optional[torch.Tensor] = None,  # [B]
-    # expansion scratch -- see chunk_gated_delta_product
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated DeltaProduct decode / MTP.
 
-    GDP decode is :func:`flashinfer.gdn_decode.gated_delta_rule_mtp` with
-    ``T -> T * num_householder``: one real token becomes ``n_h`` micro-steps.
-    With speculative decoding on top, ``T`` is already ``num_spec + 1``, so the
-    expanded axis is ``n_h * (num_spec + 1)``.
+    GDP decode is :func:`flashinfer.gdn_decode.gated_delta_rule_mtp` over an
+    ``n_h``-times-longer sub-token timeline: one real token becomes ``n_h``
+    householder micro-steps.  With speculative decoding on top, ``T`` is
+    already ``num_spec + 1``, so the micro-step axis is ``n_h * (num_spec + 1)``.
+
+    ``k``, ``v`` and ``beta`` carry the householder axis next to the token axis,
+    so reshaping them to the micro-step timeline is free.  ``q`` and ``a`` stay
+    one row per REAL token and the kernel indexes them directly, so this
+    allocates no scratch that scales with ``n_h``.
 
     **The gate is fused**, unlike the prefill kernel. Prefill takes ``g``
-    directly; here the kernel derives alpha from ``A_log``/``a``/``dt_bias``.
-    Neutralising the gate on micro-steps ``1..n_h-1`` therefore happens through
-    ``a``, using :data:`GATE_NEUTRAL_A_SENTINEL` -- not by writing 1.0 anywhere.
+    directly; here the kernel derives alpha from ``A_log``/``a``/``dt_bias``,
+    and applies it on each token's FIRST micro-step -- the rest are neutral.
 
     Parameters
     ----------
@@ -63,11 +63,8 @@ def gated_delta_product_mtp(
         one gate per REAL token.
     ssm_state_indices : torch.Tensor, optional
         ``[B, T]`` int32, one pool slot per REAL token, as for GDN MTP. The
-        wrapper expands this to ``[B, T*n_h]``, giving micro-steps ``1..n_h-1``
-        a negative slot -- which the kernel's scatter skips -- and routing only
-        the last micro-step of each token to the caller's slot.
-        Scratch for the expansion; required for CUDA graph capture. See
-        :func:`chunk_gated_delta_product` for why.
+        state is written after the final micro-step of each token, so the slot
+        holds the state with all ``n_h`` householder updates applied.
 
     Returns
     -------
