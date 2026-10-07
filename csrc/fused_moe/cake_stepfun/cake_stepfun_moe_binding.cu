@@ -33,6 +33,7 @@
 #include <string>
 #include <vector>
 
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/BatchedGemmInterface.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "generated/cake_stepfun_generated_manifest.cuh"
 #include "tvm_ffi_utils.h"
@@ -139,6 +140,21 @@ Array<int64_t> cake_stepfun_fc1_tiles(String const& family) {
     }
   }
   return tiles;
+}
+
+/** Index of the trtllm-gen batched-GEMM configuration named ``function_name`` in the metainfo
+ * table this module was built with -- the FC1 / FC2 coordinate space of the native runners'
+ * ``trtllm_get_valid_moe_factorizations`` -- or -1 when the artifact has no such kernel. */
+int64_t cake_stepfun_native_bmm_config_index(String const& function_name) {
+  auto const bmm = batchedGemm::batchedGemm::BatchedGemmInterface();
+  auto const configs = bmm.getBatchedGemmConfigs();
+  std::string const name(function_name.data(), function_name.size());
+  for (size_t index = 0; index < bmm.getNumBatchedGemmConfigs(); ++index) {
+    if (configs[index].mFunctionName != nullptr && name == configs[index].mFunctionName) {
+      return static_cast<int64_t>(index);
+    }
+  }
+  return -1;
 }
 
 /**
@@ -346,6 +362,16 @@ String cake_stepfun_fc2_activation_sf_layout(String const& family, int64_t tile_
   TVM_FFI_ICHECK(false) << "cake_stepfun_fc2: no exported Cake " << spec.name
                         << " FC2 kernel serves tile_tokens_dim " << tile_tokens_dim << ".";
   return String("none");
+}
+
+/** Device symbol of the Cake StepFun FC2 kernel at ``config_index`` of the generated FC2 table
+ * (the FC2 coordinate of a full-path tactic in ``trtllm_get_valid_moe_factorizations``). */
+String cake_stepfun_fc2_kernel_symbol(int64_t config_index) {
+  TVM_FFI_ICHECK(config_index >= 0 &&
+                 config_index < static_cast<int64_t>(generated::kFc2KernelCount))
+      << "cake_stepfun_fc2: FC2 config index " << config_index
+      << " is outside the generated table [0, " << generated::kFc2KernelCount << ").";
+  return String(generated::kFc2Kernels[config_index].symbol);
 }
 
 /**
@@ -700,6 +726,8 @@ void cake_stepfun_finalize(TensorView const& gemm2_output, TensorView const& exp
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_fc1_families, cake_stepfun_fc1_families);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_fc1_tiles, cake_stepfun_fc1_tiles);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_native_bmm_config_index,
+                              cake_stepfun_native_bmm_config_index);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_fc1, cake_stepfun_fc1);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_full_path, cake_stepfun_full_path);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_stages, cake_stepfun_stages);
@@ -709,6 +737,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_routing, cake_stepfun_routing);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_finalize_weight_dtypes,
                               cake_stepfun_finalize_weight_dtypes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_fc2_tiles, cake_stepfun_fc2_tiles);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_fc2_kernel_symbol, cake_stepfun_fc2_kernel_symbol);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_fc2_activation_sf_layout,
                               cake_stepfun_fc2_activation_sf_layout);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_fc2, cake_stepfun_fc2);

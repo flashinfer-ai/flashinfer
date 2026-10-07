@@ -113,6 +113,8 @@ class CakeStepFunInventory:
     routing_inputs: dict[CakeStepFunTarget, frozenset[str]]
     #: Per target: expert-weight dtypes (``float32`` / ``bfloat16``) with a finalize kernel.
     finalize_weight_dtypes: dict[CakeStepFunTarget, frozenset[str]]
+    #: Per target: FC2 kernel symbol -> trtllm-gen configuration (function name) it ports.
+    fc2_native_configs: dict[CakeStepFunTarget, dict[str, str]]
 
     def missing_stages(self, target: CakeStepFunTarget) -> tuple[str, ...]:
         present = self.stages.get(target, frozenset())
@@ -140,6 +142,14 @@ def _validate_tiled_record(
             f"tile {tile}) for {kernel['arch']}"
         )
     seen.add(key)
+    if stage == "fc2":
+        native = kernel.get("native_config")
+        if not isinstance(native, str) or not native.startswith("bmm_"):
+            raise ValueError(
+                f"Cake StepFun inventory kernels[{index}] (fc2) must name the trtllm-gen "
+                "configuration its kernel is a port of (native_config = bmm_* function "
+                f"name), got {native!r}"
+            )
 
 
 def _validate_variant_record(kernel: dict, index: int, stage: str, seen: set) -> None:
@@ -201,9 +211,12 @@ def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInve
     in ``families`` / ``fc2_families``; ``routing``, ``requant`` and ``finalize``
     records carry a unique ``variant`` (routing records also their ``input`` kind
     and, for the two-kernel large-token path, a ``pre_kernel`` unit; finalize
-    records their ``expert_weights_dtype``). ``program_hash`` seals ``kernels``,
-    ``families``, ``fc2_families`` and the per-file ``files`` digests, and the
-    generated manifest header must define the kernel table of every listed stage.
+    records their ``expert_weights_dtype``). Every ``fc2`` record names the
+    trtllm-gen configuration its kernel is a port of (``native_config``, a ``bmm_*``
+    function name; :func:`cake_stepfun_fc2_native_config`). ``program_hash`` seals
+    ``kernels``, ``families``, ``fc2_families`` and the per-file ``files`` digests,
+    and the generated manifest header must define the kernel table of every listed
+    stage.
     """
     csrc_dir = _get_cake_stepfun_csrc_dir() if csrc_dir is None else csrc_dir
     generated_dir = csrc_dir / "generated"
@@ -272,6 +285,9 @@ def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInve
     finalize_dtypes: dict[CakeStepFunTarget, set[str]] = {
         t: set() for t in _TARGET_FLAGS
     }
+    fc2_native_configs: dict[CakeStepFunTarget, dict[str, str]] = {
+        t: {} for t in _TARGET_FLAGS
+    }
     seen: set = set()
     for index, kernel in enumerate(kernels):
         if not isinstance(kernel, dict) or kernel.get("arch") not in _TARGET_FLAGS:
@@ -302,6 +318,8 @@ def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInve
             _validate_variant_record(kernel, index, stage, seen)
         target: CakeStepFunTarget = kernel["arch"]
         stages[target].add(stage)
+        if stage == "fc2":
+            fc2_native_configs[target][symbol] = kernel["native_config"]
         source = (repo_root / device).resolve()
         device_sources[target].append(source)
         compile_flags[target][source] = list(flags)
@@ -366,6 +384,7 @@ def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInve
         compile_flags=compile_flags,
         routing_inputs={t: frozenset(s) for t, s in routing_inputs.items()},
         finalize_weight_dtypes={t: frozenset(s) for t, s in finalize_dtypes.items()},
+        fc2_native_configs=fc2_native_configs,
     )
 
 
@@ -414,6 +433,20 @@ def cake_stepfun_finalize_weight_dtypes(target: CakeStepFunTarget) -> frozenset[
     kernels of ``target`` read."""
     _require_target(target)
     return load_cake_stepfun_inventory().finalize_weight_dtypes[target]
+
+
+def cake_stepfun_fc2_native_config(
+    target: CakeStepFunTarget, kernel_symbol: str
+) -> str:
+    """Return the trtllm-gen configuration (function name) the exported FC2 kernel
+    ``kernel_symbol`` of ``target`` is a port of."""
+    _require_target(target)
+    configs = load_cake_stepfun_inventory().fc2_native_configs[target]
+    if kernel_symbol not in configs:
+        raise KeyError(
+            f"Cake StepFun inventory has no fc2 kernel {kernel_symbol!r} for {target}"
+        )
+    return configs[kernel_symbol]
 
 
 def resolve_cake_stepfun_full_path(

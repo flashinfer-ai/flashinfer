@@ -7029,6 +7029,36 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
             return self.default_tactic(inputs)
         return tactic
 
+    def native_fc2_twin(self, fc2_config: int) -> int:
+        """trtllm-gen configuration ordinal of the native FC2 kernel that the full-path
+        FC2 component ``fc2_config`` is a port of.
+
+        ``fc2_config`` is the FC2 coordinate of a full-path tactic
+        (``get_factorized_tactic_space``): an index into the generated Cake FC2 table.
+        The generated inventory names the trtllm-gen configuration every exported FC2
+        kernel reproduces; the ordinal indexes that configuration in the batched-GEMM
+        metainfo table this module was built with, i.e. the FC2 coordinate space of the
+        native runners' factorized tactics.
+        """
+        from ..jit.cake_stepfun_moe import cake_stepfun_fc2_native_config
+
+        self._require_built()
+        if not self.full_path:
+            raise RuntimeError(
+                f"{type(self).__name__}.native_fc2_twin needs the full Cake path; the "
+                "FC1-only module runs the native FC2 configurations themselves."
+            )
+        moe_op = self._module.moe_op
+        symbol = str(moe_op.cake_stepfun_fc2_kernel_symbol(int(fc2_config)))
+        name = cake_stepfun_fc2_native_config(self.target, symbol)
+        ordinal = int(moe_op.cake_stepfun_native_bmm_config_index(name))
+        if ordinal < 0:
+            raise RuntimeError(
+                f"{type(self).__name__}: the trtllm-gen artifact of this build has no "
+                f"configuration {name} (the native twin of the Cake FC2 kernel {symbol})."
+            )
+        return ordinal
+
     def _cache_key_extras(self) -> tuple:
         # The runner name and the module variant keep the tactic spaces apart.
         return (type(self).__name__, self.full_path) + super()._cache_key_extras()
