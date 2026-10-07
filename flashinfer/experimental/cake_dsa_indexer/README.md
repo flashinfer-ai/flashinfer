@@ -8,9 +8,9 @@ flashinfer-ai/flashinfer#5676.
 
 Both the API and the backend are experimental: no compatibility guarantee.
 SM107 (Rubin) is the primary target of the request, SM100 (B200 / GB200) the
-comparison architecture; SM103 (B300 / GB300) is compiled from the same
-sources.  The feature is JIT-only and does not participate in automatic
-backend selection, autotuning or trace-apply.
+comparison architecture, SM103 (B300 / GB300) the third target.  The feature
+is JIT-only and does not participate in automatic backend selection,
+autotuning or trace-apply.
 
 ## Public entry points (`flashinfer/dsa_indexer.py`)
 
@@ -21,7 +21,7 @@ indices, scores = dsa_indexer_topk(q, k, w, cu_seqlens_q, cu_seqlens_k,
                                    top_k=2048, softmax_scale=None, q_causal_offsets=None, ratio=1,
                                    max_seqlen_q=None, max_seqlen_k=None,
                                    workspace_buffer=None, indices=None, scores=None)
-nbytes = dsa_indexer_topk_workspace_size(top_k=2048, device=q.device)
+nbytes = dsa_indexer_topk_workspace_size(T, Tkv, S, top_k=2048, ratio=1, device=q.device)
 ```
 
 | argument | shape and type | meaning |
@@ -34,8 +34,9 @@ nbytes = dsa_indexer_topk_workspace_size(top_k=2048, device=q.device)
 | `top_k` | int, `1 <= top_k <= 4096` | output slots per query (default 2048) |
 | `softmax_scale` | positive float | logit scale (default `128 ** -0.5`) |
 | `ratio` | positive int | key compression ratio (normally 1) |
-| `max_seqlen_q`, `max_seqlen_k` | optional ints | host mirrors; accepted, not read by any launch decision |
-| `workspace_buffer` | optional uint8 tensor | at least `dsa_indexer_topk_workspace_size(top_k, device)` bytes, 8-byte aligned |
+| `max_seqlen_q` | optional int | host mirror of the longest query segment; accepted, not read by any launch decision |
+| `max_seqlen_k` | optional int | the caller's bound on every key segment (`max(cu_seqlens_k[1:] - cu_seqlens_k[:-1])`); sizes the rank finalize's bitmap pool and so selects its program variant (`rank_seg_window`) -- the results are bitwise identical with and without it; a value above `Tkv` or below `ceil(Tkv / S)` is rejected |
+| `workspace_buffer` | optional uint8 tensor | at least `dsa_indexer_topk_workspace_size(T, Tkv, S, top_k=..., ratio=..., device=...)` bytes, 8-byte aligned |
 | `indices`, `scores` (outputs) | `[T, top_k]` int32 and FP32 | selected segment-local ids in ascending order and their aligned scores; tail padding `-1` / `-inf` |
 
 `T`, `Tkv`, the segment lengths and the last tile are arbitrary (the recorded
@@ -52,13 +53,13 @@ s[t, j] = sum_h w[t, h] * relu(softmax_scale * sum_d q[t, h, d] * k[j, d])
 ```
 
 with FP32 products, accumulation and score arithmetic; no BF16 intermediate
-rounding; no fast-math (IEEE round-to-nearest, no flush-to-zero).  The generated
-program evaluates it in one fixed sequence, so the score of a pair is a function
-of `(q[t], k[j], w[t], softmax_scale)` alone and does not depend on which CTA,
-tile or warp evaluates it:
+rounding; no fast-math (IEEE round-to-nearest, no flush-to-zero).  Every
+generated program evaluates it in one fixed sequence, so the score of a pair
+is a function of `(q[t], k[j], w[t], softmax_scale)` alone and does not depend
+on which program, CTA, tile or warp evaluates it:
 
-1. **Dot product**: one tensor-core MMA of a fixed shape (128 keys x 128 (4
-   queries x 32 heads) x K = 16) accumulates the 128 products of a (query,
+1. **Dot product**: one tensor-core MMA of a fixed shape (128 keys x (queries
+   of the unit x 32 heads) x K = 16) accumulates the 128 products of a (query,
    head, key) triple in eight K-steps over `d = 0 .. 127` in ascending order
    into an FP32 accumulator; the BF16 x BF16 products are exact in FP32.
 2. **Per-key head reduction** (one thread per key row): `r_h = fl(x_h +
@@ -74,15 +75,15 @@ with `n = 2D + 4H + 4 = 388`, `gamma_n = n u / (1 - n u)`, `u = 2 ** -24` and
 `A = softmax_scale * sum_h |w_h| sum_d |q_hd k_jd|` (the bound the tests
 enforce against an independent FP64 / FP32 reference).
 
-**Signed zeros.**  What the program computes: every chain accumulator is
-initialised to `+0.0` and the FMA order is fixed, and `fma(+0, w', +0) = +0`
-for either sign of `w'`, so a row whose head terms are all zero yields `+0.0`;
-a `-0.0` score cannot arise from this reduction (registry field
-`numerics["zero_sign_policy"] = "positive_accumulator"`).  Ordering rule:
-`+0.0` and `-0.0` compare equal, an equal-score tie goes to the larger key id,
-and the written score keeps the computed bits -- it is never canonicalised.
-The reference in `tests/test_helpers/cake_dsa_indexer_reference.py` follows
-the same reduction model, so the bit-exact test cases compare like with like.
+**Signed zeros.**  Every chain accumulator is initialised to `+0.0` and the
+FMA order is fixed, and `fma(+0, w', +0) = +0` for either sign of `w'`, so a
+row whose head terms are all zero yields `+0.0`; a `-0.0` score cannot arise
+from this reduction (registry field `NUMERICS["zero_sign_policy"] =
+"positive_accumulator"`).  Ordering rule: `+0.0` and `-0.0` compare equal, an
+equal-score tie goes to the larger key id, and the written score keeps the
+computed bits -- it is never canonicalised.  The reference in
+`tests/test_helpers/cake_dsa_indexer_reference.py` follows the same reduction
+model, so the bit-exact test cases compare like with like.
 
 ## Visibility
 
@@ -110,10 +111,12 @@ all padding).
   equal-score tie); `+0.0 == -0.0`.
 * Output: ascending id order with aligned scores; ids unique; tail slots
   `id = -1`, `score = -inf`.
-* Identical inputs give identical ids and score bits across calls, and the
-  internal partition knobs of the backend (`grid_ctas`, `candidate_multiplier`,
+* Identical inputs give identical ids and score bits across calls.  Neither
+  the program the host dispatches for a geometry (unit geometry, key-range
+  split, CTA pair, tile-loop unroll, unit order, sampled first threshold) nor
+  the partition knobs of the backend (`grid_ctas`, `candidate_multiplier`,
   `check_period`, `sample_tiles_max`, `sample_shift_permille`,
-  `finalize_stage`) never change a result (the tests compare bitwise).
+  `finalize_threads`) change a result (the tests compare bitwise).
 
 ## Non-finite inputs
 
@@ -129,48 +132,76 @@ NaN lowest for its own bookkeeping only).  The kernels' loop bounds and
 barriers do not depend on score comparisons, which is what lets any bit
 pattern terminate.
 
+## Host dispatch
+
+One call runs two or three kernels: the persistent **scan** (scoring, exact
+candidate gate, per-row selection; grid = `grid_ctas`, one CTA per SM), the
+**merge** of the per-range selections when the dispatch splits the key ranges
+(grid = `T`), and the **finalize** (ascending-id sort of every row in place,
+by the CUB block radix sort or -- where the policy's `finalize_rank_for`
+names a bitmap window for the call -- by the prefix-popcount rank scatter
+program of that window; grid = `T`).  The scan exists in several physical programs and the host picks
+one per call from host-known integers only -- `T`, `Tkv`, `S`, `ratio`,
+`top_k`, the optional `max_seqlen_k` bound and the SM count; no tensor is read -- through the registry's
+per-architecture `POLICY` record (`cake_policy.DispatchPolicy`,
+`cake_backend.plan_dsa_indexer_topk`).  The estimate behind most rules is the
+mean key tiles per work unit, `(Tkv - T / (2 ratio)) / S / 128`.
+
+| decision | rule (record fields) |
+|---|---|
+| unit geometry | `block_q_l6` queries per unit (three math warpgroups) when the mean unit tiles are at most `l6_rule[0]` and `top_k >= l6_rule[1]`; else `block_q_wide` when the call has at least `wide_rule[0]` wide rounds per CTA and `rounds x mean tiles >= wide_rule[1]`; else `block_q_narrow` |
+| key-range split | `n_split = clamp(grid // units, 1, min(mean tiles // split_min_range_tiles, split_max))`; on architectures with `split_wave_rule` a two-way split when the units are long and the unsplit call would idle `split_wave_rule[1]` of the CTAs in its ragged last round |
+| CTA pair | the two-CTA multicast program when the mean unit tiles lie in `pair_rule[0..1]`, `top_k >= pair_rule[2]` and the call is not split (grid made even) |
+| unit order | snake order when `snake_rule` names the program kind and the mean tiles / unit-cost spread reach its floors |
+| tile-loop unroll | `tile_unroll_factor` when `tile_unroll_rule` names the program kind and `top_k` reaches its floor (yielding to the snake order where the rule says so) |
+| sampled first threshold on buffer-fitting units | when the mean unit tiles are at most `sample_fit_max_mean_tiles` and the mean segment offset leaves fitting units |
+| candidate capacity | `candidate_multiplier` x `top_k` (`cand_mult_rule[1]` for long units), raised to `cand_cap_floor` slots, rounded up to whole tiles; the default check period follows the capacity (`check_period_cap_divisor`, per-kind overrides) |
+| finalize program | threads = the smallest power of two of sort slots holding `top_k` (`finalize_threads_fit` x `finalize_items`) for small `top_k`, else `finalize_threads_small` up to `finalize_top_k_small`, else `finalize_threads`.  Where the rank rules admit the call -- `rank_finalize` and `top_k >= rank_top_k_min` -- the row sort is a prefix-popcount rank finalize program sized for the call's **pool**: `Tkv`, or the caller's `max_seqlen_k` where `rank_seg_window` is set (lever RW; a bound above `Tkv` or below `ceil(Tkv / S)` is rejected whether or not the switch is set).  A pool above `rank_slab_window_max` takes the two-level (bucket + word) program of the smallest `rank_two_level_window_variants` entry holding it, with no segment bound, where `rank_two_level` is set and the window is within `rank_two_level_rule` (lever FR2; key `finalize_rank:t<threads>:w<window>:two`, staged where `rank_two_level_staged_rule` admits the window); a pool within the slab bound takes the smallest `rank_window_variants` entry holding it and one bitmap word (32 bits) per thread when `pool <= rank_rule[0]` and the segment -- mean `Tkv / S`, or `max_seqlen_k` itself under lever RW -- is at most `rank_rule[1]`, skipping the `rank_window_variants_seg_only` entries when the pool is `Tkv` (`finalize_rank:t<threads>:w<window>`, stage role `finalize_rank`; the kernel reads the segment boundaries on the device; where `rank_staged` is set and `rank_staged_rule` admits the window, its SMEM-staged, coalesced-I/O form `...:staged` -- lever FRS, same role and arguments); every other call sorts with the CUB block radix sort program (`finalize:t<threads>`, `(Tkv - 1).bit_length()` key bits).  Both produce the same ids and bits  Two forms of the staged program carry their own key tags: `:i16` (`rank_t16` / `rank_t16_slots`: the 4096-slot staged form runs 256 launched threads x 16 slots) and `:bulk` (`rank_bulk_io` / `rank_bulk_align_bytes`: `cp.async.bulk` row I/O when `top_k x 4` and the output addresses are multiples of the granule; unaligned caller-owned outputs run the registered plain twin, same results).  Where the record's `rank_persist_max_k` is above zero (SM107 only), the staged bulk program of rows with `top_k <= rank_persist_max_k` and 8-item threads carries `:persist` (the `:i16` form keeps the one-row program): one persistent grid of `min(rows, rank_persist_ctas_per_sm x SMs)` CTAs ranks the call's rows, each CTA landing its next row while it ranks the current one (`cake_policy.finalize_grid`); same results as the one-row program. |
+
+The dispatched program must be registered for the device's architecture
+(`cake_jit.PROGRAM_KEYS[arch]`); the backend raises `NotImplementedError`
+naming the program key otherwise, never a different program.  The kernel
+source's own dispatch functions are the reference for every rule; the export
+that writes the registry verifies the record against them before it is frozen.
+
 ## Workspace and host behaviour
 
-* **Workspace bound** (`dsa_indexer_topk_workspace_size`): `grid x
-  queries_per_cta x candidate_capacity(top_k) x entry_bytes` with `grid` the
-  device's SM count (the persistent scan grid), `candidate_capacity(top_k) =
-  max(4 top_k, top_k + 128)` rounded up to 128 and 8-byte packed entries; for
-  example about 37 MiB at `top_k = 2048` on 148 SMs (53 MiB on 212 SMs), 74 /
-  106 MiB at `top_k = 4096`, 4.6 / 6.6 MiB at `top_k = 256`.  Independent of
-  `T`, `Tkv` and `S`; separate from the inputs and the two `[T, top_k]`
-  outputs.  The constants come from the registry record (`gate_policy`), not
-  from host-side assumptions.
+* **Workspace bound** (`dsa_indexer_topk_workspace_size(T, Tkv, S, top_k=,
+  ratio=, device=)`): `grid_ctas x queries_per_unit x
+  candidate_capacity(top_k) x 8` bytes of persistent candidate buffers for the
+  dispatched unit geometry and capacity (for example about 37 MiB at `top_k =
+  2048` with four queries per unit on 148 SMs, 74 MiB with eight queries per
+  unit or the doubled long-unit capacity) plus `T x n_split x top_k x 8` bytes
+  of staging when the dispatch splits the key ranges.  The bound depends on the
+  call geometry; size a reused buffer for the largest bound over the
+  geometries it serves.  Separate from the inputs and the two `[T, top_k]`
+  outputs.
 * **No host synchronization**: the segment boundaries and offsets are read on
-  the device only; the host uses `T`, `S`, `top_k`, the SM count and the
-  strides.  The eager entry point allocates the outputs and the workspace
-  (unless supplied) through the caching allocator; the prepared runner
-  (`cake_backend.prepare_dsa_indexer_topk`) allocates nothing at launch and
-  is CUDA-graph capturable.
-* **Launch structure**: two kernels -- the persistent fused scan (grid = SM
-  count) and a per-row ascending-id finalize (grid = `T`; the 256-thread
-  program up to `top_k = 2048`, the 512-thread program above).  No
+  the device only; the host uses `T`, `Tkv`, `S`, `ratio`, `top_k`, the SM
+  count and the strides.  The eager entry point allocates the outputs and the
+  workspace (unless supplied) through the caching allocator; the prepared
+  runner (`cake_backend.prepare_dsa_indexer_topk`) allocates nothing at launch
+  and is CUDA-graph capturable.
+* **Launch structure**: scan, optional merge, finalize (see above).  No
   `[T, Tkv]` matrix is materialized.
 
 ## Layout of this package
 
-* `cake_jit.py` -- `MODULES` registry (one record per architecture, filled by
-  the generated-program export), stage names and the JIT specs.
-* `cake_backend.py` -- validation, gate policy and workspace bound, argument
-  binding, the prepared runner and the eager entry point.
-* `csrc/cake_dsa_indexer_topk/<arch>/` -- generated kernel and binding
-  translation units (`.clang-format` disables formatting: the sources are
-  identity-checked by the registry's closure digests).
+* `cake_jit.py` -- registry written by the generated-program export: one
+  record per program (`PROGRAMS`: role, sources, architectures, launch
+  geometry), the program of every dispatch key per architecture
+  (`PROGRAM_KEYS`), the per-architecture dispatch policy (`POLICY`), the
+  argument plan and compile flags per role, and the JIT specs (one library per
+  program and architecture, compiled with the exact architecture flags).
+* `cake_policy.py` -- the dependency-free dispatch policy (program choice,
+  capacity, check period, finalize program, workspace bound).
+* `cake_backend.py` -- validation, planning, argument binding, the prepared
+  runner and the eager entry point.
+* `csrc/cake_dsa_indexer_topk/` -- generated kernel and binding translation
+  units, one source per program for every architecture (`.clang-format`
+  disables formatting: the sources are identity-checked by the export).
 
-## Status
-
-**Placeholder registry.**  `MODULES` is empty until the generated programs for
-`sm_100a`, `sm_103a` and `sm_107a` are exported from the kernel snapshot named
-in the pull request.  Importing the package and the public entry point works;
-`cake_jit.select_module(arch)` raises `NotImplementedError` naming the issue,
-`cake_backend.generated_program_available(device)` returns `False`, a call
-raises the same `NotImplementedError`, and the operator tests skip.  The
-host-only tests (registry shape, gate policy, validation, binding, the
-reference itself) run without a GPU.
+## Tests and benchmark
 
 Tests: `tests/experimental/test_cake_dsa_indexer.py` with the independent
 FP64 / FP32 reference in `tests/test_helpers/cake_dsa_indexer_reference.py`
@@ -180,10 +211,12 @@ large tie; packed causality incl. explicit positive and negative offsets,
 `ratio = 2`, empty and singleton segments, short rows, `top_k = 1` and
 `4096`; random-input accuracy under the `gamma_n A` bound; near ties; both
 recorded token counts; tile-boundary neighbours; changing shapes; bitwise
-repeatability and partition-knob invariance; strided `k`; non-finite inputs;
-CUDA-graph capture; the workspace bound).  Benchmark:
-`benchmarks/bench_cake_dsa_indexer.py` (paired AB / BA / interleaved CUPTI
-spans of the complete operator against two torch + FlashInfer compositions;
-both baseline arms are reconstructions of the training stack's chunked
-scoring / coarse top-k / rescoring path written for this benchmark, not the
-stack's own kernels, so their absolute numbers are speed references only).
+repeatability, partition-knob and program-dispatch invariance; strided `k`;
+non-finite inputs; CUDA-graph capture; the workspace bound).  The host-only
+tests (registry shape, dispatch policy, validation, binding, the reference
+itself) run without a GPU.  Benchmark: `benchmarks/bench_cake_dsa_indexer.py`
+(paired AB / BA / interleaved CUPTI spans of the complete operator against two
+torch + FlashInfer compositions; both baseline arms are reconstructions of the
+training stack's chunked scoring / coarse top-k / rescoring path written for
+this benchmark, not the stack's own kernels, so their absolute numbers are
+speed references only).

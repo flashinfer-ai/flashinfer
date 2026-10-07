@@ -7,7 +7,15 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_decode_trace
 from ..utils import log2e
-from .utils import get_cudnn_fmha_gen_module, get_cudnn_attention_handle
+from .utils import (
+    cudnn_frontend_accepts_cuda_graph_replay_hint,
+    get_cudnn_fmha_gen_module,
+    get_cudnn_attention_handle,
+    supports_ordered_cudnn_execution,
+    supports_native_cudnn_log2,
+    build_cudnn_graph_with_log2,
+    require_native_cudnn_log2,
+)
 
 try:
     import cudnn
@@ -67,6 +75,8 @@ def _sdpa_decode_key_fn(
     q_len_per_req: int = 1,
     window_left: int = -1,
     sinks: Optional[torch.Tensor] = None,
+    is_cuda_graph_compatible: bool = False,
+    stats_use_log2: bool = False,
 ):
     return (
         "decode",
@@ -118,14 +128,26 @@ def _sdpa_decode_key_fn(
         q_len_per_req,
         window_left,
         _tensor_layout_key(sinks),
+        # The CUDA-graph replay hint changes which plan cudnn-frontend builds
+        # first (the d256 decode tile's split-KV plan for a replaying caller),
+        # so a graph built for eager execution must not serve a captured
+        # caller or the other way round. stats_use_log2 stays last:
+        # CudnnDecodeGraph reads it as key[-1].
+        is_cuda_graph_compatible,
+        stats_use_log2,
     )
 
 
 if CUDNN_AVAILABLE:
 
-    @cudnn.jit(heur_modes=[cudnn.heur_mode.A])
     @cudnn.graph_cache(key_fn=_sdpa_decode_key_fn)
-    def _build_decode_graph(
+    def _build_decode_graph(*args, stats_use_log2=False, **kwargs):
+        return build_cudnn_graph_with_log2(
+            cudnn, _make_decode_graph, args, kwargs, stats_use_log2
+        )
+
+    @cudnn.jit(heur_modes=[cudnn.heur_mode.A])
+    def _make_decode_graph(
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -139,8 +161,20 @@ if CUDNN_AVAILABLE:
         q_len_per_req: int = 1,
         window_left: int = -1,
         sinks: Optional[torch.Tensor] = None,
+        is_cuda_graph_compatible: bool = False,
+        stats_use_log2: bool = False,
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
+
+        # A caller that captures the graph's execute into a CUDA graph pays a
+        # plan's per-execute host cost once, at capture: tell cudnn-frontend
+        # (1.31+) so its heuristics lead with the plan that is fastest on the
+        # GPU alone (the d256 decode tile's split-KV plan) instead of the one
+        # that also covers an eager caller's extra launch. The hint changes no
+        # numerics; an older frontend is not given the keyword.
+        graph_kwargs: dict[str, Any] = {}
+        if is_cuda_graph_compatible and cudnn_frontend_accepts_cuda_graph_replay_hint():
+            graph_kwargs["is_cuda_graph_replay_expected"] = True
 
         # Decode represents fixed-length queries with dense strided Q/O
         # descriptors; public batch offsets are only used by the cubin path.
@@ -151,7 +185,7 @@ if CUDNN_AVAILABLE:
         cudnn_q_data_type = cudnn.datatypes._torch_to_cudnn_data_type(q.dtype)
         cudnn_o_data_type = cudnn_q_data_type
 
-        with cudnn.graph(handle) as (g, _):
+        with cudnn.graph(handle, **graph_kwargs) as (g, _):
             if q.dim() == 3:
                 s_qo = 1
                 b, h_qo, d_qk = q.shape[0], q.shape[1], q.shape[2]
@@ -257,6 +291,7 @@ if CUDNN_AVAILABLE:
                 paged_attention_max_seq_len_kv=max_sequence_kv,
                 compute_data_type=cudnn.data_type.FLOAT,
                 **mask_kwargs,
+                **({"stats_use_log2": True} if stats_use_log2 else {}),
             )
 
             # O is bound to a contiguous (batch * s_qo, h_qo, d_vo) buffer:
@@ -286,6 +321,8 @@ if CUDNN_AVAILABLE:
         if actual_seq_lens_kv is not None:
             tensors_to_return.append(cudnn_actual_seq_lens_kv)
 
+        if stats_use_log2:
+            require_native_cudnn_log2(g, cudnn)
         return g, tensors_to_return
 
 
@@ -482,32 +519,54 @@ def _execute_decode(
     block_tables,
     return_lse,
     sinks,
+    execution_bindings=None,
+    stats_use_log2=False,
 ):
     """Bind call-local pointers and apply the public base-2 LSE contract."""
-    handle_ = _create_cudnn_handle(torch.cuda.current_stream(q.device))
+    device = q.device
+    handle_ = _create_cudnn_handle(
+        torch.cuda.current_stream(device.index if device.type == "cuda" else device)
+    )
 
-    var_map = {
-        UIDs.Q_UID.value: q,
-        UIDs.K_UID.value: k_cache,
-        UIDs.V_UID.value: v_cache,
-        UIDs.O_UID.value: out,
-    }
-    if return_lse:
-        var_map[UIDs.STATS_UID.value] = lse
-    if sinks is not None:
-        var_map[UIDs.SINK_UID.value] = sinks
-    if actual_seq_lens_q is not None:
-        var_map[UIDs.ACTUAL_SEQ_LENS_Q_UID.value] = actual_seq_lens_q
-    if actual_seq_lens_kv is not None:
-        var_map[UIDs.ACTUAL_SEQ_LENS_KV_UID.value] = actual_seq_lens_kv
+    if execution_bindings is not None:
+        # UIDs are fixed by preparation; tensor observation remains FE's job.
+        # Each call owns its sequence, including during capture and rebind.
+        buffers = [q, k_cache, v_cache, out]
+        if return_lse:
+            buffers.append(lse)
+        if sinks is not None:
+            buffers.append(sinks)
+        buffers.extend(
+            (actual_seq_lens_q, actual_seq_lens_kv, block_tables, block_tables)
+        )
+        graph.execute(
+            buffers,
+            workspace=workspace_buffer,
+            handle=handle_,
+            tensor_uids=execution_bindings,
+        )
+    else:
+        var_map = {
+            UIDs.Q_UID.value: q,
+            UIDs.K_UID.value: k_cache,
+            UIDs.V_UID.value: v_cache,
+            UIDs.O_UID.value: out,
+        }
+        if return_lse:
+            var_map[UIDs.STATS_UID.value] = lse
+        if sinks is not None:
+            var_map[UIDs.SINK_UID.value] = sinks
+        if actual_seq_lens_q is not None:
+            var_map[UIDs.ACTUAL_SEQ_LENS_Q_UID.value] = actual_seq_lens_q
+        if actual_seq_lens_kv is not None:
+            var_map[UIDs.ACTUAL_SEQ_LENS_KV_UID.value] = actual_seq_lens_kv
 
-    if block_tables is not None:
-        var_map[UIDs.BLOCK_TABLES_K_UID.value] = block_tables
-        var_map[UIDs.BLOCK_TABLES_V_UID.value] = block_tables
+        if block_tables is not None:
+            var_map[UIDs.BLOCK_TABLES_K_UID.value] = block_tables
+            var_map[UIDs.BLOCK_TABLES_V_UID.value] = block_tables
 
-    graph.execute(var_map, workspace=workspace_buffer, handle=handle_)
-
-    if return_lse:
+        graph.execute(var_map, workspace=workspace_buffer, handle=handle_)
+    if return_lse and not stats_use_log2:
         # cuDNN emits natural-log softmax stats; FlashInfer's LSE contract is
         # base-2 (the cascade-merge kernels consume it), as in the prefill path.
         lse.mul_(log2e)
@@ -542,6 +601,9 @@ class CudnnDecodeGraph:
         "lse_shape",
         "sinks_view",
         "seq_lens_q",
+        "execution_bindings",
+        "requested_stats_use_log2",
+        "stats_use_log2",
     )
 
     def __init__(
@@ -558,6 +620,10 @@ class CudnnDecodeGraph:
         seq_lens_q: torch.Tensor,
     ):
         self.key = key
+        self.requested_stats_use_log2 = key[-1]
+        self.stats_use_log2 = return_lse and getattr(
+            graph, "_flashinfer_stats_use_log2", False
+        )
         self.graph = graph
         self.return_lse = return_lse
         self.batch_size = batch_size
@@ -566,6 +632,27 @@ class CudnnDecodeGraph:
         self.lse_shape = lse_shape
         self.sinks_view = sinks_view
         self.seq_lens_q = seq_lens_q
+        self.execution_bindings = None
+        if supports_ordered_cudnn_execution(type(graph)):
+            uids = [
+                UIDs.Q_UID.value,
+                UIDs.K_UID.value,
+                UIDs.V_UID.value,
+                UIDs.O_UID.value,
+            ]
+            if return_lse:
+                uids.append(UIDs.STATS_UID.value)
+            if sinks_view is not None:
+                uids.append(UIDs.SINK_UID.value)
+            uids.extend(
+                (
+                    UIDs.ACTUAL_SEQ_LENS_Q_UID.value,
+                    UIDs.ACTUAL_SEQ_LENS_KV_UID.value,
+                    UIDs.BLOCK_TABLES_K_UID.value,
+                    UIDs.BLOCK_TABLES_V_UID.value,
+                )
+            )
+            self.execution_bindings = tuple(uids)
 
     def _q_graph(self, q: torch.Tensor) -> torch.Tensor:
         return _decode_q_view(q, self.batch_size, self.q_len_per_req)
@@ -586,10 +673,11 @@ class CudnnDecodeGraph:
         out: torch.Tensor,
         lse: Optional[torch.Tensor],
         sinks: Optional[torch.Tensor],
+        is_cuda_graph_compatible: bool = False,
     ) -> bool:
         """Whether this prepared graph serves the call: same graph-cache key
-        (shapes, strides, dtypes, scale, flags, mask), out / lse keep their
-        layout, and sink presence is unchanged."""
+        (shapes, strides, dtypes, scale, flags, mask, CUDA-graph replay hint),
+        out / lse keep their layout, and sink presence is unchanged."""
         if (
             q_len_per_req != self.q_len_per_req
             or q.shape[0] != self.batch_size * q_len_per_req
@@ -629,6 +717,8 @@ class CudnnDecodeGraph:
             q_len_per_req=q_len_per_req,
             window_left=window_left,
             sinks=self.sinks_view,
+            is_cuda_graph_compatible=is_cuda_graph_compatible,
+            stats_use_log2=self.requested_stats_use_log2,
         )
         return key == self.key
 
@@ -674,6 +764,8 @@ class CudnnDecodeGraph:
             # Normalize current values on this call's stream. In capture, a
             # strided sink's copy is captured too, rather than cached stale.
             sinks=self.sinks_view if sinks is None else _decode_sinks(q, sinks),
+            execution_bindings=self.execution_bindings,
+            stats_use_log2=self.stats_use_log2,
         )
 
 
@@ -693,12 +785,16 @@ def prepare_cudnn_batch_decode(
     window_left: int,
     sinks: Optional[torch.Tensor],
     actual_seq_lens_q: Optional[torch.Tensor] = None,
+    is_cuda_graph_compatible: bool = False,
 ) -> CudnnDecodeGraph:
     """Validate once and build (or fetch from the graph cache) the paged-decode
     graph for this signature; steps then execute through
     :meth:`CudnnDecodeGraph.run`. Same contract as
     :func:`cudnn_batch_decode_with_kv_cache` in the paged, per-batch-length,
-    ``out``-provided form the wrappers use."""
+    ``out``-provided form the wrappers use. ``is_cuda_graph_compatible`` says
+    the caller captures :meth:`CudnnDecodeGraph.run` into a CUDA graph and
+    replays it; cudnn-frontend 1.31+ then builds the plan that is fastest on
+    the GPU alone first (see :func:`_make_decode_graph`)."""
     if not CUDNN_AVAILABLE:
         raise NotImplementedError(
             "prepare_cudnn_batch_decode requires the cuDNN graph backend"
@@ -747,6 +843,10 @@ def prepare_cudnn_batch_decode(
         q_len_per_req=q_len_per_req,
         window_left=window_left,
         sinks=sinks_view,
+        is_cuda_graph_compatible=is_cuda_graph_compatible,
+    )
+    kwargs["stats_use_log2"] = return_lse and supports_native_cudnn_log2(
+        cudnn, q.device
     )
     graph, _ = _build_decode_graph(q_graph, k_cache, v_cache, scale, **kwargs)
     key = _sdpa_decode_key_fn(q_graph, k_cache, v_cache, scale, **kwargs)
@@ -970,6 +1070,8 @@ def cudnn_batch_decode_with_kv_cache(
             q_len_per_req=q_len_per_req,
             window_left=window_left,
             sinks=sinks_view,
+            is_cuda_graph_compatible=is_cuda_graph_compatible,
+            stats_use_log2=return_lse and supports_native_cudnn_log2(cudnn, q.device),
         )
         _execute_decode(
             graph,
@@ -984,6 +1086,8 @@ def cudnn_batch_decode_with_kv_cache(
             block_tables=block_tables,
             return_lse=return_lse,
             sinks=sinks_view,
+            stats_use_log2=return_lse
+            and getattr(graph, "_flashinfer_stats_use_log2", False),
         )
 
     if return_lse:
