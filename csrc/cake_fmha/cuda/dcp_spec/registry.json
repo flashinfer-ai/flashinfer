@@ -704,7 +704,8 @@
       "source_family": [
         {
           "defines": {
-            "N_ROWS": 32
+            "N_ROWS": 32,
+            "Q_BOX_TOKENS": 8
           },
           "selector": {
             "n_rows": 32,
@@ -717,7 +718,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 64
+            "N_ROWS": 64,
+            "Q_BOX_TOKENS": 8
           },
           "selector": {
             "n_rows": 64,
@@ -730,7 +732,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 32
+            "N_ROWS": 32,
+            "Q_BOX_TOKENS": 8
           },
           "selector": {
             "n_rows": 32,
@@ -743,7 +746,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 64
+            "N_ROWS": 64,
+            "Q_BOX_TOKENS": 8
           },
           "selector": {
             "n_rows": 64,
@@ -756,7 +760,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 32
+            "N_ROWS": 32,
+            "Q_BOX_TOKENS": 4
           },
           "selector": {
             "n_rows": 32,
@@ -769,7 +774,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 64
+            "N_ROWS": 64,
+            "Q_BOX_TOKENS": 4
           },
           "selector": {
             "n_rows": 64,
@@ -782,7 +788,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 32
+            "N_ROWS": 32,
+            "Q_BOX_TOKENS": 8
           },
           "selector": {
             "n_rows": 32,
@@ -795,7 +802,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 64
+            "N_ROWS": 64,
+            "Q_BOX_TOKENS": 8
           },
           "selector": {
             "n_rows": 64,
@@ -808,7 +816,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 32
+            "N_ROWS": 32,
+            "Q_BOX_TOKENS": 4
           },
           "selector": {
             "n_rows": 32,
@@ -821,7 +830,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 64
+            "N_ROWS": 64,
+            "Q_BOX_TOKENS": 4
           },
           "selector": {
             "n_rows": 64,
@@ -953,7 +963,8 @@
       "source_family": [
         {
           "defines": {
-            "N_ROWS": 32
+            "N_ROWS": 32,
+            "Q_BOX_TOKENS": 8
           },
           "selector": {
             "n_rows": 32,
@@ -966,7 +977,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 64
+            "N_ROWS": 64,
+            "Q_BOX_TOKENS": 8
           },
           "selector": {
             "n_rows": 64,
@@ -979,7 +991,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 32
+            "N_ROWS": 32,
+            "Q_BOX_TOKENS": 8
           },
           "selector": {
             "n_rows": 32,
@@ -992,7 +1005,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 64
+            "N_ROWS": 64,
+            "Q_BOX_TOKENS": 8
           },
           "selector": {
             "n_rows": 64,
@@ -1005,7 +1019,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 32
+            "N_ROWS": 32,
+            "Q_BOX_TOKENS": 8
           },
           "selector": {
             "n_rows": 32,
@@ -1018,7 +1033,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 64
+            "N_ROWS": 64,
+            "Q_BOX_TOKENS": 8
           },
           "selector": {
             "n_rows": 64,
@@ -1150,7 +1166,8 @@
       "source_family": [
         {
           "defines": {
-            "N_ROWS": 32
+            "N_ROWS": 32,
+            "Q_BOX_TOKENS": 2
           },
           "selector": {
             "n_rows": 32
@@ -1162,7 +1179,8 @@
         },
         {
           "defines": {
-            "N_ROWS": 64
+            "N_ROWS": 64,
+            "Q_BOX_TOKENS": 2
           },
           "selector": {
             "n_rows": 64
