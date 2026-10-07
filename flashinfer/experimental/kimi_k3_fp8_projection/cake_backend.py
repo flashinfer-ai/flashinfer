@@ -1972,6 +1972,10 @@ def _activation_rows(x: torch.Tensor, prepared: PreparedProjectionWeight) -> int
         or int(x.shape[1]) != prepared.K
     ):
         raise ValueError(f"x must be a contiguous bf16 [M, {prepared.K}] tensor")
+    if x.data_ptr() % 16:
+        # The quantization programs read x with 16-byte vector loads and the fused decode programs map it as a TMA
+        # tensor (16-byte base); the driver would otherwise refuse the map with an opaque CUresult.
+        raise ValueError("x must be 16-byte aligned")
     M = int(x.shape[0])
     if M < 1:
         raise ValueError("M must be positive")
@@ -2061,6 +2065,11 @@ def _resolve_plan(
 
 # Launch arguments that bind the call's tensors (activations, output view, workspace); every other argument of a
 # stage is a function of the prepared weight and the resolved plan alone.
+# The call-bound arguments a launch receipt re-binds per call -> the index of the call tensor they bind: 0 = ``x``
+# (the quantization input / the fused instance's ``XB`` descriptor), 1 = ``out`` (the raw output pointer / the
+# TMA-store instances' ``OUT`` descriptor).  Up to four positions per program (``run_launch`` takes four slots).
+_REBIND_SOURCES = {"x": 0, "XB": 0, "out": 1, "OUT": 1}
+_REBIND_SLOTS = 4
 _CALL_ARGS = frozenset(
     (
         "x",
@@ -2279,13 +2288,26 @@ def kimi_k3_fp8_projection(
 
 
 @dataclass(frozen=True)
+class _StageEntry:
+    """One launch of a template: the program's ``run_plan`` / ``run_launch`` entries, its argument slots with the
+    call-bound arguments (_CALL_ARGS) left as names (``(is_call_arg, value_or_name)`` per FFI argument) and the
+    ``(FFI position, call tensor index)`` pairs a call re-binds (_REBIND_SOURCES; the ``OUT`` position of a
+    register-epilogue GEMM program is not among them: it carries the per-device placeholder descriptor), padded
+    with ``(-1, 0)`` to the four slots ``run_launch`` takes."""
+
+    plan: Callable[..., Any]
+    launch: Callable[..., Any]
+    slots: tuple[tuple[bool, Any], ...]
+    rebinds: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
 class _LaunchTemplate:
-    """The launch sequence of one ``(M, output row stride, output address class)`` with the call-bound arguments
-    (_CALL_ARGS) left as names: ``stages[i] = (entry, ((is_call_arg, value_or_name), ...))``."""
+    """The launch sequence of one ``(M, output row stride, output address class)``."""
 
     plan: ProjectionPlan
     ldo: int
-    stages: tuple[tuple[Callable[..., Any], tuple[tuple[bool, Any], ...]], ...]
+    stages: tuple[_StageEntry, ...]
 
 
 @dataclass
@@ -2295,32 +2317,65 @@ class _WorkspaceState:
     pinned: bool = False
 
 
+# Host bytes per launch receipt: the generated ``run_plan`` lays out at most 25 kernel arguments at 64-byte
+# alignment behind a small header (< 2 KiB) and rejects a shorter buffer with the exact requirement.
+RECEIPT_BYTES = 8192
+
+
+@dataclass(frozen=True)
+class _Receipt:
+    """The frozen launches of one ``(M, output row stride, output alignment class)``: per stage the program's
+    ``run_launch`` entry, the planned host receipt (kernel-argument bytes, grid, device) and the re-bind pairs."""
+
+    stages: tuple[
+        tuple[Callable[..., Any], torch.Tensor, tuple[tuple[int, int], ...]], ...
+    ]
+    state: _WorkspaceState
+
+
 class KimiK3Fp8ProjectionLauncher:
     """Allocation-light repeated launches of one prepared weight (an engine's linear layer).
 
     ``launcher(x, out)`` runs ``out[:, :n_valid] = bf16(x @ dequant(w2, s2).T)`` for any ``M = x.shape[0]``: the
     route plan and the per-stage argument templates are resolved once per ``(M, row stride, output address class)``,
-    the workspace of each ``M`` is allocated once and reused (the programs leave it reusable), and a call only binds
-    the call's tensors (``x``, the output view, the cached workspace views) before the launches -- no route
-    resolution, validation of the prepared weight, workspace allocation or host synchronisation per call.
+    the workspace of each ``M`` is allocated once and reused (the programs leave it reusable), and the launches of
+    one ``(M, row stride, output address class)`` are planned once into caller-owned host *launch receipts* (the
+    generated programs' ``run_plan``: the complete argument validation, descriptor encoding and scalar marshalling of
+    a launch, frozen into a host byte tensor).  A call then only re-binds its activation and its output view into
+    those receipts (the raw pointers and, for the fused / TMA-store instances, the ``XB`` / ``OUT`` descriptors) and
+    issues the launches (``run_launch``: one FFI crossing per kernel, no route resolution, validation of the prepared
+    weight, workspace allocation, descriptor re-encoding of the weights / workspace or host synchronisation).  The
+    receipts hold the kernel-argument bytes only, so the path is CUDA-graph capturable.
 
-    ``max_workspaces`` bounds the per-``M`` workspace cache (least recently used ``M`` evicted first); an ``M`` used
-    inside CUDA-graph capture (first seen there or resolved eagerly before) is pinned, because the captured graph
-    keeps referencing its workspace.  One
-    launcher serves one stream order: concurrent launches of the same ``M`` from several streams would share a
-    workspace.  Resolve a new ``(M, out)`` class once eagerly before capturing a graph of it (the JIT modules of the
-    route load on first use)."""
+    ``max_workspaces`` bounds the per-``M`` workspace cache (least recently used ``M`` evicted first, with its
+    receipts); an ``M`` used inside CUDA-graph capture (first seen there or resolved eagerly before) is pinned,
+    because the captured graph keeps referencing its workspace.  ``max_receipts`` bounds the receipt cache (least
+    recently used ``(M, row stride, output address class)`` evicted first).  One launcher serves one stream order: concurrent launches of the
+    same ``M`` from several streams would share a workspace.  Resolve a new ``(M, out)`` once eagerly before capturing
+    a graph of it (the JIT modules of the route load on first use)."""
 
-    def __init__(self, prepared: PreparedProjectionWeight, *, max_workspaces: int = 64):
+    def __init__(
+        self,
+        prepared: PreparedProjectionWeight,
+        *,
+        max_workspaces: int = 64,
+        max_receipts: int = 256,
+    ):
         if int(max_workspaces) < 1:
             raise ValueError("max_workspaces must be positive")
+        if int(max_receipts) < 1:
+            raise ValueError("max_receipts must be positive")
         self.prepared = prepared
         self.device = prepared.device
         self._device_index = _device_index(prepared.device)
         self._facts = device_facts(prepared.device)
         self._max_workspaces = int(max_workspaces)
+        self._max_receipts = int(max_receipts)
         self._templates: dict[tuple[int, int, int], _LaunchTemplate] = {}
         self._workspaces: dict[int, _WorkspaceState] = {}  # insertion order = recency
+        self._receipts: dict[
+            tuple[int, int, int], _Receipt
+        ] = {}  # (M, ldo, out address % 32); insertion order = recency
 
     # -- caches ---------------------------------------------------------------------------------------------------
 
@@ -2343,6 +2398,10 @@ class KimiK3Fp8ProjectionLauncher:
             if victim is None:
                 break  # every cached workspace is pinned by a captured graph: grow instead of evicting
             del self._workspaces[victim]
+            for key in [key for key in self._receipts if key[0] == victim]:
+                del self._receipts[
+                    key
+                ]  # the receipts froze the evicted workspace's addresses
         workspace = allocate_kimi_k3_fp8_projection_workspace(self.prepared, M)
         state = _WorkspaceState(
             workspace, {}, pinned=bool(torch.cuda.is_current_stream_capturing())
@@ -2382,7 +2441,35 @@ class KimiK3Fp8ProjectionLauncher:
                     module = load_cake_kimi_k3_fp8_projection_module(
                         name, self._facts.arch, defines
                     )
-                    stages.append((getattr(module, record["ffi_entry"]), tuple(slots)))
+                    # The register-epilogue GEMM programs take ``OUT`` as the per-device placeholder descriptor
+                    # (see ``_output_bindings``); re-encoding it from the caller's view would fail for row strides
+                    # that are not multiples of 16 bytes, so only the TMA-store programs re-bind ``OUT``.
+                    real_out = (
+                        plan.gemm_tma_store
+                        if plan.decode is None
+                        else plan.decode_tma_store
+                    )
+                    rebinds = [
+                        (index, _REBIND_SOURCES[argument])
+                        for index, (_kind, argument) in enumerate(record["arg_plan"])
+                        if argument in _REBIND_SOURCES
+                        and (real_out or argument != "OUT")
+                    ]
+                    if not 1 <= len(rebinds) <= _REBIND_SLOTS:
+                        raise ValueError(
+                            f"generated program {name!r} binds the call tensors at {len(rebinds)} positions; "
+                            f"run_launch re-binds one to {_REBIND_SLOTS}"
+                        )
+                    rebinds += [(-1, 0)] * (_REBIND_SLOTS - len(rebinds))
+                    entry = record["ffi_entry"]
+                    stages.append(
+                        _StageEntry(
+                            getattr(module, f"{entry}_plan"),
+                            getattr(module, f"{entry}_launch"),
+                            tuple(slots),
+                            tuple(rebinds),
+                        )
+                    )
             template = _LaunchTemplate(plan, ldo, tuple(stages))
             self._templates[key] = template
         return template
@@ -2400,6 +2487,8 @@ class KimiK3Fp8ProjectionLauncher:
             or not x.is_contiguous()
         ):
             raise ValueError(f"x must be a contiguous bf16 [M, {prepared.K}] tensor")
+        if x.data_ptr() % 16:
+            raise ValueError("x must be 16-byte aligned")  # see _activation_rows
         M = int(x.shape[0])
         if M < 1:
             raise ValueError("M must be positive")
@@ -2424,23 +2513,69 @@ class KimiK3Fp8ProjectionLauncher:
             raise ValueError(
                 "x, out and the prepared weight must be on one CUDA device"
             )
+        key = (M, int(out.stride(0)), out.data_ptr() % 32)
+        receipt = self._receipts.get(key)
+        if receipt is None:
+            receipt = self._plan_receipt(key, x, out)
+        elif next(reversed(self._receipts)) != key:
+            self._receipts[key] = self._receipts.pop(key)  # most recently used last
+        state = receipt.state
+        if not state.pinned and torch.cuda.is_current_stream_capturing():
+            state.pinned = True  # a graph captured after the eager resolution keeps referencing this workspace
+        stream = torch.cuda.current_stream(self._device_index).cuda_stream
+        bind = (x, out)
+        for launch, record, ((i0, s0), (i1, s1), (i2, s2), (i3, s3)) in receipt.stages:
+            launch(
+                record, stream, i0, bind[s0], i1, bind[s1], i2, bind[s2], i3, bind[s3]
+            )
+        return out
+
+    def _plan_receipt(
+        self, key: tuple[int, int, int], x: torch.Tensor, out: torch.Tensor
+    ) -> _Receipt:
+        """Plan the launches of ``(M, ldo, out address class)`` into fresh host receipts (the full ``run`` argument
+        validation and marshalling, once) and cache them, evicting the least recently used receipts."""
+        template, call = self._call_bindings(key[0], x, out)
+        state = self._workspaces[key[0]]
+        stages = []
+        for stage in template.stages:
+            record = torch.empty(RECEIPT_BYTES, dtype=torch.uint8)
+            stage.plan(
+                record,
+                *[call[value] if dynamic else value for dynamic, value in stage.slots],
+            )
+            stages.append((stage.launch, record, stage.rebinds))
+        while len(self._receipts) >= self._max_receipts:
+            del self._receipts[next(iter(self._receipts))]
+        receipt = _Receipt(tuple(stages), state)
+        self._receipts[key] = receipt
+        return receipt
+
+    def _call_bindings(
+        self, M: int, x: torch.Tensor, out: torch.Tensor
+    ) -> tuple[_LaunchTemplate, dict[str, Any]]:
+        """The template of ``(M, out)`` and the complete argument bindings of this call (workspace bindings cached
+        per ``(M, route)``, output / activation bindings per call)."""
         template = self._template(M, out)
         state = self._workspace_state(M)
         plan = template.plan
         bound = state.bindings.get(plan.kernels)
         if bound is None:
-            bound = _workspace_bindings(plan, prepared, M, state.workspace, self.device)
+            bound = _workspace_bindings(
+                plan, self.prepared, M, state.workspace, self.device
+            )
             state.bindings[plan.kernels] = bound
         call = dict(bound)
         call.update(
             _output_bindings(
-                plan, prepared, M, template.ldo, x, out, self._device_index
+                plan, self.prepared, M, template.ldo, x, out, self._device_index
             )
         )
-        with tvm_ffi.use_torch_stream():
-            for entry, slots in template.stages:
-                entry(*[call[value] if dynamic else value for dynamic, value in slots])
-        return out
+        return template, call
+
+    def pin(self, M: int) -> None:
+        """Pin the workspace of ``M`` rows ahead of a CUDA-graph capture (so no per-call capture query is needed)."""
+        self._workspace_state(int(M)).pinned = True
 
     def plan(self, x: torch.Tensor, out: torch.Tensor) -> ProjectionPlan:
         """The route plan a call with these bindings launches (resolving / caching its template)."""
@@ -2451,9 +2586,19 @@ class KimiK3Fp8ProjectionLauncher:
         """The ``M`` values with a cached workspace, least recently used first."""
         return tuple(self._workspaces)
 
+    @property
+    def cached_receipts(self) -> int:
+        """The number of planned ``(M, output row stride, output address class)`` launch receipts."""
+        return len(self._receipts)
+
 
 def kimi_k3_fp8_projection_launcher(
-    prepared: PreparedProjectionWeight, *, max_workspaces: int = 64
+    prepared: PreparedProjectionWeight,
+    *,
+    max_workspaces: int = 64,
+    max_receipts: int = 256,
 ) -> KimiK3Fp8ProjectionLauncher:
     """A :class:`KimiK3Fp8ProjectionLauncher` for ``prepared`` (one per engine linear layer)."""
-    return KimiK3Fp8ProjectionLauncher(prepared, max_workspaces=max_workspaces)
+    return KimiK3Fp8ProjectionLauncher(
+        prepared, max_workspaces=max_workspaces, max_receipts=max_receipts
+    )
