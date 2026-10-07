@@ -407,15 +407,10 @@ class CudnnFrostMxfp8MoeRunner(MoERunner):
 
     def _validate_pack(self, act, weights):
         require_moe_assembler()
-        if act.routing_input_mode not in self.supported_routing_modes:
-            raise NotImplementedError(
-                "cuDNN Frost MXFP8 MoE requires precomputed routing"
-            )
+        self._validate_pack_contract(act)
         x, xsf = act.hidden_states_q, act.hidden_states_scale
         if x.ndim != 2 or x.dtype != torch.float8_e4m3fn:
             raise ValueError("cuDNN Frost MXFP8 MoE requires E4M3 x[T,H]")
-        if act.per_token_scale is not None:
-            raise ValueError("cuDNN Frost MXFP8 does not consume per-token scales")
         t, h = x.shape
         k, e, i = (
             self.config.routing.top_k,

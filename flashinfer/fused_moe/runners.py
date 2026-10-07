@@ -8048,17 +8048,16 @@ class SM12xNvfp4Bf16Runner(MoERunner):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
-        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only PackedPrecomputed routing."
-            )
+        self._validate_pack_contract(act)
         x = act.hidden_states_q
         if x.ndim != 2 or x.dtype is not torch.bfloat16 or not x.is_contiguous():
             raise TypeError(
                 f"{type(self).__name__} requires contiguous 2D BF16 hidden states."
             )
-        if act.hidden_states_scale is not None or act.per_token_scale is not None:
-            raise ValueError(f"{type(self).__name__} requires activation scales None.")
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} requires hidden_states_scale to be None."
+            )
         num_tokens, hidden_size = x.shape
         if num_tokens == 0:
             raise NotImplementedError(

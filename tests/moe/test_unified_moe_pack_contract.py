@@ -8,6 +8,7 @@ CPU-only. Every runner shares ``MoERunner._validate_pack_contract`` and the
 from __future__ import annotations
 
 import inspect
+import re
 
 import pytest
 import torch
@@ -88,8 +89,12 @@ def test_every_pack_inputs_checks_the_contract(runner_cls):
     """The shared check must be the first thing ``pack_inputs`` does."""
     source = inspect.getsource(runner_cls.pack_inputs)
     if "_validate_pack_contract" not in source:
-        # cuTile runners validate through a shared helper.
-        source = inspect.getsource(runner_cls._validate_inputs)
+        # Some runners validate through a helper (cuTile `_validate_inputs`,
+        # cuDNN Frost `_validate_pack`); the call must be in one of them.
+        helpers = set(re.findall(r"self\.(_validate_\w+)\(", source))
+        source = "".join(
+            inspect.getsource(getattr(runner_cls, name)) for name in sorted(helpers)
+        )
     assert "self._validate_pack_contract(act)" in source
 
 
