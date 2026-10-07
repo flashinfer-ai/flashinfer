@@ -175,6 +175,9 @@ def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode, backend)
         pytest.skip(
             "Small-batch gemm_fp8_nt_groupwise dispatch is only relevant on SM100/103."
         )
+    cc = compute_capability[0] * 10 + compute_capability[1]
+    if not gemm_fp8_nt_groupwise.is_backend_supported(backend, cc):
+        pytest.skip(f"gemm_fp8_nt_groupwise backend {backend} does not support SM{cc}")
     if backend == "cutile":
         # M below BLOCK_M: partial M tile and the BLOCK_M <= M config prune.
         if scale_major_mode != "K":
