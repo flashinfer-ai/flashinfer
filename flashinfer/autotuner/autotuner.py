@@ -1170,7 +1170,9 @@ def set_autotune_process_group(
         backend = str(torch.distributed.get_backend(group)).lower()
         device = "cuda" if backend == "nccl" else "cpu"
         flag = torch.tensor([local], dtype=torch.int64, device=device)
-        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.SUM, group=group)
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.SUM, group=group
+        )
         if flag.item() != local * world_size:
             raise RuntimeError(
                 "FLASHINFER_AUTOTUNE_INDEPENDENT must be set uniformly "
@@ -1203,6 +1205,7 @@ def _sync_oom_across_tune_group(local_oom: bool) -> bool:
     # synchronized mode. See the docstring on
     # ``set_autotune_process_group`` for the caller contract.
     import os
+
     if os.environ.get("FLASHINFER_AUTOTUNE_INDEPENDENT", "0") == "1":
         return local_oom
 
@@ -3126,8 +3129,8 @@ class AutoTuner:
 
         try:
             import os
-            _independent = os.environ.get(
-                "FLASHINFER_AUTOTUNE_INDEPENDENT", "0") == "1"
+
+            _independent = os.environ.get("FLASHINFER_AUTOTUNE_INDEPENDENT", "0") == "1"
             if _tune_process_group is not None and not _independent:
                 import torch.distributed as dist
 
