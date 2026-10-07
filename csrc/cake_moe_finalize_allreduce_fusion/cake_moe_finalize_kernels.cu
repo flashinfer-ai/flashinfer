@@ -73,15 +73,15 @@ namespace cake_trtllm_moe_finalize {
 template <typename T> struct dtype_traits;
 template <> struct dtype_traits<__nv_bfloat16> {
     using vec2 = __nv_bfloat162;
+    template <typename... Args>
+    static __device__ __forceinline__ auto elem2float(Args&&... args) {
+        return __bfloat162float(static_cast<Args&&>(args)...);
+    }
     static __device__ __forceinline__ void unpack2(float* out, uint32_t in0) {
         asm volatile("{\n\t"
             "shl.b32 %0, %2, 16;\n\t"
             "and.b32 %1, %2, 0xffff0000;\n\t"
             "}\n" : "=f"(out[0]), "=f"(out[1]) : "r"(in0));
-    }
-    template <typename... Args>
-    static __device__ __forceinline__ auto elem2float(Args&&... args) {
-        return __bfloat162float(static_cast<Args&&>(args)...);
     }
     template <typename... Args>
     static __device__ __forceinline__ auto float22elem2_rn(Args&&... args) {
@@ -106,6 +106,10 @@ template <> struct dtype_traits<__nv_bfloat16> {
 };
 template <> struct dtype_traits<__half> {
     using vec2 = __half2;
+    template <typename... Args>
+    static __device__ __forceinline__ auto elem2float(Args&&... args) {
+        return __half2float(static_cast<Args&&>(args)...);
+    }
     static __device__ __forceinline__ void unpack2(float* out, uint32_t in0) {
         asm volatile("{\n\t"
             ".reg .b16 h_lo, h_hi;\n\t"
@@ -115,10 +119,6 @@ template <> struct dtype_traits<__half> {
             "cvt.f32.f16 f_hi, h_hi;\n\t"
             "mov.b64 %0, {f_lo, f_hi};\n\t"
             "}\n" : "=l"(*reinterpret_cast<unsigned long long*>(out)) : "r"(in0));
-    }
-    template <typename... Args>
-    static __device__ __forceinline__ auto elem2float(Args&&... args) {
-        return __half2float(static_cast<Args&&>(args)...);
     }
     template <typename... Args>
     static __device__ __forceinline__ auto float22elem2_rn(Args&&... args) {
@@ -209,101 +209,168 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
         for (int j = 0; j < 8; j++) {
             acc[j] = 0.0f;
         }
-        int route_index_lo = -1;
-        int route_index_hi = -1;
+        int route_index_qa = -1;
+        int route_index_qb = -1;
+        int route_index_qc = -1;
+        int route_index_qd = -1;
         if (top_k > 0) {
             int _vec_load_0[1];
             {
                 _vec_load_0[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k));
             }
-            route_index_lo = _vec_load_0[0];
+            route_index_qa = _vec_load_0[0];
         }
         if (top_k > 1) {
             int _vec_load_1[1];
             {
                 _vec_load_1[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 1));
             }
-            route_index_hi = _vec_load_1[0];
+            route_index_qb = _vec_load_1[0];
+        }
+        if (top_k > 2) {
+            int _vec_load_2[1];
+            {
+                _vec_load_2[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 2));
+            }
+            route_index_qc = _vec_load_2[0];
+        }
+        if (top_k > 3) {
+            int _vec_load_3[1];
+            {
+                _vec_load_3[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 3));
+            }
+            route_index_qd = _vec_load_3[0];
         }
         #pragma unroll 1
-        for (int route_base = 0; route_base < route_end; route_base += 2) {
-            int next_index_lo = -1;
-            int next_index_hi = -1;
-            float route_values[16];
-            float route_scales[2];
-            if (route_base + 2 < top_k) {
-                int _vec_load_2[1];
+        for (int route_base = 0; route_base < route_end; route_base += 4) {
+            int next_index_qa = -1;
+            int next_index_qb = -1;
+            int next_index_qc = -1;
+            int next_index_qd = -1;
+            unsigned int route_words[16];
+            float route_scales[4];
+            if (route_base + 4 < top_k) {
+                int _vec_load_4[1];
                 {
-                    _vec_load_2[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 2));
+                    _vec_load_4[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 4));
                 }
-                next_index_lo = _vec_load_2[0];
+                next_index_qa = _vec_load_4[0];
             }
-            if (route_base + 3 < top_k) {
-                int _vec_load_3[1];
+            if (route_base + 5 < top_k) {
+                int _vec_load_5[1];
                 {
-                    _vec_load_3[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 3));
+                    _vec_load_5[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 5));
                 }
-                next_index_hi = _vec_load_3[0];
+                next_index_qb = _vec_load_5[0];
             }
-            if (route_index_lo >= 0) {
-                long long expert_elem = (long long)route_index_lo * 7168 + (long long)(cluster_thread * 8);
-                float _vec_load_4[8];
+            if (route_base + 6 < top_k) {
+                int _vec_load_6[1];
                 {
-                    const uint4* _vptr_1 = reinterpret_cast<const uint4*>(allreduce_in + expert_elem + 0);
-                    uint4 _vld_1[1];
-                    #pragma unroll
-                    for (int _blk = 0; _blk < 1; _blk++) {
-                        _vld_1[_blk] = _vptr_1[_blk];
-                        uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
-                        #pragma unroll
-                        for (int _pair = 0; _pair < 4; _pair++) {
-                            dtype_traits<T>::unpack2(&_vec_load_4[0 + _blk * 8 + _pair * 2], _vpairs_1[_pair]);
-                        }
-                    }
+                    _vec_load_6[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 6));
                 }
-                float _vec_load_5[1];
+                next_index_qc = _vec_load_6[0];
+            }
+            if (route_base + 7 < top_k) {
+                int _vec_load_7[1];
+                {
+                    _vec_load_7[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 7));
+                }
+                next_index_qd = _vec_load_7[0];
+            }
+            if (route_index_qa >= 0) {
+                long long expert_elem = (long long)route_index_qa * 7168 + (long long)(cluster_thread * 8);
+                unsigned int _vec_load_8[4];
+                {
+                    uint4 _uv4_1 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem + 0);
+                    _vec_load_8[0 + 0] = _uv4_1.x;
+                    _vec_load_8[0 + 1] = _uv4_1.y;
+                    _vec_load_8[0 + 2] = _uv4_1.z;
+                    _vec_load_8[0 + 3] = _uv4_1.w;
+                }
+                #pragma unroll
+                for (int w = 0; w < 4; w++) {
+                    route_words[w] = _vec_load_8[w];
+                }
+                float _vec_load_9[1];
                 {
                     T _elem_2 = *reinterpret_cast<const T*>(expert_scales + token * top_k + route_base);
-                    _vec_load_5[0] = dtype_traits<T>::elem2float(_elem_2);
+                    _vec_load_9[0] = dtype_traits<T>::elem2float(_elem_2);
                 }
-                route_scales[0] = _vec_load_5[0];
-                #pragma unroll
-                for (int j_1 = 0; j_1 < 8; j_1++) {
-                    route_values[j_1] = _vec_load_4[j_1];
-                }
+                route_scales[0] = _vec_load_9[0];
             }
-            if (route_index_hi >= 0) {
-                long long expert_elem_1 = (long long)route_index_hi * 7168 + (long long)(cluster_thread * 8);
-                float _vec_load_6[8];
+            if (route_index_qb >= 0) {
+                long long expert_elem_1 = (long long)route_index_qb * 7168 + (long long)(cluster_thread * 8);
+                unsigned int _vec_load_10[4];
                 {
-                    const uint4* _vptr_3 = reinterpret_cast<const uint4*>(allreduce_in + expert_elem_1 + 0);
-                    uint4 _vld_3[1];
-                    #pragma unroll
-                    for (int _blk = 0; _blk < 1; _blk++) {
-                        _vld_3[_blk] = _vptr_3[_blk];
-                        uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
-                        #pragma unroll
-                        for (int _pair = 0; _pair < 4; _pair++) {
-                            dtype_traits<T>::unpack2(&_vec_load_6[0 + _blk * 8 + _pair * 2], _vpairs_3[_pair]);
-                        }
-                    }
+                    uint4 _uv4_3 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_1 + 0);
+                    _vec_load_10[0 + 0] = _uv4_3.x;
+                    _vec_load_10[0 + 1] = _uv4_3.y;
+                    _vec_load_10[0 + 2] = _uv4_3.z;
+                    _vec_load_10[0 + 3] = _uv4_3.w;
                 }
-                float _vec_load_7[1];
+                #pragma unroll
+                for (int w_1 = 0; w_1 < 4; w_1++) {
+                    route_words[4 + w_1] = _vec_load_10[w_1];
+                }
+                float _vec_load_11[1];
                 {
                     T _elem_4 = *reinterpret_cast<const T*>(expert_scales + token * top_k + route_base + 1);
-                    _vec_load_7[0] = dtype_traits<T>::elem2float(_elem_4);
+                    _vec_load_11[0] = dtype_traits<T>::elem2float(_elem_4);
                 }
-                route_scales[1] = _vec_load_7[0];
-                #pragma unroll
-                for (int j_2 = 0; j_2 < 8; j_2++) {
-                    route_values[8 + j_2] = _vec_load_6[j_2];
-                }
+                route_scales[1] = _vec_load_11[0];
             }
-            if (route_index_lo >= 0) {
-                float scaled[8];
+            if (route_index_qc >= 0) {
+                long long expert_elem_2 = (long long)route_index_qc * 7168 + (long long)(cluster_thread * 8);
+                unsigned int _vec_load_12[4];
+                {
+                    uint4 _uv4_5 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_2 + 0);
+                    _vec_load_12[0 + 0] = _uv4_5.x;
+                    _vec_load_12[0 + 1] = _uv4_5.y;
+                    _vec_load_12[0 + 2] = _uv4_5.z;
+                    _vec_load_12[0 + 3] = _uv4_5.w;
+                }
                 #pragma unroll
-                for (int j_3 = 0; j_3 < 8; j_3++) {
-                    scaled[j_3] = route_values[j_3] * route_scales[0];
+                for (int w_2 = 0; w_2 < 4; w_2++) {
+                    route_words[8 + w_2] = _vec_load_12[w_2];
+                }
+                float _vec_load_13[1];
+                {
+                    T _elem_6 = *reinterpret_cast<const T*>(expert_scales + token * top_k + route_base + 2);
+                    _vec_load_13[0] = dtype_traits<T>::elem2float(_elem_6);
+                }
+                route_scales[2] = _vec_load_13[0];
+            }
+            if (route_index_qd >= 0) {
+                long long expert_elem_3 = (long long)route_index_qd * 7168 + (long long)(cluster_thread * 8);
+                unsigned int _vec_load_14[4];
+                {
+                    uint4 _uv4_7 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_3 + 0);
+                    _vec_load_14[0 + 0] = _uv4_7.x;
+                    _vec_load_14[0 + 1] = _uv4_7.y;
+                    _vec_load_14[0 + 2] = _uv4_7.z;
+                    _vec_load_14[0 + 3] = _uv4_7.w;
+                }
+                #pragma unroll
+                for (int w_3 = 0; w_3 < 4; w_3++) {
+                    route_words[12 + w_3] = _vec_load_14[w_3];
+                }
+                float _vec_load_15[1];
+                {
+                    T _elem_8 = *reinterpret_cast<const T*>(expert_scales + token * top_k + route_base + 3);
+                    _vec_load_15[0] = dtype_traits<T>::elem2float(_elem_8);
+                }
+                route_scales[3] = _vec_load_15[0];
+            }
+            if (route_index_qa >= 0) {
+                float scaled[8];
+                float route_words_f32[8];
+                #pragma unroll
+                for (int _pair = 0; _pair < 4; _pair++) {
+                    dtype_traits<T>::unpack2(&route_words_f32[_pair * 2], route_words[_pair]);
+                }
+                #pragma unroll
+                for (int j_1 = 0; j_1 < 8; j_1++) {
+                    scaled[j_1] = route_words_f32[j_1] * route_scales[0];
                 }
                 uint32_t scaled_elem[4];
                 #pragma unroll
@@ -317,8 +384,8 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
                     dtype_traits<T>::unpack2(&scaled_elem_f32[_pair * 2], scaled_elem[_pair]);
                 }
                 #pragma unroll
-                for (int j_4 = 0; j_4 < 8; j_4++) {
-                    acc[j_4] = acc[j_4] + scaled_elem_f32[j_4];
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    acc[j_2] = acc[j_2] + scaled_elem_f32[j_2];
                 }
                 uint32_t acc_elem[4];
                 #pragma unroll
@@ -331,11 +398,16 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
                     dtype_traits<T>::unpack2(&acc[_pair * 2], acc_elem[_pair]);
                 }
             }
-            if (route_index_hi >= 0) {
+            if (route_index_qb >= 0) {
                 float scaled_1[8];
+                float route_words_f32_1[8];
                 #pragma unroll
-                for (int j_5 = 0; j_5 < 8; j_5++) {
-                    scaled_1[j_5] = route_values[8 + j_5] * route_scales[1];
+                for (int _pair = 0; _pair < 4; _pair++) {
+                    dtype_traits<T>::unpack2(&route_words_f32_1[_pair * 2], route_words[4 + _pair]);
+                }
+                #pragma unroll
+                for (int j_3 = 0; j_3 < 8; j_3++) {
+                    scaled_1[j_3] = route_words_f32_1[j_3] * route_scales[1];
                 }
                 uint32_t scaled_elem_1[4];
                 #pragma unroll
@@ -349,8 +421,8 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
                     dtype_traits<T>::unpack2(&scaled_elem_f32_1[_pair * 2], scaled_elem_1[_pair]);
                 }
                 #pragma unroll
-                for (int j_6 = 0; j_6 < 8; j_6++) {
-                    acc[j_6] = acc[j_6] + scaled_elem_f32_1[j_6];
+                for (int j_4 = 0; j_4 < 8; j_4++) {
+                    acc[j_4] = acc[j_4] + scaled_elem_f32_1[j_4];
                 }
                 uint32_t acc_elem_1[4];
                 #pragma unroll
@@ -363,71 +435,147 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
                     dtype_traits<T>::unpack2(&acc[_pair * 2], acc_elem_1[_pair]);
                 }
             }
-            route_index_lo = next_index_lo;
-            route_index_hi = next_index_hi;
+            if (route_index_qc >= 0) {
+                float scaled_2[8];
+                float route_words_f32_2[8];
+                #pragma unroll
+                for (int _pair = 0; _pair < 4; _pair++) {
+                    dtype_traits<T>::unpack2(&route_words_f32_2[_pair * 2], route_words[8 + _pair]);
+                }
+                #pragma unroll
+                for (int j_5 = 0; j_5 < 8; j_5++) {
+                    scaled_2[j_5] = route_words_f32_2[j_5] * route_scales[2];
+                }
+                uint32_t scaled_elem_2[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 4; _lp++) {
+                    typename dtype_traits<T>::vec2 _bf2 = dtype_traits<T>::float22elem2_rn(make_float2(scaled_2[_lp*2 + 0], scaled_2[_lp*2+1 + 0]));
+                    scaled_elem_2[_lp] = *(uint32_t*)&_bf2;
+                }
+                float scaled_elem_f32_2[8];
+                #pragma unroll
+                for (int _pair = 0; _pair < 4; _pair++) {
+                    dtype_traits<T>::unpack2(&scaled_elem_f32_2[_pair * 2], scaled_elem_2[_pair]);
+                }
+                #pragma unroll
+                for (int j_6 = 0; j_6 < 8; j_6++) {
+                    acc[j_6] = acc[j_6] + scaled_elem_f32_2[j_6];
+                }
+                uint32_t acc_elem_2[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 4; _lp++) {
+                    typename dtype_traits<T>::vec2 _bf2 = dtype_traits<T>::float22elem2_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
+                    acc_elem_2[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _pair = 0; _pair < 4; _pair++) {
+                    dtype_traits<T>::unpack2(&acc[_pair * 2], acc_elem_2[_pair]);
+                }
+            }
+            if (route_index_qd >= 0) {
+                float scaled_3[8];
+                float route_words_f32_3[8];
+                #pragma unroll
+                for (int _pair = 0; _pair < 4; _pair++) {
+                    dtype_traits<T>::unpack2(&route_words_f32_3[_pair * 2], route_words[12 + _pair]);
+                }
+                #pragma unroll
+                for (int j_7 = 0; j_7 < 8; j_7++) {
+                    scaled_3[j_7] = route_words_f32_3[j_7] * route_scales[3];
+                }
+                uint32_t scaled_elem_3[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 4; _lp++) {
+                    typename dtype_traits<T>::vec2 _bf2 = dtype_traits<T>::float22elem2_rn(make_float2(scaled_3[_lp*2 + 0], scaled_3[_lp*2+1 + 0]));
+                    scaled_elem_3[_lp] = *(uint32_t*)&_bf2;
+                }
+                float scaled_elem_f32_3[8];
+                #pragma unroll
+                for (int _pair = 0; _pair < 4; _pair++) {
+                    dtype_traits<T>::unpack2(&scaled_elem_f32_3[_pair * 2], scaled_elem_3[_pair]);
+                }
+                #pragma unroll
+                for (int j_8 = 0; j_8 < 8; j_8++) {
+                    acc[j_8] = acc[j_8] + scaled_elem_f32_3[j_8];
+                }
+                uint32_t acc_elem_3[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 4; _lp++) {
+                    typename dtype_traits<T>::vec2 _bf2 = dtype_traits<T>::float22elem2_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
+                    acc_elem_3[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _pair = 0; _pair < 4; _pair++) {
+                    dtype_traits<T>::unpack2(&acc[_pair * 2], acc_elem_3[_pair]);
+                }
+            }
+            route_index_qa = next_index_qa;
+            route_index_qb = next_index_qb;
+            route_index_qc = next_index_qc;
+            route_index_qd = next_index_qd;
         }
         if (routed_scaling_factor != 1.0f) {
             #pragma unroll
-            for (int j_7 = 0; j_7 < 8; j_7++) {
-                acc[j_7] = acc[j_7] * routed_scaling_factor;
+            for (int j_9 = 0; j_9 < 8; j_9++) {
+                acc[j_9] = acc[j_9] * routed_scaling_factor;
             }
-            uint32_t acc_elem_2[4];
+            uint32_t acc_elem_4[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 typename dtype_traits<T>::vec2 _bf2 = dtype_traits<T>::float22elem2_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
-                acc_elem_2[_lp] = *(uint32_t*)&_bf2;
+                acc_elem_4[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
-                dtype_traits<T>::unpack2(&acc[_pair * 2], acc_elem_2[_pair]);
+                dtype_traits<T>::unpack2(&acc[_pair * 2], acc_elem_4[_pair]);
             }
         }
         if (has_shared_expert != 0) {
             int shared_elem = token * 7168 + cluster_thread * 8;
-            float _vec_load_8[8];
+            float _vec_load_16[8];
             {
-                const uint4* _vptr_5 = reinterpret_cast<const uint4*>(shared_expert_output + shared_elem + 0);
-                uint4 _vld_5[1];
+                const uint4* _vptr_9 = reinterpret_cast<const uint4*>(shared_expert_output + shared_elem + 0);
+                uint4 _vld_9[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
-                    _vld_5[_blk] = _vptr_5[_blk];
-                    uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5[_blk]);
+                    _vld_9[_blk] = _vptr_9[_blk];
+                    uint32_t* _vpairs_9 = reinterpret_cast<uint32_t*>(&_vld_9[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        dtype_traits<T>::unpack2(&_vec_load_8[0 + _blk * 8 + _pair * 2], _vpairs_5[_pair]);
+                        dtype_traits<T>::unpack2(&_vec_load_16[0 + _blk * 8 + _pair * 2], _vpairs_9[_pair]);
                     }
                 }
             }
             #pragma unroll
-            for (int j_8 = 0; j_8 < 8; j_8++) {
-                acc[j_8] = acc[j_8] + _vec_load_8[j_8];
+            for (int j_10 = 0; j_10 < 8; j_10++) {
+                acc[j_10] = acc[j_10] + _vec_load_16[j_10];
             }
-            uint32_t acc_elem_3[4];
+            uint32_t acc_elem_5[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 typename dtype_traits<T>::vec2 _bf2 = dtype_traits<T>::float22elem2_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
-                acc_elem_3[_lp] = *(uint32_t*)&_bf2;
+                acc_elem_5[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
-                dtype_traits<T>::unpack2(&acc[_pair * 2], acc_elem_3[_pair]);
+                dtype_traits<T>::unpack2(&acc[_pair * 2], acc_elem_5[_pair]);
             }
         }
         #pragma unroll
-        for (int j_9 = 0; j_9 < 8; j_9++) {
-            acc[j_9] = ((acc[j_9] == 0.0f) ? 0.0f : acc[j_9]);
+        for (int j_11 = 0; j_11 < 8; j_11++) {
+            acc[j_11] = ((acc[j_11] == 0.0f) ? 0.0f : acc[j_11]);
         }
-        uint32_t acc_elem_4[4];
+        uint32_t acc_elem_6[4];
         #pragma unroll
         for (int _lp = 0; _lp < 4; _lp++) {
             typename dtype_traits<T>::vec2 _bf2 = dtype_traits<T>::float22elem2_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
-            acc_elem_4[_lp] = *(uint32_t*)&_bf2;
+            acc_elem_6[_lp] = *(uint32_t*)&_bf2;
         }
         int access = token * 896 + cluster_thread;
         long long slot = (long long)rank * (long long)total_access * 8 + (long long)access * 8;
         #pragma unroll
         for (int p = 0; p < WS; p++) {
-            asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer[p] + slot), "r"((acc_elem_4)[0]), "r"((acc_elem_4)[1]), "r"((acc_elem_4)[2]), "r"((acc_elem_4)[3]) : "memory");
+            asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer[p] + slot), "r"((acc_elem_6)[0]), "r"((acc_elem_6)[1]), "r"((acc_elem_6)[2]), "r"((acc_elem_6)[3]) : "memory");
         }
     }
     unsigned int clear_words[4];
@@ -444,6 +592,21 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
     int rms_parity = 0;
     #pragma unroll 1
     for (int token_1 = token_begin; token_1 < token_end; token_1 += token_stride) {
+        int elem_early = access_1 * 8;
+        float _vec_load_17[8];
+        {
+            const uint4* _vptr_10 = reinterpret_cast<const uint4*>(residual + elem_early + 0);
+            uint4 _vld_10[1];
+            #pragma unroll
+            for (int _blk = 0; _blk < 1; _blk++) {
+                _vld_10[_blk] = _vptr_10[_blk];
+                uint32_t* _vpairs_10 = reinterpret_cast<uint32_t*>(&_vld_10[_blk]);
+                #pragma unroll
+                for (int _pair = 0; _pair < 4; _pair++) {
+                    dtype_traits<T>::unpack2(&_vec_load_17[0 + _blk * 8 + _pair * 2], _vpairs_10[_pair]);
+                }
+            }
+        }
         uint32_t _sysv_poll_group_0[4 * WS];
         do {
             asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[0]), "=r"(_sysv_poll_group_0[1]), "=r"(_sysv_poll_group_0[2]), "=r"(_sysv_poll_group_0[3]) : "l"(workspace_local + (data_base + (long long)(access_1 * 8))) : "memory");
@@ -459,8 +622,8 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
         }
         float sum_value[8];
         #pragma unroll
-        for (int j_10 = 0; j_10 < 8; j_10++) {
-            sum_value[j_10] = _sysv_poll_group_0_f32[j_10];
+        for (int j_12 = 0; j_12 < 8; j_12++) {
+            sum_value[j_12] = _sysv_poll_group_0_f32[j_12];
         }
         #pragma unroll
         for (int p = 1; p < WS; p++) {
@@ -470,8 +633,8 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
                 dtype_traits<T>::unpack2(&_sysv_poll_group_0_f32_0[_pair * 2], _sysv_poll_group_0[4 * p + _pair]);
             }
             #pragma unroll
-            for (int j_11 = 0; j_11 < 8; j_11++) {
-                sum_value[j_11] = sum_value[j_11] + _sysv_poll_group_0_f32_0[j_11];
+            for (int j_13 = 0; j_13 < 8; j_13++) {
+                sum_value[j_13] = sum_value[j_13] + _sysv_poll_group_0_f32_0[j_13];
             }
             uint32_t sum_value_elem[4];
             #pragma unroll
@@ -486,60 +649,46 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
         }
         int access_in_token = cluster_thread;
         int elem = access_1 * 8;
-        float _vec_load_9[8];
+        float _vec_load_18[8];
         {
-            const uint4* _vptr_6 = reinterpret_cast<const uint4*>(residual + elem + 0);
-            uint4 _vld_6[1];
+            const uint4* _vptr_11 = reinterpret_cast<const uint4*>(norm_weight + (access_in_token * 8) + 0);
+            uint4 _vld_11[1];
             #pragma unroll
             for (int _blk = 0; _blk < 1; _blk++) {
-                _vld_6[_blk] = _vptr_6[_blk];
-                uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6[_blk]);
+                _vld_11[_blk] = _vptr_11[_blk];
+                uint32_t* _vpairs_11 = reinterpret_cast<uint32_t*>(&_vld_11[_blk]);
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
-                    dtype_traits<T>::unpack2(&_vec_load_9[0 + _blk * 8 + _pair * 2], _vpairs_6[_pair]);
-                }
-            }
-        }
-        float _vec_load_10[8];
-        {
-            const uint4* _vptr_7 = reinterpret_cast<const uint4*>(norm_weight + (access_in_token * 8) + 0);
-            uint4 _vld_7[1];
-            #pragma unroll
-            for (int _blk = 0; _blk < 1; _blk++) {
-                _vld_7[_blk] = _vptr_7[_blk];
-                uint32_t* _vpairs_7 = reinterpret_cast<uint32_t*>(&_vld_7[_blk]);
-                #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    dtype_traits<T>::unpack2(&_vec_load_10[0 + _blk * 8 + _pair * 2], _vpairs_7[_pair]);
+                    dtype_traits<T>::unpack2(&_vec_load_18[0 + _blk * 8 + _pair * 2], _vpairs_11[_pair]);
                 }
             }
         }
         #pragma unroll
-        for (int j_14 = 0; j_14 < 8; j_14++) {
-            _vec_load_9[j_14] = _vec_load_9[j_14] + sum_value[j_14];
+        for (int j_16 = 0; j_16 < 8; j_16++) {
+            _vec_load_17[j_16] = _vec_load_17[j_16] + sum_value[j_16];
         }
-        uint32_t _vec_load_9_elem[4];
+        uint32_t _vec_load_17_elem[4];
         #pragma unroll
         for (int _lp = 0; _lp < 4; _lp++) {
-            typename dtype_traits<T>::vec2 _bf2 = dtype_traits<T>::float22elem2_rn(make_float2(_vec_load_9[_lp*2 + 0], _vec_load_9[_lp*2+1 + 0]));
-            _vec_load_9_elem[_lp] = *(uint32_t*)&_bf2;
+            typename dtype_traits<T>::vec2 _bf2 = dtype_traits<T>::float22elem2_rn(make_float2(_vec_load_17[_lp*2 + 0], _vec_load_17[_lp*2+1 + 0]));
+            _vec_load_17_elem[_lp] = *(uint32_t*)&_bf2;
         }
         #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
-            dtype_traits<T>::unpack2(&_vec_load_9[_pair * 2], _vec_load_9_elem[_pair]);
+            dtype_traits<T>::unpack2(&_vec_load_17[_pair * 2], _vec_load_17_elem[_pair]);
         }
         {
             typename dtype_traits<T>::vec2 _pk[4];
-            _pk[0] = dtype_traits<T>::floats2elem2_rn(_vec_load_9[0 + 0], _vec_load_9[0 + 1]);
-            _pk[1] = dtype_traits<T>::floats2elem2_rn(_vec_load_9[0 + 2], _vec_load_9[0 + 3]);
-            _pk[2] = dtype_traits<T>::floats2elem2_rn(_vec_load_9[0 + 4], _vec_load_9[0 + 5]);
-            _pk[3] = dtype_traits<T>::floats2elem2_rn(_vec_load_9[0 + 6], _vec_load_9[0 + 7]);
+            _pk[0] = dtype_traits<T>::floats2elem2_rn(_vec_load_17[0 + 0], _vec_load_17[0 + 1]);
+            _pk[1] = dtype_traits<T>::floats2elem2_rn(_vec_load_17[0 + 2], _vec_load_17[0 + 3]);
+            _pk[2] = dtype_traits<T>::floats2elem2_rn(_vec_load_17[0 + 4], _vec_load_17[0 + 5]);
+            _pk[3] = dtype_traits<T>::floats2elem2_rn(_vec_load_17[0 + 6], _vec_load_17[0 + 7]);
             *reinterpret_cast<uint4*>(&((T*)(residual_out + elem))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
         }
         float square_sum = 0.0f;
         #pragma unroll
-        for (int j_15 = 0; j_15 < 8; j_15++) {
-            square_sum = square_sum + _vec_load_9[j_15] * _vec_load_9[j_15];
+        for (int j_17 = 0; j_17 < 8; j_17++) {
+            square_sum = square_sum + _vec_load_17[j_17] * _vec_load_17[j_17];
         }
         float _warp_reduce_0 = square_sum;
         #pragma unroll
@@ -598,8 +747,8 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
         float rstd = _rsqrt_0;
         float norm_value[8];
         #pragma unroll
-        for (int j_16 = 0; j_16 < 8; j_16++) {
-            norm_value[j_16] = _vec_load_9[j_16] * rstd * (_vec_load_10[j_16] + weight_bias);
+        for (int j_18 = 0; j_18 < 8; j_18++) {
+            norm_value[j_18] = _vec_load_17[j_18] * rstd * (_vec_load_18[j_18] + weight_bias);
         }
         uint32_t norm_value_elem[4];
         #pragma unroll
@@ -639,19 +788,19 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
             float _rcp_0 = approx_rcp(6.0f);
             float sf_value = scale_factor * (vector_max * _rcp_0);
             float _fp8_rt_0;
-            uint16_t _e4m3x2_8;
-            uint32_t _f16x2_8;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_8) : "f"(0.0f), "f"(sf_value));
-            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_8) : "h"(_e4m3x2_8));
-            uint16_t _fp8_h0_8 = (uint16_t)(_f16x2_8 & 0xFFFFu);
-            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_8));
+            uint16_t _e4m3x2_12;
+            uint32_t _f16x2_12;
+            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_12) : "f"(0.0f), "f"(sf_value));
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_12) : "h"(_e4m3x2_12));
+            uint16_t _fp8_h0_12 = (uint16_t)(_f16x2_12 & 0xFFFFu);
+            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_12));
             float sf_rounded = _fp8_rt_0;
             float _rcp_1 = approx_rcp(scale_factor);
             float _rcp_2 = approx_rcp(sf_rounded * _rcp_1);
             float output_scale = ((sf_rounded != 0.0f) ? _rcp_2 : 0.0f);
             #pragma unroll
-            for (int j_17 = 0; j_17 < 8; j_17++) {
-                norm_value_elem_f32[j_17] = norm_value_elem_f32[j_17] * output_scale;
+            for (int j_19 = 0; j_19 < 8; j_19++) {
+                norm_value_elem_f32[j_19] = norm_value_elem_f32[j_19] * output_scale;
             }
             uint32_t _fp4_0[1];
             asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_0[0]) : "f"(norm_value_elem_f32[0]), "f"(norm_value_elem_f32[1]), "f"(norm_value_elem_f32[2]), "f"(norm_value_elem_f32[3]), "f"(norm_value_elem_f32[4]), "f"(norm_value_elem_f32[5]), "f"(norm_value_elem_f32[6]), "f"(norm_value_elem_f32[7]));
@@ -677,8 +826,8 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
     if (bid == 0) {
         if (tid == 0) {
             {
-                volatile int* _lcv_p_8 = reinterpret_cast<volatile int*>(completion) + (0);
-                while (*_lcv_p_8 != static_cast<int>(num_bids)) {}
+                volatile int* _lcv_p_12 = reinterpret_cast<volatile int*>(completion) + (0);
+                while (*_lcv_p_12 != static_cast<int>(num_bids)) {}
                 *reinterpret_cast<int*>(flag_addr) = static_cast<int>((flag + 1) % 3);
                 *reinterpret_cast<int*>(clear_addr) = static_cast<int>(token_end * 7168 * WS);
                 *(reinterpret_cast<int*>(completion) + (0)) = 0;
