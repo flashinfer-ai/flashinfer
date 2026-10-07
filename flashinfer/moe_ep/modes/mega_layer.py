@@ -365,14 +365,17 @@ class MoEEpMegaLayer(nn.Module):
                     device=device,
                 ),
             )
-        # Output-view-capable backends capture their internal graph against a
-        # stable workspace address. Warming that path is what makes a later
-        # outer CUDA Graph capture safe.
-        self.forward(
-            t,
-            workspace=workspace,
-            return_workspace_view=self.supports_output_view and t.output is None,
-        )
+        if self._kernel.supports_unfinalized_output:
+            self.forward_unfinalized(t, workspace=workspace)
+        else:
+            # Output-view-capable backends capture their internal graph against a
+            # stable workspace address. Warming that path is what makes a later
+            # outer CUDA Graph capture safe.
+            self.forward(
+                t,
+                workspace=workspace,
+                return_workspace_view=self.supports_output_view and t.output is None,
+            )
         torch.cuda.synchronize()
 
     def _resolve_quantize_input(self, t: "MoEEpTensors") -> bool:
@@ -557,6 +560,8 @@ class MoEEpMegaLayer(nn.Module):
         backends that support one. A view remains valid under stream ordering
         until the next launch reuses the pooled physical workspace.
         """
+        if self._kernel.supports_unfinalized_output:
+            raise MoEEpConfigError("do_finalize=False requires forward_unfinalized()")
         if return_workspace_view and t.output is not None:
             raise MoEEpConfigError(
                 "return_workspace_view=True cannot be combined with t.output"
@@ -602,6 +607,35 @@ class MoEEpMegaLayer(nn.Module):
         self._staged_workspace = backend_workspace
         self._staged_transformed = transformed_weights
         return self.compute_staged(output=output)
+
+    def forward_unfinalized(
+        self,
+        t: "MoEEpTensors",
+        *,
+        workspace: MoEEpMegaWorkspace | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return GEMM2 rows, remaining routing weights, and a route-to-row map.
+
+        Requires ``do_finalize=False``. Results are contiguous BF16
+        ``[T * top_k, hidden]`` rows, FP32 ``[T, top_k]`` weights, and an int32
+        ``[T, top_k]`` identity map whose entries index the first result.
+        Weights are one when ``apply_topk_in_fc1=True`` already applied routing.
+        These tensors match the unfinalized TRTLLM MoE output layout.
+
+        All results borrow pooled workspace storage: consume them on the current
+        stream before any layer reuses that workspace. EP communication completes
+        before caller finalization; zero-token ranks still participate in the
+        full collective launch. Warm up on all ranks before capture.
+        """
+        if not self._kernel.supports_unfinalized_output:
+            raise MoEEpConfigError(
+                "forward_unfinalized() requires a backend with do_finalize=False"
+            )
+        _, backend_workspace, quantize_input, transformed_weights = (
+            self._prepare_inputs(t, workspace=workspace)
+        )
+        self._kernel.stage_inputs(t, backend_workspace, quantize_input=quantize_input)
+        return self._kernel.compute_unfinalized(backend_workspace, transformed_weights)
 
     def destroy(self) -> None:
         """Collectively release all profiles and runtime resources.

@@ -144,6 +144,7 @@ def lookup_knobs(
     combine_dtype: str = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
     apply_topk_in_fc1: bool = False,
+    defer_topk_reduce: bool = False,
     device: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss.
@@ -168,6 +169,8 @@ def lookup_knobs(
         for e in _load_entries(path)
         if all(e.get(f) == key[f] for f in _KEY_FIELDS)
         and e.get("apply_topk_in_fc1") == apply_topk_in_fc1
+        and e.get("defer_topk_reduce", False) == defer_topk_reduce
+        and e.get("profile") is None
         and isinstance(e.get("knobs"), dict)
         and isinstance(e.get("max_tokens"), int)
         and (enable_in_kernel_fc2_reduce or not _entry_needs_ikr(e))
@@ -201,6 +204,7 @@ def record_knobs(
     max_tokens: int,
     combine_dtype: str = "bf16",
     apply_topk_in_fc1: bool = False,
+    defer_topk_reduce: bool = False,
     device: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
@@ -209,9 +213,9 @@ def record_knobs(
 
     Deterministic and ikr-tuned winners for the same geometry are separate
     entries (see :func:`_entry_needs_ikr`); FC1 and post-FC2 routing-weight
-    placement also have separate winners. A ``--allow-nondeterministic``
-    sweep does not evict the deterministic winner a reproducible session needs,
-    or vice versa.
+    placement and reduced/deferred output also have separate winners. A
+    ``--allow-nondeterministic`` sweep does not evict the deterministic winner
+    a reproducible session needs, or vice versa.
 
     Returns the cache path written, or ``None`` when the cache is disabled or
     the write failed (recording is best-effort — a read-only home directory
@@ -231,6 +235,7 @@ def record_knobs(
         combine_dtype=combine_dtype,
         max_tokens=max_tokens,
         apply_topk_in_fc1=apply_topk_in_fc1,
+        defer_topk_reduce=defer_topk_reduce,
         knobs=_knobs_to_json(knobs),
         p50_us=p50_us,
         source=source,
@@ -245,6 +250,8 @@ def record_knobs(
                 all(e.get(f) == entry[f] for f in _KEY_FIELDS)
                 and e.get("max_tokens") == max_tokens
                 and e.get("apply_topk_in_fc1") == apply_topk_in_fc1
+                and e.get("defer_topk_reduce", False) == defer_topk_reduce
+                and e.get("profile") is None
                 and _entry_needs_ikr(e) == _entry_needs_ikr(entry)
             )
         ]
@@ -283,6 +290,7 @@ def resolve_knobs(
     combine_dtype: str = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
     apply_topk_in_fc1: bool = False,
+    defer_topk_reduce: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
 
@@ -309,6 +317,7 @@ def resolve_knobs(
         combine_dtype=combine_dtype,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         apply_topk_in_fc1=apply_topk_in_fc1,
+        defer_topk_reduce=defer_topk_reduce,
     )
     if cached is not None:
         return cached, "cache"
