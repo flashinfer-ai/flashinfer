@@ -26,6 +26,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     BLOCK_N_CHOICES,
     CTA_GROUP,
     CTA_ROWS_CHOICES,
+    EPI_WARPS,
     ROUTER_SPLITS,
     ROW_RULES,
     SK_DUMMY_BASE,
@@ -37,6 +38,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     default_group_m,
     default_hints,
     b_stage_bytes,
+    box_rows_of,
     default_stages,
     device_l2_bytes,
     epi_cols,
@@ -547,15 +549,15 @@ ARCH_OF_SM = {148: "sm_100a", 212: "sm_107a"}
 
 
 _TRANSPOSED_STEM = re.compile(
-    r"_t(?:_tma[12])?(?:_s\d+)?(?:_box\d+)?(?:_skx)?(?:_b(?:f|g\d+))?(?:_so[flnd])?(?:_pd\d+)?(?:_sh\d+)?$"
+    r"_t(?:_tma[12])?(?:_s\d+)?(?:_box\d+)?(?:_skx)?(?:_sks)?(?:_sb[123])?(?:_b(?:f|g\d+))?(?:_so[flnd])?(?:_pd\d+)?(?:_sh\d+)?(?:_c1)?$"
 )
 
 
 def _transposed_template(template: str) -> bool:
     """``_t`` (transposed register epilogue) or ``_t_tma1`` / ``_t_tma2`` (round-14 transposed TMA-store epilogue),
     followed by the knob suffixes ``instance_symbol`` emits after the epilogue term (``_s<stages>``, ``_box<rows>``,
-    ``_skx``, ``_bf`` / ``_bg<n>``, ``_so<x>``, ``_pd<n>``, ``_sh<n>``) - e.g. the round-16 six-stage swapped MLA
-    weight-gradient templates ``..._hee_t_tma1_s6``."""
+    ``_skx``, ``_sks`` / ``_sb<n>`` (rounds 18 / 19), ``_bf`` / ``_bg<n>``, ``_so<x>``, ``_pd<n>``, ``_sh<n>``, ``_c1``
+    (round 19)) - e.g. the round-16 six-stage swapped MLA weight-gradient templates ``..._hee_t_tma1_s6``."""
     return _TRANSPOSED_STEM.search(template) is not None
 
 
@@ -679,7 +681,12 @@ def test_registry_records_are_well_formed():
             # the raster group width is a launch parameter since round 11
             assert ["parameter", "group_m"] in plan_items
         launch = record["launch"]
-        assert list(launch["cluster"]) == [CTA_GROUP, 1, 1]
+        # round 19 (Cake W3): the single-CTA form (``_c1`` templates) has no cluster; every other program is a
+        # two-CTA cluster (the exporter's registry check)
+        want_cluster = (
+            [1, 1, 1] if record["template"].endswith("_c1") else [CTA_GROUP, 1, 1]
+        )
+        assert list(launch["cluster"]) == want_cluster, (name, launch)
         assert len(launch["block"]) == 3 and all(int(b) >= 1 for b in launch["block"])
     with pytest.raises(NotImplementedError, match="not registered"):
         cake_jit.select_module("sm_100a", "dense_proj_gemm_not_a_template")
@@ -1066,6 +1073,52 @@ def test_epilogue_rules():
             dict(a_mn=False, b_mn=True, epi="reg", quad_store=True, pd=1),
             "dense_proj_gemm_kn_n256_q_pd1",
         ),
+        # round 19 (Cake W2): the slab path of the synchronised stream-K fixup (``_sb<n>`` right after ``_sks``)
+        (
+            dict(a_mn=True, b_mn=True, cta_rows=256, sk_sync=True, sk_slab=2),
+            "dense_proj_gemm_nn_n256_m256_sks_sb2",
+        ),
+        (
+            dict(
+                a_mn=True,
+                b_mn=True,
+                cta_rows=256,
+                out_f32=True,
+                slots=1,
+                sk_sync=True,
+                sk_slab=3,
+            ),
+            "dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3",
+        ),
+        (
+            dict(
+                a_mn=True,
+                b_mn=True,
+                out_t=True,
+                block_n=192,
+                b_swz=64,
+                sk_sync=True,
+                sk_slab=2,
+            ),
+            "dense_proj_gemm_nn_n192_bz64_t_sks_sb2",
+        ),
+        # round 19 (Cake W3): the single-CTA form (trailing ``_c1``; ``_s<n>`` relative to its own stage default)
+        (
+            dict(a_mn=False, b_mn=False, block_n=128, cta1=True),
+            "dense_proj_gemm_kk_n128_c1",
+        ),
+        (
+            dict(
+                a_mn=False,
+                b_mn=True,
+                out_f32=True,
+                block_n=128,
+                slots=2,
+                stages=4,
+                cta1=True,
+            ),
+            "dense_proj_gemm_kn_n128_f32_tma2_s4_c1",
+        ),
     ],
 )
 def test_instance_symbols(kwargs, symbol):
@@ -1103,7 +1156,7 @@ def test_round13_w3_knobs():
     # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
     key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
     assert (
-        len(key) == 26
+        len(key) == 28
         and key[18] == 64
         and key[19] is False
         and key[20] == 0
@@ -1165,7 +1218,7 @@ def test_round15_store_hint_knob():
     key = instance_key(
         a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_last"
     )
-    assert len(key) == 26 and key[22] == "evict_last"
+    assert len(key) == 28 and key[22] == "evict_last"
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma1_sol"
     assert (
         instance_key(a_mn=False, b_mn=True, epi="reg", store_hint="evict_last")[22]
@@ -1207,13 +1260,18 @@ def test_round15_pd_sh_knobs():
     # family (1 = in-tile chunk pipelining, 2 = cross-tile prefetch, 3 = both chunks in flight; ``_pd<n>``) and the
     # suspend-time hint of the free-running waits in ns (``_sh<n>``); both 0 when off, validated like the Cake kernel
     key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2)
-    assert len(key) == 26 and key[23] == 2 and key[24] == 0
+    assert len(key) == 28 and key[23] == 2 and key[24] == 0
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma2_pd2"
-    assert instance_key(a_mn=False, b_mn=True)[23:] == (
-        0,
-        0,
-        False,
-    )  # ... followed by the round-18 sk_sync flag
+    assert (
+        instance_key(a_mn=False, b_mn=True)[23:]
+        == (
+            0,
+            0,
+            False,
+            0,
+            False,
+        )
+    )  # ... followed by the round-18 sk_sync flag and the round-19 sk_slab / cta1 fields
     assert (
         instance_symbol(
             instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2, sh=1000)
@@ -1317,7 +1375,7 @@ def test_round13_knob_normalisation():
     # knob (narrower or shorter tiles raise), htail needs the 256-row family or (round 16, Cake W2) the 128-row standard
     # family with the 256-column row-major tile and the plain drain, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(key) == 26 and key[15] is False and key[16] is True and key[17] is True
+    assert len(key) == 28 and key[15] is False and key[16] is True and key[17] is True
     assert (
         instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15]
         is False
@@ -1445,6 +1503,182 @@ def test_sk_sync_rule_yields_to_caller_forced_forms():
         )
 
 
+def test_round19_sk_slab_knob():
+    # field 27 of the 28-field key (round 19, Cake W2): the slab path of the synchronised stream-K fixup (symbol
+    # ``_sb<n>``: 1 = early arrival, 2 = + the bulk slab read through the dead mainloop stages, 3 = + the fp32 output as
+    # the slab).  It exists only on the ``_sks`` programs (forced to 0 without ``sk_sync``, so every other instance keeps
+    # one key); 3 needs an fp32 output through the TMA-store or the transposed register epilogue; 2 needs the eight warp
+    # slabs (EPI_WARPS x epi_cols x 128 B) to fit the mainloop stage ring
+    key = instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_sync=True, sk_slab=2)
+    assert len(key) == 28 and key[25] is True and key[26] == 2 and key[27] is False
+    assert instance_symbol(key) == "dense_proj_gemm_nn_n256_m256_sks_sb2"
+    assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2)[26] == 0
+    assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2) == instance_key(
+        a_mn=True, b_mn=True, cta_rows=256
+    )
+    f32 = instance_key(
+        a_mn=True,
+        b_mn=True,
+        cta_rows=256,
+        out_f32=True,
+        slots=1,
+        sk_sync=True,
+        sk_slab=3,
+    )
+    assert f32[7] == "tma" and f32[26] == 3
+    assert instance_symbol(f32) == "dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3"
+    # the transposed register path of an fp32 output carries the output-as-slab form too (red.global.add.f32)
+    assert (
+        instance_key(
+            a_mn=True,
+            b_mn=True,
+            out_f32=True,
+            out_t=True,
+            block_n=192,
+            b_swz=64,
+            sk_sync=True,
+            sk_slab=3,
+        )[26]
+        == 3
+    )
+    assert (
+        instance_symbol(
+            instance_key(
+                a_mn=True,
+                b_mn=True,
+                out_t=True,
+                block_n=192,
+                b_swz=64,
+                sk_sync=True,
+                sk_slab=1,
+            )
+        )
+        == "dense_proj_gemm_nn_n192_bz64_t_sks_sb1"
+    )
+    with pytest.raises(ValueError, match="sk_slab must be one of"):
+        instance_key(a_mn=True, b_mn=True, sk_sync=True, sk_slab=4)
+    with pytest.raises(ValueError, match="sk_slab=3"):
+        instance_key(
+            a_mn=True, b_mn=True, cta_rows=256, sk_sync=True, sk_slab=3
+        )  # bf16 output
+    with pytest.raises(ValueError, match="sk_slab=3"):
+        # the row-major fp32 register epilogue has no reduce-add store path
+        instance_key(
+            a_mn=True, b_mn=True, out_f32=True, epi="reg", sk_sync=True, sk_slab=3
+        )
+    with pytest.raises(ValueError, match="too small"):
+        # 8 x 128 x 128 B of warp slabs do not fit two 32 KiB stages
+        instance_key(a_mn=True, b_mn=True, sk_sync=True, sk_slab=2, stages=2)
+    # without ``sk_sync`` the knob is inert, so the sk_slab=3 / stage-ring conflicts above do not raise either
+    assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=3)[26] == 0
+    assert instance_key(a_mn=True, b_mn=True, sk_slab=2, stages=2)[26] == 0
+
+
+def test_round19_cta1_knob():
+    # field 28 (LAST) of the 28-field key (round 19, Cake W3): the single-CTA form of the 128-row single-pass family
+    # (symbol ``_c1``, cluster dims 1, cta_group::1 MMA into private TMEM, CLC per CTA).  Its B stage streams the whole
+    # BLOCK_N columns per CTA (32 KiB stages at BLOCK_N 128, 48 KiB at 256), so the default stage count is the deepest
+    # single-CTA fit and ``_s<n>`` is relative to it; it excludes the tall / 64-row families, the pair-level tail
+    # policies / probes and the batched raster knob
+    key = instance_key(a_mn=False, b_mn=False, block_n=128, cta1=True)
+    assert len(key) == 28 and key[27] is True and key[26] == 0 and key[5] == 7
+    assert instance_symbol(key) == "dense_proj_gemm_kk_n128_c1"
+    assert b_stage_bytes(False, 128, 128, 1) == 2 * b_stage_bytes(False, 128) == 16384
+    assert b_stage_bytes(True, 256, 128, 1) == 2 * b_stage_bytes(True, 256) == 32768
+    assert [default_stages(s, 128, 128, False, 128, 1) for s in (0, 1, 2)] == [7, 6, 5]
+    assert [default_stages(s, 128, 256, False, 128, 1) for s in (0, 1, 2)] == [4, 4, 3]
+    assert box_rows_of(False, False, 128, None, 128, 1) == (128, 128)
+    assert box_rows_of(False, False, 128, None, 128) == (128, 64)
+    f32 = instance_key(
+        a_mn=False, b_mn=True, out_f32=True, block_n=128, slots=2, stages=4, cta1=True
+    )
+    assert f32[5] == 4 and f32[7] == "tma" and f32[8] == 2 and f32[27] is True
+    assert instance_symbol(f32) == "dense_proj_gemm_kn_n128_f32_tma2_s4_c1"
+    assert (
+        instance_symbol(
+            instance_key(
+                a_mn=False, b_mn=True, out_f32=True, block_n=128, slots=2, cta1=True
+            )
+        )
+        == "dense_proj_gemm_kn_n128_f32_tma2_c1"
+    )  # five stages = the single-CTA default (six on the pair form)
+    assert (
+        instance_key(a_mn=False, b_mn=True, out_f32=True, block_n=128, slots=2)[5] == 6
+    )
+    for bad in (
+        dict(cta_rows=256),
+        dict(cta_rows=64),
+        dict(sk_sync=True),
+        dict(htail=True),
+        dict(sk_exact=True),
+        dict(batch_group=8),
+    ):
+        with pytest.raises(ValueError, match="cta1 needs cta_rows=128"):
+            instance_key(a_mn=False, b_mn=True, cta1=True, **bad)
+    with pytest.raises(ValueError, match="cta1 needs cta_rows=128"):
+        instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, cta1=True)
+    with pytest.raises(ValueError, match="cta1 needs cta_rows=128"):
+        instance_key(a_mn=False, b_mn=False, cta_rows=256, park=True, cta1=True)
+    # a 48 KiB single-CTA stage at BLOCK_N 256: eight of them exceed every SMEM limit
+    with pytest.raises(ValueError, match="SMEM"):
+        instance_key(a_mn=False, b_mn=False, stages=8, cta1=True)
+
+
+@pytest.mark.parametrize("T", [16231, 16172])
+def test_round19_cta1_plans_one_cta_per_tile(T):
+    # the single-CTA form through the planner (caller-forced here; the sm_100a indexer forward rules select it): the
+    # tile count is not rounded to pairs, the work items are CTA tiles, the concurrent units are the SMs (the hint
+    # working-set gate takes them as the Cake launcher's ``_sm_units``), the grid is one CTA per tile with no tail
+    # policy, and the raster group may be any count >= 1  [Cake launcher]
+    v = _views("proj", "indexer_hw", "fwd", "bf16", T)
+    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta1=True, **kw)
+    assert plan.cta1 and plan.template == "dense_proj_gemm_kk_n128_hen_c1"
+    assert (plan.m_tiles, plan.n_tiles, plan.pair_tiles, plan.sm_pairs) == (
+        127,
+        1,
+        127,
+        148,
+    )
+    assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (127, 0, 0)
+    assert plan.grid == (plan.m_tiles * plan.n_tiles, 1, 1) == (127, 1, 1)
+    assert plan.stages == 7 and plan.ws_f32_elems == 0 and plan.sk_slab == 0
+    assert plan.wave_working_set_bytes == wave_working_set(127, 1, 6144, 16, 148)
+    pair, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta1=False, **kw)
+    assert not pair.cta1 and pair.template == "dense_proj_gemm_kk_n128_hen"
+    assert (pair.m_tiles, pair.pair_tiles, pair.sm_pairs, pair.stages) == (
+        128,
+        64,
+        74,
+        9,
+    )
+    assert pair.grid == (128, 1, 1)
+    # a raster group of one is admitted under cta1 only
+    one, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], cta1=True, group_m=1, **kw
+    )
+    assert one.group_m == 1 and one.template == plan.template
+    with pytest.raises(ValueError, match="group_m must be an even number"):
+        plan_dense_projection_gemm(v["A"], v["B"], v["out"], group_m=1, **kw)
+    # the form carries no tail policy: a caller combining it with one asked for two incompatible forms
+    for bad in (
+        dict(sk=True),
+        dict(sk_sync=True),
+        dict(htail=True),
+        dict(sk_exact=3),
+        dict(sk_parts=2),
+        dict(sk_max_units=48),
+    ):
+        with pytest.raises(ValueError, match="cta1 excludes"):
+            plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta1=True, **bad, **kw)
+    # a small T: one wave's panels fit the L2, so the form keeps the hint-free program
+    small = _views("proj", "indexer_hw", "fwd", "bf16", 2049)
+    short, *_ = plan_dense_projection_gemm(
+        small["A"], small["B"], small["out"], cta1=True, **kw
+    )
+    assert short.template == "dense_proj_gemm_kk_n128_c1" and short.grid == (17, 1, 1)
+
+
 def test_wave_working_set_and_hint_rule():
     # o_proj forward at T = 16231 (m_tiles = 128, n_tiles = 24, K = 16384) on 74 pairs: a raster band of
     # 8 pair rows x 24 column tiles exceeds the wave, so the wave covers 8 pair-row panels and
@@ -1567,8 +1801,8 @@ def test_instance_key_rejects_bad_configurations():
     key = instance_key(a_mn=False, b_mn=False)
     # 20 fields since round 13 (the raster group width and the TMA L2 promotion left the key for the launch
     # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group, store_ef,
-    # store_hint, pd, sh, sk_sync (26 fields since round 18)
-    assert len(key) == 26 and key[11:] == (
+    # store_hint, pd, sh, sk_sync (26 fields since round 18), sk_slab, cta1 (28 fields since round 19)
+    assert len(key) == 28 and key[11:] == (
         0,
         ("none", "none"),
         False,
@@ -1582,6 +1816,8 @@ def test_instance_key_rejects_bad_configurations():
         False,
         "none",
         0,
+        0,
+        False,
         0,
         False,
     )
@@ -1848,20 +2084,23 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     (row, op, out_dtype, T, sm_count),
                     ARCH_OF_SM[sm_count],
                 )
-                assert plan.sm_pairs == sm_count // 2
-                assert plan.grid == ((plan.num_full + plan.sk_units) * CTA_GROUP, 1, 1)
-                assert plan.m_tiles % CTA_GROUP == 0
+                # round 19 (Cake W3): under the single-CTA form of a ``cta1`` rule the work items are CTA tiles, the
+                # concurrent units are the SMs and the grid is one CTA per work item (cluster dims 1)
+                cg = 1 if plan.cta1 else CTA_GROUP
+                assert plan.sm_pairs == sm_count // cg
+                assert plan.grid == ((plan.num_full + plan.sk_units) * cg, 1, 1)
+                assert plan.m_tiles % cg == 0
                 assert plan.k_blocks == -(-plan.K // BLOCK_K)
-                assert (
-                    plan.pair_tiles
-                    == plan.L * (plan.m_tiles // CTA_GROUP) * plan.n_tiles
-                )
+                assert plan.pair_tiles == plan.L * (plan.m_tiles // cg) * plan.n_tiles
                 assert a_desc.stride(2) == 1 and b_desc.stride(2) == 1
                 # the knob defaults of the launcher (stage depth by tile shape, raster group, working-set-gated
                 # hints) unless the row's measured rule (ROW_RULES, round 2) pins a knob; a plan that landed on the
                 # nearest generated knob variant (knob_fallback) carries that variant's knobs instead
                 mirrored = not plan.knob_fallback
                 assert not mirrored or plan.cta_rows == rule.get("cta_rows", 128)
+                assert not mirrored or plan.cta1 == bool(rule.get("cta1", False))
+                assert plan.template.endswith("_c1") == plan.cta1
+                assert not plan.cta1 or plan.cta_rows == 128
                 assert not mirrored or (
                     plan.pf == rule.get("pf", 0)
                     and plan.promo == rule.get("promo", "none")
@@ -1887,10 +2126,20 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 assert plan.stages == rule.get(
                     "stages",
                     default_stages(
-                        plan.slots, plan.cta_rows, plan.block_n, plan.b_mn, plan.b_swz
+                        plan.slots,
+                        plan.cta_rows,
+                        plan.block_n,
+                        plan.b_mn,
+                        plan.b_swz,
+                        cg,
                     ),
                 )
-                if "stages" not in rule and plan.cta_rows == 128 and plan.b_swz == 128:
+                if (
+                    "stages" not in rule
+                    and plan.cta_rows == 128
+                    and plan.b_swz == 128
+                    and not plan.cta1
+                ):
                     assert (
                         plan.stages
                         == {
@@ -1986,6 +2235,23 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 assert plan.htail == htail
                 assert plan.sk_sync == (sync_plan is not None)
                 assert ("_sks" in plan.template) == plan.sk_sync
+                # round 19 (Cake W2): the slab path of a rule's synchronised plan, with the launcher's yield rules for
+                # a rule-derived value (3 needs the fp32 TMA-store / transposed register epilogue, 2 needs the eight
+                # warp slabs to fit the mainloop stage ring); 0 on every other plan
+                sk_slab = int(rule.get("sk_slab", 0)) if sync_plan is not None else 0
+                if sk_slab == 3 and (
+                    not plan.out_f32 or (plan.epi == "reg" and not plan.transposed_out)
+                ):
+                    sk_slab = 2
+                if sk_slab == 2 and EPI_WARPS * epi_cols(
+                    plan.block_n, plan.cta_rows
+                ) * 128 > plan.stages * (
+                    plan.cta_rows * BLOCK_K * 2
+                    + b_stage_bytes(plan.b_mn, plan.block_n, plan.b_swz)
+                ):
+                    sk_slab = 0
+                assert plan.sk_slab == sk_slab
+                assert (f"_sb{sk_slab}" in plan.template) == bool(sk_slab)
                 if exact_plan is not None:
                     assert (
                         plan.num_full,
@@ -2097,8 +2363,10 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         0,
                         plan.k_blocks,
                     )
+                    # (the single-CTA form carries no tail policy: whole tiles whatever the wave count)
                     assert (
-                        plan.pair_tiles > plan.sm_pairs
+                        plan.cta1
+                        or plan.pair_tiles > plan.sm_pairs
                         or 2 * plan.pair_tiles > plan.sm_pairs
                         or plan.k_blocks < 2 * SK_MIN_ITERS
                     )

@@ -121,7 +121,9 @@ B_SWZ_CHOICES = (
     64,
     32,
 )  # round 13 (Cake L35): MN-major B panel width in bytes; 128 = the 64-column panels of rounds 1-12
-CTA_GROUP = 2  # CTAs per cluster / MMA pair  [Cake L59]
+# CTAs per work item: 2 = the pair tile (cta_group::2 MMA over 2 x 128 rows, cluster (2, 1, 1)); 1 = the round-19
+# (Cake W3) single-CTA form ``cta1`` (one 128 x BLOCK_N tile per CTA, cluster (1, 1, 1))  [Cake L59]
+CTA_GROUP = 2
 EPI_WARPS = 8  # [Cake L67]
 WORK_STAGES = 4  # cluster-launch-control work-ring depth  [Cake L68]
 GROUP_M = 16  # CTA row tiles per raster group (even: the two CTAs of a pair are the row halves of one 256-row tile)  [Cake L69]
@@ -155,6 +157,12 @@ PD_CHOICES = (
     2,
     3,
 )  # round 15 (Cake W1): pipelined-drain forms of the 128-row single-pass epilogue (0 = the blocking load)
+SK_SLAB_CHOICES = (
+    0,
+    1,
+    2,
+    3,
+)  # round 19 (Cake W2): slab-path forms of the synchronised stream-K fixup (0 off, 1 early arrival, 2 + bulk slab read, 3 + fp32 output as the slab)
 L2_HINTS = (
     "none",
     "evict_normal",
@@ -222,6 +230,14 @@ def device_sm_count(device: torch.device) -> int:
 def sm_pairs(sm_count: int) -> int:
     """CTA pairs the persistent grid can hold at once (one pair per two SMs).  [Cake ``_sm_pairs`` L1365-L1371]"""
     return max(1, int(sm_count) // CTA_GROUP)
+
+
+def sm_units(sm_count: int, cta_group: int = CTA_GROUP) -> int:
+    """Concurrent work items of the launch: CTA pairs (``cta_group`` 2) or SMs (the single-CTA form ``cta1``,
+    round 19).  [Cake ``_sm_units``]"""
+    if int(cta_group) == CTA_GROUP:
+        return sm_pairs(sm_count)
+    return max(1, int(sm_count))
 
 
 _L2_BYTES: dict[str, int] = {}
@@ -344,12 +360,14 @@ def staging_bytes(slots: int) -> int:
     return EPI_WARPS * slots * SLOT_BYTES
 
 
-def b_stage_bytes(b_mn: bool, block_n: int, b_swz: int = 128) -> int:
-    """Bytes of one B stage per CTA: K-major = ``BLOCK_N / 2`` 128-byte rows; MN-major = whole panels of
+def b_stage_bytes(
+    b_mn: bool, block_n: int, b_swz: int = 128, cta_group: int = CTA_GROUP
+) -> int:
+    """Bytes of one B stage per CTA: K-major = ``BLOCK_N / cta_group`` 128-byte rows; MN-major = whole panels of
     ``b_swz / 2`` columns (BLOCK_N = 192 with 128-byte panels loads two 64-column panels per stage and the MMA
     reads 1.5 of them; with 64-byte panels it loads exactly the three 32-column panels it reads - round 13).
-    [Cake ``b_stage_bytes``]"""
-    n_half = block_n // 2
+    The single-CTA form (``cta1``, round 19) streams the whole BLOCK_N columns per CTA.  [Cake ``b_stage_bytes``]"""
+    n_half = block_n // cta_group
     if not b_mn:
         return n_half * BLOCK_K * 2
     cols = int(b_swz) // 2
@@ -377,6 +395,7 @@ def default_stages(
     block_n: int = 256,
     b_mn: bool = False,
     b_swz: int = 128,
+    cta_group: int = CTA_GROUP,
 ) -> int:
     """Mainloop stages that fit the 227 KiB opt-in with the epilogue staging: 32 KiB stages
     for 128-row tiles (24 KiB at BLOCK_N = 128, where the streaming-bound small-N rows are
@@ -385,11 +404,12 @@ def default_stages(
     take the deepest pipeline that fits beside the staging, at most 12 stages (round 9;
     ``b_mn`` sizes the MN-major B panels).  Narrow-panel instances (``b_swz`` 64 / 32, round 13) have smaller
     stages than their 128-byte-panel siblings and likewise take the deepest pipeline that fits the opt-in (at most
-    12).  [Cake ``default_stages``]"""
-    if cta_rows == 64 or int(b_swz) != 128:
+    12).  The single-CTA form (``cta1``, round 19: 48 KiB stages at BLOCK_N 256, 32 KiB at 128) takes the deepest
+    fit the same way.  [Cake ``default_stages``]"""
+    if cta_rows == 64 or int(b_swz) != 128 or int(cta_group) == 1:
         stage = min(cta_rows, 128) * a_halves_of(
             cta_rows
-        ) * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz)
+        ) * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz, cta_group)
         return max(
             2,
             min(12, (SMEM_OPT_IN - WORK_STAGES * 16 - staging_bytes(slots)) // stage),
@@ -407,11 +427,12 @@ def box_rows_of(
     block_n: int,
     box_rows: Optional[int] = None,
     cta_rows: int = 128,
+    cta_group: int = CTA_GROUP,
 ) -> tuple[int, int]:
     """TMA box heights of the A and B operands: full height unless capped by ``box_rows``.
     [Cake ``box_rows_of`` L860-L870]"""
     a_full = BLOCK_K if a_mn else cta_rows
-    b_full = BLOCK_K if b_mn else block_n // 2
+    b_full = BLOCK_K if b_mn else block_n // cta_group
     if box_rows is None:
         return a_full, b_full
     box_rows = int(box_rows)
@@ -452,13 +473,16 @@ def instance_key(
     pd: int = 0,
     sh: int = 0,
     sk_sync: bool = False,
+    sk_slab: int = 0,
+    cta1: bool = False,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
     hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact)`` (round 13: ``park`` = parked tall epilogue, ``ovl`` =
     overlapped single-TMEM-buffer tall epilogue, ``htail`` = deterministic half-height tail wave, ``b_swz`` = MN-major B
     panel width in bytes (128 / 64 / 32; K-major B instances always keep 128), ``sk_exact`` = exact p-way stream-K
-    split, ``_skx`` symbols; round 18 (Cake W2): ``sk_sync`` = synchronised stream-K tail, field 26 = LAST, ``_sks`` symbols); the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11.  ``smem_limit`` (bytes; default = the largest
+    split, ``_skx`` symbols; round 18 (Cake W2): ``sk_sync`` = synchronised stream-K tail, field 26, ``_sks`` symbols;
+    round 19: ``sk_slab`` (Cake W2, field 27, ``_sb{n}``) and ``cta1`` (Cake W3, field 28 = LAST, ``_c1``), see below); the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11.  ``smem_limit`` (bytes; default = the largest
     architecture limit, ``smem_limit_for(None)``) only bounds the stage count - it is not part of
     the key, so an instance has one symbol on every architecture (the planner passes
     ``smem_limit_for(arch)`` like the Cake launcher).  Diagnostic (attribution) instances are not
@@ -470,9 +494,20 @@ def instance_key(
     (field 22, ``_so{f|l|n}``); only the TMA-store epilogue carries the operand, so the field is "none" for every other
     epilogue.  ``pd`` (round 15, Cake W1) = the software-pipelined chunked TMEM drain of the 128-row single-pass family
     (field 23, ``_pd{n}``: 1 = in-tile chunk pipelining, 2 = cross-tile prefetch, 3 = both chunks in flight) and ``sh``
-    (field 24, ``_sh{n}``) = the PTX suspendTimeHint in ns of the free-running waits; both 0 when off."""
+    (field 24, ``_sh{n}``) = the PTX suspendTimeHint in ns of the free-running waits; both 0 when off.
+    ``sk_slab`` (round 19, Cake W2, field 27, symbol ``_sb{n}``) selects the slab path of the synchronised stream-K fixup
+    (1 early arrival; 2 + the bulk slab read through the dead mainloop stages; 3 + the fp32 output as the slab: fp32
+    outputs through the transposed register path or the TMA-store epilogue); it is forced to 0 without ``sk_sync`` so
+    every other instance keeps one key.  ``cta1`` (round 19, Cake W3, field 28 = LAST, symbol ``_c1``) selects the
+    single-CTA form of the 128-row single-pass family: one 128 x BLOCK_N tile per CTA through the cta_group::1 MMA into
+    private TMEM, every barrier local, CLC per CTA (cluster dims 1) - no pair handoff; it excludes the pair-only tail
+    policies / probes (``htail`` / ``sk_exact`` / ``sk_sync`` / ``a_mcast``), the tall and 64-row families (``ovl`` /
+    ``park``) and the batched raster knob.  Its B stage streams the whole BLOCK_N columns per CTA, so the stage
+    geometry (``b_stage_bytes`` / ``default_stages`` / ``box_rows_of``) takes the CTA group."""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf = int(block_n), int(cta_rows), int(pf)
+    cta1 = bool(cta1)
+    cg = 1 if cta1 else CTA_GROUP
     hints = (str(hints[0]), str(hints[1]))
     if any(h not in L2_HINTS for h in hints):
         raise ValueError(f"hints must be in {L2_HINTS}, got {hints!r}")
@@ -481,7 +516,7 @@ def instance_key(
     if cta_rows not in CTA_ROWS_CHOICES:
         raise ValueError(f"cta_rows must be one of {CTA_ROWS_CHOICES}, got {cta_rows}")
     box_rows = 0 if box_rows is None else int(box_rows)
-    box_rows_of(a_mn, b_mn, block_n, box_rows or None, cta_rows)
+    box_rows_of(a_mn, b_mn, block_n, box_rows or None, cta_rows, cg)
     if block_n not in BLOCK_N_CHOICES:
         raise ValueError(f"BLOCK_N must be one of {BLOCK_N_CHOICES}, got {block_n}")
     cols = epi_cols(block_n, cta_rows)
@@ -507,7 +542,7 @@ def instance_key(
         )
     slots = epi_slots(epi, out_f32, block_n, None, slots, cta_rows, out_t)
     stages = (
-        default_stages(slots, cta_rows, block_n, b_mn, b_swz)
+        default_stages(slots, cta_rows, block_n, b_mn, b_swz, cg)
         if stages is None
         else int(stages)
     )
@@ -515,7 +550,7 @@ def instance_key(
     if diag:
         raise ValueError(f"diagnostic instances are not exported: {diag}")
     limit = smem_limit_for(None) if smem_limit is None else int(smem_limit)
-    stage_bytes = cta_rows * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz)
+    stage_bytes = cta_rows * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz, cg)
     if (
         stages < 2
         or stages * stage_bytes + staging_bytes(slots) + WORK_STAGES * 16 > limit
@@ -615,6 +650,43 @@ def instance_key(
         )
     if sh < 0 or sh > 4294967295:
         raise ValueError(f"sh (suspendTimeHint ns) must fit a u32, got {sh}")
+    # round 19 (Cake W2): the slab-path forms exist only on the synchronised stream-K programs  [Cake instance_key]
+    sk_slab = int(sk_slab) if sk_sync else 0
+    if sk_slab not in SK_SLAB_CHOICES:
+        raise ValueError(
+            f"sk_slab must be one of {SK_SLAB_CHOICES} (0 off, 1 early arrival, 2 + bulk slab read, 3 + fp32 output as the slab), got {sk_slab}"
+        )
+    if sk_slab == 3 and (not out_f32 or (epi == "reg" and not out_t)):
+        raise ValueError(
+            f"sk_slab=3 (the fp32 output as the slab) needs an fp32 output through the transposed register path or the "
+            f"TMA-store epilogue (got out_f32={out_f32}, out_t={out_t}, epi={epi!r})"
+        )
+    # the eight warp slabs of the bulk slab read stage in the mainloop stage ring (the pair form's stage: the slab
+    # forms exist only on the synchronised programs, which the single-CTA form excludes)  [Cake instance_key]
+    slab_bytes = EPI_WARPS * cols * 128
+    if sk_slab == 2 and slab_bytes > stages * (
+        cta_rows * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz)
+    ):
+        raise ValueError(
+            f"sk_slab=2 stages the eight warp slabs ({slab_bytes} B) in the mainloop stage ring ({stages} stages); too small"
+        )
+    if cta1 and (
+        cta_rows != 128
+        or ovl
+        or park
+        or htail
+        or sk_exact
+        or sk_sync
+        or batch_group
+        or "a_mcast" in diag
+    ):
+        # round 19 (Cake W3): the single-CTA form is the 128-row single-pass family without the pair-level tail
+        # policies / probes  [Cake instance_key]
+        raise ValueError(
+            f"cta1 needs cta_rows=128 and no ovl / park / htail / sk_exact / sk_sync / batch_group / a_mcast (got "
+            f"cta_rows={cta_rows}, ovl={ovl}, park={park}, htail={htail}, sk_exact={sk_exact}, sk_sync={sk_sync}, "
+            f"batch_group={batch_group}, diag={diag})"
+        )
     return (
         a_mn,
         b_mn,
@@ -642,6 +714,8 @@ def instance_key(
         pd,
         sh,
         sk_sync,
+        sk_slab,
+        cta1,
     )
 
 
@@ -653,8 +727,10 @@ def instance_symbol(key: tuple) -> str:
     ``_bz<bytes>`` right after the tile family for a narrow MN-major B panel (round 13), ``_pk`` / ``_ov`` / ``_ht`` for
     the parked / overlapped / half-height-tail tall epilogues (round 13), ``_<epi><slots>`` for the TMA-store
     epilogue, ``_s<stages>`` for a non-default stage count, ``_box<rows>`` and a trailing ``_skx`` for the exact
-    p-way stream-K split (round 13), ``_so<f|l|n>`` after the batch-raster term for the TMA-store L2 eviction policy,
-    then ``_pd<n>`` / ``_sh<n>`` for the pipelined TMEM drain / suspend-time hint (round 15)).  [Cake ``instance_symbol``]"""
+    p-way stream-K split (round 13), ``_sks`` for the synchronised stream-K tail (round 18) followed by ``_sb<n>`` for
+    its slab path (round 19), ``_so<f|l|n>`` after the batch-raster term for the TMA-store L2 eviction policy,
+    then ``_pd<n>`` / ``_sh<n>`` for the pipelined TMEM drain / suspend-time hint (round 15) and a trailing ``_c1`` for
+    the single-CTA form (round 19; its default stage count is the single-CTA fit)).  [Cake ``instance_symbol``]"""
     (
         a_mn,
         b_mn,
@@ -682,7 +758,10 @@ def instance_symbol(key: tuple) -> str:
         pd,
         sh,
         sk_sync,
+        sk_slab,
+        cta1,
     ) = key
+    cg = 1 if cta1 else CTA_GROUP
     so = {
         "evict_first": "f",
         "evict_last": "l",
@@ -709,12 +788,13 @@ def instance_symbol(key: tuple) -> str:
         + (f"_{epi}{slots}" if epi != "reg" else "")
         + (
             f"_s{stages}"
-            if stages != default_stages(slots, cta_rows, block_n, b_mn, b_swz)
+            if stages != default_stages(slots, cta_rows, block_n, b_mn, b_swz, cg)
             else ""
         )
         + (f"_box{box_rows}" if box_rows else "")
         + ("_skx" if sk_exact else "")
         + ("_sks" if sk_sync else "")
+        + (f"_sb{sk_slab}" if sk_slab else "")
         + (
             "_bf"
             if batch_group == 1
@@ -725,6 +805,7 @@ def instance_symbol(key: tuple) -> str:
         + (f"_so{so}" if so else "")
         + (f"_pd{pd}" if pd else "")
         + (f"_sh{sh}" if sh else "")
+        + ("_c1" if cta1 else "")
         + "".join(f"_{d}" for d in diag)
     )
 
@@ -1110,7 +1191,8 @@ def operand_view(
 
 @dataclass(frozen=True)
 class GemmPlan:
-    """The host plan of one dense projection GEMM launch (device-independent except ``sm_pairs``)."""
+    """The host plan of one dense projection GEMM launch (device-independent except ``sm_pairs``: the concurrent
+    work items of the device - CTA pairs, or SMs under the single-CTA form ``cta1``)."""
 
     L: int
     M: int
@@ -1165,10 +1247,18 @@ class GemmPlan:
     # round 15 (Cake W1): pipelined TMEM drain form (field 23) and suspend-time hint in ns (field 24) of the planned instance
     pd: int = 0
     sh: int = 0
-    # round 18 (Cake W2): synchronised stream-K tail of the planned instance (instance_key field 25 = the 26th and LAST
-    # field, ``_sks`` symbols): ``tail_tiles`` main units over K steps [0, iters_per_unit) + ``sk_units - tail_tiles``
+    # round 18 (Cake W2): synchronised stream-K tail of the planned instance (instance_key field 25 = the 26th field,
+    # ``_sks`` symbols): ``tail_tiles`` main units over K steps [0, iters_per_unit) + ``sk_units - tail_tiles``
     # collector units over the leftovers, two partials and one slab per tail tile, deterministic two-addend fixup
     sk_sync: bool = False
+    # round 19 (Cake W2): the slab path of that fixup (instance_key field 26 = the 27th field, ``_sb{n}`` symbols): 0 off,
+    # 1 early arrival, 2 + the bulk slab read through the dead mainloop stages, 3 + the fp32 output as the slab; always 0
+    # without ``sk_sync`` (the same synchronised plan arithmetic: ``ws_f32_elems`` keeps one slab per tail tile)
+    sk_slab: int = 0
+    # round 19 (Cake W3): the single-CTA form (instance_key field 27 = the 28th and LAST field, ``_c1`` symbols): one
+    # 128 x BLOCK_N tile per CTA with cluster dims (1, 1, 1), so ``m_tiles`` is not rounded to pairs, ``pair_tiles``
+    # counts CTA tiles, ``sm_pairs`` holds the SM count and ``grid`` = ``num_cluster_tiles`` CTAs
+    cta1: bool = False
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -1183,7 +1273,8 @@ class GemmPlan:
 
     @property
     def grid(self) -> tuple[int, int, int]:
-        return (self.num_cluster_tiles * CTA_GROUP, 1, 1)
+        """CTAs of the launch: ``num_cluster_tiles`` pairs x 2, or one CTA per work item under ``cta1``."""
+        return (self.num_cluster_tiles * (1 if self.cta1 else CTA_GROUP), 1, 1)
 
     @property
     def ws_f32_elems(self) -> int:
@@ -1264,6 +1355,8 @@ def plan_dense_projection_gemm(
     sh: Optional[int] = None,
     sk_sync: Optional[bool] = None,
     sk_sync_m: Optional[int] = None,
+    sk_slab: Optional[int] = None,
+    cta1: Optional[bool] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -1278,6 +1371,10 @@ def plan_dense_projection_gemm(
     the launcher's order) are the launcher's; a caller-forced ``cta_rows`` outside the row's
     rule (or default) family drops the rule's ``block_n`` / ``stages`` / ``slots`` / ``epi``, ``sk_parts`` is a
     caller knob over the rule's, and the stage count is bounded by ``smem_limit_for(arch)``.
+    Round 19: ``cta1`` (Cake W3) selects the single-CTA form - the tile count, the concurrent work items
+    (``sm_units``: SMs instead of CTA pairs) and the grid follow the CTA group, and the form carries no tail
+    policy; ``sk_slab`` (Cake W2) selects the slab path of a synchronised stream-K plan (the same plan arithmetic),
+    with the launcher's yield rules for a rule-derived value.
     [Cake ``dense_projection_gemm`` L1234-L1358]
 
     One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
@@ -1315,6 +1412,8 @@ def plan_dense_projection_gemm(
         sh=sh,
         sk_sync=sk_sync,
         sk_sync_m=sk_sync_m,
+        sk_slab=sk_slab,
+        cta1=cta1,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -1392,8 +1491,40 @@ def plan_dense_projection_gemm(
                 "pd",
                 "sk_sync",
                 "sk_sync_m",
+                "sk_slab",
+                "cta1",
             )
         }
+    if cta1 is None:
+        # round 19 (Cake W3): the single-CTA form of the 128-row family (no pair handoff)  [Cake launcher]
+        cta1 = bool(rule.get("cta1", False))
+    cta1 = bool(cta1)
+    # CTAs per work item: the launch grid, the tile count and the scheduler units follow it  [Cake launcher]
+    cg = 1 if cta1 else CTA_GROUP
+    if cta1 and (
+        sk is True
+        or sk_exact
+        or sk_sync
+        or htail
+        or sk_parts
+        or sk_max_units
+        or (batch_group and L > 1)
+    ):
+        # the single-CTA form carries no tail policy (its one-K-step rows never split) and no pair-only knob; a caller
+        # forcing one with cta1 asked for two incompatible forms  [Cake launcher]
+        raise ValueError(
+            f"dense_projection_gemm: cta1 excludes sk / sk_exact / sk_sync / htail / sk_parts / sk_max_units / batch_group "
+            f"(got sk={sk}, sk_exact={sk_exact}, sk_sync={sk_sync}, htail={htail}, sk_parts={sk_parts}, "
+            f"sk_max_units={sk_max_units}, batch_group={batch_group})"
+        )
+    if cta1:
+        # the row rule's tail policy / raster knob does not carry over to the single-CTA form  [Cake launcher]
+        sk, sk_exact, sk_sync, htail, batch_group = False, None, False, False, 0
+    if cta1 != bool(rule.get("cta1", False)):
+        # a caller-forced switch between the pair and the single-CTA form: the rule's stage count belongs to its own
+        # form (a 48 KiB cta1 stage at BLOCK_N 256 fits 3-4 deep where the 32 KiB pair stage fits 5-7); the instance
+        # default of the forced form applies  [Cake launcher]
+        rule = {k: v for k, v in rule.items() if k != "stages"}
     if block_n is None:
         block_n = rule.get("block_n", default_block_n(N, b_mn))
     if stages is None:
@@ -1429,6 +1560,11 @@ def plan_dense_projection_gemm(
     if sk_sync_m is None:
         # round 18 (Cake W2): main-unit margin in K steps (the collectors finish early; rule key ``sk_sync_m``)
         sk_sync_m = int(rule.get("sk_sync_m", 0))
+    rule_sk_slab = sk_slab is None
+    if sk_slab is None:
+        # round 19 (Cake W2): slab path of the synchronised fixup (0 off, 1 early arrival, 2 + bulk slab read, 3 + fp32
+        # output as the slab)  [Cake launcher]
+        sk_slab = int(rule.get("sk_slab", 0))
     if batch_group is None:
         batch_group = rule.get("batch_group", 0)
     # the raster knob only exists for batched rows (one batch entry: identical raster)  [Cake launcher]
@@ -1459,15 +1595,17 @@ def plan_dense_projection_gemm(
         # the planner does not expose).  A caller-forced ``sk_sync`` keeps raising on such a conflict.  [Cake launcher]
         sk_sync = False
     m_tiles = _ceil_div(M, cta_rows)
-    m_tiles += m_tiles % CTA_GROUP
+    m_tiles += m_tiles % cg
     n_tiles = _ceil_div(N, block_n)
     k_blocks = _ceil_div(K, BLOCK_K)
-    pair_tiles = L * (m_tiles // CTA_GROUP) * n_tiles
-    pairs = sm_pairs(sm_count)
+    # work items = tiles per CTA group (pair tiles, or CTA tiles under cta1)  [Cake launcher]
+    pair_tiles = L * (m_tiles // cg) * n_tiles
+    # concurrent work items: CTA pairs, or SMs under cta1 (``_sm_units``)  [Cake launcher]
+    units = sm_units(sm_count, cg)
     # Round 13 (Cake W3): a ``sk_exact`` rule / kwarg is the row's tail policy (exact p-way K split of every tail
     # tile, one unit per part); it pre-empts ``sk_parts`` and ``htail`` exactly as the Cake launcher orders them.
     exact_plan = (
-        sk_exact_plan(pair_tiles, k_blocks, pairs, int(sk_exact))
+        sk_exact_plan(pair_tiles, k_blocks, units, int(sk_exact))
         if (sk_exact and sk == "auto" and sk_max_units is None)
         else None
     )
@@ -1475,7 +1613,7 @@ def plan_dense_projection_gemm(
     # (the leftovers [s, k_blocks) of tail tiles c, c + C, ...), two partials and one slab per tail tile; admitted when
     # the plan is (``sk_sync_plan``, host arithmetic); it disables ``sk_parts`` and ``htail`` and yields to ``sk_exact``.
     sync_plan = (
-        sk_sync_plan(pair_tiles, k_blocks, pairs, None, int(sk_sync_m))
+        sk_sync_plan(pair_tiles, k_blocks, units, None, int(sk_sync_m))
         if (sk_sync and sk == "auto" and sk_max_units is None and exact_plan is None)
         else None
     )
@@ -1485,7 +1623,7 @@ def plan_dense_projection_gemm(
     if sk == "auto" and sk_max_units is None and parts and exact_plan is None:
         # Measured per-row p-way split of the tail wave (Cake round 4, L20); a caller ``sk_parts`` wins over the
         # rule's.  [Cake L1296-L1301]
-        sk, sk_max_units = sk_parts_plan(pair_tiles, k_blocks, pairs, int(parts))
+        sk, sk_max_units = sk_parts_plan(pair_tiles, k_blocks, units, int(parts))
     # Round 13 (Cake W1): deterministic half-height tail wave of the tall family - the tail tiles become 2 x tail
     # standard-geometry items of full K (no partial slabs, no fixup), only when there is a tail and its half items fit
     # the CTA pairs; otherwise the plain plan / stream-K policy of the row applies.  [Cake launcher]
@@ -1507,8 +1645,8 @@ def plan_dense_projection_gemm(
             and not int(pf_eff)
         )
     if htail:
-        tail_h = pair_tiles % pairs if pair_tiles > pairs else pair_tiles
-        htail = bool(tail_h) and 2 * tail_h <= pairs
+        tail_h = pair_tiles % units if pair_tiles > units else pair_tiles
+        htail = bool(tail_h) and 2 * tail_h <= units
     if exact_plan is not None:
         num_full, tail_tiles, sk_units, iters_per_unit = exact_plan
     elif sync_plan is not None:
@@ -1523,7 +1661,7 @@ def plan_dense_projection_gemm(
         )
     else:
         num_full, tail_tiles, sk_units, iters_per_unit = stream_k_plan(
-            pair_tiles, k_blocks, pairs, sk, sk_max_units
+            pair_tiles, k_blocks, units, sk, sk_max_units
         )
     if tail_tiles * 16 > SK_DUMMY_BASE:
         raise ValueError(
@@ -1532,6 +1670,29 @@ def plan_dense_projection_gemm(
     out_f32 = out.dtype == torch.float32
     mode = epi_mode(out_f32, transposed_out, K, epi, block_n, cta_rows)
     nslots = epi_slots(mode, out_f32, block_n, K, slots, cta_rows, transposed_out)
+    if (
+        sync_plan is not None
+        and rule_sk_slab
+        and int(sk_slab) == 3
+        and (not out_f32 or (mode == "reg" and not transposed_out))
+    ):
+        # Round 19 (Cake W2): the row's fp32-output-as-slab form needs the fp32 TMA-store or transposed register
+        # epilogue; a caller that forces another epilogue on the row (the registrations / sweeps of the row-major f32_v8
+        # programs) keeps the synchronised plan with the bulk slab read.  A caller-forced ``sk_slab`` keeps raising on
+        # such a conflict (``instance_key``).  [Cake launcher]
+        sk_slab = 2
+    if sync_plan is not None and rule_sk_slab and int(sk_slab) == 2:
+        stages_eff = (
+            default_stages(nslots, cta_rows, block_n, b_mn, b_swz)
+            if stages is None
+            else int(stages)
+        )
+        if EPI_WARPS * epi_cols(block_n, cta_rows) * 128 > stages_eff * (
+            cta_rows * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz)
+        ):
+            # the row's bulk slab read does not fit a caller-forced narrower pipeline: the plain synchronised program
+            # [Cake launcher]
+            sk_slab = 0
     if pf is None:
         pf = rule.get("pf", default_pf(M, N, K))
     if promo is None:
@@ -1543,18 +1704,18 @@ def plan_dense_projection_gemm(
         )
     if group_m is None:
         group_m = rule.get(
-            "group_m", default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs)
+            "group_m", default_group_m(a_mn, b_mn, m_tiles, pair_tiles, units)
         )
     group_m = int(group_m)
-    if group_m < 2 or group_m % 2:
+    if group_m < 1 or (cg == 2 and (group_m < 2 or group_m % 2)):
         raise ValueError(
-            f"dense_projection_gemm: group_m must be an even number >= 2 (CTA pairs are adjacent row tiles), got {group_m}"
+            f"dense_projection_gemm: group_m must be an even number >= 2 (CTA pairs are adjacent row tiles; any count >= 1 under cta1), got {group_m}"
         )
     if hints is None:
         hints = rule.get(
             "hints",
             default_hints(
-                a_mn, b_mn, m_tiles, n_tiles, K, group_m, pairs, int(l2_bytes)
+                a_mn, b_mn, m_tiles, n_tiles, K, group_m, units, int(l2_bytes)
             ),
         )
     key = instance_key(
@@ -1585,6 +1746,8 @@ def plan_dense_projection_gemm(
         pd=int(pd),
         sh=int(sh),
         sk_sync=sync_plan is not None,
+        sk_slab=int(sk_slab) if sync_plan is not None else 0,
+        cta1=cta1,
     )
     plan = GemmPlan(
         L=L,
@@ -1608,7 +1771,7 @@ def plan_dense_projection_gemm(
         n_tiles=n_tiles,
         k_blocks=k_blocks,
         pair_tiles=pair_tiles,
-        sm_pairs=pairs,
+        sm_pairs=units,
         l2_bytes=int(l2_bytes),
         num_full=num_full,
         tail_tiles=tail_tiles,
@@ -1628,6 +1791,8 @@ def plan_dense_projection_gemm(
         pd=int(key[23]),
         sh=int(key[24]),
         sk_sync=bool(key[25]),
+        sk_slab=int(key[26]),
+        cta1=bool(key[27]),
     )
     if _fallback and plan.template not in KERNELS.get(arch, {}):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
@@ -1869,6 +2034,8 @@ def prepare_dense_projection_gemm(
     sh: Optional[int] = None,
     sk_sync: Optional[bool] = None,
     sk_sync_m: Optional[int] = None,
+    sk_slab: Optional[int] = None,
+    cta1: Optional[bool] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
@@ -1914,6 +2081,8 @@ def prepare_dense_projection_gemm(
         sh=sh,
         sk_sync=sk_sync,
         sk_sync_m=sk_sync_m,
+        sk_slab=sk_slab,
+        cta1=cta1,
         arch=arch,
     )
     module_name = select_module(arch, plan.template)
