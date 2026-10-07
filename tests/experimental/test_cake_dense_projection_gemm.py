@@ -243,9 +243,9 @@ EXPECTED_TEMPLATES = {
         (2049, 212): 'dense_proj_gemm_kk_n192_m256_hen_s5',
     },
     ('kv_a', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_q_s6',
+        (1001, 148): 'dense_proj_gemm_kn_n256_tma1_pd2',
         (1001, 212): 'dense_proj_gemm_kn_n256_q_pd1',
-        (2049, 148): 'dense_proj_gemm_kn_n256_q_s6',
+        (2049, 148): 'dense_proj_gemm_kn_n256_tma1_pd2',
         (2049, 212): 'dense_proj_gemm_kn_n256_q_pd1',
     },
     ('kv_a', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
@@ -1879,9 +1879,10 @@ def test_round21_rules_plan_like_the_cake_launcher(T):
         plan.cta_rows,
         plan.block_n,
     ) == ("tma", 1, 2, 8, 128, 256)
-    # a caller forcing the former form still plans the round-20 program of the row
+    # a caller forcing the former form still plans the round-20 program of the row; the rule's ``pd`` carries over
+    # into a forced form unless the caller sets it (``pd=0``), exactly as in the Cake launcher
     old, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], epi="reg", quad_store=True, stages=6, **kw
+        v["A"], v["B"], v["out"], epi="reg", quad_store=True, stages=6, pd=0, **kw
     )
     assert (
         old.template == "dense_proj_gemm_kn_n256_q_s6"
