@@ -64,7 +64,7 @@ _LINEAR_ATTENTION_BUILD_ERRORS = (NotImplementedError, TypeError) + (
 # Keep successful auto calls free of descriptor-key work until a build declines.
 _LA_AUTO_DECLINE_LIMIT = 128
 _la_auto_declines: OrderedDict = OrderedDict()
-_la_auto_decline_scopes: set = set()
+_la_auto_decline_scopes: dict = {}
 _la_auto_decline_lock = Lock()
 
 
@@ -112,9 +112,10 @@ def _try_cudnn_auto(call, *args, **kwargs):
     """
     key = None
     scope = None
-    if _la_auto_declines:
+    known_scopes = _la_auto_decline_scopes.get(call)
+    if known_scopes:
         scope = _la_auto_decline_scope(call, args[0])
-    if scope in _la_auto_decline_scopes:
+    if known_scopes and scope in known_scopes:
         key = _la_auto_decline_key(scope, args, kwargs)
         with _la_auto_decline_lock:
             if key in _la_auto_declines:
@@ -138,14 +139,18 @@ def _try_cudnn_auto(call, *args, **kwargs):
             key = _la_auto_decline_key(scope, args, kwargs)
         with _la_auto_decline_lock:
             _la_auto_declines[key] = None
-            _la_auto_decline_scopes.add(scope)
+            _la_auto_decline_scopes.setdefault(call, set()).add(scope)
             _la_auto_declines.move_to_end(key)
             if len(_la_auto_declines) > _LA_AUTO_DECLINE_LIMIT:
                 old_key, _ = _la_auto_declines.popitem(last=False)
                 # Scan only on cold eviction; warm calls for other families
                 # or shapes never construct full descriptor keys.
                 if not any(k[0] == old_key[0] for k in _la_auto_declines):
-                    _la_auto_decline_scopes.discard(old_key[0])
+                    old_call = old_key[0][0]
+                    old_scopes = _la_auto_decline_scopes[old_call]
+                    old_scopes.discard(old_key[0])
+                    if not old_scopes:
+                        del _la_auto_decline_scopes[old_call]
         return None
 
 

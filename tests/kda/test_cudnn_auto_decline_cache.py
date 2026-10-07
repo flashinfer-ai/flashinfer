@@ -202,6 +202,8 @@ def test_other_shapes_and_families_skip_full_keys_after_decline(
         pytest.fail("unrelated successful calls must not build full decline keys")
 
     monkeypatch.setattr(la, "_la_auto_decline_key", unexpected)
+    if other_family:
+        monkeypatch.setattr(la, "_la_auto_decline_scope", unexpected)
     q = torch.ones(1 if other_family else 2)
     call = (lambda value: value) if other_family else candidate
     assert la._try_cudnn_auto(call, q) is q
