@@ -32,15 +32,7 @@ _CUTILE_CASES = [
 
 @pytest.fixture(autouse=True, scope="module")
 def _single_cutile_prefill_config():
-    """Validate one deterministic config per case instead of autotuning.
-
-    Every case bakes its shape (NUM_BATCH, NUM_HEADS, MAX_SEQ_LEN, SWIZZLE, ...)
-    into cuTile constants, so each case pays a fresh exhaustive_search that
-    compiles up to 10 configs (3 on SM90) and then checks only the winner.
-    That is up to 6600 config compiles for 660 cases, ~2 h on VR200, nearly
-    all spent on configs whose output is never compared.
-    Same switch as FLASHINFER_CUTILE_AUTOTUNE_DISABLED=1, scoped to this module.
-    """
+    """Check one config per case instead of autotuning (keeps CI time bounded)."""
     saved = _prefill_bsr_cutile._AUTOTUNE_DISABLED
     _prefill_bsr_cutile._AUTOTUNE_DISABLED = True
     _prefill_bsr_cutile._prefill_paged_lpt_tune_cache.clear()
