@@ -1031,7 +1031,7 @@ def chunk_gated_delta_rule(
     )
     if backend == "cudnn" or cudnn_auto:
         from .cudnn import cudnn_chunk_gated_delta_rule
-        from .cudnn.linear_attention import _LINEAR_ATTENTION_BUILD_ERRORS
+        from .cudnn.linear_attention import _try_cudnn_auto
 
         unsupported = [
             name
@@ -1046,32 +1046,31 @@ def chunk_gated_delta_rule(
                 'chunk_gated_delta_rule(backend="cudnn") does not support '
                 + ", ".join(unsupported)
             )
-        try:
-            return cudnn_chunk_gated_delta_rule(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                scale,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                output=output,
-                output_state=output_state,
-                state_indices=state_indices,
-                gate_domain=gate_domain,
-                use_gate_in_kernel=use_gate_in_kernel,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                beta_is_logit=beta_is_logit,
+        options = dict(
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            state_indices=state_indices,
+            gate_domain=gate_domain,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            beta_is_logit=beta_is_logit,
+        )
+        if cudnn_auto:
+            # Cache the value FE sees, including scalar tensors accepted by the
+            # existing adapter, rather than treating a scalar as operand layout.
+            auto_scale = float(scale) if scale is not None else None
+            result = _try_cudnn_auto(
+                cudnn_chunk_gated_delta_rule, q, k, v, g, beta, auto_scale, **options
             )
-        except _LINEAR_ATTENTION_BUILD_ERRORS as exc:
-            # Only graph construction can mark a decline. Retrying execution
-            # could overwrite a caller's output/state after a partial launch.
-            if not cudnn_auto or not getattr(exc, "_fi_la_build_unsupported", False):
-                raise
+            if result is not None:
+                return result
+        else:
+            return cudnn_chunk_gated_delta_rule(q, k, v, g, beta, scale, **options)
 
     if gate_domain != "linear" or use_gate_in_kernel or beta_is_logit:
         from .gdn_kernels.gates import materialize_gates
