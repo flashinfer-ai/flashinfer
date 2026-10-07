@@ -42,6 +42,7 @@ from .xqa import xqa, xqa_mla as xqa_mla
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .cudnn.decode import CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE
 from .cudnn.utils import (
+    cudnn_frontend_frost_runtime_available,
     cudnn_frontend_leads_short_caches,
     cudnn_frontend_serves_frost_decode,
 )
@@ -681,6 +682,9 @@ def _auto_decode_prefers_cudnn(
     fa2_available: bool = True,
     declared_kv_len: Optional[int] = None,
     frontend_leads_short_caches: bool = False,
+    frost_runtime_available: bool = True,
+    fixed_split_size: Optional[int] = None,
+    disable_split_kv: bool = False,
     override: Optional[str] = None,
 ) -> bool:
     """Whether ``backend="auto"`` should run this decode plan on cuDNN.
@@ -723,6 +727,19 @@ def _auto_decode_prefers_cudnn(
     stays on fa2 unless ``frontend_leads_short_caches`` (1.31+, which ranks the
     tile first at every cache length) or fa2 cannot serve the rows at all.
 
+    ``frost_runtime_available`` says the frontend's FROST engines can actually
+    run on this install: its own CuTe-DSL check (``nvidia-cutlass-dsl``
+    present and not below its floor, 4.7.0 today, where both packages'
+    dependency metadata admit 4.6.2). Without it the frontend's rows decline
+    and the backend engine serves the graph, so the performance-driven route
+    stays on fa2; the no-fa2 route and the ``1`` override are not gated by it.
+
+    ``fixed_split_size`` / ``disable_split_kv`` are fa2's explicit split
+    controls, the batch-invariance contract documented for fixed splitting
+    (the same request produces the same bits whatever else is in the batch).
+    cuDNN's plans have no equivalent, so a caller passing either keeps fa2
+    wherever fa2 can serve the rows.
+
     cudnn-frontend 1.30+ is required unless forced: an older frontend serves
     the graph with the backend engine, which is ~8x slower than fa2 on
     multi-token rows and rejects a sink at ``q_len_per_req == 1`` (1.30+ falls
@@ -752,6 +769,19 @@ def _auto_decode_prefers_cudnn(
         # Nothing else can run these rows: take cudnn wherever its decode
         # path serves the plan (window included), envelope or not.
         return q_len_per_req >= 2 and head_dim in (128, 256)
+    if (fixed_split_size is not None and fixed_split_size > 0) or disable_split_kv:
+        # fa2's explicit split controls are its batch-invariance contract
+        # (a positive fixed_split_size pins the KV split -- the planner's
+        # own "unset" is -1 -- and disable_split_kv removes it); cuDNN's
+        # plans have no equivalent, so a caller who asked for them keeps fa2
+        # wherever fa2 can serve the rows (the no-fa2 case above has nothing
+        # to keep).
+        return False
+    if not (frost_runtime_available or forced):
+        # The frontend is new enough but its FROST engines cannot run on this
+        # install (CuTe DSL below the frontend's floor): the backend engine
+        # would serve the graph, ~8x slower than fa2 on these rows.
+        return False
     if (
         declared_kv_len is not None
         and declared_kv_len < _CUDNN_DECODE_MAX_KV_BUCKET
@@ -1244,8 +1274,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             so there ``auto`` takes ``cudnn`` for every plan its decode path can run (such a
             plan used to raise). A caller-owned ``block_tables`` narrower than 2048 tokens
             keeps fa2 on cudnn-frontend 1.30 (its placement puts the backend's prefill-class
-            engine first below that; 1.31+ lifts the limit). ``resolved_backend`` reports the
-            choice after :meth:`plan`.
+            engine first below that; 1.31+ lifts the limit). ``auto`` takes ``cudnn`` only
+            where the frontend's FROST engines can run (its own CuTe-DSL check:
+            ``nvidia-cutlass-dsl`` 4.7.0 or newer, above the 4.6.2 the packages' dependency
+            metadata admit), and callers that pin fa2's KV split (``fixed_split_size`` /
+            ``disable_split_kv``, the batch-invariance controls) keep fa2 wherever it can
+            serve the rows. ``resolved_backend`` reports the choice after :meth:`plan`.
             ``FLASHINFER_DECODE_AUTO_CUDNN=0`` keeps fa2, ``=1`` applies the rule on an older
             frontend too. Under CUDA graphs (``use_cuda_graph=True``) ``auto`` takes ``cudnn``
             only when :meth:`plan` receives a caller-owned ``block_tables`` (the auto-built
@@ -1413,6 +1447,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         *,
         user_block_tables: bool,
         declared_kv_len: Optional[int] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ) -> bool:
         # Both plan() and workspace_size() must select the same backend.
         # A caller-provided JIT module must not be replaced by auto routing.
@@ -1452,6 +1488,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             fa2_available=self.use_tensor_cores or q_len_per_req <= 1,
             declared_kv_len=declared_kv_len,
             frontend_leads_short_caches=cudnn_frontend_leads_short_caches(),
+            # The frontend's own CuTe-DSL check: new enough for the FROST rows
+            # to run, not just a new enough frontend version.
+            frost_runtime_available=cudnn_frontend_frost_runtime_available(),
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
         )
 
     @property
@@ -1643,6 +1684,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             q_len_per_req,
             user_block_tables=user_block_tables,
             declared_kv_len=declared_kv_len,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
         ):
             backend = "cudnn"
         if backend in ("cute-dsl", "trtllm-gen", "cudnn"):
@@ -2007,6 +2050,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             declared_kv_len=None
             if block_tables is None
             else block_tables.shape[1] * page_size,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
         )
         if self.is_cuda_graph_enabled:
             # The resolved backend is part of the frozen CUDA-graph shape: a
@@ -4795,6 +4840,8 @@ def fast_decode_plan(
             declared_kv_len=self._block_tables.shape[1] * page_size
             if getattr(self, "_user_block_tables", False)
             else None,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
         )
     if wants_cudnn or self._cudnn_auto:
         # cuDNN (explicit or auto), and an auto wrapper leaving cuDNN, go
