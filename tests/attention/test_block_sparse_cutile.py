@@ -11,6 +11,10 @@ from tests.attention.test_block_sparse import _run_block_sparse_attention_case
 if not is_cuda_tile_available():
     pytest.skip("cuda.tile not available", allow_module_level=True)
 
+from flashinfer.attention.kernels.cutile import (  # noqa: E402
+    fmha_prefill_bsr_cutile as _prefill_bsr_cutile,
+)
+
 pytestmark = pytest.mark.solo
 
 _CUTILE_CASES = [
@@ -24,6 +28,18 @@ _CUTILE_CASES = [
     for head_dim in (128, 256)
     if num_qo_heads % num_kv_heads == 0 and M % R == 0 and N % C == 0
 ]
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _single_cutile_prefill_config():
+    """Check one config per case instead of autotuning (keeps CI time bounded)."""
+    saved = _prefill_bsr_cutile._AUTOTUNE_DISABLED
+    _prefill_bsr_cutile._AUTOTUNE_DISABLED = True
+    _prefill_bsr_cutile._prefill_paged_lpt_tune_cache.clear()
+    yield
+    _prefill_bsr_cutile._AUTOTUNE_DISABLED = saved
+    # Do not leak single-config tuning results into later tests in this process.
+    _prefill_bsr_cutile._prefill_paged_lpt_tune_cache.clear()
 
 
 @pytest.mark.parametrize("R,C,M,N,num_qo_heads,num_kv_heads,head_dim", _CUTILE_CASES)
