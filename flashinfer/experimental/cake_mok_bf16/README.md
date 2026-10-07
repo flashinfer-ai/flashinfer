@@ -43,10 +43,14 @@ Use a separate workspace and adapter for concurrent executions.
 
 The forward context holds the dispatched routed rows, gate, up and hidden of
 the macrobatch ring plus the real-row shared activations; routed outputs are
-not retained. Backward computes each supplied-score gradient inside the fused
-routed SwiGLU backward, as the FP32 dot product of the recomputed hidden
-activation with the unscaled upstream gradient of the routed down projection
-(no division by the score, so zero scores are exact). Context memory follows
+not retained. The BF16 backward dispatches the upstream routed gradient once,
+score-scaled, and derives every routed gradient from that single ring; the
+score gradient is the FP32 dot product of the recomputed hidden activation
+with the scaled hidden gradient divided by the score, as in MoK (a route whose
+score is exactly zero receives a zero score gradient). The MXFP8 backward
+quantizes the unscaled gradient for the hidden gradient and the score-scaled
+transposed copy for the weight gradient, so its zero scores are exact. Context
+memory follows
 the macrobatch ring and the real rows, not `schedule_capacity`. Pass the
 matching context and schedule to backward; retain both while any captured
 graph uses them.

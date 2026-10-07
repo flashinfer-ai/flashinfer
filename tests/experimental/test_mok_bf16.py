@@ -168,11 +168,11 @@ def _check_fused_training(variant="base"):
                     mini,
                 )
 
-            def mlp_backward(value, gradient, weights, score=None):
+            def mlp_backward(value, gradient, weights):
                 # Independent BF16-rounding-point reference; the clamp follows
                 # MoK: pre-clamp inclusive masks, clamped values in the SiLU.
-                # Routed experts receive the unscaled upstream gradient: the
-                # kernel rounds dh once and applies the route score in FP32.
+                # Routed experts receive the BF16 score-scaled upstream gradient
+                # (the dispatched ring); the kernel rounds dh once.
                 gate = (value.float() @ weights[0].float().T).bfloat16()
                 up = (value.float() @ weights[1].float().T).bfloat16()
                 gate_f, up_f = gate.float(), up.float()
@@ -186,7 +186,7 @@ def _check_fused_training(variant="base"):
                 activation_unrounded = silu * up_f
                 activation = activation_unrounded.bfloat16()
                 dh = (gradient.float() @ weights[2].float()).bfloat16()
-                dh_f = dh.float() if score is None else dh.float() * score[:, None]
+                dh_f = dh.float()
                 dg_f = ((1.0 - silu) * sigmoid + silu) * up_f * dh_f
                 du_f = silu * dh_f
                 if swiglu_limit is not None:
@@ -217,12 +217,11 @@ def _check_fused_training(variant="base"):
                         value = x[selected // topk]
                         score = scores.flatten()[selected]
                         gradient = dy[selected // topk]
-                        # The down weight gradient uses the BF16 score-scaled dy
-                        # that the backward dispatch publishes alongside the
-                        # unscaled rows.
+                        # The backward dispatch publishes the BF16 score-scaled dy
+                        # once (MoK SCALE_ROWS); every routed gradient derives from it.
                         scaled = (gradient.float() * score[:, None]).bfloat16()
                         rx, rg, ru, rh, rhidden, unrounded = mlp_backward(
-                            value, gradient, [w[expert] for w in routed], score
+                            value, scaled, [w[expert] for w in routed]
                         )
                         y_routed_reference[selected] = (
                             rhidden.float() @ routed[2][expert].float().T
