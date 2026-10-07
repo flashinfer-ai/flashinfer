@@ -96,13 +96,66 @@ for unequal lengths, empty ranks, count changes and graph reuse.
   report it, alongside peak memory, and time both complete iterations with
   the same CUDA Graph policy.
 
-SwiGLU clipping, MXFP8, a separate recompute API, optimizer steps, router-network
-backpropagation, and shared-gradient all-reduce are outside this adapter.
+SwiGLU clipping, a separate recompute API, optimizer steps, router-network backpropagation, and shared-gradient all-reduce are outside this adapter.
+
+## MXFP8 routed experts
+
+`prepare_mok_bf16(..., mxfp8=True)` selects kernels whose routed experts run on
+tcgen05 block-scaled MMA (E4M3 data, E8M0 scales, FP32 accumulation). The shared
+experts, the dispatch and combine of `x`, `y` and `dx`, and the router-score
+gradient stay BF16. The recipe is MoK's: one E8M0 scale per 32-element block
+along the contraction axis, `scale = max(amax / 448, 1e-12)` rounded up to a
+power of two, values rounded to E4M3 with saturation, scale bytes stored in
+128 x 128 tiles (`[rows / 128, cols / 128, 32, 16]`). The caller quantizes the
+routed weights once:
+
+```python
+from flashinfer.mok import mxfp8_quantize, prepare_mok_bf16
+
+backend = prepare_mok_bf16(ep_size=16, local_experts=16, topk=8, mxfp8=True)
+wg, wu, wd = (mxfp8_quantize(w, True, True) for w in (w_gate, w_up, w_down))
+# each tuple: (w_fp8, w_sc, w_t_fp8, w_t_sc), normal and transposed layouts
+y, ctx = backend.forward(
+    config, workspace, schedule, x, scores,
+    sg, su, sd,  # shared experts, BF16
+    (wg[0], wg[1]), (wu[0], wu[1]), (wd[0], wd[1]),
+)
+ctx = backend.recompute_forward_context(
+    config, workspace, schedule, x, sg, su, (wg[0], wg[1]), (wu[0], wu[1])
+)
+grads = backend.backward(
+    config, workspace, schedule, ctx, dy, x, scores,
+    sg, su, sd, wg, wu, (wd[2], wd[3]), wgrad_f32=False,
+)
+```
+
+Forward takes the routed `(w_fp8, w_sc)` pairs, recompute the gate/up pairs,
+and backward the gate/up 4-tuples plus the down `(w_t_fp8, w_t_sc)` pair (its
+transposed layout contracts over the hidden axis). `wgrad_f32=True` returns the
+routed weight gradients in FP32 instead of BF16. The context stores the
+dispatched rows, gate, up and hidden as `(E4M3, scale tiles)` pairs. The fused
+kernels quantize the dispatched rows, the saved gate/up (from their BF16
+values), the hidden activation and the backward `dy`, `dg` and `du` tiles in
+both layouts, so there is no separate quantization pass and no compute on
+padded rows. A context produced in one precision cannot be consumed by the
+other.
+
+Numerics: `mxfp8_reference.py` holds the recipe in FP32 PyTorch arithmetic and
+the CUDA quantizer matches it bitwise. `tests/experimental/test_mok_bf16_mxfp8.py`
+checks the fused kernels against fake-quant FP32 references of the same recipe
+(BF16 rule `atol = rtol = 1e-2` with at most `max(4, 2e-7 * numel)` exceptions),
+the saved tiles bitwise, repeated and recomputed executions bitwise, and reports
+the end-to-end error against a plain FP32 oracle: about 7% relative L1 on `dx`,
+the router-score gradient and the routed weight gradients for Gaussian inputs
+(the E4M3 block quantization error of both GEMM operands), larger with a small
+SwiGLU clamp because quantized gate values cross the clamp boundary.
+`MOK_TOY_PRECISION=mxfp8` runs `examples/mok_bf16_toy.py` on the MXFP8 kernels
+with the same fake-quant reference.
 
 ## Validation and lifecycle
 
 Run `pytest tests/experimental/test_mok_bf16.py` for the independent
-BF16-rounding reference, empty experts, multiple ring lengths, variable
+BF16-rounding reference (and `test_mok_bf16_mxfp8.py` for the MXFP8 path), empty experts, multiple ring lengths, variable
 widths, repeated eager execution, and changed-input CUDA Graph replay.
 The runnable distributed examples are `examples/mok_bf16_toy.py` and
 `examples/mok_bf16_unequal.py`. The focused validation passes six single-GPU
