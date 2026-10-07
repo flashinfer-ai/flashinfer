@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import warnings
 from typing import Optional, Tuple, Union
 
 import torch
@@ -263,6 +264,32 @@ def _proxy_dummies(device_index: int):
     )
 
 
+_F16_ACC_WARNED = False
+
+
+def _warn_f16_accumulation_once() -> None:
+    """One-time process warning for ``use_fp32_acc=False``: fp32 accumulation is the
+    required numerics; the f16 path exists to match the SM90 CuTe DSL kernel and
+    must be opted into knowingly.  Measured on H100: the f16 accumulator saturates
+    to a sticky +-inf as soon as any 128-term q.k dot or 32-term k-slice partial
+    crosses +-65,520 (-inf reads as the causal mask and the top-k then selects no
+    block), and without overflow it carries 1.6-2.2x the f32 path's error."""
+    global _F16_ACC_WARNED
+    if _F16_ACC_WARNED:
+        return
+    _F16_ACC_WARNED = True
+    warnings.warn(
+        "msa_proxy_score(use_fp32_acc=False): the prefill-regime proxy score "
+        "accumulates fp8 products in fp16 (FI #6140 numerics). Any 128-key dot or "
+        "32-term partial beyond +-65,520 saturates to +-inf and corrupts the block "
+        "selection (-inf is read as the causal mask); without overflow the scores "
+        "carry 1.6-2.2x the fp32 error. Use the default use_fp32_acc=True unless "
+        "|q.k| is bounded. This warning is emitted once per process.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 @flashinfer_api(trace=msa_proxy_score_trace)
 def msa_proxy_score(
     q: torch.Tensor,
@@ -350,7 +377,10 @@ def msa_proxy_score(
         f16, the numerics of the SM90 CuTe DSL prefill kernel. The SM90 decode
         regime and the SM120/SM121 kernels accumulate in f32 whichever value is
         given; ``False`` is accepted there as a request for at most f16
-        precision, which f32 accumulation satisfies.
+        precision, which f32 accumulation satisfies. Passing ``False`` emits a
+        ``RuntimeWarning`` once per process: f16 accumulation saturates to
+        +-inf beyond |128-key dot| 65,520 (corrupting the block selection) and
+        carries 1.6-2.2x the f32 error otherwise.
 
     Returns
     -------
@@ -381,6 +411,8 @@ def msa_proxy_score(
         raise RuntimeError(
             "msa_proxy_score requires SM90, SM120 or SM121 and CUDA >= 12.8"
         )
+    if not use_fp32_acc:
+        _warn_f16_accumulation_once()
     q_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float16) and not q_fp8:
         raise ValueError(f"q must be bf16, fp16, or fp8 e4m3, got {q.dtype}")

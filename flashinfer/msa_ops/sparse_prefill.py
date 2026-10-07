@@ -245,12 +245,6 @@ def msa_sparse_attention(
             raise NotImplementedError(
                 "SM90 msa_sparse_attention does not return an LSE"
             )
-        if not causal:
-            # Every SM90 sparse-prefill schedule masks causally with no switch;
-            # the flag used to be ignored, which silently returned causal output.
-            raise NotImplementedError(
-                "SM90 msa_sparse_attention is causal; causal=False is not supported"
-            )
         if page_table is None or seqused_k is None:
             raise NotImplementedError(
                 "SM90 msa_sparse_attention requires the paged KV layout"
@@ -269,6 +263,12 @@ def msa_sparse_attention(
             raise NotImplementedError(
                 "SM90 msa_sparse_attention requires an fp8 e4m3 KV cache, "
                 f"got k={k.dtype} v={v.dtype}"
+            )
+        if not causal:
+            # Every SM90 sparse-prefill schedule masks causally with no switch;
+            # the flag used to be ignored, which silently returned causal output.
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention is causal; causal=False is not supported"
             )
         from ._sm90_dispatch import sparse_prefill_sm90
 

@@ -14,6 +14,7 @@ prefill regime (``use_fp32_acc``).
 
 import itertools
 import math
+import warnings
 
 import pytest
 import torch
@@ -320,6 +321,36 @@ def test_proxy_score_prefill_defaults_to_fp32_accumulation():
     default = msa_proxy_score(q, k, cu_q, **common)
     fp32 = msa_proxy_score(q, k, cu_q, use_fp32_acc=True, **common)
     assert torch.equal(default, fp32)
+
+
+@sm90_only
+def test_f16_accumulation_warns_exactly_once_per_process():
+    """``use_fp32_acc=False`` is an opt-in away from the required numerics: one
+    RuntimeWarning per process, none for the default."""
+    from flashinfer.msa_ops import proxy_score as proxy_score_module
+
+    q, k, cu_q, page_table, seqused_k, pages = _proxy_prefill_inputs(seed=6)
+    common = dict(
+        page_table=page_table, seqused_k=seqused_k, max_seqlen_q=512, max_k_tiles=pages
+    )
+    proxy_score_module._F16_ACC_WARNED = False  # earlier tests may have tripped it
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        msa_proxy_score(q, k, cu_q, use_fp32_acc=False, **common)
+        msa_proxy_score(q, k, cu_q, use_fp32_acc=False, **common)
+        msa_proxy_score(q, k, cu_q, use_fp32_acc=False, **common)
+    f16 = [
+        w
+        for w in caught
+        if issubclass(w.category, RuntimeWarning)
+        and "use_fp32_acc=False" in str(w.message)
+    ]
+    assert len(f16) == 1
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        msa_proxy_score(q, k, cu_q, **common)
+        msa_proxy_score(q, k, cu_q, use_fp32_acc=True, **common)
+    assert not [w for w in caught if "use_fp32_acc" in str(w.message)]
 
 
 @sm90_only
