@@ -43,6 +43,11 @@ _LARGE_C7_TOKENS = (8192, 16384)
 # FC1 (three kernels: FC1, FC2, finalize); the others launch the separate
 # single-token quantization + router kernel before the FC1 (four kernels).
 _M1_FUSED_ARCHES = ("sm_103a",)
+# Architectures whose 8192- and 16384-token route runs the FC2 that stores an
+# 8-bit per-tile partial with per-tile FP32 scales and the finalize that
+# consumes it (eight kernels); the others run the pre-shuffled scale-factor
+# route (nine kernels).
+_LARGE_Q8I_ARCHES = ("sm_103a",)
 # The 512- and 1024-token routes launch the routing kernel as one thread-block
 # cluster of this many CTAs (the kernel declares the matching cluster size).
 _ROUTE_MC_CLUSTER = 8
@@ -169,6 +174,11 @@ _SELECTORS = {
         ),
         None,
     ),
+    "large_q8i": (
+        _GENERIC,
+        _generic(128, fc2="fc2:n128_q8i", finalize="finalize:n128_q8i"),
+        None,
+    ),
     8: (_GENERIC, _generic(8), None),
     16: (_GENERIC, _generic(16), None),
     32: (_GENERIC, _generic(32), None),
@@ -205,7 +215,7 @@ def _selector(arch, num_tokens):
     if num_tokens in _MID_WORK5FD_TOKENS:
         return "mid_work5fd"
     if num_tokens in _LARGE_C7_TOKENS:
-        return "large_c7"
+        return "large_q8i" if arch in _LARGE_Q8I_ARCHES else "large_c7"
     return tile_n
 
 
@@ -425,6 +435,28 @@ _CALL_ARGS = {
 }
 
 
+def _plan_names(prepared, stage, name):
+    """Whether the program bound to ``stage`` takes an argument called ``name``."""
+    plan = MODULES[prepared["modules"][stage]]["arg_plan"]
+    return any(item == name for _kind, item in plan)
+
+
+def _q8_partial_views(views, tile_n, max_tiles):
+    """The 8-bit FC2 partial ``[rows, H]`` and its per-tile FP32 scales.
+
+    The programs that store the FC2 result as an 8-bit per-tile partial write
+    ``max_tiles * (H // 128)`` FP32 scales next to it; both are carved out of
+    the BF16 ``expert_output`` scratch, whose byte size (``2 * rows * H``)
+    exceeds ``rows * H + 4 * max_tiles * (H // 128)`` for every token count,
+    so the workspace layout and size are those of every other route.
+    """
+    rows = max_tiles * tile_n
+    scratch = views["expert_output"].view(torch.uint8).view(-1)
+    partial = scratch[: rows * _H].view(rows, _H)
+    scales = scratch[rows * _H : rows * _H + max_tiles * (_H // 128) * 4]
+    return partial, scales.view(torch.float32)
+
+
 def _stage_constants(stage, views, prepared, num_tokens):
     """Prepare-time values of one stage's arguments (grids, scratch views, scalars)."""
     tile_n = prepared["tile_n"]
@@ -577,11 +609,16 @@ def _stage_constants(stage, views, prepared, num_tokens):
                 num_non_exiting_ctas=views["total_tiles"],
                 work_counter=views["fc2_work_counter"],
             )
+        if _plan_names(prepared, stage, "partial_scale"):
+            # The program stores an 8-bit per-tile partial and its FP32 scales
+            # instead of the BF16 expert output.
+            partial, partial_scale = _q8_partial_views(views, tile_n, max_tiles)
+            values.update(C_tma=partial, C=partial, partial_scale=partial_scale)
         return values
     if stage == "finalize":
         feature = selector in ("m1", "m1_s2a", "n8_feature", "n8_w2a_m16", "m64_claim8")
         vec = 2 if tile_n == 8 else 8
-        return dict(
+        values = dict(
             grid=(
                 num_tokens,
                 1
@@ -595,6 +632,11 @@ def _stage_constants(stage, views, prepared, num_tokens):
             token_to_permuted=views["token_to_permuted"],
             M=num_tokens,
         )
+        if _plan_names(prepared, stage, "partial_scale"):
+            # The program reads the FC2 stage's 8-bit partial and its scales.
+            partial, partial_scale = _q8_partial_views(views, tile_n, max_tiles)
+            values.update(expert_output=partial, partial_scale=partial_scale)
+        return values
     raise ValueError(f"unknown SiTU stage {stage!r}")
 
 

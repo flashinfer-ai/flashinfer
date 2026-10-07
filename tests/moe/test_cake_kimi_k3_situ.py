@@ -67,6 +67,10 @@ REFERENCE_SM_COUNT = 148
 # Architectures whose single-token route is the fused quantization + routing
 # FC1 (three kernels); the others run the separate quantization + router kernel.
 FUSED_M1_ARCHES = ("sm_103a",)
+# Architectures whose 8192- and 16384-token route stores the FC2 result as an
+# 8-bit per-tile partial with per-tile FP32 scales (eight kernels); the others
+# run the pre-shuffled scale-factor route (nine kernels).
+LARGE_Q8I_ARCHES = ("sm_103a",)
 # Token counts with a route of their own; every other count runs the generic
 # pipeline of its tile-N bucket (8 / 16 / 32 / 128).
 ROUTED = {
@@ -103,6 +107,7 @@ STAGES_BY_SELECTOR = {
     "n32_claim8": ["quant", "fused_router", "fc1", "fc2", "finalize"],
     "mid_work5fd": GENERIC_STAGES,
     "large_c7": GENERIC_STAGES[:5] + ["sfb_shuffle"] + GENERIC_STAGES[5:],
+    "large_q8i": GENERIC_STAGES,
 }
 
 
@@ -119,6 +124,8 @@ def _tile_bucket(num_tokens):
 def _expected_selector(arch, num_tokens):
     if num_tokens == 1 and arch in FUSED_M1_ARCHES:
         return "m1_s2a"
+    if num_tokens in LARGE_TOKENS and arch in LARGE_Q8I_ARCHES:
+        return "large_q8i"
     return ROUTED.get(num_tokens, _tile_bucket(num_tokens))
 
 
@@ -590,8 +597,8 @@ def _check_prepared_shape(prepared, arch, num_tokens, device):
         "n32_claim8_m512",
         "n32_claim8_m1024_grouped",
         "mid_work5fd",
-        "large_c7_m8192",
-        "large_c7_m16384",
+        "large_m8192",
+        "large_m16384",
         "tile8_generic",
         "tile16_generic",
         "tile32_generic",
@@ -698,6 +705,28 @@ def test_cake_situ_every_route_eager_and_external_graph(
             )
         else:
             assert bindings["quant_route"]["x"] is x
+    if prepared["selector"] == "large_q8i":
+        # The FC2 stage stores an 8-bit per-tile partial and its per-tile FP32
+        # scales inside the BF16 expert-output scratch, and the finalize reads
+        # the same two views: no pre-shuffled scale-factor images are bound.
+        options = _options(x, ids, route_weights, output, weights, workspace)
+        bindings = _cake_situ_stage_bindings(options, prepared)
+        views = _cake_situ_workspace_views(workspace, num_tokens)
+        scratch = views["expert_output"]
+        rows = prepared["max_tiles"] * 128
+        partial, scales = bindings["fc2"]["C"], bindings["fc2"]["partial_scale"]
+        assert partial.dtype == torch.uint8 and tuple(partial.shape) == (rows, HIDDEN)
+        assert partial.data_ptr() == scratch.data_ptr()
+        assert scales.dtype == torch.float32
+        assert scales.numel() == prepared["max_tiles"] * (HIDDEN // 128)
+        assert scales.data_ptr() == scratch.data_ptr() + rows * HIDDEN
+        assert scales.data_ptr() + 4 * scales.numel() <= (
+            scratch.data_ptr() + scratch.numel() * scratch.element_size()
+        )
+        assert bindings["fc2"]["C_tma"].data_ptr() == partial.data_ptr()
+        assert bindings["finalize"]["expert_output"].data_ptr() == partial.data_ptr()
+        assert bindings["finalize"]["partial_scale"].data_ptr() == scales.data_ptr()
+        assert "SFBS" not in bindings["fc1"] and "sfb_shuffle" not in bindings
 
     expected = _trtllm_reference(x, ids, route_weights, weights)
     # Ensure an all-zero output could not satisfy the FP4 absolute tolerance.
@@ -736,7 +765,20 @@ def test_cake_situ_every_route_eager_and_external_graph(
     default_parameters_output = output.clone()
     output.fill_(float("nan"))
     assert submit(explicit_parameters=True) is output
-    torch.testing.assert_close(output, default_parameters_output, atol=0.0, rtol=0.0)
+    if prepared["selector"] == "large_q8i":
+        # The 8-bit FC2 partial of this route carries one FP32 scale per
+        # 128x128 tile, and the atomic-counter routing assigns rows to tiles
+        # in a call-dependent order, so the tile membership (hence each
+        # tile's scale and rounding) differs between two calls: the outputs
+        # are not bitwise reproducible, but the explicit parameters must
+        # still agree within the reference tolerance.
+        torch.testing.assert_close(
+            output, default_parameters_output, atol=1.0, rtol=0.1
+        )
+    else:
+        torch.testing.assert_close(
+            output, default_parameters_output, atol=0.0, rtol=0.0
+        )
     assert output.data_ptr() == output_ptr
     assert workspace.data_ptr() == workspace_ptr
 
@@ -836,11 +878,16 @@ def test_cake_situ_pre_shuffled_route_matches_plain_fc1(
         cake_situ_weights,
         cake_situ_workspace,
     )
+    arch = _arch(device)
+    if _expected_selector(arch, num_tokens) != "large_c7":
+        pytest.skip(
+            f"{arch} routes {num_tokens} tokens to {_expected_selector(arch, num_tokens)}; "
+            "the pre-shuffled scale-factor programs are not delivered for it"
+        )
     _, _, _, output, options = _submit_prepared(
         num_tokens, routing, device, weights, workspace
     )
     prepared = _prepared(workspace, num_tokens)
-    arch = _arch(device)
     assert prepared["selector"] == "large_c7"
     plain_fc1 = cake_situ_program(arch, "fc1:n128")
     assert plain_fc1 != prepared["modules"]["fc1"]
@@ -913,6 +960,12 @@ def test_cake_situ_sfb_shuffle_writer_matches_reference(
         cake_situ_weights,
         cake_situ_workspace,
     )
+    arch = _arch(device)
+    if _expected_selector(arch, num_tokens) != "large_c7":
+        pytest.skip(
+            f"{arch} routes {num_tokens} tokens to {_expected_selector(arch, num_tokens)}; "
+            "the pre-shuffled scale-factor writer is not delivered for it"
+        )
     _, _, _, _, options = _submit_prepared(
         num_tokens, routing, device, weights, workspace
     )
