@@ -63,8 +63,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
-
-__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
 kernel_h3_mlp_norm_adaln_quant_fp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ x_norm_weight, __nv_bfloat16* __restrict__ adaln_scale, __nv_bfloat16* __restrict__ adaln_shift, long long* __restrict__ adaln_index, unsigned int* __restrict__ act_q, float* __restrict__ act_scale, int M, int adaln_rows, long long adaln_row_stride, float eps)
 {
     const int tid = threadIdx.x;
@@ -81,10 +80,10 @@ kernel_h3_mlp_norm_adaln_quant_fp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
     const int cta_rank = 0;
 
     // Kernel setup ops
-    float* partials = reinterpret_cast<float*>(smem_raw + 0);
-    const int partials_addr = smem + 0;
-    float* amax_partials = reinterpret_cast<float*>(smem_raw + 32);
-    const int amax_partials_addr = smem + 32;
+    float* partials = reinterpret_cast<float*>(smem_raw + SMEM_PARTIALS_OFF);
+    const int partials_addr = smem + SMEM_PARTIALS_OFF;
+    float* amax_partials = reinterpret_cast<float*>(smem_raw + SMEM_AMAX_PARTIALS_OFF);
+    const int amax_partials_addr = smem + SMEM_AMAX_PARTIALS_OFF;
 
     // === Task calls (dependency order) ===
     long long rows64 = (long long)adaln_rows;
@@ -361,8 +360,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
-
-__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
 kernel_h3_mlp_norm_adaln_quant_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ x_norm_weight, __nv_bfloat16* __restrict__ adaln_scale, __nv_bfloat16* __restrict__ adaln_shift, long long* __restrict__ adaln_index, unsigned int* __restrict__ act_q, uint8_t* __restrict__ act_sf, float* __restrict__ act_global_scale, int M, int adaln_rows, long long adaln_row_stride, float eps)
 {
     const int tid = threadIdx.x;
@@ -379,8 +377,8 @@ kernel_h3_mlp_norm_adaln_quant_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat1
     const int cta_rank = 0;
 
     // Kernel setup ops
-    float* partials = reinterpret_cast<float*>(smem_raw + 0);
-    const int partials_addr = smem + 0;
+    float* partials = reinterpret_cast<float*>(smem_raw + SMEM_PARTIALS_OFF);
+    const int partials_addr = smem + SMEM_PARTIALS_OFF;
 
     // === Task calls (dependency order) ===
     float global_scale = act_global_scale[0];
@@ -616,7 +614,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_B_STAGE_STRIDE 16384
 #define SMEM_TOTAL 99328
 #define THREADS 256
-#define GROUP_M 16
+#define GROUP_M 64
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -690,7 +688,7 @@ __device__ __forceinline__ float approx_rcp(float x) {
 
 
 
-__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
 kernel_h3_fc1_swiglu_gemm(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, float* __restrict__ act_scale, float* __restrict__ w_scale, unsigned int* __restrict__ out, int M, int num_m_tiles, int total_tiles, float alpha)
 {
     const int tid = threadIdx.x;
@@ -711,10 +709,10 @@ kernel_h3_fc1_swiglu_gemm(const __grid_constant__ CUtensorMap A, const __grid_co
     const int cta_rank = 0;
 
     // Kernel setup ops
-    uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int A_stage_addr = smem + 1024;
-    uint8_t* B_stage = reinterpret_cast<uint8_t*>(smem_raw + 33792);
-    const int B_stage_addr = smem + 33792;
+    uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_A_STAGE_OFF);
+    const int A_stage_addr = smem + SMEM_A_STAGE_OFF;
+    uint8_t* B_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_B_STAGE_OFF);
+    const int B_stage_addr = smem + SMEM_B_STAGE_OFF;
 
     // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 8 barriers)
     // Mbarriers at smem_raw[0..64)
@@ -3414,7 +3412,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_B_STAGE_STRIDE 16384
 #define SMEM_TOTAL 99328
 #define THREADS 256
-#define GROUP_M 16
+#define GROUP_M 64
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -3488,7 +3486,7 @@ __device__ __forceinline__ float approx_rcp(float x) {
 
 
 
-__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
 kernel_h3_mlp_fc1_swiglu_gemm(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, float* __restrict__ act_scale, float* __restrict__ w_scale, unsigned int* __restrict__ out, unsigned int* __restrict__ act_q_w, uint8_t* __restrict__ act_sf_w, float* __restrict__ y_global_scale, int M, int num_m_tiles, int total_tiles, float alpha)
 {
     const int tid = threadIdx.x;
@@ -3509,10 +3507,10 @@ kernel_h3_mlp_fc1_swiglu_gemm(const __grid_constant__ CUtensorMap A, const __gri
     const int cta_rank = 0;
 
     // Kernel setup ops
-    uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int A_stage_addr = smem + 1024;
-    uint8_t* B_stage = reinterpret_cast<uint8_t*>(smem_raw + 33792);
-    const int B_stage_addr = smem + 33792;
+    uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_A_STAGE_OFF);
+    const int A_stage_addr = smem + SMEM_A_STAGE_OFF;
+    uint8_t* B_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_B_STAGE_OFF);
+    const int B_stage_addr = smem + SMEM_B_STAGE_OFF;
 
     // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 8 barriers)
     // Mbarriers at smem_raw[0..64)
@@ -6306,7 +6304,7 @@ __device__ __forceinline__ float approx_rcp(float x) {
 
 
 
-__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
 kernel_h3_mlp_fc1_swiglu_gemm(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, float* __restrict__ act_scale, float* __restrict__ w_scale, unsigned int* __restrict__ out, unsigned int* __restrict__ act_q_w, uint8_t* __restrict__ act_sf_w, float* __restrict__ y_global_scale, int M, int num_m_tiles, int total_tiles, float alpha)
 {
     const int tid = threadIdx.x;
@@ -6327,14 +6325,14 @@ kernel_h3_mlp_fc1_swiglu_gemm(const __grid_constant__ CUtensorMap A, const __gri
     const int cta_rank = 0;
 
     // Kernel setup ops
-    uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int A_stage_addr = smem + 1024;
-    uint8_t* B_stage = reinterpret_cast<uint8_t*>(smem_raw + 25600);
-    const int B_stage_addr = smem + 25600;
-    unsigned int* SFB_stage = reinterpret_cast<unsigned int*>(smem_raw + 74752);
-    const int SFB_stage_addr = smem + 74752;
-    unsigned int* SFA_pairs = reinterpret_cast<unsigned int*>(smem_raw + 80896);
-    const int SFA_pairs_addr = smem + 80896;
+    uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_A_STAGE_OFF);
+    const int A_stage_addr = smem + SMEM_A_STAGE_OFF;
+    uint8_t* B_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_B_STAGE_OFF);
+    const int B_stage_addr = smem + SMEM_B_STAGE_OFF;
+    unsigned int* SFB_stage = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFB_STAGE_OFF);
+    const int SFB_stage_addr = smem + SMEM_SFB_STAGE_OFF;
+    unsigned int* SFA_pairs = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFA_PAIRS_OFF);
+    const int SFA_pairs_addr = smem + SMEM_SFA_PAIRS_OFF;
 
     // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 6 barriers)
     // Mbarriers at smem_raw[0..48)
@@ -11448,7 +11446,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 }
 
 
-__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
 kernel_h3_mlp_fc2_gemm_fused(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, unsigned int* __restrict__ y_w, unsigned int* __restrict__ act_q_w, uint8_t* __restrict__ act_sf_w, float* __restrict__ act_scale, float* __restrict__ act_global_scale, float* __restrict__ w_scale, __nv_bfloat16* __restrict__ gate, long long* __restrict__ gate_index, __nv_bfloat16* __restrict__ residual, unsigned int* __restrict__ out, unsigned int* __restrict__ flags, int M, int num_m_tiles, int total_tiles, int gate_rows, long long gate_row_stride, float alpha)
 {
     const int tid = threadIdx.x;
@@ -11469,16 +11467,16 @@ kernel_h3_mlp_fc2_gemm_fused(const __grid_constant__ CUtensorMap A, const __grid
     const int cta_rank = 0;
 
     // Kernel setup ops
-    uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int A_stage_addr = smem + 1024;
-    uint8_t* B_stage = reinterpret_cast<uint8_t*>(smem_raw + 50176);
-    const int B_stage_addr = smem + 50176;
-    __nv_bfloat16* staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 74752);
-    const int staging_addr = smem + 74752;
-    unsigned int* SFA_slot = reinterpret_cast<unsigned int*>(smem_raw + 82944);
-    const int SFA_slot_addr = smem + 82944;
-    unsigned int* SFB_stage = reinterpret_cast<unsigned int*>(smem_raw + 91136);
-    const int SFB_stage_addr = smem + 91136;
+    uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_A_STAGE_OFF);
+    const int A_stage_addr = smem + SMEM_A_STAGE_OFF;
+    uint8_t* B_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_B_STAGE_OFF);
+    const int B_stage_addr = smem + SMEM_B_STAGE_OFF;
+    __nv_bfloat16* staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_STAGING_OFF);
+    const int staging_addr = smem + SMEM_STAGING_OFF;
+    unsigned int* SFA_slot = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFA_SLOT_OFF);
+    const int SFA_slot_addr = smem + SMEM_SFA_SLOT_OFF;
+    unsigned int* SFB_stage = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFB_STAGE_OFF);
+    const int SFB_stage_addr = smem + SMEM_SFB_STAGE_OFF;
 
     // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 6 barriers)
     // Mbarriers at smem_raw[0..48)
@@ -14024,7 +14022,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 }
 
 
-__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
 kernel_h3_mlp_fc2_gemm_fused(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, unsigned int* __restrict__ y_w, unsigned int* __restrict__ act_q_w, uint8_t* __restrict__ act_sf_w, float* __restrict__ act_scale, float* __restrict__ act_global_scale, float* __restrict__ w_scale, __nv_bfloat16* __restrict__ gate, long long* __restrict__ gate_index, __nv_bfloat16* __restrict__ residual, unsigned int* __restrict__ out, unsigned int* __restrict__ flags, int M, int num_m_tiles, int total_tiles, int gate_rows, long long gate_row_stride, float alpha)
 {
     const int tid = threadIdx.x;
@@ -14045,16 +14043,16 @@ kernel_h3_mlp_fc2_gemm_fused(const __grid_constant__ CUtensorMap A, const __grid
     const int cta_rank = 0;
 
     // Kernel setup ops
-    uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int A_stage_addr = smem + 1024;
-    uint8_t* B_stage = reinterpret_cast<uint8_t*>(smem_raw + 50176);
-    const int B_stage_addr = smem + 50176;
-    __nv_bfloat16* staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 74752);
-    const int staging_addr = smem + 74752;
-    unsigned int* SFA_slot = reinterpret_cast<unsigned int*>(smem_raw + 82944);
-    const int SFA_slot_addr = smem + 82944;
-    unsigned int* SFB_stage = reinterpret_cast<unsigned int*>(smem_raw + 91136);
-    const int SFB_stage_addr = smem + 91136;
+    uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_A_STAGE_OFF);
+    const int A_stage_addr = smem + SMEM_A_STAGE_OFF;
+    uint8_t* B_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_B_STAGE_OFF);
+    const int B_stage_addr = smem + SMEM_B_STAGE_OFF;
+    __nv_bfloat16* staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_STAGING_OFF);
+    const int staging_addr = smem + SMEM_STAGING_OFF;
+    unsigned int* SFA_slot = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFA_SLOT_OFF);
+    const int SFA_slot_addr = smem + SMEM_SFA_SLOT_OFF;
+    unsigned int* SFB_stage = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFB_STAGE_OFF);
+    const int SFB_stage_addr = smem + SMEM_SFB_STAGE_OFF;
 
     // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 6 barriers)
     // Mbarriers at smem_raw[0..48)
@@ -16606,7 +16604,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 }
 
 
-__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
 kernel_h3_mlp_fc2_gemm_fused(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, unsigned int* __restrict__ y_w, unsigned int* __restrict__ act_q_w, uint8_t* __restrict__ act_sf_w, float* __restrict__ act_scale, float* __restrict__ act_global_scale, float* __restrict__ w_scale, __nv_bfloat16* __restrict__ gate, long long* __restrict__ gate_index, __nv_bfloat16* __restrict__ residual, unsigned int* __restrict__ out, unsigned int* __restrict__ flags, int M, int num_m_tiles, int total_tiles, int gate_rows, long long gate_row_stride, float alpha)
 {
     const int tid = threadIdx.x;
@@ -16627,16 +16625,16 @@ kernel_h3_mlp_fc2_gemm_fused(const __grid_constant__ CUtensorMap A, const __grid
     const int cta_rank = 0;
 
     // Kernel setup ops
-    uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-    const int A_stage_addr = smem + 1024;
-    uint8_t* B_stage = reinterpret_cast<uint8_t*>(smem_raw + 50176);
-    const int B_stage_addr = smem + 50176;
-    __nv_bfloat16* staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 74752);
-    const int staging_addr = smem + 74752;
-    unsigned int* SFA_slot = reinterpret_cast<unsigned int*>(smem_raw + 82944);
-    const int SFA_slot_addr = smem + 82944;
-    unsigned int* SFB_stage = reinterpret_cast<unsigned int*>(smem_raw + 91136);
-    const int SFB_stage_addr = smem + 91136;
+    uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_A_STAGE_OFF);
+    const int A_stage_addr = smem + SMEM_A_STAGE_OFF;
+    uint8_t* B_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_B_STAGE_OFF);
+    const int B_stage_addr = smem + SMEM_B_STAGE_OFF;
+    __nv_bfloat16* staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_STAGING_OFF);
+    const int staging_addr = smem + SMEM_STAGING_OFF;
+    unsigned int* SFA_slot = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFA_SLOT_OFF);
+    const int SFA_slot_addr = smem + SMEM_SFA_SLOT_OFF;
+    unsigned int* SFB_stage = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFB_STAGE_OFF);
+    const int SFB_stage_addr = smem + SMEM_SFB_STAGE_OFF;
 
     // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 6 barriers)
     // Mbarriers at smem_raw[0..48)
