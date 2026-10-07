@@ -77,7 +77,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_dsv4_bc35ea7ec11bbcbe338c(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, int num_q_heads, int num_split)
+kernel_cake_dsv4_fa5539cb1afb7555dff5(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, int num_q_heads, int num_split)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -93,9 +93,9 @@ kernel_cake_dsv4_bc35ea7ec11bbcbe338c(__nv_bfloat16* __restrict__ partial_O, flo
     const int wg_dummy = 0;
     int batch_idx = blockIdx.x;
     int head_idx = blockIdx.y;
-    int stat_base = (batch_idx * num_q_heads + head_idx) * 4;
+    int stat_base = (batch_idx * num_q_heads + head_idx) * 5;
     float local_m = -CAKE_INF;
-    if (lane < 4) {
+    if (lane < 5) {
         local_m = partial_lse[stat_base + lane];
     }
     float _warp_reduce_0 = local_m;
@@ -104,7 +104,7 @@ kernel_cake_dsv4_bc35ea7ec11bbcbe338c(__nv_bfloat16* __restrict__ partial_O, flo
         _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
     float global_max = _warp_reduce_0;
     float local_w = 0.0f;
-    if (lane < 4) {
+    if (lane < 5) {
         float _exp2_0 = approx_exp2(local_m - global_max);
         local_w = ((local_m == -CAKE_INF) ? 0.0f : _exp2_0);
     }
@@ -125,7 +125,7 @@ kernel_cake_dsv4_bc35ea7ec11bbcbe338c(__nv_bfloat16* __restrict__ partial_O, flo
         acc[e] = 0.0f;
     }
     #pragma unroll
-    for (int s = 0; s < 4; s++) {
+    for (int s = 0; s < 5; s++) {
         float _shfl_0 = __shfl_sync(0xFFFFFFFF, local_weight, s);
         float split_weight = _shfl_0;
         float _vec_load_0[4];
