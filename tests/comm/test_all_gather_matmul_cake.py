@@ -52,25 +52,54 @@ def test_route_table_covers_every_world_size_dtype_layout_and_phase():
         mains.add(program)
     # One main kernel per (world size, dtype, weight layout): twelve distinct programs.
     assert len(mains) == 12
-    assert loader.fused_peer_copy_program() in loader.PROGRAMS
+    assert loader.peer_push_program() in loader.PROGRAMS
     assert set(loader.ROUTES.values()) == set(loader.PROGRAMS)
 
 
-def test_every_program_lists_one_device_and_one_binding_source():
+def test_every_program_lists_its_device_source_only():
     for program, row in loader.PROGRAMS.items():
-        assert len(row["sources"]) == 2, program
-        assert all(
-            source.startswith("csrc/cake_all_gather_matmul/")
-            for source in row["sources"]
-        )
+        assert len(row["sources"]) == 1, program
+        assert row["sources"][0].startswith("csrc/cake_all_gather_matmul/")
+        assert row["sources"][0].endswith("_kernel.cu")
         assert len(row["block"]) == 3 and row["block"][0] > 0
         assert row["dynamic_smem_bytes"] >= 0
         assert row["arches"] and set(row["arches"]) <= set(loader.ARCH_FLAGS), program
 
 
-def test_fused_copy_program_is_delivered_for_its_routed_architecture_only():
-    fused = loader.fused_peer_copy_program()
-    assert loader.PROGRAMS[fused]["arches"] == ["sm_103a"]
+def test_every_route_has_one_host_sequence_per_architecture():
+    expected = set()
+    for arch in loader.ARCH_FLAGS:
+        for world_size, dtype_name, b_layout in _main_programs():
+            name = loader.sequence_name(world_size, dtype_name, b_layout, arch)
+            expected.add(name)
+            row = loader.SEQUENCES[name]
+            assert row["arches"] == [arch]
+            assert (row["world_size"], row["dtype"], row["b_layout"]) == (
+                world_size,
+                dtype_name,
+                b_layout,
+            )
+            programs = loader.sequence_programs(name)
+            # The sequence compiles the route's device units (one each) with
+            # its launcher; the compile order carries no meaning.
+            assert len(row["sources"]) == len(programs) + 1
+            assert set(row["sources"][:-1]) == {
+                loader.PROGRAMS[program]["sources"][0] for program in programs
+            }
+            assert row["sources"][-1].startswith(
+                "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_"
+            )
+            assert row["sources"][-1].endswith(f"{name}.cu")
+            # Every sequence module compiles the SM push kernel: the route is per call (rows, world size).
+            assert loader.peer_push_program() in programs
+    assert set(loader.SEQUENCES) == expected
+    with pytest.raises(ValueError, match="host sequence"):
+        loader.sequence_name(16, "bfloat16", "n_major", "sm_100a")
+
+
+def test_every_program_is_delivered_for_both_architectures():
+    push = loader.peer_push_program()
+    assert loader.PROGRAMS[push]["arches"] == ["sm_100a", "sm_103a"]
     for phase in (0, 1):
         assert loader.PROGRAMS[loader.barrier_program(phase)]["arches"] == [
             "sm_100a",
@@ -80,22 +109,23 @@ def test_fused_copy_program_is_delivered_for_its_routed_architecture_only():
         assert loader.PROGRAMS[loader.main_program(world_size, dtype_name, b_layout)][
             "arches"
         ] == ["sm_100a", "sm_103a"]
+    sm103_sequence = loader.sequence_name(8, "bfloat16", "n_major", "sm_103a")
     loader.spec.cache_clear()
     try:
         with pytest.raises(ValueError, match="sm_100a"):
-            loader.spec(fused, "sm_100a")
+            loader.spec(sm103_sequence, "sm_100a")
     finally:
         loader.spec.cache_clear()
 
 
-def test_barrier_and_fused_copy_programs_use_static_shared_memory_only():
+def test_barrier_and_push_programs_use_static_shared_memory_only():
     for phase in (0, 1):
         program = loader.barrier_program(phase)
         assert loader.launch_block(program) == (32, 1, 1)
         assert loader.dynamic_smem_bytes(program) == 0
-    fused = loader.fused_peer_copy_program()
-    assert loader.launch_block(fused) == (128, 1, 1)
-    assert loader.dynamic_smem_bytes(fused) == 0
+    push = loader.peer_push_program()
+    assert loader.launch_block(push) == (128, 1, 1)
+    assert loader.dynamic_smem_bytes(push) == 0
 
 
 def test_main_programs_share_one_block_and_dynamic_shared_memory_contract():
@@ -144,86 +174,65 @@ def test_chunk_plan_pads_rows_and_pushes_at_most_nineteen_row_blocks_per_chunk(
 
 
 @pytest.mark.parametrize(
-    ("rows", "n", "partitions", "expected"),
+    ("rows", "n", "world_size", "sm_count", "expected"),
     [
-        (16384, 2048, 1, (19 * 8, 1, 1)),
-        (512, 2048, 1, (4 * 8, 1, 1)),
-        (512, 1280, 4, (4 * 5, 4, 1)),
-        (512, 2560, 1, (4 * 10, 1, 1)),
-        (125, 7168, 1, (1 * 28, 1, 1)),
-        (1025, 14336, 1, (9 * 56, 1, 1)),
+        (125, 1280, 8, 148, (40, 1, 1)),  # 8 x 1 x 5 tiles < SM count
+        (512, 1280, 8, 148, (148, 1, 1)),  # 8 x 4 x 5 = 160 tiles: one CTA per SM
+        (512, 2560, 4, 148, (148, 1, 1)),
+        (125, 7168, 2, 148, (56, 1, 1)),  # 2 x 1 x 28
+        (1025, 14336, 4, 148, (148, 1, 1)),
+        (125, 1280, 8, 160, (40, 1, 1)),
     ],
 )
-def test_main_grid_covers_the_first_padded_chunk_tiles(rows, n, partitions, expected):
-    assert loader.main_grid(rows, n, peer_partitions=partitions) == expected
+def test_main_grid_is_one_cta_per_sm_bounded_by_the_total_tiles(
+    rows, n, world_size, sm_count, expected
+):
+    assert (
+        loader.main_grid(rows, n, world_size=world_size, sm_count=sm_count) == expected
+    )
+
+
+def test_main_grid_requires_a_positive_world_size_and_sm_count():
+    with pytest.raises(ValueError, match="sm_count"):
+        loader.main_grid(512, 1280, world_size=8, sm_count=0)
+    with pytest.raises(ValueError, match="world_size"):
+        loader.main_grid(512, 1280, world_size=0, sm_count=148)
 
 
 @pytest.mark.parametrize(
-    ("arch", "dtype_name", "world_size", "rows", "n", "expected", "partitions"),
+    ("world_size", "rows", "cols", "expected"),
     [
-        ("sm_103a", "bfloat16", 8, 512, 1280, True, 4),
-        ("sm_100a", "bfloat16", 8, 512, 1280, False, 8),
-        ("sm_103a", "float16", 8, 512, 1280, False, 8),
-        # ten 256-wide N tiles: the wide serial local-first traversal
-        ("sm_103a", "bfloat16", 4, 512, 2560, False, 1),
-        ("sm_103a", "bfloat16", 8, 1024, 1280, False, 8),
-        ("sm_103a", "bfloat16", 8, 500, 1280, False, 8),
-        ("sm_103a", "bfloat16", 8, 512, 2048, False, 8),
+        (8, 125, 1280, True),
+        (8, 125, 7168, True),  # 128 padded rows serve N up to 10240
+        (8, 125, 10240, True),
+        (8, 125, 10496, False),  # one tile too wide
+        (8, 512, 1280, True),
+        (8, 512, 4096, True),  # 512 padded rows serve N up to 4096
+        (8, 512, 7168, False),  # the GEMM would wait behind the SM push: copy engines
+        (8, 513, 1280, False),  # pads to 640 rows
+        (8, 1024, 1280, False),
+        (4, 500, 2560, True),
+        (4, 125, 14336, False),
+        (4, 512, 14336, False),
+        (4, 256, 8192, True),  # 256 padded rows serve N up to 8192
+        (4, 256, 8448, False),
+        (4, 1025, 2048, False),
+        (2, 125, 1280, False),  # a single peer: the copy engine wins
+        (2, 512, 2048, False),
     ],
 )
-def test_fused_peer_copy_is_the_exact_sm103_tp8_packed_qkv_route(
-    arch, dtype_name, world_size, rows, n, expected, partitions
+def test_sm_push_serves_at_most_512_padded_rows_within_the_width_ceiling_at_ws4_and_ws8(
+    world_size, rows, cols, expected
 ):
-    assert (
-        loader.uses_fused_peer_copy(
-            arch=arch, dtype_name=dtype_name, world_size=world_size, rows=rows, n=n
-        )
-        is expected
-    )
-    # fused route: four partitions; N <= 2048 up to 8192 rows: every peer at once; wider: serial
-    assert (
-        loader.peer_partitions(
-            arch=arch,
-            dtype_name=dtype_name,
-            world_size=world_size,
-            rows=rows,
-            n=n,
-            fused=expected,
-        )
-        == partitions
-    )
-
-
-@pytest.mark.parametrize(
-    ("world_size", "rows", "n", "expected"),
-    [
-        (8, 512, 1280, 8),
-        (8, 4096, 1280, 8),
-        (8, 8192, 2048, 8),
-        (8, 16384, 2048, 1),
-        (8, 65536, 2048, 1),
-        (8, 125, 7168, 8),
-        (8, 512, 7168, 1),
-        (4, 2048, 14336, 1),
-        (4, 1025, 2048, 2),
-        (2, 125, 2048, 2),
-        (2, 1024, 2048, 2),
-    ],
-)
-def test_peer_partitions_runs_latency_bound_shapes_over_every_peer(
-    world_size, rows, n, expected
-):
-    assert (
-        loader.peer_partitions(
-            arch="sm_100a",
-            dtype_name="bfloat16",
-            world_size=world_size,
-            rows=rows,
-            n=n,
-            fused=False,
-        )
-        == expected
-    )
+    assert loader.uses_sm_push(rows=rows, world_size=world_size, cols=cols) is expected
+    assert loader.SM_PUSH_MAX_ROWS == 512
+    assert (loader.SM_PUSH_COLS_INTERCEPT, loader.SM_PUSH_COLS_PER_ROW) == (12288, 16)
+    assert [loader.sm_push_max_cols(rows) for rows in (128, 256, 384, 512)] == [
+        10240,
+        8192,
+        6144,
+        4096,
+    ]
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
@@ -237,12 +246,19 @@ def test_spec_names_carry_the_exact_architecture(monkeypatch):
     monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a")
     loader.spec.cache_clear()
     try:
-        program = loader.main_program(2, "bfloat16", "n_major")
-        for arch in loader.PROGRAMS[program]["arches"]:
-            spec = loader.spec(program, arch)
-            assert spec.name == f"{program}_{arch}"
+        specs = {}
+        for arch in ("sm_100a", "sm_103a"):
+            sequence = loader.sequence_name(2, "bfloat16", "n_major", arch)
+            spec = loader.spec(sequence, arch)
+            assert spec.name == f"{loader.SOURCE_PACKAGE}_sequence_{sequence}"
+            assert sequence.endswith(arch)
             assert loader.ARCH_FLAGS[arch][0] in spec.extra_cuda_cflags
-        assert loader.spec(program, "sm_100a") is not loader.spec(program, "sm_103a")
+            assert [str(path).split("/")[-1] for path in spec.sources] == [
+                source.split("/")[-1]
+                for source in loader.SEQUENCES[sequence]["sources"]
+            ]
+            specs[arch] = spec
+        assert specs["sm_100a"] is not specs["sm_103a"]
     finally:
         loader.spec.cache_clear()
 
@@ -328,6 +344,19 @@ class _CudaLike:
 
     def is_contiguous(self):
         return self._contiguous
+
+    def t(self):
+        return _CudaLike(
+            self._shape[::-1],
+            self.dtype,
+            contiguous=self._contiguous and self.ndim < 2,
+            index=self.device.index,
+            stride=self._stride[::-1],
+        )
+
+    def view(self, *shape):
+        # Metadata-only reshape of a dense (possibly transposed-to-dense) view.
+        return _CudaLike(shape, self.dtype, index=self.device.index)
 
 
 def _k_major_weight(n, dtype=torch.bfloat16):
@@ -516,6 +545,9 @@ def test_prepared_launcher_serves_every_row_count_up_to_its_capacity(monkeypatch
         state=state,
         workspace=workspace,
     )
+    # The frozen launcher resolves the weight's tensor-map source view once.
+    assert launcher.weight_source is not None
+    assert tuple(launcher.weight_source.shape) == (1, 1280, 8192)
     for rows in (1, 125, 512, 1025, 2048):
         bound = launcher._validate_input(_CudaLike((rows, 8192), torch.bfloat16))
         assert (bound.rows, bound.n, bound.b_layout) == (rows, 1280, "k_major")
@@ -545,7 +577,7 @@ def test_launch_refuses_a_workspace_smaller_than_the_padded_rows():
     assert state.poisoned is False
 
 
-def test_cross_stream_join_records_a_fresh_event_and_skips_capture():
+def test_cross_stream_join_records_a_fresh_event_and_skips_capture(monkeypatch):
     """The join must never reuse an event that a CUDA graph capture re-recorded."""
 
     assert not hasattr(backend._LaunchState, "tail_event")
@@ -558,66 +590,153 @@ def test_cross_stream_join_records_a_fresh_event_and_skips_capture():
         def wait_stream(self, other):
             self.joined.append(other)
 
-    state = backend._LaunchState(rank=0, world_size=2)
     first, second, third = _Stream(11), _Stream(22), _Stream(33)
-    assert backend._join_previous_tail(state, first, capturing=False) is False
-    state.tail_stream = first
-    assert backend._join_previous_tail(state, first, capturing=False) is False
-    assert backend._join_previous_tail(state, second, capturing=True) is False
-    assert backend._join_previous_tail(state, second, capturing=False) is True
+    current = {11: first, 22: second, 33: third}
+    monkeypatch.setattr(
+        backend.torch.cuda, "current_stream", lambda index: current[handles[-1]]
+    )
+    handles = [11]
+    state = backend._LaunchState(rank=0, world_size=2)
+    assert backend._join_previous_tail(state, 11, 0, capturing=False) is False
+    backend._remember_tail(state, 11, 0)
+    assert state.tail_stream is first and state.tail_handle == 11
+    assert backend._join_previous_tail(state, 11, 0, capturing=False) is False
+    handles.append(22)
+    assert backend._join_previous_tail(state, 22, 0, capturing=True) is False
+    assert backend._join_previous_tail(state, 22, 0, capturing=False) is True
     assert second.joined == [first] and first.joined == []
-    state.tail_stream = second
-    assert backend._join_previous_tail(state, third, capturing=True) is False
+    backend._remember_tail(state, 22, 0)
+    assert state.tail_stream is second
+    handles.append(33)
+    assert backend._join_previous_tail(state, 33, 0, capturing=True) is False
     assert third.joined == []
+    # Re-remembering the same stream keeps the cached torch stream object.
+    backend._remember_tail(state, 22, 0)
+    assert state.tail_stream is second
 
 
-def test_barrier_launches_inside_the_main_stream_binding_of_the_call_device(
-    monkeypatch,
-):
-    """The tensor-less barrier launcher gets no stream from its arguments; the backend binds one."""
+class _Recording:
+    def __init__(self, *, index=0):
+        self.device = torch.device("cuda", index)
+        self.streams = []
 
-    bindings = []
+    def record_stream(self, stream):
+        self.streams.append(stream)
 
-    class _Binding:
-        def __init__(self, device, stream):
-            self.device, self.stream, self.active = device, stream, False
 
-        def __enter__(self):
-            self.active = True
-            bindings.append(self)
-            return self
+def _launch_fixture(monkeypatch, *, rows, n, world_size, arch, b_layout="n_major"):
+    call = backend._Call(0, 1, world_size, "g", "bfloat16", arch, rows, n, b_layout)
+    state = backend._LaunchState(rank=1, world_size=world_size, flag_peers=("flags",))
+    workspace = backend._Workspace(
+        dtype=torch.bfloat16,
+        rank=1,
+        world_size=world_size,
+        device_index=0,
+        pitch=max(2048, backend.loader.padded_rows(rows)),
+    )
+    workspace.scratch = "scratch"
+    workspace.signal_pad = "signal_pad"
+    workspace.comm_stream = "comm_stream"
+    workspace.comm_handle = 77
+    workspace.peer_scratch_ptrs = ("peer_scratch",)
+    workspace.peer_signal_ptrs = ("peer_signals",)
+    workspace.push_buffers = ("payload", "signals", "counters")
 
-        def __exit__(self, *exc):
-            self.active = False
-            return False
-
-    class _Barrier:
+    class _Sequence:
         def __init__(self):
-            self.runs = []
+            self.calls = []
 
         def run(self, *args):
-            self.runs.append((args, [binding.active for binding in bindings]))
+            self.calls.append(("run", args))
 
+        def run_push(self, *args):
+            self.calls.append(("run_push", args))
+
+    sequence = _Sequence()
+    workspace.sequences = {b_layout: sequence}
+    monkeypatch.setattr(backend, "_current_stream_handle", lambda index: 4242)
     monkeypatch.setattr(
-        backend.tvm_ffi,
-        "use_raw_stream",
-        lambda device, stream: _Binding(device, stream),
+        backend.torch.cuda, "is_current_stream_capturing", lambda: False
     )
-    call = backend._Call(
-        device_index=1,
-        rank=1,
-        world_size=2,
-        group_name="g",
-        dtype_name="bfloat16",
-        arch="sm_100a",
-        rows=256,
-        n=2048,
-        b_layout="n_major",
+    monkeypatch.setattr(backend, "_remember_tail", lambda state, handle, index: None)
+    return call, state, workspace, sequence
+
+
+def test_launch_is_one_host_sequence_call_with_the_workspace_tables(monkeypatch):
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=1025, n=2048, world_size=4, arch="sm_100a"
     )
-    state = backend._LaunchState(rank=1, world_size=2, flag_peers=("peer-table",))
-    barrier = _Barrier()
-    backend._run_barrier(barrier, call, SimpleNamespace(cuda_stream=4242), state)
-    assert barrier.runs == [((1, 2, 1, ("peer-table",), 1, 1, 1), [True])]
-    assert [
-        (binding.device, binding.stream, binding.active) for binding in bindings
-    ] == [(backend.tvm_ffi.device("cuda", 1), 4242, False)]
+    inp = _Recording()
+    backend._launch(state, workspace, call, inp, "w_source", "out")
+    grid = backend.loader.main_grid(
+        1025, 2048, world_size=4, sm_count=backend.loader.device_facts(0).sm_count
+    )
+    assert sequence.calls == [
+        (
+            "run",
+            (
+                inp,
+                "scratch",
+                "w_source",
+                "out",
+                "signal_pad",
+                ("flags",),
+                ("peer_scratch",),
+                ("peer_signals",),
+                1,
+                1025,
+                workspace.pitch,
+                0,
+                1,
+                *grid,
+                4242,
+                77,
+            ),
+        )
+    ]
+    # The pushes read ``inp`` on the communication stream.
+    assert inp.streams == ["comm_stream"]
+    assert (state.next_phase, state.ready_epoch) == (1, 1)
+    backend._launch(state, workspace, call, inp, "w_source", "out")
+    assert sequence.calls[-1][1][11:13] == (1, 2)
+    assert (state.next_phase, state.ready_epoch) == (0, 2)
+    assert state.poisoned is False
+
+
+def test_small_rows_use_the_sm_push_sequence_entry_on_the_callers_stream(monkeypatch):
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=512, n=1280, world_size=8, arch="sm_103a"
+    )
+    inp = _Recording()
+    backend._launch(state, workspace, call, inp, "w_source", "out")
+    (entry, args) = sequence.calls[0]
+    assert entry == "run_push"
+    assert args[6:9] == ("payload", "signals", "counters")
+    assert args[12:14] == (0, 1)
+    # No communication stream is involved on the SM push route.
+    assert inp.streams == []
+    assert state.next_phase == 1 and state.ready_epoch == 1
+
+
+def test_launch_refuses_an_unprepared_layout_without_poisoning(monkeypatch):
+    call, state, workspace, _sequence = _launch_fixture(
+        monkeypatch, rows=256, n=2048, world_size=2, arch="sm_100a"
+    )
+    workspace.sequences = {}
+    with pytest.raises(RuntimeError, match="host sequence"):
+        backend._launch(state, workspace, call, _Recording(), "w_source", "out")
+    assert state.poisoned is False
+
+
+def test_sequence_failure_poisons_the_launch_state(monkeypatch):
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=256, n=2048, world_size=2, arch="sm_100a"
+    )
+
+    def failing(*args):
+        raise RuntimeError("boom")
+
+    sequence.run = failing
+    with pytest.raises(RuntimeError, match="boom"):
+        backend._launch(state, workspace, call, _Recording(), "w_source", "out")
+    assert state.poisoned is True

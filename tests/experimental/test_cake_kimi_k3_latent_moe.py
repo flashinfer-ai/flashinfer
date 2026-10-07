@@ -25,6 +25,7 @@ from flashinfer.experimental.kimi_k3_latent_moe.cake_backend import (
     HIDDEN,
     LATENT,
     NUM_EXPERTS,
+    QUALIFIED_SM_COUNTS,
     RMS_EPS,
     SHARED_INTERMEDIATE,
     SM_COUNT,
@@ -172,6 +173,22 @@ def test_split_plan_rules():
         sk["num_items"] == 148 + -(-76 * 152 // 157)
         and 1 < sk["sk_max_seg"] <= cb.MAX_SEG
     )
+    # Minimum stream-K saving: on 152 SMs the TP1 T=4096 / T=8192 regions (448 / 896 pair tiles on 76
+    # resident clusters) leave a near-whole remainder wave whose cut saves 4 / 20 iterations on paper and loses 3.6-4.8 %
+    # on the device, so they stay whole-tile; T=16384 (1792 tiles, saving 52) and the 148-SM rows above keep their cut.
+    assert (
+        split_plan(448, 152, 152, 8)["sk_tiles"] == 0
+        and split_plan(448, 152, 152, 8)["num_items"] == 448
+    )
+    assert (
+        split_plan(896, 152, 152, 8)["sk_tiles"] == 0
+        and split_plan(896, 152, 152, 8)["num_items"] == 896
+    )
+    assert split_plan(1792, 152, 152, 8)["sk_tiles"] > 0
+    assert (
+        split_plan(448, 152, SM_COUNT, 8)["sk_tiles"] > 0
+        and split_plan(896, 152, SM_COUNT, 8)["sk_tiles"] > 0
+    )
 
 
 def test_front_split_plan_rules():
@@ -287,8 +304,11 @@ COVERAGE_TOKENS = tuple(range(1, 1025)) + tuple(range(1025, 16385, 97)) + (16384
 COVERAGE_PARTIALS = (1, 2, 4)
 
 
-def test_route_keys_are_registered_for_every_token_count():
-    """Every route of the public contract resolves to a registered program (no token-range holes)."""
+@pytest.mark.parametrize("sm_count", QUALIFIED_SM_COUNTS)
+def test_route_keys_are_registered_for_every_token_count(sm_count):
+    """Every route of the public contract resolves to a registered program on every qualified SM
+    count (no token-range holes; the 152-SM plans differ from the 148-SM plans only in runtime
+    values -- stream-K windows, resident pairs -- never in the program they launch)."""
     assert MODULES and KERNELS
     arches = cake_jit.registered_arches()
     assert set(arches) <= set(SUPPORTED_COMPUTE_CAPABILITIES.values()) and arches
@@ -296,11 +316,11 @@ def test_route_keys_are_registered_for_every_token_count():
     for stage in ("front", "tail"):
         for tp in SUPPORTED_TP:
             for tokens in COVERAGE_TOKENS:
-                keys = route_kernel_keys(stage, tp, tokens)
+                keys = route_kernel_keys(stage, tp, tokens, sm_count)
                 assert 1 <= len(keys) <= 2
                 for key in keys:
                     assert key in KERNELS, (
-                        f"{stage} tp{tp} T={tokens}: {key} is not registered"
+                        f"{stage} tp{tp} T={tokens} on {sm_count} SMs: {key} is not registered"
                     )
                     reached.add(KERNELS[key])
                 for arch in arches:
@@ -308,11 +328,18 @@ def test_route_keys_are_registered_for_every_token_count():
     for tp in SUPPORTED_TP:
         for num_partials in COVERAGE_PARTIALS:
             for tokens in range(1, DECODE_MAX_T + 1):
-                key = decode_kernel_key(
-                    decode_tail_plan(tokens, i_local_for_tp(tp), tp, num_partials)
+                keys = route_kernel_keys("tail", tp, tokens, sm_count, num_partials)
+                assert keys == (
+                    decode_kernel_key(
+                        decode_tail_plan(
+                            tokens, i_local_for_tp(tp), tp, num_partials, sm_count
+                        )
+                    ),
                 )
-                assert key in KERNELS, f"tail tp{tp} T={tokens} P={num_partials}: {key}"
-                reached.add(KERNELS[key])
+                assert keys[0] in KERNELS, (
+                    f"tail tp{tp} T={tokens} P={num_partials} on {sm_count} SMs: {keys[0]}"
+                )
+                reached.add(KERNELS[keys[0]])
     # Every registered program is reachable, serves every registered architecture once and carries
     # a complete launch contract.
     assert reached == set(MODULES)
@@ -336,6 +363,68 @@ def test_route_keys_are_registered_for_every_token_count():
         route_kernel_keys("front", 4, 8)
     with pytest.raises(ValueError):
         route_kernel_keys("block", 1, 8)
+    with pytest.raises(ValueError):
+        route_kernel_keys("tail", 8, 8, sm_count, 0)
+
+
+def test_plans_follow_the_device_sm_count():
+    """152-SM parts (GB200 / GB300) re-plan the resident-pair windows from their own count; the
+    decode grids are tile-bound and identical on both qualified counts."""
+    for tp in SUPPORTED_TP:
+        il = i_local_for_tp(tp)
+        for tokens in (1, 8, 16, 64, 128):
+            assert decode_front_plan(tokens, il, 148) == decode_front_plan(
+                tokens, il, 152
+            )
+            for num_partials in COVERAGE_PARTIALS:
+                assert decode_tail_plan(
+                    tokens, il, tp, num_partials, 148
+                ) == decode_tail_plan(tokens, il, tp, num_partials, 152)
+    assert decode_front_plan(1, i_local_for_tp(8), 152)["grid"] == 94
+    assert decode_front_plan(1, i_local_for_tp(1), 152)["grid"] == 131
+    assert decode_tail_plan(1, i_local_for_tp(8), 8, 1, 152)["grid"] == 112
+    # Prefill: 76 resident pairs instead of 74 change the trailing-wave plan of these contract
+    # rows (the programs stay the same; the values are launch arguments).
+    assert prefill_tail_plan(2048, 1, 148)["sk_tiles"] == 76
+    assert prefill_tail_plan(2048, 1, 152)["sk_tiles"] == 0
+    assert prefill_tail_plan(2048, 1, 152)["full_items"] == 224
+    assert prefill_tail_plan(1024, 1, 152)["full_items"] == 76
+    assert prefill_front_plan(1024, i_local_for_tp(1), 148)["sk_tiles"] == 0
+    assert prefill_front_plan(1024, i_local_for_tp(1), 152)["sk_tiles"] == 36
+    for tp in SUPPORTED_TP:
+        for tokens in (256, 512, 300, 4096, 16384):
+            assert route_kernel_keys("front", tp, tokens, 148) == route_kernel_keys(
+                "front", tp, tokens, 152
+            )
+            assert route_kernel_keys("tail", tp, tokens, 148) == route_kernel_keys(
+                "tail", tp, tokens, 152
+            )
+
+
+def test_generated_program_available_follows_partials_and_sm_count(monkeypatch):
+    """The availability answer resolves the exact route ``prepare`` would require: the caller's
+    routed-partial count selects the decode tail instance (flashinfer-ai/flashinfer#4568)
+    and an unqualified SM count is never admitted."""
+    device = torch.device("cuda", 0)
+    for sm_count in QUALIFIED_SM_COUNTS:
+        monkeypatch.setattr(cb, "_device_facts", lambda index, c=sm_count: ((10, 3), c))
+        if MODULES:
+            assert cb.generated_program_available(device)
+            for num_partials in COVERAGE_PARTIALS:
+                expected = cake_jit.route_available(
+                    "sm_103a", route_kernel_keys("tail", 8, 16, sm_count, num_partials)
+                )
+                assert (
+                    cb.generated_program_available(device, "tail", 8, 16, num_partials)
+                    is expected
+                )
+        assert cb.generated_program_available(device, "front", 4, 16) is False
+        assert cb._device_sm_count(device) == (0, sm_count)
+    monkeypatch.setattr(cb, "_device_facts", lambda index: ((10, 3), 132))
+    assert cb.generated_program_available(device) is False
+    assert cb.generated_program_available(device, "tail", 8, 16) is False
+    with pytest.raises(NotImplementedError, match="132"):
+        cb._device_sm_count(device)
 
 
 def test_route_rules_select_the_expected_programs():
@@ -464,15 +553,19 @@ def _gpu_arch():
     return SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(0))
 
 
-def _require_program(stage, tp, tokens):
+def _require_program(stage, tp, tokens, num_partials=1):
     arch = _gpu_arch()
     if arch is None:
         pytest.skip("the Kimi-K3 LatentMoE programs require an SM100/SM103 GPU")
     device = torch.device("cuda", 0)
-    if int(torch.cuda.get_device_properties(0).multi_processor_count) != SM_COUNT:
-        pytest.skip(f"the plan rules were frozen for {SM_COUNT} SMs")
-    assert cb.generated_program_available(device, stage, tp, tokens), (
-        f"the generated {stage} program for {arch} (tp {tp}, T {tokens}) is not registered"
+    sm_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    if sm_count not in QUALIFIED_SM_COUNTS:
+        pytest.skip(
+            f"the programs are qualified for {QUALIFIED_SM_COUNTS} SMs, not {sm_count}"
+        )
+    assert cb.generated_program_available(device, stage, tp, tokens, num_partials), (
+        f"the generated {stage} program for {arch} (tp {tp}, T {tokens}, P {num_partials}) "
+        "is not registered"
     )
     return device
 
@@ -774,7 +867,7 @@ def test_tail_tp8_between_the_single_wave_rows(tokens):
 def test_tail_decode_sums_routed_partials(tokens, num_partials):
     """The fused decode tail reduces P >= 2 routed partials on device before the norm."""
     tp, rank = 8, 1
-    device = _require_program("tail", tp, tokens)
+    device = _require_program("tail", tp, tokens, num_partials)
     w, routed, shared_act, out, y = _tail_case(
         device, tp, rank, tokens, num_partials, 1000 + tokens * 10 + num_partials
     )
