@@ -168,6 +168,10 @@ def test_fused_training_mxfp8(monkeypatch, variant):
     )
     forward = MoKForwardMxfp8()
     backward = MoKBackwardMxfp8(wgrad_f32=GEOMETRIES[variant][0][5])
+    # The hosts drop their ring references after each launch by default; this
+    # test inspects the dispatched and saved tiles, so it keeps them.
+    forward.keep_rings = True
+    backward.keep_rings = True
     for geometry in GEOMETRIES[variant]:
         _check_geometry(forward, backward, *geometry)
 
