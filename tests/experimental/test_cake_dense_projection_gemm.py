@@ -1816,6 +1816,37 @@ def test_round19_rules_plan_like_the_cake_launcher(T):
         assert not short.sk_sync and short.sk_slab == 0 and "_sb" not in short.template
 
 
+@pytest.mark.parametrize("T", [16172, 16231])
+def test_round20_rules_plan_like_the_cake_launcher(T):
+    # the round-20 sm_100a rule (Cake e7494f02f70): the shared_down input gradient bf16 (G @ W, 2048 x 6144 x T)
+    # takes the raster group 8 like the fp32 shared_down input gradient and the q_a / shared_gate_up input gradients
+    # (kn, 6144 x 2048) - a launch parameter of the unchanged ``kn_n256`` program (16 is the row's former default);
+    # sm_107a keeps its round-19 rules
+    key = ("sm_100a", False, True, False, False, False, 2048, 6144, None)
+    assert ROW_RULES[key] == {"group_m": 8}
+    assert ROW_RULES[
+        ("sm_100a", False, True, False, False, False, 6144, 2048, None)
+    ] == {"group_m": 8}
+    assert len(ROW_RULES) == 98
+    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 49
+    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 49
+    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
+    v = _views("proj", "shared_down", "dgrad", "bf16", T)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+    assert plan.template == "dense_proj_gemm_kn_n256" and not plan.cta1
+    assert plan.group_m == 8
+    assert (
+        default_group_m(False, True, plan.m_tiles, plan.pair_tiles, plan.sm_pairs) == 16
+    )
+    # a caller-forced raster group overrides the rule on the same program
+    forced, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], group_m=16, **kw)
+    assert forced.template == plan.template and forced.group_m == 16
+    # the shared_down forward (X @ W^T, 6144 x 2048) has no rule and keeps the 16-row default on ``kk_n256``
+    f = _views("proj", "shared_down", "fwd", "bf16", T)
+    fwd, *_ = plan_dense_projection_gemm(f["A"], f["B"], f["out"], **kw)
+    assert fwd.group_m == 16 and fwd.template == "dense_proj_gemm_kk_n256"
+
+
 def test_wave_working_set_and_hint_rule():
     # o_proj forward at T = 16231 (m_tiles = 128, n_tiles = 24, K = 16384) on 74 pairs: a raster band of
     # 8 pair rows x 24 column tiles exceeds the wave, so the wave covers 8 pair-row panels and

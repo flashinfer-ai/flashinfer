@@ -832,6 +832,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 16384, 2048, None): {"group_m": 32},
     ('sm_100a', False, False, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
     ('sm_100a', False, False, False, False, True, 256, 512, None): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b'},
+    ('sm_100a', False, True, False, False, False, 2048, 6144, None): {"group_m": 8},
     ('sm_100a', False, True, False, False, False, 2048, 16384, None): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True},
     ('sm_100a', False, True, False, False, False, 6144, 32, None): {"slots": 2, "pd": 2},
     ('sm_100a', False, True, False, False, False, 6144, 128, None): {"slots": 2, "pd": 2},
