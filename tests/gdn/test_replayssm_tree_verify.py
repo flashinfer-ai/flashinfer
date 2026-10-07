@@ -9,6 +9,11 @@ The chain parent array ``[-1, 0, 1, ...]`` must reproduce the chain path
 exactly, which is the tightest available cross-check on the masked form.
 """
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -161,3 +166,42 @@ def test_tree_differs_from_chain_where_the_tree_forks():
     assert _rel(forked[:, 0], chain[:, 0].double()) < 5e-3
     # Every later node has a different ancestor set, so it must not.
     assert _rel(forked[:, 1:], chain[:, 1:].double()) > 1e-2
+
+
+def _run_child_with_validation(parents):
+    env = dict(os.environ, FLASHINFER_VALIDATE_VERIFY_PARENTS="1")
+    return subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--validate-parents",
+            ",".join(str(p) for p in parents),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        env=env,
+    )
+
+
+def test_validation_flag_accepts_trees_and_rejects_a_forward_parent():
+    """Opt-in device-side check; a device assert is sticky, so run in a child."""
+    good = _run_child_with_validation(TREES["topk4_depth2"])
+    assert good.returncode == 0, good.stdout + good.stderr
+    bad = _run_child_with_validation([-1, 2, 1, 2, 3, 4, 5, 6])
+    combined = bad.stdout + bad.stderr
+    assert bad.returncode != 0, combined
+    assert any(
+        marker in combined
+        for marker in ("device-side assert", "CUDA error", "_assert_async_cuda_kernel")
+    ), combined
+
+
+if (
+    __name__ == "__main__"
+    and len(sys.argv) == 3
+    and sys.argv[1] == "--validate-parents"
+):
+    _args, _cache = _inputs()
+    _run(_args, _cache, [int(p) for p in sys.argv[2].split(",")])
+    torch.cuda.synchronize()
