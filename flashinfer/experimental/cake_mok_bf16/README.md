@@ -111,11 +111,14 @@ for unequal lengths, empty ranks, count changes and graph reuse.
   and intermediate widths are positive multiples of 256. Common physical
   source capacity is aligned for tiles/metadata and is at least 512 rows. Communication-SM
   counts are positive and even, leaving compute SMs available. When they are not given,
-  `create_mok_bf16_workspace` uses the measured per-precision defaults: 24 forward / 28
-  backward communication SMs for BF16 and 40 / 40 for MXFP8 (B200, EP4 GLM-5.2 shape,
-  complete training step; the MXFP8 kernels move half the activation bytes per compute
-  tile and shift the optimum towards communication). Pass `precision="mxfp8"` to the
-  factory for an MXFP8 workload, or set the counts explicitly.
+  `create_mok_bf16_workspace` uses the measured per-precision defaults: 20 forward / 24
+  backward communication SMs for BF16 and 40 / 32 for MXFP8 (B200, EP4 GLM-5.2 shape,
+  complete training step, 3 counterbalanced groups; BF16 sweep 16/24 35.56 ms, 20/20 34.35,
+  20/24 34.18, 20/28 34.35, 24/24 34.45-34.53, 24/28 34.57, 28/24 34.71, 24/32 34.88,
+  24/36 35.14; MXFP8 sweep 32/32 26.56, 36/32 25.93, 40/24 26.71, 40/28 26.04, 40/32 25.98,
+  40/40 26.17, 40/48 26.44, 40/56 26.76. The MXFP8 kernels move half the activation
+  bytes per compute tile and shift the optimum towards communication). Pass
+  `precision="mxfp8"` to the factory for an MXFP8 workload, or set the counts explicitly.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
 - An EP16 workload can use 16,384 source tokens per rank (262,144 global), hidden width

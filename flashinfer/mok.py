@@ -62,8 +62,8 @@ def mxfp8_quantize(x_bf16, return_normal=True, return_transposed=True):
 
 
 # Communication SMs (forward, backward) per precision: the splits at which the complete
-# training step is fastest on B200 (EP4 GLM-5.2 shape sweep; backend README).
-COMM_SMS_DEFAULTS = {"bf16": (24, 28), "mxfp8": (40, 40)}
+# training step is fastest on B200 (EP4 GLM-5.2 shape sweeps of each kernel pair; backend README).
+COMM_SMS_DEFAULTS = {"bf16": (20, 24), "mxfp8": (40, 32)}
 
 
 @flashinfer_experimental_api
@@ -94,9 +94,9 @@ def create_mok_bf16_workspace(
 
     ``fwd_num_comm_sms`` / ``bwd_num_comm_sms`` left ``None`` take the measured
     default of ``precision`` (``"bf16"`` or ``"mxfp8"``): the BF16 kernels run
-    their communication clusters on 24 (forward) / 28 (backward) SMs, the
-    MXFP8 kernels on 40 / 40, which is where their steps are fastest on B200
-    (see the backend README). The precision only selects these defaults; the
+    their communication clusters on 20 (forward) / 24 (backward) SMs, the
+    MXFP8 kernels on 40 / 32, which is where their complete training steps
+    are fastest on B200 (see the backend README). The precision only selects these defaults; the
     kernels a call runs are chosen by the weights passed to it.
     """
     from .experimental.cake_mok_bf16.workspace import MoKConfig
