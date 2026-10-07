@@ -245,13 +245,31 @@ def run(q, k, cu_seqlens_q, page_table, seqused_k, max_score):
     G = Hq // Hkv
     KPS = k.stride(0)
     KHS = k.stride(1)
+    # sQb is allocated as exactly 16 rows of shared memory and is indexed by the
+    # (GQA group x decode token) pair, so anything wider would write past it.
+    if G * SQ > 16:
+        raise NotImplementedError(
+            f"SM90 bf16 proxy decode supports G*seqlen_q <= 16, got G={G} seqlen_q={SQ}"
+        )
+
+    # Same bound as the fp8 decode driver: max_score is (Hq, max_k_tiles, total_q)
+    # sized from the longest sequence, while page_table is a persistent allocation
+    # sized to max_model_len and therefore wider. Sweeping the page table's width
+    # walks past the end of max_score.
+    nkt = int(max_score.shape[1])
+    if page_table.shape[1] < nkt:
+        raise ValueError(
+            f"page_table has {page_table.shape[1]} tile columns but max_score "
+            f"expects {nkt}"
+        )
+    page_table = page_table[:, :nkt]
 
     # How much of the (max_k_tiles, B) rectangle is past the end of a ragged
     # sequence is known here without touching the device: num_pages is k.shape[0]
     # and every page belongs to exactly one sequence.  Only sweep several tiles
     # per CTA when that ratio is high enough for the saved block launches to beat
     # the loss of cross-tile overlap.
-    tiles = B * page_table.shape[1]
+    tiles = B * nkt
     waste = tiles / max(1, k.shape[0])
     tpb = 4 if (tiles >= 2048 and waste >= 2.5) else 1
 
