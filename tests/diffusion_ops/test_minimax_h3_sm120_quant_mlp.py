@@ -36,7 +36,7 @@ kernel's own quantized operand:
 """
 
 import math
-from typing import Dict, Tuple
+from typing import Dict
 
 import pytest
 import torch
@@ -69,7 +69,6 @@ from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_mlp import (
     FFN_SF_COLS,
     FP8_MMA_FORM_LEGACY,
     FP8_MMA_FORM_MXF8F6F4,
-    MINIMAX_H3_FC2_BLOCK_M,
     minimax_h3_mlp_fc2_flags_sm120,
 )
 from flashinfer.diffusion_ops.minimax_h3_fc1_swiglu import (
@@ -215,7 +214,9 @@ def swiglu_from_scaled(a, w_t, a_scale=None, w_scale=None, alpha=None):
         return out
 
 
-def fc2_gated_residual(y_scaled_fn, w2_t, model, idx, residual, y_scale=None, w_scale=None, alpha=None):
+def fc2_gated_residual(
+    y_scaled_fn, w2_t, model, idx, residual, y_scale=None, w_scale=None, alpha=None
+):
     """``o = BF16(FC2)``, ``p = BF16(gate[i] * o)``, ``out = BF16(residual + p)`` in row chunks.
     ``y_scaled_fn(r0, r1)`` yields the FP32 FC2 A operand rows (codes, or ``q * sf`` for NVFP4)."""
     rows = residual.shape[0]
@@ -264,7 +265,9 @@ def assert_within_budget(y, ref, what: str) -> Dict[str, float]:
     return stats
 
 
-def assert_output_within_budget(out, ref: Dict[str, torch.Tensor], what: str) -> Dict[str, float]:
+def assert_output_within_budget(
+    out, ref: Dict[str, torch.Tensor], what: str
+) -> Dict[str, float]:
     """``out`` against the reference math on the kernel's ``y_q``: within ``atol + rtol * max(|ref|, |p|)``
     plus one BF16 ulp of ``o`` scaled by the gate (the FC2 accumulation order flips ``o`` by an ulp on a
     ~1e-6 fraction of the elements; ``|o|`` can exceed ``|out|``) plus the round points of ``p`` and
@@ -286,7 +289,9 @@ def assert_output_within_budget(out, ref: Dict[str, torch.Tensor], what: str) ->
     stats = {
         "numel": numel,
         "violations": int(bad.sum().item()),
-        "budget": max(MAX_VIOLATIONS_FLOOR, int(math.ceil(MAX_VIOLATION_FRACTION * numel))),
+        "budget": max(
+            MAX_VIOLATIONS_FLOOR, int(math.ceil(MAX_VIOLATION_FRACTION * numel))
+        ),
         "max_abs_err": float(diff.max().item()),
         "mean_abs_err": float(diff.mean().item()),
         "strict_violations": int((diff > (ATOL + RTOL * r.abs())).sum().item()),
@@ -392,9 +397,13 @@ def assert_fp8_stage2(y_q, y_scale, y_kernel, y_ref) -> Dict[str, float]:
         own_violations += int((err_own > half + 2.0**-20 * own32.abs()).sum().item())
         max_err_own = max(max_err_own, float(err_own.max().item()))
         err_ref = (deq - ref32).abs()
-        ref_violations += int((err_ref > half + bf16_ulp(ref32) + ATOL + RTOL * ref32.abs()).sum().item())
+        ref_violations += int(
+            (err_ref > half + bf16_ulp(ref32) + ATOL + RTOL * ref32.abs()).sum().item()
+        )
         max_err_ref = max(max_err_ref, float(err_ref.max().item()))
-    budget = max(MAX_VIOLATIONS_FLOOR, int(math.ceil(MAX_VIOLATION_FRACTION * y_ref.numel())))
+    budget = max(
+        MAX_VIOLATIONS_FLOOR, int(math.ceil(MAX_VIOLATION_FRACTION * y_ref.numel()))
+    )
     assert own_violations <= budget, (
         f"fp8 y codes are not the nearest E4M3 of the kernel's y / scale: {own_violations} violations "
         f"(budget {budget}), max err {max_err_own:.4g}"
@@ -553,13 +562,19 @@ def assert_nvfp4_stage2(y_q, y_sf, y_ref, g_y) -> Dict[str, float]:
         scale_violations += int(scale_bad.sum().item())
         vals, mag = e2m1_unpack(y_q[r0:r1])
         half_step = torch.where(mag < 2.0, 0.25, torch.where(mag < 4.0, 0.5, 1.0))
-        unit = (sf_k / g)[..., None].expand(r1 - r0, -1, MINIMAX_H3_SF_BLOCK).reshape(r1 - r0, -1)
+        unit = (
+            (sf_k / g)[..., None]
+            .expand(r1 - r0, -1, MINIMAX_H3_SF_BLOCK)
+            .reshape(r1 - r0, -1)
+        )
         deq = vals * unit
         bound = half_step * unit + bf16_ulp(ref32) + ATOL + RTOL * ref32.abs()
         err = (deq - ref32).abs()
         value_violations += int((err > bound).sum().item())
         max_err = max(max_err, float(err.max().item()))
-    budget = max(MAX_VIOLATIONS_FLOOR, int(math.ceil(MAX_VIOLATION_FRACTION * y_ref.numel())))
+    budget = max(
+        MAX_VIOLATIONS_FLOOR, int(math.ceil(MAX_VIOLATION_FRACTION * y_ref.numel()))
+    )
     assert scale_violations <= MAX_SCALE_MISMATCH_FLOOR, (
         f"nvfp4 stage-2 y block scales off by more than one UE4M3 code: {scale_violations}"
     )
@@ -567,7 +582,11 @@ def assert_nvfp4_stage2(y_q, y_sf, y_ref, g_y) -> Dict[str, float]:
         f"nvfp4 stage-2 y beyond its bound: {value_violations} violations (budget {budget}), "
         f"max err {max_err:.4g}"
     )
-    return {"scale_violations": scale_violations, "violations": value_violations, "max_err": max_err}
+    return {
+        "scale_violations": scale_violations,
+        "violations": value_violations,
+        "max_err": max_err,
+    }
 
 
 # --------------------------------------------------------------------------------------------
@@ -665,7 +684,9 @@ def test_prepare_fc2_weight_nvfp4_matches_nvfp4_quantize(model, prepared_nvfp4):
     _q_ref, sf_ref, _ct, scale_tie = nvfp4_quantize_emulated(
         model["fc2_weight"], prepared_nvfp4["g_w2"]
     )
-    sf_lin = _unswizzle_sf_128x4(prepared_nvfp4["w2_sf"], MINIMAX_H3_HIDDEN, FFN_SF_COLS)
+    sf_lin = _unswizzle_sf_128x4(
+        prepared_nvfp4["w2_sf"], MINIMAX_H3_HIDDEN, FFN_SF_COLS
+    )
     assert int(((sf_lin != sf_ref) & ~scale_tie).sum()) <= MAX_SCALE_MISMATCH_FLOOR
 
 
@@ -676,22 +697,40 @@ def test_prepare_fc2_weight_nvfp4_matches_nvfp4_quantize(model, prepared_nvfp4):
 
 def _workspaces_fp8(rows, device):
     return {
-        "workspace_a_q": torch.empty((rows, MINIMAX_H3_HIDDEN), dtype=torch.float8_e4m3fn, device=device),
+        "workspace_a_q": torch.empty(
+            (rows, MINIMAX_H3_HIDDEN), dtype=torch.float8_e4m3fn, device=device
+        ),
         "workspace_a_scale": torch.empty((rows,), dtype=torch.float32, device=device),
-        "workspace_y": torch.empty((rows, MINIMAX_H3_FFN), dtype=torch.bfloat16, device=device),
-        "workspace_y_q": torch.empty((rows, MINIMAX_H3_FFN), dtype=torch.float8_e4m3fn, device=device),
+        "workspace_y": torch.empty(
+            (rows, MINIMAX_H3_FFN), dtype=torch.bfloat16, device=device
+        ),
+        "workspace_y_q": torch.empty(
+            (rows, MINIMAX_H3_FFN), dtype=torch.float8_e4m3fn, device=device
+        ),
         "workspace_y_scale": torch.empty((rows,), dtype=torch.float32, device=device),
-        "workspace_flags": torch.empty((minimax_h3_mlp_fc2_flags_sm120(rows),), dtype=torch.int32, device=device),
+        "workspace_flags": torch.empty(
+            (minimax_h3_mlp_fc2_flags_sm120(rows),), dtype=torch.int32, device=device
+        ),
     }
 
 
 def _workspaces_nvfp4(rows, device):
     return {
-        "workspace_a_q": torch.empty((rows, NVFP4_PACKED_COLS), dtype=torch.uint8, device=device),
-        "workspace_a_sf": torch.empty((rows, NVFP4_SF_COLS), dtype=torch.uint8, device=device),
-        "workspace_y_q": torch.empty((rows, FFN_PACKED_COLS), dtype=torch.uint8, device=device),
-        "workspace_y_sf": torch.empty((rows, FFN_SF_COLS), dtype=torch.uint8, device=device),
-        "workspace_flags": torch.empty((minimax_h3_mlp_fc2_flags_sm120(rows),), dtype=torch.int32, device=device),
+        "workspace_a_q": torch.empty(
+            (rows, NVFP4_PACKED_COLS), dtype=torch.uint8, device=device
+        ),
+        "workspace_a_sf": torch.empty(
+            (rows, NVFP4_SF_COLS), dtype=torch.uint8, device=device
+        ),
+        "workspace_y_q": torch.empty(
+            (rows, FFN_PACKED_COLS), dtype=torch.uint8, device=device
+        ),
+        "workspace_y_sf": torch.empty(
+            (rows, FFN_SF_COLS), dtype=torch.uint8, device=device
+        ),
+        "workspace_flags": torch.empty(
+            (minimax_h3_mlp_fc2_flags_sm120(rows),), dtype=torch.int32, device=device
+        ),
     }
 
 
@@ -717,14 +756,18 @@ def run_fp8_case(rows, model, prepared, device, idx=None, fp8_mma_form=-1, out=N
     )
     torch.cuda.synchronize()
     a_ref = reference_modulated(x, model, idx)
-    assert_fp8_stage1(ws["workspace_a_q"], ws["workspace_a_scale"], x, model, idx, a_ref)
+    assert_fp8_stage1(
+        ws["workspace_a_q"], ws["workspace_a_scale"], x, model, idx, a_ref
+    )
     y_ref = swiglu_from_scaled(
         ws["workspace_a_q"],
         prepared["w1_lin_t"],
         a_scale=ws["workspace_a_scale"],
         w_scale=prepared["w1_lin_scale"],
     )
-    assert_fp8_stage2(ws["workspace_y_q"], ws["workspace_y_scale"], ws["workspace_y"], y_ref)
+    assert_fp8_stage2(
+        ws["workspace_y_q"], ws["workspace_y_scale"], ws["workspace_y"], y_ref
+    )
     y_q = ws["workspace_y_q"]
     ref = fc2_gated_residual(
         lambda r0, r1: y_q[r0:r1].float(),
@@ -735,7 +778,9 @@ def run_fp8_case(rows, model, prepared, device, idx=None, fp8_mma_form=-1, out=N
         y_scale=ws["workspace_y_scale"],
         w_scale=prepared["w2_scale"],
     )
-    stats = assert_output_within_budget(returned, ref, f"fp8 M={rows} form={fp8_mma_form}")
+    stats = assert_output_within_budget(
+        returned, ref, f"fp8 M={rows} form={fp8_mma_form}"
+    )
     return returned, ref["out"], residual, stats
 
 
@@ -815,7 +860,9 @@ def test_minimax_h3_sm120_mlp_nvfp4(rows, model, prepared_nvfp4, device):
 
 
 @requires_sm120
-def test_minimax_h3_sm120_mlp_fp8_mma_forms_are_bitwise_identical(model, prepared_fp8, device):
+def test_minimax_h3_sm120_mlp_fp8_mma_forms_are_bitwise_identical(
+    model, prepared_fp8, device
+):
     """The legacy FP8 ``mma.sync`` form and the ``kind::mxf8f6f4`` form with unit UE8M0 scales
     (the GeForce GB202 dispatch) accumulate the same products in FP32: identical outputs."""
     legacy, _ref, _res, _s = run_fp8_case(
@@ -830,11 +877,15 @@ def test_minimax_h3_sm120_mlp_fp8_mma_forms_are_bitwise_identical(model, prepare
 
 
 @requires_sm120
-def test_minimax_h3_sm120_mlp_invalid_index_rows_reproduce_residual(model, prepared_fp8, prepared_nvfp4, device):
+def test_minimax_h3_sm120_mlp_invalid_index_rows_reproduce_residual(
+    model, prepared_fp8, prepared_nvfp4, device
+):
     rows = 300
     _x, _residual, idx = make_inputs(rows, device)
     idx = idx.clone()
-    idx[:3] = torch.tensor([-1, MINIMAX_H3_ADALN_ROWS, -(2**63)], dtype=torch.int64, device=device)
+    idx[:3] = torch.tensor(
+        [-1, MINIMAX_H3_ADALN_ROWS, -(2**63)], dtype=torch.int64, device=device
+    )
     idx[257] = 2**40
     for run in (run_fp8_case, run_nvfp4_case):
         kwargs = {"idx": idx}
@@ -845,9 +896,14 @@ def test_minimax_h3_sm120_mlp_invalid_index_rows_reproduce_residual(model, prepa
 
 
 @requires_sm120
-def test_minimax_h3_sm120_mlp_out_may_alias_residual(model, prepared_fp8, prepared_nvfp4, device):
+def test_minimax_h3_sm120_mlp_out_may_alias_residual(
+    model, prepared_fp8, prepared_nvfp4, device
+):
     rows = 129
-    for run, prepared in ((run_fp8_case, prepared_fp8), (run_nvfp4_case, prepared_nvfp4)):
+    for run, prepared in (
+        (run_fp8_case, prepared_fp8),
+        (run_nvfp4_case, prepared_nvfp4),
+    ):
         separate, _ref, _res, _s = run(rows, model, prepared, device)
         x, residual, idx = make_inputs(rows, device)
         aliased = residual.clone()
@@ -860,7 +916,11 @@ def test_minimax_h3_sm120_mlp_out_may_alias_residual(model, prepared_fp8, prepar
 def test_minimax_h3_sm120_mlp_strided_tables(model, prepared_fp8, device):
     """Column chunks of a wider modulation projection serve as the table views without a copy."""
     rows = 257
-    wide = torch.zeros((MINIMAX_H3_ADALN_ROWS, 3 * MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device)
+    wide = torch.zeros(
+        (MINIMAX_H3_ADALN_ROWS, 3 * MINIMAX_H3_HIDDEN),
+        dtype=torch.bfloat16,
+        device=device,
+    )
     wide[:, :MINIMAX_H3_HIDDEN] = model["adaln_shift"]
     wide[:, MINIMAX_H3_HIDDEN : 2 * MINIMAX_H3_HIDDEN] = model["adaln_scale"]
     wide[:, 2 * MINIMAX_H3_HIDDEN :] = model["gate"]
@@ -898,11 +958,25 @@ def test_minimax_h3_sm120_mlp_default_workspaces(model, prepared_fp8, device):
 
 
 @requires_sm120
-def test_minimax_h3_sm120_mlp_rejects_bad_inputs(model, prepared_fp8, prepared_nvfp4, device):
+def test_minimax_h3_sm120_mlp_rejects_bad_inputs(
+    model, prepared_fp8, prepared_nvfp4, device
+):
     rows = 8
     x, residual, idx = make_inputs(rows, device)
-    tables = (model["x_norm_weight"], model["adaln_scale"], model["adaln_shift"], idx, model["gate"], residual)
-    w8 = (prepared_fp8["w1_q"], prepared_fp8["w1_scale"], prepared_fp8["w2_q"], prepared_fp8["w2_scale"])
+    tables = (
+        model["x_norm_weight"],
+        model["adaln_scale"],
+        model["adaln_shift"],
+        idx,
+        model["gate"],
+        residual,
+    )
+    w8 = (
+        prepared_fp8["w1_q"],
+        prepared_fp8["w1_scale"],
+        prepared_fp8["w2_q"],
+        prepared_fp8["w2_scale"],
+    )
     with pytest.raises(ValueError):
         minimax_h3_mlp_fp8_sm120(x.float(), *tables, *w8)
     with pytest.raises(ValueError):
@@ -910,14 +984,19 @@ def test_minimax_h3_sm120_mlp_rejects_bad_inputs(model, prepared_fp8, prepared_n
     with pytest.raises(ValueError):  # int32 index
         minimax_h3_mlp_fp8_sm120(x, *tables[:3], idx.int(), *tables[4:], *w8)
     with pytest.raises(ValueError):  # wrong FC2 weight dtype
-        minimax_h3_mlp_fp8_sm120(x, *tables, *w8[:2], prepared_fp8["w2_q"].view(torch.uint8), w8[3])
+        minimax_h3_mlp_fp8_sm120(
+            x, *tables, *w8[:2], prepared_fp8["w2_q"].view(torch.uint8), w8[3]
+        )
     with pytest.raises(ValueError):
         minimax_h3_mlp_fp8_sm120(x, *tables, *w8, eps=0.0)
     with pytest.raises(ValueError):
         minimax_h3_mlp_fp8_sm120(x, *tables, *w8, fp8_mma_form=1)
     with pytest.raises(ValueError):  # flags workspace too small
         minimax_h3_mlp_fp8_sm120(
-            x, *tables, *w8, workspace_flags=torch.zeros((0,), dtype=torch.int32, device=device)
+            x,
+            *tables,
+            *w8,
+            workspace_flags=torch.zeros((0,), dtype=torch.int32, device=device),
         )
     with pytest.raises(ValueError):  # gate row count differs from the AdaLN tables
         minimax_h3_mlp_fp8_sm120(x, *tables[:4], model["gate"][:4], residual, *w8)
@@ -935,4 +1014,6 @@ def test_minimax_h3_sm120_mlp_rejects_bad_inputs(model, prepared_fp8, prepared_n
     with pytest.raises(ValueError):  # host float global scale
         minimax_h3_mlp_nvfp4_sm120(x, *tables, 1.0, *w4[1:])
     with pytest.raises(ValueError):  # truncated FC2 scales
-        minimax_h3_mlp_nvfp4_sm120(x, *tables, *w4[:6], prepared_nvfp4["w2_sf"][:-1], 1.0)
+        minimax_h3_mlp_nvfp4_sm120(
+            x, *tables, *w4[:6], prepared_nvfp4["w2_sf"][:-1], 1.0
+        )

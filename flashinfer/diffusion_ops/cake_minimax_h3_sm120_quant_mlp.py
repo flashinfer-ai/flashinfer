@@ -160,7 +160,9 @@ def _output(
     out: Optional[torch.Tensor], rows: int, device: torch.device
 ) -> torch.Tensor:
     if out is None:
-        return torch.empty((rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device)
+        return torch.empty(
+            (rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device
+        )
     return _require("out", out, torch.bfloat16, (rows, MINIMAX_H3_HIDDEN), device)
 
 
@@ -571,16 +573,26 @@ def minimax_h3_mlp_fp8_sm120(
         device,
     )
     _require(
-        "fc2_weight_scale", fc2_weight_scale, torch.float32, (MINIMAX_H3_HIDDEN,), device
+        "fc2_weight_scale",
+        fc2_weight_scale,
+        torch.float32,
+        (MINIMAX_H3_HIDDEN,),
+        device,
     )
     if int(fp8_mma_form) not in (
         FP8_MMA_FORM_AUTO,
         FP8_MMA_FORM_LEGACY,
         FP8_MMA_FORM_MXF8F6F4,
     ):
-        raise ValueError("fp8_mma_form must be -1 (per board), 0 (legacy) or 2 (kind::mxf8f6f4)")
+        raise ValueError(
+            "fp8_mma_form must be -1 (per board), 0 (legacy) or 2 (kind::mxf8f6f4)"
+        )
     workspace_a_q = _workspace(
-        "workspace_a_q", workspace_a_q, torch.float8_e4m3fn, (rows, MINIMAX_H3_HIDDEN), device
+        "workspace_a_q",
+        workspace_a_q,
+        torch.float8_e4m3fn,
+        (rows, MINIMAX_H3_HIDDEN),
+        device,
     )
     workspace_a_scale = _workspace(
         "workspace_a_scale", workspace_a_scale, torch.float32, (rows,), device
@@ -589,7 +601,11 @@ def minimax_h3_mlp_fp8_sm120(
         "workspace_y", workspace_y, torch.bfloat16, (rows, MINIMAX_H3_FFN), device
     )
     workspace_y_q = _workspace(
-        "workspace_y_q", workspace_y_q, torch.float8_e4m3fn, (rows, MINIMAX_H3_FFN), device
+        "workspace_y_q",
+        workspace_y_q,
+        torch.float8_e4m3fn,
+        (rows, MINIMAX_H3_FFN),
+        device,
     )
     workspace_y_scale = _workspace(
         "workspace_y_scale", workspace_y_scale, torch.float32, (rows,), device
@@ -702,7 +718,9 @@ def minimax_h3_mlp_nvfp4_sm120(
     if not isinstance(a_global_scale, torch.Tensor) or not isinstance(
         y_global_scale, torch.Tensor
     ):
-        raise ValueError("a_global_scale and y_global_scale must be float32 [1] CUDA tensors")
+        raise ValueError(
+            "a_global_scale and y_global_scale must be float32 [1] CUDA tensors"
+        )
     a_global_scale = _require(
         "a_global_scale", a_global_scale.reshape(1), torch.float32, (1,), device
     )
@@ -722,7 +740,11 @@ def minimax_h3_mlp_nvfp4_sm120(
         "fc1_scale_tiles", fc1_scale_tiles, MINIMAX_H3_FC1_ROWS * NVFP4_SF_COLS, device
     )
     _require(
-        "fc2_weight_q", fc2_weight_q, torch.uint8, (MINIMAX_H3_HIDDEN, FFN_PACKED_COLS), device
+        "fc2_weight_q",
+        fc2_weight_q,
+        torch.uint8,
+        (MINIMAX_H3_HIDDEN, FFN_PACKED_COLS),
+        device,
     )
     fc2_weight_sf = _flat_u8(
         "fc2_weight_sf", fc2_weight_sf, MINIMAX_H3_HIDDEN * FFN_SF_COLS, device
@@ -768,7 +790,9 @@ def minimax_h3_mlp_nvfp4_sm120(
     return out
 
 
-def _flat_u8(name: str, tensor: torch.Tensor, numel: int, device: torch.device) -> torch.Tensor:
+def _flat_u8(
+    name: str, tensor: torch.Tensor, numel: int, device: torch.device
+) -> torch.Tensor:
     if (
         not isinstance(tensor, torch.Tensor)
         or tensor.dtype != torch.uint8

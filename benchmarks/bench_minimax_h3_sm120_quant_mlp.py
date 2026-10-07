@@ -83,10 +83,14 @@ def synthetic_model(device: torch.device, generator: torch.Generator) -> dict:
     }
 
 
-def synthetic_inputs(rows: int, device: torch.device, generator: torch.Generator) -> dict:
+def synthetic_inputs(
+    rows: int, device: torch.device, generator: torch.Generator
+) -> dict:
     x = torch.empty((rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device)
     x.normal_(mean=0.0, std=0.5, generator=generator)
-    residual = torch.empty((rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device)
+    residual = torch.empty(
+        (rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device
+    )
     residual.normal_(mean=0.0, std=1.0, generator=generator)
     positions = torch.arange(rows, device=device, dtype=torch.int64)
     adaln_index = torch.div(
@@ -120,7 +124,9 @@ def quantize_fp8_rows(t: torch.Tensor, chunk_rows: int = 2048):
         rows = t[start:stop].float()
         s = fp8_scale_from_amax(rows.abs().amax(dim=1).clamp_min(1e-12))
         scale[start:stop] = s
-        q[start:stop] = (rows / s[:, None]).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+        q[start:stop] = (
+            (rows / s[:, None]).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+        )
     return q, scale
 
 
@@ -135,19 +141,31 @@ def chain_fp8(inputs, model, weights):
     a = torch_pre_norm(inputs["x"], model, inputs["adaln_index"])
     a_q, a_scale = quantize_fp8_tokens(a)
     h = torch._scaled_mm(
-        a_q, w1_q.t(), scale_a=a_scale[:, None], scale_b=w1_scale[None, :], out_dtype=torch.bfloat16
+        a_q,
+        w1_q.t(),
+        scale_a=a_scale[:, None],
+        scale_b=w1_scale[None, :],
+        out_dtype=torch.bfloat16,
     )
     y = silu_and_mul(h)
     y_q, y_scale = quantize_fp8_tokens(y)
     o = torch._scaled_mm(
-        y_q, w2_q.t(), scale_a=y_scale[:, None], scale_b=w2_scale[None, :], out_dtype=torch.bfloat16
+        y_q,
+        w2_q.t(),
+        scale_a=y_scale[:, None],
+        scale_b=w2_scale[None, :],
+        out_dtype=torch.bfloat16,
     )
     return gated_residual(o, model, inputs["adaln_index"], inputs["residual"])
 
 
 def _fp4(t, g):
     return fp4_quantize(
-        t, g, sf_vec_size=MINIMAX_H3_SF_BLOCK, sf_use_ue8m0=False, is_sf_swizzled_layout=True
+        t,
+        g,
+        sf_vec_size=MINIMAX_H3_SF_BLOCK,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=True,
     )
 
 
@@ -156,12 +174,24 @@ def chain_nvfp4(inputs, model, weights, g_a, alpha1, g_y, alpha2):
     a = torch_pre_norm(inputs["x"], model, inputs["adaln_index"])
     a_q, a_sf = _fp4(a, g_a)
     h = mm_fp4(
-        a_q, w1_q.t(), a_sf, w1_sf.t() if w1_sf.ndim == 2 else w1_sf, alpha1, torch.bfloat16, backend="cutlass"
+        a_q,
+        w1_q.t(),
+        a_sf,
+        w1_sf.t() if w1_sf.ndim == 2 else w1_sf,
+        alpha1,
+        torch.bfloat16,
+        backend="cutlass",
     )
     y = silu_and_mul(h)
     y_q, y_sf = _fp4(y, g_y)
     o = mm_fp4(
-        y_q, w2_q.t(), y_sf, w2_sf.t() if w2_sf.ndim == 2 else w2_sf, alpha2, torch.bfloat16, backend="cutlass"
+        y_q,
+        w2_q.t(),
+        y_sf,
+        w2_sf.t() if w2_sf.ndim == 2 else w2_sf,
+        alpha2,
+        torch.bfloat16,
+        backend="cutlass",
     )
     return gated_residual(o, model, inputs["adaln_index"], inputs["residual"])
 
@@ -208,9 +238,13 @@ def main() -> None:
     else:
         g_w1 = minimax_h3_nvfp4_global_scale(model["fc1_weight"])
         g_w2 = minimax_h3_nvfp4_global_scale(model["fc2_weight"])
-        w1 = prepare_minimax_h3_fc1_weight_nvfp4(model["fc1_weight"], g_w1)  # SM120 layout here
+        w1 = prepare_minimax_h3_fc1_weight_nvfp4(
+            model["fc1_weight"], g_w1
+        )  # SM120 layout here
         w2 = prepare_minimax_h3_fc2_weight_nvfp4_sm120(model["fc2_weight"], g_w2)
-        chain_weights = _fp4(model["fc1_weight"], g_w1) + _fp4(model["fc2_weight"], g_w2)
+        chain_weights = _fp4(model["fc1_weight"], g_w1) + _fp4(
+            model["fc2_weight"], g_w2
+        )
         # Static activation global scale for a calibrated |a| <= 8 (synthetic model).
         g_a = torch.tensor([E4M3_MAX * 6.0 / 8.0], dtype=torch.float32, device=device)
         alpha1 = minimax_h3_nvfp4_alpha(g_a, g_w1)
@@ -238,9 +272,15 @@ def main() -> None:
                 a = torch_pre_norm(inputs["x"], model, inputs["adaln_index"])
                 a_q, a_sf = _fp4(a, g_a)
                 h = mm_fp4(
-                    a_q, chain_weights[0].t(), a_sf,
-                    chain_weights[1].t() if chain_weights[1].ndim == 2 else chain_weights[1],
-                    alpha1, torch.bfloat16, backend="cutlass",
+                    a_q,
+                    chain_weights[0].t(),
+                    a_sf,
+                    chain_weights[1].t()
+                    if chain_weights[1].ndim == 2
+                    else chain_weights[1],
+                    alpha1,
+                    torch.bfloat16,
+                    backend="cutlass",
                 )
                 g_y = minimax_h3_nvfp4_global_scale(silu_and_mul(h))
                 del a, a_q, a_sf, h
@@ -261,7 +301,9 @@ def main() -> None:
                 *w2,
                 a2,
             )
-            base = lambda: chain_nvfp4(inputs, model, chain_weights, g_a, alpha1, g_y, alpha2)  # noqa: E731
+            base = lambda: chain_nvfp4(
+                inputs, model, chain_weights, g_a, alpha1, g_y, alpha2
+            )  # noqa: E731
         fn()
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
@@ -289,7 +331,11 @@ def main() -> None:
         rows_out.append(row)
     if args.json:
         with open(args.json, "w") as stream:
-            json.dump({"device": torch.cuda.get_device_name(device), "rows": rows_out}, stream, indent=1)
+            json.dump(
+                {"device": torch.cuda.get_device_name(device), "rows": rows_out},
+                stream,
+                indent=1,
+            )
 
 
 if __name__ == "__main__":
