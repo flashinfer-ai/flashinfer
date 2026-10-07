@@ -65,6 +65,8 @@ def _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens) -> bool:
     # time for this bounded region. H32 and ragged batches can lose despite
     # faster host enqueue. Do not extrapolate this policy to SM103 or other
     # shapes; refresh with benchmarks/bench_cudnn_linear_attention.py.
+    # High-head BF16 at 8K had only a 4% completed-call margin, sensitive to
+    # host cost. Keep that region native until 16K; this is admission policy.
     return (
         q.is_cuda
         and q.dtype == torch.bfloat16
@@ -75,6 +77,11 @@ def _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens) -> bool:
         and cu_seqlens.numel() == 2
         and initial_state is not None
         and initial_state.dtype in (torch.bfloat16, torch.float32)
+        and (
+            initial_state.dtype == torch.float32
+            or q.shape[2] <= 8
+            or q.shape[1] >= 16384
+        )
         and not initial_state.requires_grad
         and (not initial_state.is_inference() or torch.is_inference_mode_enabled())
         and get_compute_capability(q.device) == (10, 0)
