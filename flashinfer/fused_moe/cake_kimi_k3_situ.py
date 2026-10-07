@@ -39,6 +39,10 @@ _N8_W2A_M16_TOKENS = (16,)
 _N32_CLAIM8_TOKENS = (512, 1024)
 _MID_WORK5FD_TOKENS = (2048, 4096)
 _LARGE_C7_TOKENS = (8192, 16384)
+# Architectures whose single-token route runs the fused quantization + routing
+# FC1 (three kernels: FC1, FC2, finalize); the others launch the separate
+# single-token quantization + router kernel before the FC1 (four kernels).
+_M1_FUSED_ARCHES = ("sm_103a",)
 # The 512- and 1024-token routes launch the routing kernel as one thread-block
 # cluster of this many CTAs (the kernel declares the matching cluster size).
 _ROUTE_MC_CLUSTER = 8
@@ -77,6 +81,7 @@ _GENERIC = (
 )
 _FUSED = ("quant", "fused_router", "fc1", "fc2", "finalize")
 _QUANT_ROUTE = ("quant_route", "fc1", "fc2", "finalize")
+_M1_FUSED = ("fc1", "fc2", "finalize")
 _LARGE = _GENERIC[:5] + ("sfb_shuffle",) + _GENERIC[5:]
 
 
@@ -97,6 +102,15 @@ _SELECTORS = {
         {
             "quant_route": "quant_route:m1",
             "fc1": "fc1:n8_small",
+            "fc2": "fc2:n8_m1",
+            "finalize": "finalize:feature",
+        },
+        None,
+    ),
+    "m1_s2a": (
+        _M1_FUSED,
+        {
+            "fc1": "fc1:n8_s2a",
             "fc2": "fc2:n8_m1",
             "finalize": "finalize:feature",
         },
@@ -179,7 +193,7 @@ def _tile_n(num_tokens):
 def _selector(arch, num_tokens):
     tile_n = _tile_n(num_tokens)
     if num_tokens == 1:
-        return "m1"
+        return "m1_s2a" if arch in _M1_FUSED_ARCHES else "m1"
     if num_tokens in _N8_W2A_M16_TOKENS:
         return "n8_w2a_m16"
     if num_tokens == 8:
@@ -247,12 +261,13 @@ def _workspace_layout(num_tokens, arch=None):
         ("intermediate_scales", torch.uint8, (rows, _I // 16), 1),
         ("expert_output", torch.bfloat16, (rows, _H), 2),
     )
-    # The layout is architecture-independent: every selector that needs the
-    # FC2 work counter or the pre-shuffled scale images gets the field on both.
-    selector = _selector("sm_100a", num_tokens)
-    if _SELECTORS[selector][2] is not None:
+    # The layout is architecture-independent: a field that any architecture's
+    # selector of this token count needs (the FC2 work counter, the
+    # pre-shuffled scale images) is present on both.
+    selectors = {_selector(name, num_tokens) for name in ("sm_100a", "sm_103a")}
+    if any(_SELECTORS[selector][2] is not None for selector in selectors):
         fields += (("fc2_work_counter", torch.int32, (1,), 4),)
-    if selector == "large_c7":
+    if "large_c7" in selectors:
         fields += (("sfb_shuffled", torch.uint8, (_sfb_shuffled_bytes(max_tiles),), 1),)
     layout, offset = {}, 0
     for name, dtype, shape, element_bytes in fields:
@@ -399,6 +414,11 @@ _CALL_ARGS = {
         "clamp_limit": "qa",
         "act_alpha": "alpha",
         "act_beta": "beta",
+        # The single-token fused program quantizes and routes inside FC1: its
+        # plan also names the quantizer and router inputs.
+        "x": "x",
+        "qx": "qx",
+        "topk_ids": "ids",
     },
     "fc2": {"A": "w2", "SFA": "sf2", "scale_c": "decode2"},
     "finalize": {"route_weights": "weights", "out": "out"},
@@ -559,7 +579,7 @@ def _stage_constants(stage, views, prepared, num_tokens):
             )
         return values
     if stage == "finalize":
-        feature = selector in ("m1", "n8_feature", "n8_w2a_m16", "m64_claim8")
+        feature = selector in ("m1", "m1_s2a", "n8_feature", "n8_w2a_m16", "m64_claim8")
         vec = 2 if tile_n == 8 else 8
         return dict(
             grid=(
