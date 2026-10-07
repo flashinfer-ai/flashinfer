@@ -216,8 +216,8 @@
       "cake_mok_backward_binding.cu"
     ],
     "sha256": [
-      "ad74d1639fd2203b7e8b1d5377bd6d8436388e4ae4ad5d392c64573cfaedf593",
-      "6d360525f2012db48aba370343f25e7893254a28a4a4ac7206975d297b3818cb"
+      "251549e57e8e304d8d06ffd3ffac76d470de0bf2c47c9fd489c3ea1815cad1dd",
+      "3f600bb08b890ef0f6a8037b71f2f7cf36adab615ad1d230e4d4df6ab372dd49"
     ],
     "arguments": [
       [
@@ -419,10 +419,6 @@
       [
         "buffer",
         "dy_routed_ptr"
-      ],
-      [
-        "buffer",
-        "dy_scaled_ptr"
       ],
       [
         "buffer",

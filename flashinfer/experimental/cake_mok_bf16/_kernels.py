@@ -165,7 +165,6 @@ class MoKBackward:
         router_weights = torch.empty(macro_size, dtype=torch.float32, device=x.device)
         partials = torch.empty(macro_size, intermediate // 128, dtype=torch.float32, device=x.device)
         dy_routed = torch.empty((macro_size, hidden), **options)
-        dy_scaled = torch.empty_like(dy_routed)
         dh_shared = torch.empty((rows_alloc, intermediate), **options)
         dh_routed = torch.empty((macro_size, intermediate), **options)
         dg_shared, dg_routed = torch.empty_like(dh_shared), torch.empty_like(dh_routed)
@@ -202,7 +201,7 @@ class MoKBackward:
             self.module.launch(grid=(comm_sms + 2 * clusters, 1, 1),
                 dy_s=dy_rows, dy_r=dy_routed, dg_s=dg_shared, dg_r=dg_routed,
                 du_s=du_shared, du_r=du_routed, x_nt_r=x_routed,
-                dy_atb_s=dy_rows, dy_atb_r=dy_scaled, dg_atb_s=dg_shared, dg_atb_r=dg_routed,
+                dy_atb_s=dy_rows, dy_atb_r=dy_routed, dg_atb_s=dg_shared, dg_atb_r=dg_routed,
                 du_atb_s=du_shared, du_atb_r=du_routed, x_atb_s=x_rows, x_atb_r=x_routed,
                 h_atb_s=hidden_rows, h_atb_r=hidden_routed,
                 wg_s=shared_gate.unsqueeze(0), wu_s=shared_up.unsqueeze(0), wd_s=shared_down.unsqueeze(0),
@@ -214,7 +213,7 @@ class MoKBackward:
                 dh_sw_s=dh_shared, dh_sw_r=dh_routed, gate_sw_s=gate_rows, gate_sw_r=gate_routed,
                 up_sw_s=up_rows, up_sw_r=up_routed, dg_sw_s=dg_shared, dg_sw_r=dg_routed,
                 du_sw_s=du_shared, du_sw_r=du_routed, h_sw_r=hidden_routed,
-                x_routed_ptr=x_routed, dy_routed_ptr=dy_routed, dy_scaled_ptr=dy_scaled,
+                x_routed_ptr=x_routed, dy_routed_ptr=dy_routed,
                 dx_routed_ptr=dx_routed, weights=router_weights, partials=partials,
                 x_peers=x_peers, dy_peers=dy_peers, dx_peers=dx_peers,
                 weight_peers=weight_peers, dweight_peers=dweight_peers,
@@ -451,7 +450,10 @@ class MoKForwardMxfp8:
 
         self.module = load_kernel("forward_mxfp8")
         self._peer_tables = {}
-        # Rings that MoK does not return (GEMM/SwiGLU inputs); kept for diagnostics.
+        # Rings that MoK does not return (GEMM/SwiGLU inputs). Retaining them keeps
+        # ~4 GiB of per-call rings alive across steps at the GLM-5.2 shape, so the
+        # validations opt in (``keep_rings = True``); training leaves them unreferenced.
+        self.keep_rings = False
         self.last_rings = None
 
     @staticmethod
@@ -648,13 +650,17 @@ class MoKForwardMxfp8:
                 swiglu_clamped=clamped,
                 recompute_only=int(recompute),
             )
-        self.last_rings = dict(
-            x_fp8_routed=x_fp8_routed,
-            x_sc_routed=x_sc_routed,
-            gate_routed=gate_routed,
-            up_routed=up_routed,
-            hidden_fp8_routed=hidden_fp8_routed,
-            hidden_sc_routed=hidden_sc_routed,
+        self.last_rings = (
+            dict(
+                x_fp8_routed=x_fp8_routed,
+                x_sc_routed=x_sc_routed,
+                gate_routed=gate_routed,
+                up_routed=up_routed,
+                hidden_fp8_routed=hidden_fp8_routed,
+                hidden_sc_routed=hidden_sc_routed,
+            )
+            if self.keep_rings
+            else None
         )
         outputs = (None, None) if recompute else (y_shared, y_routed)
         return (
@@ -690,6 +696,9 @@ class MoKBackwardMxfp8:
         self.module = load_kernel("backward_mxfp8_f32" if self.wgrad_f32 else "backward_mxfp8")
         self.zero_module = load_kernel("zero")
         self._peer_tables = {}
+        # Diagnostic ring retention (validations opt in); see MoKForwardMxfp8.
+        self.keep_rings = False
+        self.last_rings = None
 
     @staticmethod
     def _weight_tuple(weights, name, experts, n, k, transposed_pair=False):
@@ -998,21 +1007,25 @@ class MoKBackwardMxfp8:
                 counts=counts,
                 elements=elements,
             )
-        self.last_rings = dict(
-            x_fp8_routed=x_fp8_routed,
-            x_sc_routed=x_sc_routed,
-            gate_routed=gate_routed,
-            up_routed=up_routed,
-            hidden_fp8_routed=hidden_fp8_routed,
-            hidden_sc_routed=hidden_sc_routed,
-            dy_fp8_t_routed=dy_fp8_t_routed,
-            dy_sc_t_routed=dy_sc_t_routed,
-            dg_fp8_t_routed=dg_fp8_t_routed,
-            dg_sc_t_routed=dg_sc_t_routed,
-            du_fp8_t_routed=du_fp8_t_routed,
-            du_sc_t_routed=du_sc_t_routed,
-            partials=partials,
-            router_weights=router_weights,
+        self.last_rings = (
+            dict(
+                x_fp8_routed=x_fp8_routed,
+                x_sc_routed=x_sc_routed,
+                gate_routed=gate_routed,
+                up_routed=up_routed,
+                hidden_fp8_routed=hidden_fp8_routed,
+                hidden_sc_routed=hidden_sc_routed,
+                dy_fp8_t_routed=dy_fp8_t_routed,
+                dy_sc_t_routed=dy_sc_t_routed,
+                dg_fp8_t_routed=dg_fp8_t_routed,
+                dg_sc_t_routed=dg_sc_t_routed,
+                du_fp8_t_routed=du_fp8_t_routed,
+                du_sc_t_routed=du_sc_t_routed,
+                partials=partials,
+                router_weights=router_weights,
+            )
+            if self.keep_rings
+            else None
         )
         return (
             dx_shared,
