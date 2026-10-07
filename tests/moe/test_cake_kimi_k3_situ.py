@@ -685,9 +685,12 @@ def test_cake_situ_every_route_eager_and_external_graph(
         assert list(bindings) == STAGES_BY_SELECTOR[prepared["selector"]]
         assert ("x" in bindings["fc1"]) == fused
         if fused:
-            assert bindings["fc1"]["x"] is x
+            assert bindings["fc1"]["x"].data_ptr() == x.data_ptr()
             assert bindings["fc1"]["topk_ids"].data_ptr() == ids.data_ptr()
-            assert bindings["fc1"]["qx"] is options["quant_scales"][0]
+            assert (
+                bindings["fc1"]["qx"].data_ptr()
+                == options["quant_scales"][0].data_ptr()
+            )
             assert bindings["fc1"]["grid"] == (
                 INTERMEDIATE // 64,
                 prepared["max_tiles"],
