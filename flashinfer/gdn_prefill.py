@@ -416,7 +416,8 @@ def _run_cake_gdn_prefill(
         max_chunks = max((length + 63) // 64 for length in seq_lens)
         if max_chunks <= 8:
             grid_x = min(128, total_tiles)
-        elif active_clusters in (148, 160) and total_tiles == 256:
+        elif active_clusters in (148, 160, 212) and total_tiles == 256:
+            # 212 = Rubin R200 (CAKE-1096); balanced two tiles per CTA.
             grid_x = 128
         else:
             grid_x = min(active_clusters, total_tiles)

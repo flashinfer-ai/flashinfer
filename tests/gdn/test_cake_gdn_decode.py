@@ -496,9 +496,10 @@ def test_decode_resolver_fails_closed_outside_child_contract() -> None:
 def test_architecture_mapping_is_exact() -> None:
     assert cake_gdn.arch_for_compute_capability(10, 0) == "sm_100a"
     assert cake_gdn.arch_for_compute_capability(10, 3) == "sm_103a"
+    assert cake_gdn.arch_for_compute_capability(10, 7) == "sm_107a"
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
-        match="supports only SM100a/SM103a",
+        match="supports only SM100a/SM103a/SM107a",
     ):
         cake_gdn.arch_for_compute_capability(12, 0)
 
@@ -583,7 +584,7 @@ def test_prefill_resolver_keeps_sglang_tp4_checkpoint_family_fail_closed() -> No
             seq_lens=(849, 835, 862, 897, 853),
         )
 
-    for arch, num_seqs in (("sm_100a", 10), ("sm_103a", 11)):
+    for arch, num_seqs in (("sm_100a", 10), ("sm_103a", 11), ("sm_107a", 14)):
         with pytest.raises(
             cake_gdn.CakeGDNUnsupportedError,
             match="indexed DV-split contract",

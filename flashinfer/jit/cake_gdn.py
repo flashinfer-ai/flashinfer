@@ -37,13 +37,14 @@ from tvm_ffi import cpp
 from . import env as jit_env
 from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 
-CakeGDNArch = Literal["sm_100a", "sm_103a"]
+CakeGDNArch = Literal["sm_100a", "sm_103a", "sm_107a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
 _DEFINE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
+    "sm_107a": 212,
 }
 
 
@@ -812,8 +813,11 @@ def arch_for_compute_capability(major: int, minor: int) -> CakeGDNArch:
         return "sm_100a"
     if (major, minor) == (10, 3):
         return "sm_103a"
+    if (major, minor) == (10, 7):
+        return "sm_107a"
     raise CakeGDNUnsupportedError(
-        f"Cake GDN supports only SM100a/SM103a, got compute capability {major}.{minor}"
+        "Cake GDN supports only SM100a/SM103a/SM107a, "
+        f"got compute capability {major}.{minor}"
     )
 
 
