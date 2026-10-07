@@ -584,20 +584,112 @@ def test_cudnn_backend_replays_under_cuda_graph_capture():
 # ---------------------------------------------------------------------------
 
 
-def test_cudnn_backend_rejects_state_indices():
-    device = torch.device("cuda")
-    num_heads = 8
-    inputs = _make_inputs([256], num_heads, num_heads, num_heads, seed=3)
-    pool = torch.zeros(
-        4, num_heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=device
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("in_place", [False, True])
+@pytest.mark.parametrize("padding", [0, 96])
+def test_cudnn_backend_state_pool(state_dtype, in_place, padding):
+    import cudnn
+
+    if tuple(map(int, cudnn.__version__.split(".")[:2])) < (1, 31):
+        pytest.skip("state pools require cuDNN frontend 1.31+")
+    heads = 8
+    inputs = _make_inputs([65, 0, 127], heads, heads, heads, seed=3)
+    row_size = heads * HEAD_DIM * HEAD_DIM
+    storage = torch.randn(7 * (row_size + padding), device="cuda", dtype=state_dtype)
+    pool = storage.as_strided(
+        (7, heads, HEAD_DIM, HEAD_DIM),
+        (row_size + padding, HEAD_DIM * HEAD_DIM, HEAD_DIM, 1),
     )
-    with pytest.raises(NotImplementedError, match="state_indices"):
-        _run_cudnn(
+    pool.mul_(0.01)
+    slots = torch.tensor([5, 1, 3], dtype=torch.int32, device="cuda")
+    before = pool.clone()
+    packed = pool.index_select(0, slots)
+    expected_out, expected_state = _run_cudnn(
+        inputs,
+        initial_state=packed,
+        output_final_state=True,
+    )
+    destination = pool if in_place else torch.full_like(pool, 17)
+    untouched = destination.clone()
+    actual_out, actual_state = _run_cudnn(
+        inputs,
+        initial_state=pool,
+        output_state=destination,
+        output_final_state=True,
+        state_indices=slots,
+    )
+    assert actual_state is destination
+    assert_rel_close("pool output", actual_out, expected_out, SERIAL_TOLERANCE)
+    assert_rel_close(
+        "pool state",
+        destination.index_select(0, slots),
+        expected_state,
+        SERIAL_TOLERANCE,
+    )
+    assert torch.equal(destination[[0, 2, 4, 6]], untouched[[0, 2, 4, 6]])
+    if not in_place:
+        assert torch.equal(pool, before)
+    read_only = pool.clone()
+    _run_cudnn(inputs, initial_state=pool, state_indices=slots)
+    assert torch.equal(pool, read_only)
+
+
+def test_cudnn_state_pool_capture_rebinds_slots_without_host_sync():
+    import cudnn
+
+    if tuple(map(int, cudnn.__version__.split(".")[:2])) < (1, 31):
+        pytest.skip("state pools require cuDNN frontend 1.31+")
+    inputs = _make_inputs([65, 127], 8, 8, 8, seed=19)
+    pool = torch.randn(6, 8, HEAD_DIM, HEAD_DIM, device="cuda") * 0.01
+    destination = torch.full_like(pool, 17)
+    slots = torch.tensor([4, 1], device="cuda", dtype=torch.int32)
+    out = torch.empty_like(inputs["v"])
+
+    def run():
+        return _run_cudnn(
             inputs,
             initial_state=pool,
+            output_state=destination,
+            output=out,
             output_final_state=True,
-            output_state=pool,
-            state_indices=torch.zeros(1, dtype=torch.int32, device=device),
+            state_indices=slots,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    stream.synchronize()
+    old_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        run()
+    finally:
+        torch.cuda.set_sync_debug_mode(old_mode)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    for indices in ([4, 1], [2, 5]):
+        slots.copy_(torch.tensor(indices, device="cuda", dtype=torch.int32))
+        pool.mul_(0.9)
+        destination.fill_(17)
+        graph.replay()
+        expected_out, expected_state = _run_cudnn(
+            inputs,
+            initial_state=pool.index_select(0, slots),
+            output_final_state=True,
+        )
+        torch.cuda.synchronize()
+        assert_rel_close("replay output", out, expected_out, SERIAL_TOLERANCE)
+        assert_rel_close(
+            "replay state",
+            destination.index_select(0, slots),
+            expected_state,
+            SERIAL_TOLERANCE,
+        )
+        untouched = [i for i in range(6) if i not in indices]
+        assert torch.equal(
+            destination[untouched], torch.full_like(destination[untouched], 17)
         )
 
 
@@ -617,10 +709,83 @@ def test_cudnn_backend_rejects_state_checkpoints():
         )
 
 
+@pytest.mark.parametrize("direct", [False, True])
+def test_cudnn_gdn_normalizes_zero_and_tiny_vectors_with_additive_epsilon(direct):
+    inputs = _make_inputs([65], 8, 8, 8, seed=23, normalize=False, norm_scale=1e-4)
+    inputs["q"][:16].zero_()
+    inputs["k"][:16].zero_()
+    normalized = dict(inputs)
+    for name in ("q", "k"):
+        x = inputs[name].float()
+        normalized[name] = (
+            x * torch.rsqrt(x.square().sum(-1, keepdim=True) + 1e-6)
+        ).to(inputs[name].dtype)
+    if direct:
+        actual_out, actual_state = cudnn_chunk_gated_delta_rule(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            inputs["g"],
+            inputs["beta"],
+            cu_seqlens=inputs["cu_seqlens"],
+            use_qk_l2norm_in_kernel=True,
+            output_final_state=True,
+        )
+    else:
+        actual_out, actual_state = _run_cudnn(
+            inputs,
+            use_qk_l2norm_in_kernel=True,
+            output_final_state=True,
+        )
+    expected_out, expected_state = _serial(normalized)
+    assert_rel_close(
+        "additive normalization output", actual_out, expected_out, SERIAL_TOLERANCE
+    )
+    assert_rel_close(
+        "additive normalization state", actual_state, expected_state, SERIAL_TOLERANCE
+    )
+    assert torch.count_nonzero(actual_out[:16]).item() == 0
+
+
 def test_cudnn_backend_rejects_context_parallel():
     inputs = _make_inputs([256], 8, 8, 8, seed=6)
     with pytest.raises(NotImplementedError, match="use_cp"):
         _run_cudnn(inputs, use_cp=True)
+
+
+@pytest.mark.parametrize("backend", ["cudnn", "flashinfer"])
+@pytest.mark.parametrize("raw_gate", [False, True])
+@pytest.mark.parametrize("beta_dtype", [torch.float32, torch.bfloat16])
+def test_gdn_raw_and_log_gates_match_recurrence(backend, raw_gate, beta_dtype):
+    inputs = _make_inputs([65, 127], 4, 4, 8, seed=29, initial_state=True)
+    raw = torch.randn(192, 8, device="cuda", dtype=torch.bfloat16)
+    a_log = torch.linspace(-1, 1, 8, device="cuda")
+    bias = torch.full((8,), -2.0, device="cuda")
+    logits = torch.randn(192, 8, device="cuda", dtype=beta_dtype)
+    log_alpha = -a_log.exp() * torch.nn.functional.softplus(raw.float() + bias)
+    transformed = dict(
+        inputs, g=log_alpha.exp(), beta=logits.float().sigmoid().to(beta_dtype).float()
+    )
+    reference_out, reference_state = _serial(transformed)
+    out, state = chunk_gated_delta_rule(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        raw if raw_gate else log_alpha,
+        logits,
+        initial_state=inputs["initial_state"],
+        output_final_state=True,
+        cu_seqlens=inputs["cu_seqlens"],
+        backend=backend,
+        use_cp=False,
+        gate_domain="log",
+        use_gate_in_kernel=raw_gate,
+        A_log=a_log if raw_gate else None,
+        dt_bias=bias if raw_gate else None,
+        beta_is_logit=True,
+    )
+    assert_rel_close("raw/log gate output", out, reference_out, SERIAL_TOLERANCE)
+    assert_rel_close("raw/log gate state", state, reference_state, SERIAL_TOLERANCE)
 
 
 def test_cudnn_backend_names_every_unsupported_argument_at_once():
@@ -631,10 +796,12 @@ def test_cudnn_backend_names_every_unsupported_argument_at_once():
         _run_cudnn(
             inputs,
             use_cp=True,
-            state_indices=torch.zeros(1, dtype=torch.int32, device=device),
+            checkpoint_every_n_tokens=64,
+            state_checkpoints=torch.empty(4, 8, HEAD_DIM, HEAD_DIM, device=device),
+            checkpoint_cu_starts=torch.tensor([0, 4], dtype=torch.int32, device=device),
         )
     message = str(excinfo.value)
-    assert "use_cp" in message and "state_indices" in message
+    assert "use_cp" in message and "checkpoint_every_n_tokens" in message
 
 
 def test_backend_argument_is_validated():
