@@ -85,16 +85,27 @@ def test_unaligned_state_uses_legacy_route():
         )
 
 
+@pytest.mark.parametrize(
+    ("target", "target_arch", "gencode", "target_kind"),
+    [
+        ("sm100f", (10, "3a"), "-gencode=arch=compute_100f,code=sm_100f", 100),
+        ("sm107a", (10, "7a"), "-gencode=arch=compute_107a,code=sm_107a", 1070),
+    ],
+)
 @pytest.mark.parametrize("variant", cake_kda_packed_t1.CAKE_KDA_PACKED_T1_VARIANTS)
 def test_jit_specs_bind_frozen_source_and_physical_launch_metadata(
     monkeypatch,
     tmp_path,
     variant,
+    target,
+    target_arch,
+    gencode,
+    target_kind,
 ):
     monkeypatch.setattr(
         jit_core.current_compilation_context,
         "TARGET_CUDA_ARCHS",
-        {(10, "3a")},
+        {target_arch},
     )
     monkeypatch.setattr(
         cake_kda_packed_t1.jit_env,
@@ -104,13 +115,16 @@ def test_jit_specs_bind_frozen_source_and_physical_launch_metadata(
     cake_kda_packed_t1.gen_cake_kda_packed_t1_module.cache_clear()
 
     metadata = cake_kda_packed_t1.CAKE_KDA_PACKED_T1_VARIANT_METADATA[variant]
-    spec = cake_kda_packed_t1.gen_cake_kda_packed_t1_module(variant, "sm100f")
-    uri = cake_kda_packed_t1.get_cake_kda_packed_t1_uri(variant, "sm100f")
+    spec = cake_kda_packed_t1.gen_cake_kda_packed_t1_module(variant, target)
+    uri = cake_kda_packed_t1.get_cake_kda_packed_t1_uri(variant, target)
 
     assert spec.name == uri
     assert spec.sources == [tmp_path / uri / "cake_kda_packed_t1_binding.cu"]
-    assert "-gencode=arch=compute_100f,code=sm_100f" in spec.extra_cuda_cflags
-    assert "-DFLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND=100" in spec.extra_cuda_cflags
+    assert gencode in spec.extra_cuda_cflags
+    assert (
+        f"-DFLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND={target_kind}"
+        in spec.extra_cuda_cflags
+    )
     assert "-use_fast_math" in spec.extra_cuda_cflags
     assert "--maxrregcount=128" in spec.extra_cuda_cflags
     assert ("--ftz=false" in spec.extra_cuda_cflags) == (

@@ -27,7 +27,7 @@ from .core import JitSpec, logger
 from .utils import write_if_different
 
 FlashKDAPackedT1Variant = Literal["tile8", "tile16"]
-FlashKDAPackedT1Target = Literal["sm100a", "sm100f"]
+FlashKDAPackedT1Target = Literal["sm100a", "sm100f", "sm107a"]
 
 FLASH_KDA_PACKED_T1_VARIANTS: tuple[FlashKDAPackedT1Variant, ...] = (
     "tile8",
@@ -37,6 +37,7 @@ FLASH_KDA_PACKED_T1_VARIANTS: tuple[FlashKDAPackedT1Variant, ...] = (
 _FLASH_KDA_PACKED_T1_TARGET_KIND = {
     "sm100a": 1000,
     "sm100f": 100,
+    "sm107a": 1070,
 }
 
 

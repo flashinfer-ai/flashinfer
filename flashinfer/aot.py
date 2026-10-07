@@ -1365,6 +1365,7 @@ def detect_sm_capabilities():
         (10, "0f"),
         (10, "3a"),
         (10, "3f"),
+        (10, "7a"),
     }
     flash_kda_decode_sm103_arches = {(10, "3a"), (10, "3f")}
     return {
