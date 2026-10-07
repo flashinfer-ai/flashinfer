@@ -25,6 +25,14 @@ follow the standard SM100-family CuTe-DSL/Cake policy. SM120a uses a CuTe-DSL
 backend of its own. These prefill routes leave decode and speculative-decode
 dispatch unchanged.
 
+Input layout
+~~~~~~~~~~~~
+
+Ordinary prefill accepts strided Q/K. Dense-only providers pack Q/K before
+selection; cuDNN retains supported strides. V, gates, state and output keep
+their existing layout requirements. Output alias checks use the original
+Q/K storage, and decode retains its existing layout contract.
+
 .. currentmodule:: flashinfer.kda
 
 .. autosummary::
