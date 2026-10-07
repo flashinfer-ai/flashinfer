@@ -220,6 +220,13 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 f"{_NAME} launches on the current torch CUDA stream; BootstrapConfig.stream must be 0"
             )
+        from ......kernel_src.sm90.cake_bf16_megamoe import COMBINE_WIRES
+
+        if kcfg.combine_wire is not None and kcfg.combine_wire not in COMBINE_WIRES:
+            raise MoEEpConfigError(
+                f"{_NAME} combine_wire must be one of {COMBINE_WIRES} or None, got "
+                f"{kcfg.combine_wire!r}"
+            )
 
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
@@ -327,6 +334,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 pipe,
                 transformed_weights,
                 clamp=None if kcfg.clamp_limit is None else float(kcfg.clamp_limit),
+                combine_wire=kcfg.combine_wire,
             )
         except Exception:
             pipe.destroy()
@@ -352,6 +360,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             kcfg.dedup_dispatch,
             None if kcfg.clamp_limit is None else float(kcfg.clamp_limit),
             kcfg.allow_unverified_p2p,
+            kcfg.combine_wire,
             float(kcfg.init_timeout_s),
         )
 

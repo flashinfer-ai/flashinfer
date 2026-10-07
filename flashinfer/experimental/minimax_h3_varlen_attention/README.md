@@ -23,7 +23,7 @@ bias, dropout, sliding window or LSE output.
 
 | Tensor | Shape | dtype |
 | --- | --- | --- |
-| `query`, `key`, `value` | `[T, H, 128]` packed THD, contiguous | bfloat16 |
+| `query`, `key`, `value` | `[T, H, 128]` packed THD. BF16 route: any view with unit innermost stride, a head stride that is a 16-byte multiple (>= 128 elements), a token stride that is a 16-byte multiple (>= H x head stride) and a 16-byte-aligned base, e.g. the column slices of a fused `[T, 3*H*128]` QKV projection (strides `(3*H*128, 128, 1)`) or the slices of a `[T, H, 3, 128]` pack (strides `(H*384, 384, 1)`); the three may differ in strides and are read in place. NVFP4 routes: contiguous | bfloat16 |
 | `cu_seqlens` | `[B + 1]`, `cu_seqlens[0] == 0`, non-decreasing, `cu_seqlens[B] == T` | int32 (CUDA) |
 | `out` | `[T, H, 128]` (optional, caller-owned) | bfloat16 |
 
@@ -53,10 +53,12 @@ out4 = minimax_h3_varlen_nvfp4_attention(
 )  # NVFP4 QK, NVFP4 PV
 ```
 
-Both one-shot APIs read `cu_seqlens` back to the host (one synchronization)
-to build the segment plan; pass `cu_seqlens_host=[...]` to avoid it. For
-repeated launches or CUDA Graph capture use the prepared form from this
-package:
+Both one-shot APIs plan on every call. Without `cu_seqlens_host` they read
+`cu_seqlens` back to the host (one stream synchronization) to build the
+segment plan; passing `cu_seqlens_host=[...]` (the same offsets as a Python
+sequence) is the fast path: no device synchronization, only the small plan
+table uploads. For repeated launches or CUDA Graph capture use the prepared
+form from this package:
 
 ```python
 from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
@@ -210,29 +212,38 @@ is CUDA-Graph capturable.
 
 ## Supported hardware and limitations
 
-* SM100 (`sm_100a`, B200) and SM103 (`sm_103a`, B300/GB300) only. Separate
-  exact-arch programs are registered per architecture (`ROUTES["<variant>__<arch>"]`,
-  selected from the device's compute capability): the BF16 program is a
-  different trace of the same schedule per architecture (on SM103 the score
-  drain uses `tcgen05.ld.red`, every exp2 runs on MUFU and the lazy rescale
-  threshold is `2^-8`; on SM100 a quarter of the exp2 work runs as a packed
-  FMA polynomial). The NVFP4 attention programs differ per architecture the
-  same way (`USE_TMEM_LD_RED`: SM103 drains scores with `tcgen05.ld.red` and
-  runs every exp2 on MUFU; SM100 emulates the last quarter of the softmax
-  exp2 pairs with a packed polynomial). SM120/SM121 lack the tcgen05/TMEM
-  path and are not supported; SM90 is not a target.
+* SM100 (`sm_100a`, B200) and SM103 (`sm_103a`, B300/GB300) only. Each
+  program is one source compiled per exact architecture (`ROUTES["<variant>__<arch>"]`
+  selects the route from the device's compute capability; `MODULES[...]["arches"]`
+  lists the targets of a program). The per-architecture lowering lives in
+  exact `__CUDA_ARCH__` regions of that source: the BF16 schedule differs per
+  architecture (on SM103 the score drain uses `tcgen05.ld.red`, every exp2
+  runs on MUFU and the lazy rescale threshold is `2^-8`; on SM100 a quarter
+  of the exp2 work runs as a packed FMA polynomial), and the NVFP4 attention
+  programs differ the same way (`USE_TMEM_LD_RED`: SM103 drains scores with
+  `tcgen05.ld.red` and runs every exp2 on MUFU; SM100 emulates the last
+  quarter of the softmax exp2 pairs with a packed polynomial). SM120/SM121
+  lack the tcgen05/TMEM path and are not supported; SM90 is not a target.
 * BF16 THD inputs and BF16 output only, head dimension 128, noncausal,
   self-attention (`H_q == H_kv`), no bias/mask/window/LSE/dropout.
+* The BF16 route reads strided `query` / `key` / `value` views in place: the
+  host binding encodes the TMA descriptors from the views' strides and
+  passes the Q view's token/head strides to the kernel's ragged-tail copy
+  path. `out` is always contiguous. The NVFP4 routes (whose quantizers
+  read contiguous THD) require contiguous operands.
 * The NVFP4 variants trade accuracy for speed: validated tolerance against an
   FP32 reference is `atol=1.0, rtol=0.1` (BF16: `atol=rtol=1e-2`). The
   `fp8` PV mode is the default because its error is lower at similar speed;
   `fp4` PV is the fastest mode for long segments.
 * One-shot APIs synchronize once to read `cu_seqlens` unless
-  `cu_seqlens_host` is passed. The prepared runners never allocate or
-  synchronize.
-* Generated sources live under `csrc/cake_minimax_h3_varlen_attention/<arch>/`
-  and are registered in `cake_jit.py` (`MODULES`, `ROUTES`) by the Cake
-  generated-program export; the JIT builds them on first use. Until the export
+  `cu_seqlens_host` is passed (the fast path). The prepared runners never
+  allocate or synchronize; device facts (SM count, compute capability) are
+  read once per device.
+* Generated sources live under `csrc/cake_minimax_h3_varlen_attention/` (one
+  kernel source and one host binding per program, shared by both
+  architectures) and are registered in `cake_jit.py` (`MODULES`, `ROUTES`) by
+  the Cake generated-program export; the JIT builds a program for the
+  device's exact architecture on first use. Until the export
   has run, the entry points raise `NotImplementedError` naming the missing
   program.
 

@@ -14,9 +14,10 @@
 
 """Benchmark the experimental Kimi-K3 fused MoE router on SM100/SM103.
 
-The 28 routed shapes (``num_tokens in {1, 2, ..., 8192}`` x ``block_m in
-{8, 16}``) are timed with CUPTI (``--cupti``, cupti-python >= 13) or CUDA
-events and a cold L2 between iterations.  When ``sglang`` is importable the
+The 28 measured cells (``num_tokens in {1, 2, ..., 8192}`` x ``block_m in
+{8, 16}``) and a set of token counts between them (served by the
+neighbouring cell's arm) are timed with CUPTI (``--cupti``, cupti-python >= 13)
+or CUDA events and a cold L2 between iterations.  When ``sglang`` is importable the
 same tensors are also routed by SGLang's ``moe_route_radix.route_radix`` plus
 ``moe_align.moe_align_block_size`` (the two-launch equivalent of this one
 launch); the two arms are measured in interleaved rounds and the per-row and
@@ -35,8 +36,8 @@ import torch
 
 from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
     BLOCK_M_VALUES,
+    MEASURED_NUM_TOKENS,
     NUM_EXPERTS,
-    SUPPORTED_NUM_TOKENS,
     TOP_K,
     allocate_kimi_k3_route_plan,
     max_route_blocks,
@@ -44,10 +45,12 @@ from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
 from flashinfer.fused_moe import prepare_kimi_k3_fused_router
 from flashinfer.testing import bench_gpu_time
 
+# Token counts between the measured cells, one per arm range.
+ARBITRARY_NUM_TOKENS = (3, 100, 300, 1000, 3000, 8000)
 ROWS = {
     f"m{rows}_bm{bm}": (rows, bm)
     for bm in BLOCK_M_VALUES
-    for rows in SUPPORTED_NUM_TOKENS
+    for rows in (*MEASURED_NUM_TOKENS, *ARBITRARY_NUM_TOKENS)
 }
 
 

@@ -78,13 +78,13 @@ def target_arch(device_index: int) -> CakeMoeFinalizeArch:
 
 @functools.cache
 def gen_cake_moe_finalize_module(arch: CakeMoeFinalizeArch) -> JitSpec:
-    """One JIT module per architecture: the device sources plus the dispatch binding.
+    """One JIT module per architecture: the templated kernel source plus the dispatch binding.
 
-    The device sources are architecture independent; SM103 builds them with the
-    sm_103a flags.
+    The kernel source instantiates all twelve kernels and is architecture independent;
+    SM103 builds it with the sm_103a flags.
     """
     source_dir = _source_dir()
-    sources = [source_dir / "sm_100a" / f"{name}_device.cu" for name in kernel_names()]
+    sources = [source_dir / "cake_moe_finalize_kernels.cu"]
     sources.append(source_dir / f"{SOURCE_PACKAGE}_binding.cu")
     return gen_jit_spec(
         name=f"{SOURCE_PACKAGE}_{arch}",

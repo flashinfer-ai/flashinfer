@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Prepared fused grouped FP8 gate_up GEMM + SwiGLU + per-token-group FP8 quantization on Blackwell SM100a.
+"""Prepared fused grouped FP8 gate_up GEMM + SwiGLU + per-token-group FP8 quantization on Blackwell (SM100a, SM103a).
 
 These are the generated Cake programs for the MoE gate_up chain that FlashInfer
 otherwise runs as three kernels: :func:`flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous`
@@ -20,8 +20,9 @@ FP8 E4M3).  Every route reproduces the chain's rounding points exactly:
   kernel that fuses SwiGLU with the group quantization (two launches instead
   of three).  The GEMM kernel is chosen by :func:`small_m_gemm_backend`.
 * Routing-aware rule (:func:`select_route`): when the routing is known —
-  ``validate_indices=True`` derives the 128-row block count of every expert
-  from ``m_indices`` inside its synchronizing check — a large problem's three
+  the caller passes the rows per expert as ``group_counts`` (no device work),
+  or ``validate_indices=True`` derives the 128-row block count of every expert
+  from ``m_indices`` with one device-to-host transfer — a large problem's three
   candidate routes (pair + tail, mixed schedule, GEMM + act) are ranked by a
   makespan model fitted on B200 route measurements (``ROUTE_MODEL_B200``: pair
   tiles grid-striding over the clusters plus list-scheduled odd-tail units,
@@ -70,14 +71,19 @@ attribute right after the pair kernel (which signals its dependents at start),
 so its CTAs fill the SMs the pair grid leaves free or retires from; it reads
 only the operator's inputs.
 
-Descriptor storage for the pointer TMA ABI (fused routes, and the Cake GEMM of
-the small-M route) is private to each prepared launch: the first ``launch()``
-initializes it synchronously and must run outside CUDA Graph capture; later
-launches only submit work on the current stream and may be captured.
+Tensor maps are encoded by the bindings and passed to the kernels by value, so
+a prepared launch owns no descriptor storage and allocates nothing after
+preparation: every ``launch()``, including the first, only submits work on the
+current stream and may be captured into a CUDA graph (the small-M route's
+CuTe-DSL GEMM is specialized by one eager call at preparation).  The GEMM +
+act routes'
+BF16 ``(M, 2H)`` intermediate may be supplied by the caller (``workspace``) and
+is otherwise allocated once at preparation.
 """
 
 from __future__ import annotations
 
+import functools
 import heapq
 import math
 from dataclasses import dataclass
@@ -87,9 +93,12 @@ import torch
 import tvm_ffi
 
 from ..jit.gemm.cake_grouped_fp8_fused_silu_quant import (
+    ARG_PLANS,
     MODULES,
+    PROGRAMS,
     ROUTE_GEOMETRY,
     SUPPORTED_COMPUTE_CAPABILITIES,
+    device_arch,
     generated_program_available,
     load_cake_grouped_fp8_fused_silu_quant_module,
     select_stage_module,
@@ -161,6 +170,34 @@ def route_geometry(route: str) -> tuple[int, int, int]:
         int(geometry["tile_n"]),
         int(geometry["cluster_ctas"]),
     )
+
+
+@functools.cache
+def device_sm_count(device_index: int) -> int:
+    """Streaming-multiprocessor count of CUDA device ``device_index`` (queried once)."""
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+def bind_arguments(
+    arg_plan: list[list[str]],
+    bindings: dict[str, Any],
+    grid: tuple[int, int, int],
+    *,
+    module_name: str,
+) -> tuple[Any, ...]:
+    """Order ``bindings`` by the generated program's positional argument plan."""
+    grid_by_axis = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
+    arguments = []
+    for kind, name in arg_plan:
+        if kind == "grid":
+            arguments.append(grid_by_axis[name])
+        elif kind in ("tma_buffer", "buffer", "parameter") and name in bindings:
+            arguments.append(bindings[name])
+        else:
+            raise RuntimeError(
+                f"generated program {module_name} binds {kind} {name!r}, which this host plan does not declare"
+            )
+    return tuple(arguments)
 
 
 # A partial final block hands the small-M GEMM to the Cake kernel from this K on (see small_m_gemm_backend).
@@ -510,33 +547,70 @@ def _require_tensor(
 
 
 def _validate_indices(m_indices: torch.Tensor, groups: int) -> tuple[int, ...]:
-    """Synchronizing check of the routing contract (sorted, in range, 128-aligned boundaries).
+    """Check the routing contract (in range, sorted, 128-aligned internal boundaries) with one transfer.
 
-    Returns the 128-row block count of every expert (the routing statistics of
-    :func:`select_route`); every block is homogeneous under the contract, so the
-    expert of a block is the index of its first row.
+    Every statistic is reduced on the device and copied to the host in a single
+    transfer.  Returns the 128-row block count of every expert (the routing
+    statistics of :func:`select_route`); every block is homogeneous under the
+    contract, so the expert of a block is the index of its first row.
     """
     indices = m_indices.to(torch.int64)
-    lowest = int(indices.min())
-    highest = int(indices.max())
+    m = indices.numel()
+    device = indices.device
+    zero = torch.zeros((), dtype=torch.int64, device=device)
+    if m > 1:
+        step = indices[1:] - indices[:-1]
+        unsorted = (step < 0).sum()
+        misaligned = (
+            (step > 0) & (torch.arange(1, m, device=device) % ROW_BLOCK != 0)
+        ).sum()
+    else:
+        unsorted = misaligned = zero
+    block_experts = indices[::ROW_BLOCK]
+    counts = torch.zeros((groups,), dtype=torch.int64, device=device).scatter_add_(
+        0, block_experts.clamp(0, groups - 1), torch.ones_like(block_experts)
+    )
+    stats = torch.cat(
+        (torch.stack((indices.min(), indices.max(), unsorted, misaligned)), counts)
+    ).tolist()
+    lowest, highest, unsorted, misaligned = stats[:4]
     if lowest < 0 or highest >= groups:
         raise ValueError(
             "m_indices must satisfy 0 <= index < num_groups; -1 padding is unsupported"
         )
-    if indices.numel() > 1:
-        step = indices[1:] - indices[:-1]
-        if bool((step < 0).any()):
-            raise ValueError("m_indices must be sorted in nondecreasing order")
-        boundaries = torch.nonzero(step > 0).flatten() + 1
-        if bool((boundaries % ROW_BLOCK != 0).any()):
+    if unsorted:
+        raise ValueError("m_indices must be sorted in nondecreasing order")
+    if misaligned:
+        raise ValueError(
+            "m_indices must place every internal expert boundary at a multiple "
+            "of 128 rows (only the final expert may end in a partial block)"
+        )
+    return tuple(int(v) for v in stats[4:])
+
+
+def _group_blocks_from_counts(
+    group_counts: Sequence[int], m: int, groups: int
+) -> tuple[int, ...]:
+    """Block counts from caller-supplied rows per expert (host integers; no device work)."""
+    counts = [int(c) for c in group_counts]
+    if len(counts) != groups:
+        raise ValueError(
+            f"group_counts must have one entry per expert ({groups}), got {len(counts)}"
+        )
+    if any(c < 0 for c in counts) or sum(counts) != m:
+        raise ValueError(
+            f"group_counts must be non-negative and sum to M={m}, got sum {sum(counts)}"
+        )
+    prefix = 0
+    for count in counts:
+        prefix += count
+        if (
+            0 < prefix < m and prefix % ROW_BLOCK
+        ):  # only the final expert may end in a partial block
             raise ValueError(
-                "m_indices must place every internal expert boundary at a multiple "
-                "of 128 rows (only the final expert may end in a partial block)"
+                "group_counts must place every internal expert boundary at a multiple of 128 rows"
             )
-    block_experts = indices[::ROW_BLOCK]
-    return tuple(
-        int(v) for v in torch.bincount(block_experts, minlength=groups).tolist()
-    )
+    return routing_blocks(counts)
 
 
 @dataclass
@@ -550,10 +624,13 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
     for the mixed-schedule route; two for the GEMM + act routes: the grouped
     GEMM into the private BF16 workspace, then the generated activation
     kernel) on PyTorch's current stream for the bound
-    device and returns ``(out_q, out_s)``.  The first launch initializes
-    private TMA descriptor storage and must run outside CUDA Graph capture.
-    ``grid`` is the grid of the route's first generated kernel;
-    ``stage_grids`` holds every generated kernel's grid by stage name.
+    device and returns ``(out_q, out_s)``.
+    Every launch, including the first, may be captured into a CUDA graph; the
+    prepared object retains no descriptor storage, and the small-M route's
+    CuTe-DSL GEMM is run once at preparation so that it is specialized before
+    any capture.  ``grid`` is the grid of the
+    route's first generated kernel; ``stage_grids`` holds every generated
+    kernel's grid by stage name.
     """
 
     route: str
@@ -565,7 +642,6 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
     stage_module_names: dict[str, str]
     stage_grids: dict[str, tuple[int, int, int]]
     _entries: tuple[tuple[Callable[..., Any], tuple[Any, ...]], ...]
-    _descriptor_storages: tuple[torch.Tensor, ...]
     _gemm: Optional[Callable[[], Any]]
     _gemm_out: Optional[torch.Tensor]
 
@@ -610,10 +686,12 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
     m_indices: torch.Tensor,
     out_q: Optional[torch.Tensor] = None,
     out_s: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
     *,
     validate_indices: bool = False,
+    group_counts: Optional[Sequence[int]] = None,
 ) -> PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
-    r"""Prepare a contiguous grouped FP8 gate_up GEMM + SwiGLU + FP8 quantization launch on SM100a.
+    r"""Prepare a contiguous grouped FP8 gate_up GEMM + SwiGLU + FP8 quantization launch on SM100a / SM103a.
 
     Parameters
     ----------
@@ -639,8 +717,18 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
     out_s : Optional[torch.Tensor]
         Contiguous float32 scales ``(M, H // 128)`` (row-major, one per
         128-column group, ``max(absmax, 1e-10) / 448``).  Allocated if omitted.
+    workspace : Optional[torch.Tensor]
+        Contiguous bfloat16 ``(M, 2H)`` intermediate of the GEMM + act routes.
+        Allocated at preparation if omitted and the route needs it; ignored by
+        the fused routes.
     validate_indices : bool
-        Check the routing contract with a device synchronization.
+        Check the routing contract (range, sortedness, 128-aligned internal
+        boundaries) with one device-to-host transfer; the per-expert block
+        counts it yields drive the routing-aware route rule.
+    group_counts : Optional[Sequence[int]]
+        Rows per expert as host integers (``len == G``, summing to ``M``).
+        Enables the routing-aware rule without any device work; checked for
+        consistency against ``m_indices`` when ``validate_indices=True``.
 
     Returns
     -------
@@ -649,28 +737,33 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
 
     Notes
     -----
-    Requires an SM100a (compute capability 10.0) device and a registered
-    generated program for the resolved route (:func:`launch_plan`); the
-    mixed-schedule route is reachable only with ``validate_indices=True``.  All
+    Requires an SM100a (compute capability 10.0) or SM103a (10.3) device and a
+    registered generated program for the resolved route (:func:`launch_plan`);
+    the mixed-schedule route is reachable only with the routing known
+    (``group_counts`` or ``validate_indices=True``).  All
     tensors must live on the same CUDA device and be 16-byte aligned
     (``out_s`` 4-byte).  The outputs match the three-kernel FlashInfer chain
     (CuTe-DSL grouped GEMM, ``silu_and_mul``, ``per_token_group_quant_8bit``)
     element for element on the same inputs.  ``M < SMALL_M_MAX`` rows run the
-    FlashInfer grouped GEMM (:func:`small_m_gemm_backend`) into a BF16
-    ``(M, 2H)`` workspace owned by the prepared object, then one generated
-    SwiGLU + group-quantization kernel.  Index values are unchecked unless
-    ``validate_indices=True``; violating the routing contract is undefined
-    behavior.
+    FlashInfer grouped GEMM (:func:`small_m_gemm_backend`) into the BF16
+    ``(M, 2H)`` ``workspace``, then one generated SwiGLU + group-quantization
+    kernel.  Preparation performs no device work beyond the optional index
+    validation; the device SM count is read once per process.  Index values
+    are unchecked unless ``validate_indices=True``; violating the routing
+    contract is undefined behavior.
     """
     if not isinstance(a, torch.Tensor) or a.device.type != "cuda":
         raise ValueError("a must be a CUDA torch.Tensor")
     device = a.device
-    capability = torch.cuda.get_device_capability(device)
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
+    device_index = (
+        torch.cuda.current_device() if device.index is None else int(device.index)
+    )
+    arch = device_arch(device_index)
     if arch is None:
         raise NotImplementedError(
-            "prepared fused grouped FP8 gate_up+SwiGLU+quant requires an SM100a device "
-            f"(compute capability 10.0); got {capability}"
+            "prepared fused grouped FP8 gate_up+SwiGLU+quant requires an SM100a or SM103a device "
+            f"(compute capability {sorted(SUPPORTED_COMPUTE_CAPABILITIES)}); "
+            f"got {torch.cuda.get_device_capability(device_index)}"
         )
     if a.ndim != 2 or b.ndim != 3:
         raise ValueError("a must have shape (M, K) and b must have shape (G, 2H, K)")
@@ -718,10 +811,17 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         alignment=4,
     )
     group_blocks: Optional[tuple[int, ...]] = None
+    if group_counts is not None:
+        group_blocks = _group_blocks_from_counts(group_counts, m, groups)
     if validate_indices:
-        group_blocks = _validate_indices(m_indices, groups)
+        validated = _validate_indices(m_indices, groups)
+        if group_blocks is not None and validated != group_blocks:
+            raise ValueError(
+                f"group_counts {list(group_counts)} disagree with m_indices (blocks {list(validated)})"
+            )
+        group_blocks = validated
 
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    sm_count = device_sm_count(device_index)
     route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=group_blocks, k=k)
     stage_grids: dict[str, tuple[int, int, int]] = {ROUTE_STAGES[route][0]: grid}
     if route == FUSED_ROUTE:
@@ -753,7 +853,11 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
             bindings["A64"] = bindings["A"]
     else:
         gemm_backend = small_m_gemm_backend(m, n2, k)
-        gemm_out = torch.empty((m, n2), dtype=torch.bfloat16, device=device)
+        if workspace is None:
+            workspace = torch.empty((m, n2), dtype=torch.bfloat16, device=device)
+        gemm_out = _require_tensor(
+            workspace, "workspace", shape=(m, n2), dtype=torch.bfloat16, device=device
+        )
         if gemm_backend == GEMM_BACKEND_CAKE:
             gemm = prepare_group_gemm_fp8_nt_groupwise_contiguous(
                 a, b, a_scale, b_scale, m_indices, out=gemm_out
@@ -766,46 +870,26 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
                     a, b, a_scale, b_scale, m_indices, out=y
                 )
 
+            # The CuTe-DSL kernel is specialized (compiled on a cold cache) by its
+            # first call: run it once here, into the intermediate it owns anyway,
+            # so that every launch() only submits work and may be captured.
+            gemm()
+
         bindings = {"y": gemm_out, "out_q": out_q, "out_s": out_s, "M": m, "H": h}
 
     entries = []
-    descriptor_storages = []
     for stage in ROUTE_STAGES[route]:
         stage_module_name = stage_module_names[stage]
-        record = MODULES[stage_module_name]
+        program = PROGRAMS[MODULES[stage_module_name]["program"]]
         module = load_cake_grouped_fp8_fused_silu_quant_module(stage_module_name)
-        entry = getattr(module, record["ffi_entry"])
-        descriptor_storage: Optional[torch.Tensor] = None
-        workspace_bytes = int(record["tma_workspace_bytes"])
-        if route in FUSED_ROUTES:
-            descriptor_storage = torch.empty(
-                max(workspace_bytes, 128), dtype=torch.uint8, device=device
-            )
-            descriptor_storages.append(descriptor_storage)
-        elif workspace_bytes:
-            raise RuntimeError(
-                f"generated program {stage_module_name} of route {route!r} unexpectedly needs TMA descriptor storage"
-            )
-        grid_by_axis = dict(
-            zip(("grid_x", "grid_y", "grid_z"), stage_grids[stage], strict=True)
+        entry = getattr(module, program["ffi_entry"])
+        arguments = bind_arguments(
+            ARG_PLANS[program["arg_plan"]],
+            bindings,
+            stage_grids[stage],
+            module_name=stage_module_name,
         )
-        arguments = []
-        for kind, name in record["arg_plan"]:
-            if kind == "grid":
-                arguments.append(grid_by_axis[name])
-            elif kind == "workspace":
-                if descriptor_storage is None:
-                    raise RuntimeError(
-                        f"generated program {stage_module_name} binds descriptor storage this host plan does not own"
-                    )
-                arguments.append(descriptor_storage)
-            elif name in bindings:
-                arguments.append(bindings[name])
-            else:
-                raise RuntimeError(
-                    f"generated program {stage_module_name} binds {name!r}, which this host plan does not declare"
-                )
-        entries.append((entry, tuple(arguments)))
+        entries.append((entry, arguments))
     return PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant(
         route=route,
         module_name=module_name,
@@ -816,7 +900,6 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         stage_module_names=stage_module_names,
         stage_grids=stage_grids,
         _entries=tuple(entries),
-        _descriptor_storages=tuple(descriptor_storages),
         _gemm=gemm,
         _gemm_out=gemm_out,
     )
@@ -834,6 +917,7 @@ __all__ = [
     "GEMM_BACKEND_CAKE",
     "GEMM_BACKEND_CUTE",
     "SMALL_M_MAX",
+    "MAX_M",
     "PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant",
     "is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available",
     "fused_tile_counts",

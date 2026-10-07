@@ -22,26 +22,19 @@ from flashinfer.experimental.msa_nvfp4_decode.cake_backend import (
     arch_for,
     DATA_DIM,
     generated_program_available,
-    HEAD_DIM,
-    MAIN_KWARGS,
-    msa_nvfp4_decode_workspace_size,
     PAGE_SIZE,
     persistent_cta_capacity,
     prepare_msa_nvfp4_sparse_decode as prepare_backend,
     SCALE_DIM,
     short_grid,
-    SHORT_KWARGS,
     short_program_record,
     short_route_applies,
     split_factor,
     SPLIT_FACTORS,
-    STATS_PER_SLOT,
     SUPPORTED_COMPUTE_CAPABILITIES,
     tail_plan,
     TOPK,
     validate_msa_nvfp4_decode_inputs,
-    WORKSPACE_ALIGN,
-    workspace_layout,
 )
 from flashinfer.msa_ops import _nvfp4_decode_sm100 as upstream
 from flashinfer.msa_ops import (
@@ -135,30 +128,6 @@ def test_page_layout_matches_the_route_contract(num_kv_heads):
 )
 def test_split_factor_rule(items, capacity, max_pages, expected):
     assert split_factor(items, capacity, max_pages) == expected
-
-
-def test_workspace_layout_sizes_and_alignment():
-    assert workspace_layout(37, 1) == {"total": 0}
-    items, splits = 32, 4
-    layout = workspace_layout(items, splits)
-    slots = items * splits
-    assert layout["partial_o"] == (0, slots * STATS_PER_SLOT * HEAD_DIM * 4)
-    assert layout["partial_m"][1] == slots * STATS_PER_SLOT * 4
-    assert layout["partial_d"][1] == slots * STATS_PER_SLOT * 4
-    assert layout["split_completion"][1] == items * 4
-    offsets = [
-        layout[k][0]
-        for k in ("partial_o", "partial_m", "partial_d", "split_completion")
-    ]
-    assert offsets == sorted(offsets)
-    assert all(o % WORKSPACE_ALIGN == 0 for o in offsets)
-    assert layout["total"] % WORKSPACE_ALIGN == 0
-    assert layout["total"] >= sum(
-        layout[k][1]
-        for k in ("partial_o", "partial_m", "partial_d", "split_completion")
-    )
-    with pytest.raises(ValueError, match="split factor"):
-        workspace_layout(4, 3)
 
 
 def _cpu_inputs(seq_lens=(300, 257), num_kv_heads=4, group_size=16, seqlen_q=1):
@@ -297,22 +266,6 @@ def test_public_entry_routes_only_to_cake():
         )
 
 
-GRID_ARG_PLAN = [["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]]
-EXPECTED_ARG_PLAN = (
-    [["tma_buffer", n] for n in MAIN_KWARGS[:5]]
-    + [["buffer", n] for n in MAIN_KWARGS[5:16]]
-    + [["parameter", n] for n in MAIN_KWARGS[16:23]]
-    + GRID_ARG_PLAN
-)
-# The short-item program takes the page views as flat byte aliases (pointer
-# ABI, no tensor maps) and their page / head byte strides as parameters.
-EXPECTED_SHORT_ARG_PLAN = (
-    [["buffer", n] for n in SHORT_KWARGS[:12]]
-    + [["parameter", n] for n in SHORT_KWARGS[12:27]]
-    + GRID_ARG_PLAN
-)
-
-
 def test_toolchain_guard_declines_programs_the_toolkit_cannot_compile(monkeypatch):
     """A checkout may register sm_107a programs on a toolkit without compute_107a:
     the JIT declines them up front and the backend reports no program for 10.7."""
@@ -325,86 +278,62 @@ def test_toolchain_guard_declines_programs_the_toolkit_cannot_compile(monkeypatc
         assert cake_jit.toolchain_supports("sm_103a")
         assert not cake_jit.toolchain_supports("sm_107a")
         assert not cake_jit.toolchain_supports("sm_120a")
-        for name, record in cake_jit.MODULES.items():
-            if record["arch"] != "sm_107a":
-                continue
-            cake_jit.gen_cake_msa_nvfp4_decode_module.cache_clear()
+        for name in cake_jit.programs_for("sm_107a"):
+            cake_jit.gen_program_spec.cache_clear()
             with pytest.raises(RuntimeError, match="compute_107a"):
-                cake_jit.gen_cake_msa_nvfp4_decode_module(name, cake_jit.STAGES[0])
+                cake_jit.gen_program_spec(name, "sm_107a")
             break
         if torch.cuda.is_available() and torch.cuda.get_device_capability(0) == (10, 7):
             assert not generated_program_available(torch.device("cuda"))
     finally:
         cake_jit.toolchain_supports.cache_clear()
-        cake_jit.gen_cake_msa_nvfp4_decode_module.cache_clear()
+        cake_jit.gen_program_spec.cache_clear()
 
 
-def test_registry_records_match_the_host_binding():
-    if not cake_jit.MODULES:
-        pytest.skip("no generated program registered in this checkout")
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_every_architecture_registers_the_split_ladder(arch):
+    """Behaviour of the registry: each supported architecture resolves a plain
+    persistent program for every split factor and (optionally) one short-item
+    program, each with a source pair the JIT can hand to nvcc."""
+    if not cake_jit.programs_for(arch):
+        pytest.skip(f"no generated program registered for {arch}")
+    assert cake_jit.registered_split_factors(arch) == SPLIT_FACTORS
+    names = {cake_jit.select_program(arch, splits=s) for s in SPLIT_FACTORS}
+    assert len(names) == len(SPLIT_FACTORS)  # one distinct program per factor
+    for _name, record in cake_jit.tail_programs(arch):
+        assert int(record["splits"]) > 1
+        assert all(
+            int(sms) > 0 and int(ctas) >= int(record["splits"])
+            for sms, ctas in record["cluster_capacity"].items()
+        )
+        names.add(cake_jit.select_program(arch, splits=record["splits"], tail=True))
+    short = cake_jit.short_program(arch)
+    if short is not None:
+        record = cake_jit.PROGRAMS[short]
+        assert int(record["max_pages"]) >= 1 and int(record["cluster"]) >= 2
+        assert int(record["max_clusters"]) >= 1
+        names.add(short)
     root = cake_jit.Path(cake_jit.__file__).resolve().parent / "csrc"
-    seen = set()
-    per_arch_ctas = {}
-    short_arches = set()
-    for name, record in cake_jit.MODULES.items():
-        assert record["arch"] in SUPPORTED_COMPUTE_CAPABILITIES.values()
-        route = cake_jit.route_of(record)
-        assert route in {"swap_tsk", "short"}
-        if route == "swap_tsk":
-            assert int(record["splits"]) in SPLIT_FACTORS
-            assert int(record["ctas_per_sm"]) >= 1
-            per_arch_ctas.setdefault(record["arch"], set()).add(
-                int(record["ctas_per_sm"])
-            )
-            tail = bool(record.get("tail", False))
-            key = (record["arch"], int(record["splits"]), tail)
-            expected_plan = EXPECTED_ARG_PLAN
-            assert (
-                cake_jit.select_module(record["arch"], int(record["splits"]), tail=tail)
-                == name
-            )
-            if tail:
-                # A last-round-split program names the parts it was frozen for.
-                assert int(record["splits"]) > 1
-                capacity = record["cluster_capacity"]
-                assert capacity and all(
-                    int(sms) > 0 and int(ctas) >= int(record["splits"])
-                    for sms, ctas in capacity.items()
-                )
-                assert record in cake_jit.tail_records(record["arch"])
-        else:
-            assert int(record["max_pages"]) >= 1
-            assert int(record["cluster"]) >= 2
-            assert int(record["max_clusters"]) >= 1
-            key = (record["arch"], "short")
-            expected_plan = EXPECTED_SHORT_ARG_PLAN
-            assert cake_jit.select_short_module(record["arch"]) == name
-            short_arches.add(record["arch"])
-        assert key not in seen, f"duplicate registration for {key}"
-        seen.add(key)
-        main = record["main"]
-        assert main["ffi_entry"] == "run"
-        assert [list(item) for item in main["arg_plan"]] == expected_plan
-        assert record["closure_sha256"] == main["closure_sha256"]
-        assert len(main["sources"]) == 2
-        for relative in main["sources"]:
-            assert (root / relative).is_file(), relative
-            assert relative.startswith(f"cake_msa_nvfp4_decode/{record['arch']}/")
-    assert all(len(v) == 1 for v in per_arch_ctas.values())
-    for arch in per_arch_ctas:
-        assert cake_jit.registered_split_factors(arch) == SPLIT_FACTORS
-    # A short program is only registered next to the persistent programs of its architecture.
-    assert short_arches <= set(per_arch_ctas)
-    for arch in set(per_arch_ctas) - short_arches:
-        assert cake_jit.select_short_module(arch) is None
+    for name in names:
+        record = cake_jit.PROGRAMS[name]
+        assert arch in record["arches"]
+        assert len(record["sources"]) == 2
+        assert all((root / relative).is_file() for relative in record["sources"])
+        if cake_jit.toolchain_supports(arch):
+            spec = cake_jit.gen_program_spec(name, arch)
+            assert spec.name == f"{name}_{arch}"
+    for route in ("persistent", "short"):
+        plan = cake_jit.ARG_PLANS.get(route)
+        if plan:
+            assert [n for k, n in plan if k == "grid"] == ["grid_x", "grid_y", "grid_z"]
     with pytest.raises(NotImplementedError):
-        cake_jit.select_module("sm_90a", 1)
-    assert cake_jit.select_short_module("sm_90a") is None
-    assert cake_jit.tail_records("sm_90a") == []
+        cake_jit.select_program("sm_90a", splits=1)
+    assert cake_jit.short_program("sm_90a") is None
+    assert cake_jit.tail_programs("sm_90a") == []
 
 
 def test_tail_plan_rule():
-    if not cake_jit.tail_records("sm_107a"):
+    if not cake_jit.tail_programs("sm_107a"):
         pytest.skip("no last-round-split program registered for sm_107a")
     # 212 resident CTAs: 256 items are 1.21 -> 2 rounds plain, 1.5 with a two-way last round on a
     # 212-CTA grid; 512 items 2.42 -> 3 plain, 2.5 split.
@@ -420,7 +349,7 @@ def test_tail_plan_rule():
 
 
 # ---------------------------------------------------------------------------
-# Device (SM100 / SM103 with the generated program registered)
+# Device (SM100 / SM103 / SM107 with the generated program registered)
 # ---------------------------------------------------------------------------
 
 
@@ -443,19 +372,8 @@ def _oracle(inputs):
     )
 
 
-def _prepare(inputs, *, workspace=None, out=None, lse=None):
-    device = inputs["q"].device
-    batch = int(inputs["seqused_k"].numel())
-    num_kv_heads = int(inputs["k"].shape[1])
-    if workspace is None:
-        workspace = torch.empty(
-            msa_nvfp4_decode_workspace_size(
-                batch, num_kv_heads, device, seqlen_q=inputs["seqlen_q"]
-            ),
-            dtype=torch.uint8,
-            device=device,
-        )
-    runner = prepare_msa_nvfp4_sparse_decode(
+def _prepare(inputs, *, out=None, lse=None):
+    return prepare_msa_nvfp4_sparse_decode(
         inputs["q"],
         inputs["k"],
         inputs["v"],
@@ -466,13 +384,11 @@ def _prepare(inputs, *, workspace=None, out=None, lse=None):
         seqused_k=inputs["seqused_k"],
         k_global_scale=inputs["k_global_scale"],
         v_global_scale=inputs["v_global_scale"],
-        workspace_buffer=workspace,
         seqlen_q=inputs["seqlen_q"],
         softmax_scale=inputs["softmax_scale"],
         out=out,
         lse=lse,
     )
-    return runner, workspace
 
 
 def _run_and_check(seq_lens, num_kv_heads, *, group_size=16, seqlen_q=1, seed):
@@ -484,10 +400,11 @@ def _run_and_check(seq_lens, num_kv_heads, *, group_size=16, seqlen_q=1, seed):
         device="cuda",
         seed=seed,
     )
-    runner, workspace = _prepare(inputs)
+    runner = _prepare(inputs)
     items = len(seq_lens) * seqlen_q * num_kv_heads
     device = inputs["q"].device
     arch = arch_for(device)
+    assert runner.arch == arch
     if short_route_applies(arch, inputs["max_pages"]):
         # Requests of at most the short program's page budget take the
         # eight-CTA-cluster program: one cluster per work item, no split.
@@ -497,7 +414,7 @@ def _run_and_check(seq_lens, num_kv_heads, *, group_size=16, seqlen_q=1, seed):
         sms = torch.cuda.get_device_properties(device).multi_processor_count
         assert runner.num_ctas == short_grid(items, sms, record)[0]
     else:
-        assert runner.route == "swap_tsk"
+        assert runner.route == "persistent"
         capacity = persistent_cta_capacity(device)
         expected_splits = split_factor(items, capacity, inputs["max_pages"])
         # A part that registers a last-round-split program (sm_107a) turns a
@@ -514,6 +431,9 @@ def _run_and_check(seq_lens, num_kv_heads, *, group_size=16, seqlen_q=1, seed):
         else:
             assert runner.tail is True
             assert (runner.splits, runner.num_ctas) == plan
+        assert runner.program == cake_jit.select_program(
+            arch, splits=runner.splits, tail=runner.tail
+        )
     runner.out.fill_(float("nan"))
     out = runner()
     torch.cuda.synchronize()
@@ -521,7 +441,7 @@ def _run_and_check(seq_lens, num_kv_heads, *, group_size=16, seqlen_q=1, seed):
     torch.testing.assert_close(out, expected, atol=ATOL, rtol=RTOL)
     assert torch.isfinite(runner.lse).all()
     assert runner.lse.shape == (inputs["q"].shape[0], inputs["q"].shape[1])
-    return inputs, runner, workspace
+    return inputs, runner
 
 
 @pytest.mark.parametrize(
@@ -561,6 +481,62 @@ def test_decode_matches_the_fp32_oracle(seq_lens, num_kv_heads, group_size, seql
     )
 
 
+def _batch_requesting(splits: int, capacity: int, num_kv_heads: int) -> int:
+    """Smallest batch of 64K-token requests whose ``batch * num_kv_heads`` items
+    make ``split_factor`` pick ``splits`` on a ``capacity``-CTA part, or 0 when
+    the part cannot request that factor with whole requests (checked, not
+    assumed: the rule is re-evaluated on the chosen item count)."""
+    pages = (65536 + PAGE_SIZE - 1) // PAGE_SIZE
+    if splits == 1:
+        # one CTA per item: the items alone fill more than half of the part
+        items = (capacity // 2 // num_kv_heads + 1) * num_kv_heads
+    else:
+        # the rule doubles while every (item, split) CTA fits one wave, so the
+        # largest item count with items * splits <= capacity selects ``splits``
+        items = capacity // splits // num_kv_heads * num_kv_heads
+    if items < num_kv_heads or items > capacity:
+        return 0
+    return (
+        items // num_kv_heads if split_factor(items, capacity, pages) == splits else 0
+    )
+
+
+def test_every_split_factor_runs_its_program():
+    """Each registered split factor of the attached part prepares, launches and
+    matches the oracle.  The batch for each factor is derived from the part's
+    resident-CTA capacity (so every factor is actually requested on a 148-,
+    160- or 212-CTA part instead of assuming a fixed batch list), and the
+    selection is asserted, not assumed."""
+    _require_program()
+    device = torch.device("cuda")
+    capacity = persistent_cta_capacity(device)
+    requested, seen = {}, {}
+    for splits in SPLIT_FACTORS:
+        batch = _batch_requesting(splits, capacity, 4)
+        if batch == 0:
+            continue
+        requested[splits] = batch
+        _inputs, runner = _run_and_check([65536] * batch, 4, seed=50 + batch)
+        assert runner.route == "persistent" and not runner.tail, (
+            splits,
+            batch,
+            capacity,
+            runner.route,
+            runner.tail,
+        )
+        assert runner.splits == splits, (splits, batch, capacity, runner.splits)
+        seen[splits] = runner.splits
+    assert set(seen) == set(requested) and len(requested) >= 2, (
+        capacity,
+        requested,
+        seen,
+    )
+    assert set(requested) == set(SPLIT_FACTORS), (
+        capacity,
+        requested,
+    )  # every registered factor is reachable on a supported part
+
+
 @pytest.mark.parametrize(
     "seq_lens,num_kv_heads",
     [([8192] * 8, 4), ([300, 65536, 1029], 1)],
@@ -573,7 +549,7 @@ def test_matches_the_existing_nvfp4_route(seq_lens, num_kv_heads):
     """
     _require_program()
     _require_existing_route()
-    inputs, runner, _ = _run_and_check(seq_lens, num_kv_heads, seed=41)
+    inputs, runner = _run_and_check(seq_lens, num_kv_heads, seed=41)
     route_out = torch.empty_like(inputs["q"])
     msa_sparse_decode_attention(
         inputs["q"],
@@ -594,7 +570,7 @@ def test_serves_a_geometry_the_existing_route_declines():
     generated program serves it from the same pages."""
     _require_program()
     _require_existing_route()
-    inputs, _, _ = _run_and_check([4096] * 3, 1, group_size=8, seed=43)
+    inputs, _ = _run_and_check([4096] * 3, 1, group_size=8, seed=43)
     with pytest.raises(NotImplementedError):
         msa_sparse_decode_attention(
             inputs["q"],
@@ -616,41 +592,25 @@ def _require_short_program():
 
 def test_short_items_take_the_cluster_program():
     """Requests within the short program's page budget run one eight-CTA cluster
-    per work item from the same pages, with no workspace and no allocation."""
+    per work item from the same pages, with no allocation at launch."""
     _require_short_program()
-    inputs, runner, _ = _run_and_check([257, 300, 1, 512], 4, seed=17)
+    inputs, runner = _run_and_check([257, 300, 1, 512], 4, seed=17)
     assert runner.route == "short"
     # A KV head serving fewer than sixteen query heads (tp8 geometry) is served
     # from the same program; rows beyond the group are never read or written.
     _run_and_check([385, 300, 129], 1, group_size=8, seed=29)
-    assert runner.main_kwargs["msa_max_pages"] == inputs["max_pages"]
-    # No workspace is bound: preparing without one succeeds for these requests.
-    bare = prepare_msa_nvfp4_sparse_decode(
-        inputs["q"],
-        inputs["k"],
-        inputs["v"],
-        inputs["q2k_indices"],
-        k_scale=inputs["k_scale"],
-        v_scale=inputs["v_scale"],
-        page_table=inputs["page_table"],
-        seqused_k=inputs["seqused_k"],
-        k_global_scale=inputs["k_global_scale"],
-        v_global_scale=inputs["v_global_scale"],
-    )
-    assert bare.route == "short"
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats()
-    bare()
+    runner()
     torch.cuda.synchronize()
     after = torch.cuda.memory_stats()
     assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 0
-    torch.testing.assert_close(bare.out, _oracle(inputs), atol=ATOL, rtol=RTOL)
-    torch.testing.assert_close(bare.out, runner.out, atol=0, rtol=0)
+    torch.testing.assert_close(runner.out, _oracle(inputs), atol=ATOL, rtol=RTOL)
 
 
 def test_short_program_graph_replay_follows_new_selections():
     _require_short_program()
-    inputs, runner, _ = _run_and_check([300] * 8, 4, seed=19)
+    inputs, runner = _run_and_check([300] * 8, 4, seed=19)
     assert runner.route == "short"
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -675,9 +635,7 @@ def test_short_program_graph_replay_follows_new_selections():
 def test_graph_replay_follows_new_queries_and_selections():
     """Capture once; replay after new queries and a new top-k selection are written in place."""
     _require_program()
-    inputs, runner, _ = _run_and_check(
-        [8192] * 4, 4, seed=11
-    )  # eight-way split: exercises the workspace
+    inputs, runner = _run_and_check([8192] * 4, 4, seed=11)  # eight-way split
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -710,9 +668,7 @@ def test_graph_replay_follows_new_queries_and_selections():
 
 def test_launch_makes_no_allocation():
     _require_program()
-    _, runner, _ = _run_and_check(
-        [65536] * 2, 4, seed=5
-    )  # split path binds the workspace
+    _, runner = _run_and_check([65536] * 2, 4, seed=5)  # split path
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats()
     runner()
@@ -725,7 +681,7 @@ def test_multi_round_batches_take_the_last_round_split():
     _require_program()
     device = torch.device("cuda")
     arch = arch_for(device)
-    if not cake_jit.tail_records(arch):
+    if not cake_jit.tail_programs(arch):
         pytest.skip(f"no last-round-split program registered for {arch}")
     capacity = persistent_cta_capacity(device)
     # More items than resident CTAs (256 on the 212-SM part) with eight page pairs each.
@@ -733,60 +689,11 @@ def test_multi_round_batches_take_the_last_round_split():
     items = 64 * 4
     plan = tail_plan(arch, items, capacity, inputs["max_pages"])
     assert plan is not None and items > capacity
-    runner = prepare_msa_nvfp4_sparse_decode(
-        inputs["q"],
-        inputs["k"],
-        inputs["v"],
-        inputs["q2k_indices"],
-        k_scale=inputs["k_scale"],
-        v_scale=inputs["v_scale"],
-        page_table=inputs["page_table"],
-        seqused_k=inputs["seqused_k"],
-        k_global_scale=inputs["k_global_scale"],
-        v_global_scale=inputs["v_global_scale"],
-    )
-    # The tail program merges through distributed shared memory: no workspace was needed.
-    assert runner.tail and runner.route == "swap_tsk"
+    runner = _prepare(inputs)
+    assert runner.tail and runner.route == "persistent"
     assert (runner.splits, runner.num_ctas) == plan
-    assert cake_jit.MODULES[runner.module_name]["tail"] is True
+    assert cake_jit.PROGRAMS[runner.program]["tail"] is True
     runner()
     torch.cuda.synchronize()
     torch.testing.assert_close(runner.out, _oracle(inputs), atol=ATOL, rtol=RTOL)
     assert torch.isfinite(runner.lse).all()
-
-
-def test_split_batches_require_a_sized_workspace():
-    _require_program()
-    inputs = build_decode_inputs([65536] * 2, num_kv_heads=4, device="cuda", seed=9)
-    with pytest.raises(ValueError, match="workspace_buffer"):
-        _prepare(inputs, workspace=torch.empty(0, dtype=torch.uint8, device="cuda"))
-    kwargs = dict(
-        k_scale=inputs["k_scale"],
-        v_scale=inputs["v_scale"],
-        page_table=inputs["page_table"],
-        seqused_k=inputs["seqused_k"],
-        k_global_scale=inputs["k_global_scale"],
-        v_global_scale=inputs["v_global_scale"],
-    )
-    with pytest.raises(ValueError, match="workspace_buffer"):
-        prepare_msa_nvfp4_sparse_decode(
-            inputs["q"], inputs["k"], inputs["v"], inputs["q2k_indices"], **kwargs
-        )
-    # An unsplit batch needs no workspace at all.
-    big = build_decode_inputs([4096] * 40, num_kv_heads=4, device="cuda", seed=10)
-    runner = prepare_msa_nvfp4_sparse_decode(
-        big["q"],
-        big["k"],
-        big["v"],
-        big["q2k_indices"],
-        k_scale=big["k_scale"],
-        v_scale=big["v_scale"],
-        page_table=big["page_table"],
-        seqused_k=big["seqused_k"],
-        k_global_scale=big["k_global_scale"],
-        v_global_scale=big["v_global_scale"],
-    )
-    assert runner.splits == 1
-    runner()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(runner.out, _oracle(big), atol=ATOL, rtol=RTOL)

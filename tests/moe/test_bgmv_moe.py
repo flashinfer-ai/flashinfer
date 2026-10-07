@@ -223,10 +223,10 @@ def generate_test_data(
 # Tests
 # ============================================================
 
-# BGMV MoE kernels are tested on SM80-SM90 (A100, H100, B200).
-# Skip on consumer Blackwell GPUs (SM120, e.g., RTX 5090, RTX Pro 6000)
-# where extended shared memory behavior may differ.
-_SUPPORTED_SM = {90, 100, 103}
+# BGMV MoE kernels are tested on SM80-SM90 (A100, H100, B200) and the
+# datacenter Blackwell/Rubin parts. Skip on consumer Blackwell GPUs (SM120,
+# e.g. RTX 5090, RTX Pro 6000) where extended shared memory behavior may differ.
+_SUPPORTED_SM = {90, 100, 103, 107}
 
 
 def _skip_if_unsupported_sm():
