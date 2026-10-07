@@ -524,6 +524,8 @@ def _gdn_prefill_gates_reference(
     output_state=None,
 ):
     """Independent token recurrence for transformed GDN gate inputs."""
+    if beta_is_logit and b is None:
+        raise ValueError("beta_is_logit requires beta")
     heads, dim = max(q.shape[1], v.shape[1]), q.shape[-1]
     scale = scale or dim**-0.5
     if use_qk_l2norm_in_kernel:
