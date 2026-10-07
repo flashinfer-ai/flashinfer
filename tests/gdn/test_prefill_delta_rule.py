@@ -300,6 +300,12 @@ def test_prefill_kernel_basic(
 
     if head_size_v > head_size:
         pytest.skip("DV > DK is not supported")
+    if (
+        not is_sm90a_supported(torch.device("cuda"))
+        and not is_sm100a_supported(torch.device("cuda"))
+        and (head_size, head_size_v) != (128, 128)
+    ):
+        pytest.skip("the SM12x kernel only implements DK == DV == 128")
     if use_cp and (head_size, head_size_v) != (128, 128):
         pytest.skip("CP path only supports square DK=DV=128")
 
@@ -1163,10 +1169,14 @@ def _test_prefill_kernel_state_dtype(
     scale: float,
     use_cp: bool,
     seed: int | None = None,
+    head_size_v: int | None = None,
 ):
     _skip_if_unsupported()
     if use_cp:
         _skip_if_cp_unsupported()
+
+    if head_size_v is None:
+        head_size_v = head_size
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -1181,7 +1191,13 @@ def _test_prefill_kernel_state_dtype(
     device = torch.device("cuda")
     with device:
         q, k, v = qkv_factory(
-            seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+            seq_lens,
+            num_q_heads,
+            num_k_heads,
+            num_v_heads,
+            head_size,
+            dtype,
+            head_size_v=head_size_v,
         )
         k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
         cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
@@ -1192,7 +1208,7 @@ def _test_prefill_kernel_state_dtype(
                 num_seqs,
                 num_sab_heads,
                 head_size,
-                head_size,
+                head_size_v,
                 dtype=torch.float32,
             )
             * 0.01
@@ -1200,10 +1216,10 @@ def _test_prefill_kernel_state_dtype(
         initial_state = initial_state_ref.transpose(-1, -2).contiguous()
 
     our_o = torch.empty(
-        [total_seqlen, num_o_heads, head_size], dtype=dtype, device=device
+        [total_seqlen, num_o_heads, head_size_v], dtype=dtype, device=device
     )
     our_state = torch.empty(
-        (num_seqs, num_sab_heads, head_size, head_size),
+        (num_seqs, num_sab_heads, head_size_v, head_size),
         dtype=state_dtype,
         device=device,
     )
@@ -1258,6 +1274,7 @@ def _test_prefill_kernel_state_dtype(
 
 @pytest.mark.parametrize("scale", ["auto"])
 @pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("head_size_v", [128, 64], ids=lambda d: f"dv{d}")
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [
@@ -1280,12 +1297,15 @@ def test_prefill_kernel_state_dtype(
     num_k_heads: int,
     num_v_heads: int,
     head_size: int,
+    head_size_v: int,
     seq_lens: list[int],
     scale: float | str,
     state_dtype: torch.dtype,
     use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
+    if head_size_v != head_size and use_cp:
+        pytest.skip("CP requires DV == DK")
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_prefill_kernel_state_dtype(
         qkv_factory,
@@ -1299,4 +1319,5 @@ def test_prefill_kernel_state_dtype(
         scale,
         use_cp,
         seed=seed,
+        head_size_v=head_size_v,
     )

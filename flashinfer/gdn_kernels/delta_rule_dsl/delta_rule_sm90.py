@@ -8,7 +8,13 @@ from cutlass.cute.nvgpu import warp, warpgroup, cpasync
 from ...utils import get_device_sm_count, _get_cache_buf
 from .alpha import AlphaProcessor
 from .collective_store_tma import CollectiveStoreTma
-from .custom_compile_cache import KeyedCompileMixin, cached_compile
+from .custom_compile_cache import (
+    KeyedCompileMixin,
+    cached_compile,
+    get_cached_compile,
+)
+
+_SM90_COMPILE_OPTIONS = (cute.EnableTVMFFI(True), cute.GPUArch("sm_90a"))
 from .collective_inverse_hmma import CollectiveInverse
 from .helpers import SM90, round_down, select_tensor_10, state_dtype_to_cutlass
 from .schedule import WorkDesc
@@ -2561,55 +2567,8 @@ def delta_rule_prefill_dsl_sm90(
     workspace_size = get_device_sm_count(q.device) * 128
     tensormaps_t = _get_cache_buf("gdn_prefill_tensormaps", workspace_size, q.device)
 
-    stream_val = torch.cuda.current_stream().cuda_stream
-    stream = cuda_driver.CUstream(stream_val)
-
-    enable_tvm_ffi = True
-    if enable_tvm_ffi:
-        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
-            *args, **{**kwargs, "enable_tvm_ffi": True}
-        )
-
-    # Keep head counts and varlen extents runtime values across cached compiles.
-    q_cute = from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-    k_cute = from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-    v_cute = from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-    o_cute = from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-    alpha_cute = (
-        from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_alpha
-        else None
-    )
-    beta_cute = (
-        from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_beta
-        else None
-    )
-    state_cute = from_dlpack(state, assumed_align=16).mark_layout_dynamic()
-    init_state_cute = (
-        from_dlpack(init_state, assumed_align=16).mark_layout_dynamic()
-        if needs_init_state
-        else None
-    )
-    state_indices_cute = (
-        from_dlpack(state_indices, assumed_align=4).mark_layout_dynamic()
-        if use_state_indices
-        else None
-    )
-    state_checkpoints_cute = (
-        from_dlpack(
-            state_checkpoints.reshape(-1), assumed_align=16
-        ).mark_layout_dynamic()
-        if needs_checkpointing
-        else None
-    )
-    checkpoint_cu_cute = (
-        from_dlpack(checkpoint_cu_starts, assumed_align=8).mark_layout_dynamic()
-        if needs_checkpointing
-        else None
-    )
-    tensormaps_cute = from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic()
-    cu_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+    # Launch on q's device, not whichever device happens to be current.
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
 
     delta_rule_kernel = _FullyFusedDeltaRuleSm90(
         needs_alpha,
@@ -2640,34 +2599,113 @@ def delta_rule_prefill_dsl_sm90(
         head_size_v=DV,
     )
 
-    kernel_args = (
-        q_cute,
-        k_cute,
-        v_cute,
-        o_cute,
-        alpha_cute,
-        beta_cute,
-        state_cute,
-        init_state_cute,
-        state_indices_cute,
-        state_checkpoints_cute,
-        checkpoint_cu_cute,
-        tensormaps_cute,
-        cu_cute,
-        cutlass.Float32(scale),
-        cutlass.Int32(num_q_heads),
-        cutlass.Int32(num_k_heads),
-        cutlass.Int32(num_v_heads),
-        cutlass.Int32(num_sab_heads),
-        cutlass.Int32(num_seqs),
-        cutlass.Int32(total_checkpoints),
-        cutlass.Int32(checkpoint_every_n_tokens),
+    # Fast path: a cache hit needs no CuTe wrappers at all, so build them
+    # only when we are about to compile.
+    compiled_delta_rule_kernel = get_cached_compile(
+        delta_rule_kernel, _SM90_COMPILE_OPTIONS
+    )
+    if compiled_delta_rule_kernel is None:
+        enable_tvm_ffi = True
+        if enable_tvm_ffi:
+            from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
+                *args, **{**kwargs, "enable_tvm_ffi": True}
+            )
+
+        # Keep head counts and varlen extents runtime values across cached compiles.
+        q_cute = from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        k_cute = from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+        v_cute = from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+        o_cute = from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+        alpha_cute = (
+            from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic()
+            if needs_alpha
+            else None
+        )
+        beta_cute = (
+            from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic()
+            if needs_beta
+            else None
+        )
+        state_cute = from_dlpack(state, assumed_align=16).mark_layout_dynamic()
+        init_state_cute = (
+            from_dlpack(init_state, assumed_align=16).mark_layout_dynamic()
+            if needs_init_state
+            else None
+        )
+        state_indices_cute = (
+            from_dlpack(state_indices, assumed_align=4).mark_layout_dynamic()
+            if use_state_indices
+            else None
+        )
+        state_checkpoints_cute = (
+            from_dlpack(
+                state_checkpoints.reshape(-1), assumed_align=16
+            ).mark_layout_dynamic()
+            if needs_checkpointing
+            else None
+        )
+        checkpoint_cu_cute = (
+            from_dlpack(checkpoint_cu_starts, assumed_align=8).mark_layout_dynamic()
+            if needs_checkpointing
+            else None
+        )
+        tensormaps_cute = from_dlpack(
+            tensormaps_t, assumed_align=128
+        ).mark_layout_dynamic()
+        cu_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
+
+        kernel_args = (
+            q_cute,
+            k_cute,
+            v_cute,
+            o_cute,
+            alpha_cute,
+            beta_cute,
+            state_cute,
+            init_state_cute,
+            state_indices_cute,
+            state_checkpoints_cute,
+            checkpoint_cu_cute,
+            tensormaps_cute,
+            cu_cute,
+            cutlass.Float32(scale),
+            cutlass.Int32(num_q_heads),
+            cutlass.Int32(num_k_heads),
+            cutlass.Int32(num_v_heads),
+            cutlass.Int32(num_sab_heads),
+            cutlass.Int32(num_seqs),
+            cutlass.Int32(total_checkpoints),
+            cutlass.Int32(checkpoint_every_n_tokens),
+            num_seqs * num_sab_heads,
+            stream,
+        )
+        compiled_delta_rule_kernel = cached_compile(
+            delta_rule_kernel,
+            *kernel_args,
+            compile_options=_SM90_COMPILE_OPTIONS,
+        )
+    compiled_delta_rule_kernel(
+        q_tma,
+        k_tma,
+        v_tma,
+        o_tma,
+        alpha.reshape(-1) if needs_alpha else None,
+        beta.reshape(-1) if needs_beta else None,
+        state,
+        init_state if needs_init_state else None,
+        state_indices if use_state_indices else None,
+        state_checkpoints.reshape(-1) if needs_checkpointing else None,
+        checkpoint_cu_starts if needs_checkpointing else None,
+        tensormaps_t,
+        cu_seqlens,
+        scale,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        num_sab_heads,
+        num_seqs,
+        total_checkpoints,
+        checkpoint_every_n_tokens,
         num_seqs * num_sab_heads,
         stream,
     )
-    compiled_delta_rule_kernel = cached_compile(
-        delta_rule_kernel,
-        *kernel_args,
-        compile_options=(cute.GPUArch("sm_90a"),),
-    )
-    compiled_delta_rule_kernel(*kernel_args)

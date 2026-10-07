@@ -1250,6 +1250,13 @@ def chunk_gated_delta_rule(
         # SM120 Blackwell path (CuTe DSL kernel)
         if chunk_gated_delta_rule_sm120 is None:
             raise NotImplementedError("SM120 GDN prefill DSL kernel is unavailable")
+        # The SM120 kernel derives one D from q and views v with it, so a
+        # narrower value head would read past v's storage.
+        if head_size != 128 or head_size_v != head_size:
+            raise NotImplementedError(
+                "SM120 GDN prefill requires head_size == head_size_v == 128, got "
+                f"head_size={head_size}, head_size_v={head_size_v}"
+            )
         if output_state is None:
             output_state_shape = (
                 initial_state.shape
