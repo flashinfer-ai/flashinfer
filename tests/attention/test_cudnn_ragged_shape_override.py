@@ -511,6 +511,8 @@ def test_bounded_mla_replan_capture_and_rebinding(causal, lse_layout, monkeypatc
 @pytest.mark.parametrize("return_lse", [False, True])
 def test_bounded_mla_prewarm_classes_before_capture(return_lse, monkeypatch):
     """Warm declared capacities once, then capture new live shapes in any order."""
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("bounded MLA cache classes are qualified on SM100")
     if not cudnn_prefill._cudnn_supports_bounded_ragged():
         pytest.skip("requires FE bounded packed overrides")
     from cutlass import cute
