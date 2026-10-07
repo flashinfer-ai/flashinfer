@@ -417,6 +417,29 @@ def msa_sparse_decode_attention(
                 "SM90 msa_sparse_decode_attention requires an fp8 e4m3 KV cache, "
                 f"got k={k.dtype} v={v.dtype}"
             )
+        if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            # The SM90 schedule folds scales into a bf16 q; fp16 would be read as
+            # bf16 and return wrong numbers rather than failing.
+            raise NotImplementedError(
+                f"SM90 msa_sparse_decode_attention requires bf16 or fp8 q, got {q.dtype}"
+            )
+        if q2k_indices.shape[-1] != 16:
+            raise NotImplementedError(
+                f"SM90 msa_sparse_decode_attention supports topk=16 only, got "
+                f"{q2k_indices.shape[-1]}"
+            )
+        if seqused_k.dtype != torch.int32 or seqused_k.ndim != 1:
+            raise ValueError("SM90 seqused_k must be 1D int32")
+        if seqused_k.numel() != batch_size:
+            raise ValueError(
+                f"SM90 seqused_k must have batch_size ({batch_size}) entries, got "
+                f"{seqused_k.numel()}"
+            )
+        if page_table.ndim != 2 or page_table.shape[0] != batch_size:
+            raise ValueError(
+                f"SM90 page_table must be (batch_size={batch_size}, max_pages), got "
+                f"{tuple(page_table.shape)}"
+            )
         from ._sm90_dispatch import sparse_decode_sm90
 
         out = torch.empty(

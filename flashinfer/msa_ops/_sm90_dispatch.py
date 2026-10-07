@@ -77,6 +77,24 @@ def proxy_score_sm90(
     pt = page_table.to(torch.int32).contiguous()
     sk = seqused_k.to(torch.int32).contiguous()
 
+    # The decode/prefill schedules read the index cache with a fixed element type,
+    # so a mismatched q or k dtype is read as the wrong bits rather than rejected.
+    if kv_fp8:
+        if k.dtype != torch.float8_e4m3fn:
+            raise NotImplementedError(
+                f"SM90 proxy-score fp8 path requires an fp8 e4m3 k cache, got {k.dtype}"
+            )
+        if q.dtype != torch.float8_e4m3fn:
+            raise NotImplementedError(
+                f"SM90 proxy-score fp8 path requires fp8 e4m3 q, got {q.dtype}"
+            )
+    else:
+        if k.dtype != torch.bfloat16 or q.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"SM90 proxy-score bf16 path requires bf16 q and k, got "
+                f"q={q.dtype} k={k.dtype}"
+            )
+
     if decode:
         if kv_fp8:
             # The fp8 decode schedule indexes a log2 table keyed on Hq.
@@ -102,7 +120,7 @@ def proxy_score_sm90(
         if q_offset is not None
         else _prefix_lens(cu, sk)
     )
-    _prefill(q, k, cu, pt, sk, pfx, per_head)
+    _prefill(q, k, cu, pt, sk, pfx, per_head, max_seqlen_q=max_seqlen_q)
     return per_head
 
 

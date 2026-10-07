@@ -436,7 +436,23 @@ def msa_proxy_score(
     if sm90:
         if not paged:
             raise NotImplementedError("SM90 proxy-score requires the paged KV layout")
+        if not causal:
+            # The SM90 proxy kernels always apply the causal mask; accepting
+            # causal=False would silently return masked scores the caller did not
+            # ask for.
+            raise NotImplementedError("SM90 proxy-score is causal-only")
         from ._sm90_dispatch import proxy_score_sm90
+
+        # An int q_offset applies to every sequence; materialize it rather than
+        # dropping it, which would silently align the mask at 0.
+        if isinstance(q_offset, torch.Tensor):
+            sm90_q_offset = q_offset
+        elif q_offset is None:
+            sm90_q_offset = None
+        else:
+            sm90_q_offset = torch.full(
+                (batch_size,), int(q_offset), dtype=torch.int32, device=dev
+            )
 
         proxy_score_sm90(
             q,
@@ -448,7 +464,7 @@ def msa_proxy_score(
             max_seqlen_q=max_seqlen_q,
             batch_size=batch_size,
             kv_fp8=kv_fp8,
-            q_offset=q_offset if isinstance(q_offset, torch.Tensor) else None,
+            q_offset=sm90_q_offset,
         )
         if not reduce_heads:
             return per_head

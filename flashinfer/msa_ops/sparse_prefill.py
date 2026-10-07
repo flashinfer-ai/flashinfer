@@ -253,6 +253,24 @@ def msa_sparse_attention(
                 "SM90 msa_sparse_attention requires an fp8 e4m3 KV cache, "
                 f"got k={k.dtype} v={v.dtype}"
             )
+        if q.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"SM90 msa_sparse_attention requires bf16 q, got {q.dtype}"
+            )
+        if q2k_indices.shape[-1] != 16:
+            raise NotImplementedError(
+                f"SM90 msa_sparse_attention supports topk=16 only, got "
+                f"{q2k_indices.shape[-1]}"
+            )
+        if group_size not in (8, 16):
+            raise NotImplementedError(
+                f"SM90 msa_sparse_attention supports GQA group 8 or 16, got {group_size}"
+            )
+        if not causal:
+            # The SM90 schedule always applies the causal mask; honouring
+            # causal=False would need a separate kernel, and silently ignoring it
+            # would return wrong numbers.
+            raise NotImplementedError("SM90 msa_sparse_attention is causal-only")
         from ._sm90_dispatch import sparse_prefill_sm90
 
         out = torch.zeros(
