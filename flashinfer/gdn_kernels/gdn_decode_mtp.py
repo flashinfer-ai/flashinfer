@@ -923,62 +923,63 @@ def gdn_verify_kernel_mtp(
                         # the slot-flat index is pool_slot * HV + i_hv.
                         if cutlass.const_expr(per_token_pool_scatter):
                             pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
-                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                            # (65,536 bytes). Element multiply overflows Int32 at
-                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                            # T=8 the max is 73,727 — well over. Matches the
-                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                            # used by reads (PR #3230). Zero reg cost: compiler
-                            # emits mad.wide.u32.
-                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                            fla_t0 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v0, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t0)
-                            fla_t1 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v1, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t1)
-                            fla_t2 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v2, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t2)
-                            fla_t3 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v3, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t3)
-                            fla_t4 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v4, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (4, None)), fla_t4)
-                            fla_t5 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v5, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (5, None)), fla_t5)
-                            fla_t6 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v6, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (6, None)), fla_t6)
-                            fla_t7 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v7, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (7, None)), fla_t7)
+                            if pool_slot_t >= 0:
+                                # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                                # (65,536 bytes). Element multiply overflows Int32 at
+                                # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                                # T=8 the max is 73,727 — well over. Matches the
+                                # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                                # used by reads (PR #3230). Zero reg cost: compiler
+                                # emits mad.wide.u32.
+                                fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                                fla_t0 = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v0, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t0)
+                                fla_t1 = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v1, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t1)
+                                fla_t2 = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v2, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t2)
+                                fla_t3 = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v3, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t3)
+                                fla_t4 = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v4, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (4, None)), fla_t4)
+                                fla_t5 = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v5, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (5, None)), fla_t5)
+                                fla_t6 = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v6, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (6, None)), fla_t6)
+                                fla_t7 = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v7, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (7, None)), fla_t7)
 
                         # Step 5: Output dot products h@q for all 8 rows
                         o0 = 0.0
@@ -1490,38 +1491,39 @@ def gdn_verify_kernel_mtp(
                         # FLA-style per-token pool scatter (parallel to cache).
                         if cutlass.const_expr(per_token_pool_scatter):
                             pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
-                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                            # (65,536 bytes). Element multiply overflows Int32 at
-                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                            # T=8 the max is 73,727 — well over. Matches the
-                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                            # used by reads (PR #3230). Zero reg cost: compiler
-                            # emits mad.wide.u32.
-                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                            fla_t_a = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_a, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
-                            fla_t_b = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_b, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
-                            fla_t_c = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_c, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t_c)
-                            fla_t_d = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_d, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t_d)
+                            if pool_slot_t >= 0:
+                                # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                                # (65,536 bytes). Element multiply overflows Int32 at
+                                # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                                # T=8 the max is 73,727 — well over. Matches the
+                                # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                                # used by reads (PR #3230). Zero reg cost: compiler
+                                # emits mad.wide.u32.
+                                fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                                fla_t_a = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v_idx_a, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
+                                fla_t_b = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v_idx_b, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
+                                fla_t_c = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v_idx_c, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t_c)
+                                fla_t_d = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v_idx_d, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t_d)
 
                     # Write final state back for ALL 4 rows (if not disabled).
                     # Negative write indices skip the writeback.
@@ -1653,26 +1655,27 @@ def gdn_verify_kernel_mtp(
                         # FLA-style per-token pool scatter (parallel to cache).
                         if cutlass.const_expr(per_token_pool_scatter):
                             pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
-                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                            # (65,536 bytes). Element multiply overflows Int32 at
-                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                            # T=8 the max is 73,727 — well over. Matches the
-                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                            # used by reads (PR #3230). Zero reg cost: compiler
-                            # emits mad.wide.u32.
-                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                            fla_t_a = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_a, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
-                            fla_t_b = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_b, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
+                            if pool_slot_t >= 0:
+                                # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                                # (65,536 bytes). Element multiply overflows Int32 at
+                                # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                                # T=8 the max is 73,727 — well over. Matches the
+                                # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                                # used by reads (PR #3230). Zero reg cost: compiler
+                                # emits mad.wide.u32.
+                                fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                                fla_t_a = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v_idx_a, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
+                                fla_t_b = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v_idx_b, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
 
                         # Step 5: Compute output for BOTH rows (ILP)
                         sum_hq_a = 0.0
@@ -2254,38 +2257,39 @@ def gdn_verify_kernel_mtp_inline(
                         # FLA-style per-token pool scatter (inline ilp_rows=4).
                         if cutlass.const_expr(per_token_pool_scatter):
                             pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
-                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                            # (65,536 bytes). Element multiply overflows Int32 at
-                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                            # T=8 the max is 73,727 — well over. Matches the
-                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                            # used by reads (PR #3230). Zero reg cost: compiler
-                            # emits mad.wide.u32.
-                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                            fla_t_a = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_a, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
-                            fla_t_b = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_b, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
-                            fla_t_c = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_c, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t_c)
-                            fla_t_d = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_d, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t_d)
+                            if pool_slot_t >= 0:
+                                # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                                # (65,536 bytes). Element multiply overflows Int32 at
+                                # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                                # T=8 the max is 73,727 — well over. Matches the
+                                # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                                # used by reads (PR #3230). Zero reg cost: compiler
+                                # emits mad.wide.u32.
+                                fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                                fla_t_a = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v_idx_a, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
+                                fla_t_b = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v_idx_b, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
+                                fla_t_c = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v_idx_c, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t_c)
+                                fla_t_d = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v_idx_d, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t_d)
 
                         # Step 5: h@q with deferred L2 norm
                         sum_hq_a = 0.0
@@ -2576,26 +2580,27 @@ def gdn_verify_kernel_mtp_inline(
                         # FLA-style per-token pool scatter (inline ilp_rows=2).
                         if cutlass.const_expr(per_token_pool_scatter):
                             pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
-                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                            # (65,536 bytes). Element multiply overflows Int32 at
-                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                            # T=8 the max is 73,727 — well over. Matches the
-                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                            # used by reads (PR #3230). Zero reg cost: compiler
-                            # emits mad.wide.u32.
-                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                            fla_t_a = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_a, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
-                            fla_t_b = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_b, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
+                            if pool_slot_t >= 0:
+                                # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                                # (65,536 bytes). Element multiply overflows Int32 at
+                                # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                                # T=8 the max is 73,727 — well over. Matches the
+                                # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                                # used by reads (PR #3230). Zero reg cost: compiler
+                                # emits mad.wide.u32.
+                                fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                                fla_t_a = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v_idx_a, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
+                                fla_t_b = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (fla_idx, v_idx_b, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
 
                         # h@q reduction
                         for offset in [16, 8, 4, 2, 1]:
