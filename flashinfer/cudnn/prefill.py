@@ -160,10 +160,11 @@ def _override_cache_shape(
     # A bounded declaration lets either FE provider reserve packed partials and
     # select an underfilled packed launch. Powers of two retain graph reuse across
     # steps; the packed-Q capacity follows the declaration, not the live total.
+    # Q=1 stays in the distinct decode class; shorter prefill shares Q<=128.
     if (
         bounded_ragged
         and 1 <= batch_size <= 4
-        and 64 <= max_seq_q <= 1024
+        and 2 <= max_seq_q <= 1024
         and 2048 <= max_seq_kv <= 32768
         and 4 * max_seq_q <= max_seq_kv
     ):

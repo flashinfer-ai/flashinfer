@@ -220,22 +220,31 @@ def test_short_q_long_kv_rows(q_len):
     _assert_matches_fa2(
         lens, hq, hkv, d, causal=False, kv_lens=kv_lens, return_lse=(q_len != 1)
     )
-    # a stream of such steps builds nothing new
-    before = cudnn_prefill._prefill_graph_builds
+    # Warm the encountered classes, then revisit them in a different order.
+    # Small bounded batches and the broad fallback may use different graphs.
+    steps = []
     for _ in range(4):
-        b2 = int(torch.randint(1, 30, (1,)))
+        batch = int(torch.randint(1, 30, (1,)))
+        steps.append((batch, torch.randint(129, 4096, (batch,)).tolist()))
+
+    def run_step(step):
+        batch, kv = step
         _run(
             "cudnn",
-            [q_len] * b2,
+            [q_len] * batch,
             hq,
             hkv,
             d,
             causal=False,
-            kv_lens=torch.randint(
-                129, 4096, (b2,)
-            ).tolist(),  # stays in the long-kv class
-            return_lse=(q_len != 1),  # same graph family as the parity call above
+            kv_lens=kv,
+            return_lse=(q_len != 1),
         )
+
+    for step in steps:
+        run_step(step)
+    before = cudnn_prefill._prefill_graph_builds
+    for step in reversed(steps):
+        run_step(step)
     assert cudnn_prefill._prefill_graph_builds == before
 
 
@@ -376,8 +385,9 @@ def test_cache_shape_growth_when_exceeded(monkeypatch):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("lse_layout", [None, "NH", "HN"])
 @pytest.mark.parametrize("head_dim_qk,num_kv_heads", [(192, 4), (128, 4), (128, 1)])
+@pytest.mark.parametrize("small_q", [False, True], ids=["regular_q", "small_q"])
 def test_bounded_ragged_replan_capture_and_rebinding(
-    causal, lse_layout, head_dim_qk, num_kv_heads, monkeypatch
+    causal, lse_layout, head_dim_qk, num_kv_heads, small_q, monkeypatch
 ):
     """One bounded graph handles different batches, totals, pointers and strides."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
@@ -392,10 +402,12 @@ def test_bounded_ragged_replan_capture_and_rebinding(
     )
     graph = None
     generator = torch.Generator(device="cuda").manual_seed(733)
-    for qlens, klens in (
-        ([129, 65, 0], [2049, 2011, 0]),
-        ([241, 1, 0, 128], [3001, 127, 0, 4096]),
-    ):
+    steps = (
+        (([63, 2, 0], [2049, 2011, 0]), ([31, 1, 0, 7], [3001, 127, 0, 4096]))
+        if small_q
+        else (([129, 65, 0], [2049, 2011, 0]), ([241, 1, 0, 128], [3001, 127, 0, 4096]))
+    )
+    for qlens, klens in steps:
         qo, ko = _indptr(qlens), _indptr(klens)
         q = torch.randn(
             sum(qlens),
@@ -589,11 +601,13 @@ def test_bounded_ragged_prewarm_classes_before_capture(
             lse_base="ln",
         )
 
-    # Warm two capacity classes using fewer live tokens than their bounds.
+    # Warm capacity classes using fewer live tokens than their bounds.
     # No bucket size, engine winner or split count is pinned by this test.
     warm = torch.cuda.Stream()
     warm.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warm):
+        plan([63], [2049], 128, 4096)
+        run()
         plan([129], [2049], 256, 4096)
         run()
         plan([321, 1], [4096, 1], 512, 4096)
@@ -610,6 +624,9 @@ def test_bounded_ragged_prewarm_classes_before_capture(
                 ([241], [3001], 256),
                 ([400, 0], [4096, 0], 512),
                 ([65], [2048], 256),
+                ([2], [3001], 2),
+                ([7], [2049], 7),
+                ([31], [2048], 31),
             ):
                 # Keep each capture's metadata owner alive. Different wrappers
                 # must also reuse the graph signatures warmed above.
