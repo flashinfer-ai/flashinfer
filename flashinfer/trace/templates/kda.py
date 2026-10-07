@@ -140,7 +140,7 @@ def _recurrent_kda_template(
     )
 
 
-recurrent_kda_trace = _recurrent_kda_template(
+_recurrent_kda_default_trace = _recurrent_kda_template(
     name_prefix="recurrent_kda",
     description=(
         "Recurrent Key-Driven Attention with per-key-dimension gating and an "
@@ -151,6 +151,31 @@ recurrent_kda_trace = _recurrent_kda_template(
     # here; the decode-only variant below keeps the single decode stage.
     tags=["stage:prefill", "stage:decode", "status:verified"],
 )
+
+
+_recurrent_kda_additive_trace = _recurrent_kda_template(
+    name_prefix="recurrent_kda_additive",
+    description=(
+        "Recurrent Key-Driven Attention prefill with explicit additive Q/K "
+        "normalization: x / sqrt(sum(x*x) + qk_l2norm_additive_epsilon)."
+    ),
+    tags=["stage:prefill", "status:verified"],
+)
+_recurrent_kda_additive_trace.inputs["qk_l2norm_additive_epsilon"] = Scalar("float32")
+
+
+def recurrent_kda_trace(**kwargs):
+    # Keep the legacy positional Trace Apply ABI and definition identity for
+    # default calls; an additive request must not match a legacy solution.
+    if kwargs.get("qk_l2norm_additive_epsilon") is not None:
+        return _recurrent_kda_additive_trace
+    return _recurrent_kda_default_trace
+
+
+recurrent_kda_trace.templates = [  # type: ignore[attr-defined]
+    _recurrent_kda_default_trace,
+    _recurrent_kda_additive_trace,
+]
 
 
 recurrent_kda_decode_trace = _recurrent_kda_template(

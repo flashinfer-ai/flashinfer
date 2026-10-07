@@ -34,9 +34,11 @@ gdn_fused_decode_h5120_v48_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_replayssm_commit_k2_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
+gdn_prefill_gates_q4_k4_v8_d128.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
+recurrent_kda_additive_q16_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
 packed_fused_kda_decode_t3_h12_d128.json
@@ -1062,6 +1064,15 @@ with contextlib.suppress(Exception):
         gp_q, gp_k, gp_v, cu_seqlens=cu_seqlens
     )
 
+# ── GDN raw gate fusion (trace-only; no optional cuDNN dependency) ───────────
+from flashinfer.trace.templates.gdn import gdn_prefill_trace
+
+flashinfer.gdn_prefill.chunk_gated_delta_rule.fi_trace(
+    **gdn_prefill_trace(use_gate_in_kernel=True).init(total_seq_len=256, device=device),
+    backend="cudnn",
+    save_dir=SAVE_DIR,
+)
+
 # ── GDN-2 prefill (channel-wise gates, chunk prefill) ────────────────────────
 with contextlib.suppress(Exception):
     import flashinfer.gdn2_prefill  # noqa: PLC0415
@@ -1177,6 +1188,24 @@ flashinfer.recurrent_kda(
     initial_state_source=rk_source,
     initial_state_indices=rk_source_indices,
     beta_is_logit=True,
+)
+
+# ── additive Q/K normalization for an 8K-token KDA prefill ──────────────────
+# Trace-only so generation also works without the optional cuDNN FE feature.
+ak_q = torch.randn(1, 8192, 16, 128, dtype=torch.bfloat16, device=device)
+flashinfer.recurrent_kda.fi_trace(
+    q=ak_q,
+    k=torch.randn_like(ak_q),
+    v=torch.randn_like(ak_q),
+    g=torch.full_like(ak_q, -0.01),
+    beta=torch.full((1, 8192, 16), 0.5, dtype=torch.bfloat16, device=device),
+    initial_state=torch.zeros(1, 16, 128, 128, dtype=torch.bfloat16, device=device),
+    cu_seqlens=torch.tensor([0, 8192], dtype=torch.int64, device=device),
+    output_final_state=True,
+    use_qk_l2norm_in_kernel=True,
+    qk_l2norm_additive_epsilon=1e-6,
+    backend="cudnn",
+    save_dir=SAVE_DIR,
 )
 
 # ── AlphaMoE NVFP4 (SM100/SM103, pre-aligned route plan) ────────────────────

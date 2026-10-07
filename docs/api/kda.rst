@@ -32,6 +32,24 @@ dispatch unchanged.
 
     recurrent_kda
 
+cuDNN prefill normalization and layouts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For callers that use ``x / sqrt(sum(x*x) + epsilon)``, ordinary prefill can
+fuse this normalization with ``backend="cudnn"``,
+``use_qk_l2norm_in_kernel=True`` and
+``qk_l2norm_additive_epsilon=1e-6``. This explicit scalar requires a cuDNN
+frontend supporting the additive KDA normalization attribute. An older
+frontend or another backend raises instead of silently choosing a different
+formula. Leaving the scalar as ``None`` preserves existing behavior.
+Fusion may change intermediate rounding relative to a separate operation.
+
+Ordinary multi-token prefill accepts Q/K views without caller-side
+``contiguous()`` calls: cuDNN reads supported strides directly, while the
+native prefill routes pack Q/K as needed before selecting their kernel.
+V, gates, state and output retain their existing layout contracts. Explicit
+persistent, TIRX and PTX routes retain their own input requirements.
+
 Static PTX prefill on B300
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
