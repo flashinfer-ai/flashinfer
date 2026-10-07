@@ -1170,12 +1170,15 @@ def verify_delta_rule(
     use_l2_norm: bool = True,
     cache_intermediate_states: bool = False,
     state_dtype: torch.dtype = torch.float32,
+    parents: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Reference implementation for multi-token (verify mode) delta rule.
 
     Processes T tokens sequentially, updating the state after each token.
     Optionally caches intermediate states for rollback in speculative decoding.
+    With ``parents`` the draft is a tree and each token continues from its
+    parent's state instead of the previous token's.
 
     Args:
         q: Query tensor [B, T, num_q_heads, K]
@@ -1192,11 +1195,15 @@ def verify_delta_rule(
         use_l2_norm: Whether to apply L2 normalization
         cache_intermediate_states: Whether to cache state at each time step
         state_dtype: Storage dtype for the hidden state (read in fp32, stored in this dtype)
+        parents: Draft topology, int [T] shared by the batch or [B, T] per request.
+            parents[t] is the index of token t's parent in the draft, or -1 for
+            the initial state, and must be < t. None is the chain [-1, 0, ..., T-2].
 
     Returns:
         output: Output tensor [B, T, num_heads, V]
-        new_state: Final state tensor [B, num_heads, K, V]
-        intermediate_states: Cached intermediate states [B, T, num_heads, K, V] or None
+        new_state: State after token T-1 along its own path [B, num_heads, K, V]
+        intermediate_states: State after each token along its own path
+            [B, T, num_heads, K, V], or None
     """
     B, T, num_q_heads, K = q.shape
     _, _, num_k_heads, _ = k.shape
@@ -1254,22 +1261,34 @@ def verify_delta_rule(
     # Apply scaling to q
     q = q * scale_factor
 
+    if parents is not None:
+        parents = _validate_parents(parents, B, T).to(q.device)
+
     # Initialize output and intermediate states
     output = torch.zeros(B, T, num_heads, V, dtype=torch.float32, device=q.device)
     current_state = state.clone().to(
         state_dtype
     )  # [B, num_heads, K, V] stored in state_dtype
+    initial_state = current_state
 
-    if cache_intermediate_states:
-        intermediate_states = torch.zeros(
+    if cache_intermediate_states or parents is not None:
+        node_states = torch.zeros(
             B, T, num_heads, K, V, dtype=state_dtype, device=q.device
         )
     else:
-        intermediate_states = None
+        node_states = None
+    rows = torch.arange(B, device=q.device)
 
     # Process each time step sequentially (only t carries a dependency; the
     # per-(batch, head) updates are independent and vectorized over [B, H]).
     for t in range(T):
+        if parents is not None and t > 0:
+            parent = parents[:, t]
+            current_state = torch.where(
+                (parent < 0)[:, None, None, None],
+                initial_state,
+                node_states[rows, parent.clamp_min(0)],
+            )
         # Recurrent update
         # 1. Apply decay (state read as fp32)
         h_state = current_state.to(torch.float32) * g[:, t, :, None, None]
@@ -1289,8 +1308,23 @@ def verify_delta_rule(
         # Update current state (cast back to state_dtype)
         current_state = h_state.to(state_dtype)
 
-        # Cache intermediate state if requested
-        if cache_intermediate_states:
-            intermediate_states[:, t] = current_state
+        if node_states is not None:
+            node_states[:, t] = current_state
 
+    intermediate_states = node_states if cache_intermediate_states else None
     return output, current_state, intermediate_states
+
+
+def _validate_parents(parents, batch: int, steps: int) -> torch.Tensor:
+    parents = torch.as_tensor(parents).cpu()
+    if parents.dim() == 1:
+        parents = parents.unsqueeze(0).expand(batch, -1)
+    if parents.dtype.is_floating_point or parents.shape != (batch, steps):
+        raise ValueError(
+            f"parents must be an int [{steps}] or [{batch}, {steps}] tensor, "
+            f"got {parents.dtype} {tuple(parents.shape)}"
+        )
+    parents = parents.long()
+    if bool((parents < -1).any()) or bool((parents >= torch.arange(steps)).any()):
+        raise ValueError("parents[t] must be in [-1, t): a token follows its parent")
+    return parents
