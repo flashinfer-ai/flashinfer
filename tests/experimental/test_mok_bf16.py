@@ -338,8 +338,30 @@ def _check_fused_training(variant="base"):
                 for values in saved[1:]
             )
             # Context-only recompute (MoK ``recompute_forward_context``): the
-            # rebuilt context and a backward from it are bitwise identical.
-            saved_context = forward_context[0]
+            # rebuilt context and a backward from it are bitwise identical. The
+            # backward replays later macrobatches into the context rings, so the
+            # comparison uses a fresh forward context, not a consumed one.
+            fresh = forward(
+                x,
+                [x.data_ptr()],
+                combine,
+                [combine.data_ptr()],
+                shared[0],
+                routed[0],
+                shared[1],
+                routed[1],
+                shared[2],
+                routed[2],
+                peers,
+                schedule,
+                num_tokens,
+                counts,
+                topk,
+                swiglu_limit,
+                comm,
+                macro,
+                mini,
+            )
             recomputed = forward(
                 x,
                 [x.data_ptr()],
@@ -363,10 +385,15 @@ def _check_fused_training(variant="base"):
                 recompute_only=True,
             )
             assert recomputed[7] is None and recomputed[8] is None
-            assert all(
-                torch.equal(a, b)
-                for a, b in zip(recomputed[:7], saved_context[:7], strict=True)
-            ), "recomputed context differs"
+            # Defined context rows: the routed rings hold the retained macrobatch
+            # (min(macro, routed rows)) and the shared activations the real source
+            # rows; neither path writes the rows beyond (allocator contents).
+            routed_valid = min(macro, actual_tokens)
+            for index, (a, b) in enumerate(zip(recomputed[:7], fresh[:7], strict=True)):
+                valid = tokens if index in (1, 3, 5) else routed_valid
+                assert torch.equal(a[:valid], b[:valid]), (
+                    f"recomputed context tensor {index} differs"
+                )
             result = backward(
                 dy,
                 [dy.data_ptr()],

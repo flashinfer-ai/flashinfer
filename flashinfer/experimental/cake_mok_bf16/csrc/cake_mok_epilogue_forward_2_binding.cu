@@ -18,10 +18,10 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_mok_epilogue_forward_2(const __grid_constant__ CUtensorMap shared, const __grid_constant__ CUtensorMap routed, float* __restrict__ scores, const __grid_constant__ CUtensorMap output, int hidden);
+extern "C" __global__ void kernel_cake_mok_epilogue_forward_2(const __grid_constant__ CUtensorMap shared, const __grid_constant__ CUtensorMap routed, float* __restrict__ scores, const __grid_constant__ CUtensorMap output, int hidden, int tokens);
 
 
-namespace cake_host_shim_11adb90b19d03623 {
+namespace cake_host_shim_991b9221fe3a406d {
 
 using tvm::ffi::TensorView;
 
@@ -199,7 +199,7 @@ inline CUtensorMap EncodeTma_output(const TensorView& t) {
   return tm;
 }
 
-void Run(TensorView arg_shared, TensorView arg_routed, TensorView arg_scores, TensorView arg_output, int64_t arg_hidden, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_shared, TensorView arg_routed, TensorView arg_scores, TensorView arg_output, int64_t arg_hidden, int64_t arg_tokens, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_shared.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));  // binds the context for the encoders
@@ -215,6 +215,9 @@ void Run(TensorView arg_shared, TensorView arg_routed, TensorView arg_scores, Te
   TVM_FFI_CHECK(arg_hidden >= -2147483648LL && arg_hidden <= 2147483647LL, ValueError)
       << "scalar 'hidden' value " << arg_hidden
       << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_tokens >= -2147483648LL && arg_tokens <= 2147483647LL, ValueError)
+      << "scalar 'tokens' value " << arg_tokens
+      << " is outside i32 range [-2147483648, 2147483647]";
   check_same_device(arg_routed, arg_shared, "routed", "shared");
   check_same_device(arg_scores, arg_shared, "scores", "shared");
   check_same_device(arg_output, arg_shared, "output", "shared");
@@ -228,7 +231,8 @@ void Run(TensorView arg_shared, TensorView arg_routed, TensorView arg_scores, Te
   float* p_scores = static_cast<float*>(arg_scores.data_ptr());
   CUtensorMap p_output = EncodeTma_output(arg_output);
   int32_t v_hidden = (int32_t)arg_hidden;
-  void* kargs[] = {&p_shared, &p_routed, &p_scores, &p_output, &v_hidden};
+  int32_t v_tokens = (int32_t)arg_tokens;
+  void* kargs[] = {&p_shared, &p_routed, &p_scores, &p_output, &v_hidden, &v_tokens};
 
 
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
@@ -241,6 +245,6 @@ void Run(TensorView arg_shared, TensorView arg_routed, TensorView arg_scores, Te
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_11adb90b19d03623
+}  // namespace cake_host_shim_991b9221fe3a406d
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_11adb90b19d03623::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_991b9221fe3a406d::Run);

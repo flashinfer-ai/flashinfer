@@ -5,8 +5,8 @@
       "cake_mok_forward_binding.cu"
     ],
     "sha256": [
-      "3a1498aefc7089827e3b585d37a22f9ac67cfc1d57e25356244129b3e84c0ecf",
-      "4bd894ed033db46a98a7ec940c8258258aef6be76f359bea05761412326a2495"
+      "77d18652eb48c3802084ebaae9d317186993dcd858b959daeccf2f201bf7dfe9",
+      "c2d4c52a2dd5a48f89d5b5315fb805523c56174eacecfc2c10dc66db894586b4"
     ],
     "arguments": [
       [
@@ -182,6 +182,18 @@
         "mini_size"
       ],
       [
+        "parameter",
+        "swiglu_limit"
+      ],
+      [
+        "parameter",
+        "swiglu_clamped"
+      ],
+      [
+        "parameter",
+        "recompute_only"
+      ],
+      [
         "grid",
         "grid_x"
       ],
@@ -204,8 +216,8 @@
       "cake_mok_backward_binding.cu"
     ],
     "sha256": [
-      "9667b7ac806935fa27ade95f1d0c43c2379560c125496155e50a027916ef48ba",
-      "5de9fc009bcba2d2de5df56a085261bf56eaf9f38271bcb7518b2ca8f73767b2"
+      "ad74d1639fd2203b7e8b1d5377bd6d8436388e4ae4ad5d392c64573cfaedf593",
+      "6d360525f2012db48aba370343f25e7893254a28a4a4ac7206975d297b3818cb"
     ],
     "arguments": [
       [
@@ -410,15 +422,19 @@
       ],
       [
         "buffer",
+        "dy_scaled_ptr"
+      ],
+      [
+        "buffer",
         "dx_routed_ptr"
       ],
       [
         "buffer",
-        "saved_y"
+        "weights"
       ],
       [
         "buffer",
-        "weights"
+        "partials"
       ],
       [
         "buffer",
@@ -523,6 +539,14 @@
       [
         "parameter",
         "mini_size"
+      ],
+      [
+        "parameter",
+        "swiglu_limit"
+      ],
+      [
+        "parameter",
+        "swiglu_clamped"
       ],
       [
         "grid",
@@ -1109,186 +1133,6 @@
     ],
     "flags": []
   },
-  "epilogue_forward_2": {
-    "sources": [
-      "cake_mok_epilogue_forward_2.cu",
-      "cake_mok_epilogue_forward_2_binding.cu"
-    ],
-    "sha256": [
-      "35a3511ffcf71703ba2cef03be924940d72600294066b8c9b4e3530d7414ad74",
-      "093a1eb252a36ebf054992af0a37f69b49eef8efa48fa78ea1e69992361dec0d"
-    ],
-    "arguments": [
-      [
-        "tma_buffer",
-        "shared"
-      ],
-      [
-        "tma_buffer",
-        "routed"
-      ],
-      [
-        "buffer",
-        "scores"
-      ],
-      [
-        "tma_buffer",
-        "output"
-      ],
-      [
-        "parameter",
-        "hidden"
-      ],
-      [
-        "grid",
-        "grid_x"
-      ],
-      [
-        "grid",
-        "grid_y"
-      ],
-      [
-        "grid",
-        "grid_z"
-      ]
-    ],
-    "flags": [
-      "--use_fast_math"
-    ]
-  },
-  "epilogue_backward_2": {
-    "sources": [
-      "cake_mok_epilogue_backward_2.cu",
-      "cake_mok_epilogue_backward_2_binding.cu"
-    ],
-    "sha256": [
-      "4d60354d45cfd276e4cfb9d232a6e4d3ed6740d7338c6fa52d976209b14e75fe",
-      "18a0fec8884393f3876616c3042f3dca92bba11c157b42a6d79045155dd73192"
-    ],
-    "arguments": [
-      [
-        "tma_buffer",
-        "shared"
-      ],
-      [
-        "tma_buffer",
-        "routed"
-      ],
-      [
-        "tma_buffer",
-        "output"
-      ],
-      [
-        "parameter",
-        "hidden"
-      ],
-      [
-        "grid",
-        "grid_x"
-      ],
-      [
-        "grid",
-        "grid_y"
-      ],
-      [
-        "grid",
-        "grid_z"
-      ]
-    ],
-    "flags": [
-      "--use_fast_math"
-    ]
-  },
-  "epilogue_forward_8": {
-    "sources": [
-      "cake_mok_epilogue_forward_8.cu",
-      "cake_mok_epilogue_forward_8_binding.cu"
-    ],
-    "sha256": [
-      "f9a4f00f99ea76e0ba6c5018ca304ffbdd0f76ebc49fe498fafbb88549c5a8ec",
-      "431193b41f7707a0db4179465eb2886662a715b6745d66c46ec8bec21ba8dd50"
-    ],
-    "arguments": [
-      [
-        "tma_buffer",
-        "shared"
-      ],
-      [
-        "tma_buffer",
-        "routed"
-      ],
-      [
-        "buffer",
-        "scores"
-      ],
-      [
-        "tma_buffer",
-        "output"
-      ],
-      [
-        "parameter",
-        "hidden"
-      ],
-      [
-        "grid",
-        "grid_x"
-      ],
-      [
-        "grid",
-        "grid_y"
-      ],
-      [
-        "grid",
-        "grid_z"
-      ]
-    ],
-    "flags": [
-      "--use_fast_math"
-    ]
-  },
-  "epilogue_backward_8": {
-    "sources": [
-      "cake_mok_epilogue_backward_8.cu",
-      "cake_mok_epilogue_backward_8_binding.cu"
-    ],
-    "sha256": [
-      "b7e80bd6d60b23453a2baed9e0450b5bee375dafaa657763dc1a8a5c2ad6b1ed",
-      "ea4a082ca955a35a68c6c35fd6ee6dbef37bc34f3932d76b5acd78b8d5023d97"
-    ],
-    "arguments": [
-      [
-        "tma_buffer",
-        "shared"
-      ],
-      [
-        "tma_buffer",
-        "routed"
-      ],
-      [
-        "tma_buffer",
-        "output"
-      ],
-      [
-        "parameter",
-        "hidden"
-      ],
-      [
-        "grid",
-        "grid_x"
-      ],
-      [
-        "grid",
-        "grid_y"
-      ],
-      [
-        "grid",
-        "grid_z"
-      ]
-    ],
-    "flags": [
-      "--use_fast_math"
-    ]
-  },
   "count_64_4": {
     "sources": [
       "cake_mok_count_64_4.cu",
@@ -1435,5 +1279,928 @@
       ]
     ],
     "flags": []
+  },
+  "count_4_64": {
+    "sources": [
+      "cake_mok_count_4_64.cu",
+      "cake_mok_count_4_64_binding.cu"
+    ],
+    "sha256": [
+      "a1c57d30e61d9c5387281e88a0a59964fc2b319f6ea0d2fd8dfa1825c802b0ba",
+      "0ec09763743d2eb5b7ba61e4953466c2550ceeaa250f7fa75e9de7228fca2e81"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "topk_all"
+      ],
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "parameter",
+        "local_tokens"
+      ],
+      [
+        "parameter",
+        "top_k"
+      ],
+      [
+        "parameter",
+        "rank"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "pad_4_64": {
+    "sources": [
+      "cake_mok_pad_4_64.cu",
+      "cake_mok_pad_4_64_binding.cu"
+    ],
+    "sha256": [
+      "a8c6ae4fbde950d76233be1e4c2c178f5183e0543366e998dda9895bf1b4293c",
+      "a65ed512e51d8c815b8b1ec5b3bcb0bba7c38ef98e6808a88133c099af5046cd"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "buffer",
+        "tokens_per_expert"
+      ],
+      [
+        "buffer",
+        "num_tokens"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "rows_4_64": {
+    "sources": [
+      "cake_mok_rows_4_64.cu",
+      "cake_mok_rows_4_64_binding.cu"
+    ],
+    "sha256": [
+      "2671fa61933240c265ed0eeb4c5a26cd4a4fc988746408d63d1ade9ee8c5566b",
+      "51b9d2a7140f8711e91f2ad187cc9558752c62482825b78857338f61fb315b23"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "topk_all"
+      ],
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "buffer",
+        "tokens_per_expert"
+      ],
+      [
+        "buffer",
+        "num_tokens"
+      ],
+      [
+        "buffer",
+        "schedule_peer_rank"
+      ],
+      [
+        "buffer",
+        "schedule_peer_token_idx"
+      ],
+      [
+        "parameter",
+        "local_tokens"
+      ],
+      [
+        "parameter",
+        "top_k"
+      ],
+      [
+        "parameter",
+        "capacity"
+      ],
+      [
+        "parameter",
+        "rank"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "count_8_32": {
+    "sources": [
+      "cake_mok_count_8_32.cu",
+      "cake_mok_count_8_32_binding.cu"
+    ],
+    "sha256": [
+      "19d30590856f5253278437983e9b72c540306821f2d98d0bf1e1d4e738750f1f",
+      "aaa0dfc1cc19e3473c8da377cf84b1a2c44042fa9c8f34fdc617d6850f8cfe46"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "topk_all"
+      ],
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "parameter",
+        "local_tokens"
+      ],
+      [
+        "parameter",
+        "top_k"
+      ],
+      [
+        "parameter",
+        "rank"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "pad_8_32": {
+    "sources": [
+      "cake_mok_pad_8_32.cu",
+      "cake_mok_pad_8_32_binding.cu"
+    ],
+    "sha256": [
+      "7456c7abd8fd710bd77f302699e8201b25da6cb8a8431e7676bb2a39e2219dd3",
+      "152ef681402a71a2d1a36b2119e81cd59aeb4ed100f7343944429c814d49deb3"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "buffer",
+        "tokens_per_expert"
+      ],
+      [
+        "buffer",
+        "num_tokens"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "rows_8_32": {
+    "sources": [
+      "cake_mok_rows_8_32.cu",
+      "cake_mok_rows_8_32_binding.cu"
+    ],
+    "sha256": [
+      "790b354caad1e9c643a04b386eb0b5b21820703302ff51ec7aa6191d4ca72478",
+      "09bdc139a067f672b657e7c13f4f0c7ff3296b06ddd9b2ab383502fd7c2198f9"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "topk_all"
+      ],
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "buffer",
+        "tokens_per_expert"
+      ],
+      [
+        "buffer",
+        "num_tokens"
+      ],
+      [
+        "buffer",
+        "schedule_peer_rank"
+      ],
+      [
+        "buffer",
+        "schedule_peer_token_idx"
+      ],
+      [
+        "parameter",
+        "local_tokens"
+      ],
+      [
+        "parameter",
+        "top_k"
+      ],
+      [
+        "parameter",
+        "capacity"
+      ],
+      [
+        "parameter",
+        "rank"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "count_32_8": {
+    "sources": [
+      "cake_mok_count_32_8.cu",
+      "cake_mok_count_32_8_binding.cu"
+    ],
+    "sha256": [
+      "215a2bc404c36437538d262ac7c8fb48e7fdd6a053971fb281339c61e279acc9",
+      "ed8cb5184827360c9f7da54c0b4f0b355db3f6f4421bdbc49c64994a61f499e5"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "topk_all"
+      ],
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "parameter",
+        "local_tokens"
+      ],
+      [
+        "parameter",
+        "top_k"
+      ],
+      [
+        "parameter",
+        "rank"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "pad_32_8": {
+    "sources": [
+      "cake_mok_pad_32_8.cu",
+      "cake_mok_pad_32_8_binding.cu"
+    ],
+    "sha256": [
+      "b99423a4cb2e2fe719b8446165a3ed90c05f20682e0ad739b2c44b7f8e90d5f3",
+      "086ee42fe6604bdfbf68cf59b4c6bec4884f58bb095285bbadb924e600ebea68"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "buffer",
+        "tokens_per_expert"
+      ],
+      [
+        "buffer",
+        "num_tokens"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "rows_32_8": {
+    "sources": [
+      "cake_mok_rows_32_8.cu",
+      "cake_mok_rows_32_8_binding.cu"
+    ],
+    "sha256": [
+      "23d4a89fbbc9b177681f73e695fddeabb3216116ebfe25fb0d7ad267b5113256",
+      "adb5b4eb2ae92dd0af90324d87946b28d3d4c7c78630abdb5fef0277b7fc2f60"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "topk_all"
+      ],
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "buffer",
+        "tokens_per_expert"
+      ],
+      [
+        "buffer",
+        "num_tokens"
+      ],
+      [
+        "buffer",
+        "schedule_peer_rank"
+      ],
+      [
+        "buffer",
+        "schedule_peer_token_idx"
+      ],
+      [
+        "parameter",
+        "local_tokens"
+      ],
+      [
+        "parameter",
+        "top_k"
+      ],
+      [
+        "parameter",
+        "capacity"
+      ],
+      [
+        "parameter",
+        "rank"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "count_8_36": {
+    "sources": [
+      "cake_mok_count_8_36.cu",
+      "cake_mok_count_8_36_binding.cu"
+    ],
+    "sha256": [
+      "e1d02ec994732fbb4c8fe18175e0ae359de0733521c948e0b9ef0d86cc1c4bea",
+      "e183f6a3f17d082fb335f0ae3d5e6fe567154d219db3b7ccbadd23925ad7efe8"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "topk_all"
+      ],
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "parameter",
+        "local_tokens"
+      ],
+      [
+        "parameter",
+        "top_k"
+      ],
+      [
+        "parameter",
+        "rank"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "pad_8_36": {
+    "sources": [
+      "cake_mok_pad_8_36.cu",
+      "cake_mok_pad_8_36_binding.cu"
+    ],
+    "sha256": [
+      "9580bebac0bd624291764223629835e51d8049a60d52259875fef9142e66f2e6",
+      "ab394c0c412ccfb0f72f23f6d5e7b101db30e6893de412df4c464a9221cac8b6"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "buffer",
+        "tokens_per_expert"
+      ],
+      [
+        "buffer",
+        "num_tokens"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "rows_8_36": {
+    "sources": [
+      "cake_mok_rows_8_36.cu",
+      "cake_mok_rows_8_36_binding.cu"
+    ],
+    "sha256": [
+      "f8332040240daad710e2d09f2c8a478ec1727a7f83dc344e49507a5edd9791be",
+      "5181ad60cc8e264e6856d8756d9f02fd9f02941e5d28aded5ad7f6af9cd548ab"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "topk_all"
+      ],
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "buffer",
+        "tokens_per_expert"
+      ],
+      [
+        "buffer",
+        "num_tokens"
+      ],
+      [
+        "buffer",
+        "schedule_peer_rank"
+      ],
+      [
+        "buffer",
+        "schedule_peer_token_idx"
+      ],
+      [
+        "parameter",
+        "local_tokens"
+      ],
+      [
+        "parameter",
+        "top_k"
+      ],
+      [
+        "parameter",
+        "capacity"
+      ],
+      [
+        "parameter",
+        "rank"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "count_32_9": {
+    "sources": [
+      "cake_mok_count_32_9.cu",
+      "cake_mok_count_32_9_binding.cu"
+    ],
+    "sha256": [
+      "ba6f3e5409f9995d869c1dc767e79af2a8533cc8691a14f2c95b4cde302f6b06",
+      "ae9a08708811e01634c68514e83c09a9aa0844c6741523417d3960f2dcfc0ec6"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "topk_all"
+      ],
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "parameter",
+        "local_tokens"
+      ],
+      [
+        "parameter",
+        "top_k"
+      ],
+      [
+        "parameter",
+        "rank"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "pad_32_9": {
+    "sources": [
+      "cake_mok_pad_32_9.cu",
+      "cake_mok_pad_32_9_binding.cu"
+    ],
+    "sha256": [
+      "9074ab86b2dcb3bbbee542b610aa592f50647ebc27843fba15ecb4018b9c4a9e",
+      "a329bb44c4c247680063a78cf587192467acaf60b2c3a427a7713be7efed9cff"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "buffer",
+        "tokens_per_expert"
+      ],
+      [
+        "buffer",
+        "num_tokens"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "rows_32_9": {
+    "sources": [
+      "cake_mok_rows_32_9.cu",
+      "cake_mok_rows_32_9_binding.cu"
+    ],
+    "sha256": [
+      "1313550ccc1996879ca4c0fd9bd98415281aa4f0a78ef70700dc12b523478396",
+      "d7fcbf5726e529dfa9fa8ce0365b18dbebc7f6a3e90b3fa44a7de35a69a6ebb8"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "topk_all"
+      ],
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "buffer",
+        "tokens_per_expert"
+      ],
+      [
+        "buffer",
+        "num_tokens"
+      ],
+      [
+        "buffer",
+        "schedule_peer_rank"
+      ],
+      [
+        "buffer",
+        "schedule_peer_token_idx"
+      ],
+      [
+        "parameter",
+        "local_tokens"
+      ],
+      [
+        "parameter",
+        "top_k"
+      ],
+      [
+        "parameter",
+        "capacity"
+      ],
+      [
+        "parameter",
+        "rank"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "epilogue_forward_2": {
+    "sources": [
+      "cake_mok_epilogue_forward_2.cu",
+      "cake_mok_epilogue_forward_2_binding.cu"
+    ],
+    "sha256": [
+      "7dfd21e1f653cdadbd1295bd158f725d3f6d5a8d72818bfc53428fc3c323f2f3",
+      "dc75bbfde7721fb7a1d188fd0b4adf95a479a10539ccb81e10c7fb5c36e21cf5"
+    ],
+    "arguments": [
+      [
+        "tma_buffer",
+        "shared"
+      ],
+      [
+        "tma_buffer",
+        "routed"
+      ],
+      [
+        "buffer",
+        "scores"
+      ],
+      [
+        "tma_buffer",
+        "output"
+      ],
+      [
+        "parameter",
+        "hidden"
+      ],
+      [
+        "parameter",
+        "tokens"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": [
+      "--use_fast_math"
+    ]
+  },
+  "epilogue_backward_2": {
+    "sources": [
+      "cake_mok_epilogue_backward_2.cu",
+      "cake_mok_epilogue_backward_2_binding.cu"
+    ],
+    "sha256": [
+      "4d60354d45cfd276e4cfb9d232a6e4d3ed6740d7338c6fa52d976209b14e75fe",
+      "18a0fec8884393f3876616c3042f3dca92bba11c157b42a6d79045155dd73192"
+    ],
+    "arguments": [
+      [
+        "tma_buffer",
+        "shared"
+      ],
+      [
+        "tma_buffer",
+        "routed"
+      ],
+      [
+        "tma_buffer",
+        "output"
+      ],
+      [
+        "parameter",
+        "hidden"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": [
+      "--use_fast_math"
+    ]
+  },
+  "epilogue_forward_8": {
+    "sources": [
+      "cake_mok_epilogue_forward_8.cu",
+      "cake_mok_epilogue_forward_8_binding.cu"
+    ],
+    "sha256": [
+      "1ca7e7f6e219debe2947043988c62d3010de180c27b09e406b2045d8055d6ce5",
+      "b44ea76e47c5c8efec6a14315aa2f332bbb72eb6f691d774691337dce0244c48"
+    ],
+    "arguments": [
+      [
+        "tma_buffer",
+        "shared"
+      ],
+      [
+        "tma_buffer",
+        "routed"
+      ],
+      [
+        "buffer",
+        "scores"
+      ],
+      [
+        "tma_buffer",
+        "output"
+      ],
+      [
+        "parameter",
+        "hidden"
+      ],
+      [
+        "parameter",
+        "tokens"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": [
+      "--use_fast_math"
+    ]
+  },
+  "epilogue_backward_8": {
+    "sources": [
+      "cake_mok_epilogue_backward_8.cu",
+      "cake_mok_epilogue_backward_8_binding.cu"
+    ],
+    "sha256": [
+      "b7e80bd6d60b23453a2baed9e0450b5bee375dafaa657763dc1a8a5c2ad6b1ed",
+      "ea4a082ca955a35a68c6c35fd6ee6dbef37bc34f3932d76b5acd78b8d5023d97"
+    ],
+    "arguments": [
+      [
+        "tma_buffer",
+        "shared"
+      ],
+      [
+        "tma_buffer",
+        "routed"
+      ],
+      [
+        "tma_buffer",
+        "output"
+      ],
+      [
+        "parameter",
+        "hidden"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": [
+      "--use_fast_math"
+    ]
   }
 }

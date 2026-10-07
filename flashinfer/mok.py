@@ -78,3 +78,19 @@ def create_mok_bf16_workspace(
         topk=topk,
         source_capacity=source_capacity,
     )
+
+
+@flashinfer_experimental_api
+def context_defined_rows(config, context):
+    """Rows of a forward or recomputed context that the kernels define.
+
+    Returns ``(routed_rows, shared_rows)``: the routed rings hold the retained
+    macrobatch, i.e. their first ``min(macrobatch_size, routed rows)`` rows, and
+    the shared activations cover the real source rows. Rows beyond these are
+    never written (allocator contents), so a bitwise comparison of a saved and
+    a recomputed context must stop there. Synchronizes on the schedule's routed
+    row count; call outside CUDA Graph capture.
+    """
+    from .experimental.cake_mok_bf16.backend import context_defined_rows as rows
+
+    return rows(config, context)

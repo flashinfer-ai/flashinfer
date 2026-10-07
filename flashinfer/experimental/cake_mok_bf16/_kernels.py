@@ -4,6 +4,24 @@
 # Modified: standalone CUDA module loading; original host launch boundaries.
 
 
+def mok_swiglu_limit_args(swiglu_limit):
+    """Encode the optional clamp as the kernels' ``(limit, clamped)`` scalars.
+
+    ``None`` selects the exact unclamped path. A finite positive float enables
+    ``silu(min(gate, L)) * clamp(up, -L, L)`` in both expert MLPs.
+    """
+    import math
+
+    if swiglu_limit is None:
+        return 0.0, 0
+    if isinstance(swiglu_limit, bool) or not isinstance(swiglu_limit, (int, float)):
+        raise TypeError("swiglu_limit must be None or a positive finite number")
+    limit = float(swiglu_limit)
+    if not math.isfinite(limit) or limit <= 0.0:
+        raise ValueError("swiglu_limit must be None or a positive finite number")
+    return limit, 1
+
+
 class MoKForward:
     """Low-level native-signature BF16 forward; caller owns peer barriers."""
 
@@ -34,20 +52,38 @@ class MoKForward:
         comm_sms,
         macro_size,
         mini_size,
+        source_rows=None,
+        recompute_only=False,
     ):
+        """``x`` holds this rank's real source rows (any count, including a
+        one-row placeholder when ``source_rows == 0``); shared-expert work and
+        retained shared activations cover ``source_rows`` rows only.
+
+        ``recompute_only`` rebuilds the backward context only (dispatch, gate/up
+        GEMMs, SwiGLU): no down projections, no combine, no ``y`` outputs; the
+        down weights and combine pointers are unused placeholders then, and the
+        returned ``y_shared``/``y_routed`` are ``None``."""
         import torch
         import tvm_ffi
 
-        if swiglu_limit is not None:
-            raise ValueError(
-                "The current BF16 port implements the required unclamped SwiGLU"
-            )
+        limit, clamped = mok_swiglu_limit_args(swiglu_limit)
         local_tokens, hidden = x.shape
+        if source_rows is None:
+            source_rows = local_tokens
+        if (
+            type(source_rows) is not int
+            or not 0 <= source_rows <= local_tokens
+            or local_tokens < 1
+        ):
+            raise ValueError(
+                "source_rows must be an integer within the supplied source rows"
+            )
+        local_tokens = source_rows
+        rows_alloc = max(local_tokens, 1)
         intermediate, experts = shared_gate.shape[0], counts.numel()
         capacity = peer_rank.numel()
         if (
             x.dtype != torch.bfloat16
-            or local_tokens % 256
             or hidden % 256
             or intermediate % 256
             or macro_size % mini_size
@@ -65,9 +101,11 @@ class MoKForward:
                 torch.tensor(combine_ptrs, dtype=torch.uint64, device=x.device),
             )
         x_peers, y_peers = self._peer_tables[key]
+        recompute = bool(recompute_only)
         options = dict(device=x.device, dtype=torch.bfloat16)
         x_routed = torch.empty((macro_size, hidden), **options)
-        gate_shared = torch.empty((local_tokens, intermediate), **options)
+        # Retained shared activations are sized by the real source rows.
+        gate_shared = torch.empty((rows_alloc, intermediate), **options)
         gate_routed = torch.empty((macro_size, intermediate), **options)
         up_shared, up_routed = (
             torch.empty_like(gate_shared),
@@ -77,21 +115,26 @@ class MoKForward:
             torch.empty_like(gate_shared),
             torch.empty_like(gate_routed),
         )
-        # Preserve every routed BF16 output for the exact score derivative.
-        # Other expert activations retain the existing macrobatch ring policy.
-        y_shared = torch.empty_like(x)
-        y_routed = torch.empty((capacity, hidden), **options)
-        shared_rows, routed_rows = local_tokens // 256, capacity // 256
+        # Every routed activation, including the output, is a macrobatch ring;
+        # the score derivative needs no retained routed output (see
+        # mok_swiglu_backward).
+        if recompute:
+            # Unwritten map/pointer placeholders: the recompute has no down GEMM tasks.
+            y_shared = y_routed = torch.empty((1, hidden), **options)
+        else:
+            y_shared = torch.empty((rows_alloc, hidden), **options)
+            y_routed = torch.empty_like(x_routed)
+        shared_rows, routed_rows = (local_tokens + 255) // 256, capacity // 256
         shared_gate_tasks = shared_rows * (intermediate // 256)
         mini_gate_tasks = (mini_size // 256) * (intermediate // 256)
-        shared_swiglu = ((local_tokens // 128) * (intermediate // 128) + 5) // 6
+        shared_swiglu = (
+            shared_rows * 2 * (intermediate // 128) + 5
+        ) // 6  # whole 256-row blocks, as the kernel
         mini_swiglu = ((mini_size // 128) * (intermediate // 128) + 5) // 6
-        shared_tasks = (
-            2 * shared_gate_tasks + shared_swiglu + shared_rows * (hidden // 256)
-        )
-        mini_tasks = (
-            2 * mini_gate_tasks + mini_swiglu + (mini_size // 256) * (hidden // 256)
-        )
+        shared_down_tasks = 0 if recompute else shared_rows * (hidden // 256)
+        mini_down_tasks = 0 if recompute else (mini_size // 256) * (hidden // 256)
+        shared_tasks = 2 * shared_gate_tasks + shared_swiglu + shared_down_tasks
+        mini_tasks = 2 * mini_gate_tasks + mini_swiglu + mini_down_tasks
         minis = (capacity + mini_size - 1) // mini_size
         counter_opts = dict(dtype=torch.int32, device=x.device)
         x_ready = torch.zeros(minis, **counter_opts)
@@ -104,7 +147,7 @@ class MoKForward:
         with tvm_ffi.use_torch_stream():
             self.module.launch(
                 grid=(2 * (shared_tasks + minis * mini_tasks) + comm_sms, 1, 1),
-                x_shared=x,
+                x_shared=x[:rows_alloc],
                 x_routed=x_routed,
                 wg_shared=shared_gate.unsqueeze(0),
                 wu_shared=shared_up.unsqueeze(0),
@@ -147,6 +190,21 @@ class MoKForward:
                 comm_sms=comm_sms,
                 macro_size=macro_size,
                 mini_size=mini_size,
+                swiglu_limit=limit,
+                swiglu_clamped=clamped,
+                recompute_only=int(recompute),
+            )
+        if recompute:
+            return (
+                x_routed,
+                gate_shared,
+                gate_routed,
+                up_shared,
+                up_routed,
+                hidden_shared,
+                hidden_routed,
+                None,
+                None,
             )
         return (
             x_routed,
@@ -194,7 +252,6 @@ class MoKBackward:
         up_routed,
         hidden_shared,
         hidden_routed,
-        saved_y,
         x,
         x_ptrs,
         peer_rank,
@@ -206,23 +263,44 @@ class MoKBackward:
         comm_sms,
         macro_size,
         mini_size,
+        source_rows=None,
     ):
+        """``dy_buffer`` and ``x`` hold this rank's real source rows (any
+        count; one-row placeholders when ``source_rows == 0``). The context
+        carries the macrobatch rings only; the score derivative is computed
+        from the unscaled routed gradient inside the SwiGLU backward."""
         import torch
         import tvm_ffi
 
-        if swiglu_limit is not None:
-            raise ValueError(
-                "The current BF16 port implements the required unclamped SwiGLU"
-            )
+        limit, clamped = mok_swiglu_limit_args(swiglu_limit)
         local_tokens, hidden = x.shape
+        if source_rows is None:
+            source_rows = local_tokens
+        if (
+            type(source_rows) is not int
+            or not 0 <= source_rows <= local_tokens
+            or local_tokens < 1
+            or dy_buffer.shape[0] < max(source_rows, 1)
+            or dy_buffer.shape[1] != hidden
+        ):
+            raise ValueError(
+                "source_rows must be an integer within the supplied source rows"
+            )
+        local_tokens = source_rows
+        rows_alloc = max(local_tokens, 1)
         intermediate, experts, capacity = (
             shared_gate.shape[0],
             counts.numel(),
             peer_rank.numel(),
         )
         if (
+            gate_shared.shape[0] < rows_alloc
+            or hidden_shared.shape[0] < rows_alloc
+            or up_shared.shape[0] < rows_alloc
+        ):
+            raise ValueError("The forward context must cover the source rows")
+        if (
             x.dtype != torch.bfloat16
-            or local_tokens % 256
             or hidden % 256
             or intermediate % 256
             or macro_size % mini_size
@@ -232,15 +310,6 @@ class MoKBackward:
         ):
             raise ValueError(
                 "MoK native BF16 tile and communication geometry is required"
-            )
-        if (
-            saved_y.shape != (capacity, hidden)
-            or saved_y.dtype != torch.bfloat16
-            or saved_y.device != x.device
-            or not saved_y.is_contiguous()
-        ):
-            raise ValueError(
-                "Backward requires the matching complete routed forward output"
             )
         key = (
             tuple(x_ptrs),
@@ -260,12 +329,25 @@ class MoKBackward:
         ]
         options = dict(device=x.device, dtype=torch.bfloat16)
         router_weights = torch.empty(macro_size, dtype=torch.float32, device=x.device)
+        partials = torch.empty(
+            macro_size, intermediate // 128, dtype=torch.float32, device=x.device
+        )
         dy_routed = torch.empty((macro_size, hidden), **options)
-        dh_shared = torch.empty((local_tokens, intermediate), **options)
+        dy_scaled = torch.empty_like(dy_routed)
+        dh_shared = torch.empty((rows_alloc, intermediate), **options)
         dh_routed = torch.empty((macro_size, intermediate), **options)
         dg_shared, dg_routed = torch.empty_like(dh_shared), torch.empty_like(dh_routed)
         du_shared, du_routed = torch.empty_like(dh_shared), torch.empty_like(dh_routed)
-        dx_shared, dx_routed = torch.empty_like(x), torch.empty_like(dy_routed)
+        dx_shared, dx_routed = (
+            torch.empty((rows_alloc, hidden), **options),
+            torch.empty_like(dy_routed),
+        )
+        x_rows, dy_rows = x[:rows_alloc], dy_buffer[:rows_alloc]
+        gate_rows, up_rows, hidden_rows = (
+            gate_shared[:rows_alloc],
+            up_shared[:rows_alloc],
+            hidden_shared[:rows_alloc],
+        )
         dwg_shared, dwg_routed = (
             torch.empty_like(shared_gate),
             torch.empty_like(routed_gate),
@@ -280,7 +362,7 @@ class MoKBackward:
         )
         minis = (capacity + mini_size - 1) // mini_size
         macros = (capacity + macro_size - 1) // macro_size
-        shared_rows, routed_rows = local_tokens // 256, capacity // 256
+        shared_rows, routed_rows = (local_tokens + 255) // 256, capacity // 256
         ib, hb = intermediate // 256, hidden // 256
         counter_options = dict(dtype=torch.int32, device=x.device)
         dy_ready = torch.zeros(minis, **counter_options)
@@ -294,7 +376,7 @@ class MoKBackward:
         weight_ready = torch.zeros(macros, **counter_options)
         shared_tasks = (
             shared_rows * (ib + hb)
-            + ((local_tokens // 128) * (intermediate // 128) + 3) // 4
+            + (shared_rows * 2 * (intermediate // 128) + 3) // 4
             + 3 * ib * hb
         )
         mini_bwd = (mini_size // 256) * (ib + hb) + (
@@ -313,22 +395,22 @@ class MoKBackward:
         with tvm_ffi.use_torch_stream():
             self.module.launch(
                 grid=(comm_sms + 2 * clusters, 1, 1),
-                dy_s=dy_buffer,
+                dy_s=dy_rows,
                 dy_r=dy_routed,
                 dg_s=dg_shared,
                 dg_r=dg_routed,
                 du_s=du_shared,
                 du_r=du_routed,
                 x_nt_r=x_routed,
-                dy_atb_s=dy_buffer,
-                dy_atb_r=dy_routed,
+                dy_atb_s=dy_rows,
+                dy_atb_r=dy_scaled,
                 dg_atb_s=dg_shared,
                 dg_atb_r=dg_routed,
                 du_atb_s=du_shared,
                 du_atb_r=du_routed,
-                x_atb_s=x,
+                x_atb_s=x_rows,
                 x_atb_r=x_routed,
-                h_atb_s=hidden_shared,
+                h_atb_s=hidden_rows,
                 h_atb_r=hidden_routed,
                 wg_s=shared_gate.unsqueeze(0),
                 wu_s=shared_up.unsqueeze(0),
@@ -352,9 +434,9 @@ class MoKBackward:
                 dwd_r=dwd_routed,
                 dh_sw_s=dh_shared,
                 dh_sw_r=dh_routed,
-                gate_sw_s=gate_shared,
+                gate_sw_s=gate_rows,
                 gate_sw_r=gate_routed,
-                up_sw_s=up_shared,
+                up_sw_s=up_rows,
                 up_sw_r=up_routed,
                 dg_sw_s=dg_shared,
                 dg_sw_r=dg_routed,
@@ -363,9 +445,10 @@ class MoKBackward:
                 h_sw_r=hidden_routed,
                 x_routed_ptr=x_routed,
                 dy_routed_ptr=dy_routed,
+                dy_scaled_ptr=dy_scaled,
                 dx_routed_ptr=dx_routed,
-                saved_y=saved_y,
                 weights=router_weights,
+                partials=partials,
                 x_peers=x_peers,
                 dy_peers=dy_peers,
                 dx_peers=dx_peers,
@@ -392,6 +475,8 @@ class MoKBackward:
                 comm_sms=comm_sms,
                 macro_size=macro_size,
                 mini_size=mini_size,
+                swiglu_limit=limit,
+                swiglu_clamped=clamped,
             )
             self.zero_module.launch(
                 grid=(128, experts, 1),
@@ -515,7 +600,17 @@ class MoKScheduler:
     def __init__(self, world_size: int, local_experts: int):
         from .jit import load_kernel
 
-        if (world_size, local_experts) not in ((1, 4), (4, 4), (16, 16), (64, 4)):
+        if (world_size, local_experts) not in (
+            (1, 4),
+            (4, 4),
+            (16, 16),
+            (64, 4),
+            (4, 64),
+            (8, 32),
+            (32, 8),
+            (8, 36),
+            (32, 9),
+        ):
             raise ValueError("Unsupported EP size or expert count")
         self.world_size = world_size
         self.local_experts = local_experts
@@ -589,7 +684,7 @@ class MoKEpilogues:
         from .jit import load_kernel
 
         if type(top_k) is not int or top_k not in (2, 8):
-            raise ValueError("Exported epilogues support top_k=2 or 8")
+            raise ValueError("Exported epilogues support top_k in (2, 8)")
         self.top_k = top_k
         self.forward_module = load_kernel(f"epilogue_forward_{top_k}")
         self.backward_module = load_kernel(f"epilogue_backward_{top_k}")
@@ -618,8 +713,6 @@ class MoKEpilogues:
 
         self._check(shared, routed)
         tokens, hidden = shared.shape
-        if tokens % 2:
-            raise ValueError("The native forward epilogue requires an even token count")
         if (
             tuple(scores.shape) != (tokens, self.top_k)
             or scores.dtype != torch.float32
@@ -630,12 +723,13 @@ class MoKEpilogues:
         output = torch.empty_like(shared)
         with tvm_ffi.use_torch_stream():
             self.forward_module.launch(
-                grid=((hidden + 1023) // 1024 * (tokens // 2), 1, 1),
+                grid=((hidden + 1023) // 1024 * ((tokens + 1) // 2), 1, 1),
                 shared=shared,
                 routed=routed,
                 scores=scores,
                 output=output,
                 hidden=hidden,
+                tokens=tokens,
             )
         return output
 

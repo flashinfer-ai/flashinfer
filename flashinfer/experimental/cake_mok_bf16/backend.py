@@ -47,6 +47,20 @@ class MoKForwardContext(native.MoKForwardContext):
     schedule: native.MoKSchedule
 
 
+def context_defined_rows(config, context):
+    """Rows of a forward or recomputed context that the kernels define.
+
+    The routed rings (``x_routed``/``gate_routed``/``up_routed``/``hidden_routed``)
+    hold the retained macrobatch, i.e. their first ``min(macrobatch_size, routed
+    rows)`` rows; the shared activations cover the real source rows. Rows beyond
+    these are never written and hold whatever the allocator handed out, so
+    bitwise comparisons (saved vs. recomputed context) must stop there.
+    Synchronizes on the schedule's routed row count; not for graph capture."""
+    schedule = context.schedule
+    routed = min(config.macrobatch_size, int(schedule.num_tokens.item()))
+    return routed, schedule.num_source_tokens
+
+
 # (EP, local experts, top-k) layouts with exported scheduler kernels: the toy
 # layouts of the tests, GLM-5.2 (256 routed experts) and GLM-5.3-Flash (288).
 SUPPORTED_LAYOUTS = (

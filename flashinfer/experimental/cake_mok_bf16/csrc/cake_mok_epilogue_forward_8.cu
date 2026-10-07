@@ -109,7 +109,7 @@ __device__ __forceinline__ void tma_store_4d(
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_mok_epilogue_forward_8(const __grid_constant__ CUtensorMap shared, const __grid_constant__ CUtensorMap routed, float* __restrict__ scores, const __grid_constant__ CUtensorMap output, int hidden)
+kernel_cake_mok_epilogue_forward_8(const __grid_constant__ CUtensorMap shared, const __grid_constant__ CUtensorMap routed, float* __restrict__ scores, const __grid_constant__ CUtensorMap output, int hidden, int tokens)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -156,7 +156,11 @@ kernel_cake_mok_epilogue_forward_8(const __grid_constant__ CUtensorMap shared, c
         }
     }
     for (int idx = tid; idx < 16; idx += 256) {
-        weights[idx] = scores[first_token * 8 + idx];
+        float weight = 0.0f;
+        if (first_token * 8 + idx < tokens * 8) {
+            weight = scores[first_token * 8 + idx];
+        }
+        weights[idx] = weight;
     }
     __syncthreads();
     #pragma unroll
@@ -187,11 +191,11 @@ kernel_cake_mok_epilogue_forward_8(const __grid_constant__ CUtensorMap shared, c
         }
         #pragma unroll 1
         for (int k = 0; k < 8; k++) {
-            float weight = weights[stage_2 * 8 + k];
+            float weight_1 = weights[stage_2 * 8 + k];
             #pragma unroll
             for (int elem_1 = 0; elem_1 < 4; elem_1++) {
                 float term = (float)vectors[(stage_2 * 9 + 1 + k) * 1024 + lane_col + elem_1 * 32];
-                term = term * weight;
+                term = term * weight_1;
                 accumulator[elem_1] = accumulator[elem_1] + term;
             }
         }

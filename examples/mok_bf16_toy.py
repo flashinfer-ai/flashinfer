@@ -13,7 +13,11 @@ import os
 
 import torch
 import torch.distributed as dist
-from flashinfer.mok import prepare_mok_bf16, create_mok_bf16_workspace
+from flashinfer.mok import (
+    context_defined_rows,
+    create_mok_bf16_workspace,
+    prepare_mok_bf16,
+)
 
 
 RESULT_NAMES = (
@@ -265,24 +269,22 @@ class TrainingIteration:
                 swiglu_limit=self.swiglu_limit,
             )
             if not torch.cuda.is_current_stream_capturing():
-                saved = (
-                    self.context.x_routed,
-                    self.context.gate_shared,
-                    self.context.gate_routed,
-                    self.context.up_shared,
-                    self.context.up_routed,
-                    self.context.hidden_shared,
-                    self.context.hidden_routed,
-                )
-                rebuilt = (
-                    context.x_routed,
-                    context.gate_shared,
-                    context.gate_routed,
-                    context.up_shared,
-                    context.up_routed,
-                    context.hidden_shared,
-                    context.hidden_routed,
-                )
+                # Only the defined rows are comparable (ring rows beyond the
+                # retained macrobatch / real source rows are never written).
+                routed_rows, shared_rows = context_defined_rows(self.config, context)
+
+                def defined(ctx):
+                    return (
+                        ctx.x_routed[:routed_rows],
+                        ctx.gate_shared[:shared_rows],
+                        ctx.gate_routed[:routed_rows],
+                        ctx.up_shared[:shared_rows],
+                        ctx.up_routed[:routed_rows],
+                        ctx.hidden_shared[:shared_rows],
+                        ctx.hidden_routed[:routed_rows],
+                    )
+
+                saved, rebuilt = defined(self.context), defined(context)
                 if not all(
                     torch.equal(a, b) for a, b in zip(saved, rebuilt, strict=True)
                 ):

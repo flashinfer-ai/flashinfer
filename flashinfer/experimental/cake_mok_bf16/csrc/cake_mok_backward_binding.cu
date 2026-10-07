@@ -18,10 +18,10 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_constant__ CUtensorMap dy_r, const __grid_constant__ CUtensorMap dg_s, const __grid_constant__ CUtensorMap dg_r, const __grid_constant__ CUtensorMap du_s, const __grid_constant__ CUtensorMap du_r, const __grid_constant__ CUtensorMap x_nt_r, const __grid_constant__ CUtensorMap dy_atb_s, const __grid_constant__ CUtensorMap dy_atb_r, const __grid_constant__ CUtensorMap dg_atb_s, const __grid_constant__ CUtensorMap dg_atb_r, const __grid_constant__ CUtensorMap du_atb_s, const __grid_constant__ CUtensorMap du_atb_r, const __grid_constant__ CUtensorMap x_atb_s, const __grid_constant__ CUtensorMap x_atb_r, const __grid_constant__ CUtensorMap h_atb_s, const __grid_constant__ CUtensorMap h_atb_r, const __grid_constant__ CUtensorMap wg_s, const __grid_constant__ CUtensorMap wu_s, const __grid_constant__ CUtensorMap wd_s, const __grid_constant__ CUtensorMap wg_r, const __grid_constant__ CUtensorMap wu_r, const __grid_constant__ CUtensorMap wd_r, const __grid_constant__ CUtensorMap wg_nt_r, const __grid_constant__ CUtensorMap wu_nt_r, const __grid_constant__ CUtensorMap dh_s, const __grid_constant__ CUtensorMap dh_r, const __grid_constant__ CUtensorMap dx_s, const __grid_constant__ CUtensorMap dx_r, const __grid_constant__ CUtensorMap gate_out_r, const __grid_constant__ CUtensorMap up_out_r, const __grid_constant__ CUtensorMap dwg_s, const __grid_constant__ CUtensorMap dwu_s, const __grid_constant__ CUtensorMap dwd_s, const __grid_constant__ CUtensorMap dwg_r, const __grid_constant__ CUtensorMap dwu_r, const __grid_constant__ CUtensorMap dwd_r, const __grid_constant__ CUtensorMap dh_sw_s, const __grid_constant__ CUtensorMap dh_sw_r, const __grid_constant__ CUtensorMap gate_sw_s, const __grid_constant__ CUtensorMap gate_sw_r, const __grid_constant__ CUtensorMap up_sw_s, const __grid_constant__ CUtensorMap up_sw_r, const __grid_constant__ CUtensorMap dg_sw_s, const __grid_constant__ CUtensorMap dg_sw_r, const __grid_constant__ CUtensorMap du_sw_s, const __grid_constant__ CUtensorMap du_sw_r, const __grid_constant__ CUtensorMap h_sw_r, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ dy_routed_ptr, __nv_bfloat16* __restrict__ dx_routed_ptr, __nv_bfloat16* __restrict__ saved_y, float* __restrict__ weights, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ dy_peers, unsigned long long* __restrict__ dx_peers, unsigned long long* __restrict__ weight_peers, unsigned long long* __restrict__ dweight_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ dh_ready, int* __restrict__ dg_ready, int* __restrict__ dy_ready, int* __restrict__ dx_ready, int* __restrict__ replay_x, int* __restrict__ replay_gu, int* __restrict__ replay_h, int* __restrict__ buffers_done, int* __restrict__ weight_ready, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size);
+extern "C" __global__ void kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_constant__ CUtensorMap dy_r, const __grid_constant__ CUtensorMap dg_s, const __grid_constant__ CUtensorMap dg_r, const __grid_constant__ CUtensorMap du_s, const __grid_constant__ CUtensorMap du_r, const __grid_constant__ CUtensorMap x_nt_r, const __grid_constant__ CUtensorMap dy_atb_s, const __grid_constant__ CUtensorMap dy_atb_r, const __grid_constant__ CUtensorMap dg_atb_s, const __grid_constant__ CUtensorMap dg_atb_r, const __grid_constant__ CUtensorMap du_atb_s, const __grid_constant__ CUtensorMap du_atb_r, const __grid_constant__ CUtensorMap x_atb_s, const __grid_constant__ CUtensorMap x_atb_r, const __grid_constant__ CUtensorMap h_atb_s, const __grid_constant__ CUtensorMap h_atb_r, const __grid_constant__ CUtensorMap wg_s, const __grid_constant__ CUtensorMap wu_s, const __grid_constant__ CUtensorMap wd_s, const __grid_constant__ CUtensorMap wg_r, const __grid_constant__ CUtensorMap wu_r, const __grid_constant__ CUtensorMap wd_r, const __grid_constant__ CUtensorMap wg_nt_r, const __grid_constant__ CUtensorMap wu_nt_r, const __grid_constant__ CUtensorMap dh_s, const __grid_constant__ CUtensorMap dh_r, const __grid_constant__ CUtensorMap dx_s, const __grid_constant__ CUtensorMap dx_r, const __grid_constant__ CUtensorMap gate_out_r, const __grid_constant__ CUtensorMap up_out_r, const __grid_constant__ CUtensorMap dwg_s, const __grid_constant__ CUtensorMap dwu_s, const __grid_constant__ CUtensorMap dwd_s, const __grid_constant__ CUtensorMap dwg_r, const __grid_constant__ CUtensorMap dwu_r, const __grid_constant__ CUtensorMap dwd_r, const __grid_constant__ CUtensorMap dh_sw_s, const __grid_constant__ CUtensorMap dh_sw_r, const __grid_constant__ CUtensorMap gate_sw_s, const __grid_constant__ CUtensorMap gate_sw_r, const __grid_constant__ CUtensorMap up_sw_s, const __grid_constant__ CUtensorMap up_sw_r, const __grid_constant__ CUtensorMap dg_sw_s, const __grid_constant__ CUtensorMap dg_sw_r, const __grid_constant__ CUtensorMap du_sw_s, const __grid_constant__ CUtensorMap du_sw_r, const __grid_constant__ CUtensorMap h_sw_r, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ dy_routed_ptr, __nv_bfloat16* __restrict__ dy_scaled_ptr, __nv_bfloat16* __restrict__ dx_routed_ptr, float* __restrict__ weights, float* __restrict__ partials, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ dy_peers, unsigned long long* __restrict__ dx_peers, unsigned long long* __restrict__ weight_peers, unsigned long long* __restrict__ dweight_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ dh_ready, int* __restrict__ dg_ready, int* __restrict__ dy_ready, int* __restrict__ dx_ready, int* __restrict__ replay_x, int* __restrict__ replay_gu, int* __restrict__ replay_h, int* __restrict__ buffers_done, int* __restrict__ weight_ready, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit, int swiglu_clamped);
 
 
-namespace cake_host_shim_917f5b65b04cbcd0 {
+namespace cake_host_shim_1fe6cdb386b834f3 {
 
 using tvm::ffi::TensorView;
 
@@ -68,7 +68,7 @@ inline CUtensorMap EncodeTma_dy_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dy_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 1, 1, 1) exceeds resolved global dims for 'dy_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -137,7 +137,7 @@ inline CUtensorMap EncodeTma_dy_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dy_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 1, 1, 1) exceeds resolved global dims for 'dy_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -206,7 +206,7 @@ inline CUtensorMap EncodeTma_dg_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dg_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 1, 1, 1) exceeds resolved global dims for 'dg_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -275,7 +275,7 @@ inline CUtensorMap EncodeTma_dg_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dg_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 1, 1, 1) exceeds resolved global dims for 'dg_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -344,7 +344,7 @@ inline CUtensorMap EncodeTma_du_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'du_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 1, 1, 1) exceeds resolved global dims for 'du_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -413,7 +413,7 @@ inline CUtensorMap EncodeTma_du_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'du_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 1, 1, 1) exceeds resolved global dims for 'du_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -482,7 +482,7 @@ inline CUtensorMap EncodeTma_x_nt_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'x_nt_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 1, 1, 1) exceeds resolved global dims for 'x_nt_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -551,7 +551,7 @@ inline CUtensorMap EncodeTma_dy_atb_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dy_atb_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'dy_atb_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -620,7 +620,7 @@ inline CUtensorMap EncodeTma_dy_atb_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dy_atb_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'dy_atb_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -689,7 +689,7 @@ inline CUtensorMap EncodeTma_dg_atb_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dg_atb_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'dg_atb_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -758,7 +758,7 @@ inline CUtensorMap EncodeTma_dg_atb_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dg_atb_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'dg_atb_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -827,7 +827,7 @@ inline CUtensorMap EncodeTma_du_atb_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'du_atb_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'du_atb_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -896,7 +896,7 @@ inline CUtensorMap EncodeTma_du_atb_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'du_atb_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'du_atb_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -965,7 +965,7 @@ inline CUtensorMap EncodeTma_x_atb_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'x_atb_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'x_atb_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1034,7 +1034,7 @@ inline CUtensorMap EncodeTma_x_atb_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'x_atb_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'x_atb_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1103,7 +1103,7 @@ inline CUtensorMap EncodeTma_h_atb_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'h_atb_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'h_atb_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1172,7 +1172,7 @@ inline CUtensorMap EncodeTma_h_atb_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'h_atb_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'h_atb_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1242,7 +1242,7 @@ inline CUtensorMap EncodeTma_wg_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'wg_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'wg_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1312,7 +1312,7 @@ inline CUtensorMap EncodeTma_wu_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'wu_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'wu_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1382,7 +1382,7 @@ inline CUtensorMap EncodeTma_wd_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'wd_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'wd_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1452,7 +1452,7 @@ inline CUtensorMap EncodeTma_wg_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'wg_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'wg_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1522,7 +1522,7 @@ inline CUtensorMap EncodeTma_wu_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'wu_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'wu_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1592,7 +1592,7 @@ inline CUtensorMap EncodeTma_wd_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'wd_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 64u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 64, 2, 1, 1) exceeds resolved global dims for 'wd_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1662,7 +1662,7 @@ inline CUtensorMap EncodeTma_wg_nt_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'wg_nt_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 1, 1, 1) exceeds resolved global dims for 'wg_nt_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1732,7 +1732,7 @@ inline CUtensorMap EncodeTma_wu_nt_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'wu_nt_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 1, 1, 1) exceeds resolved global dims for 'wu_nt_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1801,7 +1801,7 @@ inline CUtensorMap EncodeTma_dh_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dh_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'dh_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1870,7 +1870,7 @@ inline CUtensorMap EncodeTma_dh_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dh_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'dh_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -1939,7 +1939,7 @@ inline CUtensorMap EncodeTma_dx_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dx_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'dx_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2008,7 +2008,7 @@ inline CUtensorMap EncodeTma_dx_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dx_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'dx_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2077,7 +2077,7 @@ inline CUtensorMap EncodeTma_gate_out_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'gate_out_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'gate_out_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2146,7 +2146,7 @@ inline CUtensorMap EncodeTma_up_out_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'up_out_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'up_out_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2216,7 +2216,7 @@ inline CUtensorMap EncodeTma_dwg_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dwg_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'dwg_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2286,7 +2286,7 @@ inline CUtensorMap EncodeTma_dwu_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dwu_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'dwu_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2356,7 +2356,7 @@ inline CUtensorMap EncodeTma_dwd_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dwd_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'dwd_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2426,7 +2426,7 @@ inline CUtensorMap EncodeTma_dwg_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dwg_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'dwg_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2496,7 +2496,7 @@ inline CUtensorMap EncodeTma_dwu_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dwu_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'dwu_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2566,7 +2566,7 @@ inline CUtensorMap EncodeTma_dwd_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(32), (uint64_t)(d2), (uint64_t)((d1 / 32)), (uint64_t)(d3), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dwd_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (32, 128, 1, 1, 1) exceeds resolved global dims for 'dwd_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2635,7 +2635,7 @@ inline CUtensorMap EncodeTma_dh_sw_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dh_sw_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'dh_sw_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2704,7 +2704,7 @@ inline CUtensorMap EncodeTma_dh_sw_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dh_sw_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'dh_sw_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2773,7 +2773,7 @@ inline CUtensorMap EncodeTma_gate_sw_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'gate_sw_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'gate_sw_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2842,7 +2842,7 @@ inline CUtensorMap EncodeTma_gate_sw_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'gate_sw_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'gate_sw_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2911,7 +2911,7 @@ inline CUtensorMap EncodeTma_up_sw_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'up_sw_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'up_sw_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -2980,7 +2980,7 @@ inline CUtensorMap EncodeTma_up_sw_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'up_sw_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'up_sw_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -3049,7 +3049,7 @@ inline CUtensorMap EncodeTma_dg_sw_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dg_sw_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'dg_sw_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -3118,7 +3118,7 @@ inline CUtensorMap EncodeTma_dg_sw_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'dg_sw_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'dg_sw_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -3187,7 +3187,7 @@ inline CUtensorMap EncodeTma_du_sw_s(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'du_sw_s' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'du_sw_s'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -3256,7 +3256,7 @@ inline CUtensorMap EncodeTma_du_sw_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'du_sw_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'du_sw_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -3325,7 +3325,7 @@ inline CUtensorMap EncodeTma_h_sw_r(const TensorView& t) {
   uint64_t global_dim[5] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(1), (uint64_t)(1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0 && global_dim[4] > 0, ValueError)
       << "TMA descriptor for 'h_sw_r' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 128u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[2] && 1u <= global_dim[3] && 1u <= global_dim[4], ValueError)
       << "TMA box (64, 128, 2, 1, 1) exceeds resolved global dims for 'h_sw_r'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -3374,7 +3374,7 @@ inline CUtensorMap EncodeTma_h_sw_r(const TensorView& t) {
   return tm;
 }
 
-void Run(TensorView arg_dy_s, TensorView arg_dy_r, TensorView arg_dg_s, TensorView arg_dg_r, TensorView arg_du_s, TensorView arg_du_r, TensorView arg_x_nt_r, TensorView arg_dy_atb_s, TensorView arg_dy_atb_r, TensorView arg_dg_atb_s, TensorView arg_dg_atb_r, TensorView arg_du_atb_s, TensorView arg_du_atb_r, TensorView arg_x_atb_s, TensorView arg_x_atb_r, TensorView arg_h_atb_s, TensorView arg_h_atb_r, TensorView arg_wg_s, TensorView arg_wu_s, TensorView arg_wd_s, TensorView arg_wg_r, TensorView arg_wu_r, TensorView arg_wd_r, TensorView arg_wg_nt_r, TensorView arg_wu_nt_r, TensorView arg_dh_s, TensorView arg_dh_r, TensorView arg_dx_s, TensorView arg_dx_r, TensorView arg_gate_out_r, TensorView arg_up_out_r, TensorView arg_dwg_s, TensorView arg_dwu_s, TensorView arg_dwd_s, TensorView arg_dwg_r, TensorView arg_dwu_r, TensorView arg_dwd_r, TensorView arg_dh_sw_s, TensorView arg_dh_sw_r, TensorView arg_gate_sw_s, TensorView arg_gate_sw_r, TensorView arg_up_sw_s, TensorView arg_up_sw_r, TensorView arg_dg_sw_s, TensorView arg_dg_sw_r, TensorView arg_du_sw_s, TensorView arg_du_sw_r, TensorView arg_h_sw_r, TensorView arg_x_routed_ptr, TensorView arg_dy_routed_ptr, TensorView arg_dx_routed_ptr, TensorView arg_saved_y, TensorView arg_weights, TensorView arg_x_peers, TensorView arg_dy_peers, TensorView arg_dx_peers, TensorView arg_weight_peers, TensorView arg_dweight_peers, TensorView arg_schedule_rank, TensorView arg_schedule_token, TensorView arg_num_tokens, TensorView arg_counts, TensorView arg_dh_ready, TensorView arg_dg_ready, TensorView arg_dy_ready, TensorView arg_dx_ready, TensorView arg_replay_x, TensorView arg_replay_gu, TensorView arg_replay_h, TensorView arg_buffers_done, TensorView arg_weight_ready, int64_t arg_local_tokens, int64_t arg_hidden, int64_t arg_intermediate, int64_t arg_experts, int64_t arg_topk, int64_t arg_comm_sms, int64_t arg_macro_size, int64_t arg_mini_size, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_dy_s, TensorView arg_dy_r, TensorView arg_dg_s, TensorView arg_dg_r, TensorView arg_du_s, TensorView arg_du_r, TensorView arg_x_nt_r, TensorView arg_dy_atb_s, TensorView arg_dy_atb_r, TensorView arg_dg_atb_s, TensorView arg_dg_atb_r, TensorView arg_du_atb_s, TensorView arg_du_atb_r, TensorView arg_x_atb_s, TensorView arg_x_atb_r, TensorView arg_h_atb_s, TensorView arg_h_atb_r, TensorView arg_wg_s, TensorView arg_wu_s, TensorView arg_wd_s, TensorView arg_wg_r, TensorView arg_wu_r, TensorView arg_wd_r, TensorView arg_wg_nt_r, TensorView arg_wu_nt_r, TensorView arg_dh_s, TensorView arg_dh_r, TensorView arg_dx_s, TensorView arg_dx_r, TensorView arg_gate_out_r, TensorView arg_up_out_r, TensorView arg_dwg_s, TensorView arg_dwu_s, TensorView arg_dwd_s, TensorView arg_dwg_r, TensorView arg_dwu_r, TensorView arg_dwd_r, TensorView arg_dh_sw_s, TensorView arg_dh_sw_r, TensorView arg_gate_sw_s, TensorView arg_gate_sw_r, TensorView arg_up_sw_s, TensorView arg_up_sw_r, TensorView arg_dg_sw_s, TensorView arg_dg_sw_r, TensorView arg_du_sw_s, TensorView arg_du_sw_r, TensorView arg_h_sw_r, TensorView arg_x_routed_ptr, TensorView arg_dy_routed_ptr, TensorView arg_dy_scaled_ptr, TensorView arg_dx_routed_ptr, TensorView arg_weights, TensorView arg_partials, TensorView arg_x_peers, TensorView arg_dy_peers, TensorView arg_dx_peers, TensorView arg_weight_peers, TensorView arg_dweight_peers, TensorView arg_schedule_rank, TensorView arg_schedule_token, TensorView arg_num_tokens, TensorView arg_counts, TensorView arg_dh_ready, TensorView arg_dg_ready, TensorView arg_dy_ready, TensorView arg_dx_ready, TensorView arg_replay_x, TensorView arg_replay_gu, TensorView arg_replay_h, TensorView arg_buffers_done, TensorView arg_weight_ready, int64_t arg_local_tokens, int64_t arg_hidden, int64_t arg_intermediate, int64_t arg_experts, int64_t arg_topk, int64_t arg_comm_sms, int64_t arg_macro_size, int64_t arg_mini_size, double arg_swiglu_limit, int64_t arg_swiglu_clamped, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_dy_s.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));  // binds the context for the encoders
@@ -3480,15 +3480,18 @@ void Run(TensorView arg_dy_s, TensorView arg_dy_r, TensorView arg_dg_s, TensorVi
   check_cuda_tensor(arg_dy_routed_ptr, "dy_routed_ptr");
   check_dtype(arg_dy_routed_ptr, DLDataType{kDLBfloat, 16, 1}, "dy_routed_ptr");
   check_contiguous(arg_dy_routed_ptr, "dy_routed_ptr");
+  check_cuda_tensor(arg_dy_scaled_ptr, "dy_scaled_ptr");
+  check_dtype(arg_dy_scaled_ptr, DLDataType{kDLBfloat, 16, 1}, "dy_scaled_ptr");
+  check_contiguous(arg_dy_scaled_ptr, "dy_scaled_ptr");
   check_cuda_tensor(arg_dx_routed_ptr, "dx_routed_ptr");
   check_dtype(arg_dx_routed_ptr, DLDataType{kDLBfloat, 16, 1}, "dx_routed_ptr");
   check_contiguous(arg_dx_routed_ptr, "dx_routed_ptr");
-  check_cuda_tensor(arg_saved_y, "saved_y");
-  check_dtype(arg_saved_y, DLDataType{kDLBfloat, 16, 1}, "saved_y");
-  check_contiguous(arg_saved_y, "saved_y");
   check_cuda_tensor(arg_weights, "weights");
   check_dtype(arg_weights, DLDataType{kDLFloat, 32, 1}, "weights");
   check_contiguous(arg_weights, "weights");
+  check_cuda_tensor(arg_partials, "partials");
+  check_dtype(arg_partials, DLDataType{kDLFloat, 32, 1}, "partials");
+  check_contiguous(arg_partials, "partials");
   check_cuda_tensor(arg_x_peers, "x_peers");
   check_dtype(arg_x_peers, DLDataType{kDLUInt, 64, 1}, "x_peers");
   check_contiguous(arg_x_peers, "x_peers");
@@ -3567,6 +3570,9 @@ void Run(TensorView arg_dy_s, TensorView arg_dy_r, TensorView arg_dg_s, TensorVi
   TVM_FFI_CHECK(arg_mini_size >= -2147483648LL && arg_mini_size <= 2147483647LL, ValueError)
       << "scalar 'mini_size' value " << arg_mini_size
       << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_swiglu_clamped >= -2147483648LL && arg_swiglu_clamped <= 2147483647LL, ValueError)
+      << "scalar 'swiglu_clamped' value " << arg_swiglu_clamped
+      << " is outside i32 range [-2147483648, 2147483647]";
   check_same_device(arg_dy_r, arg_dy_s, "dy_r", "dy_s");
   check_same_device(arg_dg_s, arg_dy_s, "dg_s", "dy_s");
   check_same_device(arg_dg_r, arg_dy_s, "dg_r", "dy_s");
@@ -3616,9 +3622,10 @@ void Run(TensorView arg_dy_s, TensorView arg_dy_r, TensorView arg_dg_s, TensorVi
   check_same_device(arg_h_sw_r, arg_dy_s, "h_sw_r", "dy_s");
   check_same_device(arg_x_routed_ptr, arg_dy_s, "x_routed_ptr", "dy_s");
   check_same_device(arg_dy_routed_ptr, arg_dy_s, "dy_routed_ptr", "dy_s");
+  check_same_device(arg_dy_scaled_ptr, arg_dy_s, "dy_scaled_ptr", "dy_s");
   check_same_device(arg_dx_routed_ptr, arg_dy_s, "dx_routed_ptr", "dy_s");
-  check_same_device(arg_saved_y, arg_dy_s, "saved_y", "dy_s");
   check_same_device(arg_weights, arg_dy_s, "weights", "dy_s");
+  check_same_device(arg_partials, arg_dy_s, "partials", "dy_s");
   check_same_device(arg_x_peers, arg_dy_s, "x_peers", "dy_s");
   check_same_device(arg_dy_peers, arg_dy_s, "dy_peers", "dy_s");
   check_same_device(arg_dx_peers, arg_dy_s, "dx_peers", "dy_s");
@@ -3695,9 +3702,10 @@ void Run(TensorView arg_dy_s, TensorView arg_dy_r, TensorView arg_dg_s, TensorVi
   CUtensorMap p_h_sw_r = EncodeTma_h_sw_r(arg_h_sw_r);
   __nv_bfloat16* p_x_routed_ptr = static_cast<__nv_bfloat16*>(arg_x_routed_ptr.data_ptr());
   __nv_bfloat16* p_dy_routed_ptr = static_cast<__nv_bfloat16*>(arg_dy_routed_ptr.data_ptr());
+  __nv_bfloat16* p_dy_scaled_ptr = static_cast<__nv_bfloat16*>(arg_dy_scaled_ptr.data_ptr());
   __nv_bfloat16* p_dx_routed_ptr = static_cast<__nv_bfloat16*>(arg_dx_routed_ptr.data_ptr());
-  __nv_bfloat16* p_saved_y = static_cast<__nv_bfloat16*>(arg_saved_y.data_ptr());
   float* p_weights = static_cast<float*>(arg_weights.data_ptr());
+  float* p_partials = static_cast<float*>(arg_partials.data_ptr());
   unsigned long long* p_x_peers = static_cast<unsigned long long*>(arg_x_peers.data_ptr());
   unsigned long long* p_dy_peers = static_cast<unsigned long long*>(arg_dy_peers.data_ptr());
   unsigned long long* p_dx_peers = static_cast<unsigned long long*>(arg_dx_peers.data_ptr());
@@ -3724,7 +3732,9 @@ void Run(TensorView arg_dy_s, TensorView arg_dy_r, TensorView arg_dg_s, TensorVi
   int32_t v_comm_sms = (int32_t)arg_comm_sms;
   int32_t v_macro_size = (int32_t)arg_macro_size;
   int32_t v_mini_size = (int32_t)arg_mini_size;
-  void* kargs[] = {&p_dy_s, &p_dy_r, &p_dg_s, &p_dg_r, &p_du_s, &p_du_r, &p_x_nt_r, &p_dy_atb_s, &p_dy_atb_r, &p_dg_atb_s, &p_dg_atb_r, &p_du_atb_s, &p_du_atb_r, &p_x_atb_s, &p_x_atb_r, &p_h_atb_s, &p_h_atb_r, &p_wg_s, &p_wu_s, &p_wd_s, &p_wg_r, &p_wu_r, &p_wd_r, &p_wg_nt_r, &p_wu_nt_r, &p_dh_s, &p_dh_r, &p_dx_s, &p_dx_r, &p_gate_out_r, &p_up_out_r, &p_dwg_s, &p_dwu_s, &p_dwd_s, &p_dwg_r, &p_dwu_r, &p_dwd_r, &p_dh_sw_s, &p_dh_sw_r, &p_gate_sw_s, &p_gate_sw_r, &p_up_sw_s, &p_up_sw_r, &p_dg_sw_s, &p_dg_sw_r, &p_du_sw_s, &p_du_sw_r, &p_h_sw_r, &p_x_routed_ptr, &p_dy_routed_ptr, &p_dx_routed_ptr, &p_saved_y, &p_weights, &p_x_peers, &p_dy_peers, &p_dx_peers, &p_weight_peers, &p_dweight_peers, &p_schedule_rank, &p_schedule_token, &p_num_tokens, &p_counts, &p_dh_ready, &p_dg_ready, &p_dy_ready, &p_dx_ready, &p_replay_x, &p_replay_gu, &p_replay_h, &p_buffers_done, &p_weight_ready, &v_local_tokens, &v_hidden, &v_intermediate, &v_experts, &v_topk, &v_comm_sms, &v_macro_size, &v_mini_size};
+  float v_swiglu_limit = (float)arg_swiglu_limit;
+  int32_t v_swiglu_clamped = (int32_t)arg_swiglu_clamped;
+  void* kargs[] = {&p_dy_s, &p_dy_r, &p_dg_s, &p_dg_r, &p_du_s, &p_du_r, &p_x_nt_r, &p_dy_atb_s, &p_dy_atb_r, &p_dg_atb_s, &p_dg_atb_r, &p_du_atb_s, &p_du_atb_r, &p_x_atb_s, &p_x_atb_r, &p_h_atb_s, &p_h_atb_r, &p_wg_s, &p_wu_s, &p_wd_s, &p_wg_r, &p_wu_r, &p_wd_r, &p_wg_nt_r, &p_wu_nt_r, &p_dh_s, &p_dh_r, &p_dx_s, &p_dx_r, &p_gate_out_r, &p_up_out_r, &p_dwg_s, &p_dwu_s, &p_dwd_s, &p_dwg_r, &p_dwu_r, &p_dwd_r, &p_dh_sw_s, &p_dh_sw_r, &p_gate_sw_s, &p_gate_sw_r, &p_up_sw_s, &p_up_sw_r, &p_dg_sw_s, &p_dg_sw_r, &p_du_sw_s, &p_du_sw_r, &p_h_sw_r, &p_x_routed_ptr, &p_dy_routed_ptr, &p_dy_scaled_ptr, &p_dx_routed_ptr, &p_weights, &p_partials, &p_x_peers, &p_dy_peers, &p_dx_peers, &p_weight_peers, &p_dweight_peers, &p_schedule_rank, &p_schedule_token, &p_num_tokens, &p_counts, &p_dh_ready, &p_dg_ready, &p_dy_ready, &p_dx_ready, &p_replay_x, &p_replay_gu, &p_replay_h, &p_buffers_done, &p_weight_ready, &v_local_tokens, &v_hidden, &v_intermediate, &v_experts, &v_topk, &v_comm_sms, &v_macro_size, &v_mini_size, &v_swiglu_limit, &v_swiglu_clamped};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
       reinterpret_cast<const void*>(kernel_cake_mok_backward), 232448);
@@ -3757,6 +3767,6 @@ void Run(TensorView arg_dy_s, TensorView arg_dy_r, TensorView arg_dg_s, TensorVi
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_917f5b65b04cbcd0
+}  // namespace cake_host_shim_1fe6cdb386b834f3
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_917f5b65b04cbcd0::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_1fe6cdb386b834f3::Run);
