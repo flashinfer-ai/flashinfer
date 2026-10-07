@@ -342,13 +342,17 @@ def _check_schedule_meta(schedule_meta, num_sms, device):
 
 
 def fused_cache_rows(kv_cache, page_kv=None):
-    """``(fused_2d, pages, page_kv, row_bytes)`` of the fused uint8 KV cache.
+    """``(fused_2d, pages, page_kv, block_stride_bytes)`` of the fused uint8 KV cache.
 
-    Accepts the engine's 4-D ``[pages, page_kv, 1, 132]`` cache and the padded
-    2-D ``[pages, block_stride_bytes]`` view a vLLM allocation may hand over
-    (``block_stride_bytes >= page_kv * 132``, a multiple of 16); the padded view
-    requires ``page_kv`` explicitly.  The physical row stride is what the TMA
-    descriptor carries, so a padded page costs nothing.
+    Accepts the engine's 4-D ``[pages, page_kv, 1, 132]`` cache -- contiguous,
+    or the strided per-layer view a block-outermost allocation hands over
+    (``stride(0)`` = the bytes between consecutive pages, larger than
+    ``page_kv * 132`` when every layer's page shares one block or the page is
+    padded) -- and the 2-D ``[pages, row_bytes]`` view (``row_bytes >= page_kv *
+    132``, ``stride(0) >= row_bytes``), which requires ``page_kv`` explicitly.
+    Block strides must be multiples of 16 bytes.  The kernel reads exactly
+    ``page_kv * 132`` bytes of every page through a TMA descriptor that carries
+    the physical block stride, so neither padding nor interleaving costs anything.
     """
     import torch
 
@@ -364,11 +368,18 @@ def fused_cache_rows(kv_cache, page_kv=None):
             raise ValueError(
                 f"page_kv = {page_kv} disagrees with kv_cache.shape[1] = {cached_page}"
             )
-        if not kv_cache.is_contiguous():
-            raise ValueError("the 4-D fused cache must be contiguous")
+        if int(kv_cache.stride(3)) != 1 or (
+            cached_page > 1 and int(kv_cache.stride(1)) != FUSED_ROW_BYTES
+        ):
+            raise ValueError(
+                "the 4-D fused cache must hold dense 132-byte token rows "
+                "(stride(3) == 1, stride(1) == 132)"
+            )
         page_kv = cached_page
         row_bytes = page_kv * FUSED_ROW_BYTES
-        fused = kv_cache.reshape(pages, row_bytes)
+        # Keep the view's physical page stride: a per-layer view of a
+        # block-outermost layout is not contiguous, and reshape would copy it.
+        fused = kv_cache.as_strided((pages, row_bytes), (int(kv_cache.stride(0)), 1))
     elif kv_cache.ndim == 2:
         if page_kv is None:
             raise ValueError(
@@ -381,16 +392,20 @@ def fused_cache_rows(kv_cache, page_kv=None):
         raise ValueError(
             f"kv_cache must be 4-D [pages, page_kv, 1, 132] or 2-D [pages, block_stride_bytes], got {kv_cache.ndim}-D"
         )
+    block_stride_bytes = int(fused.stride(0))
     if (
         row_bytes < page_kv * FUSED_ROW_BYTES
         or row_bytes % 16
         or int(fused.stride(1)) != 1
-        or int(fused.stride(0)) != row_bytes
+        or block_stride_bytes < row_bytes
+        or block_stride_bytes % 16
     ):
         raise ValueError(
-            f"fused cache rows must be contiguous, at least {page_kv * FUSED_ROW_BYTES} bytes and 16-byte aligned"
+            "fused cache rows must be unit-stride, at least "
+            f"{page_kv * FUSED_ROW_BYTES} bytes and 16-byte aligned, with a 16-byte-aligned "
+            f"block stride >= the row; got row {row_bytes} B, block stride {block_stride_bytes} B"
         )
-    return fused, pages, page_kv, row_bytes
+    return fused, pages, page_kv, block_stride_bytes
 
 
 def metadata_bindings(context_lens, schedule_meta, *, num_sms):
@@ -567,7 +582,7 @@ class Sm120PagedIndexerPlan:
             )
         if q.dtype != torch.float8_e4m3fn or not q.is_contiguous():
             raise ValueError("q must be contiguous E4M3")
-        fused, pages, page_kv, row_bytes = fused_cache_rows(kv_cache, page_kv)
+        fused, pages, page_kv, block_stride_bytes = fused_cache_rows(kv_cache, page_kv)
         if page_kv not in exported_page_sizes():
             raise ValueError(
                 f"page_kv {page_kv} is not exported; exported page sizes: {exported_page_sizes()}"
@@ -618,7 +633,7 @@ class Sm120PagedIndexerPlan:
         _check_schedule_meta(schedule_meta, num_sms, q.device)
         self.arch, self.num_sms, self.num_heads = arch, num_sms, num_heads
         self.page_kv, self.next_n, self.batch = page_kv, next_n, batch
-        self.pages, self.block_stride_bytes = pages, row_bytes
+        self.pages, self.block_stride_bytes = pages, block_stride_bytes
         self.max_context_len = max_context_len
         self.route_name = route_name(num_heads, page_kv, next_n, logits_dtype)
         self.route = _catalog()["routes"][self.route_name]

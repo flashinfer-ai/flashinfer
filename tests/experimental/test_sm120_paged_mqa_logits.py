@@ -312,6 +312,60 @@ def test_sm120_paged_padded_block_stride():
         )
 
 
+def test_sm120_paged_strided_per_layer_view():
+    """The per-layer view of a block-outermost engine layout (every layer's page
+    in one block: ``stride(0) > page_kv * 132``, not contiguous) is accepted as
+    the 4-D cache and scores bitwise what the dense layout scores."""
+    heads, page_kv, next_n = 32, 128, 1
+    _skip_unless_route(heads, page_kv, next_n)
+    data = _inputs(heads, page_kv, next_n, 4, 1024, seed=37)
+    dense = data["kv_cache"]
+    assert dense.ndim == 4 and dense.is_contiguous()
+    pages = int(dense.shape[0])
+    layer_bytes = page_kv * FUSED_ROW_BYTES
+    # Two layers per block; the indexer's pages sit in the second layer slot.
+    block = torch.zeros(pages, 2 * layer_bytes, device=dense.device, dtype=torch.uint8)
+    block[:, layer_bytes:] = dense.reshape(pages, layer_bytes)
+    strided = torch.as_strided(
+        block,
+        (pages, page_kv, 1, FUSED_ROW_BYTES),
+        (2 * layer_bytes, FUSED_ROW_BYTES, FUSED_ROW_BYTES, 1),
+        storage_offset=layer_bytes,
+    )
+    assert not strided.is_contiguous() and strided.stride(0) == 2 * layer_bytes
+    args = (
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+        data["max_context_len"],
+    )
+    plan_dense = prepare_sm120_paged_mqa_logits(data["q"], dense, *args)
+    plan_dense.output.fill_(float("nan"))
+    plan_dense.run()
+    plan = prepare_sm120_paged_mqa_logits(data["q"], strided, *args)
+    assert plan.page_kv == page_kv and plan.block_stride_bytes == 2 * layer_bytes
+    plan.output.fill_(float("nan"))
+    plan.run()
+    torch.cuda.synchronize()
+    _check(plan.logical_output, _reference(data), data, plan.output)
+    lengths = data["context_lens"].reshape(-1)
+    position = torch.arange(data["max_context_len"], device=dense.device)[None, :]
+    inside = position < lengths[:, None]
+    assert torch.equal(plan.logical_output[inside], plan_dense.logical_output[inside])
+    with pytest.raises(ValueError):
+        # Token rows must stay dense: a view that skips every other row is refused.
+        prepare_sm120_paged_mqa_logits(
+            data["q"],
+            torch.as_strided(
+                block,
+                (pages, page_kv // 2, 1, FUSED_ROW_BYTES),
+                (2 * layer_bytes, 2 * FUSED_ROW_BYTES, FUSED_ROW_BYTES, 1),
+                storage_offset=layer_bytes,
+            ),
+            *args,
+        )
+
+
 def test_sm120_paged_host_helpers_and_rejections():
     catalog = _runtime._catalog()
     assert catalog["schema"] == _runtime.CATALOG_SCHEMA
@@ -335,8 +389,11 @@ def test_sm120_paged_host_helpers_and_rejections():
         else:
             assert stages == ["metadata", "logits"] and record["sequence"]
             assert record["kernel_launches"] == 2
+    # One Q atom per request for every shipped next_n: 1 and 2 pair the tokens as
+    # DeepGEMM does; 4 scores the whole request from one atom (DeepGEMM: two
+    # 2-token atoms), so its schedule has half as many items as DeepGEMM's.
     for next_n in _runtime.exported_next_n():
-        assert _runtime.next_n_atoms(next_n) == max(1, (next_n + 1) // 2)
+        assert _runtime.next_n_atoms(next_n) == 1
 
 
 def test_sm120_arch_targets_follow_the_compilation_context(monkeypatch):

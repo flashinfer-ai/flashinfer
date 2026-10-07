@@ -17,41 +17,8 @@
 // Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek.
 // DeepGEMM portions are licensed under MIT; see DEEPGEMM_NOTICE.txt in this directory.
 
-typedef signed char int8_t;
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int int32_t;
-typedef short int int16_t;
-struct __align__(64) CakeTensorMap64 {
-  uint64_t opaque[16];
-};
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) {
-  uint64_t opaque[16];
-} CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-  int result;
-  asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;" : "=r"(result) : "r"(x));
-  return result;
-}
+// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
+#include "cake_deepgemm_sm120_paged_mqa_logits_device_common.cuh"
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_Q_PIPE_STAGES 2
@@ -78,84 +45,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
-#include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-  uint32_t pred = 0;
-  asm volatile(
-      "{\n\t"
-      ".reg .pred %%px;\n\t"
-      "elect.sync _|%%px, %1;\n\t"
-      "@%%px mov.s32 %0, 1;\n\t"
-      "}\n"
-      : "+r"(pred)
-      : "r"(0xFFFFFFFF));
-  return pred;
-}
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_addr), "r"(count) : "memory");
-}
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "LAB_WAIT:\n\t"
-      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-      " P1, [%0], %1;\n\t"
-      "@P1 bra.uni DONE;\n\t"
-      "bra.uni LAB_WAIT;\n\t"
-      "DONE:\n\t"
-      "}\n" ::"r"(mbar_addr),
-      "r"(phase)
-      : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::"r"(mbar_addr) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-  asm volatile(
-      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(mbar_addr),
-      "r"(bytes)
-      : "memory");
-}
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-  float c;
-  asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-  return c;
-}
-
-__device__ __forceinline__ void tma_3d_gmem2smem(int dst, const void* tmap_ptr, int x, int y, int z,
-                                                 int mbar_addr) {
-  asm volatile(
-      "cp.async.bulk.tensor.3d.shared::cta.global"
-      ".mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3, %4}], [%5];" ::"r"(dst),
-      "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr)
-      : "memory");
-}
-
-__device__ __forceinline__ void tma_2d_gmem2smem(int dst, const void* tmap_ptr, int x, int y,
-                                                 int mbar_addr) {
-  asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cta.global"
-      ".mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3}], [%4];" ::"r"(dst),
-      "l"(tmap_ptr), "r"(x), "r"(y), "r"(mbar_addr)
-      : "memory");
-}
-
 extern "C" {
 
 __global__
-__launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_mqa_logits_7cf71a2a9fe278d9f45c(
+__launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_mqa_logits_e75c87a8b487fc90607f(
     const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV,
     const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights,
     float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table,
@@ -182,18 +75,18 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
   const int cta_rank = 0;
 
   // Kernel setup ops
-  uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
-  const int smem_q_addr = smem + 1024;
-  float* smem_w = reinterpret_cast<float*>(smem_raw + 17408);
-  const int smem_w_addr = smem + 17408;
-  uint8_t* smem_kv_g0 = reinterpret_cast<uint8_t*>(smem_raw + 19456);
-  const int smem_kv_g0_addr = smem + 19456;
-  uint8_t* smem_kv_g1 = reinterpret_cast<uint8_t*>(smem_raw + 44032);
-  const int smem_kv_g1_addr = smem + 44032;
-  float* smem_sc_g0 = reinterpret_cast<float*>(smem_raw + 68608);
-  const int smem_sc_g0_addr = smem + 68608;
-  float* smem_sc_g1 = reinterpret_cast<float*>(smem_raw + 71680);
-  const int smem_sc_g1_addr = smem + 71680;
+  uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_Q_OFF);
+  const int smem_q_addr = smem + SMEM_SMEM_Q_OFF;
+  float* smem_w = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_W_OFF);
+  const int smem_w_addr = smem + SMEM_SMEM_W_OFF;
+  uint8_t* smem_kv_g0 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_KV_G0_OFF);
+  const int smem_kv_g0_addr = smem + SMEM_SMEM_KV_G0_OFF;
+  uint8_t* smem_kv_g1 = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_KV_G1_OFF);
+  const int smem_kv_g1_addr = smem + SMEM_SMEM_KV_G1_OFF;
+  float* smem_sc_g0 = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_SC_G0_OFF);
+  const int smem_sc_g0_addr = smem + SMEM_SMEM_SC_G0_OFF;
+  float* smem_sc_g1 = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_SC_G1_OFF);
+  const int smem_sc_g1_addr = smem + SMEM_SMEM_SC_G1_OFF;
 
   // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 16 barriers)
   // Mbarriers at smem_raw[0..128)
@@ -273,7 +166,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
         int lo = ((q_atom == start_q) ? start_kv : 0);
         int hi = ((q_atom == end_q) ? end_kv : num_kv);
         mbarrier_wait(q_full_addr + (q_stage_m) * 8, q_phase_m);
-        int n_tok = 2;
+        int n_tok_m = 2;
 #pragma unroll 1
         for (int kv_idx = lo; kv_idx < hi; kv_idx += 2) {
           mbarrier_wait(kv_full_g0_addr + (kv_stage_m) * 8, kv_phase_m);
@@ -401,133 +294,129 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
           int out0 = kv_offset + quad;
           *(reinterpret_cast<float*>(Logits + out0) + (0)) = v0;
           *(reinterpret_cast<float*>(Logits + (out0 + 8)) + (0)) = v1;
-          if (n_tok == 2) {
-            float partial0_0 = 0.0f;
-            float partial1_1 = 0.0f;
+          float partial0_0 = 0.0f;
+          float partial1_1 = 0.0f;
 #pragma unroll
-            for (int nt_1 = 0; nt_1 < 4; nt_1++) {
-              int b_row_1 = 32 + nt_1 * 8 + b_row_lane;
-              acc[0] = 0.0f;
-              acc[1] = 0.0f;
-              acc[2] = 0.0f;
-              acc[3] = 0.0f;
-              int a_cb_1 = a_col;
-              unsigned int a_addr_2 = smem_kv_g0_addr + kv_stage_m * 8192 +
+          for (int nt_1 = 0; nt_1 < 4; nt_1++) {
+            int b_row_1 = 32 + nt_1 * 8 + b_row_lane;
+            acc[0] = 0.0f;
+            acc[1] = 0.0f;
+            acc[2] = 0.0f;
+            acc[3] = 0.0f;
+            int a_cb_1 = a_col;
+            unsigned int a_addr_2 = smem_kv_g0_addr + kv_stage_m * 8192 +
+                                    (unsigned int)(a_row * 128) +
+                                    (unsigned int)(a_cb_1 ^ (a_row & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
+                         : "r"(a_addr_2)
+                         : "memory");
+            int b_cb_1 = b_col;
+            unsigned int b_addr_1 = smem_q_addr + q_stage_m * 8192 + (unsigned int)(b_row_1 * 128) +
+                                    (unsigned int)(b_cb_1 ^ (b_row_1 & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                         : "=r"(b_frag[0]), "=r"(b_frag[1])
+                         : "r"(b_addr_1)
+                         : "memory");
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
+                "%6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+                : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
+                : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]),
+                  "r"(b_frag[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+            int a_cb_0_1 = a_col + 32;
+            unsigned int a_addr_1_1 = smem_kv_g0_addr + kv_stage_m * 8192 +
                                       (unsigned int)(a_row * 128) +
-                                      (unsigned int)(a_cb_1 ^ (a_row & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                           : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                           : "r"(a_addr_2)
-                           : "memory");
-              int b_cb_1 = b_col;
-              unsigned int b_addr_1 = smem_q_addr + q_stage_m * 8192 +
+                                      (unsigned int)(a_cb_0_1 ^ (a_row & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
+                         : "r"(a_addr_1_1)
+                         : "memory");
+            int b_cb_2_1 = b_col + 32;
+            unsigned int b_addr_3_1 = smem_q_addr + q_stage_m * 8192 +
                                       (unsigned int)(b_row_1 * 128) +
-                                      (unsigned int)(b_cb_1 ^ (b_row_1 & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                           : "=r"(b_frag[0]), "=r"(b_frag[1])
-                           : "r"(b_addr_1)
-                           : "memory");
-              asm volatile(
-                  "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
-                  "%6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
-                  : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3])
-                  : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]),
-                    "r"(b_frag[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
-              int a_cb_0_1 = a_col + 32;
-              unsigned int a_addr_1_1 = smem_kv_g0_addr + kv_stage_m * 8192 +
-                                        (unsigned int)(a_row * 128) +
-                                        (unsigned int)(a_cb_0_1 ^ (a_row & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                           : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                           : "r"(a_addr_1_1)
-                           : "memory");
-              int b_cb_2_1 = b_col + 32;
-              unsigned int b_addr_3_1 = smem_q_addr + q_stage_m * 8192 +
-                                        (unsigned int)(b_row_1 * 128) +
-                                        (unsigned int)(b_cb_2_1 ^ (b_row_1 & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                           : "=r"(b_frag[0]), "=r"(b_frag[1])
-                           : "r"(b_addr_3_1)
-                           : "memory");
-              asm volatile(
-                  "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
-                  "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                  : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
-                  : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]),
-                    "r"(b_frag[1]));
-              int a_cb_4_1 = a_col + 64;
-              unsigned int a_addr_5_1 = smem_kv_g0_addr + kv_stage_m * 8192 +
-                                        (unsigned int)(a_row * 128) +
-                                        (unsigned int)(a_cb_4_1 ^ (a_row & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                           : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                           : "r"(a_addr_5_1)
-                           : "memory");
-              int b_cb_6_1 = b_col + 64;
-              unsigned int b_addr_7_1 = smem_q_addr + q_stage_m * 8192 +
-                                        (unsigned int)(b_row_1 * 128) +
-                                        (unsigned int)(b_cb_6_1 ^ (b_row_1 & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                           : "=r"(b_frag[0]), "=r"(b_frag[1])
-                           : "r"(b_addr_7_1)
-                           : "memory");
-              asm volatile(
-                  "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
-                  "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                  : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
-                  : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]),
-                    "r"(b_frag[1]));
-              int a_cb_8_1 = a_col + 96;
-              unsigned int a_addr_9_1 = smem_kv_g0_addr + kv_stage_m * 8192 +
-                                        (unsigned int)(a_row * 128) +
-                                        (unsigned int)(a_cb_8_1 ^ (a_row & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                           : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
-                           : "r"(a_addr_9_1)
-                           : "memory");
-              int b_cb_10_1 = b_col + 96;
-              unsigned int b_addr_11_1 = smem_q_addr + q_stage_m * 8192 +
-                                         (unsigned int)(b_row_1 * 128) +
-                                         (unsigned int)(b_cb_10_1 ^ (b_row_1 & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                           : "=r"(b_frag[0]), "=r"(b_frag[1])
-                           : "r"(b_addr_11_1)
-                           : "memory");
-              asm volatile(
-                  "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
-                  "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                  : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
-                  : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]),
-                    "r"(b_frag[1]));
-              int w_idx_1 =
-                  q_stage_m * 256 + 32 + (unsigned int)(nt_1 * 8) + (unsigned int)(tq * 2);
-              float w0_1 = smem_w[w_idx_1];
-              float w1_1 = smem_w[w_idx_1 + 1];
-              float _max_4 = max_noftz(acc[0], 0.0f);
-              float r0_1 = _max_4;
-              float _max_5 = max_noftz(acc[1], 0.0f);
-              float r1_1 = _max_5;
-              float _max_6 = max_noftz(acc[2], 0.0f);
-              float r2_1 = _max_6;
-              float _max_7 = max_noftz(acc[3], 0.0f);
-              float r3_1 = _max_7;
-              partial0_0 += r0_1 * w0_1 + r1_1 * w1_1;
-              partial1_1 += r2_1 * w0_1 + r3_1 * w1_1;
-            }
-            float v0_2 = partial0_0 * scale0;
-            float v1_3 = partial1_1 * scale1;
-            float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, v0_2, 1);
-            v0_2 = v0_2 + _shfl_xor_4;
-            float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, v1_3, 1);
-            v1_3 = v1_3 + _shfl_xor_5;
-            float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, v0_2, 2);
-            v0_2 = v0_2 + _shfl_xor_6;
-            float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, v1_3, 2);
-            v1_3 = v1_3 + _shfl_xor_7;
-            int out0_4 = kv_offset + logits_stride + quad;
-            *(reinterpret_cast<float*>(Logits + out0_4) + (0)) = v0_2;
-            *(reinterpret_cast<float*>(Logits + (out0_4 + 8)) + (0)) = v1_3;
+                                      (unsigned int)(b_cb_2_1 ^ (b_row_1 & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                         : "=r"(b_frag[0]), "=r"(b_frag[1])
+                         : "r"(b_addr_3_1)
+                         : "memory");
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
+                "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]),
+                  "r"(b_frag[1]));
+            int a_cb_4_1 = a_col + 64;
+            unsigned int a_addr_5_1 = smem_kv_g0_addr + kv_stage_m * 8192 +
+                                      (unsigned int)(a_row * 128) +
+                                      (unsigned int)(a_cb_4_1 ^ (a_row & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
+                         : "r"(a_addr_5_1)
+                         : "memory");
+            int b_cb_6_1 = b_col + 64;
+            unsigned int b_addr_7_1 = smem_q_addr + q_stage_m * 8192 +
+                                      (unsigned int)(b_row_1 * 128) +
+                                      (unsigned int)(b_cb_6_1 ^ (b_row_1 & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                         : "=r"(b_frag[0]), "=r"(b_frag[1])
+                         : "r"(b_addr_7_1)
+                         : "memory");
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
+                "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]),
+                  "r"(b_frag[1]));
+            int a_cb_8_1 = a_col + 96;
+            unsigned int a_addr_9_1 = smem_kv_g0_addr + kv_stage_m * 8192 +
+                                      (unsigned int)(a_row * 128) +
+                                      (unsigned int)(a_cb_8_1 ^ (a_row & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
+                         : "r"(a_addr_9_1)
+                         : "memory");
+            int b_cb_10_1 = b_col + 96;
+            unsigned int b_addr_11_1 = smem_q_addr + q_stage_m * 8192 +
+                                       (unsigned int)(b_row_1 * 128) +
+                                       (unsigned int)(b_cb_10_1 ^ (b_row_1 & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                         : "=r"(b_frag[0]), "=r"(b_frag[1])
+                         : "r"(b_addr_11_1)
+                         : "memory");
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
+                "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]),
+                  "r"(b_frag[1]));
+            int w_idx_1 = q_stage_m * 256 + 32 + (unsigned int)(nt_1 * 8) + (unsigned int)(tq * 2);
+            float w0_1 = smem_w[w_idx_1];
+            float w1_1 = smem_w[w_idx_1 + 1];
+            float _max_4 = max_noftz(acc[0], 0.0f);
+            float r0_1 = _max_4;
+            float _max_5 = max_noftz(acc[1], 0.0f);
+            float r1_1 = _max_5;
+            float _max_6 = max_noftz(acc[2], 0.0f);
+            float r2_1 = _max_6;
+            float _max_7 = max_noftz(acc[3], 0.0f);
+            float r3_1 = _max_7;
+            partial0_0 += r0_1 * w0_1 + r1_1 * w1_1;
+            partial1_1 += r2_1 * w0_1 + r3_1 * w1_1;
           }
+          float v0_2 = partial0_0 * scale0;
+          float v1_3 = partial1_1 * scale1;
+          float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, v0_2, 1);
+          v0_2 = v0_2 + _shfl_xor_4;
+          float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, v1_3, 1);
+          v1_3 = v1_3 + _shfl_xor_5;
+          float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, v0_2, 2);
+          v0_2 = v0_2 + _shfl_xor_6;
+          float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, v1_3, 2);
+          v1_3 = v1_3 + _shfl_xor_7;
+          int out0_4 = kv_offset + logits_stride + quad;
+          *(reinterpret_cast<float*>(Logits + out0_4) + (0)) = v0_2;
+          *(reinterpret_cast<float*>(Logits + (out0_4 + 8)) + (0)) = v1_3;
           asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
           mbarrier_arrive(kv_empty_g0_addr + (kv_stage_m) * 8);
           kv_stage_m += 1;
@@ -581,7 +470,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
         int lo_1 = ((q_atom_1 == start_q_1) ? start_kv_1 : 0);
         int hi_1 = ((q_atom_1 == end_q_1) ? end_kv_1 : num_kv_1);
         mbarrier_wait(q_full_addr + (q_stage_m_1) * 8, q_phase_m_1);
-        int n_tok_1 = 2;
+        int n_tok_m_1 = 2;
 #pragma unroll 1
         for (int kv_idx_1 = lo_1; kv_idx_1 < hi_1; kv_idx_1 += 2) {
           mbarrier_wait(kv_full_g1_addr + (kv_stage_m_1) * 8, kv_phase_m_1);
@@ -717,137 +606,135 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
           int out0_1 = kv_offset_1 + quad_1;
           *(reinterpret_cast<float*>(Logits + out0_1) + (0)) = v0_1;
           *(reinterpret_cast<float*>(Logits + (out0_1 + 8)) + (0)) = v1_1;
-          if (n_tok_1 == 2) {
-            float partial0_0_1 = 0.0f;
-            float partial1_1_1 = 0.0f;
+          float partial0_0_1 = 0.0f;
+          float partial1_1_1 = 0.0f;
 #pragma unroll
-            for (int nt_3 = 0; nt_3 < 4; nt_3++) {
-              int b_row_3 = 32 + nt_3 * 8 + b_row_lane_1;
-              acc_1[0] = 0.0f;
-              acc_1[1] = 0.0f;
-              acc_1[2] = 0.0f;
-              acc_1[3] = 0.0f;
-              int a_cb_3 = a_col_1;
-              unsigned int a_addr_4 = smem_kv_g1_addr + kv_stage_m_1 * 8192 +
+          for (int nt_3 = 0; nt_3 < 4; nt_3++) {
+            int b_row_3 = 32 + nt_3 * 8 + b_row_lane_1;
+            acc_1[0] = 0.0f;
+            acc_1[1] = 0.0f;
+            acc_1[2] = 0.0f;
+            acc_1[3] = 0.0f;
+            int a_cb_3 = a_col_1;
+            unsigned int a_addr_4 = smem_kv_g1_addr + kv_stage_m_1 * 8192 +
+                                    (unsigned int)(a_row_1 * 128) +
+                                    (unsigned int)(a_cb_3 ^ (a_row_1 & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                         : "=r"(a_frag_1[0]), "=r"(a_frag_1[1]), "=r"(a_frag_1[2]),
+                           "=r"(a_frag_1[3])
+                         : "r"(a_addr_4)
+                         : "memory");
+            int b_cb_4 = b_col_1;
+            unsigned int b_addr_4 = smem_q_addr + q_stage_m_1 * 8192 +
+                                    (unsigned int)(b_row_3 * 128) +
+                                    (unsigned int)(b_cb_4 ^ (b_row_3 & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                         : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
+                         : "r"(b_addr_4)
+                         : "memory");
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
+                "%6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+                : "=f"(acc_1[0]), "=f"(acc_1[1]), "=f"(acc_1[2]), "=f"(acc_1[3])
+                : "r"(a_frag_1[0]), "r"(a_frag_1[1]), "r"(a_frag_1[2]), "r"(a_frag_1[3]),
+                  "r"(b_frag_1[0]), "r"(b_frag_1[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+            int a_cb_0_3 = a_col_1 + 32;
+            unsigned int a_addr_1_3 = smem_kv_g1_addr + kv_stage_m_1 * 8192 +
                                       (unsigned int)(a_row_1 * 128) +
-                                      (unsigned int)(a_cb_3 ^ (a_row_1 & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                           : "=r"(a_frag_1[0]), "=r"(a_frag_1[1]), "=r"(a_frag_1[2]),
-                             "=r"(a_frag_1[3])
-                           : "r"(a_addr_4)
-                           : "memory");
-              int b_cb_4 = b_col_1;
-              unsigned int b_addr_4 = smem_q_addr + q_stage_m_1 * 8192 +
+                                      (unsigned int)(a_cb_0_3 ^ (a_row_1 & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                         : "=r"(a_frag_1[0]), "=r"(a_frag_1[1]), "=r"(a_frag_1[2]),
+                           "=r"(a_frag_1[3])
+                         : "r"(a_addr_1_3)
+                         : "memory");
+            int b_cb_2_3 = b_col_1 + 32;
+            unsigned int b_addr_3_3 = smem_q_addr + q_stage_m_1 * 8192 +
                                       (unsigned int)(b_row_3 * 128) +
-                                      (unsigned int)(b_cb_4 ^ (b_row_3 & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                           : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
-                           : "r"(b_addr_4)
-                           : "memory");
-              asm volatile(
-                  "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
-                  "%6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
-                  : "=f"(acc_1[0]), "=f"(acc_1[1]), "=f"(acc_1[2]), "=f"(acc_1[3])
-                  : "r"(a_frag_1[0]), "r"(a_frag_1[1]), "r"(a_frag_1[2]), "r"(a_frag_1[3]),
-                    "r"(b_frag_1[0]), "r"(b_frag_1[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
-              int a_cb_0_3 = a_col_1 + 32;
-              unsigned int a_addr_1_3 = smem_kv_g1_addr + kv_stage_m_1 * 8192 +
-                                        (unsigned int)(a_row_1 * 128) +
-                                        (unsigned int)(a_cb_0_3 ^ (a_row_1 & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                           : "=r"(a_frag_1[0]), "=r"(a_frag_1[1]), "=r"(a_frag_1[2]),
-                             "=r"(a_frag_1[3])
-                           : "r"(a_addr_1_3)
-                           : "memory");
-              int b_cb_2_3 = b_col_1 + 32;
-              unsigned int b_addr_3_3 = smem_q_addr + q_stage_m_1 * 8192 +
-                                        (unsigned int)(b_row_3 * 128) +
-                                        (unsigned int)(b_cb_2_3 ^ (b_row_3 & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                           : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
-                           : "r"(b_addr_3_3)
-                           : "memory");
-              asm volatile(
-                  "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
-                  "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                  : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
-                  : "r"(a_frag_1[0]), "r"(a_frag_1[1]), "r"(a_frag_1[2]), "r"(a_frag_1[3]),
-                    "r"(b_frag_1[0]), "r"(b_frag_1[1]));
-              int a_cb_4_3 = a_col_1 + 64;
-              unsigned int a_addr_5_3 = smem_kv_g1_addr + kv_stage_m_1 * 8192 +
-                                        (unsigned int)(a_row_1 * 128) +
-                                        (unsigned int)(a_cb_4_3 ^ (a_row_1 & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                           : "=r"(a_frag_1[0]), "=r"(a_frag_1[1]), "=r"(a_frag_1[2]),
-                             "=r"(a_frag_1[3])
-                           : "r"(a_addr_5_3)
-                           : "memory");
-              int b_cb_6_3 = b_col_1 + 64;
-              unsigned int b_addr_7_3 = smem_q_addr + q_stage_m_1 * 8192 +
-                                        (unsigned int)(b_row_3 * 128) +
-                                        (unsigned int)(b_cb_6_3 ^ (b_row_3 & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                           : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
-                           : "r"(b_addr_7_3)
-                           : "memory");
-              asm volatile(
-                  "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
-                  "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                  : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
-                  : "r"(a_frag_1[0]), "r"(a_frag_1[1]), "r"(a_frag_1[2]), "r"(a_frag_1[3]),
-                    "r"(b_frag_1[0]), "r"(b_frag_1[1]));
-              int a_cb_8_3 = a_col_1 + 96;
-              unsigned int a_addr_9_3 = smem_kv_g1_addr + kv_stage_m_1 * 8192 +
-                                        (unsigned int)(a_row_1 * 128) +
-                                        (unsigned int)(a_cb_8_3 ^ (a_row_1 & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                           : "=r"(a_frag_1[0]), "=r"(a_frag_1[1]), "=r"(a_frag_1[2]),
-                             "=r"(a_frag_1[3])
-                           : "r"(a_addr_9_3)
-                           : "memory");
-              int b_cb_10_3 = b_col_1 + 96;
-              unsigned int b_addr_11_3 = smem_q_addr + q_stage_m_1 * 8192 +
-                                         (unsigned int)(b_row_3 * 128) +
-                                         (unsigned int)(b_cb_10_3 ^ (b_row_3 & 7) << 4);
-              asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                           : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
-                           : "r"(b_addr_11_3)
-                           : "memory");
-              asm volatile(
-                  "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
-                  "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                  : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
-                  : "r"(a_frag_1[0]), "r"(a_frag_1[1]), "r"(a_frag_1[2]), "r"(a_frag_1[3]),
-                    "r"(b_frag_1[0]), "r"(b_frag_1[1]));
-              int w_idx_3 =
-                  q_stage_m_1 * 256 + 32 + (unsigned int)(nt_3 * 8) + (unsigned int)(tq_1 * 2);
-              float w0_3 = smem_w[w_idx_3];
-              float w1_3 = smem_w[w_idx_3 + 1];
-              float _max_12 = max_noftz(acc_1[0], 0.0f);
-              float r0_3 = _max_12;
-              float _max_13 = max_noftz(acc_1[1], 0.0f);
-              float r1_3 = _max_13;
-              float _max_14 = max_noftz(acc_1[2], 0.0f);
-              float r2_3 = _max_14;
-              float _max_15 = max_noftz(acc_1[3], 0.0f);
-              float r3_3 = _max_15;
-              partial0_0_1 += r0_3 * w0_3 + r1_3 * w1_3;
-              partial1_1_1 += r2_3 * w0_3 + r3_3 * w1_3;
-            }
-            float v0_2_1 = partial0_0_1 * scale0_1;
-            float v1_3_1 = partial1_1_1 * scale1_1;
-            float _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, v0_2_1, 1);
-            v0_2_1 = v0_2_1 + _shfl_xor_12;
-            float _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, v1_3_1, 1);
-            v1_3_1 = v1_3_1 + _shfl_xor_13;
-            float _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, v0_2_1, 2);
-            v0_2_1 = v0_2_1 + _shfl_xor_14;
-            float _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, v1_3_1, 2);
-            v1_3_1 = v1_3_1 + _shfl_xor_15;
-            int out0_4_1 = kv_offset_1 + logits_stride + quad_1;
-            *(reinterpret_cast<float*>(Logits + out0_4_1) + (0)) = v0_2_1;
-            *(reinterpret_cast<float*>(Logits + (out0_4_1 + 8)) + (0)) = v1_3_1;
+                                      (unsigned int)(b_cb_2_3 ^ (b_row_3 & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                         : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
+                         : "r"(b_addr_3_3)
+                         : "memory");
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
+                "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
+                : "r"(a_frag_1[0]), "r"(a_frag_1[1]), "r"(a_frag_1[2]), "r"(a_frag_1[3]),
+                  "r"(b_frag_1[0]), "r"(b_frag_1[1]));
+            int a_cb_4_3 = a_col_1 + 64;
+            unsigned int a_addr_5_3 = smem_kv_g1_addr + kv_stage_m_1 * 8192 +
+                                      (unsigned int)(a_row_1 * 128) +
+                                      (unsigned int)(a_cb_4_3 ^ (a_row_1 & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                         : "=r"(a_frag_1[0]), "=r"(a_frag_1[1]), "=r"(a_frag_1[2]),
+                           "=r"(a_frag_1[3])
+                         : "r"(a_addr_5_3)
+                         : "memory");
+            int b_cb_6_3 = b_col_1 + 64;
+            unsigned int b_addr_7_3 = smem_q_addr + q_stage_m_1 * 8192 +
+                                      (unsigned int)(b_row_3 * 128) +
+                                      (unsigned int)(b_cb_6_3 ^ (b_row_3 & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                         : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
+                         : "r"(b_addr_7_3)
+                         : "memory");
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
+                "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
+                : "r"(a_frag_1[0]), "r"(a_frag_1[1]), "r"(a_frag_1[2]), "r"(a_frag_1[3]),
+                  "r"(b_frag_1[0]), "r"(b_frag_1[1]));
+            int a_cb_8_3 = a_col_1 + 96;
+            unsigned int a_addr_9_3 = smem_kv_g1_addr + kv_stage_m_1 * 8192 +
+                                      (unsigned int)(a_row_1 * 128) +
+                                      (unsigned int)(a_cb_8_3 ^ (a_row_1 & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                         : "=r"(a_frag_1[0]), "=r"(a_frag_1[1]), "=r"(a_frag_1[2]),
+                           "=r"(a_frag_1[3])
+                         : "r"(a_addr_9_3)
+                         : "memory");
+            int b_cb_10_3 = b_col_1 + 96;
+            unsigned int b_addr_11_3 = smem_q_addr + q_stage_m_1 * 8192 +
+                                       (unsigned int)(b_row_3 * 128) +
+                                       (unsigned int)(b_cb_10_3 ^ (b_row_3 & 7) << 4);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                         : "=r"(b_frag_1[0]), "=r"(b_frag_1[1])
+                         : "r"(b_addr_11_3)
+                         : "memory");
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, "
+                "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                : "+f"(acc_1[0]), "+f"(acc_1[1]), "+f"(acc_1[2]), "+f"(acc_1[3])
+                : "r"(a_frag_1[0]), "r"(a_frag_1[1]), "r"(a_frag_1[2]), "r"(a_frag_1[3]),
+                  "r"(b_frag_1[0]), "r"(b_frag_1[1]));
+            int w_idx_3 =
+                q_stage_m_1 * 256 + 32 + (unsigned int)(nt_3 * 8) + (unsigned int)(tq_1 * 2);
+            float w0_3 = smem_w[w_idx_3];
+            float w1_3 = smem_w[w_idx_3 + 1];
+            float _max_12 = max_noftz(acc_1[0], 0.0f);
+            float r0_3 = _max_12;
+            float _max_13 = max_noftz(acc_1[1], 0.0f);
+            float r1_3 = _max_13;
+            float _max_14 = max_noftz(acc_1[2], 0.0f);
+            float r2_3 = _max_14;
+            float _max_15 = max_noftz(acc_1[3], 0.0f);
+            float r3_3 = _max_15;
+            partial0_0_1 += r0_3 * w0_3 + r1_3 * w1_3;
+            partial1_1_1 += r2_3 * w0_3 + r3_3 * w1_3;
           }
+          float v0_2_1 = partial0_0_1 * scale0_1;
+          float v1_3_1 = partial1_1_1 * scale1_1;
+          float _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, v0_2_1, 1);
+          v0_2_1 = v0_2_1 + _shfl_xor_12;
+          float _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, v1_3_1, 1);
+          v1_3_1 = v1_3_1 + _shfl_xor_13;
+          float _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, v0_2_1, 2);
+          v0_2_1 = v0_2_1 + _shfl_xor_14;
+          float _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, v1_3_1, 2);
+          v1_3_1 = v1_3_1 + _shfl_xor_15;
+          int out0_4_1 = kv_offset_1 + logits_stride + quad_1;
+          *(reinterpret_cast<float*>(Logits + out0_4_1) + (0)) = v0_2_1;
+          *(reinterpret_cast<float*>(Logits + (out0_4_1 + 8)) + (0)) = v1_3_1;
           asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
           mbarrier_arrive(kv_empty_g1_addr + (kv_stage_m_1) * 8);
           kv_stage_m_1 += 1;
@@ -907,15 +794,15 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
           int tile = kv_idx_2;
           int kv_block = 0;
           if (tile < num_kv_2) {
-            kv_block = block_table[bt_row + tile / 2];
+            kv_block = block_table[bt_row + tile];
           }
-          int page_off = tile % 2 * 64;
+          int page_off = 0;
           mbarrier_wait(kv_empty_g0_addr + (kv_stage) * 8, kv_phase);
           if (elect_sync()) {
             mbarrier_arrive_expect_tx(kv_full_g0_addr + (kv_stage) * 8, 8448);
             tma_3d_gmem2smem(smem_kv_g0_addr + kv_stage * 8192, (&KV), 0, page_off, kv_block,
                              kv_full_g0_addr + (kv_stage) * 8);
-            tma_2d_gmem2smem(smem_sc_g0_addr + kv_stage * 1024, (&KV_scales), 4096 + page_off,
+            tma_2d_gmem2smem(smem_sc_g0_addr + kv_stage * 1024, (&KV_scales), 2048 + page_off,
                              kv_block, kv_full_g0_addr + (kv_stage) * 8);
           }
           kv_stage += 1;
@@ -955,15 +842,15 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_deepgemm_sm120_paged_
           int tile_1 = kv_idx_3 + 1;
           int kv_block_1 = 0;
           if (tile_1 < num_kv_3) {
-            kv_block_1 = block_table[bt_row_1 + tile_1 / 2];
+            kv_block_1 = block_table[bt_row_1 + tile_1];
           }
-          int page_off_1 = tile_1 % 2 * 64;
+          int page_off_1 = 0;
           mbarrier_wait(kv_empty_g1_addr + (kv_stage_1) * 8, kv_phase_1);
           if (elect_sync()) {
             mbarrier_arrive_expect_tx(kv_full_g1_addr + (kv_stage_1) * 8, 8448);
             tma_3d_gmem2smem(smem_kv_g1_addr + kv_stage_1 * 8192, (&KV), 0, page_off_1, kv_block_1,
                              kv_full_g1_addr + (kv_stage_1) * 8);
-            tma_2d_gmem2smem(smem_sc_g1_addr + kv_stage_1 * 1024, (&KV_scales), 4096 + page_off_1,
+            tma_2d_gmem2smem(smem_sc_g1_addr + kv_stage_1 * 1024, (&KV_scales), 2048 + page_off_1,
                              kv_block_1, kv_full_g1_addr + (kv_stage_1) * 8);
           }
           kv_stage_1 += 1;
