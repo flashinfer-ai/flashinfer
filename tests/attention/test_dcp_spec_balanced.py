@@ -13,6 +13,7 @@ import torch
 import flashinfer.cake_dcp as cake_dcp
 from flashinfer.cake_dcp import (
     DCP_BALANCED_BF16_LONG_TILE_BLOCKS,
+    DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS,
     DCP_BALANCED_BF16_MAX_Q_LEN,
     DCP_BALANCED_BF16_MIN_ITEMS,
     DCP_BALANCED_BF16_MIN_Q_LEN,
@@ -115,6 +116,10 @@ def test_balanced_band_constants_match_the_cake_dispatcher() -> None:
     assert (DCP_BALANCED_BF16_MIN_Q_LEN, DCP_BALANCED_BF16_MAX_Q_LEN) == (3, 8)
     assert DCP_BALANCED_BF16_MIN_ITEMS == 128
     assert DCP_BALANCED_BF16_LONG_TILE_BLOCKS == 16
+    assert DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS == {
+        "sm_100a": (32,),
+        "sm_103a": (32, 64),
+    }
     assert (DCP_BALANCED_FP8_MIN_Q_LEN, DCP_BALANCED_FP8_MAX_Q_LEN) == (3, 8)
     assert DCP_BALANCED_FP8_MIN_ITEMS == 160
     # round 5: 24 -> 17 on sm_103a; the 17-block class is a tie band on sm_100a (floor 18)
@@ -138,7 +143,16 @@ def test_balanced_band_constants_match_the_cake_dispatcher() -> None:
 # to its winner on both architectures unless a per-arch dict says otherwise.
 _ROUTE_ROWS = [
     # bf16 / page 16: the 19-row band probe, the three crossover rows and the perf rows
-    ("band_b1_s4096_q8_w4_r0", "bf16_p16", 1, 8, 4096, 4, 0, "static"),
+    (
+        "band_b1_s4096_q8_w4_r0",
+        "bf16_p16",
+        1,
+        8,
+        4096,
+        4,
+        0,
+        {"sm_100a": "static", "sm_103a": "balanced"},
+    ),
     ("band_b2_s4096_q4_w4_r0", "bf16_p16", 2, 4, 4096, 4, 0, "static"),
     ("band_b4_s4096_q4_w4_r0", "bf16_p16", 4, 4, 4096, 4, 0, "static"),
     ("band_b1_s8192_q4_w4_r0", "bf16_p16", 1, 4, 8192, 4, 0, "static"),
@@ -157,10 +171,10 @@ _ROUTE_ROWS = [
     ("band_b8_s4096_q1_w4_r0", "bf16_p16", 8, 1, 4096, 4, 0, "static"),
     ("band_b256_s4096_q4_w4_r0", "bf16_p16", 256, 4, 4096, 4, 0, "balanced"),
     ("band_b128_s16384_q8_w4_r0", "bf16_p16", 128, 8, 16384, 4, 0, "balanced"),
-    ("band_b1_s6144_q4_w4_r0", "bf16_p16", 1, 4, 6144, 4, 0, "static"),
+    ("band_b1_s6144_q4_w4_r0", "bf16_p16", 1, 4, 6144, 4, 0, "balanced"),
     ("band_b1_s7168_q4_w4_r0", "bf16_p16", 1, 4, 7168, 4, 0, "static"),
     ("band_b2_s6144_q8_w4_r0", "bf16_p16", 2, 8, 6144, 4, 0, "static"),
-    ("perf_b1_s4096_q4_w4_r0", "bf16_p16", 1, 4, 4096, 4, 0, "static"),
+    ("perf_b1_s4096_q4_w4_r0", "bf16_p16", 1, 4, 4096, 4, 0, "balanced"),
     ("perf_b8_s4096_q4_w4_r0", "bf16_p16", 8, 4, 4096, 4, 0, "balanced"),
     ("perf_b64_s4096_q4_w4_r0", "bf16_p16", 64, 4, 4096, 4, 0, "balanced"),
     ("perf_b1_s16384_q8_w4_r0", "bf16_p16", 1, 8, 16384, 4, 0, "balanced"),
@@ -169,6 +183,9 @@ _ROUTE_ROWS = [
     ("perf_b8_s16383_q8_w4_r3_tail", "bf16_p16", 8, 8, 16383, 4, 3, "balanced"),
     ("dcp_bf16_agentx_b16_q4_cp4_r0", "bf16_p16", 16, 4, AGENTX, 4, 0, "balanced"),
     ("dcp_bf16_agentx_b16_q8_cp4_r3", "bf16_p16", 16, 8, AGENTX, 4, 3, "balanced"),
+    # unit 87: the single-request one-wave rows within the whole-tile bound (65 / 65 / 97 pages <= 112) route to the
+    # whole-tile static program -- the 64-row instance (band_b1_s4096_q8) only on sm_103a; band_b1_s7168_q4 (113 pages)
+    # and the b2 / b4 one-wave rows stay static
     # fp8 e4m3 / page 64 / D128: the 27-row band probe and production rows
     ("bandfp8_b1_s4096_q8_w4_r0", "fp8_p64", 1, 8, 4096, 4, 0, "static"),
     ("bandfp8_b2_s4096_q4_w4_r0", "fp8_p64", 2, 4, 4096, 4, 0, "static"),
@@ -985,11 +1002,19 @@ def test_bf16_program_row_selection(monkeypatch) -> None:
         ], (target, batch, prefix, route, q_len)
         assert not calls["static"]
     calls, _launches = _patch_loaders(monkeypatch)
-    # ``auto`` routes the one-wave b1 row to the static specialization (band reason ``one_wave``).
+    # ``auto`` routes the one-wave b1 row to the whole-tile program (band reason ``whole_tile_one_wave``, unit 87);
+    # the one-wave b1 row outside the whole-tile bound (129 pages) stays on the static specialization (``one_wave``).
     calls["balanced"].clear()
     calls["static"].clear()
     inputs = _rank_inputs(
         "bf16_p16", batch=1, q_len=4, prefixes=[4096], cp_world=4, cp_rank=0
+    )
+    run_dcp_spec_decode(**inputs)
+    assert calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, 5)]
+    assert not calls["static"]
+    calls["balanced"].clear()
+    inputs = _rank_inputs(
+        "bf16_p16", batch=1, q_len=4, prefixes=[8192], cp_world=4, cp_rank=0
     )
     run_dcp_spec_decode(**inputs)
     assert not calls["balanced"] and len(calls["static"]) == 1
@@ -1382,27 +1407,89 @@ def test_forced_static_route_bypasses_the_band(monkeypatch) -> None:
 
 def test_forced_balanced_route_serves_a_row_outside_the_band(monkeypatch) -> None:
     calls, launches = _patch_loaders(monkeypatch)
+    # one request of 129 pages on 148 SMs: one static wave outside the whole-tile bound (whole_pages_max 112), so the
+    # band keeps the static route (``one_wave``) and the forced balanced route runs the planner program (1)
     inputs = _rank_inputs(
-        "bf16_p16", batch=1, q_len=4, prefixes=[4096], cp_world=4, cp_rank=0
+        "bf16_p16", batch=1, q_len=4, prefixes=[8192], cp_world=4, cp_rank=0
     )
+    band = _band(
+        "bf16_p16",
+        batch=1,
+        q_len=4,
+        prefix=8192,
+        cp_world=4,
+        cp_rank=0,
+        arch="sm_100a",
+    )
+    assert (band.route, band.reason) == ("static", "one_wave")
+    run_dcp_spec_decode(**inputs, route="balanced")
     assert (
-        _band(
+        calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, 1)]
+        and len(launches["balanced"]) == 1
+    )
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+def test_bf16_whole_tile_one_wave_rows_route_balanced(arch) -> None:
+    """Unit 87: a single request under one static wave within the whole-tile bound routes balanced when the
+    architecture lists its packed-row instance (32 rows on both, 64 rows on sm_103a only); the launch's block-table
+    width decides, and rows outside the bound keep the static route."""
+
+    instances = DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS[arch]
+    for prefix, q_len in ((4096, 4), (4096, 8), (6144, 4)):
+        band = _band(
             "bf16_p16",
             batch=1,
-            q_len=4,
-            prefix=4096,
+            q_len=q_len,
+            prefix=prefix,
             cp_world=4,
             cp_rank=0,
-            arch="sm_100a",
-        ).route
-        == "static"
+            arch=arch,
+        )
+        expected = (
+            ("balanced", "whole_tile_one_wave")
+            if dcp_balanced_n_rows("bf16_p16", q_len) in instances
+            else ("static", "one_wave")
+        )
+        assert (band.waves, band.route, band.reason) == (1, *expected), (
+            prefix,
+            q_len,
+            band,
+        )
+    for prefix, batch in ((7168, 1), (8192, 1), (4096, 2), (4096, 4)):
+        band = _band(
+            "bf16_p16",
+            batch=batch,
+            q_len=4,
+            prefix=prefix,
+            cp_world=4,
+            cp_rank=0,
+            arch=arch,
+        )
+        assert (band.waves, band.route, band.reason) == (1, "static", "one_wave"), (
+            prefix,
+            batch,
+            band,
+        )
+    # the block-table width of the launch, not the narrowest table for the length, is what the bound sees
+    kwargs = dict(
+        batch_size=1,
+        q_len=4,
+        num_q_heads=64,
+        num_kv_heads=8,
+        head_dim=128,
+        max_local_seq_len=_max_local([4096], 4, 4, 0),
+        cp_world=4,
+        sm_count=_SM_COUNT[arch],
+        arch=arch,
     )
-    run_dcp_spec_decode(**inputs, route="balanced")
-    # one request of 65 pages on 148 SMs is inside the whole-tile regime (whole_pages_max 112): the swapped
-    # whole-tile program (3) in its early-issue form (5) on sm100a (sm103a keeps program 2)
+    assert dcp_balanced_route("bf16_p16", **kwargs) == "balanced"
+    assert dcp_balanced_route("bf16_p16", max_pages_per_seq=112, **kwargs) == "balanced"
+    assert dcp_balanced_route("bf16_p16", max_pages_per_seq=113, **kwargs) == "static"
+    assert dcp_balanced_band("bf16_p16", **kwargs).reason == "whole_tile_one_wave"
     assert (
-        calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, 5)]
-        and len(launches["balanced"]) == 1
+        dcp_balanced_band("bf16_p16", max_pages_per_seq=113, **kwargs).reason
+        == "one_wave"
     )
 
 

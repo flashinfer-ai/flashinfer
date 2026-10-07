@@ -261,6 +261,7 @@ _DCP_BALANCED_FAMILY = {
     "fp8_p64_d256": "dcp_spec_bf16_fp8_d256_balanced",
 }
 _DCP_BALANCED_GROUP = {"bf16_p16": 8, "fp8_p64": 8, "fp8_p64_d256": 16}
+_DCP_BALANCED_PAGE_SIZE = {"bf16_p16": 16, "fp8_p64": 64, "fp8_p64_d256": 64}
 _DCP_BALANCED_HEAD_DIM = {
     "bf16_p16": _HEAD_DIM,
     "fp8_p64": _HEAD_DIM,
@@ -286,6 +287,10 @@ DCP_BALANCED_BF16_MIN_Q_LEN = 3  # q_len 1-2 stay static (<= 16 live rows per ti
 DCP_BALANCED_BF16_MAX_Q_LEN = 8
 DCP_BALANCED_BF16_MIN_ITEMS = 128
 DCP_BALANCED_BF16_LONG_TILE_BLOCKS = 16
+# unit 87: a single request within the whole-tile bound of the BF16 family runs its whole-tile static program instead of
+# one static wave, per architecture and packed-row instance (the 32-row instance measured faster on both GPUs, the 64-row
+# instance only on GB300; see the band probe in the design document)
+DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS = {"sm_100a": (32,), "sm_103a": (32, 64)}
 DCP_BALANCED_FP8_MIN_Q_LEN = 3
 DCP_BALANCED_FP8_MAX_Q_LEN = 8
 DCP_BALANCED_FP8_MIN_ITEMS = 160
@@ -522,6 +527,34 @@ def dcp_balanced_program(
     return int(variants["below_grid"])
 
 
+def _dcp_whole_tile_one_wave(
+    kind: str, *, num_kv_heads: int, max_pages_per_seq: int, sm_count: int
+) -> bool:
+    """Does a single request with this page-table width run the family's whole-tile
+    static program (manifest regime ``form = whole_tiles``,
+    ``whole_pages_max[sm_count][num_kv_heads]``)?  ``False`` for families without
+    the whole-tile form, SM counts or KV-head counts outside the table."""
+
+    from .jit.cake_dcp import dcp_balanced_program_variants
+
+    variants = dcp_balanced_program_variants(_DCP_BALANCED_FAMILY[kind])
+    if variants is None:
+        return False
+    regime = variants.get("static_one_wave_regime") or {}
+    if regime.get("form", "split_chunks") != "whole_tiles":
+        return False
+    limit = (
+        regime["whole_pages_max"]
+        .get(str(int(sm_count)), {})
+        .get(str(int(num_kv_heads)))
+    )
+    return (
+        limit is not None
+        and int(regime.get("one_request", 1)) == 1
+        and 0 < int(max_pages_per_seq) <= int(limit)
+    )
+
+
 def dcp_balanced_items_bound(
     *, batch_size: int, num_kv_heads: int, max_local_seq_len: int
 ) -> int:
@@ -601,6 +634,7 @@ def dcp_balanced_band(
     cp_world: int,
     sm_count: int,
     arch: str,
+    max_pages_per_seq: Optional[int] = None,
 ) -> DcpBalancedBand:
     """Host-metadata band of the balanced DCP kernels (mirror of the Cake dispatcher).
 
@@ -614,7 +648,13 @@ def dcp_balanced_band(
     balanced row tile (``q_len >= DCP_BALANCED_D256_ONE_WAVE_MIN_Q_LEN``)
     streams the ``arch``'s one-wave long-tile block count or more per CTA.  On
     the FP8 D128 family a row at exactly two static waves must reach the
-    ``arch``'s two-wave items floor.  ``arch`` is the compile target's
+    ``arch``'s two-wave items floor.  On the BF16 family one static wave
+    serving a single request whose page-table width (``max_pages_per_seq``,
+    the ``block_tables`` width; the narrowest table for ``max_local_seq_len``
+    when not given) is within the whole-tile bound runs the whole-tile static
+    program when the ``arch`` lists the row's packed-row instance in
+    ``DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS`` (``balanced`` /
+    ``whole_tile_one_wave``).  ``arch`` is the compile target's
     architecture key (``sm_100a`` / ``sm_103a``); other keys take the scalar
     defaults.
     """
@@ -671,6 +711,25 @@ def dcp_balanced_band(
             )
         ):
             return decide("balanced", "one_wave_row_tiles")
+        if (
+            kind == "bf16_p16"
+            and int(batch_size) == 1
+            and dcp_balanced_n_rows(kind, q_len)
+            in DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS.get(arch, ())
+            and _dcp_whole_tile_one_wave(
+                kind,
+                num_kv_heads=num_kv_heads,
+                max_pages_per_seq=(
+                    int(max_pages_per_seq)
+                    if max_pages_per_seq is not None
+                    else max(
+                        1, -(-int(max_local_seq_len) // _DCP_BALANCED_PAGE_SIZE[kind])
+                    )
+                ),
+                sm_count=sm_count,
+            )
+        ):
+            return decide("balanced", "whole_tile_one_wave")
         return decide("static", "one_wave")
     if items < _DCP_BALANCED_MIN_ITEMS[kind]:
         return decide("static", "items")
@@ -696,6 +755,7 @@ def dcp_balanced_route(
     cp_world: int,
     sm_count: int,
     arch: str,
+    max_pages_per_seq: Optional[int] = None,
 ) -> str:
     """``"balanced"`` or ``"static"`` for one DCP row (see :func:`dcp_balanced_band`)."""
 
@@ -710,6 +770,7 @@ def dcp_balanced_route(
         cp_world=cp_world,
         sm_count=sm_count,
         arch=arch,
+        max_pages_per_seq=max_pages_per_seq,
     ).route
 
 
@@ -1099,6 +1160,7 @@ def run_dcp_spec_decode(
             cp_world=cp_world,
             sm_count=sm_count,
             arch=_DCP_BALANCED_ARCH.get(target, target),
+            max_pages_per_seq=max_pages_per_seq,
         )
         if route == "balanced" or band.route == "balanced":
             problem = _dcp_balanced_buffer_problem(
