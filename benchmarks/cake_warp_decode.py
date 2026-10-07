@@ -167,6 +167,11 @@ GEOMETRIES = (
         (1, 2, 32),
         SiTU(gate_scale=4.0, linear_scale=25.0),
     ),
+    # Sharded per-partition slices (fused route packing on every token count).
+    Geometry("h4096_e512_i512_k10", 4096, 512, 512, 10, (1, 2, 16, 32)),
+    Geometry("h4096_e512_i256_k10", 4096, 256, 512, 10, (1, 2, 16, 32)),
+    Geometry("h3072_e256_i768_k8", 3072, 768, 256, 8, (1, 2, 16, 32)),
+    Geometry("h3072_e256_i384_k8", 3072, 384, 256, 8, (1, 2, 16, 32)),
 )
 
 

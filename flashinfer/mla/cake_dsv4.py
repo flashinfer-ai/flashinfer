@@ -23,29 +23,154 @@ Host contract (flashinfer#4671 hardening)
   ``query`` and ``out`` may carry more rows; rows ``>= T`` are neither read nor
   written. Grids and workspace views derive from ``T``, never from query rows.
 * **Argument binding.** Kernel arguments are bound *by name* through the
-  registration ``arg_plan`` (:func:`_launch_variant`) or the program signature
-  (:func:`_launch_program`), so regenerated bindings only need names from the
-  host vocabulary (:func:`is_bindable_arg`).
+  registration ``arg_plan`` (:func:`_prepare_variant`), so regenerated bindings
+  only need names from the host vocabulary (:func:`is_bindable_arg`). Every
+  route launches its variant kernels directly; two-stage routes bind the
+  producer and the reducer first and issue both through one FFI call
+  (``run_sequence`` in ``cake_dsv4_launch_sequence.cc``), so no host work
+  sits between the two kernels.
+* **Query layout.** Every variant receives the five query-layout parameters
+  (:data:`QUERY_LAYOUT_PARAMS`): ``seq_lens`` (int32, the cache length of
+  every request), ``cum_seq_lens_q``, ``ragged_query``, ``max_q_len`` and
+  ``batch_size``. The kernels derive the trtllm-gen SWA validity window from
+  them: with ``b`` the request owning metadata row ``t``, ``q_len_b`` its
+  query length and ``q_off`` the row's position in the request, combined
+  column ``c < 128`` is attended only when
+  ``c < clamp(seq_lens[b] - (q_len_b - 1 - q_off), 0, 128)`` (CAKE-957). A
+  dense call (``cum_seq_lens_q=None``) binds ``ragged_query = 0``,
+  ``max_q_len`` = the caller's per-request query length, ``batch_size =
+  seq_lens.numel()`` and ``seq_lens`` in place of the never-read
+  ``cum_seq_lens_q`` pointer; a ragged call binds the caller's offsets with
+  ``ragged_query = 1``. The producers in :data:`_RAGGED_ONLY_ROUTES` read the
+  request boundaries from ``cum_seq_lens_q`` unconditionally and receive the
+  cached dense offsets instead. No host value is ever ``None``.
+* **Preconditions on the metadata.** Every metadata row must keep at least
+  one column inside the three validity predicates' domain: the active length
+  ``sparse_topk_lens[t] + sparse_topk_lens_offset`` must be ``>= 1`` and the
+  owning request must satisfy ``seq_lens[b] >= q_len_b`` (so the SWA window
+  holds at least the row's own token). sglang satisfies both by construction
+  (constant 128 on SWA-only layers, the window always contains the current
+  token). A row whose columns are all ``-1`` or all beyond the window is a
+  defined input and returns the all-invalid zero result. An active length of
+  0 is outside the trtllm-gen contract (the stock FP8 kernels read past the
+  active length or return NaN there); the Cake programs regenerated for
+  CAKE-957 all return the zero result for it (tile-count guards in the FP8
+  persistent, BF16 H64 guard/prefill and FP8 H64 source-exact bodies). The
+  host does not synchronise to check these values.
 * **Workspace.** One caller-owned ``workspace_buffer`` is carved
   deterministically (:func:`cake_dsv4_workspace_layout`)::
 
-      [0,      1024)          TMA descriptor slab (bindings refresh it on every launch)
-      [1024,   1024 + 256 KiB) split-merge counters, uint32[65536]; zero at first use,
-                               the kernel leaves them zero after every launch
-      [P,      P + O_bytes)    partial_O  bf16 [T * H * S * 512]  (P = 1024 + 256 KiB)
-      [P + O_bytes, ...)       partial_lse f32 [T * H * S]
+      [0,      1024)          reserved (formerly the TMA descriptor slab; see below)
+      [1024,   1024 + 256 KiB) split-merge counters, uint32[65536]
+      [P,      P + O_bytes)    partial_O  bf16 [T * H * S * 512]  (P = 1024 + 256 KiB;
+                               O_bytes = 0 when the route runs one split)
+      [P + O_bytes, + L_bytes) partial_lse f32 [T * H * S]
+      [..., + Q_bytes)         shifted request offsets int32 [B + 1]
+                               (row-tiled launches after the first chunk only)
 
-  with every region 128-byte aligned. No call path allocates device memory:
-  callers zero the counter region once (:func:`cake_dsv4_workspace_reset`, or
-  the first eager call does it for that tensor) and the kernels self-reset.
+  with every region 128-byte aligned. The requirement is exact per route
+  (:func:`cake_dsv4_workspace_requirement`, from the same
+  :func:`_route_plan` table the dispatcher launches with): routes without
+  partial buffers need no workspace bytes, one-split routes need the LSE
+  region only, split routes the partial O and LSE regions. When
+  ``workspace_buffer`` cannot hold one launch over all ``T`` metadata rows,
+  the host tiles the rows into consecutive launches that fit
+  (:func:`_dispatch_row_tiles`): ``Q``, ``O`` and the metadata tables are
+  sliced by row (views, no copies) and every chunk after the first receives
+  its request boundaries as ``cum_seq_lens_q - first_row`` (``B + 1`` int32
+  written into the workspace's offsets region by one ``torch.sub`` in stream
+  order, capturable) with ``ragged_query = 1``, so the window resolves for
+  any chunk start. The smallest accepted workspace is the one-row
+  requirement; :func:`get_cake_dsv4_workspace_bytes` is the single-launch
+  upper bound. sglang's fixed 128 MiB buffer therefore admits every row
+  count on every route; the only route whose single launch can outgrow it is
+  ``bf16_h32_topk128x_early_v47`` (``ceil(sparse_topk / 128)`` splits of
+  ``32 * 1028`` bytes per row, no token bound), which tiles.
+* **Split-merge counters.** ``bf16_h32_topk128x_early_v47`` (the only route
+  with an in-kernel last-arriver merge) needs its ``T * ceil(H / 8)``
+  counters zero at launch and leaves them zero afterwards. Zeroing is part
+  of the launch contract and never raises: the first eager launch through a
+  workspace zeroes the whole counter region once and registers the
+  workspace in :data:`_primed_workspaces` (keyed by device and base address,
+  guarded by a weak reference to the tensor owning the storage, so views of
+  one buffer share the state and a freed and reused address is re-primed);
+  a launch under CUDA Graph capture through an unregistered workspace
+  records a zero fill of exactly the counters it uses into the graph
+  (replays stay self-contained, nothing is registered). The kernels do not
+  depend on any other host state. :func:`cake_dsv4_workspace_reset` zeroes
+  and registers explicitly.
+* **Descriptor storage.** The SM103 bindings that read their TMA descriptors
+  from device memory (``tma_workspace_bytes`` in their registration; the SM100
+  twins pass descriptors by value and use none of this) take a private,
+  host-retained 1 KiB tensor per launch and write the descriptors of the call
+  into it when they differ from what it holds, in stream order and never
+  inside CUDA Graph capture. The host keeps a pool of such tensors per
+  (variant, device) (:func:`_descriptor_storage`) keyed by the *descriptor
+  set* = the TMA source geometry (pointer, shape, strides, dtype of ``Q`` and
+  the KV caches). Rules:
+
+  1. A set launched eagerly becomes a *live* entry; at most
+     :data:`_DESCRIPTOR_POOL_CAPACITY` live entries exist per pool, and a new
+     set beyond that takes the least recently used live entry's storage (the
+     binding rewrites it before the launch). A live hit does no device write.
+  2. A set launched under graph capture must be live at that moment (prepare
+     it with one eager call on the same tensors); it then becomes a *captured*
+     entry, which is never evicted or reassigned for the process lifetime
+     because its graph may replay at any time. Eviction applies to live
+     entries only.
+  3. A set that is not live when a capture reaches it raises before any
+     allocation or binding call.
+  4. One lock covers the pool bookkeeping, the bindings' descriptor checks
+     and the launch enqueues of a call; a launch on another stream than the
+     storage's last reader waits for that stream first.
+
+  Successive calls through one workspace (the layers of a model) therefore do
+  not collide, and a stream of fresh query tensors does not grow memory
+  without bound. Nothing else allocates device memory.
+
+NVFP4 cache route (``kv_cache_format="nvfp4"``)
+---------------------------------------------------------
+
+:func:`run_cake_dsv4_nvfp4` hosts the DeepSeek-V4 NVFP4 sparse-MLA decode
+family (Cake ``flashinfer_blackwell_sparse_mla_dsv4_nvfp4_decode`` and
+``..._decode_tile`` plus their shared split merge). The pools are the SM120
+NVFP4 cache ABI: opaque ``uint8`` pages of ``page_size * 352`` data bytes
+(224 B E2M1 NoPE + 128 B BF16 RoPE per token) followed by ``page_size * 32``
+scale bytes, i.e. 384 bytes per token; indices are flat token coordinates
+``page * page_size + slot``, ``-1`` masks a candidate, and the optional length
+vectors clamp the active prefix of each table. The two tables are
+independent (``sparse_indices`` over ``swa_kv_cache``, ``extra_sparse_indices``
+over ``compressed_kv_cache``); there is no combined-table column offset.
+
+The launch plan (:func:`_nvfp4_plan`) reproduces the Cake family ``plan()``:
+128-wide candidate tiles; rows with ``H <= 32`` run the persistent SwapsAB
+member (``pv``) when its wave-aware split rule gives more than one tile per
+CTA and the one-tile SwapsAB member (``swap``) otherwise; rows with ``H >= 64``
+pick the member and split count with the lowest modelled chain cost among the
+one-tile ``tile`` member, the persistent member, the 2-CTA ``cluster`` member
+and the tile64 member (``t64``, 64 heads per CTA). The one-tile members run
+``o_chunks`` CTAs per work item; the split merge runs on
+``merge_heads_per_cta`` heads per CTA. Each (member, retrace knobs) pair is one
+registered variant (``_nvfp4_variant_name``: ``nvfp4_decode_persistent``,
+``nvfp4_decode_cluster``, ``nvfp4_decode_t64_n64_oc1``,
+``nvfp4_decode_pv_n{16,32}_oc1``, ``nvfp4_decode_swap_n{16,32}_oc{1,2,4}``,
+``nvfp4_decode_tile_oc{1,2,4}``) plus ``nvfp4_merge``, bound through the same
+registration machinery as the BF16/FP8 routes from the generated sources under
+``csrc/cake_dsv4/sm_100a`` and ``csrc/cake_dsv4/sm_103a``; a plan that selects
+an unexported variant raises ``NotImplementedError``. Splits write
+``partial_O [T, H, S, 512]`` BF16 and ``partial_lse [T, H, S]`` FP32 into the
+workspace; the final base-2 LSE lives in an extra ``lse`` region appended
+after ``partial_lse`` (:func:`cake_dsv4_workspace_layout` ``with_lse=True``).
 """
 
 from __future__ import annotations
 
+import collections
 import functools
 import threading
-from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Optional, Union
+import weakref
+from dataclasses import dataclass, field
+from typing import Any, Literal, Mapping, Optional, Sequence, Union
 
 import torch
 
@@ -68,19 +193,82 @@ _PARTIAL_OFFSET = _COUNTER_OFFSET + _COUNTER_REGION_BYTES
 _MAX_FIXED_SPLITS = 5
 # BF16/H128 SWA-only and topk4x rows with this many metadata tokens or more use
 # the persistent KV-reuse prefill body (mirrors the Cake dispatcher's
-# BF16_H128_PREFILL_MIN_TOKENS, CAKE-624 W11).
+# BF16_H128_PREFILL_MIN_TOKENS).
 _BF16_H128_PREFILL_MIN_TOKENS = 64
 # The two-stage split4 program (4 owners x 2 CTAs per token) runs one wave
-# only up to this many query tokens; wider grids lose to trtllm-gen (CAKE-624 W12).
+# only up to this many query tokens; wider grids lose to trtllm-gen.
 # Mirrors the Cake seed's BF16_TOPK128X_SPLIT_MAX_TOKENS.
 _BF16_TOPK128X_SPLIT_MAX_TOKENS = 16
+# Mirrors the Cake seed's BF16_ROW_FIRST_V_HALF_SPLIT_MAX_TOKENS: row-first rows
+# with at most this many tokens run the V-half split program (two 2-CTA
+# clusters per token = 4 CTAs per token, one wave on 148+ SMs).
+_BF16_ROW_FIRST_V_HALF_SPLIT_MAX_TOKENS = 37
+# Widths the BF16/H128 four-owner split and row-first producers cover (two or
+# three live KV tiles); other widths below the prefill token bound have no
+# exported kernel.
+_BF16_TOPK128X_MIN_WIDTH = 256
+_BF16_TOPK128X_MAX_WIDTH = 388
+# One FP8 low-head producer partition owns up to three sparse tiles; mirrors
+# the producer's FP8_ONE_PARTITION_MAX_TILES = 3.
+_FP8_ONE_PARTITION_MAX_WIDTH = 384
 _BF16_H64_COMPRESSED_PREFILL_TOKENS = 24
 _BF16_H64_PREFILL_MAX_SPARSE_WIDTH = 640
-_PRIMED_ATTR = "_cake_dsv4_counters_primed"
+# Workspaces whose split-merge counter region is known to be zero:
+# (device index, address of the workspace view) -> weak reference to the
+# tensor owning the storage (the view's ``_base`` or the tensor itself). A dead
+# reference or another owner at the same address means the memory was freed
+# and possibly reused: the workspace is primed again.
+_primed_workspaces: dict[tuple[Optional[int], int], "weakref.ref[torch.Tensor]"] = {}
+_primed_lock = threading.Lock()
+
+# NVFP4 cache route. Mirrors the Cake kernel module constants
+# (flashinfer_blackwell_sparse_mla_dsv4_nvfp4_decode: TOKEN_DATA_BYTES +
+# TOKEN_SF_BYTES, TILE_Q, MAX_SPLITS, SUPPORTED_HEAD_COUNTS).
+_NVFP4_TOKEN_BYTES = 384
+_NVFP4_TILE_Q = 128
+_NVFP4_MAX_SPLITS = 12
+_NVFP4_HEAD_COUNTS = (8, 16, 32, 64, 128)
+_NVFP4_HEAD_DIM = 512
+_NVFP4_VARIANT_PERSISTENT = "nvfp4_decode_persistent"
+_NVFP4_VARIANT_CLUSTER = "nvfp4_decode_cluster"
+_NVFP4_VARIANT_MERGE = "nvfp4_merge"
+_NVFP4_CLUSTER_CTAS = (
+    2  # CTAs per cluster of the cluster member (each owns 256 of the 512 output dims)
+)
+# Family planner (Cake flashinfer_blackwell_sparse_mla_dsv4_nvfp4_decode.plan, round 43 / 45).  Multi-tile rows
+# with H <= _NVFP4_PV_MAX_HEADS take the persistent SwapsAB member ("pv") when its wave-aware split rule gives more
+# than one tile per CTA; H > _NVFP4_PV_MAX_HEADS rows pick (member, splits) with the lowest modelled chain cost among
+# the one-tile "tile" member, the persistent member, the 2-CTA cluster member (H >= _NVFP4_CLUSTER_MIN_HEADS) and
+# the tile64 member "t64" (_NVFP4_T64_HEAD_COUNTS); one-tile rows take the SwapsAB one-tile member "swap" (H <=
+# _NVFP4_SWAP_MAX_HEADS) or the "tile" member, each with its own CTAs-per-work-item split (o_chunks).
+_NVFP4_PV_MAX_HEADS = 32
+_NVFP4_SWAP_MAX_HEADS = 32
+_NVFP4_CLUSTER_MIN_HEADS = 64
+_NVFP4_T64_HEAD_COUNTS = (64, 128)
+_NVFP4_T64_TILE_Q = 64  # heads per CTA of the tile64 member (H128 runs two head tiles)
+# Round-43 chain model (Cake PLAN_CHAIN_US / PLAN_MERGE_US / PLAN_MERGE_US_PER_MB): member -> (HEAD, TILE, LOAD) us;
+# a row costs waves * (HEAD + (tiles_per_split - 1) * TILE + LOAD * min(grid, slots) / slots) plus, with more than
+# one split, MERGE + MERGE_PER_MB * (T * H * (splits + 1) * 512 * 2 bytes / 1e6).
+_NVFP4_PLAN_CHAIN_US: Mapping[str, tuple[float, float, float]] = {
+    "persistent": (11.4, 4.5, 3.1),
+    "cluster": (10.6, 3.9, 0.2),
+    "t64": (8.2, 3.5, 3.4),
+    "tile": (8.8, 0.0, 1.7),
+}
+_NVFP4_PLAN_MERGE_US = 3.9
+_NVFP4_PLAN_MERGE_US_PER_MB = 0.20
+# Persistent SwapsAB member split rule (Cake flashinfer_blackwell_sparse_mla_dsv4_nvfp4_decode_swap_pv.plan):
+# waves * (HEAD + (tiles_per_split - 1) * TILE) + MERGE over every split count, first minimum wins.
+_NVFP4_PV_PLAN_HEAD_US = 8.6
+_NVFP4_PV_PLAN_TILE_US = 3.0
+_NVFP4_PV_PLAN_MERGE_US = 1.5
+# Split merge (Cake MERGE_HEADS_PER_CTA / merge_heads_per_cta): 16 warps per CTA, one (token, head) per warp;
+# heads_per_cta is the smallest power of two whose grid T x ceil(H / hpc) stays within one CTA per SM (round 45).
+_NVFP4_MERGE_HEADS_PER_CTA = 16
 
 
 # Work feed of the BF16/H128 persistent prefill body (mirrors the Cake seed's
-# bf16_h128_prefill_uses_snake_feed, CAKE-624 W17).  With C = min(T, SMs // 2)
+# bf16_h128_prefill_uses_snake_feed).  With C = min(T, SMs // 2)
 # clusters the striped feed gives base = T // C strided PREFIX items to the
 # C - T % C regular clusters and base + 1 contiguous SUFFIX items to the T % C
 # tail clusters; when the tail clusters are the majority the few regular
@@ -117,6 +305,16 @@ KERNEL_METADATA_PARAMS = (
     "num_query_tokens",
 )
 
+# Query-layout parameters of every generated variant (the SWA validity window;
+# see the module docstring). Mirrors the Cake seeds' SWA_WINDOW_PARAMS.
+QUERY_LAYOUT_PARAMS = (
+    "seq_lens",
+    "cum_seq_lens_q",
+    "ragged_query",
+    "max_q_len",
+    "batch_size",
+)
+
 _scale_cache: dict[tuple[str, Optional[int], float], torch.Tensor] = {}
 _scale_cache_lock = threading.Lock()
 _dense_offsets_cache: dict[tuple[str, Optional[int], int, int], torch.Tensor] = {}
@@ -133,10 +331,6 @@ def _variant_module(variant: str, *, arch: str):
     from ..jit.cake_dsv4 import get_cake_dsv4_module
 
     return get_cake_dsv4_module(variant, arch=arch)
-
-
-def _stream_ptr(device: torch.device) -> int:
-    return int(torch.cuda.current_stream(device).cuda_stream)
 
 
 def _is_capturing(device: torch.device) -> bool:
@@ -385,27 +579,66 @@ class WorkspaceLayout:
     counters: tuple[int, int]
     partial_o: tuple[int, int]
     partial_lse: tuple[int, int]
+    # Shifted request offsets of a row-tiled chunk (size 0 for whole launches).
+    query_offsets: tuple[int, int]
     total_bytes: int
+    # Final base-2 LSE f32 [T * H]; only carved for the NVFP4 route
+    # (``with_lse=True``), otherwise an empty region at the layout end.
+    lse: tuple[int, int] = (0, 0)
 
 
 def cake_dsv4_workspace_layout(
-    num_query_tokens: int, num_heads: int, num_splits: int
+    num_query_tokens: int,
+    num_heads: int,
+    num_splits: int,
+    *,
+    num_query_offsets: int = 0,
+    with_lse: bool = False,
 ) -> WorkspaceLayout:
-    """Deterministic carve of ``workspace_buffer`` for one launch shape."""
+    """Deterministic carve of ``workspace_buffer`` for one launch shape.
+
+    One-split launches (``num_splits == 1``) write the final output directly
+    and carry no ``partial_O`` region (size 0); the LSE region follows the
+    counters immediately. ``num_query_offsets`` (``batch_size + 1`` for a
+    row-tiled chunk after the first, else 0) sizes the int32 region after
+    ``partial_lse`` that holds the chunk's shifted ``cum_seq_lens_q``.
+    ``with_lse`` appends the NVFP4 route's final-LSE region after that; the
+    default layout is unchanged.
+    """
     tokens = _positive_int(num_query_tokens, "num_query_tokens")
     heads = _positive_int(num_heads, "num_heads")
     splits = _positive_int(num_splits, "num_splits")
+    if (
+        isinstance(num_query_offsets, bool)
+        or not isinstance(num_query_offsets, int)
+        or num_query_offsets < 0
+    ):
+        raise ValueError(
+            f"num_query_offsets must be a non-negative int, got {num_query_offsets!r}"
+        )
     partial_elems = tokens * heads * splits
-    o_bytes = _align_up(partial_elems * _HEAD_DIM * torch.bfloat16.itemsize)
+    o_bytes = (
+        _align_up(partial_elems * _HEAD_DIM * torch.bfloat16.itemsize)
+        if splits > 1
+        else 0
+    )
     lse_bytes = _align_up(partial_elems * torch.float32.itemsize)
+    offsets_bytes = _align_up(num_query_offsets * torch.int32.itemsize)
     o_offset = _PARTIAL_OFFSET
     lse_offset = o_offset + o_bytes
+    offsets_offset = lse_offset + lse_bytes
+    final_lse_offset = offsets_offset + offsets_bytes
+    final_lse_bytes = (
+        _align_up(tokens * heads * torch.float32.itemsize) if with_lse else 0
+    )
     return WorkspaceLayout(
         descriptor_slab=(_DESCRIPTOR_SLAB_OFFSET, _DESCRIPTOR_SLAB_BYTES),
         counters=(_COUNTER_OFFSET, _COUNTER_REGION_BYTES),
         partial_o=(o_offset, o_bytes),
         partial_lse=(lse_offset, lse_bytes),
-        total_bytes=lse_offset + lse_bytes,
+        query_offsets=(offsets_offset, offsets_bytes),
+        total_bytes=final_lse_offset + final_lse_bytes,
+        lse=(final_lse_offset, final_lse_bytes),
     )
 
 
@@ -416,25 +649,60 @@ def get_cake_dsv4_workspace_bytes(
     dtype: torch.dtype,
     *,
     num_splits: Optional[int] = None,
+    kv_cache_format: Literal["fp8", "nvfp4"] = "fp8",
+    extra_topk: int = 0,
 ) -> int:
-    """Bytes ``workspace_buffer`` needs for ``backend="cake"`` at this shape.
+    """Single-launch upper bound of ``workspace_buffer`` for ``backend="cake"``.
 
     ``num_query_tokens`` is the metadata row count (padded query rows do not
-    count). The result is an upper bound over every route::
+    count). The result bounds every route's one-launch carve::
 
         S      = num_splits if given else max(ceil(sparse_topk / 128), 5)
-        bytes  = 1024                                   # TMA descriptor slab
+        bytes  = 1024                                   # reserved slab
                + 262144                                 # split-merge counters (uint32[65536])
-               + align128(num_query_tokens * num_heads * S * 512 * 2)   # partial_O (BF16)
+               + align128(num_query_tokens * num_heads * S * 512 * 2)   # partial_O (BF16), S > 1 only
                + align128(num_query_tokens * num_heads * S * 4)         # partial_lse (FP32)
 
     Partial buffers are BF16/FP32 for both BF16 and FP8 inputs; ``dtype`` is
     validated only. Pass ``num_splits`` to size for a known route (routes use
-    ``ceil(sparse_topk / 128)`` or a fixed 1..5 splits).
+    ``ceil(sparse_topk / 128)`` or a fixed 1..5 splits). A smaller buffer is
+    not an error: the host tiles the metadata rows into launches that fit,
+    down to the one-row requirement; :func:`cake_dsv4_workspace_requirement`
+    reports the exact per-route numbers for a call.
+
+    ``kv_cache_format="nvfp4"`` sizes the NVFP4 cache route instead: ``S`` is
+    ``num_splits`` if given, else ``min(ceil(sparse_topk / 128) +
+    ceil(extra_topk / 128), 12)`` (the plan never exceeds the candidate tile
+    count or the kernel's 12-split cap), and a final-LSE region
+    ``align128(num_query_tokens * num_heads * 4)`` is appended.
     """
     if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(f"unsupported CAKE DSv4 dtype: {dtype}")
     topk = _positive_int(sparse_topk, "sparse_topk")
+    if kv_cache_format == "nvfp4":
+        if dtype != torch.bfloat16:
+            raise ValueError("the CAKE DSv4 NVFP4 route takes a BF16 query")
+        if (
+            isinstance(extra_topk, bool)
+            or not isinstance(extra_topk, int)
+            or extra_topk < 0
+        ):
+            raise ValueError(
+                f"extra_topk must be a non-negative int, got {extra_topk!r}"
+            )
+        splits = (
+            min(
+                _ceil_div(topk, _TILE_KV) + _ceil_div(extra_topk, _TILE_KV),
+                _NVFP4_MAX_SPLITS,
+            )
+            if num_splits is None
+            else _positive_int(num_splits, "num_splits")
+        )
+        return cake_dsv4_workspace_layout(
+            num_query_tokens, num_heads, splits, with_lse=True
+        ).total_bytes
+    if kv_cache_format != "fp8":
+        raise ValueError(f"unsupported CAKE DSv4 kv_cache_format: {kv_cache_format!r}")
     if topk < _SWA_WIDTH or topk % 4:
         raise ValueError(
             f"sparse_topk must be a multiple of 4 and at least {_SWA_WIDTH}, got {topk}"
@@ -500,51 +768,170 @@ def _counters(raw: torch.Tensor, merge_groups: int) -> torch.Tensor:
     return raw[_COUNTER_OFFSET : _COUNTER_OFFSET + merge_groups * 4].view(torch.uint32)
 
 
-def _descriptor_workspace(raw: torch.Tensor, num_bytes: int) -> torch.Tensor:
-    """Descriptor slab at a fixed offset of the workspace.
+# Descriptor storage pools (see the module docstring, "Descriptor storage").
+# Bound on the storages a pool hands to eager launches; descriptor sets that
+# were launched under CUDA Graph capture are retained separately for the
+# process lifetime because their graphs keep reading them.
+_DESCRIPTOR_POOL_CAPACITY = 4096
+_descriptor_lock = threading.Lock()
+_descriptor_pools: dict[tuple[str, str, torch.device], "_DescriptorPool"] = {}
 
-    The generated bindings encode fresh TMA descriptors and upload them into this
-    slab on every launch (by-value kernel parameters, so CUDA graphs record the
-    upload), which makes the slab plain mutable scratch: its address is stable
-    per workspace and no separate per-layout storage is needed.
+
+@dataclass
+class _DescriptorStorage:
+    tensor: torch.Tensor
+    # Stream of the last launch that read this storage; a launch on another
+    # stream waits for it before the binding may rewrite the descriptors.
+    stream: Optional[torch.cuda.Stream]
+
+
+@dataclass
+class _DescriptorPool:
+    """Descriptor storages of one variant module on one device."""
+
+    # descriptor set -> storage, least recently used first; reassignable
+    live: "collections.OrderedDict[tuple, _DescriptorStorage]"
+    # descriptor sets launched under graph capture: never reassigned
+    captured: dict[tuple, _DescriptorStorage]
+    # storages released by a capacity change, reused before allocating
+    spare: list[_DescriptorStorage]
+
+
+def _new_descriptor_storage(device: torch.device) -> _DescriptorStorage:
+    backing = torch.empty(
+        _DESCRIPTOR_SLAB_BYTES + _ALIGN, dtype=torch.uint8, device=device
+    )
+    offset = (-backing.data_ptr()) % _ALIGN
+    return _DescriptorStorage(backing[offset : offset + _DESCRIPTOR_SLAB_BYTES], None)
+
+
+def _descriptor_storage(
+    variant: str,
+    arch: str,
+    num_bytes: int,
+    sources: Sequence[tuple[str, torch.Tensor]],
+    *,
+    capturing: bool,
+) -> torch.Tensor:
+    """Private descriptor storage for ``variant`` over these TMA source tensors.
+
+    A descriptor set is a pure function of each source tensor's pointer, shape,
+    strides and dtype, so that geometry is the key. The pool of one variant on
+    one device hands out at most :data:`_DESCRIPTOR_POOL_CAPACITY` storages to
+    eager launches: a hit reuses the storage whose bytes the binding already
+    holds, a miss takes a fresh storage until the pool is full and the least
+    recently used one afterwards (the binding rewrites its descriptors in
+    stream order before the launch). A set launched under CUDA Graph capture
+    moves to the pool's retained part and is never reassigned, so replays keep
+    reading the descriptors they captured; a set that is not resident when a
+    capture reaches it is an error, because the binding cannot initialize
+    descriptors inside a capture. The caller holds :data:`_descriptor_lock`
+    from this lookup through the launch, so a storage is never reassigned
+    between the binding's descriptor check and the launch that reads it.
     """
     if num_bytes > _DESCRIPTOR_SLAB_BYTES:
         raise ValueError(
             f"CAKE DSv4 variant needs {num_bytes} TMA descriptor bytes; the "
-            f"workspace slab holds {_DESCRIPTOR_SLAB_BYTES}"
+            f"descriptor storage holds {_DESCRIPTOR_SLAB_BYTES}"
         )
-    _require_workspace_bytes(raw, _PARTIAL_OFFSET)
-    return raw[
-        _DESCRIPTOR_SLAB_OFFSET : _DESCRIPTOR_SLAB_OFFSET + _DESCRIPTOR_SLAB_BYTES
-    ]
+    device = sources[0][1].device if sources else torch.device("cpu")
+    key = tuple(
+        (name, t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
+        for name, t in sources
+    )
+    stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+    pool = _descriptor_pools.get((variant, arch, device))
+    if pool is None:
+        pool = _DescriptorPool(collections.OrderedDict(), {}, [])
+        _descriptor_pools[variant, arch, device] = pool
+    storage = pool.captured.get(key)
+    if storage is not None:
+        return storage.tensor
+    storage = pool.live.get(key)
+    if capturing:
+        if storage is None:
+            raise RuntimeError(
+                f"CAKE DSv4 {variant}: the TMA descriptors for these query / "
+                "KV-cache tensors have not been initialised and the current "
+                "stream is capturing a CUDA graph; run one eager call with the "
+                "same tensors (pointers, shapes and strides) before capture"
+            )
+        del pool.live[key]
+        pool.captured[key] = storage
+        return storage.tensor
+    if storage is not None:
+        pool.live.move_to_end(key)
+    else:
+        capacity = max(1, int(_DESCRIPTOR_POOL_CAPACITY))
+        while len(pool.live) >= capacity:
+            pool.spare.append(pool.live.popitem(last=False)[1])
+        storage = pool.spare.pop() if pool.spare else _new_descriptor_storage(device)
+        pool.live[key] = storage
+    if stream is not None and storage.stream is not None and storage.stream != stream:
+        # Order this launch (and a descriptor rewrite the binding may issue
+        # on this stream) after the last launch that read the storage.
+        stream.wait_stream(storage.stream)
+    storage.stream = stream
+    return storage.tensor
+
+
+def _workspace_owner(workspace: torch.Tensor) -> torch.Tensor:
+    """The tensor whose lifetime owns ``workspace``'s storage (its ``_base`` or itself)."""
+    base = workspace._base
+    return workspace if base is None else base
+
+
+def _primed_key(raw: torch.Tensor) -> tuple[Optional[int], int]:
+    return (raw.device.index, raw.data_ptr())
+
+
+def _counters_primed(workspace: torch.Tensor, raw: torch.Tensor) -> bool:
+    """Whether the counter region behind ``raw`` is registered as zero."""
+    with _primed_lock:
+        ref = _primed_workspaces.get(_primed_key(raw))
+    return ref is not None and ref() is _workspace_owner(workspace)
+
+
+def _register_primed(workspace: torch.Tensor, raw: torch.Tensor) -> None:
+    with _primed_lock:
+        for key in [k for k, ref in _primed_workspaces.items() if ref() is None]:
+            del _primed_workspaces[key]
+        _primed_workspaces[_primed_key(raw)] = weakref.ref(_workspace_owner(workspace))
 
 
 def cake_dsv4_workspace_reset(workspace_buffer: torch.Tensor) -> None:
-    """Zero the split-merge counter region of ``workspace_buffer``.
+    """Zero the split-merge counter region of ``workspace_buffer`` and register it.
 
-    Call once after allocating a workspace (or allocate it with ``torch.zeros``
-    and warm up eagerly). The generated kernels leave the counters zero after
-    every launch, so no per-call reset is needed and CUDA graph replays stay
-    self-contained. Zeroing is an in-place fill; nothing is allocated.
+    Optional: the launch contract zeroes the counters itself (first eager use
+    zeroes and registers the workspace; a capture through an unregistered
+    workspace records the zero fill into the graph). Calling this after
+    allocating a workspace only moves that first fill out of the hot path.
+    Zeroing is an in-place fill; nothing is allocated.
     """
     raw = _workspace_bytes(workspace_buffer)
     _require_workspace_bytes(raw, _PARTIAL_OFFSET)
     raw[_COUNTER_OFFSET:_PARTIAL_OFFSET].zero_()
-    setattr(workspace_buffer, _PRIMED_ATTR, True)
+    _register_primed(workspace_buffer, raw)
 
 
-def _ensure_counters_zeroed(workspace: torch.Tensor, raw: torch.Tensor) -> None:
-    if getattr(workspace, _PRIMED_ATTR, False):
+def _ensure_counters_zeroed(
+    workspace: torch.Tensor, raw: torch.Tensor, merge_groups: int
+) -> None:
+    """Make the ``merge_groups`` counters of this launch zero; never raises for capture.
+
+    Registered workspace: nothing (the kernels leave the counters zero).
+    Unregistered, eager: zero the whole region once and register it.
+    Unregistered, under CUDA Graph capture: record a zero fill of exactly the
+    counters this launch uses into the graph; the registry is left alone
+    because the fill has not executed and only replays carry it.
+    """
+    if _counters_primed(workspace, raw):
         return
     if _is_capturing(workspace.device):
-        raise RuntimeError(
-            "CAKE DSv4 split-merge counters in this workspace_buffer have not been "
-            "initialised and the current stream is capturing a CUDA graph; call "
-            "flashinfer.mla.cake_dsv4_workspace_reset(workspace_buffer) or run one "
-            "eager call with this workspace before capture"
-        )
+        raw[_COUNTER_OFFSET : _COUNTER_OFFSET + merge_groups * 4].zero_()
+        return
     raw[_COUNTER_OFFSET:_PARTIAL_OFFSET].zero_()
-    setattr(workspace, _PRIMED_ATTR, True)
+    _register_primed(workspace, raw)
 
 
 # --------------------------------------------------------------------------- #
@@ -559,6 +946,24 @@ _TMA_SOURCE_ALIASES: Mapping[str, str] = {
     "tmap_compressed_k": "compressed_KV_cache",
     "tmap_compressed_v": "compressed_KV_cache",
     "tmap_compressed_kv": "compressed_KV_cache",
+    # The FP8 persistent bodies (round 5) store O through a TMA descriptor over
+    # the same [tokens, heads, 512] rows the plain ``O`` pointer argument sees.
+    "tmap_o": "O",
+    # The bf16 H64 guard program binds its ``O`` parameter itself as a 3-D
+    # tensor map (box 64 x 16 x 1 over [tokens, heads, 512]; head rows >=
+    # num_heads are clipped by the map), so the registration carries
+    # ("tma_buffer", "O"): the same output rows, encoded by the grid_constant
+    # binding -- no descriptor workspace and no host copy.
+    "O": "O",
+    # NVFP4 decode members store their (partial) output through a TMA
+    # descriptor over the [tokens, heads, splits, 512] view of partial_O.
+    "tmap_out": "partial_O_tiles",
+    # The gather4 members (pv / t64) read the pools through TMA gather descriptors over 32-byte-pitch int32 row
+    # views of each flat pool (data rows and footer rows; ``_nvfp4_gather4_views``).
+    "tmap_g4d": "main_cache_g4d",
+    "tmap_g4f": "main_cache_g4f",
+    "tmap_g4dx": "extra_cache_g4d",
+    "tmap_g4fx": "extra_cache_g4f",
 }
 _SCALAR_ALIASES: Mapping[str, str] = {
     "num_q_heads": "num_heads",
@@ -583,8 +988,25 @@ _TENSOR_VALUE_NAMES = frozenset(
         "sparse_topk_lens",
         # Pre-hardening combined table; bound only for combined metadata.
         "sparse_indices",
+        # NVFP4 cache route (two independent tables over two uint8 pools).
+        "q_rows",
+        "main_cache",
+        "extra_cache",
+        "main_indices",
+        "extra_indices",
+        "main_lengths",
+        "extra_lengths",
+        "partial_O_tiles",
+        "lse_out",
+        "main_cache_g4d",
+        "main_cache_g4f",
+        "extra_cache_g4d",
+        "extra_cache_g4f",
     }
 )
+# Kernel parameters bound as Python floats (the NVFP4 members take the LSE
+# scales by value); every other parameter is an int.
+_FLOAT_SCALAR_VALUE_NAMES = frozenset({"lse_partial_scale", "lse_scale"})
 _SCALAR_VALUE_NAMES = frozenset(
     {
         "swa_index_stride",
@@ -600,6 +1022,22 @@ _SCALAR_VALUE_NAMES = frozenset(
         "batch_size",
         "max_q_len",
         "ragged_query",
+        # NVFP4 cache route.
+        "num_main_tiles",
+        "tiles_per_split",
+        "total_tiles",
+        "main_width",
+        "extra_width",
+        "main_index_stride",
+        "extra_index_stride",
+        "has_main_lengths",
+        "has_extra_lengths",
+        "main_page_shift",
+        "extra_page_shift",
+        "main_page_stride",
+        "extra_page_stride",
+        "heads_per_cta",
+        *_FLOAT_SCALAR_VALUE_NAMES,
     }
 )
 _GRID_NAMES = ("grid_x", "grid_y", "grid_z")
@@ -617,9 +1055,10 @@ _RAGGED_ONLY_ROUTES = frozenset(
         "fp8_h128_prefill_source_persistent",
         "fp8_h128_prefill_source_persistent_uniform",
         "fp8_h64_prefill_source_persistent_m64",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile",
     }
 )
-# CAKE-624 W9: mirrors the Cake seed's LANE_GATHER_MIN_TOKENS. Below it the
+# Mirrors the Cake seed's LANE_GATHER_MIN_TOKENS. Below it the
 # persistent FP8 body runs the program with elected-lane uniform K/V gathers;
 # from 128 tokens on, the lane-issued gathers (several waves per cluster) win.
 _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS = 128
@@ -631,18 +1070,31 @@ def _fp8_persistent_program(num_query_tokens: int) -> str:
     return "fp8_h128_prefill_source_persistent"
 
 
-# CAKE-624 W14: mirrors the Cake seed's H64_M64_MIN_TOKENS
+# Mirrors the Cake seed's H64_M64_MIN_TOKENS
 # (portfolio_v34.persistent_program): FP8/H64 rows admitted to the persistent
 # body with at least this many tokens run the H64-specific single-CTA M64 body.
 _FP8_H64_M64_MIN_TOKENS = 128
 
 
 def _fp8_h64_uses_persistent_body(sparse_topk: int, num_query_tokens: int) -> bool:
-    """CAKE-624 FP8/H64 rule (Cake seed ``portfolio_v34.uses_persistent_body``)."""
+    """FP8/H64 persistent-body rule (Cake seed ``portfolio_v34.uses_persistent_body``)."""
     full_tiles = sparse_topk // 128
     if num_query_tokens <= 12:
         return full_tiles >= 3
     return full_tiles >= 2 or num_query_tokens >= 128
+
+
+# Mirrors the Cake M64 seed's box_k_gather_for_width (TILE_KV = 128).  The M64
+# body is exported twice: single-tile items (the SWA tile is the whole item)
+# run the program whose load warp gathers contiguous 16-key SWA chunks through
+# one box TMA (-0.35..-0.42 us on the 128/256-token SWA rows); every wider item
+# runs the program without that block, which measured at +0.03..+0.11 us of
+# load-warp code layout on the multi-tile rows even when the in-kernel gate
+# kept it off.  Same bits from both programs.
+def _fp8_h64_m64_program(sparse_topk: int) -> str:
+    if sparse_topk == _TILE_KV:
+        return "fp8_h64_prefill_source_persistent_m64"
+    return "fp8_h64_prefill_source_persistent_m64_multi_tile"
 
 
 _UNAVAILABLE_HINTS: Mapping[str, str] = {
@@ -651,7 +1103,6 @@ _UNAVAILABLE_HINTS: Mapping[str, str] = {
         "combined sparse_indices table with sparse_topk_lens_offset == 0; "
         "regenerate the bindings for separate tables or length offsets"
     ),
-    "cum_seq_lens_q": "this variant needs ragged queries (cum_seq_lens_q)",
 }
 
 
@@ -719,6 +1170,12 @@ def _bind_argument(
         hint = _UNAVAILABLE_HINTS.get(canonical, "it is not available for this call")
         raise ValueError(f"CAKE DSv4 {variant} argument {name!r}: {hint}")
     if kind == "parameter":
+        if canonical in _FLOAT_SCALAR_VALUE_NAMES:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(
+                    f"CAKE DSv4 {variant} parameter {name!r} must be a float, got {type(value).__name__}"
+                )
+            return float(value)
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(
                 f"CAKE DSv4 {variant} parameter {name!r} must be an int, got {type(value).__name__}"
@@ -739,67 +1196,80 @@ def _grid_values(grid: tuple[int, int, int]) -> dict[str, int]:
     return dict(zip(_GRID_NAMES, grid, strict=True))
 
 
+class _PreparedLaunch:
+    """A bound variant launch: the FFI call is the only work left to do."""
+
+    __slots__ = ("module", "bound")
+
+    def __init__(self, module, bound: list):
+        self.module = module
+        self.bound = bound
+
+    def __call__(self):
+        # Direct-source bindings use the target FFI current stream.
+        return self.module.run(*self.bound)
+
+
+def _sequence_module():
+    from ..jit.cake_dsv4 import get_cake_dsv4_launch_sequence_module
+
+    return get_cake_dsv4_launch_sequence_module()
+
+
+def _prepare_variant(
+    variant: str,
+    *,
+    arch: str,
+    grid: tuple[int, int, int],
+    values: Mapping[str, Any],
+) -> _PreparedLaunch:
+    """Bind the generated ABI by name through the registration ``arg_plan``.
+
+    Two-stage routes prepare the producer and the reducer before launching
+    either, so no Python-side binding sits between the two kernels. The caller
+    holds :data:`_descriptor_lock` from the first preparation through the last
+    launch of the call.
+    """
+    from ..jit.cake_dsv4 import get_cake_dsv4_spec
+
+    contract = get_cake_dsv4_spec(variant, arch=arch)
+    plan = contract["arg_plan"]
+    grid_values = _grid_values(grid)
+
+    def bind(kind, name, storage=None):
+        return _bind_argument(
+            values,
+            kind,
+            name,
+            variant=variant,
+            grid=grid_values,
+            descriptor_slab=storage,
+        )
+
+    tma_bytes = int(contract.get("tma_workspace_bytes", 0) or 0)
+    storage = None
+    if tma_bytes:
+        sources = [
+            (name, bind(kind, name)) for kind, name in plan if kind == "tma_buffer"
+        ]
+        device = sources[0][1].device if sources else torch.device("cpu")
+        storage = _descriptor_storage(
+            variant, arch, tma_bytes, sources, capturing=_is_capturing(device)
+        )
+    bound = [bind(kind, name, storage) for kind, name in plan]
+    return _PreparedLaunch(_variant_module(variant, arch=arch), bound)
+
+
 def _launch_variant(
     variant: str,
     *,
     arch: str,
     grid: tuple[int, int, int],
-    workspace_raw: torch.Tensor,
     values: Mapping[str, Any],
 ):
-    """Bind the generated ABI by name through the registration ``arg_plan``."""
-    from ..jit.cake_dsv4 import get_cake_dsv4_spec
-
-    contract = get_cake_dsv4_spec(variant, arch=arch)
-    tma_bytes = int(contract.get("tma_workspace_bytes", 0) or 0)
-    slab = _descriptor_workspace(workspace_raw, tma_bytes) if tma_bytes else None
-    grid_values = _grid_values(grid)
-    bound = [
-        _bind_argument(
-            values, kind, name, variant=variant, grid=grid_values, descriptor_slab=slab
-        )
-        for kind, name in contract["arg_plan"]
-    ]
-    # Direct-source bindings use the target FFI current stream.
-    return getattr(_variant_module(variant, arch=arch), contract["entry"])(*bound)
-
-
-def _launch_program(
-    variant: str,
-    *,
-    arch: str,
-    stream: int,
-    workspace_raw: torch.Tensor,
-    values: Mapping[str, Any],
-) -> None:
-    from ..jit.cake_dsv4 import (
-        get_cake_dsv4_program,
-        get_cake_dsv4_program_for_variant,
-    )
-
-    selected = get_cake_dsv4_program_for_variant(variant, arch=arch)
-    if selected is None:
-        raise ValueError(f"CAKE DSv4 variant has no compiled program: {variant}")
-    program_id, contract = selected
-    signature = contract["signature"]
-    plan = [
-        *(("buffer", name) for name in signature["tensor_keys"]),
-        *(("workspace", name) for name in signature["workspace_keys"]),
-        *(("parameter", name) for name in signature["scalar_names"]),
-    ]
-    slab = (
-        _descriptor_workspace(workspace_raw, _DESCRIPTOR_SLAB_BYTES)
-        if signature["workspace_keys"]
-        else None
-    )
-    args = [
-        _bind_argument(
-            values, kind, name, variant=variant, grid={}, descriptor_slab=slab
-        )
-        for kind, name in plan
-    ]
-    program = get_cake_dsv4_program(program_id, arch=arch)
-    getattr(program, contract["entry"])(*args, stream)
+    """Prepare and launch one variant (single-launch convenience)."""
+    with _descriptor_lock:
+        return _prepare_variant(variant, arch=arch, grid=grid, values=values)()
 
 
 # --------------------------------------------------------------------------- #
@@ -809,7 +1279,6 @@ def _launch_program(
 
 def _route(
     *,
-    arch: str,
     dtype: torch.dtype,
     num_heads: int,
     max_q_len: int,
@@ -854,7 +1323,7 @@ def _route(
                 or (is_topk4x and sparse_topk == (192 if num_heads == 8 else 256))
             )
         ):
-            # CAKE-624 W18: FP8 port of the 1-CTA SwapsAb body trtllm-gen runs
+            # FP8 port of the 1-CTA SwapsAb body trtllm-gen runs
             # on these rows (heads on the MMA N side, kind::f8f6f4, P e4m3
             # x448); same shape lock as the BF16 source-exact route.  Paired
             # vs trtllm-gen: rows 55/58/67/70 GB300 1.27-1.30x / B200
@@ -864,7 +1333,7 @@ def _route(
         if num_heads == 64 and _fp8_h64_uses_persistent_body(
             sparse_topk, num_query_tokens
         ):
-            # Mirrors the Cake seed's H64_PERSISTENT_* rule (CAKE-624 W5 + W10):
+            # Mirrors the Cake seed's H64_PERSISTENT_* rule:
             # 12-token rows with >= 3 complete sparse tiles; every many-token
             # compressed row (>= 2 complete tiles); SWA-only rows from 128
             # tokens.  Same persistent FP8 body as FP8/H128 (heads >= num_heads
@@ -873,27 +1342,28 @@ def _route(
             # per-token cluster body and the SWA producer sat at 0.6-0.87x.
             # Evaluated before the SWA-only test on purpose.
             if num_query_tokens >= _FP8_H64_M64_MIN_TOKENS:
-                # CAKE-624 W14: H64-specific single-CTA M64 persistent body (one
+                # H64-specific single-CTA M64 persistent body (one
                 # CTA per token, unified 128-row KV stage, no V gathers): GB300
                 # 1.25-1.55x / B200 1.22-1.44x on the 128-512 token rows where
-                # the FP8/H128 body sat at 0.81-1.13x.
-                return "fp8_h64_prefill_source_persistent_m64"
+                # the FP8/H128 body sat at 0.81-1.13x.  Two exported programs,
+                # selected by the item width.
+                return _fp8_h64_m64_program(sparse_topk)
             return _fp8_persistent_program(num_query_tokens)
         if is_swa:
             return "fp8_lowhead_prefill"
         if num_heads == 64:
-            if arch == "sm_100a" and sparse_topk >= 640:
-                return "fp8_lowhead_h64_split"
             return "fp8_lowhead_h64"
         # One producer partition owns up to three sparse tiles (widths up to
-        # 384) and writes final O directly; the two-partition path splits
-        # three tiles as 2 + 1 and still pays the reducer launch, so it never
-        # shortens the critical path there (one partition measured 1.18-1.26x
-        # on the width-260 rows).  Mirrors the Cake seed's
-        # FP8_ONE_PARTITION_MAX_TILES = 3.
-        return (
-            "fp8_lowhead_one_partition" if sparse_topk <= 384 else "fp8_lowhead_split"
-        )
+        # 384) and writes final O directly (one partition measured 1.18-1.26x
+        # on the width-260 rows).  No two-partition producer is exported for
+        # wider low-head rows.
+        if sparse_topk > _FP8_ONE_PARTITION_MAX_WIDTH:
+            raise ValueError(
+                f"backend='cake' has no FP8 kernel for {num_heads} heads with "
+                f"sparse_topk {sparse_topk} > {_FP8_ONE_PARTITION_MAX_WIDTH} "
+                f"below max_q_len 257"
+            )
+        return "fp8_lowhead_one_partition"
     if dtype != torch.bfloat16:
         raise ValueError(f"unsupported CAKE DSv4 dtype: {dtype}")
     if (
@@ -910,12 +1380,15 @@ def _route(
     if num_heads in (8, 16):
         if is_swa:
             return "bf16_h8_swa128_v43" if num_heads == 8 else "bf16_h16_h32_swa128_v44"
-        return "bf16_h8_h32"
+        raise ValueError(
+            f"backend='cake' has no BF16 kernel for {num_heads} heads with a "
+            "compressed cache outside the batch-3, max_q_len-5 ragged rows"
+        )
     if num_heads == 32:
         if is_swa:
             return "bf16_h16_h32_swa128_v44"
         if is_topk4x or is_topk128x:
-            # CAKE-624 W13: the retained-KV body with the last-arriver merge
+            # The retained-KV body with the last-arriver merge
             # beats the topk4x body on the H32 topk4x rows on both targets.
             return "bf16_h32_topk128x_early_v47"
         raise ValueError("BF16 H32 compressed cache requires page size 64 or 2")
@@ -953,8 +1426,325 @@ def _route(
             return "bf16_h128_swa128"
         if is_topk4x and sparse_topk == 1152:
             return "bf16_h128_topk4x_v52"
-        return "bf16_h128_topk128x"
+        if _BF16_TOPK128X_MIN_WIDTH < sparse_topk <= _BF16_TOPK128X_MAX_WIDTH:
+            return "bf16_h128_topk128x"
+        raise ValueError(
+            f"backend='cake' has no BF16 H128 kernel for sparse_topk {sparse_topk} "
+            f"below {_BF16_H128_PREFILL_MIN_TOKENS} tokens (supported: 128, "
+            f"{_BF16_TOPK128X_MIN_WIDTH + 4}-{_BF16_TOPK128X_MAX_WIDTH} and 1152 "
+            "with page size 64)"
+        )
     raise ValueError(f"unsupported CAKE BF16 DSv4 head count: {num_heads}")
+
+
+# --------------------------------------------------------------------------- #
+# Route workspace plan                                                        #
+# --------------------------------------------------------------------------- #
+
+# Routes whose producers write the final output directly and keep no LSE:
+# they never touch the workspace.
+_NO_WORKSPACE_ROUTES = frozenset(
+    {
+        "bf16_swa128_single_cta",
+        "bf16_h128_swa128",
+        "bf16_h8_swa128_v43",
+        "bf16_h16_h32_swa128_v44",
+        "bf16_h8_h16_source_exact",
+        "fp8_h8_h16_source_exact",
+        "bf16_h64_guard_q_tma_batch_r25",
+        "bf16_h64_prefill",
+        "fp8_h64_source_exact",
+    }
+)
+# Routes that launch one producer with ``partials(1)``: final O written
+# directly, the LSE region of the workspace only.
+_ONE_SPLIT_ROUTES = frozenset(
+    {
+        "bf16_h128_prefill_v42",
+        "fp8_h128_prefill_source_persistent",
+        "fp8_h128_prefill_source_persistent_uniform",
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "fp8_lowhead_one_partition",
+        "fp8_lowhead_h64",
+        "fp8_lowhead_prefill",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _RoutePlan:
+    """Workspace use of one route at one shape: the single source for the
+    dispatcher's ``partials`` / ``counters`` calls and for the sizing API."""
+
+    # Partial buffers per (token, head); 1 = LSE region only, no partial_O.
+    num_splits: int
+    # False: the route binds no partial buffers and needs no workspace bytes.
+    uses_partials: bool
+    # Split-merge counters per metadata row (0: no in-kernel merge).
+    merge_groups_per_row: int
+
+
+def _route_plan(
+    route: str, *, num_query_tokens: int, num_heads: int, sparse_topk: int
+) -> _RoutePlan:
+    if route == "bf16_h64_compressed_q8_v38":
+        # One KV tile per split plus the H64 reducer (single split: direct O).
+        return _RoutePlan(_ceil_div(sparse_topk, _TILE_KV), True, 0)
+    if route == "bf16_h32_topk128x_early_v47":
+        # One KV tile per split; the last-arriving split of each (token, head
+        # tile) merges in-kernel through one counter per group.
+        return _RoutePlan(
+            _ceil_div(sparse_topk, _TILE_KV), True, _ceil_div(num_heads, 8)
+        )
+    if route == "bf16_h128_topk4x_v52":
+        # Five fixed full-V KV owners per token plus the split-5 reducer.
+        return _RoutePlan(5, True, 0)
+    if route == "bf16_h128_topk128x":
+        # Four disjoint full-V owners plus the LSE reducer up to the token
+        # bound; one row-first owner per token above it.
+        return _RoutePlan(
+            4 if num_query_tokens <= _BF16_TOPK128X_SPLIT_MAX_TOKENS else 1, True, 0
+        )
+    if route in _ONE_SPLIT_ROUTES:
+        return _RoutePlan(1, True, 0)
+    if route in _NO_WORKSPACE_ROUTES:
+        return _RoutePlan(1, False, 0)
+    raise RuntimeError(f"unhandled CAKE DSv4 route: {route}")
+
+
+def _launch_workspace_bytes(
+    plan: _RoutePlan, rows: int, num_heads: int, num_query_offsets: int = 0
+) -> int:
+    """Workspace bytes one launch of ``plan`` over ``rows`` metadata rows carves."""
+    if not plan.uses_partials:
+        return 0
+    return cake_dsv4_workspace_layout(
+        rows, num_heads, plan.num_splits, num_query_offsets=num_query_offsets
+    ).total_bytes
+
+
+def _launch_fits(
+    plan: _RoutePlan,
+    rows: int,
+    num_heads: int,
+    num_query_offsets: int,
+    workspace_bytes: int,
+) -> bool:
+    if (
+        plan.merge_groups_per_row
+        and rows * plan.merge_groups_per_row > _MAX_MERGE_GROUPS
+    ):
+        return False
+    return (
+        _launch_workspace_bytes(plan, rows, num_heads, num_query_offsets)
+        <= workspace_bytes
+    )
+
+
+def _rows_per_launch(
+    plan: _RoutePlan,
+    *,
+    num_query_tokens: int,
+    num_heads: int,
+    batch_size: int,
+    workspace_bytes: int,
+) -> int:
+    """Metadata rows per launch for a workspace of ``workspace_bytes``.
+
+    All rows when one launch fits (no row tiling, no offsets region);
+    otherwise the largest chunk whose carve, including the shifted request
+    offsets (``batch_size + 1`` int32) of the chunks after the first, fits;
+    0 when not even one row fits.
+    """
+    total = num_query_tokens
+    if _launch_fits(plan, total, num_heads, 0, workspace_bytes):
+        return total
+    offsets = batch_size + 1
+    per_row = (
+        num_heads
+        * plan.num_splits
+        * (
+            (_HEAD_DIM * torch.bfloat16.itemsize if plan.num_splits > 1 else 0)
+            + torch.float32.itemsize
+        )
+    )
+    rows = (
+        workspace_bytes
+        - _PARTIAL_OFFSET
+        - _align_up(offsets * torch.int32.itemsize)
+        - 2 * _ALIGN
+    ) // per_row
+    if plan.merge_groups_per_row:
+        rows = min(rows, _MAX_MERGE_GROUPS // plan.merge_groups_per_row)
+    rows = max(0, min(rows, total - 1))
+    while rows > 0 and not _launch_fits(
+        plan, rows, num_heads, offsets, workspace_bytes
+    ):
+        rows -= 1
+    while rows + 1 < total and _launch_fits(
+        plan, rows + 1, num_heads, offsets, workspace_bytes
+    ):
+        rows += 1
+    return rows
+
+
+@dataclass(frozen=True)
+class WorkspaceRequirement:
+    """Exact workspace numbers of one ``backend="cake"`` call.
+
+    ``single_launch_bytes`` is what one launch over all metadata rows carves
+    (0 for routes without partial buffers); ``minimum_bytes`` is the smallest
+    workspace the call accepts (one row per launch, row tiling); any size in
+    between works with :meth:`rows_per_launch` rows per launch.
+    """
+
+    route: str
+    num_splits: int
+    uses_workspace: bool
+    single_launch_bytes: int
+    minimum_bytes: int
+    num_query_tokens: int
+    num_heads: int
+    batch_size: int
+    plan: _RoutePlan = field(repr=False)
+
+    def rows_per_launch(self, workspace_bytes: int) -> int:
+        """Metadata rows per launch with ``workspace_bytes`` (0: too small)."""
+        return _rows_per_launch(
+            self.plan,
+            num_query_tokens=self.num_query_tokens,
+            num_heads=self.num_heads,
+            batch_size=self.batch_size,
+            workspace_bytes=int(workspace_bytes),
+        )
+
+
+def cake_dsv4_workspace_requirement(
+    *,
+    dtype: torch.dtype,
+    num_heads: int,
+    num_query_tokens: int,
+    sparse_topk: int,
+    compressed_page_size: int,
+    max_q_len: int,
+    batch_size: int,
+    ragged: bool,
+) -> WorkspaceRequirement:
+    """Route and exact workspace requirement of one call, without device access.
+
+    The arguments are the route inputs of :func:`run_cake_dsv4`:
+    ``num_query_tokens`` = metadata rows, ``sparse_topk`` = combined table
+    width, ``compressed_page_size`` = ``compressed_kv_cache.shape[-2]``
+    (irrelevant for SWA-only calls), ``max_q_len`` = dense per-request query
+    length or the ragged maximum, ``batch_size`` = ``seq_lens.numel()``,
+    ``ragged`` = ``cum_seq_lens_q is not None``. Raises ``ValueError`` for a
+    shape ``backend="cake"`` has no kernel for.
+    """
+    tokens = _positive_int(num_query_tokens, "num_query_tokens")
+    heads = _positive_int(num_heads, "num_heads")
+    batch = _positive_int(batch_size, "batch_size")
+    topk = _positive_int(sparse_topk, "sparse_topk")
+    route = _route(
+        dtype=dtype,
+        num_heads=heads,
+        max_q_len=_positive_int(max_q_len, "max_q_len"),
+        ragged=bool(ragged),
+        sparse_topk=topk,
+        batch_size=batch,
+        compressed_page_size=int(compressed_page_size),
+        num_query_tokens=tokens,
+    )
+    plan = _route_plan(
+        route, num_query_tokens=tokens, num_heads=heads, sparse_topk=topk
+    )
+    single = _launch_workspace_bytes(plan, tokens, heads, 0)
+    minimum = min(single, _launch_workspace_bytes(plan, 1, heads, batch + 1))
+    return WorkspaceRequirement(
+        route=route,
+        num_splits=plan.num_splits,
+        uses_workspace=plan.uses_partials,
+        single_launch_bytes=single,
+        minimum_bytes=minimum,
+        num_query_tokens=tokens,
+        num_heads=heads,
+        batch_size=batch,
+        plan=plan,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Output placement                                                            #
+# --------------------------------------------------------------------------- #
+_OUT_PHASE_PERIOD = 4096
+
+# Output placement: on the routes below the kernel time is a 4 KiB-periodic
+# function of the output buffer's base address (bits 0..11 only; bits >= 12 do
+# nothing).  ``base % 4096 == 0`` -- what a fresh >= 2 MiB caching-allocator
+# block gives, i.e. the default ``torch.empty`` for these outputs -- is the SLOW
+# phase; ``0x800`` is the fast one.  Pinned-phase paired measurements (cold-L2
+# CUPTI, both arm orders) on the exported programs, us at phase 0 ->
+# phase 0x800, B200 / GB300:
+#   bf16_h128_prefill_v42 (every bf16 H128 persistent row, striped and snake):
+#     hardening-000035 40.13 -> 36.96 / 35.74 -> 33.25, hardening-000023 17.98 ->
+#     16.70 / 16.58 -> 15.42, hardening-000029 26.78 -> 24.77 / 24.16 -> 22.94,
+#     prefill-style-000088 90.66 -> 88.10 / 74.88 -> 72.48, prefill-style-000092
+#     94.56 -> 92.26 / 78.21 -> 76.10 (-2.3 .. -8 %).
+#   fp8_lowhead_prefill, 64 heads, SWA-128 table (the single-CTA K1 body):
+#     decode-000006 7.07 -> 6.72 / 6.75 -> 6.43, decode-000009 7.07 -> 6.72 /
+#     6.66 -> 6.30, hardening-000020 7.84 -> 7.49 / 7.55 -> 7.20 (-4.5 .. -5.3 %);
+#     32 heads move +-0.1 us with a process-dependent sign and 8 / 16 heads do
+#     not move, so they keep the allocator default.
+# The kernels are untouched: the same program writes the same bits to the same
+# (token, head, column) positions; only the buffer's base address is chosen.
+# Applies to ``out=None`` only -- a caller-provided ``out`` is used as is, and a
+# 2 MiB-aligned caller buffer sits in the slow phase.
+_OUT_PHASE_BY_ROUTE: dict[str, int] = {
+    "bf16_h128_prefill_v42": 0x800,
+    "fp8_lowhead_prefill": 0x800,
+    # 134-row public-API pass, allocator default -> 0x800, both arm orders:
+    #   bf16_h64_prefill (086/087/090/091) -0.70..-1.50 us GB300,
+    #   fp8_h64_source_exact -1.09..-1.18 us GB300, fp8_lowhead_h64 (008/011) -0.34 us GB300.
+    "bf16_h64_prefill": 0x800,
+    "fp8_h64_source_exact": 0x800,
+    "fp8_lowhead_h64": 0x800,
+    #   bf16_h128_topk128x: hardening-000025 / -000031 -0.74 / -0.70 us GB300, the
+    #   other rows of the route flat (|d| <= 0.03 us).
+    "bf16_h128_topk128x": 0x800,
+}
+
+
+def cake_dsv4_out_phase(
+    route: str, *, num_heads: int, sparse_topk: int
+) -> Optional[int]:
+    """Preferred ``out.data_ptr() % 4096`` for ``route`` (None = allocator default)."""
+    phase = _OUT_PHASE_BY_ROUTE.get(route)
+    if phase is None:
+        return None
+    if route == "fp8_lowhead_prefill" and not (num_heads == 64 and sparse_topk == 128):
+        return None
+    return phase
+
+
+def allocate_cake_dsv4_output(
+    shape: tuple[int, ...], device: torch.device, *, phase: Optional[int]
+) -> torch.Tensor:
+    """bf16 output of ``shape``; with ``phase`` the view's ``data_ptr() % 4096 == phase``
+    (one extra 4 KiB page is allocated), with None a plain ``torch.empty``."""
+    if phase is None:
+        return torch.empty(shape, dtype=torch.bfloat16, device=device)
+    if phase % 2 or not 0 <= phase < _OUT_PHASE_PERIOD:
+        raise ValueError(
+            f"output phase must be an even byte offset below {_OUT_PHASE_PERIOD}, got {phase}"
+        )
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    raw = torch.empty(
+        numel + _OUT_PHASE_PERIOD // 2, dtype=torch.bfloat16, device=device
+    )
+    start = ((phase - raw.data_ptr()) % _OUT_PHASE_PERIOD) // 2
+    return raw[start : start + numel].view(shape)
 
 
 # --------------------------------------------------------------------------- #
@@ -1037,7 +1827,10 @@ def _int32_vector(
         raise ValueError(f"{name} must be int32, got {tensor.dtype}")
     if tensor.device != device:
         raise ValueError(f"{name} must be on {device}, got {tensor.device}")
-    flat = tensor.reshape(-1)
+    # A 1-D vector is bound as the caller's own object (reshape would wrap it
+    # in a new view object even when nothing changes); higher-rank inputs
+    # flatten without a copy or are rejected.
+    flat = tensor if tensor.dim() == 1 else tensor.reshape(-1)
     if flat.data_ptr() != tensor.data_ptr() or not flat.is_contiguous():
         raise ValueError(
             f"{name} must be contiguous; backend='cake' makes no host copy"
@@ -1054,32 +1847,37 @@ class _Launcher:
         arch: str,
         workspace: torch.Tensor,
         raw: torch.Tensor,
-        stream: int,
         values: dict[str, Any],
     ):
         self.arch = arch
         self.workspace = workspace
         self.raw = raw
-        self.stream = stream
         self.values = values
 
-    def variant(self, name: str, *, grid: tuple[int, int, int], **overrides: Any):
-        return _launch_variant(
-            name,
-            arch=self.arch,
-            grid=grid,
-            workspace_raw=self.raw,
-            values={**self.values, **overrides},
+    def variant(
+        self, name: str, *, grid: tuple[int, int, int], **overrides: Any
+    ) -> _PreparedLaunch:
+        return _prepare_variant(
+            name, arch=self.arch, grid=grid, values={**self.values, **overrides}
         )
 
-    def program(self, name: str, **overrides: Any) -> None:
-        _launch_program(
-            name,
-            arch=self.arch,
-            stream=self.stream,
-            workspace_raw=self.raw,
-            values={**self.values, **overrides},
-        )
+    @staticmethod
+    def run(*launches: _PreparedLaunch):
+        """Issue the launches of one route.
+
+        A single launch is one FFI call. Several launches go through the
+        ``run_sequence`` host helper in one FFI call, so the host work of the
+        second launch (argument conversion, Python-to-C transition) does not
+        sit between the two kernels.
+        """
+        if len(launches) == 1:
+            return launches[0]()
+        flat: list[Any] = []
+        for launch in launches:
+            flat.append(launch.module.run)
+            flat.append(len(launch.bound))
+            flat.extend(launch.bound)
+        return _sequence_module().run_sequence(*flat)
 
     def partials(self, num_splits: int) -> dict[str, Any]:
         partial_o, partial_lse = _partial_views(
@@ -1096,13 +1894,14 @@ class _Launcher:
         }
 
     def counters(self, merge_groups: int) -> torch.Tensor:
-        _ensure_counters_zeroed(self.workspace, self.raw)
-        return _counters(self.raw, merge_groups)
+        counters = _counters(self.raw, merge_groups)
+        _ensure_counters_zeroed(self.workspace, self.raw, merge_groups)
+        return counters
 
-    def reduce(self, reducer: str, **overrides: Any) -> None:
+    def reduce(self, reducer: str, **overrides: Any) -> _PreparedLaunch:
         tokens = self.values["num_query_tokens"]
         heads = self.values["num_heads"]
-        self.variant(reducer, grid=(tokens, heads, 1), **overrides)
+        return self.variant(reducer, grid=(tokens, heads, 1), **overrides)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -1117,7 +1916,7 @@ def run_cake_dsv4(
     workspace_buffer: torch.Tensor,
     sparse_indices: torch.Tensor,
     sparse_topk_lens: Optional[torch.Tensor],
-    out: torch.Tensor,
+    out: Optional[torch.Tensor],
     bmm1_scale: Union[float, torch.Tensor],
     bmm2_scale: Union[float, torch.Tensor],
     sinks: Optional[torch.Tensor],
@@ -1128,12 +1927,24 @@ def run_cake_dsv4(
     extra_sparse_indices: Optional[torch.Tensor] = None,
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
     sparse_topk_lens_offset: int = 0,
+    out_shape: Optional[tuple[int, ...]] = None,
 ) -> torch.Tensor:
     """Launch the CAKE DSv4 route for flattened ``query [rows, num_heads, 512]``.
 
+    ``out=None`` allocates the output here, after the route is known, so the
+    routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
+    ``out_shape`` (default ``[rows, num_heads, 512]``) is the shape to allocate.
+
     ``query`` / ``out`` may have more rows than the metadata; only the first
-    ``num_query_tokens`` (metadata rows) are read and written. No device memory
-    is allocated here; see the module docstring for the workspace contract.
+    ``num_query_tokens`` (metadata rows) are read and written. ``max_q_len`` is
+    the dense per-request query length (``query.shape[1]`` of the caller's
+    ``[B, Q, H, 512]``) or the ragged maximum; ``seq_lens`` has one entry per
+    request and ``cum_seq_lens_q`` (ragged only) ``batch_size + 1`` offsets.
+    Apart from the ``out=None`` output no device memory is allocated here
+    (the dense request offsets of the ragged-only producers and of row-tiled
+    dense launches are process-lifetime constants, created on first use:
+    warm such shapes up eagerly before a capture); see the module docstring
+    for the workspace, counter and row-tiling contract.
     """
     if backend != "cake":
         raise ValueError(f"expected backend='cake', got {backend!r}")
@@ -1169,20 +1980,22 @@ def run_cake_dsv4(
     num_query_tokens = meta.num_query_tokens
     sparse_topk = meta.sparse_topk
 
-    if out.dtype != torch.bfloat16:
-        raise ValueError(f"out must be bfloat16, got {out.dtype}")
-    if out.device != device:
-        raise ValueError(f"out must be on {device}, got {out.device}")
-    if not out.is_contiguous():
-        raise ValueError("out must be contiguous; backend='cake' makes no host copy")
-    row_elems = num_heads * _HEAD_DIM
-    if out.numel() % row_elems or out.numel() < num_query_tokens * row_elems:
-        raise ValueError(
-            f"out must hold at least {num_query_tokens} rows of [{num_heads}, {_HEAD_DIM}], "
-            f"got {tuple(out.shape)}"
-        )
+    if out is not None:
+        if out.dtype != torch.bfloat16:
+            raise ValueError(f"out must be bfloat16, got {out.dtype}")
+        if out.device != device:
+            raise ValueError(f"out must be on {device}, got {out.device}")
+        if not out.is_contiguous():
+            raise ValueError(
+                "out must be contiguous; backend='cake' makes no host copy"
+            )
+        row_elems = num_heads * _HEAD_DIM
+        if out.numel() % row_elems or out.numel() < num_query_tokens * row_elems:
+            raise ValueError(
+                f"out must hold at least {num_query_tokens} rows of [{num_heads}, {_HEAD_DIM}], "
+                f"got {tuple(out.shape)}"
+            )
     query_rows = query[:num_query_tokens]
-    out_rows = out.view(-1, num_heads, _HEAD_DIM)[:num_query_tokens]
 
     swa = _dense_rows(swa_kv_cache, "swa_kv_cache", query.dtype)
     compressed = _dense_rows(compressed_kv_cache, "compressed_kv_cache", query.dtype)
@@ -1209,7 +2022,6 @@ def run_cake_dsv4(
         )
     raw = _workspace_bytes(workspace_buffer)
     route = _route(
-        arch=arch,
         dtype=query.dtype,
         num_heads=num_heads,
         max_q_len=max_q_len,
@@ -1220,9 +2032,42 @@ def run_cake_dsv4(
         num_query_tokens=meta.num_query_tokens,
     )
 
-    if cum_seq_lens_q is None and route in _RAGGED_ONLY_ROUTES:
-        # Dense query on a ragged-only producer: every request is max_q_len long.
-        cum_seq_lens_q = _dense_query_offsets(batch_size, max_q_len, device=device)
+    if out is None:
+        out = allocate_cake_dsv4_output(
+            tuple(out_shape)
+            if out_shape is not None
+            else (query_capacity, num_heads, _HEAD_DIM),
+            device,
+            phase=cake_dsv4_out_phase(
+                route, num_heads=num_heads, sparse_topk=sparse_topk
+            ),
+        )
+        if out.numel() < num_query_tokens * num_heads * _HEAD_DIM:
+            raise ValueError(
+                f"out_shape {tuple(out.shape)} holds fewer than {num_query_tokens} rows"
+            )
+    out_rows = out.view(-1, num_heads, _HEAD_DIM)[:num_query_tokens]
+
+    if not ragged and batch_size * max_q_len < num_query_tokens:
+        raise ValueError(
+            f"dense query layout [batch_size={batch_size}, max_q_len={max_q_len}] "
+            f"holds {batch_size * max_q_len} rows but the metadata describes "
+            f"{num_query_tokens}"
+        )
+    if ragged:
+        request_offsets: Optional[torch.Tensor] = cum_seq_lens_q
+        cum_seq_lens_q_value = cum_seq_lens_q
+    else:
+        # Dense rows: the kernels map t -> (t // max_q_len, t % max_q_len) and
+        # never read cum_seq_lens_q, which is bound to the seq_lens pointer.
+        # The ragged-only producers read request boundaries unconditionally
+        # and receive the cached dense offsets (every request max_q_len long).
+        request_offsets = None
+        cum_seq_lens_q_value = (
+            _dense_query_offsets(batch_size, max_q_len, device=device)
+            if route in _RAGGED_ONLY_ROUTES
+            else seq_lens
+        )
 
     is_fp8 = query.dtype == torch.float8_e4m3fn
     values: dict[str, Any] = {
@@ -1231,7 +2076,7 @@ def run_cake_dsv4(
         "compressed_KV_cache": compressed.view(torch.uint8) if is_fp8 else compressed,
         "O": out_rows,
         "seq_lens": seq_lens,
-        "cum_seq_lens_q": cum_seq_lens_q,
+        "cum_seq_lens_q": cum_seq_lens_q_value,
         "sinks": sink_tensor,
         "bmm1_scale": scale1,
         "bmm2_scale": scale2,
@@ -1246,15 +2091,111 @@ def run_cake_dsv4(
         "num_splits": 1,
         "total_work_items": num_query_tokens,
     }
-    launcher = _Launcher(
-        arch=arch,
-        workspace=workspace_buffer,
-        raw=raw,
-        stream=_stream_ptr(device),
-        values=values,
+    plan = _route_plan(
+        route,
+        num_query_tokens=num_query_tokens,
+        num_heads=num_heads,
+        sparse_topk=sparse_topk,
     )
-    _dispatch_route(route, launcher)
+    rows_per_launch = _rows_per_launch(
+        plan,
+        num_query_tokens=num_query_tokens,
+        num_heads=num_heads,
+        batch_size=batch_size,
+        workspace_bytes=raw.numel(),
+    )
+    if rows_per_launch < 1:
+        minimum = _launch_workspace_bytes(plan, 1, num_heads, batch_size + 1)
+        raise ValueError(
+            f"workspace_buffer holds {raw.numel()} bytes; the CAKE DSv4 route "
+            f"{route} needs at least {minimum} bytes for one metadata row "
+            f"({num_heads} heads, {plan.num_splits} splits); size it with "
+            "get_cake_dsv4_workspace_bytes() or cake_dsv4_workspace_requirement()"
+        )
+    # One host-side critical section per call: descriptor-pool bookkeeping,
+    # the bindings' descriptor checks and the launch enqueues (see
+    # _descriptor_storage).
+    with _descriptor_lock:
+        if rows_per_launch >= num_query_tokens:
+            _dispatch_route(
+                route,
+                _Launcher(
+                    arch=arch, workspace=workspace_buffer, raw=raw, values=values
+                ),
+            )
+        else:
+            if request_offsets is None:
+                request_offsets = _dense_query_offsets(
+                    batch_size, max_q_len, device=device
+                )
+            _dispatch_row_tiles(
+                route,
+                arch=arch,
+                workspace=workspace_buffer,
+                raw=raw,
+                values=values,
+                meta=meta,
+                plan=plan,
+                rows_per_launch=rows_per_launch,
+                request_offsets=request_offsets,
+            )
     return out
+
+
+def _dispatch_row_tiles(
+    route: str,
+    *,
+    arch: str,
+    workspace: torch.Tensor,
+    raw: torch.Tensor,
+    values: Mapping[str, Any],
+    meta: SparseMetadata,
+    plan: _RoutePlan,
+    rows_per_launch: int,
+    request_offsets: torch.Tensor,
+) -> None:
+    """Launch ``route`` over consecutive metadata-row chunks that fit the workspace.
+
+    Every chunk sees row-sliced views of ``Q``, ``O`` and the metadata tables
+    (no copies; the index tables keep their row strides) and its own row
+    count. Chunks after the first cannot use the caller's layout (the kernels
+    index rows from 0), so they run as ragged rows whose request boundaries
+    are ``request_offsets - first_row`` (all ``batch_size + 1`` entries; the
+    kernels' scan tolerates negative entries of the requests before the
+    chunk), written into the workspace's offsets region in stream order --
+    one captured ``torch.sub`` per chunk, nothing allocated.
+    """
+    total = values["num_query_tokens"]
+    num_heads = values["num_heads"]
+    num_offsets = int(request_offsets.numel())
+    legacy = values["sparse_indices"]
+    for first in range(0, total, rows_per_launch):
+        rows = min(rows_per_launch, total - first)
+        stop = first + rows
+        chunk: dict[str, Any] = dict(values)
+        chunk.update(
+            Q=values["Q"][first:stop],
+            O=values["O"][first:stop],
+            swa_indices=_flat_index_span(meta.swa_indices[first:stop]),
+            compressed_indices=_flat_index_span(meta.compressed_indices[first:stop]),
+            sparse_topk_lens=meta.sparse_topk_lens[first:stop],
+            sparse_indices=None if legacy is None else legacy[first:stop],
+            num_query_tokens=rows,
+            total_work_items=rows,
+        )
+        if first:
+            layout = cake_dsv4_workspace_layout(
+                rows, num_heads, plan.num_splits, num_query_offsets=num_offsets
+            )
+            begin = layout.query_offsets[0]
+            shifted = raw[begin : begin + num_offsets * torch.int32.itemsize].view(
+                torch.int32
+            )
+            torch.sub(request_offsets, first, out=shifted)
+            chunk.update(cum_seq_lens_q=shifted, ragged_query=1)
+        _dispatch_route(
+            route, _Launcher(arch=arch, workspace=workspace, raw=raw, values=chunk)
+        )
 
 
 def _dispatch_route(route: str, L: _Launcher) -> None:
@@ -1262,15 +2203,7 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
     T = v["num_query_tokens"]
     H = v["num_heads"]
     topk = v["sparse_topk"]
-
-    if route == "bf16_h8_h32":
-        # General low-head path outside the specialized profiles.
-        num_splits = _ceil_div(topk, _TILE_KV)
-        parts = L.partials(num_splits)
-        L.variant(route, grid=(T * num_splits * 4, 1, 1), **parts)
-        if num_splits > 1:
-            L.reduce("bf16_h8_h32_reduce", **parts)
-        return
+    plan = _route_plan(route, num_query_tokens=T, num_heads=H, sparse_topk=topk)
 
     if route in (
         "bf16_swa128_single_cta",
@@ -1279,98 +2212,133 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         "bf16_h16_h32_swa128_v44",
     ):
         head_tiles = _ceil_div(H, 64) if route == "bf16_h128_swa128" else 1
-        L.variant(route, grid=(T * head_tiles * 4, 1, 1), num_head_tiles=head_tiles)
+        L.run(
+            L.variant(route, grid=(T * head_tiles * 4, 1, 1), num_head_tiles=head_tiles)
+        )
         return
 
     if route == "bf16_h8_h16_source_exact":
-        L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"]))
+        L.run(L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"])))
         return
 
     if route == "fp8_h8_h16_source_exact":
         # Same launch shape as the BF16 source-exact body (one CTA per
         # (query-within-sequence, value quarter, batch)); FP8 Q/KV pools.
-        L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"]))
+        L.run(L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"])))
         return
 
     if route == "bf16_h64_guard_q_tma_batch_r25":
-        L.variant(route, grid=(T, 2, 1))
+        L.run(L.variant(route, grid=(T, 2, 1)))
         return
 
-    if route in ("bf16_h64_compressed_q8_v38", "bf16_h64_fixed_q"):
-        num_splits = _ceil_div(topk, _TILE_KV)
+    if route == "bf16_h64_compressed_q8_v38":
+        num_splits = plan.num_splits
         parts = L.partials(num_splits)
-        L.variant(route, grid=(T * num_splits * 2, 1, 1), **parts)
+        compressed = L.variant(route, grid=(T * num_splits * 2, 1, 1), **parts)
         if num_splits > 1:
-            reducer = (
-                "bf16_h64_compressed_reduce"
-                if route == "bf16_h64_compressed_q8_v38"
-                else "bf16_h64_fixed_q_reduce"
-            )
-            L.reduce(reducer, **parts)
+            L.run(compressed, L.reduce("bf16_h64_compressed_reduce", **parts))
+        else:
+            L.run(compressed)
         return
 
     if route == "bf16_h32_topk128x_early_v47":
-        num_splits = _ceil_div(topk, _TILE_KV)
-        head_tiles = _ceil_div(H, 8)
+        num_splits = plan.num_splits
+        head_tiles = plan.merge_groups_per_row
         parts = L.partials(num_splits)
         arrivals = L.counters(T * head_tiles)
-        L.variant(
-            route,
-            grid=(T * num_splits * head_tiles, 1, 1),
-            partition_arrivals=arrivals,
-            num_head_tiles=head_tiles,
-            **parts,
+        L.run(
+            L.variant(
+                route,
+                grid=(T * num_splits * head_tiles, 1, 1),
+                partition_arrivals=arrivals,
+                num_head_tiles=head_tiles,
+                **parts,
+            )
         )
         return
 
     if route == "bf16_h64_prefill":
-        L.variant(route, grid=(T, 1, 1), total_work_items=T)
+        L.run(L.variant(route, grid=(T, 1, 1), total_work_items=T))
         return
 
     if route in ("bf16_h128_topk128x", "bf16_h128_topk4x_v52", "bf16_h128_prefill_v42"):
-        num_splits = 5 if route == "bf16_h128_topk4x_v52" else 1
-        program_variant = route
-        if route == "bf16_h128_prefill_v42" and _bf16_h128_prefill_uses_snake_feed(
-            T, topk, _bf16_h128_prefill_num_clusters(v["Q"].device)
-        ):
-            # CAKE-624 W17: boustrophedon work feed of the same body (see the
-            # predicate above); hardening-000037 0.77-0.90x -> 0.98-1.01x and
-            # hardening-000027 +8-10 % vs the striped program.
-            program_variant = "bf16_h128_prefill_v42_snake"
-        # The two-stage split program (four disjoint full-V KV owners + one
-        # LSE reducer) ships on both Blackwell targets: GB300 rows at width
-        # 260/388 measured 1.18-1.26x vs trtllm-gen against 0.83-1.05x for
-        # the single-owner kernel (CAKE-624 W2).  Mirrors the Cake seed's
-        # BF16_TOPK128X_SPLIT_ARCHES.  Above the token bound the rows run one
-        # full-V owner per token whose invalid (-1) sparse rows gather the
-        # tile's first index (CAKE-624 W12: hardening-000025/31 0.45-0.95x ->
-        # 1.13-1.65x); mirrors bf16_topk128x_uses_row_first_owner.
-        if (
-            route == "bf16_h128_topk128x"
-            and 256 < topk <= 388
-            and T > _BF16_TOPK128X_SPLIT_MAX_TOKENS
-        ):
-            program_variant = "bf16_h128_topk128x_row_first"
-        elif route == "bf16_h128_topk128x" and 256 < topk <= 388:
-            # Three live KV tiles run the four-owner program with a fully
-            # masked fourth tile: the split4 owner kernel is 12.3-13.0 us for
-            # width 260 against 14.8 us on the three-owner pair (GB300
-            # 1.23x -> 1.44x, B200 1.11x -> 1.29x vs trtllm-gen), so the
-            # three-owner program is retired.  Mirrors the Cake seed rule
-            # bf16_topk128x_uses_split3 (always False).
-            num_splits = 4
-            program_variant = "bf16_h128_topk128x_split4_sm100"
+        # The BF16/H128 producers launch directly with the grids their former
+        # single-route family libraries computed: two CTAs per work item.
+        producer = route
+        num_splits = plan.num_splits
+        grid_x = 2 * T
+        if route == "bf16_h128_prefill_v42":
+            # Persistent KV-reuse body: one two-CTA cluster per item, at most
+            # half the SMs in clusters; the boustrophedon feed of the same body
+            # serves the tail-majority rows (see the predicate above:
+            # hardening-000037 0.77-0.90x -> 0.98-1.01x, hardening-000027
+            # +8-10 % vs the striped feed).
+            clusters = _bf16_h128_prefill_num_clusters(v["Q"].device)
+            if _bf16_h128_prefill_uses_snake_feed(T, topk, clusters):
+                producer = "bf16_h128_prefill_v42_snake"
+            grid_x = min(2 * T, 2 * clusters)
+        elif route == "bf16_h128_topk4x_v52":
+            # Five fixed full-V KV owners per token plus the split-5 reducer
+            # (plan.num_splits == 5).
+            pass
+        elif T > _BF16_TOPK128X_SPLIT_MAX_TOKENS:
+            # Above the token bound one full-V owner per token whose invalid
+            # (-1) sparse rows gather the tile's first index
+            # (hardening-000025/31 0.45-0.95x -> 1.13-1.65x).  While four
+            # CTAs per token still fit one wave, each token runs two 2-CTA
+            # clusters that gather the full K tiles and only their 256-column
+            # V half (same MMA operands and order per element -> identical
+            # bits; -1.1 us / -8 % on the 32-token row on both targets): grid
+            # = 4 * tokens, total_work_items keeps meaning query tokens.
+            # Mirrors the Cake seed rule bf16_topk128x_uses_row_first_vsplit.
+            if T <= _BF16_ROW_FIRST_V_HALF_SPLIT_MAX_TOKENS:
+                producer = "bf16_h128_topk128x_row_first_vsplit"
+                grid_x = 4 * T
+            else:
+                producer = "bf16_h128_topk128x_row_first"
+        else:
+            # Two-stage split program on both Blackwell targets: four disjoint
+            # full-V KV owners (a three-tile row runs with the fourth tile
+            # masked: 12.3-13.0 us vs 14.8 us for a three-owner pair) plus one
+            # LSE reducer; GB300 width 260/388 rows measured 1.18-1.26x vs
+            # trtllm-gen against 0.83-1.05x for the single-owner kernel
+            # (plan.num_splits == 4).
+            producer = "bf16_h128_topk128x_split4_sm100"
         parts = L.partials(num_splits)
-        L.program(program_variant, total_work_items=T * num_splits, **parts)
+        if num_splits == 1:
+            L.run(L.variant(producer, grid=(grid_x, 1, 1), total_work_items=T, **parts))
+            return
+        # The split producers write their per-owner outputs through ``O``.
+        work_items = T * num_splits
+        split = L.variant(
+            producer,
+            grid=(2 * work_items, 1, 1),
+            total_work_items=work_items,
+            **{**parts, "O": parts["partial_O"]},
+        )
+        if num_splits == 5:
+            # The two split-5 reducers are different kernels with different
+            # launch contracts (copied from their former family libraries):
+            # the sm_103a body runs grid (tokens, heads / 4), the sm_100a
+            # body grid (tokens, heads).
+            reducer_heads = H // 4 if L.arch == "sm_103a" else H
+            reduce = L.variant(
+                "bf16_h128_split5_reduce", grid=(T, reducer_heads, 1), **parts
+            )
+        else:
+            reduce = L.reduce("split_reduce", **parts)
+        L.run(split, reduce)
         return
 
     if route == "fp8_h64_source_exact":
         head_tiles = _ceil_div(H, 64)
-        L.variant(
-            route,
-            grid=(v["max_q_len"], head_tiles, v["batch_size"]),
-            num_head_tiles=head_tiles,
-            total_work_items=v["max_q_len"] * head_tiles * v["batch_size"],
+        L.run(
+            L.variant(
+                route,
+                grid=(v["max_q_len"], head_tiles, v["batch_size"]),
+                num_head_tiles=head_tiles,
+                total_work_items=v["max_q_len"] * head_tiles * v["batch_size"],
+            )
         )
         return
 
@@ -1379,63 +2347,828 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         "fp8_h128_prefill_source_persistent_uniform",
     ):
         parts = L.partials(1)
-        L.variant(route, grid=(T * 2, 1, 1), total_work_items=T, **parts)
-        return
-
-    if route == "fp8_h64_prefill_source_persistent_m64":
-        # One CTA per token (cta_group::1, M = 64); same kernel kwargs as the
-        # FP8/H128 persistent body (num_heads runtime, -1 masking, padded rows,
-        # caller-owned workspace), grid = tokens.
-        parts = L.partials(1)
-        L.variant(route, grid=(T, 1, 1), total_work_items=T, **parts)
+        L.run(L.variant(route, grid=(T * 2, 1, 1), total_work_items=T, **parts))
         return
 
     if route in (
-        "fp8_lowhead_swa",
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile",
+    ):
+        # One CTA per token (cta_group::1, M = 64); same kernel kwargs as the
+        # FP8/H128 persistent body (num_heads runtime, -1 masking, padded rows,
+        # caller-owned workspace), grid = tokens.  Both M64 programs share the
+        # kernel ABI; _fp8_h64_m64_program picks one by the item width.
+        parts = L.partials(1)
+        L.run(L.variant(route, grid=(T, 1, 1), total_work_items=T, **parts))
+        return
+
+    if route in (
         "fp8_lowhead_one_partition",
-        "fp8_lowhead_split",
         "fp8_lowhead_h64",
-        "fp8_lowhead_h64_split",
         "fp8_lowhead_prefill",
     ):
-        num_splits = 2 if route in ("fp8_lowhead_split", "fp8_lowhead_h64_split") else 1
-        parts = L.partials(num_splits)
-        work_factor = (
-            2 if route in ("fp8_lowhead_swa", "fp8_lowhead_prefill") else num_splits
+        # One producer partition writes the final output directly.  The
+        # prefill producer runs one CTA per work item over two items per
+        # token; the decode producers run one two-CTA cluster per token.
+        work_items = 2 * T if route == "fp8_lowhead_prefill" else T
+        L.run(
+            L.variant(
+                route, grid=(2 * T, 1, 1), total_work_items=work_items, **L.partials(1)
+            )
         )
-        total_work_items = T * work_factor
-        cluster = 1 if route == "fp8_lowhead_prefill" else 2
-        producer = dict(parts)
-        if num_splits > 1:
-            # The FP8 split producers write their per-partition outputs through
-            # the ``O`` argument ([tokens, heads, splits, 512], as the Cake
-            # dispatcher passes its partial buffer); only the reducer writes
-            # the caller's output rows.
-            producer["O"] = parts["partial_O"]
-        L.variant(
-            route,
-            grid=(total_work_items * cluster, 1, 1),
-            total_work_items=total_work_items,
-            **producer,
-        )
-        if route == "fp8_lowhead_h64_split":
-            L.reduce("fp8_h64_split_reduce2", **parts)
-        elif num_splits > 1:
-            L.reduce("split_reduce", **parts)
         return
 
     raise RuntimeError(f"unhandled CAKE DSv4 route: {route}")
 
 
+# --------------------------------------------------------------------------- #
+# NVFP4 cache route                                                           #
+# --------------------------------------------------------------------------- #
+
+
+NVFP4Member = Literal["persistent", "cluster", "t64", "pv", "swap", "tile"]
+
+
+@dataclass(frozen=True)
+class NVFP4Plan:
+    """Launch plan of the NVFP4 decode family (Cake ``plan()`` output)."""
+
+    num_query_tokens: int
+    num_heads: int
+    num_head_tiles: int
+    main_width: int
+    extra_width: int
+    num_main_tiles: int
+    num_extra_tiles: int
+    total_tiles: int
+    num_splits: int
+    tiles_per_split: int
+    member: NVFP4Member
+    sm_count: int
+    tile_n: Optional[int] = (
+        None  # heads on the MMA N side of the SwapsAB / tile64 members (retrace knob)
+    )
+    o_chunks: int = 1  # CTAs per work item of the one-tile members (retrace knob)
+    merge_heads_per_cta: int = _NVFP4_MERGE_HEADS_PER_CTA
+
+    @property
+    def cluster_ctas(self) -> int:
+        return _NVFP4_CLUSTER_CTAS if self.member == "cluster" else 1
+
+    @property
+    def grid(self) -> int:
+        return (
+            self.num_query_tokens
+            * self.num_splits
+            * self.num_head_tiles
+            * self.cluster_ctas
+            * self.o_chunks
+        )
+
+    @property
+    def merge_groups(self) -> int:
+        return self.num_query_tokens * self.num_head_tiles
+
+    @property
+    def merge_grid(self) -> tuple[int, int, int]:
+        return (
+            self.num_query_tokens,
+            _ceil_div(self.num_heads, self.merge_heads_per_cta),
+            1,
+        )
+
+    @property
+    def variant(self) -> str:
+        return _nvfp4_variant_name(
+            self.member, tile_n=self.tile_n, o_chunks=self.o_chunks
+        )
+
+
+# Retrace knobs each member's generated program is specialised on, in variant-name order (Cake
+# flashinfer_blackwell_sparse_mla_dsv4_nvfp4_program.MEMBER_VARIANT_KNOBS).
+_NVFP4_VARIANT_KNOBS: Mapping[str, tuple[str, ...]] = {
+    "persistent": (),
+    "cluster": (),
+    "t64": ("tile_n", "o_chunks"),
+    "pv": ("tile_n", "o_chunks"),
+    "swap": ("tile_n", "o_chunks"),
+    "tile": ("o_chunks",),
+}
+_NVFP4_KNOB_TAGS = {"tile_n": "n", "o_chunks": "oc"}
+
+
+def _nvfp4_variant_name(
+    member: str, *, tile_n: Optional[int] = None, o_chunks: int = 1
+) -> str:
+    """Registered variant name of a member's physical program:
+    ``nvfp4_decode_<member>[_n<tile_n>][_oc<o_chunks>]`` (the merge is ``nvfp4_merge``)."""
+    if member not in _NVFP4_VARIANT_KNOBS:
+        raise ValueError(f"unknown NVFP4 family member {member!r}")
+    values = {"tile_n": tile_n, "o_chunks": o_chunks}
+    tags = []
+    for knob in _NVFP4_VARIANT_KNOBS[member]:
+        if values[knob] is None:
+            raise ValueError(f"{member}: variant knob {knob} is required")
+        tags.append(f"_{_NVFP4_KNOB_TAGS[knob]}{int(values[knob])}")
+    return "nvfp4_decode_" + member + "".join(tags)
+
+
+# Every decode variant a plan can select (the host names them statically so the export can check that each
+# generated program is bindable): persistent, cluster, t64 n64, pv n16 / n32, swap n{16,32} x oc{1,2,4},
+# tile oc{1,2,4}.
+_NVFP4_DECODE_VARIANTS = (
+    _NVFP4_VARIANT_PERSISTENT,
+    _NVFP4_VARIANT_CLUSTER,
+    "nvfp4_decode_t64_n64_oc1",
+    "nvfp4_decode_pv_n16_oc1",
+    "nvfp4_decode_pv_n32_oc1",
+    "nvfp4_decode_swap_n16_oc1",
+    "nvfp4_decode_swap_n16_oc2",
+    "nvfp4_decode_swap_n16_oc4",
+    "nvfp4_decode_swap_n32_oc1",
+    "nvfp4_decode_swap_n32_oc2",
+    "nvfp4_decode_swap_n32_oc4",
+    "nvfp4_decode_tile_oc1",
+    "nvfp4_decode_tile_oc2",
+    "nvfp4_decode_tile_oc4",
+)
+_NVFP4_VARIANTS = (*_NVFP4_DECODE_VARIANTS, _NVFP4_VARIANT_MERGE)
+
+
+def _nvfp4_split_shape(total_tiles: int, num_splits: int) -> tuple[int, int]:
+    """Canonical (splits, tiles per split): contiguous tile ranges, the split count is the number of non-empty
+    ranges (Cake ``_split_shape``)."""
+    num_splits = max(1, min(int(num_splits), total_tiles))
+    tiles_per_split = _ceil_div(total_tiles, num_splits)
+    num_splits = _ceil_div(total_tiles, tiles_per_split)
+    if num_splits > _NVFP4_MAX_SPLITS:
+        raise ValueError(
+            f"num_splits {num_splits} exceeds the NVFP4 route cap {_NVFP4_MAX_SPLITS}"
+        )
+    return num_splits, tiles_per_split
+
+
+def _nvfp4_plan_cost_us(
+    member: str,
+    *,
+    num_tokens: int,
+    num_heads: int,
+    head_tiles: int,
+    total_tiles: int,
+    num_splits: int,
+    sm_count: int,
+) -> float:
+    """Round-43 chain model of ``member`` running the row with ``num_splits`` splits (Cake ``plan_cost_us``)."""
+    head_us, tile_us, load_us = _NVFP4_PLAN_CHAIN_US[member]
+    num_splits, tiles_per_split = _nvfp4_split_shape(total_tiles, num_splits)
+    ctas_per_unit = _NVFP4_CLUSTER_CTAS if member == "cluster" else 1
+    grid = num_tokens * head_tiles * num_splits * ctas_per_unit
+    slots = sm_count - (sm_count % ctas_per_unit)
+    waves = _ceil_div(grid, slots)
+    chain = (
+        head_us + (tiles_per_split - 1) * tile_us + load_us * min(grid, slots) / slots
+    )
+    cost = waves * chain
+    if num_splits > 1:
+        cost += _NVFP4_PLAN_MERGE_US + _NVFP4_PLAN_MERGE_US_PER_MB * (
+            num_tokens * num_heads * (num_splits + 1) * _NVFP4_HEAD_DIM * 2 / 1e6
+        )
+    return cost
+
+
+def _nvfp4_plan_large_heads(
+    num_tokens: int, num_heads: int, total_tiles: int, sm_count: int
+) -> tuple[NVFP4Member, int]:
+    """(member, splits) with the lowest modelled cost for an H > _NVFP4_PV_MAX_HEADS row (Cake ``_plan_large_heads``):
+    the tile member at one tile per CTA, then persistent / cluster / tile64 over every canonical split count that
+    leaves >= 2 tiles per CTA; ties keep the earlier candidate."""
+    common = dict(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        total_tiles=total_tiles,
+        sm_count=sm_count,
+    )
+    head_tiles = _ceil_div(num_heads, _NVFP4_TILE_Q)
+    cands: list[tuple[NVFP4Member, int, float]] = [
+        (
+            "tile",
+            total_tiles,
+            _nvfp4_plan_cost_us(
+                "tile", head_tiles=head_tiles, num_splits=total_tiles, **common
+            ),
+        )
+    ]
+    for splits in range(1, min(total_tiles - 1, _NVFP4_MAX_SPLITS) + 1):
+        if _ceil_div(total_tiles, _ceil_div(total_tiles, splits)) != splits:
+            continue  # not a canonical split count
+        cands.append(
+            (
+                "persistent",
+                splits,
+                _nvfp4_plan_cost_us(
+                    "persistent", head_tiles=head_tiles, num_splits=splits, **common
+                ),
+            )
+        )
+        if num_heads >= _NVFP4_CLUSTER_MIN_HEADS:
+            cands.append(
+                (
+                    "cluster",
+                    splits,
+                    _nvfp4_plan_cost_us(
+                        "cluster", head_tiles=head_tiles, num_splits=splits, **common
+                    ),
+                )
+            )
+        if num_heads in _NVFP4_T64_HEAD_COUNTS:
+            cands.append(
+                (
+                    "t64",
+                    splits,
+                    _nvfp4_plan_cost_us(
+                        "t64",
+                        head_tiles=_ceil_div(num_heads, _NVFP4_T64_TILE_Q),
+                        num_splits=splits,
+                        **common,
+                    ),
+                )
+            )
+    best = min(cands, key=lambda c: c[2])
+    return best[0], best[1]
+
+
+def _nvfp4_pv_splits(
+    num_tokens: int, total_tiles: int, sm_count: int
+) -> tuple[int, int]:
+    """Split count of the persistent SwapsAB member for an H <= 32 row (Cake swap_pv ``plan``: one CTA per SM, the
+    chain ``waves * (HEAD + (tiles - 1) * TILE) + MERGE`` minimised over the split count; first minimum wins)."""
+    best = None
+    for cand in range(1, min(total_tiles, _NVFP4_MAX_SPLITS) + 1):
+        tiles_per_split = _ceil_div(total_tiles, cand)
+        splits = _ceil_div(total_tiles, tiles_per_split)
+        waves = _ceil_div(num_tokens * splits, sm_count)
+        cost = waves * (
+            _NVFP4_PV_PLAN_HEAD_US + (tiles_per_split - 1) * _NVFP4_PV_PLAN_TILE_US
+        ) + (_NVFP4_PV_PLAN_MERGE_US if splits > 1 else 0.0)
+        if best is None or cost < best[0] - 1e-9:
+            best = (cost, splits, tiles_per_split)
+    return best[1], best[2]
+
+
+def _nvfp4_swap_o_chunks(work_items: int, sm_count: int) -> int:
+    """CTAs per work item of the one-tile SwapsAB member: the largest of 4 / 2 / 1 whose grid fits one wave."""
+    if 4 * work_items <= sm_count:
+        return 4
+    if 2 * work_items <= sm_count:
+        return 2
+    return 1
+
+
+def _nvfp4_tile_o_chunks(work_items: int, sm_count: int) -> int:
+    """CTAs per work item of the one-tile member (two CTAs per SM at its footprint: half the SM count)."""
+    if 4 * work_items <= sm_count // 2:
+        return 4
+    if 2 * work_items <= sm_count // 2:
+        return 2
+    return 1
+
+
+def _nvfp4_merge_heads_per_cta(num_tokens: int, num_heads: int, sm_count: int) -> int:
+    """Heads (warps) per merge CTA: the smallest power of two <= 16 whose grid stays within one CTA per SM, else 16
+    (Cake ``merge_heads_per_cta``, round 45)."""
+    for hpc in (1, 2, 4, 8, 16):
+        if num_tokens * _ceil_div(num_heads, hpc) <= sm_count:
+            return hpc
+    return _NVFP4_MERGE_HEADS_PER_CTA
+
+
+def _nvfp4_plan(
+    *,
+    num_query_tokens: int,
+    num_heads: int,
+    sparse_topk: int,
+    extra_topk: int,
+    sm_count: int,
+) -> NVFP4Plan:
+    """Reproduce the Cake NVFP4 family ``plan()`` and member dispatch.
+
+    Candidate tiles are 128 wide (``total_tiles`` over both tables).  Rows with
+    ``H <= 32`` run the persistent SwapsAB member (``pv``) when its wave-aware
+    split rule gives more than one tile per CTA, otherwise the one-tile SwapsAB
+    member (``swap``, ``o_chunks`` CTAs per work item).  Rows with ``H >= 64``
+    pick (member, splits) from the round-43 chain model over the one-tile
+    ``tile`` member, the persistent member, the 2-CTA ``cluster`` member and the
+    tile64 member ``t64`` (64 heads per CTA; ``H128`` runs two head tiles).  The
+    split merge runs behind any member with ``num_splits > 1`` on
+    ``merge_heads_per_cta`` heads per CTA.
+    """
+    tokens = _positive_int(num_query_tokens, "num_query_tokens")
+    heads = _positive_int(num_heads, "num_heads")
+    if heads not in _NVFP4_HEAD_COUNTS:
+        raise ValueError(f"num_heads must be one of {_NVFP4_HEAD_COUNTS}, got {heads}")
+    sms = _positive_int(sm_count, "sm_count")
+    main_width = _positive_int(sparse_topk, "sparse_topk")
+    if (
+        isinstance(extra_topk, bool)
+        or not isinstance(extra_topk, int)
+        or extra_topk < 0
+    ):
+        raise ValueError(f"extra_topk must be a non-negative int, got {extra_topk!r}")
+    main_tiles = _ceil_div(main_width, _TILE_KV)
+    extra_tiles = _ceil_div(extra_topk, _TILE_KV)
+    total_tiles = main_tiles + extra_tiles
+    if total_tiles < 1:
+        raise ValueError("at least one candidate tile is required")
+    if total_tiles > _NVFP4_MAX_SPLITS:
+        raise ValueError(
+            f"total candidate tiles {total_tiles} exceeds the NVFP4 route cap {_NVFP4_MAX_SPLITS}"
+        )
+    num_head_tiles = _ceil_div(heads, _NVFP4_TILE_Q)
+    common = dict(
+        num_query_tokens=tokens,
+        num_heads=heads,
+        main_width=main_width,
+        extra_width=extra_topk,
+        num_main_tiles=main_tiles,
+        num_extra_tiles=extra_tiles,
+        total_tiles=total_tiles,
+        sm_count=sms,
+        merge_heads_per_cta=_nvfp4_merge_heads_per_cta(tokens, heads, sms),
+    )
+    # the persistent member's own split rule: enough CTAs to cover the SMs
+    p_splits, p_tiles = _nvfp4_split_shape(
+        total_tiles, max(1, min(total_tiles, _ceil_div(sms, tokens * num_head_tiles)))
+    )
+    if heads > _NVFP4_PV_MAX_HEADS:
+        member, splits = _nvfp4_plan_large_heads(tokens, heads, total_tiles, sms)
+        if member == "t64":
+            splits, tiles_per_split = _nvfp4_split_shape(total_tiles, splits)
+            return NVFP4Plan(
+                num_head_tiles=_ceil_div(heads, _NVFP4_T64_TILE_Q),
+                num_splits=splits,
+                tiles_per_split=tiles_per_split,
+                member="t64",
+                tile_n=_NVFP4_T64_TILE_Q,
+                o_chunks=1,
+                **common,
+            )
+        if member in ("cluster", "persistent"):
+            splits, tiles_per_split = _nvfp4_split_shape(total_tiles, splits)
+            return NVFP4Plan(
+                num_head_tiles=num_head_tiles,
+                num_splits=splits,
+                tiles_per_split=tiles_per_split,
+                member=member,
+                **common,
+            )
+        # the one-tile member: one candidate tile per CTA, o_chunks CTAs per work item
+        return NVFP4Plan(
+            num_head_tiles=num_head_tiles,
+            num_splits=total_tiles,
+            tiles_per_split=1,
+            member="tile",
+            o_chunks=_nvfp4_tile_o_chunks(tokens * total_tiles * num_head_tiles, sms),
+            **common,
+        )
+    pv_splits, pv_tiles = _nvfp4_pv_splits(tokens, total_tiles, sms)
+    if pv_tiles > 1:
+        return NVFP4Plan(
+            num_head_tiles=num_head_tiles,
+            num_splits=pv_splits,
+            tiles_per_split=pv_tiles,
+            member="pv",
+            tile_n=16 if heads <= 16 else 32,
+            o_chunks=1,
+            **common,
+        )
+    if p_tiles == 1:
+        # one-tile rows with H <= _NVFP4_SWAP_MAX_HEADS: the one-tile SwapsAB member
+        return NVFP4Plan(
+            num_head_tiles=num_head_tiles,
+            num_splits=total_tiles,
+            tiles_per_split=1,
+            member="swap",
+            tile_n=16 if heads <= 16 else 32,
+            o_chunks=_nvfp4_swap_o_chunks(tokens * total_tiles * num_head_tiles, sms),
+            **common,
+        )
+    return NVFP4Plan(
+        num_head_tiles=num_head_tiles,
+        num_splits=p_splits,
+        tiles_per_split=p_tiles,
+        member="persistent",
+        **common,
+    )
+
+
+def _nvfp4_sm_count(device: torch.device) -> int:
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+def _require_nvfp4_variant(variant: str, *, arch: str) -> None:
+    """Fail early and clearly while the NVFP4 sources are not exported yet."""
+    from ..jit.cake_dsv4 import get_cake_dsv4_spec
+
+    try:
+        get_cake_dsv4_spec(variant, arch=arch)
+    except ValueError as exc:
+        raise NotImplementedError(
+            "cake_dsv4 NVFP4 generated sources not yet exported: variant "
+            f"{variant!r} has no registered contract for {arch} "
+            "(csrc/cake_dsv4/<arch>/ and flashinfer/jit/cake_dsv4.py)"
+        ) from exc
+
+
+def _log2_page_size(page_size: int, *, name: str) -> int:
+    if page_size <= 0 or page_size & (page_size - 1):
+        raise ValueError(f"{name}: page_size must be a power of two, got {page_size}")
+    return page_size.bit_length() - 1
+
+
+def _nvfp4_cache_geometry(
+    cache: torch.Tensor,
+    *,
+    name: str,
+    kv_layout: Literal["HND", "NHD"],
+    page_size: Optional[int],
+    device: torch.device,
+) -> tuple[torch.Tensor, int, int]:
+    """``(flat uint8 [pages, page_stride] view, page_size, page_stride_bytes)`` of an NVFP4 pool.
+
+    Mirrors the Cake ``_cache_geometry``: accepts ``[P, bytes]`` (needs the
+    logical ``page_size``), HND ``[P, 1, page_size, 384]``, NHD
+    ``[P, page_size, 1, 384]`` and ``[P, page_size, 384]`` tensors. Tokens of a
+    page are contiguous 384-byte records; the page stride may be padded. No
+    copy is made.
+    """
+    if not isinstance(cache, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if cache.dtype != torch.uint8:
+        raise TypeError(f"{name} must be uint8, got {cache.dtype}")
+    if cache.device != device:
+        raise ValueError(f"{name} must be on {device}, got {cache.device}")
+    if cache.dim() == 2:
+        if not cache.is_contiguous():
+            raise ValueError(f"{name}: a 2-D packed pool must be contiguous")
+        if page_size is None:
+            raise ValueError(
+                f"{name}: a 2-D [pages, bytes] pool needs the logical page_size"
+            )
+        logical = _positive_int(page_size, f"{name} page_size")
+        page_stride = int(cache.shape[1])
+        if page_stride < logical * _NVFP4_TOKEN_BYTES:
+            raise ValueError(
+                f"{name}: page byte count {page_stride} is smaller than "
+                f"page_size {logical} x {_NVFP4_TOKEN_BYTES}"
+            )
+        return cache, logical, page_stride
+    if cache.dim() == 4:
+        if kv_layout == "HND":
+            if cache.shape[1] != 1:
+                raise ValueError(
+                    f"{name}: expected HND [P, 1, page_size, {_NVFP4_TOKEN_BYTES}], "
+                    f"got {tuple(cache.shape)}"
+                )
+            page_dim = 2
+        elif kv_layout == "NHD":
+            if cache.shape[2] != 1:
+                raise ValueError(
+                    f"{name}: expected NHD [P, page_size, 1, {_NVFP4_TOKEN_BYTES}], "
+                    f"got {tuple(cache.shape)}"
+                )
+            page_dim = 1
+        else:
+            raise ValueError(
+                f"kv_layout must be either 'HND' or 'NHD', got {kv_layout}"
+            )
+    elif cache.dim() == 3:
+        page_dim = 1
+    else:
+        raise ValueError(f"{name}: unsupported rank {cache.dim()}")
+    geometry_page_size = int(cache.shape[page_dim])
+    if (
+        int(cache.shape[-1]) != _NVFP4_TOKEN_BYTES
+        or int(cache.stride(-1)) != 1
+        or int(cache.stride(page_dim)) != _NVFP4_TOKEN_BYTES
+    ):
+        raise ValueError(
+            f"{name}: tokens must be contiguous {_NVFP4_TOKEN_BYTES}-byte records "
+            f"(shape {tuple(cache.shape)}, strides {cache.stride()})"
+        )
+    page_stride = int(cache.stride(0))
+    if page_stride < geometry_page_size * _NVFP4_TOKEN_BYTES:
+        raise ValueError(
+            f"{name}: page stride {page_stride} B is smaller than page_size * {_NVFP4_TOKEN_BYTES}"
+        )
+    if page_size is not None and int(page_size) != geometry_page_size:
+        raise ValueError(
+            f"{name}: page_size {page_size} does not match the cache geometry ({geometry_page_size})"
+        )
+    flat = cache.as_strided((int(cache.shape[0]), page_stride), (page_stride, 1))
+    return flat, geometry_page_size, page_stride
+
+
+def _nvfp4_lengths(
+    tensor: Optional[torch.Tensor], name: str, *, rows: int, device: torch.device
+) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    if tensor.dtype != torch.int32:
+        raise ValueError(f"{name} must be int32, got {tensor.dtype}")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    if not tensor.is_contiguous() or tensor.numel() < rows:
+        raise ValueError(
+            f"{name} must be a contiguous int32 tensor with >= {rows} entries"
+        )
+    return tensor
+
+
+def run_cake_dsv4_nvfp4(
+    *,
+    query: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    compressed_kv_cache: Optional[torch.Tensor],
+    workspace_buffer: torch.Tensor,
+    sparse_indices: torch.Tensor,
+    sparse_topk_lens: Optional[torch.Tensor],
+    out: torch.Tensor,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    sinks: Optional[torch.Tensor],
+    max_q_len: Optional[int],
+    cum_seq_lens_q: Optional[torch.Tensor],
+    seq_lens: Optional[torch.Tensor],
+    backend: Literal["cake"],
+    extra_sparse_indices: Optional[torch.Tensor] = None,
+    extra_sparse_topk_lens: Optional[torch.Tensor] = None,
+    kv_layout: Literal["HND", "NHD"] = "HND",
+    swa_page_size: Optional[int] = None,
+    compressed_page_size: Optional[int] = None,
+    lse_scale: float = 1.0,
+) -> torch.Tensor:
+    """Launch the CAKE DSv4 NVFP4 decode for ``query [rows, num_heads, 512]`` BF16.
+
+    ``sparse_indices [T, topk]`` (int32, unit inner stride) indexes
+    ``swa_kv_cache``; ``sparse_topk_lens`` (optional, int32 ``>= T``) clamps its
+    active prefix. ``extra_sparse_indices [T, extra_topk]`` indexes
+    ``compressed_kv_cache`` with ``extra_sparse_topk_lens``; without it the
+    compressed pool is unused. Both pools are opaque ``uint8`` NVFP4 pages (see
+    the module docstring); ``swa_page_size`` / ``compressed_page_size`` are
+    required for 2-D ``[pages, bytes]`` pools and otherwise checked against the
+    geometry. ``query`` / ``out`` may carry more rows than ``T``; rows ``>= T``
+    are untouched. ``max_q_len``, ``cum_seq_lens_q`` and ``seq_lens`` are
+    accepted for surface parity with :func:`run_cake_dsv4` but unused: the
+    kernels consume flat token coordinates. The base-2 LSE is written to the
+    workspace (not returned). No device memory is allocated.
+    """
+    if backend != "cake":
+        raise ValueError(f"expected backend='cake', got {backend!r}")
+    if query.ndim != 3:
+        raise ValueError(
+            f"query must be [num_tokens, num_heads, {_HEAD_DIM}], got shape {tuple(query.shape)}"
+        )
+    query_capacity, num_heads, head_dim = (int(d) for d in query.shape)
+    if head_dim != _HEAD_DIM:
+        raise ValueError(f"CAKE DSv4 requires head dim {_HEAD_DIM}, got {head_dim}")
+    if query.dtype != torch.bfloat16:
+        raise ValueError(
+            f"the CAKE DSv4 NVFP4 route takes a BF16 query, got {query.dtype}"
+        )
+    if not query.is_contiguous():
+        raise ValueError("query must be contiguous; backend='cake' makes no host copy")
+    if num_heads not in _NVFP4_HEAD_COUNTS:
+        raise ValueError(
+            f"num_heads must be one of {_NVFP4_HEAD_COUNTS}, got {num_heads}"
+        )
+    device = query.device
+    arch = _target_arch(device)
+
+    main_indices = _int32_table(sparse_indices, "sparse_indices")
+    if main_indices.device != device:
+        raise ValueError(
+            f"sparse_indices must be on {device}, got {main_indices.device}"
+        )
+    num_query_tokens = int(main_indices.shape[0])
+    if not 1 <= num_query_tokens <= query_capacity:
+        raise ValueError(
+            f"sparse_indices must describe 1..{query_capacity} query rows, got {num_query_tokens}"
+        )
+    main_width = int(main_indices.shape[1])
+    if extra_sparse_topk_lens is not None and extra_sparse_indices is None:
+        raise ValueError("extra_sparse_topk_lens requires extra_sparse_indices")
+    if extra_sparse_indices is not None:
+        extra_indices = _int32_table(
+            extra_sparse_indices, "extra_sparse_indices", rows=num_query_tokens
+        )
+        if extra_indices.device != device:
+            raise ValueError(
+                f"extra_sparse_indices must be on {device}, got {extra_indices.device}"
+            )
+        extra_width = int(extra_indices.shape[1])
+        if compressed_kv_cache is None:
+            raise ValueError("extra_sparse_indices requires compressed_kv_cache")
+    else:
+        extra_indices = main_indices
+        extra_width = 0
+    main_lengths = _nvfp4_lengths(
+        sparse_topk_lens, "sparse_topk_lens", rows=num_query_tokens, device=device
+    )
+    extra_lengths = _nvfp4_lengths(
+        extra_sparse_topk_lens,
+        "extra_sparse_topk_lens",
+        rows=num_query_tokens,
+        device=device,
+    )
+    if seq_lens is not None and seq_lens.dtype != torch.int32:
+        raise ValueError(f"seq_lens must be int32, got {seq_lens.dtype}")
+    if cum_seq_lens_q is not None and cum_seq_lens_q.dtype != torch.int32:
+        raise ValueError(f"cum_seq_lens_q must be int32, got {cum_seq_lens_q.dtype}")
+
+    main_flat, main_page_size, main_page_stride = _nvfp4_cache_geometry(
+        swa_kv_cache,
+        name="swa_kv_cache",
+        kv_layout=kv_layout,
+        page_size=swa_page_size,
+        device=device,
+    )
+    if extra_width:
+        extra_flat, extra_page_size, extra_page_stride = _nvfp4_cache_geometry(
+            compressed_kv_cache,
+            name="compressed_kv_cache",
+            kv_layout=kv_layout,
+            page_size=compressed_page_size,
+            device=device,
+        )
+    else:
+        extra_flat, extra_page_size, extra_page_stride = (
+            main_flat,
+            main_page_size,
+            main_page_stride,
+        )
+
+    if out.dtype != torch.bfloat16:
+        raise ValueError(f"out must be bfloat16, got {out.dtype}")
+    if out.device != device:
+        raise ValueError(f"out must be on {device}, got {out.device}")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous; backend='cake' makes no host copy")
+    row_elems = num_heads * _HEAD_DIM
+    if out.numel() % row_elems or out.numel() < num_query_tokens * row_elems:
+        raise ValueError(
+            f"out must hold at least {num_query_tokens} rows of [{num_heads}, {_HEAD_DIM}], "
+            f"got {tuple(out.shape)}"
+        )
+    query_rows = query[:num_query_tokens]
+    out_rows = out.view(-1, num_heads, _HEAD_DIM)[:num_query_tokens]
+
+    scale1 = _device_scale(bmm1_scale, device=device, name="bmm1_scale")
+    scale2 = _device_scale(bmm2_scale, device=device, name="bmm2_scale")
+    if sinks is not None:
+        if (
+            sinks.dtype != torch.float32
+            or sinks.device != device
+            or not sinks.is_contiguous()
+            or sinks.numel() < num_heads
+        ):
+            raise ValueError(
+                f"sinks must be a contiguous FP32 tensor with >= {num_heads} entries on {device}"
+            )
+    sink_tensor = sinks if sinks is not None else scale1
+    lse_scale = float(lse_scale)
+
+    plan = _nvfp4_plan(
+        num_query_tokens=num_query_tokens,
+        num_heads=num_heads,
+        sparse_topk=main_width,
+        extra_topk=extra_width,
+        sm_count=_nvfp4_sm_count(device),
+    )
+    num_splits = plan.num_splits
+
+    if workspace_buffer.device != device:
+        raise ValueError(
+            f"workspace_buffer must be on {device}, got {workspace_buffer.device}"
+        )
+    raw = _workspace_bytes(workspace_buffer)
+    layout = cake_dsv4_workspace_layout(
+        num_query_tokens, num_heads, num_splits, with_lse=True
+    )
+    _require_workspace_bytes(raw, layout.total_bytes)
+    partial_o, partial_lse = _partial_views(
+        raw, out_rows, num_query_tokens, num_heads, num_splits
+    )
+    lse_offset, lse_bytes = layout.lse
+    lse_out = raw[
+        lse_offset : lse_offset + num_query_tokens * num_heads * torch.float32.itemsize
+    ].view(torch.float32)
+    if num_splits == 1:
+        # The decode member writes the final output and base-2 LSE directly.
+        partial_lse = lse_out
+        lse_partial_scale = lse_scale
+        partial_o_tiles = out_rows.view(num_query_tokens, num_heads, 1, _HEAD_DIM)
+    else:
+        lse_partial_scale = 1.0
+        partial_o_tiles = partial_o.view(
+            num_query_tokens, num_heads, num_splits, _HEAD_DIM
+        )
+
+    _require_nvfp4_variant(plan.variant, arch=arch)
+    if num_splits > 1:
+        _require_nvfp4_variant(_NVFP4_VARIANT_MERGE, arch=arch)
+    main_g4d, main_g4f = _nvfp4_gather4_views(main_flat)
+    extra_g4d, extra_g4f = _nvfp4_gather4_views(extra_flat)
+
+    values: dict[str, Any] = {
+        "Q": query_rows,
+        "q_rows": query_rows,
+        "partial_O_tiles": partial_o_tiles,
+        "main_cache": main_flat,
+        "extra_cache": extra_flat,
+        "main_cache_g4d": main_g4d,
+        "main_cache_g4f": main_g4f,
+        "extra_cache_g4d": extra_g4d,
+        "extra_cache_g4f": extra_g4f,
+        "main_indices": main_indices,
+        "extra_indices": extra_indices,
+        "main_lengths": main_lengths if main_lengths is not None else main_indices,
+        "extra_lengths": extra_lengths if extra_lengths is not None else main_indices,
+        "sinks": sink_tensor,
+        "bmm1_scale": scale1,
+        "bmm2_scale": scale2,
+        "partial_O": partial_o,
+        "partial_lse": partial_lse,
+        "O": out_rows,
+        "lse_out": lse_out,
+        "num_query_tokens": num_query_tokens,
+        "num_heads": num_heads,
+        "num_head_tiles": plan.num_head_tiles,
+        "num_splits": num_splits,
+        "num_main_tiles": plan.num_main_tiles,
+        "tiles_per_split": plan.tiles_per_split,
+        "total_tiles": plan.total_tiles,
+        "main_width": main_width,
+        "extra_width": extra_width,
+        "main_index_stride": int(main_indices.stride(0)),
+        "extra_index_stride": int(extra_indices.stride(0)),
+        "has_main_lengths": int(main_lengths is not None),
+        "has_extra_lengths": int(extra_lengths is not None),
+        "main_page_shift": _log2_page_size(main_page_size, name="swa_kv_cache"),
+        "extra_page_shift": _log2_page_size(
+            extra_page_size, name="compressed_kv_cache"
+        ),
+        "main_page_stride": int(main_page_stride),
+        "extra_page_stride": int(extra_page_stride),
+        "has_sinks": int(sinks is not None),
+        "heads_per_cta": plan.merge_heads_per_cta,
+        "lse_partial_scale": float(lse_partial_scale),
+        "lse_scale": lse_scale,
+    }
+    launcher = _Launcher(
+        arch=arch,
+        workspace=workspace_buffer,
+        raw=raw,
+        values=values,
+    )
+    launches = [launcher.variant(plan.variant, grid=(plan.grid, 1, 1))]
+    if num_splits > 1:
+        # Split merge: one CTA per (token, heads_per_cta heads) over partial_O / partial_lse.
+        launches.append(launcher.variant(_NVFP4_VARIANT_MERGE, grid=plan.merge_grid))
+    # One host-side critical section per call, as for the BF16 / FP8 routes
+    # (descriptor-pool bookkeeping, descriptor checks, launch enqueues).
+    with _descriptor_lock:
+        launcher.run(*launches)
+    return out
+
+
+def _nvfp4_gather4_views(flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """TMA gather views of a flat NVFP4 pool (``[pages, page_stride]`` uint8) for the gather4 members: 32-byte-pitch
+    int32 rows -- data rows (88 x int32, overlapping: token ``t`` of page ``p`` is row ``p * page_stride / 32 + 11 t``)
+    and footer rows (8 x int32).  Mirrors the Cake members' ``_gather4_views``."""
+    f32 = flat.view(torch.int32).reshape(-1)
+    n_rows = f32.numel() // 8
+    n_data_rows = (
+        f32.numel() - 88
+    ) // 8 + 1  # the overlapping 88-element rows must stay inside the storage
+    return f32.as_strided((n_data_rows, 88), (8, 1)), f32.as_strided(
+        (n_rows, 8), (8, 1)
+    )
+
+
 __all__ = [
     "KERNEL_METADATA_PARAMS",
+    "NVFP4Plan",
+    "QUERY_LAYOUT_PARAMS",
     "SparseMetadata",
     "WorkspaceLayout",
+    "WorkspaceRequirement",
     "cake_dsv4_workspace_layout",
+    "cake_dsv4_workspace_requirement",
     "cake_dsv4_workspace_reset",
     "canonical_arg_name",
     "get_cake_dsv4_workspace_bytes",
     "is_bindable_arg",
     "resolve_cake_dsv4_sparse_metadata",
     "run_cake_dsv4",
+    "run_cake_dsv4_nvfp4",
 ]

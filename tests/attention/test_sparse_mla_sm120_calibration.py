@@ -176,7 +176,7 @@ def clean_cpb_state(store, monkeypatch, tmp_path):
 
 def _skip_if_low_vram(needed_gib: int) -> None:
     """Skip when the GPU cannot fit the multi-GiB KV pool (mirrors the
-    torch.cuda.mem_get_info precedent in test_mla_decode_kernel.py)."""
+    torch.cuda.mem_get_info precedent in test_mla_wrapper.py)."""
     if torch.cuda.mem_get_info(torch.device("cuda"))[0] < needed_gib * (1 << 30):
         pytest.skip(f"needs >= {needed_gib} GiB free VRAM for the KV pool")
 

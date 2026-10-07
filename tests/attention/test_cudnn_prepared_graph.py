@@ -43,6 +43,113 @@ def _reference(q, k, v, q_lens, kv_lens, scale):
     return torch.cat(outputs), torch.cat(stats)
 
 
+@pytest.mark.parametrize(
+    "require_ordered", [False, True], ids=["compatible", "ordered"]
+)
+def test_prepared_ragged_interleaved_wrappers_capture_replan(
+    monkeypatch, require_ordered
+):
+    """Shared graph-cache entries must not share shapes or changing bindings."""
+    if not cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16):
+        pytest.skip("requires direct cuDNN cumulative sequence lengths")
+    if require_ordered and not cudnn_prefill.supports_ordered_cudnn_execution(
+        cudnn_prefill.cudnn.pygraph
+    ):
+        pytest.skip("requires FE ordered tensor execution support")
+    torch.manual_seed(52)
+    scale = 128**-0.5
+    cases = []
+    for q_lens, kv_lens in (([3, 14], [9, 22]), ([9, 2], [7, 16])):
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            torch.empty(128 << 20, device="cuda", dtype=torch.uint8),
+            backend="cudnn",
+            use_cuda_graph=True,
+            qo_indptr_buf=torch.empty(3, device="cuda", dtype=torch.int32),
+            kv_indptr_buf=torch.empty(3, device="cuda", dtype=torch.int32),
+        )
+        q = torch.randn(sum(q_lens), 4, 128, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(sum(kv_lens), 2, 128, device="cuda", dtype=q.dtype)
+        v = torch.randn_like(k)
+        out = torch.empty_like(q)
+        lse = torch.empty(q.shape[:2], device=q.device)
+        cases.append((wrapper, q, k, v, out, lse, q_lens, kv_lens))
+
+    def plan(case):
+        wrapper, _, _, _, _, _, q_lens, kv_lens = case
+        wrapper.plan(
+            torch.tensor([0, q_lens[0], sum(q_lens)], dtype=torch.int32),
+            torch.tensor([0, kv_lens[0], sum(kv_lens)], dtype=torch.int32),
+            4,
+            2,
+            128,
+            causal=False,
+            q_data_type=torch.bfloat16,
+            sm_scale=scale,
+        )
+
+    def run(case):
+        wrapper, q, k, v, out, lse, _, _ = case
+        return wrapper.run(q, k, v, out=out, lse=lse, return_lse=True)
+
+    def check(case):
+        _, q, k, v, out, lse, q_lens, kv_lens = case
+        ref, ref_lse = _reference(q, k, v, q_lens, kv_lens, scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+    # Prepare both before capture. Their shapes fall in the same override class.
+    for case in cases:
+        plan(case)
+        run(case)
+        check(case)
+    if require_ordered:
+        original_execute = cudnn_prefill.cudnn.pygraph.execute
+
+        def require_tensor_sequence(self, tensors, *args, tensor_uids=None, **kwargs):
+            assert tensor_uids is not None, "ordered execution fell back to a mapping"
+            assert isinstance(tensors, (tuple, list))
+            return original_execute(
+                self, tensors, *args, tensor_uids=tensor_uids, **kwargs
+            )
+
+        # Include graph instances created after replan/workspace replacement.
+        # The same consumer contract applies to native and FROST providers.
+        monkeypatch.setattr(
+            cudnn_prefill.cudnn.pygraph, "execute", require_tensor_sequence
+        )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(cases[0])
+
+    # A second wrapper and replacement workspace cannot mutate captured bindings.
+    other = cases[1][0]
+    other.reset_workspace_buffer(
+        torch.empty_like(other._float_workspace_buffer), other._int_workspace_buffer
+    )
+    run(cases[1])
+    check(cases[1])
+
+    # Replan within the captured bounds, updating the registered indptr buffers.
+    first = cases[0]
+    first[-2].reverse()
+    first[-1].reverse()
+    plan(first)
+    first[1].mul_(0.5)
+    first[4].fill_(torch.nan)
+    first[5].fill_(torch.nan)
+    graph.replay()
+    check(first)
+
+    # The next eager call must use the caller's current stream, not capture's.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        first[3].neg_()
+        run(first)
+    torch.cuda.current_stream().wait_stream(stream)
+    check(first)
+
+
 @pytest.mark.parametrize("return_lse", [False, True])
 def test_prepared_ragged_rebind_replan_workspace(return_lse):
     if not cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16):

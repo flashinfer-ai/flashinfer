@@ -19,7 +19,8 @@ limitations under the License.
 # tcgen05 GEMM against the serialized ModelOpt weight -> BF16) for SM100 / SM103
 # (flashinfer-ai/flashinfer#4568, tracker #4254).  The public entry points are
 # ``flashinfer.gemm.prepare_kimi_k3_fp8_projection_weights``,
-# ``flashinfer.gemm.prepare_kimi_k3_fp8_projection`` and
-# ``flashinfer.gemm.kimi_k3_fp8_projection``; the weight preparation, the
+# ``flashinfer.gemm.prepare_kimi_k3_fp8_projection``,
+# ``flashinfer.gemm.kimi_k3_fp8_projection`` and
+# ``flashinfer.gemm.kimi_k3_fp8_projection_launcher``; the weight preparation, the
 # measured dispatch, the launch binding, the JIT registration and the
 # generated sources live in this package.

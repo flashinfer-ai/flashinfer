@@ -67,3 +67,32 @@ def test_clamped_layer_graph_routes(clamped_fixture, num_tokens):
     # Exercise the public MoELayer/weight-pack API and graph replay, including
     # every route family and the two count-rank selections.
     harness._layer_graph_case(fixture, num_tokens=num_tokens)
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_clamped_sources_keep_target_and_compile_options(target):
+    from flashinfer.jit import cake_fused_moe_warp_decode as jit
+
+    csrc = jit._get_cake_fused_moe_warp_decode_csrc_dir()
+    clamped = jit._load_clamped_e256_sources(csrc, target)
+    spec = jit.gen_cake_fused_moe_warp_decode_module(target)
+    assert len(spec.sources) == len(set(spec.sources))
+    if target == "sm100a":
+        assert len(clamped) == 15
+        assert set(clamped) <= set(spec.sources)
+        assert (
+            "-DFLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256=1" in spec.extra_cuda_cflags
+        )
+        for source in clamped:
+            assert "--use_fast_math" in spec.extra_cuda_cflags_by_source[source]
+    else:
+        assert not clamped
+        assert not any(
+            source.parent.name == "dsv4_clamped_e256" for source in spec.sources
+        )
+        assert (
+            "-DFLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256=0" in spec.extra_cuda_cflags
+        )
+    for source in spec.sources:
+        if source.name in jit._NO_FAST_MATH_SOURCES:
+            assert "--use_fast_math" not in spec.extra_cuda_cflags_by_source[source]

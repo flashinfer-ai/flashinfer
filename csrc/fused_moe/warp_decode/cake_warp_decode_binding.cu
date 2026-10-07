@@ -29,12 +29,6 @@
 #include "cake_warp_decode_contract.cuh"
 #include "tvm_ffi_utils.h"
 
-#ifndef FLASHINFER_CAKE_WARP_DECODE_HAS_SILU
-#define FLASHINFER_CAKE_WARP_DECODE_HAS_SILU 0
-#elif FLASHINFER_CAKE_WARP_DECODE_HAS_SILU != 0 && FLASHINFER_CAKE_WARP_DECODE_HAS_SILU != 1
-#error "FLASHINFER_CAKE_WARP_DECODE_HAS_SILU must be 0 or 1"
-#endif
-
 #ifndef FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256
 #define FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256 0
 #endif
@@ -219,9 +213,6 @@ Shape CheckedShape(int64_t num_tokens, int64_t hidden_size, int64_t intermediate
          "(H=6144, I=3072, E=128, top_k=4) with parameterized SwiGLU, "
          "(H=4096, I=2048, E=256, top_k=6) with clamped SwiGLU, or "
          "(H=3584, I=3072, E=896, top_k=16) with SiTU, with 1 <= num_tokens <= 32";
-  TVM_FFI_ICHECK(ActivationForGeometry(schedule.geometry) != Activation::kSiLU ||
-                 FLASHINFER_CAKE_WARP_DECODE_HAS_SILU)
-      << "cake warp decode SiLU generated programs are not installed for this exact target";
   TVM_FFI_ICHECK(schedule.geometry != Geometry::kH4096I2048E256K6 ||
                  FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256)
       << "clamped E256 generated programs are not installed for this exact target";
