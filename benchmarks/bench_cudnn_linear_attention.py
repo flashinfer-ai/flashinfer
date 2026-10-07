@@ -360,6 +360,17 @@ def observe_route(run):
     """Collect real Python launch/build paths on an untimed call only."""
     routes = set()
     plans = []
+    adapter = importlib.import_module("flashinfer.cudnn.linear_attention")
+    original_run = adapter._run_la_graph
+    cudnn_executions = 0
+
+    def record_execution(*args, **kwargs):
+        nonlocal cudnn_executions
+        result = original_run(*args, **kwargs)
+        # A build decline may enter the adapter before auto falls back. Only
+        # a successful execution proves cuDNN ran, independent of FE internals.
+        cudnn_executions += 1
+        return result
 
     def trace(frame, event, arg):
         if event != "call":
@@ -382,12 +393,31 @@ def observe_route(run):
             )
 
     previous = sys.getprofile()
-    sys.setprofile(trace)
+    adapter._run_la_graph = record_execution
     try:
+        sys.setprofile(trace)
         result = run()
     finally:
         sys.setprofile(previous)
-    return result, dict(python_calls=sorted(routes), frontend_plans=plans)
+        adapter._run_la_graph = original_run
+    return result, dict(
+        python_calls=sorted(routes),
+        frontend_plans=plans,
+        cudnn_executions=cudnn_executions,
+    )
+
+
+def check_route(backend, route, eager_route=None):
+    """Reject missing route proof and eager/capture provider changes."""
+    uses_cudnn = bool(route["cudnn_executions"])
+    if route["frontend_plans"] and not uses_cudnn:
+        raise AssertionError("frontend execution bypassed the cuDNN route observer")
+    if backend == "cudnn" and not uses_cudnn:
+        raise AssertionError("cuDNN route detection observed no successful execution")
+    if backend not in ("auto", "cudnn") and uses_cudnn:
+        raise AssertionError(f"{backend} unexpectedly executed cuDNN")
+    if eager_route is not None and uses_cudnn != bool(eager_route["cudnn_executions"]):
+        raise AssertionError("eager and captured calls selected different providers")
 
 
 def check_ownership(args, arm):
@@ -399,6 +429,7 @@ def prepare_arm(args, data, backend, references, norm):
     arm = make_runner(args, data, backend, norm)
     arm["state"].copy_(data["seed"])
     actual, route = observe_route(arm["run"])
+    check_route(backend, route)
     torch.cuda.synchronize()
     if args.family == "gdn" and backend in ("native-auto", "cudnn"):
         if bool(route["frontend_plans"]) != (backend == "cudnn"):
@@ -444,17 +475,14 @@ def prepare_arm(args, data, backend, references, norm):
         backend,
         actual_norm,
         capture=True,
-        capture_uses_cudnn=bool(route["frontend_plans"]),
+        capture_uses_cudnn=bool(route["cudnn_executions"]),
     )
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(capture_stream):
         captured["state"].copy_(data["seed"])
         result, capture_route = observe_route(captured["run"])
-        if bool(route["frontend_plans"]) != bool(capture_route["frontend_plans"]):
-            raise AssertionError(
-                "eager and captured calls selected different providers"
-            )
+        check_route(backend, capture_route, eager_route=route)
         capture_stream.synchronize()
         assert_result(args, result, references[actual_norm])
         graph = torch.cuda.CUDAGraph()
