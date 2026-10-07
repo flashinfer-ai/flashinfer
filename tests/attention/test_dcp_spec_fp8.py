@@ -12,7 +12,7 @@ from flashinfer.cake_dcp import (
     get_dcp_spec_workspace_size_bytes,
 )
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import get_compute_capability, is_sm100a_supported
 
 
 _HEAD_DIM = 128
@@ -23,6 +23,8 @@ _LOG2_E = math.log2(math.e)
 def _require_blackwell_dcp() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
+    if get_compute_capability(torch.device("cuda")) == (10, 7):
+        pytest.skip("Cake FMHA DCP supports SM100 and SM103, not SM107")
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("Cake FMHA DCP requires SM100 or SM103")
 
@@ -232,7 +234,7 @@ def _run_public_rank(
         bmm2_scale=bmm2_scale,
         out=out.flatten(0, 1),
         kv_layout="HND",
-        backend="trtllm-gen",
+        backend="cake",
         q_len_per_req=q_len,
         lse=lse.flatten(0, 1),
         return_lse=True,

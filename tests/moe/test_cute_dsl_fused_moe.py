@@ -64,8 +64,9 @@ def _skip_sm107_unimplemented_moe_features(request):
     """Skip parameterizations the SM107 (Rubin) CuTe DSL MoE kernels do not implement.
 
     ``fused_moe/cute_dsl/rubin/`` holds a narrower specialisation of the
-    Blackwell kernels rather than a port of them: the gather kernel hardcodes
-    SwiGLU and exposes no ``activation_type``, its wrapper has no
+    Blackwell kernels rather than a port of them: the gather kernel implements
+    SwiGLU (including its SiTU variant) and Relu2 but not GeGLU-tanh or custom
+    SwiGLU alpha/beta/limit constants, its wrapper has no
     ``a_per_token_scale_ptr``, and the finalize kernel implements no unfused
     path. The wrappers raise ``NotImplementedError`` for these cases, which is
     correct behaviour -- but on Rubin it reports as a test failure on every CI
@@ -97,7 +98,7 @@ def _skip_sm107_unimplemented_moe_features(request):
         pytest.skip("SM107 finalize kernel implements only the fused path")
 
     if params.get("activation_type") == ActivationType.GegluTanh:
-        pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
+        pytest.skip("SM107 gather grouped GEMM does not implement GeGLU-tanh")
 
     # test_geglu_tanh_accuracy sets the activation in its body rather than via a
     # parameter, so it has to be matched by identity. Match the function exactly
@@ -105,7 +106,7 @@ def _skip_sm107_unimplemented_moe_features(request):
     # prefix but only exercises normalize_cute_dsl_moe_activation_type, touches no
     # kernel, and passes on SM107 -- a substring match silently dropped it.
     if request.node.function.__name__ == "test_geglu_tanh_accuracy":
-        pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
+        pytest.skip("SM107 gather grouped GEMM does not implement GeGLU-tanh")
 
     if (
         request.node.function.__name__
@@ -249,7 +250,12 @@ def test_w4a4_and_w4a8_use_distinct_tuner_cache_keys():
     [
         (ActivationType.Swiglu, None, 1.0, "requires situ_beta"),
         (ActivationType.Swiglu, 0.0, None, "positive and finite"),
-        (ActivationType.GegluTanh, 1.0, None, "require ActivationType.Swiglu"),
+        (
+            ActivationType.GegluTanh,
+            1.0,
+            None,
+            "require ActivationType.Swiglu",
+        ),
     ],
 )
 def test_invalid_situ_config(activation_type, situ_beta, situ_linear_beta, error: str):
@@ -284,6 +290,70 @@ def test_situ_changes_autotuner_cache_key(quant_mode: str):
     runners = [swiglu_runner, situ_runner, situ_beta_runner, situ_linear_runner]
     assert len({hash(runner) for runner in runners}) == len(runners)
     assert len({runner.get_cache_key_extras([]) for runner in runners}) == len(runners)
+
+
+@cute_dsl_available
+@pytest.mark.parametrize("k", [128, 256, 384, 512])
+@pytest.mark.parametrize("num_tokens", [1, 17])
+@pytest.mark.parametrize("tile_m", [128, 256])
+def test_gather_gemm_k_tail(k, num_tokens, tile_m):
+    if not torch.cuda.is_available() or get_compute_capability(
+        torch.device("cuda")
+    ) not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Requires Blackwell SM100 or SM103")
+
+    from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion,
+    )
+
+    device = "cuda"
+    n = 256
+    # Two FP4 ones per byte. An extra row keeps the old kernel's tail reads
+    # inside allocated storage, so a failure cannot poison the CUDA context.
+    a_storage = torch.full(
+        (num_tokens + 1, k // 2), 0x22, dtype=torch.uint8, device=device
+    )
+    a = a_storage[:num_tokens]
+    # E4M3 1.0 = 0x38; 0x7f is NaN. Reading the extra scale row must not
+    # contaminate the last real row, even though the weight K tail is zero.
+    scale_storage = torch.full(
+        (num_tokens + 1, k // 16), 0x7F, dtype=torch.uint8, device=device
+    )
+    a_scale = scale_storage[:num_tokens]
+    a_scale.fill_(0x38)
+    b = torch.full((1, n, k // 2), 0x22, dtype=torch.uint8, device=device)
+    b_scale = torch.full(
+        (32, 4, n // 128, 4, k // 64, 1), 0x38, dtype=torch.uint8, device=device
+    )
+    mapping = torch.full((tile_m,), -1, dtype=torch.int32, device=device)
+    mapping[:num_tokens] = torch.arange(num_tokens - 1, -1, -1, device=device)
+
+    output, _ = blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+        a=a,
+        b=b,
+        a_scale=a_scale,
+        b_scale=b_scale,
+        alpha=torch.full((1,), 1.0 / k, device=device),
+        tile_idx_to_expert_idx=torch.zeros(1, dtype=torch.int32, device=device),
+        tile_idx_to_mn_limit=torch.tensor(
+            [num_tokens], dtype=torch.int32, device=device
+        ),
+        token_id_mapping=mapping,
+        num_non_exiting_tiles=torch.ones(1, dtype=torch.int32, device=device),
+        topk=1,
+        c_dtype="bfloat16",
+        mma_tiler_mn=(tile_m, 128),
+        cluster_shape_mn=(tile_m // 128, 1),
+        enable_pdl=False,
+    )
+    # Both projections are dot(ones, ones) / K = 1, hence SwiGLU = sigmoid(1).
+    expected = torch.full_like(
+        output[:num_tokens], torch.sigmoid(torch.tensor(1.0)).item()
+    )
+    torch.testing.assert_close(output[:num_tokens], expected, rtol=0, atol=0)
 
 
 # =============================================================================
@@ -681,6 +751,47 @@ class TestInputsHelperContract:
             "token_selected_experts tensors. The seeded "
             "torch.random.fork_rng + manual_seed pattern in "
             "generate_token_selected_experts is broken."
+        )
+
+
+# =============================================================================
+# Test: routing PDL forwarding (no GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+@pytest.mark.parametrize("enable_pdl", [False, True], ids=["pdl-off", "pdl-on"])
+def test_moe_core_forwards_enable_pdl(monkeypatch, enable_pdl):
+    from flashinfer.fused_moe.cute_dsl import fused_moe
+
+    class RoutingReached(Exception):
+        pass
+
+    def check_routing_pdl(**kwargs):
+        assert kwargs["enable_pdl"] is enable_pdl
+        # Stop before routing or GEMM kernels execute; only test flag forwarding.
+        raise RoutingReached
+
+    monkeypatch.setattr(fused_moe, "moe_sort", check_routing_pdl)
+
+    with pytest.raises(RoutingReached):
+        fused_moe._moe_core_impl(
+            x=torch.empty((2, 8), dtype=torch.uint8),
+            x_sf=torch.empty((2, 1), dtype=torch.uint8),
+            token_selected_experts=torch.zeros((2, 1), dtype=torch.int32),
+            token_final_scales=torch.ones((2, 1), dtype=torch.float32),
+            w1_weight=torch.empty((1, 32, 8), dtype=torch.uint8),
+            w1_weight_sf=torch.empty((1, 32, 1), dtype=torch.uint8),
+            w1_alpha=torch.ones(1, dtype=torch.float32),
+            fc2_input_scale=torch.ones(1, dtype=torch.float32),
+            w2_weight=torch.empty((1, 16, 8), dtype=torch.uint8),
+            w2_weight_sf=torch.empty((1, 16, 1), dtype=torch.uint8),
+            w2_alpha=torch.ones(1, dtype=torch.float32),
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            use_async_memset=False,
+            enable_pdl=enable_pdl,
         )
 
 
@@ -1411,19 +1522,28 @@ class TestCuteDslMoeW4A16:
             ),
         ],
     )
+    @pytest.mark.parametrize(
+        "half_tile_tail", [False, True], ids=["tail1", "tail-half-plus1"]
+    )
+    @pytest.mark.parametrize("top_k", [2, 3])
+    @pytest.mark.parametrize("use_fused_finalize", [False, True])
     def test_route_tile_boundary_accuracy(
         self,
         route_tile: int,
         gemm1_tactic: tuple,
         gemm2_tactic: tuple,
+        half_tile_tail: bool,
+        top_k: int,
+        use_fused_finalize: bool,
     ):
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             launch_w4a16_moe,
         )
         from flashinfer.fused_moe.cute_dsl.tuner import W4A16_MOE_TACTICS
 
-        num_tokens, hidden_size, intermediate_size = route_tile + 1, 256, 512
-        num_experts, top_k = 8, 2
+        num_tokens = route_tile + (route_tile // 2 + 1 if half_tile_tail else 1)
+        hidden_size, intermediate_size = 256, 512
+        num_experts = 8
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
@@ -1432,7 +1552,7 @@ class TestCuteDslMoeW4A16:
             num_local_experts=num_experts,
             top_k=top_k,
         )
-        # Give two experts one full route tile and one boundary tile each.
+        # Give each selected expert one full route tile and one boundary tile.
         tensors["token_selected_experts"][:] = torch.arange(
             top_k, device=tensors["token_selected_experts"].device
         )
@@ -1456,7 +1576,7 @@ class TestCuteDslMoeW4A16:
             moe_output=torch.empty(
                 (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
             ),
-            use_fused_finalize=False,
+            use_fused_finalize=use_fused_finalize,
             enable_pdl=False,
             activation_type=ActivationType.Swiglu,
             tactic=tactic,
@@ -1600,15 +1720,20 @@ class TestCuteDslFusedMoeFunctional:
         )
 
     @pytest.mark.parametrize(
-        "quant_mode, use_per_token_activation",
-        _MOE_QUANT_MODE_CASES,
+        "quant_mode,use_per_token_activation,use_fused_finalize,hidden_sizes",
+        [
+            pytest.param("w4a4", False, True, (256, 384), id="w4a4-per-tensor"),
+            pytest.param("w4a4", True, True, (256, 384), id="w4a4-per-token"),
+            pytest.param("w4a16", False, False, (256, 384, 256), id="w4a16-ordinary"),
+            pytest.param("w4a16", False, True, (256, 384, 256), id="w4a16-fused"),
+        ],
     )
-    @pytest.mark.parametrize("hidden_size", [256, 384])
     def test_finalize_handles_cluster_padding_and_partial_tiles(
         self,
         quant_mode: str,
         use_per_token_activation: bool,
-        hidden_size: int,
+        use_fused_finalize: bool,
+        hidden_sizes: tuple[int, ...],
         monkeypatch: pytest.MonkeyPatch,
     ):
         from flashinfer.autotuner import AutoTuner
@@ -1624,8 +1749,8 @@ class TestCuteDslFusedMoeFunctional:
                 ((256, 256), (2, 2), False),
             )
         elif quant_mode == "w4a16":
-            # W4A16 clusters 128-wide M CTAs in pairs, so hidden=384 leaves a
-            # padding peer.
+            # The same cache sees a full cluster, a padding peer, then a full
+            # cluster again. Keep route tails in both finalize modes.
             tail_config = (
                 ((256, 128, 256), (2, 1), True),
                 ((256, 128, 256), (2, 1), True),
@@ -1639,17 +1764,18 @@ class TestCuteDslFusedMoeFunctional:
             return runners[0], tail_config
 
         monkeypatch.setattr(AutoTuner, "choose_one", choose_tail_config)
-        self._run_numerical_accuracy(
-            activation_type=ActivationType.Relu2,
-            num_tokens=128,
-            top_k=2,
-            hidden_size=hidden_size,
-            intermediate_size=512,
-            num_experts=8,
-            quant_mode=quant_mode,
-            use_per_token_activation=use_per_token_activation,
-            use_fused_finalize=True,
-        )
+        for hidden_size in hidden_sizes:
+            self._run_numerical_accuracy(
+                activation_type=ActivationType.Relu2,
+                num_tokens=128,
+                top_k=2,
+                hidden_size=hidden_size,
+                intermediate_size=512,
+                num_experts=8,
+                quant_mode=quant_mode,
+                use_per_token_activation=use_per_token_activation,
+                use_fused_finalize=use_fused_finalize,
+            )
 
     def _run_numerical_accuracy(
         self,
@@ -1664,12 +1790,6 @@ class TestCuteDslFusedMoeFunctional:
         use_fused_finalize: bool,
     ):
         from flashinfer import cute_dsl_fused_moe
-
-        if activation_type == ActivationType.Relu2 and is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
-                "(SwiGLU) activation path"
-            )
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_local_experts = num_experts
@@ -1820,12 +1940,6 @@ class TestCuteDslFusedMoeFunctional:
         situ_linear_beta: float | None,
     ):
         """Accuracy test for SiTU with optional smooth up-branch clamping."""
-        if is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels do not implement SiTU; the "
-                "gather kernel is SwiGLU-only and silently ignores situ_beta/"
-                "situ_linear_beta"
-            )
         from flashinfer import cute_dsl_fused_moe
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
@@ -2324,12 +2438,6 @@ class TestCuteDslMoEWrapper:
         """Test wrapper API with autotune context."""
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
-
-        if activation_type == ActivationType.Relu2 and is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
-                "(SwiGLU) activation path"
-            )
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
@@ -3446,7 +3554,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
         mxfp8_quantize,
     )
     from flashinfer.autotuner import AutoTuner
-    from flashinfer.fused_moe import CuteDslConfig, QuantVariant
+    from flashinfer.fused_moe import CuteDslConfig, QuantConfig, QuantFormat
 
     torch.manual_seed(20260827)
     device = torch.device("cuda")
@@ -3488,7 +3596,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
     view = CuteDslConfig.prepare_weights(
         w1,
         w2,
-        variant=QuantVariant.MXFP4,
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -3628,6 +3736,450 @@ def test_w4a8_fused_moe_tactics_and_apis(
     )
     passed, percent_within, atol = check_accuracy(functional, reference)
     assert passed, f"Only {percent_within * 100:.2f}% within tolerance ({atol=:.4f})"
+
+
+@cute_dsl_available
+@sm10x_required
+class TestRubinMultiCtaTacticRejected:
+    """A Rubin tactic with ``cluster_shape_m > 1`` must be refused.
+
+    ``moe_sort`` leaves tile-metadata entries past ``num_non_exiting_tiles``
+    uninitialized. A multi-CTA cluster would require the tile count handed to
+    the kernel to be rounded up to a multiple of ``cluster_shape_m`` so every
+    cluster reaches its barrier uniformly, which widens the kernels' bounds
+    check past what routing wrote. Neither the rounding nor the matching
+    buffer initialization is implemented.
+
+    ``get_valid_tactics`` filters these out during autotuning, but that path
+    is bypassed by an explicitly supplied or cache-restored tactic, so
+    ``_moe_core_impl`` refuses them too. Both paths are covered here, and the
+    rejection is asserted to happen *before* routing runs.
+    """
+
+    pytestmark = _requires_dsl_arch
+
+    @staticmethod
+    def _rubin_tactic_params(gemm1_cluster_m: int, gemm2_cluster_m: int):
+        """Synthetic Rubin tactic parameters, optionally multi-CTA."""
+        return dict(
+            gemm1_mma_tiler=(128, 128, 256),
+            gemm1_mma_inst_shape=(128, 128, 128),
+            gemm1_cluster_shape_mn=(gemm1_cluster_m, 1),
+            gemm2_mma_tiler=(128, 128, 256),
+            gemm2_mma_inst_shape=(128, 128, 128),
+            gemm2_cluster_shape_mn=(gemm2_cluster_m, 1),
+        )
+
+    @pytest.mark.parametrize(
+        "gemm1_cluster_m,gemm2_cluster_m", [(2, 1), (1, 2), (2, 2)]
+    )
+    def test_rejected_before_routing(
+        self, monkeypatch, gemm1_cluster_m: int, gemm2_cluster_m: int
+    ):
+        """Rejection must precede ``moe_sort`` and any GEMM launch."""
+        import flashinfer.fused_moe.cute_dsl.fused_moe as fused_moe_mod
+        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+
+        routing_calls = []
+
+        def _tripwire(*args, **kwargs):
+            routing_calls.append(1)
+            raise AssertionError(
+                "moe_sort ran before the multi-CTA tactic was rejected"
+            )
+
+        monkeypatch.setattr(fused_moe_mod, "moe_sort", _tripwire)
+
+        num_experts, top_k = 256, 8
+        tensors = create_moe_tensors(
+            num_tokens=64,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        with pytest.raises(NotImplementedError, match="cluster_shape_m"):
+            _moe_core_impl(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_experts,
+                output_dtype=torch.bfloat16,
+                **self._rubin_tactic_params(gemm1_cluster_m, gemm2_cluster_m),
+            )
+
+        assert not routing_calls, "routing ran despite an unsupported tactic"
+
+    def test_single_cta_rubin_tactic_is_not_rejected(self, monkeypatch):
+        """Guard against the check rejecting every Rubin tactic.
+
+        Without this, a predicate inverted to ``>= 1`` would still pass the
+        rejection cases above while disabling Rubin entirely.
+        """
+        import flashinfer.fused_moe.cute_dsl.fused_moe as fused_moe_mod
+        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+
+        class _Reached(Exception):
+            pass
+
+        def _tripwire(*args, **kwargs):
+            raise _Reached
+
+        monkeypatch.setattr(fused_moe_mod, "moe_sort", _tripwire)
+
+        num_experts, top_k = 256, 8
+        tensors = create_moe_tensors(
+            num_tokens=64,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        # Reaching moe_sort means the tactic was accepted, which is the point.
+        with pytest.raises(_Reached):
+            _moe_core_impl(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_experts,
+                output_dtype=torch.bfloat16,
+                **self._rubin_tactic_params(1, 1),
+            )
+
+    def test_autotuner_filters_multi_cta_tactics(self):
+        """``_tactic_ok`` must drop synthetic multi-CTA Rubin tactics.
+
+        Complements the runtime backstop above: this is the primary
+        rejection, applied while the autotuner enumerates candidates.
+        """
+        from flashinfer.fused_moe.cute_dsl.tuner import (
+            ALL_RUBIN_MOE_TACTICS,
+            _is_rubin_tactic,
+        )
+
+        assert ALL_RUBIN_MOE_TACTICS
+        base_tile, base_gemm1, base_gemm2 = ALL_RUBIN_MOE_TACTICS[0]
+        mma_tiler, mma_inst_shape, _, raster = base_gemm1
+        synthetic = (
+            base_tile,
+            (mma_tiler, mma_inst_shape, (2, 1), raster),
+            base_gemm2,
+        )
+        assert _is_rubin_tactic(synthetic), "synthetic tactic is not Rubin-shaped"
+        assert synthetic not in ALL_RUBIN_MOE_TACTICS, (
+            "a multi-CTA tactic is present in the enumerated Rubin list"
+        )
+
+
+@cute_dsl_available
+@sm10x_required
+class TestOddTileCountBoundsContract:
+    """Exercise the active-count bounds contract at an *odd* tile count.
+
+    ``moe_sort`` leaves tile-metadata entries past ``num_non_exiting_tiles``
+    uninitialized; both GEMMs must read strictly within that count. An odd
+    count is the interesting case, because a multi-CTA rounding scheme would
+    round it up and read exactly one entry the routing kernel never wrote.
+
+    Routing is constructed so the tile count is deterministic and odd, and
+    the count is asserted at runtime -- without that assertion a change in
+    tiling could silently make this an even-count test that proves nothing.
+
+    Between CUDA-graph replays the routing is changed in place, so tail
+    entries written by the previous replay remain in the buffers. If any
+    consumer ever read past the active count, those stale values would
+    surface as divergence rather than being harmlessly ignored.
+    """
+
+    pytestmark = _requires_dsl_arch
+
+    TILE_SIZE = 128
+    POISON = 0x7FFFFFFE
+
+    @staticmethod
+    def _routing_for_tile_count(num_tokens, top_k, target_tiles, device="cuda"):
+        """Route every token across the first ``target_tiles`` experts.
+
+        Each token picks ``top_k`` distinct experts from a window of
+        ``target_tiles``, so exactly that many experts are non-empty. Sized
+        so no expert exceeds one tile, making the tile count exactly
+        ``target_tiles``.
+        """
+        assert target_tiles >= top_k, "need at least top_k experts to fill"
+        idx = torch.arange(num_tokens, device=device).unsqueeze(1)
+        offs = torch.arange(top_k, device=device).unsqueeze(0)
+        return ((idx + offs) % target_tiles).to(torch.int32)
+
+    @staticmethod
+    def _default_tactic_kwargs():
+        """Arch-correct tactic parameters for a direct ``_moe_core_impl`` call.
+
+        SM107 rejects the Blackwell defaults outright ("SM107 requires the
+        Rubin tactic parameters mma_tiler and mma_inst_shape"), so the tactic
+        has to come from the same place the runner gets it. Filtered by
+        signature because ``_extract_tactic_params`` also returns keys
+        ``_moe_core_impl`` does not take (``is_rubin``, ``*_raster_along_m``).
+        """
+        import inspect
+
+        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+        from flashinfer.fused_moe.cute_dsl.tuner import (
+            _extract_tactic_params,
+            _get_default_tactic,
+        )
+
+        allowed = set(inspect.signature(_moe_core_impl).parameters)
+        params = _extract_tactic_params(_get_default_tactic())
+        return {k: v for k, v in params.items() if k in allowed}
+
+    def _run_eager(self, tensors, buffers, num_experts, top_k, tactic_kwargs):
+        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+
+        return _moe_core_impl(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            moe_sort_buffers=buffers,
+            output_dtype=torch.bfloat16,
+            **tactic_kwargs,
+        )
+
+    @pytest.mark.parametrize("target_tiles", [9, 11])
+    def test_odd_tile_count_with_poisoned_buffers(self, target_tiles: int):
+        """Eager run at an odd tile count with both tile maps poisoned."""
+        from flashinfer.fused_moe.cute_dsl.moe_utils import allocate_moe_sort_buffers
+
+        assert target_tiles % 2 == 1, "this test is about odd tile counts"
+
+        num_tokens, top_k = 64, 8
+        hidden_size, intermediate_size = 256, 512
+        num_experts = 256
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        tensors["token_selected_experts"] = self._routing_for_tile_count(
+            num_tokens, top_k, target_tiles
+        )
+
+        tactic_kwargs = self._default_tactic_kwargs()
+        tile_size = tactic_kwargs.get("tile_size", self.TILE_SIZE)
+        buffers = allocate_moe_sort_buffers(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            tile_tokens_dim=tile_size,
+            device="cuda",
+        )
+        assert buffers, "allocate_moe_sort_buffers returned nothing to poison"
+        for buf in buffers.values():
+            buf.fill_(self.POISON)
+
+        result = self._run_eager(tensors, buffers, num_experts, top_k, tactic_kwargs)
+        torch.cuda.synchronize()
+
+        # The whole point of the test: confirm routing really produced an odd
+        # count. If tiling changes, fail loudly instead of silently passing.
+        active = int(buffers["out_num_non_exiting_tiles"][0].item())
+        assert active == target_tiles, (
+            f"expected {target_tiles} active tiles, routing produced {active}; "
+            f"this test no longer exercises the odd-count case"
+        )
+
+        assert not torch.isnan(result).any(), "NaN with poisoned buffers"
+        assert not torch.isinf(result).any(), "Inf with poisoned buffers"
+
+        # Entries past the active count must still hold poison -- proof that
+        # nothing wrote them and, combined with a correct result, that nothing
+        # read them either.
+        tail = buffers["out_tile_idx_to_expert_idx"][active:]
+        assert (tail == self.POISON).all(), (
+            "routing wrote past num_non_exiting_tiles; the uninitialized-tail "
+            "contract documented in moe_sort no longer holds"
+        )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            gemm1_alpha=tensors["w1_alpha"],
+            gemm2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            num_local_experts=num_experts,
+            local_expert_offset=0,
+        )
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"odd tile count {target_tiles}: only {percent_within * 100:.2f}% "
+            f"within tolerance (atol={atol:.4f}) -- a poison sentinel from "
+            f"past the active count leaked into the result"
+        )
+
+    def test_cuda_graph_replay_with_changed_routing(self):
+        """Replay at a shrinking odd tile count so a stale tail is present.
+
+        Order matters: replaying 11 active tiles and then 9 leaves entries
+        9-10 holding what the previous replay wrote. Replaying 9 then 11
+        would grow the active prefix and overwrite those entries, so the
+        stale-tail condition would never arise and the test would pass
+        without exercising anything.
+
+        The realized count is asserted after each replay, and the stale
+        entries are checked to have actually survived, so the setup cannot
+        silently stop reproducing the condition.
+        """
+        from flashinfer.fused_moe.cute_dsl.moe_utils import allocate_moe_sort_buffers
+
+        num_tokens, top_k = 64, 8
+        hidden_size, intermediate_size = 256, 512
+        num_experts = 256
+        high, low = 11, 9
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        routing_slot = tensors["token_selected_experts"]
+        routing_high = self._routing_for_tile_count(num_tokens, top_k, high)
+        routing_low = self._routing_for_tile_count(num_tokens, top_k, low)
+
+        tactic_kwargs = self._default_tactic_kwargs()
+        tile_size = tactic_kwargs.get("tile_size", self.TILE_SIZE)
+        # Pre-allocated buffers are required for CUDA graph capture, and they
+        # are also what makes the active count and the tail observable here.
+        buffers = allocate_moe_sort_buffers(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            tile_tokens_dim=tile_size,
+            device="cuda",
+        )
+        for buf in buffers.values():
+            buf.fill_(self.POISON)
+
+        def _run():
+            return self._run_eager(tensors, buffers, num_experts, top_k, tactic_kwargs)
+
+        routing_slot.copy_(routing_high)
+        for _ in range(3):
+            _run()
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            output = _run()
+        torch.cuda.synchronize()
+
+        expert_map = buffers["out_tile_idx_to_expert_idx"]
+        stale_from_high = None
+
+        for routing, expected, label in (
+            (routing_high, high, "high"),
+            (routing_low, low, "low"),
+        ):
+            # In place, so the captured graph reads the new routing and the
+            # previous replay's tail values stay where they are.
+            routing_slot.copy_(routing)
+            g.replay()
+            torch.cuda.synchronize()
+
+            active = int(buffers["out_num_non_exiting_tiles"][0].item())
+            assert active == expected, (
+                f"replay {label}: expected {expected} active tiles, got "
+                f"{active}; this test no longer exercises the intended counts"
+            )
+
+            if label == "high":
+                stale_from_high = expert_map[low:high].clone()
+            else:
+                # The shrunk prefix must have left the previous replay's
+                # entries untouched -- that is the stale tail whose being
+                # ignored is the property under test.
+                assert torch.equal(expert_map[low:high], stale_from_high), (
+                    "entries beyond the active count were rewritten, so no "
+                    "stale tail survived and this test proves nothing"
+                )
+
+            assert not torch.isnan(output).any(), f"NaN after replay {label}"
+            assert not torch.isinf(output).any(), f"Inf after replay {label}"
+
+            ref_output = compute_reference_moe_fp4(
+                hidden_states=tensors["x_bf16"].float().cuda(),
+                gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+                gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+                gemm1_alpha=tensors["w1_alpha"],
+                gemm2_alpha=tensors["w2_alpha"],
+                token_selected_experts=routing_slot,
+                token_final_scales=tensors["token_final_scales"],
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                fc2_input_scale=tensors["fc2_input_scale"],
+                num_local_experts=num_experts,
+                local_expert_offset=0,
+            )
+            passed, percent_within, atol = check_accuracy(output, ref_output)
+            assert passed, (
+                f"replay {label} ({expected} active tiles): only "
+                f"{percent_within * 100:.2f}% within tolerance "
+                f"(atol={atol:.4f}) -- a stale tile-map entry from the "
+                f"previous replay leaked into this one"
+            )
 
 
 if __name__ == "__main__":

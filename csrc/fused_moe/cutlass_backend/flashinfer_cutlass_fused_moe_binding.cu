@@ -150,20 +150,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kDisabled;
     mInnerDimMultiplier = 1;
 
-    auto make_humming_runner = [&] {
-      mInnerDimMultiplier = 2;
-      mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
-      TVM_FFI_ICHECK(mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16)
-          << "Humming-style MXFP4 x FP8 requires FP16/BF16 inputs and online FP8 activation "
-             "quantization.";
-      TVM_FFI_ICHECK(mActivationDtype == mOutputDtype)
-          << "Humming-style MXFP4 x FP8 online activation quantization currently requires "
-             "activation dtype and output dtype to match.";
-      mKernelRunner =
-          switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, true, false,
-                             kernels::Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
-    };
-
     // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
     if (mActivationDtype == dl_float16 && mWeightDtype == dl_float16) {
       mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, half>>();
@@ -214,6 +200,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>(mOutputDtype);
     }
 #endif
+
+    auto make_humming_runner = [&] {
+      mInnerDimMultiplier = 2;
+      mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
+      TVM_FFI_ICHECK(mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16)
+          << "Humming-style MXFP4 x FP8 requires FP16/BF16 inputs and online FP8 activation "
+             "quantization.";
+      TVM_FFI_ICHECK(mActivationDtype == mOutputDtype)
+          << "Humming-style MXFP4 x FP8 online activation quantization currently requires "
+             "activation dtype and output dtype to match.";
+      mKernelRunner =
+          switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, true, false,
+                             kernels::Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
+    };
 
     if (isWMxfp4AFp8HummingQuant()) {
       TVM_FFI_ICHECK_EQ(sm, 90) << "Humming-style MXFP4 x FP8 is only supported on SM90.";
@@ -922,7 +922,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
             tensorrt_llm::cutlass_extensions::MainloopScheduleType::SINGLE_WARPGROUP_ROLLING;
     if (is_single_warpgroup) {
       if (!mUseWfp4Afp8Humming || profile.sm_version != 90 || tile_m != 128 || tile_k != 128 ||
-          (tile_n != 8 && tile_n != 16 && tile_n != 32 && tile_n != 40) ||
+          (tile_n != 8 && tile_n != 16 && tile_n != 32 && tile_n != 40 && tile_n != 64) ||
           profile.cluster_shape !=
               tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_1x1x1 ||
           gemm_n % 128 != 0) {

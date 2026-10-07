@@ -96,6 +96,16 @@ inline __device__ void convertAndStore(int16_t* output, float input) {
 // Philox-4x32 PRNG (matches Triton's tl.randint)
 // =============================================================================
 
+// Derive a per-layer Philox seed with the SplitMix64 finalizer (Stafford mix13).
+// Multi-layer kernels use this to derive independent layer streams from one
+// base seed; single-layer kernels receive their layer-specific seed directly.
+__device__ __forceinline__ int64_t layer_philox_seed(int64_t base_seed, int layer) {
+  uint64_t z = static_cast<uint64_t>(base_seed) ^ (0x9E3779B97F4A7C15ULL * (uint64_t(layer) + 1));
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return static_cast<int64_t>(z ^ (z >> 31));
+}
+
 // Generates four pseudorandom uint32s from (seed, offset) using the Philox-4x32 algorithm.
 // Produces bit-identical output to Triton's tl.randint4x(seed, offset, n_rounds).
 // The offset is int64 and split across Philox c0 (low 32 bits) and c1 (high
@@ -148,19 +158,21 @@ __device__ __forceinline__ uint32_t philox_randint(int64_t seed, int64_t offset)
 }
 
 // Hardware `cvt.rs.*` (stochastic-rounding convert) is available ONLY on the
-// datacenter Blackwell "a" targets that actually carry the `.rs` PTX feature:
-// sm_100a (B200) and sm_103a (B300).  There is NO generic CUDA feature macro for
-// it — `__CUDA_ARCH_SPECIFIC__` is too broad (sm_120a defines it but ptxas
-// rejects `.rs`), so the arches are enumerated here in ONE place.
+// datacenter Blackwell and Rubin "a" targets that carry the `.rs` PTX feature:
+// sm_100a (B200), sm_103a (B300), and sm_107a (Rubin). There is NO generic CUDA
+// feature macro for it — `__CUDA_ARCH_SPECIFIC__` is too broad (sm_120a defines
+// it but ptxas rejects `.rs`), so the arches are enumerated here in ONE place.
 //
 // The trap this guard exists to avoid: B300 is sm_103a and does NOT define
 // `__CUDA_ARCH_FEAT_SM100_ALL`, so a SM100-only guard silently compiled the
 // ~12-instruction software emulation there — measured +99% SR cost at b1024 vs
 // +24% on B200 (2026-07-13).  sm_110a / sm_120a lack `.rs` (ptxas errors) → they
 // correctly fall to the software path below.  Extend the list only after
-// confirming `cvt.rs.f16x2.f32` assembles for the new arch.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
-    (defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL))
+// confirming `cvt.rs.f16x2.f32` assembles for the new arch.  sm_107a: verified with
+// the CUDA 13.4 ptxas (sm_110a/sm_120a still reject `.rs`).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 &&                             \
+    (defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL) || \
+     defined(__CUDA_ARCH_FEAT_SM107_ALL))
 #define FLASHINFER_MAMBA_HAS_CVT_RS 1
 #else
 #define FLASHINFER_MAMBA_HAS_CVT_RS 0
@@ -206,7 +218,7 @@ __device__ __forceinline__ uint16_t cvt_rs_f16_sw(float x, uint32_t rand13) {
 __device__ __forceinline__ uint32_t cvt_rs_f16x2_f32(float a, float b, uint32_t rbits);
 
 // Stochastic rounding: convert one fp32 value to fp16 using 13 random bits.
-// On sm_100a+: uses PTX cvt.rs.f16x2.f32 with a dummy zero second input.
+// On sm_100a/sm_103a/sm_107a: uses PTX cvt.rs.f16x2.f32 with a dummy zero second input.
 // On other archs: software emulation.
 __device__ __forceinline__ __half cvt_rs_f16_f32(float x, uint32_t rand13) {
 #if FLASHINFER_MAMBA_HAS_CVT_RS
@@ -221,7 +233,7 @@ __device__ __forceinline__ __half cvt_rs_f16_f32(float x, uint32_t rand13) {
 }
 
 // Stochastic rounding: convert two fp32 values to packed fp16x2 using random bits.
-// On sm_100a+: uses PTX cvt.rs.f16x2.f32 instruction.
+// On sm_100a/sm_103a/sm_107a: uses PTX cvt.rs.f16x2.f32 instruction.
 // On other archs: software emulation matching the hardware behavior.
 //
 // rbits layout (from PTX docs):

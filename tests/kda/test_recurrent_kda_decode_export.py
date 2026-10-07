@@ -13,8 +13,14 @@
 # limitations under the License.
 
 import dataclasses
+import os
+import subprocess
+import sys
+import textwrap
 import importlib
+import inspect
 import math
+import typing
 from types import SimpleNamespace
 
 import pytest
@@ -22,13 +28,37 @@ import torch
 import torch.nn.functional as F
 from packaging.version import Version
 
+from flashinfer import recurrent_kda as public_recurrent_kda
 from flashinfer.kda_decode import recurrent_kda
 
 kda_decode_module = importlib.import_module("flashinfer.kda_decode")
 recurrent_module = importlib.import_module("flashinfer.kda_kernels.recurrent_kda")
 cake_decode_jit_module = importlib.import_module("flashinfer.jit.cake_kda_decode")
 
+# This file is the deprecated facade's regression suite, so its own deprecation
+# is expected rather than a finding. Matched by message so unrelated
+# DeprecationWarnings still surface.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:flashinfer.kda_decode.recurrent_kda is deprecated:DeprecationWarning"
+)
+
 _D = 128
+
+
+@pytest.fixture(autouse=True)
+def _fresh_frozen_decode_selection_cache():
+    """Every test starts from empty frozen-decode selection and module caches.
+
+    The cache is keyed by tensor address/shape/stride/dtype, so a test that
+    monkeypatches the selector or emulates another architecture must not see a
+    schedule memoized by an earlier test on recycled allocator addresses.
+    """
+
+    recurrent_module._reset_frozen_decode_caches()
+    yield
+    recurrent_module._reset_frozen_decode_caches()
+
+
 _T = 5
 _VARIANT_PREFIX = "d128_t5_precomputed_gram_split"
 _T3 = 3
@@ -245,6 +275,7 @@ def _patch_cpu_selector_environment(monkeypatch, *, sm_count=148, cc=(10, 0)):
         "get_device_properties",
         lambda device: SimpleNamespace(multi_processor_count=sm_count),
     )
+    recurrent_module._device_multi_processor_count.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -283,6 +314,108 @@ def test_public_backend_option_rejects_unknown_value_cpu(monkeypatch):
     tensors = [object() for _ in range(5)]
     with pytest.raises(ValueError, match="backend must be"):
         recurrent_kda(*tensors, backend="unknown")
+
+
+def test_decode_facade_deprecation_points_at_the_canonical_entry_point_cpu(
+    monkeypatch,
+):
+    """The shim warns, and blames the caller's line rather than its own."""
+    monkeypatch.setattr(
+        kda_decode_module, "_run_recurrent_kda", lambda **kwargs: (object(), None)
+    )
+    tensors = [object() for _ in range(5)]
+    with pytest.warns(DeprecationWarning, match=r"flashinfer\.recurrent_kda") as record:
+        recurrent_kda(*tensors)
+    assert record[0].filename == __file__
+
+
+def test_decode_facade_deprecation_blames_the_caller_under_api_logging_cpu():
+    """Attribution must survive FLASHINFER_LOGLEVEL>0 (see #5248 review).
+
+    The loglevel fixes the decorator chain's depth at import time, so it cannot
+    be varied in-process; a subprocess is the only way to pin it.
+    """
+
+    program = textwrap.dedent(
+        """
+        import warnings
+        from flashinfer.kda_decode import recurrent_kda
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                recurrent_kda(*[object()] * 5)
+            except Exception:
+                pass
+        blamed = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        print(blamed[0].filename if blamed else "NONE")
+        """
+    )
+    env = {**os.environ, "FLASHINFER_LOGLEVEL": "1"}
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    blamed = result.stdout.strip().splitlines()[-1]
+    assert blamed == "<string>", f"warning blamed {blamed!r}, not the caller"
+
+
+def test_omitted_backend_stays_distinguishable_from_explicit_cute_dsl_cpu():
+    """``None`` records "not requested", which an explicit value cannot.
+
+    Both resolve to ``"cute-dsl"`` today -- see
+    ``test_public_backend_option_forwards_to_kernel_layer_cpu`` -- so the only
+    thing this pins is that the distinction survives, which is what lets a
+    later release converge omitted calls onto ``"auto"`` without overriding
+    callers who named ``"cute-dsl"``.
+    """
+    assert inspect.signature(recurrent_kda).parameters["backend"].default is None
+
+
+def _backend_enum(func) -> set[str]:
+    """The ``backend`` annotation's literal values, through any ``Optional``.
+
+    ``get_args`` on ``Optional[Literal[...]]`` yields the inner ``Literal`` and
+    ``NoneType`` rather than the strings, so the enum has to be unwrapped one
+    level to be assertable at all.
+    """
+
+    annotation = inspect.signature(func).parameters["backend"].annotation
+    args = typing.get_args(annotation)
+    values = {arg for arg in args if isinstance(arg, str)}
+    for arg in args:
+        values |= {inner for inner in typing.get_args(arg) if isinstance(inner, str)}
+    return values
+
+
+def test_decode_facade_rejects_cudnn_by_naming_the_phase_neutral_facade_cpu(
+    monkeypatch,
+):
+    """The two facades' ``backend`` enums differ on purpose, so say why.
+
+    ``"cudnn"`` is valid on ``flashinfer.recurrent_kda`` and not here, because
+    the cuDNN engine serves ordinary multi-token prefill only. A caller who
+    switches import paths should learn that from the error rather than read it
+    as an unrecognised value.
+    """
+    monkeypatch.setattr(
+        kda_decode_module,
+        "_run_recurrent_kda",
+        lambda **kwargs: pytest.fail(f"unexpected kernel call: {kwargs}"),
+    )
+    tensors = [object() for _ in range(5)]
+    with pytest.raises(ValueError, match="flashinfer.recurrent_kda"):
+        recurrent_kda(*tensors, backend="cudnn")
+
+    top_level = importlib.import_module("flashinfer.kda").recurrent_kda
+    assert "cudnn" in _backend_enum(top_level)
+    assert "cudnn" not in _backend_enum(recurrent_kda)
+    # Without this the negative assertion above passes vacuously whenever the
+    # annotation stops being unwrappable, which is how it read before #5248.
+    assert "cute-dsl" in _backend_enum(recurrent_kda)
 
 
 def test_cake_backend_rejects_empty_packed_decode_instead_of_noop_cpu():
@@ -939,7 +1072,7 @@ def test_frozen_runner_selects_physical_target_and_forwards_ffi_abi_cpu(
 
     assert loaded == [(variant, expected_target)]
     (args,) = module.calls
-    assert len(args) == 15
+    assert len(args) == 16
     assert args[:5] == (
         tensors["q"],
         tensors["k"],
@@ -957,7 +1090,8 @@ def test_frozen_runner_selects_physical_target_and_forwards_ffi_abi_cpu(
     )
     assert args[12] == tensors["scale"]
     assert args[13] == 0.0
-    assert args[14] == 0xCAFE
+    assert args[14] == 0
+    assert args[15] == 0xCAFE
 
 
 @pytest.mark.parametrize(
@@ -1157,8 +1291,9 @@ def test_t3_frozen_runner_forwards_real_gate_parameters_cpu(monkeypatch):
     assert args[5] is tensors["A_log"]
     assert args[6] is tensors["dt_bias"]
     assert args[13] == tensors["lower_bound"]
-    assert len(args) == 15
-    assert args[14] == 0xFACE
+    assert len(args) == 16
+    assert args[14] == 0
+    assert args[15] == 0xFACE
 
 
 def _padded_slot_state(slots, num_value_heads, device, *, seed):
@@ -1895,6 +2030,679 @@ def test_t1_unbounded_softplus_auto_route_tp_shapes_match_cute_with_strided_inpu
     assert actual_state_storage.numel() > actual_state.numel()
 
 
+@pytest.mark.parametrize(
+    ("ineligible", "num_heads", "num_sequences"),
+    [
+        # Straddle ONE_WARP_MIN_SEQUENCE_HEADS (128 sequence-heads): the two CuTe
+        # routes carry different state conventions, so a fallback correct on one
+        # can write zero rows on the other.
+        ("qk_l2norm_off", 32, 2),
+        ("qk_l2norm_off", 32, 4),
+        # A padded head dimension is a witness only below the threshold; the
+        # one-warp route rejects the layout under "cute-dsl" too, so there is no
+        # divergence to assert there.
+        ("padded_head_dim", 32, 2),
+    ],
+)
+def test_t1_unbounded_softplus_auto_falls_back_to_cute_when_cake_cannot_serve(
+    flash_kda_device, monkeypatch, num_heads, num_sequences, ineligible
+):
+    generator = torch.Generator(device=flash_kda_device).manual_seed(4935 + num_heads)
+    state_slots = 2 * num_sequences + 1
+    case = _make_case(
+        flash_kda_device,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        num_value_heads=num_heads,
+        num_tokens=1,
+        seed=4935 + num_heads,
+    )
+
+    A_log = (
+        torch.rand(
+            num_heads,
+            dtype=torch.float32,
+            device=flash_kda_device,
+            generator=generator,
+        )
+        - 1.5
+    )
+    dt_bias = torch.randn(
+        num_heads * _D,
+        dtype=torch.float32,
+        device=flash_kda_device,
+        generator=generator,
+    )
+    # Non-identity indices are load-bearing: identity indices hide a state
+    # convention mismatch regardless of pool contents.
+    state_indices = (
+        2 * torch.arange(num_sequences, dtype=torch.int32, device=flash_kda_device) + 1
+    )
+    logical_initial = torch.randn(
+        (state_slots, num_heads, _D, _D),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+        generator=generator,
+    )
+
+    case.update(
+        beta_is_logit=True,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        use_gate_in_kernel=True,
+        lower_bound=None,
+        ssm_state_indices=state_indices,
+    )
+    if ineligible == "qk_l2norm_off":
+        case["use_qk_l2norm_in_kernel"] = False
+    else:
+        padded = torch.randn(
+            (num_sequences, 1, num_heads, _D + 8),
+            dtype=torch.bfloat16,
+            device=flash_kda_device,
+            generator=generator,
+        )
+        case["q"] = padded[..., :_D]
+
+    baseline_state = logical_initial.clone()
+    expected_output, expected_state = recurrent_kda(
+        **_call_kwargs(
+            baseline_case := dict(case),
+            state=baseline_state,
+            output=torch.empty_like(case["output"]),
+        ),
+        backend="cute-dsl",
+    )
+
+    frozen_calls = []
+    run_frozen = recurrent_module._run_flash_kda_decode
+
+    def track_frozen_call(variant, **kwargs):
+        frozen_calls.append(variant)
+        return run_frozen(variant, **kwargs)
+
+    monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
+    actual_state = logical_initial.clone()
+    actual_before = actual_state.clone()
+    actual_output, actual_state_result = recurrent_kda(
+        **_call_kwargs(
+            dict(baseline_case),
+            state=actual_state,
+            output=torch.empty_like(case["output"]),
+        ),
+        backend="auto",
+    )
+
+    # The negative contract this test exists for: Cake is not servable here, so
+    # "auto" must reach CuTe rather than raise.
+    assert frozen_calls == []
+    # Bit-exact, not approximate: after the fallback both spellings launch the
+    # same kernel on the same inputs, so any drift is a convention mismatch.
+    torch.testing.assert_close(
+        actual_state_result.float(), expected_state.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state[state_indices].float(),
+        baseline_state[state_indices].float(),
+        atol=0,
+        rtol=0,
+    )
+    untouched = torch.ones(state_slots, dtype=torch.bool, device=flash_kda_device)
+    untouched[state_indices.to(torch.long)] = False
+    torch.testing.assert_close(
+        actual_state[untouched], actual_before[untouched], atol=0, rtol=0
+    )
+
+    # Explicitly naming Cake still reports the unsupported contract.
+    with pytest.raises(ValueError, match="contract is unsupported"):
+        recurrent_kda(
+            **_call_kwargs(
+                dict(baseline_case),
+                state=logical_initial.clone(),
+                output=torch.empty_like(case["output"]),
+            ),
+            backend="cake",
+        )
+
+
+def _unbounded_softplus_cake_ineligible_case(device, *, num_sequences, num_heads, seed):
+    """A T=1 unbounded-softplus decode case the Cake selector always rejects."""
+
+    generator = torch.Generator(device=device).manual_seed(seed)
+    case = _make_case(
+        device,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        num_value_heads=num_heads,
+        num_tokens=1,
+        seed=seed,
+    )
+    case.update(
+        beta_is_logit=True,
+        A_log=torch.rand(
+            num_heads, dtype=torch.float32, device=device, generator=generator
+        )
+        - 1.5,
+        dt_bias=torch.randn(
+            num_heads * _D, dtype=torch.float32, device=device, generator=generator
+        ),
+        use_gate_in_kernel=True,
+        lower_bound=None,
+        use_qk_l2norm_in_kernel=False,
+    )
+    return case
+
+
+@pytest.mark.parametrize("num_sequences", [2, 4])
+def test_t1_unbounded_softplus_default_auto_falls_back_with_dense_state(
+    flash_kda_device, monkeypatch, num_sequences
+):
+    """The public default preserves caller-owned state when Cake rejects.
+
+    Two and four sequences straddle the grouped-CTA/one-warp threshold at 32
+    heads while exercising the same dense, unindexed state contract.
+    """
+
+    num_heads = 32
+    case = _unbounded_softplus_cake_ineligible_case(
+        flash_kda_device,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        seed=4941,
+    )
+    assert case["cu_seqlens"] is None
+    assert case["ssm_state_indices"] is None
+    assert case["initial_state"].is_contiguous()
+
+    baseline_case = dict(case)
+    for name in ("q", "k", "v", "g", "beta", "A_log", "dt_bias"):
+        baseline_case[name] = case[name].clone()
+    baseline_state = case["initial_state"].clone()
+    expected_output, expected_state = recurrent_kda(
+        **_call_kwargs(
+            baseline_case,
+            state=baseline_state,
+            output=torch.empty_like(case["output"]),
+        ),
+        backend="cute-dsl",
+    )
+
+    selected_variants = []
+    select_flash_kda_variant = recurrent_module._select_flash_kda_decode_variant
+
+    def track_flash_kda_selection(**kwargs):
+        variant = select_flash_kda_variant(**kwargs)
+        selected_variants.append(variant)
+        return variant
+
+    monkeypatch.setattr(
+        recurrent_module,
+        "_select_flash_kda_decode_variant",
+        track_flash_kda_selection,
+    )
+    monkeypatch.setattr(
+        recurrent_module,
+        "_run_flash_kda_decode",
+        lambda *args, **kwargs: pytest.fail("Cake must not launch after selector miss"),
+    )
+    actual_state = case["initial_state"].clone()
+    actual_before = actual_state.clone()
+    actual_output, actual_state_result = public_recurrent_kda(
+        **_call_kwargs(
+            dict(case),
+            state=actual_state,
+            output=torch.empty_like(case["output"]),
+        )
+    )
+
+    assert selected_variants == [None]
+    assert actual_state_result is actual_state
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state_result.float(), expected_state.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state.float(), baseline_state.float(), atol=0, rtol=0
+    )
+    assert torch.count_nonzero(actual_state != actual_before).item() > 0
+
+
+@pytest.mark.parametrize("num_sequences", [2, 4])
+def test_t1_unbounded_softplus_auto_fallback_handles_absent_and_strided_state(
+    flash_kda_device, num_sequences
+):
+    """The fallback's own edge branches must not diverge from "cute-dsl".
+
+    Straddles the one-warp threshold at 32 heads: 2 sequences is multi-warp,
+    4 is one-warp.
+    """
+
+    num_heads = 32
+    slots = 2 * num_sequences + 1
+    state_indices = (
+        2 * torch.arange(num_sequences, dtype=torch.int32, device=flash_kda_device) + 1
+    )
+
+    # No state pool at all: the gate seeds zeros, so there is nothing to restore
+    # and the indices must not be applied to a missing tensor.
+    case = _unbounded_softplus_cake_ineligible_case(
+        flash_kda_device, num_sequences=num_sequences, num_heads=num_heads, seed=4936
+    )
+    case.update(ssm_state_indices=state_indices, initial_state=None)
+    expected = recurrent_kda(
+        **_call_kwargs(dict(case), output=torch.empty_like(case["output"])),
+        backend="cute-dsl",
+    )
+    actual = recurrent_kda(
+        **_call_kwargs(dict(case), output=torch.empty_like(case["output"])),
+        backend="auto",
+    )
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            actual_value.float(), expected_value.float(), atol=0, rtol=0
+        )
+
+    # A non-contiguous pool without indices cannot be updated in place, because
+    # the wrapper has to copy it. "auto" must report that rather than silently
+    # dropping the update, exactly as "cute-dsl" does.
+    strided_state, _ = _padded_slot_state(
+        num_sequences, num_heads, flash_kda_device, seed=4936
+    )
+    case = _unbounded_softplus_cake_ineligible_case(
+        flash_kda_device, num_sequences=num_sequences, num_heads=num_heads, seed=4937
+    )
+    case.update(ssm_state_indices=None)
+    for backend in ("cute-dsl", "auto"):
+        with pytest.raises(ValueError, match="non-contiguous initial_state"):
+            recurrent_kda(
+                **_call_kwargs(
+                    dict(case),
+                    state=strided_state,
+                    output=torch.empty_like(case["output"]),
+                ),
+                backend=backend,
+            )
+
+    # With indices the pool is gathered rather than copied, so a non-contiguous
+    # pool stays supported on the fallback and untouched slots stay untouched.
+    # "cute-dsl" rejects this layout outright, so the oracle is the same "auto"
+    # call over a dense pool holding the same values.
+    strided_pool, _ = _padded_slot_state(slots, num_heads, flash_kda_device, seed=4938)
+    case = _unbounded_softplus_cake_ineligible_case(
+        flash_kda_device, num_sequences=num_sequences, num_heads=num_heads, seed=4939
+    )
+    case.update(ssm_state_indices=state_indices)
+    before = strided_pool.clone()
+    with pytest.raises(ValueError, match="non-contiguous initial_state"):
+        recurrent_kda(
+            **_call_kwargs(
+                dict(case),
+                state=strided_pool,
+                output=torch.empty_like(case["output"]),
+            ),
+            backend="cute-dsl",
+        )
+    torch.testing.assert_close(strided_pool, before, atol=0, rtol=0)
+
+    baseline_pool = strided_pool.contiguous().clone()
+    expected = recurrent_kda(
+        **_call_kwargs(
+            dict(case),
+            state=baseline_pool,
+            output=torch.empty_like(case["output"]),
+        ),
+        backend="auto",
+    )
+    actual = recurrent_kda(
+        **_call_kwargs(
+            dict(case), state=strided_pool, output=torch.empty_like(case["output"])
+        ),
+        backend="auto",
+    )
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            actual_value.float(), expected_value.float(), atol=0, rtol=0
+        )
+    torch.testing.assert_close(
+        strided_pool[state_indices].float(),
+        baseline_pool[state_indices].float(),
+        atol=0,
+        rtol=0,
+    )
+    untouched = torch.ones(slots, dtype=torch.bool, device=flash_kda_device)
+    untouched[state_indices.to(torch.long)] = False
+    torch.testing.assert_close(
+        strided_pool[untouched], before[untouched], atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize("explicit_num_accepted_tokens", [False, True])
+@pytest.mark.parametrize("use_qk_l2norm_in_kernel", [True, False])
+@pytest.mark.parametrize("num_sequences", [1, 2, 4])
+def test_t1_unbounded_softplus_auto_falls_back_to_cute_with_explicit_cu_seqlens(
+    flash_kda_device,
+    monkeypatch,
+    num_sequences,
+    use_qk_l2norm_in_kernel,
+    explicit_num_accepted_tokens,
+):
+    """Explicit T=1 ``cu_seqlens`` decode routes to CuTe without probing Cake.
+
+    ``backend="cake"`` serves this contract on the frozen route (see
+    ``test_cake_backend_serves_explicit_t1_cu_seqlens_like_dense_decode``), but
+    ``"auto"`` keeps CuTe for it: in the launch-bound regime CuTe's host path is
+    the cheaper one, and the candidate drops the form before the selector is
+    ever consulted. Parametrised over the one-warp threshold at 32 heads and over
+    both ways the probe used to resolve -- with a per-sequence
+    ``num_accepted_tokens`` the selector accepted at every ``num_sequences``,
+    and without one it accepted only at ``num_sequences=1``, where the single
+    scalar supplied here trivially satisfies its per-sequence check.
+    """
+
+    num_heads = 32
+    slots = 2 * num_sequences + 1
+    generator = torch.Generator(device=flash_kda_device).manual_seed(4940)
+    state_indices = (
+        2 * torch.arange(num_sequences, dtype=torch.int32, device=flash_kda_device) + 1
+    )
+    cu_seqlens = torch.arange(
+        num_sequences + 1, dtype=torch.int32, device=flash_kda_device
+    )
+
+    def packed(*shape):
+        return torch.randn(
+            shape, dtype=torch.bfloat16, device=flash_kda_device, generator=generator
+        )
+
+    call = dict(
+        q=packed(1, num_sequences, num_heads, _D),
+        k=packed(1, num_sequences, num_heads, _D),
+        v=packed(1, num_sequences, num_heads, _D),
+        g=packed(1, num_sequences, num_heads, _D),
+        beta=packed(1, num_sequences, num_heads),
+        A_log=torch.rand(
+            num_heads, dtype=torch.float32, device=flash_kda_device, generator=generator
+        )
+        - 1.5,
+        dt_bias=torch.randn(
+            num_heads * _D,
+            dtype=torch.float32,
+            device=flash_kda_device,
+            generator=generator,
+        ),
+        use_gate_in_kernel=True,
+        beta_is_logit=True,
+        lower_bound=None,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        ssm_state_indices=state_indices,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+        num_accepted_tokens=(
+            torch.ones(num_sequences, dtype=torch.int32, device=flash_kda_device)
+            if explicit_num_accepted_tokens
+            else None
+        ),
+    )
+    pool = torch.randn(
+        (slots, num_heads, _D, _D),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+        generator=generator,
+    )
+
+    baseline_pool = pool.clone()
+    expected_output, expected_state = recurrent_kda(
+        **call,
+        initial_state=baseline_pool,
+        output=torch.empty_like(call["q"]),
+        backend="cute-dsl",
+    )
+
+    frozen_calls = []
+    run_frozen = recurrent_module._run_flash_kda_decode
+
+    def track_frozen_call(variant, **kwargs):
+        frozen_calls.append(variant)
+        return run_frozen(variant, **kwargs)
+
+    select_calls = 0
+    select_variant = recurrent_module._select_flash_kda_decode_variant
+
+    def track_select_call(**kwargs):
+        nonlocal select_calls
+        select_calls += 1
+        return select_variant(**kwargs)
+
+    monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
+    monkeypatch.setattr(
+        recurrent_module, "_select_flash_kda_decode_variant", track_select_call
+    )
+    actual_pool = pool.clone()
+    before = actual_pool.clone()
+    actual_output, actual_state = recurrent_kda(
+        **call,
+        initial_state=actual_pool,
+        output=torch.empty_like(call["q"]),
+        backend="auto",
+    )
+
+    assert frozen_calls == []
+    assert select_calls == 0
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_pool.float(), baseline_pool.float(), atol=0, rtol=0
+    )
+    untouched = torch.ones(slots, dtype=torch.bool, device=flash_kda_device)
+    untouched[state_indices.to(torch.long)] = False
+    torch.testing.assert_close(
+        actual_pool[untouched], before[untouched], atol=0, rtol=0
+    )
+
+
+def test_frozen_decode_selection_is_memoized_per_contract(
+    flash_kda_device, monkeypatch
+):
+    """Repeated decode steps on the same buffers consult the selector once.
+
+    The memo key covers every tensor's address, shape, strides and dtype plus
+    the scalar flags, so a changed pitch (a different view of the same
+    storage) or a different head count re-runs the predicate chain.
+    """
+
+    num_sequences = 4
+    num_heads = 16
+    generator = torch.Generator(device=flash_kda_device).manual_seed(4941)
+
+    def dense(*shape):
+        return torch.randn(
+            shape, dtype=torch.bfloat16, device=flash_kda_device, generator=generator
+        )
+
+    call = dict(
+        q=dense(num_sequences, 1, num_heads, _D),
+        k=dense(num_sequences, 1, num_heads, _D),
+        v=dense(num_sequences, 1, num_heads, _D),
+        g=dense(num_sequences, 1, num_heads, _D),
+        beta=dense(num_sequences, 1, num_heads),
+        A_log=torch.rand(
+            num_heads, dtype=torch.float32, device=flash_kda_device, generator=generator
+        )
+        - 1.5,
+        dt_bias=torch.randn(
+            num_heads * _D,
+            dtype=torch.float32,
+            device=flash_kda_device,
+            generator=generator,
+        ),
+        use_gate_in_kernel=True,
+        beta_is_logit=True,
+        lower_bound=None,
+        use_qk_l2norm_in_kernel=True,
+        ssm_state_indices=torch.arange(
+            num_sequences, dtype=torch.int32, device=flash_kda_device
+        ),
+        output_final_state=True,
+    )
+    pool = dense(num_sequences, num_heads, _D, _D)
+    output = torch.empty_like(call["q"])
+
+    select_calls = 0
+    select_variant = recurrent_module._select_flash_kda_decode_variant
+
+    def track_select_call(**kwargs):
+        nonlocal select_calls
+        select_calls += 1
+        return select_variant(**kwargs)
+
+    monkeypatch.setattr(
+        recurrent_module, "_select_flash_kda_decode_variant", track_select_call
+    )
+
+    for _ in range(3):
+        recurrent_kda(**call, initial_state=pool, output=output, backend="cake")
+    assert select_calls == 1
+
+    # A wider token pitch on the same storage is a different contract.
+    wide = dense(num_sequences, 1, num_heads + 8, _D)
+    strided = dict(call, q=wide[:, :, :num_heads, :])
+    recurrent_kda(**strided, initial_state=pool, output=output, backend="cake")
+    assert select_calls == 2
+    recurrent_kda(**strided, initial_state=pool, output=output, backend="cake")
+    assert select_calls == 2
+
+    # Fresh buffers of the same shape at new addresses are validated again.
+    other = dict(call, q=dense(num_sequences, 1, num_heads, _D))
+    recurrent_kda(**other, initial_state=pool, output=output, backend="cake")
+    assert select_calls == 3
+
+
+@pytest.mark.parametrize("emulated_capability", [(9, 0), (12, 0)])
+@pytest.mark.parametrize("num_heads", [64, 16])
+def test_t1_unbounded_softplus_auto_falls_back_to_cute_on_unservable_arch(
+    flash_kda_device, monkeypatch, num_heads, emulated_capability
+):
+    """Cake eligibility is irrelevant when the arch cannot run Cake at all.
+
+    The candidate gate carries no compute-capability term but the selector
+    requires exact CC 10.0/10.3, so off those two the gate commits to Cake's
+    state convention for every T=1 unbounded-softplus call, including
+    Cake-shaped ones. Emulating the capability keeps this pinned on the only
+    hardware the surrounding file runs on.
+    """
+
+    num_sequences = 2
+    generator = torch.Generator(device=flash_kda_device).manual_seed(4935 + num_heads)
+    state_slots = 2 * num_sequences + 1
+    case = _make_case(
+        flash_kda_device,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        num_value_heads=num_heads,
+        num_tokens=1,
+        seed=4935 + num_heads,
+    )
+    A_log = (
+        torch.rand(
+            num_heads,
+            dtype=torch.float32,
+            device=flash_kda_device,
+            generator=generator,
+        )
+        - 1.5
+    )
+    dt_bias = torch.randn(
+        num_heads * _D,
+        dtype=torch.float32,
+        device=flash_kda_device,
+        generator=generator,
+    )
+    state_indices = (
+        2 * torch.arange(num_sequences, dtype=torch.int32, device=flash_kda_device) + 1
+    )
+    logical_initial = torch.randn(
+        (state_slots, num_heads, _D, _D),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+        generator=generator,
+    )
+    # Deliberately Cake-eligible: l2norm on, unpadded, indexed.
+    case.update(
+        beta_is_logit=True,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        use_gate_in_kernel=True,
+        lower_bound=None,
+        ssm_state_indices=state_indices,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    # Patch before the baseline too, so both spellings route identically and the
+    # only variable is ``backend``.
+    monkeypatch.setattr(
+        recurrent_module,
+        "get_compute_capability",
+        lambda *args, **kwargs: emulated_capability,
+    )
+
+    baseline_state = logical_initial.clone()
+    expected_output, expected_state = recurrent_kda(
+        **_call_kwargs(
+            baseline_case := dict(case),
+            state=baseline_state,
+            output=torch.empty_like(case["output"]),
+        ),
+        backend="cute-dsl",
+    )
+
+    frozen_calls = []
+    run_frozen = recurrent_module._run_flash_kda_decode
+
+    def track_frozen_call(variant, **kwargs):
+        frozen_calls.append(variant)
+        return run_frozen(variant, **kwargs)
+
+    monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
+    actual_state = logical_initial.clone()
+    actual_before = actual_state.clone()
+    actual_output, actual_state_result = recurrent_kda(
+        **_call_kwargs(
+            dict(baseline_case),
+            state=actual_state,
+            output=torch.empty_like(case["output"]),
+        ),
+        backend="auto",
+    )
+
+    assert frozen_calls == []
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state_result.float(), expected_state.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state[state_indices].float(),
+        baseline_state[state_indices].float(),
+        atol=0,
+        rtol=0,
+    )
+    untouched = torch.ones(state_slots, dtype=torch.bool, device=flash_kda_device)
+    untouched[state_indices.to(torch.long)] = False
+    torch.testing.assert_close(
+        actual_state[untouched], actual_before[untouched], atol=0, rtol=0
+    )
+
+
 def test_cake_backend_rejects_unexported_precomputed_t3_without_entering_cute_dsl(
     flash_kda_device, monkeypatch
 ):
@@ -1934,10 +2742,20 @@ def test_cake_backend_rejects_unexported_precomputed_t3_without_entering_cute_ds
         recurrent_kda(**_call_kwargs(case), backend="cake")
 
 
-def test_cake_backend_rejects_explicit_t1_cu_seqlens_without_launching(
-    flash_kda_device, monkeypatch
+@pytest.mark.parametrize("explicit_num_accepted_tokens", [False, True])
+@pytest.mark.parametrize("num_sequences", [1, 2, 8])
+def test_cake_backend_serves_explicit_t1_cu_seqlens_like_dense_decode(
+    flash_kda_device, monkeypatch, num_sequences, explicit_num_accepted_tokens
 ):
-    num_sequences = 2
+    """``backend="cake"`` launches explicit T=1 ``cu_seqlens`` decode in place.
+
+    The frozen family's ABI is one packed token axis plus ``cu_seqlens`` and a
+    per-sequence accepted-token count; the dense ``[B, 1, ...]`` entry point
+    synthesizes exactly that. Handing the metadata in explicitly (the precomputed
+    H=16 / HV=32 route here) must pick the same schedule, write the same bits
+    and leave every other state slot untouched.
+    """
+
     case = _make_case(
         flash_kda_device,
         num_sequences=num_sequences,
@@ -1946,39 +2764,50 @@ def test_cake_backend_rejects_explicit_t1_cu_seqlens_without_launching(
         num_tokens=1,
         seed=2270,
     )
+    frozen_calls = []
+    run_frozen = recurrent_module._run_flash_kda_decode
+
+    def track_frozen_call(variant, **kwargs):
+        frozen_calls.append(variant)
+        return run_frozen(variant, **kwargs)
+
+    monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
+
+    dense_state = case["initial_state"].clone()
+    dense_output, _ = recurrent_kda(
+        **_call_kwargs(
+            case, state=dense_state, output=torch.empty_like(case["output"])
+        ),
+        backend="cake",
+    )
+    assert len(frozen_calls) == 1
+
+    explicit = dict(case)
     for name in ("q", "k", "v", "g", "beta", "output"):
         tensor = case[name]
-        case[name] = tensor.reshape(1, num_sequences, *tensor.shape[2:])
-    case["cu_seqlens"] = torch.arange(
+        explicit[name] = tensor.reshape(1, num_sequences, *tensor.shape[2:])
+    explicit["cu_seqlens"] = torch.arange(
         num_sequences + 1, dtype=torch.int32, device=flash_kda_device
     )
-    case["ssm_state_indices"] = torch.arange(
+    explicit["ssm_state_indices"] = torch.arange(
         num_sequences, dtype=torch.int32, device=flash_kda_device
     )
-
-    def unexpected_launch(*args, **kwargs):
-        pytest.fail(f"unexpected kernel launch: args={args}, kwargs={kwargs}")
-
-    monkeypatch.setattr(
-        recurrent_module,
-        "_run_flash_kda_decode",
-        unexpected_launch,
+    if explicit_num_accepted_tokens:
+        explicit["num_accepted_tokens"] = torch.ones(
+            num_sequences, dtype=torch.int32, device=flash_kda_device
+        )
+    explicit_state = case["initial_state"].clone()
+    explicit_output, _ = recurrent_kda(
+        **_call_kwargs(
+            explicit, state=explicit_state, output=torch.empty_like(explicit["output"])
+        ),
+        backend="cake",
     )
-    monkeypatch.setattr(
-        recurrent_module,
-        "_get_grouped_compiled",
-        unexpected_launch,
+    assert frozen_calls == [frozen_calls[0]] * 2
+    torch.testing.assert_close(
+        explicit_output.reshape(dense_output.shape), dense_output, atol=0, rtol=0
     )
-    monkeypatch.setattr(
-        recurrent_module,
-        "_get_compiled_kernel",
-        unexpected_launch,
-    )
-    with pytest.raises(
-        ValueError,
-        match="does not support explicit T=1 cu_seqlens",
-    ):
-        recurrent_kda(**_call_kwargs(case), backend="cake")
+    torch.testing.assert_close(explicit_state, dense_state, atol=0, rtol=0)
 
 
 def test_internal_direct_t1_nonidentity_metadata_is_memory_safe(flash_kda_device):

@@ -14,18 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import List
+import os
+import platform
+from typing import List, Optional
 
 from . import env as jit_env
 from ..artifacts import ArtifactPath, CheckSumHash
 from .core import (
     JitSpec,
+    common_nvcc_flags,
     gen_jit_spec,
     current_compilation_context,
     sm90a_nvcc_flags,
     sm89_nvcc_flags,
 )
-from .cpp_ext import is_cuda_version_at_least
+from .cpp_ext import host_compiler_is_gcc, is_cuda_version_at_least
 from .cubin_loader import (
     get_artifact,
     get_meta_hash,
@@ -38,6 +41,22 @@ from .trtllm_gen_metainfo import (
     RUBIN_CUBIN_ARCHS,
     write_filtered_metainfo,
 )
+
+
+def _should_enable_sm90_moe_prebuilt_d_descriptor() -> bool:
+    """Return whether to use the H20-specific prebuilt-D JIT variant."""
+    if os.environ.get("FLASHINFER_DISABLE_JIT"):
+        return False
+
+    try:
+        import torch
+
+        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+        # H20 and H20-3e expose 78 SMs, unlike H100 and H200.
+        return properties.multi_processor_count == 78
+    except Exception:  # noqa: BLE001 - an unknown device must use the generic path
+        return False
+
 
 BMM_EXPORT_HEADERS = [
     "BatchedGemmEnums.h",
@@ -58,6 +77,32 @@ BMM_EXPORT_HEADERS = [
     "trtllm/gen/SfLayoutDecl.h",
     "trtllm/gen/SparsityDecl.h",
 ]
+
+
+def _alphamoe_nvfp4_sm100_nvcc_flags() -> List[str]:
+    """Return flags for exactly the AlphaMoE-supported Blackwell targets.
+
+    Filtering only by CUDA major version is not sufficient here: major 10
+    also contains targets such as SM107 whose instruction and cubin contracts
+    differ from the frozen SM100/SM103 Loom schedule.
+    """
+
+    supported_archs = {(10, "0a"), (10, "3a")}
+    target_archs = sorted(
+        current_compilation_context.TARGET_CUDA_ARCHS.intersection(supported_archs)
+    )
+    if not target_archs:
+        raise RuntimeError(
+            "alphamoe_nvfp4_sm100 requires an exact SM100a or SM103a compilation target"
+        )
+    return [
+        *(
+            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+            for major, minor in target_archs
+        ),
+        "--use_fast_math",
+        *common_nvcc_flags,
+    ]
 
 
 def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
@@ -127,7 +172,13 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         "-DCUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1",
     ]
-    return gen_cutlass_fused_moe_module(nvcc_flags, "90", use_fast_build)
+    module_name = None
+    if _should_enable_sm90_moe_prebuilt_d_descriptor():
+        nvcc_flags.append("-DFLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR=1")
+        module_name = "fused_moe_90_h20_prebuilt_d"
+    return gen_cutlass_fused_moe_module(
+        nvcc_flags, "90", use_fast_build, module_name=module_name
+    )
 
 
 def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
@@ -141,7 +192,10 @@ def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
 
 
 def gen_cutlass_fused_moe_module(
-    nvcc_flags: List[str], device_arch: str, use_fast_build: bool = False
+    nvcc_flags: List[str],
+    device_arch: str,
+    use_fast_build: bool = False,
+    module_name: Optional[str] = None,
 ) -> JitSpec:
     """
     Generate a JitSpec for the cutlass fused moe module.
@@ -218,7 +272,7 @@ def gen_cutlass_fused_moe_module(
     ]
 
     return gen_jit_spec(
-        f"fused_moe_{device_arch}",
+        module_name or f"fused_moe_{device_arch}",
         sources,
         extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
@@ -246,6 +300,32 @@ def gen_cutlass_fused_moe_module(
             output_dir,
         ],
     )
+
+
+# The trtllm-gen kernel manifest is a large table of prebuilt-cubin descriptors.
+# Its entry type is not a literal type -- it embeds the polymorphic option
+# structs, which own heap members -- so the table cannot be a compile-time
+# constant and cannot live in read-only data. The host compiler materializes it
+# as load-time initialization code instead, concentrating the whole manifest
+# into one enormous straight-line basic block.
+#
+# GCC schedules instructions once before and once after register allocation, and
+# the pre-allocation pass is superlinear in basic block size. x86 already
+# disables that pass by default, because lengthening live ranges ahead of
+# allocation costs more than it gains on a register-poor target; aarch64 leaves
+# it on. An initializer that only stores constants gives the pass nothing worth
+# reordering, so on aarch64 it ends up dominating the build time of this module
+# for no benefit. Turning it off there is just adopting the x86 default.
+#
+# Scoped to GCC on aarch64: the spelling is GCC's, and on x86 the pass is
+# already off. Post-allocation scheduling still runs everywhere. -Xcompiler
+# reaches only the host compiler, so device compilation is untouched and the
+# emitted cubins are identical; what is given up applies to code that runs once
+# per process during initialization.
+def _manifest_host_compile_flags() -> List[str]:
+    if platform.machine() != "aarch64" or not host_compiler_is_gcc():
+        return []
+    return ["-Xcompiler", "-fno-schedule-insns"]
 
 
 def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec:
@@ -348,6 +428,7 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
             "-DENABLE_FP4",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{bmm_path}\\"',
+            *_manifest_host_compile_flags(),
         ]
         + nvcc_flags,
         extra_include_paths=[
@@ -428,4 +509,95 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
             jit_env.FLASHINFER_CUBIN_DIR,
         ],
+    )
+
+
+def gen_alphamoe_fused_router_module() -> JitSpec:
+    """Generate the exact-SM100a/SM103a AlphaMoE router JIT spec.
+
+    Do not select this source by CUDA major version: CC 10.7 and other future
+    SM10x targets are not part of the frozen kernel's validated instruction
+    contract.
+    """
+
+    supported_archs = set()
+    if is_cuda_version_at_least("12.8"):
+        supported_archs.add((10, "0a"))
+    if is_cuda_version_at_least("12.9"):
+        supported_archs.add((10, "3a"))
+    selected_archs = sorted(
+        current_compilation_context.TARGET_CUDA_ARCHS & supported_archs
+    )
+    if not selected_archs:
+        raise RuntimeError(
+            "AlphaMoE fused router requires an exact SM100a or SM103a "
+            "compilation target; configured targets are "
+            f"{sorted(current_compilation_context.TARGET_CUDA_ARCHS)}"
+        )
+    nvcc_flags = [
+        f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+        for major, minor in selected_archs
+    ]
+    # The frozen Loom artifact was generated and compiled with this option.
+    nvcc_flags.append("--use_fast_math")
+    nvcc_flags += common_nvcc_flags
+    from .alphamoe_nvrtc import get_alphamoe_nvrtc_spec
+
+    closure_key, embedded_flags, cubin_factory = get_alphamoe_nvrtc_spec(
+        jit_env.FLASHINFER_CSRC_DIR / "alphamoe_router", selected_archs
+    )
+    return gen_jit_spec(
+        f"alphamoe_fused_router_nvrtc_{closure_key}",
+        [jit_env.FLASHINFER_CSRC_DIR / "alphamoe_fused_router.cu"],
+        extra_cuda_cflags=[*nvcc_flags, *embedded_flags],
+        extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
+        embedded_cubin_factory=cubin_factory,
+    )
+
+
+def gen_alphamoe_sm100_module() -> JitSpec:
+    """Generate the JIT spec for the alphamoe_sm100 fused W8A8 MoE kernel.
+
+    ``csrc/alphamoe_sm100.cu`` is a single translation unit holding the
+    generated schedule with a zero-activation guard and its TVM-FFI binding,
+    mirroring the ``csrc/tinygemm2_sm100.cu`` layout.
+    """
+    targets = sorted(
+        current_compilation_context.TARGET_CUDA_ARCHS & {(10, "0a"), (10, "3a")}
+    )
+    if not targets:
+        raise RuntimeError(
+            "AlphaMoE W8A8 requires an SM100a or SM103a compilation target"
+        )
+    if not is_cuda_version_at_least("12.8"):
+        raise RuntimeError("AlphaMoE W8A8 on SM100a requires CUDA 12.8 or newer")
+    if (10, "3a") in targets and not is_cuda_version_at_least("12.9"):
+        raise RuntimeError("AlphaMoE W8A8 on SM103a requires CUDA 12.9 or newer")
+    nvcc_flags = [
+        f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+        for major, minor in targets
+    ] + current_compilation_context.COMMON_NVCC_FLAGS
+    return gen_jit_spec(
+        "alphamoe_sm100",
+        [jit_env.FLASHINFER_CSRC_DIR / "alphamoe_sm100.cu"],
+        extra_cuda_cflags=nvcc_flags,
+        extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
+    )
+
+
+def gen_alphamoe_nvfp4_sm100_module() -> JitSpec:
+    """Generate the frozen SM100/SM103 AlphaMoE NVFP4 module."""
+
+    return gen_jit_spec(
+        "alphamoe_nvfp4_sm100",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_sm100.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c346_finalize.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c368_finalize.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c376_alignment.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c386_up.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c388_up.cu",
+        ],
+        extra_cuda_cflags=_alphamoe_nvfp4_sm100_nvcc_flags(),
+        extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
     )

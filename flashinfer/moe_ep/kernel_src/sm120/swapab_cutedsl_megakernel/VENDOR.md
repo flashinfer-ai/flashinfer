@@ -6,14 +6,10 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Upstream
 
-- **Repo**: https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe.git
-  (fork of the NVIDIA CuTeDSL MegaMoE kernel team's repo; see the mother
-  tree's `ACKNOWLEDGEMENT.md` for authors/contacts)
 - **Branch**: `run/sm120-mxfp8-perf`
 - **Vendored commit**: `d19d30a748f9e402b8a2a33083fdf530231cf647`
   ("Adapt SM120 runner to latest MXFP8 host utils", 2026-07-27)
-- **Last synced**: 2026-08-06 (copied from the local worktree
-  `/home/scratch.mhoqueanik_gpu/cutedsl_megamoe_sm120/sm120_swapab_wt`)
+- **Last synced**: 2026-08-06 (copied from a local development worktree)
 - **Vendored subset**: the five kernel packages only (`common/`, `src/`,
   `moe_sm120_mxfp8_swapab/`, `moe_mxfp8_glu/`, `moe_nvfp4_swapab/`) under
   `src/` — no repo scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`,
@@ -72,6 +68,15 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Pending local diffs vs upstream
 
+- Sanitization (2026-09-14): internal release-scrub markers removed across
+  `src/` (`moe_persistent_scheduler.py`, `mega_reference.py`, `moe_utils.py`
+  in both kernel packages), the marker-wrapped internal-example
+  `GeneralGroupedGemmTensormapConstructor` class deleted from both
+  `moe_utils.py` copies (unused; grep-verified), and the CLC
+  docstring's internal ISA-spec citation rewritten against the public PTX
+  clusterlaunchcontrol documentation. Upstream should strip these before
+  the next drop.
+
 The snapshot was taken from a **dirty worktree**: two files carried
 uncommitted changes on top of `d19d30a` and are vendored as found on disk
 (they are still verbatim w.r.t. the worktree, not the commit):
@@ -83,7 +88,7 @@ Fold these into a committed upstream state on the next re-sync.
 
 ## Related trees
 
-- `kernel_src/cutedsl_megamoe/` is the mother-repo snapshot (SM100 NVFP4 +
+- `kernel_src/sm100/cutedsl_megamoe/` is the mother-repo snapshot (SM100 NVFP4 +
   MXFP8 kernels). This tree is a **separate snapshot** of a fork carrying the
   SM120 MXFP8 swap-AB kernel; it is not merged into the mother tree on
   purpose: one kernel_src dir = one upstream commit. If upstream merges the

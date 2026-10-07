@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from flashinfer.fused_moe.api import ActivationConfig, QuantVariant
+from flashinfer.fused_moe.api import ActivationConfig, QuantFormat
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 
 DEFAULT_DOC_PATH = REPO_ROOT / "docs" / "design_docs" / "flashinfer_moe_api.md"
@@ -22,43 +22,47 @@ REGENERATE_COMMAND = "python scripts/generate_moe_activation_matrix.py --write"
 ActivationMatrixRow = tuple[
     str,
     str,
-    QuantVariant,
+    str,
     tuple[type[ActivationConfig], ...],
 ]
+
+
+def _quant_label(pair: tuple[QuantFormat, QuantFormat]) -> str:
+    weight, activation = pair
+    return f"{weight.name}×{activation.name}"
 
 
 def get_activation_matrix_rows() -> tuple[ActivationMatrixRow, ...]:
     """Collect and validate backend × quantization × activation rows."""
     rows = []
     for config_type, runner_type in _BACKEND_RUNNERS.items():
-        variants = runner_type.supported_quant_variants
+        pairs = runner_type.supported_quant_variants
         by_quant = runner_type.supported_activation_classes_by_quant
-        if by_quant and set(by_quant) != set(variants):
+        if by_quant and set(by_quant) != set(pairs):
+            expected = tuple(f"{w.name}×{a.name}" for w, a in pairs)
             raise ValueError(
                 f"{runner_type.__name__} activation mapping must cover exactly "
-                f"{tuple(variant.name for variant in variants)}."
+                f"{expected}."
             )
 
-        for variant in variants:
+        for pair in pairs:
             activations = (
-                by_quant[variant]
-                if by_quant
-                else runner_type.supported_activation_classes
+                by_quant[pair] if by_quant else runner_type.supported_activation_classes
             )
+            label = _quant_label(pair)
             if not activations:
                 raise ValueError(
-                    f"{runner_type.__name__} declares no activations for "
-                    f"QuantVariant.{variant.name}."
+                    f"{runner_type.__name__} declares no activations for {label}."
                 )
             rows.append(
                 (
                     runner_type.backend_key,
                     config_type.__name__,
-                    variant,
+                    label,
                     activations,
                 )
             )
-    return tuple(sorted(rows, key=lambda row: (row[0], row[2].name)))
+    return tuple(sorted(rows, key=lambda row: (row[0], row[2])))
 
 
 def render_activation_matrix(
@@ -70,12 +74,12 @@ def render_activation_matrix(
         "| Backend | Config | Quantization | Typed activations |",
         "| --- | --- | --- | --- |",
     ]
-    for backend_key, config_name, variant, activation_classes in rows:
+    for backend_key, config_name, label, activation_classes in rows:
         activations = ", ".join(
             f"`{activation.__name__}`" for activation in activation_classes
         )
         lines.append(
-            f"| `{backend_key}` | `{config_name}` | `{variant.name}` | {activations} |"
+            f"| `{backend_key}` | `{config_name}` | `{label}` | {activations} |"
         )
     return "\n".join(lines)
 

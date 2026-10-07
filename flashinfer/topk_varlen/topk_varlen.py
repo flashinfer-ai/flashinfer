@@ -33,7 +33,10 @@ Backend choices
 ``"gvr_2"``          — self-sampling GVR V2 (sample-calibrated threshold
                        ladders; TRT-LLM PR #17821 port). Requires a datacentre
                        Blackwell-class GPU (sm_100/103, or Rubin sm_107),
-                       nvidia-cutlass-dsl, ``pre_idx``, and fp32 logits.
+                       nvidia-cutlass-dsl and fp32 logits; ``pre_idx`` is
+                       optional (hint-free engines sample the identity
+                       positions when it is absent — exact either way, the
+                       hint only steers sampling).
 ``"radix_cutlass"``  — masked-radix fallback; masks logits to ``seq_lens`` then
                        calls the FlashInfer CUTLASS radix top-K.  Runs on any GPU.
 ``"radix_filter"``   — filtered-radix (coarse histogram → filter → on-chip
@@ -45,8 +48,9 @@ Backend choices
                        accepted and ignored (the kernel takes no hint).
 ``"auto"``           — shape/dtype-aware ranking that tracks the measured
                        per-config winner (see ``_top_k_varlen_heuristic``):
-                       gvr_2 for hinted fp32; radix_filter for hint-free
-                       fp32 from 32K columns up and for the mid/large bf16 and
+                       gvr_2 for fp32, hinted or hint-free (one tiny
+                       single-row K>=2048 cell excepted); radix_filter for
+                       the rest of hint-free fp32 and for the mid/large bf16 and
                        fp16 regions; gvr only for large hinted batches of
                        mid/long rows; radix otherwise, with radix_cutlass
                        preferred in its fp32 big-batch/long-row corner and as
@@ -55,6 +59,7 @@ Backend choices
 
 import functools
 import math
+import sys
 import warnings
 from typing import Literal, Optional, Tuple
 
@@ -272,12 +277,13 @@ def _gvr2_top_k_varlen_check(
 
     Mirrors the TRT-LLM ``run_varlen`` hard contract so backend="auto" (and an
     explicit backend="gvr_2") never reaches a kernel-side RuntimeError.
+
+    ``pre_idx`` is NOT a requirement: the kernels use the hint only as a
+    sampling anchor, so the host runs the hint-free compiled engines (identity
+    sample, TRT-LLM #18410) when it is absent — or malformed, in which case the
+    API body discards it with a RuntimeWarning first.
     """
-    if not (
-        _cute_dsl_ready(logits.device)
-        and pre_idx is not None
-        and _hint_problem(pre_idx, logits, seq_lens, top_k) is None
-    ):
+    if not _cute_dsl_ready(logits.device):
         return False
     # fp32 only: the upstream self-sampling kernels declare bf16/fp16 a
     # follow-up (run_varlen raises on any other dtype).
@@ -327,8 +333,17 @@ def _top_k_varlen_heuristic(
     cr in {1, 4}, next_n in {1, 2}; see PR #4811). Decision rules, using only
     capture-stable host facts (dtype, logits width N, request count B):
 
-    1. fp32 + pre_idx: gvr_2 first — it won 211/213 measured cells (geomean
-       2.1-3.8x over every other backend) and ~1.00x vs its TRT-LLM origin.
+    1. fp32: gvr_2 first, hinted or not — hinted it won 211/213 measured
+       cells (geomean 2.1-3.8x over every other backend) and ~1.00x vs its
+       TRT-LLM origin; HINT-FREE (identity-sample engines, TRT-LLM #18410;
+       measured on the earlier arange-anchor form) it stays within ~10% of the
+       hinted time on most cells and beats the best hint-free radix backend
+       by 1.5-5x on every measured cell (B100, K in {512, 1024, 2048}, N in
+       [4K, 512K], B in [1, 256], cr 1 and 4, uniform and mixed lengths)
+       except one: K >= 2048 with N <= 4096 at B == 1, where radix_filter is
+       ~1.3x faster (3.0 vs 3.9 us) — that cell is carved out, as is the
+       static all-rows-short case N <= K (identity answer; radix_filter
+       0.85 vs gvr_2 1.1 us), hinted or not.
     2. gvr vs radix (when a hint is given but gvr_2 is unsuitable, and for
        every bf16/fp16 hinted call): gvr only pays off when the batch is
        large AND rows are long — B*N >= 2^22 (fp32) / 2^23 (bf16/fp16).
@@ -392,8 +407,21 @@ def _top_k_varlen_heuristic(
         )
         gvr_first = batch >= 256 and 32768 <= n_cols <= 524288
     cutlass_first = fp32 and n_cols >= 65536 and elems >= (1 << 23)
+    # the one measured cell where hint-free radix_filter beats gvr_2 (rule 1);
+    # hinted gvr_2 is still ahead there, so that carve-out is hint-free only.
+    # N <= top_k is static "every row is the identity answer": radix_filter
+    # emits it without reading logits, ~0.25 us under gvr_2's short-path
+    # launch (0.85 vs 1.1 us on B100 and B200, hinted or not; re-measured
+    # with the hint-free compiled engines, 2026-09).
+    hinted = (
+        pre_idx is not None and _hint_problem(pre_idx, logits, seq_lens, top_k) is None
+    )
+    all_short = n_cols <= top_k
+    gvr2_tiny_loss = all_short or (
+        (not hinted) and top_k >= 2048 and n_cols <= 4096 and batch == 1
+    )
 
-    order = ["gvr_2"]
+    order = [] if gvr2_tiny_loss else ["gvr_2"]
     if fp32:
         # radix_filter beats gvr in every measured fp32 cell (1.2-3x)
         if rf_first:
@@ -413,6 +441,11 @@ def _top_k_varlen_heuristic(
     if "gvr" not in order:
         # small-problem fallback rank: radix > gvr > radix_cutlass
         order.insert(order.index("radix") + 1, "gvr")
+    if gvr2_tiny_loss:
+        # radix_filter (the cell's winner) first, gvr_2 right behind it
+        order = ["radix_filter", "gvr_2"] + [
+            b for b in order if b not in ("radix_filter", "gvr_2")
+        ]
     return [b for b in order if b in suitable_backends]
 
 
@@ -1038,7 +1071,7 @@ def _run_gvr(
 
 def _run_gvr2(
     logits: torch.Tensor,
-    pre_idx: torch.Tensor,
+    pre_idx: Optional[torch.Tensor],
     seq_lens: torch.Tensor,
     top_k: int,
     next_n: int,
@@ -1057,6 +1090,10 @@ def _run_gvr2(
     the launcher for this shape has been compiled (warm up before capture).
     The kernel reads each request's ``seq_lens`` on device and re-derives its
     sampling ladder per row, so no LJF sort or prepare kernel is needed.
+    ``pre_idx=None`` runs hint-free: distinct compiled engines with the hint
+    loads compiled out (the identity sample is the anchor; TRT-LLM #18410) —
+    exact, no host-side hint state, CUDA-graph safe once compiled by an eager
+    hint-free call at the geometry (hint mode is a warm-up dimension).
     """
     from .kernels import gvr2_topk_host
 
@@ -1070,8 +1107,58 @@ def _run_gvr2(
         values=out_values if return_output_values else None,
         max_seq_len=logits.shape[1] * compress_ratio,
         workspace=workspace.get("gvr2_workspace") if workspace else None,
+        top_k=top_k,
     )
     return out_indices, (out_values if return_output_values else None)
+
+
+def release_gvr2_resources(device=None) -> int:
+    """Release the ``gvr_2`` backend's lazily created per-device caches.
+
+    ``top_k_varlen(backend="gvr_2")`` keeps, per device, one default workspace
+    slab per raw CUDA stream handle it has run on (20,973,568 bytes each; as
+    many as there are distinct stream handles that ran an eager slab-using
+    launch). They are created by eager launches and live for the process. Returns 0
+    without importing the kernel modules if the ``gvr_2`` host was never
+    loaded in this process (nothing can be cached then). This call
+    synchronizes ``device`` (default: the current device; an int, a
+    ``torch.device`` or a device string — CUDA only, anything else raises
+    ``ValueError``), drops them all and returns the number of bytes released
+    to the torch caching allocator (``torch.cuda.empty_cache()`` returns that
+    memory to the driver).
+
+    The caller must be quiescent on ``device`` for the duration of the call:
+    no ``gvr_2`` call in flight or being issued from any thread, eager or
+    CUDA-graph replay — the same rule as ``torch.cuda.empty_cache()`` versus
+    live tensors. The launch hot paths do not take the cache locks, so a
+    launch issued concurrently could otherwise address a slab this call has
+    just released.
+
+    Any CUDA graph captured against a released slab would replay on
+    freed memory: release only when no such graph will be replayed again, and
+    re-capture after one eager ``gvr_2`` launch on the capturing stream, the
+    same warm-up rule as the first capture. Explicit ``workspace=`` buffers
+    passed by the caller are never touched.
+    """
+    if device is not None:  # same argument contract whether or not the host is loaded
+        dev = (
+            torch.device("cuda", device)
+            if isinstance(device, int)
+            else torch.device(device)
+        )
+        if dev.type != "cuda":
+            raise ValueError(
+                f"release_gvr2_resources: expected a CUDA device, got {dev!r}"
+            )
+    # The caches live in the gvr_2 host module; if it was never imported in
+    # this process no gvr_2 launch has happened and nothing can be cached.
+    # Looking it up in sys.modules (instead of importing `.kernels`, whose
+    # package __init__ eagerly imports the optional CuTe-DSL kernel modules)
+    # keeps this a no-op on installations without nvidia-cutlass-dsl.
+    host = sys.modules.get(f"{__package__}.kernels.gvr2_topk_host")
+    if host is None:
+        return 0
+    return host.release_cached_resources(device)
 
 
 # ---------------------------------------------------------------------------
@@ -1102,7 +1189,9 @@ def _run_radix_cutlass(
         row_seq_lens = (row_seq_lens - next_n + row_offsets + 1) // compress_ratio
     else:
         row_seq_lens = seq_lens // compress_ratio
-    lengths = row_seq_lens.clamp(max=N).to(torch.int32)
+    # min=0: a padded / evicted request (seq_len < next_n - nn) gives a negative
+    # numerator; the kernel would reinterpret a negative length as unsigned.
+    lengths = row_seq_lens.clamp(min=0, max=N).to(torch.int32)
 
     # offsets=zeros: output indices are local column indices (0..N-1), no shift.
     offsets = torch.zeros(num_rows, dtype=torch.int32, device=logits.device)
@@ -1436,8 +1525,9 @@ def top_k_varlen(
     Backend selection
     -----------------
     ``backend="auto"`` (default) ranks the backends that can run the call by
-    shape and dtype (see ``_top_k_varlen_heuristic``): ``gvr_2`` for hinted
-    fp32 on datacentre Blackwell-class GPUs, ``radix_filter`` in the
+    shape and dtype (see ``_top_k_varlen_heuristic``): ``gvr_2`` for fp32 on
+    datacentre Blackwell-class GPUs, with or without a hint (a missing hint
+    costs ~10% on most shapes), ``radix_filter`` in the
     measured large-N regions, ``gvr`` for large hinted half-precision
     batches of mid-length rows, otherwise the CuTe DSL ``radix`` backend on
     Blackwell, with the ``radix_cutlass`` masked fallback in its fp32 big
@@ -1457,11 +1547,20 @@ def top_k_varlen(
         such constraint.
     seq_lens : torch.Tensor
         1-D ``int32`` tensor of shape ``(num_rows // next_n,)`` with the
-        effective KV-cache length per request.  Logits at or beyond
-        ``seq_lens[i]`` are excluded from the search. A row whose length
-        exceeds the logits width (the dynamic length has outgrown the static
-        buffer, e.g. under CUDA-graph replay) is clamped to the width by every
-        backend: only the scores present in the buffer are ranked.
+        effective KV-cache length per request, in **KV-token units** regardless
+        of ``compress_ratio`` (the raw sequence length, not a length already
+        divided by the compression factor). Row ``t`` of request ``i`` (``t``
+        in ``[0, next_n)``) ranks its first
+        ``max(0, (seq_lens[i] - next_n + t + 1) // compress_ratio)`` logit
+        columns (padded or evicted slots can make the numerator negative; such
+        rows have no valid columns and are emitted as all ``-1``); logits at or
+        beyond that count are excluded from the search. Passing
+        lengths already expressed in compressed / logit-column units together
+        with ``compress_ratio > 1`` would divide the search range twice.
+        A row whose length exceeds the logits width (the dynamic length has
+        outgrown the static buffer, e.g. under CUDA-graph replay) is clamped
+        to the width by every backend: only the scores present in the buffer
+        are ranked.
     top_k : int
         Number of top elements per row.  GVR backend supports
         ``{512, 1024, 2048}``; radix backend has no restriction.
@@ -1473,15 +1572,21 @@ def top_k_varlen(
         internally applies a ``+1`` offset (DSv3.2) so the previous step's
         indices land correctly in the current step's grown KV-cache space.
         ``pre_idx[:, 0]`` must be the argmax index.
-        Required by the ``"gvr"`` and ``"gvr_2"`` backends; ignored by the
-        radix backends. Must be a contiguous, 16-byte-aligned int32 CUDA
-        tensor on ``logits.device`` of shape ``[seq_lens.shape[0], top_k]``:
-        a hint that violates this is **discarded with a RuntimeWarning** and
-        the call runs hint-free (``auto`` picks a hint-free backend; an
-        explicit ``"gvr"`` / ``"gvr_2"`` request is refused).
+        Required by the ``"gvr"`` backend; optional for ``"gvr_2"`` (the
+        kernels use it only as a sampling anchor, so a hint-free call is
+        exact and only somewhat slower); ignored by the radix backends. Must
+        be a contiguous, 16-byte-aligned int32 CUDA tensor on
+        ``logits.device`` of shape ``[seq_lens.shape[0], top_k]``: a hint
+        that violates this is **discarded with a RuntimeWarning** and the
+        call runs hint-free (``gvr_2`` with its hint-free engines; an explicit
+        ``"gvr"`` request is refused).
     compress_ratio : int, optional
-        KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4).
-        Default ``1``.
+        KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4): every
+        logit column stands for ``compress_ratio`` consecutive KV tokens.
+        ``seq_lens`` stay in KV-token units; the kernels derive each row's
+        valid column count as
+        ``max(0, (seq_len - next_n + t + 1) // compress_ratio)`` (see
+        ``seq_lens``). Default ``1``.
     next_n : int, optional
         Speculative-decode temporal stride.  Default ``1``.
     return_values : bool, optional
@@ -1511,16 +1616,24 @@ def top_k_varlen(
                               sample-calibrated threshold ladders, exact
                               tie-interchangeable top-K, one launch per batch.
                               Datacentre Blackwell-class only (sm_100/103, or
-                              Rubin sm_107); requires
-                              ``pre_idx`` (hints steer sampling, never
-                              exactness) and fp32 logits;
+                              Rubin sm_107); fp32 logits; ``pre_idx``
+                              optional (hints steer sampling, never
+                              exactness — without one the kernels run
+                              hint-free on the identity sample);
                               ``top_k`` in {512, 1024, 2048}. ``load_balance``
                               is ignored (the kernel families load-balance
                               internally). CUDA graphs: warm up each
-                              (num_rows, N, top_k, next_n, compress_ratio)
-                              geometry with one eager call before capture
-                              (an uncompiled launcher raises loudly under
-                              capture); replays may change ``seq_lens``
+                              (num_rows, N, top_k, next_n, compress_ratio,
+                              hinted-or-not) geometry with one eager call,
+                              ON THE STREAM THAT WILL CAPTURE, before
+                              capture: the eager call compiles the launcher
+                              (hinted and hint-free are distinct compiled
+                              engines, so hint mode IS a warm-up dimension)
+                              and creates that stream's default workspace
+                              slab (one per device and stream, so graphs
+                              captured on different streams never share
+                              scratch); either missing raises loudly under
+                              capture; replays may change ``seq_lens``
                               CONTENTS freely in either direction. All finite
                               values, ``+inf`` and ``-inf`` are tie-aware
                               exact (TRT-LLM #18501/#18625 ported); NaN
@@ -1539,8 +1652,13 @@ def top_k_varlen(
                               hint), as for ``"radix"`` and
                               ``"radix_cutlass"``.
         ``"auto"``          — shape/dtype-aware selection tracking the
-                              measured per-config winner: gvr_2 for hinted
-                              fp32; radix_filter for hint-free fp32 from 32K
+                              measured per-config winner: gvr_2 for fp32,
+                              hinted or hint-free (except hint-free
+                              ``top_k >= 2048`` at ``N <= 4096`` for a single
+                              row, and ``N <= top_k`` where every row is the
+                              identity answer: radix_filter wins both);
+                              radix_filter
+                              for the remaining hint-free fp32 cells from 32K
                               columns up (all N once ``batch >= 256``) and
                               for the bf16/fp16 mid/large regions; gvr for
                               fp32 when ``batch * max_seq_len >= 2^22`` and
@@ -1583,7 +1701,7 @@ def top_k_varlen(
         (CUDA tensor of at least
         ``flashinfer.topk_varlen.kernels.gvr2_topk_host.workspace_bytes()``
         = 20,973,568 bytes, zero-initialized before first use, 16-byte
-        aligned) overrides the per-device cached slab.
+        aligned) overrides the cached default slab.
 
         .. warning::
             Do **not** share the same workspace dict across concurrent CUDA
@@ -1591,15 +1709,32 @@ def top_k_varlen(
             on the device tensors.  For the ``"gvr"`` backend, ``workspace=None``
             (default) allocates per call and is safe for any concurrency.
             For ``"gvr_2"``, ``workspace=None`` resolves to **one slab per
-            device**, shared by every launch on that device: it holds the
-            cross-CTA counters, offsets and candidate buffer of the multi-CTA
-            streaming path (selected by the kernel's ``route()`` from row
-            count, envelope and ``top_k``; small batches with long rows), so
-            two such launches in flight at once — two eager streams, or two
-            CUDA graphs replayed concurrently — race on it. Every concurrently
-            active stream, and every CUDA graph that may replay concurrently
-            with another launch, must pass its own ``"gvr2_workspace"``;
-            stream-ordered use needs nothing.
+            device and CUDA stream**: it holds the cross-CTA counters,
+            offsets and candidate buffer of the multi-CTA streaming path
+            (selected by the kernel's ``route()`` from row count, envelope
+            and ``top_k``; small batches with long rows), so launches that
+            can overlap must not share it — and with per-stream slabs, two
+            eager streams or two CUDA graphs captured on different streams
+            and replayed concurrently do not. The slab is created by the
+            first **eager** launch on a stream; a graph captured on a stream
+            that has never run an eager ``gvr_2`` launch (and whose plan
+            needs the slab) raises under capture instead of allocating from
+            the graph pool. Graphs captured on the SAME stream share that
+            stream's slab and must not be replayed concurrently with each
+            other; pass a private ``"gvr2_workspace"`` for that pattern.
+            Slabs are keyed by the raw CUDA stream handle: there is one 21 MB
+            slab per distinct handle that has run an eager slab-using launch.
+            PyTorch hands out ``torch.cuda.Stream()`` objects from a fixed
+            pool per device and priority (two ``Stream`` objects may share one
+            slab when the pool wraps — they also share the raw stream, so
+            their launches are ordered), but stream handles created outside
+            that pool (external streams, other priorities) each add a slab,
+            so the total is not bounded by the pool size. The slabs live for
+            the process unless released with
+            ``flashinfer.topk_varlen.release_gvr2_resources(device)``, which
+            synchronizes the device, drops them and returns the bytes freed;
+            graphs captured against them must then be re-captured after a
+            fresh eager warm-up.
 
     Returns
     -------
@@ -1612,7 +1747,7 @@ def top_k_varlen(
     ------
     BackendSupportedError
         If the requested backend is not supported on the current device, or
-        an explicit ``"gvr"`` / ``"gvr_2"`` request has no usable ``pre_idx``.
+        an explicit ``"gvr"`` request has no usable ``pre_idx``.
     ValueError
         If ``logits`` / ``seq_lens`` / ``next_n`` violate the shape, dtype or
         grouping contract, an ``out_indices`` / ``out_values`` buffer is
@@ -1698,13 +1833,17 @@ def top_k_varlen(
     if pre_idx is not None:
         problem = _hint_problem(pre_idx, logits, seq_lens, top_k)
         if problem is not None:
-            tail = (
-                "Fix the caller: with a well-formed hint auto can use the gvr_2 / "
-                "gvr paths, which are several times faster on hinted fp32 shapes."
-                if backend == "auto"
-                else f"backend={backend!r} never consumes the hint; the result is "
-                "unaffected, but fix the caller."
-            )
+            if backend in ("auto", "gvr_2"):
+                tail = (
+                    "Fix the caller: gvr_2 falls back to its hint-free engines "
+                    "(exact, but slower than with a real previous-step hint) and "
+                    "gvr cannot run at all without a well-formed hint."
+                )
+            else:
+                tail = (
+                    f"backend={backend!r} never consumes the hint; the result is "
+                    "unaffected, but fix the caller."
+                )
             warnings.warn(
                 f"top_k_varlen: pre_idx is malformed ({problem}); the hint is "
                 f"DISCARDED and this call runs hint-free (int32[{seq_lens.shape[0]}, "
@@ -1752,10 +1891,10 @@ def top_k_varlen(
 
     if backend == "auto":
         backend = top_k_varlen.suitable_auto_backends[0]
-    if pre_idx is None and backend in ("gvr", "gvr_2"):
+    if pre_idx is None and backend == "gvr":
         # reachable under skip_check=True (the checkers did not run) with a
         # missing or just-discarded hint: refuse here instead of handing None
-        # to a kernel host
+        # to a kernel host (gvr_2 runs hint-free, see _run_gvr2)
         raise BackendSupportedError(
             f"backend={backend!r} requires a well-formed pre_idx hint "
             f"(int32[{seq_lens.shape[0]}, {top_k}] contiguous CUDA tensor on "

@@ -5,10 +5,12 @@
 - nvfp4_quantize_smooth : NVFP4-quantize(x * pre_quant_scale).
 - svdquant_linear       : the full quantize -> LoRA-down -> residual/correction chain.
 
-SM100/SM103 use fused CUTLASS. SM120/SM121 use fused CuTe DSL, with an explicit
+SM100/SM103 use fused CUTLASS or the explicit generated Cake backend. SM120/SM121
+use fused CuTe DSL, with an explicit
 ``cute-dsl-unfused`` composition retained as a differential oracle.
 """
 
+from packaging.version import Version
 import pytest
 import torch
 
@@ -26,6 +28,7 @@ from flashinfer.gemm.gemm_svdquant import (
     SVDQUANT_LORA_RANK_GRANULARITY,
     get_nvfp4_svdquant_module,
 )
+from flashinfer.jit.cpp_ext import get_cuda_version
 from flashinfer.utils import device_support_pdl, get_compute_capability
 
 _RANK = SVDQUANT_LORA_RANK_GRANULARITY  # base rank == the collective's rank granularity
@@ -42,6 +45,11 @@ def test_nvfp4_svdquant_backend_arch_support():
     assert mm_nvfp4_svdquant.is_backend_supported("cute-dsl-unfused", 120)
     assert mm_nvfp4_svdquant.is_backend_supported("cute-dsl-unfused", 121)
     assert not mm_nvfp4_svdquant.is_backend_supported("cute-dsl-unfused", 100)
+    assert mm_nvfp4_svdquant.is_backend_supported("cake", 100)
+    assert mm_nvfp4_svdquant.is_backend_supported("cake", 103)
+    assert not mm_nvfp4_svdquant.is_backend_supported("cake", 107)
+    assert not mm_nvfp4_svdquant.is_backend_supported("cake", 120)
+    assert not mm_nvfp4_svdquant.is_backend_supported("cake", 121)
 
 
 def test_sm120_svdquant_kernel_iket_flag_defaults_off():
@@ -1061,6 +1069,85 @@ def test_mm_nvfp4_svdquant_cuda_graph(rank):
     assert torch.equal(out_graph, out_eager)
 
 
+@pytest.mark.parametrize(
+    "m,k,rank,use_bias",
+    [
+        (129, 3072, 32, False),
+        (129, 12288, 32, False),
+        (129, 3072, 96, True),
+        (6912, 3072, 96, True),
+        (129, 3072, 64, True),
+        (129, 12288, 32, True),
+        (129, 3072, 32, True),
+        (129, 3072, 128, True),
+    ],
+)
+def test_mm_nvfp4_svdquant_cake_cuda_graph_replay(m, k, rank, use_bias):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    if get_cuda_version() < Version("13.0"):
+        pytest.skip("Cake NVFP4 SVDQuant requires CUDA 13.0 or later")
+    torch.manual_seed(0)
+    p = _make_gemm_problem(m, 3072, k, rank=rank)
+    out = torch.empty(m, 3072, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return mm_nvfp4_svdquant(
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            bias=p["bias"] if use_bias else None,
+            out=out,
+            backend="cake",
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = p["ref_bias"] if use_bias else p["ref"]
+    assert _sqnr_db(expected, out.float()) > 40.0
+
+
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_mm_nvfp4_svdquant_cake_pooled_scale_buffers(use_bias):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    if get_cuda_version() < Version("13.0"):
+        pytest.skip("Cake NVFP4 SVDQuant requires CUDA 13.0 or later")
+    torch.manual_seed(0)
+    p = _make_gemm_problem(129, 3072, 3072, rank=32)
+
+    def run(a_sf, b_sf):
+        return mm_nvfp4_svdquant(
+            p["xq"],
+            p["wq"],
+            a_sf,
+            b_sf,
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            bias=p["bias"] if use_bias else None,
+            backend="cake",
+        )
+
+    expected = run(p["x_sf_flat"], p["w_sf_flat"])
+    padding = torch.tensor([255], dtype=torch.uint8, device="cuda")
+    actual = run(
+        torch.cat((p["x_sf_flat"], padding)),
+        torch.cat((p["w_sf_flat"], padding)),
+    )
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("backend", ["cute-dsl", "auto"])
 def test_mm_nvfp4_svdquant_sm120_cuda_graph_replay(backend):
     _skip_unless_sm120()
@@ -1100,6 +1187,150 @@ def test_mm_nvfp4_svdquant_sm120_cuda_graph_replay(backend):
     graph.replay()
     torch.cuda.synchronize()
     _assert_sm120_accuracy(p["ref_bias"], out)
+
+
+def test_mm_nvfp4_svdquant_cake_requires_cuda13():
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    if get_cuda_version() >= Version("13.0"):
+        pytest.skip("Requires an unsupported CUDA toolkit")
+    p = _make_gemm_problem(129, 3072, 3072, rank=32)
+    with pytest.raises(ValueError, match="Cake NVFP4 SVDQuant requires CUDA 13.0"):
+        mm_nvfp4_svdquant(
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            backend="cake",
+        )
+
+
+def _skip_unless_cake_backend():
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    if get_cuda_version() < Version("13.0"):
+        pytest.skip("Cake NVFP4 SVDQuant requires CUDA 13.0 or later")
+
+
+def _run_cake(p, out, use_bias):
+    return mm_nvfp4_svdquant(
+        p["xq"],
+        p["wq"],
+        p["x_sf_flat"],
+        p["w_sf_flat"],
+        p["alpha"],
+        p["d"],
+        p["l1_scaled"],
+        bias=p["bias"] if use_bias else None,
+        out=out,
+        backend="cake",
+    )
+
+
+# Shapes the previous exact-shape route table did not list: ragged and tiny M,
+# new N / K, every rank, with and without bias.
+@pytest.mark.parametrize(
+    "m,n,k,rank,use_bias",
+    [
+        (128, 3072, 3072, 32, True),
+        (135, 3072, 3072, 32, False),
+        (333, 4096, 4096, 64, False),
+        (2048, 6144, 3072, 128, True),
+        (4097, 3072, 12288, 32, True),
+        (200, 3072, 3072, 96, True),
+        (191, 3072, 3072, 64, True),
+        (129, 4096, 3072, 96, False),
+    ],
+)
+def test_mm_nvfp4_svdquant_cake_general_shapes(m, n, k, rank, use_bias):
+    _skip_unless_cake_backend()
+    torch.manual_seed(0)
+    p = _make_gemm_problem(m, n, k, rank=rank)
+    out = _run_cake(p, None, use_bias)
+    torch.cuda.synchronize()
+    expected = p["ref_bias"] if use_bias else p["ref"]
+    assert out.shape == (m, n)
+    assert torch.isfinite(out.float()).all()
+    assert _sqnr_db(expected, out.float()) > 40.0
+
+
+@pytest.mark.parametrize(
+    "m,n,k,rank",
+    [
+        (65, 3072, 3072, 32),  # M below the 128-row tensor-map box
+        (129, 3104, 3072, 32),  # N must be a multiple of 128
+        (129, 3072, 3200, 96),  # K must be a multiple of the 256-deep K tile at rank 96
+        (129, 3072, 3072, 160),  # ranks above 128 are not supported
+    ],
+)
+def test_mm_nvfp4_svdquant_cake_rejects_unsupported_shapes(m, n, k, rank):
+    _skip_unless_cake_backend()
+    device = torch.device("cuda")
+    a = torch.zeros(m, k // 2, dtype=torch.uint8, device=device)
+    b = torch.zeros(n, k // 2, dtype=torch.uint8, device=device)
+    sf_rows_a = (m + 127) // 128 * 128
+    sf_rows_b = (n + 127) // 128 * 128
+    sf_cols = (k // 16 + 3) // 4 * 4
+    a_sf = torch.zeros(sf_rows_a * sf_cols, dtype=torch.uint8, device=device)
+    b_sf = torch.zeros(sf_rows_b * sf_cols, dtype=torch.uint8, device=device)
+    alpha = torch.ones(1, dtype=torch.float32, device=device)
+    d = torch.zeros(m, rank, dtype=torch.bfloat16, device=device)
+    l1 = torch.zeros(n, rank, dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError):
+        mm_nvfp4_svdquant(a, b, a_sf, b_sf, alpha, d, l1, backend="cake")
+
+
+def test_mm_nvfp4_svdquant_cake_two_layers_cuda_graph():
+    """Two layers with their own weights, K and rank replay correctly from one
+    graph and from two alternating graphs: each launch carries its own
+    descriptors, so no layer can observe the other's."""
+    _skip_unless_cake_backend()
+    torch.manual_seed(0)
+    m = 129
+    layer1 = _make_gemm_problem(m, 3072, 3072, rank=32)
+    layer2 = _make_gemm_problem(m, 3072, 12288, rank=64)
+    out1 = torch.empty(m, 3072, dtype=torch.bfloat16, device="cuda")
+    out2 = torch.empty(m, 3072, dtype=torch.bfloat16, device="cuda")
+
+    def run1():
+        _run_cake(layer1, out1, True)
+
+    def run2():
+        _run_cake(layer2, out2, True)
+
+    run1()
+    run2()
+    torch.cuda.synchronize()
+    eager1, eager2 = out1.clone(), out2.clone()
+    assert _sqnr_db(layer1["ref_bias"], eager1.float()) > 40.0
+    assert _sqnr_db(layer2["ref_bias"], eager2.float()) > 40.0
+
+    both = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(both):
+        run1()
+        run2()
+    for _ in range(2):
+        out1.fill_(float("nan"))
+        out2.fill_(float("nan"))
+        both.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out1, eager1)
+        assert torch.equal(out2, eager2)
+
+    graph1 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph1):
+        run1()
+    graph2 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph2):
+        run2()
+    for graph, out, eager in ((graph1, out1, eager1), (graph2, out2, eager2)) * 2:
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager)
 
 
 if __name__ == "__main__":

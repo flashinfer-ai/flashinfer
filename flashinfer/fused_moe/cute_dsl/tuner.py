@@ -739,9 +739,13 @@ class CuteDslFusedMoERunner(TunableRunner):
             )
 
             if _is_rubin_tactic(tactic):
-                # The Rubin (SM107) kernels only implement the gated (SwiGLU)
-                # activation path; skip Rubin tactics for non-gated activations.
-                if not gated:
+                # The Rubin (SM107) gather kernel implements SwiGLU (and its
+                # SiTU variant) plus Relu2, but not GeGLU-tanh; skip Rubin
+                # tactics for the unimplemented activation.
+                if (
+                    ActivationType(int(self.activation_type))
+                    == ActivationType.GegluTanh
+                ):
                     return False
 
                 # The SM107 kernels need cutlass.utils.rubin_helpers, which only
@@ -767,6 +771,9 @@ class CuteDslFusedMoERunner(TunableRunner):
                 gemm2_mma_tiler, gemm2_mma_inst_shape, gemm2_cluster_shape_mn, _ = (
                     gemm2_tactic
                 )
+
+                if gemm1_cluster_shape_mn[0] > 1 or gemm2_cluster_shape_mn[0] > 1:
+                    return False
 
                 gemm1_ok = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel.can_implement(
                     a_dtype=a_dtype,

@@ -839,6 +839,12 @@ class MoEDirectMicroKernel:
             eid_addr = Int32(kk)
             eid = Int32(topk_ids[eid_addr])
             router_w = topk_weights[eid_addr]
+            # Unrouted pair: read expert 0 with a zero routing weight.
+            # Assumes fc2(expert 0) is finite: 0.0 * inf/NaN would poison the
+            # token row. Skipping unrouted pairs' tiles (follow-up) drops this.
+            if eid < Int32(0):
+                eid = Int32(0)
+                router_w = Float32(0.0)
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1036,6 +1042,8 @@ class MoEDirectMicroKernel:
             eid_addr = Int32(kk)
             eid = Int32(topk_ids[eid_addr])
             router_w = topk_weights[eid_addr]
+            route_valid = eid >= Int32(0)
+            eid = cutlass.max(eid, Int32(0))
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1046,6 +1054,8 @@ class MoEDirectMicroKernel:
             else:
                 alpha_fc2 = w2_alphas[eid]
                 scale_lane = alpha_fc2 * router_w
+            if not route_valid:
+                scale_lane = Float32(0.0)
 
             ebase_w = Int64(eid) * Int64(cfg.k_dim * cfg.n_half)
             ebase_sf = Int64(eid) * Int64(cfg.w2_sf_rows * cfg.w2_sf_cols)
@@ -1278,6 +1288,9 @@ class MoEDirectMicroKernel:
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
             eid = Int32(topk_ids[eid_addr])
             router_w = topk_weights[eid_addr]
+            if eid < Int32(0):
+                eid = Int32(0)
+                router_w = Float32(0.0)
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1494,6 +1507,9 @@ class MoEDirectMicroKernel:
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
             eid = Int32(topk_ids[eid_addr])
             router_w = topk_weights[eid_addr]
+            if eid < Int32(0):
+                eid = Int32(0)
+                router_w = Float32(0.0)
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1705,10 +1721,21 @@ class MoEDirectMicroKernel:
         row_mode_a3 = (k_row3 >> Int32(5)) & Int32(3)
         row_mode_32_3 = k_row3 & Int32(31)
 
+        # is_supported limits top-k to 32, so each lane can hold one route.
+        # Read and mask them once, avoiding serial ID loads in FC2/prefetch.
+        lane_eid = Int32(0)
+        lane_router_w = Float32(0.0)
+        if lane < Int32(cfg.num_topk):
+            route = t * Int32(cfg.num_topk) + lane
+            lane_eid = Int32(topk_ids[route])
+            lane_router_w = topk_weights[route]
+            if lane_eid < Int32(0):
+                lane_eid = Int32(0)
+                lane_router_w = Float32(0.0)
+
         for kk in cutlass.range_constexpr(cfg.num_topk):
-            eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
-            eid = Int32(topk_ids[eid_addr])
-            router_w = topk_weights[eid_addr]
+            eid = cute.arch.shuffle_sync(lane_eid, Int32(kk))
+            router_w = cute.arch.shuffle_sync(lane_router_w, Int32(kk))
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1761,8 +1788,7 @@ class MoEDirectMicroKernel:
                             + lane_byte_off,
                         )
                 elif cutlass.const_expr(kk + 1 < cfg.num_topk):
-                    next_eid_addr = t * Int32(cfg.num_topk) + Int32(kk + 1)
-                    next_eid = Int32(topk_ids[next_eid_addr])
+                    next_eid = cute.arch.shuffle_sync(lane_eid, Int32(kk + 1))
                     next_ebase_w = Int64(next_eid) * Int64(cfg.k_dim * cfg.n_half)
                     next_ebase_sf = Int64(next_eid) * Int64(
                         cfg.w2_sf_rows * cfg.w2_sf_cols
@@ -2201,9 +2227,10 @@ class MoEDirectMicroKernel:
                 eid_addr_0 = t0 * Int32(cfg.num_topk) + (
                     route_idx_0 - t0 * Int32(cfg.num_topk)
                 )
-                gs_fc1_0 = self._input_scale_multiplier(
-                    input_gs[Int32(topk_ids[eid_addr_0])]
-                )
+                eid_0 = Int32(topk_ids[eid_addr_0])
+                if eid_0 < Int32(0):
+                    eid_0 = Int32(0)
+                gs_fc1_0 = self._input_scale_multiplier(input_gs[eid_0])
                 in_blk = tidx
                 while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
                     x_base = t0 * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
@@ -2280,6 +2307,9 @@ class MoEDirectMicroKernel:
 
             eid_addr = t * Int32(cfg.num_topk) + k_idx
             eid = Int32(topk_ids[eid_addr])
+            # Unrouted pair: run FC1 on expert 0; FC2 zeroes its routing weight.
+            if eid < Int32(0):
+                eid = Int32(0)
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -4521,9 +4551,10 @@ class MoEDirectMicroKernel:
                     next_eid_addr = t_next * Int32(cfg.num_topk) + (
                         next_route - t_next * Int32(cfg.num_topk)
                     )
-                    gs_fc1_next = self._input_scale_multiplier(
-                        input_gs[Int32(topk_ids[next_eid_addr])]
-                    )
+                    next_eid = Int32(topk_ids[next_eid_addr])
+                    if next_eid < Int32(0):
+                        next_eid = Int32(0)
+                    gs_fc1_next = self._input_scale_multiplier(input_gs[next_eid])
                     next_buf_base = (Int32(1) - buf_idx) * Int32(cfg.smem_xh_size)
                     in_blk = tidx
                     while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):

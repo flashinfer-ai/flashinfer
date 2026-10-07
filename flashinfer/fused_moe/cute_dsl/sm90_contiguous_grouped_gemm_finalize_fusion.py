@@ -55,7 +55,6 @@ def _get_compiled_finalize_kernel(
     ab_dtype: type,
     c_dtype: type,
     tile_shape_mn: Tuple[int, int],
-    tile_k: int,
     cluster_shape_mn: Tuple[int, int],
     topk: int,
     use_fused_finalize: bool,
@@ -65,15 +64,15 @@ def _get_compiled_finalize_kernel(
     """Get or compile one GEMM2 specialization.
 
     Problem dimensions, pointers, and the CUDA stream are runtime parameters;
-    pointer dtypes and the kernel-specializing parameters (tile/cluster/raster
-    tactics, ``topk``, ``use_fused_finalize``, ``max_active_clusters``,
-    ``enable_pdl``) form the process-local compile key.
+    pointer dtypes and the kernel-specializing parameters
+    (tile_size/cluster_shape_mn/raster_along_m tactics, ``topk``,
+    ``use_fused_finalize``, ``max_active_clusters``, ``enable_pdl``) form the
+    process-local compile key.
     """
     cache_key = (
         ab_dtype,
         c_dtype,
         tile_shape_mn,
-        tile_k,
         cluster_shape_mn,
         topk,
         use_fused_finalize,
@@ -90,7 +89,6 @@ def _get_compiled_finalize_kernel(
         tile_shape_mn=tile_shape_mn,
         topk=topk,
         use_fused_finalize=use_fused_finalize,
-        tile_k=tile_k,
         cluster_shape_mn=cluster_shape_mn,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
@@ -131,7 +129,6 @@ def sm90_contiguous_grouped_gemm_finalize_fusion(
     topk: int,
     use_fused_finalize: bool = True,
     tile_shape_mn: Tuple[int, int] = (128, 128),
-    tile_k: int = 64,
     cluster_shape_mn: Tuple[int, int] = (1, 1),
     raster_along_m: bool = False,
     enable_pdl: bool = True,
@@ -158,24 +155,31 @@ def sm90_contiguous_grouped_gemm_finalize_fusion(
     num_local_experts, n, w_k = w2_weight.shape
     if w_k != k:
         raise ValueError(f"k mismatch: a k={k}, w2_weight k={w_k}")
-    tile_size = tile_shape_mn[0]
-    if permuted_m % tile_size != 0:
-        raise ValueError(f"permuted_m={permuted_m} not a multiple of {tile_size}")
-    if n % tile_shape_mn[1] != 0:
-        raise ValueError(f"n={n} must be a multiple of tile_n={tile_shape_mn[1]}")
     num_tokens = token_final_scales.shape[0]
     out_rows = out.shape[0]
     expected_rows = num_tokens if use_fused_finalize else num_tokens * topk
     if out_rows != expected_rows or out.shape[1] != n:
         raise ValueError(f"out shape {tuple(out.shape)} != ({expected_rows}, {n})")
 
-    if cluster_shape_mn == (1, 2) and (n // tile_shape_mn[1]) % 2 != 0:
-        cluster_shape_mn = (1, 1)
-    if k % tile_k != 0:
-        raise ValueError(f"k={k} must be a multiple of tile_k={tile_k}")
-
     ab_dtype = TORCH_TO_CUTLASS_DTYPE[a.dtype]
     c_dtype = TORCH_TO_CUTLASS_DTYPE[out.dtype]
+    if not Sm90ContiguousGroupedGemmFinalizeFusionKernel.can_implement(
+        ab_dtype,
+        ab_dtype,
+        c_dtype,
+        tile_shape_mn,
+        cluster_shape_mn,
+        permuted_m,
+        n,
+        k,
+        num_local_experts,
+    ):
+        raise ValueError(
+            "sm90_contiguous_grouped_gemm_finalize_fusion cannot implement "
+            f"tile_shape_mn={tile_shape_mn}, cluster_shape_mn={cluster_shape_mn} "
+            f"for permuted_m={permuted_m}, n={n} (hidden), "
+            f"k={k} (I), {a.dtype} -> {out.dtype}"
+        )
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
@@ -238,7 +242,6 @@ def sm90_contiguous_grouped_gemm_finalize_fusion(
         ab_dtype=ab_dtype,
         c_dtype=c_dtype,
         tile_shape_mn=tile_shape_mn,
-        tile_k=tile_k,
         cluster_shape_mn=cluster_shape_mn,
         topk=topk,
         use_fused_finalize=use_fused_finalize,

@@ -19,6 +19,10 @@ import math
 import pytest
 import torch
 from tests.test_helpers.sink_attention_reference import sink_attention_unified
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 import flashinfer
 from flashinfer.jit.utils import filename_safe_dtype_map
@@ -147,14 +151,20 @@ def sink_attention_varlen_ref(
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("batch_size", [1, 4, 16])
-@pytest.mark.parametrize("seq_len", [1, 4, 16, 128])
-@pytest.mark.parametrize("num_qo_heads", [32])
-@pytest.mark.parametrize("num_kv_heads", [8, 32])
-@pytest.mark.parametrize("window_left", [-1, 128])
-@pytest.mark.parametrize("causal", [True, False])
+# Preserve pairwise coverage independently for each backend.
 @pytest.mark.parametrize("backend", ["fa2", "fa3"])
+@parametrize_product(
+    {
+        "dtype": [torch.float16, torch.bfloat16],
+        "batch_size": [1, 4, 16],
+        "seq_len": [1, 4, 16, 128],
+        "num_qo_heads": [32],
+        "num_kv_heads": [8, 32],
+        "window_left": [-1, 128],
+        "causal": [True, False],
+    },
+    regular=pairwise_product_cases,
+)
 def test_attention_sink(
     dtype, batch_size, seq_len, num_qo_heads, num_kv_heads, window_left, causal, backend
 ):

@@ -1,7 +1,7 @@
 """ctypes shim for NCCL-EP's fault-tolerance mask API.
 
-``nccl4py`` binds ``GroupConfig.enable_mask`` and ``timeout_ns`` (so masking
-can be switched on) but its ``Group`` class stops at ``create`` /
+``nccl-extensions`` binds ``GroupConfig.enable_mask`` and ``timeout_ns`` (so
+masking can be switched on) but its ``Group`` class stops at ``create`` /
 ``create_handle`` / ``destroy`` / ``.ptr`` — the five mask functions are not
 exposed to Python:
 
@@ -9,12 +9,12 @@ exposed to Python:
     ncclEpGetAsyncError / ncclEpErrorClear
 
 ``Group.ptr`` is the raw ``ncclEpGroup_t``, so we can call them directly until
-nccl4py catches up. Every method here tries a native ``Group`` method FIRST
+nccl-extensions catches up. Every method here tries a native ``Group`` method FIRST
 and only then falls back to ctypes, so the shim retires itself with no
 call-site churn the day those bindings land.
 
 Which library: the symbols live in **libnccl_ep.so**, not libnccl.so.2.
-nccl4py dlopens it with ``RTLD_GLOBAL`` and resolves through
+``nccl.ep`` dlopens it with ``RTLD_GLOBAL`` and resolves through
 ``dlsym(RTLD_DEFAULT, ...)``, so once ``nccl.ep`` has initialized, the symbols
 are in the process-global namespace and ``CDLL(None)`` binds *exactly* the
 library the caller's group came from. That matters: resolving a path
@@ -23,7 +23,7 @@ LD_LIBRARY_PATH disagree, and calling into it with a group created by the
 other one is undefined behaviour. Path resolution is only a fallback for
 probing before any group exists.
 
-TODO(moe_ep): drop the ctypes fallback once nccl4py binds ncclEpMask* on
+TODO(moe_ep): drop the ctypes fallback once nccl-extensions binds ncclEpMask* on
 ``nccl.ep.Group``; the native-first dispatch below already prefers it.
 """
 
@@ -65,17 +65,18 @@ _NCCL_RESULT_NAMES = {
 
 _UPGRADE_HINT = (
     "Fault tolerance needs an NCCL-EP build carrying the ncclEpMask* API "
-    "(nccl-ep >= v0.1.0 with active-mask support). Upgrade the nccl4py wheel "
-    "that ships libnccl_ep.so, and make sure it is the one actually loaded "
-    "(check `python -m nccl show_versions`)."
+    "(nccl-ep >= v0.1.0 with active-mask support). Upgrade the nccl-extensions "
+    "wheel that ships libnccl_ep.so, and make sure it is the one actually "
+    "loaded (check `python -c 'import nccl.ep; print(nccl.ep.get_lib_path(), "
+    "nccl.ep.get_lib_version())'`)."
 )
 
 
 def _resolve_libnccl_ep() -> ctypes.CDLL | None:
     """Return a handle exporting the mask symbols, or None.
 
-    Mirrors nccl4py's own resolution order so we bind the same library it
-    does. The global namespace is tried first because that is the one case
+    Mirrors nccl-extensions' own resolution order so we bind the same library
+    it does. The global namespace is tried first because that is the one case
     where the identity is *guaranteed* rather than merely likely.
     """
     # 1. Process-global namespace. If nccl.ep has initialized, its
@@ -87,14 +88,38 @@ def _resolve_libnccl_ep() -> ctypes.CDLL | None:
     except (OSError, AttributeError):
         pass
 
-    # 2. nccl4py package path (nccl/ep/lib/libnccl_ep.so), then the linker's
-    #    own search. libnccl_ep.so has NEEDED libnccl.so.2, so preload that
-    #    first exactly as the transport backend does.
+    # 2. Ask nccl.ep itself, then fall back to its package layout, then to
+    #    the linker's own search. ``get_lib_path()`` reports the library the
+    #    bindings actually loaded, which is the only answer guaranteed to
+    #    match the one a Group would come from; it raises rather than returns
+    #    None when libnccl.so.2 is missing, hence the broad except.
+    #
+    #    Layout note: since nccl-extensions 0.1.0 the bundled libraries are
+    #    split per CUDA major (nccl/ep/lib/cu{12,13}/libnccl_ep.so), whereas
+    #    nccl4py <= 0.3.x shipped a flat nccl/ep/lib/libnccl_ep.so. Probe the
+    #    CUDA-matched directory first, then the other, then the flat legacy
+    #    path. libnccl_ep.so has NEEDED libnccl.so.2, so preload that first
+    #    exactly as the transport backend does.
     candidates: list[str] = []
     try:
-        import nccl  # type: ignore[import-not-found]
+        import nccl.ep as _nccl_ep  # type: ignore[import-not-found]
 
-        candidates.append(str(Path(nccl.__path__[0]) / "ep" / "lib" / "libnccl_ep.so"))
+        with contextlib.suppress(Exception):
+            lib_path = _nccl_ep.get_lib_path()
+            if lib_path is not None:
+                candidates.append(str(lib_path))
+
+        ep_lib = Path(_nccl_ep.__path__[0]) / "lib"
+        majors = ["12", "13"]
+        with contextlib.suppress(Exception):
+            from nccl._extensions._runtime import (  # type: ignore[import-not-found]
+                cuda_major,
+            )
+
+            majors.remove(str(cuda_major()))
+            majors.insert(0, str(cuda_major()))
+        candidates += [str(ep_lib / f"cu{m}" / "libnccl_ep.so") for m in majors]
+        candidates.append(str(ep_lib / "libnccl_ep.so"))
     except Exception:
         pass
     conda = os.environ.get("CONDA_PREFIX")
@@ -176,7 +201,7 @@ class _MaskFfi:
 
     # ------------------------------------------------------- public wrappers
     #
-    # Each prefers a native nccl4py Group method when one exists, so this
+    # Each prefers a native nccl.ep Group method when one exists, so this
     # module becomes dead weight (not a blocker) once those land.
 
     def mask_query(self, group, dev_ptr: int, stream: int) -> None:

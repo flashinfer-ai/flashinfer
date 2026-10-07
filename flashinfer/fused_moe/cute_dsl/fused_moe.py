@@ -57,7 +57,7 @@ import weakref
 
 import torch
 
-from ...api_logging import flashinfer_api
+from ...api_logging import _is_current_stream_capturing, flashinfer_api
 from ...trace.templates.moe import (
     cute_dsl_fused_moe_mxfp8_mxfp4_trace,
     cute_dsl_fused_moe_trace,
@@ -77,11 +77,18 @@ from ...quantization.kernels.nvfp4_quantize import (
     SF_LAYOUT_128x4,
     nvfp4_quantize_per_token_cute_dsl,
 )
+from ...quantization.nvfp4_quantization_utils import (
+    nvfp4_per_token_scale_inv,
+    NVFP4_PER_TOKEN_SCALE_RTOL,
+    _UNSET,
+    NVFP44Over6Config,
+    nvfp4_e4m3_max,
+    resolve_nvfp4_4over6,
+)
 from ...utils import supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
-    moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
 )
@@ -127,6 +134,63 @@ def _canonicalize_quant_mode(quant_mode: str) -> str:
         )
         return "w4a4"
     return quant_mode
+
+
+#: ``(data_ptr, device index, e4m3_max, _version)`` of GEMM2-input scales
+#: already checked against their recipe. The scale is a weight-pack constant,
+#: so checking it once per tensor avoids a device->host sync on every forward.
+#: An in-place write bumps ``_version`` and re-checks; a ``weakref.finalize``
+#: evicts the entry when the tensor dies, so a reused address is re-checked.
+_validated_gemm2_input_scales: set[tuple[int, int, float, int]] = set()
+
+
+def _check_gemm2_input_scale(
+    fc2_input_scale: torch.Tensor | float,
+    nvfp4_4over6_config: Optional[NVFP44Over6Config],
+) -> None:
+    """Verify ``fc2_input_scale`` was built from the pinned 4over6 recipe.
+
+    The 4over6 candidate search bakes ``1 / (6 * e4m3_max)`` into the
+    dequantization it ranks its candidates with, so any other GEMM2-input
+    scale ranks them on the wrong magnitudes. Raising beats overriding a
+    caller-supplied pack constant. ``None`` (standard NVFP4) returns
+    immediately; a CUDA tensor is read once and remembered by storage pointer.
+    """
+    if nvfp4_4over6_config is None:
+        return
+    e4m3_max = nvfp4_e4m3_max(nvfp4_4over6_config)
+    key = None
+    if isinstance(fc2_input_scale, torch.Tensor):
+        if fc2_input_scale.is_cuda:
+            key = (
+                fc2_input_scale.data_ptr(),
+                fc2_input_scale.device.index,
+                e4m3_max,
+                fc2_input_scale._version,
+            )
+            if key in _validated_gemm2_input_scales:
+                return
+            if _is_current_stream_capturing():
+                # Reading a device tensor mid-capture is illegal; the warmup
+                # iterations CUDA graphs require have already checked it.
+                return
+        value = float(fc2_input_scale.reshape(-1)[0])
+    else:
+        value = float(fc2_input_scale)
+    expected = nvfp4_per_token_scale_inv(nvfp4_4over6_config)
+    if abs(value - expected) > NVFP4_PER_TOKEN_SCALE_RTOL * expected:
+        raise ValueError(
+            f"fc2_input_scale={value!r} does not match the requested NVFP4 "
+            f"4over6 recipe {nvfp4_4over6_config!r}, which implies "
+            f"fc2_input_scale={expected!r}. Build the pack with "
+            "prepare_cute_dsl_weights(..., nvfp4_4over6=<the same value>) "
+            "(CuteDslConfig.prepare_weights) or the scale with "
+            "flashinfer.make_nvfp4_global_scale(x, per_token_activation=True, "
+            "nvfp4_4over6_config=<the same value>)."
+        )
+    if key is not None:
+        _validated_gemm2_input_scales.add(key)
+        weakref.finalize(fc2_input_scale, _validated_gemm2_input_scales.discard, key)
 
 
 def _get_cuda_graph_resources() -> Dict[str, Any]:
@@ -235,6 +299,7 @@ def _moe_core_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -290,6 +355,16 @@ def _moe_core_impl(
         swiglu_limit: SwiGLU clamp limit.
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        nvfp4_4over6: NVFP4 4over6 recipe for the GEMM2-input quantization.
+            - omitted (the default): read FLASHINFER_NVFP4_4OVER6* on every
+              call.
+            - None: 4over6 off regardless of the environment.
+            - NVFP44Over6Config: exactly that recipe, no per-field merge.
+            Only consulted with per_token_scale: otherwise the GEMM2 input
+            comes out of GEMM1's NVFP4 epilogue, which has no 4over6 variant.
+            A pinned recipe requires fc2_input_scale == 1 / (6 * e4m3_max)
+            (what prepare_cute_dsl_weights(..., nvfp4_4over6=...) emits), or
+            ValueError is raised.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -331,6 +406,13 @@ def _moe_core_impl(
     hidden_size = w2_weight.size(1)
     use_per_token_activation = per_token_scale is not None
 
+    # A pinned recipe is either honored or refused: the GEMM2-input quantizer
+    # only measures what it claims to when fc2_input_scale came from the same
+    # recipe. An omitted argument keeps the pre-existing behaviour and reads
+    # neither the environment nor the scale here.
+    if use_per_token_activation and nvfp4_4over6 is not _UNSET:
+        _check_gemm2_input_scale(fc2_input_scale, resolve_nvfp4_4over6(nvfp4_4over6))
+
     if moe_output is None:
         moe_output = torch.empty(
             (num_tokens, hidden_size),
@@ -351,6 +433,21 @@ def _moe_core_impl(
             main_event = main_event or resources["main_event"]
             memset_event = memset_event or resources["memset_event"]
 
+    is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
+
+    # Multi-CTA Rubin tactics are filtered out in tuner.get_valid_tactics; this
+    # is the backstop for callers that pass tactic parameters directly.
+    cluster_m = max(gemm1_cluster_shape_mn[0], gemm2_cluster_shape_mn[0])
+    if is_rubin and cluster_m > 1:
+        raise NotImplementedError(
+            f"Rubin MoE with cluster_shape_m={cluster_m} is not supported. The "
+            "tile count handed to the kernel must be rounded up to a multiple "
+            "of cluster_shape_m so every cluster reaches the barrier "
+            "uniformly, and tile_idx_to_expert_idx / tile_idx_to_mn_limit must "
+            "be initialized past num_non_exiting_tiles to match, since the "
+            "kernel bounds-checks them against that same rounded count."
+        )
+
     # Step 1: Sort tokens by expert
     moe_sort_kwargs = moe_sort_buffers or {}
     (
@@ -368,18 +465,9 @@ def _moe_core_impl(
         local_expert_offset=local_expert_offset,
         num_local_experts=num_local_experts,
         tile_tokens_dim=tile_size,
+        enable_pdl=enable_pdl,
         **moe_sort_kwargs,
     )
-
-    # For Rubin, round num_non_exiting_tiles to the next EVEN number to
-    # prevent a cluster-synchronization deadlock. With cluster_shape_m=2,
-    # two CTAs get consecutive tile indices; if the count is odd, one CTA
-    # enters the cluster barrier while the other skips it.
-    is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
-    if is_rubin:
-        kernel_num_non_exiting_tiles = ((num_non_exiting_tiles + 1) // 2) * 2
-    else:
-        kernel_num_non_exiting_tiles = num_non_exiting_tiles
 
     # Record event for async memset synchronization
     if use_async_memset and use_fused_finalize:
@@ -408,7 +496,7 @@ def _moe_core_impl(
             tile_idx_to_expert_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             token_id_mapping=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=kernel_num_non_exiting_tiles,
+            num_non_exiting_tiles=num_non_exiting_tiles,
             out=gemm1_out,
             out_scale=None if use_per_token_activation else gemm1_out_scale,
             global_scale=(
@@ -445,6 +533,7 @@ def _moe_core_impl(
                 fc2_input_scale,
                 sf_layout=SF_LAYOUT_128x4,
                 enable_pdl=enable_pdl,
+                nvfp4_4over6=nvfp4_4over6,
             )
         )
         intermediate_sf = convert_sf_to_mma_layout(
@@ -482,7 +571,7 @@ def _moe_core_impl(
         b_scale=w2_weight_sf,
         alpha=w2_alpha,
         tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-        num_non_exiting_tiles=kernel_num_non_exiting_tiles,
+        num_non_exiting_tiles=num_non_exiting_tiles,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         token_final_scales=token_final_scales,
@@ -503,6 +592,8 @@ def _moe_core_impl(
 
     # Step 4: Deterministic routing-weight reduction
     if not use_fused_finalize:
+        from .blackwell.moe_finalize import moe_unpermute
+
         moe_unpermute(
             permuted_input=gemm2_output,
             output=moe_output,
@@ -1076,6 +1167,7 @@ def _cute_dsl_fused_moe_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -1116,6 +1208,7 @@ def _cute_dsl_fused_moe_impl(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        nvfp4_4over6=nvfp4_4over6,
     )
 
 

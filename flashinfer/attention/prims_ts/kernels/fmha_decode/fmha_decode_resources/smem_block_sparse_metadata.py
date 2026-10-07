@@ -27,7 +27,7 @@ from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Uint32
+from cutlass import Float32, Int32, Uint32
 from cutlass.experimental.task_scheduling.enums import WorkAttr
 from cutlass.experimental.task_scheduling.memory import (
     ResourceContext,
@@ -50,6 +50,7 @@ from ...placeholder_helpers import _placeholder_smem_array
 from ...stage import FmhaStage
 from ..fmha_decode_config import FmhaDecodeConfig
 from .helpers_common import (
+    _SOFTMAX_ROUTE_IS_PROXY_FLAG,
     _TASK_CACHE_SEQ_LEN_KV,
     _TASK_CACHE_WARP_IDX,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
@@ -57,20 +58,30 @@ from .helpers_common import (
     DecodeGenResourceBase,
     ResourceVars,
     _decode_gen_task_cache,
-    _keeps_col_base,
+    _keeps_spatial_half,
+    _logical_head_batch,
     _sparse_task_cache_route_begin,
     _sparse_task_cache_route_count,
     _warp_broadcast_i32,
+)
+from .sage_scales import (
+    SageScaleTensors,
+    block_sparse_k_scale_source,
+    load_k_scale,
+    sage_scale_arr_size,
+    sage_word_position,
+    sage_k_scale_words,
+    sage_staged_k_scale_words,
 )
 
 
 # Keeps staging uses the low four bits for structural KV64 validity. Bit 4
 # carries the conservative prepared summary that token masking can be skipped;
-# structural, tail, and causal masking remain independent.
+# structural, tail, and causal masking remain independent. The streamed Keeps
+# max pass derives its keep words from the token words directly, so the bit is
+# currently staged for the consumer but not read.
 _SOFTMAX_TOKEN_MASK_IS_FULL_FLAG = 1 << 4
-# Keeps reserves bit 5 for the prepared route kind. The low four structural
-# validity bits and bit 4 keep their existing meaning.
-_SOFTMAX_ROUTE_IS_PROXY_FLAG = 1 << 5
+
 
 # SWAP origins are at least eight-token aligned, so their low two bits are free
 # while the route is in Softmax's private staging payload. Reusing them avoids
@@ -148,12 +159,13 @@ def _kv_retained_route_words(
 class _BlockSparseSoftmaxStagingLayout:
     """Layout of the staged cross-warp Softmax metadata payload.
 
-    Keeps retains all route origins, a flags word, alignment padding, and the
-    optional K32 token words. KV256 consumers then select the four words owned
-    by their spatial half. SWAP stores execution-ordered origins followed by
-    optional logical K32 token words, one for each consumer warp. Selected
-    prepared route flags travel in the otherwise-zero low bits of each warp's
-    first aligned origin.
+    Keeps retains all route origins, a flags word, alignment padding, the
+    optional K32 token words and, for Sage attention, the route's ``sfK``
+    words on their own aligned boundary. KV256 consumers then select the four
+    words owned by their spatial half. SWAP stores execution-ordered origins
+    followed by optional logical K32 token words, one for each consumer warp.
+    Selected prepared route flags travel in the otherwise-zero low bits of
+    each warp's first aligned origin.
     """
 
     # Logical-origin scalars staged for one complete KV route.
@@ -162,6 +174,7 @@ class _BlockSparseSoftmaxStagingLayout:
     origins_per_warp: int
     route_flags_word_offset: int | None
     token_words_word_offset: int | None
+    sage_scale_words_word_offset: int | None
     stage_stride_words: int
     total_words: int
 
@@ -177,12 +190,14 @@ class _BlockSparseSoftmaxStagingLayout:
         use_keeps_mma_ab: bool,
         route_layout: _BlockSparseRouteLayout,
         num_stages: int,
+        sage_scale_words: int = 0,
     ) -> "_BlockSparseSoftmaxStagingLayout":
         """Build a stage-count-dependent layout for Softmax metadata."""
 
         kv_route_size = route_layout.kv_route_size
         atom_size = route_layout.atom_size
         has_token_bits = route_layout.has_token_bits
+        sage_scale_words_word_offset = None
         if use_keeps_mma_ab:
             num_origin_words = kv_route_size // atom_size
             assert num_origin_words <= 4, (
@@ -194,7 +209,11 @@ class _BlockSparseSoftmaxStagingLayout:
             token_words_word_offset = aligned_payload_words if has_token_bits else None
             token_words = kv_route_size // 32 if has_token_bits else 0
             stage_stride_words = ((aligned_payload_words + token_words + 3) // 4) * 4
+            if sage_scale_words > 0:
+                sage_scale_words_word_offset = stage_stride_words
+                stage_stride_words += ((sage_scale_words + 3) // 4) * 4
         else:
+            assert sage_scale_words == 0, "Sage scales are staged for Keeps only"
             softmax_atom_size = min(atom_size, 32)
             num_origin_words = kv_route_size // softmax_atom_size
             origins_per_warp = 32 // softmax_atom_size
@@ -208,6 +227,7 @@ class _BlockSparseSoftmaxStagingLayout:
             origins_per_warp=origins_per_warp,
             route_flags_word_offset=route_flags_word_offset,
             token_words_word_offset=token_words_word_offset,
+            sage_scale_words_word_offset=sage_scale_words_word_offset,
             stage_stride_words=stage_stride_words,
             total_words=num_stages * stage_stride_words,
         )
@@ -248,6 +268,18 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
             Int32(-1),
             "Metadata-relative record offset, or -1 for a dummy route.",
         ),
+        (
+            "prefetched_record_word_slot",
+            Int32,
+            Int32(0),
+            "Lane-owned record word loaded one resolution ahead.",
+        ),
+        (
+            "prefetched_record_offset_slot",
+            Int32,
+            Int32(-1),
+            "Record offset of the prefetched route, or -1 for a dummy route.",
+        ),
     )
     cfg: Constexpr[FmhaDecodeConfig] = None
     inst_id: Constexpr[int] = 0
@@ -267,6 +299,12 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
         TaskLocalVariable.uninitialized()
     )
     route_record_word_offset_slot: Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+    prefetched_record_word_slot: Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+    prefetched_record_offset_slot: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
 
@@ -359,6 +397,78 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
             )
         return physical_page_id
 
+    @cute.jit
+    def _route_record_word_offset(
+        self, stage_info: StageInfo, route_idx: Int32
+    ) -> Int32:
+        """Return the record offset of one route index, or -1 past the row."""
+
+        task_cache = _decode_gen_task_cache(stage_info)
+        row_route_begin = _sparse_task_cache_route_begin(task_cache)
+        route_count = _sparse_task_cache_route_count(task_cache)
+        route_record_word_offset = Int32(-1)
+        if route_idx < route_count:
+            route_record_word_offset = (row_route_begin + route_idx) * Int32(
+                self.route_layout.route_metadata_stride_words
+            )
+        return cute.arch.make_warp_uniform(route_record_word_offset)
+
+    @consumer_work(
+        returns=(
+            prefetched_record_word_slot,
+            prefetched_record_offset_slot,
+        )
+    )
+    @cute.jit
+    def prefetch_route(
+        self, stage_info: StageInfo, *, target: Constexpr[str]
+    ) -> tuple[Int32, Int32]:
+        """Issue the record load for a route that ``resolve_route`` uses later.
+
+        ``target`` selects the route relative to the calling section:
+        ``"head"`` is this instance's HEAD route, ``"first_loop"`` the route of
+        LOOP iteration 0 (called from HEAD), ``"current_loop"`` the route of
+        the calling LOOP iteration (no pipelining), and ``"next_loop"`` the
+        route of the following LOOP iteration. Only the lane-distributed load is issued
+        here; the warp broadcasts happen in ``resolve_route`` so the global
+        memory latency overlaps the TMA issue of the current route instead of
+        stalling the load warp. Layouts without one-warp transport keep their
+        loads in ``resolve_route`` and get placeholder values here.
+        """
+
+        assert self.route_metadata is not None
+        num_insts = Int32(self.cfg.num_insts_kv)
+        if cutlass.const_expr(target == "head"):
+            route_idx = Int32(self.inst_id)
+        elif cutlass.const_expr(target == "first_loop"):
+            route_idx = num_insts + Int32(self.inst_id)
+        elif cutlass.const_expr(target == "current_loop"):
+            route_idx = (stage_info.loop_offset + Int32(1)) * num_insts + Int32(
+                self.inst_id
+            )
+        else:
+            route_idx = (stage_info.loop_offset + Int32(2)) * num_insts + Int32(
+                self.inst_id
+            )
+        route_record_word_offset = self._route_record_word_offset(stage_info, route_idx)
+        record_word = Int32(0)
+        if cutlass.const_expr(self.route_layout.uses_one_warp_transport):
+            assert self.route_layout.token_words_word_offset is not None
+            meaningful_words = (
+                self.route_layout.token_words_word_offset
+                + self.route_layout.token_words_per_route
+            )
+            lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
+            if lane_idx < Int32(self.route_layout.logical_origins_per_route):
+                record_word = Int32(-1)
+            if route_record_word_offset >= Int32(0) and lane_idx < Int32(
+                meaningful_words
+            ):
+                record_word = Int32(
+                    self.route_metadata[route_record_word_offset + lane_idx]
+                )
+        return record_word, route_record_word_offset
+
     @consumer_work(
         returns=(
             resolved_record_word_slot,
@@ -369,14 +479,23 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
     )
     @cute.jit
     def resolve_route(
-        self, stage_info: StageInfo, *, section: Constexpr[FmhaStage]
+        self,
+        stage_info: StageInfo,
+        *,
+        section: Constexpr[FmhaStage],
+        prefetched_record_word_slot: Int32,
+        prefetched_record_offset_slot: Int32,
     ) -> tuple[Int32, Int32, Int32, Int32]:
-        """Load this resource instance's real or dummy prepared KV route."""
+        """Resolve this instance's real or dummy prepared KV route.
+
+        One-warp-transport layouts consume the words that ``prefetch_route``
+        loaded earlier; other layouts load their record here. The routed
+        inputs carry the task-local slot names so that every ``prefetch_route``
+        call, including the one at the end of the previous LOOP iteration,
+        updates the value read here.
+        """
 
         assert self.route_metadata is not None
-        task_cache = _decode_gen_task_cache(stage_info)
-        row_route_begin = _sparse_task_cache_route_begin(task_cache)
-        route_count = _sparse_task_cache_route_count(task_cache)
         # HEAD publishes one route per instruction. LOOP starts after those
         # two publications, hence the one-based loop offset below. Keeping the
         # constexpr branch local lets the task scheduler specialize each work
@@ -388,12 +507,12 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
                 self.cfg.num_insts_kv
             ) + Int32(self.inst_id)
         lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
-        route_record_word_offset = Int32(-1)
-        if route_idx < route_count:
-            route_record_word_offset = (row_route_begin + route_idx) * Int32(
-                self.route_layout.route_metadata_stride_words
+        if cutlass.const_expr(self.route_layout.uses_one_warp_transport):
+            route_record_word_offset = prefetched_record_offset_slot
+        else:
+            route_record_word_offset = self._route_record_word_offset(
+                stage_info, route_idx
             )
-        route_record_word_offset = cute.arch.make_warp_uniform(route_record_word_offset)
 
         num_logical_origins = self.route_layout.logical_origins_per_route
         uses_two_fragment_route = num_logical_origins == 2
@@ -406,18 +525,7 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
         route_record_is_valid = route_record_word_offset >= Int32(0)
 
         if cutlass.const_expr(self.route_layout.uses_one_warp_transport):
-            assert self.route_layout.token_words_word_offset is not None
-            meaningful_words = (
-                self.route_layout.token_words_word_offset
-                + self.route_layout.token_words_per_route
-            )
-            resolved_record_word = Int32(0)
-            if lane_idx < Int32(num_logical_origins):
-                resolved_record_word = Int32(-1)
-            if route_record_is_valid and lane_idx < Int32(meaningful_words):
-                resolved_record_word = Int32(
-                    self.route_metadata[route_record_word_offset + lane_idx]
-                )
+            resolved_record_word = prefetched_record_word_slot
             atom_valid_mask = _warp_broadcast_i32(
                 resolved_record_word,
                 self.route_layout.atom_valid_mask_word_offset,
@@ -617,6 +725,10 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     data-dependent branch; each consumer receives at most four words through
     the stable task-local ABI. Runtime route flags carry the conservative FULL
     summary and, for proxy-capable builds, the route source kind.
+
+    Sage attention adds the route's ``sfK`` words to the staged payload, so
+    the softmax threads read them from SMEM instead of issuing scattered
+    global loads before the score wait.
     """
 
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
@@ -658,8 +770,12 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     route_metadata: cute.Pointer | None = None
     staging_layout: Constexpr[_BlockSparseSoftmaxStagingLayout | None] = None
     route_layout: Constexpr[_BlockSparseRouteLayout | None] = None
+    h_k_idx: Int32 | None = None
+    b_idx: Int32 | None = None
+    scale_tensors: SageScaleTensors | None = None
     _alloc: Constexpr[SmemAllocation | None] = None
     _smem_words: cutlass.Array = None
+    _smem_scales: cutlass.Array = None
     softmax_origin0_slot: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
@@ -693,6 +809,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             use_keeps_mma_ab=self.cfg.use_keeps_mma_ab,
             route_layout=self.route_layout,
             num_stages=self.pipeline_config.num_stages,
+            sage_scale_words=sage_staged_k_scale_words(self.cfg),
         )
         super().__post_init__()
 
@@ -701,6 +818,9 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
 
         self._smem_words = _placeholder_smem_array(
             Int32, self.staging_layout.total_words
+        )
+        self._smem_scales = _placeholder_smem_array(
+            Float32, self.staging_layout.total_words
         )
 
     def get_smem_requirements(self) -> list[SmemAllocation]:
@@ -729,6 +849,13 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             self._smem_words = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
                 dtype=Int32,
+                shape=(self.staging_layout.total_words,),
+                addrspace=3,
+            )
+            # Float32 view of the same allocation for the staged sfK words.
+            self._smem_scales = cutlass.Array(
+                context.smem_base.data_ptr() + self._alloc.offset,
+                dtype=Float32,
                 shape=(self.staging_layout.total_words,),
                 addrspace=3,
             )
@@ -1011,6 +1138,90 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                     + Int32(self.staging_layout.token_words_word_offset)
                     + lane_idx
                 ] = Int32(token_word)
+        if cutlass.const_expr(self.cfg.use_sage_attention):
+            # Stage the route's ``sfK`` words in the exact geometry. Lane ``l``
+            # owns words ``l * words_per_lane`` onward, which lie in one
+            # fragment of one spatial half, so it resolves one atom origin and
+            # loads its words at the group stride. Invalid atoms (origin
+            # ``-1``) are masked; the clamp to token zero only keeps the load
+            # in bounds. Proxy routes of a mixed-geometry plan stage nothing:
+            # the softmax warps gather their summary scales behind the score
+            # wait.
+            cfg = self.cfg
+            assert self.staging_layout.sage_scale_words_word_offset is not None
+            route_is_proxy = cutlass.Boolean(False)
+            if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                route_is_proxy = cutlass.Boolean(
+                    (
+                        _warp_broadcast_i32(
+                            resolved_record_word,
+                            self.route_layout.route_flags_word_offset,
+                        )
+                        & Int32(_PREPARED_ROUTE_IS_PROXY_FLAG)
+                    )
+                    != Int32(0)
+                )
+            task_cache = _decode_gen_task_cache(stage_info)
+            scale_addr, scale_head_stride, scale_seq_len, log2_k_block_size = (
+                block_sparse_k_scale_source(
+                    cfg,
+                    self.scale_tensors,
+                    seq_len_kv=Int32(task_cache[_TASK_CACHE_SEQ_LEN_KV]),
+                    route_is_proxy=route_is_proxy,
+                )
+            )
+            kv_head_idx, batch_idx = _logical_head_batch(
+                stage_info, self.h_k_idx, self.b_idx
+            )
+            groups: Constexpr[int] = cfg.sage_k_groups_per_fragment
+            num_words: Constexpr[int] = sage_k_scale_words(cfg, groups)
+            words_per_lane: Constexpr[int] = max(1, num_words // 32)
+            assert words_per_lane * 32 >= num_words and groups % words_per_lane == 0
+            group_tokens: Constexpr[int] = cfg.softmax_score_fragment_regs // groups
+            arr_size: Constexpr[int] = sage_scale_arr_size(cfg, groups)
+            # Build the view outside the dynamic branch so the store reuses
+            # its base pointer.
+            staged = cutlass.Array(
+                self._smem_scales.data_ptr(),
+                dtype=Float32,
+                shape=(self.staging_layout.total_words,),
+                addrspace=3,
+            )
+            if cutlass.const_expr(not cfg.sage_mixed_k_geometry) or not route_is_proxy:
+                first_word = lane_idx * Int32(words_per_lane)
+                atom_idx, token_offset = sage_word_position(
+                    cfg,
+                    first_word // Int32(arr_size),
+                    first_word % Int32(arr_size),
+                    groups,
+                )
+                atom_idx = cute.math.min(atom_idx, Int32(num_origins - 1))
+                if cutlass.const_expr(num_origins == 2 and not uses_one_warp_transport):
+                    origin = Int32(resolved_record_word)
+                    if atom_idx != Int32(0):
+                        origin = Int32(resolved_origin1)
+                else:
+                    origin = Int32(
+                        cute.arch.shuffle_sync(Int32(resolved_record_word), atom_idx)
+                    )
+                if first_word < Int32(num_words):
+                    first_token = cute.math.max(origin, Int32(0)) + token_offset
+                    word_base = (
+                        stage_base
+                        + Int32(self.staging_layout.sage_scale_words_word_offset)
+                        + first_word
+                    )
+                    for entry in cutlass.range_constexpr(words_per_lane):
+                        staged[word_base + Int32(entry)] = load_k_scale(
+                            cfg,
+                            scale_addr,
+                            scale_head_stride,
+                            kv_head_idx=kv_head_idx,
+                            batch_idx=batch_idx,
+                            seq_len_kv=scale_seq_len,
+                            kv_token_idx=first_token + Int32(entry * group_tokens),
+                            log2_k_block_size=log2_k_block_size,
+                        )
         cute.arch.sync_warp()
 
     @producer_work
@@ -1163,7 +1374,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             warp_grp_thread_idx = Int32(
                 _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
             )
-            spatial = warp_grp_thread_idx >> Int32(6)
+            spatial = _keeps_spatial_half(self.cfg, warp_grp_thread_idx)
             origin0_idx = spatial
             origin1_idx = spatial + Int32(2)
             valid0 = (stored_route_flags >> origin0_idx) & Int32(1)
@@ -1200,28 +1411,6 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                 )
                 token_word3 = Uint32(
                     self._smem_words[stage_base + token_base + word1_idx + Int32(1)]
-                )
-            elif cutlass.const_expr(self.cfg.tile_size_q == 64):
-                lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
-                local_word_base = _keeps_col_base(
-                    self.cfg,
-                    lane_idx,
-                    self.cfg.num_s_regs_per_thread,
-                ) >> Int32(5)
-                token_word0 = Uint32(
-                    self._smem_words[
-                        stage_base
-                        + Int32(self.staging_layout.token_words_word_offset)
-                        + local_word_base
-                    ]
-                )
-                token_word1 = Uint32(
-                    self._smem_words[
-                        stage_base
-                        + Int32(self.staging_layout.token_words_word_offset)
-                        + local_word_base
-                        + Int32(1)
-                    ]
                 )
             else:
                 token_word0 = Uint32(
