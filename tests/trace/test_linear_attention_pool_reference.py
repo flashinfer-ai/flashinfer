@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from pathlib import Path
+
+import pytest
 import torch
 
 from flashinfer.gdn2_prefill import chunk_gated_delta_rule2
@@ -34,3 +38,37 @@ def test_gdn2_exported_reference_reads_natural_log_decay():
     # No write/erase: a decay of 1/2 maps incoming state 2 to state/output 1.
     torch.testing.assert_close(output, torch.ones_like(output), rtol=0, atol=0)
     torch.testing.assert_close(final, torch.ones_like(final), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("definition_source", ["generated", "checked_in"])
+def test_gdn2_exported_initializer_produces_finite_prefill(definition_source):
+    if definition_source == "generated":
+        q, v = torch.empty(1, 4, 128), torch.empty(1, 8, 128)
+        definition = chunk_gated_delta_rule2.fi_trace(
+            q=q, k=q, v=v, g=v, beta=v, w=v, cu_seqlens=torch.tensor([0, 1])
+        )
+    else:
+        definition = json.loads(
+            (
+                Path(__file__).parent / "fi_trace_out/gdn2_prefill_qk4_v8_d128.json"
+            ).read_text()
+        )
+    namespace = {}
+    exec(definition["init"], namespace)
+    exec(definition["reference"], namespace)
+    args = namespace["_gdn2_prefill_init"](
+        total_seq_len=512,
+        num_seqs=1,
+        num_q_heads=1,
+        num_k_heads=1,
+        num_v_heads=1,
+        head_size=8,
+        device="cpu",
+    )
+    # Positive g means amplifying decay; a long sequence exposes overflow.
+    output, final = namespace["_gdn2_prefill_reference"](
+        **args, initial_state=None, scale=None
+    )
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(final).all()
+    assert (args["g"] <= 0).all()
