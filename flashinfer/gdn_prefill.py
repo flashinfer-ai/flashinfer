@@ -653,6 +653,12 @@ def chunk_gated_delta_rule(
     _cp_chunk_len: Optional[int] = None,
     backend: Literal["auto", "flashinfer", "cake_gdn", "cudnn"] = "auto",
     max_seqlen: Optional[int] = None,
+    *,
+    gate_domain: Literal["linear", "log"] = "linear",
+    use_gate_in_kernel: bool = False,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    beta_is_logit: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -762,6 +768,10 @@ def chunk_gated_delta_rule(
         work tiles, leaving that row's final state nondeterministic. Uniqueness
         is a caller precondition (not checked at launch, to avoid a per-call
         host sync); the caller's slot allocator is expected to guarantee it.
+        ``backend="cudnn"`` requires frontend 1.31+, int32 indices and
+        float32/bfloat16 pools with dense ``[H, V, K]`` rows and a 16-byte
+        aligned slot stride. It supports identical input/output pool views
+        or disjoint memory, and does not support checkpoints.
     _cp_chunk_len : int, optional
         Internal context-parallel chunk-length override used for testing and
         tuning. ``None`` lets the CP backend select the length automatically;
@@ -782,6 +792,21 @@ def chunk_gated_delta_rule(
         back from the GPU. When omitted, CP uses ``total_seq_len``, which is
         correct for any batch; passing the exact maximum of a batched call
         lets CP launch smaller grids.
+    gate_domain : {"linear", "log"}
+        Domain of precomputed ``g``: linear alpha (default) or natural-log
+        alpha. ``None`` still means no decay. Ignored when use_gate_in_kernel
+        is set, since that flag makes ``g`` a raw gate input.
+    use_gate_in_kernel : bool
+        Interpret ``g`` as raw logits and compute
+        ``log(alpha) = -exp(A_log) * softplus(g + dt_bias)``. cuDNN fuses
+        this transform; other backends materialize the same FP32 alpha.
+    A_log, dt_bias : torch.Tensor, optional
+        Per-head ``[num_sab_heads]`` parameters, required with
+        use_gate_in_kernel. Float32, float16 or bfloat16, on q's device.
+    beta_is_logit : bool
+        Apply sigmoid to beta in FP32, round to beta's input dtype, then
+        accumulate in FP32. cuDNN fuses the transform; other backends
+        materialize it. The default accepts precomputed beta.
 
     Returns
     -------
@@ -809,6 +834,26 @@ def chunk_gated_delta_rule(
     """
     if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if backend != "cudnn" and (
+        gate_domain != "linear"
+        or use_gate_in_kernel
+        or beta_is_logit
+        or A_log is not None
+        or dt_bias is not None
+    ):
+        from .gdn_kernels.gates import validate_gate_inputs
+
+        validate_gate_inputs(
+            q,
+            v,
+            g,
+            beta,
+            gate_domain,
+            use_gate_in_kernel,
+            A_log,
+            dt_bias,
+            beta_is_logit,
+        )
     if (
         backend == "cake_gdn"
         and use_cp is not True
@@ -880,7 +925,6 @@ def chunk_gated_delta_rule(
             for name, requested in (
                 ("use_cp", use_cp is True or _cp_chunk_len is not None),
                 ("checkpoint_every_n_tokens", checkpoint_every_n_tokens > 0),
-                ("state_indices", state_indices is not None),
             )
             if requested
         ]
@@ -902,6 +946,19 @@ def chunk_gated_delta_rule(
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             output=output,
             output_state=output_state,
+            state_indices=state_indices,
+            gate_domain=gate_domain,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            beta_is_logit=beta_is_logit,
+        )
+
+    if gate_domain != "linear" or use_gate_in_kernel or beta_is_logit:
+        from .gdn_kernels.gates import materialize_gates
+
+        g, beta = materialize_gates(
+            g, beta, gate_domain, use_gate_in_kernel, A_log, dt_bias, beta_is_logit
         )
 
     if checkpoint_every_n_tokens > 0:
