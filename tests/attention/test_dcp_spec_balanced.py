@@ -798,6 +798,8 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
         rule_values = {below, above, static}
         if "swapped" in regime:
             rule_values.add(int(regime["swapped"]["program"]))
+        if "early_issue" in regime:
+            rule_values.update(int(value) for value in regime["early_issue"]["programs"].values())
         assert sorted(rule_values) == sorted(int(v) for v in variants["values"])
 
         def program(batch, hkv, pages, sm, **selection):
@@ -833,18 +835,26 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
             # instance, sm_103a, the SM107 family target and unknown selection keep the whole-tile program
             swapped = regime["swapped"]
             assert swapped == {"program": 3, "arches": ["sm_100a"], "n_rows": [32]}
+            # unit 85e lever S: on sm_100a the whole-tile programs run in their early-issue forms (program 3 -> 5, 2 -> 4)
+            early = regime["early_issue"]
+            assert early == {"programs": {"2": 4, "3": 5}, "arches": ["sm_100a"]}
             for sm in (148, 152):
                 assert (
                     program(1, 8, 65, sm, arch="sm_100a", n_rows=32)
-                    == swapped["program"]
+                    == early["programs"][str(swapped["program"])]
+                    == 5
                 )
                 assert (
                     program(1, 8, 112, sm, arch="sm_100a", n_rows=32)
-                    == swapped["program"]
+                    == early["programs"][str(swapped["program"])]
                 )
                 assert program(1, 8, 113, sm, arch="sm_100a", n_rows=32) == below
                 assert program(2, 8, 65, sm, arch="sm_100a", n_rows=32) == below
-                assert program(1, 8, 65, sm, arch="sm_100a", n_rows=64) == static
+                assert (
+                    program(1, 8, 65, sm, arch="sm_100a", n_rows=64)
+                    == early["programs"][str(static)]
+                    == 4
+                )
                 assert program(1, 8, 65, sm, arch="sm_103a", n_rows=32) == static
                 assert program(1, 8, 65, sm, arch="sm107a", n_rows=32) == static
                 assert program(1, 8, 65, sm, n_rows=32) == static

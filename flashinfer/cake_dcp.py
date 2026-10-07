@@ -449,8 +449,12 @@ def dcp_balanced_program(
     swapped-QK whole-tile program (S^T = K Q^T with the keys on M, lane-per-key
     softmax, two P^T staging buffers; bitwise the whole-tile program's
     output).  An unknown architecture or instance keeps the whole-tile
-    program.  Mirrors the manifest's ``program_variants`` rule from host
-    metadata only.
+    program.  Where the regime names an ``early_issue`` block, a whole-tile
+    launch on one of its architectures runs the early-issue form of its
+    program (``programs[program]``: the loader decodes its own ticket in the
+    kernel prologue and issues the first Q / K / V boxes before the
+    scheduler's token; bitwise the program's output).  Mirrors the manifest's
+    ``program_variants`` rule from host metadata only.
     """
 
     _check_dcp_balanced_kind(kind)
@@ -492,14 +496,19 @@ def dcp_balanced_program(
             and int(max_pages_per_seq) <= int(limit)
         ):
             swapped = regime.get("swapped")
+            program = int(variants["static_one_wave"])
             if (
                 swapped is not None
                 and arch in swapped["arches"]
                 and n_rows is not None
                 and int(n_rows) in [int(value) for value in swapped["n_rows"]]
             ):
-                return int(swapped["program"])
-            return int(variants["static_one_wave"])
+                program = int(swapped["program"])
+            early = regime.get("early_issue")
+            if early is not None and arch in early["arches"]:
+                # the early-issue form of the whole-tile program on its architectures (CAKE-685 unit 85e)
+                program = int(early["programs"].get(str(program), program))
+            return program
         return int(variants["below_grid"])
     n_max = -(
         -int(max_pages_per_seq)
