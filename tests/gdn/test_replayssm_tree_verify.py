@@ -20,20 +20,13 @@ import torch
 from flashinfer.gdn_decode import gated_delta_rule_mtp
 from flashinfer.utils import get_compute_capability
 
+from tests.test_helpers.spec_tree import CHAIN_8 as CHAIN, TREES, ancestors
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or get_compute_capability(torch.device("cuda"))[0] != 10,
     reason="ReplaySSM requires SM100/SM103",
 )
-
-CHAIN = [-1, 0, 1, 2, 3, 4, 5, 6]
-TREES = {
-    "chain": CHAIN,
-    "fork_at_root": [-1, 0, 0, 1, 2, 3, 4, 5],
-    "topk4_depth2": [-1, 0, 0, 0, 0, 1, 1, 2],
-    "lopsided": [-1, 0, 1, 1, 3, 3, 5, 2],
-    "star": [-1, 0, 0, 0, 0, 0, 0, 0],
-}
 
 
 def _inputs(batch=4, steps=8, heads=2, value_heads=8):
@@ -72,14 +65,6 @@ def _inputs(batch=4, steps=8, heads=2, value_heads=8):
     return args, cache
 
 
-def _ancestors(parents, i):
-    chain, cur = [], parents[i]
-    while cur >= 0:
-        chain.append(cur)
-        cur = parents[cur]
-    return chain[::-1]
-
-
 def _oracle(args, parents):
     """Replay each node's own ancestor path from the checkpoint, in FP64."""
     q, k, v = (args[n].double() for n in ("q", "k", "v"))
@@ -100,7 +85,7 @@ def _oracle(args, parents):
     out = torch.zeros(batch, steps, hv, v.shape[-1], dtype=torch.float64, device="cuda")
     for i in range(steps):
         state = checkpoint.clone()
-        for t in _ancestors(parents, i) + [i]:
+        for t in ancestors(parents, i) + [i]:
             state = state * log_g[:, t, :, None, None].exp()
             prediction = (state * k[:, t, :, None, :]).sum(-1)
             delta = (v[:, t] - prediction) * beta[:, t, :, None]

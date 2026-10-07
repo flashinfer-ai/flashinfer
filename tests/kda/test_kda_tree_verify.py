@@ -24,20 +24,12 @@ import torch.nn.functional as F
 from flashinfer.utils import is_sm100a_supported
 from flashinfer.kda_decode import _KDA_OUTPUT_ONLY_AVAILABLE
 
+from tests.test_helpers.spec_tree import CHAIN_8 as CHAIN, TREES, ancestors
+
 if _KDA_OUTPUT_ONLY_AVAILABLE:
     from flashinfer.kda_kernels.kda_decode_wy_output_only import kda_wy_output_only
 else:
     kda_wy_output_only = None
-
-CHAIN = [-1, 0, 1, 2, 3, 4, 5, 6]
-TREES = {
-    "chain": CHAIN,
-    "fork_at_root": [-1, 0, 0, 1, 2, 3, 4, 5],
-    "topk4_depth2": [-1, 0, 0, 0, 0, 1, 1, 2],
-    "lopsided": [-1, 0, 1, 1, 3, 3, 5, 2],
-    "star": [-1, 0, 0, 0, 0, 0, 0, 0],
-    "topk2_depth4": [-1, 0, 0, 1, 1, 2, 2, 3],
-}
 
 
 @pytest.fixture(autouse=True)
@@ -68,14 +60,6 @@ def _inputs(B=2, T=8, H=2, HV=4, K=128, V=128):
     )
 
 
-def _ancestors(parents, i):
-    out, cur = [], parents[i]
-    while cur >= 0:
-        out.append(cur)
-        cur = parents[cur]
-    return out[::-1]
-
-
 def _oracle(a, parents):
     """Replay each node's own root-to-node path from the checkpoint."""
     q, k, v = a["q"].float() * a["scale"], a["k"].float(), a["v"].float()
@@ -88,7 +72,7 @@ def _oracle(a, parents):
         ckpt = a["h0"][a["idx"][b]].float()
         for i in range(T):
             S = ckpt.clone()
-            for t in _ancestors(parents, i) + [i]:
+            for t in ancestors(parents, i) + [i]:
                 S = S * g[b, t].exp()[:, None, :]
                 k_hv = k[b, t].repeat_interleave(rep, dim=0)
                 u = torch.einsum("hvk,hk->hv", S, k_hv)
