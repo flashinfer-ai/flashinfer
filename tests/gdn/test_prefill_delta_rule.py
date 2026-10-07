@@ -917,10 +917,10 @@ def _test_checkpoint(
             prefix_cu = torch.tensor([0, prefix_len], dtype=torch.int64, device=device)
 
             prefix_o = torch.empty(
-                [prefix_len, num_o_heads, head_size], dtype=dtype, device=device
+                [prefix_len, num_o_heads, head_size_v], dtype=dtype, device=device
             )
             prefix_state = torch.empty(
-                (1, num_sab_heads, head_size, head_size),
+                (1, num_sab_heads, head_size_v, head_size),
                 dtype=torch.float32,
                 device=device,
             )
