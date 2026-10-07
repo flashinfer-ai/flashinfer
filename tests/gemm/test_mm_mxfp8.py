@@ -357,6 +357,7 @@ def test_mm_mxfp8_cute_dsl_offers_sm107_tactics():
     tactics = _sm107_mxfp8_cute_dsl_tactics(256, 1536, 6144)
     assert tactics, "SM107 kernel is importable but contributes no mm_mxfp8 tactics"
     assert {t[2] for t in tactics} == {False, True}
+    assert any(t[0][0] == 512 for t in tactics), "512-row (B-reuse) tiles missing"
     # On SM107 the SM100 kernels are not autotuned when the SM107 kernel fits.
     assert len(tactics) == len(_mxfp8_cute_dsl_tactics(256, 1536, 6144))
     # Swap-AB puts M on the kernel's N axis, but the output's contiguous dimension
@@ -367,7 +368,16 @@ def test_mm_mxfp8_cute_dsl_offers_sm107_tactics():
     }
 
 
-@pytest.mark.parametrize("m,n,k", [(256, 1536, 6144), (1000, 4096, 1024)])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (256, 1536, 6144),
+        (1000, 4096, 1024),
+        # K % 128 != 0: the K tile is 128, so the last K tile is partial.
+        (256, 1536, 544),
+        (100, 4096, 2080),
+    ],
+)
 def test_mm_mxfp8_cute_dsl_sm107_tactics(m, n, k):
     """Every (tile, MMA M, swap-AB) group of SM107 tactics computes the GEMM."""
     tactics = _sm107_mxfp8_cute_dsl_tactics(m, n, k)
@@ -403,9 +413,10 @@ def test_mm_mxfp8_cute_dsl_sm107_tactics(m, n, k):
 
 
 @pytest.mark.parametrize("m", [1, 100, 256, 4096])
-def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m):
+@pytest.mark.parametrize("k", [1024, 544])
+def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m, k):
     """Without autotuning, SM107 runs the SM107 kernel."""
-    n, k = 1536, 1024
+    n = 1536
     _sm107_mxfp8_cute_dsl_tactics(m, n, k)
     from flashinfer.gemm.kernels.utils import _select_sm107_mm_mxfp8_cute_dsl_tactic
     from flashinfer.utils import get_device_sm_count

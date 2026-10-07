@@ -278,6 +278,14 @@ _SM107_MM_MXFP8_TACTIC_CACHE: dict[tuple, dict] = {}
 _SM107_MXFP8_MMA_INST_SHAPE_K = 64
 _SM107_MXFP8_MMA_TILER_K = 128
 
+# mm_mxfp8 also offers 512-row tiles: two 256-row MMAs per CTA (B-reuse).
+_SM107_MXFP8_MMA_TILER_MN_CANDIDATES = _SM107_MMA_TILER_MN_CANDIDATES + [
+    (512, 64),
+    (512, 128),
+    (512, 192),
+    (512, 256),
+]
+
 # Fixed for FP4, matching the tactic enumeration in gemm_base.py.
 _SM107_MMA_INST_SHAPE_K = 128
 _SM107_MMA_TILER_K = 256
@@ -449,7 +457,7 @@ def _get_sm107_mxfp8_tactics(m, n, real_k, c_cutlass_dtype):
     )
 
     tactics = []
-    for tile in _SM107_MMA_TILER_MN_CANDIDATES:
+    for tile in _SM107_MXFP8_MMA_TILER_MN_CANDIDATES:
         for mma_inst_shape_m in (128, 256):
             inst_shape = (mma_inst_shape_m, tile[1], _SM107_MXFP8_MMA_INST_SHAPE_K)
             for cluster in _CLUSTER_SHAPE_MN_CANDIDATES:
