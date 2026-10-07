@@ -36,6 +36,14 @@ cuDNN planner for these updates; its FA2/FA3 copy-elision does not apply to
 cuDNN. ``workspace_size`` currently raises for both explicit and auto-selected
 cuDNN, rather than returning another backend's workspace requirements.
 
+FP16/BF16 graph execution can write base-2 LSE directly, avoiding a separate
+conversion. This requires cuDNN 9.27+ headers and runtime, an FE exposing the
+capability, and backend support for the requested graph. Older or unsupported
+configurations retain natural-log Stats plus conversion; FP8 handling is
+unchanged. Prefill callers requesting ``lse_base="ln"`` still receive the
+natural-log output directly. Each requested LSE base/layout is a graph
+specialization: warm it before CUDA graph capture.
+
 .. currentmodule:: flashinfer.cudnn
 
 .. autosummary::
