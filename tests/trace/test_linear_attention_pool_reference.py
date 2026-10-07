@@ -19,6 +19,13 @@ import pytest
 import torch
 
 from flashinfer.gdn2_prefill import chunk_gated_delta_rule2
+from flashinfer.gdp_prefill import chunk_gated_delta_product
+from flashinfer.trace.templates.gdn2 import gdn2_prefill_trace
+from flashinfer.trace.templates.gdp import gdp_prefill_trace
+from tests.test_helpers.cudnn_linear_attention import (
+    serial_delta_product,
+    serial_delta_rule2,
+)
 
 
 @pytest.mark.parametrize("definition_source", ["generated", "checked_in"])
@@ -87,17 +94,6 @@ def test_gdn2_exported_initializer_produces_finite_prefill(definition_source):
     assert torch.isfinite(output).all()
     assert torch.isfinite(final).all()
     assert (args["g"] <= 0).all()
-
-
-import pytest
-
-from flashinfer.gdp_prefill import chunk_gated_delta_product
-from flashinfer.trace.templates.gdn2 import gdn2_prefill_trace
-from flashinfer.trace.templates.gdp import gdp_prefill_trace
-from tests.test_helpers.cudnn_linear_attention import (
-    serial_delta_product,
-    serial_delta_rule2,
-)
 
 
 @pytest.mark.parametrize("family", ["gdn2", "gdp"])
