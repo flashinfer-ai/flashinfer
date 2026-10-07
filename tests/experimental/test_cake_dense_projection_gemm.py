@@ -1762,14 +1762,15 @@ def test_round19_rules_plan_like_the_cake_launcher(T):
     assert not pair.cta1 and pair.template == "dense_proj_gemm_kn_n128_f32_tma2"
     assert (pair.m_tiles, pair.stages, pair.sm_pairs) == (128, 6, 74)
     # the indexer_q weight gradients (G.T @ X, both MN-major, K = T): 64 tall tiles on 74 pairs -> 64 main units of
-    # s = ceil((7 x 254 + 62) / 8) = 230 K steps + 10 collectors, one slab per tail tile; bf16 reads the slab back
+    # s = ceil((7 x kb + 62) / 8) = 230 K steps (kb = 253 / 254 K blocks at T 16172 / 16231) + 10 collectors, one slab
+    # per tail tile; bf16 reads the slab back
     # through the dead mainloop stages (sb2), fp32 reduce-adds into the output through the TMA-store path (sb3)
     v = _views("proj", "indexer_q", "wgrad", "bf16", T)
     assert not v["transposed"]
     bf16, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
     assert bf16.sk_sync and bf16.sk_slab == 2
     assert bf16.template == "dense_proj_gemm_nn_n256_m256_sks_sb2"
-    assert (bf16.pair_tiles, bf16.k_blocks, bf16.sm_pairs) == (64, 254, 74)
+    assert (bf16.pair_tiles, bf16.k_blocks, bf16.sm_pairs) == (64, -(-T // BLOCK_K), 74)
     assert (
         bf16.num_full,
         bf16.tail_tiles,
