@@ -3871,9 +3871,7 @@ def test_source_direct_preprocess_and_sequence_argument_order():
     )
     assert bound == (
         *(preprocess[name] for name in module._PREPROCESS_ARGS),
-        12,
-        1,
-        1,
+        *preprocess_grid,
         *(main[name] for name in module._MAIN_ARGS),
         148,
         1,
@@ -4122,7 +4120,10 @@ def test_source_program_table_names_shipped_sources():
         assert f"TVM_FFI_EMBED_CUBIN({program.main.module});" in rendered
         assert f'"{program.main.kernel}"' in rendered
         assert f"namespace cake_mamba_ssd_combined_host_{name} {{" in rendered
-        assert f"stream, {program.main_smem_bytes}u)" in rendered
+        # The main launch is a cuLaunchKernelEx config (programmatic dependent
+        # launch after the preprocess); its dynamic SMEM is the family literal.
+        assert f"dynamicSmemBytes = {program.main_smem_bytes}u;" in rendered
+        assert f"sharedMemBytes = {program.main_smem_bytes}u;" in rendered
         # The regenerated host shim brace-initialises the DLDataType of the
         # three state tensors from the two state placeholders; delta checks
         # are FP16 for every program (D1) and not factored.
@@ -4721,7 +4722,8 @@ def test_source_chunk_parallel_host_template_binds_main_arguments_in_loader_orde
     for placeholder in _HOST_PLACEHOLDERS:
         assert placeholder in template, placeholder
     assert "namespace cake_mamba_ssd_combined_host_CAKE_SSD_PROGRAM {" in template
-    assert "stream, CAKE_SSD_MAIN_SMEM_BYTESu)" in template
+    assert "dynamicSmemBytes = CAKE_SSD_MAIN_SMEM_BYTESu;" in template
+    assert "sharedMemBytes = CAKE_SSD_MAIN_SMEM_BYTESu;" in template
     program = module._PROGRAMS["chunkpar_bf16_varlen"]
     rendered = module._render_host_source(template, "chunkpar_bf16_varlen", program)
     assert not any(placeholder in rendered for placeholder in _HOST_PLACEHOLDERS)
