@@ -1,3 +1,5 @@
+import re
+
 import pytest
 import torch
 
@@ -1311,6 +1313,15 @@ _PUBLIC_COMPILE_FLAGS = {
     "--use_fast_math",
     "-Xptxas=--register-usage-level=10",
 }
+# The NVFP4 decode swap / tile / pv schedules ship as one kernel-template unit each.  A
+# variant's module compiles that unit with two preprocessor defines (a public nvcc option):
+# the member's select macro and the variant's own instance macro, so it instantiates only
+# its kernel.  Every instantiation is proven SASS-identical to the per-knob program it
+# replaced before the unit ships.
+_TEMPLATE_SELECT_DEFINE = re.compile(
+    r"-DCAKE_DSV4_NVFP4_(?P<member>[A-Z0-9_]+)_SELECT=1"
+)
+_TEMPLATE_MEMBERS = {"DECODE_SWAP", "DECODE_TILE", "DECODE_PV"}
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
@@ -1324,6 +1335,11 @@ def test_registered_compile_flags_are_public(arch):
     (sub-128-token decode) variant of the same body ships without the pin:
     its softmax chain is not what paces the item and the pinned build reads
     1-2 % slower on the uniform decode rows, so the flag must stay off there.
+
+    The kernel-template members (NVFP4 decode swap, tile, pv) additionally
+    carry their select and instance defines: the select macro names one of
+    the three members and the variant, the instance macro is the variant's
+    own; nothing else may be added.
     """
     pin = "-Xptxas=--register-usage-level=10"
     variants = _ARCH_REGISTRATIONS[arch]["variants"]
@@ -1331,6 +1347,16 @@ def test_registered_compile_flags_are_public(arch):
     assert "fp8_h128_prefill_source_persistent_uniform" in variants
     for variant, spec in variants.items():
         flags = set(spec["compile_flags"])
+        selects = {flag for flag in flags if _TEMPLATE_SELECT_DEFINE.fullmatch(flag)}
+        if selects:
+            assert len(selects) == 1, (variant, sorted(selects))
+            select = next(iter(selects))
+            member = _TEMPLATE_SELECT_DEFINE.fullmatch(select).group("member")
+            assert member in _TEMPLATE_MEMBERS, (variant, select)
+            assert variant.upper().startswith(f"NVFP4_{member}_"), (variant, select)
+            instance = f"-DCAKE_DSV4_{variant.upper()}=1"
+            assert instance in flags, (variant, sorted(flags))
+            flags -= {select, instance}
         assert flags <= _PUBLIC_COMPILE_FLAGS, (variant, sorted(flags))
         if variant == "fp8_h128_prefill_source_persistent":
             assert pin in flags, variant
