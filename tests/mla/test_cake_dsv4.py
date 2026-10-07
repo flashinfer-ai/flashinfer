@@ -1325,6 +1325,18 @@ _TEMPLATE_MEMBERS = {"DECODE_SWAP", "DECODE_TILE", "DECODE_PV"}
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
+def test_registered_min_cuda_version_marks_the_nvfp4_programs(arch):
+    """The NVFP4 programs spell the Blackwell QMUL4 as the PTX ISA 9.4 packed
+    multiply, so their registrations require CUDA 13.4 (the loader refuses older
+    toolkits by name); every other generated program carries no toolkit floor."""
+    for variant, spec in _ARCH_REGISTRATIONS[arch]["variants"].items():
+        if variant.startswith("nvfp4_"):
+            assert spec.get("min_cuda_version") == "13.4", variant
+        else:
+            assert "min_cuda_version" not in spec, variant
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
 def test_registered_compile_flags_are_public(arch):
     """Exported programs must build with public nvcc/ptxas options only.
 
