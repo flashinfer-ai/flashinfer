@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
 
 import importlib
+import os
 import socket
+from datetime import timedelta
 
 import pytest
 import torch
@@ -56,20 +58,29 @@ def _reference(
     )[:, :HIDDEN_SIZE]
     rows = rows.view(num_tokens, TOPK, HIDDEN_SIZE)
     rows.masked_fill_(~valid.view(num_tokens, TOPK, 1), 0)
-    rows = rows.float()
-    dist.all_reduce(rows)
-    rows = rows.to(torch.bfloat16).float()
+    # Bound oracle memory while enforcing rank order rather than NCCL's tree.
+    reduced = torch.empty_like(rows)
+    for start in range(0, num_tokens, 32):
+        local = rows[start : start + 32].contiguous()
+        peers = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+        dist.all_gather(peers, local)
+        total = torch.zeros_like(local, dtype=torch.float32)
+        for peer in peers:
+            total += peer.float()
+        reduced[start : start + 32] = total.bfloat16()
+    rows = reduced.float()
     if weight_before_norm:
         rows *= norm_weight.float() + gain_center
     inv_rms = torch.rsqrt(rows.square().mean(dim=-1, keepdim=True) + eps)
     normalized = rows * inv_rms
     if not weight_before_norm:
         normalized *= norm_weight.float() + gain_center
-    return (
-        normalized.mul(expert_weights.float().unsqueeze(-1))
-        .sum(dim=1)
-        .to(torch.bfloat16)
-    )
+    result = torch.zeros_like(normalized[:, 0])
+    for expert in range(TOPK):
+        result += normalized[:, expert] * expert_weights[:, expert].float().unsqueeze(
+            -1
+        )
+    return result.bfloat16()
 
 
 def _rounded_reference(
@@ -141,14 +152,49 @@ def _make_permuted(
     return gemm2_permuted, physical_rows.to(torch.int32).view(num_tokens, TOPK)
 
 
-def _worker(local_rank: int, master_port: int, world_size: int) -> None:
+def _init_group(local_rank: int, master_port: int | None, world_size: int) -> None:
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(
-        "nccl",
-        rank=local_rank,
-        world_size=world_size,
-        init_method=f"tcp://127.0.0.1:{master_port}",
-    )
+    if master_port is None:
+        store = dist.TCPStore(
+            os.environ["MASTER_ADDR"],
+            int(os.environ["MASTER_PORT"]),
+            world_size,
+            False,
+            timeout=timedelta(seconds=180),
+        )
+        store = dist.PrefixStore(os.environ["FLASHINFER_TP_TEST_CASE"], store)
+        dist.init_process_group(
+            "nccl", store=store, rank=int(os.environ["RANK"]), world_size=world_size
+        )
+    else:
+        dist.init_process_group(
+            "nccl",
+            rank=local_rank,
+            world_size=world_size,
+            init_method=f"tcp://127.0.0.1:{master_port}",
+        )
+
+
+def _run_env_worker(worker, args) -> None:
+    # Isolate collectives so a stalled kernel becomes a failing test ID and
+    # cannot strand the rest of the suite in the same CUDA context.
+    os.environ["FLASHINFER_TP_TEST_CASE"] = repr((worker.__name__, args[2:]))
+    process = mp.get_context("spawn").Process(target=worker, args=args)
+    process.start()
+    process.join(180)
+    stalled = process.is_alive()
+    if stalled:
+        process.terminate()
+        process.join(10)
+        if process.is_alive():
+            process.kill()
+            process.join()
+    assert not stalled, "collective worker timed out after 180 seconds"
+    assert process.exitcode == 0, f"collective worker exited with {process.exitcode}"
+
+
+def _worker(local_rank: int, master_port: int | None, world_size: int) -> None:
+    _init_group(local_rank, master_port, world_size)
     device = torch.device("cuda", local_rank)
     finalize_module = importlib.import_module("flashinfer.comm.tp_moe_finalize_rmsnorm")
     assert not finalize_module._group_all(local_rank != 0, device, dist.group.WORLD), (
@@ -588,19 +634,13 @@ def _worker(local_rank: int, master_port: int, world_size: int) -> None:
 
 
 def _allocation_failure_worker(
-    local_rank: int, master_port: int, world_size: int
+    local_rank: int, master_port: int | None, world_size: int
 ) -> None:
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(
-        "nccl",
-        rank=local_rank,
-        world_size=world_size,
-        init_method=f"tcp://127.0.0.1:{master_port}",
-    )
+    _init_group(local_rank, master_port, world_size)
     import torch.distributed._symmetric_memory as symm_mem
 
     original_empty = symm_mem.empty
-    if local_rank == 0:
+    if dist.get_rank() == 0:
 
         def fail_empty(*args, **kwargs):
             raise torch.OutOfMemoryError("injected workspace allocation failure")
@@ -613,11 +653,196 @@ def _allocation_failure_worker(
         dist.destroy_process_group()
 
 
+def _path_worker(
+    local_rank: int,
+    master_port: int | None,
+    world_size: int,
+    path: str,
+    routing_fp32: bool,
+    weight_before_norm: bool,
+) -> None:
+    _init_group(local_rank, master_port, world_size)
+    module = importlib.import_module("flashinfer.comm.tp_moe_finalize_rmsnorm")
+    selector = getattr(module, "_select_path", None)
+    try:
+        if path.startswith("token"):
+            assert hasattr(module, f"_make_{path}_program"), (
+                "token-owner path is missing"
+            )
+        if path != "auto" and selector is not None:
+            module._select_path = lambda *_: path
+        assert init_tp_moe_finalize_rmsnorm()
+        crossover = 256 if selector is None else module._token_crossover(module._WS.nsm)
+        tokens = dict.fromkeys(
+            (
+                1,
+                8,
+                32,
+                33,
+                crossover - 1,
+                crossover,
+                crossover + 1,
+                512,
+                1025,
+                8192,
+                8193,
+            )
+        )
+        device = torch.device("cuda", local_rank)
+        rank = dist.get_rank()
+        for num_tokens in tokens:
+            shared = torch.Generator(device=device).manual_seed(11000 + num_tokens)
+            local = torch.Generator(device=device).manual_seed(12000 + rank)
+            partial = torch.randn(
+                num_tokens,
+                TOPK,
+                HIDDEN_SIZE,
+                dtype=torch.bfloat16,
+                device=device,
+                generator=local,
+            )
+            # Include epsilon-sensitive rows and invalid slots on every shape.
+            partial[0] *= 1e-4
+            rows, indices = _make_permuted(partial, seed=13000 + rank)
+            indices[0, 0] = -1
+            indices[-1, -1] = rows.shape[0]
+            weights = torch.rand(
+                num_tokens,
+                TOPK,
+                device=device,
+                generator=shared,
+                dtype=torch.float32 if routing_fp32 else torch.bfloat16,
+            )
+            weights /= weights.sum(-1, keepdim=True)
+            norm = torch.randn(
+                HIDDEN_SIZE, device=device, dtype=torch.bfloat16, generator=shared
+            )
+            norm *= 0.1
+            out = torch.empty(
+                num_tokens, HIDDEN_SIZE, device=device, dtype=torch.bfloat16
+            )
+            gain = float(num_tokens % 2)
+
+            def call():
+                tp_moe_finalize_rmsnorm(
+                    rows,
+                    weights,
+                    indices,
+                    norm,
+                    out,
+                    eps=1e-8,
+                    gain_center=gain,
+                    weight_before_norm=weight_before_norm,
+                )
+
+            def check():
+                expected = _reference(
+                    rows, indices, weights, norm, 1e-8, gain, weight_before_norm
+                )
+                _assert_model_close(
+                    out, expected, context=f"{path=} {num_tokens=} {rank=}"
+                )
+                rank0 = out.clone()
+                dist.broadcast(rank0, src=0)
+                assert torch.equal(out, rank0), (
+                    f"rank disagreement: {path=} {num_tokens=}"
+                )
+
+            call()
+            check()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                call()
+            for replay in range(3):
+                partial.normal_(generator=local)
+                partial[0] *= 1e-4
+                new_rows, new_indices = _make_permuted(
+                    partial, seed=14000 + rank + replay
+                )
+                new_indices[0, 0] = -1
+                new_indices[-1, -1] = rows.shape[0]
+                rows.copy_(new_rows)
+                indices.copy_(new_indices)
+                weights.uniform_(generator=shared)
+                weights /= weights.sum(-1, keepdim=True)
+                norm.normal_(generator=shared)
+                norm *= 0.1
+                graph.replay()
+                check()
+            if num_tokens == 33:
+                norm.zero_()
+                weights.fill_(1.0 / TOPK)
+                if world_size >= 4:
+                    # A tree reduction retains the unit that ordered FP32
+                    # accumulation loses between the cancelling large rows.
+                    partial.fill_((2**24, 1, -(2**24))[rank] if rank < 3 else 0)
+                    new_rows, new_indices = _make_permuted(partial, seed=15000 + rank)
+                    rows.copy_(new_rows)
+                    indices.copy_(new_indices)
+                    graph.replay()
+                    check()
+                partial.fill_(1 if rank == 0 else 0)
+                new_rows, new_indices = _make_permuted(partial, seed=16000 + rank)
+                rows.copy_(new_rows)
+                indices.copy_(new_indices)
+                weights.zero_()
+                weights[:, 0] = 2**24
+                weights[:, 1] = 1
+                weights[:, 2] = -(2**24)
+                graph.replay()
+                check()
+            del graph
+    finally:
+        if selector is not None:
+            module._select_path = selector
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("path", ["auto", "expert", "token"])
+@pytest.mark.parametrize("routing_fp32", [False, True])
+@pytest.mark.parametrize("weight_before_norm", [False, True])
+def test_tp_moe_finalize_rmsnorm_paths(
+    world_size: int, path: str, routing_fp32: bool, weight_before_norm: bool
+) -> None:
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("TP MoE finalize requires SM100 or SM103")
+    if "LOCAL_RANK" in os.environ:
+        if int(os.environ["WORLD_SIZE"]) != world_size:
+            pytest.skip("different torchrun world size")
+        _run_env_worker(
+            _path_worker,
+            (
+                int(os.environ["LOCAL_RANK"]),
+                None,
+                world_size,
+                path,
+                routing_fp32,
+                weight_before_norm,
+            ),
+        )
+    else:
+        if torch.cuda.device_count() < world_size:
+            pytest.skip(f"{world_size} GPUs are required")
+        mp.spawn(
+            _path_worker,
+            args=(_free_port(), world_size, path, routing_fp32, weight_before_norm),
+            nprocs=world_size,
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_tp_moe_finalize_rmsnorm_eager_and_cudagraph(world_size: int) -> None:
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("TP MoE finalize requires SM100 or SM103")
+    if "LOCAL_RANK" in os.environ:
+        if int(os.environ["WORLD_SIZE"]) != world_size:
+            pytest.skip("different torchrun world size")
+        _run_env_worker(_worker, (int(os.environ["LOCAL_RANK"]), None, world_size))
+        return
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"{world_size} GPUs are required")
     mp.spawn(_worker, args=(_free_port(), world_size), nprocs=world_size)
@@ -630,6 +855,20 @@ def test_tp_moe_finalize_rmsnorm_allocation_failure_is_rank_consistent(
 ) -> None:
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("TP MoE finalize requires SM100 or SM103")
+    if "LOCAL_RANK" in os.environ:
+        if int(os.environ["WORLD_SIZE"]) != world_size:
+            pytest.skip("different torchrun world size")
+        module = importlib.import_module("flashinfer.comm.tp_moe_finalize_rmsnorm")
+        workspace = module._WS
+        module._WS = module._Ws()
+        try:
+            _run_env_worker(
+                _allocation_failure_worker,
+                (int(os.environ["LOCAL_RANK"]), None, world_size),
+            )
+        finally:
+            module._WS = workspace
+        return
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"{world_size} GPUs are required")
     mp.spawn(

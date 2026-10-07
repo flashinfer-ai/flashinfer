@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
 """TP MoE finalize and post-expert RMSNorm on SM100/SM103.
 
-One candidate-owned kernel, no framework collective.  The input is the raw
+Candidate-owned collectives, no framework collective. The input is the raw
 permuted GEMM2 buffer plus its expanded-to-permuted row map; resolving that map
 inside the kernel avoids materializing the logical [T,K,H] partial-row tensor.
 The TP group size P must exceed one and evenly divide K_EXPERTS. Each rank
-owns KO = K_EXPERTS / P expert slots:
+owns KO = K_EXPERTS / P expert slots on the small-token path:
 
   phase 1 (scatter by expert owner): rank r owns slots [r*KO, (r+1)*KO).
       Each rank pushes its partial rows for other owners straight from
@@ -41,6 +41,13 @@ band.  The single piece of cross-CTA state is the per-expert sums of
 squares, exchanged through distributed shared memory with one cluster barrier.
 ``S`` is a launch parameter: small token counts leave most of the machine idle
 with one CTA per token, so S grows until the grid covers the SM array.
+
+The large-token path stages rows to token owners in bounded chunks. Rank
+``token % P`` sums every expert's partial rows in rank order, normalizes and
+accumulates the experts in FP32, then multicasts the final BF16 row. Separate
+staging, owner, and copy launches expose more parallelism. The copy waits for
+every owner before input storage is reused; the next owner waits for every
+rank's next stage, so all previous output reads finish before overwrite.
 """
 
 import logging
@@ -90,6 +97,7 @@ H_DIM = 4096
 VEC = 8
 NSLOT = 256  # >= max CTAs in the grid; one Lamport slot per CTA
 NGEN = 3
+_MAX_SPLIT = 16
 # packed pair of BF16 negative zeros / one FP32 negative zero
 SENT_A = 0x80008000
 SENT_B = 0x80000000
@@ -386,6 +394,39 @@ def st_gen(ptr: Pointer, v: Int32, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def ld_acquire(ptr: Pointer, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            MLIR_T.i32(),
+            [ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.sys.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def st_release(ptr: Pointer, value: Int32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [
+            ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            Int32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.release.sys.global.u32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def map_smem_rank(smem_ptr: Pointer, rank: Int32, *, loc=None, ip=None) -> Int32:
     """Translate a local SMEM address to the same slot in a cluster peer."""
     a = smem_ptr.toint(loc=loc, ip=ip).ir_value()
@@ -422,7 +463,7 @@ def _pick_split(n_tok, nsm):
     if not _HAS_CLUSTER:
         return 1
     s = 1
-    while s < 16 and n_tok * s * 2 <= nsm:
+    while s < _MAX_SPLIT and n_tok * s * 2 <= nsm:
         s *= 2
     return s
 
@@ -445,38 +486,151 @@ def _make_program(
     use_mc,
     addrs,
     my_rank,
+    token_owner=False,
 ):
     inv_h = 1.0 / float(H_DIM)
-    n_iter = (n_tok + grid_y - 1) // grid_y
+    tiles = (n_tok + ws - 1) // ws if token_owner else n_tok
+    n_iter = 1 if token_owner else (tiles + grid_y - 1) // grid_y
     comm = ws > 1
     nwarps = nthr // 32
     band = nthr * VEC  # H columns owned by one CTA
     peers = [r for r in range(ws) if r != my_rank]
-    KO = K_EXPERTS // ws if comm else K_EXPERTS  # experts owned by this rank
+    KO = K_EXPERTS if token_owner else K_EXPERTS // ws if comm else K_EXPERTS
     NLOC = KO if comm else K_EXPERTS
     my_experts = (
-        [my_rank * KO + i for i in range(KO)] if comm else list(range(K_EXPERTS))
+        [my_rank * KO + i for i in range(KO)]
+        if comm and not token_owner
+        else list(range(K_EXPERTS))
     )
 
     # element counts of the two Lamport regions
     A_ELEMS = NGEN * NSLOT * KO * ws * H_DIM  # BF16 elements
     A_BYTES = A_ELEMS * 2
 
-    a_lam = addrs["lam_uc"]
-    a_lam_mc = addrs["lam_mc"] if use_mc else addrs["lam_uc"]
-    a_lam_peers = addrs["lam_peers"]
-    a_gen = addrs["gen"]
+    a_lam = addrs["token_uc"] if token_owner else addrs["lam_uc"]
+    a_lam_mc = (
+        (addrs["token_mc"] if token_owner else addrs["lam_mc"]) if use_mc else a_lam
+    )
+    a_lam_peers = addrs["token_peers"] if token_owner else addrs["lam_peers"]
+    a_gen = addrs["token_gen"] if token_owner else addrs["gen"]
+    token_slots = addrs["token_slots"]
+    if token_owner:
+        A_BYTES = token_slots * K_EXPERTS * ws * H_DIM * 2
+    flag_bytes = A_BYTES + token_slots * ws * H_DIM * 2
 
     def _pin(dt, a, al=16):
         return cute.make_ptr(dt, a, cutlass.AddressSpace.gmem, assumed_align=al)
 
     def a_off(gm, slot, ko, src):
         # BF16 element offset of scattered expert row [gen][slot][ko][src]
+        if token_owner:
+            return ((slot * K_EXPERTS + ko) * ws + src) * H_DIM
         return (((gm * NSLOT + slot) * KO + ko) * ws + src) * H_DIM
 
     def b_off(gm, slot, src):
         # FP32 element offset of the partial output row [gen][slot][src]
+        if token_owner:
+            return (slot * ws + src) * H_DIM
         return ((gm * NSLOT + slot) * ws + src) * H_DIM
+
+    def flag_off(slot, phase, src, sx):
+        return (slot * 2 + phase) * ws + src
+
+    @cute.jit
+    def push_rows(
+        gIn: cute.Tensor,
+        gIdx: cute.Tensor,
+        tok: Int32,
+        dest: cutlass.Constexpr,
+        slot: Int32,
+        h0: Int32,
+    ):
+        pp = _pin(cutlass.BFloat16, a_lam_peers[dest])
+        for k in cutlass.range_constexpr(K_EXPERTS):
+            idx = cutlass.Int32(gIdx[tok, k])
+            q0, q1, q2, q3 = (
+                cutlass.Int32(0),
+                cutlass.Int32(0),
+                cutlass.Int32(0),
+                cutlass.Int32(0),
+            )
+            if idx >= 0 and idx < num_rows:
+                q0, q1, q2, q3 = ld_global_v4(gIn.iterator + idx * row_stride + h0)
+            st_global_v4(pp + a_off(0, slot, k, my_rank) + h0, q0, q1, q2, q3)
+
+    @cute.jit
+    def wait_phase(
+        slot: Int32, phase: cutlass.Constexpr, gen: Int32, tidx: Int32, sx: Int32
+    ):
+        if tidx < ws and tidx != my_rank:
+            flags = _pin(cutlass.Int32, a_lam + flag_bytes, 4)
+            ptr = flags + flag_off(slot, phase, tidx, sx)
+            value = ld_acquire(ptr)
+            while value != gen:
+                value = ld_acquire(ptr)
+        cute.arch.barrier()
+
+    @cute.jit
+    def publish_phase(
+        slot: Int32, phase: cutlass.Constexpr, gen: Int32, tidx: Int32, sx: Int32
+    ):
+        # CTA synchronization carries every writer's accesses into the
+        # system release/acquire chain, as in multi_gpu_barrier.
+        cute.arch.barrier()
+        if tidx < ws and tidx != my_rank:
+            peer = cutlass.Int64(a_lam_peers[0])
+            for r in cutlass.range_constexpr(len(peers)):
+                if tidx == peers[r]:
+                    peer = cutlass.Int64(a_lam_peers[peers[r]])
+            flags = _pin(cutlass.Int32, peer + flag_bytes, 4)
+            st_release(flags + flag_off(slot, phase, my_rank, sx), gen)
+        cute.arch.barrier()
+
+    @cute.jit
+    def scatter_tokens(
+        gIn: cute.Tensor,
+        gIdx: cute.Tensor,
+        tok: Int32,
+        slot: Int32,
+        gen: Int32,
+        tidx: Int32,
+        h0: Int32,
+        sx: Int32,
+    ):
+        # The previous copy waited for every owner, which had consumed all
+        # input rows before publishing its output. Input storage is now free.
+        for dest in cutlass.range_constexpr(ws):
+            if cutlass.const_expr(dest != my_rank):
+                if tok < n_tok and tok % ws == dest:
+                    push_rows(gIn, gIdx, tok, dest, slot, h0)
+        cute.arch.barrier()
+        if tidx == 0:
+            for dest in cutlass.range_constexpr(ws):
+                if cutlass.const_expr(dest != my_rank):
+                    if tok % ws == dest:
+                        flags = _pin(cutlass.Int32, a_lam_peers[dest] + flag_bytes, 4)
+                        st_release(flags + flag_off(slot, 0, my_rank, sx), gen)
+
+    @cute.jit
+    def copy_tokens(
+        gOut: cute.Tensor,
+        base: Int32,
+        slot: Int32,
+        gen: Int32,
+        tidx: Int32,
+        h0: Int32,
+        sx: Int32,
+    ):
+        wait_phase(slot, 1, gen, tidx, sx)
+        pb = _pin(cutlass.BFloat16, a_lam + A_BYTES)
+        for src in cutlass.range_constexpr(ws):
+            tok = base + src
+            if tok < n_tok:
+                q = ld_global_v4(pb + b_off(0, slot, src) + h0)
+                st_global_v4(gOut.iterator + tok * H_DIM + h0, q[0], q[1], q[2], q[3])
+        # The next owner waits for every rank's next stage, which follows this
+        # copy on that rank's stream. It cannot overwrite any live output row.
+        cute.arch.barrier()
 
     # probe offsets are byte deltas from the (ko=0, src=0) anchor
     _pa_off = [
@@ -514,6 +668,39 @@ def _make_program(
             base = b_off(gc, slot, peers[r]) + h0
             for j in cutlass.range_constexpr(2):
                 st_global_v4(pb + (base + j * (VEC // 2)), sb, sb, sb, sb)
+
+    @cute.jit
+    def advance_idle(gen: Int32, slot: Int32, h0: Int32):
+        # Publishing the intervening generation proves peers have consumed the
+        # previous one before rearm clears it, even when this slot has no token.
+        gm = gen % NGEN
+        zero = cutlass.Int32(0)
+        for k in cutlass.range_constexpr(K_EXPERTS):
+            owner = k // KO
+            if cutlass.const_expr(owner != my_rank):
+                pp = _pin(cutlass.BFloat16, a_lam_peers[owner])
+                st_global_v4(
+                    pp + a_off(gm, slot, k % KO, my_rank) + h0, zero, zero, zero, zero
+                )
+        pa = _pin(cutlass.BFloat16, a_lam)
+        ok = lamport_probe_a(pa + a_off(gm, slot, 0, 0) + h0, _pa_off)
+        while ok == 0:
+            ok = lamport_probe_a(pa + a_off(gm, slot, 0, 0) + h0, _pa_off)
+        rearm(gen, slot, h0)
+        pb = _pin(cutlass.Float32, a_lam + A_BYTES)
+        pb_mc = _pin(cutlass.Float32, a_lam_mc + A_BYTES)
+        for j in cutlass.range_constexpr(2):
+            multimem_st_v4(
+                pb_mc + b_off(gm, slot, my_rank) + h0 + j * (VEC // 2),
+                zero,
+                zero,
+                zero,
+                zero,
+            )
+        fence_proxy_alias()
+        ok = lamport_probe_b(pb + b_off(gm, slot, 0) + h0, _pb_off)
+        while ok == 0:
+            ok = lamport_probe_b(pb + b_off(gm, slot, 0) + h0, _pb_off)
 
     @cute.jit
     def finalize_tile(
@@ -573,7 +760,7 @@ def _make_program(
             # fabric egress here is (ws - 1) / ws of its payload.
             for k in cutlass.range_constexpr(K_EXPERTS):
                 o = k // KO
-                if cutlass.const_expr(o != my_rank):
+                if cutlass.const_expr(not token_owner and o != my_rank):
                     pp = _pin(cutlass.BFloat16, a_lam_peers[o])
                     q = mine[k]
                     st_global_v4(
@@ -587,11 +774,11 @@ def _make_program(
             # ---- FP32 cross-rank accumulate of the owned expert rows, in rank
             # order.  One spin covers every incoming slot, so the arrival test
             # is a single memory round rather than one per source rank.
-            anchor = pa + (a_off(gm, slot, 0, 0) + h0)
-            ok = lamport_probe_a(anchor, _pa_off)
-            while ok == 0:
+            if cutlass.const_expr(not token_owner):
+                anchor = pa + (a_off(gm, slot, 0, 0) + h0)
                 ok = lamport_probe_a(anchor, _pa_off)
-
+                while ok == 0:
+                    ok = lamport_probe_a(anchor, _pa_off)
             acc = []
             for ko in cutlass.range_constexpr(KO):
                 v = [cutlass.Float32(0.0) for _ in range(2 * 4)]
@@ -604,19 +791,29 @@ def _make_program(
                         lo, hi = cvt_bf16x2_to_2xf32(dv[j])
                         v[2 * j] = v[2 * j] + lo
                         v[2 * j + 1] = v[2 * j + 1] + hi
-                acc.append(v)
-
-            for ko in cutlass.range_constexpr(KO):
-                packed.append(
-                    tuple(
-                        cvt_2xf32_to_bf16x2(acc[ko][2 * j], acc[ko][2 * j + 1])
-                        for j in range(4)
+                if cutlass.const_expr(token_owner):
+                    packed.append(
+                        tuple(
+                            cvt_2xf32_to_bf16x2(v[2 * j], v[2 * j + 1])
+                            for j in range(4)
+                        )
                     )
-                )
+                else:
+                    acc.append(v)
+
+            if cutlass.const_expr(not token_owner):
+                for ko in cutlass.range_constexpr(KO):
+                    packed.append(
+                        tuple(
+                            cvt_2xf32_to_bf16x2(acc[ko][2 * j], acc[ko][2 * j + 1])
+                            for j in range(4)
+                        )
+                    )
 
             # every incoming row is now in registers, so the sentinel re-arm can
             # be issued here and drain behind the RMS reduction and the epilogue
-            rearm(gen, slot, h0)
+            if cutlass.const_expr(not token_owner):
+                rearm(gen, slot, h0)
         else:
             for k in cutlass.range_constexpr(K_EXPERTS):
                 packed.append(mine[k])
@@ -712,7 +909,7 @@ def _make_program(
                 accs[2 * j] = accs[2 * j] + ylo * wk
                 accs[2 * j + 1] = accs[2 * j + 1] + yhi * wk
 
-        if cutlass.const_expr(comm):
+        if cutlass.const_expr(comm and not token_owner):
             gm = gen % NGEN
             pb = _pin(cutlass.Float32, a_lam + A_BYTES)
             pb_mc = _pin(cutlass.Float32, a_lam_mc + A_BYTES)
@@ -721,12 +918,24 @@ def _make_program(
             # quarter of the BF16 payload, so the multicast fan-out is cheap.
             mo = [bitcast_f32_i32(x) for x in accs]
             mo = [scrub_b(x) for x in mo]
-            src_b = b_off(gm, slot, my_rank) + h0
             for j in cutlass.range_constexpr(2):
                 q = mo[4 * j : 4 * j + 4]
                 if cutlass.const_expr(use_mc):
+                    # Pack adjacent sectors instead of two half-sector stores
+                    # with a 32-byte stride between lanes.
+                    source_lane = lane // 2 + j * 16
+                    q = []
+                    for i in cutlass.range_constexpr(4):
+                        lo = cute.arch.shuffle_sync(mo[i], source_lane)
+                        hi = cute.arch.shuffle_sync(mo[i + 4], source_lane)
+                        q.append(lo if lane % 2 == 0 else hi)
+                    packed_h = h0 - lane * VEC + lane * (VEC // 2) + j * 32 * (VEC // 2)
                     multimem_st_v4(
-                        pb_mc + (src_b + j * (VEC // 2)), q[0], q[1], q[2], q[3]
+                        pb_mc + b_off(gm, slot, my_rank) + packed_h,
+                        q[0],
+                        q[1],
+                        q[2],
+                        q[3],
                     )
                 else:
                     for r in cutlass.range_constexpr(len(peers)):
@@ -764,7 +973,12 @@ def _make_program(
         o1 = cvt_2xf32_to_bf16x2(accs[2], accs[3])
         o2 = cvt_2xf32_to_bf16x2(accs[4], accs[5])
         o3 = cvt_2xf32_to_bf16x2(accs[6], accs[7])
-        st_global_v4(gOut.iterator + (tok * H_DIM + h0), o0, o1, o2, o3)
+        if cutlass.const_expr(token_owner):
+            pb_mc = _pin(cutlass.BFloat16, a_lam_mc + A_BYTES)
+            multimem_st_v4(pb_mc + b_off(0, slot, my_rank) + h0, o0, o1, o2, o3)
+            fence_proxy_alias()
+        else:
+            st_global_v4(gOut.iterator + (tok * H_DIM + h0), o0, o1, o2, o3)
 
     @cute.kernel
     def fused_kernel(
@@ -773,6 +987,7 @@ def _make_program(
         gIdx: cute.Tensor,
         gNw: cute.Tensor,
         gOut: cute.Tensor,
+        start: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         sx, cta, _ = cute.arch.block_idx()
@@ -801,6 +1016,10 @@ def _make_program(
 
         for it in cutlass.range(n_iter):
             tok = cta + it * grid_y
+            if cutlass.const_expr(token_owner):
+                base = tok * ws + start
+                tok = base + my_rank
+                wait_phase(cta, 0, g0 + it + 1, tidx, sx)
             if tok < n_tok:
                 finalize_tile(
                     gIn,
@@ -821,13 +1040,40 @@ def _make_program(
             else:
                 # idle tail iteration: the slot still burns a generation, so it
                 # must still hand a sentinel-armed buffer to a later launch
-                if cutlass.const_expr(comm):
-                    rearm(g0 + it, cta, h0)
+                if cutlass.const_expr(comm and not token_owner):
+                    advance_idle(g0 + it, cta, h0)
+            if cutlass.const_expr(token_owner):
+                publish_phase(cta, 1, g0 + it + 1, tidx, sx)
 
         # every CTA of the cluster has read the counter by now (they all passed
         # the cluster barrier inside the first tile), so one writer is safe.
-        if cutlass.const_expr(comm) and tidx == 0 and sx == 0:
+        if cutlass.const_expr(comm and not token_owner) and tidx == 0 and sx == 0:
             st_gen(_pin(cutlass.Int32, a_gen, 4) + cta, g0 + n_iter)
+
+    @cute.kernel
+    def stage_kernel(gIn: cute.Tensor, gIdx: cute.Tensor, start: Int32):
+        tidx, _, _ = cute.arch.thread_idx()
+        sx, cta, _ = cute.arch.block_idx()
+        slot = cta // ws
+        gen = ld_gen(_pin(cutlass.Int32, a_gen, 4) + slot) + 1
+        scatter_tokens(
+            gIn, gIdx, start + cta, slot, gen, tidx, sx * band + tidx * VEC, sx
+        )
+
+    @cute.kernel
+    def copy_kernel(gOut: cute.Tensor, start: Int32):
+        tidx, _, _ = cute.arch.thread_idx()
+        sx, cta, _ = cute.arch.block_idx()
+        gen = ld_gen(_pin(cutlass.Int32, a_gen, 4) + cta) + 1
+        if cutlass.const_expr(split > 1):
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+        copy_tokens(gOut, start + cta * ws, cta, gen, tidx, sx * band + tidx * VEC, sx)
+        if cutlass.const_expr(split > 1):
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+        if tidx == 0 and sx == 0:
+            st_gen(_pin(cutlass.Int32, a_gen, 4) + cta, gen)
 
     @cute.jit
     def host(
@@ -838,8 +1084,43 @@ def _make_program(
         gOut: cute.Tensor,
         stream: _drv.CUstream,
     ):
-        if cutlass.const_expr(split > 1):
-            fused_kernel(gIn, gW, gIdx, gNw, gOut).launch(
+        if cutlass.const_expr(token_owner):
+            for chunk in cutlass.range_constexpr(
+                (n_tok + grid_y * ws - 1) // (grid_y * ws)
+            ):
+                start = chunk * grid_y * ws
+                groups = min(grid_y, (n_tok - start + ws - 1) // ws)
+                stage_kernel(gIn, gIdx, cutlass.Int32(start)).launch(
+                    grid=(split, groups * ws, 1),
+                    block=(nthr, 1, 1),
+                    stream=stream,
+                )
+                if cutlass.const_expr(split > 1):
+                    fused_kernel(gIn, gW, gIdx, gNw, gOut, cutlass.Int32(start)).launch(
+                        grid=(split, groups, 1),
+                        block=(nthr, 1, 1),
+                        cluster=(split, 1, 1),
+                        stream=stream,
+                    )
+                    copy_kernel(gOut, cutlass.Int32(start)).launch(
+                        grid=(split, groups, 1),
+                        block=(nthr, 1, 1),
+                        cluster=(split, 1, 1),
+                        stream=stream,
+                    )
+                else:
+                    fused_kernel(gIn, gW, gIdx, gNw, gOut, cutlass.Int32(start)).launch(
+                        grid=(split, groups, 1),
+                        block=(nthr, 1, 1),
+                        stream=stream,
+                    )
+                    copy_kernel(gOut, cutlass.Int32(start)).launch(
+                        grid=(split, groups, 1),
+                        block=(nthr, 1, 1),
+                        stream=stream,
+                    )
+        elif cutlass.const_expr(split > 1):
+            fused_kernel(gIn, gW, gIdx, gNw, gOut, cutlass.Int32(0)).launch(
                 grid=(split, grid_y, 1),
                 block=(nthr, 1, 1),
                 cluster=(split, 1, 1),
@@ -847,7 +1128,7 @@ def _make_program(
                 stream=stream,
             )
         else:
-            fused_kernel(gIn, gW, gIdx, gNw, gOut).launch(
+            fused_kernel(gIn, gW, gIdx, gNw, gOut, cutlass.Int32(0)).launch(
                 grid=(1, grid_y, 1),
                 block=(nthr, 1, 1),
                 min_blocks_per_mp=1,
@@ -855,6 +1136,18 @@ def _make_program(
             )
 
     return host
+
+
+def _make_token_program(*args):
+    return _make_program(*args, token_owner=True)
+
+
+def _token_crossover(nsm):
+    return 256
+
+
+def _select_path(n_tok, nsm):
+    return "token" if n_tok >= _token_crossover(nsm) else "expert"
 
 
 # --------------------------------------------------------------------------- #
@@ -883,9 +1176,14 @@ class _WorkspaceAddresses(TypedDict):
     lam_mc: int
     lam_peers: list[int]
     gen: int
+    token_uc: int
+    token_mc: int
+    token_peers: list[int]
+    token_gen: int
+    token_slots: int
 
 
-_PROGRAMS: dict[tuple[int, int, int, int, int, float, float], "_Program"] = {}
+_PROGRAMS: dict[tuple[int, int, int, int, int, float, float, str], "_Program"] = {}
 
 
 def _group_all(
@@ -951,24 +1249,33 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
         _WS.initialized = True
         return False
 
-    _WS.nsm = props.multi_processor_count
+    sm_count = torch.tensor(
+        props.multi_processor_count, dtype=torch.int32, device=device
+    )
+    dist.all_reduce(sm_count, op=dist.ReduceOp.MIN, group=group)
+    _WS.nsm = int(sm_count.item())
     _WS.dev_ord = torch.cuda.current_device()
     _WS.ws = world_size
     _WS.rank = dist.get_rank(group)
-    _WS.addrs = {"lam_uc": 0, "lam_mc": 0, "lam_peers": [], "gen": 0}
 
     import torch.distributed._symmetric_memory as symm_mem
 
     ko = K_EXPERTS // _WS.ws
     a_i32 = NGEN * NSLOT * ko * _WS.ws * H_DIM // 2  # BF16 region, in int32 words
     b_i32 = NGEN * NSLOT * _WS.ws * H_DIM  # FP32 region, in int32 words
+    token_i32 = _WS.nsm * (K_EXPERTS + 1) * _WS.ws * H_DIM // 2
+    token_flags_i32 = _WS.nsm * 2 * _WS.ws
     allocation_flag = torch.empty((1,), dtype=torch.int32, device=device)
     lam = None
     generation = None
     allocation_error = None
     try:
-        lam = symm_mem.empty((a_i32 + b_i32,), dtype=torch.int32, device=device)
-        generation = torch.zeros((NSLOT,), dtype=torch.int32, device=device)
+        lam = symm_mem.empty(
+            (a_i32 + b_i32 + token_i32 + token_flags_i32,),
+            dtype=torch.int32,
+            device=device,
+        )
+        generation = torch.zeros((2 * NSLOT,), dtype=torch.int32, device=device)
     except RuntimeError as error:
         allocation_error = error
     if not _group_all(allocation_error is None, device, group, flag=allocation_flag):
@@ -987,7 +1294,8 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
         return False
     assert lam is not None and generation is not None
     lam[:a_i32].fill_(SENT_A_I32)
-    lam[a_i32:].fill_(SENT_B_I32)
+    lam[a_i32 : a_i32 + b_i32].fill_(SENT_B_I32)
+    lam[a_i32 + b_i32 + token_i32 :].zero_()
     _WS.gen = generation
     torch.cuda.synchronize()
     hdl = symm_mem.rendezvous(lam, group=group)
@@ -1012,7 +1320,7 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
         peers = [int(p) for p in hdl.buffer_ptrs]
     except (AttributeError, TypeError):
         peers = [
-            hdl.get_buffer(r, (a_i32 + b_i32,), torch.int32).data_ptr()
+            hdl.get_buffer(r, (lam.numel(),), torch.int32).data_ptr()
             for r in range(_WS.ws)
         ]
     _WS.addrs = {
@@ -1020,6 +1328,11 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
         "lam_mc": mc,
         "lam_peers": peers,
         "gen": generation.data_ptr(),
+        "token_uc": lam.data_ptr() + (a_i32 + b_i32) * 4,
+        "token_mc": mc + (a_i32 + b_i32) * 4,
+        "token_peers": [p + (a_i32 + b_i32) * 4 for p in peers],
+        "token_gen": generation.data_ptr() + NSLOT * 4,
+        "token_slots": _WS.nsm,
     }
     torch.accelerator.synchronize(device)
     dist.barrier(group=group)
@@ -1053,14 +1366,16 @@ def _build(key, a, b, c, d, e, stream):
     # The generated program embeds process-local symmetric-memory and multicast
     # addresses. It must therefore remain in the process cache rather than the
     # persistent CuTe-DSL cache, whose objects are reusable across processes.
-    n_tok, num_rows, row_stride, expert_weights_fp32, mode, eps, gain_center = key
-    split = _pick_split(n_tok, _WS.nsm)
+    n_tok, num_rows, row_stride, expert_weights_fp32, mode, eps, gain_center, path = key
+    tiles = (n_tok + _WS.ws - 1) // _WS.ws if path != "expert" else n_tok
+    split = 1 if path == "token" else _pick_split(tiles, _WS.nsm)
     nthr = H_DIM // (VEC * split)
-    grid_y = min(n_tok, _WS.nsm // split)
+    grid_y = min(tiles, _WS.nsm // split)
     addrs = _WS.addrs
     if addrs is None:
         raise RuntimeError("TP MoE finalize workspace addresses are unavailable")
-    host = _make_program(
+    factory = _make_token_program if path == "token" else _make_program
+    host = factory(
         n_tok,
         num_rows,
         row_stride,
@@ -1116,6 +1431,7 @@ def _run(
         int(weight_before_norm),
         float(eps),
         float(gain_center),
+        _select_path(n_tok, _WS.nsm),
     )
     capturing = torch.cuda.is_current_stream_capturing()
     stream = _cur_stream(_WS.dev_ord)
