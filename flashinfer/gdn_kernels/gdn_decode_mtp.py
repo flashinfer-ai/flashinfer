@@ -2943,7 +2943,8 @@ def run_mtp_decode(
         cache_replayssm: Whether to persist only the fold-every-commit
             ReplaySSM inputs instead of full intermediate states.
         verify_parents: Optional int32 [B, T] parent indices for tree-structured
-            drafts. Requires ``parent[i] < i``. ReplaySSM verify only.
+            drafts. Requires ``parent[i] < i``, checked on device only when
+            ``FLASHINFER_VALIDATE_VERIFY_PARENTS=1``. ReplaySSM verify only.
     """
     if B == 0:
         return
