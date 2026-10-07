@@ -99,22 +99,22 @@ class _Program:
 # derives from it.  Two kernel families ship, each x {bf16, f16, f32 state} x
 # {batched, varlen}, plus one preprocess shared by both: the exact scan
 # (``exact_*``) and the chunk-parallel program (``chunkpar_*``).
-_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_95b8cddffd"
+_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_ff8a998f8c"
 _SCAN_MODULES = {
-    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_8033f7fce1",
-    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_931d9e1ef5",
-    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_492a7a1109",
-    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_6b09edb72f",
-    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_d6335c937c",
-    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_2a4bde83c7",
+    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_e2bea5f3e7",
+    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_1d9fc0c3c8",
+    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_0a79355dd1",
+    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_fca9cbf4e7",
+    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_2ac63fe21c",
+    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_fb7365f694",
 }
 _CHUNKPAR_MODULES = {
-    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_4347eec4ce",
-    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_f2907cb882",
-    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_3dcdabfdf3",
-    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_d90ab39833",
-    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_8a72a78990",
-    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_dec819c6c2",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_39deb388f5",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_73359c8907",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_289739d002",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_8877d644f7",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_8af2ca5619",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_a92577a08a",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(

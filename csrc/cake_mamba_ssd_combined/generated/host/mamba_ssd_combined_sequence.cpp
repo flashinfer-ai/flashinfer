@@ -658,12 +658,6 @@ struct PreparedLaunch {
   tvm::ffi::dim3 block;
   void* kargs[41] = {};
   std::vector<TensorView> retained;
-  tvm::ffi::cuda_api::LaunchConfig config{};
-#if TVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API
-  CUlaunchAttribute attrs[1]{};
-#else
-  cudaLaunchAttribute attrs[1]{};
-#endif
 };
 
 inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView arg_b_map, TensorView arg_c_map, TensorView arg_out_map, TensorView arg_x, TensorView arg_dt, TensorView arg_delta_precomputed, TensorView arg_cumsum_precomputed, TensorView arg_A, TensorView arg_B_tensor, TensorView arg_C, TensorView arg_D, TensorView arg_z, TensorView arg_dt_bias, TensorView arg_initial_states, TensorView arg_final_states, TensorView arg_checkpoint_states, TensorView arg_checkpoint_token_indices, TensorView arg_checkpoint_state_slots, TensorView arg_seq_idx_i32, TensorView arg_seq_idx_i64, TensorView arg_chunk_indices, TensorView arg_chunk_offsets, TensorView arg_seq_chunk_cumsum, TensorView arg_out_native, int64_t arg_nheads, int64_t arg_ngroups, int64_t arg_batch, int64_t arg_seqlen, int64_t arg_nchunks, int64_t arg_sequence_count, int64_t arg_num_logical_chunks, int64_t arg_mode_varlen, int64_t arg_D_mode, int64_t arg_has_z, int64_t arg_has_initial, int64_t arg_dt_softplus, double arg_dt_min, double arg_dt_max, int64_t arg_write_final_states, int64_t arg_checkpoint_state_count, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
@@ -922,35 +916,11 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
   prepared.kargs[39] = &prepared.v_write_final_states;
   prepared.kargs[40] = &prepared.v_checkpoint_state_count;
 
-#if TVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API
-  prepared.attrs[0].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
-  prepared.attrs[0].value.programmaticStreamSerializationAllowed = 1;
-  prepared.config.gridDimX = prepared.grid.x;
-  prepared.config.gridDimY = prepared.grid.y;
-  prepared.config.gridDimZ = prepared.grid.z;
-  prepared.config.blockDimX = prepared.block.x;
-  prepared.config.blockDimY = prepared.block.y;
-  prepared.config.blockDimZ = prepared.block.z;
-  prepared.config.sharedMemBytes = CAKE_SSD_MAIN_SMEM_BYTESu;
-  prepared.config.hStream = stream;
-  prepared.config.attrs = prepared.attrs;
-  prepared.config.numAttrs = 1;
-#else
-  prepared.attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  prepared.attrs[0].val.programmaticStreamSerializationAllowed = 1;
-  prepared.config.gridDim = {prepared.grid.x, prepared.grid.y, prepared.grid.z};
-  prepared.config.blockDim = {prepared.block.x, prepared.block.y, prepared.block.z};
-  prepared.config.dynamicSmemBytes = CAKE_SSD_MAIN_SMEM_BYTESu;
-  prepared.config.stream = stream;
-  prepared.config.attrs = prepared.attrs;
-  prepared.config.numAttrs = 1;
-#endif
-
 }
 
 inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      prepared.kernel->LaunchEx(prepared.kargs, prepared.config));
+      prepared.kernel->Launch(prepared.kargs, prepared.grid, prepared.block, stream, CAKE_SSD_MAIN_SMEM_BYTESu));
 }
 }  // namespace stage_main
 

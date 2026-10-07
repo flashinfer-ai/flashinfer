@@ -236,8 +236,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, const __grid_constant__ CUtensorMap h_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, float* __restrict__ initial_states, float* __restrict__ final_states, float* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, float* __restrict__ s_work, unsigned int* __restrict__ h_words, unsigned int* __restrict__ grid_barrier, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count)
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
+kernel_mamba_ssd_chunk_parallel_bf16_varlen(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, const __grid_constant__ CUtensorMap h_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ initial_states, __nv_bfloat16* __restrict__ final_states, __nv_bfloat16* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, float* __restrict__ s_work, unsigned int* __restrict__ h_words, unsigned int* __restrict__ grid_barrier, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -284,24 +284,24 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
     const int cta_rank = 0;
 
     // Kernel setup ops
-    __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int smem_b_addr = smem + 1024;
-    __nv_bfloat16* smem_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
-    const int smem_c_addr = smem + 66560;
-    __nv_bfloat16* smem_x_tma = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
-    const int smem_x_tma_addr = smem + 132096;
-    __nv_bfloat16* smem_x = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
-    const int smem_x_addr = smem + 132096;
-    __nv_bfloat16* smem_scaled_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 164864);
-    const int smem_scaled_b_addr = smem + 164864;
-    __nv_bfloat16* smem_state = reinterpret_cast<__nv_bfloat16*>(smem_raw + 164864);
-    const int smem_state_addr = smem + 164864;
-    __half* smem_delta_all = reinterpret_cast<__half*>(smem_raw + 230400);
-    const int smem_delta_all_addr = smem + 230400;
-    float* smem_cumsum_all = reinterpret_cast<float*>(smem_raw + 230912);
-    const int smem_cumsum_all_addr = smem + 230912;
-    __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + 197632);
-    const int smem_y_addr = smem + 197632;
+    __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_B_OFF);
+    const int smem_b_addr = smem + SMEM_SMEM_B_OFF;
+    __nv_bfloat16* smem_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_C_OFF);
+    const int smem_c_addr = smem + SMEM_SMEM_C_OFF;
+    __nv_bfloat16* smem_x_tma = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_X_TMA_OFF);
+    const int smem_x_tma_addr = smem + SMEM_SMEM_X_TMA_OFF;
+    __nv_bfloat16* smem_x = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_X_OFF);
+    const int smem_x_addr = smem + SMEM_SMEM_X_OFF;
+    __nv_bfloat16* smem_scaled_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_SCALED_B_OFF);
+    const int smem_scaled_b_addr = smem + SMEM_SMEM_SCALED_B_OFF;
+    __nv_bfloat16* smem_state = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_STATE_OFF);
+    const int smem_state_addr = smem + SMEM_SMEM_STATE_OFF;
+    __half* smem_delta_all = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_DELTA_ALL_OFF);
+    const int smem_delta_all_addr = smem + SMEM_SMEM_DELTA_ALL_OFF;
+    float* smem_cumsum_all = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_CUMSUM_ALL_OFF);
+    const int smem_cumsum_all_addr = smem + SMEM_SMEM_CUMSUM_ALL_OFF;
+    __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_Y_OFF);
+    const int smem_y_addr = smem + SMEM_SMEM_Y_OFF;
 
     // Mbarrier init (24 pipeline groups, 0 ordered-sequence groups, 40 barriers)
     // Mbarriers at smem_raw[0..320)
@@ -403,7 +403,6 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
     const int tmem_intra_tmem = taddr + 320;
     const int tmem_state_delta_tmem = taddr + 384;
     const int tmem_inter_tmem = taddr + 448;
-    asm volatile("griddepcontrol.wait;" ::: "memory");
 
     // ---- Ordered hardware-WG register redistribution ----
     // Dec phase frees registers before any WG attempts inc.
@@ -415,6 +414,7 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
     if (warp == 0) {
         { // mma_inter_main
             int total_tiles = sequence_count * nchunks * nheads;
+            total_tiles = seq_chunk_cumsum[sequence_count] * nheads;
             int _uniform_3 = make_warp_uniform(total_tiles);
             total_tiles = _uniform_3;
             unsigned int stage1 = 0;
@@ -598,6 +598,7 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
     if (warp == 1) {
         { // mma_intra_main
             int total_tiles_1 = sequence_count * nchunks * nheads;
+            total_tiles_1 = seq_chunk_cumsum[sequence_count] * nheads;
             int _uniform_2 = make_warp_uniform(total_tiles_1);
             total_tiles_1 = _uniform_2;
             __threadfence();
@@ -732,6 +733,7 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
     if (warp == 2) {
         { // load_bc_main
             int total_tiles_2 = sequence_count * nchunks * nheads;
+            total_tiles_2 = seq_chunk_cumsum[sequence_count] * nheads;
             int _uniform_0 = make_warp_uniform(total_tiles_2);
             total_tiles_2 = _uniform_0;
             unsigned int stage1_1 = 0;
@@ -743,8 +745,7 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                 int group = head * ngroups / nheads;
                 int physical_chunk = 0;
                 int physical_batch = 0;
-                physical_batch = logical / nchunks;
-                physical_chunk = logical - physical_batch * nchunks;
+                physical_chunk = chunk_indices[logical];
                 int token_in_batch = physical_chunk * 128;
                 mbarrier_wait(b1_empty_addr + (stage1_1) * 8, _phase_b1_empty);
                 if (elect_sync()) {
@@ -776,8 +777,7 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                 int group_1 = head_1 * ngroups / nheads;
                 int physical_chunk_1 = 0;
                 int physical_batch_1 = 0;
-                physical_batch_1 = logical_1 / nchunks;
-                physical_chunk_1 = logical_1 - physical_batch_1 * nchunks;
+                physical_chunk_1 = chunk_indices[logical_1];
                 int token_in_batch_1 = physical_chunk_1 * 128;
                 mbarrier_wait(bc_empty_addr + (stage3_2) * 8, _phase_bc_empty);
                 if (elect_sync()) {
@@ -804,6 +804,7 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
     if (warp == 3) {
         { // load_x_dt_main
             int total_tiles_3 = sequence_count * nchunks * nheads;
+            total_tiles_3 = seq_chunk_cumsum[sequence_count] * nheads;
             int _uniform_1 = make_warp_uniform(total_tiles_3);
             total_tiles_3 = _uniform_1;
             unsigned int stage1_2 = 0;
@@ -818,11 +819,20 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                 int physical_batch_2 = 0;
                 int segment_offset = 0;
                 int segment_limit = 128;
-                physical_batch_2 = logical_2 / nchunks;
-                physical_chunk_2 = logical_2 - physical_batch_2 * nchunks;
+                physical_chunk_2 = chunk_indices[logical_2];
+                segment_offset = chunk_offsets[logical_2];
+                if (logical_2 + 1 < num_logical_chunks) {
+                    int next_chunk = chunk_indices[logical_2 + 1];
+                    if (next_chunk == physical_chunk_2) {
+                        segment_limit = chunk_offsets[logical_2 + 1];
+                    }
+                }
                 int chunk_tokens = seqlen - physical_chunk_2 * 128;
                 if (chunk_tokens > 128) {
                     chunk_tokens = 128;
+                }
+                if (segment_limit > chunk_tokens) {
+                    segment_limit = chunk_tokens;
                 }
                 mbarrier_wait(aux1_empty_addr + (stage1_2) * 8, _phase_aux1_empty);
                 mbarrier_wait(x1_empty_addr + (stage1_2) * 8, _phase_x1_empty);
@@ -838,13 +848,9 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                     int factor_token = physical_token - segment_offset;
                     float cumsum_value = 0.0f;
                     __half delta_value = (__half)0.0f;
-                    int source_token = physical_token;
-                    if (source_token >= chunk_tokens) {
-                        source_token = chunk_tokens - 1;
-                    }
-                    cumsum_value = cumsum_precomputed[tile_row_1 * 128 + source_token];
-                    if (physical_token < chunk_tokens) {
-                        delta_value = delta_precomputed[tile_row_1 * 128 + physical_token];
+                    if (physical_token >= segment_offset && physical_token < segment_limit) {
+                        cumsum_value = cumsum_precomputed[tile_row_1 * 128 + factor_token];
+                        delta_value = delta_precomputed[tile_row_1 * 128 + factor_token];
                     }
                     smem_cumsum_all[stage1_2 * 128 + (unsigned int)physical_token] = cumsum_value;
                     smem_delta_all[stage1_2 * 128 + (unsigned int)physical_token] = delta_value;
@@ -877,11 +883,20 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                 int physical_batch_3 = 0;
                 int segment_offset_1 = 0;
                 int segment_limit_1 = 128;
-                physical_batch_3 = logical_3 / nchunks;
-                physical_chunk_3 = logical_3 - physical_batch_3 * nchunks;
+                physical_chunk_3 = chunk_indices[logical_3];
+                segment_offset_1 = chunk_offsets[logical_3];
+                if (logical_3 + 1 < num_logical_chunks) {
+                    int next_chunk_1 = chunk_indices[logical_3 + 1];
+                    if (next_chunk_1 == physical_chunk_3) {
+                        segment_limit_1 = chunk_offsets[logical_3 + 1];
+                    }
+                }
                 int chunk_tokens_1 = seqlen - physical_chunk_3 * 128;
                 if (chunk_tokens_1 > 128) {
                     chunk_tokens_1 = 128;
+                }
+                if (segment_limit_1 > chunk_tokens_1) {
+                    segment_limit_1 = chunk_tokens_1;
                 }
                 mbarrier_wait(aux3_empty_addr + (stage3_3) * 8, _phase_aux3_empty);
                 mbarrier_wait(x3_empty_addr + (stage3_3) * 8, _phase_x3_empty);
@@ -897,13 +912,9 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                     int factor_token_1 = physical_token_1 - segment_offset_1;
                     float cumsum_value_1 = 0.0f;
                     __half delta_value_1 = (__half)0.0f;
-                    int source_token_1 = physical_token_1;
-                    if (source_token_1 >= chunk_tokens_1) {
-                        source_token_1 = chunk_tokens_1 - 1;
-                    }
-                    cumsum_value_1 = cumsum_precomputed[tile_row_2 * 128 + source_token_1];
-                    if (physical_token_1 < chunk_tokens_1) {
-                        delta_value_1 = delta_precomputed[tile_row_2 * 128 + physical_token_1];
+                    if (physical_token_1 >= segment_offset_1 && physical_token_1 < segment_limit_1) {
+                        cumsum_value_1 = cumsum_precomputed[tile_row_2 * 128 + factor_token_1];
+                        delta_value_1 = delta_precomputed[tile_row_2 * 128 + factor_token_1];
                     }
                     smem_cumsum_all[stage3_3 * 128 + (unsigned int)physical_token_1] = cumsum_value_1;
                     smem_delta_all[stage3_3 * 128 + (unsigned int)physical_token_1] = delta_value_1;
@@ -925,6 +936,7 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
             int taddr_0 = taddr;
             unsigned int stage1_3 = 0;
             int total_tiles_4 = sequence_count * nchunks * nheads;
+            total_tiles_4 = seq_chunk_cumsum[sequence_count] * nheads;
             int _uniform_8 = make_warp_uniform(total_tiles_4);
             total_tiles_4 = _uniform_8;
             int b_state_base = (warp % 4 * 4 + lane / 8) * 8;
@@ -941,11 +953,20 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                 int physical_chunk_4 = 0;
                 int segment_offset_2 = 0;
                 int segment_limit_2 = 128;
-                int sequence = logical_4 / nchunks;
-                physical_chunk_4 = logical_4 - sequence * nchunks;
+                physical_chunk_4 = chunk_indices[logical_4];
+                segment_offset_2 = chunk_offsets[logical_4];
+                if (logical_4 + 1 < num_logical_chunks) {
+                    int next_chunk_2 = chunk_indices[logical_4 + 1];
+                    if (next_chunk_2 == physical_chunk_4) {
+                        segment_limit_2 = chunk_offsets[logical_4 + 1];
+                    }
+                }
                 int chunk_tokens_2 = seqlen - physical_chunk_4 * 128;
                 if (chunk_tokens_2 > 128) {
                     chunk_tokens_2 = 128;
+                }
+                if (segment_limit_2 > chunk_tokens_2) {
+                    segment_limit_2 = chunk_tokens_2;
                 }
                 mbarrier_wait(aux1_full_addr + (stage1_3) * 8, _phase_aux1_full);
                 mbarrier_wait(b1_full_addr + (stage1_3) * 8, _phase_b1_full);
@@ -1040,26 +1061,28 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
             for (int pair = bid * 384 + heavy_tid; pair < total_pairs; pair += num_bids * 384) {
                 int work = pair / 4096;
                 int local_pair = pair - work * 4096;
-                int sequence_1 = work / nheads;
-                int head_5 = work - sequence_1 * nheads;
+                int sequence = work / nheads;
+                int head_5 = work - sequence * nheads;
                 int elem = local_pair * 2;
                 int state_head_base = work * 8192;
                 float h_pair[2];
                 h_pair[0] = 0.0f;
                 h_pair[1] = 0.0f;
                 if (has_initial != 0) {
-                    h_pair[0] = initial_states[state_head_base + elem];
-                    h_pair[1] = initial_states[state_head_base + elem + 1];
+                    h_pair[0] = (float)initial_states[state_head_base + elem];
+                    h_pair[1] = (float)initial_states[state_head_base + elem + 1];
                 }
-                int first_logical = sequence_1 * nchunks;
+                int first_logical = sequence * nchunks;
                 int logical_end = first_logical + nchunks;
+                first_logical = seq_chunk_cumsum[sequence];
+                logical_end = seq_chunk_cumsum[sequence + 1];
                 int _uniform_9 = make_warp_uniform(first_logical);
                 first_logical = _uniform_9;
                 int _uniform_10 = make_warp_uniform(logical_end);
                 logical_end = _uniform_10;
                 int checkpoint_token = -1;
                 if (checkpoint_state_count > 0) {
-                    checkpoint_token = checkpoint_token_indices[sequence_1];
+                    checkpoint_token = checkpoint_token_indices[sequence];
                 }
                 if (first_logical < logical_end) {
                     uint32_t h_pair_bf16[1];
@@ -1082,13 +1105,24 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                         int look_physical = 0;
                         int look_offset = 0;
                         int look_limit = 128;
-                        look_physical = look - sequence_1 * nchunks;
+                        look_physical = chunk_indices[look];
+                        look_offset = chunk_offsets[look];
+                        if (look + 1 < num_logical_chunks) {
+                            int look_next = chunk_indices[look + 1];
+                            if (look_next == look_physical) {
+                                look_limit = chunk_offsets[look + 1];
+                            }
+                        }
                         int look_tokens = seqlen - look_physical * 128;
                         if (look_tokens > 128) {
                             look_tokens = 128;
                         }
-                        int source_token_2 = look_tokens - 1;
-                        float last_cumsum_1 = cumsum_precomputed[look_tile * 128 + source_token_2];
+                        int source_token = look_tokens - 1;
+                        if (look_limit > look_tokens) {
+                            look_limit = look_tokens;
+                        }
+                        source_token = look_limit - 1 - look_offset;
+                        float last_cumsum_1 = cumsum_precomputed[look_tile * 128 + source_token];
                         float segment_base = 0.0f;
                         float _exp2_4 = approx_exp2((last_cumsum_1 - segment_base) * 1.4426950408889634f);
                         d_pre[k] = _exp2_4;
@@ -1128,17 +1162,26 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                             if (checkpoint_state_count > 0) {
                                 int cur_physical = 0;
                                 int cur_limit = 128;
-                                cur_physical = current - sequence_1 * nchunks;
+                                cur_physical = chunk_indices[current];
+                                if (current + 1 < num_logical_chunks) {
+                                    int cur_next = chunk_indices[current + 1];
+                                    if (cur_next == cur_physical) {
+                                        cur_limit = chunk_offsets[current + 1];
+                                    }
+                                }
                                 int cur_tokens = seqlen - cur_physical * 128;
                                 if (cur_tokens > 128) {
                                     cur_tokens = 128;
+                                }
+                                if (cur_limit > cur_tokens) {
+                                    cur_limit = cur_tokens;
                                 }
                                 int segment_end = cur_physical * 128 + cur_limit;
                                 if (segment_end > seqlen) {
                                     segment_end = seqlen;
                                 }
                                 if (checkpoint_token == segment_end) {
-                                    int checkpoint_slot = checkpoint_state_slots[sequence_1];
+                                    int checkpoint_slot = checkpoint_state_slots[sequence];
                                     if (checkpoint_slot >= 0 && checkpoint_slot < checkpoint_state_count) {
                                         int checkpoint_head_base = (checkpoint_slot * nheads + head_5) * 8192;
                                         checkpoint_states[checkpoint_head_base + elem] = h_pair[0];
@@ -1165,11 +1208,13 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
         asm volatile("setmaxnreg.inc.sync.aligned.u32 208;");
         { // pre_intra_main
             int total_tiles_5 = sequence_count * nchunks * nheads;
+            total_tiles_5 = seq_chunk_cumsum[sequence_count] * nheads;
             int _uniform_4 = make_warp_uniform(total_tiles_5);
             total_tiles_5 = _uniform_4;
             int taddr_0_1 = taddr;
             unsigned int stage1_4 = 0;
             int total_tiles_1_1 = sequence_count * nchunks * nheads;
+            total_tiles_1_1 = seq_chunk_cumsum[sequence_count] * nheads;
             int _uniform_5 = make_warp_uniform(total_tiles_1_1);
             total_tiles_1_1 = _uniform_5;
             int b_state_base_1 = (warp % 4 * 4 + lane / 8) * 8;
@@ -1186,11 +1231,20 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                 int physical_chunk_5 = 0;
                 int segment_offset_3 = 0;
                 int segment_limit_3 = 128;
-                int sequence_2 = logical_6 / nchunks;
-                physical_chunk_5 = logical_6 - sequence_2 * nchunks;
+                physical_chunk_5 = chunk_indices[logical_6];
+                segment_offset_3 = chunk_offsets[logical_6];
+                if (logical_6 + 1 < num_logical_chunks) {
+                    int next_chunk_3 = chunk_indices[logical_6 + 1];
+                    if (next_chunk_3 == physical_chunk_5) {
+                        segment_limit_3 = chunk_offsets[logical_6 + 1];
+                    }
+                }
                 int chunk_tokens_3 = seqlen - physical_chunk_5 * 128;
                 if (chunk_tokens_3 > 128) {
                     chunk_tokens_3 = 128;
+                }
+                if (segment_limit_3 > chunk_tokens_3) {
+                    segment_limit_3 = chunk_tokens_3;
                 }
                 mbarrier_wait(aux1_full_addr + (stage1_4) * 8, _phase_aux1_full_1);
                 mbarrier_wait(b1_full_addr + (stage1_4) * 8, _phase_b1_full_1);
@@ -1285,26 +1339,28 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
             for (int pair_1 = bid * 384 + heavy_tid_1; pair_1 < total_pairs_1; pair_1 += num_bids * 384) {
                 int work_1 = pair_1 / 4096;
                 int local_pair_1 = pair_1 - work_1 * 4096;
-                int sequence_3 = work_1 / nheads;
-                int head_7 = work_1 - sequence_3 * nheads;
+                int sequence_1 = work_1 / nheads;
+                int head_7 = work_1 - sequence_1 * nheads;
                 int elem_1 = local_pair_1 * 2;
                 int state_head_base_1 = work_1 * 8192;
                 float h_pair_1[2];
                 h_pair_1[0] = 0.0f;
                 h_pair_1[1] = 0.0f;
                 if (has_initial != 0) {
-                    h_pair_1[0] = initial_states[state_head_base_1 + elem_1];
-                    h_pair_1[1] = initial_states[state_head_base_1 + elem_1 + 1];
+                    h_pair_1[0] = (float)initial_states[state_head_base_1 + elem_1];
+                    h_pair_1[1] = (float)initial_states[state_head_base_1 + elem_1 + 1];
                 }
-                int first_logical_1 = sequence_3 * nchunks;
+                int first_logical_1 = sequence_1 * nchunks;
                 int logical_end_1 = first_logical_1 + nchunks;
+                first_logical_1 = seq_chunk_cumsum[sequence_1];
+                logical_end_1 = seq_chunk_cumsum[sequence_1 + 1];
                 int _uniform_6 = make_warp_uniform(first_logical_1);
                 first_logical_1 = _uniform_6;
                 int _uniform_7 = make_warp_uniform(logical_end_1);
                 logical_end_1 = _uniform_7;
                 int checkpoint_token_1 = -1;
                 if (checkpoint_state_count > 0) {
-                    checkpoint_token_1 = checkpoint_token_indices[sequence_3];
+                    checkpoint_token_1 = checkpoint_token_indices[sequence_1];
                 }
                 if (first_logical_1 < logical_end_1) {
                     uint32_t h_pair_bf16_2[1];
@@ -1327,13 +1383,24 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                         int look_physical_1 = 0;
                         int look_offset_1 = 0;
                         int look_limit_1 = 128;
-                        look_physical_1 = look_1 - sequence_3 * nchunks;
+                        look_physical_1 = chunk_indices[look_1];
+                        look_offset_1 = chunk_offsets[look_1];
+                        if (look_1 + 1 < num_logical_chunks) {
+                            int look_next_1 = chunk_indices[look_1 + 1];
+                            if (look_next_1 == look_physical_1) {
+                                look_limit_1 = chunk_offsets[look_1 + 1];
+                            }
+                        }
                         int look_tokens_1 = seqlen - look_physical_1 * 128;
                         if (look_tokens_1 > 128) {
                             look_tokens_1 = 128;
                         }
-                        int source_token_3 = look_tokens_1 - 1;
-                        float last_cumsum_3 = cumsum_precomputed[look_tile_1 * 128 + source_token_3];
+                        int source_token_1 = look_tokens_1 - 1;
+                        if (look_limit_1 > look_tokens_1) {
+                            look_limit_1 = look_tokens_1;
+                        }
+                        source_token_1 = look_limit_1 - 1 - look_offset_1;
+                        float last_cumsum_3 = cumsum_precomputed[look_tile_1 * 128 + source_token_1];
                         float segment_base_1 = 0.0f;
                         float _exp2_1 = approx_exp2((last_cumsum_3 - segment_base_1) * 1.4426950408889634f);
                         d_pre_1[k_2] = _exp2_1;
@@ -1373,17 +1440,26 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                             if (checkpoint_state_count > 0) {
                                 int cur_physical_1 = 0;
                                 int cur_limit_1 = 128;
-                                cur_physical_1 = current_1 - sequence_3 * nchunks;
+                                cur_physical_1 = chunk_indices[current_1];
+                                if (current_1 + 1 < num_logical_chunks) {
+                                    int cur_next_1 = chunk_indices[current_1 + 1];
+                                    if (cur_next_1 == cur_physical_1) {
+                                        cur_limit_1 = chunk_offsets[current_1 + 1];
+                                    }
+                                }
                                 int cur_tokens_1 = seqlen - cur_physical_1 * 128;
                                 if (cur_tokens_1 > 128) {
                                     cur_tokens_1 = 128;
+                                }
+                                if (cur_limit_1 > cur_tokens_1) {
+                                    cur_limit_1 = cur_tokens_1;
                                 }
                                 int segment_end_1 = cur_physical_1 * 128 + cur_limit_1;
                                 if (segment_end_1 > seqlen) {
                                     segment_end_1 = seqlen;
                                 }
                                 if (checkpoint_token_1 == segment_end_1) {
-                                    int checkpoint_slot_1 = checkpoint_state_slots[sequence_3];
+                                    int checkpoint_slot_1 = checkpoint_state_slots[sequence_1];
                                     if (checkpoint_slot_1 >= 0 && checkpoint_slot_1 < checkpoint_state_count) {
                                         int checkpoint_head_base_1 = (checkpoint_slot_1 * nheads + head_7) * 8192;
                                         checkpoint_states[checkpoint_head_base_1 + elem_1] = h_pair_1[0];
@@ -1416,11 +1492,20 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                 int physical_chunk_6 = 0;
                 int segment_offset_4 = 0;
                 int segment_limit_4 = 128;
-                int sequence_4 = logical_8 / nchunks;
-                physical_chunk_6 = logical_8 - sequence_4 * nchunks;
+                physical_chunk_6 = chunk_indices[logical_8];
+                segment_offset_4 = chunk_offsets[logical_8];
+                if (logical_8 + 1 < num_logical_chunks) {
+                    int next_chunk_4 = chunk_indices[logical_8 + 1];
+                    if (next_chunk_4 == physical_chunk_6) {
+                        segment_limit_4 = chunk_offsets[logical_8 + 1];
+                    }
+                }
                 int chunk_tokens_4 = seqlen - physical_chunk_6 * 128;
                 if (chunk_tokens_4 > 128) {
                     chunk_tokens_4 = 128;
+                }
+                if (segment_limit_4 > chunk_tokens_4) {
+                    segment_limit_4 = chunk_tokens_4;
                 }
                 mbarrier_wait(cb_full_addr + (acc_stage_1) * 8, _phase_cb_full);
                 mbarrier_wait(aux3_full_addr + (stage3_4) * 8, _phase_aux3_full);
@@ -1485,6 +1570,7 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
         asm volatile("setmaxnreg.dec.sync.aligned.u32 112;");
         { // epilogue_main
             int total_tiles_6 = sequence_count * nchunks * nheads;
+            total_tiles_6 = seq_chunk_cumsum[sequence_count] * nheads;
             int _uniform_11 = make_warp_uniform(total_tiles_6);
             total_tiles_6 = _uniform_11;
             __threadfence();
@@ -1497,26 +1583,28 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
             for (int pair_2 = bid * 384 + heavy_tid_2; pair_2 < total_pairs_2; pair_2 += num_bids * 384) {
                 int work_2 = pair_2 / 4096;
                 int local_pair_2 = pair_2 - work_2 * 4096;
-                int sequence_5 = work_2 / nheads;
-                int head_8 = work_2 - sequence_5 * nheads;
+                int sequence_2 = work_2 / nheads;
+                int head_8 = work_2 - sequence_2 * nheads;
                 int elem_2 = local_pair_2 * 2;
                 int state_head_base_2 = work_2 * 8192;
                 float h_pair_2[2];
                 h_pair_2[0] = 0.0f;
                 h_pair_2[1] = 0.0f;
                 if (has_initial != 0) {
-                    h_pair_2[0] = initial_states[state_head_base_2 + elem_2];
-                    h_pair_2[1] = initial_states[state_head_base_2 + elem_2 + 1];
+                    h_pair_2[0] = (float)initial_states[state_head_base_2 + elem_2];
+                    h_pair_2[1] = (float)initial_states[state_head_base_2 + elem_2 + 1];
                 }
-                int first_logical_2 = sequence_5 * nchunks;
+                int first_logical_2 = sequence_2 * nchunks;
                 int logical_end_2 = first_logical_2 + nchunks;
+                first_logical_2 = seq_chunk_cumsum[sequence_2];
+                logical_end_2 = seq_chunk_cumsum[sequence_2 + 1];
                 int _uniform_12 = make_warp_uniform(first_logical_2);
                 first_logical_2 = _uniform_12;
                 int _uniform_13 = make_warp_uniform(logical_end_2);
                 logical_end_2 = _uniform_13;
                 int checkpoint_token_2 = -1;
                 if (checkpoint_state_count > 0) {
-                    checkpoint_token_2 = checkpoint_token_indices[sequence_5];
+                    checkpoint_token_2 = checkpoint_token_indices[sequence_2];
                 }
                 if (first_logical_2 < logical_end_2) {
                     uint32_t h_pair_bf16_4[1];
@@ -1539,13 +1627,24 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                         int look_physical_2 = 0;
                         int look_offset_2 = 0;
                         int look_limit_2 = 128;
-                        look_physical_2 = look_2 - sequence_5 * nchunks;
+                        look_physical_2 = chunk_indices[look_2];
+                        look_offset_2 = chunk_offsets[look_2];
+                        if (look_2 + 1 < num_logical_chunks) {
+                            int look_next_2 = chunk_indices[look_2 + 1];
+                            if (look_next_2 == look_physical_2) {
+                                look_limit_2 = chunk_offsets[look_2 + 1];
+                            }
+                        }
                         int look_tokens_2 = seqlen - look_physical_2 * 128;
                         if (look_tokens_2 > 128) {
                             look_tokens_2 = 128;
                         }
-                        int source_token_4 = look_tokens_2 - 1;
-                        float last_cumsum_4 = cumsum_precomputed[look_tile_2 * 128 + source_token_4];
+                        int source_token_2 = look_tokens_2 - 1;
+                        if (look_limit_2 > look_tokens_2) {
+                            look_limit_2 = look_tokens_2;
+                        }
+                        source_token_2 = look_limit_2 - 1 - look_offset_2;
+                        float last_cumsum_4 = cumsum_precomputed[look_tile_2 * 128 + source_token_2];
                         float segment_base_3 = 0.0f;
                         float _exp2_5 = approx_exp2((last_cumsum_4 - segment_base_3) * 1.4426950408889634f);
                         d_pre_2[k_4] = _exp2_5;
@@ -1585,17 +1684,26 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                             if (checkpoint_state_count > 0) {
                                 int cur_physical_2 = 0;
                                 int cur_limit_2 = 128;
-                                cur_physical_2 = current_2 - sequence_5 * nchunks;
+                                cur_physical_2 = chunk_indices[current_2];
+                                if (current_2 + 1 < num_logical_chunks) {
+                                    int cur_next_2 = chunk_indices[current_2 + 1];
+                                    if (cur_next_2 == cur_physical_2) {
+                                        cur_limit_2 = chunk_offsets[current_2 + 1];
+                                    }
+                                }
                                 int cur_tokens_2 = seqlen - cur_physical_2 * 128;
                                 if (cur_tokens_2 > 128) {
                                     cur_tokens_2 = 128;
+                                }
+                                if (cur_limit_2 > cur_tokens_2) {
+                                    cur_limit_2 = cur_tokens_2;
                                 }
                                 int segment_end_2 = cur_physical_2 * 128 + cur_limit_2;
                                 if (segment_end_2 > seqlen) {
                                     segment_end_2 = seqlen;
                                 }
                                 if (checkpoint_token_2 == segment_end_2) {
-                                    int checkpoint_slot_2 = checkpoint_state_slots[sequence_5];
+                                    int checkpoint_slot_2 = checkpoint_state_slots[sequence_2];
                                     if (checkpoint_slot_2 >= 0 && checkpoint_slot_2 < checkpoint_state_count) {
                                         int checkpoint_head_base_2 = (checkpoint_slot_2 * nheads + head_8) * 8192;
                                         checkpoint_states[checkpoint_head_base_2 + elem_2] = h_pair_2[0];
@@ -1637,11 +1745,20 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                 int physical_batch_4 = 0;
                 int segment_offset_5 = 0;
                 int segment_limit_5 = 128;
-                physical_batch_4 = logical_10 / nchunks;
-                physical_chunk_7 = logical_10 - physical_batch_4 * nchunks;
+                physical_chunk_7 = chunk_indices[logical_10];
+                segment_offset_5 = chunk_offsets[logical_10];
+                if (logical_10 + 1 < num_logical_chunks) {
+                    int next_chunk_5 = chunk_indices[logical_10 + 1];
+                    if (next_chunk_5 == physical_chunk_7) {
+                        segment_limit_5 = chunk_offsets[logical_10 + 1];
+                    }
+                }
                 int chunk_tokens_5 = seqlen - physical_chunk_7 * 128;
                 if (chunk_tokens_5 > 128) {
                     chunk_tokens_5 = 128;
+                }
+                if (segment_limit_5 > chunk_tokens_5) {
+                    segment_limit_5 = chunk_tokens_5;
                 }
                 mbarrier_wait(intra_full_addr, _phase_intra_full_0);
                 _phase_intra_full_0 ^= 1;
@@ -1654,6 +1771,10 @@ kernel_mamba_ssd_chunk_parallel_f32_batched(const __grid_constant__ CUtensorMap 
                     segment_base_4 = smem_cumsum_all[stage3_5 * 128 + (unsigned int)(segment_offset_5 - 1)];
                 }
                 int full_chunk = 1;
+                full_chunk = 0;
+                if (segment_offset_5 == 0 && segment_limit_5 == chunk_tokens_5) {
+                    full_chunk = 1;
+                }
                 if (full_chunk != 0 && output_issued >= 2) {
                     int warp_id_in_role = (warp - 12);
                     if (warp_id_in_role == 0) {

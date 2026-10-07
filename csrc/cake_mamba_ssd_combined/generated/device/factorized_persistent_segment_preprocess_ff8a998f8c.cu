@@ -67,7 +67,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* __restrict__ A, float* __restrict__ dt_bias, int* __restrict__ segment_starts, int* __restrict__ segment_lengths, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, __half* __restrict__ delta, float* __restrict__ cumsum, int num_segments, int nheads, int seqlen, int direct_varlen_metadata, int dt_softplus, float dt_min, float dt_max, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int seq_idx_int64, int* __restrict__ seq_chunk_cumsum, int num_sequences, int write_seq_chunk_cumsum, int* __restrict__ cu_seqlens, int* __restrict__ checkpoint_token_indices, int metadata_from_cu_seqlens, int checkpoint_state_count, int* __restrict__ preprocess_status)
 {
     const int tid = threadIdx.x;
@@ -89,12 +89,12 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
     const int cta_rank = 0;
 
     // Kernel setup ops
-    int* smem_sequence_excl = reinterpret_cast<int*>(smem_raw + 0);
-    const int smem_sequence_excl_addr = smem + 0;
-    int* smem_warp_totals = reinterpret_cast<int*>(smem_raw + 1040);
-    const int smem_warp_totals_addr = smem + 1040;
-    float* smem_dt_stage = reinterpret_cast<float*>(smem_raw + 1072);
-    const int smem_dt_stage_addr = smem + 1072;
+    int* smem_sequence_excl = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_SEQUENCE_EXCL_OFF);
+    const int smem_sequence_excl_addr = smem + SMEM_SMEM_SEQUENCE_EXCL_OFF;
+    int* smem_warp_totals = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_WARP_TOTALS_OFF);
+    const int smem_warp_totals_addr = smem + SMEM_SMEM_WARP_TOTALS_OFF;
+    float* smem_dt_stage = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_DT_STAGE_OFF);
+    const int smem_dt_stage_addr = smem + SMEM_SMEM_DT_STAGE_OFF;
 
     // === Task calls (dependency order) ===
     int tile_warp = tid / 32;
@@ -587,7 +587,6 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
             }
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
 
 } // extern "C"

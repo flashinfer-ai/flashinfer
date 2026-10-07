@@ -236,7 +236,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
 kernel_mamba_ssd_chunk_parallel_f16_batched(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, const __grid_constant__ CUtensorMap h_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __half* __restrict__ initial_states, __half* __restrict__ final_states, __half* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, float* __restrict__ s_work, unsigned int* __restrict__ h_words, unsigned int* __restrict__ grid_barrier, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count)
 {
     const int tid = threadIdx.x;
@@ -284,24 +284,24 @@ kernel_mamba_ssd_chunk_parallel_f16_batched(const __grid_constant__ CUtensorMap 
     const int cta_rank = 0;
 
     // Kernel setup ops
-    __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int smem_b_addr = smem + 1024;
-    __nv_bfloat16* smem_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
-    const int smem_c_addr = smem + 66560;
-    __nv_bfloat16* smem_x_tma = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
-    const int smem_x_tma_addr = smem + 132096;
-    __nv_bfloat16* smem_x = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
-    const int smem_x_addr = smem + 132096;
-    __nv_bfloat16* smem_scaled_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 164864);
-    const int smem_scaled_b_addr = smem + 164864;
-    __nv_bfloat16* smem_state = reinterpret_cast<__nv_bfloat16*>(smem_raw + 164864);
-    const int smem_state_addr = smem + 164864;
-    __half* smem_delta_all = reinterpret_cast<__half*>(smem_raw + 230400);
-    const int smem_delta_all_addr = smem + 230400;
-    float* smem_cumsum_all = reinterpret_cast<float*>(smem_raw + 230912);
-    const int smem_cumsum_all_addr = smem + 230912;
-    __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + 197632);
-    const int smem_y_addr = smem + 197632;
+    __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_B_OFF);
+    const int smem_b_addr = smem + SMEM_SMEM_B_OFF;
+    __nv_bfloat16* smem_c = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_C_OFF);
+    const int smem_c_addr = smem + SMEM_SMEM_C_OFF;
+    __nv_bfloat16* smem_x_tma = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_X_TMA_OFF);
+    const int smem_x_tma_addr = smem + SMEM_SMEM_X_TMA_OFF;
+    __nv_bfloat16* smem_x = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_X_OFF);
+    const int smem_x_addr = smem + SMEM_SMEM_X_OFF;
+    __nv_bfloat16* smem_scaled_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_SCALED_B_OFF);
+    const int smem_scaled_b_addr = smem + SMEM_SMEM_SCALED_B_OFF;
+    __nv_bfloat16* smem_state = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_STATE_OFF);
+    const int smem_state_addr = smem + SMEM_SMEM_STATE_OFF;
+    __half* smem_delta_all = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_DELTA_ALL_OFF);
+    const int smem_delta_all_addr = smem + SMEM_SMEM_DELTA_ALL_OFF;
+    float* smem_cumsum_all = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_CUMSUM_ALL_OFF);
+    const int smem_cumsum_all_addr = smem + SMEM_SMEM_CUMSUM_ALL_OFF;
+    __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_Y_OFF);
+    const int smem_y_addr = smem + SMEM_SMEM_Y_OFF;
 
     // Mbarrier init (24 pipeline groups, 0 ordered-sequence groups, 40 barriers)
     // Mbarriers at smem_raw[0..320)
@@ -403,7 +403,6 @@ kernel_mamba_ssd_chunk_parallel_f16_batched(const __grid_constant__ CUtensorMap 
     const int tmem_intra_tmem = taddr + 320;
     const int tmem_state_delta_tmem = taddr + 384;
     const int tmem_inter_tmem = taddr + 448;
-    asm volatile("griddepcontrol.wait;" ::: "memory");
 
     // ---- Ordered hardware-WG register redistribution ----
     // Dec phase frees registers before any WG attempts inc.

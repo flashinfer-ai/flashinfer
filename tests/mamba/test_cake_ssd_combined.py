@@ -4120,10 +4120,12 @@ def test_source_program_table_names_shipped_sources():
         assert f"TVM_FFI_EMBED_CUBIN({program.main.module});" in rendered
         assert f'"{program.main.kernel}"' in rendered
         assert f"namespace cake_mamba_ssd_combined_host_{name} {{" in rendered
-        # The main launch is a cuLaunchKernelEx config (programmatic dependent
-        # launch after the preprocess); its dynamic SMEM is the family literal.
-        assert f"dynamicSmemBytes = {program.main_smem_bytes}u;" in rendered
-        assert f"sharedMemBytes = {program.main_smem_bytes}u;" in rendered
+        # The main launch is a plain back-to-back launch after the preprocess
+        # (no programmatic dependent launch); its dynamic SMEM is the family
+        # literal.
+        assert f"stream, {program.main_smem_bytes}u)" in rendered
+        assert "LaunchEx(" not in rendered
+        assert "PROGRAMMATIC_STREAM_SERIALIZATION" not in rendered
         # The regenerated host shim brace-initialises the DLDataType of the
         # three state tensors from the two state placeholders; delta checks
         # are FP16 for every program (D1) and not factored.
