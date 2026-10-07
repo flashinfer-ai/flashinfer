@@ -21,15 +21,30 @@ import torch
 from flashinfer.gdn2_prefill import chunk_gated_delta_rule2
 
 
-def test_gdn2_exported_reference_reads_natural_log_decay():
+@pytest.mark.parametrize("definition_source", ["generated", "checked_in"])
+def test_gdn2_exported_reference_reads_natural_log_decay(definition_source):
     q = torch.ones(1, 1, 1)
     zero = torch.zeros_like(q)
     g = torch.full_like(q, 0.5).log()
     state = torch.full((1, 1, 1, 1), 2.0)
     cu = torch.tensor([0, 1], dtype=torch.int64)
-    definition = chunk_gated_delta_rule2.fi_trace(
-        q=q, k=zero, v=zero, g=g, beta=zero, w=zero, initial_state=state, cu_seqlens=cu
-    )
+    if definition_source == "generated":
+        definition = chunk_gated_delta_rule2.fi_trace(
+            q=q,
+            k=zero,
+            v=zero,
+            g=g,
+            beta=zero,
+            w=zero,
+            initial_state=state,
+            cu_seqlens=cu,
+        )
+    else:
+        definition = json.loads(
+            (
+                Path(__file__).parent / "fi_trace_out/gdn2_prefill_qk4_v8_d128.json"
+            ).read_text()
+        )
     namespace = {}
     exec(definition["reference"], namespace)
     output, final = namespace["_gdn2_prefill_reference"](
