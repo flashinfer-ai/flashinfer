@@ -593,18 +593,30 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
     #pragma unroll 1
     for (int token_1 = token_begin; token_1 < token_end; token_1 += token_stride) {
         int elem_early = access_1 * 8;
-        float _vec_load_17[8];
-        {
-            const uint4* _vptr_10 = reinterpret_cast<const uint4*>(residual + elem_early + 0);
-            uint4 _vld_10[1];
-            #pragma unroll
-            for (int _blk = 0; _blk < 1; _blk++) {
-                _vld_10[_blk] = _vptr_10[_blk];
-                uint32_t* _vpairs_10 = reinterpret_cast<uint32_t*>(&_vld_10[_blk]);
+        float residual_early[8];
+        int hoist_on = 1;
+        int hoist_ws_max_lit = WS;
+        if (hoist_ws_max_lit > 4) {
+            hoist_on = 0;
+        }
+        if (hoist_on == 1) {
+            float _vec_load_17[8];
+            {
+                const uint4* _vptr_10 = reinterpret_cast<const uint4*>(residual + elem_early + 0);
+                uint4 _vld_10[1];
                 #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    dtype_traits<T>::unpack2(&_vec_load_17[0 + _blk * 8 + _pair * 2], _vpairs_10[_pair]);
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_10[_blk] = _vptr_10[_blk];
+                    uint32_t* _vpairs_10 = reinterpret_cast<uint32_t*>(&_vld_10[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        dtype_traits<T>::unpack2(&_vec_load_17[0 + _blk * 8 + _pair * 2], _vpairs_10[_pair]);
+                    }
                 }
+            }
+            #pragma unroll
+            for (int j_12 = 0; j_12 < 8; j_12++) {
+                residual_early[j_12] = _vec_load_17[j_12];
             }
         }
         uint32_t _sysv_poll_group_0[4 * WS];
@@ -622,8 +634,8 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
         }
         float sum_value[8];
         #pragma unroll
-        for (int j_12 = 0; j_12 < 8; j_12++) {
-            sum_value[j_12] = _sysv_poll_group_0_f32[j_12];
+        for (int j_13 = 0; j_13 < 8; j_13++) {
+            sum_value[j_13] = _sysv_poll_group_0_f32[j_13];
         }
         #pragma unroll
         for (int p = 1; p < WS; p++) {
@@ -633,8 +645,8 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
                 dtype_traits<T>::unpack2(&_sysv_poll_group_0_f32_0[_pair * 2], _sysv_poll_group_0[4 * p + _pair]);
             }
             #pragma unroll
-            for (int j_13 = 0; j_13 < 8; j_13++) {
-                sum_value[j_13] = sum_value[j_13] + _sysv_poll_group_0_f32_0[j_13];
+            for (int j_14 = 0; j_14 < 8; j_14++) {
+                sum_value[j_14] = sum_value[j_14] + _sysv_poll_group_0_f32_0[j_14];
             }
             uint32_t sum_value_elem[4];
             #pragma unroll
@@ -649,46 +661,73 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
         }
         int access_in_token = cluster_thread;
         int elem = access_1 * 8;
-        float _vec_load_18[8];
+        float residual_value[8];
+        if (hoist_on == 1) {
+            #pragma unroll
+            for (int j_17 = 0; j_17 < 8; j_17++) {
+                residual_value[j_17] = residual_early[j_17];
+            }
+        }
+        if (hoist_on == 0) {
+            float _vec_load_18[8];
+            {
+                const uint4* _vptr_11 = reinterpret_cast<const uint4*>(residual + elem + 0);
+                uint4 _vld_11[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_11[_blk] = _vptr_11[_blk];
+                    uint32_t* _vpairs_11 = reinterpret_cast<uint32_t*>(&_vld_11[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        dtype_traits<T>::unpack2(&_vec_load_18[0 + _blk * 8 + _pair * 2], _vpairs_11[_pair]);
+                    }
+                }
+            }
+            #pragma unroll
+            for (int j_18 = 0; j_18 < 8; j_18++) {
+                residual_value[j_18] = _vec_load_18[j_18];
+            }
+        }
+        float _vec_load_19[8];
         {
-            const uint4* _vptr_11 = reinterpret_cast<const uint4*>(norm_weight + (access_in_token * 8) + 0);
-            uint4 _vld_11[1];
+            const uint4* _vptr_12 = reinterpret_cast<const uint4*>(norm_weight + (access_in_token * 8) + 0);
+            uint4 _vld_12[1];
             #pragma unroll
             for (int _blk = 0; _blk < 1; _blk++) {
-                _vld_11[_blk] = _vptr_11[_blk];
-                uint32_t* _vpairs_11 = reinterpret_cast<uint32_t*>(&_vld_11[_blk]);
+                _vld_12[_blk] = _vptr_12[_blk];
+                uint32_t* _vpairs_12 = reinterpret_cast<uint32_t*>(&_vld_12[_blk]);
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
-                    dtype_traits<T>::unpack2(&_vec_load_18[0 + _blk * 8 + _pair * 2], _vpairs_11[_pair]);
+                    dtype_traits<T>::unpack2(&_vec_load_19[0 + _blk * 8 + _pair * 2], _vpairs_12[_pair]);
                 }
             }
         }
         #pragma unroll
-        for (int j_16 = 0; j_16 < 8; j_16++) {
-            _vec_load_17[j_16] = _vec_load_17[j_16] + sum_value[j_16];
+        for (int j_19 = 0; j_19 < 8; j_19++) {
+            residual_value[j_19] = residual_value[j_19] + sum_value[j_19];
         }
-        uint32_t _vec_load_17_elem[4];
+        uint32_t residual_value_elem[4];
         #pragma unroll
         for (int _lp = 0; _lp < 4; _lp++) {
-            typename dtype_traits<T>::vec2 _bf2 = dtype_traits<T>::float22elem2_rn(make_float2(_vec_load_17[_lp*2 + 0], _vec_load_17[_lp*2+1 + 0]));
-            _vec_load_17_elem[_lp] = *(uint32_t*)&_bf2;
+            typename dtype_traits<T>::vec2 _bf2 = dtype_traits<T>::float22elem2_rn(make_float2(residual_value[_lp*2 + 0], residual_value[_lp*2+1 + 0]));
+            residual_value_elem[_lp] = *(uint32_t*)&_bf2;
         }
         #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
-            dtype_traits<T>::unpack2(&_vec_load_17[_pair * 2], _vec_load_17_elem[_pair]);
+            dtype_traits<T>::unpack2(&residual_value[_pair * 2], residual_value_elem[_pair]);
         }
         {
             typename dtype_traits<T>::vec2 _pk[4];
-            _pk[0] = dtype_traits<T>::floats2elem2_rn(_vec_load_17[0 + 0], _vec_load_17[0 + 1]);
-            _pk[1] = dtype_traits<T>::floats2elem2_rn(_vec_load_17[0 + 2], _vec_load_17[0 + 3]);
-            _pk[2] = dtype_traits<T>::floats2elem2_rn(_vec_load_17[0 + 4], _vec_load_17[0 + 5]);
-            _pk[3] = dtype_traits<T>::floats2elem2_rn(_vec_load_17[0 + 6], _vec_load_17[0 + 7]);
+            _pk[0] = dtype_traits<T>::floats2elem2_rn(residual_value[0 + 0], residual_value[0 + 1]);
+            _pk[1] = dtype_traits<T>::floats2elem2_rn(residual_value[0 + 2], residual_value[0 + 3]);
+            _pk[2] = dtype_traits<T>::floats2elem2_rn(residual_value[0 + 4], residual_value[0 + 5]);
+            _pk[3] = dtype_traits<T>::floats2elem2_rn(residual_value[0 + 6], residual_value[0 + 7]);
             *reinterpret_cast<uint4*>(&((T*)(residual_out + elem))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
         }
         float square_sum = 0.0f;
         #pragma unroll
-        for (int j_17 = 0; j_17 < 8; j_17++) {
-            square_sum = square_sum + _vec_load_17[j_17] * _vec_load_17[j_17];
+        for (int j_20 = 0; j_20 < 8; j_20++) {
+            square_sum = square_sum + residual_value[j_20] * residual_value[j_20];
         }
         float _warp_reduce_0 = square_sum;
         #pragma unroll
@@ -747,8 +786,8 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
         float rstd = _rsqrt_0;
         float norm_value[8];
         #pragma unroll
-        for (int j_18 = 0; j_18 < 8; j_18++) {
-            norm_value[j_18] = _vec_load_17[j_18] * rstd * (_vec_load_18[j_18] + weight_bias);
+        for (int j_21 = 0; j_21 < 8; j_21++) {
+            norm_value[j_21] = residual_value[j_21] * rstd * (_vec_load_19[j_21] + weight_bias);
         }
         uint32_t norm_value_elem[4];
         #pragma unroll
@@ -788,19 +827,19 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
             float _rcp_0 = approx_rcp(6.0f);
             float sf_value = scale_factor * (vector_max * _rcp_0);
             float _fp8_rt_0;
-            uint16_t _e4m3x2_12;
-            uint32_t _f16x2_12;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_12) : "f"(0.0f), "f"(sf_value));
-            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_12) : "h"(_e4m3x2_12));
-            uint16_t _fp8_h0_12 = (uint16_t)(_f16x2_12 & 0xFFFFu);
-            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_12));
+            uint16_t _e4m3x2_13;
+            uint32_t _f16x2_13;
+            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_13) : "f"(0.0f), "f"(sf_value));
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_13) : "h"(_e4m3x2_13));
+            uint16_t _fp8_h0_13 = (uint16_t)(_f16x2_13 & 0xFFFFu);
+            asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_13));
             float sf_rounded = _fp8_rt_0;
             float _rcp_1 = approx_rcp(scale_factor);
             float _rcp_2 = approx_rcp(sf_rounded * _rcp_1);
             float output_scale = ((sf_rounded != 0.0f) ? _rcp_2 : 0.0f);
             #pragma unroll
-            for (int j_19 = 0; j_19 < 8; j_19++) {
-                norm_value_elem_f32[j_19] = norm_value_elem_f32[j_19] * output_scale;
+            for (int j_22 = 0; j_22 < 8; j_22++) {
+                norm_value_elem_f32[j_22] = norm_value_elem_f32[j_22] * output_scale;
             }
             uint32_t _fp4_0[1];
             asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_0[0]) : "f"(norm_value_elem_f32[0]), "f"(norm_value_elem_f32[1]), "f"(norm_value_elem_f32[2]), "f"(norm_value_elem_f32[3]), "f"(norm_value_elem_f32[4]), "f"(norm_value_elem_f32[5]), "f"(norm_value_elem_f32[6]), "f"(norm_value_elem_f32[7]));
@@ -826,8 +865,8 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
     if (bid == 0) {
         if (tid == 0) {
             {
-                volatile int* _lcv_p_12 = reinterpret_cast<volatile int*>(completion) + (0);
-                while (*_lcv_p_12 != static_cast<int>(num_bids)) {}
+                volatile int* _lcv_p_13 = reinterpret_cast<volatile int*>(completion) + (0);
+                while (*_lcv_p_13 != static_cast<int>(num_bids)) {}
                 *reinterpret_cast<int*>(flag_addr) = static_cast<int>((flag + 1) % 3);
                 *reinterpret_cast<int*>(clear_addr) = static_cast<int>(token_end * 7168 * WS);
                 *(reinterpret_cast<int*>(completion) + (0)) = 0;
