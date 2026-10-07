@@ -252,7 +252,6 @@ def _static_retained_groups(n: int) -> int:
     return max(1, _align_up(n, _STATIC_RETAINED_GROUP_N) // _STATIC_RETAINED_GROUP_N)
 
 
-_STATIC_MERGED_GROUPS_ENV = "FLASHINFER_B12X_STATIC_MERGED_GROUPS"
 # Routed-pair floor of the merged (retained-three) schedule, calibrated by the
 # registered forced-schedule A/B/A (ac3_c3_q38_tp2, E512 / I320 / top-k 10 vs
 # the retained2 parent): merged at every M lost 2-8 % at 160-1280 routed pairs
@@ -272,17 +271,12 @@ def _static_merged_groups(n: int, routed_pairs: int) -> bool:
     for the three-slice intermediate extents (256 < n <= 384, the retained-three
     specialization) at or above the calibrated routed-pair floor.  Two-slice
     extents already form one group and keep the retained2 schedule; four or more
-    slices do not fit the three A/SFA stages.  ``FLASHINFER_B12X_STATIC_MERGED_GROUPS``
-    = ``0`` / ``1`` forces the schedule where it is representable (measurement
-    campaigns); the rule is part of the static cache key and artifact name."""
+    slices do not fit the three A/SFA stages. The selected schedule is part
+    of the static cache key and artifact name."""
     slices = max(1, _align_up(n, _LEVEL_TILE_N) // _LEVEL_TILE_N)
-    override = os.environ.get(_STATIC_MERGED_GROUPS_ENV)
-    if override in ("0", "1"):
-        return override == "1" and 2 <= slices <= 3
     return slices == 3 and routed_pairs >= _STATIC_MERGED_GROUPS_MIN_PAIRS
 
 
-_STATIC_DEFERRED_INIT_ENV = "FLASHINFER_B12X_STATIC_DEFERRED_INIT"
 # Deferred initialisation pays for itself only when the launch is big enough to
 # feel the prologue's grid barrier: measured on E512 / I320 (top-k 10) the
 # barrier-free prologue gains 0.6-1.9 % from M64 upwards while the finalize's
@@ -295,11 +289,7 @@ _STATIC_DEFERRED_INIT_MIN_PAIRS = 256
 def _static_deferred_init(routed_pairs: int | None = None) -> bool:
     """Whether the static kernel defers its routing-counter clear to the previous
     launch's finalize kernel: on from ``_STATIC_DEFERRED_INIT_MIN_PAIRS`` routed
-    pairs upwards (always on when the pair count is unknown); the environment
-    override forces either mode for measurement runs on one revision."""
-    override = os.environ.get(_STATIC_DEFERRED_INIT_ENV)
-    if override is not None and override.strip() != "":
-        return override.strip().lower() not in ("0", "false", "off", "no")
+    pairs upwards (always on when the pair count is unknown)."""
     if routed_pairs is None:
         return True
     return int(routed_pairs) >= _STATIC_DEFERRED_INIT_MIN_PAIRS
@@ -495,7 +485,6 @@ def _get_static_compact_cutover_pairs(
         num_topk,
         sm_count,
         capacity_key,
-        os.environ.get(_STATIC_MERGED_GROUPS_ENV),
     )
     cached = _STATIC_COMPACT_CUTOVER_PAIRS_CACHE.get(cache_key)
     if cached is not None:
@@ -920,11 +909,6 @@ def static_needs_256_extent(intermediate_size: int) -> bool:
     return _align_up(int(intermediate_size), _LEVEL_TILE_N) < _STATIC_MIN_EXTENT
 
 
-# Measurement runs compare the two scale paths on one revision: "0" keeps the
-# tile-padded scale copies for the static kernel as well.
-_STATIC_SOURCE_SCALES_ENV = "FLASHINFER_B12X_STATIC_SOURCE_SCALES"
-
-
 def static_source_scales(
     intermediate_size: int, is_gated: bool, quant_mode: str = "nvfp4"
 ) -> bool:
@@ -941,9 +925,6 @@ def static_source_scales(
     lazily on first use.
     """
     n = int(intermediate_size)
-    override = os.environ.get(_STATIC_SOURCE_SCALES_ENV)
-    if override is not None and override.strip().lower() in ("0", "false", "off", "no"):
-        return False
     return (
         bool(is_gated)
         and _normalize_quant_mode(quant_mode) == "nvfp4"

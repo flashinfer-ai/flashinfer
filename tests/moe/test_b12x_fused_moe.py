@@ -3906,7 +3906,6 @@ class TestB12xMoEStatefulAccuracy:
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
 
         monkeypatch.setattr(md, "_FORCED_BACKEND", "static")
-        monkeypatch.delenv(md._STATIC_SOURCE_SCALES_ENV, raising=False)
         tensors, kwargs = self._inputs(200, intermediate)
         wrapper = self._wrapper(kwargs)
         expected = self._reference(tensors, kwargs)
@@ -3919,7 +3918,7 @@ class TestB12xMoEStatefulAccuracy:
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(captured, eager, rtol=0, atol=0)
-        monkeypatch.setenv(md._STATIC_SOURCE_SCALES_ENV, "0")
+        monkeypatch.setattr(md, "static_source_scales", lambda *args: False)
         padded = self._wrapper(kwargs).run(**kwargs)
         torch.testing.assert_close(padded, eager, rtol=0, atol=0)
 
@@ -3940,7 +3939,6 @@ class TestB12xMoEStatefulAccuracy:
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
 
         monkeypatch.setattr(md, "_FORCED_BACKEND", None)
-        monkeypatch.delenv(md._STATIC_SOURCE_SCALES_ENV, raising=False)
         _clear_static_cutover_env(monkeypatch)
         tensors, kwargs = self._inputs(
             num_tokens, intermediate, experts=8, hidden=hidden
@@ -3974,7 +3972,7 @@ class TestB12xMoEStatefulAccuracy:
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
 
         monkeypatch.setattr(md, "_FORCED_BACKEND", "static")
-        monkeypatch.setenv(md._STATIC_MERGED_GROUPS_ENV, "1" if merged else "0")
+        monkeypatch.setattr(md, "_static_merged_groups", lambda n, routed_pairs: merged)
         tensors, kwargs = self._inputs(num_tokens, experts=4)
         kwargs["token_selected_experts"][:] = torch.tensor([0, 1], device="cuda")
         kwargs["token_final_scales"].fill_(0.5)
@@ -3994,7 +3992,9 @@ class TestB12xMoEStatefulAccuracy:
     def test_reused_workspace_eager_and_graph_accuracy(self, deferred, monkeypatch):
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
 
-        monkeypatch.setenv(md._STATIC_DEFERRED_INIT_ENV, "1" if deferred else "0")
+        monkeypatch.setattr(
+            md, "_static_deferred_init", lambda routed_pairs=None: deferred
+        )
         tensors, inputs = self._inputs(1024)
         wrapper = self._wrapper(inputs)
         cases = []
@@ -4379,7 +4379,6 @@ def test_direct_micro_scale_contract(
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
 
     monkeypatch.setattr(md, "_FORCED_BACKEND", None)
-    monkeypatch.delenv(md._STATIC_SOURCE_SCALES_ENV, raising=False)
     backend = None if m == 4 else "direct_micro"
     t, decoded = direct_scale_inputs
     kwargs = _direct_scale_kwargs(t, m, scale_kind, duplicate)
@@ -4454,11 +4453,10 @@ def test_m4_source_layout_fallback(direct_scale_inputs, monkeypatch, fallback):
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
 
     monkeypatch.setattr(md, "_FORCED_BACKEND", None)
-    monkeypatch.delenv(md._STATIC_SOURCE_SCALES_ENV, raising=False)
     t, decoded = direct_scale_inputs
     kwargs = _direct_scale_kwargs(t, 4, "vector")
     if fallback == "source_off":
-        monkeypatch.setenv(md._STATIC_SOURCE_SCALES_ENV, "0")
+        monkeypatch.setattr(md, "static_source_scales", lambda *args: False)
     else:
         key = "w1_weight" if fallback == "w1_strided" else "w2_weight"
         packed = kwargs[key]
@@ -4492,7 +4490,6 @@ def test_m3_m4_m6_m4_shared_wrapper_graph(direct_scale_inputs, monkeypatch):
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
 
     monkeypatch.setattr(md, "_FORCED_BACKEND", None)
-    monkeypatch.delenv(md._STATIC_SOURCE_SCALES_ENV, raising=False)
     t, decoded = direct_scale_inputs
     kwargs = {m: _direct_scale_kwargs(t, m, "vector") for m in (3, 4, 6)}
     # Hold the same FC1/FC2 scale tensors through every warm-up and replay.
