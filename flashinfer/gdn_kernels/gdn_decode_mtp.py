@@ -2785,7 +2785,7 @@ def _mtp_kernel_name(
     cache_steps: int,
     disable_state_update: bool,
     use_pool_indexing: bool,
-    pool_strides_key,
+    pool_layout_key,
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
@@ -2811,7 +2811,7 @@ def _mtp_kernel_name(
         cache_steps,
         disable_state_update,
         use_pool_indexing,
-        pool_strides_key,
+        pool_layout_key,
         scale,
         use_qk_l2norm,
         tile_v,
@@ -2836,7 +2836,7 @@ def _get_compiled_mtp_kernel(
     cache_steps: int,
     disable_state_update: bool,
     use_pool_indexing: bool,
-    pool_strides_key,
+    pool_layout_key,
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
@@ -2863,7 +2863,7 @@ def _get_compiled_mtp_kernel_inline(
     cache_steps: int,
     disable_state_update: bool,
     use_pool_indexing: bool,
-    pool_strides_key,
+    pool_layout_key,
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
@@ -3020,11 +3020,11 @@ def run_mtp_decode(
         )
         return
 
-    # cute.compile bakes pool strides; key them only for the 4D pool-indexing path.
+    # cute.compile bakes the 4D pool's shape and strides into its FFI signature.
     if use_pool_indexing:
-        pool_strides_key = tuple(h0_source.stride())
+        pool_layout_key = (tuple(h0_source.shape), tuple(h0_source.stride()))
     else:
-        pool_strides_key = None
+        pool_layout_key = None
 
     # Dynamic layouts still specialize on the inferred unit-stride dimension.
     # Strided gate/input views must not reuse a contiguous tensor's ABI.
@@ -3063,7 +3063,7 @@ def run_mtp_decode(
             cache_steps,
             disable_state_update,
             use_pool_indexing,
-            pool_strides_key,
+            pool_layout_key,
             scale,
             use_qk_l2norm,
             tile_v,
@@ -3087,7 +3087,7 @@ def run_mtp_decode(
             cache_steps,
             disable_state_update,
             use_pool_indexing,
-            pool_strides_key,
+            pool_layout_key,
             scale,
             use_qk_l2norm,
             tile_v,
@@ -3165,11 +3165,8 @@ def run_mtp_decode(
             # assumes a compact 3D flat pool (wrong rank + compactness here), and
             # mark_layout_dynamic would make V/K dynamic (the kernel needs them as
             # compile-time constants, e.g. num_v_tiles). So pass the layout through
-            # statically: the exact strides are baked in and keyed via
-            # pool_strides_key. The pool-dim (mode 0) stride is independent of the
-            # pool size, so one compiled kernel is reused across batch sizes and
-            # indexes correctly by cache_idx * stride — pool_size is not needed in
-            # the cache key or as a compile-time shape.
+            # statically and key both shape and strides via pool_layout_key.
+            # A resized pool needs a new FFI signature even with identical strides.
             h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
         else:
             # 3D flat pool [pool*HV, V, K], compact.
