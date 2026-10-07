@@ -75,6 +75,7 @@ def test_prims_ts_bootstrap_scopes_work_tile_info_customization():
         """
 from cutlass import Boolean, Int32
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
+from flashinfer.prims_ts import cutlass_dsl
 from flashinfer.prims_ts.cutlass_dsl import (
     require_cutlass_dsl_experimental,
     task_scheduling_scope,
@@ -83,6 +84,11 @@ from flashinfer.prims_ts.cutlass_dsl import (
 original_init = WorkTileInfo.__init__
 require_cutlass_dsl_experimental()
 assert WorkTileInfo.__init__ is original_init
+# Only DSL 4.7 patches WorkTileInfo; 4.8 ships its own subclass.
+dsl_patches_work_tile_info = (
+    cutlass_dsl._TASK_SCHEDULING_WORK_TILE_INFO
+    != cutlass_dsl._ORIGINAL_WORK_TILE_INFO
+)
 
 flat = WorkTileInfo((Int32(1), Int32(0), Int32(2)), Boolean(True))
 nested = WorkTileInfo(
@@ -94,9 +100,12 @@ assert isinstance(nested.tile_idx[2], tuple)
 assert len(nested.tile_idx[2]) == 2
 
 with task_scheduling_scope():
-    assert WorkTileInfo.__init__ is not original_init
-    task_tile = WorkTileInfo((Int32(1), Int32(0), Int32(2)), Boolean(True))
-    assert not hasattr(task_tile, "_tile_idx")
+    if dsl_patches_work_tile_info:
+        assert WorkTileInfo.__init__ is not original_init
+        task_tile = WorkTileInfo((Int32(1), Int32(0), Int32(2)), Boolean(True))
+        assert not hasattr(task_tile, "_tile_idx")
+    else:
+        assert WorkTileInfo.__init__ is original_init
 
 assert WorkTileInfo.__init__ is original_init
 
