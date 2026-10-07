@@ -61,6 +61,11 @@ def mxfp8_quantize(x_bf16, return_normal=True, return_transposed=True):
     return quantize(x_bf16, return_normal, return_transposed)
 
 
+# Communication SMs (forward, backward) per precision: the splits at which the complete
+# training step is fastest on B200 (EP4 GLM-5.2 shape sweep; backend README).
+COMM_SMS_DEFAULTS = {"bf16": (24, 28), "mxfp8": (40, 40)}
+
+
 @flashinfer_experimental_api
 def create_mok_bf16_workspace(
     *,
@@ -70,11 +75,12 @@ def create_mok_bf16_workspace(
     hidden_size,
     topk,
     source_capacity=None,
-    fwd_num_comm_sms=24,
-    bwd_num_comm_sms=28,
+    fwd_num_comm_sms=None,
+    bwd_num_comm_sms=None,
     minibatch_size=4096,
     macrobatch_size=32768,
     schedule_capacity_multiplier=3 / 16,
+    precision="bf16",
 ):
     """Collectively create a caller-owned ``(config, workspace)`` pair.
 
@@ -85,10 +91,26 @@ def create_mok_bf16_workspace(
     exposes ``source_capacity`` and physical ``storage``. Defaults describe
     a small toy ring; see the backend README for capacity and reuse rules.
     Call outside CUDA Graph capture; retain the workspace for every replay.
+
+    ``fwd_num_comm_sms`` / ``bwd_num_comm_sms`` left ``None`` take the measured
+    default of ``precision`` (``"bf16"`` or ``"mxfp8"``): the BF16 kernels run
+    their communication clusters on 24 (forward) / 28 (backward) SMs, the
+    MXFP8 kernels on 40 / 40, which is where their steps are fastest on B200
+    (see the backend README). The precision only selects these defaults; the
+    kernels a call runs are chosen by the weights passed to it.
     """
     from .experimental.cake_mok_bf16.workspace import MoKConfig
     from .experimental.cake_mok_bf16.backend import create_source_workspace
 
+    if precision not in COMM_SMS_DEFAULTS:
+        raise ValueError(
+            f"precision must be one of {sorted(COMM_SMS_DEFAULTS)}, got {precision!r}"
+        )
+    default_fwd, default_bwd = COMM_SMS_DEFAULTS[precision]
+    if fwd_num_comm_sms is None:
+        fwd_num_comm_sms = default_fwd
+    if bwd_num_comm_sms is None:
+        bwd_num_comm_sms = default_bwd
     config = MoKConfig(
         fwd_num_comm_sms=fwd_num_comm_sms,
         bwd_num_comm_sms=bwd_num_comm_sms,

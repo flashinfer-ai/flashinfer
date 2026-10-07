@@ -107,9 +107,23 @@ def parse_args():
         help="source_capacity = ceil(max_rows * mult) (the 2x source-capacity constraint row uses 2)",
     )
     p.add_argument(
-        "--fwd-comm-sms", type=int, default=None, help="per impl default when omitted"
+        "--fwd-comm-sms",
+        type=int,
+        default=None,
+        help="communication SMs of the forward kernels for EVERY implementation (sweep rows); "
+        "omitted = each implementation's own default",
     )
     p.add_argument("--bwd-comm-sms", type=int, default=None)
+    p.add_argument(
+        "--cake-comm-sms",
+        default=None,
+        help="FWD:BWD communication SMs of the cake arm only (overrides --fwd/--bwd-comm-sms)",
+    )
+    p.add_argument(
+        "--mok-comm-sms",
+        default=None,
+        help="FWD:BWD communication SMs of the mok17 arm only (overrides --fwd/--bwd-comm-sms)",
+    )
     p.add_argument("--groups", type=int, default=3)
     p.add_argument("--warmup-ms", type=float, default=WARMUP_MS)
     p.add_argument("--sample-ms", type=float, default=SAMPLE_MS)
@@ -121,6 +135,19 @@ def parse_args():
     )
     p.add_argument("--json", default=None, help="write the rank-0 record here")
     return p.parse_args()
+
+
+def comm_sms_override(args, arm):
+    """(fwd, bwd) communication SMs requested for ``arm`` or ``None`` (= the implementation's default)."""
+    spec = getattr(args, f"{arm}_comm_sms")
+    if spec:
+        fwd, bwd = (int(v) for v in spec.replace(",", ":").split(":"))
+        return fwd, bwd
+    if args.fwd_comm_sms is None and args.bwd_comm_sms is None:
+        return None
+    if args.fwd_comm_sms is None or args.bwd_comm_sms is None:
+        raise SystemExit("--fwd-comm-sms and --bwd-comm-sms must be given together")
+    return args.fwd_comm_sms, args.bwd_comm_sms
 
 
 def init_distributed():
@@ -262,8 +289,9 @@ class CakeImpl:
             )
         else:
             self.forward_weights = self.backward_weights = tuple(self.weights)
-        fwd = args.fwd_comm_sms or 24
-        bwd = args.bwd_comm_sms or 28
+        # Communication SMs: the package default for this precision unless a row overrides it.
+        override = comm_sms_override(args, "cake")
+        fwd, bwd = override if override else (None, None)
         self.config, self.workspace = create_mok_bf16_workspace(
             group=dist.group.WORLD,
             device=device,
@@ -276,10 +304,12 @@ class CakeImpl:
             minibatch_size=args.minibatch,
             macrobatch_size=args.macrobatch,
             schedule_capacity_multiplier=factor / ep,
+            precision=self.precision,
         )
         self.settings = dict(
-            fwd_num_comm_sms=fwd,
-            bwd_num_comm_sms=bwd,
+            fwd_num_comm_sms=self.config.fwd_num_comm_sms,
+            bwd_num_comm_sms=self.config.bwd_num_comm_sms,
+            comm_sms_source="row override" if override else "package default",
             minibatch=args.minibatch,
             macrobatch=args.macrobatch,
             schedule_capacity_multiplier=factor / ep,
@@ -372,16 +402,20 @@ class Mok17Impl:
         self.shape, self.rank, self.ep = shape, rank, ep
         self.x, self.ids, self.scores, self.dy, self.weights = inputs
         self.local_experts = shape.experts // ep
-        fwd = args.fwd_comm_sms or 24
-        bwd = args.bwd_comm_sms or 28
+        # Communication SMs: MoK's own MoKConfig defaults unless a row overrides them.
+        override = comm_sms_override(args, "mok")
+        comm = (
+            dict(zip(("fwd_num_comm_sms", "bwd_num_comm_sms"), override, strict=True))
+            if override
+            else {}
+        )
         # The native workspace capacity is common across ranks (multiple of 256, >= 512).
         self.capacity = capacity
         self.config = mokf.MoKConfig(
-            fwd_num_comm_sms=fwd,
-            bwd_num_comm_sms=bwd,
             minibatch_size=args.minibatch,
             macrobatch_size=args.macrobatch,
             schedule_capacity_multiplier=factor / ep,
+            **comm,
         )
         self.workspace = mokf.create_workspace(
             self.config,
@@ -397,8 +431,9 @@ class Mok17Impl:
 
             self.wq = [ops.mxfp8_quantize(w, True, True) for w in self.weights[3:]]
         self.settings = dict(
-            fwd_num_comm_sms=fwd,
-            bwd_num_comm_sms=bwd,
+            fwd_num_comm_sms=self.config.fwd_num_comm_sms,
+            bwd_num_comm_sms=self.config.bwd_num_comm_sms,
+            comm_sms_source="row override" if override else "MoKConfig default",
             minibatch=args.minibatch,
             macrobatch=args.macrobatch,
             schedule_capacity_multiplier=factor / ep,

@@ -110,7 +110,12 @@ for unequal lengths, empty ranks, count changes and graph reuse.
 - Logical source token counts may differ across ranks and may be zero. Hidden
   and intermediate widths are positive multiples of 256. Common physical
   source capacity is aligned for tiles/metadata and is at least 512 rows. Communication-SM
-  counts are positive and even, leaving compute SMs available.
+  counts are positive and even, leaving compute SMs available. When they are not given,
+  `create_mok_bf16_workspace` uses the measured per-precision defaults: 24 forward / 28
+  backward communication SMs for BF16 and 40 / 40 for MXFP8 (B200, EP4 GLM-5.2 shape,
+  complete training step; the MXFP8 kernels move half the activation bytes per compute
+  tile and shift the optimum towards communication). Pass `precision="mxfp8"` to the
+  factory for an MXFP8 workload, or set the counts explicitly.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
 - An EP16 workload can use 16,384 source tokens per rank (262,144 global), hidden width
