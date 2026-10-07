@@ -332,13 +332,16 @@ DCP_BALANCED_D256_LONG_TILE_BLOCKS = 96
 # public path -- a tie or a loss at q_len 3 on B200, so sm_100a admits the
 # class from q_len 4 and sm_103a from q_len 3.  At 8 blocks the plan + fold are
 # not amortised (b4 q4 0.91 | 0.88, b1 1.04 | 0.96); q_len 1 reads KV once on
-# both routes (0.92-0.98) and q_len 2 gains at most 2-7 % at 32+ blocks (16
-# blocks: 0.94 | 0.92 against the public path), both stay static.  The scalar
+# both routes (0.92-0.98) and stays static.  The (32 blocks, q_len 2) class:
+# two rows per tile pay off from 32 blocks per CTA on both parts (10 rounds,
+# against the static route and the public path, GB300 / B200: b32 q2 1.112 /
+# 1.082 and 1.057 / 1.026, b64 q2 1.063 / 1.075 and 1.053 / 1.060) and lose at
+# 16 blocks (b16 q2 0.94 | 0.92 against the public path, static).  The scalar
 # tuple is the default for unmeasured targets.
 DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES = ((22, 3),)
 DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH = {
-    "sm_100a": ((22, 3), (16, 4)),
-    "sm_103a": ((16, 3),),
+    "sm_100a": ((32, 2), (22, 3), (16, 4)),
+    "sm_103a": ((32, 2), (16, 3)),
 }
 _DCP_BALANCED_Q_LEN_RANGE = {
     "bf16_p16": (DCP_BALANCED_BF16_MIN_Q_LEN, DCP_BALANCED_BF16_MAX_Q_LEN),

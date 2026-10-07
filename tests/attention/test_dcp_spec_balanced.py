@@ -130,8 +130,8 @@ def test_balanced_band_constants_match_the_cake_dispatcher() -> None:
     assert DCP_BALANCED_D256_LONG_TILE_BLOCKS == 96
     assert DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES == ((22, 3),)
     assert DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH == {
-        "sm_100a": ((22, 3), (16, 4)),
-        "sm_103a": ((16, 3),),
+        "sm_100a": ((32, 2), (22, 3), (16, 4)),
+        "sm_103a": ((32, 2), (16, 3)),
     }
 
 
@@ -472,9 +472,9 @@ def test_d256_one_wave_row_tile_regime(arch) -> None:
     # balanced row tile of up to four rows once per tile -- rows at q_len >= 3 whose static
     # tile streams >= 22 blocks per CTA route balanced (b12 / b16 / b32 at q_len 4, b16 at
     # q_len 3, b16 at q_len 5 and 8, b8 at q_len 8); the 16-block class (static split 4)
-    # routes balanced from q_len 4 on sm_100a and from q_len 3 on sm_103a (unit 88); b1 and
-    # the 8-block class stay static, q_len 1 (no sharing) and q_len 2 (two rows per tile,
-    # <= 7 %) stay static.
+    # routes balanced from q_len 4 on sm_100a and from q_len 3 on sm_103a; q_len 2 (two rows
+    # per tile) routes balanced from 32 blocks per CTA; b1 and the 8-block class stay static,
+    # q_len 1 (no sharing) and q_len 2 at 16 blocks stay static.
     def band(batch, q_len):
         return _band(
             "fp8_p64_d256",
@@ -540,10 +540,15 @@ def test_d256_one_wave_row_tile_regime(arch) -> None:
         1,
         "static",
     )  # q_len 1: no row-tile sharing (0.888 / 0.897)
-    assert (band(64, 2).blocks_per_cta, band(64, 2).route) == (
-        64,
-        "static",
-    )  # q_len 2: two rows per tile, 1.051 / 1.055 -- recorded, kept static
+    # q_len 2 from 32 blocks per CTA: b32 1.057 / 1.026, b64 1.053 / 1.060 vs the public
+    # path (GB300 / B200, 10 rounds); q_len 1 at 32 blocks (b64 q1) stays static
+    assert (band(32, 2).blocks_per_cta, band(32, 2).route, band(32, 2).reason) == (
+        32,
+        "balanced",
+        "one_wave_row_tiles",
+    )
+    assert (band(64, 2).blocks_per_cta, band(64, 2).route) == (64, "balanced")
+    assert (band(64, 1).blocks_per_cta, band(64, 1).route) == (32, "static")
     assert (band(16, 2).blocks_per_cta, band(16, 2).route) == (
         16,
         "static",
