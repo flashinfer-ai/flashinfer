@@ -31,7 +31,16 @@
         "band": {
           "chunk_tokens": 256,
           "long_tile_blocks": 16,
-          "min_items": 128
+          "min_items": 128,
+          "whole_tile_one_wave_n_rows": {
+            "sm_100a": [
+              32
+            ],
+            "sm_103a": [
+              32,
+              64
+            ]
+          }
         },
         "contract": {
           "head_dim": 128,
@@ -41,7 +50,7 @@
           "q_heads_per_kv_head": 8,
           "q_tiles": 1
         },
-        "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items)",
+        "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items) or (waves < 2 and batch_size == 1 and n_rows in whole_tile_one_wave_n_rows[arch] and max_pages_per_seq <= whole_pages_max[sm_count][num_kv_heads])",
         "family": "dcp_spec_bf16_balanced",
         "incumbent_family": "dcp_spec_bf16_v4",
         "incumbent_shape": {
