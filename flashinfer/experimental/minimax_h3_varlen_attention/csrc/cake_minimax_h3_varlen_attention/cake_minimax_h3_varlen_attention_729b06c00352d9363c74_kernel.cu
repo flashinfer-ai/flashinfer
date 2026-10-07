@@ -342,7 +342,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, __nv_bfloat16* __restrict__ O_raw, int* __restrict__ unit_table, __half* __restrict__ partial_O, float* __restrict__ partial_ML, unsigned int total_tiles, int num_heads, float softmax_scale_log2)
+kernel_cake_minimax_h3_varlen_attention_729b06c00352d9363c74(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, __nv_bfloat16* __restrict__ O_raw, int* __restrict__ unit_table, __half* __restrict__ partial_O, float* __restrict__ partial_ML, unsigned int total_tiles, int num_heads, float softmax_scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1015,59 +1015,72 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 4] = approx_exp2(sv[_le + 4]);
-#endif
                         }
-#if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_25 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_26 = {neg_max_scaled, neg_max_scaled};
-#else
                         const float2 _fma_b2_21 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_22 = {neg_max_scaled, neg_max_scaled};
-#endif
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
-#if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 16))[_lf], _fma_b2_25, _fma_c2_26);
-#else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 16))[_lf], _fma_b2_21, _fma_c2_22);
-#endif
                         float2 _f2_1 = make_float2(sv[2], sv[3]);
                         psum0 = add_f32x2(psum0, _f2_1);
                         #pragma unroll
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 6] = approx_exp2(sv[_le + 6]);
                         }
-#if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_27 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_28 = {neg_max_scaled, neg_max_scaled};
-#else
                         const float2 _fma_b2_23 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_24 = {neg_max_scaled, neg_max_scaled};
-#endif
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
-#if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 18))[_lf], _fma_b2_27, _fma_c2_28);
-#else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 18))[_lf], _fma_b2_23, _fma_c2_24);
-#endif
                         float2 _f2_2 = make_float2(sv[4], sv[5]);
                         psum0 = add_f32x2(psum0, _f2_2);
                         #pragma unroll
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 8] = approx_exp2(sv[_le + 8]);
+#endif
                         }
-#if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_29 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_30 = {neg_max_scaled, neg_max_scaled};
-#else
                         const float2 _fma_b2_25 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_26 = {neg_max_scaled, neg_max_scaled};
-#endif
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 20))[_lf], _fma_b2_29, _fma_c2_30);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 16))[_lf], _fma_b2_25, _fma_c2_26);
+                        float2 _f2_1 = make_float2(sv[2], sv[3]);
+                        psum0 = add_f32x2(psum0, _f2_1);
+                        #pragma unroll
+                        for (int _le = 0; _le < 1; _le++) {
+                            if (1 && _le >= 0) {
+                                float2 _exp2_pair_27 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 6], sv[_le*2 + 1 + 6]));
+                                sv[_le*2 + 6] = _exp2_pair_27.x;
+                                sv[_le*2 + 1 + 6] = _exp2_pair_27.y;
+                            } else {
+                                sv[_le*2 + 6] = approx_exp2(sv[_le*2 + 6]);
+                                sv[_le*2 + 1 + 6] = approx_exp2(sv[_le*2 + 1 + 6]);
+                            }
+                        }
+                        const float2 _fma_b2_28 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_29 = {neg_max_scaled, neg_max_scaled};
+                        #pragma unroll
+                        for (int _lf = 0; _lf < 1; _lf++)
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 18))[_lf], _fma_b2_28, _fma_c2_29);
+                        float2 _f2_2 = make_float2(sv[4], sv[5]);
+                        psum0 = add_f32x2(psum0, _f2_2);
+                        #pragma unroll
+                        for (int _le = 0; _le < 1; _le++) {
+                            if (1 && _le >= 0) {
+                                float2 _exp2_pair_30 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 8], sv[_le*2 + 1 + 8]));
+                                sv[_le*2 + 8] = _exp2_pair_30.x;
+                                sv[_le*2 + 1 + 8] = _exp2_pair_30.y;
+                            } else {
+                                sv[_le*2 + 8] = approx_exp2(sv[_le*2 + 8]);
+                                sv[_le*2 + 1 + 8] = approx_exp2(sv[_le*2 + 1 + 8]);
+                            }
+                        }
+                        const float2 _fma_b2_31 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_32 = {neg_max_scaled, neg_max_scaled};
+                        #pragma unroll
+                        for (int _lf = 0; _lf < 1; _lf++)
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 20))[_lf], _fma_b2_31, _fma_c2_32);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 20))[_lf], _fma_b2_25, _fma_c2_26);
 #endif
@@ -1078,8 +1091,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 10] = approx_exp2(sv[_le + 10]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_31 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_32 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_33 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_34 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_27 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_28 = {neg_max_scaled, neg_max_scaled};
@@ -1087,7 +1100,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 22))[_lf], _fma_b2_31, _fma_c2_32);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 22))[_lf], _fma_b2_33, _fma_c2_34);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 22))[_lf], _fma_b2_27, _fma_c2_28);
 #endif
@@ -1098,8 +1111,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 12] = approx_exp2(sv[_le + 12]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_33 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_34 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_35 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_36 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_29 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_30 = {neg_max_scaled, neg_max_scaled};
@@ -1107,7 +1120,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 24))[_lf], _fma_b2_33, _fma_c2_34);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 24))[_lf], _fma_b2_35, _fma_c2_36);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 24))[_lf], _fma_b2_29, _fma_c2_30);
 #endif
@@ -1117,71 +1130,56 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 14] = approx_exp2(sv[_le + 14]);
                         }
-#if !(__CUDA_ARCH__ == 1000)
+#if __CUDA_ARCH__ == 1000
+                        const float2 _fma_b2_37 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_38 = {neg_max_scaled, neg_max_scaled};
+#else
                         const float2 _fma_b2_31 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_32 = {neg_max_scaled, neg_max_scaled};
+#endif
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
+#if __CUDA_ARCH__ == 1000
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 26))[_lf], _fma_b2_37, _fma_c2_38);
+#else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 26))[_lf], _fma_b2_31, _fma_c2_32);
+#endif
                         float2 _f2_6 = make_float2(sv[12], sv[13]);
                         psum0 = add_f32x2(psum0, _f2_6);
                         #pragma unroll
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 16] = approx_exp2(sv[_le + 16]);
                         }
+#if __CUDA_ARCH__ == 1000
+                        const float2 _fma_b2_39 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_40 = {neg_max_scaled, neg_max_scaled};
+#else
                         const float2 _fma_b2_33 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_34 = {neg_max_scaled, neg_max_scaled};
+#endif
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
+#if __CUDA_ARCH__ == 1000
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 28))[_lf], _fma_b2_39, _fma_c2_40);
+#else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 28))[_lf], _fma_b2_33, _fma_c2_34);
+#endif
                         float2 _f2_7 = make_float2(sv[14], sv[15]);
                         psum0 = add_f32x2(psum0, _f2_7);
                         #pragma unroll
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 18] = approx_exp2(sv[_le + 18]);
                         }
-#endif
+#if __CUDA_ARCH__ == 1000
+                        const float2 _fma_b2_41 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_42 = {neg_max_scaled, neg_max_scaled};
+#else
                         const float2 _fma_b2_35 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_36 = {neg_max_scaled, neg_max_scaled};
+#endif
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 26))[_lf], _fma_b2_35, _fma_c2_36);
-                        float2 _f2_6 = make_float2(sv[12], sv[13]);
-                        psum0 = add_f32x2(psum0, _f2_6);
-                        #pragma unroll
-                        for (int _le = 0; _le < 1; _le++) {
-                            if (1 && _le >= 0) {
-                                float2 _exp2_pair_37 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 16], sv[_le*2 + 1 + 16]));
-                                sv[_le*2 + 16] = _exp2_pair_37.x;
-                                sv[_le*2 + 1 + 16] = _exp2_pair_37.y;
-                            } else {
-                                sv[_le*2 + 16] = approx_exp2(sv[_le*2 + 16]);
-                                sv[_le*2 + 1 + 16] = approx_exp2(sv[_le*2 + 1 + 16]);
-                            }
-                        }
-                        const float2 _fma_b2_38 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_39 = {neg_max_scaled, neg_max_scaled};
-                        #pragma unroll
-                        for (int _lf = 0; _lf < 1; _lf++)
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 28))[_lf], _fma_b2_38, _fma_c2_39);
-                        float2 _f2_7 = make_float2(sv[14], sv[15]);
-                        psum0 = add_f32x2(psum0, _f2_7);
-                        #pragma unroll
-                        for (int _le = 0; _le < 1; _le++) {
-                            if (1 && _le >= 0) {
-                                float2 _exp2_pair_40 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 18], sv[_le*2 + 1 + 18]));
-                                sv[_le*2 + 18] = _exp2_pair_40.x;
-                                sv[_le*2 + 1 + 18] = _exp2_pair_40.y;
-                            } else {
-                                sv[_le*2 + 18] = approx_exp2(sv[_le*2 + 18]);
-                                sv[_le*2 + 1 + 18] = approx_exp2(sv[_le*2 + 1 + 18]);
-                            }
-                        }
-                        const float2 _fma_b2_41 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_42 = {neg_max_scaled, neg_max_scaled};
-                        #pragma unroll
-                        for (int _lf = 0; _lf < 1; _lf++)
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 30))[_lf], _fma_b2_41, _fma_c2_42);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 30))[_lf], _fma_b2_35, _fma_c2_36);
@@ -1189,24 +1187,12 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         float2 _f2_8 = make_float2(sv[16], sv[17]);
                         psum0 = add_f32x2(psum0, _f2_8);
                         #pragma unroll
-#if __CUDA_ARCH__ == 1000
-                        for (int _le = 0; _le < 1; _le++) {
-                            if (1 && _le >= 0) {
-                                float2 _exp2_pair_43 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 20], sv[_le*2 + 1 + 20]));
-                                sv[_le*2 + 20] = _exp2_pair_43.x;
-                                sv[_le*2 + 1 + 20] = _exp2_pair_43.y;
-                            } else {
-                                sv[_le*2 + 20] = approx_exp2(sv[_le*2 + 20]);
-                                sv[_le*2 + 1 + 20] = approx_exp2(sv[_le*2 + 1 + 20]);
-                            }
-#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 20] = approx_exp2(sv[_le + 20]);
-#endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_44 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_45 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_43 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_44 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_37 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_38 = {neg_max_scaled, neg_max_scaled};
@@ -1214,7 +1200,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 32))[_lf], _fma_b2_44, _fma_c2_45);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 32))[_lf], _fma_b2_43, _fma_c2_44);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 32))[_lf], _fma_b2_37, _fma_c2_38);
 #endif
@@ -1225,8 +1211,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 22] = approx_exp2(sv[_le + 22]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_46 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_47 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_45 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_46 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_39 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_40 = {neg_max_scaled, neg_max_scaled};
@@ -1234,7 +1220,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 34))[_lf], _fma_b2_46, _fma_c2_47);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 34))[_lf], _fma_b2_45, _fma_c2_46);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 34))[_lf], _fma_b2_39, _fma_c2_40);
 #endif
@@ -1245,8 +1231,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 24] = approx_exp2(sv[_le + 24]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_48 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_49 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_47 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_48 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_41 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_42 = {neg_max_scaled, neg_max_scaled};
@@ -1254,7 +1240,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 36))[_lf], _fma_b2_48, _fma_c2_49);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 36))[_lf], _fma_b2_47, _fma_c2_48);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 36))[_lf], _fma_b2_41, _fma_c2_42);
 #endif
@@ -1265,8 +1251,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 26] = approx_exp2(sv[_le + 26]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_50 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_51 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_49 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_50 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_43 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_44 = {neg_max_scaled, neg_max_scaled};
@@ -1274,7 +1260,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 38))[_lf], _fma_b2_50, _fma_c2_51);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 38))[_lf], _fma_b2_49, _fma_c2_50);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 38))[_lf], _fma_b2_43, _fma_c2_44);
 #endif
@@ -1285,8 +1271,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 28] = approx_exp2(sv[_le + 28]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_52 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_53 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_51 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_52 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_45 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_46 = {neg_max_scaled, neg_max_scaled};
@@ -1294,7 +1280,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 40))[_lf], _fma_b2_52, _fma_c2_53);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 40))[_lf], _fma_b2_51, _fma_c2_52);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 40))[_lf], _fma_b2_45, _fma_c2_46);
 #endif
@@ -1305,8 +1291,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 30] = approx_exp2(sv[_le + 30]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_54 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_55 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_53 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_54 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_47 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_48 = {neg_max_scaled, neg_max_scaled};
@@ -1314,7 +1300,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 42))[_lf], _fma_b2_54, _fma_c2_55);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 42))[_lf], _fma_b2_53, _fma_c2_54);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 42))[_lf], _fma_b2_47, _fma_c2_48);
 #endif
@@ -1324,9 +1310,9 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #if __CUDA_ARCH__ == 1000
                         for (int _le = 0; _le < 1; _le++) {
                             if (1 && _le >= 0) {
-                                float2 _exp2_pair_56 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 32], sv[_le*2 + 1 + 32]));
-                                sv[_le*2 + 32] = _exp2_pair_56.x;
-                                sv[_le*2 + 1 + 32] = _exp2_pair_56.y;
+                                float2 _exp2_pair_55 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 32], sv[_le*2 + 1 + 32]));
+                                sv[_le*2 + 32] = _exp2_pair_55.x;
+                                sv[_le*2 + 1 + 32] = _exp2_pair_55.y;
                             } else {
                                 sv[_le*2 + 32] = approx_exp2(sv[_le*2 + 32]);
                                 sv[_le*2 + 1 + 32] = approx_exp2(sv[_le*2 + 1 + 32]);
@@ -1337,8 +1323,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_57 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_58 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_56 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_57 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_49 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_50 = {neg_max_scaled, neg_max_scaled};
@@ -1346,7 +1332,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 44))[_lf], _fma_b2_57, _fma_c2_58);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 44))[_lf], _fma_b2_56, _fma_c2_57);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 44))[_lf], _fma_b2_49, _fma_c2_50);
 #endif
@@ -1362,9 +1348,9 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #if __CUDA_ARCH__ == 1000
                         for (int _le = 0; _le < 1; _le++) {
                             if (1 && _le >= 0) {
-                                float2 _exp2_pair_59 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 34], sv[_le*2 + 1 + 34]));
-                                sv[_le*2 + 34] = _exp2_pair_59.x;
-                                sv[_le*2 + 1 + 34] = _exp2_pair_59.y;
+                                float2 _exp2_pair_58 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 34], sv[_le*2 + 1 + 34]));
+                                sv[_le*2 + 34] = _exp2_pair_58.x;
+                                sv[_le*2 + 1 + 34] = _exp2_pair_58.y;
                             } else {
                                 sv[_le*2 + 34] = approx_exp2(sv[_le*2 + 34]);
                                 sv[_le*2 + 1 + 34] = approx_exp2(sv[_le*2 + 1 + 34]);
@@ -1375,8 +1361,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_60 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_61 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_59 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_60 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_51 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_52 = {neg_max_scaled, neg_max_scaled};
@@ -1384,7 +1370,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 46))[_lf], _fma_b2_60, _fma_c2_61);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 46))[_lf], _fma_b2_59, _fma_c2_60);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 46))[_lf], _fma_b2_51, _fma_c2_52);
 #endif
@@ -1394,9 +1380,9 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #if __CUDA_ARCH__ == 1000
                         for (int _le = 0; _le < 1; _le++) {
                             if (1 && _le >= 0) {
-                                float2 _exp2_pair_62 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 36], sv[_le*2 + 1 + 36]));
-                                sv[_le*2 + 36] = _exp2_pair_62.x;
-                                sv[_le*2 + 1 + 36] = _exp2_pair_62.y;
+                                float2 _exp2_pair_61 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 36], sv[_le*2 + 1 + 36]));
+                                sv[_le*2 + 36] = _exp2_pair_61.x;
+                                sv[_le*2 + 1 + 36] = _exp2_pair_61.y;
                             } else {
                                 sv[_le*2 + 36] = approx_exp2(sv[_le*2 + 36]);
                                 sv[_le*2 + 1 + 36] = approx_exp2(sv[_le*2 + 1 + 36]);
@@ -1407,8 +1393,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_63 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_64 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_62 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_63 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_53 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_54 = {neg_max_scaled, neg_max_scaled};
@@ -1416,15 +1402,27 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 48))[_lf], _fma_b2_63, _fma_c2_64);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 48))[_lf], _fma_b2_62, _fma_c2_63);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 48))[_lf], _fma_b2_53, _fma_c2_54);
 #endif
                         float2 _f2_17 = make_float2(sv[34], sv[35]);
                         psum1 = add_f32x2(psum1, _f2_17);
                         #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                        for (int _le = 0; _le < 1; _le++) {
+                            if (1 && _le >= 0) {
+                                float2 _exp2_pair_64 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 38], sv[_le*2 + 1 + 38]));
+                                sv[_le*2 + 38] = _exp2_pair_64.x;
+                                sv[_le*2 + 1 + 38] = _exp2_pair_64.y;
+                            } else {
+                                sv[_le*2 + 38] = approx_exp2(sv[_le*2 + 38]);
+                                sv[_le*2 + 1 + 38] = approx_exp2(sv[_le*2 + 1 + 38]);
+                            }
+#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 38] = approx_exp2(sv[_le + 38]);
+#endif
                         }
 #if __CUDA_ARCH__ == 1000
                         const float2 _fma_b2_65 = {softmax_scale_log2, softmax_scale_log2};
@@ -1443,12 +1441,24 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         float2 _f2_18 = make_float2(sv[36], sv[37]);
                         psum1 = add_f32x2(psum1, _f2_18);
                         #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                        for (int _le = 0; _le < 1; _le++) {
+                            if (1 && _le >= 0) {
+                                float2 _exp2_pair_67 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 40], sv[_le*2 + 1 + 40]));
+                                sv[_le*2 + 40] = _exp2_pair_67.x;
+                                sv[_le*2 + 1 + 40] = _exp2_pair_67.y;
+                            } else {
+                                sv[_le*2 + 40] = approx_exp2(sv[_le*2 + 40]);
+                                sv[_le*2 + 1 + 40] = approx_exp2(sv[_le*2 + 1 + 40]);
+                            }
+#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 40] = approx_exp2(sv[_le + 40]);
+#endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_67 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_68 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_68 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_69 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_57 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_58 = {neg_max_scaled, neg_max_scaled};
@@ -1456,7 +1466,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 52))[_lf], _fma_b2_67, _fma_c2_68);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 52))[_lf], _fma_b2_68, _fma_c2_69);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 52))[_lf], _fma_b2_57, _fma_c2_58);
 #endif
@@ -1467,8 +1477,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 42] = approx_exp2(sv[_le + 42]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_69 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_70 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_70 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_71 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_59 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_60 = {neg_max_scaled, neg_max_scaled};
@@ -1476,7 +1486,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 54))[_lf], _fma_b2_69, _fma_c2_70);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 54))[_lf], _fma_b2_70, _fma_c2_71);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 54))[_lf], _fma_b2_59, _fma_c2_60);
 #endif
@@ -1487,8 +1497,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 44] = approx_exp2(sv[_le + 44]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_71 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_72 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_72 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_73 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_61 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_62 = {neg_max_scaled, neg_max_scaled};
@@ -1496,7 +1506,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 56))[_lf], _fma_b2_71, _fma_c2_72);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 56))[_lf], _fma_b2_72, _fma_c2_73);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 56))[_lf], _fma_b2_61, _fma_c2_62);
 #endif
@@ -1507,8 +1517,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 46] = approx_exp2(sv[_le + 46]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_73 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_74 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_74 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_75 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_63 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_64 = {neg_max_scaled, neg_max_scaled};
@@ -1516,27 +1526,15 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 58))[_lf], _fma_b2_73, _fma_c2_74);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 58))[_lf], _fma_b2_74, _fma_c2_75);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 58))[_lf], _fma_b2_63, _fma_c2_64);
 #endif
                         float2 _f2_22 = make_float2(sv[44], sv[45]);
                         psum1 = add_f32x2(psum1, _f2_22);
                         #pragma unroll
-#if __CUDA_ARCH__ == 1000
-                        for (int _le = 0; _le < 1; _le++) {
-                            if (1 && _le >= 0) {
-                                float2 _exp2_pair_75 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 48], sv[_le*2 + 1 + 48]));
-                                sv[_le*2 + 48] = _exp2_pair_75.x;
-                                sv[_le*2 + 1 + 48] = _exp2_pair_75.y;
-                            } else {
-                                sv[_le*2 + 48] = approx_exp2(sv[_le*2 + 48]);
-                                sv[_le*2 + 1 + 48] = approx_exp2(sv[_le*2 + 1 + 48]);
-                            }
-#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 48] = approx_exp2(sv[_le + 48]);
-#endif
                         }
 #if __CUDA_ARCH__ == 1000
                         const float2 _fma_b2_76 = {softmax_scale_log2, softmax_scale_log2};
@@ -1555,24 +1553,12 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         float2 _f2_23 = make_float2(sv[46], sv[47]);
                         psum1 = add_f32x2(psum1, _f2_23);
                         #pragma unroll
-#if __CUDA_ARCH__ == 1000
-                        for (int _le = 0; _le < 1; _le++) {
-                            if (1 && _le >= 0) {
-                                float2 _exp2_pair_78 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 50], sv[_le*2 + 1 + 50]));
-                                sv[_le*2 + 50] = _exp2_pair_78.x;
-                                sv[_le*2 + 1 + 50] = _exp2_pair_78.y;
-                            } else {
-                                sv[_le*2 + 50] = approx_exp2(sv[_le*2 + 50]);
-                                sv[_le*2 + 1 + 50] = approx_exp2(sv[_le*2 + 1 + 50]);
-                            }
-#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 50] = approx_exp2(sv[_le + 50]);
-#endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_79 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_80 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_78 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_79 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_67 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_68 = {neg_max_scaled, neg_max_scaled};
@@ -1580,31 +1566,19 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 62))[_lf], _fma_b2_79, _fma_c2_80);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 62))[_lf], _fma_b2_78, _fma_c2_79);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 62))[_lf], _fma_b2_67, _fma_c2_68);
 #endif
                         float2 _f2_24 = make_float2(sv[48], sv[49]);
                         psum1 = add_f32x2(psum1, _f2_24);
                         #pragma unroll
-#if __CUDA_ARCH__ == 1000
-                        for (int _le = 0; _le < 1; _le++) {
-                            if (1 && _le >= 0) {
-                                float2 _exp2_pair_81 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 52], sv[_le*2 + 1 + 52]));
-                                sv[_le*2 + 52] = _exp2_pair_81.x;
-                                sv[_le*2 + 1 + 52] = _exp2_pair_81.y;
-                            } else {
-                                sv[_le*2 + 52] = approx_exp2(sv[_le*2 + 52]);
-                                sv[_le*2 + 1 + 52] = approx_exp2(sv[_le*2 + 1 + 52]);
-                            }
-#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 52] = approx_exp2(sv[_le + 52]);
-#endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_82 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_83 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_80 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_81 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_69 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_70 = {neg_max_scaled, neg_max_scaled};
@@ -1612,7 +1586,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 64))[_lf], _fma_b2_82, _fma_c2_83);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 64))[_lf], _fma_b2_80, _fma_c2_81);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 64))[_lf], _fma_b2_69, _fma_c2_70);
 #endif
@@ -1623,8 +1597,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 54] = approx_exp2(sv[_le + 54]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_84 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_85 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_82 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_83 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_71 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_72 = {neg_max_scaled, neg_max_scaled};
@@ -1632,7 +1606,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 66))[_lf], _fma_b2_84, _fma_c2_85);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 66))[_lf], _fma_b2_82, _fma_c2_83);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 66))[_lf], _fma_b2_71, _fma_c2_72);
 #endif
@@ -1643,8 +1617,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 56] = approx_exp2(sv[_le + 56]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_86 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_87 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_84 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_85 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_73 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_74 = {neg_max_scaled, neg_max_scaled};
@@ -1652,7 +1626,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 68))[_lf], _fma_b2_86, _fma_c2_87);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 68))[_lf], _fma_b2_84, _fma_c2_85);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 68))[_lf], _fma_b2_73, _fma_c2_74);
 #endif
@@ -1663,8 +1637,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 58] = approx_exp2(sv[_le + 58]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_88 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_89 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_86 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_87 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_75 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_76 = {neg_max_scaled, neg_max_scaled};
@@ -1672,7 +1646,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 70))[_lf], _fma_b2_88, _fma_c2_89);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 70))[_lf], _fma_b2_86, _fma_c2_87);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 70))[_lf], _fma_b2_75, _fma_c2_76);
 #endif
@@ -1683,8 +1657,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 60] = approx_exp2(sv[_le + 60]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_90 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_91 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_88 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_89 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_77 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_78 = {neg_max_scaled, neg_max_scaled};
@@ -1692,7 +1666,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 72))[_lf], _fma_b2_90, _fma_c2_91);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 72))[_lf], _fma_b2_88, _fma_c2_89);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 72))[_lf], _fma_b2_77, _fma_c2_78);
 #endif
@@ -1703,8 +1677,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 62] = approx_exp2(sv[_le + 62]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_92 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_93 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_90 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_91 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_79 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_80 = {neg_max_scaled, neg_max_scaled};
@@ -1712,7 +1686,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 74))[_lf], _fma_b2_92, _fma_c2_93);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 74))[_lf], _fma_b2_90, _fma_c2_91);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 74))[_lf], _fma_b2_79, _fma_c2_80);
 #endif
@@ -1722,9 +1696,9 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #if __CUDA_ARCH__ == 1000
                         for (int _le = 0; _le < 1; _le++) {
                             if (1 && _le >= 0) {
-                                float2 _exp2_pair_94 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 64], sv[_le*2 + 1 + 64]));
-                                sv[_le*2 + 64] = _exp2_pair_94.x;
-                                sv[_le*2 + 1 + 64] = _exp2_pair_94.y;
+                                float2 _exp2_pair_92 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 64], sv[_le*2 + 1 + 64]));
+                                sv[_le*2 + 64] = _exp2_pair_92.x;
+                                sv[_le*2 + 1 + 64] = _exp2_pair_92.y;
                             } else {
                                 sv[_le*2 + 64] = approx_exp2(sv[_le*2 + 64]);
                                 sv[_le*2 + 1 + 64] = approx_exp2(sv[_le*2 + 1 + 64]);
@@ -1735,8 +1709,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_95 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_96 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_93 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_94 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_81 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_82 = {neg_max_scaled, neg_max_scaled};
@@ -1744,7 +1718,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 76))[_lf], _fma_b2_95, _fma_c2_96);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 76))[_lf], _fma_b2_93, _fma_c2_94);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 76))[_lf], _fma_b2_81, _fma_c2_82);
 #endif
@@ -1760,9 +1734,9 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #if __CUDA_ARCH__ == 1000
                         for (int _le = 0; _le < 1; _le++) {
                             if (1 && _le >= 0) {
-                                float2 _exp2_pair_97 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 66], sv[_le*2 + 1 + 66]));
-                                sv[_le*2 + 66] = _exp2_pair_97.x;
-                                sv[_le*2 + 1 + 66] = _exp2_pair_97.y;
+                                float2 _exp2_pair_95 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 66], sv[_le*2 + 1 + 66]));
+                                sv[_le*2 + 66] = _exp2_pair_95.x;
+                                sv[_le*2 + 1 + 66] = _exp2_pair_95.y;
                             } else {
                                 sv[_le*2 + 66] = approx_exp2(sv[_le*2 + 66]);
                                 sv[_le*2 + 1 + 66] = approx_exp2(sv[_le*2 + 1 + 66]);
@@ -1773,8 +1747,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_98 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_99 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_96 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_97 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_83 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_84 = {neg_max_scaled, neg_max_scaled};
@@ -1782,7 +1756,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 78))[_lf], _fma_b2_98, _fma_c2_99);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 78))[_lf], _fma_b2_96, _fma_c2_97);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 78))[_lf], _fma_b2_83, _fma_c2_84);
 #endif
@@ -1792,9 +1766,9 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #if __CUDA_ARCH__ == 1000
                         for (int _le = 0; _le < 1; _le++) {
                             if (1 && _le >= 0) {
-                                float2 _exp2_pair_100 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 68], sv[_le*2 + 1 + 68]));
-                                sv[_le*2 + 68] = _exp2_pair_100.x;
-                                sv[_le*2 + 1 + 68] = _exp2_pair_100.y;
+                                float2 _exp2_pair_98 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 68], sv[_le*2 + 1 + 68]));
+                                sv[_le*2 + 68] = _exp2_pair_98.x;
+                                sv[_le*2 + 1 + 68] = _exp2_pair_98.y;
                             } else {
                                 sv[_le*2 + 68] = approx_exp2(sv[_le*2 + 68]);
                                 sv[_le*2 + 1 + 68] = approx_exp2(sv[_le*2 + 1 + 68]);
@@ -1805,8 +1779,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_101 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_102 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_99 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_100 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_85 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_86 = {neg_max_scaled, neg_max_scaled};
@@ -1814,19 +1788,31 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 80))[_lf], _fma_b2_101, _fma_c2_102);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 80))[_lf], _fma_b2_99, _fma_c2_100);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 80))[_lf], _fma_b2_85, _fma_c2_86);
 #endif
                         float2 _f2_33 = make_float2(sv[66], sv[67]);
                         psum2 = add_f32x2(psum2, _f2_33);
                         #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                        for (int _le = 0; _le < 1; _le++) {
+                            if (1 && _le >= 0) {
+                                float2 _exp2_pair_101 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 70], sv[_le*2 + 1 + 70]));
+                                sv[_le*2 + 70] = _exp2_pair_101.x;
+                                sv[_le*2 + 1 + 70] = _exp2_pair_101.y;
+                            } else {
+                                sv[_le*2 + 70] = approx_exp2(sv[_le*2 + 70]);
+                                sv[_le*2 + 1 + 70] = approx_exp2(sv[_le*2 + 1 + 70]);
+                            }
+#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 70] = approx_exp2(sv[_le + 70]);
+#endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_103 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_104 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_102 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_103 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_87 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_88 = {neg_max_scaled, neg_max_scaled};
@@ -1834,15 +1820,27 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 82))[_lf], _fma_b2_103, _fma_c2_104);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 82))[_lf], _fma_b2_102, _fma_c2_103);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 82))[_lf], _fma_b2_87, _fma_c2_88);
 #endif
                         float2 _f2_34 = make_float2(sv[68], sv[69]);
                         psum2 = add_f32x2(psum2, _f2_34);
                         #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                        for (int _le = 0; _le < 1; _le++) {
+                            if (1 && _le >= 0) {
+                                float2 _exp2_pair_104 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 72], sv[_le*2 + 1 + 72]));
+                                sv[_le*2 + 72] = _exp2_pair_104.x;
+                                sv[_le*2 + 1 + 72] = _exp2_pair_104.y;
+                            } else {
+                                sv[_le*2 + 72] = approx_exp2(sv[_le*2 + 72]);
+                                sv[_le*2 + 1 + 72] = approx_exp2(sv[_le*2 + 1 + 72]);
+                            }
+#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 72] = approx_exp2(sv[_le + 72]);
+#endif
                         }
 #if __CUDA_ARCH__ == 1000
                         const float2 _fma_b2_105 = {softmax_scale_log2, softmax_scale_log2};
@@ -1921,24 +1919,12 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         float2 _f2_38 = make_float2(sv[76], sv[77]);
                         psum2 = add_f32x2(psum2, _f2_38);
                         #pragma unroll
-#if __CUDA_ARCH__ == 1000
-                        for (int _le = 0; _le < 1; _le++) {
-                            if (1 && _le >= 0) {
-                                float2 _exp2_pair_113 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 80], sv[_le*2 + 1 + 80]));
-                                sv[_le*2 + 80] = _exp2_pair_113.x;
-                                sv[_le*2 + 1 + 80] = _exp2_pair_113.y;
-                            } else {
-                                sv[_le*2 + 80] = approx_exp2(sv[_le*2 + 80]);
-                                sv[_le*2 + 1 + 80] = approx_exp2(sv[_le*2 + 1 + 80]);
-                            }
-#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 80] = approx_exp2(sv[_le + 80]);
-#endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_114 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_115 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_113 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_114 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_97 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_98 = {neg_max_scaled, neg_max_scaled};
@@ -1946,31 +1932,19 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 92))[_lf], _fma_b2_114, _fma_c2_115);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 92))[_lf], _fma_b2_113, _fma_c2_114);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 92))[_lf], _fma_b2_97, _fma_c2_98);
 #endif
                         float2 _f2_39 = make_float2(sv[78], sv[79]);
                         psum2 = add_f32x2(psum2, _f2_39);
                         #pragma unroll
-#if __CUDA_ARCH__ == 1000
-                        for (int _le = 0; _le < 1; _le++) {
-                            if (1 && _le >= 0) {
-                                float2 _exp2_pair_116 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 82], sv[_le*2 + 1 + 82]));
-                                sv[_le*2 + 82] = _exp2_pair_116.x;
-                                sv[_le*2 + 1 + 82] = _exp2_pair_116.y;
-                            } else {
-                                sv[_le*2 + 82] = approx_exp2(sv[_le*2 + 82]);
-                                sv[_le*2 + 1 + 82] = approx_exp2(sv[_le*2 + 1 + 82]);
-                            }
-#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 82] = approx_exp2(sv[_le + 82]);
-#endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_117 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_118 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_115 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_116 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_99 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_100 = {neg_max_scaled, neg_max_scaled};
@@ -1978,31 +1952,19 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 94))[_lf], _fma_b2_117, _fma_c2_118);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 94))[_lf], _fma_b2_115, _fma_c2_116);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 94))[_lf], _fma_b2_99, _fma_c2_100);
 #endif
                         float2 _f2_40 = make_float2(sv[80], sv[81]);
                         psum2 = add_f32x2(psum2, _f2_40);
                         #pragma unroll
-#if __CUDA_ARCH__ == 1000
-                        for (int _le = 0; _le < 1; _le++) {
-                            if (1 && _le >= 0) {
-                                float2 _exp2_pair_119 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 84], sv[_le*2 + 1 + 84]));
-                                sv[_le*2 + 84] = _exp2_pair_119.x;
-                                sv[_le*2 + 1 + 84] = _exp2_pair_119.y;
-                            } else {
-                                sv[_le*2 + 84] = approx_exp2(sv[_le*2 + 84]);
-                                sv[_le*2 + 1 + 84] = approx_exp2(sv[_le*2 + 1 + 84]);
-                            }
-#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 84] = approx_exp2(sv[_le + 84]);
-#endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_120 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_121 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_117 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_118 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_101 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_102 = {neg_max_scaled, neg_max_scaled};
@@ -2010,7 +1972,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 96))[_lf], _fma_b2_120, _fma_c2_121);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 96))[_lf], _fma_b2_117, _fma_c2_118);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 96))[_lf], _fma_b2_101, _fma_c2_102);
 #endif
@@ -2021,8 +1983,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 86] = approx_exp2(sv[_le + 86]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_122 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_123 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_119 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_120 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_103 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_104 = {neg_max_scaled, neg_max_scaled};
@@ -2030,7 +1992,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 98))[_lf], _fma_b2_122, _fma_c2_123);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 98))[_lf], _fma_b2_119, _fma_c2_120);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 98))[_lf], _fma_b2_103, _fma_c2_104);
 #endif
@@ -2041,8 +2003,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 88] = approx_exp2(sv[_le + 88]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_124 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_125 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_121 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_122 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_105 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_106 = {neg_max_scaled, neg_max_scaled};
@@ -2050,7 +2012,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 100))[_lf], _fma_b2_124, _fma_c2_125);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 100))[_lf], _fma_b2_121, _fma_c2_122);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 100))[_lf], _fma_b2_105, _fma_c2_106);
 #endif
@@ -2061,8 +2023,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 90] = approx_exp2(sv[_le + 90]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_126 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_127 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_123 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_124 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_107 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_108 = {neg_max_scaled, neg_max_scaled};
@@ -2070,7 +2032,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 102))[_lf], _fma_b2_126, _fma_c2_127);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 102))[_lf], _fma_b2_123, _fma_c2_124);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 102))[_lf], _fma_b2_107, _fma_c2_108);
 #endif
@@ -2081,8 +2043,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 92] = approx_exp2(sv[_le + 92]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_128 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_129 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_125 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_126 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_109 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_110 = {neg_max_scaled, neg_max_scaled};
@@ -2090,7 +2052,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 104))[_lf], _fma_b2_128, _fma_c2_129);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 104))[_lf], _fma_b2_125, _fma_c2_126);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 104))[_lf], _fma_b2_109, _fma_c2_110);
 #endif
@@ -2101,8 +2063,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 94] = approx_exp2(sv[_le + 94]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_130 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_131 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_127 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_128 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_111 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_112 = {neg_max_scaled, neg_max_scaled};
@@ -2110,7 +2072,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 106))[_lf], _fma_b2_130, _fma_c2_131);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 106))[_lf], _fma_b2_127, _fma_c2_128);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 106))[_lf], _fma_b2_111, _fma_c2_112);
 #endif
@@ -2120,9 +2082,9 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #if __CUDA_ARCH__ == 1000
                         for (int _le = 0; _le < 1; _le++) {
                             if (1 && _le >= 0) {
-                                float2 _exp2_pair_132 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 96], sv[_le*2 + 1 + 96]));
-                                sv[_le*2 + 96] = _exp2_pair_132.x;
-                                sv[_le*2 + 1 + 96] = _exp2_pair_132.y;
+                                float2 _exp2_pair_129 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 96], sv[_le*2 + 1 + 96]));
+                                sv[_le*2 + 96] = _exp2_pair_129.x;
+                                sv[_le*2 + 1 + 96] = _exp2_pair_129.y;
                             } else {
                                 sv[_le*2 + 96] = approx_exp2(sv[_le*2 + 96]);
                                 sv[_le*2 + 1 + 96] = approx_exp2(sv[_le*2 + 1 + 96]);
@@ -2133,8 +2095,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_133 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_134 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_130 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_131 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_113 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_114 = {neg_max_scaled, neg_max_scaled};
@@ -2142,7 +2104,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 108))[_lf], _fma_b2_133, _fma_c2_134);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 108))[_lf], _fma_b2_130, _fma_c2_131);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 108))[_lf], _fma_b2_113, _fma_c2_114);
 #endif
@@ -2158,9 +2120,9 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #if __CUDA_ARCH__ == 1000
                         for (int _le = 0; _le < 1; _le++) {
                             if (1 && _le >= 0) {
-                                float2 _exp2_pair_135 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 98], sv[_le*2 + 1 + 98]));
-                                sv[_le*2 + 98] = _exp2_pair_135.x;
-                                sv[_le*2 + 1 + 98] = _exp2_pair_135.y;
+                                float2 _exp2_pair_132 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 98], sv[_le*2 + 1 + 98]));
+                                sv[_le*2 + 98] = _exp2_pair_132.x;
+                                sv[_le*2 + 1 + 98] = _exp2_pair_132.y;
                             } else {
                                 sv[_le*2 + 98] = approx_exp2(sv[_le*2 + 98]);
                                 sv[_le*2 + 1 + 98] = approx_exp2(sv[_le*2 + 1 + 98]);
@@ -2171,8 +2133,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_136 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_137 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_133 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_134 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_115 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_116 = {neg_max_scaled, neg_max_scaled};
@@ -2180,7 +2142,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 110))[_lf], _fma_b2_136, _fma_c2_137);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 110))[_lf], _fma_b2_133, _fma_c2_134);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 110))[_lf], _fma_b2_115, _fma_c2_116);
 #endif
@@ -2190,9 +2152,9 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #if __CUDA_ARCH__ == 1000
                         for (int _le = 0; _le < 1; _le++) {
                             if (1 && _le >= 0) {
-                                float2 _exp2_pair_138 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 100], sv[_le*2 + 1 + 100]));
-                                sv[_le*2 + 100] = _exp2_pair_138.x;
-                                sv[_le*2 + 1 + 100] = _exp2_pair_138.y;
+                                float2 _exp2_pair_135 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 100], sv[_le*2 + 1 + 100]));
+                                sv[_le*2 + 100] = _exp2_pair_135.x;
+                                sv[_le*2 + 1 + 100] = _exp2_pair_135.y;
                             } else {
                                 sv[_le*2 + 100] = approx_exp2(sv[_le*2 + 100]);
                                 sv[_le*2 + 1 + 100] = approx_exp2(sv[_le*2 + 1 + 100]);
@@ -2203,8 +2165,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
 #endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_139 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_140 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_136 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_137 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_117 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_118 = {neg_max_scaled, neg_max_scaled};
@@ -2212,19 +2174,31 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 112))[_lf], _fma_b2_139, _fma_c2_140);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 112))[_lf], _fma_b2_136, _fma_c2_137);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 112))[_lf], _fma_b2_117, _fma_c2_118);
 #endif
                         float2 _f2_49 = make_float2(sv[98], sv[99]);
                         psum3 = add_f32x2(psum3, _f2_49);
                         #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                        for (int _le = 0; _le < 1; _le++) {
+                            if (1 && _le >= 0) {
+                                float2 _exp2_pair_138 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 102], sv[_le*2 + 1 + 102]));
+                                sv[_le*2 + 102] = _exp2_pair_138.x;
+                                sv[_le*2 + 1 + 102] = _exp2_pair_138.y;
+                            } else {
+                                sv[_le*2 + 102] = approx_exp2(sv[_le*2 + 102]);
+                                sv[_le*2 + 1 + 102] = approx_exp2(sv[_le*2 + 1 + 102]);
+                            }
+#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 102] = approx_exp2(sv[_le + 102]);
+#endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_141 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_142 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_139 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_140 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_119 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_120 = {neg_max_scaled, neg_max_scaled};
@@ -2232,19 +2206,31 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 114))[_lf], _fma_b2_141, _fma_c2_142);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 114))[_lf], _fma_b2_139, _fma_c2_140);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 114))[_lf], _fma_b2_119, _fma_c2_120);
 #endif
                         float2 _f2_50 = make_float2(sv[100], sv[101]);
                         psum3 = add_f32x2(psum3, _f2_50);
                         #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                        for (int _le = 0; _le < 1; _le++) {
+                            if (1 && _le >= 0) {
+                                float2 _exp2_pair_141 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 104], sv[_le*2 + 1 + 104]));
+                                sv[_le*2 + 104] = _exp2_pair_141.x;
+                                sv[_le*2 + 1 + 104] = _exp2_pair_141.y;
+                            } else {
+                                sv[_le*2 + 104] = approx_exp2(sv[_le*2 + 104]);
+                                sv[_le*2 + 1 + 104] = approx_exp2(sv[_le*2 + 1 + 104]);
+                            }
+#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 104] = approx_exp2(sv[_le + 104]);
+#endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_143 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_144 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_142 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_143 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_121 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_122 = {neg_max_scaled, neg_max_scaled};
@@ -2252,7 +2238,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 116))[_lf], _fma_b2_143, _fma_c2_144);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 116))[_lf], _fma_b2_142, _fma_c2_143);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 116))[_lf], _fma_b2_121, _fma_c2_122);
 #endif
@@ -2263,8 +2249,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 106] = approx_exp2(sv[_le + 106]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_145 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_146 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_144 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_145 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_123 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_124 = {neg_max_scaled, neg_max_scaled};
@@ -2272,7 +2258,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 118))[_lf], _fma_b2_145, _fma_c2_146);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 118))[_lf], _fma_b2_144, _fma_c2_145);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 118))[_lf], _fma_b2_123, _fma_c2_124);
 #endif
@@ -2283,8 +2269,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 108] = approx_exp2(sv[_le + 108]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_147 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_148 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_146 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_147 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_125 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_126 = {neg_max_scaled, neg_max_scaled};
@@ -2292,7 +2278,7 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 120))[_lf], _fma_b2_147, _fma_c2_148);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 120))[_lf], _fma_b2_146, _fma_c2_147);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 120))[_lf], _fma_b2_125, _fma_c2_126);
 #endif
@@ -2303,8 +2289,8 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                             sv[_le + 110] = approx_exp2(sv[_le + 110]);
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_149 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_150 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_148 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_149 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_127 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_128 = {neg_max_scaled, neg_max_scaled};
@@ -2312,31 +2298,19 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 122))[_lf], _fma_b2_149, _fma_c2_150);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 122))[_lf], _fma_b2_148, _fma_c2_149);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 122))[_lf], _fma_b2_127, _fma_c2_128);
 #endif
                         float2 _f2_54 = make_float2(sv[108], sv[109]);
                         psum3 = add_f32x2(psum3, _f2_54);
                         #pragma unroll
-#if __CUDA_ARCH__ == 1000
-                        for (int _le = 0; _le < 1; _le++) {
-                            if (1 && _le >= 0) {
-                                float2 _exp2_pair_151 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 112], sv[_le*2 + 1 + 112]));
-                                sv[_le*2 + 112] = _exp2_pair_151.x;
-                                sv[_le*2 + 1 + 112] = _exp2_pair_151.y;
-                            } else {
-                                sv[_le*2 + 112] = approx_exp2(sv[_le*2 + 112]);
-                                sv[_le*2 + 1 + 112] = approx_exp2(sv[_le*2 + 1 + 112]);
-                            }
-#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 112] = approx_exp2(sv[_le + 112]);
-#endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_152 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_153 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_150 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_151 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_129 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_130 = {neg_max_scaled, neg_max_scaled};
@@ -2344,31 +2318,19 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 124))[_lf], _fma_b2_152, _fma_c2_153);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 124))[_lf], _fma_b2_150, _fma_c2_151);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 124))[_lf], _fma_b2_129, _fma_c2_130);
 #endif
                         float2 _f2_55 = make_float2(sv[110], sv[111]);
                         psum3 = add_f32x2(psum3, _f2_55);
                         #pragma unroll
-#if __CUDA_ARCH__ == 1000
-                        for (int _le = 0; _le < 1; _le++) {
-                            if (1 && _le >= 0) {
-                                float2 _exp2_pair_154 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 114], sv[_le*2 + 1 + 114]));
-                                sv[_le*2 + 114] = _exp2_pair_154.x;
-                                sv[_le*2 + 1 + 114] = _exp2_pair_154.y;
-                            } else {
-                                sv[_le*2 + 114] = approx_exp2(sv[_le*2 + 114]);
-                                sv[_le*2 + 1 + 114] = approx_exp2(sv[_le*2 + 1 + 114]);
-                            }
-#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 114] = approx_exp2(sv[_le + 114]);
-#endif
                         }
 #if __CUDA_ARCH__ == 1000
-                        const float2 _fma_b2_155 = {softmax_scale_log2, softmax_scale_log2};
-                        const float2 _fma_c2_156 = {neg_max_scaled, neg_max_scaled};
+                        const float2 _fma_b2_152 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_153 = {neg_max_scaled, neg_max_scaled};
 #else
                         const float2 _fma_b2_131 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_132 = {neg_max_scaled, neg_max_scaled};
@@ -2376,27 +2338,15 @@ kernel_cake_minimax_h3_varlen_attention_4cfed868802f277c0494(const __grid_consta
                         #pragma unroll
                         for (int _lf = 0; _lf < 1; _lf++)
 #if __CUDA_ARCH__ == 1000
-                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 126))[_lf], _fma_b2_155, _fma_c2_156);
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 126))[_lf], _fma_b2_152, _fma_c2_153);
 #else
                             fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 126))[_lf], _fma_b2_131, _fma_c2_132);
 #endif
                         float2 _f2_56 = make_float2(sv[112], sv[113]);
                         psum3 = add_f32x2(psum3, _f2_56);
                         #pragma unroll
-#if __CUDA_ARCH__ == 1000
-                        for (int _le = 0; _le < 1; _le++) {
-                            if (1 && _le >= 0) {
-                                float2 _exp2_pair_157 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 116], sv[_le*2 + 1 + 116]));
-                                sv[_le*2 + 116] = _exp2_pair_157.x;
-                                sv[_le*2 + 1 + 116] = _exp2_pair_157.y;
-                            } else {
-                                sv[_le*2 + 116] = approx_exp2(sv[_le*2 + 116]);
-                                sv[_le*2 + 1 + 116] = approx_exp2(sv[_le*2 + 1 + 116]);
-                            }
-#else
                         for (int _le = 0; _le < 2; _le++) {
                             sv[_le + 116] = approx_exp2(sv[_le + 116]);
-#endif
                         }
                         float2 _f2_57 = make_float2(sv[114], sv[115]);
                         psum3 = add_f32x2(psum3, _f2_57);

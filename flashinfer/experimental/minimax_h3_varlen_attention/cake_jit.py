@@ -132,12 +132,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "8c1821e65e84d351798d96cd92f086722bb51405a073d5878ec7157b1dbfe5f7",
         },
     },
-    "cake_minimax_h3_varlen_attention_4cfed868802f277c0494": {
+    "cake_minimax_h3_varlen_attention_729b06c00352d9363c74": {
         "arches": ["sm_100a", "sm_103a"],
         "role": "kernel",
         "sources": [
-            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_4cfed868802f277c0494_kernel.cu",
-            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_4cfed868802f277c0494_binding.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_729b06c00352d9363c74_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_729b06c00352d9363c74_binding.cu",
         ],
         "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
         "ffi_entry": "run",
@@ -158,8 +158,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "4d0b9c545a1b8ff090afb47e452d5c017b6f8fa204838b27c3cdae26e9c6e8f4",
-            "sm_103a": "ee5646d48f4b89b53b34f86195e3aa5def82359fcbf01a61517ddb76b5e37814",
+            "sm_100a": "be2c60f5cad23d947821d1661d25273716089bb1c11181a119e39e64d74a421c",
+            "sm_103a": "50047ae2db2ef3e7337cc4c6cf17d605d294ad0239b3aeb367af36870fc5639e",
         },
     },
     "cake_minimax_h3_varlen_attention_998a9624b757b0a48881": {
@@ -361,7 +361,7 @@ ROUTES: dict[str, dict[str, Any]] = {
         "variant": "bf16",
         "stages": ["attention", "combine"],
         "modules": {
-            "attention": "cake_minimax_h3_varlen_attention_4cfed868802f277c0494",
+            "attention": "cake_minimax_h3_varlen_attention_729b06c00352d9363c74",
             "combine": "cake_minimax_h3_varlen_attention_ff9654b6e96277c07d5e",
         },
     },
@@ -370,7 +370,7 @@ ROUTES: dict[str, dict[str, Any]] = {
         "variant": "bf16",
         "stages": ["attention", "combine"],
         "modules": {
-            "attention": "cake_minimax_h3_varlen_attention_4cfed868802f277c0494",
+            "attention": "cake_minimax_h3_varlen_attention_729b06c00352d9363c74",
             "combine": "cake_minimax_h3_varlen_attention_ff9654b6e96277c07d5e",
         },
     },
