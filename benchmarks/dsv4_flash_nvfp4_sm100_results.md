@@ -1,6 +1,6 @@
 # B200 routed NVFP4 decode: cooperative FC1 full32 results
 
-The current public candidate beats `flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe` at every integer T=1..32: **1.025160423562× geometric-mean speedup**, **32/32 shapes faster**. The minimum is **1.006047396915× at T14**, with public **161.422111112 µs** and baseline **162.398294689 µs**. The matched source implementation measures **1.025096697119×**. Hardware-limit evidence and broader promotion remain incomplete.
+The current public candidate beats `flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe` at every integer T=1..32: **1.025160423562× geometric-mean speedup**, **32/32 shapes faster**. The minimum is **1.006047396915× at T14**, with public **161.422111112 µs** and baseline **162.398294689 µs**. The matched source implementation measures **1.025096697119×**. The linked hardware evidence supports a measured practical frontier for the explored source schedules, not an absolute optimum or a numerical whole-call hardware ceiling.
 
 Additional [hardware evidence and scheduling probes](dsv4_flash_nvfp4_sm100_hardware_evidence.md) concern the generated source schedule in separate cohorts; they do not constitute a new public-export qualification.
 

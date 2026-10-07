@@ -87,4 +87,5 @@ traffic sampling also does not establish ownership of every transferred byte.
 No new benchmark, profile or public qualification was run to assemble this
 summary. The rejected prototypes did not trigger new sanitizer runs.
 Previously reported separate synccheck and racecheck 20-second timeout skips
-remain skips, not passes. Broader validation remains incomplete.
+remain skips, not passes. The public-export qualification and the source-schedule
+evidence above retain their separately stated scopes and limitations.
