@@ -391,10 +391,27 @@ def _run_la_graph(
     if final_state is not None:
         buffers += (final_state,)
 
-    workspace_buffer = _get_cache_buf(
-        "cudnn_linear_attention", graph._fi_la_workspace_size, q.device
-    )
-    handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
+    stream = torch.cuda.current_stream(q.device)
+    if q.device.index == torch.cuda.current_device():
+        capturing = torch.cuda.is_current_stream_capturing()
+    else:
+        # Capture status is queried on the operand's device, even when the
+        # caller has a different CUDA device current on this host thread.
+        with torch.cuda.device(q.device):
+            capturing = torch.cuda.is_current_stream_capturing()
+    if capturing:
+        # CUDA Graph owns its private allocator pool. Separate captures on the
+        # same stream must not share eager scratch when replayed concurrently.
+        workspace_buffer = torch.empty(
+            graph._fi_la_workspace_size, dtype=torch.uint8, device=q.device
+        )
+    else:
+        workspace_buffer = _get_cache_buf(
+            f"cudnn_linear_attention_{stream.cuda_stream}",
+            graph._fi_la_workspace_size,
+            q.device,
+        )
+    handle = _create_cudnn_handle(stream)
     if graph._fi_la_ordered:
         graph.execute(
             buffers,
