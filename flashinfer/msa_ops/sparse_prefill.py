@@ -57,8 +57,9 @@ def msa_sparse_attention(
     return_temperature_lse: bool = False,
     lse_temperature_scale: float = 1.0,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
+    out: Optional[torch.Tensor] = None,
 ):
-    """Minimax Sparse Attention forward for SM100/SM103 and SM120/SM121 GPUs.
+    """Minimax Sparse Attention forward for SM90, SM100/SM103 and SM120/SM121 GPUs.
 
     Each query attends only the top-K KV blocks selected in ``q2k_indices``.
     Query tokens are processed in tiles: each tile runs one online softmax over
@@ -164,6 +165,11 @@ def msa_sparse_attention(
         capability 10.0/10.3. Warm the workspace eagerly with the exact
         tensors, options, and capture stream before capture. It is not used by
         the SM120/SM121 backend.
+    out : torch.Tensor, optional
+        Pre-allocated bf16 output of shape ``(total_q, num_qo_heads, head_dim)``
+        (SM90 only, where the kernels allocate nothing per call and are
+        CUDA-graph capturable as is). Other architectures allocate their own
+        output and reject ``out``.
 
     Returns
     -------
@@ -175,6 +181,11 @@ def msa_sparse_attention(
         false, returns ``out``. Each returned LSE tensor has shape
         ``(total_q, num_qo_heads)`` and dtype float32.
     """
+    if out is not None and not is_sm90a_supported(q.device):
+        raise NotImplementedError(
+            "out= is implemented on SM90; the compute capability 10.0/10.3 and "
+            "SM120/SM121 backends allocate their own output"
+        )
     if is_blackwell_msa_device(q.device):
         return blackwell_msa_sparse_attention(
             q,
@@ -234,6 +245,12 @@ def msa_sparse_attention(
             raise NotImplementedError(
                 "SM90 msa_sparse_attention does not return an LSE"
             )
+        if not causal:
+            # Every SM90 sparse-prefill schedule masks causally with no switch;
+            # the flag used to be ignored, which silently returned causal output.
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention is causal; causal=False is not supported"
+            )
         if page_table is None or seqused_k is None:
             raise NotImplementedError(
                 "SM90 msa_sparse_attention requires the paged KV layout"
@@ -255,9 +272,15 @@ def msa_sparse_attention(
             )
         from ._sm90_dispatch import sparse_prefill_sm90
 
-        out = torch.zeros(
-            (total_q, num_qo_heads, head_dim), dtype=q.dtype, device=q.device
-        )
+        if out is None:
+            out = torch.zeros(
+                (total_q, num_qo_heads, head_dim), dtype=q.dtype, device=q.device
+            )
+        elif out.shape != q.shape or out.dtype != q.dtype or not out.is_contiguous():
+            raise ValueError(
+                "out must be a contiguous tensor shaped and typed like q, got "
+                f"{tuple(out.shape)} {out.dtype}"
+            )
         return sparse_prefill_sm90(
             q,
             k,

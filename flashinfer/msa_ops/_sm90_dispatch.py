@@ -1,19 +1,30 @@
 """SM90 (Hopper) dispatch for the MSA ops.
 
 Routes each operation / shape class to the backend that serves it: the Cake
-programs of ``cake_hopper_sm90`` (sparse decode; proxy-score decode regime for
-fp8 and bf16 with one index head, Hq in {1, 2, 4} and max_seqlen_q in
-{1, 2, 3, 4}) or the Hopper CuTe DSL backends in ``cute_dsl/*_sm90.py`` (top-k
-select, sparse prefill, proxy-score prefill regime and the remaining decode
-coordinates). Selection is on capability, never on measured shape thresholds:
-a schedule is chosen only where it is the one that can run the shape
-correctly, and the surface's raise rules apply before any backend is reached.
+programs of ``cake_hopper_sm90`` or the Hopper CuTe DSL backends in
+``cute_dsl/*_sm90.py``. Selection is on capability, never on measured shape
+thresholds: a Cake program is chosen where one exists for the class
+(``*_route_available``), and the surface's raise rules apply before any
+backend is reached.
 
-TODO(cake sm90): ``topk_select_sm90`` and ``sparse_prefill_sm90`` (and the
-proxy-score prefill regime below) still launch the CuTe DSL bodies; each moves
-to its Cake program by adding the program family to ``cake_hopper_msa.ROUTES``
-/ ``MODULES``, a launcher in ``cake_hopper_sm90``, and replacing the
-``cute_dsl`` import in the function here.
+Cake-served classes:
+
+* sparse decode: every admitted coordinate;
+* proxy score, decode regime (``max_seqlen_q <= 4``): fp8 and bf16 q with a
+  one-head index cache, Hq in {1, 2, 4};
+* proxy score, prefill regime: fp8 q with a one-head index cache, in both
+  accumulation precisions (``use_fp32_acc``);
+* top-k select: every (Hq, max_k_tiles, total_q) whose planner coordinate
+  (columns per CTA, tile groups, index bits, mask form) is a delivered
+  program;
+* sparse prefill: GQA groups 4, 8 and 16 with at most 4096 pages per sequence.
+
+The remaining classes keep the CuTe DSL kernels (proxy-score decode for bf16
+Hq outside {1, 2, 4} or multi-head index caches, top-k planner coordinates
+without a program, sparse prefill of GQA groups 1 / 2 / 32 / 64 or above
+4096 pages).  The proxy-score prefill regime has no f32-accumulating CuTe
+kernel: ``use_fp32_acc=True`` (the default) raises for the classes without a
+Cake program instead of silently returning f16-accumulated scores.
 """
 
 from typing import Optional
@@ -74,8 +85,14 @@ def proxy_score_sm90(
     batch_size: int,
     kv_fp8: bool,
     q_offset: Optional[torch.Tensor] = None,
+    use_fp32_acc: bool = True,
 ) -> torch.Tensor:
-    """MSA proxy score on Hopper. Writes ``per_head`` (Hq, max_k_tiles, total_q)."""
+    """MSA proxy score on Hopper. Writes ``per_head`` (Hq, max_k_tiles, total_q).
+
+    ``use_fp32_acc`` selects the accumulation precision of the prefill regime
+    (exact-product f32 by default, f16 like the CuTe DSL kernel when False);
+    the decode-regime programs accumulate in f32 whichever value is given.
+    """
     total_q = q.shape[0]
     sq = total_q // batch_size if batch_size else 0
     decode = (
@@ -136,6 +153,38 @@ def proxy_score_sm90(
             "SM90 proxy-score prefill requires an fp8 e4m3 index cache; "
             "bf16 is supported for decode only"
         )
+    from .cake_hopper_sm90 import (
+        hopper_msa_proxy_score_prefill,
+        proxy_prefill_route_available,
+    )
+
+    # Cake programs serve fp8 prefill scoring of a one-head index cache in
+    # both accumulation precisions; a multi-head index cache keeps the CuTe
+    # DSL kernel, which accumulates in f16 only.
+    if proxy_prefill_route_available(
+        q_dtype=q.dtype, num_kv_heads=k.shape[1], use_fp32_acc=use_fp32_acc
+    ):
+        return hopper_msa_proxy_score_prefill(
+            q,
+            k,
+            cu,
+            page_table=pt,
+            seqused_k=sk,
+            per_head=per_head,
+            max_seqlen_q=max_seqlen_q,
+            batch_size=batch_size,
+            q_offset=(
+                q_offset.to(torch.int32).contiguous() if q_offset is not None else None
+            ),
+            use_fp32_acc=use_fp32_acc,
+        )
+    if use_fp32_acc:
+        raise NotImplementedError(
+            "SM90 proxy-score prefill with f32 accumulation (use_fp32_acc=True) "
+            f"serves fp8 q with a one-head index cache; got q {q.dtype} with "
+            f"{k.shape[1]} index heads. Pass use_fp32_acc=False for the "
+            "f16-accumulating kernel."
+        )
     from .cute_dsl.proxy_score_prefill_sm90 import run as _prefill
 
     pfx = (
@@ -158,16 +207,14 @@ def topk_select_sm90(
 ) -> torch.Tensor:
     """MSA top-k block selection on Hopper. Writes sorted indices into ``output``.
 
-    The kernel reads validity from the ``-inf`` tiles ``msa_proxy_score`` already
-    writes, so it needs no sequence-length arguments.
+    The kernels read validity from the ``-inf`` tiles ``msa_proxy_score`` already
+    writes, so they need no sequence-length arguments.
     """
     if topk != 16:
         raise NotImplementedError(
             f"SM90 msa_topk_select supports topk=16 only, got {topk}"
         )
-    from .cute_dsl.topk_select_sm90 import run as _topk
-
-    # Forced blocks and per-token validity are applied inside the kernel at the
+    # Forced blocks and per-token validity are applied inside the kernels at the
     # score load, so they cost no extra traffic and no extra launch. Biasing
     # max_score in a separate pass instead measured 431us against a 6.8us kernel.
     nvp = None
@@ -180,12 +227,36 @@ def topk_select_sm90(
             )
         nvp = num_valid_pages.to(torch.int32).contiguous()
 
-    # The kernel emits (Hq, total_q, topk); this op returns (total_q, Hq, topk).
+    hq, tiles, total_q = (int(x) for x in max_score.shape)
+    from ..utils import get_device_sm_count
+    from .cake_hopper_sm90 import hopper_msa_topk_select, topk_route_available
+
+    # The Cake program writes the op's (total_q, Hq, topk) layout directly, so
+    # it needs neither the permuted view nor the staging copy below.
+    if topk_route_available(
+        num_heads=hq,
+        tiles=tiles,
+        total_q=total_q,
+        num_sms=int(get_device_sm_count(max_score.device)),
+        masked=force_begin_blocks > 0 or force_end_blocks > 0,
+        nvp=nvp is not None,
+    ):
+        return hopper_msa_topk_select(
+            max_score,
+            topk,
+            output,
+            num_valid_pages=nvp,
+            force_begin_blocks=force_begin_blocks,
+            force_end_blocks=force_end_blocks,
+        )
+
+    from .cute_dsl.topk_select_sm90 import run as _topk
+
+    # The CuTe kernel emits (Hq, total_q, topk); this op returns (total_q, Hq, topk).
     # Permuting the caller's buffer gives the kernel's view for free whenever that
     # view is contiguous -- always so for the MQA indexer (Hq == 1), which is the
     # MiniMax-M3 path. Staging through a temporary instead costs an allocation and
     # a copy launch, ~12us against a ~7us kernel, so only pay it when forced.
-    hq, _, total_q = max_score.shape
     view = output.permute(1, 0, 2)
     if view.is_contiguous():
         _topk(max_score, None, None, view, nvp, force_begin_blocks, force_end_blocks)
@@ -283,7 +354,41 @@ def sparse_prefill_sm90(
     softmax_scale: Optional[float] = None,
     v_global_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """MSA sparse prefill attention on Hopper. Writes ``out``."""
+    """MSA sparse prefill attention on Hopper. Writes ``out``.
+
+    The Cake programs take ``softmax_scale`` as a kernel parameter, derive the
+    query positions from ``seqused_k`` in the kernel when no ``q_offset`` is
+    given, and read K and V through their own strides, so they allocate
+    nothing per call (CUDA-graph capturable as is).  Query ``i`` of sequence
+    ``b`` attends the keys of its selected blocks at positions
+    ``<= q_offset[b] + i``.
+    """
+    from .cake_hopper_sm90 import hopper_msa_sparse_attention, prefill_route_available
+
+    if prefill_route_available(
+        num_q_heads=q.shape[1],
+        num_kv_heads=k.shape[1],
+        max_pages=int(page_table.shape[1]),
+    ):
+        _as_packed_kv(k, v)
+        hopper_msa_sparse_attention(
+            q,
+            k,
+            v,
+            q2k_indices.to(torch.int32).contiguous(),
+            cu_seqlens_q.to(torch.int32).contiguous(),
+            page_table=page_table.to(torch.int32).contiguous(),
+            seqused_k=seqused_k.to(torch.int32).contiguous(),
+            out=out,
+            q_offset=(
+                q_offset.to(torch.int32).contiguous() if q_offset is not None else None
+            ),
+            softmax_scale=softmax_scale,
+        )
+        if v_global_scale is not None and v_global_scale != 1.0:
+            out.mul_(v_global_scale)
+        return out
+
     if int(page_table.shape[1]) > _MPG_UNION_MAX:
         from .cute_dsl.sparse_prefill_single_sm90 import run as _prefill
     else:

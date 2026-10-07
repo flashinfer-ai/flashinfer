@@ -278,9 +278,10 @@ def msa_proxy_score(
     output: Optional[torch.Tensor] = None,
     reduce_heads: bool = False,
     q_offset=None,
+    use_fp32_acc: bool = True,
 ) -> torch.Tensor:
-    """MSA dense proxy pass for SM120/SM121: per-KV-block max attention
-    logits.
+    """MSA dense proxy pass for SM90 and SM120/SM121: per-KV-block max
+    attention logits.
 
     Computes ``max_score[h, t, q]``, the maximum of the unscaled,
     causally-masked ``Q K^T`` logits over the 128 tokens of KV block ``t``,
@@ -342,6 +343,14 @@ def msa_proxy_score(
         future optimization (saves materializing the per-head buffer).
     q_offset : int or torch.Tensor, optional
         Optional query-position offset used by the causal alignment logic.
+    use_fp32_acc : bool, default=True
+        Accumulation precision of the fp8 ``Q K^T`` products in the SM90
+        prefill regime (``max_seqlen_q > 4``). ``True`` accumulates the exact
+        products in f32 (the original MSA numerics); ``False`` accumulates in
+        f16, the numerics of the SM90 CuTe DSL prefill kernel. The SM90 decode
+        regime and the SM120/SM121 kernels accumulate in f32 whichever value is
+        given; ``False`` is accepted there as a request for at most f16
+        precision, which f32 accumulation satisfies.
 
     Returns
     -------
@@ -453,6 +462,7 @@ def msa_proxy_score(
             batch_size=batch_size,
             kv_fp8=kv_fp8,
             q_offset=q_offset if isinstance(q_offset, torch.Tensor) else None,
+            use_fp32_acc=use_fp32_acc,
         )
         if not reduce_heads:
             return per_head

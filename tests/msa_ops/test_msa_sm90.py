@@ -5,8 +5,14 @@ of it runs here. SM90 also supports a deliberately narrower surface than SM12x -
 paged KV only, fp8 index cache for prefill, no LSE, no per-tensor KV dequant
 scales -- so those cases cannot simply be un-gated. This file covers what SM90
 does support and pins each restriction to the error it is supposed to raise.
+
+The reference checks compare every SM90 operation against an FP32 torch oracle
+over the same selected blocks (bf16 outputs at atol = rtol = 1e-2, top-k
+indices exactly), including both accumulation precisions of the proxy-score
+prefill regime (``use_fp32_acc``).
 """
 
+import itertools
 import math
 
 import pytest
@@ -80,6 +86,135 @@ def _decode_inputs(
     return q, k, v, idx, page_table, seqused_k
 
 
+def _proxy_prefill_inputs(batch=2, chunk=512, ctx=2048, hq=4, seed=0):
+    """A chunked-prefill scoring call: ``chunk`` fp8 query tokens per sequence
+    sitting at the end of a ``ctx``-token paged fp8 index cache (one index head),
+    permuted page table, a page tail of 37 tokens."""
+    torch.manual_seed(seed)
+    pages = ctx // BLK_KV
+    npages = pages * batch
+    total_q = chunk * batch
+    q = (torch.randn(total_q, hq, HEAD_DIM, device="cuda") / 3).to(torch.float8_e4m3fn)
+    k = (torch.randn(npages, 1, BLK_KV, HEAD_DIM, device="cuda") / 3).to(
+        torch.float8_e4m3fn
+    )
+    page_table = (
+        torch.randperm(npages, device="cuda").to(torch.int32).view(batch, pages)
+    )
+    cu_q = torch.arange(0, total_q + 1, chunk, dtype=torch.int32, device="cuda")
+    seqused_k = torch.full((batch,), ctx - 37, dtype=torch.int32, device="cuda")
+    return q, k, cu_q, page_table, seqused_k, pages
+
+
+def _proxy_prefill_reference(q, k, cu_q, page_table, seqused_k, pages):
+    """FP32 per-block causal max of ``Q K^T`` (query ``i`` of sequence ``b`` at
+    position ``seqused_k[b] - qlen_b + i``); blocks without a visible key are -inf."""
+    hq = q.shape[1]
+    batch = seqused_k.numel()
+    ref = torch.full((hq, pages, q.shape[0]), float("-inf"), device=q.device)
+    qf = q.float()
+    kf = k.float()[:, 0]
+    for b in range(batch):
+        q0, q1 = int(cu_q[b]), int(cu_q[b + 1])
+        kv_len = int(seqused_k[b])
+        qpos = torch.arange(kv_len - (q1 - q0), kv_len, device=q.device)
+        for t in range(pages):
+            kpos = t * BLK_KV + torch.arange(BLK_KV, device=q.device)
+            visible = (kpos[None, :] <= qpos[:, None]) & (kpos[None, :] < kv_len)
+            if not bool(visible.any()):
+                continue
+            logits = torch.einsum("qhd,kd->hqk", qf[q0:q1], kf[int(page_table[b, t])])
+            logits = logits.masked_fill(~visible[None], float("-inf"))
+            ref[:, t, q0:q1] = logits.amax(dim=-1)
+    return ref
+
+
+def _topk_reference(scores, nvp, fb, fe):
+    """Exact top-k over the valid blocks of every (token, head): forced sink /
+    window blocks first, the largest remaining scores, ascending, -1 padded."""
+    hq, tiles, total_q = scores.shape
+    out = torch.full((total_q, hq, TOPK), -1, dtype=torch.int32, device=scores.device)
+    for t in range(total_q):
+        valid = tiles if nvp is None else int(nvp[t])
+        forced = sorted(set(range(fb)) | set(range(max(valid - fe, 0), valid)))
+        for h in range(hq):
+            column = scores[h, :valid, t]
+            finite = torch.isfinite(column)
+            cands = [i for i in range(valid) if bool(finite[i]) and i not in forced]
+            chosen = list(forced)
+            take = min(TOPK - len(chosen), len(cands))
+            if take > 0:
+                picks = torch.topk(column[cands], take).indices.tolist()
+                chosen.extend(cands[i] for i in picks)
+            chosen.sort()
+            out[t, h, : len(chosen)] = torch.tensor(
+                chosen, dtype=torch.int32, device=scores.device
+            )
+    return out
+
+
+def _prefill_inputs(hq, hkv, pages, q_lens, seed=0):
+    """Ragged sparse-prefill batch against a paged, interleaved fp8 KV cache:
+    every token selects block 0 plus 15 distinct other blocks of its sequence."""
+    torch.manual_seed(seed)
+    batch = len(q_lens)
+    npages = pages * batch
+    total_q = sum(q_lens)
+    base = (torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 3).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    q = (torch.randn(total_q, hq, HEAD_DIM, device="cuda") / 3).to(torch.bfloat16)
+    page_table = (
+        torch.randperm(npages, device="cuda").to(torch.int32).view(batch, pages)
+    )
+    seqused_k = torch.tensor(
+        [pages * BLK_KV - 13 * (b + 1) for b in range(batch)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    cu_q = torch.tensor(
+        [0] + list(itertools.accumulate(q_lens)), dtype=torch.int32, device="cuda"
+    )
+    idx = torch.empty(hkv, total_q, TOPK, dtype=torch.int32, device="cuda")
+    for b in range(batch):
+        nblk = (int(seqused_k[b]) + BLK_KV - 1) // BLK_KV
+        q0, q1 = int(cu_q[b]), int(cu_q[b + 1])
+        others = torch.rand(hkv, q1 - q0, nblk - 1, device="cuda").argsort(dim=-1)
+        idx[:, q0:q1, 0] = 0
+        idx[:, q0:q1, 1:] = (others[..., : TOPK - 1] + 1).to(torch.int32)
+    return q, k, v, idx.contiguous(), cu_q, page_table, seqused_k
+
+
+def _prefill_reference(q, k, v, idx, cu_q, page_table, seqused_k):
+    """FP32 causal softmax attention of every token over its selected blocks."""
+    total_q, hq, _ = q.shape
+    hkv = k.shape[1]
+    group = hq // hkv
+    kf, vf = k.float(), v.float()
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    ref = torch.empty(total_q, hq, HEAD_DIM, device=q.device)
+    offsets = torch.arange(BLK_KV, device=q.device)
+    for b in range(seqused_k.numel()):
+        q0, q1 = int(cu_q[b]), int(cu_q[b + 1])
+        kv_len = int(seqused_k[b])
+        for i in range(q1 - q0):
+            qpos = kv_len - (q1 - q0) + i
+            for h in range(hkv):
+                blocks = idx[h, q0 + i].long()
+                phys = page_table[b, blocks].long()
+                kpos = blocks[:, None] * BLK_KV + offsets[None, :]
+                visible = (kpos <= qpos) & (kpos < kv_len)
+                qh = q[q0 + i, h * group : (h + 1) * group].float()
+                logits = torch.einsum("gd,bkd->gbk", qh, kf[phys, h]) * scale
+                logits = logits.masked_fill(~visible[None], float("-inf"))
+                probs = torch.softmax(logits.reshape(group, -1), dim=-1)
+                ref[q0 + i, h * group : (h + 1) * group] = probs @ vf[phys, h].reshape(
+                    -1, HEAD_DIM
+                )
+    return ref
+
+
 # ---------------------------------------------------------------------------
 # correctness
 # ---------------------------------------------------------------------------
@@ -150,6 +285,166 @@ def test_proxy_score_paged_fp8_runs():
     )
     assert out.shape[-1] == total_q
     assert out.dtype == torch.float32
+
+
+@sm90_only
+@pytest.mark.parametrize("use_fp32_acc", [True, False])
+def test_proxy_score_prefill_matches_fp32_reference(use_fp32_acc):
+    """Chunked-prefill scoring against the FP32 oracle in both accumulation
+    precisions: f32 (default) and f16 (the CuTe DSL kernel's numerics); -inf
+    blocks must match exactly."""
+    q, k, cu_q, page_table, seqused_k, pages = _proxy_prefill_inputs()
+    out = msa_proxy_score(
+        q,
+        k,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=512,
+        max_k_tiles=pages,
+        use_fp32_acc=use_fp32_acc,
+    )
+    ref = _proxy_prefill_reference(q, k, cu_q, page_table, seqused_k, pages)
+    finite = torch.isfinite(ref)
+    assert torch.equal(torch.isfinite(out), finite)
+    torch.testing.assert_close(out[finite], ref[finite], atol=1e-2, rtol=1e-2)
+
+
+@sm90_only
+def test_proxy_score_prefill_defaults_to_fp32_accumulation():
+    """The keyword's default is the exact f32 path, bitwise."""
+    q, k, cu_q, page_table, seqused_k, pages = _proxy_prefill_inputs(seed=1)
+    common = dict(
+        page_table=page_table, seqused_k=seqused_k, max_seqlen_q=512, max_k_tiles=pages
+    )
+    default = msa_proxy_score(q, k, cu_q, **common)
+    fp32 = msa_proxy_score(q, k, cu_q, use_fp32_acc=True, **common)
+    assert torch.equal(default, fp32)
+
+
+@sm90_only
+def test_proxy_score_prefill_honours_q_offset():
+    """An explicit per-sequence query offset replaces the end-of-sequence alignment."""
+    q, k, cu_q, page_table, seqused_k, pages = _proxy_prefill_inputs(seed=2)
+    batch = seqused_k.numel()
+    offset = torch.full((batch,), 300, dtype=torch.int32, device="cuda")
+    out = msa_proxy_score(
+        q,
+        k,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=512,
+        max_k_tiles=pages,
+        q_offset=offset,
+    )
+    # the reference aligns on seqused_k - qlen: emulate the offset by shortening
+    # the sequence so that position 300 + i is where query i sits
+    shortened = offset + 512
+    ref = _proxy_prefill_reference(q, k, cu_q, page_table, shortened, pages)
+    # keys beyond seqused_k are invalid for the kernel but not for the shortened
+    # reference: restrict the comparison to the blocks both consider valid
+    valid_pages = (int(seqused_k[0]) + BLK_KV - 1) // BLK_KV
+    finite = torch.isfinite(ref)
+    assert torch.equal(torch.isfinite(out), finite)
+    torch.testing.assert_close(
+        out[:, :valid_pages][finite[:, :valid_pages]],
+        ref[:, :valid_pages][finite[:, :valid_pages]],
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+@sm90_only
+def test_topk_select_matches_reference_from_inf_validity():
+    """Validity read from the -inf tiles the proxy pass writes, including a token
+    with fewer than 16 valid blocks (-1 padded)."""
+    torch.manual_seed(0)
+    hq, tiles, total_q = 2, 48, 37
+    scores = torch.randn(hq, tiles, total_q, dtype=torch.float32, device="cuda")
+    valid = torch.randint(16, tiles + 1, (total_q,), device="cuda")
+    valid[5] = 10
+    for t in range(total_q):
+        scores[:, int(valid[t]) :, t] = float("-inf")
+    out = msa_topk_select(scores, TOPK)
+    assert torch.equal(out, _topk_reference(scores, None, 0, 0))
+
+
+@sm90_only
+def test_topk_select_matches_reference_with_valid_pages_and_forced_blocks():
+    """Per-token num_valid_pages clamps the candidates; forced sink / window
+    blocks are selected regardless of their scores."""
+    torch.manual_seed(1)
+    hq, tiles, total_q = 1, 64, 53
+    scores = torch.randn(hq, tiles, total_q, dtype=torch.float32, device="cuda")
+    nvp = torch.randint(20, tiles + 1, (total_q,), dtype=torch.int32, device="cuda")
+    out = msa_topk_select(
+        scores, TOPK, num_valid_pages=nvp, force_begin_blocks=1, force_end_blocks=2
+    )
+    assert torch.equal(out, _topk_reference(scores, nvp, 1, 2))
+
+
+@sm90_only
+@pytest.mark.parametrize(
+    "num_qo_heads,num_kv_heads,pages,q_lens",
+    [
+        (8, 1, 16, (96, 160)),  # GQA 8, 16 pages per sequence
+        (8, 2, 32, (64, 100)),  # GQA 4, two KV heads
+        (16, 1, 80, (64, 100)),  # GQA 16, 80 pages per sequence
+    ],
+)
+def test_sparse_prefill_matches_fp32_reference(
+    num_qo_heads, num_kv_heads, pages, q_lens
+):
+    """Ragged paged sparse prefill against the FP32 oracle over the selected blocks."""
+    q, k, v, idx, cu_q, page_table, seqused_k = _prefill_inputs(
+        num_qo_heads, num_kv_heads, pages, q_lens
+    )
+    out = msa_sparse_attention(
+        q, k, v, idx, cu_q, causal=True, page_table=page_table, seqused_k=seqused_k
+    )
+    assert out.shape == q.shape and out.dtype == q.dtype
+    ref = _prefill_reference(q, k, v, idx, cu_q, page_table, seqused_k)
+    torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+
+@sm90_only
+def test_sparse_prefill_writes_out_and_scales_v():
+    """``out=`` is written in place (no allocation) and ``v_global_scale`` scales it."""
+    q, k, v, idx, cu_q, page_table, seqused_k = _prefill_inputs(
+        8, 1, 16, (40, 72), seed=3
+    )
+    plain = msa_sparse_attention(
+        q, k, v, idx, cu_q, causal=True, page_table=page_table, seqused_k=seqused_k
+    )
+    out = torch.empty_like(q)
+    returned = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        causal=True,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        out=out,
+    )
+    assert returned is out
+    assert torch.equal(out, plain)
+    scaled = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        causal=True,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        v_global_scale=0.5,
+    )
+    torch.testing.assert_close(
+        scaled.float(), plain.float() * 0.5, atol=1e-2, rtol=1e-2
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +537,67 @@ def test_multiple_captured_graph_sizes_stay_valid():
     torch.cuda.synchronize()
     for o in outs:
         assert torch.isfinite(o.float()).all()
+
+
+@sm90_only
+def test_prefill_pipeline_replays_bitwise_from_cuda_graph():
+    """Proxy score (prefill regime), top-k select and sparse prefill capture into
+    one graph and replay bitwise against their eager results."""
+    # 32 pages so that every query of the 256-token chunk sees at least 16
+    # finite blocks: the selection never carries -1 padding into the prefill
+    q, k, cu_q, page_table, seqused_k, pages = _proxy_prefill_inputs(
+        batch=2, chunk=256, ctx=4096, hq=1, seed=4
+    )
+    scores = torch.empty((1, pages, q.shape[0]), dtype=torch.float32, device="cuda")
+    sel = torch.empty((q.shape[0], 1, TOPK), dtype=torch.int32, device="cuda")
+    nvp = torch.randint(16, pages + 1, (q.shape[0],), dtype=torch.int32, device="cuda")
+    aq, ak, av, _idx, acu, apt, ask = _prefill_inputs(8, 1, 32, (256, 256), seed=4)
+    aout = torch.empty_like(aq)
+
+    def pipeline():
+        msa_proxy_score(
+            q,
+            k,
+            cu_q,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_q=256,
+            max_k_tiles=pages,
+            output=scores,
+        )
+        msa_topk_select(
+            scores, TOPK, num_valid_pages=nvp, output=sel, force_begin_blocks=1
+        )
+        msa_sparse_attention(
+            aq,
+            ak,
+            av,
+            sel.permute(1, 0, 2).contiguous(),
+            acu,
+            causal=True,
+            page_table=apt,
+            seqused_k=ask,
+            out=aout,
+        )
+
+    for _ in range(2):  # warm the compile caches outside capture
+        pipeline()
+    torch.cuda.synchronize()
+    eager = (scores.clone(), sel.clone(), aout.clone())
+    scores.zero_()
+    sel.fill_(-7)
+    aout.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        pipeline()
+    scores.zero_()
+    sel.fill_(-7)
+    aout.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(scores, eager[0])
+    assert torch.equal(sel, eager[1])
+    assert torch.equal(aout, eager[2])
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +740,18 @@ def test_bf16_kv_cache_is_rejected_by_sparse_attention():
             cu_q,
             page_table=page_table,
             seqused_k=seqused_k,
+        )
+
+
+@sm90_only
+def test_sparse_attention_rejects_causal_false():
+    """Every SM90 sparse-prefill schedule is causal; the flag used to be ignored."""
+    q, k, v, idx, cu_q, page_table, seqused_k = _prefill_inputs(
+        8, 1, 16, (32, 32), seed=5
+    )
+    with pytest.raises(NotImplementedError, match="causal"):
+        msa_sparse_attention(
+            q, k, v, idx, cu_q, page_table=page_table, seqused_k=seqused_k
         )
 
 
