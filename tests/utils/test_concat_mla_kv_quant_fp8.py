@@ -197,6 +197,7 @@ def test_launch_args_follow_the_generated_arg_plan():
             ["parameter", "num_heads"],
             ["parameter", "head_pairs"],
             ["parameter", "warps_per_token"],
+            ["parameter", "k_pe_row_stride"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
@@ -211,6 +212,7 @@ def test_launch_args_follow_the_generated_arg_plan():
         "num_heads": 12,
         "head_pairs": 6,
         "warps_per_token": 2,
+        "k_pe_row_stride": 576,
     }
     assert cake_concat_mla_kv_quant_fp8.launch_args(record, values, (2, 1, 1)) == (
         "kv",
@@ -221,6 +223,7 @@ def test_launch_args_follow_the_generated_arg_plan():
         12,
         6,
         2,
+        576,
         2,
         1,
         1,
@@ -356,6 +359,76 @@ def test_k_pe_3d_and_preallocated_outputs():
     ref_key, ref_value = _reference(kv, pe)
     assert torch.equal(key.view(torch.uint8), ref_key)
     assert torch.equal(value.view(torch.uint8), ref_value)
+
+
+def _strided_k_pe(pe: torch.Tensor, row_stride: int, col_offset: int) -> torch.Tensor:
+    """``pe`` placed as columns [col_offset, col_offset + 64) of a [T, row_stride] bf16 workspace (other columns noise)."""
+    T = pe.shape[0]
+    workspace = (torch.randn(T, row_stride, device="cuda") * 3).to(torch.bfloat16)
+    view = workspace[:, col_offset : col_offset + ROPE]
+    view.copy_(pe)
+    assert view.stride() == (row_stride, 1) and not view.is_contiguous()
+    return view
+
+
+@requires_fused_dispatch
+@pytest.mark.parametrize(("T", "H"), [(129, 13), (1536, 12), (3, 1)])
+@pytest.mark.parametrize(
+    ("row_stride", "col_offset"),
+    [(576, 512), (576, 0), (128, 64), (80, 16)],
+)
+def test_strided_k_pe_byte_exact(T, H, row_stride, col_offset):
+    """A row-strided k_pe (vLLM's non-DCP prefill passes the last 64 columns of
+    the [T, 576] latent; 32-byte-aligned rows) is served by the fused kernel
+    byte-exactly, without a contiguous copy."""
+    kv, pe = _inputs(T, H)
+    pe_view = _strided_k_pe(pe, row_stride, col_offset)
+    assert (
+        mla_kv_pack._specialized_supported(
+            kv,
+            pe_view,
+            torch.empty(T, H, NOPE + ROPE, dtype=torch.float8_e4m3fn, device="cuda"),
+            torch.empty(T, H, V, dtype=torch.float8_e4m3fn, device="cuda"),
+            NOPE,
+        )
+        is None
+    )
+    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
+    key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe_view)
+    assert (
+        mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
+        == before + 1
+    )
+    ref_key, ref_value = _reference(kv, pe)
+    assert torch.equal(key.view(torch.uint8), ref_key)
+    assert torch.equal(value.view(torch.uint8), ref_value)
+    # the [T, 1, 64] view of the same strided columns
+    key3, value3 = flashinfer.concat_mla_kv_quant_fp8(kv, pe_view.unsqueeze(1))
+    assert torch.equal(key3.view(torch.uint8), ref_key)
+    assert torch.equal(value3.view(torch.uint8), ref_value)
+
+
+@pytest.mark.parametrize(
+    ("row_stride", "col_offset", "reason"),
+    [(72, 8, "non_contiguous"), (576, 8, "alignment")],
+)
+def test_inadmissible_k_pe_layout_takes_fallback(row_stride, col_offset, reason):
+    """Row strides that are not 32-byte multiples, or a base that is only
+    16-byte aligned, take the composable torch path (256-bit lane loads)."""
+    kv, pe = _inputs(257, 12)
+    pe_view = _strided_k_pe(pe, row_stride, col_offset)
+    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["fallback_reasons"].get(
+        reason, 0
+    )
+    key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe_view)
+    assert (
+        mla_kv_pack._concat_mla_kv_quant_fp8_stats()["fallback_reasons"][reason]
+        == before + 1
+    )
+    if _torch_cast_saturates():
+        ref_key, ref_value = _reference(kv, pe)
+        assert torch.equal(key.view(torch.uint8), ref_key)
+        assert torch.equal(value.view(torch.uint8), ref_value)
 
 
 def test_non_contiguous_takes_fallback():

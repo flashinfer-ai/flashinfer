@@ -75,6 +75,8 @@ def launch(
         "num_heads": num_heads,
         "head_pairs": (num_heads + 1) // 2,
         "warps_per_token": int(warps_per_token),
+        # k_pe rows may be a column slice of a wider workspace (unit last stride, 16-byte-aligned rows).
+        "k_pe_row_stride": int(k_pe.stride(0)),
     }
     args = launch_args(record, values, (int(grid), 1, 1))
     with tvm_ffi.use_torch_stream():

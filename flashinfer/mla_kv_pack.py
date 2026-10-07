@@ -230,6 +230,21 @@ def _fallback(
     return key, value
 
 
+def _k_pe_rows_admissible(k_pe: torch.Tensor) -> bool:
+    """``k_pe`` ``[T, 64]`` may be a column slice of a wider row-major workspace
+    (vLLM's non-DCP prefill passes the last 64 columns of the ``[T, 576]``
+    latent): unit last stride and a 32-byte-aligned row stride (a multiple of
+    16 elements) of at least one row, because the generated kernels issue
+    256-bit lane loads.  They take the row stride in elements."""
+    if k_pe.dim() != 2:
+        return False
+    if k_pe.shape[0] == 1:
+        return k_pe.stride(1) == 1
+    return (
+        k_pe.stride(1) == 1 and k_pe.stride(0) % 16 == 0 and k_pe.stride(0) >= ROPE_DIM
+    )
+
+
 def _specialized_supported(
     kv_nope: torch.Tensor,
     k_pe: torch.Tensor,
@@ -253,14 +268,13 @@ def _specialized_supported(
         return "head_geometry"
     if key.shape[-1] != _QK_DIM or value.shape[-1] != V_DIM:
         return "output_geometry"
-    if not (
-        kv_nope.is_contiguous()
-        and k_pe.is_contiguous()
-        and key.is_contiguous()
-        and value.is_contiguous()
-    ):
+    if not (kv_nope.is_contiguous() and key.is_contiguous() and value.is_contiguous()):
         return "non_contiguous"
-    if any(t.data_ptr() % 16 for t in (kv_nope, k_pe, key, value)):
+    if not _k_pe_rows_admissible(k_pe):
+        return "non_contiguous"
+    # 256-bit lane loads: every base must be 32-byte aligned (torch allocations
+    # are; a 16-byte-aligned slice is not and takes the fallback).
+    if any(t.data_ptr() % 32 for t in (kv_nope, k_pe, key, value)):
         return "alignment"
     allowlist = _load_allowlist()
     if allowlist is None:

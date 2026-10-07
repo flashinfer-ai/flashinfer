@@ -57,7 +57,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_concat_mla_kv_quant_fp8_c0cfcdc78ae960cd4a69(const __nv_bfloat16* __restrict__ kv_nope, const __nv_bfloat16* __restrict__ k_pe, uint8_t* __restrict__ key, uint8_t* __restrict__ value, int num_tokens, int num_heads, int head_pairs, int warps_per_token)
+kernel_cake_concat_mla_kv_quant_fp8_982430f4a5a8e3e38334(const __nv_bfloat16* __restrict__ kv_nope, const __nv_bfloat16* __restrict__ k_pe, uint8_t* __restrict__ key, uint8_t* __restrict__ value, int num_tokens, int num_heads, int head_pairs, int warps_per_token, int k_pe_row_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -89,7 +89,7 @@ kernel_cake_concat_mla_kv_quant_fp8_c0cfcdc78ae960cd4a69(const __nv_bfloat16* __
         long long kv_off = (long long)token * kv_elems_per_token + (long long)(pair0 * 512 + head_select * 256 + sub * 16);
         long long dst_off = (long long)token * lane_elems_per_token + (long long)(pair0 * 2 + head_select) * lane_head_stride + (long long)(piece * 16);
         long long dst_pair_step = 2 * lane_head_stride;
-        long long rope_src = (long long)token * 64 + (long long)(rope_piece * 16);
+        long long rope_src = (long long)token * (long long)k_pe_row_stride + (long long)(rope_piece * 16);
         long long rope_dst = (long long)token * key_elems_per_token + (long long)(pair0 * 2 + rope_hsel) * 192 + (long long)(128 + rope_piece * 16);
         int head0 = pair0 * 2 + head_select;
         unsigned int words[24];
