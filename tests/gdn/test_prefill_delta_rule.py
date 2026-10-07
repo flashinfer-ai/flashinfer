@@ -23,7 +23,7 @@ import random
 import torch
 import pytest
 
-from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule
+from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule, delta_rule
 
 from flashinfer.utils import (
     is_sm90a_supported,
@@ -86,10 +86,13 @@ def _test_prefill_kernel(
     beta: bool,
     use_cp: bool,
     seed: int | None = None,
+    head_size_v: int | None = None,
 ):
     _skip_if_unsupported()
     if use_cp:
         _skip_if_cp_unsupported()
+    if head_size_v is None:
+        head_size_v = head_size
     if not alpha and not beta:
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
@@ -109,7 +112,13 @@ def _test_prefill_kernel(
     device = torch.device("cuda")
     with device:
         q, k, v = qkv_factory(
-            seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+            seq_lens,
+            num_q_heads,
+            num_k_heads,
+            num_v_heads,
+            head_size,
+            dtype,
+            head_size_v=head_size_v,
         )
         # l2 norm k to avoid numerical instability
         k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
@@ -118,10 +127,11 @@ def _test_prefill_kernel(
         beta = torch.rand(total_seqlen, num_sab_heads) if beta else None
 
     our_o = torch.empty(
-        [total_seqlen, num_o_heads, head_size], dtype=q.dtype, device=q.device
+        [total_seqlen, num_o_heads, head_size_v], dtype=q.dtype, device=q.device
     )
+    # Kernel state layout is [N, H, V, K]; the reference is [N, H, K, V].
     our_state = torch.empty(
-        (num_seqs, num_sab_heads, head_size, head_size),
+        (num_seqs, num_sab_heads, head_size_v, head_size),
         dtype=torch.float32,
         device=q.device,
     )
@@ -243,8 +253,8 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])
-@pytest.mark.parametrize("use_cp", [False, True])
-@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("use_cp", [False, True], ids=lambda cp: f"cp{int(cp)}")
+@pytest.mark.parametrize("head_size", [128, 64], ids=lambda head_size: f"dk{head_size}")
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [
@@ -261,6 +271,9 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
 @pytest.mark.parametrize("seq_lens", [[64], [128], [256], [256, 256], [64, 128, 512]])
 @pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize(
+    "head_size_v", [128, 64], ids=lambda head_size: f"dv{head_size}"
+)
 def test_prefill_kernel_basic(
     qkv_factory,
     dtype: str,
@@ -274,8 +287,22 @@ def test_prefill_kernel_basic(
     alpha: bool,
     beta: bool,
     use_cp: bool,
+    head_size_v: int,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
+    if head_size != head_size_v:
+        device = torch.device("cuda")
+        cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+        if not is_sm90a_supported(device) and not (
+            is_sm100a_supported(device) and cuda_major >= 13
+        ):
+            pytest.skip("DV != DK requires SM100 or SM90")
+
+    if head_size_v > head_size:
+        pytest.skip("DV > DK is not supported")
+    if use_cp and (head_size, head_size_v) != (128, 128):
+        pytest.skip("CP path only supports square DK=DV=128")
+
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_prefill_kernel(
         qkv_factory,
@@ -291,6 +318,7 @@ def test_prefill_kernel_basic(
         beta,
         use_cp,
         seed,
+        head_size_v,
     )
 
 
@@ -349,6 +377,64 @@ def test_prefill_kernel_nonfull(
         use_cp,
         seed,
     )
+
+
+@pytest.mark.parametrize(
+    "head_size, head_size_v", [(128, 128), (128, 64)], ids=lambda hs: f"{hs}"
+)
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads", [(8, 8, 8), (8, 8, 16)]
+)
+@pytest.mark.parametrize("seq_lens", [[64], [64, 128, 200]])
+def test_reference_blockwise_matches_sequential(
+    qkv_factory,
+    seq_lens: list[int],
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    head_size_v: int,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    """The chunked matrix-form reference agrees with the sequential one.
+
+    Reference-vs-reference in fp32, so it runs on any CUDA device.  This is what
+    pins the rectangular-state generalisation of ``blockwise_delta_rule`` -- the
+    reference every GDN prefill kernel test is checked against -- without
+    needing an SM100 GPU.
+    """
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    total_seqlen = sum(seq_lens)
+    num_sab_heads = max(num_q_heads, num_v_heads)
+    device = torch.device("cuda")
+    with device:
+        q, k, v = qkv_factory(
+            seq_lens,
+            num_q_heads,
+            num_k_heads,
+            num_v_heads,
+            head_size,
+            torch.float32,
+            head_size_v=head_size_v,
+        )
+        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+        alpha = torch.rand(total_seqlen, num_sab_heads)
+        beta = torch.rand(total_seqlen, num_sab_heads)
+
+    blk_o, blk_state = blockwise_delta_rule(
+        q, k, v, seq_lens, alpha=alpha, beta=beta, block_size=64
+    )
+    seq_o, seq_state = delta_rule(q, k, v, seq_lens, alpha=alpha, beta=beta)
+
+    assert blk_o.shape == (total_seqlen, num_sab_heads, head_size_v)
+    assert blk_state.shape == (len(seq_lens), num_sab_heads, head_size, head_size_v)
+    # Two fp32 formulations of the same recurrence: measured max abs diff is
+    # ~7e-7, so 1e-5 leaves >10x headroom while still catching a real drift.
+    torch.testing.assert_close(blk_o, seq_o, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(blk_state, seq_state, atol=1e-5, rtol=1e-4)
 
 
 @pytest.mark.parametrize("use_cp", [False, True])

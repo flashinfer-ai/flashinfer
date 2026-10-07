@@ -605,6 +605,11 @@ def _cp_delta_rule_rejection_reason(
         return "CP delta rule is currently implemented only for SM90, SM100, and SM120"
     if q.shape[-1] != 128:
         return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
+    if v.shape[-1] != q.shape[-1]:
+        return (
+            "CP delta rule requires head_size_v == head_size_k, got "
+            f"{v.shape[-1]} != {q.shape[-1]}"
+        )
     if q.dtype not in (torch.float16, torch.bfloat16):
         return f"CP delta rule only supports fp16/bf16 inputs, got {q.dtype}"
     if k.dtype != q.dtype or v.dtype != q.dtype or output.dtype != q.dtype:
@@ -869,8 +874,16 @@ def chunk_gated_delta_rule(
     num_q_heads = q.size(1)
     num_v_heads = v.size(1)
     head_size = q.size(2)
+    # Rectangular state: the value and output head dim may be narrower than the
+    # key one. Only the SM100 kernel implements head_size_v < head_size.
+    head_size_v = v.size(2)
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
+    if head_size_v > head_size:
+        raise NotImplementedError(
+            f"head_size_v ({head_size_v}) must not exceed head_size "
+            f"({head_size}); wider values than keys are not supported"
+        )
 
     if backend == "cudnn":
         from .cudnn import cudnn_chunk_gated_delta_rule
@@ -936,20 +949,20 @@ def chunk_gated_delta_rule(
         expected_shape = (
             state_checkpoints.size(0),
             num_sab_heads,
-            head_size,
+            head_size_v,
             head_size,
         )
         if tuple(state_checkpoints.shape[1:]) != expected_shape[1:]:
             raise ValueError(
                 f"state_checkpoints shape mismatch: expected "
-                f"[*, {num_sab_heads}, {head_size}, {head_size}], "
+                f"[*, {num_sab_heads}, {head_size_v}, {head_size}], "
                 f"got {list(state_checkpoints.shape)}"
             )
 
     # Allocate output if not provided
     if output is None:
         output = torch.empty(
-            (total_seq_len, num_o_heads, head_size),
+            (total_seq_len, num_o_heads, head_size_v),
             dtype=q.dtype,
             device=q.device,
         )
@@ -1185,8 +1198,11 @@ def chunk_gated_delta_rule(
             raise NotImplementedError("Blackwell GDN prefill kernel is unavailable")
 
         # Blackwell SM100 and SM103 path (CuTe DSL kernel)
-        assert head_size == 128, (
-            f"Blackwell GDN prefill requires head_size=128, got {head_size}"
+        assert head_size in (64, 128), (
+            f"Blackwell GDN prefill requires head_size=64 or 128, got {head_size}"
+        )
+        assert head_size_v in (64, 128), (
+            f"Blackwell GDN prefill requires head_size_v=64 or 128, got {head_size_v}"
         )
 
         # Allocate output_state only when needed
@@ -1194,7 +1210,7 @@ def chunk_gated_delta_rule(
             output_state = None
         elif output_state is None:
             output_state = torch.empty(
-                (num_seqs, num_sab_heads, head_size, head_size),
+                (num_seqs, num_sab_heads, head_size_v, head_size),
                 dtype=torch.float32,
                 device=device,
             )
@@ -1266,7 +1282,7 @@ def chunk_gated_delta_rule(
 
         if output_state is None:
             output_state = torch.empty(
-                (num_seqs, num_sab_heads, head_size, head_size),
+                (num_seqs, num_sab_heads, head_size_v, head_size),
                 dtype=torch.float32,
                 device=device,
             )
