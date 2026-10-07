@@ -6,6 +6,7 @@ Examples (run on an otherwise idle allocated GPU):
   python benchmarks/bench_cudnn_linear_attention.py --family kda --lengths 8192 --heads 16 --output kda.json
   python benchmarks/bench_cudnn_linear_attention.py --family kda --lengths 8192 --heads 16 --backends native-auto,auto,cudnn --output kda-auto.json
   python benchmarks/bench_cudnn_linear_attention.py --family gdn --lengths 1024,3072 --heads 4 --value-heads 8 --state-dtype fp32 --backends auto,cake_gdn,cake_gdn_cp,cudnn --output gdn.json
+  python benchmarks/bench_cudnn_linear_attention.py --family gdn --gdn-raw-gates --lengths 8192 --heads 4 --value-heads 8 --state-dtype fp32 --backends native-auto,auto,cudnn --output gdn-raw.json
 
 CPU active, wall enqueue, synchronized completion and CUDA-event graph replay
 are separate experiments, not additive components. Host clocks exclude state
@@ -20,8 +21,11 @@ other explicit backends report their own formula and comparability. GDN uses
 pre-normalized Q/K by default; --gdn-normalize measures the public additive
 normalization path on every backend, including any provider-owned conversion.
 These are adapter measurements, not serving TTFT or full-model accuracy.
-The KDA native-auto arm disables only the new cuDNN preference outside each
+The native-auto arm disables only the cuDNN preference outside each
 timed block, keeping the public callable and original native selection intact.
+--gdn-raw-gates passes raw BF16 gates and FP32 A_log/bias to every provider.
+Its native baseline includes the public API's Torch gate materialization; it
+does not reproduce a caller using a separate fused gate producer such as vLLM.
 --seq-order passes the B1 identity scheduling hint to auto/native arms, as
 upstream Kimi does. Explicit cuDNN currently rejects that optional hint, so its
 arm omits it; the per-arm result records whether it was supplied.
@@ -54,6 +58,7 @@ def arguments():
     parser.add_argument("--state-dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--layout", choices=("dense", "glm-qk"), default="dense")
     parser.add_argument("--gdn-normalize", action="store_true")
+    parser.add_argument("--gdn-raw-gates", action="store_true")
     parser.add_argument(
         "--seq-order",
         action="store_true",
@@ -86,8 +91,8 @@ def arguments():
         parser.error("shapes and iteration counts must be positive")
     if args.backends[0] not in ("auto", "native-auto"):
         parser.error("the first backend must be auto or native-auto")
-    if "native-auto" in args.backends and args.family != "kda":
-        parser.error("native-auto currently applies only to KDA")
+    if args.gdn_raw_gates and args.family != "gdn":
+        parser.error("--gdn-raw-gates applies only to GDN")
     if args.seq_order and (args.family != "kda" or len(args.lengths) != 1):
         parser.error("--seq-order currently exercises B1 KDA only")
     if args.family == "kda" and args.value_heads != args.heads:
@@ -158,6 +163,13 @@ def make_data(args, seed):
         A_log=torch.zeros(hv, device="cuda"),
         dt_bias=torch.zeros(hv, dim, device="cuda"),
     )
+    if args.family == "gdn" and args.gdn_raw_gates:
+        result.update(
+            g=-1 + 0.5 * torch.randn(total, hv, device="cuda", dtype=dtype),
+            beta=torch.randn(total, hv, device="cuda", dtype=dtype),
+            A_log=0.3 * torch.randn(hv, device="cuda"),
+            dt_bias=0.2 * torch.randn(hv, device="cuda"),
+        )
     if args.seq_order:
         result["seq_order"] = torch.zeros(1, dtype=torch.int32, device="cuda")
     return result
@@ -192,6 +204,12 @@ def serial_reference(args, data, norm):
             )
         ).exp()
         beta = data["beta"][0].float().sigmoid()
+    elif args.gdn_raw_gates:
+        alpha = torch.exp(
+            -data["A_log"].float().exp()
+            * torch.nn.functional.softplus(data["g"].float() + data["dt_bias"].float())
+        )
+        beta = data["beta"].float().sigmoid().to(data["beta"].dtype).float()
     else:
         alpha, beta = data["g"], data["beta"]
     state = data["seed"].float().clone()
@@ -251,16 +269,19 @@ def assert_result(args, actual, expected):
 @contextmanager
 def dispatch_policy(args, backend):
     """Choose the native baseline outside measured calls, without unwrapping APIs."""
-    if args.family != "kda" or backend != "native-auto":
+    if backend != "native-auto":
         yield
         return
-    kda = importlib.import_module("flashinfer.kda")
-    previous = kda._prefer_cudnn_kda_prefill
-    kda._prefer_cudnn_kda_prefill = lambda *args: False
+    module = importlib.import_module(
+        "flashinfer.kda" if args.family == "kda" else "flashinfer.gdn_prefill"
+    )
+    name = f"_prefer_cudnn_{args.family}_prefill"
+    previous = getattr(module, name)
+    setattr(module, name, lambda *args: False)
     try:
         yield
     finally:
-        kda._prefer_cudnn_kda_prefill = previous
+        setattr(module, name, previous)
 
 
 def make_runner(
@@ -317,6 +338,15 @@ def make_runner(
             backend="cake_gdn" if backend == "cake_gdn_cp" else backend,
             use_cp=True if backend == "cake_gdn_cp" else "auto",
         )
+        if backend == "native-auto":
+            kwargs["backend"] = "auto"
+        if args.gdn_raw_gates:
+            kwargs.update(
+                use_gate_in_kernel=True,
+                A_log=data["A_log"],
+                dt_bias=data["dt_bias"],
+                beta_is_logit=True,
+            )
 
         def run():
             return chunk_gated_delta_rule(
@@ -370,6 +400,9 @@ def prepare_arm(args, data, backend, references, norm):
     arm["state"].copy_(data["seed"])
     actual, route = observe_route(arm["run"])
     torch.cuda.synchronize()
+    if args.family == "gdn" and backend in ("native-auto", "cudnn"):
+        if bool(route["frontend_plans"]) != (backend == "cudnn"):
+            raise AssertionError(f"{backend} selected the wrong provider: {route}")
     choices = {key: errors(args, actual, value) for key, value in references.items()}
     matching = [
         key for key, value in choices.items() if max(value.values()) <= args.tolerance
@@ -418,10 +451,10 @@ def prepare_arm(args, data, backend, references, norm):
     with torch.cuda.stream(capture_stream):
         captured["state"].copy_(data["seed"])
         result, capture_route = observe_route(captured["run"])
-        if args.family == "kda" and bool(route["frontend_plans"]) != bool(
-            capture_route["frontend_plans"]
-        ):
-            raise AssertionError("eager and captured KDA selected different providers")
+        if bool(route["frontend_plans"]) != bool(capture_route["frontend_plans"]):
+            raise AssertionError(
+                "eager and captured calls selected different providers"
+            )
         capture_stream.synchronize()
         assert_result(args, result, references[actual_norm])
         graph = torch.cuda.CUDAGraph()
