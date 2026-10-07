@@ -79,7 +79,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
 "flashinfer.experimental.msa_nvfp4_decode" = ["csrc/**"]
 "flashinfer.experimental.nvfp4_mla_decode" = ["csrc/**"]
-"flashinfer" = ["_build_meta.py", "minimax_m3_workloads.json"]
+"flashinfer" = ["_build_meta.py"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.prims_ts.moe" = ["prims_ts_moe_configs.json"]
@@ -128,6 +128,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 # populated by build_backend._build_nvep_if_enabled).
 "flashinfer.moe_ep.backends.split.comm.nixl_ep" = ["_libs/**", "_vendored/**"]
 "flashinfer.moe_ep.backends.split.comm.nccl_ep" = ["_libs/*.so*"]
+
+# MiniMax workload registry shipped beside the root package API.
+"*" = ["minimax_m3_workloads.json"]
 
 [tool.mypy]
 files = ["flashinfer"]
