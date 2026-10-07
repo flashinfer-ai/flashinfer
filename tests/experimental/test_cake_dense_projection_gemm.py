@@ -193,7 +193,12 @@ EXPECTED_TEMPLATES = {
         (2049, 148): 'dense_proj_gemm_nn_n256_m256_f32_ht_tma1',
         (2049, 212): 'dense_proj_gemm_nn_n256_m256_f32_tma1',
     },
-    ('q_a', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
+    ('q_a', 'fwd', 'bf16'): {
+        (1001, 148): 'dense_proj_gemm_kk_n256_cg',
+        (1001, 212): 'dense_proj_gemm_kk_n256',
+        (2049, 148): 'dense_proj_gemm_kk_n256_cg',
+        (2049, 212): 'dense_proj_gemm_kk_n256',
+    },
     ('q_a', 'dgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_kn_n256',
         (1001, 212): 'dense_proj_gemm_kn_n256',
@@ -1910,7 +1915,8 @@ def test_round21_rules_plan_like_the_cake_launcher(T):
     assert ph.template == "dense_proj_gemm_kn_n256_tma2_pd2"
     # round 21 (W3, lever B): the sm_100a shared_gate_up forward bf16 (X @ W^T, 2048 x 6144 x T) keeps its raster group 8
     # and takes the column-grouped raster form (``kk_n256_cg``, instance-key field 29: the group counts column tiles);
-    # sm_107a has no rule on the row and keeps the row-grouped ``kk_n256``
+    # the q_a forward shares the row key (6144 -> 2048) and therefore the rule; sm_107a has no rule on the key and
+    # keeps the row-grouped ``kk_n256``
     assert ROW_RULES[
         ("sm_100a", False, False, False, False, False, 2048, 6144, None)
     ] == {
@@ -1922,6 +1928,9 @@ def test_round21_rules_plan_like_the_cake_launcher(T):
     assert pg.cgrp and pg.template == "dense_proj_gemm_kk_n256_cg" and pg.group_m == 8
     pg107, *_ = plan_dense_projection_gemm(g["A"], g["B"], g["out"], **kw107)
     assert not pg107.cgrp and pg107.template == "dense_proj_gemm_kk_n256"
+    q = _views("proj", "q_a", "fwd", "bf16", T)
+    pq, *_ = plan_dense_projection_gemm(q["A"], q["B"], q["out"], **kw)
+    assert pq.cgrp and pq.template == "dense_proj_gemm_kk_n256_cg" and pq.group_m == 8
 
 
 @pytest.mark.parametrize("T", [16172, 16231])
