@@ -4724,8 +4724,9 @@ def test_source_chunk_parallel_host_template_binds_main_arguments_in_loader_orde
     for placeholder in _HOST_PLACEHOLDERS:
         assert placeholder in template, placeholder
     assert "namespace cake_mamba_ssd_combined_host_CAKE_SSD_PROGRAM {" in template
-    assert "dynamicSmemBytes = CAKE_SSD_MAIN_SMEM_BYTESu;" in template
-    assert "sharedMemBytes = CAKE_SSD_MAIN_SMEM_BYTESu;" in template
+    assert "stream, CAKE_SSD_MAIN_SMEM_BYTESu)" in template
+    assert "LaunchEx(" not in template
+    assert "PROGRAMMATIC_STREAM_SERIALIZATION" not in template
     program = module._PROGRAMS["chunkpar_bf16_varlen"]
     rendered = module._render_host_source(template, "chunkpar_bf16_varlen", program)
     assert not any(placeholder in rendered for placeholder in _HOST_PLACEHOLDERS)
