@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
-from typing import Any, List, Literal, Optional
+from typing import Any, ClassVar, List, Literal, Optional
 
 import torch
 
@@ -34,7 +34,7 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
     _supports_fp8_output = True
     _split_tactic_schema = "split-budget-v1"
     _split_budgets = (1, 2, 4, 8, 16, 32)
-    _plan_capabilities = MLAPlanCapabilities(
+    _plan_capabilities: ClassVar[MLAPlanCapabilities] = MLAPlanCapabilities(
         backend_name="cute-dsl-monolithic",
         lse_modes=frozenset({"none", "basee", "base2"}),
         kv_layouts=frozenset({"combined", "adjacent-split"}),
@@ -208,6 +208,11 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
                         head_dim_ckv,
                         implementation.get_num_sm(device),
                         max_seq_len=max_seq_len,
+                        occupancy_q_tiles=(
+                            max(1, min(total_q, batch_size * num_q_tiles))
+                            if is_var_q
+                            else None
+                        ),
                         num_kv_splits=1,
                     )
                 )

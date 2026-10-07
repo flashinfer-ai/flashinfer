@@ -1224,6 +1224,42 @@ def test_mtp_family_only_compiler_target_is_typed_refusal(case, monkeypatch):
     assert wrapper._planned_backend is None
 
 
+@pytest.mark.parametrize("q_len,page_size", [(2, 64), (4, 128)])
+def test_mtp_low_level_default_output_dtype(case, q_len, page_size):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("requires SM107")
+    from flashinfer.cute_dsl.attention.rubin_mtp.mla_decode import cute_dsl_mla_decode
+
+    case.update(
+        query=torch.randn(2 * q_len, 128, 576, device="cuda").to(torch.float8_e4m3fn),
+        kv=torch.randn(6, page_size, 576, device="cuda").to(torch.float8_e4m3fn),
+        tables=torch.tensor([[2, 0, 1], [5, 3, 4]], dtype=torch.int32, device="cuda"),
+        lengths=[129, 97],
+        offsets=[0, q_len, 2 * q_len],
+    )
+    out, lse = cute_dsl_mla_decode(
+        query=case["query"].reshape(2, q_len, 128, 576),
+        kv_cache=case["kv"],
+        workspace_buffer=torch.empty(128 << 20, dtype=torch.uint8, device="cuda"),
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=case["tables"],
+        seq_lens=torch.tensor(case["lengths"], dtype=torch.int32, device="cuda"),
+        max_seq_len=129,
+        softmax_scale=1 / 24,
+        return_lse=True,
+    )
+    expected, expected_lse = _reference(case, scale=1 / 24, output_scale=1.0)
+    assert out.dtype == torch.float8_e4m3fn
+    assert out.shape == (2, q_len, 128, 512)
+    torch.testing.assert_close(
+        out.flatten(0, 1).float(), expected, atol=0.03, rtol=0.12
+    )
+    torch.testing.assert_close(
+        lse.reshape(2 * q_len, 128), expected_lse * math.log(2), atol=0.02, rtol=0.002
+    )
+
+
 @pytest.mark.parametrize(
     "softmax_scale,output_scale,message",
     [

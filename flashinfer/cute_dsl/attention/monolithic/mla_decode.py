@@ -137,11 +137,7 @@ def _get_split_kv_and_workspace_size(
     ):
         raise ValueError("num_kv_splits must be an integer or None")
     if num_kv_splits is not None and num_kv_splits != -1:
-        if (
-            isinstance(num_kv_splits, bool)
-            or not isinstance(num_kv_splits, int)
-            or not 1 <= num_kv_splits <= _STATIC_REDUCER_MAX_SPLITS
-        ):
+        if not 1 <= num_kv_splits <= _STATIC_REDUCER_MAX_SPLITS:
             raise ValueError(
                 "num_kv_splits must be -1 or an integer in "
                 f"[1, {_STATIC_REDUCER_MAX_SPLITS}], got {num_kv_splits!r}"
