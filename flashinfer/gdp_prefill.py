@@ -80,8 +80,8 @@ def chunk_gated_delta_product(
     g : torch.Tensor, optional
         Per-head forget gate in linear space (``alpha``, elementwise in
         ``(0, 1]``), shape ``[total_seq_len, num_sab_heads]`` at real-token
-        rows, at float32, bfloat16 or float16.  All-ones (no decay) when
-        ``None``.
+        rows, at float32, bfloat16 or float16 (float32 only when
+        ``backend="flashinfer"``).  All-ones (no decay) when ``None``.
     beta : torch.Tensor, optional
         Per-head, per-Householder update gate ``[total_seq_len *
         num_householder, num_sab_heads]``, post-sigmoid, in float32 or
@@ -112,10 +112,13 @@ def chunk_gated_delta_product(
         not alias ``initial_state``; the kernel splits one sequence across
         CTAs, so the CTA reading the incoming state would race the one writing
         the outgoing state.
-    backend : Literal["auto", "cudnn"], optional
-        FlashInfer carries no GDP kernel of its own, so ``"auto"`` (default)
-        and ``"cudnn"`` both run cuDNN's fused SM100 linear-attention engine
-        through :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_product`.
+    backend : Literal["auto", "cudnn", "flashinfer"], optional
+        ``"auto"`` (default) and ``"cudnn"`` run cuDNN's fused SM100
+        linear-attention engine through
+        :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_product`.
+        ``"flashinfer"`` runs the SM100 GDN prefill kernel over the expanded
+        sub-token timeline; it requires ``g`` and ``beta`` in float32, as
+        :func:`flashinfer.gdn_prefill.chunk_gated_delta_rule` does.
 
     Returns
     -------
@@ -143,6 +146,13 @@ def chunk_gated_delta_product(
 
     if backend == "flashinfer":
         from .gdn_prefill import chunk_gated_delta_rule
+
+        for _name, _gate in (("g", g), ("beta", beta)):
+            if _gate is not None and _gate.dtype != torch.float32:
+                raise ValueError(
+                    f'backend="flashinfer" requires {_name} in float32, got '
+                    f"{_gate.dtype}; cast it or use the cudnn backend"
+                )
 
         # GDP is GDN over the expanded sub-token timeline: only cu_seqlens is
         # scaled.  q, the forget gate and the output stay at real-token rows and

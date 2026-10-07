@@ -291,14 +291,26 @@ def test_gdp_defaults_gates_to_ones(backend):
 
 
 @pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", GDP_BACKENDS)
-def test_gdp_accepts_forget_gate_dtypes(backend, gate_dtype):
-    """``g`` may be fp32, bf16 or fp16, like GDN's."""
+def test_gdp_cudnn_accepts_forget_gate_dtypes(gate_dtype):
+    """cuDNN takes ``g`` in fp32, bf16 or fp16."""
     inputs = _make_inputs([256, 128], 4, 4, 4, 2, seed=47, gate_dtype=gate_dtype)
     ref_out, ref_state = _serial(inputs)
-    out, final_state = _run(inputs, backend=backend, output_final_state=True)
+    out, final_state = _run(inputs, backend="cudnn", output_final_state=True)
     assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
     assert_rel_close("final_state", final_state, ref_state, SERIAL_TOLERANCE)
+
+
+@pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float16])
+def test_gdp_flashinfer_rejects_non_float32_gates(gate_dtype):
+    """GDN documents g/beta as float32, so GDP must say so before the kernel does.
+
+    Reaching the kernel with a bf16 gate fails deep in the FFI layer with
+    "Mismatched Tensor on argument #3", which names neither the parameter nor
+    the fix.
+    """
+    inputs = _make_inputs([256, 128], 4, 4, 4, 2, seed=47, gate_dtype=gate_dtype)
+    with pytest.raises(ValueError, match="requires g in float32"):
+        _run(inputs, backend="flashinfer", output_final_state=True)
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
