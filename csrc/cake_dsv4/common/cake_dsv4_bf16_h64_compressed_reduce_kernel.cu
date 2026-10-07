@@ -76,7 +76,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_dsv4_b9c4afa107e20bf48d99(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, int num_heads, int num_splits)
+kernel_cake_dsv4_066155afbbeb7c940ca0(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, int num_heads, int num_splits)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
