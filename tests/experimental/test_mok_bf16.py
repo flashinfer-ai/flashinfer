@@ -444,12 +444,17 @@ def _check_fused_training(variant="base"):
                 for values in graph_saved[1:]
             )
             # d(score) = dot(BF16 expert output, original upstream gradient).
-            # A non-power-of-two score change catches scale/round/unscale errors.
+            # Changing only that score leaves its own gradient unchanged up to
+            # the BF16 rounding of the score-scaled upstream gradient the
+            # backward dispatches (MoK form): BF16 rule, not bitwise. A
+            # non-power-of-two change exercises the scale/round/unscale path.
             router_gradient = ds_peer.clone()
             scores.add_(0.03125)
             graph.replay()
             check(result)
-            assert torch.equal(ds_peer, router_gradient)
+            torch.testing.assert_close(
+                ds_peer.float(), router_gradient.float(), atol=1e-2, rtol=1e-2
+            )
             for _ in range(2):
                 x.normal_(std=0.125)
                 dy.normal_(std=0.125)
@@ -475,7 +480,7 @@ def _check_fused_training(variant="base"):
                 three_eager_executions_bitwise_equal=True,
                 three_graph_replays_bitwise_equal=True,
                 recompute_context_and_backward_bitwise_equal=True,
-                router_gradient_independent_of_scores=True,
+                router_gradient_score_invariance="bf16_rule",
                 changed_inputs_scores_upstream_gradients=2,
             )
             print(record, flush=True)
