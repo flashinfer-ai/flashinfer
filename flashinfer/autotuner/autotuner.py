@@ -1160,6 +1160,24 @@ def set_autotune_process_group(
     """
     global _tune_process_group
     _tune_process_group = group
+    # Verify FLASHINFER_AUTOTUNE_INDEPENDENT matches across the tune group
+    # to prevent mixed-mode deadlocks (one rank skips a collective that
+    # another enters). SUM-based so that EVERY misconfigured rank raises,
+    # not just the minority side.
+    if group is not None:
+        local = int(os.environ.get("FLASHINFER_AUTOTUNE_INDEPENDENT", "0") == "1")
+        world_size = torch.distributed.get_world_size(group)
+        backend = str(torch.distributed.get_backend(group)).lower()
+        device = "cuda" if backend == "nccl" else "cpu"
+        flag = torch.tensor([local], dtype=torch.int64, device=device)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.SUM, group=group)
+        if flag.item() != local * world_size:
+            raise RuntimeError(
+                "FLASHINFER_AUTOTUNE_INDEPENDENT must be set uniformly "
+                f"across all ranks in the tune group (local={local}, "
+                "at least one rank differs). Mixed settings cause "
+                "collective-order mismatches and tuning deadlocks."
+            )
 
 
 def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
