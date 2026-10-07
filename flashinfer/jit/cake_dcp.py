@@ -250,8 +250,11 @@ def _load_dcp_spec_static_module(
 # program of a family with ``program_variants``; the shared-base prologue is
 # switched by ``__CUDA_ARCH__``).  Its 32- and 64-row packed instances are the
 # manifest members' ``defines`` (``-DN_ROWS=32`` / ``64``), selected by the
-# packed-row tile the request's speculative rows need; batch, heads, lengths,
-# rank and world are runtime kernel arguments.
+# packed-row tile the request's speculative rows need; every member also
+# defines ``Q_BOX_TOKENS``, the tokens per Q TMA box of its program, from which
+# the adapter encodes the Q tensor map (the swapped-QK whole-tile programs
+# load 32-row boxes, every other program the 64-row tile).  Batch, heads,
+# lengths, rank and world are runtime kernel arguments.
 
 DcpBalancedFamily = Literal[
     "dcp_spec_bf16_balanced",
@@ -340,6 +343,16 @@ def _get_dcp_balanced_sources(
     if defines.get("N_ROWS") != n_rows:
         raise RuntimeError(
             f"Cake FMHA DCP member {family} {selector!r} does not define N_ROWS={n_rows}"
+        )
+    q_box_tokens = defines.get("Q_BOX_TOKENS")
+    if (
+        not isinstance(q_box_tokens, int)
+        or isinstance(q_box_tokens, bool)
+        or q_box_tokens <= 0
+    ):
+        raise RuntimeError(
+            f"Cake FMHA DCP member {family} {selector!r} does not define Q_BOX_TOKENS "
+            "(the tokens per Q TMA box of its program)"
         )
     launch_binding = (
         get_cake_fmha_csrc_dir() / _get_dcp_family(family)["binding_source"]

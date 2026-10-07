@@ -1041,6 +1041,17 @@ _KIND_MANIFEST_BAND = {
 }
 
 
+# Tokens per Q TMA box of each program: the member define the adapter encodes the Q tensor
+# map from.  The bf16 swapped-QK whole-tile program (3) and its early-issue form (5) load
+# 32-row Q boxes; every other D128 program loads the 64-row tile; the D256 family's 16-head
+# group makes a box two tokens.
+_Q_BOX_TOKENS = {
+    "dcp_spec_bf16_balanced": lambda program: 4 if program in (3, 5) else 8,
+    "dcp_spec_bf16_fp8_balanced": lambda program: 8,
+    "dcp_spec_bf16_fp8_d256_balanced": lambda program: 2,
+}
+
+
 def test_balanced_families_ship_one_program_per_selector_with_both_packed_instances() -> (
     None
 ):
@@ -1095,7 +1106,13 @@ def test_balanced_families_ship_one_program_per_selector_with_both_packed_instan
                 None if variants is None else int(member["selector"][variants["key"]])
             ]
             assert member["sources"] == {"sm_100a": program, "sm_103a": program}
-            assert member["defines"] == {"N_ROWS": member["selector"]["n_rows"]}
+            program_value = (
+                None if variants is None else int(member["selector"][variants["key"]])
+            )
+            assert member["defines"] == {
+                "N_ROWS": member["selector"]["n_rows"],
+                "Q_BOX_TOKENS": _Q_BOX_TOKENS[family](program_value),
+            }
         assert entry["binding_source"] == f"bindings/cake_fmha_{family}_binding.cu"
         assert (csrc_dir / entry["binding_source"]).is_file()
         assert entry["launch_binding"] == f"cake_fmha_launch_{family}"

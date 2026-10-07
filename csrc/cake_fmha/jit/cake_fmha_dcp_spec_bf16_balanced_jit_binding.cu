@@ -62,7 +62,10 @@ constexpr int64_t kGroup = 8;              // query heads per KV head (ForGen GQ
 constexpr int64_t kHeadDim = 128;
 constexpr int64_t kPageSize = 16;
 constexpr int64_t kMaxQTiles = 1;          // one row tile per request (q_len 1..8)
-constexpr int64_t kQBoxTokens = 8;         // speculative rows per Q box (the full M64 tile)
+#ifndef Q_BOX_TOKENS
+#error "Q_BOX_TOKENS must carry the manifest member's tokens per Q TMA box (its program's Q descriptor)"
+#endif
+constexpr int64_t kQBoxTokens = Q_BOX_TOKENS;  // speculative rows per Q box (the member define)
 constexpr int64_t kMaxNRows = 64;          // physical packed tile (rows = speculative rows x group)
 constexpr int64_t kQBoxRows = kMaxNRows / kGroup;      // speculative rows per row tile
 constexpr int64_t kMaxQLen = kMaxQTiles * kQBoxRows;   // 8 on every family
@@ -84,7 +87,8 @@ void CheckSameDevice(TensorView query, TensorView tensor, const char* name) {
 
 // Query [batch * q_len, Hq, kHeadDim] read in place as a 4-D map (64 dims,
 // head, token, k-group) whose box (64, kGroup, kQBoxTokens, kQBoxKGroups) is one
-// packed row tile: SMEM row r = token * kGroup + head.  Tokens past the tensor
+// Q box of the member's program (its Q_BOX_TOKENS define): SMEM row r = token *
+// kGroup + head.  Tokens past the tensor
 // end are TMA zero fill (padding rows whose results are never stored), so the
 // token box may exceed the token extent of a small batch.
 CUtensorMap EncodeTmaQuery(TensorView tensor) {
