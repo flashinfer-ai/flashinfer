@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -134,6 +137,35 @@ def test_transformed_trace_preserves_default_definition_and_runs_standalone():
         device="cpu",
     )
     assert replay["use_gate_in_kernel"] and replay["beta_is_logit"]
+
+
+@pytest.mark.parametrize("definition_source", ["generated", "checked_in"])
+def test_gate_trace_requires_beta_for_logit_transform(definition_source):
+    if definition_source == "generated":
+        args = gdn_prefill_trace(beta_is_logit=True).init(
+            total_seq_len=1, num_seqs=1, head_size=8, device="cpu"
+        )
+        definition = chunk_gated_delta_rule.fi_trace(**args)
+    else:
+        definition = json.loads(
+            (
+                Path(__file__).parents[1]
+                / "trace/fi_trace_out/gdn_prefill_gates_q4_k4_v8_d128.json"
+            ).read_text()
+        )
+    namespace = {}
+    exec(definition["reference"], namespace)
+    reference = namespace["_gdn_prefill_gates_reference"]
+    q = torch.ones(1, 1, 1)
+    cu = torch.tensor([0, 1], dtype=torch.int64)
+    args = (q, q, q, None, None, None, None, None, cu, None)
+    # Omitted precomputed beta still means one; omitted logits are invalid.
+    output, _ = reference(*args)
+    torch.testing.assert_close(output, torch.ones_like(output), rtol=0, atol=0)
+    with pytest.raises(ValueError, match="beta_is_logit requires beta"):
+        reference(*args, beta_is_logit=True)
+    with pytest.raises(ValueError, match="beta_is_logit requires beta"):
+        validate_gate_inputs(q, q, None, None, "linear", False, None, None, True)
 
 
 @pytest.mark.parametrize("heads", [(4, 2, 2), (2, 2, 4)])
