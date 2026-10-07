@@ -502,6 +502,7 @@ jobs:
             junit/**/*.telemetry.json
             junit/**/*.meta.json
             junit/**/*.memory.csv
+            junit/run-summary.json
           if-no-files-found: warn
           retention-days: 30
 
@@ -650,6 +651,59 @@ jobs:
           echo "::warning::CI skipped — pending authorization"
           exit 1
 
+      - name: Checkout (for skip-all analysis)
+        if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download H100 JUnit artifacts
+        if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-h100-*
+          path: junit-h100
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Check skip-all test files
+        id: skip-all
+        if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          SUMMARY_ARGS=""
+          if [ -f junit-h100/run-summary.json ]; then
+            SUMMARY_ARGS="--summary junit-h100/run-summary.json"
+          fi
+          if [ -z "$SUMMARY_ARGS" ]; then
+            echo "No run-summary.json artifacts found; skipping skip-all check"
+            echo "skip_all_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Run the check (warning mode: annotations but no hard failure yet).
+          # Capture the report for the step summary.
+          REPORT=$(python3 scripts/pr_checks/check_skip_all.py \
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            $SUMMARY_ARGS \
+            --github-actions 2>&1) || true
+          echo "$REPORT"
+
+          if echo "$REPORT" | grep -q "skip-all"; then
+            echo "skip_all_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_all_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Append to step summary.
+          {
+            echo ""
+            echo "$REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Check Results
         if: needs.gate.outputs.authorized == 'true'
         env:
@@ -658,6 +712,7 @@ jobs:
           # TARGET_RE happens to exclude quotes and backticks, but that guarantee lives
           # in another file and must not be what keeps this step from being injectable.
           TEST_SCOPE: ${{ needs.setup.outputs.test_scope }}
+          SKIP_ALL_FOUND: ${{ steps.skip-all.outputs.skip_all_found }}
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -692,6 +747,13 @@ jobs:
             echo "> **Scoped run — NOT the full suite.**" >> $GITHUB_STEP_SUMMARY
             echo "> Tested only: \`${TEST_SCOPE}\`" >> $GITHUB_STEP_SUMMARY
             echo "> Comment \`@flashinfer-bot run\` with no paths for full coverage." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$SKIP_ALL_FOUND" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⚠️ **Some changed test files had all nodes skipped on every lane.**" >> $GITHUB_STEP_SUMMARY
+            echo "> See the skip-all report above for details." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
