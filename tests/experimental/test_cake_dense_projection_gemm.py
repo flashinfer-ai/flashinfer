@@ -1659,7 +1659,9 @@ def test_round19_cta1_plans_one_cta_per_tile(T):
     )
     assert one.group_m == 1 and one.template == plan.template
     with pytest.raises(ValueError, match="group_m must be an even number"):
-        plan_dense_projection_gemm(v["A"], v["B"], v["out"], group_m=1, **kw)
+        plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], cta1=False, group_m=1, **kw
+        )
     # the form carries no tail policy: a caller combining it with one asked for two incompatible forms
     for bad in (
         dict(sk=True),
@@ -1677,6 +1679,120 @@ def test_round19_cta1_plans_one_cta_per_tile(T):
         small["A"], small["B"], small["out"], cta1=True, **kw
     )
     assert short.template == "dense_proj_gemm_kk_n128_c1" and short.grid == (17, 1, 1)
+
+
+@pytest.mark.parametrize("T", [16231, 16172])
+def test_round19_rules_plan_like_the_cake_launcher(T):
+    # the round-19 sm_100a rules (Cake 97c4ca33270): the indexer_hw / indexer_k forwards and the fp32 indexer_hw
+    # input gradient take the single-CTA form (Cake W3, lever D), the indexer_q weight gradients the synchronised
+    # stream-K tail with the slab path (Cake W2: main-unit margin 62, the bulk slab read for bf16, the fp32 output as
+    # the slab for fp32); sm_107a keeps its round-18 rules
+    for key in (
+        ("sm_100a", False, False, False, False, False, 32, 6144, None),
+        ("sm_100a", False, False, False, False, False, 128, 6144, None),
+    ):
+        assert ROW_RULES[key] == {"cta1": True}
+    assert ROW_RULES[("sm_100a", False, True, True, False, False, 6144, 32, None)] == {
+        "block_n": 128,
+        "slots": 2,
+        "stages": 4,
+        "cta1": True,
+    }
+    assert ROW_RULES[
+        ("sm_100a", True, True, False, False, False, 2048, None, 4096)
+    ] == {
+        "cta_rows": 256,
+        "sk_sync": True,
+        "sk_sync_m": 62,
+        "sk_slab": 2,
+    }
+    assert ROW_RULES[("sm_100a", True, True, True, False, False, 2048, None, 4096)] == {
+        "cta_rows": 256,
+        "sk_sync": True,
+        "sk_sync_m": 62,
+        "sk_slab": 3,
+    }
+    assert len(ROW_RULES) == 97
+    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 48
+    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 49
+    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
+    # the 32- / 128-column indexer forwards: one 128 x 128 tile per CTA, 127 tiles on 148 SMs, whole tiles, the
+    # streaming A operand evict_first (one column tile, the wave's panels exceed the L2)
+    for row in ("indexer_hw", "indexer_k"):
+        v = _views("proj", row, "fwd", "bf16", T)
+        plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+        assert plan.cta1 and plan.template == "dense_proj_gemm_kk_n128_hen_c1", row
+        assert (plan.m_tiles, plan.n_tiles, plan.sm_pairs) == (127, 1, 148)
+        assert plan.grid == (plan.m_tiles * plan.n_tiles, 1, 1) == (127, 1, 1)
+        assert (plan.num_full, plan.sk_units, plan.sk_slab, plan.stages) == (
+            127,
+            0,
+            0,
+            7,
+        )
+    # the fp32 indexer_hw input gradient: the two-slot BLOCK_N 128 TMA-store staging with four 32 KiB single-CTA
+    # stages (``_s4``: the single-CTA default is five), 127 x 48 tiles; a caller forcing the pair form drops the
+    # rule's stage count (the pair default of that family is six)
+    v = _views("proj", "indexer_hw", "dgrad", "f32", T)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+    assert plan.cta1 and plan.template == "dense_proj_gemm_kn_n128_f32_tma2_s4_c1"
+    assert (plan.m_tiles, plan.n_tiles, plan.stages, plan.sm_pairs) == (127, 48, 4, 148)
+    assert plan.grid == (127 * 48, 1, 1) and plan.sk_units == 0
+    pair, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta1=False, **kw)
+    assert not pair.cta1 and pair.template == "dense_proj_gemm_kn_n128_f32_tma2"
+    assert (pair.m_tiles, pair.stages, pair.sm_pairs) == (128, 6, 74)
+    # the indexer_q weight gradients (G.T @ X, both MN-major, K = T): 64 tall tiles on 74 pairs -> 64 main units of
+    # s = ceil((7 x 254 + 62) / 8) = 230 K steps + 10 collectors, one slab per tail tile; bf16 reads the slab back
+    # through the dead mainloop stages (sb2), fp32 reduce-adds into the output through the TMA-store path (sb3)
+    v = _views("proj", "indexer_q", "wgrad", "bf16", T)
+    assert not v["transposed"]
+    bf16, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+    assert bf16.sk_sync and bf16.sk_slab == 2
+    assert bf16.template == "dense_proj_gemm_nn_n256_m256_sks_sb2"
+    assert (bf16.pair_tiles, bf16.k_blocks, bf16.sm_pairs) == (64, 254, 74)
+    assert (
+        bf16.num_full,
+        bf16.tail_tiles,
+        bf16.sk_units,
+        bf16.iters_per_unit,
+        bf16.sk_collectors,
+    ) == (0, 64, 74, 230, 10)
+    assert bf16.grid == (148, 1, 1) and bf16.sk_iters == 64
+    assert bf16.ws_f32_elems == 64 * 2 * 256 * 256
+    vf = _views("proj", "indexer_q", "wgrad", "f32", T)
+    f32, *_ = plan_dense_projection_gemm(vf["A"], vf["B"], vf["out"], **kw)
+    assert f32.sk_sync and f32.sk_slab == 3 and f32.epi == "tma"
+    assert f32.template == "dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3"
+    assert (f32.num_full, f32.tail_tiles, f32.sk_units, f32.iters_per_unit) == (
+        0,
+        64,
+        74,
+        230,
+    )
+    # the launcher's yield rules for the rule's slab path: the row-major fp32 register epilogue has no reduce-add
+    # store, so a caller forcing it keeps the synchronised plan with the bulk slab read; a caller-forced two-stage
+    # pipeline cannot stage the eight 16 KiB warp slabs, so the row keeps the plain synchronised program; a
+    # caller-forced ``sk_slab`` keeps raising on such a conflict, and a caller-forced tile family drops the rule's
+    # synchronised plan with its slab path
+    reg, *_ = plan_dense_projection_gemm(vf["A"], vf["B"], vf["out"], epi="reg", **kw)
+    assert reg.sk_sync and reg.sk_slab == 2
+    assert reg.template == "dense_proj_gemm_nn_n256_m256_f32_sks_sb2"
+    narrow, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], stages=2, **kw)
+    assert narrow.sk_sync and narrow.sk_slab == 0
+    assert narrow.template == "dense_proj_gemm_nn_n256_m256_s2_sks"
+    with pytest.raises(ValueError, match="sk_slab=3"):
+        plan_dense_projection_gemm(v["A"], v["B"], v["out"], sk_slab=3, **kw)
+    with pytest.raises(ValueError, match="too small"):
+        plan_dense_projection_gemm(v["A"], v["B"], v["out"], stages=2, sk_slab=2, **kw)
+    std, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta_rows=128, **kw)
+    assert not std.sk_sync and std.sk_slab == 0 and "_sks" not in std.template
+    off, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], sk=False, **kw)
+    assert not off.sk_sync and off.template == "dense_proj_gemm_nn_n256_m256"
+    # at the test tables' T the synchronised plan is not admitted (a part under SK_MIN_ITERS): the plain tall plan
+    for short_T in (2049, 1001):
+        vs = _views("proj", "indexer_q", "wgrad", "bf16", short_T)
+        short, *_ = plan_dense_projection_gemm(vs["A"], vs["B"], vs["out"], **kw)
+        assert not short.sk_sync and short.sk_slab == 0 and "_sb" not in short.template
 
 
 def test_wave_working_set_and_hint_rule():
