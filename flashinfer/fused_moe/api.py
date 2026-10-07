@@ -2093,8 +2093,91 @@ class B12xW4A16Config:
         return "B12xW4A16Config()"
 
 
+@dataclass(frozen=True)
+class CudnnFrostBf16Config:
+    """Frost BF16 MoE on SM107 and SM120, with packed precomputed routing.
+
+    Register prepared weights under ``cudnn_frost_bf16``. The canonical
+    ``cutlass_bf16`` view is also accepted without conversion. Supported model
+    geometries follow the backend's measured BF16 shortlist.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (107, 120)
+
+    prepare_weights = staticmethod(CutlassBf16Config.prepare_weights)
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, quant: Optional[QuantConfig] = None):
+        """Return contiguous BF16 activations and no block scales."""
+        if hidden_states_bf16.dtype != torch.bfloat16:
+            raise ValueError("CudnnFrostBf16Config requires BF16 activations")
+        if quant is not None and quant.pair != (QuantFormat.BF16, QuantFormat.BF16):
+            raise ValueError(
+                "CudnnFrostBf16Config requires BF16 weights and activations"
+            )
+        return hidden_states_bf16.contiguous(), None
+
+
+@dataclass(frozen=True)
+class CudnnFrostMxfp8Config:
+    """Frost MXFP8 MoE on SM107, with packed precomputed routing.
+
+    Register prepared weights under ``cudnn_frost_mxfp8``. The canonical
+    ``cutlass_mxfp8`` view is also accepted without conversion. H/I must be
+    multiples of 128. Pass the layer's quant config to prepare_activations.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 107
+
+    prepare_weights = staticmethod(CutlassMxfp8Config.prepare_weights)
+    prepare_activations = staticmethod(CutlassMxfp8Config.prepare_activations)
+
+
+@dataclass(frozen=True)
+class CudnnFrostNvfp4Config:
+    """Frost NVFP4 MoE on SM107, with packed precomputed routing.
+
+    Register prepared weights under ``cudnn_frost_nvfp4``. The canonical
+    ``cutlass_nvfp4`` view is also accepted without conversion. H/I must be
+    multiples of 128. Pass the layer's quant config to prepare_activations.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 107
+
+    prepare_weights = staticmethod(CutlassNvfp4Config.prepare_weights)
+    prepare_activations = staticmethod(CutlassNvfp4Config.prepare_activations)
+
+
+@dataclass(frozen=True)
+class CudnnFrostMxfp8Mxfp4Config:
+    """Frost MXFP8-activation / MXFP4-weight MoE on SM107.
+
+    Requires packed precomputed routing and H/I divisible by 128. Register
+    prepared weights under ``cudnn_frost_mxfp8_mxfp4``; the canonical
+    ``cutlass_mxfp8_mxfp4`` view is also accepted without conversion.
+    Pass the layer's quant config to prepare_activations.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 107
+
+    prepare_weights = staticmethod(CutlassMxfp8Mxfp4Config.prepare_weights)
+    prepare_activations = staticmethod(CutlassMxfp8Mxfp4Config.prepare_activations)
+
+
 # Union type for backend config
 BackendConfigType = Union[
+    CudnnFrostBf16Config,
+    CudnnFrostMxfp8Config,
+    CudnnFrostNvfp4Config,
+    CudnnFrostMxfp8Mxfp4Config,
     CakeWarpDecodeConfig,
     PrimsTsConfig,
     TrtllmFp4Config,
@@ -2130,6 +2213,10 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
+    CudnnFrostBf16Config,
+    CudnnFrostMxfp8Config,
+    CudnnFrostNvfp4Config,
+    CudnnFrostMxfp8Mxfp4Config,
     CakeWarpDecodeConfig,
     PrimsTsConfig,
     TrtllmFp4Config,

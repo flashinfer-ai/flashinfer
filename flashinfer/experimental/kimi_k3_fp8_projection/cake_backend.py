@@ -44,9 +44,11 @@ runs as one or two generated Cake programs on the current stream:
   whose finishing pair adds the other pairs' FP32 partials in ordinal order --
   the FP32 reduction order of those tiles differs from the plain schedule), or
 * ``decode:t<tok>_p<stages>[_fused][_res]`` -- the swap-AB split-K decode kernel
-  (M <= 256, and the single-N-tile families the measured table routes here up
-  to 16384 rows; the ``_fused`` instances quantize the token tile in-CTA, so
-  the quantization launch is skipped).
+  (M <= 256, the single-N-tile families the measured table routes here up to
+  16384 rows, and the mid-M rows -- 512 / 1024 / 2048 tokens of most K = 7168
+  families -- whose under-filled 2-CTA GEMM grid the table measured slower
+  than the token-tiled decode kernel; the ``_fused`` instances quantize the
+  token tile in-CTA, so the quantization launch is skipped).
 
 Host work is split exactly like the Cake production launcher:
 
@@ -112,6 +114,12 @@ GEMM_SK_SUFFIX = "_sk"  # round 6 continuation 12 (lever SKO): the ordered strea
 GEMM_SKF_SUFFIX = "_skf"  # round 6 continuation 17/18 (lever SKF): the fix-up stream-K instance of the TMA-store GEMM programs (table key ``gemm_skf``)
 GEMM_SKF_MIN_ITERS = 4  # lever SKF: a pair's range of fewer K iterations cannot pay for the partial hand-offs
 GEMM_SKF_MAX_SLOTS = 2  # lever SKF: contributor partial slots per tile the finisher adds (more contributors: plain schedule)
+GEMM_SKF_SLOT_FORMS = (
+    2,
+    4,
+    8,
+)  # round 7 (CAKE-985): slot bounds of the shipped fix-up forms (``_skf`` = 2, ``_skf4`` / ``_skf8``)
+GEMM_SKS_SUFFIX = "_sks"  # round 7 (CAKE-985, lever SKS): the sliced fix-up stream-K instance (table key ``gemm_sks``; ``_sks<slots>``)
 GEMM_SK_MIN_K_ITERS = 4  # lever SKO: a head / tail chunk of fewer than two K iterations cannot pay for the partial hand-off
 GEMM_SK_FLAG_BYTES = 2048  # stream-K flag area: 512 u32 flags >= 2 x the largest tile count of a split region (SKO: pairs / 2 tail tiles; SKF: < 2 pairs SK tiles)
 GEMM_EPI_WARPS = (
@@ -134,15 +142,19 @@ DECODE_TABLE_BUCKETS = (
     8,
     64,
     256,
+    512,
+    1024,
+    2048,
     4096,
     16384,
-)  # M buckets of the measured dispatch table (the two large
-#                                                     buckets only list families measured faster than the GEMM)
+)  # M buckets of the measured dispatch table (buckets above DECODE_MAX_M
+#    list only the families whose measured route differs from the plain GEMM)
 DEC_W_BYTES = 128 * BLOCK_K  # one 128-row weight tile x 256 K per stage
 DEC_SF_BYTES = 2048  # 2 K-sets x 512 B per operand
 DEC_SMEM_CAP = 230400  # decode SMEM pool budget
 DEC_MAX_STAGES = 4
 DEC_XB_MAX_STAGES = 8  # BF16 ring depth cap of the decoupled fused decode variant
+DEC_XQ_MAX_STAGES = 8  # FP8 token-ring depth cap (round 4 lever F; table key ``xq_stages``, adopted in round 7 on the 1,28,256 cells)
 DEC_QUANT_WARPS = (
     8  # quantizing warps of the fused decode instance (narrow-unit divisibility rule)
 )
@@ -374,6 +386,32 @@ def quant_units(M: int, k_blocks: int, sm_count: int) -> int:
     return 1
 
 
+def _decode_stage_geometry(
+    tok: int, fused: bool, resident: bool, xb_stages: int, xq_stages: int
+) -> tuple[int, int, int, int]:
+    """``(stage_bytes, xb_ring_bytes, xq_ring_bytes, res_bytes)`` of a decode instance (the Cake ``decode_ir`` SMEM rule).
+
+    ``xb_stages`` > 0 is the decoupled fused variant: the BF16 token tiles stream through their own ``xb_stages``-deep
+    ring instead of sharing the W / X stage; ``xq_stages`` > 0 (round 4 lever F, table key ``xq_stages``; needs the
+    BF16 ring) moves the FP8 token tile and its scales out of the W stage into an ``xq_stages``-deep ring, so a W stage
+    holds the weight tile plus one 1 KB scale set."""
+    tok_rows = max(tok, 32)
+    xb_bytes = tok * 512 if (fused and not resident) else 0
+    xb_ring = bool(fused and not resident and xb_stages > 0)
+    xq_ring = bool(fused and not resident and xq_stages > 0)
+    stage_x_bytes = 0 if (resident or xq_ring) else tok_rows * BLOCK_K
+    stage_bytes = (
+        DEC_W_BYTES
+        + stage_x_bytes
+        + (1024 if xq_ring else DEC_SF_BYTES)
+        + (0 if xb_ring else xb_bytes)
+    )
+    xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
+    xq_ring_bytes = xq_stages * (tok_rows * BLOCK_K + 1024) if xq_ring else 0
+    res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
+    return stage_bytes, xb_ring_bytes, xq_ring_bytes, res_bytes
+
+
 def decode_module_stages(
     tok: int,
     stages: int,
@@ -381,26 +419,20 @@ def decode_module_stages(
     resident: bool,
     xb_stages: int = 0,
     epi_chunk: int = 32,
+    xq_stages: int = 0,
 ) -> int:
-    """Pipeline depth of the physical decode instance after its SMEM clamp (the Cake ``decode_ir`` rule).
-
-    ``xb_stages`` > 0 is the decoupled fused variant: the BF16 token tiles stream through their own
-    ``xb_stages``-deep ring instead of sharing the W / X stage."""
-    tok_rows = max(tok, 32)
-    xb_bytes = tok * 512 if (fused and not resident) else 0
-    xb_ring = bool(fused and not resident and xb_stages > 0)
-    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
-    stage_bytes = (
-        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+    """Pipeline depth of the physical decode instance after its SMEM clamp (the Cake ``decode_ir`` rule); see
+    ``_decode_stage_geometry`` for the ring forms."""
+    stage_bytes, xb_ring_bytes, xq_ring_bytes, res_bytes = _decode_stage_geometry(
+        tok, fused, resident, xb_stages, xq_stages
     )
-    xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
-    res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
     epi_bytes = min(int(epi_chunk), 32, tok) * 128 * 4
     return max(
         1,
         min(
             stages,
-            (DEC_SMEM_CAP - epi_bytes - res_bytes - xb_ring_bytes) // stage_bytes,
+            (DEC_SMEM_CAP - epi_bytes - res_bytes - xb_ring_bytes - xq_ring_bytes)
+            // stage_bytes,
         ),
     )
 
@@ -408,26 +440,48 @@ def decode_module_stages(
 # Co-resident cluster capacity of the cluster split-K decode instances per cluster size
 # (``cuOccupancyMaxActiveClusters`` of the ``_cs<C>`` instance; one CTA per SM, so it depends only on the GPC topology).
 # A persistent cluster grid larger than ``C x capacity`` serialises whole clusters into a second pass.  Measured on
-# B200 and B300 (148 SMs, the same GPC topology, identical capacities); mirrors the source repository's table.
-# 9..16 = non-portable clusters (round 6, lever C16), measured on the t16 fused small-inbox instance on both GPUs.
-DECODE_MAX_ACTIVE_CLUSTERS: dict[int, int] = {
-    2: 74,
-    3: 45,
-    4: 33,
-    5: 26,
-    6: 22,
-    7: 15,
-    8: 15,
-    9: 15,
-    10: 11,
-    12: 7,
-    14: 7,
-    16: 7,
+# B200 / B300; mirrors the source repository's table.
+DECODE_MAX_ACTIVE_CLUSTERS: dict[str, dict[int, int]] = {
+    # 9..16 = non-portable clusters (round 6, lever C16), measured on the t16 fused small-inbox instance on both GPUs
+    "sm_100a": {
+        2: 74,
+        3: 45,
+        4: 33,
+        5: 26,
+        6: 22,
+        7: 15,
+        8: 15,
+        9: 15,
+        10: 11,
+        12: 7,
+        14: 7,
+        16: 7,
+    },  # B200, 148 SMs
+    "sm_103a": {
+        2: 74,
+        3: 45,
+        4: 33,
+        5: 26,
+        6: 22,
+        7: 15,
+        8: 15,
+        9: 15,
+        10: 11,
+        12: 7,
+        14: 7,
+        16: 7,
+    },  # B300 / GB300 (152 SMs on the JHB nodes; same per-GPC cluster capacity as B200 -- measured values)
 }
 
 
 def decode_cs_alias_fits(
-    tok: int, stages: int, fused: bool, resident: bool, csplit: int, xb_stages: int = 0
+    tok: int,
+    stages: int,
+    fused: bool,
+    resident: bool,
+    csplit: int,
+    xb_stages: int = 0,
+    xq_stages: int = 0,
 ) -> bool:
     """Round 5: True when the one-round cluster exchange inbox + staging blocks
     ``(2C - 1) x 128 x (chunk | 1) x 4`` fit inside the physical instance's pipeline
@@ -435,14 +489,12 @@ def decode_cs_alias_fits(
     wide tile (1 stage at t128) does not fit and keeps the small-inbox exchange."""
     if csplit < 2:
         return False
-    tok_rows = max(tok, 32)
-    xb_bytes = tok * 512 if (fused and not resident) else 0
-    xb_ring = bool(fused and not resident and xb_stages > 0)
-    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
-    stage_bytes = (
-        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+    stage_bytes, _xb_ring_bytes, _xq_ring_bytes, _res_bytes = _decode_stage_geometry(
+        tok, fused, resident, xb_stages, xq_stages
     )
-    module_stages = decode_module_stages(tok, stages, fused, resident, xb_stages)
+    module_stages = decode_module_stages(
+        tok, stages, fused, resident, xb_stages, xq_stages=xq_stages
+    )
     tok_per_cta = -(-tok // csplit)  # ceil(tok / csplit)
     chunk = (
         -(-tok_per_cta // 4) * 4
@@ -458,29 +510,30 @@ def decode_cs_inbox_stages(
     csplit: int,
     xb_stages: int = 0,
     epi_chunk: int = 32,
+    xq_stages: int = 0,
 ) -> int:
     """Physical pipeline depth of the small-inbox (non-aliased) cluster split-K instance: the clamped depth of
     ``decode_module_stages`` reduced until a 4-row inbox round, ``(2C - 1) x 128 x 5 x 4`` bytes, fits next to the
     stages (host mirror of the Cake ``decode_cs_inbox_stages`` rule; the 7..16-wide clusters of round 6 give up one
     t16 stage)."""
     if csplit < 2:
-        return decode_module_stages(tok, stages, fused, resident, xb_stages, epi_chunk)
-    tok_rows = max(tok, 32)
-    xb_bytes = tok * 512 if (fused and not resident) else 0
-    xb_ring = bool(fused and not resident and xb_stages > 0)
-    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
-    stage_bytes = (
-        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+        return decode_module_stages(
+            tok, stages, fused, resident, xb_stages, epi_chunk, xq_stages
+        )
+    stage_bytes, xb_ring_bytes, xq_ring_bytes, res_bytes = _decode_stage_geometry(
+        tok, fused, resident, xb_stages, xq_stages
     )
-    xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
-    res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
     module_stages = decode_module_stages(
-        tok, stages, fused, resident, xb_stages, epi_chunk
+        tok, stages, fused, resident, xb_stages, epi_chunk, xq_stages
     )
     need = 5 * (2 * csplit - 1) * 128 * 4
     while (
         module_stages > 1
-        and DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes
+        and DEC_SMEM_CAP
+        - module_stages * stage_bytes
+        - res_bytes
+        - xb_ring_bytes
+        - xq_ring_bytes
         < need
     ):
         module_stages -= 1
@@ -488,7 +541,13 @@ def decode_cs_inbox_stages(
 
 
 def decode_cs_small_inbox_rounds(
-    tok: int, stages: int, fused: bool, resident: bool, csplit: int, xb_stages: int = 0
+    tok: int,
+    stages: int,
+    fused: bool,
+    resident: bool,
+    csplit: int,
+    xb_stages: int = 0,
+    xq_stages: int = 0,
 ) -> int:
     """Round 5: exchange rounds of the small (non-aliased) cluster inbox next to the
     physical pipeline stages (host mirror of the Cake ``decode_cs_small_inbox_rounds``
@@ -497,36 +556,43 @@ def decode_cs_small_inbox_rounds(
     all-rank ordering the aliased exchange needs costs ~1.6 us at C8."""
     if csplit < 2:
         return 1
-    tok_rows = max(tok, 32)
-    xb_bytes = tok * 512 if (fused and not resident) else 0
-    xb_ring = bool(fused and not resident and xb_stages > 0)
-    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
-    stage_bytes = (
-        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+    stage_bytes, xb_ring_bytes, xq_ring_bytes, res_bytes = _decode_stage_geometry(
+        tok, fused, resident, xb_stages, xq_stages
     )
-    xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
-    res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
-    module_stages = decode_module_stages(tok, stages, fused, resident, xb_stages)
+    module_stages = decode_module_stages(
+        tok, stages, fused, resident, xb_stages, xq_stages=xq_stages
+    )
     need = 5 * (2 * csplit - 1) * 128 * 4
     while (
         module_stages > 1
-        and DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes
+        and DEC_SMEM_CAP
+        - module_stages * stage_bytes
+        - res_bytes
+        - xb_ring_bytes
+        - xq_ring_bytes
         < need
     ):
         module_stages -= 1
-    budget = DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes
+    budget = (
+        DEC_SMEM_CAP
+        - module_stages * stage_bytes
+        - res_bytes
+        - xb_ring_bytes
+        - xq_ring_bytes
+    )
     tpc = -(-tok // csplit)
     chunk = min(-(-tpc // 4) * 4, (budget // ((2 * csplit - 1) * 128 * 4) - 1) // 4 * 4)
     return -(-tpc // max(chunk, 4))
 
 
-def decode_cluster_capacity(csplit: int) -> int:
-    """Co-resident cluster capacity for cluster size ``csplit`` (tabulated; raises when not measured)."""
-    if csplit not in DECODE_MAX_ACTIVE_CLUSTERS:
+def decode_cluster_capacity(arch: str, csplit: int) -> int:
+    """Co-resident cluster capacity of ``arch`` for cluster size ``csplit`` (tabulated; raises when not measured)."""
+    table = DECODE_MAX_ACTIVE_CLUSTERS.get(arch, {})
+    if csplit not in table:
         raise ValueError(
-            f"cluster capacity for csplit {csplit} is not tabulated (DECODE_MAX_ACTIVE_CLUSTERS)"
+            f"cluster capacity of {arch} for csplit {csplit} is not tabulated (DECODE_MAX_ACTIVE_CLUSTERS)"
         )
-    return int(DECODE_MAX_ACTIVE_CLUSTERS[csplit])
+    return int(table[csplit])
 
 
 @dataclass(frozen=True)
@@ -548,6 +614,7 @@ class DecodeConfig:
     xb_stages: int = (
         0  # decoupled BF16 ring depth (fused, non-resident); 0 = coupled staging
     )
+    xq_stages: int = 0  # round 4 (lever F) FP8 token-ring depth (table key ``xq_stages``; needs the BF16 ring); 0 = FP8 tile inside the W stage
     qlanes: int = (
         16  # lanes per quantization unit (16 = half-warp units, 8 / 4 = narrow units)
     )
@@ -562,6 +629,7 @@ class DecodeConfig:
     qwarps: int = DEC_QUANT_WARPS  # round 6 continuation 8 (lever QW16): quantizing warps of the fused instance (table key ``qwarps``; 8 = the round-3 default, 16 on the fused 16384 rows)
     xbh: bool = False  # round 6 continuation 9 (lever XBH): half-slot BF16 ring -- the two 128-K blocks of a stage are loaded and released separately (table key ``xbh``; fused ring rows with narrow units)
     qer: bool = False  # round 6 continuation 10 (lever QER): early half-slot release -- each quantizing warp frees its BF16 half slot right after its register loads, before the conversion (table key ``qer``; xbh rows only)
+    xp: bool = False  # round 7 (lever XP): the cluster split-K exchange issues its DSM copies from one lane per peer in parallel (table key ``xp``; ``csplit`` > 1 rows only; bit-exact)
 
     @property
     def tok_rows(self) -> int:
@@ -583,6 +651,7 @@ class DecodeConfig:
             self.qlanes,
             self.csplit,
             cs_alias=self.cs_alias,
+            xq_stages=self.xq_stages,
             epi_chunk=self.epi_chunk,
             pf=self.pf,
             mc=self.mc,
@@ -595,6 +664,7 @@ class DecodeConfig:
             qwarps=self.qwarps,
             xbh=self.xbh,
             qer=self.qer,
+            xp=self.xp,
         )
 
 
@@ -618,8 +688,9 @@ def decode_config(
 
     ``(N, K)`` families the table does not cover take the GEMM route (the Cake dispatcher falls back to its
     calibrated cost model for uncovered families up to ``DECODE_MAX_M`` rows; every representative Kimi-K3 family
-    is covered on both architectures).  Above ``DECODE_MAX_M`` rows only the tabulated narrow-N families (whose
-    activation stream the 2-CTA GEMM cannot spread over the SMs) keep the decode route."""
+    is covered on both architectures).  Above ``DECODE_MAX_M`` rows the decode route is taken only where the table
+    says so: the narrow-N families up to 16384 rows (whose activation stream the 2-CTA GEMM cannot spread over the
+    SMs) and the tabulated mid-M rows (512 / 1024 / 2048 tokens, round 7) whose GEMM grid is under-filled."""
     M = int(M)
     entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
     if entry is None or entry.get("route") != "decode":
@@ -679,6 +750,69 @@ def decode_config(
     if xb_stages == 0:
         stage_bytes = stage_bytes_ring + (xb_bytes if fused else 0)
         stages = max(2, min(DEC_MAX_STAGES, (DEC_SMEM_CAP - epi_bytes) // stage_bytes))
+    # Table key ``xq_stages`` (round 4 lever F, adopted in round 7 on the t16 cluster split-K M = 256 cells): the FP8 token
+    # tiles leave the W stage for their own ring ("auto" | N; needs the BF16 ring).  "auto" splits the budget over the three
+    # rings for the largest smallest depth, then the deepest W ring, then the most slots (host mirror of the Cake
+    # ``decode_config`` rule; a table ``stages`` pin is the Cake ``force_stages``).
+    xq_mode = entry.get("xq_stages", 0) if (fused and xb_stages > 0) else 0
+    xq_stages = 0
+    if xq_mode not in (0, "0", "", "none", None):
+        xq_bytes = tok_rows * BLOCK_K + 1024
+        w_only_bytes = DEC_W_BYTES + 1024
+        budget = DEC_SMEM_CAP - epi_bytes
+        force_stages = int(entry["stages"]) if entry.get("stages") else 0
+        if xq_mode == "auto":
+            best3 = None
+            for cw in range(2, DEC_MAX_STAGES + 1):
+                if force_stages and cw != force_stages:
+                    continue
+                for cq in range(1, DEC_XQ_MAX_STAGES + 1):
+                    cb = min(
+                        DEC_XB_MAX_STAGES,
+                        (budget - cw * w_only_bytes - cq * xq_bytes) // xb_bytes,
+                    )
+                    if xb_mode != "auto":
+                        if cb < int(xb_mode):
+                            continue  # an explicit BF16 depth must fit next to this (W, FP8) pair
+                        cb = int(xb_mode)
+                    if cb < 1:
+                        continue
+                    score3 = (min(cw, cq, cb), cw, cq + cb)
+                    if best3 is None or score3 > best3[0]:
+                        best3 = (score3, cw, cq, cb)
+            if best3 is not None:
+                _, stages, xq_stages, xb_stages = best3
+        else:
+            xq_stages = int(xq_mode)
+            if force_stages:
+                stages = force_stages
+            else:
+                stages = max(
+                    2,
+                    min(
+                        DEC_MAX_STAGES,
+                        (
+                            budget
+                            - xq_stages * xq_bytes
+                            - (xb_stages if xb_mode != "auto" else 1) * xb_bytes
+                        )
+                        // w_only_bytes,
+                    ),
+                )
+            if xb_mode == "auto":
+                xb_stages = min(
+                    DEC_XB_MAX_STAGES,
+                    (budget - stages * w_only_bytes - xq_stages * xq_bytes) // xb_bytes,
+                )
+            if (
+                xb_stages < 1
+                or stages * w_only_bytes + xq_stages * xq_bytes + xb_stages * xb_bytes
+                > budget
+            ):
+                raise ValueError(
+                    f"decode table entry: W {stages} x {w_only_bytes} + FP8 ring {xq_stages} x {xq_bytes} + BF16 ring "
+                    f"{xb_stages} x {xb_bytes} B exceed the {budget} B budget ({entry})"
+                )
     # Table key ``stages`` (round 6, lever D): the row pins the ring depth past ``DEC_MAX_STAGES`` (5 x 43008 B + an 8 KB
     # epilogue chunk fit the pool at t32); the physical instance still applies the SMEM clamp (``decode_module_stages``).
     if entry.get("stages"):
@@ -709,10 +843,14 @@ def decode_config(
     )
     if csplit > 1:
         # Whole clusters, and no more clusters than the GPCs co-schedule (a second pass of clusters doubles the time).
-        grid = csplit * max(1, min(grid // csplit, decode_cluster_capacity(csplit)))
+        grid = csplit * max(
+            1, min(grid // csplit, decode_cluster_capacity(arch, csplit))
+        )
     if mc > 1:
         # Lever M: ``grid`` counted cluster items so far; C CTAs per cluster, no more clusters than co-schedule.
-        grid = mc * max(1, min(grid, int(sm_count) // mc, decode_cluster_capacity(mc)))
+        grid = mc * max(
+            1, min(grid, int(sm_count) // mc, decode_cluster_capacity(arch, mc))
+        )
     resident = (
         bool(entry.get("resident", False))
         and fused
@@ -725,6 +863,7 @@ def decode_config(
     )
     if resident:
         xb_stages = 0  # resident tiles are fetched once; no ring
+        xq_stages = 0
     # Narrow quantization units (table key ``qlanes`` 4 / 8): every lane group must own a unit each stage, so the
     # width is doubled until the units divide evenly over the quantizing warps.
     qlanes = int(entry.get("qlanes", 16)) if fused and not resident else 16
@@ -745,6 +884,10 @@ def decode_config(
     # Table key ``qer`` (round 6 continuation 10, lever QER): early half-slot release (host mirror of the Cake ``decode_config`` rule:
     # xbh rows only; the kernel instance validates the one-unit-per-lane-group split).
     qer = bool(entry.get("qer", False)) and xbh
+    # Table key ``xp`` (round 7, lever XP): the cluster split-K exchange issues its DSM copies from one lane per peer in
+    # parallel instead of one lane walking the peers (host mirror of the Cake ``decode_config`` rule: csplit > 1 rows only;
+    # the same partials land in the same inbox slots, so the reduction is bit-exact with the serial issue).
+    xp = bool(entry.get("xp", False)) and csplit > 1
     # Table key ``tstore`` (round 6, lever E1): the split-1 epilogue stores BF16 through TMA; the instance has no TMA path
     # for the split-K / cluster reductions.
     tstore = bool(entry.get("tstore", False))
@@ -762,9 +905,11 @@ def decode_config(
     cs_alias = (
         csplit > 1
         and grid == total_work
-        and decode_cs_alias_fits(tok, stages, fused, resident, csplit, xb_stages)
+        and decode_cs_alias_fits(
+            tok, stages, fused, resident, csplit, xb_stages, xq_stages
+        )
         and decode_cs_small_inbox_rounds(
-            tok, stages, fused, resident, csplit, xb_stages
+            tok, stages, fused, resident, csplit, xb_stages, xq_stages
         )
         > 1
     )
@@ -778,16 +923,19 @@ def decode_config(
         stages=stages,
         # The small-inbox cluster exchange gives up pipeline depth until the inbox fits (round 6: one t16 stage at C7..C16).
         module_stages=decode_cs_inbox_stages(
-            tok, stages, fused, resident, csplit, xb_stages, epi_chunk
+            tok, stages, fused, resident, csplit, xb_stages, epi_chunk, xq_stages
         )
         if csplit > 1 and not cs_alias
-        else decode_module_stages(tok, stages, fused, resident, xb_stages, epi_chunk),
+        else decode_module_stages(
+            tok, stages, fused, resident, xb_stages, epi_chunk, xq_stages
+        ),
         m_tiles=m_tiles,
         tiles=tiles,
         total_work=total_work,
         grid=grid,
         tok_per_cta=-(-tok // split),
         xb_stages=xb_stages,
+        xq_stages=xq_stages,
         qlanes=qlanes,
         csplit=csplit,
         epi_chunk=epi_chunk,
@@ -799,6 +947,7 @@ def decode_config(
         xbh=xbh,
         qer=qer,
         cs_alias=cs_alias,
+        xp=xp,
     )
 
 
@@ -921,14 +1070,27 @@ class StreamKFixupPlan(NamedTuple):
     sk_tiles: int
     grid: int
     partial_bytes: int
+    inst_slots: int = GEMM_SKF_MAX_SLOTS  # round 7 (CAKE-985): slot bound of the launched instance form
+    sliced: bool = False  # round 7 (CAKE-985, lever SKS): sliced range mapping (``pairs`` = tiles, ``total`` = slices)
+
+    @property
+    def program_suffix(self) -> str:
+        """Program key suffix of the launched form: ``_skf`` (round 6), ``_skf4`` / ``_skf8``, or ``_sks<slots>``."""
+        if self.sliced:
+            return f"{GEMM_SKS_SUFFIX}{self.inst_slots}"
+        return GEMM_SKF_SUFFIX + (
+            "" if self.inst_slots == GEMM_SKF_MAX_SLOTS else str(self.inst_slots)
+        )
 
 
 def gemm_stream_k_fixup(M: int, n_tiles128: int, num_k_iters: int, arch: str) -> bool:
-    """Round 6 continuation 17/18 (lever SKF): True when the shape's table row asks for the fix-up stream-K GEMM
-    instance (key ``gemm_skf``; GEMM-routed rows only)."""
+    """Round 6 continuation 17/18 (lever SKF): True when the shape's table row asks for a fix-up stream-K GEMM
+    instance (key ``gemm_skf``, or the sliced form's ``gemm_sks``; GEMM-routed rows only)."""
     entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
     return bool(
-        entry is not None and entry.get("route") == "gemm" and entry.get("gemm_skf", 0)
+        entry is not None
+        and entry.get("route") == "gemm"
+        and (entry.get("gemm_skf", 0) or entry.get("gemm_sks", 0))
     )
 
 
@@ -956,8 +1118,36 @@ def gemm_stream_k_fixup_plan(
     adds the slots in ordinal order before rounding (Cake host mirror, including the contributor count bound)."""
     if not gemm_stream_k_fixup(M, n_tiles128, num_k_iters, arch):
         return None
+    entry = decode_table_entry(M, n_tiles128, num_k_iters, arch) or {}
+    skf_key = int(entry.get("gemm_skf", 0))
+    slot_cap = skf_key if skf_key in GEMM_SKF_SLOT_FORMS else GEMM_SKF_MAX_SLOTS
+    sks_want = int(entry.get("gemm_sks", 0))
     pairs = int(sm_count) // CTA_GROUP
     tiles = (int(m_tiles) // CTA_GROUP) * int(gemm_n_tiles)
+    if sks_want:
+        # round 7 (CAKE-985, lever SKS): S slices per tile on tiles x S resident pairs (Cake host mirror)
+        slices = min(
+            pairs // tiles,
+            int(num_k_iters) // GEMM_SKF_MIN_ITERS,
+            slot_cap + 1,
+            sks_want if sks_want > 1 else pairs,
+        )
+        if slices < 2:
+            return None
+        inst = next(f for f in GEMM_SKF_SLOT_FORMS if f >= slices - 1)
+        return StreamKFixupPlan(
+            tiles,
+            slices,
+            slices - 1,
+            0,
+            tiles,
+            tiles * slices * CTA_GROUP,
+            tiles * (slices - 1) * gemm_skf_tile_bytes(gemm_bn),
+            inst,
+            True,
+        )
+    if not skf_key:
+        return None
     full, rem = divmod(tiles, pairs)
     if rem == 0:
         return None
@@ -971,7 +1161,7 @@ def gemm_stream_k_fixup_plan(
         return ((i + 1) * pairs - 1) // total
 
     maxc = max(pair_of((t + 1) * nk - 1) - pair_of(t * nk) + 1 for t in range(sk_tiles))
-    if maxc - 1 > GEMM_SKF_MAX_SLOTS:
+    if maxc - 1 > slot_cap:
         return None
     slots = max(maxc - 1, 1)
     return StreamKFixupPlan(
@@ -982,6 +1172,8 @@ def gemm_stream_k_fixup_plan(
         sk_tiles,
         (first if first > 0 else pairs) * CTA_GROUP,
         sk_tiles * slots * gemm_skf_tile_bytes(gemm_bn),
+        next(f for f in GEMM_SKF_SLOT_FORMS if f >= slots),
+        False,
     )
 
 
@@ -1113,6 +1305,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
             sfx = GEMM_N192_SUFFIX if gbn != BLOCK_N else ""
             gsk = bool(entry.get("gemm_sk", 0))
             gskf = bool(entry.get("gemm_skf", 0))
+            gsks = bool(entry.get("gemm_sks", 0))
             gkeys: list[str] = []
             if gpf > 0:
                 # round 6 (lever GP): the prefetching GEMM program of the tabulated row's production epilogue (16-byte
@@ -1132,10 +1325,27 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                 )
             if gskf:
                 # round 6 continuation 17/18 (lever SKF): the fix-up stream-K instance of the row's TMA-store program (the
-                # only fix-up program the Cake export plan ships); other views fall back to the plain programs
-                gkeys.append(
-                    gemm_kernel_key(GEMM_TSTORE_KERNEL_KEY + sfx + GEMM_SKF_SUFFIX, gpf)
+                # only fix-up program the Cake export plan ships); other views fall back to the plain programs.  Round 7:
+                # a slot bound of 4 / 8 in the cell names the wider form.
+                skf_key = int(entry.get("gemm_skf", 0))
+                skf_sfx = GEMM_SKF_SUFFIX + (
+                    str(skf_key)
+                    if skf_key in GEMM_SKF_SLOT_FORMS and skf_key != GEMM_SKF_MAX_SLOTS
+                    else ""
                 )
+                gkeys.append(
+                    gemm_kernel_key(GEMM_TSTORE_KERNEL_KEY + sfx + skf_sfx, gpf)
+                )
+            if gsks:
+                # round 7 (CAKE-985, lever SKS): the sliced fix-up forms the row may launch (the slot form follows the
+                # row count inside the bucket: every form is listed, unavailable ones fall back in ``route_plan``)
+                for form in GEMM_SKF_SLOT_FORMS:
+                    gkeys.append(
+                        gemm_kernel_key(
+                            GEMM_TSTORE_KERNEL_KEY + sfx + f"{GEMM_SKS_SUFFIX}{form}",
+                            gpf,
+                        )
+                    )
             for gkey in gkeys:
                 if gkey not in keys:
                     keys.append(gkey)
@@ -1390,17 +1600,18 @@ def allocate_kimi_k3_fp8_projection_workspace(
 ) -> ProjectionWorkspace:
     """Allocate the caller-owned workspaces for ``M`` activation rows on the weight's device (no launch).
 
-    The activation scale tiles (their padding rows must read as zero scales), the per-tile counters and the
-    stream-K hand-off flags are zero initialised; the programs leave the counters and flags reset, so one
-    workspace serves every launch of this ``M``."""
+    The auxiliary buffer is sized for the resolved route (activation scale tiles, decode split-K counters +
+    partials, or the stream-K flags + partial tiles of a GEMM-route table row) and zero initialised as a whole: the
+    scale padding rows must read as zero scales, the counters / flags start at zero, and the programs leave them
+    reset, so one workspace serves every launch of this ``M``."""
     M = int(M)
     if M < 1:
         raise ValueError("M must be positive")
     device = prepared.device
     facts = device_facts(device)
     q = torch.empty((M, prepared.K), dtype=torch.float8_e4m3fn, device=device)
-    # ``workspace_sf_bytes`` covers the decode split-K area or, on the GEMM path of a stream-K row (round 6, levers
-    # SKO / SKF), the hand-off flags + partial tiles, which must start zeroed (the programs leave them reset).
+    # Zero initialised as a whole: the activation scale padding rows must read as zero scales, the decode per-tile
+    # counters and the stream-K flags (levers SKO / SKF) start at zero, and the programs leave them reset.
     sf = torch.zeros(
         (workspace_sf_bytes(prepared, M, facts.arch, facts.sm_count),),
         dtype=torch.uint8,
@@ -1562,7 +1773,9 @@ def route_plan(
         # registered.  Round 6 (lever L5): the 192-wide instance of the row's epilogue program when the table row asks
         # for it and the program is registered; every fallback keeps the row on a registered program.
         stems: list[tuple[str, int, int]] = []  # (program stem, prefetch distance, bn)
-        if gbn != BLOCK_N:
+        if gbn != BLOCK_N and base != GEMM_KERNEL_KEY:
+            # round 7 (CAKE-985): the 192-wide form ships for the TMA-store and staged-register epilogues only (Cake
+            # launcher rule); the predicated register epilogue keeps the 256-wide program
             stems.append((base + GEMM_N192_SUFFIX, gpf, gbn))
             if gpf:
                 stems.append((base + GEMM_N192_SUFFIX, 0, gbn))
@@ -1576,14 +1789,20 @@ def route_plan(
             tuple[str, int, Optional[StreamKPlan], Optional[StreamKFixupPlan]]
         ] = []
         for stem, pf, bn in stems:
-            sk = gemm_stream_k_plan(
-                M,
-                prepared.n_tiles128,
-                prepared.num_k_iters,
-                arch,
-                sm_count,
-                _m_tiles(M),
-                gemm_n_tiles(prepared, bn),
+            # round 7 (CAKE-985): the ordered stream-K form ships for the TMA-store epilogue only, like the fix-up form
+            # (Cake launcher rule); the register epilogues keep the plain schedule
+            sk = (
+                gemm_stream_k_plan(
+                    M,
+                    prepared.n_tiles128,
+                    prepared.num_k_iters,
+                    arch,
+                    sm_count,
+                    _m_tiles(M),
+                    gemm_n_tiles(prepared, bn),
+                )
+                if stem.startswith(GEMM_TSTORE_KERNEL_KEY)
+                else None
             )
             if sk is not None:
                 candidates.append(
@@ -1608,7 +1827,7 @@ def route_plan(
                 )
                 if skf is not None:
                     candidates.append(
-                        (gemm_kernel_key(stem + GEMM_SKF_SUFFIX, pf), bn, None, skf)
+                        (gemm_kernel_key(stem + skf.program_suffix, pf), bn, None, skf)
                     )
             candidates.append((gemm_kernel_key(stem, pf), bn, None, None))
         key, gbn, sk_plan, skf_plan = next(
@@ -1815,23 +2034,11 @@ def validate_kimi_k3_fp8_projection_inputs(
     return M
 
 
-def prepare_kimi_k3_fp8_projection(
-    x: torch.Tensor,
-    prepared: PreparedProjectionWeight,
-    out: torch.Tensor,
-    workspace: ProjectionWorkspace,
-) -> KimiK3Fp8ProjectionRunner:
-    """Validate the binding, select the route and bind the launch sequence.
-
-    ``out`` is a ``[M, n_valid]`` BF16 view with unit column stride and an even row stride (any view into a
-    wider buffer); ``workspace`` comes from :func:`allocate_kimi_k3_fp8_projection_workspace` for this ``M``
-    (its scale-tile and counter bytes zero initialised once; the programs keep the counters reset).  The route
-    is resolved once here from the device's cached architecture / SM count; the JIT modules of the route are
-    built and loaded here, so prepare outside CUDA Graph capture."""
-    device = prepared.device
-    device_index = _device_index(device)
-    facts = device_facts(device)
-    M = _activation_rows(x, prepared)
+def _resolve_plan(
+    prepared: PreparedProjectionWeight, M: int, out: torch.Tensor, facts: DeviceFacts
+) -> tuple[ProjectionPlan, int]:
+    """Route plan of ``M`` rows into the output view ``out`` (its row stride and address alignment select the
+    epilogue program); returns ``(plan, ldo)``."""
     cfg = decode_config(
         M, prepared.n_tiles128, prepared.num_k_iters, facts.arch, facts.sm_count
     )
@@ -1849,112 +2056,205 @@ def prepare_kimi_k3_fp8_projection(
         ),
         decode_tma_store=tma_store,
     )
-    validate_kimi_k3_fp8_projection_inputs(
-        x, prepared, out, workspace, sf_bytes=plan.workspace_sf_bytes
+    return plan, ldo
+
+
+# Launch arguments that bind the call's tensors (activations, output view, workspace); every other argument of a
+# stage is a function of the prepared weight and the resolved plan alone.
+_CALL_ARGS = frozenset(
+    (
+        "x",
+        "XB",
+        "out",
+        "OUT",
+        "a_q",
+        "a_sf",
+        "A",
+        "SFA",
+        "X",
+        "SFX",
+        "partials",
+        "counters",
+        "sk_partials",
+        "sk_flags",
     )
+)
+
+
+def _workspace_bindings(
+    plan: ProjectionPlan,
+    prepared: PreparedProjectionWeight,
+    M: int,
+    workspace: ProjectionWorkspace,
+    device: torch.device,
+) -> dict[str, Any]:
+    """The workspace-derived launch arguments of ``plan`` (views of ``workspace`` for ``M`` rows)."""
     q, sf = workspace
-    out_flat = torch.as_strided(
-        out, (ldo * (M - 1) + prepared.n_valid,), (1,), out.storage_offset()
-    )
     a_u8 = q.view(torch.uint8)
-    b_u8 = prepared.weight_tiles.view(torch.uint8)
     sfa = sf[: activation_sf_workspace_bytes(M, prepared.K, plan.sf_rows)].view(
         -1, 4, 128
     )
-    launches: list[tuple[Callable[..., Any], tuple]] = []
+    bound: dict[str, Any] = dict(a_q=q, a_sf=sf, A=a_u8, SFA=sfa, X=a_u8, SFX=sfa)
+    if plan.decode is None:
+        bound.update(_sk_launch_kwargs(plan, sf, device))
+    else:
+        c_off, c_bytes, p_off, p_bytes = (
+            plan.counters_offset,
+            plan.counters_bytes,
+            plan.partials_offset,
+            plan.partials_bytes,
+        )
+        bound["partials"] = sf[p_off : p_off + p_bytes].view(torch.float32)
+        bound["counters"] = sf[c_off : c_off + c_bytes].view(torch.uint32)
+    return bound
+
+
+def _output_bindings(
+    plan: ProjectionPlan,
+    prepared: PreparedProjectionWeight,
+    M: int,
+    ldo: int,
+    x: torch.Tensor,
+    out: torch.Tensor,
+    device_index: int,
+) -> dict[str, Any]:
+    """The activation / output launch arguments of one call: ``x`` (also ``XB`` of the fused decode instance), the
+    flat output view and the ``OUT`` TMA-store descriptor source (the output view for the TMA-store programs, the
+    per-device placeholder for the register-epilogue GEMM programs; the register-epilogue decode programs do not
+    take it)."""
+    out_flat = torch.as_strided(
+        out, (ldo * (M - 1) + prepared.n_valid,), (1,), out.storage_offset()
+    )
+    bound: dict[str, Any] = dict(x=x, XB=x, out=out_flat)
+    if plan.decode is None:
+        bound["OUT"] = (
+            out if plan.gemm_tma_store else _placeholder_out_map(device_index)
+        )
+    elif plan.decode_tma_store:
+        bound["OUT"] = out
+    return bound
+
+
+def _stage_kwargs(
+    plan: ProjectionPlan,
+    prepared: PreparedProjectionWeight,
+    facts: DeviceFacts,
+    M: int,
+    ldo: int,
+    out_ptr: int,
+) -> list[tuple[tuple[str, Defines], dict[str, Any]]]:
+    """``(program, fixed kwargs)`` per launch of ``plan`` -- every argument except the call-bound ones (_CALL_ARGS)."""
+    stages: list[tuple[tuple[str, Defines], dict[str, Any]]] = []
     stage = 0
+    cfg = plan.decode
+    if plan.quant_units is not None:
+        k_blocks = prepared.K // BLOCK
+        stages.append(
+            (
+                plan.programs[stage],
+                dict(
+                    M=M,
+                    K=prepared.K,
+                    units_per_row=k_blocks // plan.quant_units,
+                    sf_k_sets=prepared.sf_k_sets,
+                    sf_rows=plan.sf_rows,
+                    grid=(plan.grids[stage], 1, 1),
+                ),
+            )
+        )
+        stage += 1
+    if cfg is None:
+        stages.append(
+            (
+                plan.programs[stage],
+                dict(
+                    B=prepared.weight_tiles.view(torch.uint8),
+                    SFB=prepared.scale_tiles_for(plan.gemm_bn).view(-1, 8, 128),
+                    K=prepared.K,
+                    M=M,
+                    m_tiles=_m_tiles(M),
+                    n_tiles=plan.gemm_n_tiles,
+                    n_valid=prepared.n_valid,
+                    ldo=ldo,
+                    store_vec=_store_vec(out_ptr, ldo),
+                    num_k_iters=prepared.num_k_iters,
+                    sf_k_tiles=prepared.sf_k_sets,
+                    **_sk_scalar_kwargs(plan),
+                    grid=(plan.grids[stage], 1, 1),
+                ),
+            )
+        )
+    else:
+        stages.append(
+            (
+                plan.programs[stage],
+                dict(
+                    W=prepared.weight_tiles.view(torch.uint8),
+                    SFW=prepared.scale_tiles.view(-1, 4, 128),
+                    M=M,
+                    n_tiles=prepared.n_tiles128,
+                    n_valid=prepared.n_valid,
+                    ldo=ldo,
+                    num_k_iters=prepared.num_k_iters,
+                    sf_k_tiles=prepared.sf_k_sets,
+                    split=cfg.split,
+                    tok_per_cta=cfg.tok_per_cta,
+                    total_work=cfg.total_work,
+                    store_vec=_decode_store_vec(out_ptr, ldo, prepared.n_valid),
+                    K=prepared.K,
+                    grid=(plan.grids[stage], 1, 1),
+                ),
+            )
+        )
+    return stages
+
+
+def _sk_scalar_kwargs(plan: ProjectionPlan) -> dict[str, int]:
+    """The four stream-K split scalars of a GEMM program (the two hand-off tensors are workspace bindings)."""
+    sk = plan.gemm_sk
+    skf = plan.gemm_skf
+    if sk is None and skf is not None:
+        return dict(
+            sk_pairs=skf.pairs, sk_rem=skf.total, sk_ksplit=skf.slots, sk_dp=skf.first
+        )
+    if sk is None:
+        return dict(sk_pairs=0, sk_rem=0, sk_ksplit=0, sk_dp=0)
+    return dict(sk_pairs=sk.pairs, sk_rem=sk.rem, sk_ksplit=sk.ksplit, sk_dp=sk.dp)
+
+
+def prepare_kimi_k3_fp8_projection(
+    x: torch.Tensor,
+    prepared: PreparedProjectionWeight,
+    out: torch.Tensor,
+    workspace: ProjectionWorkspace,
+) -> KimiK3Fp8ProjectionRunner:
+    """Validate the binding, select the route and bind the launch sequence.
+
+    ``out`` is a ``[M, n_valid]`` BF16 view with unit column stride and an even row stride (any view into a
+    wider buffer); ``workspace`` comes from :func:`allocate_kimi_k3_fp8_projection_workspace` for this ``M``
+    (its scale-tile and counter bytes zero initialised once; the programs keep the counters reset).  The route
+    is resolved once here from the device's cached architecture / SM count; the JIT modules of the route are
+    built and loaded here, so prepare outside CUDA Graph capture.  For many launches of one weight with changing
+    activations / output views (an engine's prefill), :class:`KimiK3Fp8ProjectionLauncher` caches the route and
+    the workspaces per ``M`` and binds only the call's tensors."""
+    device = prepared.device
+    device_index = _device_index(device)
+    facts = device_facts(device)
+    M = _activation_rows(x, prepared)
+    plan, ldo = _resolve_plan(prepared, M, out, facts)
+    validate_kimi_k3_fp8_projection_inputs(
+        x, prepared, out, workspace, sf_bytes=plan.workspace_sf_bytes
+    )
+    bound = _workspace_bindings(plan, prepared, M, workspace, device)
+    bound.update(_output_bindings(plan, prepared, M, ldo, x, out, device_index))
+    launches: list[tuple[Callable[..., Any], tuple]] = []
     with torch.cuda.device(device_index):
-        if plan.quant_units is not None:
-            k_blocks = prepared.K // BLOCK
-            launches.append(
-                _bind(
-                    plan.programs[stage],
-                    facts.arch,
-                    dict(
-                        x=x,
-                        a_q=q,
-                        a_sf=sf,
-                        M=M,
-                        K=prepared.K,
-                        units_per_row=k_blocks // plan.quant_units,
-                        sf_k_sets=prepared.sf_k_sets,
-                        sf_rows=plan.sf_rows,
-                        grid=(plan.grids[stage], 1, 1),
-                    ),
-                )
-            )
-            stage += 1
-        if cfg is None:
-            # ``OUT`` is the TMA-store descriptor over the [M, n_valid] output view (clipped rows / columns are never
-            # written); the register-epilogue programs receive the per-device placeholder map they never access.
-            out_map = out if plan.gemm_tma_store else _placeholder_out_map(device_index)
-            launches.append(
-                _bind(
-                    plan.programs[stage],
-                    facts.arch,
-                    dict(
-                        A=a_u8,
-                        B=b_u8,
-                        SFA=sfa,
-                        SFB=prepared.scale_tiles_for(plan.gemm_bn).view(-1, 8, 128),
-                        OUT=out_map,
-                        x=x,
-                        K=prepared.K,
-                        out=out_flat,
-                        M=M,
-                        m_tiles=_m_tiles(M),
-                        n_tiles=plan.gemm_n_tiles,
-                        n_valid=prepared.n_valid,
-                        ldo=ldo,
-                        store_vec=_store_vec(out.data_ptr(), ldo),
-                        num_k_iters=prepared.num_k_iters,
-                        sf_k_tiles=prepared.sf_k_sets,
-                        **_sk_launch_kwargs(plan, sf, device),
-                        grid=(plan.grids[stage], 1, 1),
-                    ),
-                )
-            )
-        else:
-            c_off, c_bytes, p_off, p_bytes = (
-                plan.counters_offset,
-                plan.counters_bytes,
-                plan.partials_offset,
-                plan.partials_bytes,
-            )
-            launches.append(
-                _bind(
-                    plan.programs[stage],
-                    facts.arch,
-                    dict(
-                        W=b_u8,
-                        X=a_u8,
-                        SFW=prepared.scale_tiles.view(-1, 4, 128),
-                        SFX=sfa,
-                        out=out_flat,
-                        partials=sf[p_off : p_off + p_bytes].view(torch.float32),
-                        counters=sf[c_off : c_off + c_bytes].view(torch.uint32),
-                        M=M,
-                        n_tiles=prepared.n_tiles128,
-                        n_valid=prepared.n_valid,
-                        ldo=ldo,
-                        num_k_iters=prepared.num_k_iters,
-                        sf_k_tiles=prepared.sf_k_sets,
-                        split=cfg.split,
-                        tok_per_cta=cfg.tok_per_cta,
-                        total_work=cfg.total_work,
-                        store_vec=_decode_store_vec(
-                            out.data_ptr(), ldo, prepared.n_valid
-                        ),
-                        x=x,
-                        K=prepared.K,
-                        XB=x,
-                        # ``OUT``: the [M, n_valid] output view for the TMA-store epilogue (rows >= M / columns >= n_valid are
-                        # clipped by the unit); the register-epilogue programs do not take the parameter.
-                        **({"OUT": out} if plan.decode_tma_store else {}),
-                        grid=(plan.grids[stage], 1, 1),
-                    ),
-                )
-            )
+        for program, fixed in _stage_kwargs(
+            plan, prepared, facts, M, ldo, out.data_ptr()
+        ):
+            kwargs = dict(fixed)
+            kwargs.update(bound)
+            launches.append(_bind(program, facts.arch, kwargs))
     return KimiK3Fp8ProjectionRunner(plan, prepared, x, out, workspace, tuple(launches))
 
 
@@ -1976,3 +2276,184 @@ def kimi_k3_fp8_projection(
     if workspace is None:
         workspace = allocate_kimi_k3_fp8_projection_workspace(prepared, int(x.shape[0]))
     return prepare_kimi_k3_fp8_projection(x, prepared, out, workspace)()
+
+
+@dataclass(frozen=True)
+class _LaunchTemplate:
+    """The launch sequence of one ``(M, output row stride, output address class)`` with the call-bound arguments
+    (_CALL_ARGS) left as names: ``stages[i] = (entry, ((is_call_arg, value_or_name), ...))``."""
+
+    plan: ProjectionPlan
+    ldo: int
+    stages: tuple[tuple[Callable[..., Any], tuple[tuple[bool, Any], ...]], ...]
+
+
+@dataclass
+class _WorkspaceState:
+    workspace: ProjectionWorkspace
+    bindings: dict[tuple[str, ...], dict[str, Any]]
+    pinned: bool = False
+
+
+class KimiK3Fp8ProjectionLauncher:
+    """Allocation-light repeated launches of one prepared weight (an engine's linear layer).
+
+    ``launcher(x, out)`` runs ``out[:, :n_valid] = bf16(x @ dequant(w2, s2).T)`` for any ``M = x.shape[0]``: the
+    route plan and the per-stage argument templates are resolved once per ``(M, row stride, output address class)``,
+    the workspace of each ``M`` is allocated once and reused (the programs leave it reusable), and a call only binds
+    the call's tensors (``x``, the output view, the cached workspace views) before the launches -- no route
+    resolution, validation of the prepared weight, workspace allocation or host synchronisation per call.
+
+    ``max_workspaces`` bounds the per-``M`` workspace cache (least recently used ``M`` evicted first); an ``M`` used
+    inside CUDA-graph capture (first seen there or resolved eagerly before) is pinned, because the captured graph
+    keeps referencing its workspace.  One
+    launcher serves one stream order: concurrent launches of the same ``M`` from several streams would share a
+    workspace.  Resolve a new ``(M, out)`` class once eagerly before capturing a graph of it (the JIT modules of the
+    route load on first use)."""
+
+    def __init__(self, prepared: PreparedProjectionWeight, *, max_workspaces: int = 64):
+        if int(max_workspaces) < 1:
+            raise ValueError("max_workspaces must be positive")
+        self.prepared = prepared
+        self.device = prepared.device
+        self._device_index = _device_index(prepared.device)
+        self._facts = device_facts(prepared.device)
+        self._max_workspaces = int(max_workspaces)
+        self._templates: dict[tuple[int, int, int], _LaunchTemplate] = {}
+        self._workspaces: dict[int, _WorkspaceState] = {}  # insertion order = recency
+
+    # -- caches ---------------------------------------------------------------------------------------------------
+
+    def workspace(self, M: int) -> ProjectionWorkspace:
+        """The cached workspace of ``M`` rows (allocated on first use)."""
+        return self._workspace_state(int(M)).workspace
+
+    def _workspace_state(self, M: int) -> _WorkspaceState:
+        state = self._workspaces.get(M)
+        if state is not None:
+            if next(reversed(self._workspaces)) != M:
+                self._workspaces[M] = self._workspaces.pop(M)  # most recently used last
+            if not state.pinned and torch.cuda.is_current_stream_capturing():
+                state.pinned = True  # a graph captured after the eager resolution keeps referencing this workspace
+            return state
+        while len(self._workspaces) >= self._max_workspaces:
+            victim = next(
+                (m for m, st in self._workspaces.items() if not st.pinned), None
+            )
+            if victim is None:
+                break  # every cached workspace is pinned by a captured graph: grow instead of evicting
+            del self._workspaces[victim]
+        workspace = allocate_kimi_k3_fp8_projection_workspace(self.prepared, M)
+        state = _WorkspaceState(
+            workspace, {}, pinned=bool(torch.cuda.is_current_stream_capturing())
+        )
+        self._workspaces[M] = state
+        return state
+
+    def _template(self, M: int, out: torch.Tensor) -> _LaunchTemplate:
+        ldo = int(out.stride(0))
+        key = (M, ldo, out.data_ptr() % 32)
+        template = self._templates.get(key)
+        if template is None:
+            plan, _ldo = _resolve_plan(self.prepared, M, out, self._facts)
+            stages = []
+            with torch.cuda.device(self._device_index):
+                for program, fixed in _stage_kwargs(
+                    plan, self.prepared, self._facts, M, ldo, out.data_ptr()
+                ):
+                    name, defines = program
+                    record = MODULES[name]
+                    grid = dict(
+                        zip(("grid_x", "grid_y", "grid_z"), fixed["grid"], strict=True)
+                    )
+                    slots: list[tuple[bool, Any]] = []
+                    for kind, argument in record["arg_plan"]:
+                        if kind == "grid":
+                            slots.append((False, grid[argument]))
+                        elif argument in _CALL_ARGS:
+                            slots.append((True, argument))
+                        elif argument in fixed:
+                            slots.append((False, fixed[argument]))
+                        else:
+                            raise KeyError(
+                                f"generated program {name!r} expects argument {argument!r} ({kind}); "
+                                f"host binding provides {sorted(fixed) + sorted(_CALL_ARGS)}"
+                            )
+                    module = load_cake_kimi_k3_fp8_projection_module(
+                        name, self._facts.arch, defines
+                    )
+                    stages.append((getattr(module, record["ffi_entry"]), tuple(slots)))
+            template = _LaunchTemplate(plan, ldo, tuple(stages))
+            self._templates[key] = template
+        return template
+
+    # -- launch ---------------------------------------------------------------------------------------------------
+
+    def __call__(
+        self, x: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        prepared = self.prepared
+        if (
+            x.dtype != torch.bfloat16
+            or x.dim() != 2
+            or int(x.shape[1]) != prepared.K
+            or not x.is_contiguous()
+        ):
+            raise ValueError(f"x must be a contiguous bf16 [M, {prepared.K}] tensor")
+        M = int(x.shape[0])
+        if M < 1:
+            raise ValueError("M must be positive")
+        if out is None:
+            out = torch.empty(
+                (M, prepared.n_valid), dtype=torch.bfloat16, device=self.device
+            )
+        elif (
+            out.dtype != torch.bfloat16
+            or out.dim() != 2
+            or tuple(out.shape) != (M, prepared.n_valid)
+            or out.stride(1) != 1
+            or out.stride(0) % 2
+            or out.stride(0) < prepared.n_valid
+            or (out.storage_offset() * 2) % 4
+        ):
+            raise ValueError(
+                f"out must be a 4-byte aligned bf16 [{M}, {prepared.n_valid}] view with unit column stride and an "
+                f"even row stride >= {prepared.n_valid}"
+            )
+        if x.device != self.device or out.device != self.device:
+            raise ValueError(
+                "x, out and the prepared weight must be on one CUDA device"
+            )
+        template = self._template(M, out)
+        state = self._workspace_state(M)
+        plan = template.plan
+        bound = state.bindings.get(plan.kernels)
+        if bound is None:
+            bound = _workspace_bindings(plan, prepared, M, state.workspace, self.device)
+            state.bindings[plan.kernels] = bound
+        call = dict(bound)
+        call.update(
+            _output_bindings(
+                plan, prepared, M, template.ldo, x, out, self._device_index
+            )
+        )
+        with tvm_ffi.use_torch_stream():
+            for entry, slots in template.stages:
+                entry(*[call[value] if dynamic else value for dynamic, value in slots])
+        return out
+
+    def plan(self, x: torch.Tensor, out: torch.Tensor) -> ProjectionPlan:
+        """The route plan a call with these bindings launches (resolving / caching its template)."""
+        return self._template(int(x.shape[0]), out).plan
+
+    @property
+    def cached_rows(self) -> tuple[int, ...]:
+        """The ``M`` values with a cached workspace, least recently used first."""
+        return tuple(self._workspaces)
+
+
+def kimi_k3_fp8_projection_launcher(
+    prepared: PreparedProjectionWeight, *, max_workspaces: int = 64
+) -> KimiK3Fp8ProjectionLauncher:
+    """A :class:`KimiK3Fp8ProjectionLauncher` for ``prepared`` (one per engine linear layer)."""
+    return KimiK3Fp8ProjectionLauncher(prepared, max_workspaces=max_workspaces)

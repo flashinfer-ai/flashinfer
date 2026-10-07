@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public SiTU backend correctness and caller-owned graph/workspace behavior."""
+"""Cake SiTU backend: route selection, caller-owned workspace and graph behaviour.
 
-import re
+Every test observes the backend through its public entry points and the
+prepared-shape facts the host records (stages, bound programs, FC2 pool); none
+asserts the text or structure of a generated source.
+"""
 
 import pytest
 import torch
@@ -25,24 +28,28 @@ from flashinfer.fused_moe import (
     QuantFormat,
     SiTU,
     TrtllmFp4Config,
-    cutlass_fused_moe,
     cake_fused_moe_prepare_workspace,
+    cutlass_fused_moe,
     cutlass_fused_moe_workspace_size,
     trtllm_fp4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe.cake_kimi_k3_situ import (
-    _N8_W2A_M16_FC2_GRID_N_SM_FACTOR,
-    _cake_situ_flat_args,
+    _ROUTE_MC_CLUSTER,
+    _SELECTORS,
     _cake_situ_stage_bindings,
     _cake_situ_workspace_views,
+    _fc2_grid_n,
     _geometry,
     _prepared,
+    _route,
+    _selector,
     _workspace_layout,
 )
 from flashinfer.jit.cake_kimi_k3_situ import (
-    PROGRAMS,
-    ROUTES,
-    _source_path,
+    CARRIED_PROGRAMS,
+    KERNELS,
+    MODULES,
+    cake_situ_program,
     get_cake_situ_module,
 )
 from flashinfer.tllm_enums import ActivationType, RoutingMethodType
@@ -51,77 +58,77 @@ from flashinfer.utils import device_support_pdl
 
 HIDDEN, INTERMEDIATE, EXPERTS, TOP_K = 3584, 384, 896, 16
 NVFP4_QUANT = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+ARCHES = ("sm_100a", "sm_103a")
 ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+LARGE_TOKENS = (8192, 16384)
+# SM count of the B200 and B300 parts the FC2 pools were sized on.
+REFERENCE_SM_COUNT = 148
+
+# Token counts with a route of their own; every other count runs the generic
+# pipeline of its tile-N bucket (8 / 16 / 32 / 128).
+ROUTED = {
+    1: "m1",
+    8: "n8_feature",
+    16: "n8_w2a_m16",
+    32: "m64_claim8",
+    64: "m64_claim8",
+    128: "m64_claim8",
+    256: "m64_claim8",
+    512: "n32_claim8",
+    1024: "n32_claim8",
+    2048: "mid_work5fd",
+    4096: "mid_work5fd",
+    8192: "large_c7",
+    16384: "large_c7",
+}
+GENERIC_STAGES = [
+    "route_reset",
+    "quant",
+    "route_histogram",
+    "route_prefix",
+    "route_scatter",
+    "fc1",
+    "fc2",
+    "finalize",
+]
+STAGES_BY_SELECTOR = {
+    "m1": ["quant_route", "fc1", "fc2", "finalize"],
+    "n8_feature": ["quant_route", "fc1", "fc2", "finalize"],
+    "n8_w2a_m16": ["quant_route", "fc1", "fc2", "finalize"],
+    "m64_claim8": ["quant", "fused_router", "fc1", "fc2", "finalize"],
+    "n32_claim8": ["quant", "fused_router", "fc1", "fc2", "finalize"],
+    "mid_work5fd": GENERIC_STAGES,
+    "large_c7": GENERIC_STAGES[:5] + ["sfb_shuffle"] + GENERIC_STAGES[5:],
+}
 
 
-def _small_row_selector(arch, num_tokens):
-    # Route selectors of the small token counts: the two-CTA-per-SM FC2 route
-    # for 16 tokens on both architectures, the single-token route for 1 token
-    # and the fused quantization + router route for 8 tokens.
-    if num_tokens == 16:
-        return "n8_w2a_m16"
-    if num_tokens == 1:
-        return "m1"
-    if num_tokens in (8, 16):
-        return "n8_feature"
-    return None
+def _tile_bucket(num_tokens):
+    if num_tokens <= 128:
+        return 8
+    if num_tokens <= 256:
+        return 16
+    if num_tokens <= 1024:
+        return 32
+    return 128
 
 
-def _declares_fused_quant_route(program_key):
-    return any(
-        name == "quant_route.s2b_num_tokens"
-        for _, name in PROGRAMS[program_key]["arg_plan"]
-    )
+def _expected_selector(num_tokens):
+    return ROUTED.get(num_tokens, _tile_bucket(num_tokens))
 
 
-def _stage_kernel_source(program_key, stage):
-    # A prepared launch sequence binds one generated kernel per stage inside a
-    # `namespace stage_<name> { ... }` block of its binding translation unit.
-    record = PROGRAMS[program_key]
-    binding = _source_path(record["sources"][-1]).read_text()
-    block = re.search(
-        rf"namespace stage_{stage} \{{(.*?)\}}  // namespace stage_{stage}",
-        binding,
-        re.S,
-    )
-    assert block is not None, (
-        f"{program_key}: the sequence binding no longer has a "
-        f"`namespace stage_{stage} {{ ... }}  // namespace stage_{stage}` block"
-    )
-    names = set(
-        re.findall(
-            r"kernel_(cake_kimi_k3_nvfp4_situ_routed_moe_[0-9a-f]{20})", block[1]
-        )
-    )
-    assert len(names) == 1, (
-        f"{program_key}: stage {stage} should launch exactly one "
-        f"`kernel_cake_kimi_k3_nvfp4_situ_routed_moe_<20 hex>` symbol, found {names}"
-    )
-    (name,) = names
-    kernels = [
-        source for source in record["sources"] if source.endswith(f"/{name}_kernel.cu")
-    ]
-    assert len(kernels) == 1, (
-        f"{program_key}: expected one `{name}_kernel.cu` among the record's sources, "
-        f"found {kernels}"
-    )
-    return _source_path(kernels[0]).read_text()
-
-
-def _fc2_launch_footprint(arch, selector):
-    program_key = ROUTES[(arch, selector)]
-    source = _stage_kernel_source(program_key, "fc2")
-    bounds = re.search(r"__launch_bounds__\((\d+),\s*(\d+)\)", source)
-    assert bounds is not None, (
-        f"{program_key}: the FC2 kernel no longer declares "
-        "`__launch_bounds__(<threads>, <min blocks>)`"
-    )
-    smem = re.search(r"#define SMEM_TOTAL (\d+)", source)
-    assert smem is not None, (
-        f"{program_key}: the FC2 kernel no longer defines `SMEM_TOTAL`"
-    )
-    threads, min_blocks = map(int, bounds.groups())
-    return threads, min_blocks, int(smem.group(1))
+def _expected_fc2_grid_n(selector, max_tiles, sm_count):
+    # The device-workfeed pools: one FC2 CTA per SM for 8 tokens, two per SM
+    # for 16 tokens, twelve rows for 32..256 tokens and seven rows for 512 and
+    # 1024 tokens; every other route covers the whole tile range.
+    # The 16-token pool is sized from twice the SM count (two resident CTAs
+    # per SM), not from twice the rounded single-CTA pool.
+    pools = {
+        "n8_feature": sm_count // (HIDDEN // 128),
+        "n8_w2a_m16": 2 * sm_count // (HIDDEN // 128),
+        "m64_claim8": 12,
+        "n32_claim8": 7,
+    }
+    return min(max_tiles, pools[selector]) if selector in pools else max_tiles
 
 
 def _workspace_size(**overrides):
@@ -157,9 +164,11 @@ def test_cake_situ_rejects_unsupported_dispatch(options, message):
 
 def test_cake_situ_workspace_size_holds_every_smaller_shape():
     # The per-shape layout is not monotonic in the token count (32 and 64 force
-    # tile-N16 and need more scratch than the tile-N8 counts after them), but
-    # the public size query must still honor the documented contract that a
-    # maximum-size buffer holds every smaller prepared shape.
+    # tile-N16 and need more scratch than the tile-N8 counts after them, and
+    # the pre-shuffled scale-factor images of 8192 tokens exceed the ordinary
+    # layout of the counts just above), but the public size query must still
+    # honor the documented contract that a maximum-size buffer holds every
+    # smaller prepared shape.
     sizes = [_workspace_size(max_num_tokens=n) for n in range(1, 16385)]
     running_max = 0
     for size in sizes:
@@ -167,117 +176,114 @@ def test_cake_situ_workspace_size_holds_every_smaller_shape():
         assert size == running_max
     assert _workspace_size(max_num_tokens=40) >= _workspace_size(max_num_tokens=32)
     assert _workspace_size(max_num_tokens=100) >= _workspace_size(max_num_tokens=64)
+    for t in LARGE_TOKENS:
+        at_t = _workspace_size(max_num_tokens=t)
+        for max_tokens in (t, t + 1, t + 128, t + 255, 16384):
+            if max_tokens <= 16384:
+                assert _workspace_size(max_num_tokens=max_tokens) >= at_t
 
 
 def test_cake_situ_workspace_layout_adds_pre_shuffled_scale_factors():
-    # The 16384-token layout appends the pre-shuffled FC1 scale-factor images
-    # (one 4096-byte image per N-tile and 512-element K-step) as its last
-    # field; every other token count keeps its previous layout.
-    tile_n, _, max_tiles = _geometry(16384)
-    assert (tile_n, max_tiles) == (128, 2937)
-    layout, nbytes = _workspace_layout(16384)
-    offset, size, dtype, shape = layout["sfb_shuffled"]
-    assert size == max_tiles * (HIDDEN // 512) * 4096 == 84_209_664
-    assert dtype == torch.uint8 and shape == (size,)
-    assert offset == max(start for start, _, _, _ in layout.values())
-    assert nbytes >= offset + size
-    assert "sfb_shuffled" not in _workspace_layout(8192)[0]
-    assert "sfb_shuffled" not in _workspace_layout(2048)[0]
+    # The 8192- and 16384-token layouts append the pre-shuffled FC1 scale-factor
+    # images (one 4096-byte image per N-tile and 512-element K-step) as their
+    # last field; every other token count keeps its previous layout.
+    for num_tokens, expected_tiles in ((8192, 1913), (16384, 2937)):
+        tile_n, _, max_tiles = _geometry(num_tokens)
+        assert (tile_n, max_tiles) == (128, expected_tiles)
+        layout, nbytes = _workspace_layout(num_tokens)
+        offset, size, dtype, shape = layout["sfb_shuffled"]
+        assert size == max_tiles * (HIDDEN // 512) * 4096
+        assert dtype == torch.uint8 and shape == (size,)
+        assert offset == max(start for start, _, _, _ in layout.values())
+        assert nbytes >= offset + size
+    for num_tokens in (1, 8, 16, 64, 256, 512, 2048, 4096, 8191, 8193):
+        assert "sfb_shuffled" not in _workspace_layout(num_tokens)[0]
 
 
-# SM100 and SM103 shared memory per SM and the per-CTA reservation (CUDA C
-# Programming Guide, compute capability 10.x), and the register file per SM.
-# These are the values of the two architectures this backend supports; revisit
-# them if another SM is ever added to `cake_fused_moe_prepare_workspace`.
-SMEM_PER_SM_BYTES = 228 * 1024
-SMEM_RESERVED_PER_CTA_BYTES = 1024
-REGISTERS_PER_SM = 65536
-
-
-def test_cake_situ_two_cta_fc2_program_fits_two_ctas_per_sm():
-    # The 16-token routes size their FC2 device-workfeed pool as
-    # _N8_W2A_M16_FC2_GRID_N_SM_FACTOR CTAs per SM. That is only correct if the
-    # generated FC2 program really fits that many CTAs per SM, so pin the
-    # program's launch bounds and shared-memory footprint to the host factor on
-    # both architectures.
-    for arch in ("sm_103a", "sm_100a"):
-        threads, min_blocks, smem_bytes = _fc2_launch_footprint(arch, "n8_w2a_m16")
-        assert (threads, min_blocks) == (512, _N8_W2A_M16_FC2_GRID_N_SM_FACTOR)
-        assert (
-            min_blocks * (smem_bytes + SMEM_RESERVED_PER_CTA_BYTES) <= SMEM_PER_SM_BYTES
+@pytest.mark.parametrize("arch", ARCHES)
+def test_cake_situ_route_table(arch):
+    # GPU-free: every supported token count selects the documented route on
+    # both architectures, with the documented stage list, a registered program
+    # for every stage, the forced tile-N16 geometry of the 32..256-token rows
+    # and the documented FC2 device-workfeed pool.
+    for num_tokens in range(1, 16385):
+        selector = _selector(arch, num_tokens)
+        assert selector == _expected_selector(num_tokens), num_tokens
+        stages, kernels = _route(arch, num_tokens)
+        assert stages == STAGES_BY_SELECTOR.get(selector, GENERIC_STAGES), num_tokens
+        assert list(kernels) == stages
+        for stage, key in kernels.items():
+            assert key.split(":", 1)[0] == stage
+            program = cake_situ_program(arch, key)
+            assert program == KERNELS[arch][key]
+            assert arch in MODULES[program]["arches"]
+        tile_n, total_pairs, max_tiles = _geometry(num_tokens, arch)
+        assert total_pairs == num_tokens * TOP_K
+        assert tile_n == (
+            16 if num_tokens in (32, 64, 128, 256) else _tile_bucket(num_tokens)
         )
-        # __launch_bounds__(512, 2) caps ptxas at this many registers per thread.
-        assert REGISTERS_PER_SM // (threads * min_blocks) >= 64
-    # The single-CTA FC2 program of the other small routes does not fit twice.
-    for arch, selector in (("sm_103a", "n8_feature"), ("sm_100a", "n8_feature")):
-        threads, min_blocks, smem_bytes = _fc2_launch_footprint(arch, selector)
-        assert (threads, min_blocks) == (512, 1)
-        assert 2 * (smem_bytes + SMEM_RESERVED_PER_CTA_BYTES) > SMEM_PER_SM_BYTES
+        occupied = min(EXPERTS, total_pairs)
+        assert max_tiles == occupied + (total_pairs - occupied) // tile_n
+        for sm_count in (REFERENCE_SM_COUNT, 132, 160):
+            assert _fc2_grid_n(selector, max_tiles, sm_count) == _expected_fc2_grid_n(
+                selector, max_tiles, sm_count
+            ), (num_tokens, sm_count)
+    # Every registered kernel key is reachable by some token count.
+    reachable = {
+        key
+        for num_tokens in range(1, 16385)
+        for key in _route(arch, num_tokens)[1].values()
+    }
+    assert reachable == set(KERNELS[arch])
 
 
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
-@pytest.mark.parametrize("num_tokens", [1, 8, 16], ids=["m1", "m8", "m16"])
-def test_cake_situ_small_row_routes_declare_fused_quant_route(arch, num_tokens):
-    # The fused quantization + router stage is part of the 8- and 16-token
-    # programs on both architectures and of no other small-row program.
-    program_key = ROUTES[(arch, _small_row_selector(arch, num_tokens))]
-    assert _declares_fused_quant_route(program_key) is (num_tokens in (8, 16))
+def test_cake_situ_sixteen_token_pool_is_twice_the_eight_token_pool():
+    # The 16-token route runs an FC2 program built for two resident CTAs per SM;
+    # its device-workfeed pool therefore holds twice the rows of the 8-token
+    # route on the same part (280 against 140 CTAs on 148 SMs).
+    eight = _fc2_grid_n("n8_feature", _geometry(8)[2], REFERENCE_SM_COUNT)
+    sixteen = _fc2_grid_n("n8_w2a_m16", _geometry(16)[2], REFERENCE_SM_COUNT)
+    assert (eight, sixteen) == (5, 10)
+    assert _SELECTORS["n8_w2a_m16"][1]["fc2"] != _SELECTORS["n8_feature"][1]["fc2"]
+    # The 32..256-token rows share a twelve-row pool, the 512/1024-token rows a
+    # seven-row pool, on every part with at least that many tiles.
+    for num_tokens in (32, 64, 128, 256):
+        assert (
+            _fc2_grid_n("m64_claim8", _geometry(num_tokens)[2], REFERENCE_SM_COUNT)
+            == 12
+        )
+    for num_tokens in (512, 1024):
+        assert (
+            _fc2_grid_n("n32_claim8", _geometry(num_tokens)[2], REFERENCE_SM_COUNT) == 7
+        )
 
 
 def test_cake_situ_program_records_are_consistent():
-    # Every program record names its generated sources, which must be present,
-    # and its JIT cache name is derived from the record's closure hash.
-    for program_key, record in PROGRAMS.items():
-        name = program_key.split(":")[1]
-        assert record["cache_name"] == (
-            f"cake_situ_{record['arch']}_{name}_{record['closure_sha256'][:16]}"
-        ), program_key
-        assert len(record["closure_sha256"]) == 64, program_key
-        for source in record["sources"]:
-            assert f"/{record['arch']}/" in source, (program_key, source)
-            assert _source_path(source).is_file(), (program_key, source)
-    for (arch, _selector), program_key in ROUTES.items():
-        assert PROGRAMS[program_key]["arch"] == arch, (arch, program_key)
-
-
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
-def test_cake_situ_two_cta_fc2_route_is_sixteen_tokens_only(arch):
-    # Only 16 tokens reach the two-CTA-per-SM FC2 route on either architecture:
-    # 8 tokens keep the fused-router route and the larger counts their own.
-    two_cta = ROUTES[(arch, "n8_w2a_m16")]
-    assert PROGRAMS[two_cta]["arch"] == arch
-    assert _small_row_selector(arch, 16) == "n8_w2a_m16"
-    assert _small_row_selector(arch, 8) == "n8_feature"
-    assert ROUTES[(arch, "n8_feature")] != two_cta
-    assert two_cta not in (ROUTES[(arch, 8)], ROUTES[(arch, 16)])
-
-
-def test_cake_situ_n32_route_uses_the_cluster_router():
-    # GPU-free: the 512/1024-token sequence of each architecture lists exactly one
-    # routing kernel source, and it declares the eight-CTA cluster the runtime launches.
-    from flashinfer.fused_moe.cake_kimi_k3_situ import _ROUTE_MC_CLUSTER
-    from flashinfer.jit.cake_kimi_k3_situ import (
-        PROGRAMS,
-        ROUTES,
-        _source_path,
-        cake_situ_sequence,
-    )
-
-    for arch in ("sm_100a", "sm_103a"):
-        key = cake_situ_sequence(arch, 32, False, False, n32_claim8=True)
-        assert key == ROUTES[(arch, "n32_claim8")]
-        kernels = [
-            source
-            for source in PROGRAMS[key]["sources"]
-            if source.endswith("_kernel.cu")
-        ]
-        clustered = [
-            source
-            for source in kernels
-            if f"__cluster_dims__({_ROUTE_MC_CLUSTER},1,1)"
-            in _source_path(source).read_text()
-        ]
-        assert len(clustered) == 1, (arch, kernels)
+    # Every program record names its two sources, the architectures it compiles
+    # for and a complete launch plan; every program is bound by a kernel key on
+    # each architecture it lists, and the carried programs are a subset of the
+    # registry that records where each one came from.
+    bound = {arch: set(KERNELS[arch].values()) for arch in ARCHES}
+    for name, record in MODULES.items():
+        assert record["sources"][0].endswith(f"{name}_kernel.cu"), name
+        assert record["sources"][1].endswith(f"{name}_binding.cu"), name
+        assert record["arches"] == sorted(record["arches"]), name
+        assert set(record["arches"]) <= set(ARCHES), name
+        assert len(record["closure_sha256"]) == 64, name
+        kinds = {kind for kind, _ in record["arg_plan"]}
+        assert kinds <= {"tma_buffer", "buffer", "parameter", "grid"}, name
+        assert [n for kind, n in record["arg_plan"] if kind == "grid"] == [
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ], name
+        for arch in record["arches"]:
+            assert name in bound[arch], (name, arch)
+        assert (name in CARRIED_PROGRAMS) == ("carried" in record), name
+    for arch in ARCHES:
+        for name in bound[arch]:
+            assert arch in MODULES[name]["arches"], (name, arch)
+    assert set(CARRIED_PROGRAMS) <= set(MODULES)
 
 
 @pytest.fixture(scope="module")
@@ -347,8 +353,8 @@ def cake_situ_workspace(cake_situ_device):
 
 @pytest.mark.parametrize(
     "max_num_tokens, num_tokens",
-    [(40, 32), (100, 64)],
-    ids=["n40_holds_32", "n100_holds_64"],
+    [(40, 32), (100, 64), (8200, 8192)],
+    ids=["n40_holds_32", "n100_holds_64", "n8200_holds_8192"],
 )
 def test_cake_situ_prepare_smaller_shape_in_maximum_size_buffer(
     max_num_tokens,
@@ -356,7 +362,8 @@ def test_cake_situ_prepare_smaller_shape_in_maximum_size_buffer(
     cake_situ_device,
 ):
     # Allocating for a token count strictly between two forced tile-N16 counts
-    # must still allow preparing the smaller forced count in the same buffer.
+    # (or just above a pre-shuffled count) must still allow preparing the
+    # smaller count in the same buffer.
     workspace = torch.empty(
         _workspace_size(max_num_tokens=max_num_tokens),
         dtype=torch.uint8,
@@ -372,6 +379,48 @@ def test_cake_situ_prepare_smaller_shape_in_maximum_size_buffer(
             )
             is workspace
         )
+
+
+def _arch(device):
+    return ARCH_BY_CAPABILITY[torch.cuda.get_device_capability(device)]
+
+
+def _uniform_routing(num_tokens, device):
+    slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
+    tokens = torch.arange(num_tokens, dtype=torch.int32, device=device)
+    return ((tokens[:, None] * TOP_K + slots[None, :]) % EXPERTS).contiguous()
+
+
+def _grouped_routing(num_tokens, device):
+    # Heavy expert skew for the clustered 512- and 1024-token routes: every
+    # token picks one of four disjoint 16-expert groups, so 64 experts each
+    # receive num_tokens / 4 rows (several 32-row tiles per expert span) and
+    # the other 832 experts receive none.
+    slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
+    tokens = torch.arange(num_tokens, dtype=torch.int32, device=device)
+    return ((tokens[:, None] % 4) * TOP_K + slots[None, :]).contiguous()
+
+
+def _skewed_routing(num_tokens, device):
+    # Sixteen experts receive almost every token (127 full tiles plus one
+    # partial tile each). The last 96 tokens spread their 1536 pairs over the
+    # other 880 experts, so most of those experts own a tile with one or two
+    # valid rows, and the routed tile count stays below the maximum.
+    slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
+    tokens = torch.arange(num_tokens, dtype=torch.int32, device=device)
+    ids = slots[None, :].expand(num_tokens, TOP_K).clone()
+    tail = tokens >= num_tokens - 96
+    ids[tail] = TOP_K + (tokens[tail, None] * TOP_K + slots[None, :]) % (
+        EXPERTS - TOP_K
+    )
+    return ids.contiguous()
+
+
+ROUTINGS = {
+    "uniform": _uniform_routing,
+    "grouped": _grouped_routing,
+    "skewed": _skewed_routing,
+}
 
 
 def _trtllm_reference(x, ids, route_weights, prepared):
@@ -420,46 +469,19 @@ def _trtllm_reference(x, ids, route_weights, prepared):
     return output
 
 
-@pytest.mark.parametrize(
-    "num_tokens, routing",
-    [
-        (1, "uniform"),
-        (8, "uniform"),
-        (16, "uniform"),
-        (64, "uniform"),
-        (256, "uniform"),
-        (512, "uniform"),
-        (2048, "uniform"),
-        (16384, "uniform"),
-        (512, "skew"),
-        (1024, "skew"),
-    ],
-    ids=[
-        "m1",
-        "m8",
-        "m16",
-        "n8",
-        "n16",
-        "n32",
-        "n128",
-        "m16384",
-        "n32_skew",
-        "n64_skew",
-    ],
-)
-def test_cake_situ_output_workspace_and_external_graph(
-    num_tokens,
-    routing,
-    cake_situ_device,
-    cake_situ_weights,
-    cake_situ_workspace,
-):
-    device, prepared, workspace = (
-        cake_situ_device,
-        cake_situ_weights,
-        cake_situ_workspace,
-    )
-    generator = torch.Generator(device=device).manual_seed(9000 + num_tokens)
+def _quant_scales(prepared, device):
+    return [
+        torch.ones(1, device=device, dtype=torch.float32),
+        prepared["gemm1_weights_scale"],
+        prepared["output1_scale_gate_scalar"],
+        prepared["output1_scale_scalar"],
+        prepared["gemm2_weights_scale"],
+        prepared["output2_scale_scalar"],
+    ]
+
+
+def _inputs(num_tokens, routing, device, seed):
+    generator = torch.Generator(device=device).manual_seed(seed)
     x = torch.randn(
         num_tokens,
         HIDDEN,
@@ -467,16 +489,7 @@ def test_cake_situ_output_workspace_and_external_graph(
         dtype=torch.bfloat16,
         generator=generator,
     )
-    slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
-    tokens = torch.arange(num_tokens, dtype=torch.int32, device=device)
-    if routing == "uniform":
-        ids = ((tokens[:, None] * TOP_K + slots[None, :]) % EXPERTS).contiguous()
-    else:
-        # Heavy expert skew for the clustered 512- and 1024-token routes: every
-        # token picks one of four disjoint 16-expert groups, so 64 experts each
-        # receive num_tokens / 4 rows (several 32-row tiles per expert span) and
-        # the other 832 experts receive none.
-        ids = ((tokens[:, None] % 4) * TOP_K + slots[None, :]).contiguous()
+    ids = ROUTINGS[routing](num_tokens, device)
     route_weights = (
         torch.randn(
             num_tokens,
@@ -487,22 +500,127 @@ def test_cake_situ_output_workspace_and_external_graph(
         .softmax(dim=-1)
         .to(torch.bfloat16)
     )
+    return x, ids, route_weights
+
+
+def _options(x, ids, route_weights, output, weights, workspace):
+    """The option dictionary the host's stage bindings consume."""
+    return dict(
+        input=x,
+        workspace_buffer=workspace,
+        token_selected_experts=ids,
+        token_final_scales=route_weights,
+        fc1_expert_weights=weights["gemm1_weights"],
+        fc2_expert_weights=weights["gemm2_weights"],
+        output=output,
+        quant_scales=_quant_scales(weights, x.device),
+        situ_beta=None,
+        situ_linear_beta=None,
+    )
+
+
+def _check_prepared_shape(prepared, arch, num_tokens, device):
+    # The prepared shape binds the documented route: its selector, stage list,
+    # the registered program of every stage and the FC2 device-workfeed pool.
+    selector = _expected_selector(num_tokens)
+    stages, kernels = _route(arch, num_tokens)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    assert prepared["selector"] == selector
+    assert prepared["stages"] == stages
+    assert prepared["modules"] == {
+        stage: cake_situ_program(arch, key) for stage, key in kernels.items()
+    }
+    assert len(prepared["launches"]) == len(stages)
+    submit, plan, slots = prepared["submit"]
+    assert len(plan) == sum(3 + len(flat) for _, flat in prepared["launches"])
+    index = 0
+    for _entry, flat in prepared["launches"]:
+        prepare_entry, submit_entry, argc = plan[index : index + 3]
+        # The stage shim's two-phase entry points, resolved once per program.
+        assert isinstance(prepare_entry, int) and prepare_entry > 0
+        assert isinstance(submit_entry, int) and submit_entry > 0
+        assert argc == len(flat)
+        index += 3 + len(flat)
+    assert all(plan[index] is None for index, _ in slots)
+    assert callable(submit)
+    assert prepared["fc2_grid_n"] == _expected_fc2_grid_n(
+        selector, prepared["max_tiles"], sm_count
+    )
+    assert prepared["fc2_pool_ctas"] == (HIDDEN // 128) * prepared["fc2_grid_n"]
+    if selector == "n32_claim8":
+        assert (prepared["fc2_grid_n"], prepared["fc2_pool_ctas"]) == (7, 196)
+    if selector == "m64_claim8":
+        assert (prepared["fc2_grid_n"], prepared["fc2_pool_ctas"]) == (12, 336)
+    if selector == "n8_w2a_m16":
+        assert prepared["fc2_grid_n"] == min(
+            prepared["max_tiles"], 2 * sm_count // (HIDDEN // 128)
+        )
+
+
+@pytest.mark.parametrize(
+    "num_tokens, routing",
+    [
+        (1, "uniform"),
+        (8, "uniform"),
+        (16, "uniform"),
+        (64, "uniform"),
+        (256, "uniform"),
+        (512, "uniform"),
+        (1024, "grouped"),
+        (2048, "uniform"),
+        (8192, "uniform"),
+        (16384, "uniform"),
+        (2, "uniform"),
+        (200, "uniform"),
+        (300, "uniform"),
+        (3000, "uniform"),
+    ],
+    ids=[
+        "m1",
+        "n8_feature",
+        "n8_w2a_m16",
+        "m64_claim8_m64",
+        "m64_claim8_m256",
+        "n32_claim8_m512",
+        "n32_claim8_m1024_grouped",
+        "mid_work5fd",
+        "large_c7_m8192",
+        "large_c7_m16384",
+        "tile8_generic",
+        "tile16_generic",
+        "tile32_generic",
+        "tile128_generic",
+    ],
+)
+def test_cake_situ_every_route_eager_and_external_graph(
+    num_tokens,
+    routing,
+    cake_situ_device,
+    cake_situ_weights,
+    cake_situ_workspace,
+):
+    # Every route the host can select, on this device's architecture: the
+    # eleven routed selectors (one token count each, two for the claim8
+    # routes) and the four generic tile buckets. Each case checks the
+    # prepared-shape facts, the eager result against the trtllm-gen
+    # reference, external CUDA-graph capture and replay with changed inputs,
+    # and that the default SiTU parameters equal the explicit ones.
+    device, weights, workspace = (
+        cake_situ_device,
+        cake_situ_weights,
+        cake_situ_workspace,
+    )
+    arch = _arch(device)
+    x, ids, route_weights = _inputs(num_tokens, routing, device, 9000 + num_tokens)
     output = torch.full_like(x, float("nan"))
     output_ptr, workspace_ptr = output.data_ptr(), workspace.data_ptr()
-    quant_scales = [
-        torch.ones(1, device=device, dtype=torch.float32),
-        prepared["gemm1_weights_scale"],
-        prepared["output1_scale_gate_scalar"],
-        prepared["output1_scale_scalar"],
-        prepared["gemm2_weights_scale"],
-        prepared["output2_scale_scalar"],
-    ]
+    quant_scales = _quant_scales(weights, device)
 
     def submit(*, explicit_parameters=False):
         activation_kwargs = (
             {
-                "situ_beta": prepared["gemm1_alpha"],
-                "situ_linear_beta": prepared["gemm1_beta"],
+                "situ_beta": weights["gemm1_alpha"],
+                "situ_linear_beta": weights["gemm1_beta"],
             }
             if explicit_parameters
             else {}
@@ -511,8 +629,8 @@ def test_cake_situ_output_workspace_and_external_graph(
             x,
             ids,
             route_weights,
-            prepared["gemm1_weights"],
-            prepared["gemm2_weights"],
+            weights["gemm1_weights"],
+            weights["gemm2_weights"],
             torch.bfloat16,
             quant_scales,
             activation_type=ActivationType.Situ,
@@ -523,10 +641,8 @@ def test_cake_situ_output_workspace_and_external_graph(
             **activation_kwargs,
         )
 
-    # The module-scoped workspace keeps every prepared shape; a token count that an
-    # earlier case already prepared (the skewed 512-token case follows the round-robin
-    # one) is served without a fresh prepare, so the unprepared-shape rejection is
-    # asserted on the first case of each token count only.
+    # The module-scoped workspace keeps every prepared shape; the unprepared
+    # rejection is asserted on the first case of each token count only.
     state = getattr(workspace, "_flashinfer_cake_situ_workspace", None)
     if state is None or num_tokens not in state["shapes"]:
         with pytest.raises(ValueError, match="prepar"):
@@ -541,38 +657,18 @@ def test_cake_situ_output_workspace_and_external_graph(
         )
         is workspace
     )
-    # The prepared shape must select the expected route: the two-CTA-per-SM
-    # FC2 route for 16 tokens, the single-token and fused-router routes for
-    # the other small counts, and the fused quantization + router stage
-    # exactly for 8 and 16 tokens, on both architectures.
-    arch = ARCH_BY_CAPABILITY[torch.cuda.get_device_capability(device)]
-    prepared_shape = workspace._flashinfer_cake_situ_workspace["shapes"][num_tokens]
-    selector = _small_row_selector(arch, num_tokens)
-    assert prepared_shape["n8_w2a_m16"] is (selector == "n8_w2a_m16")
-    if selector is not None:
-        assert prepared_shape["program_key"] == ROUTES[(arch, selector)]
-    assert prepared_shape["fused_quant_route"] is (num_tokens in (8, 16))
-    assert _declares_fused_quant_route(prepared_shape["program_key"]) is (
-        num_tokens in (8, 16)
-    )
-    if prepared_shape["n8_w2a_m16"]:
-        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-        assert prepared_shape["fc2_grid_n"] == min(
-            prepared_shape["max_tiles"],
-            _N8_W2A_M16_FC2_GRID_N_SM_FACTOR * sm_count // (HIDDEN // 128),
+    prepared = _prepared(workspace, num_tokens)
+    _check_prepared_shape(prepared, arch, num_tokens, device)
+    if prepared["selector"] == "n32_claim8":
+        # The 512- and 1024-token routes launch their router as one
+        # eight-CTA cluster over the seven-row FC2 pool.
+        bindings = _cake_situ_stage_bindings(
+            _options(x, ids, route_weights, output, weights, workspace), prepared
         )
-        assert (
-            prepared_shape["fc2_pool_ctas"]
-            == (HIDDEN // 128) * prepared_shape["fc2_grid_n"]
-        )
-    # The 512- and 1024-token routes run the routing kernel as one eight-CTA
-    # cluster over a seven-row FC2 pool; every other row keeps its route.
-    assert prepared_shape["n32_claim8"] is (num_tokens in (512, 1024))
-    if prepared_shape["n32_claim8"]:
-        assert prepared_shape["fc2_grid_n"] == 7
-        assert prepared_shape["fc2_pool_ctas"] == 196
+        assert bindings["fused_router"]["grid"] == (_ROUTE_MC_CLUSTER, 1, 1)
+        assert bindings["fused_router"]["fc2_pool_ctas"] == 196
 
-    expected = _trtllm_reference(x, ids, route_weights, prepared)
+    expected = _trtllm_reference(x, ids, route_weights, weights)
     # Ensure an all-zero output could not satisfy the FP4 absolute tolerance.
     assert expected.abs().max() > 2.0
     assert submit() is output
@@ -597,9 +693,10 @@ def test_cake_situ_output_workspace_and_external_graph(
     # token), the maximally skewed pattern. Replay must consume these values,
     # not stale routing or hidden states.
     x.mul_(-0.75)
+    slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
     ids.copy_(slots[None, :].expand_as(ids))
     route_weights.copy_(route_weights.flip(-1))
-    changed_expected = _trtllm_reference(x, ids, route_weights, prepared)
+    changed_expected = _trtllm_reference(x, ids, route_weights, weights)
     assert not torch.equal(expected, changed_expected)
     output.fill_(float("nan"))
     graph.replay()
@@ -613,64 +710,10 @@ def test_cake_situ_output_workspace_and_external_graph(
     assert workspace.data_ptr() == workspace_ptr
 
 
-def _arch(device):
-    return {(10, 0): "sm_100a", (10, 3): "sm_103a"}[
-        torch.cuda.get_device_capability(device)
-    ]
-
-
-def _uniform_routing(num_tokens, device):
-    slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
-    tokens = torch.arange(num_tokens, dtype=torch.int32, device=device)
-    return ((tokens[:, None] * TOP_K + slots[None, :]) % EXPERTS).contiguous()
-
-
-def _skewed_routing(num_tokens, device):
-    # Sixteen experts receive almost every token (127 full tiles plus one
-    # partial tile each). The last 96 tokens spread their 1536 pairs over the
-    # other 880 experts, so most of those experts own a tile with one or two
-    # valid rows, and the routed tile count stays below the maximum.
-    slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
-    tokens = torch.arange(num_tokens, dtype=torch.int32, device=device)
-    ids = slots[None, :].expand(num_tokens, TOP_K).clone()
-    tail = tokens >= num_tokens - 96
-    ids[tail] = TOP_K + (tokens[tail, None] * TOP_K + slots[None, :]) % (
-        EXPERTS - TOP_K
-    )
-    return ids.contiguous()
-
-
-def _submit_large_route(num_tokens, routing, device, prepared, workspace):
-    """Prepare and submit one complete call; return the inputs and the
-    option dictionary the stage bindings consume for direct-launch checks."""
-    generator = torch.Generator(device=device).manual_seed(7000 + num_tokens)
-    x = torch.randn(
-        num_tokens,
-        HIDDEN,
-        device=device,
-        dtype=torch.bfloat16,
-        generator=generator,
-    )
-    ids = routing(num_tokens, device)
-    route_weights = (
-        torch.randn(
-            num_tokens,
-            TOP_K,
-            device=device,
-            generator=generator,
-        )
-        .softmax(dim=-1)
-        .to(torch.bfloat16)
-    )
+def _submit_prepared(num_tokens, routing, device, weights, workspace):
+    """Prepare and submit one complete call; return its tensors and options."""
+    x, ids, route_weights = _inputs(num_tokens, routing, device, 7000 + num_tokens)
     output = torch.full_like(x, float("nan"))
-    quant_scales = [
-        torch.ones(1, device=device, dtype=torch.float32),
-        prepared["gemm1_weights_scale"],
-        prepared["output1_scale_gate_scalar"],
-        prepared["output1_scale_scalar"],
-        prepared["gemm2_weights_scale"],
-        prepared["output2_scale_scalar"],
-    ]
     cake_fused_moe_prepare_workspace(
         workspace,
         num_tokens,
@@ -682,10 +725,10 @@ def _submit_large_route(num_tokens, routing, device, prepared, workspace):
             x,
             ids,
             route_weights,
-            prepared["gemm1_weights"],
-            prepared["gemm2_weights"],
+            weights["gemm1_weights"],
+            weights["gemm2_weights"],
             torch.bfloat16,
-            quant_scales,
+            _quant_scales(weights, device),
             activation_type=ActivationType.Situ,
             tp_size=8,
             backend="cake",
@@ -695,19 +738,13 @@ def _submit_large_route(num_tokens, routing, device, prepared, workspace):
         is output
     )
     torch.cuda.synchronize(device)
-    options = dict(
-        input=x,
-        workspace_buffer=workspace,
-        token_selected_experts=ids,
-        token_final_scales=route_weights,
-        fc1_expert_weights=prepared["gemm1_weights"],
-        fc2_expert_weights=prepared["gemm2_weights"],
-        output=output,
-        quant_scales=quant_scales,
-        situ_beta=None,
-        situ_linear_beta=None,
+    return (
+        x,
+        ids,
+        route_weights,
+        output,
+        _options(x, ids, route_weights, output, weights, workspace),
     )
-    return x, ids, route_weights, output, options
 
 
 def _fc1_scales_by_row(views, max_tiles):
@@ -731,60 +768,53 @@ def _per_pair_scratch(views, max_tiles):
     }
 
 
-def _launch_program(program_key, args):
-    module = get_cake_situ_module(program_key)
-    entry = getattr(module, PROGRAMS[program_key]["ffi_entry"])
+def _launch(program, arch, stage_values):
+    # Launch one program alone with the values the host bound for its stage.
+    module = get_cake_situ_module(program, arch)
+    entry = getattr(module, MODULES[program]["ffi_entry"])
+    args = [
+        stage_values["grid"][("grid_x", "grid_y", "grid_z").index(name)]
+        if kind == "grid"
+        else stage_values[name]
+        for kind, name in MODULES[program]["arg_plan"]
+    ]
     with tvm_ffi.use_torch_stream():
         entry(*args)
 
 
-def _module_args(program_key, stage):
-    # A single-kernel module takes the stage's bindings with unqualified names.
-    return [
-        stage["grid"][("grid_x", "grid_y", "grid_z").index(name)]
-        if kind == "grid"
-        else stage[name]
-        for kind, name in PROGRAMS[program_key]["arg_plan"]
-    ]
-
-
 @pytest.mark.parametrize(
-    "routing", [_uniform_routing, _skewed_routing], ids=["uniform", "skewed"]
+    "num_tokens, routing",
+    [(8192, "skewed"), (16384, "uniform")],
+    ids=["m8192_skewed", "m16384_uniform"],
 )
-def test_cake_situ_m16384_pre_shuffled_route_matches_previous_fc1_program(
+def test_cake_situ_pre_shuffled_route_matches_plain_fc1(
+    num_tokens,
     routing,
     cake_situ_device,
     cake_situ_weights,
     cake_situ_workspace,
 ):
-    # The 16384-token route runs the scale-factor writer and the FC1 program
-    # that loads the pre-shuffled images. Its FC1 outputs (per routed pair),
-    # the FC2 outputs and the complete call must be bitwise identical to the
-    # previous FC1 program, which gathers and shuffles the scale factors
-    # itself. That program is still shipped as the tile-N128 sequence, so it
-    # runs here on the same workspace, inputs and stage bindings.
-    num_tokens = 16384
+    # The 8192- and 16384-token routes run the scale-factor writer and the FC1
+    # program that loads the pre-shuffled images. Their FC1 outputs (per routed
+    # pair), the FC2 outputs and the complete call must be bitwise identical to
+    # the tile-N128 FC1 program that gathers and shuffles the scale factors
+    # itself (the generic tile-128 route's FC1), run here on the same
+    # workspace, inputs and stage bindings.
     device, weights, workspace = (
         cake_situ_device,
         cake_situ_weights,
         cake_situ_workspace,
     )
-    x, ids, route_weights, output, options = _submit_large_route(
+    _, _, _, output, options = _submit_prepared(
         num_tokens, routing, device, weights, workspace
     )
-    expected = _trtllm_reference(x, ids, route_weights, weights)
-    assert expected.abs().max() > 2.0
-    torch.testing.assert_close(output, expected, atol=1.0, rtol=0.1)
-
     prepared = _prepared(workspace, num_tokens)
     arch = _arch(device)
-    assert prepared["large_c7"]
-    assert prepared["program_key"] == ROUTES[(arch, "large_c7")]
-    previous_key = ROUTES[(arch, 128)]
-    assert previous_key != prepared["program_key"]
-    previous_names = {name for _, name in PROGRAMS[previous_key]["arg_plan"]}
-    assert "fc1.SFB" in previous_names and "fc1.SFBS" not in previous_names
-    assert not any(name.startswith("sfb_shuffle.") for name in previous_names)
+    assert prepared["selector"] == "large_c7"
+    plain_fc1 = cake_situ_program(arch, "fc1:n128")
+    assert plain_fc1 != prepared["modules"]["fc1"]
+    plain_names = {name for _, name in MODULES[plain_fc1]["arg_plan"]}
+    assert "SFB" in plain_names and "SFBS" not in plain_names
 
     views = _cake_situ_workspace_views(workspace, num_tokens)
     total_tiles = int(views["total_tiles"].item())
@@ -796,39 +826,18 @@ def test_cake_situ_m16384_pre_shuffled_route_matches_previous_fc1_program(
     views["expert_output"].fill_(float("nan"))
     output.fill_(float("nan"))
 
-    stages = _cake_situ_stage_bindings(options, prepared)
-    _launch_program(previous_key, _cake_situ_flat_args(stages, previous_key))
+    bindings = _cake_situ_stage_bindings(options, prepared)
+    # The route's FC1 binding carries the pre-shuffled images (SFBS); the plain
+    # program gathers the routed scale factors itself from the quantized
+    # activations' scales (SFB), which the host binds for the writer stage.
+    _launch(plain_fc1, arch, {**bindings["fc1"], "SFB": views["x_scales"]})
+    for stage in ("fc2", "finalize"):
+        _launch(prepared["modules"][stage], arch, bindings[stage])
     torch.cuda.synchronize(device)
     assert int(views["total_tiles"].item()) == total_tiles
     for name, tensor in _per_pair_scratch(views, prepared["max_tiles"]).items():
         assert torch.equal(tensor, pre_shuffled[name]), name
     assert torch.equal(output, pre_shuffled_output)
-
-
-_WRITER_ARGUMENTS = [
-    "SFB",
-    "route_map",
-    "tile_mn_limit",
-    "total_tiles",
-    "SFBS",
-    "K",
-    "K_tiles",
-    "grid_n",
-    "grid_x",
-    "grid_y",
-    "grid_z",
-]
-
-
-def _writer_program_key(arch):
-    keys = [
-        key
-        for key, record in PROGRAMS.items()
-        if record["arch"] == arch
-        and [name for _, name in record["arg_plan"]] == _WRITER_ARGUMENTS
-    ]
-    assert len(keys) == 1, keys
-    return keys[0]
 
 
 def _reference_sfb_shuffle(x_scales, route_map, tile_mn_limit, total_tiles):
@@ -852,9 +861,12 @@ def _reference_sfb_shuffle(x_scales, route_map, tile_mn_limit, total_tiles):
 
 
 @pytest.mark.parametrize(
-    "routing", [_uniform_routing, _skewed_routing], ids=["uniform", "skewed"]
+    "num_tokens, routing",
+    [(8192, "uniform"), (16384, "skewed")],
+    ids=["m8192_uniform", "m16384_skewed"],
 )
 def test_cake_situ_sfb_shuffle_writer_matches_reference(
+    num_tokens,
     routing,
     cake_situ_device,
     cake_situ_weights,
@@ -865,20 +877,18 @@ def test_cake_situ_sfb_shuffle_writer_matches_reference(
     # compare its images with a Python shuffle. A sentinel fill shows that
     # padding tiles past the routed tile count are never written and that
     # padding rows of a partial tile are written as zeros.
-    num_tokens = 16384
     device, weights, workspace = (
         cake_situ_device,
         cake_situ_weights,
         cake_situ_workspace,
     )
-    _, _, _, _, options = _submit_large_route(
+    _, _, _, _, options = _submit_prepared(
         num_tokens, routing, device, weights, workspace
     )
     prepared = _prepared(workspace, num_tokens)
-    assert prepared["large_c7"]
+    assert prepared["selector"] == "large_c7"
     views = _cake_situ_workspace_views(workspace, num_tokens)
-    stages = _cake_situ_stage_bindings(options, prepared)
-    stage = stages["sfb_shuffle"]
+    stage = _cake_situ_stage_bindings(options, prepared)["sfb_shuffle"]
     max_tiles = prepared["max_tiles"]
     assert stage["grid"] == (max_tiles, 1, 1) and stage["grid_n"] == max_tiles
     total_tiles = int(views["total_tiles"].item())
@@ -888,14 +898,13 @@ def test_cake_situ_sfb_shuffle_writer_matches_reference(
     )
     assert rows_in_tile.min() >= 1 and rows_in_tile.max() <= 128
     assert (rows_in_tile < 128).any()
-    if routing is _skewed_routing:
+    if routing == "skewed":
         assert (rows_in_tile <= 2).sum() >= 400
 
     sentinel = 0xFF
     images = views["sfb_shuffled"].view(max_tiles, -1)
     images.fill_(sentinel)
-    key = _writer_program_key(_arch(device))
-    _launch_program(key, _module_args(key, stage))
+    _launch(prepared["modules"]["sfb_shuffle"], _arch(device), stage)
     torch.cuda.synchronize(device)
     expected = _reference_sfb_shuffle(
         views["x_scales"], views["route_map"], views["tile_mn_limit"], total_tiles
@@ -904,7 +913,7 @@ def test_cake_situ_sfb_shuffle_writer_matches_reference(
     assert (images[total_tiles:] == sentinel).all()
     # FC1 consumes the same bytes through its 4-D TMA view: one 512-byte
     # (2 x 256) block per 64 elements of K for every tile.
-    fc1_images = stages["fc1"]["SFBS"]
+    fc1_images = _cake_situ_stage_bindings(options, prepared)["fc1"]["SFBS"]
     assert fc1_images.data_ptr() == images.data_ptr()
     assert tuple(fc1_images.shape) == (max_tiles, HIDDEN // 64, 2, 256)
     assert fc1_images.numel() == images.numel()
