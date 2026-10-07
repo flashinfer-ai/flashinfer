@@ -8,6 +8,7 @@ selection.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import os
 import threading
 import weakref
@@ -566,14 +567,16 @@ def _register_cache_eviction(cache: Dict, key: Tuple, *source_tensors) -> None:
     """Evict ``key`` when a source weight tensor is collected, so the cache
     follows the weights' lifetime instead of growing for the whole process.
 
-    Eviction is bound to the entry cached now, so it never drops a later
-    entry for the same key, and parks the entry instead of freeing it when a
-    captured CUDA graph references it (see _evict_weight_cache_entry()).
+    Eviction is bound to this insertion by a generation number, so it never
+    drops a later entry for the same key, and parks the entry instead of
+    freeing it when a captured CUDA graph references it (see
+    _evict_weight_cache_entry()).
     """
-    entry_id = id(cache[key])
+    generation = next(_WEIGHT_ENTRY_GENERATION_COUNTER)
+    _WEIGHT_ENTRY_GENERATIONS[(id(cache), key)] = generation
     for tensor in source_tensors:
         if tensor is not None:
-            weakref.finalize(tensor, _evict_weight_cache_entry, cache, key, entry_id)
+            weakref.finalize(tensor, _evict_weight_cache_entry, cache, key, generation)
 
 
 _WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
@@ -2950,6 +2953,11 @@ _GRAPH_REFERENCED_WORKSPACES: list = []
 # (id(cache), key). Weight entries are tuples or shared dataclasses, so they
 # are tracked by key rather than marked in place.
 _GRAPH_REFERENCED_WEIGHT_KEYS: set = set()
+# Insertion generation of each prepared-weight cache entry, as
+# (id(cache), key) -> generation, so a source-collection finalizer only
+# evicts the insertion it was registered for.
+_WEIGHT_ENTRY_GENERATIONS: Dict[Tuple, int] = {}
+_WEIGHT_ENTRY_GENERATION_COUNTER = itertools.count()
 # Serializes cache lookup and marking against replacement, clearing and
 # source-collection eviction so a concurrent mutation cannot drop a workspace
 # or prepared weights between a capture-time cache read and its
@@ -2981,37 +2989,44 @@ def _get_weight_cache_entry(cache: Dict, key: Tuple):
 
 
 def _put_weight_cache_entry(cache: Dict, key: Tuple, value, *source_tensors):
-    """Insert a prepared-weight cache entry and return the cached entry.
+    """Insert a prepared-weight cache entry and return ``value``.
 
-    Preparation runs outside the lock, so two callers can miss on the same
-    key. The first insertion wins and later callers use it: replacing it
-    could drop storage that a graph captured in between still references.
-    Use during capture is recorded, and the entry is evicted when a source
-    tensor is collected.
+    Preparation runs outside the lock on the caller's stream, so two callers
+    can miss on the same key. The first insertion is cached and is never
+    replaced, since a graph captured in between may reference it. A later
+    caller keeps using the buffers it prepared itself, because the cached
+    ones may still be pending on another stream; if that caller is
+    capturing, its uncached buffers are parked as graph-referenced. Use
+    during capture is recorded, and the cached entry is evicted when a
+    source tensor is collected.
     """
     with _WORKSPACE_CACHE_LOCK:
-        cached = cache.get(key)
-        if cached is None:
-            cache[key] = cached = value
+        capturing = _is_cuda_graph_capturing()
+        if key not in cache:
+            cache[key] = value
             _register_cache_eviction(cache, key, *source_tensors)
-        if _is_cuda_graph_capturing():
-            _GRAPH_REFERENCED_WEIGHT_KEYS.add((id(cache), key))
-        return cached
+            if capturing:
+                _GRAPH_REFERENCED_WEIGHT_KEYS.add((id(cache), key))
+        elif capturing:
+            _GRAPH_REFERENCED_WORKSPACES.append(value)
+        return value
 
 
-def _evict_weight_cache_entry(cache: Dict, key: Tuple, entry_id: int) -> None:
+def _evict_weight_cache_entry(cache: Dict, key: Tuple, generation: int) -> None:
     """Drop a prepared-weight entry whose source tensor was collected.
 
-    Only the entry registered for eviction is dropped. If a captured graph
-    references it, it is parked like a graph-referenced workspace instead of
-    being freed.
+    Only the insertion registered for eviction is dropped. If a captured
+    graph references it, it is parked like a graph-referenced workspace
+    instead of being freed.
     """
     with _WORKSPACE_CACHE_LOCK:
-        entry = cache.get(key)
-        if entry is None or id(entry) != entry_id:
-            return
-        del cache[key]
         graph_key = (id(cache), key)
+        if _WEIGHT_ENTRY_GENERATIONS.get(graph_key) != generation:
+            return
+        del _WEIGHT_ENTRY_GENERATIONS[graph_key]
+        entry = cache.pop(key, None)
+        if entry is None:
+            return
         if graph_key in _GRAPH_REFERENCED_WEIGHT_KEYS:
             _GRAPH_REFERENCED_WEIGHT_KEYS.discard(graph_key)
             _GRAPH_REFERENCED_WORKSPACES.append(entry)
@@ -3081,6 +3096,7 @@ def clear_sm120_moe_caches() -> None:
                     _GRAPH_REFERENCED_WORKSPACES.append(value)
             cache.clear()
         _GRAPH_REFERENCED_WEIGHT_KEYS.clear()
+        _WEIGHT_ENTRY_GENERATIONS.clear()
     _STATIC_KERNEL_CACHE.clear()
     _MICRO_KERNEL_CACHE.clear()
     _DIRECT_MICRO_LAUNCH_CACHE.clear()

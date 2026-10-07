@@ -40,11 +40,13 @@ def _isolated_workspace_state():
     saved = {name: dict(getattr(moe_dispatch, name)) for name in _MODULE_CACHES}
     saved_parked = list(moe_dispatch._GRAPH_REFERENCED_WORKSPACES)
     saved_weight_keys = set(moe_dispatch._GRAPH_REFERENCED_WEIGHT_KEYS)
+    saved_generations = dict(moe_dispatch._WEIGHT_ENTRY_GENERATIONS)
     capture_probe = moe_dispatch._is_cuda_graph_capturing
     for name in ("_WORKSPACE_CACHE", *_WEIGHT_CACHES):
         getattr(moe_dispatch, name).clear()
     moe_dispatch._GRAPH_REFERENCED_WORKSPACES.clear()
     moe_dispatch._GRAPH_REFERENCED_WEIGHT_KEYS.clear()
+    moe_dispatch._WEIGHT_ENTRY_GENERATIONS.clear()
     yield
     assert moe_dispatch._is_cuda_graph_capturing is capture_probe
     for name in _MODULE_CACHES:
@@ -55,6 +57,8 @@ def _isolated_workspace_state():
     moe_dispatch._GRAPH_REFERENCED_WORKSPACES.extend(saved_parked)
     moe_dispatch._GRAPH_REFERENCED_WEIGHT_KEYS.clear()
     moe_dispatch._GRAPH_REFERENCED_WEIGHT_KEYS.update(saved_weight_keys)
+    moe_dispatch._WEIGHT_ENTRY_GENERATIONS.clear()
+    moe_dispatch._WEIGHT_ENTRY_GENERATIONS.update(saved_generations)
 
 
 def _lookup(routed_rows):
@@ -300,22 +304,41 @@ def test_source_collection_while_holding_the_cache_lock_does_not_deadlock():
 
 def test_source_collection_does_not_evict_a_later_entry_for_the_key():
     cache = moe_dispatch._PADDED_WEIGHT_CACHE
-    old_source = torch.empty(4)
-    old_value = (torch.empty(1),)
-    moe_dispatch._put_weight_cache_entry(cache, ("key",), old_value, old_source)
-    moe_dispatch.clear_sm120_moe_caches()
+    for _ in range(50):
+        old_source = torch.empty(4)
+        moe_dispatch._put_weight_cache_entry(
+            cache, ("key",), (torch.empty(1),), old_source
+        )
+        # Free the old entry so a later entry can reuse its address.
+        moe_dispatch.clear_sm120_moe_caches()
+        gc.collect()
 
-    new_source = torch.empty(4)
-    new_value = (torch.empty(1),)
-    moe_dispatch._put_weight_cache_entry(cache, ("key",), new_value, new_source)
-    del old_source
+        new_source = torch.empty(4)
+        new_value = (torch.empty(1),)
+        moe_dispatch._put_weight_cache_entry(cache, ("key",), new_value, new_source)
+        del old_source
+        gc.collect()
+
+        assert cache == {("key",): new_value}
+        moe_dispatch.clear_sm120_moe_caches()
+
+
+def test_source_alias_kept_across_clear_evicts_only_the_current_entry():
+    cache = moe_dispatch._PADDED_WEIGHT_CACHE
+    source = torch.empty(4)
+    moe_dispatch._put_weight_cache_entry(cache, ("key",), (torch.empty(1),), source)
+    moe_dispatch.clear_sm120_moe_caches()
+    moe_dispatch._put_weight_cache_entry(cache, ("key",), (torch.empty(1),), source)
+
+    del source
     gc.collect()
 
-    assert cache == {("key",): new_value}
+    assert cache == {}
+    assert not moe_dispatch._WEIGHT_ENTRY_GENERATIONS
 
 
-def test_delayed_preparation_keeps_the_entry_captured_in_between():
-    sources = {
+def _w4a16_sources():
+    return {
         name: torch.empty(4)
         for name in (
             "w1_weight",
@@ -326,6 +349,10 @@ def test_delayed_preparation_keeps_the_entry_captured_in_between():
             "w2_alpha",
         )
     }
+
+
+def test_delayed_preparation_keeps_the_entry_captured_in_between():
+    sources = _w4a16_sources()
 
     def lookup():
         return moe_dispatch._get_w4a16_packed_weights(
@@ -354,11 +381,26 @@ def test_delayed_preparation_keeps_the_entry_captured_in_between():
             moe_dispatch, "prepare_w4a16_packed_weights", side_effect=prepare_slowly
         ),
     ):
-        assert lookup() is captured
+        # The delayed caller keeps the buffers it prepared on its own stream
+        # rather than the cached ones, which may still be pending elsewhere.
+        assert lookup() is delayed
 
     assert list(moe_dispatch._W4A16_WEIGHT_CACHE.values()) == [captured]
     moe_dispatch.clear_sm120_moe_caches()
     assert [captured] == moe_dispatch._GRAPH_REFERENCED_WORKSPACES
+
+
+def test_losing_insert_during_capture_parks_its_own_buffers():
+    cache = moe_dispatch._PADDED_WEIGHT_CACHE
+    cached = (torch.empty(1),)
+    own = (torch.empty(1),)
+    moe_dispatch._put_weight_cache_entry(cache, ("key",), cached)
+    with mock.patch.object(moe_dispatch, "_is_cuda_graph_capturing", return_value=True):
+        assert moe_dispatch._put_weight_cache_entry(cache, ("key",), own) is own
+
+    assert cache == {("key",): cached}
+    assert [own] == moe_dispatch._GRAPH_REFERENCED_WORKSPACES
+    assert not moe_dispatch._GRAPH_REFERENCED_WEIGHT_KEYS
 
 
 def test_release_synchronizes_before_dropping_graph_referenced_storage():
@@ -439,17 +481,49 @@ def _sm12x_functional_available():
     return is_sm120a_supported(device) or is_sm121a_supported(device)
 
 
+def _cuda_storages(*caches):
+    """(data_ptr, nbytes) of the CUDA storages held by cache entries.
+
+    Returns plain integers so that no tensor reference outlives the call.
+    """
+    storages = set()
+    for cache in caches:
+        for entry in cache.values():
+            values = entry if isinstance(entry, tuple) else tuple(vars(entry).values())
+            for value in values:
+                if isinstance(value, torch.Tensor) and value.is_cuda:
+                    storage = value.untyped_storage()
+                    storages.add((storage.data_ptr(), storage.nbytes()))
+    return storages
+
+
+def _padded_weight_storages():
+    """Storages of the padded weights and scale factors, not their inputs."""
+    storages = set()
+    for entry in moe_dispatch._PADDED_WEIGHT_CACHE.values():
+        for value in entry[:4]:
+            storage = value.untyped_storage()
+            storages.add((storage.data_ptr(), storage.nbytes()))
+    return storages
+
+
 @pytest.mark.skipif(
     not _sm12x_functional_available(),
     reason="Requires an SM120/SM121 GPU, CuTe DSL and CUDA 13",
 )
-def test_functional_capture_replays_correctly_after_cache_clear():
+def test_functional_capture_replays_correctly_after_cache_clear(monkeypatch):
     from flashinfer import b12x_fused_moe
 
     from .utils import create_b12x_moe_tensors
 
-    num_tokens, hidden_size, intermediate_size = 128, 256, 512
+    # The static backend pads an intermediate size that is not a multiple of
+    # its retained N group into cache-owned weights and scale factors. The
+    # captured graph reads only those copies, so after clearing only the
+    # cache can keep them alive.
+    monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", "static")
+    num_tokens, hidden_size, intermediate_size = 128, 512, 704
     num_experts, top_k = 8, 2
+    assert intermediate_size % moe_dispatch._STATIC_RETAINED_GROUP_N != 0
     tensors = create_b12x_moe_tensors(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
@@ -480,33 +554,36 @@ def test_functional_capture_replays_correctly_after_cache_clear():
 
     run()
     torch.cuda.synchronize()
+    input_ptrs = {
+        value.untyped_storage().data_ptr()
+        for value in tensors.values()
+        if isinstance(value, torch.Tensor) and value.is_cuda
+    }
+    padded = _padded_weight_storages()
+    assert padded
+    assert not {ptr for ptr, _ in padded} & input_ptrs
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
     graph.replay()
     torch.cuda.synchronize()
     expected = output.clone()
+    assert torch.isfinite(expected.float()).all()
 
-    # Size scribbles to the prepared weights and workspaces the graph uses so
-    # that, if clearing freed them, the allocator hands their blocks back here.
-    storage_bytes = []
-    for entry in (
-        *moe_dispatch._WEIGHT_CACHE.values(),
-        *moe_dispatch._WORKSPACE_CACHE.values(),
-    ):
-        values = entry if isinstance(entry, tuple) else vars(entry).values()
-        storage_bytes.extend(
-            value.untyped_storage().nbytes()
-            for value in values
-            if isinstance(value, torch.Tensor) and value.is_cuda
+    sizes = [
+        nbytes
+        for _, nbytes in _cuda_storages(
+            moe_dispatch._PADDED_WEIGHT_CACHE, moe_dispatch._WEIGHT_CACHE
         )
-    assert storage_bytes
-
+    ]
     try:
         moe_dispatch.clear_sm120_moe_caches()
+        # Without retention the allocator hands the freed blocks back here,
+        # and replay reads NaN scale factors (0xFF) and garbage weights.
         scribbles = [
             torch.full((nbytes,), 0xFF, dtype=torch.uint8, device="cuda")
-            for nbytes in storage_bytes
+            for nbytes in sizes
         ]
         output.zero_()
         graph.replay()
