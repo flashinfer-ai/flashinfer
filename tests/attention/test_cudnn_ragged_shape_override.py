@@ -643,3 +643,81 @@ def test_bounded_mla_older_frontend_keeps_broad_graph(monkeypatch):
             assert observed
         finally:
             cudnn_prefill._cudnn_supports_bounded_ragged.cache_clear()
+
+
+@requires_override
+@pytest.mark.parametrize("lse_layout", ["NH", "HN"])
+def test_small_workspace_selection_reuse_and_capture(lse_layout, monkeypatch):
+    """Smaller workspaces keep valid plans and do not mutate cached captures."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("bounded ragged qualification requires SM100/SM107")
+    import flashinfer.prefill as prefill_module
+
+    qlens, klens = [257, 1, 1], [8192] * 3
+    qo, ko = _indptr(qlens), _indptr(klens)
+    q = torch.zeros(sum(qlens), 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(sum(klens), 4, 128, device="cuda", dtype=q.dtype)
+    v = torch.empty_like(k)
+    expected = torch.empty_like(q)
+    expected_lse = torch.empty(sum(qlens), 16, device="cuda")
+    for i, (nq, nk) in enumerate(zip(qlens, klens, strict=True)):
+        v[ko[i] : ko[i + 1]].fill_(i + 1)
+        expected[qo[i] : qo[i + 1]].fill_(i + 1)
+        rows = torch.arange(nk - nq + 1, nk + 1, device="cuda", dtype=torch.float64)
+        expected_lse[qo[i] : qo[i + 1]] = rows.log().float()[:, None]
+    out = torch.empty_like(q)
+    lse = torch.empty_like(
+        expected_lse if lse_layout == "NH" else expected_lse.T,
+        memory_format=torch.contiguous_format,
+    )
+    workspaces = [
+        torch.empty(mib << 20, device="cuda", dtype=torch.uint8) for mib in (128, 1, 8)
+    ]
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspaces[0], backend="cudnn"
+    )
+    captures, graphs = [], []
+
+    def run():
+        wrapper.run(
+            q,
+            k,
+            v,
+            out=out,
+            lse=lse,
+            return_lse=True,
+            lse_layout=lse_layout,
+            lse_base="ln",
+        )
+
+    try:
+        for workspace in (*workspaces, workspaces[0]):
+            wrapper.reset_workspace_buffer(workspace, wrapper._int_workspace_buffer)
+            wrapper.plan(qo, ko, 16, 4, 128, q_data_type=q.dtype, causal=True)
+            run()
+            graph = wrapper._cudnn_prepared.graph
+            assert graph.get_workspace_size() <= workspace.numel()
+            graphs.append(graph)
+            with monkeypatch.context() as m:
+                m.setattr(
+                    prefill_module,
+                    "prepare_cudnn_batch_prefill",
+                    lambda *a, **kw: pytest.fail("warm run prepared again"),
+                )
+                capture = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(capture):
+                    run()
+                captures.append(capture)
+            # Earlier captures must still work after selecting another workspace.
+            for captured in captures:
+                out.fill_(float("nan"))
+                lse.fill_(float("nan"))
+                captured.replay()
+                torch.testing.assert_close(out, expected)
+                torch.testing.assert_close(
+                    lse if lse_layout == "NH" else lse.T, expected_lse
+                )
+        assert graphs[-1] is graphs[0]
+    finally:
+        for capture in captures:
+            capture.reset()

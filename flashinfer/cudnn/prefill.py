@@ -364,6 +364,7 @@ def _sdpa_prefill_key_fn(
     o_data_type=None,
     stats_head_stride=0,
     stats_use_log2=False,
+    workspace_limit=None,
     **metadata,
 ):
     return (
@@ -373,6 +374,7 @@ def _sdpa_prefill_key_fn(
         if metadata.get("override_cache") is not None and _CUDNN_NATIVE_HN_SUPPORTED
         else stats_head_stride,
         stats_use_log2,
+        workspace_limit,
     )
 
 
@@ -411,6 +413,7 @@ if CUDNN_AVAILABLE:
         override_cache: Optional[tuple[int, int, int]] = None,
         stats_head_stride: int = 0,
         stats_use_log2: bool = False,
+        workspace_limit: Optional[int] = None,
     ):
         global _prefill_graph_builds
         _prefill_graph_builds += 1
@@ -857,6 +860,10 @@ if CUDNN_AVAILABLE:
                 if actual_seq_lens_kv is not None:
                     tensors_to_return.append(cudnn_actual_seq_lens_kv)
 
+            if workspace_limit is not None:
+                # The same constraint applies to backend and Python engines.
+                # This graph has its own cache key; never filter a shared graph.
+                g.deselect_workspace_greater_than(workspace_limit)
             if stats_use_log2:
                 require_native_cudnn_log2(g, cudnn)
             return g, tensors_to_return
@@ -1560,6 +1567,7 @@ def prepare_cudnn_batch_prefill(
     with metadata resolved for that call.
     """
     override_cache = metadata.override_shape(q, k_cache)
+    workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
 
     stats_use_log2 = (
         metadata.return_lse
@@ -1615,7 +1623,6 @@ def prepare_cudnn_batch_prefill(
         **metadata.graph_kwargs(override_cache),
     )
     if override_cache is not None:
-        workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
         if _graph_workspace_size(graph, key) > workspace_bytes:
             # The override graph reserves TMA descriptors for its declared
             # batch (~1 MiB at 4096). A caller whose workspace cannot hold them
@@ -1639,6 +1646,32 @@ def prepare_cudnn_batch_prefill(
                 stats_use_log2=stats_use_log2,
                 **metadata.graph_kwargs(None),
             )
+    if _graph_workspace_size(graph, key) > workspace_bytes:
+        # An exact graph may still prefer split-KV with large FP32 partials.
+        # Let FE walk its ordinary plan list under the caller's workspace limit.
+        # Cache this separately so earlier captures and larger-workspace callers
+        # retain their selected plan. Prepared warm runs do not revisit this.
+        constrained = dict(
+            **metadata.graph_kwargs(override_cache), workspace_limit=workspace_bytes
+        )
+        graph, _ = _build_prefill_graph(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            scale=scale,
+            stats_head_stride=stats_head_stride,
+            stats_use_log2=stats_use_log2,
+            **constrained,
+        )
+        key = _sdpa_prefill_key_fn(
+            q,
+            k_cache,
+            v_cache,
+            scale,
+            stats_head_stride=stats_head_stride,
+            stats_use_log2=stats_use_log2,
+            **constrained,
+        )
     return CudnnPrefillGraph(
         key,
         graph,
