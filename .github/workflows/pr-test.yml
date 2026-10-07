@@ -705,6 +705,24 @@ jobs:
             echo "$REPORT"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Check trace reference coverage
+        id: trace-coverage
+        if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
+        run: |
+          REPORT=$(python3 scripts/pr_checks/check_trace_coverage.py \
+            --github-actions 2>&1) || true
+          echo "$REPORT"
+          {
+            echo ""
+            echo "$REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if echo "$REPORT" | grep -q "gap"; then
+            echo "trace_gaps=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "trace_gaps=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check Results
         if: needs.gate.outputs.authorized == 'true'
         env:
@@ -714,6 +732,7 @@ jobs:
           # in another file and must not be what keeps this step from being injectable.
           TEST_SCOPE: ${{ needs.setup.outputs.test_scope }}
           SKIP_ALL_FOUND: ${{ steps.skip-all.outputs.skip_all_found }}
+          TRACE_GAPS: ${{ steps.trace-coverage.outputs.trace_gaps }}
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -755,6 +774,13 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "> ⚠️ **Some changed test files had all nodes skipped on every lane.**" >> $GITHUB_STEP_SUMMARY
             echo "> See the skip-all report above for details." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$TRACE_GAPS" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⚠️ **Some GDN/KDA trace definitions are missing numerical coverage.**" >> $GITHUB_STEP_SUMMARY
+            echo "> See the trace coverage report above for details." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
