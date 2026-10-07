@@ -21,6 +21,7 @@ tcgen05 TF32 MMAs.  The small low-rank recurrence is evaluated directly
 from the TMEM epilogue, so no intermediate state-dot tensor reaches GMEM.
 """
 
+import os
 from typing import Optional
 
 import torch
@@ -660,6 +661,22 @@ def _chain_parents(T: int, device: torch.device) -> torch.Tensor:
     return _CHAIN_PARENTS[key]
 
 
+_VALIDATE_VERIFY_PARENTS = (
+    os.environ.get("FLASHINFER_VALIDATE_VERIFY_PARENTS", "0") == "1"
+)
+
+
+def _assert_verify_parents(parents: torch.Tensor) -> None:
+    """Device-side ``parent[i] < i`` check; FLASHINFER_VALIDATE_VERIFY_PARENTS=1 only."""
+    if not _VALIDATE_VERIFY_PARENTS:
+        return
+    steps = torch.arange(parents.shape[1], device=parents.device, dtype=parents.dtype)
+    torch._assert_async(
+        ((parents >= -1) & (parents < steps)).all(),
+        "verify_parents[:, i] must be in [-1, i)",
+    )
+
+
 def _slot_dynamic(tensor: torch.Tensor):
     return from_dlpack(tensor, assumed_align=16).mark_compact_shape_dynamic(
         mode=0,
@@ -701,8 +718,7 @@ def run_gdn_verify_kernel_mtp_replayssm_tcgen(
             raise ValueError("verify_parents must be int32")
         if verify_parents.device != q.device:
             raise ValueError("verify_parents must be on the query device")
-        # parent[i] < i is a device-side property, so checking it here would
-        # sync.  Callers must guarantee it; EAGLE's level-by-level layout does.
+        _assert_verify_parents(verify_parents)
     else:
         verify_parents = _chain_parents(T, q.device)
     # mark_layout_dynamic preserves the inferred unit-stride dimension.
