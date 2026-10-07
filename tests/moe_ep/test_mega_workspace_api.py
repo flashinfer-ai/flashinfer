@@ -262,6 +262,92 @@ def test_forward_uses_selected_workspace_and_capacity_profile():
     layer.destroy()
 
 
+def test_unfinalized_output_requires_explicit_backend_opt_in():
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    layer, _, _ = _make_layer()
+    with pytest.raises(MoEEpConfigError, match="do_finalize=False"):
+        layer.forward_unfinalized(_inputs(8))
+    layer._kernel.supports_unfinalized_output = True
+    with pytest.raises(MoEEpConfigError, match="requires forward_unfinalized"):
+        layer.forward(_inputs(8))
+    layer.destroy()
+
+
+@pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
+def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
+    monkeypatch, apply_topk_in_fc1
+):
+    """Remaining weights and identity indices reuse storage across live sizes."""
+    import torch
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.backend import (
+        Nvfp4CutedslMegaKernelBackend,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe
+
+    capacity, top_k, hidden = 7, 2, 128
+    partials = torch.randn(capacity, top_k, hidden, dtype=torch.bfloat16)
+    raw = SimpleNamespace(
+        topk_idx=torch.empty(capacity, top_k, dtype=torch.int32),
+        topk_weights=torch.randn(capacity, top_k, dtype=torch.float32),
+        _frontend=SimpleNamespace(
+            deferred_topk_reduce_workspace=lambda: (partials, partials, None)
+        ),
+    )
+    monkeypatch.setattr(
+        cutedsl_megamoe, "get_symm_buffer_for_mega_moe", lambda *a, **k: raw
+    )
+    kernel = Nvfp4CutedslMegaKernelBackend(
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=top_k,
+            apply_topk_in_fc1=apply_topk_in_fc1,
+            do_finalize=False,
+        )
+    )
+    kernel.bind_ep_bootstrap(
+        BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    )
+    workspace = kernel._allocate_workspace(FleetParams(2, capacity, hidden))
+    assert workspace is raw
+    weights_storage = raw._unfinalized_weights.untyped_storage().data_ptr()
+    map_storage = raw._unfinalized_route_map.untyped_storage().data_ptr()
+    thunk = mock.Mock()
+    monkeypatch.setattr(
+        kernel, "_prepared_thunk_state", lambda *args: ((), thunk, None)
+    )
+    monkeypatch.setattr(torch, "arange", mock.Mock(side_effect=AssertionError))
+    monkeypatch.setattr(torch, "ones_like", mock.Mock(side_effect=AssertionError))
+
+    for live_tokens in (3, 0, 5):
+        monkeypatch.setattr(cutedsl_megamoe, "staged_tokens", lambda _: live_tokens)
+        rows, weights, indices = kernel.compute_unfinalized(workspace, ())
+        assert rows.shape == (live_tokens * top_k, hidden)
+        assert rows.dtype == torch.bfloat16
+        assert weights.shape == indices.shape == (live_tokens, top_k)
+        assert weights.dtype == torch.float32 and indices.dtype == torch.int32
+        assert (
+            rows.untyped_storage().data_ptr() == partials.untyped_storage().data_ptr()
+        )
+        assert weights.untyped_storage().data_ptr() == weights_storage
+        assert indices.untyped_storage().data_ptr() == map_storage
+        assert indices.flatten().tolist() == list(range(live_tokens * top_k))
+        expected_weights = (
+            torch.full((live_tokens, top_k), 1.0)
+            if apply_topk_in_fc1
+            else raw.topk_weights[:live_tokens]
+        )
+        torch.testing.assert_close(weights, expected_weights)
+        torch.testing.assert_close(rows[indices.long()], partials[:live_tokens])
+    assert thunk.call_count == 3
+
+
 def test_workspace_over_capacity_rejected_before_allocation_stage_or_compute():
     from flashinfer.moe_ep import MoEEpConfigError
 
@@ -567,3 +653,58 @@ def test_create_workspace_rejects_mutable_auto_tuning_state():
     validate_init.assert_not_called()
     prepare_workspace.assert_not_called()
     layer.destroy()
+
+
+def test_nvfp4_recompiled_workspace_releases_obsolete_launch_scratch(monkeypatch):
+    """Recompiling one profile releases its old scratch and preserves its peers."""
+    import weakref
+
+    import torch
+
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.backend import (
+        Nvfp4CutedslMegaKernelBackend,
+    )
+
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda: SimpleNamespace(cuda_stream=1)
+    )
+    kernel = Nvfp4CutedslMegaKernelBackend(
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
+    )
+    monkeypatch.setattr(kernel, "_mega_inputs", lambda workspace, weights: workspace)
+
+    def session(value):
+        return SimpleNamespace(compiled=object(), scratch=torch.full((1, 128), value))
+
+    def workspace(value):
+        frontend = SimpleNamespace(
+            _mega=session(value),
+            config=SimpleNamespace(defer_topk_reduce=False),
+            set_swiglu_params=lambda *args: None,
+        )
+        raw = SimpleNamespace(_frontend=frontend, output_activation=torch.empty(1, 128))
+
+        def prepare(inputs):
+            mega = frontend._mega
+            return lambda: inputs.output_activation.copy_(mega.scratch)
+
+        frontend.make_launch_thunk = prepare
+        return raw
+
+    first, second = workspace(1.0), workspace(2.0)
+    output = torch.empty(1, 128)
+    kernel.compute(first, (), output=output)
+    old_scratch = weakref.ref(first._frontend._mega.scratch)
+    kernel.compute(second, (), output=output)
+
+    first._frontend._mega = session(3.0)
+    assert old_scratch() is not None  # The old launch still owns its scratch.
+    kernel.compute(first, (), output=output)
+    assert torch.equal(output, torch.full_like(output, 3.0))
+    assert old_scratch() is None
+
+    # The other profile's prepared launch remains valid and cached.
+    second._frontend.make_launch_thunk = mock.Mock(side_effect=AssertionError)
+    kernel.compute(second, (), output=output)
+    assert torch.equal(output, torch.full_like(output, 2.0))

@@ -1741,7 +1741,7 @@ def test_nvfp4_cutedsl_mega_kernel_is_registered():
     assert kernel.kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
 
-def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
+def test_nvfp4_cutedsl_config_exposes_finalization_ikr_and_combine_dtype():
     """The TRT-LLM-import knobs are plumbed through the FI backend config."""
     from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
@@ -1752,7 +1752,17 @@ def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
         enable_in_kernel_fc2_reduce=True,
     )
     assert cfg.combine_dtype == "bf16"
-    assert create_mega_kernel(cfg).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+    assert cfg.do_finalize is True
+    kernel = create_mega_kernel(cfg)
+    assert kernel.kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+    assert not kernel.supports_unfinalized_output
+
+    cfg_unfinalized = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        do_finalize=False,
+    )
+    assert create_mega_kernel(cfg_unfinalized).supports_unfinalized_output
 
     cfg_q = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
@@ -1760,6 +1770,26 @@ def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
         combine_dtype="nvfp4",
     )
     assert create_mega_kernel(cfg_q).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+
+
+@pytest.mark.parametrize(
+    "incompatible",
+    [
+        {"enable_in_kernel_fc2_reduce": True},
+        {"combine_dtype": "mxfp8"},
+        {"knobs": "auto"},
+    ],
+)
+def test_nvfp4_deferred_output_rejects_incompatible_modes(incompatible):
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+
+    with pytest.raises(ValueError, match="do_finalize=False requires"):
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+            do_finalize=False,
+            **incompatible,
+        )
 
 
 def test_nvfp4_cutedsl_config_validates_situ():

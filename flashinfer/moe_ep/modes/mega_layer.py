@@ -356,7 +356,10 @@ class MoEEpMegaLayer(nn.Module):
                     device=device,
                 ),
             )
-        self.forward(t, workspace=workspace)
+        if self._kernel.supports_unfinalized_output:
+            self.forward_unfinalized(t, workspace=workspace)
+        else:
+            self.forward(t, workspace=workspace)
         torch.cuda.synchronize()
 
     def _resolve_quantize_input(self, t: "MoEEpTensors") -> bool:
@@ -385,13 +388,72 @@ class MoEEpMegaLayer(nn.Module):
         backends that support one. A view remains valid under stream ordering
         until the next launch reuses the pooled physical workspace.
         """
-        ensure_bootstrap_dist_validated(self._bootstrap)
-        quantize_input = self._resolve_quantize_input(t)
-
+        if self._kernel.supports_unfinalized_output:
+            raise MoEEpConfigError("do_finalize=False requires forward_unfinalized()")
         if return_workspace_view and not self.supports_output_view:
             raise MoEEpConfigError(
                 "return_workspace_view=True is not supported by this MegaMoE backend"
             )
+        fleet_params, backend_workspace, transformed_weights, quantize_input = (
+            self._prepare_forward(t, workspace)
+        )
+
+        y = None
+        if not return_workspace_view:
+            # Allocate before staging; allocator work can synchronize the device.
+            y = torch.empty(
+                t.num_tokens,
+                fleet_params.token_hidden_size,
+                dtype=torch.bfloat16,
+                device=t.hidden_states.device,
+            )
+        self._kernel.stage_inputs(
+            t,
+            backend_workspace,
+            quantize_input=quantize_input,
+        )
+        return self._kernel.compute(
+            backend_workspace,
+            transformed_weights,
+            output=y,
+        )
+
+    def forward_unfinalized(
+        self,
+        t: "MoEEpTensors",
+        *,
+        workspace: MoEEpMegaWorkspace | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return GEMM2 rows, remaining routing weights, and a route-to-row map.
+
+        Requires ``do_finalize=False``. Results are contiguous BF16
+        ``[T * top_k, hidden]`` rows, FP32 ``[T, top_k]`` weights, and an int32
+        ``[T, top_k]`` identity map whose entries index the first result.
+        Weights are one when ``apply_topk_in_fc1=True`` already applied routing.
+        These tensors match the unfinalized TRTLLM MoE output layout.
+
+        All results borrow pooled workspace storage: consume them on the current
+        stream before any layer reuses that workspace. EP communication completes
+        before caller finalization; zero-token ranks still participate in the
+        full collective launch. Warm up on all ranks before capture.
+        """
+        if not self._kernel.supports_unfinalized_output:
+            raise MoEEpConfigError(
+                "forward_unfinalized() requires a backend with do_finalize=False"
+            )
+        _, backend_workspace, transformed_weights, quantize_input = (
+            self._prepare_forward(t, workspace)
+        )
+        self._kernel.stage_inputs(t, backend_workspace, quantize_input=quantize_input)
+        return self._kernel.compute_unfinalized(backend_workspace, transformed_weights)
+
+    def _prepare_forward(
+        self,
+        t: "MoEEpTensors",
+        workspace: MoEEpMegaWorkspace | None,
+    ) -> tuple[FleetParams, Any, Any, bool]:
+        ensure_bootstrap_dist_validated(self._bootstrap)
+        quantize_input = self._resolve_quantize_input(t)
 
         if workspace is None:
             if self._destroyed:
@@ -416,28 +478,7 @@ class MoEEpMegaLayer(nn.Module):
                 transformed_weights,
             )
 
-        y = None
-        use_workspace_view = return_workspace_view
-        if not use_workspace_view:
-            # Owned-output allocation must stay ahead of the staging round
-            # (allocator work between stage and compute can sync the device
-            # mid-round).
-            y = torch.empty(
-                t.num_tokens,
-                fleet_params.token_hidden_size,
-                dtype=torch.bfloat16,
-                device=t.hidden_states.device,
-            )
-        self._kernel.stage_inputs(
-            t,
-            backend_workspace,
-            quantize_input=quantize_input,
-        )
-        return self._kernel.compute(
-            backend_workspace,
-            transformed_weights,
-            output=y,
-        )
+        return fleet_params, backend_workspace, transformed_weights, quantize_input
 
     def destroy(self) -> None:
         """Collectively release all profiles and runtime resources.

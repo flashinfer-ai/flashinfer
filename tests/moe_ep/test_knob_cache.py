@@ -113,6 +113,155 @@ def test_record_upserts_same_key(monkeypatch, tmp_path):
     assert len(data["entries"]) == 1
 
 
+@pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
+def test_deferred_output_winners_do_not_replace_reduced_winners(
+    monkeypatch, tmp_path, apply_topk_in_fc1
+):
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
+
+    _cache_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(knob_cache, "_current_device_name", lambda: "testgpu")
+    key = dict(max_tokens=128, apply_topk_in_fc1=apply_topk_in_fc1, **_KEY)
+    deferred = {**_KNOBS, "flag_batch": 8}
+    knob_cache.record_knobs(_KNOBS, **key)
+    knob_cache.record_knobs(deferred, defer_topk_reduce=True, **key)
+    replacement = {**deferred, "flag_batch": 4}
+    knob_cache.record_knobs(replacement, defer_topk_reduce=True, **key)
+    assert knob_cache.resolve_knobs(**key) == (_KNOBS, "cache")
+    assert knob_cache.resolve_knobs(defer_topk_reduce=True, **key) == (
+        replacement,
+        "cache",
+    )
+    assert (
+        knob_cache.lookup_knobs(
+            **{**key, "apply_topk_in_fc1": not apply_topk_in_fc1},
+            defer_topk_reduce=True,
+        )
+        is None
+    )
+
+
+def test_legacy_reduced_entries_load_but_startup_profiles_are_ignored(
+    monkeypatch, tmp_path
+):
+    import json
+
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+        lookup_knobs,
+        record_knobs,
+    )
+
+    path = _cache_env(monkeypatch, tmp_path)
+    key = dict(max_tokens=128, device="testgpu", **_KEY)
+    record_knobs(_KNOBS, **key)
+    data = json.loads(path.read_text())
+    entry = data["entries"][0]
+    del entry["defer_topk_reduce"]
+    path.write_text(json.dumps(data))
+    assert lookup_knobs(**key) == _KNOBS
+    assert lookup_knobs(defer_topk_reduce=True, **key) is None
+    entry["profile"] = {"defer_topk_reduce": True, "live_tokens": [32] * 4}
+    path.write_text(json.dumps(data))
+    assert lookup_knobs(**key) is None
+    record_knobs(_KNOBS, **key)
+    assert lookup_knobs(**key) == _KNOBS
+
+
+@pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
+def test_offline_deferred_tuning_rebuilds_launches_and_records_output_mode(
+    monkeypatch, tmp_path, apply_topk_in_fc1
+):
+    from types import SimpleNamespace
+
+    import torch
+
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import (
+        autotune,
+        comm,
+        knob_cache,
+        nvfp4,
+    )
+
+    _cache_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(knob_cache, "_current_device_name", lambda: "testgpu")
+    monkeypatch.setattr(comm, "ensure_not_capturing", lambda _: None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    synchronize = mock.Mock()
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+    tensor = torch.tensor
+    monkeypatch.setattr(
+        torch,
+        "tensor",
+        lambda data, **kwargs: tensor(data, **{**kwargs, "device": "cpu"}),
+    )
+    monkeypatch.setattr(
+        autotune.time, "perf_counter", mock.Mock(side_effect=[0.0, 2.0, 2.0, 3.0])
+    )
+    config = nvfp4.MegaMoENvfp4Config(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=64,
+        num_topk=2,
+        num_total_experts=8,
+        hidden=128,
+        intermediate=256,
+        apply_topk_in_fc1=apply_topk_in_fc1,
+        defer_topk_reduce=True,
+    )
+    frontend = SimpleNamespace(config=config, generation=0)
+
+    def apply_knobs(knobs):
+        frontend.generation += 1
+
+    frontend.apply_knobs = apply_knobs
+    symm_buffer = SimpleNamespace(_frontend=frontend)
+    launches = []
+
+    def prepare(*args):
+        generation = frontend.generation
+
+        def launch():
+            assert frontend.generation == generation, "reused an invalidated thunk"
+            launches.append(generation)
+
+        return launch
+
+    prepare = mock.Mock(side_effect=prepare)
+    reduced = mock.Mock(side_effect=AssertionError("must not reduce the output"))
+    monkeypatch.setattr(nvfp4, "nvfp4_mega_launch_thunk", prepare)
+    monkeypatch.setattr(nvfp4, "nvfp4_mega_moe", reduced)
+    candidates = [_KNOBS, {**_KNOBS, "flag_batch": 8}]
+    y = torch.full((8, 128), float("nan"))
+    winner = autotune.autotune_nvfp4_mega_moe(
+        y,
+        object(),
+        object(),
+        symm_buffer,
+        num_tokens=8,
+        candidates=candidates,
+        warmup_iters=1,
+        timed_iters=1,
+    )
+    assert winner == candidates[1]
+    assert prepare.call_count == 2
+    assert launches == [1, 1, 2, 2]
+    assert synchronize.call_count == 4
+    assert torch.isnan(y).all()
+    reduced.assert_not_called()
+    key = dict(
+        dtype="nvfp4",
+        world_size=1,
+        hidden=128,
+        intermediate=256,
+        num_experts=8,
+        topk=2,
+        max_tokens=64,
+        apply_topk_in_fc1=apply_topk_in_fc1,
+    )
+    assert knob_cache.resolve_knobs(defer_topk_reduce=True, **key) == (winner, "cache")
+    assert knob_cache.lookup_knobs(**key) is None
+
+
 def test_ikr_and_deterministic_winners_are_separate_entries(monkeypatch, tmp_path):
     """The two objectives are tuned separately, so neither may evict the other."""
     import json
@@ -310,6 +459,7 @@ def test_symm_buffer_resolves_cached_knobs(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
+        apply_topk_in_fc1=mode == "nvfp4",
     )
     knobs = cached if explicit else None
     buf = get_symm_buffer_for_mega_moe(

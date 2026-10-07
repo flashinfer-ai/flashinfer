@@ -58,8 +58,21 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # Uniform per-layer SwiGLU constants; None/None keeps standard SwiGLU.
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
+    # False exposes per-route outputs through MoEEpMegaLayer.forward_unfinalized()
+    # for caller finalization. Requires fixed/offline-tuned knobs.
+    do_finalize: bool = True
 
     def __post_init__(self) -> None:
+        if not self.do_finalize:
+            if self.enable_in_kernel_fc2_reduce or self.combine_dtype != "bf16":
+                raise ValueError(
+                    "do_finalize=False requires enable_in_kernel_fc2_reduce=False "
+                    "and combine_dtype='bf16'."
+                )
+            if self.knobs == "auto":
+                raise ValueError(
+                    "do_finalize=False requires fixed/offline-tuned knobs."
+                )
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         if self.activation not in ("swiglu", "situ"):

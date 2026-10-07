@@ -251,12 +251,15 @@ def autotune_knobs(
     warmup_iters: int = 3,
     timed_iters: int = 10,
     on_winner: Optional[Callable[[Dict[str, Any], float], None]] = None,
+    prepare_launch: Optional[Callable[[], Callable[[], None]]] = None,
 ) -> Dict[str, Any]:
     """Time each candidate on the live problem and apply the winner.
 
     ``frontend`` is a NVFP4/MXFP8 mega frontend (must have ``apply_knobs``);
     ``launch`` is a zero-arg closure that runs one synchronized forward with
     the caller's real staged inputs (e.g. a ``nvfp4_mega_moe(...)`` call).
+    ``prepare_launch``, when supplied, builds that callable after each knob
+    change, outside the timed interval.
 
     ``on_winner`` (optional) is called once with ``(winner, p50_seconds)``
     after the winner is applied — used to persist the result in the knob
@@ -288,16 +291,20 @@ def autotune_knobs(
         # A candidate failure (ctor reject / compile error) is deterministic
         # across ranks -- same static problem, same knobs -- so scoring it inf
         # keeps the collective iteration aligned.
+        candidate_launch = None
         try:
             frontend.apply_knobs(knobs)
             _barrier()
+            candidate_launch = (
+                prepare_launch() if prepare_launch is not None else launch
+            )
             for _ in range(warmup_iters):  # first launch compiles
-                launch()
+                candidate_launch()
             _barrier()
             iters: List[float] = []
             for _ in range(timed_iters):  # launch() syncs internally
                 t0 = time.perf_counter()
-                launch()
+                candidate_launch()
                 iters.append(time.perf_counter() - t0)
             scores.append(statistics.median(iters))
         except Exception as exc:  # noqa: BLE001 -- score-and-continue by design
@@ -307,6 +314,8 @@ def autotune_knobs(
                 stacklevel=2,
             )
             scores.append(math.inf)
+        finally:
+            candidate_launch = None
         _barrier()
 
     t = torch.tensor(scores, dtype=torch.float64, device="cuda")
@@ -351,11 +360,17 @@ def autotune_nvfp4_mega_moe(
     """Autotune the NVFP4 mega session on the caller's staged inputs.
 
     Arguments mirror :func:`.nvfp4.nvfp4_mega_moe`; ``y`` is clobbered by the
-    candidate launches.  Apply the winner and return its knob dict; subsequent
-    ``nvfp4_mega_moe`` calls on ``symm_buffer`` reuse the winning compile.
+    candidate launches. Deferred sessions leave ``y`` untouched and time only
+    the megakernel, excluding the caller's finalizer. Apply the winner and
+    return its knob dict; rebuild any earlier launch thunks or borrowed views.
     COLLECTIVE -- see :func:`autotune_knobs`.
     """
-    from .nvfp4 import COMBINE_FORMAT_NAMES, nvfp4_mega_moe
+    from .comm import resolve_gate_up_clamp
+    from .nvfp4 import (
+        COMBINE_FORMAT_NAMES,
+        nvfp4_mega_launch_thunk,
+        nvfp4_mega_moe,
+    )
 
     def launch() -> None:
         # sync=True: the tune loop times launches with perf_counter, so the
@@ -374,13 +389,40 @@ def autotune_nvfp4_mega_moe(
         )
 
     cfg = symm_buffer._frontend.config
+    prepare_launch = None
+    if cfg.defer_topk_reduce:
+        n = num_tokens if num_tokens is not None else cfg.num_tokens_per_rank
+        if n < 0 or n > cfg.num_tokens_per_rank:
+            raise ValueError(
+                f"num_tokens must be in [0, {cfg.num_tokens_per_rank}], got {n}."
+            )
+
+        def prepare_launch() -> Callable[[], None]:
+            frontend = symm_buffer._frontend
+            if swiglu_alpha is not None or swiglu_beta is not None:
+                frontend.set_swiglu_params(swiglu_alpha, swiglu_beta)
+            clamp = resolve_gate_up_clamp(
+                gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
+            )
+            if clamp is not None:
+                frontend.set_gate_up_clamp(clamp)
+            thunk = nvfp4_mega_launch_thunk(transformed_l1, transformed_l2, symm_buffer)
+
+            def launch_unreduced() -> None:
+                thunk()
+                torch.cuda.synchronize()
+
+            return launch_unreduced
+
     if candidates is None:
         # Session-aware default sweep: prune ikr when the session did not
         # permit it or cannot run it, and quantized-combine-invalid combos.
         candidates = nvfp4_candidates(
             combine_format=COMBINE_FORMAT_NAMES[cfg.combine_dtype],
             enable_in_kernel_fc2_reduce=(
-                cfg.enable_in_kernel_fc2_reduce and cfg.apply_topk_in_fc1
+                cfg.enable_in_kernel_fc2_reduce
+                and cfg.apply_topk_in_fc1
+                and not cfg.defer_topk_reduce
             ),
         )
 
@@ -400,6 +442,8 @@ def autotune_nvfp4_mega_moe(
                 topk=cfg.num_topk,
                 max_tokens=cfg.num_tokens_per_rank,
                 combine_dtype=cfg.combine_dtype,
+                apply_topk_in_fc1=cfg.apply_topk_in_fc1,
+                defer_topk_reduce=cfg.defer_topk_reduce,
                 p50_us=p50_s * 1e6,
                 source="autotune",
             )
@@ -412,6 +456,7 @@ def autotune_nvfp4_mega_moe(
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
         on_winner=_record,
+        prepare_launch=prepare_launch,
     )
 
 
