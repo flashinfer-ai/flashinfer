@@ -441,23 +441,35 @@ def _build_case(
     )
 
 
+def _require_runner_support(runner_cls, config, device, *, unavailable: str) -> None:
+    """Skip when ``runner_cls`` rejects ``config`` for ``unavailable``, a path this tree or
+    module does not provide; any other rejection is a failure.
+
+    ``"SwiGLUStep"``: the public trtllm-gen artifact ships no StepFun kernels, so the native
+    runners do not advertise SwiGLUStep and a native comparison needs a tree with the native
+    StepFun path. ``"full Cake path"``: the Cake router serves Renormalize over routed experts
+    only. ``MoELayer`` folds every runner rejection into one ``RuntimeError`` while it builds
+    its runners, so the probe runs on the runner before the layer is constructed.
+    """
+    try:
+        runner_cls(config, device).check_support()
+    except NotImplementedError as error:
+        if unavailable in str(error):
+            pytest.skip(
+                f"{runner_cls.__name__} does not serve this configuration in this tree "
+                f"({unavailable}): {error}"
+            )
+        raise
+
+
 def _layer_runner(config, device, runner_cls, act, weights, *, native=False):
+    if native:
+        _require_runner_support(runner_cls, config, device, unavailable="SwiGLUStep")
     layer = MoELayer(config, device)
     assert len(layer.runners) == 1
     runner = layer.runners[0]
     assert isinstance(runner, runner_cls), type(runner)
-    try:
-        runner.check_support()
-    except NotImplementedError as error:
-        if native and "SwiGLUStep" in str(error):
-            # The public trtllm-gen artifact ships no StepFun kernels, so the native
-            # runners do not advertise SwiGLUStep; the comparison needs a tree with
-            # the native StepFun path.
-            pytest.skip(
-                f"native {runner_cls.__name__} does not advertise SwiGLUStep "
-                f"(no native StepFun path in this tree): {error}"
-            )
-        raise
+    runner.check_support()
     runner.build()
     packed = runner.pack_inputs(act, weights)
     kwargs = runner.launch_kwargs_for(packed)
@@ -828,11 +840,21 @@ def _fp8_global_scales(hidden, limit, device):
 
 @pytest.mark.parametrize("precision", list(PRECISIONS))
 def test_prepare_weights_adds_step_limits_and_matches_trtllm_backend(precision):
-    """The shared view carries limits in kernel units; Cake and trtllm agree on it."""
+    """The shared view carries limits in kernel units; Cake and trtllm agree on it.
+
+    The StepFun serving geometry: the exported Cake kernels stream K in whole BLOCK_K tiles
+    sized for H=4096 / I=1536 (the tile-8 NVFP4 FC2 kernel splits K three ways across its
+    cluster), so a smaller geometry is not a configuration the backend serves.
+    """
     device = _require_cake_device()
     spec = PRECISIONS[precision]
     torch.manual_seed(0)
-    num_experts, hidden_size, intermediate_size, num_tokens = 4, 512, 512, 8
+    num_experts, hidden_size, intermediate_size, num_tokens = (
+        NUM_EXPERTS,
+        HIDDEN_SIZE,
+        INTERMEDIATE_SIZE,
+        8,
+    )
     w1 = torch.randn(
         num_experts,
         2 * intermediate_size,
@@ -848,7 +870,10 @@ def test_prepare_weights_adds_step_limits_and_matches_trtllm_backend(precision):
     hidden = 12.0 * torch.randn(
         num_tokens, hidden_size, device=device, dtype=torch.bfloat16
     )
-    step_limits = torch.tensor([7.0, 16.0, 7.0, 16.0], device=device)
+    step_limits = torch.tensor(
+        [7.0 if expert % 2 == 0 else 16.0 for expert in range(num_experts)],
+        device=device,
+    )
     common = dict(
         quant=spec.quant,
         num_local_experts=num_experts,
@@ -879,7 +904,9 @@ def test_prepare_weights_adds_step_limits_and_matches_trtllm_backend(precision):
         default_expected = default_expected / default_view[gate_key]
     assert torch.equal(default_view["gemm1_clamp_limit"], default_expected)
     with pytest.raises(ValueError, match="one limit per physical expert row"):
-        CakeStepFunConfig.prepare_weights(w1, w2, step_limits=step_limits[:2], **common)
+        CakeStepFunConfig.prepare_weights(
+            w1, w2, step_limits=step_limits[: num_experts // 2], **common
+        )
 
     quantized, scales = CakeStepFunConfig.prepare_activations(
         hidden, quant=spec.quant, **activation_kwargs
@@ -899,8 +926,13 @@ def test_prepare_weights_adds_step_limits_and_matches_trtllm_backend(precision):
         (CakeStepFunConfig(backend="cake_stepfun"), spec.runner_cls),
         (spec.native_config(), spec.native_runner),
     ):
+        # The full Cake path routes Renormalize (the StepFun routing contract).
         config = MoEConfig(
-            routing=RoutingConfig(num_experts=num_experts, top_k=2),
+            routing=RoutingConfig(
+                num_experts=num_experts,
+                top_k=TOP_K,
+                method=RoutingMethodType.Renormalize,
+            ),
             quant=spec.quant,
             experts=ExpertConfig(
                 intermediate_size=intermediate_size, local_num_experts=num_experts
@@ -909,16 +941,12 @@ def test_prepare_weights_adds_step_limits_and_matches_trtllm_backend(precision):
             backend=BackendOptions(candidates=(backend,)),
             execution=ExecutionConfig(enable_pdl=True, tune_max_num_tokens=num_tokens),
         )
+        if runner_cls is spec.native_runner:
+            _require_runner_support(
+                runner_cls, config, device, unavailable="SwiGLUStep"
+            )
         runner = runner_cls(config, device)
-        try:
-            runner.check_support()
-        except NotImplementedError as error:
-            if runner_cls is spec.native_runner and "SwiGLUStep" in str(error):
-                pytest.skip(
-                    f"native {runner_cls.__name__} does not advertise SwiGLUStep "
-                    f"(no native StepFun path in this tree): {error}"
-                )
-            raise
+        runner.check_support()
         runner.build()
         packed = runner.pack_inputs(act, weights)
         outputs[runner_cls.__name__] = _forward(
@@ -988,6 +1016,12 @@ def test_stepfun_mixed_expert_limits(precision, cache_permute_indices):
         num_fused_shared_experts=shared,
         **routing,
     )
+    if shared:
+        # Fused shared experts route DeepSeekV3 (MoEConfig); the full Cake path serves
+        # Renormalize over routed experts only and declines this row with its own reason.
+        _require_runner_support(
+            spec.runner_cls, case.config, device, unavailable="full Cake path"
+        )
     layer, runner, packed, kwargs, tactics = _cake_runner(case, device)
     for tactic in tactics:
         output = _forward(runner, packed, kwargs, tactic)
@@ -1040,16 +1074,23 @@ def test_stepfun_reproduces_native_fc1_twin_bitwise(
         cache_permute_indices, precision=precision, num_tokens=num_tokens, limits=limits
     )
     _, cake, cake_packed, cake_kwargs, cake_tactics = _cake_runner(case, device)
-    _, native, native_packed, native_kwargs, _ = _native_runner(case, device)
     cake_tiles = _cake_tiles(cake, spec.family)
-    cake_space = _factorized(cake, cake_packed)
-    checked = 0
+    outputs = {}
     for tactic in cake_tactics:
         assert tactic[0] in cake_tiles, (tactic, sorted(cake_tiles))
         output = _forward(cake, cake_packed, cake_kwargs, tactic)
         check_accuracy(case.reference, output.float(), **case.tolerances)
-        # The native arm is pinned to the twinned (FC1, FC2) configurations; a mismatch lists
-        # the native tactics of the tile that do match, if any.
+        outputs[tuple(tactic)] = output
+    assert outputs, (
+        f"no Cake tactic at T={num_tokens}: {cake_tactics} vs tiles {sorted(cake_tiles)}"
+    )
+    # The native arm (skips here on a tree without the native StepFun path) is pinned to the
+    # twinned (FC1, FC2) configurations; a mismatch lists the native tactics of the tile that
+    # do match, if any.
+    _, native, native_packed, native_kwargs, _ = _native_runner(case, device)
+    cake_space = _factorized(cake, cake_packed)
+    for tactic in cake_tactics:
+        output = outputs[tuple(tactic)]
         twin = _native_twin_tactic(
             native, native_packed, cake_space, tactic, cake.full_path
         )
@@ -1064,10 +1105,6 @@ def test_stepfun_reproduces_native_fc1_twin_bitwise(
                 f"{twin} (max |diff| {diff}); native (tactic, FC1, FC2) of tile {tactic[0]} "
                 f"matching bitwise: {matches or 'none'}"
             )
-        checked += 1
-    assert checked, (
-        f"no Cake tactic at T={num_tokens}: {cake_tactics} vs tiles {sorted(cake_tiles)}"
-    )
 
 
 @pytest.mark.parametrize("num_tokens", [8, 512, 2048])
@@ -1361,16 +1398,22 @@ def test_full_path_matches_native_pipeline(
             cache_permute_indices, precision, num_tokens, limit_mode, regime, input_set
         )
         _, cake, cake_packed, cake_kwargs, cake_tactics = _cake_runner(case, device)
-        _, native, native_packed, native_kwargs, _ = _native_runner(case, device)
         assert cake.full_path
         cake_tiles = _cake_tiles(cake, spec.family)
         assert cake_tactics and all(t[0] in cake_tiles for t in cake_tactics)
-        cake_space = _factorized(cake, cake_packed)
-        twin_outputs = {}
+        outputs = {}
         for tactic in cake_tactics:
             output = _forward(cake, cake_packed, cake_kwargs, tactic)
             check_accuracy(case.reference, output.float(), **case.tolerances)
-            # The native arm runs the twinned (FC1, FC2) configurations of the tile.
+            outputs[tuple(tactic)] = output
+        default = _forward(cake, cake_packed, cake_kwargs, -1)
+        check_accuracy(case.reference, default.float(), **case.tolerances)
+        # The native arm runs the twinned (FC1, FC2) configurations of the tile; on a tree
+        # without the native StepFun path it skips here, after the Cake accuracy checks.
+        _, native, native_packed, native_kwargs, _ = _native_runner(case, device)
+        cake_space = _factorized(cake, cake_packed)
+        twin_outputs = {}
+        for tactic in cake_tactics:
             twin = tuple(
                 _native_twin_tactic(native, native_packed, cake_space, tactic, True)
             )
@@ -1378,18 +1421,16 @@ def test_full_path_matches_native_pipeline(
                 twin_outputs[twin] = _forward(
                     native, native_packed, native_kwargs, list(twin)
                 )
-            twin_output = twin_outputs[twin]
+            output, twin_output = outputs[tuple(tactic)], twin_outputs[twin]
             assert torch.equal(output, twin_output), (
                 f"{precision} T={num_tokens} limit={limit_mode} {regime} set {input_set}: "
                 f"Cake tactic {tactic} differs from its native twin {list(twin)} (max "
                 f"|diff| {(output.float() - twin_output.float()).abs().max().item()})"
             )
-        default = _forward(cake, cake_packed, cake_kwargs, -1)
-        check_accuracy(case.reference, default.float(), **case.tolerances)
 
 
 # Staged routing op of each case family (``csrc/trtllm_fused_moe_kernel_launcher.cu``); its positional
-# arguments are assembled by ``_staged_routing_args`` from the family's fused native runner call.
+# arguments are assembled by ``_staged_routing_args`` from the family runner's packed call.
 _STAGED_ROUTING_OPS = {
     "bf16": "trtllm_moe_run_routing",
     "fp8": "trtllm_moe_run_routing_fp8_per_tensor",
@@ -1403,7 +1444,7 @@ def _staged_routing_args(
 ):
     """``(op name, positional arguments)`` of the family's staged routing op for one FC1 tile.
 
-    Every value comes from the fused native runner's own call: ``packed`` is its ``pack_inputs``
+    Every value comes from the family runner's own call: ``packed`` is its ``pack_inputs``
     result (the ``MoeRunnerInputs`` list plus the static launch kwargs with the prepared weights,
     scales and routing flags; ``flashinfer.fused_moe.runners``) and ``inner`` the trtllm-gen
     ``MoERunner`` it drives (``flashinfer.fused_moe.backends.trtllm.sm100_runner``). The ids /
@@ -1513,11 +1554,14 @@ def _staged_routing_args(
 
 def _staged_routing(moe_op, case, tile: int, num_tokens: int, logits: torch.Tensor):
     """Routing tables of ``moe_op``'s staged routing op of the case's family for one FC1 tile
-    (arguments per :func:`_staged_routing_args`, from the native runner's packed call)."""
-    _, native, packed, _, _ = _native_runner(case, logits.device)
-    name, args = _staged_routing_args(
-        case.precision, native._inner, packed, tile, logits
-    )
+    (arguments per :func:`_staged_routing_args`, from the Cake runner's packed call).
+
+    The Cake runners pack through the native family runner they mirror, over the same weight
+    view, and drive the same trtllm-gen ``MoERunner``, so the argument list is the native
+    runner's own while needing no native StepFun path: the staged routing op is
+    activation-agnostic and the public native module runs it."""
+    _, cake, packed, _, _ = _cake_runner(case, logits.device)
+    name, args = _staged_routing_args(case.precision, cake._inner, packed, tile, logits)
     out = getattr(moe_op, name)(*args)
     tensors = [t if isinstance(t, torch.Tensor) else torch.from_dlpack(t) for t in out]
     torch.cuda.synchronize()
@@ -1719,26 +1763,31 @@ def test_full_path_precomputed_ids_matches_native_pipeline(
     _, cake, cake_packed, cake_kwargs, cake_tactics = _layer_runner(
         case.config, device, spec.runner_cls, act, case.weights
     )
-    _, native, native_packed, native_kwargs, _ = _layer_runner(
-        case.native_config, device, spec.native_runner, act, case.weights, native=True
-    )
     assert cake.full_path
-    cake_space = _factorized(cake, cake_packed)
+    outputs = {}
     for tactic in cake_tactics:
         output = _forward(cake, cake_packed, cake_kwargs, tactic)
         # The pre-computed tables are the native router's own, so the reference still holds.
         check_accuracy(case.reference, output.float(), **case.tolerances)
-        twin = _native_twin_tactic(native, native_packed, cake_space, tactic, True)
-        twin_output = _forward(native, native_packed, native_kwargs, twin)
-        assert torch.equal(output, twin_output), (
-            f"{precision} T={num_tokens} {weights_dtype} weights: Cake tactic {tactic} "
-            f"differs from its native twin {twin} (max |diff| "
-            f"{(output.float() - twin_output.float()).abs().max().item()})"
-        )
+        outputs[tuple(tactic)] = output
     replayed, _ = _capture_and_replay(cake, cake_packed, cake_kwargs, cake_tactics[0])
     assert torch.equal(
         replayed, _forward(cake, cake_packed, cake_kwargs, cake_tactics[0])
     )
+    # The native arm (skips here on a tree without the native StepFun path) runs the twinned
+    # (FC1, FC2) configurations of the tile.
+    _, native, native_packed, native_kwargs, _ = _layer_runner(
+        case.native_config, device, spec.native_runner, act, case.weights, native=True
+    )
+    cake_space = _factorized(cake, cake_packed)
+    for tactic in cake_tactics:
+        twin = _native_twin_tactic(native, native_packed, cake_space, tactic, True)
+        twin_output = _forward(native, native_packed, native_kwargs, twin)
+        assert torch.equal(outputs[tuple(tactic)], twin_output), (
+            f"{precision} T={num_tokens} {weights_dtype} weights: Cake tactic {tactic} "
+            f"differs from its native twin {twin} (max |diff| "
+            f"{(outputs[tuple(tactic)].float() - twin_output.float()).abs().max().item()})"
+        )
 
 
 @pytest.mark.parametrize("num_tokens", TOKENS)
@@ -2004,10 +2053,19 @@ def _expected_full_path_kernels(
 
 
 def _profiled_kernel_names(runner, packed, kwargs, tactic) -> list[str]:
-    """CUDA kernel names of one forward (memcpy / memset activities excluded)."""
+    """CUDA kernel names of one forward (memcpy / memset activities excluded).
+
+    The profiler's warm-up step runs one forward whose records are discarded: CUDA activity
+    collection starts asynchronously once the profiler is entered, and without the warm-up a
+    leading prefix of the forward's launches (routing, then FC1) can be missing from the trace
+    (observed on the GB200 CI runners). The asserted forward is the active step."""
     with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA]
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
     ) as profile:
+        runner.forward(packed, tactic=tactic, **kwargs)
+        torch.cuda.synchronize()
+        profile.step()
         runner.forward(packed, tactic=tactic, **kwargs)
         torch.cuda.synchronize()
     return [
