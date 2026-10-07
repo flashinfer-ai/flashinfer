@@ -852,7 +852,9 @@ def _kf_stream():
 _CACHE: dict = {}
 
 
-def run(q, k, cu_seqlens_q, page_table, seqused_k, prefix_lens, max_score):
+def run(
+    q, k, cu_seqlens_q, page_table, seqused_k, prefix_lens, max_score, max_seqlen_q=None
+):
     total_q, hq, _ = q.shape
     batch_size = seqused_k.shape[0]
     # The caller's score buffer is (hq, max_k_tiles, total_q) where max_k_tiles
@@ -869,11 +871,15 @@ def run(q, k, cu_seqlens_q, page_table, seqused_k, prefix_lens, max_score):
         )
     page_table = page_table[:, :nkt]
     nkchunk = select_split_k(total_q, hq, batch_size, nkt)
-    n_mtiles = (total_q // batch_size + 127) // 128
+    # The M-tile count and the TMA-Q choice must cover the LONGEST request, not
+    # the mean: total_q // batch_size understates a ragged batch, which would
+    # leave the tail of the longest sequence unprocessed.
+    sq_max = int(max_seqlen_q) if max_seqlen_q is not None else total_q // batch_size
+    n_mtiles = (sq_max + 127) // 128
     # Derived inside the kernel object while shapes were static; with dynamic
     # shapes these are the only compile-time selections left, so the driver
     # computes them and they alone key the cache.
-    use_tma_q = (total_q // batch_size) % 128 == 0
+    use_tma_q = sq_max % 128 == 0 and total_q % batch_size == 0
     fold = 1 if n_mtiles * 16 >= nkt else 0
 
     key = (hq, k.shape[2], k.shape[3], use_tma_q, fold)

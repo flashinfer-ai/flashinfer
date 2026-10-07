@@ -443,6 +443,11 @@ def msa_sparse_decode_attention(
             raise ValueError("page_table must be int32 of shape (batch, max_pages)")
         if page_table.shape[0] != batch_size:
             raise ValueError("page_table batch dimension must match q batch_size")
+        if q2k_indices.shape[-1] != 16:
+            raise NotImplementedError(
+                f"SM90 msa_sparse_decode_attention supports topk=16 only, got "
+                f"{q2k_indices.shape[-1]}"
+            )
         from ._sm90_dispatch import sparse_decode_sm90
 
         if out is None:

@@ -274,6 +274,11 @@ def msa_sparse_attention(
             raise NotImplementedError(
                 "SM90 msa_sparse_attention is causal; causal=False is not supported"
             )
+        if q2k_indices.shape[-1] != 16:
+            raise NotImplementedError(
+                f"SM90 msa_sparse_attention supports topk=16 only, got "
+                f"{q2k_indices.shape[-1]}"
+            )
         from ._sm90_dispatch import sparse_prefill_sm90
 
         if out is None:
