@@ -106,6 +106,100 @@ def test_sparse_decode_paged_matches_reference(num_qo_heads, num_kv_heads):
     assert torch.isfinite(out.float()).all()
 
 
+def _ref_sparse_decode(q, kv, idx, page_table, seqused_k, scale):
+    """Dense torch reference over the selected blocks, in fp32."""
+    total_q, hq, d = q.shape
+    hkv = kv.shape[1]
+    g = hq // hkv
+    out = torch.zeros(total_q, hq, d, dtype=torch.float32, device=q.device)
+    k_all = kv[..., :d].float()
+    v_all = kv[..., d:].float()
+    for b in range(total_q):
+        qpos = int(seqused_k[b]) - 1
+        for h in range(hq):
+            kh = h // g
+            keys, vals = [], []
+            for blk in idx[kh, b].tolist():
+                if blk < 0 or blk >= page_table.shape[1]:
+                    continue
+                pg = int(page_table[b, blk])
+                base = blk * BLK_KV
+                for t in range(BLK_KV):
+                    if base + t <= qpos:  # causal
+                        keys.append(k_all[pg, kh, t])
+                        vals.append(v_all[pg, kh, t])
+            if not keys:
+                continue
+            kmat = torch.stack(keys)
+            vmat = torch.stack(vals)
+            logits = (q[b, h].float() @ kmat.T) * scale
+            p = torch.softmax(logits, dim=-1)
+            out[b, h] = p @ vmat
+    return out
+
+
+@sm90_only
+def test_sparse_decode_matches_dense_reference():
+    """Numerical check against a dense softmax over the selected blocks."""
+    q, k, v, idx, page_table, seqused_k = _decode_inputs(
+        batch=2, num_qo_heads=8, num_kv_heads=1, max_k_tiles=8, seed=7
+    )
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    out = msa_sparse_decode_attention(
+        q,
+        k,
+        v,
+        idx,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        seqlen_q=1,
+        softmax_scale=scale,
+    )
+    # rebuild the packed cache the reference walks
+    kv = torch.cat([k, v], dim=-1)
+    ref = _ref_sparse_decode(q, kv, idx, page_table, seqused_k, scale)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize("max_k_tiles", [16, 1024])
+def test_sparse_prefill_runs_both_backends(max_k_tiles):
+    """Exercise the union backend (mpg <= 800) and the single-token one above it."""
+    torch.manual_seed(max_k_tiles)
+    batch, qlen, hq, hkv = 1, 256, 8, 1
+    npages = max_k_tiles * batch
+    base = (torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    q = (torch.randn(qlen, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = torch.randint(
+        0, max_k_tiles, (hkv, qlen, TOPK), dtype=torch.int32, device="cuda"
+    )
+    cu_q = torch.tensor([0, qlen], dtype=torch.int32, device="cuda")
+    page_table = (
+        torch.randperm(npages, device="cuda")[: batch * max_k_tiles]
+        .to(torch.int32)
+        .view(batch, max_k_tiles)
+    )
+    seqused_k = torch.full(
+        (batch,), max_k_tiles * BLK_KV - 13, dtype=torch.int32, device="cuda"
+    )
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+    )
+    assert out.shape == q.shape
+    assert torch.isfinite(out.float()).all()
+
+
 @sm90_only
 def test_topk_select_shape_and_dtype():
     """top-k select is the only width SM90 supports (16) and must emit int32."""
