@@ -88,7 +88,7 @@ def gen_dsv3_fused_routing_module(backend: str = "default") -> JitSpec:
             / "kernels"
             / "cutlass_kernels",
         ],
-        extra_cuda_cflags=["-DFLASHINFER_CAKE_BACKEND", "--use_fast_math"]
-        if backend == "cake"
-        else None,
+        # Same compile flags as the default backend: the Cake kernels are bit-identical
+        # to NoAuxTc (tanh.approx sigmoid, FP64 normalisation) only without fast-math.
+        extra_cuda_cflags=["-DFLASHINFER_CAKE_BACKEND"] if backend == "cake" else None,
     )

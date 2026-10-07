@@ -16,6 +16,12 @@ from flashinfer.utils import (
 
 _CAKE_DTYPES = frozenset((torch.float16, torch.bfloat16, torch.float32))
 
+# backend="cake" writes the same bits as backend="default" (expert ids, weights,
+# routing replay): same tanh.approx sigmoid, FP64 normalisation with a double
+# routed_scaling_factor and one RN conversion into the score dtype, same compile
+# flags.  Engines pin their bitwise tests on this marker.
+CAKE_DSV3_ROUTING_BIT_EXACT = True
+
 
 @functools.cache
 def _device_capability(device_index: int) -> tuple[int, int]:

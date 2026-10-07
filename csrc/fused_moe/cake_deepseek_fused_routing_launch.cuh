@@ -35,26 +35,28 @@ cudaError_t launch(ScoreT* scores, BiasT* bias, ScoreT* topk_values, int32_t* to
   int32_t const topk32 = static_cast<int32_t>(topk);
   int32_t const groups32 = static_cast<int32_t>(n_group);
   int32_t const top_groups32 = static_cast<int32_t>(topk_group);
-  float const scaling32 = static_cast<float>(routed_scaling_factor);
+  // The kernels normalise in double like the default NoAuxTc backend; pass the scaling factor
+  // through unchanged.
+  double const scaling64 = routed_scaling_factor;
   int32_t const has_replay = routing_replay_out != nullptr;
   if (n_group > 1) {
     if (num_experts == 256 && n_group == 8 && topk_group == 4 && topk == 8) {
       return cudaLaunchKernelEx(&config, kernel_cake_deepseek_routing_grouped<ScoreT, BiasT, 4, 8>,
                                 scores, bias, topk_values, topk_indices, replay_bytes, tokens32,
-                                experts32, topk32, groups32, top_groups32, scaling32, has_replay);
+                                experts32, topk32, groups32, top_groups32, scaling64, has_replay);
     }
     return cudaLaunchKernelEx(&config, kernel_cake_deepseek_routing_grouped<ScoreT, BiasT, 1, 1>,
                               scores, bias, topk_values, topk_indices, replay_bytes, tokens32,
-                              experts32, topk32, groups32, top_groups32, scaling32, has_replay);
+                              experts32, topk32, groups32, top_groups32, scaling64, has_replay);
   }
   if (num_experts <= 128) {
     return cudaLaunchKernelEx(&config, kernel_cake_deepseek_routing_single<ScoreT, BiasT, 128>,
                               scores, bias, topk_values, topk_indices, replay_bytes, tokens32,
-                              experts32, topk32, groups32, top_groups32, scaling32, has_replay);
+                              experts32, topk32, groups32, top_groups32, scaling64, has_replay);
   }
   return cudaLaunchKernelEx(&config, kernel_cake_deepseek_routing_single<ScoreT, BiasT, 384>,
                             scores, bias, topk_values, topk_indices, replay_bytes, tokens32,
-                            experts32, topk32, groups32, top_groups32, scaling32, has_replay);
+                            experts32, topk32, groups32, top_groups32, scaling64, has_replay);
 }
 
 }  // namespace flashinfer::cake_deepseek_fused_routing
