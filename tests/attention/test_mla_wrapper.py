@@ -7,6 +7,10 @@ you may not use this file except in compliance with the License.
 
 import gc
 import math
+import os
+from pathlib import Path
+import subprocess
+import sys
 import warnings
 import weakref
 
@@ -1145,6 +1149,40 @@ def test_batch_mla_wrapper_public_imports_remain_compatible():
     assert flashinfer.BatchMLAPagedAttentionWrapper is mla.BatchMLAPagedAttentionWrapper
     assert _core.MLAPlanMetadata is mla.MLAPlanMetadata
     assert hasattr(mla, "MLAPlanMetadata")
+
+
+def test_batch_mla_wrapper_imports_without_cute_dsl():
+    """Registering the Rubin backend must not require the optional DSL."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(Path(__file__).parents[2]), env.get("PYTHONPATH")))
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import importlib.util
+import sys
+
+sys.modules["cutlass"] = None
+assert importlib.util.find_spec("cutlass") is None
+
+import flashinfer
+from flashinfer.mla import BatchMLAPagedAttentionWrapper
+from flashinfer.cute_dsl.availability import is_cute_dsl_available
+
+assert flashinfer.BatchMLAPagedAttentionWrapper is BatchMLAPagedAttentionWrapper
+assert not is_cute_dsl_available()
+assert "flashinfer.cute_dsl.attention" not in sys.modules
+""",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 # Structural wrapper inputs and plan/run contracts
@@ -3051,9 +3089,11 @@ def test_cutile_availability_uses_planned_device(monkeypatch, planned_supported)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_capability",
-        lambda device=None: (10, (0 if planned_supported else 7))
-        if device == target
-        else (10, current[0] - 100),
+        lambda device=None: (
+            (10, (0 if planned_supported else 7))
+            if device == target
+            else (10, current[0] - 100)
+        ),
     )
     monkeypatch.setattr(cutile_backend, "_get_compute_capability", lambda _: (10, 7))
     kernel = _FakeCutileKernel()
@@ -3835,3 +3875,57 @@ def test_mla_page_index_uint32_overflow_regression(backend):
     ref = _run(real_ckv, real_kpe, ref_indices)
 
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "backend_name,output_dtype,admitted",
+    [
+        ("cute-dsl-monolithic", torch.float8_e4m3fn, True),
+        ("cute-dsl-monolithic", torch.float8_e5m2, False),
+        ("cute-dsl-modular", torch.float8_e4m3fn, False),
+        ("cute-dsl-rubin-mtp", torch.float8_e4m3fn, True),
+        ("cute-dsl-rubin-mtp", torch.bfloat16, False),
+    ],
+)
+def test_cute_planned_fp8_output_admission(
+    monkeypatch, backend_name, output_dtype, admitted
+):
+    from types import SimpleNamespace
+
+    from flashinfer.cute_dsl import availability
+    from flashinfer.mla._batch_mla._backends import _cute_dsl_common as common
+    from flashinfer.mla._batch_mla._backends import cute_dsl_rubin_mtp_backend as mtp
+
+    monkeypatch.setattr(common, "get_compute_capability", lambda device: (10, 7))
+    monkeypatch.setattr(mtp, "get_compute_capability", lambda device: (10, 7))
+    monkeypatch.setattr(availability, "is_cute_dsl_arch_supported", lambda *args: True)
+    args = SimpleNamespace(
+        _float_workspace_buffer=torch.empty(0, dtype=torch.uint8),
+        _use_cuda_graph=False,
+        num_heads=128,
+        head_dim_ckv=512,
+        head_dim_kpe=64,
+        page_size=64,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        output_dtype=output_dtype,
+        sm_scale=0.125,
+        use_profiler=False,
+        enable_pdl=False,
+        use_sinks=False,
+        lse_mode="basee",
+        kv_layout="combined",
+        output_scale="none",
+        scale_mode="bmm-scalar",
+        skip_softmax=False,
+        query_kind="packed",
+        kv_kind="packed",
+        query_layout="packed",
+        kv_cache_layout="packed",
+    )
+    backend = _wrapper._BACKEND_TYPES[backend_name]
+    if admitted:
+        backend.preflight_plan_from_wrapper(args)
+    else:
+        with pytest.raises(_BackendPlanUnsupportedError):
+            backend.preflight_plan_from_wrapper(args)

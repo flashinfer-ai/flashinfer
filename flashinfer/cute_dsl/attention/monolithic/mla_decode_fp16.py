@@ -3985,8 +3985,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                     workspace_rows * split_kv * S,
                 ),
             )
+            # Use widened element offsets; byte multiplication can overflow Int32.
             acc_lse_iter = cute.recast_ptr(
-                workspace.iterator + cute.cosize(acc_o_layout) * acc_dtype.width // 8,
+                acc_o_iter + cutlass.Int64(cute.cosize(acc_o_layout)),
                 dtype=acc_dtype,
             )
             acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
