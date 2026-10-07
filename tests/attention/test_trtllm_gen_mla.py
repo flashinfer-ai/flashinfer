@@ -1519,6 +1519,23 @@ def test_trtllm_batch_decode_mla_sparse(
     )
 
 
+@pytest.mark.parametrize("batch_size", [1, 3])
+def test_trtllm_batch_decode_mla_sparse_compact_query(batch_size: int):
+    """Test sparse MLA with a 64-wide query and latent rank 512."""
+    trtllm_batch_decode_mla_sparse(
+        batch_size=batch_size,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        q_len_per_request=1,
+        topk=2048,
+        is_varlen=True,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        qk_nope_head_dim=64,
+        num_attn_heads=8,
+    )
+
+
 def test_trtllm_batch_decode_mla_sparse_cum_seq_lens_q():
     trtllm_batch_decode_mla_sparse(
         batch_size=2,
