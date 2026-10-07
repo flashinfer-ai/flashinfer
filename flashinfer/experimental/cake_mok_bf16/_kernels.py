@@ -30,6 +30,17 @@ class MoKForward:
 
         self.module = load_kernel("forward")
         self._peer_tables = {}
+        self._unused_counters = {}
+
+    def _unused_counter(self, device):
+        """One cached int32 zero per device for counters a launch never reads (created eagerly, outside any capture)."""
+        import torch
+
+        counter = self._unused_counters.get(device)
+        if counter is None:
+            counter = torch.zeros(1, dtype=torch.int32, device=device)
+            self._unused_counters[device] = counter
+        return counter
 
     def __call__(
         self,
@@ -142,8 +153,13 @@ class MoKForward:
             (shared_rows + routed_rows) * (intermediate // 256), **counter_opts
         )
         hidden_ready = torch.zeros(shared_rows + routed_rows, **counter_opts)
-        y_ready = torch.zeros(minis, **counter_opts)
-        y_done = torch.zeros(capacity // 128, **counter_opts)
+        if recompute:
+            # No combine and no down tasks touch these two counters in recompute mode: hand the
+            # kernel one cached zero word instead of two zero-fill launches per call.
+            y_ready = y_done = self._unused_counter(x.device)
+        else:
+            y_ready = torch.zeros(minis, **counter_opts)
+            y_done = torch.zeros(capacity // 128, **counter_opts)
         with tvm_ffi.use_torch_stream():
             self.module.launch(
                 grid=(2 * (shared_tasks + minis * mini_tasks) + comm_sms, 1, 1),
@@ -775,6 +791,17 @@ class MoKForwardMxfp8:
         # validations opt in (``keep_rings = True``); training leaves them unreferenced.
         self.keep_rings = False
         self.last_rings = None
+        self._unused_counters = {}
+
+    def _unused_counter(self, device):
+        """One cached int32 zero per device for counters a launch never reads (created eagerly, outside any capture)."""
+        import torch
+
+        counter = self._unused_counters.get(device)
+        if counter is None:
+            counter = torch.zeros(1, dtype=torch.int32, device=device)
+            self._unused_counters[device] = counter
+        return counter
 
     @staticmethod
     def _weight_tuple(weights, name):
@@ -928,8 +955,13 @@ class MoKForwardMxfp8:
             (shared_rows + routed_rows) * (intermediate // 256), **counter_opts
         )
         hidden_ready = torch.zeros(shared_rows + routed_rows, **counter_opts)
-        y_ready = torch.zeros(minis, **counter_opts)
-        y_done = torch.zeros(capacity // 128, **counter_opts)
+        if recompute:
+            # No combine and no down tasks touch these two counters in recompute mode: hand the
+            # kernel one cached zero word instead of two zero-fill launches per call.
+            y_ready = y_done = self._unused_counter(x.device)
+        else:
+            y_ready = torch.zeros(minis, **counter_opts)
+            y_done = torch.zeros(capacity // 128, **counter_opts)
         u8 = torch.uint8
         with tvm_ffi.use_torch_stream():
             self.module.launch(

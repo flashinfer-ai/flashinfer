@@ -272,7 +272,10 @@ class MoKFunctional:
             )
         self._check_device(workspace)
         properties = torch.cuda.get_device_properties(workspace.device)
-        for count in (config.fwd_num_comm_sms, config.bwd_num_comm_sms):
+        comm_counts = [config.fwd_num_comm_sms, config.bwd_num_comm_sms]
+        if config.recompute_num_comm_sms is not None:
+            comm_counts.append(config.recompute_num_comm_sms)
+        for count in comm_counts:
             if (
                 type(count) is not int
                 or count <= 0
@@ -547,7 +550,9 @@ class MoKFunctional:
             *self._schedule(schedule),
             workspace.topk,
             swiglu_limit,
-            config.fwd_num_comm_sms,
+            config.fwd_num_comm_sms
+            if config.recompute_num_comm_sms is None
+            else config.recompute_num_comm_sms,
             config.macrobatch_size,
             config.minibatch_size,
             source_rows=source_count,

@@ -20,6 +20,10 @@ import torch.distributed._symmetric_memory as symm_mem
 class MoKConfig:
     fwd_num_comm_sms: int = 40
     bwd_num_comm_sms: int = 28
+    # Communication SMs of the context-only recompute launch; ``None`` reuses ``fwd_num_comm_sms``
+    # (the recompute runs the full dispatch but no down projections and no combine, so its balance
+    # point differs from the full forward's).
+    recompute_num_comm_sms: int | None = None
     minibatch_size: int = 4096
     macrobatch_size: int = 131072
     schedule_capacity_multiplier: float = 0.5
