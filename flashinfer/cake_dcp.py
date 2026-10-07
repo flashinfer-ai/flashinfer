@@ -326,7 +326,7 @@ DCP_BALANCED_D256_LONG_TILE_BLOCKS = 96
 # B200): q4 b12 at 22 blocks 1.11 | 1.14, b16 1.22 | 1.28, b32 1.42 | 1.43; q3
 # b16 at 22 blocks 1.07 | 1.06; q5 / q8 1.45-1.79.  The 16-block class (static
 # split 4), against the static route and against the FlashInfer public path
-# (GB300 / B200): q4 b8 1.138 / 1.101 and 1.037 / 1.000 (10 rounds), q4 b5-b9
+# (GB300 / B200): q4 b8 1.138 / 1.100 and 1.037 / 0.999 (10 rounds), q4 b5-b9
 # 1.08-1.16 / 1.11-1.21 and 1.00-1.08 / 1.01-1.11; q3 b9-b12 1.08-1.14 /
 # 1.06-1.12 against the static route but 1.007-1.043 / 0.971-1.020 against the
 # public path -- a tie or a loss at q_len 3 on B200, so sm_100a admits the

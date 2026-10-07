@@ -291,7 +291,7 @@ _ROUTE_ROWS = [
         4,
         0,
         "balanced",
-    ),  # 16 blocks per CTA: 1.138 GB300 / 1.101 B200 vs the static route (1.037 / 1.000 vs FlashInfer main, 10 rounds)
+    ),  # 16 blocks per CTA: 1.138 GB300 / 1.100 B200 vs the static route (1.037 / 0.999 vs FlashInfer main, 10 rounds)
     (
         "prod_d256_b16_ctx32768_q4_cp4_graph",
         "fp8_p64_d256",
@@ -505,8 +505,8 @@ def test_d256_one_wave_row_tile_regime(arch) -> None:
         "balanced",
         "one_wave_row_tiles",
     )
-    # the 16-block class (static split 4): 1.138 / 1.101 vs the static route and
-    # 1.037 / 1.000 vs the public path (GB300 / B200, 10 rounds)
+    # the 16-block class (static split 4): 1.138 / 1.100 vs the static route and
+    # 1.037 / 0.999 vs the public path (GB300 / B200, 10 rounds)
     assert (band(8, 4).blocks_per_cta, band(8, 4).route, band(8, 4).reason) == (
         16,
         "balanced",
