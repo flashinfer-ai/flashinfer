@@ -210,7 +210,8 @@ def test_gdp_matches_serial_reference(
 
 
 @pytest.mark.parametrize("use_initial_state", [False, True])
-def test_gdp_with_num_householder_one_matches_gdn(use_initial_state):
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_with_num_householder_one_matches_gdn(backend, use_initial_state):
     """``num_householder == 1`` is exactly the gated delta rule.
 
     Same inputs through ``chunk_gated_delta_rule`` are an independent kernel
@@ -236,6 +237,7 @@ def test_gdp_with_num_householder_one_matches_gdn(use_initial_state):
     )
     gdp_out, gdp_state = _run(
         inputs,
+        backend=backend,
         initial_state=None if state is None else state.clone(),
         output_final_state=True,
     )
@@ -247,35 +249,41 @@ def test_gdp_with_num_householder_one_matches_gdn(use_initial_state):
     assert_rel_close("state vs serial", gdp_state, ref_state, SERIAL_TOLERANCE)
 
 
-def test_gdp_applies_in_kernel_l2norm():
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_applies_in_kernel_l2norm(backend):
     """Un-normalized q/k plus the in-kernel norm must match a hand-normalized oracle."""
     inputs = _make_inputs([96, 64], 4, 4, 4, 2, seed=37, normalize=False)
     ref_out, ref_state = _serial(inputs, l2norm=True)
     out, final_state = _run(
-        inputs, output_final_state=True, use_qk_l2norm_in_kernel=True
+        inputs, backend=backend, output_final_state=True, use_qk_l2norm_in_kernel=True
     )
     assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
     assert_rel_close("final_state", final_state, ref_state, SERIAL_TOLERANCE)
 
 
-def test_gdp_honors_scale():
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_honors_scale(backend):
     inputs = _make_inputs([256], 4, 4, 4, 2, seed=43)
     scale = 3.0 / math.sqrt(HEAD_DIM)
     ref_out, _ = _serial(inputs, scale=scale)
-    out = _run(inputs, scale=scale)
+    out = _run(inputs, backend=backend, scale=scale)
     assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
-    assert rel_err(out, _run(inputs)) > 0.5, "scale=3/sqrt(d) matched the default"
+    assert rel_err(out, _run(inputs, backend=backend)) > 0.5, (
+        "scale=3/sqrt(d) matched the default"
+    )
 
 
-def test_gdp_defaults_gates_to_ones():
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_defaults_gates_to_ones(backend):
     """Omitting g/beta selects the identity gates."""
     device = torch.device("cuda")
     num_heads = 4
     inputs = _make_inputs([256], num_heads, num_heads, num_heads, 2, seed=31)
     total = inputs["q"].shape[0]
-    implicit = _run(inputs, g=None, beta=None)
+    implicit = _run(inputs, backend=backend, g=None, beta=None)
     explicit = _run(
         inputs,
+        backend=backend,
         g=torch.ones(total, num_heads, dtype=torch.float32, device=device),
         beta=torch.ones(2 * total, num_heads, dtype=torch.float32, device=device),
     )
@@ -283,17 +291,19 @@ def test_gdp_defaults_gates_to_ones():
 
 
 @pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16, torch.float16])
-def test_gdp_accepts_forget_gate_dtypes(gate_dtype):
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_accepts_forget_gate_dtypes(backend, gate_dtype):
     """``g`` may be fp32, bf16 or fp16, like GDN's."""
     inputs = _make_inputs([256, 128], 4, 4, 4, 2, seed=47, gate_dtype=gate_dtype)
     ref_out, ref_state = _serial(inputs)
-    out, final_state = _run(inputs, output_final_state=True)
+    out, final_state = _run(inputs, backend=backend, output_final_state=True)
     assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
     assert_rel_close("final_state", final_state, ref_state, SERIAL_TOLERANCE)
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_gdp_carries_state_dtype(state_dtype):
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_carries_state_dtype(backend, state_dtype):
     device = torch.device("cuda")
     inputs = _make_inputs(
         [192, 64], 4, 4, 4, 2, seed=59, initial_state=True, state_dtype=state_dtype
@@ -304,6 +314,7 @@ def test_gdp_carries_state_dtype(state_dtype):
     )
     out, final_state = _run(
         inputs,
+        backend=backend,
         initial_state=inputs["initial_state"],
         output_final_state=True,
         output_state=output_state,
@@ -314,12 +325,14 @@ def test_gdp_carries_state_dtype(state_dtype):
     assert_rel_close("final_state", final_state, ref_state, SERIAL_TOLERANCE)
 
 
-def test_gdp_handles_zero_length_sequences():
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_handles_zero_length_sequences(backend):
     seq_lens = [0, 65, 0, 33]
     inputs = _make_inputs(seq_lens, 4, 4, 4, 2, seed=61, initial_state=True)
     ref_out, ref_state = _serial(inputs)
     out, final_state = _run(
         inputs,
+        backend=backend,
         initial_state=inputs["initial_state"].clone(),
         output_final_state=True,
     )
@@ -396,15 +409,17 @@ def test_gdp_serves_both_batch_invariant_settings():
 
 
 @pytest.mark.parametrize("cu_seqlens_dtype", [torch.int32, torch.int64])
-def test_gdp_accepts_both_cu_seqlens_dtypes(cu_seqlens_dtype):
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_accepts_both_cu_seqlens_dtypes(backend, cu_seqlens_dtype):
     inputs = _make_inputs(
         [256, 256], 4, 4, 4, 2, seed=29, cu_seqlens_dtype=cu_seqlens_dtype
     )
     ref_out, _ = _serial(inputs)
-    assert_rel_close("output", _run(inputs), ref_out, SERIAL_TOLERANCE)
+    assert_rel_close("output", _run(inputs, backend=backend), ref_out, SERIAL_TOLERANCE)
 
 
-def test_gdp_honors_output_buffers():
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_honors_output_buffers(backend):
     device = torch.device("cuda")
     num_heads = 8
     inputs = _make_inputs([384, 384], num_heads, num_heads, num_heads, 2, seed=5)
@@ -413,7 +428,7 @@ def test_gdp_honors_output_buffers():
         2, num_heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=device
     )
     returned_out, returned_state = _run(
-        inputs, output_final_state=True, output=out, output_state=state
+        inputs, backend=backend, output_final_state=True, output=out, output_state=state
     )
     assert returned_out.data_ptr() == out.data_ptr()
     assert returned_state.data_ptr() == state.data_ptr()
