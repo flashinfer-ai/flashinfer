@@ -3899,6 +3899,7 @@ def test_cute_planned_fp8_output_admission(
     monkeypatch.setattr(common, "get_compute_capability", lambda device: (10, 7))
     monkeypatch.setattr(mtp, "get_compute_capability", lambda device: (10, 7))
     monkeypatch.setattr(availability, "is_cute_dsl_arch_supported", lambda *args: True)
+    monkeypatch.setattr(availability, "cute_dsl_compile_arch", lambda *args: "sm_107a")
     args = SimpleNamespace(
         _float_workspace_buffer=torch.empty(0, dtype=torch.uint8),
         _use_cuda_graph=False,

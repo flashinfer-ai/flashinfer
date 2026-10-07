@@ -414,6 +414,7 @@ class _BatchMLAPagedAttentionCuteDslBackendBase(TunableRunner):
     _supports_fp8_output = False
     _plan_capability_error_type = _BackendPlanUnsupportedError
     _plan_capabilities: ClassVar[MLAPlanCapabilities]
+    _execution_state: _CuteDslMlaExecutionState
 
     # Call-local state populated by the concrete functional factories.
     _functional_run: Callable[..., Any]

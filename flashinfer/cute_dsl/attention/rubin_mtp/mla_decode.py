@@ -434,7 +434,7 @@ def cute_dsl_mla_decode(
     if query.ndim != 4:
         raise ValueError("Rubin MTP query must have shape [B,Q,128,576]")
     B, Q, H, D = query.shape
-    dtype = out.dtype if out is not None else out_dtype or torch.bfloat16
+    dtype = out.dtype if out is not None else out_dtype or torch.float8_e4m3fn
     if kv_cache.ndim == 4 and kv_cache.shape[1] == 1:
         kv_cache = kv_cache.squeeze(1)
     if (
