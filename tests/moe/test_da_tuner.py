@@ -510,6 +510,44 @@ def test_singleton_pruning_preserves_preferred_distribution_eager_winner():
     assert compiled.eager_tactic == preferred_tactic
 
 
+@pytest.mark.parametrize("guard_enabled", [False, True])
+@pytest.mark.parametrize(
+    "alternative_ms,keep_switch", [(99.5, False), (99.0, False), (98.9, True)]
+)
+def test_switch_requires_more_than_one_percent_over_a_fixed_body(
+    guard_enabled, alternative_ms, keep_switch
+):
+    compiler = DAPlanCompiler(
+        num_experts=4, guard_enabled=guard_enabled, control_overhead_us=0
+    )
+    first = FactorizedTactic((8, 43), tile_n=8, fc1=0, fc2=0)
+    second = FactorizedTactic((16, 61), tile_n=16, fc1=1, fc2=1)
+    selections = (
+        replace(_selection("uniform", [[0, 1]], first), candidate_latency_ms=100.0),
+        replace(
+            _selection("ddist:4", [[0, 0]], second),
+            candidate_latency_ms=alternative_ms,
+        ),
+    )
+    latencies = {
+        (selections[0].realization_key, first.tactic): 100.0,
+        (selections[0].realization_key, second.tactic): 102.0,
+        (selections[1].realization_key, first.tactic): 100.0,
+        (selections[1].realization_key, second.tactic): alternative_ms,
+    }
+
+    pruned = compiler.prefer_control_aware_singleton(selections, latencies)
+
+    if keep_switch:
+        assert pruned == selections
+    else:
+        assert tuple(item.selected_tactic for item in pruned) == (first, first)
+        assert tuple(item.candidate_latency_ms for item in pruned) == (100.0, 100.0)
+        assert tuple(item.realization_key for item in pruned) == tuple(
+            item.realization_key for item in selections
+        )
+
+
 def test_singleton_collapses_equivalent_selector_exemplars():
     compiler = DAPlanCompiler(num_experts=4, guard_enabled=False)
     tactic = FactorizedTactic((16, 4), tile_n=16, fc1=0, fc2=0)

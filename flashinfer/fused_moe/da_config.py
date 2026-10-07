@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass
 
 from flashinfer.fused_moe.da_tuner import (
+    DA_SWITCH_MINIMUM_IMPROVEMENT,
     DEFAULT_DA_DISTRIBUTIONS,
     DADistribution,
     validate_realization_capacity,
@@ -113,6 +114,7 @@ class DaMoeConfig:
             "baseline_guard_enabled": self.baseline_guard_enabled,
             "baseline_guard_margin": self.baseline_guard_margin,
             "control_overhead_us": self.control_overhead_us,
+            "switch_minimum_improvement": DA_SWITCH_MINIMUM_IMPROVEMENT,
             # Guard order can change plan admission, so it participates in persisted identity.
             "guard_profile_order": _GUARD_PROFILE_ORDER,
         }

@@ -23,6 +23,10 @@ from flashinfer.fused_moe.da_moe import (
     _local_load_spectrum,
 )
 
+# Sub-percent profiling differences can change the winner without paying for a switch.
+# Keep this admission policy in the persisted tuning identity as well.
+DA_SWITCH_MINIMUM_IMPROVEMENT = 0.01
+
 
 @dataclass(frozen=True)
 class FullWorkload:
@@ -764,18 +768,17 @@ class DAPlanCompiler:
         selections: Sequence[DAProfileSelection],
         candidate_latencies: Mapping[tuple[RoutingRealizationKey, Any], float],
     ) -> tuple[DAProfileSelection, ...]:
-        """Collapse a guarded switch when one measured body absorbs its charge."""
-        # This prune applies only to guarded multi-body candidates and never merges selector
-        # exemplar rows.
+        """Prefer one body when switching offers only a near tie or an absorbed charge."""
+        # Preserve every selector exemplar. The noise floor applies independently of the
+        # optional baseline guard, which can additionally account for absolute control cost.
         retained = tuple(selections)
-        if not self._guard_enabled:
-            return retained
         bodies = tuple(dict.fromkeys(item.selected_tactic for item in retained))
         if len(bodies) < 2:
             return retained
 
-        # A body is eligible only when its regret on every exemplar is no larger than the switch
-        # control charge eliminated by singleton capture.
+        # Switching must save strictly more than 1% against each possible fixed body on at
+        # least one exemplar. This avoids creating branches from noisy near ties without
+        # assuming a distribution mixture or requiring every exemplar to beat ordinary NoDA.
         eligible: list[tuple[float, float, str, FactorizedTactic]] = []
         for body in bodies:
             latencies = tuple(
@@ -786,7 +789,14 @@ class DAPlanCompiler:
                 latency - selection.candidate_latency_ms
                 for latency, selection in zip(latencies, retained, strict=True)
             )
-            if all(regret <= self._control_overhead_ms for regret in regrets):
+            if all(
+                selection.candidate_latency_ms
+                >= latency * (1.0 - DA_SWITCH_MINIMUM_IMPROVEMENT)
+                or (self._guard_enabled and regret <= self._control_overhead_ms)
+                for selection, latency, regret in zip(
+                    retained, latencies, regrets, strict=True
+                )
+            ):
                 eligible.append((max(regrets), sum(latencies), repr(body.tactic), body))
         if not eligible:
             return retained

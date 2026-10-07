@@ -16,7 +16,11 @@ from flashinfer.fused_moe import da_runtime
 from flashinfer.fused_moe.da_tuner import RoutingRealizationFactory
 from flashinfer.fused_moe.tactic_search import FactorizedSearch
 from flashinfer.tllm_enums import RoutingMethodType, WeightLayout
-from tests.moe.da_acceptance_utils import compact_shape, require_sm100
+from tests.moe.da_acceptance_utils import (
+    compact_shape,
+    force_profile_winner_crossover,
+    require_sm100,
+)
 
 
 @pytest.mark.parametrize("routing_mode", ("packed", "unpacked"))
@@ -43,6 +47,7 @@ def test_da_capture_rebinds_live_tensors(monkeypatch, routing_mode):
         return tactic
 
     monkeypatch.setattr(FactorizedSearch, "search", select_tile)
+    force_profile_winner_crossover(monkeypatch)
     monkeypatch.setattr(tuner, "get_factorized_search_result", lambda *args: None)
     shape = compact_shape(num_tokens=32)
     hidden, w1, w2, ids, weights = _canonical_inputs(shape)

@@ -886,8 +886,8 @@ class DaMoeOperationState:
                     )
                     sample_index += 1
 
-            # Measure each retained body against every exemplar only when a guarded multi-body
-            # plan could profitably collapse to one body and remove control overhead.
+            # Compare retained bodies on every exemplar before publishing a switch. Near-tie
+            # pruning applies even when the optional baseline/control-cost guard is disabled.
             # Host dispatch keeps the original distribution winners; only capture may prune them.
             eager_selections = tuple(selections)
             capture_selections = eager_selections
@@ -897,7 +897,7 @@ class DaMoeOperationState:
                 )
             )
             candidate_latencies: dict[tuple[RoutingRealizationKey, Any], float] = {}
-            if config.baseline_guard_enabled and len(candidate_bodies) > 1:
+            if len(candidate_bodies) > 1:
                 for selection in selections:
                     realization = self._realizations.get_or_create(
                         selection.realization_key

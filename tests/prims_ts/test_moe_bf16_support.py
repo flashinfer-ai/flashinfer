@@ -254,6 +254,36 @@ def test_kimi_k3_tile_selection_keeps_128_and_adds_192(num_tokens):
     ) == (128, 192, 256)
 
 
+@pytest.mark.parametrize("num_tokens", [64, 8192])
+@pytest.mark.parametrize(
+    "enumerator,supported_tiles",
+    [
+        (
+            config_mapper.valid_prims_ts_bf16_moe_tactics,
+            config_mapper.SUPPORTED_BF16_TILE_N,
+        ),
+        (
+            config_mapper.valid_prims_ts_nvfp4_moe_tactics,
+            config_mapper.SUPPORTED_NVFP4_TILE_N,
+        ),
+        (
+            config_mapper.valid_prims_ts_mxfp4_mxfp8_moe_tactics,
+            SUPPORTED_MXFP4_MXFP8_TILE_N,
+        ),
+    ],
+)
+def test_autotune_keeps_supported_tiles_across_token_counts(
+    num_tokens, enumerator, supported_tiles
+):
+    tactics = enumerator(num_tokens=num_tokens, top_k=6, num_local_experts=48)
+    unpruned = enumerator(top_k=6, num_local_experts=48)
+    # Kernel compatibility may exclude a tile (e.g. BF16 tile 256); token
+    # occupancy must not remove any otherwise valid tactic.
+    assert tactics == unpruned
+    assert {8, 16, 32, 64, 128} <= {tile_n for tile_n, _ in tactics}
+    assert {tile_n for tile_n, _ in tactics} <= set(supported_tiles)
+
+
 def test_kimi_k3_n192_pair_uses_compact_scale_factor_copies():
     pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
         [192, 0],

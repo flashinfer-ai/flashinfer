@@ -230,6 +230,7 @@ def _selected_tile_ns(
     num_local_experts: int | None,
     supported_tiles: Sequence[int] = SUPPORTED_BF16_TILE_N,
 ) -> tuple[int, ...]:
+    """Resolve an untuned default; autotuning must consider every supported tile."""
     if num_tokens is None or top_k is None or num_local_experts is None:
         return (supported_tiles[-1],)
     if num_local_experts <= 0:
@@ -1434,12 +1435,12 @@ def _valid_json_moe_tactics(
     enable_pdl: bool = False,
 ) -> list[list[int]]:
     tactics: list[list[int]] = []
-    for tile_n in _selected_tile_ns(
-        num_tokens=num_tokens,
-        top_k=top_k,
-        num_local_experts=num_local_experts,
-        supported_tiles=supported_tiles,
-    ):
+    if num_local_experts is not None and num_local_experts <= 0:
+        raise ValueError(f"num_local_experts must be positive, got {num_local_experts}")
+    # Average tokens per expert cannot predict the winning tile under skew or
+    # EP routing. Enumerate all supported tiles; the config and runner checks
+    # below still reject incompatible kernels.
+    for tile_n in supported_tiles:
         fc1_indices = _moe_json_passing_indices(
             tile_n=tile_n,
             activation_type=activation_type,

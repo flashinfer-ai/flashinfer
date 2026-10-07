@@ -71,6 +71,14 @@ def test_baseline_guard_is_opt_in_and_part_of_cache_identity(monkeypatch):
     assert guarded.cache_identity() != unguarded.cache_identity()
 
 
+def test_da_cache_identity_records_switch_minimum_improvement():
+    # Plans admitted before near-tie pruning must not restore under the new policy.
+    assert (
+        DaMoeConfig.from_environment().cache_identity()["switch_minimum_improvement"]
+        == 0.01
+    )
+
+
 def test_da_cache_identity_records_guard_profile_order(monkeypatch):
     """Records tuned with a different guard order must not restore as equivalent."""
     monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")

@@ -47,6 +47,7 @@ from flashinfer.tllm_enums import RoutingInputMode, RoutingMethodType
 from tests.moe.da_acceptance_utils import (
     PRODUCTION_PRECISIONS,
     compact_shape,
+    force_profile_winner_crossover,
     deepseek_l0_shape,
     require_sm100,
     run_matched_public_graphs,
@@ -840,6 +841,7 @@ def test_from_logits_large_token_capture_installs_da_switch(
         return selected
 
     monkeypatch.setattr(FactorizedSearch, "search", select_distinct_tile_body)
+    force_profile_winner_crossover(monkeypatch)
     with _temporary_environment(
         FLASHINFER_DIST_AWARE_AUTOTUNE="1",
         FLASHINFER_DA_DISTRIBUTIONS=",".join(distributions),
