@@ -390,6 +390,63 @@ def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
     assert len(poison) == 128
 
 
+@pytest.mark.parametrize("backend", ["fa2", "auto"])
+@pytest.mark.parametrize("length_dtype", [None, torch.int32, torch.uint32])
+def test_paged_prefill_explicit_max_preserves_fallback_metadata(backend, length_dtype):
+    q, k, v, qo, ip, ix, last = _paged_inputs()
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, device=q.device, dtype=torch.uint8),
+        "NHD",
+        backend=backend,
+        use_cuda_graph=True,
+        qo_indptr_buf=qo.cuda(),
+        paged_kv_indptr_buf=ip.cuda(),
+        paged_kv_indices_buf=ix.cuda(),
+        paged_kv_last_page_len_buf=last.cuda(),
+    )
+
+    def plan(last):
+        lengths = (ip[1:] - ip[:-1] - 1) * 16 + last
+        w.plan(
+            qo,
+            ip,
+            ix,
+            last,
+            8,
+            2,
+            128,
+            16,
+            causal=True,
+            q_data_type=q.dtype,
+            max_token_per_sequence=8,
+            max_sequence_kv=48,
+            seq_lens=None
+            if length_dtype is None
+            else lengths.to(q.device, length_dtype),
+        )
+        assert w._max_kv_len == 48
+
+    def check(out, lse, last):
+        ref, stats = _reference(q, k, v, qo, ip, ix, last, causal=True, scale=128**-0.5)
+        torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(
+            lse, stats * math.log2(math.e), atol=0.003, rtol=0.003
+        )
+
+    plan(last)
+    out, lse = w.run(q, (k, v), return_lse=True)
+    check(out, lse, last)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w.run(q, (k, v), out=out, lse=lse, return_lse=True)
+    last = last + 4
+    plan(last)
+    out.fill_(torch.nan)
+    lse.fill_(torch.nan)
+    graph.replay()
+    check(out, lse, last)
+
+
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 @pytest.mark.parametrize("lse_base", ["ln", "log2"])
