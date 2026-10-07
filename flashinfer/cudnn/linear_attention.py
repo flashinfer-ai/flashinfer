@@ -16,7 +16,11 @@ limitations under the License.
 
 import inspect
 import math
+from collections import OrderedDict
 from enum import Enum
+from functools import cache
+from importlib.metadata import version as package_version
+from threading import Lock
 from typing import Optional, Union
 
 import torch
@@ -54,6 +58,94 @@ _cudnn_handles: dict = {}
 _LINEAR_ATTENTION_BUILD_ERRORS = (NotImplementedError, TypeError) + (
     (cudnn.cudnnGraphNotSupportedError,) if CUDNN_AVAILABLE else ()
 )
+
+# Process-local support decisions, never tensors, pointers or exception objects.
+# Keep successful auto calls free of descriptor-key work until a build declines.
+_LA_AUTO_DECLINE_LIMIT = 128
+_la_auto_declines: OrderedDict = OrderedDict()
+_la_auto_decline_scopes: set = set()
+_la_auto_decline_lock = Lock()
+
+
+@cache
+def _la_auto_runtime_versions(frontend, frontend_version):
+    # Loaded backend/DSL libraries are fixed for this process. Include frontend
+    # identity/version so replacing the frontend cannot inherit old declines.
+    return frontend.backend_version(), package_version("nvidia-cutlass-dsl")
+
+
+def _la_auto_decline_scope(call, q):
+    return call, q.device, q.shape, q.dtype
+
+
+def _la_auto_decline_key(scope, args, kwargs):
+    def descriptor(value):
+        if isinstance(value, torch.Tensor):
+            return (
+                value.device,
+                value.shape,
+                value.stride(),
+                value.dtype,
+                value.requires_grad,
+                value.is_inference(),
+            )
+        return value
+
+    return (
+        scope,
+        _build_la_graph,
+        cudnn,
+        cudnn.__version__,
+        _la_auto_runtime_versions(cudnn, cudnn.__version__),
+        torch.is_inference_mode_enabled(),
+        tuple(descriptor(value) for value in args),
+        tuple((name, descriptor(value)) for name, value in sorted(kwargs.items())),
+    )
+
+
+def _try_cudnn_auto(call, *args, **kwargs):
+    """Return None only for a deterministic, pre-execution support decline.
+
+    Callers must validate native eligibility and storage aliases before entry.
+    Explicit cuDNN calls bypass this cache and retain their original diagnostics.
+    """
+    key = None
+    scope = None
+    if _la_auto_declines:
+        scope = _la_auto_decline_scope(call, args[0])
+    if scope in _la_auto_decline_scopes:
+        key = _la_auto_decline_key(scope, args, kwargs)
+        with _la_auto_decline_lock:
+            if key in _la_auto_declines:
+                _la_auto_declines.move_to_end(key)
+                return None
+    try:
+        return call(*args, **kwargs)
+    except _LINEAR_ATTENTION_BUILD_ERRORS as exc:
+        if not getattr(exc, "_fi_la_build_unsupported", False):
+            raise
+        # A build can fail only because it was attempted during capture. Do
+        # not turn that contextual failure into a lasting eager support claim.
+        q = args[0]
+        if q.is_cuda:
+            with torch.cuda.device(q.device):
+                if torch.cuda.is_current_stream_capturing():
+                    return None
+        if scope is None:
+            scope = _la_auto_decline_scope(call, q)
+        if key is None:
+            key = _la_auto_decline_key(scope, args, kwargs)
+        with _la_auto_decline_lock:
+            _la_auto_declines[key] = None
+            _la_auto_decline_scopes.add(scope)
+            _la_auto_declines.move_to_end(key)
+            if len(_la_auto_declines) > _LA_AUTO_DECLINE_LIMIT:
+                old_key, _ = _la_auto_declines.popitem(last=False)
+                # Scan only on cold eviction; warm calls for other families
+                # or shapes never construct full descriptor keys.
+                if not any(k[0] == old_key[0] for k in _la_auto_declines):
+                    _la_auto_decline_scopes.discard(old_key[0])
+        return None
 
 
 def _linear_attention_auto_available() -> bool:

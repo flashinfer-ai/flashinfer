@@ -96,40 +96,38 @@ def _try_cudnn_kda_prefill(
 ):
     """Substitute an eligible native prefill without changing its math or aliases."""
     from .cudnn import cudnn_recurrent_kda
-    from .cudnn.linear_attention import _LINEAR_ATTENTION_BUILD_ERRORS
+    from .cudnn.linear_attention import _try_cudnn_auto
 
     # Native launchers check these after eligibility. Keep that contract even
     # when auto replaces the launcher; FE descriptor checks do not check aliasing.
     _kda_prefill._check_output_does_not_overlap_inputs(
         output, q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state
     )
-    if scale is not None and not math.isfinite(float(scale)):
-        raise ValueError(f"scale must be finite, got {scale}")
-    try:
-        return cudnn_recurrent_kda(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
-            beta_is_logit=True,
-            output=output,
-        )
-    except _LINEAR_ATTENTION_BUILD_ERRORS as exc:
-        # This signal is raised only before execute. An execution error must
-        # propagate because the incoming state may already have been advanced.
-        if not getattr(exc, "_fi_la_build_unsupported", False):
-            raise
-        return None
+    if scale is not None:
+        scale = float(scale)
+        if not math.isfinite(scale):
+            raise ValueError(f"scale must be finite, got {scale}")
+    # FE graph attributes are scalar values, not tensor-layout cache entries.
+    lower_bound = float(lower_bound) if lower_bound is not None else None
+    return _try_cudnn_auto(
+        cudnn_recurrent_kda,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        beta_is_logit=True,
+        output=output,
+    )
 
 
 @flashinfer_api(trace=recurrent_kda_trace)
