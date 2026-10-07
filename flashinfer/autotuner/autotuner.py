@@ -1171,6 +1171,13 @@ def _sync_oom_across_tune_group(local_oom: bool) -> bool:
     """Return whether any rank in the tuning group observed an OOM."""
     if _tune_process_group is None:
         return local_oom
+    # Independent mode (#5898): skip the collective. On cold-start
+    # autotuning one rank profiles for >30 min while others block in this
+    # all_reduce, exceeding the gloo/NCCL timeout and killing all workers.
+    # Each rank handles its own OOM fallback instead.
+    import os
+    if os.environ.get("FLASHINFER_AUTOTUNE_INDEPENDENT", "0") == "1":
+        return local_oom
 
     import torch.distributed as dist
 
@@ -3091,7 +3098,10 @@ class AutoTuner:
             profile_exc = e
 
         try:
-            if _tune_process_group is not None:
+            import os
+            _independent = os.environ.get(
+                "FLASHINFER_AUTOTUNE_INDEPENDENT", "0") == "1"
+            if _tune_process_group is not None and not _independent:
                 import torch.distributed as dist
 
                 # NCCL requires a CUDA tensor; a gloo (CPU) subgroup — the
