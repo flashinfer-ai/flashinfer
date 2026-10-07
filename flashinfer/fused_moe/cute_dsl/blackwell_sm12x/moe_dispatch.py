@@ -565,10 +565,15 @@ class _WeightViews:
 def _register_cache_eviction(cache: Dict, key: Tuple, *source_tensors) -> None:
     """Evict ``key`` when a source weight tensor is collected, so the cache
     follows the weights' lifetime instead of growing for the whole process.
+
+    Eviction is bound to the entry cached now, so it never drops a later
+    entry for the same key, and parks the entry instead of freeing it when a
+    captured CUDA graph references it (see _evict_weight_cache_entry()).
     """
+    entry_id = id(cache[key])
     for tensor in source_tensors:
         if tensor is not None:
-            weakref.finalize(tensor, cache.pop, key, None)
+            weakref.finalize(tensor, _evict_weight_cache_entry, cache, key, entry_id)
 
 
 _WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
@@ -635,10 +640,10 @@ def _get_weight_views(
             w1_alphas.contiguous().to(torch.float32),
             w2_alphas.contiguous().to(torch.float32),
         )
-        _put_weight_cache_entry(_WEIGHT_CACHE, key, cached)
-        _register_cache_eviction(
+        cached = _put_weight_cache_entry(
             _WEIGHT_CACHE,
             key,
+            cached,
             w1_fp4,
             w1_blockscale,
             w1_alphas,
@@ -2765,10 +2770,10 @@ def _get_w4a16_packed_weights(
         params_dtype=params_dtype,
         source_format=source_format,
     )
-    _put_weight_cache_entry(_W4A16_WEIGHT_CACHE, key, prepared)
-    _register_cache_eviction(
+    return _put_weight_cache_entry(
         _W4A16_WEIGHT_CACHE,
         key,
+        prepared,
         w1_weight,
         w1_weight_sf,
         w1_alpha,
@@ -2776,7 +2781,6 @@ def _get_w4a16_packed_weights(
         w2_weight_sf,
         w2_alpha,
     )
-    return prepared
 
 
 def _validate_w4a16_workspace(
@@ -2946,10 +2950,13 @@ _GRAPH_REFERENCED_WORKSPACES: list = []
 # (id(cache), key). Weight entries are tuples or shared dataclasses, so they
 # are tracked by key rather than marked in place.
 _GRAPH_REFERENCED_WEIGHT_KEYS: set = set()
-# Serializes cache lookup and marking against replacement and clearing so a
-# concurrent mutation cannot drop a workspace or prepared weights between a
-# capture-time cache read and its graph-referenced marking.
-_WORKSPACE_CACHE_LOCK = threading.Lock()
+# Serializes cache lookup and marking against replacement, clearing and
+# source-collection eviction so a concurrent mutation cannot drop a workspace
+# or prepared weights between a capture-time cache read and its
+# graph-referenced marking. Reentrant because eviction runs from weakref
+# finalizers, which garbage collection can trigger on a thread that already
+# holds the lock.
+_WORKSPACE_CACHE_LOCK = threading.RLock()
 
 
 def _mark_graph_referenced(workspace):
@@ -2973,12 +2980,41 @@ def _get_weight_cache_entry(cache: Dict, key: Tuple):
         return value
 
 
-def _put_weight_cache_entry(cache: Dict, key: Tuple, value) -> None:
-    """Insert a prepared-weight cache entry, recording use during capture."""
+def _put_weight_cache_entry(cache: Dict, key: Tuple, value, *source_tensors):
+    """Insert a prepared-weight cache entry and return the cached entry.
+
+    Preparation runs outside the lock, so two callers can miss on the same
+    key. The first insertion wins and later callers use it: replacing it
+    could drop storage that a graph captured in between still references.
+    Use during capture is recorded, and the entry is evicted when a source
+    tensor is collected.
+    """
     with _WORKSPACE_CACHE_LOCK:
-        cache[key] = value
+        cached = cache.get(key)
+        if cached is None:
+            cache[key] = cached = value
+            _register_cache_eviction(cache, key, *source_tensors)
         if _is_cuda_graph_capturing():
             _GRAPH_REFERENCED_WEIGHT_KEYS.add((id(cache), key))
+        return cached
+
+
+def _evict_weight_cache_entry(cache: Dict, key: Tuple, entry_id: int) -> None:
+    """Drop a prepared-weight entry whose source tensor was collected.
+
+    Only the entry registered for eviction is dropped. If a captured graph
+    references it, it is parked like a graph-referenced workspace instead of
+    being freed.
+    """
+    with _WORKSPACE_CACHE_LOCK:
+        entry = cache.get(key)
+        if entry is None or id(entry) != entry_id:
+            return
+        del cache[key]
+        graph_key = (id(cache), key)
+        if graph_key in _GRAPH_REFERENCED_WEIGHT_KEYS:
+            _GRAPH_REFERENCED_WEIGHT_KEYS.discard(graph_key)
+            _GRAPH_REFERENCED_WORKSPACES.append(entry)
 
 
 def _cuda_devices_of(entries) -> set:
@@ -3333,17 +3369,16 @@ def _pad_intermediate_to_tile(
     if fc2_input_scale_src is not None and fc2_input_scale_src.numel() == n:
         fc2_input_scale = pad_dim(fc2_input_scale_src, 0, n, n_pad)
     result = (w1p, w1_sf_p, w2p, w2_sf_p, fc2_input_scale, n_pad)
-    _put_weight_cache_entry(_PADDED_WEIGHT_CACHE, key, result)
-    _register_cache_eviction(
+    return _put_weight_cache_entry(
         _PADDED_WEIGHT_CACHE,
         key,
+        result,
         w1_weight,
         w1_weight_sf,
         w2_weight,
         w2_weight_sf,
         fc2_input_scale_src,
     )
-    return result
 
 
 def _validate_static_workspace_for_launch(

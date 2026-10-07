@@ -10,6 +10,7 @@ the marking and retirement semantics and drive the real cache functions
 through hit, replacement, clear, and release.
 """
 
+import gc
 import threading
 from types import SimpleNamespace
 from unittest import mock
@@ -255,6 +256,109 @@ def test_prepared_weights_inserted_during_capture_are_parked_on_clear():
         )
     moe_dispatch.clear_sm120_moe_caches()
     assert [value] == moe_dispatch._GRAPH_REFERENCED_WORKSPACES
+
+
+@pytest.mark.parametrize("capturing", [True, False])
+def test_source_collection_parks_graph_referenced_prepared_weights(capturing):
+    cache = moe_dispatch._WEIGHT_CACHE
+    source = torch.empty(4)
+    value = (torch.empty(4), torch.empty(2))
+    with mock.patch.object(
+        moe_dispatch, "_is_cuda_graph_capturing", return_value=capturing
+    ):
+        moe_dispatch._put_weight_cache_entry(cache, ("evict",), value, source)
+
+    del source
+    gc.collect()
+
+    assert cache == {}
+    parked = moe_dispatch._GRAPH_REFERENCED_WORKSPACES
+    assert parked == ([value] if capturing else [])
+    assert not moe_dispatch._GRAPH_REFERENCED_WEIGHT_KEYS
+
+
+def test_source_collection_while_holding_the_cache_lock_does_not_deadlock():
+    cache = moe_dispatch._WEIGHT_CACHE
+    source = torch.empty(4)
+    moe_dispatch._put_weight_cache_entry(cache, ("lock",), (torch.empty(1),), source)
+    sources = [source]
+    del source
+
+    def collect_under_lock():
+        # Garbage collection can run eviction finalizers on a thread that
+        # already holds the lock, e.g. while it allocates a workspace.
+        with moe_dispatch._WORKSPACE_CACHE_LOCK:
+            sources.clear()
+            gc.collect()
+
+    thread = threading.Thread(target=collect_under_lock, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert cache == {}
+
+
+def test_source_collection_does_not_evict_a_later_entry_for_the_key():
+    cache = moe_dispatch._PADDED_WEIGHT_CACHE
+    old_source = torch.empty(4)
+    old_value = (torch.empty(1),)
+    moe_dispatch._put_weight_cache_entry(cache, ("key",), old_value, old_source)
+    moe_dispatch.clear_sm120_moe_caches()
+
+    new_source = torch.empty(4)
+    new_value = (torch.empty(1),)
+    moe_dispatch._put_weight_cache_entry(cache, ("key",), new_value, new_source)
+    del old_source
+    gc.collect()
+
+    assert cache == {("key",): new_value}
+
+
+def test_delayed_preparation_keeps_the_entry_captured_in_between():
+    sources = {
+        name: torch.empty(4)
+        for name in (
+            "w1_weight",
+            "w1_weight_sf",
+            "w1_alpha",
+            "w2_weight",
+            "w2_weight_sf",
+            "w2_alpha",
+        )
+    }
+
+    def lookup():
+        return moe_dispatch._get_w4a16_packed_weights(
+            **sources, activation="silu", params_dtype=torch.bfloat16
+        )
+
+    captured = SimpleNamespace(name="captured")
+    delayed = SimpleNamespace(name="delayed")
+
+    def prepare_slowly(*args, **kwargs):
+        # While this caller prepares, another caller misses, inserts its own
+        # entry, and a graph captures that entry.
+        with mock.patch.object(
+            moe_dispatch, "prepare_w4a16_packed_weights", return_value=captured
+        ):
+            assert lookup() is captured
+        with mock.patch.object(
+            moe_dispatch, "_is_cuda_graph_capturing", return_value=True
+        ):
+            assert lookup() is captured
+        return delayed
+
+    with (
+        mock.patch.object(moe_dispatch, "_is_cuda_graph_capturing", return_value=False),
+        mock.patch.object(
+            moe_dispatch, "prepare_w4a16_packed_weights", side_effect=prepare_slowly
+        ),
+    ):
+        assert lookup() is captured
+
+    assert list(moe_dispatch._W4A16_WEIGHT_CACHE.values()) == [captured]
+    moe_dispatch.clear_sm120_moe_caches()
+    assert [captured] == moe_dispatch._GRAPH_REFERENCED_WORKSPACES
 
 
 def test_release_synchronizes_before_dropping_graph_referenced_storage():
