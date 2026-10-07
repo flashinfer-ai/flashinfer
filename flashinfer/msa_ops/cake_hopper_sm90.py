@@ -454,6 +454,24 @@ def plan_proxy_score(*, batch: int, max_k_tiles: int, num_pages: int) -> bool:
     return bool(num_pages * 20 >= batch * max_k_tiles * 17)
 
 
+_L2_BYTES = 50 << 20  # compute capability 9.0 (H100 / H200) L2
+
+
+def proxy_evict_first(
+    *, batch: int, max_k_tiles: int, num_pages: int, fp8: bool
+) -> bool:
+    """L2 eviction policy of the index-K page loads: ``evict_first`` while the footprint is short.
+
+    The footprint upper bound is ``min(batch * max_k_tiles, num_pages)`` pages (no device sync);
+    below five L2 capacities the streamed pages are inserted ahead of the resident lines, beyond
+    it the default policy avoids the ~3 % steady-state cost of the hint.
+    """
+
+    page_bytes = _BLOCK_SIZE * _HEAD_DIM * (1 if fp8 else 2)
+    footprint = min(int(batch) * int(max_k_tiles), int(num_pages)) * page_bytes
+    return footprint < 5 * _L2_BYTES
+
+
 def hopper_msa_proxy_score_decode(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -543,6 +561,12 @@ def hopper_msa_proxy_score_decode(
     batch_fast = plan_proxy_score(
         batch=batch, max_k_tiles=max_k_tiles, num_pages=num_pages
     )
+    evict_first = proxy_evict_first(
+        batch=batch,
+        max_k_tiles=max_k_tiles,
+        num_pages=num_pages,
+        fp8=q.dtype == torch.float8_e4m3fn,
+    )
     _program(
         proxy_route(q_dtype=q.dtype, num_q_heads=num_q_heads, max_seqlen_q=sq)
     ).launch(
@@ -558,6 +582,7 @@ def hopper_msa_proxy_score_decode(
         max_k_tiles=max_k_tiles,
         total_q=total_q,
         batch_fast=1 if batch_fast else 0,
+        evict_first=1 if evict_first else 0,
         trace=_trace_carrier(q.device),
     )
     return per_head
@@ -569,6 +594,7 @@ __all__ = [
     "hopper_msa_sparse_decode_attention",
     "is_hopper_msa_device",
     "plan_proxy_score",
+    "proxy_evict_first",
     "plan_sparse_decode",
     "proxy_decode_route_available",
     "proxy_route",
