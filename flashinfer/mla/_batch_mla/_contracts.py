@@ -178,16 +178,15 @@ class MLAInputContract:
                     "bmm1_scale and bmm2_scale must have the same scale type."
                 )
             if bmm1_is_tensor:
-                raise ValueError(
-                    "BMM tensor scales are not supported by this planned-wrapper version."
-                )
-            if not _is_valid_bmm_scalar(bmm1_scale) or not _is_valid_bmm_scalar(
+                actual_scale_mode = "bmm-tensor"
+            elif not _is_valid_bmm_scalar(bmm1_scale) or not _is_valid_bmm_scalar(
                 bmm2_scale
             ):
                 raise TypeError(
                     "bmm1_scale and bmm2_scale must be numeric scalar values."
                 )
-            actual_scale_mode = "bmm-scalar"
+            else:
+                actual_scale_mode = "bmm-scalar"
         elif self.scale_mode == "kv-per-tensor":
             actual_scale_mode = "kv-per-tensor"
         else:

@@ -97,9 +97,7 @@ def _patch_shared_impl_and_forbid_decode_routing(monkeypatch):
     def forbidden_decode(*args, **kwargs):
         raise AssertionError("prefill must not route through the public decode wrapper")
 
-    monkeypatch.setattr(
-        core, "_trtllm_batch_decode_with_kv_cache_mla_impl", capture_impl
-    )
+    monkeypatch.setattr(core, "_mla_with_kv_cache_impl", capture_impl)
     monkeypatch.setattr(core, "trtllm_batch_decode_with_kv_cache_mla", forbidden_decode)
     monkeypatch.setattr(
         flashinfer.mla, "trtllm_batch_decode_with_kv_cache_mla", forbidden_decode

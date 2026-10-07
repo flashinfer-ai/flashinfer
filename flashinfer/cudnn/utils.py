@@ -29,6 +29,95 @@ from ..jit import gen_cudnn_fmha_module
 _attention_handles = threading.local()
 
 
+def supports_ordered_cudnn_execution(graph_type):
+    """Detect the optional tensor-sequence overload once, independent of engine."""
+    return _supports_ordered_execute(getattr(graph_type, "execute", None))
+
+
+@functools.cache
+def _supports_ordered_execute(execute):
+    try:
+        return "tensor_uids" in inspect.signature(execute).parameters
+    except (TypeError, ValueError):
+        # Older native graph classes may not expose an inspectable signature.
+        return False
+
+
+@functools.cache
+def supports_native_cudnn_log2(backend, device):
+    """Probe headers and runtime once without excluding backend candidates.
+
+    A runtime version check alone is insufficient: FE built with older headers
+    can accept the Python flag but decline every backend plan. Do not turn that
+    into an accidental FROST-only routing policy.
+    """
+    if (
+        device.type != "cuda"
+        or backend.backend_version() < 92700
+        or not hasattr(backend.pygraph, "backend_plan_entries")
+    ):
+        return False
+    stream = torch.cuda.current_stream(device)
+    graph = backend.pygraph(
+        handle=get_cudnn_attention_handle(backend, stream),
+        io_data_type=backend.data_type.HALF,
+        intermediate_data_type=backend.data_type.FLOAT,
+        compute_data_type=backend.data_type.FLOAT,
+    )
+    tensors = [
+        graph.tensor(dim=[1, 1, 16, 64], stride=[1024, 1024, 64, 1]) for _ in range(3)
+    ]
+    try:
+        out, stats = graph.sdpa(
+            q=tensors[0],
+            k=tensors[1],
+            v=tensors[2],
+            generate_stats=True,
+            stats_use_log2=True,
+        )
+        out.set_output(True)
+        stats.set_output(True).set_data_type(backend.data_type.FLOAT)
+        graph.validate()
+        graph.create_execution_plans([backend.heur_mode.A])
+        return bool(graph.backend_plan_entries())
+    except backend.cudnnGraphNotSupportedError:
+        return False
+    except TypeError as exc:
+        message = str(exc)
+        if "stats_use_log2" not in message or not any(
+            reason in message
+            for reason in ("unexpected", "incompatible function arguments")
+        ):
+            raise
+        return False
+
+
+def build_cudnn_graph_with_log2(backend, build, args, kwargs, stats_use_log2):
+    """Fall back only on a graph capability decline, before any execution."""
+    if stats_use_log2:
+        try:
+            return build(*args, stats_use_log2=True, **kwargs)
+        except backend.cudnnGraphNotSupportedError:
+            pass
+    return build(*args, **kwargs)
+
+
+def require_native_cudnn_log2(graph, backend):
+    # Check the real graph too: a small capability probe does not establish
+    # support for every paged/mask/layout combination. Keep the old route when
+    # the backend declines, even if a FROST plan could serve log2 by itself.
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([backend.heur_mode.A])
+    if not graph.backend_plan_entries():
+        raise backend.cudnnGraphNotSupportedError(
+            "native log2 Stats would exclude the cuDNN backend"
+        )
+    graph.check_support()
+    graph.build_plans()
+    graph._flashinfer_stats_use_log2 = True
+
+
 class _AttentionHandle:
     def __init__(self, backend):
         self.value = backend.create_handle()
@@ -133,3 +222,52 @@ def cudnn_frontend_accepts_cuda_graph_replay_hint() -> bool:
     return "is_cuda_graph_replay_expected" in ctor and any(
         p.kind is inspect.Parameter.VAR_KEYWORD for p in helper.values()
     )
+
+
+@functools.cache
+def cudnn_frontend_frost_runtime_available() -> bool:
+    """Whether the installed cudnn-frontend can run its FROST (CuTe-DSL) SDPA
+    engines on this install: the CuTe DSL they need is present and not below
+    the frontend's own floor (``cudnn.frost.buffers.CUTEDSL_MIN_VERSION``,
+    4.7.0 today).
+
+    Both this package and cudnn-frontend admit ``nvidia-cutlass-dsl`` 4.6.2 in
+    their dependency metadata, which is below that floor. On such an install
+    the frontend's FROST rows decline and its backend engine serves the graph
+    (~8x slower than fa2 on multi-token rows), so a performance-driven
+    ``auto`` choice must not count on the frontend version alone. The check
+    is the frontend's own (``cutedsl_state`` / ``cutedsl_too_old``, which
+    the SDPA forward engines gate on): internal DSL builds count as new
+    enough, as they do there. A frontend without those helpers (1.29 and
+    older, which have no FROST decode rows either) reports False.
+    """
+    try:
+        from cudnn.frost.buffers import (  # noqa: PLC0415 -- optional dependency
+            cutedsl_state,
+            cutedsl_too_old,
+        )
+    except Exception:  # noqa: BLE001 -- any import failure means "not available"
+        return False
+    try:
+        installed, version = cutedsl_state()
+        return bool(installed) and not cutedsl_too_old(version)
+    except Exception:  # noqa: BLE001 -- a probe that fails is a runtime that is not there
+        return False
+
+
+# cudnn-frontend 1.30 ranks its FROST decode tile ahead of the backend engine for
+# multi-token rows only from a declared 2048-token cache; below that the backend's
+# prefill-class engine goes first (~8x fa2's time). 1.31 ranks the tile first at
+# every cache length (NVIDIA/cudnn-frontend#1420).
+CUDNN_FRONTEND_SHORT_CACHE_LEAD_MIN_VERSION: Tuple[int, int, int] = (1, 31, 0)
+
+
+def cudnn_frontend_leads_short_caches() -> bool:
+    """Whether the installed cudnn-frontend ranks its decode tile first for
+    multi-token rows at every declared cache length (1.31+)."""
+    version = cudnn_frontend_version()
+    if version is None:
+        return False
+    return (tuple(version) + (0, 0, 0))[
+        :3
+    ] >= CUDNN_FRONTEND_SHORT_CACHE_LEAD_MIN_VERSION
