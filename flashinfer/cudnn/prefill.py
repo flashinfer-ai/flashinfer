@@ -88,7 +88,7 @@ def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -
 # boundary), and the heuristic picks the short-row engine for a declared
 # max_len <= 128 and another engine above (flip measured between 128 and 256 on
 # SM100 and SM107, independent of batch, LSE and head dims). Within a class
-# override matches a natively built plan. Bounded SM100 MLA and D128 prefixes use
+# override matches a natively built plan. Bounded SM100/SM107 MLA and D128 use
 # smaller power-of-two classes so plan-time occupancy and partial workspace
 # bounds remain useful without specializing every live length.
 _PREFILL_SHAPE_OVERRIDE_ENV = "FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE"
@@ -993,7 +993,8 @@ class _PrefillMetadata:
             and _cudnn_supports_bounded_ragged(d128=head_dim_qk == 128)
             and self.batch_offsets_q is not None
             and self.batch_offsets_q.device.type == "cuda"
-            and get_compute_capability(self.batch_offsets_q.device) == (10, 0)
+            and get_compute_capability(self.batch_offsets_q.device)
+            in ((10, 0), (10, 7))
         )
         if batch_offsets_units != "tokens":
             return self

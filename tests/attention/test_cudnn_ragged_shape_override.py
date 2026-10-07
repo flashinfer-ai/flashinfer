@@ -380,8 +380,8 @@ def test_bounded_ragged_replan_capture_and_rebinding(
     causal, lse_layout, head_dim_qk, num_kv_heads, monkeypatch
 ):
     """One bounded graph handles different batches, totals, pointers and strides."""
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("bounded packed cache classes are qualified on SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("bounded packed cache classes are qualified on SM100/SM107")
     if not cudnn_prefill._cudnn_supports_bounded_ragged(d128=head_dim_qk == 128):
         pytest.skip("requires FE bounded packed overrides")
     from cutlass import cute
@@ -541,8 +541,8 @@ def test_bounded_ragged_prewarm_classes_before_capture(
     return_lse, head_dim_qk, num_kv_heads, monkeypatch
 ):
     """Warm declared capacities once, then capture new live shapes in any order."""
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("bounded packed cache classes are qualified on SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("bounded packed cache classes are qualified on SM100/SM107")
     if not cudnn_prefill._cudnn_supports_bounded_ragged(d128=head_dim_qk == 128):
         pytest.skip("requires FE bounded packed overrides")
     from cutlass import cute
