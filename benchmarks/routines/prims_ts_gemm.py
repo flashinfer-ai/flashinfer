@@ -284,7 +284,7 @@ def _validate_case(args, arch):
         raise ValueError("mma_k=96 requires SM103")
 
 
-def _check_output(args, actual, expected, encode_scale):
+def _assert_output(args, actual, expected, encode_scale):
     if args.output_format == "nvfp4":
         payload, scales = actual
         decoded = _dequantize_nvfp4_output(payload, scales, encode_scale)
@@ -306,6 +306,17 @@ def _check_output(args, actual, expected, encode_scale):
     else:
         atol, rtol = 1.0, 8e-2
     torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=rtol)
+
+
+def _check_output(args, actual, expected, encode_scale):
+    try:
+        _assert_output(args, actual, expected, encode_scale)
+    except AssertionError as exc:
+        if not args.allow_output_mismatch:
+            raise
+        print(f"[ERROR] prims-ts output mismatch: {exc}")
+        return False
+    return True
 
 
 def run_prims_ts_gemm_test(args):
@@ -344,6 +355,7 @@ def run_prims_ts_gemm_test(args):
     else:
         out = torch.empty((args.m, logical_n), device=device, dtype=torch.bfloat16)
 
+    refcheck_passed = False
     if args.mode == "one_shot":
         context = {"tuning_buckets": (args.tuning_bucket,), "round_up": True}
 
@@ -358,7 +370,7 @@ def run_prims_ts_gemm_test(args):
             tactic = _format_tactic(_selected_tactic(op_name, run))
             actual = run()
             if expected is not None:
-                _check_output(args, actual, expected, encode_scale)
+                refcheck_passed = _check_output(args, actual, expected, encode_scale)
             samples = bench_gpu_time(
                 run,
                 dry_run_iters=args.dry_run_iters,
@@ -391,7 +403,7 @@ def run_prims_ts_gemm_test(args):
         actual = run()
         tactic = repr(prepared.config)
         if expected is not None:
-            _check_output(args, actual, expected, encode_scale)
+            refcheck_passed = _check_output(args, actual, expected, encode_scale)
         samples = bench_gpu_time(
             run,
             dry_run_iters=args.dry_run_iters,
@@ -426,7 +438,7 @@ def run_prims_ts_gemm_test(args):
         mma_k=args.mma_k,
         gpu_sm=arch,
         tactic=tactic,
-        refcheck_passed=bool(args.refcheck),
+        refcheck_passed=refcheck_passed,
         case_tag=args.case_tag,
     )
     return [result]
