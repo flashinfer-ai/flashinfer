@@ -71,7 +71,6 @@ def _mark_slot_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 16):
 #   B=8:   TILE_V=16 (balance between parallelism and efficiency)
 #   B>=16: TILE_V=32 (fewer blocks, better efficiency for large batches)
 
-TILE_K_MTP = 128  # Full K dimension (shared across all configs)
 NUM_THREADS_MTP = 128  # 4 warps
 
 
@@ -80,6 +79,8 @@ def get_mtp_config(
     seq_len: int,
     num_v_heads: int = 64,
     v_dim: int = 128,
+    *,
+    k_dim: int = 128,
     disable_state_update: bool = False,
 ) -> tuple:
     """Unified MTP config selection based on CTA work units.
@@ -102,7 +103,7 @@ def get_mtp_config(
     *smem_v=False if state_update ON + T≤2; ilp=8 if tile_v≥64 + state_update ON + T≤2.
     """
     work_units = batch_size * num_v_heads
-    vec_size = 4  # Always 4 (full warp shuffle)
+    vec_size = get_vec_size_mtp(k_dim=k_dim, batch_size=batch_size, seq_len=seq_len)
 
     if work_units <= 64:
         tile_v, ilp_rows, use_smem_v = 8, 2, False
@@ -131,13 +132,13 @@ def get_mtp_config(
     return tile_v, vec_size, ilp_rows, use_smem_v
 
 
-def get_vec_size_mtp(batch_size: int, seq_len: int = 1) -> int:
+def get_vec_size_mtp(k_dim: int, batch_size: int, seq_len: int = 1) -> int:
     """Select vec_size for MTP kernel.
 
-    Always use vec_size=4 (32 threads per group = full warp, 4 groups per block).
-    Full warp shuffle is more efficient and achieves >= 1.0x speedup vs Triton.
+    We select a size that guarantees full warp shuffle (32 threads per group).
     """
-    return 4
+    threads_per_group = 32
+    return k_dim // threads_per_group
 
 
 def get_tile_v_mtp(
@@ -162,7 +163,11 @@ def get_ilp_rows(
 ) -> int:
     """Select number of ILP rows for the MTP kernel. Delegates to get_mtp_config()."""
     _, _, ilp_rows, _ = get_mtp_config(
-        batch_size, seq_len, num_v_heads, v_dim, disable_state_update
+        batch_size,
+        seq_len,
+        num_v_heads,
+        v_dim,
+        disable_state_update=disable_state_update,
     )
     return ilp_rows
 
@@ -177,7 +182,11 @@ def get_use_smem_v(
 ) -> bool:
     """Decide whether to preload v values into SMEM. Delegates to get_mtp_config()."""
     _, _, _, use_smem_v = get_mtp_config(
-        batch_size, seq_len, num_v_heads, v_dim, disable_state_update
+        batch_size,
+        seq_len,
+        num_v_heads,
+        v_dim,
+        disable_state_update=disable_state_update,
     )
     return use_smem_v
 
@@ -2954,7 +2963,9 @@ def run_mtp_decode(
         output = output_writeback.to(torch.bfloat16)
 
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
-    tile_v, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
+    tile_v, _, ilp_rows, use_smem_v = get_mtp_config(
+        B, T, HV, V, k_dim=K, disable_state_update=disable_state_update
+    )
     use_inline_kernel = (B * HV) <= 128
     target = gdn_device_target(q.device)
     use_packed_fma = target.use_packed_fma

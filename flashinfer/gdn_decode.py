@@ -1259,16 +1259,16 @@ def gated_delta_rule_mtp(
 
     # Dynamic TILE_V and vec_size selection based on batch size and sequence length
     tile_v = get_tile_v_mtp(B, T, num_v_heads=HV, v_dim=V)
-    vec_size = get_vec_size_mtp(B, T)
+    vec_size = get_vec_size_mtp(batch_size=B, seq_len=T, k_dim=K)
 
     # Validate state shape
     assert initial_state.shape == (pool_size, HV, V, K), (
         f"Expected initial_state shape [pool_size={pool_size}, HV={HV}, V={V}, K={K}], got {initial_state.shape}"
     )
 
-    # Validate K and V constraints
-    assert K >= 128, f"K must be at least 128, got K={K}"
-    assert V >= 128, f"V must be at least 128, got V={V}"
+    # Validate K and V constraints (64 and 128 were validated, other sizes may also be valid)
+    assert K in (64, 128), f"K must be in (64, 128), got K={K}"
+    assert V in (64, 128), f"V must be in (64, 128), got V={V}"
     assert V % tile_v == 0, (
         f"V must be divisible by {tile_v} to prevent out-of-bounds access, got V={V}"
     )
