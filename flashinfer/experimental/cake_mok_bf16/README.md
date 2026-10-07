@@ -41,13 +41,32 @@ All ranks must execute matching collective calls. Keep workspace allocations
 and peer mappings alive while the adapter or a captured graph can use them.
 Use a separate workspace and adapter for concurrent executions.
 
-Each forward context retains the BF16 routed expert outputs across all
-macrobatches. Backward computes each supplied-score gradient as their FP32
-dot product with the original upstream gradient, inside the fused kernel.
-This requires `2 * schedule_capacity * hidden_size` bytes per live context
-for routed outputs. Other routed activations keep the macrobatch ring and
-recompute policy. Pass the matching context and schedule to backward; retain
-both while any captured graph uses them.
+The forward context holds the dispatched routed rows, gate, up and hidden of
+the macrobatch ring plus the real-row shared activations; routed outputs are
+not retained. Backward computes each supplied-score gradient inside the fused
+routed SwiGLU backward, as the FP32 dot product of the recomputed hidden
+activation with the unscaled upstream gradient of the routed down projection
+(no division by the score, so zero scores are exact). Context memory follows
+the macrobatch ring and the real rows, not `schedule_capacity`. Pass the
+matching context and schedule to backward; retain both while any captured
+graph uses them.
+
+`recompute_forward_context` rebuilds the context from `x` for activation
+checkpointing: dispatch, the gate/up expert GEMMs and the SwiGLU only, no down
+projections, combine or output. It is bitwise identical to the context
+`forward` saved for the same inputs and schedule, so a backward from it
+reproduces the saved-context backward bitwise. `swiglu_limit=L` (GLM-5.3-Flash
+uses `L = 10`) selects the clamped activation `silu(min(gate, L)) * clamp(up,
+-L, L)` with the exact masked backward for both expert kinds:
+
+```python
+context = backend.recompute_forward_context(
+    config, workspace, schedule, x, *weights[:2], *weights[3:5], swiglu_limit=10.0
+)
+grads = backend.backward(
+    config, workspace, schedule, context, dy, x, scores, *weights, swiglu_limit=10.0
+)
+```
 
 Calling the experimental API is the opt-in; it emits an experimental warning.
 There is no automatic dispatch or AOT registration.
@@ -67,16 +86,20 @@ Recapture CUDA Graphs when tensor shapes or addresses change. Same-shape value
 updates can replay directly. Earlier graphs can still replay while their
 inputs and workspace remain alive. Run graphs sharing a workspace serially
 and in the same order across ranks. Growth beyond capacity requires all ranks
-to recreate the workspace. Padding increases storage and work according to
-the maximum reserved capacity, not only the sum of real input lengths.
+to recreate the workspace. Reserved capacity determines storage only; compute
+and the retained shared activations follow the real input lengths (shared
+expert tiles cover whole 256-row blocks).
 
 Run `torchrun --standalone --nproc-per-node=4 examples/mok_bf16_unequal.py`
 for unequal lengths, empty ranks, count changes and graph reuse.
 
 ## Toy contract
 
-- Scheduler layouts `(EP, local experts, top-k)`: `(1, 4, 2)`, `(4, 4, 2)`,
-  `(16, 16, 8)`, and `(64, 4, 8)`. EP1/EP4 are small diagnostic settings.
+- Scheduler layouts `(EP, local experts, top-k)`: the toy layouts `(1, 4, 2)`,
+  `(4, 4, 2)`, `(16, 16, 8)` and `(64, 4, 8)` (EP1/EP4 are small diagnostic
+  settings), the 256-expert GLM-5.2 layouts `(4, 64, 8)`, `(8, 32, 8)` and
+  `(32, 8, 8)`, and the 288-expert GLM-5.3-Flash layouts `(8, 36, 8)` and
+  `(32, 9, 8)`.
 - BF16 inputs, expert weights, outputs and weight gradients; FP32 positive
   router scores; contiguous int64 expert IDs. Each token selects distinct,
   valid expert IDs. Scores are already normalized/scaled by the caller.
