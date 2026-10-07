@@ -15,13 +15,15 @@ limitations under the License.
 
 Behavioural tests of the Cake all-gather matmul backend that need no GPU:
 route-table coverage, launch geometry, operand classification, input
-validation and the public dispatch. The multi-GPU numerical test lives in
-``test_all_gather_matmul_cake_e2e.py``.
+validation, the symmetric-memory rendezvous guard and the public dispatch. The
+multi-GPU numerical test lives in ``test_all_gather_matmul_cake_e2e.py``.
 """
 
 from __future__ import annotations
 
+import gc
 import importlib
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -740,3 +742,270 @@ def test_sequence_failure_poisons_the_launch_state(monkeypatch):
     with pytest.raises(RuntimeError, match="boom"):
         backend._launch(state, workspace, call, _Recording(), "w_source", "out")
     assert state.poisoned is True
+
+
+class _FakeHandle:
+    """Symmetric-memory handle stand-in: topology, ``buffer_size`` and CPU peer buffers."""
+
+    def __init__(self, *, rank, world_size, buffer_size):
+        self.rank = rank
+        self.world_size = world_size
+        self.buffer_size = buffer_size
+
+    def get_buffer(self, peer, shape, dtype, offset):
+        return torch.empty(shape, dtype=dtype)
+
+
+def _patch_symmetric_memory(monkeypatch, handles):
+    """``symm_mem.empty`` hands out CPU tensors; ``rendezvous`` returns the scripted handles in order."""
+
+    allocated = []
+
+    def empty(*shape, dtype, device):
+        tensor = torch.empty(*shape, dtype=dtype)
+        allocated.append(weakref.ref(tensor))
+        return tensor
+
+    def rendezvous(tensor, group):
+        assert group == "g"
+        return handles.pop(0)
+
+    monkeypatch.setattr(backend.symm_mem, "empty", empty)
+    monkeypatch.setattr(backend.symm_mem, "rendezvous", rendezvous)
+    return allocated
+
+
+def _guard_call(rank=1, world_size=2):
+    return backend._Call(
+        0, rank, world_size, "g", "bfloat16", "sm_100a", 128, 2048, "n_major"
+    )
+
+
+def _allocate_words(words):
+    return lambda: backend.symm_mem.empty(words, dtype=torch.uint32, device=0)
+
+
+def test_rendezvous_reallocates_past_a_stale_handle_and_releases_the_parked_allocation(
+    monkeypatch,
+):
+    """A handle smaller than its tensor is torch's cached handle of a freed allocation (pre-pytorch#192579)."""
+
+    words = 64
+    stale = _FakeHandle(rank=1, world_size=2, buffer_size=4 * words - 4)
+    fresh = _FakeHandle(rank=1, world_size=2, buffer_size=4 * words)
+    allocated = _patch_symmetric_memory(monkeypatch, [stale, fresh])
+    votes = []
+    monkeypatch.setattr(
+        backend, "_group_max", lambda mask, call, group: votes.append(mask) or mask
+    )
+    monkeypatch.setitem(backend._RENDEZVOUS_STATS, "stale_retries", 0)
+    with pytest.warns(RuntimeWarning, match="pytorch#192579"):
+        [(tensor, handle)] = backend._rendezvous(
+            _guard_call(), "group", [("barrier flag", _allocate_words(words))]
+        )
+    assert handle is fresh and tensor.numel() == words
+    assert votes == [1, 0]
+    assert backend._RENDEZVOUS_STATS["stale_retries"] == 1
+    gc.collect()
+    # The parked (stale) allocation is released once the loop ends; the returned one lives on.
+    assert allocated[0]() is None
+    assert allocated[1]() is tensor
+
+
+def test_rendezvous_votes_once_per_round_and_retries_only_the_stale_allocations(
+    monkeypatch,
+):
+    """Flags and scratch of one growth round share one all-reduce; only the stale one is re-allocated."""
+
+    words, scratch_words = 32, 64
+    flags_ok = _FakeHandle(rank=1, world_size=2, buffer_size=4 * words)
+    scratch_stale = _FakeHandle(rank=1, world_size=2, buffer_size=4 * scratch_words - 4)
+    scratch_ok = _FakeHandle(rank=1, world_size=2, buffer_size=4 * scratch_words)
+    allocated = _patch_symmetric_memory(
+        monkeypatch, [flags_ok, scratch_stale, scratch_ok]
+    )
+    votes = []
+    monkeypatch.setattr(
+        backend, "_group_max", lambda mask, call, group: votes.append(mask) or mask
+    )
+    monkeypatch.setitem(backend._RENDEZVOUS_STATS, "stale_retries", 0)
+    with pytest.warns(RuntimeWarning, match="scratch"):
+        (flags, flag_handle), (scratch, scratch_handle) = backend._rendezvous(
+            _guard_call(),
+            "group",
+            [
+                ("barrier flag", _allocate_words(words)),
+                ("scratch", _allocate_words(scratch_words)),
+            ],
+        )
+    # One vote per round (a bitmask over the round's allocations), not one per allocation.
+    assert votes == [0b10, 0]
+    assert flag_handle is flags_ok and scratch_handle is scratch_ok
+    assert flags.numel() == words and scratch.numel() == scratch_words
+    assert len(allocated) == 3 and backend._RENDEZVOUS_STATS["stale_retries"] == 1
+    gc.collect()
+    assert allocated[1]() is None
+    assert allocated[0]() is flags and allocated[2]() is scratch
+
+
+def test_rendezvous_follows_a_peer_stale_vote_so_every_rank_reallocates(monkeypatch):
+    words = 64
+    first = _FakeHandle(rank=0, world_size=2, buffer_size=4 * words)
+    second = _FakeHandle(rank=0, world_size=2, buffer_size=4 * words)
+    allocated = _patch_symmetric_memory(monkeypatch, [first, second])
+    peer_votes = iter([1, 0])
+    local_masks = []
+    monkeypatch.setattr(
+        backend,
+        "_group_max",
+        lambda mask, call, group: local_masks.append(mask) or next(peer_votes),
+    )
+    monkeypatch.setitem(backend._RENDEZVOUS_STATS, "stale_retries", 3)
+    [(tensor, handle)] = backend._rendezvous(
+        _guard_call(rank=0), "group", [("scratch", _allocate_words(words))]
+    )
+    # This rank's handles were fine; the peer's stale vote still made it re-allocate.
+    assert local_masks == [0, 0]
+    assert handle is second and len(allocated) == 2
+    assert backend._RENDEZVOUS_STATS["stale_retries"] == 4
+    gc.collect()
+    assert allocated[0]() is None and allocated[1]() is tensor
+
+
+def test_rendezvous_gives_up_after_the_bounded_attempts_with_a_named_error(monkeypatch):
+    words = 64
+    handles = [
+        _FakeHandle(rank=1, world_size=2, buffer_size=4)
+        for _ in range(backend._RENDEZVOUS_ATTEMPTS)
+    ]
+    allocated = _patch_symmetric_memory(monkeypatch, handles)
+    monkeypatch.setattr(backend, "_group_max", lambda mask, call, group: mask)
+    monkeypatch.setitem(backend._RENDEZVOUS_STATS, "stale_retries", 1)
+    with pytest.raises(backend.StaleSymmetricHandleError, match="max_rows"):
+        backend._rendezvous(
+            _guard_call(), "group", [("scratch", _allocate_words(words))]
+        )
+    assert issubclass(backend.StaleSymmetricHandleError, RuntimeError)
+    assert len(allocated) == backend._RENDEZVOUS_ATTEMPTS and not handles
+    gc.collect()
+    assert all(ref() is None for ref in allocated)
+
+
+def test_rendezvous_rejects_a_topology_mismatch_before_voting(monkeypatch):
+    _patch_symmetric_memory(
+        monkeypatch, [_FakeHandle(rank=0, world_size=4, buffer_size=4 * 64)]
+    )
+    monkeypatch.setattr(
+        backend,
+        "_group_max",
+        lambda mask, call, group: pytest.fail("no vote on a topology mismatch"),
+    )
+    with pytest.raises(RuntimeError, match="topology"):
+        backend._rendezvous(_guard_call(), "group", [("scratch", _allocate_words(64))])
+
+
+def test_publish_flags_publishes_every_peer_pointer_of_the_cleared_pad():
+    call = _guard_call(rank=1, world_size=2)
+    words = backend.loader.barrier_flag_words(2)
+    fresh = _FakeHandle(rank=1, world_size=2, buffer_size=4 * words)
+    flags = torch.zeros(words, dtype=torch.uint32)
+    state = backend._LaunchState(rank=1, world_size=2)
+    backend._publish_flags(state, call, flags, fresh)
+    assert state.flag_handle is fresh and state.flags is flags
+    assert len(state.flag_peers) == 2
+
+
+def test_rendezvous_clears_fresh_allocations_before_the_single_vote(monkeypatch):
+    """The round zeroes the local pads, synchronizes and votes: the vote is also the post-allocation barrier."""
+
+    words = 64
+    fresh = _FakeHandle(rank=1, world_size=2, buffer_size=4 * words)
+    _patch_symmetric_memory(monkeypatch, [fresh])
+    order = []
+    monkeypatch.setattr(
+        backend, "_group_max", lambda mask, call, group: order.append("vote") or mask
+    )
+    monkeypatch.setattr(
+        backend.torch.cuda,
+        "current_stream",
+        lambda index: type(
+            "S", (), {"synchronize": lambda self: order.append("sync")}
+        )(),
+    )
+    [(tensor, handle)] = backend._rendezvous(
+        _guard_call(),
+        "group",
+        [("barrier flag", _allocate_words(words))],
+        clear=lambda index, tensor, handle: order.append(("clear", index))
+        or tensor.zero_(),
+    )
+    assert order == [("clear", 0), "sync", "vote"] and not tensor.any()
+
+
+class _SyncStream:
+    def __init__(self):
+        self.synchronized = 0
+
+    def synchronize(self):
+        self.synchronized += 1
+
+
+def _prepare_fixture(monkeypatch, name):
+    _patch_distributed(monkeypatch, world_size=2, rank=0)
+    stream = _SyncStream()
+    monkeypatch.setattr(backend.torch.cuda, "current_stream", lambda index: stream)
+    monkeypatch.setattr(backend.dist, "barrier", lambda group: None)
+    monkeypatch.setattr(backend.loader, "load", lambda *a: object())
+    group = _fake_group(2, 0, name=name)
+    call = backend._Call(0, 0, 2, name, "bfloat16", "sm_100a", 512, 2048, "n_major")
+    return call, group, stream
+
+
+def test_prepare_session_rendezvous_plan_covers_flags_and_scratch_in_one_round(
+    monkeypatch,
+):
+    call, group, stream = _prepare_fixture(monkeypatch, "one_round")
+    plans = []
+
+    def rendezvous(call, group, plan, *, clear):
+        plans.append([what for what, _ in plan])
+        flags = torch.full((4,), 7, dtype=torch.uint32)
+        clear(0, flags, None)
+        assert not flags.any()  # the barrier-flag pad is cleared before the vote
+        raise backend.StaleSymmetricHandleError("stop here")
+
+    monkeypatch.setattr(backend, "_rendezvous", rendezvous)
+    with pytest.raises(backend.StaleSymmetricHandleError):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=512)
+    # First prepare of a group: barrier flags and the scratch growth share one rendezvous round.
+    assert plans == [["barrier flag", "scratch"]]
+
+
+def test_prepare_session_keeps_the_state_usable_after_a_rank_uniform_stale_exhaustion(
+    monkeypatch,
+):
+    call, group, stream = _prepare_fixture(monkeypatch, "stale_exhaustion")
+
+    def exhausted(call, group, plan, *, clear):
+        raise backend.StaleSymmetricHandleError("stale")
+
+    monkeypatch.setattr(backend, "_rendezvous", exhausted)
+    with pytest.raises(backend.StaleSymmetricHandleError):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=512)
+    state = backend._launch_state(call, group)
+    assert state.poisoned is False and stream.synchronized == 1
+
+
+def test_prepare_session_poisons_the_state_when_a_growth_collective_fails(monkeypatch):
+    call, group, stream = _prepare_fixture(monkeypatch, "growth_failure")
+
+    def failing(call, group, plan, *, clear):
+        raise RuntimeError("nvshmem_malloc failed")
+
+    monkeypatch.setattr(backend, "_rendezvous", failing)
+    with pytest.raises(RuntimeError, match="nvshmem_malloc"):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=512)
+    state = backend._launch_state(call, group)
+    assert state.poisoned is True
+    with pytest.raises(RuntimeError, match="poisoned"):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=512)
