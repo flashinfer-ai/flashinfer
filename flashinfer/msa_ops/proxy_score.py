@@ -436,6 +436,10 @@ def msa_proxy_score(
     if sm90:
         if not paged:
             raise NotImplementedError("SM90 proxy-score requires the paged KV layout")
+        if not causal:
+            # Every SM90 proxy schedule masks causally with no switch; the flag
+            # used to be ignored, which silently returned causal scores.
+            raise NotImplementedError("SM90 proxy-score is causal only")
         from ._sm90_dispatch import proxy_score_sm90
 
         proxy_score_sm90(

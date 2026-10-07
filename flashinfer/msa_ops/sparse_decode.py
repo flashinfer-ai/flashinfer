@@ -411,6 +411,20 @@ def msa_sparse_decode_attention(
                 "SM90 msa_sparse_decode_attention requires an fp8 e4m3 KV cache, "
                 f"got k={k.dtype} v={v.dtype}"
             )
+        if not causal:
+            # The SM90 decode program is right-aligned causal with no mask
+            # switch; ignoring the flag would return plausible, wrong numbers.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention is right-aligned causal; "
+                "causal=False is not supported"
+            )
+        if q_offset is not None:
+            # Query i of a sequence sits at seqused_k - seqlen_q + i; the program
+            # takes no offset input, so an explicit q_offset cannot be honoured.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention derives query positions as "
+                "seqused_k - seqlen_q + i; q_offset is not supported"
+            )
         from ._sm90_dispatch import sparse_decode_sm90
 
         if out is None:

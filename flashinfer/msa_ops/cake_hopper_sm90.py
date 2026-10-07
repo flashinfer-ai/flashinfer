@@ -16,7 +16,7 @@ limitations under the License.
 Compute-capability 9.0 (Hopper) Cake backend for MiniMax Sparse Attention.
 
 The Cake-generated programs behind this module are registered in
-``flashinfer.jit.hopper_msa``: ``ROUTES`` maps a logical route
+``flashinfer.jit.cake_hopper_msa``: ``ROUTES`` maps a logical route
 (``<route key>:<stage>``) to the program that serves it and ``MODULES``
 carries each program's physical argument order.  This module owns the public
 semantics only: argument validation, the host-side plan that selects the
@@ -50,7 +50,7 @@ from typing import Any, Optional
 import torch
 import tvm_ffi
 
-from ..jit.hopper_msa import MODULES, load_hopper_msa_module, route_program
+from ..jit.cake_hopper_msa import MODULES, load_hopper_msa_module, route_program
 from ..utils import get_compute_capability, get_device_sm_count
 
 _BLOCK_SIZE = 128
@@ -72,8 +72,10 @@ _HINT_STREAM = "evict_first"
 _HINT_DEFAULT = "none"
 # Proxy-score decode program coordinates.
 _PROXY_HEADS = (1, 2, 4)
-_PROXY_QLENS = (1, 2, 4)
-# Both programs take a trace carrier they never write (tracing is compiled out).
+_PROXY_QLENS = (1, 2, 3, 4)
+# Both program families declare a trace carrier parameter (``TRACE=0`` compiles the
+# stamp stores out, the parameter stays in the kernel signature); one never-written
+# 12-word buffer per device satisfies it.
 _TRACE_WORDS = 12
 
 
@@ -319,7 +321,10 @@ def hopper_msa_sparse_decode_attention(
 
     ``k`` and ``v`` are the ``(num_pages, num_kv_heads, 128, 128)`` fp8 e4m3
     halves of the interleaved cache (the layout contract is checked by the
-    caller); the program reads them through their own strides.
+    caller); the program reads them through their own strides.  Query ``i``
+    of a sequence sits at position ``seqused_k - seqlen_q + i`` (right-aligned
+    causal); the program takes no query-offset input, so the public surface
+    rejects ``q_offset`` and ``causal=False`` instead of ignoring them.
     """
 
     total_q, num_q_heads, head_dim = (int(x) for x in q.shape)
@@ -420,17 +425,19 @@ def hopper_msa_sparse_decode_attention(
 
 
 def proxy_decode_route_available(
-    *, q_dtype: torch.dtype, num_q_heads: int, max_seqlen_q: int
+    *, q_dtype: torch.dtype, num_q_heads: int, num_kv_heads: int, max_seqlen_q: int
 ) -> bool:
     """Whether a Cake proxy-score program serves these host-known coordinates.
 
     The decode-regime programs exist for fp8 e4m3 and bf16 q / index cache,
-    ``Hq`` in {1, 2, 4} and ``max_seqlen_q`` in {1, 2, 4}; ``_sm90_dispatch``
-    keeps its other decode schedules for the remaining admitted coordinates.
+    one index (KV) head, ``Hq`` in {1, 2, 4} and ``max_seqlen_q`` in
+    {1, 2, 3, 4}; ``_sm90_dispatch`` keeps its other decode schedules for the
+    remaining admitted coordinates.
     """
 
     return (
         q_dtype in (torch.float8_e4m3fn, torch.bfloat16)
+        and int(num_kv_heads) == 1
         and int(num_q_heads) in _PROXY_HEADS
         and int(max_seqlen_q) in _PROXY_QLENS
     )
@@ -477,7 +484,10 @@ def hopper_msa_proxy_score_decode(
             "q and the index cache must be contiguous tensors of one dtype"
         )
     if not proxy_decode_route_available(
-        q_dtype=q.dtype, num_q_heads=num_q_heads, max_seqlen_q=max_seqlen_q
+        q_dtype=q.dtype,
+        num_q_heads=num_q_heads,
+        num_kv_heads=int(k.shape[1]),
+        max_seqlen_q=max_seqlen_q,
     ):
         raise NotImplementedError(
             f"no Cake SM90 proxy-score program for dtype {q.dtype}, Hq {num_q_heads}, max_seqlen_q {max_seqlen_q}"

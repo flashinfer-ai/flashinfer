@@ -35,8 +35,8 @@ _TARGET = "sm90a"
 MODULES: dict[str, dict[str, Any]] = {
     "cake_hopper_msa_003b5465e77b790a9114": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_003b5465e77b790a9114_kernel.cu",
-            "hopper_msa/cake_hopper_msa_003b5465e77b790a9114_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_003b5465e77b790a9114_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_003b5465e77b790a9114_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -80,8 +80,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_0462a19ac588e6c8bd63": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_0462a19ac588e6c8bd63_kernel.cu",
-            "hopper_msa/cake_hopper_msa_0462a19ac588e6c8bd63_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_0462a19ac588e6c8bd63_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_0462a19ac588e6c8bd63_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -117,8 +117,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_065a485700df577ebe10": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_065a485700df577ebe10_kernel.cu",
-            "hopper_msa/cake_hopper_msa_065a485700df577ebe10_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_065a485700df577ebe10_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_065a485700df577ebe10_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -154,8 +154,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_0952589e2b34ea760d55": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_0952589e2b34ea760d55_kernel.cu",
-            "hopper_msa/cake_hopper_msa_0952589e2b34ea760d55_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_0952589e2b34ea760d55_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_0952589e2b34ea760d55_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -191,8 +191,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_162af71cdd4537102d9b": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_162af71cdd4537102d9b_kernel.cu",
-            "hopper_msa/cake_hopper_msa_162af71cdd4537102d9b_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_162af71cdd4537102d9b_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_162af71cdd4537102d9b_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -236,8 +236,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_1e9797726a19fa488072": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_1e9797726a19fa488072_kernel.cu",
-            "hopper_msa/cake_hopper_msa_1e9797726a19fa488072_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_1e9797726a19fa488072_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_1e9797726a19fa488072_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -281,8 +281,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_1fd27e38633d6ea82673": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_1fd27e38633d6ea82673_kernel.cu",
-            "hopper_msa/cake_hopper_msa_1fd27e38633d6ea82673_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_1fd27e38633d6ea82673_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_1fd27e38633d6ea82673_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -326,8 +326,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_21873273fae8a3c615a2": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_21873273fae8a3c615a2_kernel.cu",
-            "hopper_msa/cake_hopper_msa_21873273fae8a3c615a2_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_21873273fae8a3c615a2_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_21873273fae8a3c615a2_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -371,8 +371,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_22ebc0f51af3d75f13dd": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_22ebc0f51af3d75f13dd_kernel.cu",
-            "hopper_msa/cake_hopper_msa_22ebc0f51af3d75f13dd_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_22ebc0f51af3d75f13dd_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_22ebc0f51af3d75f13dd_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -408,8 +408,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_26344b48428342e063aa": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_26344b48428342e063aa_kernel.cu",
-            "hopper_msa/cake_hopper_msa_26344b48428342e063aa_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_26344b48428342e063aa_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_26344b48428342e063aa_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -445,8 +445,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_26ff947d109d665e2c4d": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_26ff947d109d665e2c4d_kernel.cu",
-            "hopper_msa/cake_hopper_msa_26ff947d109d665e2c4d_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_26ff947d109d665e2c4d_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_26ff947d109d665e2c4d_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -482,8 +482,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_2bd172db346f7133b82c": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_2bd172db346f7133b82c_kernel.cu",
-            "hopper_msa/cake_hopper_msa_2bd172db346f7133b82c_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_2bd172db346f7133b82c_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_2bd172db346f7133b82c_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -527,8 +527,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_2e1c5ebe73754bda4155": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_2e1c5ebe73754bda4155_kernel.cu",
-            "hopper_msa/cake_hopper_msa_2e1c5ebe73754bda4155_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_2e1c5ebe73754bda4155_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_2e1c5ebe73754bda4155_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -572,8 +572,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_2fa3726f462d8c70ed4e": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_2fa3726f462d8c70ed4e_kernel.cu",
-            "hopper_msa/cake_hopper_msa_2fa3726f462d8c70ed4e_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_2fa3726f462d8c70ed4e_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_2fa3726f462d8c70ed4e_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -617,8 +617,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_34a2ca63ee1bd9b197e3": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_34a2ca63ee1bd9b197e3_kernel.cu",
-            "hopper_msa/cake_hopper_msa_34a2ca63ee1bd9b197e3_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_34a2ca63ee1bd9b197e3_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_34a2ca63ee1bd9b197e3_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -654,8 +654,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_35bc38a12cf2bbf0e86f": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_35bc38a12cf2bbf0e86f_kernel.cu",
-            "hopper_msa/cake_hopper_msa_35bc38a12cf2bbf0e86f_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_35bc38a12cf2bbf0e86f_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_35bc38a12cf2bbf0e86f_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -699,8 +699,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_43c3ad08016f1c2c561e": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_43c3ad08016f1c2c561e_kernel.cu",
-            "hopper_msa/cake_hopper_msa_43c3ad08016f1c2c561e_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_43c3ad08016f1c2c561e_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_43c3ad08016f1c2c561e_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -744,8 +744,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_4a357f5ea76dc72ceb44": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_4a357f5ea76dc72ceb44_kernel.cu",
-            "hopper_msa/cake_hopper_msa_4a357f5ea76dc72ceb44_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_4a357f5ea76dc72ceb44_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_4a357f5ea76dc72ceb44_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -781,8 +781,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_542942520ec68077d62e": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_542942520ec68077d62e_kernel.cu",
-            "hopper_msa/cake_hopper_msa_542942520ec68077d62e_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_542942520ec68077d62e_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_542942520ec68077d62e_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -826,8 +826,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_5deed3067b4b08970f90": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_5deed3067b4b08970f90_kernel.cu",
-            "hopper_msa/cake_hopper_msa_5deed3067b4b08970f90_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_5deed3067b4b08970f90_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_5deed3067b4b08970f90_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -863,8 +863,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_5eb31e4eaf76b78fed57": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_5eb31e4eaf76b78fed57_kernel.cu",
-            "hopper_msa/cake_hopper_msa_5eb31e4eaf76b78fed57_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_5eb31e4eaf76b78fed57_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_5eb31e4eaf76b78fed57_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -900,8 +900,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_6f8e57b5fc1555236457": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_6f8e57b5fc1555236457_kernel.cu",
-            "hopper_msa/cake_hopper_msa_6f8e57b5fc1555236457_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_6f8e57b5fc1555236457_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_6f8e57b5fc1555236457_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -945,8 +945,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_70a72c8695dfcc520faf": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_70a72c8695dfcc520faf_kernel.cu",
-            "hopper_msa/cake_hopper_msa_70a72c8695dfcc520faf_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_70a72c8695dfcc520faf_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_70a72c8695dfcc520faf_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -990,8 +990,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_7343e5b584e26ae2f7ac": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_7343e5b584e26ae2f7ac_kernel.cu",
-            "hopper_msa/cake_hopper_msa_7343e5b584e26ae2f7ac_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_7343e5b584e26ae2f7ac_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_7343e5b584e26ae2f7ac_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -1035,8 +1035,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_81f144a9f72d9671882d": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_81f144a9f72d9671882d_kernel.cu",
-            "hopper_msa/cake_hopper_msa_81f144a9f72d9671882d_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_81f144a9f72d9671882d_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_81f144a9f72d9671882d_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -1080,8 +1080,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_8877938a4daf6b5ee23f": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_8877938a4daf6b5ee23f_kernel.cu",
-            "hopper_msa/cake_hopper_msa_8877938a4daf6b5ee23f_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_8877938a4daf6b5ee23f_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_8877938a4daf6b5ee23f_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -1125,8 +1125,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_8976e9c16261809fa7c4": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_8976e9c16261809fa7c4_kernel.cu",
-            "hopper_msa/cake_hopper_msa_8976e9c16261809fa7c4_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_8976e9c16261809fa7c4_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_8976e9c16261809fa7c4_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -1162,8 +1162,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_9d46dd3b31f3a832a397": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_9d46dd3b31f3a832a397_kernel.cu",
-            "hopper_msa/cake_hopper_msa_9d46dd3b31f3a832a397_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_9d46dd3b31f3a832a397_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_9d46dd3b31f3a832a397_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -1199,8 +1199,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_9ff4175787ceb89dce8e": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_9ff4175787ceb89dce8e_kernel.cu",
-            "hopper_msa/cake_hopper_msa_9ff4175787ceb89dce8e_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_9ff4175787ceb89dce8e_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_9ff4175787ceb89dce8e_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -1244,8 +1244,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_ab4a6608645a52682c56": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_ab4a6608645a52682c56_kernel.cu",
-            "hopper_msa/cake_hopper_msa_ab4a6608645a52682c56_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_ab4a6608645a52682c56_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_ab4a6608645a52682c56_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -1289,8 +1289,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_bfa992f26b7bc653a8ce": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_bfa992f26b7bc653a8ce_kernel.cu",
-            "hopper_msa/cake_hopper_msa_bfa992f26b7bc653a8ce_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_bfa992f26b7bc653a8ce_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_bfa992f26b7bc653a8ce_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -1326,8 +1326,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_cd6d09a015115a110166": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_cd6d09a015115a110166_kernel.cu",
-            "hopper_msa/cake_hopper_msa_cd6d09a015115a110166_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_cd6d09a015115a110166_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_cd6d09a015115a110166_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -1371,8 +1371,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_d3fe04aefb6ffe2cdc14": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_d3fe04aefb6ffe2cdc14_kernel.cu",
-            "hopper_msa/cake_hopper_msa_d3fe04aefb6ffe2cdc14_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_d3fe04aefb6ffe2cdc14_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_d3fe04aefb6ffe2cdc14_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -1408,8 +1408,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_d5130641114f60c91b14": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_d5130641114f60c91b14_kernel.cu",
-            "hopper_msa/cake_hopper_msa_d5130641114f60c91b14_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_d5130641114f60c91b14_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_d5130641114f60c91b14_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -1453,8 +1453,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_d63df15e4090199b514c": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_d63df15e4090199b514c_kernel.cu",
-            "hopper_msa/cake_hopper_msa_d63df15e4090199b514c_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_d63df15e4090199b514c_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_d63df15e4090199b514c_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -1498,8 +1498,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_ddfc82015c1436f34552": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_ddfc82015c1436f34552_kernel.cu",
-            "hopper_msa/cake_hopper_msa_ddfc82015c1436f34552_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_ddfc82015c1436f34552_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_ddfc82015c1436f34552_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -1535,8 +1535,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_df30c37becd6d9edd3e0": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_df30c37becd6d9edd3e0_kernel.cu",
-            "hopper_msa/cake_hopper_msa_df30c37becd6d9edd3e0_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_df30c37becd6d9edd3e0_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_df30c37becd6d9edd3e0_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -1572,8 +1572,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_f0894a48315c8a3e9d8c": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_f0894a48315c8a3e9d8c_kernel.cu",
-            "hopper_msa/cake_hopper_msa_f0894a48315c8a3e9d8c_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_f0894a48315c8a3e9d8c_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_f0894a48315c8a3e9d8c_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -1609,8 +1609,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_f4b5b279e07cb845206c": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_f4b5b279e07cb845206c_kernel.cu",
-            "hopper_msa/cake_hopper_msa_f4b5b279e07cb845206c_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_f4b5b279e07cb845206c_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_f4b5b279e07cb845206c_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -1646,8 +1646,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_hopper_msa_fb72a8bf9b9aff82b63f": {
         "sources": [
-            "hopper_msa/cake_hopper_msa_fb72a8bf9b9aff82b63f_kernel.cu",
-            "hopper_msa/cake_hopper_msa_fb72a8bf9b9aff82b63f_binding.cu",
+            "cake_hopper_msa/cake_hopper_msa_fb72a8bf9b9aff82b63f_kernel.cu",
+            "cake_hopper_msa/cake_hopper_msa_fb72a8bf9b9aff82b63f_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -1742,10 +1742,10 @@ def _csrc_dir() -> Path:
         jit_env.FLASHINFER_CSRC_DIR,
         Path(__file__).resolve().parents[2] / "csrc",
     ):
-        if (root / "hopper_msa").exists():
+        if (root / "cake_hopper_msa").exists():
             return root
     raise FileNotFoundError(
-        "Hopper MSA CUDA sources were not found under csrc/hopper_msa"
+        "Hopper MSA CUDA sources were not found under csrc/cake_hopper_msa"
     )
 
 
@@ -1768,7 +1768,7 @@ def get_hopper_msa_uri(name: HopperMSAVariant) -> str:
     record = MODULES.get(name)
     if record is None or _ARCH not in record["arches"]:
         raise ValueError(f"unsupported Hopper MSA program: {name}")
-    return f"hopper_msa_{name}_{_TARGET}"
+    return f"{name}_{_TARGET}"
 
 
 @functools.cache
@@ -1780,7 +1780,7 @@ def gen_hopper_msa_module(name: HopperMSAVariant) -> JitSpec:
         name=uri,
         sources=[csrc / path for path in record["sources"]],
         extra_cuda_cflags=[*sm90a_nvcc_flags, *record["compile_flags"]],
-        extra_include_paths=[csrc / "hopper_msa", csrc, _include_dir()],
+        extra_include_paths=[csrc / "cake_hopper_msa", csrc, _include_dir()],
     )
 
 
