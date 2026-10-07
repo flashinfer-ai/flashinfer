@@ -190,6 +190,7 @@ with contextlib.suppress(ImportError):
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gdn2_prefill import chunk_gated_delta_rule2 as chunk_gated_delta_rule2
+from .gdp_decode import gated_delta_product_mtp as gated_delta_product_mtp
 from .gdp_prefill import chunk_gated_delta_product as chunk_gated_delta_product
 
 
