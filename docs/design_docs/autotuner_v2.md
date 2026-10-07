@@ -129,9 +129,9 @@ maintaining a migration path for data that is, by construction, an optimization.
   tempfile + `os.replace` in the same directory (same-filesystem rename, atomic). There is no
   read/merge/write cycle and no exit-time save, so a crashed or killed tuning run keeps every
   winner it had already measured.
-- **No locks.** Concurrent writers do redundant work and the last valid write wins. This is what
-  makes SGLang's all-ranks-tune-simultaneously pattern safe with zero framework code. It is a
-  deliberate divergence from FlashInfer's JIT kernel cache, which takes a cross-process
+- **No locks.** Concurrent writers do redundant work and the last valid write wins. Atomic
+  publication protects individual files, not agreement on cache hits. It is a deliberate
+  divergence from FlashInfer's JIT kernel cache, which takes a cross-process
   `FileLock` for single-flight: that is correct there and wrong here. Compiling the same kernel
   twice wastes minutes of CPU, whereas ranks tune *inside collectives*, so a cross-rank lock
   would either serialize warmup or deadlock it. Redundant measurement is the cheaper failure.
@@ -215,13 +215,20 @@ indexing into one.
 
 Persistence and orchestration stay separate responsibilities.
 
-- **Shared filesystem**: solved with zero framework code. Per-entry atomic publish makes
-  all-ranks-tune-simultaneously safe; per-rank cache files and framework hash directories become
-  unnecessary.
+- **Shared filesystem**: per-entry publication prevents torn entries. It does not provide a
+  snapshot across ranks: concurrent publishers or an interrupted run can produce mixed hits.
+- **Profiling participation**: with `set_autotune_process_group`, each profile first reduces
+  its hit flag. Only an all-hit group skips profiling; any miss makes all ranks discard that
+  profile's old runner entries and re-profile. Invalidation covers memory and persistence so
+  a different runner can win without an older entry taking precedence after reload. These
+  collectives run only during tuning, outside CUDA Graph capture. The framework must still
+  ensure matching op/profile/candidate order and skip lists across the group.
 - **In-session rank consistency**: ranks may still hold divergent locally-measured winners until
   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process
   winners, bulk re-hydrates the attached store's final published state into memory, and thereby
-  makes every rank serve byte-identical tactics warm (no lazy per-key disk reads afterwards).
+  makes shared keys use the store's final tactics (no lazy per-key disk reads afterwards).
+  Rank-specific keys remain distinct, and independent deployments must not keep publishing
+  into the store while another group finalizes if identical snapshots are required.
   Composes with [#3187](https://github.com/flashinfer-ai/flashinfer/pull/3187), which fixes the
   in-session window by all-reducing measured times before the argmin.
 - **No shared filesystem**: a small opaque boundary — `export()` produces bytes the framework
