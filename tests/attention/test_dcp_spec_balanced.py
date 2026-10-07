@@ -1144,6 +1144,13 @@ def test_balanced_route_constants_match_the_shipped_manifest() -> None:
             )
         else:
             assert "long_tile_blocks_by_arch" not in band["band"]
+        if kind == "bf16_p16":
+            assert band["band"]["whole_tile_one_wave_n_rows"] == {
+                arch: list(n_rows)
+                for arch, n_rows in DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS.items()
+            }
+        else:
+            assert "whole_tile_one_wave_n_rows" not in band["band"]
         if kind == "fp8_p64_d256":
             assert (
                 band["band"]["one_wave_min_q_len"]
@@ -1435,27 +1442,31 @@ def test_bf16_whole_tile_one_wave_rows_route_balanced(arch) -> None:
     architecture lists its packed-row instance (32 rows on both, 64 rows on sm_103a only); the launch's block-table
     width decides, and rows outside the bound keep the static route."""
 
-    instances = DCP_BALANCED_BF16_WHOLE_TILE_N_ROWS[arch]
-    for prefix, q_len in ((4096, 4), (4096, 8), (6144, 4)):
-        band = _band(
-            "bf16_p16",
-            batch=1,
-            q_len=q_len,
-            prefix=prefix,
-            cp_world=4,
-            cp_rank=0,
-            arch=arch,
-        )
-        expected = (
-            ("balanced", "whole_tile_one_wave")
-            if dcp_balanced_n_rows("bf16_p16", q_len) in instances
-            else ("static", "one_wave")
-        )
-        assert (band.waves, band.route, band.reason) == (1, *expected), (
-            prefix,
-            q_len,
-            band,
-        )
+    # the measured rule, stated independently of the implementation: q_len 3-4 (the 32-row instance) route balanced
+    # on both architectures, q_len 5-8 (the 64-row instance) on sm_103a only
+    for prefix in (4096, 6144):
+        for q_len in range(
+            DCP_BALANCED_BF16_MIN_Q_LEN, DCP_BALANCED_BF16_MAX_Q_LEN + 1
+        ):
+            band = _band(
+                "bf16_p16",
+                batch=1,
+                q_len=q_len,
+                prefix=prefix,
+                cp_world=4,
+                cp_rank=0,
+                arch=arch,
+            )
+            expected = (
+                ("balanced", "whole_tile_one_wave")
+                if q_len <= 4 or arch == "sm_103a"
+                else ("static", "one_wave")
+            )
+            assert (band.waves, band.route, band.reason) == (1, *expected), (
+                prefix,
+                q_len,
+                band,
+            )
     for prefix, batch in ((7168, 1), (8192, 1), (4096, 2), (4096, 4)):
         band = _band(
             "bf16_p16",
@@ -1958,6 +1969,9 @@ class _GpuCase:
 _GPU_CASES = {
     "bf16_b8_s4096_q4_cp4_r0_n32": ("bf16_p16", [4096] * 8, 4, 4, 0),
     "bf16_b1_s16384_q8_cp4_r0_n64_longtile": ("bf16_p16", [16384], 8, 4, 0),
+    # one request of 65 pages under one static wave: the whole-tile static program (its early-issue swapped form on
+    # sm_100a), routed by the band's whole_tile_one_wave clause on both architectures
+    "bf16_b1_s4096_q4_cp4_r0_n32_whole_tile": ("bf16_p16", [4096], 4, 4, 0),
     "bf16_b4_ragged_q4_cp4_r1_empty_rows": (
         "bf16_p16",
         [5000, 20000, 0, 12345],
@@ -2032,6 +2046,77 @@ def test_gpu_balanced_route_matches_static_route_and_reference(
     problem.check(expected_o, expected_lse)
     torch.testing.assert_close(problem.out, balanced_o, atol=atol, rtol=rtol)
     torch.testing.assert_close(problem.lse, balanced_lse, atol=atol, rtol=rtol)
+
+
+# (kind, prefixes, q_len, cp_world, cp_rank): single requests inside the whole-tile bound whose packed-row instance
+# the band routes balanced on sm_103a only (the 64-row instance) or on both (the 32-row instance at 97 pages); the
+# balanced route is forced so the whole-tile programs run on every architecture.
+_GPU_WHOLE_TILE_CASES = {
+    "bf16_b1_s4096_q8_cp4_r0_n64_whole_tile": ("bf16_p16", [4096], 8, 4, 0),
+    "bf16_b1_s6144_q4_cp4_r0_n32_whole_tile_97_pages": ("bf16_p16", [6144], 4, 4, 0),
+}
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "case", list(_GPU_WHOLE_TILE_CASES), ids=list(_GPU_WHOLE_TILE_CASES)
+)
+def test_gpu_whole_tile_programs_match_static_route_and_reference(
+    case, monkeypatch
+) -> None:
+    _require_blackwell_dcp()
+    kind, prefixes, q_len, cp_world, cp_rank = _GPU_WHOLE_TILE_CASES[case]
+    problem = _GpuCase(
+        kind,
+        prefixes=prefixes,
+        q_len=q_len,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        seed=685_400 + len(case),
+    )
+    arch = _device_arch()
+    band = problem.band()
+    routed = q_len <= 4 or arch == "sm_103a"
+    assert (band.waves, band.route, band.reason) == (
+        (1, "balanced", "whole_tile_one_wave") if routed else (1, "static", "one_wave")
+    ), band
+    expected_o, expected_lse = problem.reference()
+
+    problem.run("static")
+    torch.cuda.synchronize()
+    problem.check(expected_o, expected_lse)
+    static_o, static_lse = problem.out.clone(), problem.lse.clone()
+
+    problem.out.fill_(float("nan"))
+    problem.lse.fill_(float("nan"))
+    problem.run("balanced")
+    torch.cuda.synchronize()
+    problem.check(expected_o, expected_lse)
+    balanced_o, balanced_lse = problem.out.clone(), problem.lse.clone()
+    atol, rtol = _KIND_TOLERANCE[kind]
+    torch.testing.assert_close(balanced_o, static_o, atol=2 * atol, rtol=2 * rtol)
+    torch.testing.assert_close(balanced_lse, static_lse, atol=2 * atol, rtol=2 * rtol)
+
+    # The public entry point follows the band: the balanced launcher runs exactly when the band routes the row.
+    launched = []
+    real_launch = cake_dcp._run_dcp_spec_balanced
+
+    def observed_launch(**kwargs):
+        launched.append(kwargs["kind"])
+        return real_launch(**kwargs)
+
+    monkeypatch.setattr(cake_dcp, "_run_dcp_spec_balanced", observed_launch)
+    problem.out.fill_(float("nan"))
+    problem.lse.fill_(float("nan"))
+    problem.run_public()
+    torch.cuda.synchronize()
+    assert launched == ([kind] if routed else [])
+    problem.check(expected_o, expected_lse)
+    reference_o, reference_lse = (
+        (balanced_o, balanced_lse) if routed else (static_o, static_lse)
+    )
+    torch.testing.assert_close(problem.out, reference_o, atol=atol, rtol=rtol)
+    torch.testing.assert_close(problem.lse, reference_lse, atol=atol, rtol=rtol)
 
 
 _GRAPH_CASES = {
