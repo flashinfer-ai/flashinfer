@@ -50,6 +50,20 @@ epochs (or launches the SM push kernel on the caller's stream) and launches
 the main kernel with cached tensor maps. No device-property query, no host
 synchronization, no implicit copy of the inputs and no per-call torch stream
 or copy operator.
+
+Symmetric memory comes from ``torch.distributed._symmetric_memory`` under the
+backend the process already selected: the default ``CUDA`` backend or
+``NVSHMEM``. Both map every peer's buffers into the local address space, which
+is all the device programs need; the module never selects a backend itself.
+An eagerly prepared session is CUDA-graph capturable: a captured call performs
+no allocation, collective or JIT build, publishes the readiness sentinel
+``0xFFFFFFFF`` instead of the monotonic host epoch and clears its readiness
+words after the main kernel with a stream memset (no extra kernel), so replays
+interleave with eager calls on the same group. A captured launch pins the
+group's scratch generation: the workspace no longer grows afterwards (a larger
+call raises a named error; prepare with ``max_rows`` covering every call
+before capturing). Both routes (copy-engine pushes
+and the PDL-chained SM push kernel) capture the same way.
 """
 
 from __future__ import annotations
@@ -65,6 +79,13 @@ import torch.distributed._symmetric_memory as symm_mem
 import tvm_ffi
 
 from flashinfer.jit import cake_all_gather_matmul as loader
+
+# Torch symmetric-memory backends whose rendezvous handles expose the peer
+# mappings the device programs consume (``get_buffer`` / ``get_remote_tensor``
+# / ``get_signal_pad``): the default CUDA backend and NVSHMEM.
+SUPPORTED_SYMMETRIC_MEMORY_BACKENDS: frozenset[str] = frozenset({"CUDA", "NVSHMEM"})
+# Readiness word published by a captured call; eager epochs stay below it.
+_CAPTURE_READY_TARGET = 2**32 - 1
 
 
 @dataclass
@@ -92,9 +113,17 @@ class _Workspace:
     """Per (device, process group, dtype) symmetric scratch with ``pitch`` rows per peer.
 
     ``pitch`` is a multiple of 128 and grows (collectively) when a call needs
-    more padded rows than the current capacity. Per-call signal views and the
-    SM-push tables are resolved lazily from the handle (host-side address
-    arithmetic, no collective).
+    more padded rows than the current capacity. The peer address tables of the
+    copy-engine route are built when the workspace grows (host-side address
+    arithmetic, no collective); the SM push route's device tables are resolved
+    at prepare time (``materialize``) so a captured call allocates nothing.
+
+    A graph captured on the workspace bakes the addresses of the current
+    generation (this rank's scratch and readiness pad, every peer's scratch
+    slice and pad, the SM push tables) on every rank, so once a call was
+    captured (``captured``) the workspace no longer grows: a larger call raises
+    a named error instead of invalidating the captured replays. Prepare with
+    ``max_rows`` covering every call before capturing.
     """
 
     dtype: torch.dtype
@@ -119,6 +148,20 @@ class _Workspace:
     # Loaded host-sequence module per weight layout.
     sequences: dict[str, Any] = field(default_factory=dict)
     push_buffers: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    # Set by the first captured launch; growth is refused from then on because
+    # the captured graphs address this generation.
+    captured: bool = False
+
+    def materialize(self, *, sm_push: bool) -> None:
+        """Resolve the SM push route's device tables now; a captured call allocates nothing.
+
+        The copy-engine route's peer tables are address tuples built when the
+        workspace grows, so only the SM push route's tables are left to resolve,
+        and only when that route is reachable for the prepared group.
+        """
+
+        if sm_push:
+            self.push_tables()
 
     def push_tables(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Device tables of the SM push kernel: this rank's payload slot in every
@@ -185,6 +228,23 @@ class _Call:
     b_layout: str
 
 
+def symmetric_memory_backend(device: torch.device) -> str:
+    """Upper-case name of torch's symmetric-memory backend for ``device`` (empty when none)."""
+
+    name = symm_mem.get_backend(device)
+    return "" if name is None else str(name).upper()
+
+
+def supports_symmetric_memory_backend(device: torch.device) -> bool:
+    """Whether the process's symmetric-memory backend for ``device`` can serve this backend.
+
+    Torch fixes the backend at its first use and this module never changes it,
+    so an engine checks here before it selects the route.
+    """
+
+    return symmetric_memory_backend(device) in SUPPORTED_SYMMETRIC_MEMORY_BACKENDS
+
+
 def _validate(inp: torch.Tensor, w: torch.Tensor, group: dist.ProcessGroup) -> _Call:
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("an initialized NCCL process group is required")
@@ -225,16 +285,17 @@ def _validate(inp: torch.Tensor, w: torch.Tensor, group: dist.ProcessGroup) -> _
         )
     if not 0 <= rank < world_size:
         raise RuntimeError("process-group rank is outside its world size")
-    if str(symm_mem.get_backend(inp.device)).upper() != "NVSHMEM":
+    backend_name = symmetric_memory_backend(inp.device)
+    if backend_name not in SUPPORTED_SYMMETRIC_MEMORY_BACKENDS:
         raise ValueError(
-            "the Cake backend requires the NVSHMEM symmetric-memory backend"
+            "the Cake backend requires one of the torch symmetric-memory backends "
+            f"{sorted(SUPPORTED_SYMMETRIC_MEMORY_BACKENDS)}, got {backend_name!r}"
         )
     arch = loader.device_facts(device_index).arch
     if arch is None:
         capability = loader.device_facts(device_index).capability
         raise ValueError(
-            "the Cake all-gather matmul backend requires SM100 or SM103, got "
-            f"SM{capability[0]}{capability[1]}"
+            f"the Cake all-gather matmul backend requires SM100 or SM103, got SM{capability[0]}{capability[1]}"
         )
     return _Call(
         device_index,
@@ -444,9 +505,12 @@ def _publish_scratch(
 
     The previous scratch stays allocated until the new one is published here,
     so the new allocation cannot land on its address; the rendezvous guard
-    covers addresses freed by other symmetric-memory users.
+    covers addresses freed by other symmetric-memory users. The SM push tables
+    are resolved again when they were materialized before the growth, so a
+    launcher prepared earlier keeps serving both routes on the new generation.
     """
 
+    had_push_tables = workspace.push_buffers is not None
     max_chunks = loader.chunk_plan(pitch)[2]
     signal_pad = handle.get_signal_pad(
         call.rank, (call.world_size * max_chunks,), torch.uint32, 0
@@ -478,6 +542,8 @@ def _publish_scratch(
     )
     workspace.peer_signal_ptrs = tvm_ffi.Shape(peer_signal_ptrs)
     workspace.push_buffers = None
+    if had_push_tables:
+        workspace.push_tables()
 
 
 def _prepare_session(
@@ -494,6 +560,20 @@ def _prepare_session(
             )
         workspace = _workspace(call, group, dtype)
         if state.flags is None or workspace.pitch < pitch:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Cake all-gather matmul cannot allocate its barrier flags or grow "
+                    f"its symmetric scratch to {pitch} rows inside CUDA-graph capture; "
+                    "prepare the launcher eagerly with max_rows covering every captured call"
+                )
+            if workspace.captured and 0 < workspace.pitch < pitch:
+                raise RuntimeError(
+                    "Cake all-gather matmul: the symmetric scratch of group "
+                    f"{call.group_name} ({workspace.dtype}) was captured into a CUDA "
+                    f"graph at {workspace.pitch} rows per peer; growing it to {pitch} "
+                    "rows would invalidate the captured replays. Prepare the launcher "
+                    "with max_rows covering every call before capturing."
+                )
             # Symmetric allocation, rendezvous and flag clearing are host-side
             # collectives; order them after every queued launch of this group
             # once, then steady-state calls stay asynchronous. Every rank sees
@@ -556,12 +636,33 @@ def _prepare_session(
         # collective launch so no rank enters the barrier while a peer still
         # builds.
         if call.b_layout not in workspace.sequences:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"Cake all-gather matmul cannot build the {call.b_layout} host sequence "
+                    "inside CUDA-graph capture; prepare the launcher eagerly first"
+                )
             workspace.sequences[call.b_layout] = loader.load(
                 loader.sequence_name(
                     call.world_size, call.dtype_name, call.b_layout, call.arch
                 ),
                 call.arch,
             )
+        # The SM push route's device tables are resolved now (when any row
+        # count of this group and width can take that route: the ceiling is
+        # widest at 128 padded rows) so a captured call allocates nothing.
+        sm_push = loader.uses_sm_push(
+            rows=loader.BLOCK_M, world_size=call.world_size, cols=call.n
+        )
+        if (
+            sm_push
+            and workspace.push_buffers is None
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError(
+                "Cake all-gather matmul cannot resolve the SM push route's device "
+                "tables inside CUDA-graph capture; prepare the launcher eagerly first"
+            )
+        workspace.materialize(sm_push=sm_push)
     return state, workspace
 
 
@@ -603,6 +704,23 @@ def _remember_tail(state: _LaunchState, main_handle: int, device_index: int) -> 
         state.tail_handle = int(main_handle)
 
 
+def _clear_readiness(workspace: _Workspace, words: int) -> None:
+    """Reset the readiness words a captured call used, after its main kernel.
+
+    Issued on the caller's current stream, which the sequence already joined
+    with the communication stream (copy-engine route) or ran alone (SM push
+    route): stream-ordered behind the main kernel, which acquired every word
+    the call needed, and before the next call's barrier, which no peer passes
+    until this rank arrives; no push of a later call can land before the
+    clear. The clear is a stream memset (``cuMemsetD32Async``, a graph memset
+    node), not a kernel: a captured call launches exactly the eager kernel
+    sequence. The ``words`` leading pad words are the ones the call's peers
+    wrote: the ``(world_size, num_chunks)`` epoch words of either route.
+    """
+
+    torch.ops.symm_mem.memset32_(workspace.signal_pad, 0, 0, words)
+
+
 def _launch(
     state: _LaunchState,
     workspace: _Workspace,
@@ -622,29 +740,47 @@ def _launch(
         m_pad = loader.padded_rows(rows)
         if workspace.pitch < m_pad:
             raise RuntimeError(
-                f"Cake all-gather matmul workspace holds {workspace.pitch} rows per peer, "
-                f"the call needs {m_pad}"
+                f"Cake all-gather matmul workspace holds {workspace.pitch} rows per peer, the call needs {m_pad}"
             )
         sequence = workspace.sequences.get(call.b_layout)
         if sequence is None:
             raise RuntimeError(
                 f"the {call.b_layout} host sequence of this workspace was not prepared"
             )
+        capturing = bool(torch.cuda.is_current_stream_capturing())
+        sm_push = loader.uses_sm_push(
+            rows=rows, world_size=call.world_size, cols=call.n
+        )
+        if capturing and sm_push and workspace.push_buffers is None:
+            # A caller error, not a failed collective: nothing was submitted.
+            raise RuntimeError(
+                "Cake all-gather matmul SM push tables are not materialized; "
+                "prepare the launcher eagerly before CUDA-graph capture"
+            )
+        if capturing:
+            # The graph bakes this generation's addresses on every rank; the
+            # workspace must not grow from now on (see _prepare_session).
+            workspace.captured = True
         try:
             main_handle = _current_stream_handle(call.device_index)
-            capturing = bool(torch.cuda.is_current_stream_capturing())
             _join_previous_tail(
                 state, main_handle, call.device_index, capturing=capturing
             )
-            if state.ready_epoch >= 2**32 - 1:
-                raise RuntimeError(
-                    "Cake all-gather matmul ready epoch exhausted uint32 range"
-                )
-            state.ready_epoch += 1
-            ready_target = state.ready_epoch
+            if capturing:
+                # A replayed graph re-issues the same readiness words, so a
+                # captured call publishes the sentinel and clears its words
+                # after the main kernel; eager calls keep the monotonic epoch
+                # and never clear.
+                ready_target = _CAPTURE_READY_TARGET
+            else:
+                if state.ready_epoch >= _CAPTURE_READY_TARGET - 1:
+                    raise RuntimeError(
+                        "Cake all-gather matmul ready epoch exhausted uint32 range"
+                    )
+                state.ready_epoch += 1
+                ready_target = state.ready_epoch
             phase = state.next_phase
             world_size = call.world_size
-            sm_push = loader.uses_sm_push(rows=rows, world_size=world_size, cols=call.n)
             grid_x, grid_y, grid_z = loader.main_grid(
                 rows,
                 call.n,
@@ -681,7 +817,9 @@ def _launch(
                 # stream; the sequence joins that stream back into the caller's
                 # stream, and the record keeps the allocator from recycling
                 # ``inp`` before the join.
-                inp.record_stream(workspace.comm_stream)
+                if not capturing:
+                    # Graph inputs are the caller's static buffers for the graph's lifetime.
+                    inp.record_stream(workspace.comm_stream)
                 sequence.run(
                     inp,
                     workspace.scratch,
@@ -702,6 +840,8 @@ def _launch(
                     main_handle,
                     workspace.comm_handle,
                 )
+            if capturing:
+                _clear_readiness(workspace, world_size * loader.chunk_plan(rows)[2])
             state.next_phase = 1 - phase
             if not capturing:
                 _remember_tail(state, main_handle, call.device_index)
@@ -753,7 +893,11 @@ def all_gather_matmul_cake(
 
 @dataclass(frozen=True)
 class _PreparedLauncher:
-    """Bound weight, process group and row capacity; accepts any input of up to ``max_rows`` rows."""
+    """Bound weight, process group and row capacity; accepts any input of up to ``max_rows`` rows.
+
+    Every launch is asynchronous and CUDA-graph capturable: the session was
+    prepared eagerly, so a captured call allocates nothing but its output.
+    """
 
     group: dist.ProcessGroup = field(repr=False)
     group_id: int
@@ -862,4 +1006,9 @@ def _prepare_all_gather_matmul_cake(
     )
 
 
-__all__ = ["all_gather_matmul_cake"]
+__all__ = [
+    "SUPPORTED_SYMMETRIC_MEMORY_BACKENDS",
+    "all_gather_matmul_cake",
+    "supports_symmetric_memory_backend",
+    "symmetric_memory_backend",
+]

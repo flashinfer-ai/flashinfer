@@ -33,8 +33,8 @@
 
 extern "C" {
 
-__global__ __launch_bounds__(192) void
-kernel_cake_all_gather_matmul_1a649d1fcaec779cf0ac(const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch, const __grid_constant__ CUtensorMap B, __half* __restrict__ C, __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles, int remote_order)
+__global__ __launch_bounds__(THREADS) void
+kernel_cake_all_gather_matmul_0207fc52f60d8009b335(const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch, const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles, int remote_order)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -61,10 +61,10 @@ kernel_cake_all_gather_matmul_1a649d1fcaec779cf0ac(const __grid_constant__ CUten
     const int cta_rank = 0;
 
     // Kernel setup ops
-    __half* smem_a = reinterpret_cast<__half*>(smem_raw + 1024);
-    const int smem_a_addr = smem + 1024;
-    __half* smem_b = reinterpret_cast<__half*>(smem_raw + 17408);
-    const int smem_b_addr = smem + 17408;
+    __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_A_OFF);
+    const int smem_a_addr = smem + SMEM_SMEM_A_OFF;
+    __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_B_OFF);
+    const int smem_b_addr = smem + SMEM_SMEM_B_OFF;
 
     // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 12 barriers)
     // Mbarriers at smem_raw[0..96)
@@ -122,16 +122,16 @@ kernel_cake_all_gather_matmul_1a649d1fcaec779cf0ac(const __grid_constant__ CUten
             unsigned int load_stage = 0;
             unsigned int load_phase = 1;
             #pragma unroll 1
-            for (int tile = bid; tile < 8 * ((M + 127) / 128 * 128 / 128 * n_tiles); tile += num_bids) {
+            for (int tile = bid; tile < 2 * ((M + 127) / 128 * 128 / 128 * n_tiles); tile += num_bids) {
                 int peer_pass_pm = tile / ((M + 127) / 128 * 128 / 128 * n_tiles);
                 int rem_pm = tile - peer_pass_pm * ((M + 127) / 128 * 128 / 128 * n_tiles);
                 int c_pm_raw = rem_pm / ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles);
                 int c_pm = ((c_pm_raw < ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) ? c_pm_raw : ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1);
                 int inner_pm = rem_pm - c_pm * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles);
                 int u_cm = tile - (M + 127) / 128 * 128 / 128 * n_tiles;
-                int c_cm_raw = u_cm / (7 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles));
+                int c_cm_raw = u_cm / ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles);
                 int c_cm = ((c_cm_raw < ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) ? c_cm_raw : ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1);
-                int v_cm = u_cm - c_cm * (7 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles));
+                int v_cm = u_cm - c_cm * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles);
                 int tiles_m_cm = ((c_cm < ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) ? (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 : (M + 127) / 128 * 128 / 128 - (((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128));
                 int tiles_c_cm = tiles_m_cm * n_tiles;
                 int pp_cm = 1 + v_cm / tiles_c_cm;
@@ -144,7 +144,7 @@ kernel_cake_all_gather_matmul_1a649d1fcaec779cf0ac(const __grid_constant__ CUten
                 int tiles_m_c = ((chunk_idx < ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) ? (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 : (M + 127) / 128 * 128 / 128 - (((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128));
                 int bid_m = inner % tiles_m_c;
                 int bid_n = inner / tiles_m_c;
-                int peer = (rank - peer_pass + 8) % 8;
+                int peer = (rank - peer_pass + 2) % 2;
                 int off_m = chunk_idx * (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) + bid_m * 128;
                 int off_n = bid_n * 256;
                 if (peer_pass != 0) {
@@ -190,7 +190,7 @@ kernel_cake_all_gather_matmul_1a649d1fcaec779cf0ac(const __grid_constant__ CUten
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_tma_full = 0;
             #pragma unroll 1
-            for (int tile_1 = bid; tile_1 < 8 * ((M + 127) / 128 * 128 / 128 * n_tiles); tile_1 += num_bids) {
+            for (int tile_1 = bid; tile_1 < 2 * ((M + 127) / 128 * 128 / 128 * n_tiles); tile_1 += num_bids) {
                 mbarrier_wait(epilogue_done_addr + (mma_epi_stage) * 8, _phase_epilogue_done);
                 #pragma unroll 1
                 for (int iter_k_1 = 0; iter_k_1 < 128; iter_k_1++) {
@@ -203,22 +203,22 @@ kernel_cake_all_gather_matmul_1a649d1fcaec779cf0ac(const __grid_constant__ CUten
                         uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
                         uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
                         if (elect_sync()) {
-                            tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138412048, ((init_flag) ? 0 : 1));
+                            tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138413200, ((init_flag) ? 0 : 1));
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138412048, 1);
+                            tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138413200, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138412048, 1);
+                            tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138413200, 1);
                         }
                         incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
                         incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138412048, 1);
+                            tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138413200, 1);
                         }
                     }
                     elect_commit(mma_done_addr + (mma_tma_stage) * 8);
@@ -239,16 +239,16 @@ kernel_cake_all_gather_matmul_1a649d1fcaec779cf0ac(const __grid_constant__ CUten
             const int epi_tid = epi_warp * 32 + lane;
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
-            for (int tile_2 = bid; tile_2 < 8 * ((M + 127) / 128 * 128 / 128 * n_tiles); tile_2 += num_bids) {
+            for (int tile_2 = bid; tile_2 < 2 * ((M + 127) / 128 * 128 / 128 * n_tiles); tile_2 += num_bids) {
                 int peer_pass_pm_1 = tile_2 / ((M + 127) / 128 * 128 / 128 * n_tiles);
                 int rem_pm_1 = tile_2 - peer_pass_pm_1 * ((M + 127) / 128 * 128 / 128 * n_tiles);
                 int c_pm_raw_1 = rem_pm_1 / ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles);
                 int c_pm_1 = ((c_pm_raw_1 < ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) ? c_pm_raw_1 : ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1);
                 int inner_pm_1 = rem_pm_1 - c_pm_1 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles);
                 int u_cm_1 = tile_2 - (M + 127) / 128 * 128 / 128 * n_tiles;
-                int c_cm_raw_1 = u_cm_1 / (7 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles));
+                int c_cm_raw_1 = u_cm_1 / ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles);
                 int c_cm_1 = ((c_cm_raw_1 < ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) ? c_cm_raw_1 : ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1);
-                int v_cm_1 = u_cm_1 - c_cm_1 * (7 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles));
+                int v_cm_1 = u_cm_1 - c_cm_1 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles);
                 int tiles_m_cm_1 = ((c_cm_1 < ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) ? (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 : (M + 127) / 128 * 128 / 128 - (((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128));
                 int tiles_c_cm_1 = tiles_m_cm_1 * n_tiles;
                 int pp_cm_1 = 1 + v_cm_1 / tiles_c_cm_1;
@@ -261,7 +261,7 @@ kernel_cake_all_gather_matmul_1a649d1fcaec779cf0ac(const __grid_constant__ CUten
                 int tiles_m_c_1 = ((chunk_idx_1 < ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) ? (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 : (M + 127) / 128 * 128 / 128 - (((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128));
                 int bid_m_1 = inner_1 % tiles_m_c_1;
                 int bid_n_1 = inner_1 / tiles_m_c_1;
-                int peer_1 = (rank - peer_pass_1 + 8) % 8;
+                int peer_1 = (rank - peer_pass_1 + 2) % 2;
                 int off_m_1 = chunk_idx_1 * (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) + bid_m_1 * 128;
                 int off_n_1 = bid_n_1 * 256;
                 int local_row = off_m_1 + epi_tid;
@@ -278,13 +278,13 @@ kernel_cake_all_gather_matmul_1a649d1fcaec779cf0ac(const __grid_constant__ CUten
                         float _tmem_load_0[8];
                         tmem_ld_x8(&_tmem_load_0[0], tmem_addr);
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        uint32_t _tmem_load_0_f16[4];
+                        uint32_t _tmem_load_0_bf16[4];
                         #pragma unroll
                         for (int _lp = 0; _lp < 4; _lp++) {
-                            __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
-                            _tmem_load_0_f16[_lp] = *(uint32_t*)&_h2;
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
+                            _tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
                         }
-                        reinterpret_cast<int4*>(C + (out_base + (long long)(n_chunk * 8)))[0] = reinterpret_cast<int4*>(_tmem_load_0_f16)[0];
+                        reinterpret_cast<int4*>(C + (out_base + (long long)(n_chunk * 8)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16)[0];
                     }
                 }
                 if (off_m_1 + 128 > M) {
@@ -296,14 +296,14 @@ kernel_cake_all_gather_matmul_1a649d1fcaec779cf0ac(const __grid_constant__ CUten
                         float _tmem_load_1[8];
                         tmem_ld_x8(&_tmem_load_1[0], tmem_addr_1);
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        uint32_t _tmem_load_1_f16[4];
+                        uint32_t _tmem_load_1_bf16[4];
                         #pragma unroll
                         for (int _lp = 0; _lp < 4; _lp++) {
-                            __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_1[_lp*2 + 0], _tmem_load_1[_lp*2+1 + 0]));
-                            _tmem_load_1_f16[_lp] = *(uint32_t*)&_h2;
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 0], _tmem_load_1[_lp*2+1 + 0]));
+                            _tmem_load_1_bf16[_lp] = *(uint32_t*)&_bf2;
                         }
                         if (local_row < M) {
-                            reinterpret_cast<int4*>(C + (out_base + (long long)(n_chunk_1 * 8)))[0] = reinterpret_cast<int4*>(_tmem_load_1_f16)[0];
+                            reinterpret_cast<int4*>(C + (out_base + (long long)(n_chunk_1 * 8)))[0] = reinterpret_cast<int4*>(_tmem_load_1_bf16)[0];
                         }
                     }
                 }

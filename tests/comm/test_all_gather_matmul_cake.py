@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import gc
 import importlib
+import types
 import weakref
 from types import SimpleNamespace
 
@@ -110,7 +111,10 @@ def test_every_program_is_delivered_for_both_architectures():
     for world_size, dtype_name, b_layout in _main_programs():
         assert loader.PROGRAMS[loader.main_program(world_size, dtype_name, b_layout)][
             "arches"
-        ] == ["sm_100a", "sm_103a"]
+        ] == [
+            "sm_100a",
+            "sm_103a",
+        ]
     sm103_sequence = loader.sequence_name(8, "bfloat16", "n_major", "sm_103a")
     loader.spec.cache_clear()
     try:
@@ -291,14 +295,20 @@ def _fake_group(world_size, rank, name="fake_group"):
 
 
 def _patch_distributed(
-    monkeypatch, *, world_size, rank, backend_name="nccl", arch="sm_100a"
+    monkeypatch,
+    *,
+    world_size,
+    rank,
+    backend_name="nccl",
+    arch="sm_100a",
+    symm_backend="CUDA",
 ):
     monkeypatch.setattr(backend.dist, "is_available", lambda: True)
     monkeypatch.setattr(backend.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(backend.dist, "get_backend", lambda group: backend_name)
     monkeypatch.setattr(backend.dist, "get_world_size", lambda group: group._world_size)
     monkeypatch.setattr(backend.dist, "get_rank", lambda group: group._rank)
-    monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
+    monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: symm_backend)
     monkeypatch.setattr(
         loader,
         "device_facts",
@@ -448,6 +458,226 @@ def test_validation_rejects_unsupported_world_sizes_and_backends(monkeypatch):
             _CudaLike((8192, 2048), torch.bfloat16),
             _fake_group(2, 0),
         )
+
+
+@pytest.mark.parametrize("symm_backend", ["CUDA", "NVSHMEM", "cuda", "nvshmem"])
+def test_validation_admits_the_cuda_and_nvshmem_symmetric_memory_backends(
+    monkeypatch, symm_backend
+):
+    _patch_distributed(monkeypatch, world_size=2, rank=0, symm_backend=symm_backend)
+    device = torch.device("cuda", 0)
+    assert backend.symmetric_memory_backend(device) == symm_backend.upper()
+    assert backend.supports_symmetric_memory_backend(device)
+    call = backend._validate(
+        _CudaLike((256, 8192), torch.bfloat16),
+        _CudaLike((8192, 2048), torch.bfloat16),
+        _fake_group(2, 0),
+    )
+    assert call.rows == 256
+
+
+@pytest.mark.parametrize("symm_backend", ["NCCL", None, "XPU"])
+def test_validation_rejects_other_symmetric_memory_backends_without_selecting_one(
+    monkeypatch, symm_backend
+):
+    _patch_distributed(monkeypatch, world_size=2, rank=0, symm_backend=symm_backend)
+    selected = []
+    monkeypatch.setattr(backend.symm_mem, "set_backend", selected.append)
+    device = torch.device("cuda", 0)
+    assert not backend.supports_symmetric_memory_backend(device)
+    with pytest.raises(ValueError, match=r"\['CUDA', 'NVSHMEM'\]"):
+        backend._validate(
+            _CudaLike((256, 8192), torch.bfloat16),
+            _CudaLike((8192, 2048), torch.bfloat16),
+            _fake_group(2, 0),
+        )
+    assert selected == []
+
+
+def test_capture_sentinel_is_above_every_eager_epoch():
+    assert backend._CAPTURE_READY_TARGET == 2**32 - 1
+    state = backend._LaunchState(rank=0, world_size=2)
+    assert state.ready_epoch < backend._CAPTURE_READY_TARGET - 1
+
+
+def test_captured_call_clears_only_its_readiness_words_with_a_stream_memset(
+    monkeypatch,
+):
+    """The clear is a ``memset32_`` on the pad's leading words (no kernel) on the
+    caller's current stream, so a captured call issues exactly the eager kernel
+    sequence."""
+    calls = []
+    monkeypatch.setattr(
+        backend.torch.ops.symm_mem,
+        "memset32_",
+        lambda pad, offset, val, count: calls.append((pad, offset, val, count)),
+    )
+    pad = torch.zeros(4 * 8, dtype=torch.uint32)
+    workspace = backend._Workspace(
+        dtype=torch.bfloat16, rank=0, world_size=4, device_index=0, signal_pad=pad
+    )
+    backend._clear_readiness(workspace, 4 * 3)
+    assert calls == [(pad, 0, 0, 12)]
+
+
+def test_prepare_session_refuses_to_allocate_or_grow_inside_capture(monkeypatch):
+    _patch_distributed(monkeypatch, world_size=2, rank=0)
+    monkeypatch.setattr(backend.torch.cuda, "is_current_stream_capturing", lambda: True)
+    call = backend._Call(0, 0, 2, "g", "bfloat16", "sm_100a", 256, 2048, "n_major")
+    with pytest.raises(RuntimeError, match="inside CUDA-graph capture"):
+        backend._prepare_session(
+            call, _fake_group(2, 0, name="g"), torch.bfloat16, capacity_rows=256
+        )
+
+
+def test_workspace_materializes_the_sm_push_tables_at_prepare_time():
+    """The copy-engine route's peer tables are address tuples built when the
+    workspace grows; ``materialize`` resolves the SM push route's device tables,
+    and only when that route is reachable for the prepared group."""
+
+    workspace = backend._Workspace(
+        dtype=torch.bfloat16, rank=1, world_size=4, device_index=0
+    )
+    resolved = []
+    workspace.push_tables = lambda: resolved.append(True)
+    workspace.materialize(sm_push=False)
+    assert resolved == []
+    workspace.materialize(sm_push=True)
+    assert resolved == [True]
+
+
+def test_sm_push_tables_are_reachable_exactly_when_some_row_count_takes_that_route():
+    """``_prepare_session`` materializes for the widest ceiling (128 padded rows)."""
+
+    reachable = {
+        (2, 1280): False,
+        (4, 2560): True,
+        (4, 10240): True,
+        (4, 10496): False,
+        (8, 1280): True,
+        (8, 14336): False,
+    }
+    for (world_size, cols), expected in reachable.items():
+        assert (
+            loader.uses_sm_push(rows=loader.BLOCK_M, world_size=world_size, cols=cols)
+            is expected
+        ), (
+            world_size,
+            cols,
+        )
+
+
+def _published_workspace(push_buffers):
+    """A workspace one generation old, as ``_publish_scratch`` finds it at a growth (CPU stand-ins)."""
+
+    workspace = backend._Workspace(
+        dtype=torch.bfloat16, rank=0, world_size=2, device_index=0
+    )
+    workspace.pitch = 512
+    workspace.scratch = torch.empty(2, 512, 8, dtype=torch.bfloat16)
+    workspace.scratch_handle = object()
+    workspace.signal_pad = torch.zeros(8, dtype=torch.uint32)
+    workspace.peer_scratch = ("old peer slice",)
+    workspace.push_buffers = push_buffers
+    workspace.comm_stream = types.SimpleNamespace(cuda_stream=7)
+    return workspace
+
+
+class _GrowthHandle:
+    """Rendezvous handle of a grown scratch: CPU readiness pads and remote views."""
+
+    def get_signal_pad(self, peer, shape, dtype, offset):
+        return torch.zeros(shape, dtype=dtype)
+
+    def get_remote_tensor(self, peer, shape, dtype):
+        return torch.empty(shape, dtype=dtype)
+
+
+def test_growth_resolves_the_sm_push_tables_again_when_they_existed():
+    """A launcher prepared before the growth keeps both routes: the SM push
+    tables address the scratch generation, so they are resolved again."""
+
+    workspace = _published_workspace(push_buffers=("payload", "signals", "counters"))
+    resolved = []
+    workspace.push_tables = lambda: resolved.append(True)
+    call = backend._Call(0, 0, 2, "g", "bfloat16", "sm_100a", 1024, 2048, "n_major")
+    grown = torch.empty(2, 1024, 8, dtype=torch.bfloat16)
+    backend._publish_scratch(workspace, call, 1024, grown, _GrowthHandle())
+    assert workspace.pitch == 1024 and workspace.scratch is grown
+    assert workspace.max_chunks == loader.chunk_plan(1024)[2]
+    assert resolved == [True]
+
+
+def test_growth_without_push_tables_resolves_none():
+    workspace = _published_workspace(push_buffers=None)
+    resolved = []
+    workspace.push_tables = lambda: resolved.append(True)
+    call = backend._Call(0, 0, 2, "g", "bfloat16", "sm_100a", 1024, 2048, "n_major")
+    grown = torch.empty(2, 1024, 8, dtype=torch.bfloat16)
+    backend._publish_scratch(workspace, call, 1024, grown, _GrowthHandle())
+    assert workspace.push_buffers is None and resolved == []
+
+
+def test_prepare_session_refuses_to_grow_a_captured_workspace_before_any_collective(
+    monkeypatch,
+):
+    """A captured graph bakes this generation's addresses on every rank: a larger
+    call raises a named error before any synchronize or collective, without
+    poisoning the state."""
+
+    call, group, stream = _prepare_fixture(monkeypatch, "captured_growth")
+    state = backend._launch_state(call, group)
+    state.flags = torch.zeros(4, dtype=torch.uint32)
+    workspace = backend._workspace(call, group, torch.bfloat16)
+    workspace.pitch = 512
+    workspace.captured = True
+
+    def rendezvous(*args, **kwargs):
+        raise AssertionError("no collective may run for a refused growth")
+
+    monkeypatch.setattr(backend, "_rendezvous", rendezvous)
+    with pytest.raises(RuntimeError, match="captured into a CUDA graph"):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=1024)
+    assert stream.synchronized == 0
+    assert state.poisoned is False and workspace.pitch == 512
+
+
+def test_prepare_session_refuses_to_build_the_host_sequence_inside_capture(
+    monkeypatch,
+):
+    call, group, stream = _prepare_fixture(monkeypatch, "jit_capture")
+    state = backend._launch_state(call, group)
+    state.flags = torch.zeros(4, dtype=torch.uint32)
+    workspace = backend._workspace(call, group, torch.bfloat16)
+    workspace.pitch = 512
+    workspace.sequences = {}
+    monkeypatch.setattr(backend.torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def load(*args):
+        raise AssertionError("no JIT build may run inside capture")
+
+    monkeypatch.setattr(backend.loader, "load", load)
+    with pytest.raises(RuntimeError, match="host sequence inside CUDA-graph capture"):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=512)
+    assert stream.synchronized == 0 and state.poisoned is False
+
+
+def test_prepare_session_refuses_to_resolve_push_tables_inside_capture(monkeypatch):
+    """Resolving the SM push tables allocates; under capture that is a named refusal."""
+
+    _patch_distributed(monkeypatch, world_size=8, rank=0)
+    call = backend._Call(0, 0, 8, "g8", "bfloat16", "sm_103a", 512, 1280, "n_major")
+    group = _fake_group(8, 0, name="g8")
+    state = backend._launch_state(call, group)
+    state.flags = torch.zeros(16, dtype=torch.uint32)
+    workspace = backend._workspace(call, group, torch.bfloat16)
+    workspace.pitch = 512
+    workspace.sequences = {"n_major": object()}
+    workspace.push_buffers = None
+    monkeypatch.setattr(backend.torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="SM push route's device tables inside"):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=512)
+    assert state.poisoned is False and workspace.push_buffers is None
 
 
 def test_validation_rejects_devices_outside_the_exported_architectures(monkeypatch):
@@ -720,6 +950,53 @@ def test_small_rows_use_the_sm_push_sequence_entry_on_the_callers_stream(monkeyp
     assert state.next_phase == 1 and state.ready_epoch == 1
 
 
+@pytest.mark.parametrize(
+    "rows, n, world_size, arch, entry, target_index",
+    [
+        (1025, 2048, 4, "sm_100a", "run", 12),
+        (512, 1280, 8, "sm_103a", "run_push", 13),
+    ],
+)
+def test_captured_launch_publishes_the_sentinel_and_clears_its_words_on_both_routes(
+    monkeypatch, rows, n, world_size, arch, entry, target_index
+):
+    """Under capture both routes pass the sentinel as ``ready_target``, leave the
+    eager epoch untouched, skip ``record_stream`` and clear exactly the
+    ``world_size * num_chunks`` words the peers wrote, after the sequence."""
+
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=rows, n=n, world_size=world_size, arch=arch
+    )
+    monkeypatch.setattr(backend.torch.cuda, "is_current_stream_capturing", lambda: True)
+    cleared = []
+    monkeypatch.setattr(
+        backend, "_clear_readiness", lambda ws, words: cleared.append((ws, words))
+    )
+    inp = _Recording()
+    backend._launch(state, workspace, call, inp, "w_source", "out")
+    (name, args) = sequence.calls[0]
+    assert name == entry
+    assert args[target_index] == backend._CAPTURE_READY_TARGET
+    assert state.ready_epoch == 0
+    assert inp.streams == []
+    assert cleared == [(workspace, world_size * backend.loader.chunk_plan(rows)[2])]
+    assert state.next_phase == 1 and state.poisoned is False
+    assert workspace.captured is True
+
+
+def test_captured_sm_push_launch_refuses_unmaterialized_tables(monkeypatch):
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=512, n=1280, world_size=8, arch="sm_103a"
+    )
+    monkeypatch.setattr(backend.torch.cuda, "is_current_stream_capturing", lambda: True)
+    workspace.push_buffers = None
+    with pytest.raises(RuntimeError, match="prepare the launcher eagerly"):
+        backend._launch(state, workspace, call, _Recording(), "w_source", "out")
+    assert sequence.calls == []
+    # A caller error before any submission: the group stays usable and uncaptured.
+    assert state.poisoned is False and workspace.captured is False
+
+
 def test_launch_refuses_an_unprepared_layout_without_poisoning(monkeypatch):
     call, state, workspace, _sequence = _launch_fixture(
         monkeypatch, rows=256, n=2048, world_size=2, arch="sm_100a"
@@ -954,7 +1231,9 @@ def _prepare_fixture(monkeypatch, name):
     _patch_distributed(monkeypatch, world_size=2, rank=0)
     stream = _SyncStream()
     monkeypatch.setattr(backend.torch.cuda, "current_stream", lambda index: stream)
-    monkeypatch.setattr(backend.dist, "barrier", lambda group: None)
+    monkeypatch.setattr(
+        backend.torch.cuda, "is_current_stream_capturing", lambda: False
+    )
     monkeypatch.setattr(backend.loader, "load", lambda *a: object())
     group = _fake_group(2, 0, name=name)
     call = backend._Call(0, 0, 2, name, "bfloat16", "sm_100a", 512, 2048, "n_major")

@@ -37,10 +37,10 @@
 #define CAKE_PEER_POINTER_TABLE_DECLARED
 template<typename T, int Capacity = 8> struct __align__(16) CakePeerPointerTable { T* ptrs[Capacity]; };
 #endif
-extern "C" __global__ void kernel_cake_all_gather_matmul_ffe749098469b859325c(int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags);
-extern "C" __global__ void kernel_cake_all_gather_matmul_c085eacc7dfe656a7c9f(int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags);
-extern "C" __global__ void kernel_cake_all_gather_matmul_57b670500d63c6a7e797(unsigned int* __restrict__ inp, long long* __restrict__ payload_peers, long long* __restrict__ signal_peers, unsigned int* __restrict__ counters, unsigned int ready_target, int rank, int rows, int chunk_rows, int num_chunks);
-extern "C" __global__ void kernel_cake_all_gather_matmul_8479166503e0eafc0b90(const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch, const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles, int remote_order);
+extern "C" __global__ void kernel_cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9(int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags);
+extern "C" __global__ void kernel_cake_all_gather_matmul_8dea171063652cd775f8(int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags);
+extern "C" __global__ void kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5(unsigned int* __restrict__ inp, long long* __restrict__ payload_peers, long long* __restrict__ signal_peers, unsigned int* __restrict__ counters, unsigned int ready_target, int rank, int rows, int chunk_rows, int num_chunks);
+extern "C" __global__ void kernel_cake_all_gather_matmul_72c819bc06bbde0de32b(const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch, const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles, int remote_order);
 
 namespace cake_host_shim_seq_bba9ca64823aa75e {
 
@@ -316,8 +316,8 @@ inline void launch_barrier(int64_t phase, int32_t world, int32_t rank,
   config.dynamicSmemBytes = 0u;
   config.stream = stream;
   const void* kernel = phase == 0
-                           ? reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_ffe749098469b859325c)
-                           : reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_c085eacc7dfe656a7c9f);
+                           ? reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9)
+                           : reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_8dea171063652cd775f8);
   cudaError_t status = cudaLaunchKernelExC(&config, kernel, kargs);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "cudaLaunchKernelExC for the phase " << phase
@@ -337,7 +337,7 @@ inline void launch_main(const CUtensorMap& a_local, const CUtensorMap& a_scratch
                    &ready,     &ready_target, &rank, &m, &scratch_pitch,
                    &signal_rows, &n_tiles, &remote_order};
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_8479166503e0eafc0b90), static_cast<int>(kMainDynamicSmem));
+      reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_72c819bc06bbde0de32b), static_cast<int>(kMainDynamicSmem));
   (void)smem_ready;
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
@@ -352,7 +352,7 @@ inline void launch_main(const CUtensorMap& a_local, const CUtensorMap& a_scratch
   config.attrs = programmatic_launch ? &attribute : nullptr;
   config.numAttrs = programmatic_launch ? 1u : 0u;
   cudaError_t status =
-      cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_8479166503e0eafc0b90), kargs);
+      cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_72c819bc06bbde0de32b), kargs);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "cudaLaunchKernelExC for the main kernel failed: " << cudaGetErrorString(status);
 }
@@ -593,7 +593,7 @@ void RunPush(TensorView inp, TensorView scratch, TensorView weight, TensorView o
     config.attrs = &attribute;
     config.numAttrs = 1u;
     cudaError_t status =
-        cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_57b670500d63c6a7e797), kargs);
+        cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5), kargs);
     TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
         << "cudaLaunchKernelExC for the peer push failed: " << cudaGetErrorString(status);
   }
