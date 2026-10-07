@@ -506,36 +506,28 @@ class MoKFunctional:
         workspace, source_count = self._inputs(config, workspace, schedule, x, None)
         self._check_device(workspace)
         mxfp8 = self._is_mxfp8(routed_gate_weights, routed_up_weights)
+        # The unused down projections are absent from the shape checks: no
+        # placeholder tensors are materialized per call (a transposed copy of
+        # the routed gate weights cost ~4 ms per recompute at the GLM-5.2 shape).
         if mxfp8:
             self._mxfp8_weights(
                 x,
-                (
-                    shared_gate_weights,
-                    shared_up_weights,
-                    shared_gate_weights.transpose(0, 1).contiguous()
-                    if shared_gate_weights.ndim == 2
-                    else shared_gate_weights,
-                ),
+                (shared_gate_weights, shared_up_weights, None),
                 (routed_gate_weights, routed_up_weights),
             )
             # The MXFP8 kernel takes no down weights in recompute mode.
             routed_down_weights = None
         else:
-            # Shape checks reuse the six-weight rule with the gate/up weights
-            # standing in for the unused down projections.
             self._weights(
                 x,
                 shared_gate_weights,
                 shared_up_weights,
-                shared_gate_weights.transpose(0, 1).contiguous()
-                if shared_gate_weights.ndim == 2
-                else shared_gate_weights,
+                None,
                 routed_gate_weights,
                 routed_up_weights,
-                routed_gate_weights.transpose(1, 2).contiguous()
-                if routed_gate_weights.ndim == 3
-                else routed_gate_weights,
+                None,
             )
+            # The BF16 kernel's down-weight TMA maps need a tensor; unused.
             routed_down_weights = routed_gate_weights
         self._copy_source(workspace.x_buffer, x)
         self._barrier(workspace)
