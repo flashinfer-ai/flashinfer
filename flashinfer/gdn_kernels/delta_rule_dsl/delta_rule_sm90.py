@@ -2532,6 +2532,9 @@ def delta_rule_prefill_dsl_sm90(
         ("alpha", alpha),
         ("beta", beta),
         ("state_indices", state_indices),
+        # reshape(-1) below would copy a non-contiguous buffer, and the kernel
+        # would write to the copy instead of the caller's tensor
+        ("state_checkpoints", state_checkpoints),
     ):
         if tensor is not None and not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")

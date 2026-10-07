@@ -815,9 +815,12 @@ def _test_checkpoint(
     checkpoint_every_n_tokens: int,
     seed: int | None = None,
     use_cp: bool = False,
+    head_size_v: int | None = None,
 ):
     """Test state checkpointing by comparing against prefix-based reference runs."""
     _skip_if_unsupported()
+    if head_size_v is None:
+        head_size_v = head_size
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -833,7 +836,13 @@ def _test_checkpoint(
 
     with device:
         q, k, v = qkv_factory(
-            seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+            seq_lens,
+            num_q_heads,
+            num_k_heads,
+            num_v_heads,
+            head_size,
+            dtype,
+            head_size_v=head_size_v,
         )
         k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
         cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
@@ -853,15 +862,15 @@ def _test_checkpoint(
 
     # Allocate outputs
     our_o = torch.empty(
-        [total_seqlen, num_o_heads, head_size], dtype=dtype, device=device
+        [total_seqlen, num_o_heads, head_size_v], dtype=dtype, device=device
     )
     our_state = torch.empty(
-        (num_seqs, num_sab_heads, head_size, head_size),
+        (num_seqs, num_sab_heads, head_size_v, head_size),
         dtype=torch.float32,
         device=device,
     )
     state_checkpoints = torch.full(
-        (total_checkpoints, num_sab_heads, head_size, head_size),
+        (total_checkpoints, num_sab_heads, head_size_v, head_size),
         float("nan"),
         dtype=torch.float32,
         device=device,
@@ -959,6 +968,7 @@ def test_checkpoint_correctness(
     num_k_heads: int,
     num_v_heads: int,
     head_size: int,
+    head_size_v: int,
     seq_lens: list[int],
     checkpoint_every_n_tokens: int,
     use_cp: bool,
@@ -970,6 +980,14 @@ def test_checkpoint_correctness(
         or is_sm12x_supported(torch.device("cuda"))
     ):
         pytest.skip("CP state checkpointing requires SM90, SM100, or SM120")
+    if head_size_v != head_size and use_cp:
+        pytest.skip("CP requires DV == DK")
+    if (
+        not is_sm90a_supported(torch.device("cuda"))
+        and not is_sm100a_supported(torch.device("cuda"))
+        and (head_size, head_size_v) != (128, 128)
+    ):
+        pytest.skip("the SM12x kernel only implements DK == DV == 128")
     scale = 1.0 / math.sqrt(head_size)
     _test_checkpoint(
         qkv_factory,
@@ -983,6 +1001,7 @@ def test_checkpoint_correctness(
         checkpoint_every_n_tokens,
         seed,
         use_cp=use_cp,
+        head_size_v=head_size_v,
     )
 
 
@@ -1306,6 +1325,12 @@ def test_prefill_kernel_state_dtype(
 ):
     if head_size_v != head_size and use_cp:
         pytest.skip("CP requires DV == DK")
+    if (
+        not is_sm90a_supported(torch.device("cuda"))
+        and not is_sm100a_supported(torch.device("cuda"))
+        and (head_size, head_size_v) != (128, 128)
+    ):
+        pytest.skip("the SM12x kernel only implements DK == DV == 128")
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_prefill_kernel_state_dtype(
         qkv_factory,
