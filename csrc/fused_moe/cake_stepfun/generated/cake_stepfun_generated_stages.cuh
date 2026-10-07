@@ -156,24 +156,24 @@ __global__ __launch_bounds__(128) void
 kernel_cake_stepfun_moe_8984d35182a1af879aad(const __nv_bfloat16* input, const int* expanded_idx_to_permuted_idx, uint8_t* out_fp4, uint8_t* out_sf, float* per_token_scale, float global_scale_inv, int m, int n);
 __global__ __launch_bounds__(128) void
 kernel_cake_stepfun_moe_aba390aa6eae368c64bc(const __nv_bfloat16* input, const int* expanded_idx_to_permuted_idx, uint8_t* out_fp4, uint8_t* out_sf, float* per_token_scale, float global_scale_inv, int m, int n);
-__global__ __launch_bounds__(512, 1) __cluster_dims__(1,1,3) void
-kernel_cake_stepfun_moe_b6bcabbe13352c0b68e4(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+__global__ __launch_bounds__(512, 1) void
+kernel_cake_stepfun_moe_293365ede9b8c04cd195(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_daab7862b66c995993b6(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_ecc014f7777aa3586e03(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_166593bcc515dea036a3(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_aece2dada06b83728fa3(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_fa5a1b7b329321c031d6(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_719cb5c8adff3b06dd3d(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
+kernel_cake_stepfun_moe_7f72e89902efb1ad82fd(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_1291f7bef54adbc14aa7(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
+kernel_cake_stepfun_moe_4517c7747ddc144998d9(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_ca26d81018b9aaa0f648(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_259f0e6627bfd6da9c15(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
+kernel_cake_stepfun_moe_4c337ece2a6735a3ccbd(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(384, 1) void
 kernel_cake_stepfun_moe_c1cf8595503254f4dde0(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(384, 1) void
@@ -182,8 +182,8 @@ __global__ __launch_bounds__(384, 1) void
 kernel_cake_stepfun_moe_57dcacf43c06b3cd08ba(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(384, 1) void
 kernel_cake_stepfun_moe_8b7e7004b564a9f60e62(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_186da208cce77c30d208(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+__global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
+kernel_cake_stepfun_moe_5358a45b0c32f824a800(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_bbb59d8e3bd2ae8450b3(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) void
@@ -196,8 +196,8 @@ __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_a5513a15cd476d0d510b(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_39df49fb2f2b565764a7(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(512, 1) __cluster_dims__(1,1,2) void
-kernel_cake_stepfun_moe_d5bf7f66b3de57a95323(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+__global__ __launch_bounds__(512, 1) void
+kernel_cake_stepfun_moe_672259d07af5fe99b756(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
 kernel_cake_stepfun_moe_e8fc19b12bb2f4c4deae(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
@@ -692,11 +692,11 @@ inline bool EncodeTensorMap_400_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_400(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_b6bcabbe13352c0b68e4, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_293365ede9b8c04cd195, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_400(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_b6bcabbe13352c0b68e4, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_293365ede9b8c04cd195, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_401_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1004,11 +1004,11 @@ inline bool EncodeTensorMap_403_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_403(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_166593bcc515dea036a3, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_aece2dada06b83728fa3, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_403(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_166593bcc515dea036a3, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_aece2dada06b83728fa3, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_404_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1215,11 +1215,11 @@ inline bool EncodeTensorMap_405_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_405(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_719cb5c8adff3b06dd3d, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_7f72e89902efb1ad82fd, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_405(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_719cb5c8adff3b06dd3d, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_7f72e89902efb1ad82fd, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
 }
 inline bool EncodeTensorMap_406_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1319,11 +1319,11 @@ inline bool EncodeTensorMap_406_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_406(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_1291f7bef54adbc14aa7, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_4517c7747ddc144998d9, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_406(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_1291f7bef54adbc14aa7, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_4517c7747ddc144998d9, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
 }
 inline bool EncodeTensorMap_407_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1527,11 +1527,11 @@ inline bool EncodeTensorMap_408_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_408(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_259f0e6627bfd6da9c15, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_4c337ece2a6735a3ccbd, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_408(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_259f0e6627bfd6da9c15, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_4c337ece2a6735a3ccbd, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
 }
 inline bool EncodeTensorMap_409_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -1805,28 +1805,10 @@ inline bool EncodeTensorMap_413_A(CUtensorMap* out, const TensorLayout& tensor) 
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
       out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
 inline bool EncodeTensorMap_413_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t outer1 = static_cast<int64_t>(tensor.elements) / (d1);
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[2] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(outer1)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0)) return false;
-  if (!(64u <= global_dim[0] && 32u <= global_dim[1])) return false;
-  uint64_t global_strides[1] = {static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[2] = {64u, 32u};
-  uint32_t element_stride[2] = {1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_413_C(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
   const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
   if (!(d1 > 0)) return false;
@@ -1840,15 +1822,32 @@ inline bool EncodeTensorMap_413_C(CUtensorMap* out, const TensorLayout& tensor) 
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
       out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_413_C(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  if (!(d1 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  if (s2 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(64), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
+  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_413(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_186da208cce77c30d208, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_5358a45b0c32f824a800, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_413(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_186da208cce77c30d208, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_5358a45b0c32f824a800, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_414_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
@@ -2260,9 +2259,9 @@ inline bool EncodeTensorMap_420_SFA(CUtensorMap* out, const TensorLayout& tensor
   if (s4 <= 0) return false;
   uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
   if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 4u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3])) return false;
   uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 4u, 1u};
+  uint32_t box_dim[4] = {256u, 2u, 2u, 1u};
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
       out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
@@ -2281,9 +2280,9 @@ inline bool EncodeTensorMap_420_SFB(CUtensorMap* out, const TensorLayout& tensor
   if (s3 <= 0) return false;
   uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
   if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 4u <= global_dim[1] && 1u <= global_dim[2])) return false;
+  if (!(32u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[2])) return false;
   uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 4u, 1u};
+  uint32_t box_dim[3] = {32u, 2u, 1u};
   uint32_t element_stride[3] = {1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
       out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
@@ -2308,11 +2307,11 @@ inline bool EncodeTensorMap_420_C(CUtensorMap* out, const TensorLayout& tensor) 
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_420(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_d5bf7f66b3de57a95323, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_672259d07af5fe99b756, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_420(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_d5bf7f66b3de57a95323, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_672259d07af5fe99b756, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_421_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -2823,31 +2822,31 @@ inline constexpr RequantKernelSpec kRequantKernels[] = {
 inline constexpr size_t kRequantKernelCount = 2;
 
 inline constexpr Fc2KernelSpec kFc2Kernels[] = {
-    {"kernel_cake_stepfun_moe_b6bcabbe13352c0b68e4", 0, 8, 128, 512, 3, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 3u}, false, 209280u, &EncodeTensorMap_400_A, &EncodeTensorMap_400_B, &EncodeTensorMap_400_SFA, &EncodeTensorMap_400_SFB, &EncodeTensorMap_400_C, &Configure_400, &Submit_400},
-    {"kernel_cake_stepfun_moe_daab7862b66c995993b6", 0, 16, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 202368u, &EncodeTensorMap_401_A, &EncodeTensorMap_401_B, &EncodeTensorMap_401_SFA, &EncodeTensorMap_401_SFB, &EncodeTensorMap_401_C, &Configure_401, &Submit_401},
-    {"kernel_cake_stepfun_moe_ecc014f7777aa3586e03", 0, 32, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 219264u, &EncodeTensorMap_402_A, &EncodeTensorMap_402_B, &EncodeTensorMap_402_SFA, &EncodeTensorMap_402_SFB, &EncodeTensorMap_402_C, &Configure_402, &Submit_402},
-    {"kernel_cake_stepfun_moe_166593bcc515dea036a3", 0, 64, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_403_A, &EncodeTensorMap_403_B, &EncodeTensorMap_403_SFA, &EncodeTensorMap_403_SFB, &EncodeTensorMap_403_C, &Configure_403, &Submit_403},
-    {"kernel_cake_stepfun_moe_fa5a1b7b329321c031d6", 0, 256, 128, 256, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 220288u, &EncodeTensorMap_404_A, &EncodeTensorMap_404_B, &EncodeTensorMap_404_SFA, &EncodeTensorMap_404_SFB, &EncodeTensorMap_404_C, &Configure_404, &Submit_404},
-    {"kernel_cake_stepfun_moe_719cb5c8adff3b06dd3d", 1, 8, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_405_A, &EncodeTensorMap_405_B, &EncodeTensorMap_405_SFA, &EncodeTensorMap_405_SFB, &EncodeTensorMap_405_C, &Configure_405, &Submit_405},
-    {"kernel_cake_stepfun_moe_1291f7bef54adbc14aa7", 1, 16, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 212608u, &EncodeTensorMap_406_A, &EncodeTensorMap_406_B, &EncodeTensorMap_406_SFA, &EncodeTensorMap_406_SFB, &EncodeTensorMap_406_C, &Configure_406, &Submit_406},
-    {"kernel_cake_stepfun_moe_ca26d81018b9aaa0f648", 1, 32, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 177280u, &EncodeTensorMap_407_A, &EncodeTensorMap_407_B, &EncodeTensorMap_407_SFA, &EncodeTensorMap_407_SFB, &EncodeTensorMap_407_C, &Configure_407, &Submit_407},
-    {"kernel_cake_stepfun_moe_259f0e6627bfd6da9c15", 1, 64, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_408_A, &EncodeTensorMap_408_B, &EncodeTensorMap_408_SFA, &EncodeTensorMap_408_SFB, &EncodeTensorMap_408_C, &Configure_408, &Submit_408},
-    {"kernel_cake_stepfun_moe_c1cf8595503254f4dde0", 1, 256, 128, 256, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 184448u, &EncodeTensorMap_409_A, &EncodeTensorMap_409_B, &EncodeTensorMap_409_SFA, &EncodeTensorMap_409_SFB, &EncodeTensorMap_409_C, &Configure_409, &Submit_409},
-    {"kernel_cake_stepfun_moe_0905842144a4faaa740c", 2, 8, 128, 128, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_410_A, nullptr, nullptr, nullptr, &EncodeTensorMap_410_C, &Configure_410, &Submit_410},
-    {"kernel_cake_stepfun_moe_57dcacf43c06b3cd08ba", 2, 16, 128, 128, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_411_A, nullptr, nullptr, nullptr, &EncodeTensorMap_411_C, &Configure_411, &Submit_411},
-    {"kernel_cake_stepfun_moe_8b7e7004b564a9f60e62", 2, 32, 128, 128, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_412_A, nullptr, nullptr, nullptr, &EncodeTensorMap_412_C, &Configure_412, &Submit_412},
-    {"kernel_cake_stepfun_moe_186da208cce77c30d208", 2, 64, 128, 128, 1, SfLayout::kNone, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 214144u, &EncodeTensorMap_413_A, &EncodeTensorMap_413_B, nullptr, nullptr, &EncodeTensorMap_413_C, &Configure_413, &Submit_413},
-    {"kernel_cake_stepfun_moe_bbb59d8e3bd2ae8450b3", 2, 128, 128, 64, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 214144u, &EncodeTensorMap_414_A, &EncodeTensorMap_414_B, nullptr, nullptr, &EncodeTensorMap_414_C, &Configure_414, &Submit_414},
-    {"kernel_cake_stepfun_moe_b7ed6822e6c7e5ffdf75", 3, 8, 128, 256, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_415_A, &EncodeTensorMap_415_B, nullptr, nullptr, &EncodeTensorMap_415_C, &Configure_415, &Submit_415},
-    {"kernel_cake_stepfun_moe_68e628a389017e4569ae", 3, 16, 128, 256, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_416_A, &EncodeTensorMap_416_B, nullptr, nullptr, &EncodeTensorMap_416_C, &Configure_416, &Submit_416},
-    {"kernel_cake_stepfun_moe_5d6f9cb8b0e15d33a401", 3, 32, 128, 256, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_417_A, &EncodeTensorMap_417_B, nullptr, nullptr, &EncodeTensorMap_417_C, &Configure_417, &Submit_417},
-    {"kernel_cake_stepfun_moe_a5513a15cd476d0d510b", 3, 64, 128, 128, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_418_A, &EncodeTensorMap_418_B, nullptr, nullptr, &EncodeTensorMap_418_C, &Configure_418, &Submit_418},
-    {"kernel_cake_stepfun_moe_39df49fb2f2b565764a7", 3, 128, 128, 128, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_419_A, &EncodeTensorMap_419_B, nullptr, nullptr, &EncodeTensorMap_419_C, &Configure_419, &Submit_419},
-    {"kernel_cake_stepfun_moe_d5bf7f66b3de57a95323", 4, 8, 128, 512, 2, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 2u}, false, 227456u, &EncodeTensorMap_420_A, &EncodeTensorMap_420_B, &EncodeTensorMap_420_SFA, &EncodeTensorMap_420_SFB, &EncodeTensorMap_420_C, &Configure_420, &Submit_420},
-    {"kernel_cake_stepfun_moe_e8fc19b12bb2f4c4deae", 4, 16, 128, 256, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 119296u, &EncodeTensorMap_421_A, &EncodeTensorMap_421_B, &EncodeTensorMap_421_SFA, &EncodeTensorMap_421_SFB, &EncodeTensorMap_421_C, &Configure_421, &Submit_421},
-    {"kernel_cake_stepfun_moe_1de86ae74fed77b9b444", 4, 32, 128, 256, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 136064u, &EncodeTensorMap_422_A, &EncodeTensorMap_422_B, &EncodeTensorMap_422_SFA, &EncodeTensorMap_422_SFB, &EncodeTensorMap_422_C, &Configure_422, &Submit_422},
-    {"kernel_cake_stepfun_moe_c6ebc65e8bb4883c3fcd", 4, 64, 128, 256, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 187520u, &EncodeTensorMap_423_A, &EncodeTensorMap_423_B, &EncodeTensorMap_423_SFA, &EncodeTensorMap_423_SFB, &EncodeTensorMap_423_C, &Configure_423, &Submit_423},
-    {"kernel_cake_stepfun_moe_442338599676316b93bd", 4, 256, 128, 128, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 189056u, &EncodeTensorMap_424_A, &EncodeTensorMap_424_B, &EncodeTensorMap_424_SFA, &EncodeTensorMap_424_SFB, &EncodeTensorMap_424_C, &Configure_424, &Submit_424},
+    {"kernel_cake_stepfun_moe_293365ede9b8c04cd195", 0, 8, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_400_A, &EncodeTensorMap_400_B, &EncodeTensorMap_400_SFA, &EncodeTensorMap_400_SFB, &EncodeTensorMap_400_C, &Configure_400, &Submit_400},
+    {"kernel_cake_stepfun_moe_daab7862b66c995993b6", 0, 16, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 202368u, &EncodeTensorMap_401_A, &EncodeTensorMap_401_B, &EncodeTensorMap_401_SFA, &EncodeTensorMap_401_SFB, &EncodeTensorMap_401_C, &Configure_401, &Submit_401},
+    {"kernel_cake_stepfun_moe_ecc014f7777aa3586e03", 0, 32, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 219264u, &EncodeTensorMap_402_A, &EncodeTensorMap_402_B, &EncodeTensorMap_402_SFA, &EncodeTensorMap_402_SFB, &EncodeTensorMap_402_C, &Configure_402, &Submit_402},
+    {"kernel_cake_stepfun_moe_aece2dada06b83728fa3", 0, 64, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_403_A, &EncodeTensorMap_403_B, &EncodeTensorMap_403_SFA, &EncodeTensorMap_403_SFB, &EncodeTensorMap_403_C, &Configure_403, &Submit_403},
+    {"kernel_cake_stepfun_moe_fa5a1b7b329321c031d6", 0, 256, 128, 256, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 220288u, &EncodeTensorMap_404_A, &EncodeTensorMap_404_B, &EncodeTensorMap_404_SFA, &EncodeTensorMap_404_SFB, &EncodeTensorMap_404_C, &Configure_404, &Submit_404},
+    {"kernel_cake_stepfun_moe_7f72e89902efb1ad82fd", 1, 8, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_405_A, &EncodeTensorMap_405_B, &EncodeTensorMap_405_SFA, &EncodeTensorMap_405_SFB, &EncodeTensorMap_405_C, &Configure_405, &Submit_405},
+    {"kernel_cake_stepfun_moe_4517c7747ddc144998d9", 1, 16, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 212608u, &EncodeTensorMap_406_A, &EncodeTensorMap_406_B, &EncodeTensorMap_406_SFA, &EncodeTensorMap_406_SFB, &EncodeTensorMap_406_C, &Configure_406, &Submit_406},
+    {"kernel_cake_stepfun_moe_ca26d81018b9aaa0f648", 1, 32, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 177280u, &EncodeTensorMap_407_A, &EncodeTensorMap_407_B, &EncodeTensorMap_407_SFA, &EncodeTensorMap_407_SFB, &EncodeTensorMap_407_C, &Configure_407, &Submit_407},
+    {"kernel_cake_stepfun_moe_4c337ece2a6735a3ccbd", 1, 64, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_408_A, &EncodeTensorMap_408_B, &EncodeTensorMap_408_SFA, &EncodeTensorMap_408_SFB, &EncodeTensorMap_408_C, &Configure_408, &Submit_408},
+    {"kernel_cake_stepfun_moe_c1cf8595503254f4dde0", 1, 256, 128, 256, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 184448u, &EncodeTensorMap_409_A, &EncodeTensorMap_409_B, &EncodeTensorMap_409_SFA, &EncodeTensorMap_409_SFB, &EncodeTensorMap_409_C, &Configure_409, &Submit_409},
+    {"kernel_cake_stepfun_moe_0905842144a4faaa740c", 2, 8, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_410_A, nullptr, nullptr, nullptr, &EncodeTensorMap_410_C, &Configure_410, &Submit_410},
+    {"kernel_cake_stepfun_moe_57dcacf43c06b3cd08ba", 2, 16, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_411_A, nullptr, nullptr, nullptr, &EncodeTensorMap_411_C, &Configure_411, &Submit_411},
+    {"kernel_cake_stepfun_moe_8b7e7004b564a9f60e62", 2, 32, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_412_A, nullptr, nullptr, nullptr, &EncodeTensorMap_412_C, &Configure_412, &Submit_412},
+    {"kernel_cake_stepfun_moe_5358a45b0c32f824a800", 2, 64, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 222336u, &EncodeTensorMap_413_A, &EncodeTensorMap_413_B, nullptr, nullptr, &EncodeTensorMap_413_C, &Configure_413, &Submit_413},
+    {"kernel_cake_stepfun_moe_bbb59d8e3bd2ae8450b3", 2, 128, 128, 64, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 214144u, &EncodeTensorMap_414_A, &EncodeTensorMap_414_B, nullptr, nullptr, &EncodeTensorMap_414_C, &Configure_414, &Submit_414},
+    {"kernel_cake_stepfun_moe_b7ed6822e6c7e5ffdf75", 3, 8, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_415_A, &EncodeTensorMap_415_B, nullptr, nullptr, &EncodeTensorMap_415_C, &Configure_415, &Submit_415},
+    {"kernel_cake_stepfun_moe_68e628a389017e4569ae", 3, 16, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_416_A, &EncodeTensorMap_416_B, nullptr, nullptr, &EncodeTensorMap_416_C, &Configure_416, &Submit_416},
+    {"kernel_cake_stepfun_moe_5d6f9cb8b0e15d33a401", 3, 32, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_417_A, &EncodeTensorMap_417_B, nullptr, nullptr, &EncodeTensorMap_417_C, &Configure_417, &Submit_417},
+    {"kernel_cake_stepfun_moe_a5513a15cd476d0d510b", 3, 64, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_418_A, &EncodeTensorMap_418_B, nullptr, nullptr, &EncodeTensorMap_418_C, &Configure_418, &Submit_418},
+    {"kernel_cake_stepfun_moe_39df49fb2f2b565764a7", 3, 128, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_419_A, &EncodeTensorMap_419_B, nullptr, nullptr, &EncodeTensorMap_419_C, &Configure_419, &Submit_419},
+    {"kernel_cake_stepfun_moe_672259d07af5fe99b756", 4, 8, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 147072u, &EncodeTensorMap_420_A, &EncodeTensorMap_420_B, &EncodeTensorMap_420_SFA, &EncodeTensorMap_420_SFB, &EncodeTensorMap_420_C, &Configure_420, &Submit_420},
+    {"kernel_cake_stepfun_moe_e8fc19b12bb2f4c4deae", 4, 16, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 119296u, &EncodeTensorMap_421_A, &EncodeTensorMap_421_B, &EncodeTensorMap_421_SFA, &EncodeTensorMap_421_SFB, &EncodeTensorMap_421_C, &Configure_421, &Submit_421},
+    {"kernel_cake_stepfun_moe_1de86ae74fed77b9b444", 4, 32, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 136064u, &EncodeTensorMap_422_A, &EncodeTensorMap_422_B, &EncodeTensorMap_422_SFA, &EncodeTensorMap_422_SFB, &EncodeTensorMap_422_C, &Configure_422, &Submit_422},
+    {"kernel_cake_stepfun_moe_c6ebc65e8bb4883c3fcd", 4, 64, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 187520u, &EncodeTensorMap_423_A, &EncodeTensorMap_423_B, &EncodeTensorMap_423_SFA, &EncodeTensorMap_423_SFB, &EncodeTensorMap_423_C, &Configure_423, &Submit_423},
+    {"kernel_cake_stepfun_moe_442338599676316b93bd", 4, 256, 128, 128, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 189056u, &EncodeTensorMap_424_A, &EncodeTensorMap_424_B, &EncodeTensorMap_424_SFA, &EncodeTensorMap_424_SFB, &EncodeTensorMap_424_C, &Configure_424, &Submit_424},
 };
 inline constexpr size_t kFc2KernelCount = 25;
 
@@ -2968,24 +2967,24 @@ __global__ __launch_bounds__(128) void
 kernel_cake_stepfun_moe_97ebed750eec2cdf32ba(const __nv_bfloat16* input, const int* expanded_idx_to_permuted_idx, uint8_t* out_fp4, uint8_t* out_sf, float* per_token_scale, float global_scale_inv, int m, int n);
 __global__ __launch_bounds__(128) void
 kernel_cake_stepfun_moe_282d3a4e475b39ddebdb(const __nv_bfloat16* input, const int* expanded_idx_to_permuted_idx, uint8_t* out_fp4, uint8_t* out_sf, float* per_token_scale, float global_scale_inv, int m, int n);
-__global__ __launch_bounds__(512, 1) __cluster_dims__(1,1,3) void
-kernel_cake_stepfun_moe_368d93f58ed9c0a354fa(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+__global__ __launch_bounds__(512, 1) void
+kernel_cake_stepfun_moe_af54235e12c43d03ddfb(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_7a7364458c28e6cb1a7d(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_b51b9374ade0ea2da26a(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_7e5785d8567f43845e33(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_stepfun_moe_745d7cae27b19d4707e9(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_5302768610fd41191fbe(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_d230c7423080cb2356df(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
+kernel_cake_stepfun_moe_1affd84ecdad6aa6f746(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_cd1764565cc059d5f045(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
+kernel_cake_stepfun_moe_20b19b21600beea76603(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_b5e4943f24e1e51fdc78(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_stepfun_moe_fea2d35a97691d172da4(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
+kernel_cake_stepfun_moe_908549983cb48c2e3319(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(384, 1) void
 kernel_cake_stepfun_moe_0ce0a269e5e6b1310c49(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles, float* __restrict__ token_sf);
 __global__ __launch_bounds__(384, 1) void
@@ -2994,8 +2993,8 @@ __global__ __launch_bounds__(384, 1) void
 kernel_cake_stepfun_moe_51eaa147c145c6baae92(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(384, 1) void
 kernel_cake_stepfun_moe_78a3999ea5c6c49300b8(const __grid_constant__ CUtensorMap A, __nv_bfloat16* __restrict__ B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
-kernel_cake_stepfun_moe_2102fab6523f4ab43959(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+__global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
+kernel_cake_stepfun_moe_523b88200133e63e9ad2(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_3d50e2c4de4abcbcdc56(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) void
@@ -3008,8 +3007,8 @@ __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_14983f8b8b8671bfa4f8(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
 kernel_cake_stepfun_moe_a970c128baa745427870(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, float* __restrict__ scale_c, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-__global__ __launch_bounds__(512, 1) __cluster_dims__(1,1,2) void
-kernel_cake_stepfun_moe_dd896dce7f975ac8eb3e(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+__global__ __launch_bounds__(512, 1) void
+kernel_cake_stepfun_moe_3c4cf5a5cece15e7b261(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
 kernel_cake_stepfun_moe_5d8bb4082218bd03fbc1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
@@ -3504,11 +3503,11 @@ inline bool EncodeTensorMap_1400_C(CUtensorMap* out, const TensorLayout& tensor)
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_1400(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_368d93f58ed9c0a354fa, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_af54235e12c43d03ddfb, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_1400(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_368d93f58ed9c0a354fa, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_af54235e12c43d03ddfb, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_1401_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -3816,11 +3815,11 @@ inline bool EncodeTensorMap_1403_C(CUtensorMap* out, const TensorLayout& tensor)
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_1403(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_7e5785d8567f43845e33, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_745d7cae27b19d4707e9, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_1403(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_7e5785d8567f43845e33, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_745d7cae27b19d4707e9, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_1404_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -4027,11 +4026,11 @@ inline bool EncodeTensorMap_1405_C(CUtensorMap* out, const TensorLayout& tensor)
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_1405(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_d230c7423080cb2356df, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_1affd84ecdad6aa6f746, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_1405(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_d230c7423080cb2356df, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_1affd84ecdad6aa6f746, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
 }
 inline bool EncodeTensorMap_1406_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -4131,11 +4130,11 @@ inline bool EncodeTensorMap_1406_C(CUtensorMap* out, const TensorLayout& tensor)
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_1406(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_cd1764565cc059d5f045, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_20b19b21600beea76603, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_1406(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_cd1764565cc059d5f045, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_20b19b21600beea76603, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
 }
 inline bool EncodeTensorMap_1407_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -4339,11 +4338,11 @@ inline bool EncodeTensorMap_1408_C(CUtensorMap* out, const TensorLayout& tensor)
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_1408(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_fea2d35a97691d172da4, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_908549983cb48c2e3319, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_1408(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_fea2d35a97691d172da4, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_908549983cb48c2e3319, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.scale_c, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.per_token_scale);
 }
 inline bool EncodeTensorMap_1409_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -4617,28 +4616,10 @@ inline bool EncodeTensorMap_1413_A(CUtensorMap* out, const TensorLayout& tensor)
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
       out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
 inline bool EncodeTensorMap_1413_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  if (!(d1 > 0)) return false;
-  const int64_t outer1 = static_cast<int64_t>(tensor.elements) / (d1);
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
-  if (s2 <= 0) return false;
-  uint64_t global_dim[2] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(outer1)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0)) return false;
-  if (!(64u <= global_dim[0] && 32u <= global_dim[1])) return false;
-  uint64_t global_strides[1] = {static_cast<uint64_t>(((s2) * 16) / 8)};
-  uint32_t box_dim[2] = {64u, 32u};
-  uint32_t element_stride[2] = {1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_1413_C(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
   const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
   if (!(d1 > 0)) return false;
@@ -4652,15 +4633,32 @@ inline bool EncodeTensorMap_1413_C(CUtensorMap* out, const TensorLayout& tensor)
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
       out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_1413_C(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  if (!(d1 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  if (s2 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(64), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(64u <= global_dim[0] && 64u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
+  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_1413(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_2102fab6523f4ab43959, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_523b88200133e63e9ad2, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_1413(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_2102fab6523f4ab43959, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_523b88200133e63e9ad2, args.A, args.B_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_1414_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
@@ -5072,9 +5070,9 @@ inline bool EncodeTensorMap_1420_SFA(CUtensorMap* out, const TensorLayout& tenso
   if (s4 <= 0) return false;
   uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
   if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 4u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 2u <= global_dim[2] && 1u <= global_dim[3])) return false;
   uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 4u, 1u};
+  uint32_t box_dim[4] = {256u, 2u, 2u, 1u};
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
       out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
@@ -5093,9 +5091,9 @@ inline bool EncodeTensorMap_1420_SFB(CUtensorMap* out, const TensorLayout& tenso
   if (s3 <= 0) return false;
   uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3)};
   if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 4u <= global_dim[1] && 1u <= global_dim[2])) return false;
+  if (!(32u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[2])) return false;
   uint64_t global_strides[2] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 4u, 1u};
+  uint32_t box_dim[3] = {32u, 2u, 1u};
   uint32_t element_stride[3] = {1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
       out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
@@ -5120,11 +5118,11 @@ inline bool EncodeTensorMap_1420_C(CUtensorMap* out, const TensorLayout& tensor)
   return result == CUDA_SUCCESS;
 }
 inline cudaError_t Configure_1420(size_t dynamic_smem_bytes) {
-  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_dd896dce7f975ac8eb3e, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  return cudaFuncSetAttribute(kernel_cake_stepfun_moe_3c4cf5a5cece15e7b261, cudaFuncAttributeMaxDynamicSharedMemorySize,
                               static_cast<int>(dynamic_smem_bytes));
 }
 inline cudaError_t Submit_1420(const cudaLaunchConfig_t* config, const Fc2Args& args) {
-  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_dd896dce7f975ac8eb3e, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+  return cudaLaunchKernelEx(config, kernel_cake_stepfun_moe_3c4cf5a5cece15e7b261, args.A, args.B_map, args.SFA, args.SFB_map, args.C_map, args.tile_expert, args.tile_mn_limit, args.total_tiles, args.N_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 inline bool EncodeTensorMap_1421_A(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
@@ -5635,31 +5633,31 @@ inline constexpr RequantKernelSpec kRequantKernels[] = {
 inline constexpr size_t kRequantKernelCount = 2;
 
 inline constexpr Fc2KernelSpec kFc2Kernels[] = {
-    {"kernel_cake_stepfun_moe_368d93f58ed9c0a354fa", 0, 8, 128, 512, 3, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 3u}, false, 209280u, &EncodeTensorMap_1400_A, &EncodeTensorMap_1400_B, &EncodeTensorMap_1400_SFA, &EncodeTensorMap_1400_SFB, &EncodeTensorMap_1400_C, &Configure_1400, &Submit_1400},
-    {"kernel_cake_stepfun_moe_7a7364458c28e6cb1a7d", 0, 16, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 202368u, &EncodeTensorMap_1401_A, &EncodeTensorMap_1401_B, &EncodeTensorMap_1401_SFA, &EncodeTensorMap_1401_SFB, &EncodeTensorMap_1401_C, &Configure_1401, &Submit_1401},
-    {"kernel_cake_stepfun_moe_b51b9374ade0ea2da26a", 0, 32, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 219264u, &EncodeTensorMap_1402_A, &EncodeTensorMap_1402_B, &EncodeTensorMap_1402_SFA, &EncodeTensorMap_1402_SFB, &EncodeTensorMap_1402_C, &Configure_1402, &Submit_1402},
-    {"kernel_cake_stepfun_moe_7e5785d8567f43845e33", 0, 64, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_1403_A, &EncodeTensorMap_1403_B, &EncodeTensorMap_1403_SFA, &EncodeTensorMap_1403_SFB, &EncodeTensorMap_1403_C, &Configure_1403, &Submit_1403},
-    {"kernel_cake_stepfun_moe_5302768610fd41191fbe", 0, 256, 128, 256, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 220288u, &EncodeTensorMap_1404_A, &EncodeTensorMap_1404_B, &EncodeTensorMap_1404_SFA, &EncodeTensorMap_1404_SFB, &EncodeTensorMap_1404_C, &Configure_1404, &Submit_1404},
-    {"kernel_cake_stepfun_moe_d230c7423080cb2356df", 1, 8, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_1405_A, &EncodeTensorMap_1405_B, &EncodeTensorMap_1405_SFA, &EncodeTensorMap_1405_SFB, &EncodeTensorMap_1405_C, &Configure_1405, &Submit_1405},
-    {"kernel_cake_stepfun_moe_cd1764565cc059d5f045", 1, 16, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 212608u, &EncodeTensorMap_1406_A, &EncodeTensorMap_1406_B, &EncodeTensorMap_1406_SFA, &EncodeTensorMap_1406_SFB, &EncodeTensorMap_1406_C, &Configure_1406, &Submit_1406},
-    {"kernel_cake_stepfun_moe_b5e4943f24e1e51fdc78", 1, 32, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 177280u, &EncodeTensorMap_1407_A, &EncodeTensorMap_1407_B, &EncodeTensorMap_1407_SFA, &EncodeTensorMap_1407_SFB, &EncodeTensorMap_1407_C, &Configure_1407, &Submit_1407},
-    {"kernel_cake_stepfun_moe_fea2d35a97691d172da4", 1, 64, 128, 512, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_1408_A, &EncodeTensorMap_1408_B, &EncodeTensorMap_1408_SFA, &EncodeTensorMap_1408_SFB, &EncodeTensorMap_1408_C, &Configure_1408, &Submit_1408},
-    {"kernel_cake_stepfun_moe_0ce0a269e5e6b1310c49", 1, 256, 128, 256, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 184448u, &EncodeTensorMap_1409_A, &EncodeTensorMap_1409_B, &EncodeTensorMap_1409_SFA, &EncodeTensorMap_1409_SFB, &EncodeTensorMap_1409_C, &Configure_1409, &Submit_1409},
-    {"kernel_cake_stepfun_moe_fae43c2e883ffc119677", 2, 8, 128, 128, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_1410_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1410_C, &Configure_1410, &Submit_1410},
-    {"kernel_cake_stepfun_moe_51eaa147c145c6baae92", 2, 16, 128, 128, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_1411_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1411_C, &Configure_1411, &Submit_1411},
-    {"kernel_cake_stepfun_moe_78a3999ea5c6c49300b8", 2, 32, 128, 128, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_1412_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1412_C, &Configure_1412, &Submit_1412},
-    {"kernel_cake_stepfun_moe_2102fab6523f4ab43959", 2, 64, 128, 128, 1, SfLayout::kNone, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 214144u, &EncodeTensorMap_1413_A, &EncodeTensorMap_1413_B, nullptr, nullptr, &EncodeTensorMap_1413_C, &Configure_1413, &Submit_1413},
-    {"kernel_cake_stepfun_moe_3d50e2c4de4abcbcdc56", 2, 128, 128, 64, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 214144u, &EncodeTensorMap_1414_A, &EncodeTensorMap_1414_B, nullptr, nullptr, &EncodeTensorMap_1414_C, &Configure_1414, &Submit_1414},
-    {"kernel_cake_stepfun_moe_821b1975dd838b262d78", 3, 8, 128, 256, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_1415_A, &EncodeTensorMap_1415_B, nullptr, nullptr, &EncodeTensorMap_1415_C, &Configure_1415, &Submit_1415},
-    {"kernel_cake_stepfun_moe_618da7443921108284bd", 3, 16, 128, 256, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_1416_A, &EncodeTensorMap_1416_B, nullptr, nullptr, &EncodeTensorMap_1416_C, &Configure_1416, &Submit_1416},
-    {"kernel_cake_stepfun_moe_3c6c2fbcee1c4a6f170c", 3, 32, 128, 256, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_1417_A, &EncodeTensorMap_1417_B, nullptr, nullptr, &EncodeTensorMap_1417_C, &Configure_1417, &Submit_1417},
-    {"kernel_cake_stepfun_moe_14983f8b8b8671bfa4f8", 3, 64, 128, 128, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_1418_A, &EncodeTensorMap_1418_B, nullptr, nullptr, &EncodeTensorMap_1418_C, &Configure_1418, &Submit_1418},
-    {"kernel_cake_stepfun_moe_a970c128baa745427870", 3, 128, 128, 128, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_1419_A, &EncodeTensorMap_1419_B, nullptr, nullptr, &EncodeTensorMap_1419_C, &Configure_1419, &Submit_1419},
-    {"kernel_cake_stepfun_moe_dd896dce7f975ac8eb3e", 4, 8, 128, 512, 2, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 2u}, false, 227456u, &EncodeTensorMap_1420_A, &EncodeTensorMap_1420_B, &EncodeTensorMap_1420_SFA, &EncodeTensorMap_1420_SFB, &EncodeTensorMap_1420_C, &Configure_1420, &Submit_1420},
-    {"kernel_cake_stepfun_moe_5d8bb4082218bd03fbc1", 4, 16, 128, 256, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 119296u, &EncodeTensorMap_1421_A, &EncodeTensorMap_1421_B, &EncodeTensorMap_1421_SFA, &EncodeTensorMap_1421_SFB, &EncodeTensorMap_1421_C, &Configure_1421, &Submit_1421},
-    {"kernel_cake_stepfun_moe_2fdae48b32159c58c8a1", 4, 32, 128, 256, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 136064u, &EncodeTensorMap_1422_A, &EncodeTensorMap_1422_B, &EncodeTensorMap_1422_SFA, &EncodeTensorMap_1422_SFB, &EncodeTensorMap_1422_C, &Configure_1422, &Submit_1422},
-    {"kernel_cake_stepfun_moe_10245ebec71cb50dee88", 4, 64, 128, 256, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 187520u, &EncodeTensorMap_1423_A, &EncodeTensorMap_1423_B, &EncodeTensorMap_1423_SFA, &EncodeTensorMap_1423_SFB, &EncodeTensorMap_1423_C, &Configure_1423, &Submit_1423},
-    {"kernel_cake_stepfun_moe_4b17d6a175100c155a63", 4, 256, 128, 128, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 189056u, &EncodeTensorMap_1424_A, &EncodeTensorMap_1424_B, &EncodeTensorMap_1424_SFA, &EncodeTensorMap_1424_SFB, &EncodeTensorMap_1424_C, &Configure_1424, &Submit_1424},
+    {"kernel_cake_stepfun_moe_af54235e12c43d03ddfb", 0, 8, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_1400_A, &EncodeTensorMap_1400_B, &EncodeTensorMap_1400_SFA, &EncodeTensorMap_1400_SFB, &EncodeTensorMap_1400_C, &Configure_1400, &Submit_1400},
+    {"kernel_cake_stepfun_moe_7a7364458c28e6cb1a7d", 0, 16, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 202368u, &EncodeTensorMap_1401_A, &EncodeTensorMap_1401_B, &EncodeTensorMap_1401_SFA, &EncodeTensorMap_1401_SFB, &EncodeTensorMap_1401_C, &Configure_1401, &Submit_1401},
+    {"kernel_cake_stepfun_moe_b51b9374ade0ea2da26a", 0, 32, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 219264u, &EncodeTensorMap_1402_A, &EncodeTensorMap_1402_B, &EncodeTensorMap_1402_SFA, &EncodeTensorMap_1402_SFB, &EncodeTensorMap_1402_C, &Configure_1402, &Submit_1402},
+    {"kernel_cake_stepfun_moe_745d7cae27b19d4707e9", 0, 64, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_1403_A, &EncodeTensorMap_1403_B, &EncodeTensorMap_1403_SFA, &EncodeTensorMap_1403_SFB, &EncodeTensorMap_1403_C, &Configure_1403, &Submit_1403},
+    {"kernel_cake_stepfun_moe_5302768610fd41191fbe", 0, 256, 128, 256, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 220288u, &EncodeTensorMap_1404_A, &EncodeTensorMap_1404_B, &EncodeTensorMap_1404_SFA, &EncodeTensorMap_1404_SFB, &EncodeTensorMap_1404_C, &Configure_1404, &Submit_1404},
+    {"kernel_cake_stepfun_moe_1affd84ecdad6aa6f746", 1, 8, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_1405_A, &EncodeTensorMap_1405_B, &EncodeTensorMap_1405_SFA, &EncodeTensorMap_1405_SFB, &EncodeTensorMap_1405_C, &Configure_1405, &Submit_1405},
+    {"kernel_cake_stepfun_moe_20b19b21600beea76603", 1, 16, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 212608u, &EncodeTensorMap_1406_A, &EncodeTensorMap_1406_B, &EncodeTensorMap_1406_SFA, &EncodeTensorMap_1406_SFB, &EncodeTensorMap_1406_C, &Configure_1406, &Submit_1406},
+    {"kernel_cake_stepfun_moe_b5e4943f24e1e51fdc78", 1, 32, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 177280u, &EncodeTensorMap_1407_A, &EncodeTensorMap_1407_B, &EncodeTensorMap_1407_SFA, &EncodeTensorMap_1407_SFB, &EncodeTensorMap_1407_C, &Configure_1407, &Submit_1407},
+    {"kernel_cake_stepfun_moe_908549983cb48c2e3319", 1, 64, 128, 512, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 183424u, &EncodeTensorMap_1408_A, &EncodeTensorMap_1408_B, &EncodeTensorMap_1408_SFA, &EncodeTensorMap_1408_SFB, &EncodeTensorMap_1408_C, &Configure_1408, &Submit_1408},
+    {"kernel_cake_stepfun_moe_0ce0a269e5e6b1310c49", 1, 256, 128, 256, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 184448u, &EncodeTensorMap_1409_A, &EncodeTensorMap_1409_B, &EncodeTensorMap_1409_SFA, &EncodeTensorMap_1409_SFB, &EncodeTensorMap_1409_C, &Configure_1409, &Submit_1409},
+    {"kernel_cake_stepfun_moe_fae43c2e883ffc119677", 2, 8, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_1410_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1410_C, &Configure_1410, &Submit_1410},
+    {"kernel_cake_stepfun_moe_51eaa147c145c6baae92", 2, 16, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_1411_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1411_C, &Configure_1411, &Submit_1411},
+    {"kernel_cake_stepfun_moe_78a3999ea5c6c49300b8", 2, 32, 128, 128, 1, 1, 1, SfLayout::kNone, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_1412_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1412_C, &Configure_1412, &Submit_1412},
+    {"kernel_cake_stepfun_moe_523b88200133e63e9ad2", 2, 64, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 222336u, &EncodeTensorMap_1413_A, &EncodeTensorMap_1413_B, nullptr, nullptr, &EncodeTensorMap_1413_C, &Configure_1413, &Submit_1413},
+    {"kernel_cake_stepfun_moe_3d50e2c4de4abcbcdc56", 2, 128, 128, 64, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 214144u, &EncodeTensorMap_1414_A, &EncodeTensorMap_1414_B, nullptr, nullptr, &EncodeTensorMap_1414_C, &Configure_1414, &Submit_1414},
+    {"kernel_cake_stepfun_moe_821b1975dd838b262d78", 3, 8, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 212096u, &EncodeTensorMap_1415_A, &EncodeTensorMap_1415_B, nullptr, nullptr, &EncodeTensorMap_1415_C, &Configure_1415, &Submit_1415},
+    {"kernel_cake_stepfun_moe_618da7443921108284bd", 3, 16, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 226432u, &EncodeTensorMap_1416_A, &EncodeTensorMap_1416_B, nullptr, nullptr, &EncodeTensorMap_1416_C, &Configure_1416, &Submit_1416},
+    {"kernel_cake_stepfun_moe_3c6c2fbcee1c4a6f170c", 3, 32, 128, 256, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 214144u, &EncodeTensorMap_1417_A, &EncodeTensorMap_1417_B, nullptr, nullptr, &EncodeTensorMap_1417_C, &Configure_1417, &Submit_1417},
+    {"kernel_cake_stepfun_moe_14983f8b8b8671bfa4f8", 3, 64, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_1418_A, &EncodeTensorMap_1418_B, nullptr, nullptr, &EncodeTensorMap_1418_C, &Configure_1418, &Submit_1418},
+    {"kernel_cake_stepfun_moe_a970c128baa745427870", 3, 128, 128, 128, 1, 1, 1, SfLayout::kNone, {256u, 1u, 1u}, {2u, 1u, 1u}, false, 181376u, &EncodeTensorMap_1419_A, &EncodeTensorMap_1419_B, nullptr, nullptr, &EncodeTensorMap_1419_C, &Configure_1419, &Submit_1419},
+    {"kernel_cake_stepfun_moe_3c4cf5a5cece15e7b261", 4, 8, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 147072u, &EncodeTensorMap_1420_A, &EncodeTensorMap_1420_B, &EncodeTensorMap_1420_SFA, &EncodeTensorMap_1420_SFB, &EncodeTensorMap_1420_C, &Configure_1420, &Submit_1420},
+    {"kernel_cake_stepfun_moe_5d8bb4082218bd03fbc1", 4, 16, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 119296u, &EncodeTensorMap_1421_A, &EncodeTensorMap_1421_B, &EncodeTensorMap_1421_SFA, &EncodeTensorMap_1421_SFB, &EncodeTensorMap_1421_C, &Configure_1421, &Submit_1421},
+    {"kernel_cake_stepfun_moe_2fdae48b32159c58c8a1", 4, 32, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 136064u, &EncodeTensorMap_1422_A, &EncodeTensorMap_1422_B, &EncodeTensorMap_1422_SFA, &EncodeTensorMap_1422_SFB, &EncodeTensorMap_1422_C, &Configure_1422, &Submit_1422},
+    {"kernel_cake_stepfun_moe_10245ebec71cb50dee88", 4, 64, 128, 256, 1, 1, 1, SfLayout::kR8c4, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 187520u, &EncodeTensorMap_1423_A, &EncodeTensorMap_1423_B, &EncodeTensorMap_1423_SFA, &EncodeTensorMap_1423_SFB, &EncodeTensorMap_1423_C, &Configure_1423, &Submit_1423},
+    {"kernel_cake_stepfun_moe_4b17d6a175100c155a63", 4, 256, 128, 128, 1, 1, 1, SfLayout::kR128c4, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 189056u, &EncodeTensorMap_1424_A, &EncodeTensorMap_1424_B, &EncodeTensorMap_1424_SFA, &EncodeTensorMap_1424_SFB, &EncodeTensorMap_1424_C, &Configure_1424, &Submit_1424},
 };
 inline constexpr size_t kFc2KernelCount = 25;
 
