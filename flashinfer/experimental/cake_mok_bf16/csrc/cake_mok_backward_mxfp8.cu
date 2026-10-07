@@ -489,6 +489,10 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
     int minis = (tokens + mini_size - 1) / mini_size;
     int _min_0 = ((tokens) < (macro_size) ? (tokens) : (macro_size));
     int saved_minis = (_min_0 + mini_size - 1) / mini_size;
+    int weight_tasks = experts * shared_wgrad;
+    int saved_tasks = saved_minis * mini_bwd + 3 * weight_tasks;
+    int minis_per_macro = macro_size / mini_size;
+    int replay_macro_tasks = minis_per_macro * (mini_replay + mini_bwd) + 3 * weight_tasks;
     int true_compute = shared_tasks + minis * mini_bwd + (minis - saved_minis) * mini_replay + macros * wgrad_tasks;
     int comm_clusters = comm_sms / 2;
     int true_clusters = comm_clusters + true_compute;
@@ -1544,6 +1548,88 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
         }
     } else {
         int iteration = 0;
+        int kind = -1;
+        int task_3 = 0;
+        int macro_1 = 0;
+        int mini_1 = 0;
+        int shared = 0;
+        int kind_0 = -1;
+        int task_1_1 = 0;
+        int macro_2 = 0;
+        int mini_3 = 0;
+        int shared_4 = 0;
+        if (cluster - comm_clusters >= 0 && true_compute > cluster - comm_clusters) {
+            if (shared_tasks > cluster - comm_clusters) {
+                shared_4 = 1;
+                if (shared_down > cluster - comm_clusters) {
+                    kind_0 = 0;
+                    task_1_1 = cluster - comm_clusters;
+                } else if (cluster - comm_clusters < shared_down + shared_swiglu) {
+                    kind_0 = 1;
+                    task_1_1 = cluster - comm_clusters - shared_down;
+                } else {
+                    if (cluster - comm_clusters < shared_down + shared_swiglu + shared_dx) {
+                        kind_0 = 2;
+                        task_1_1 = cluster - comm_clusters - shared_down - shared_swiglu;
+                    } else {
+                        int weight_task = cluster - comm_clusters - shared_down - shared_swiglu - shared_dx;
+                        kind_0 = 3 + weight_task / shared_wgrad;
+                        task_1_1 = weight_task % shared_wgrad;
+                    }
+                }
+            } else {
+                int routed = cluster - comm_clusters - shared_tasks;
+                int macro_task = routed;
+                int macro_minis = saved_minis;
+                int replay_tasks = 0;
+                if (routed >= saved_tasks) {
+                    macro_2 = 1 + (routed - saved_tasks) / replay_macro_tasks;
+                    macro_task = (routed - saved_tasks) % replay_macro_tasks;
+                    int _min_24 = ((tokens - macro_2 * macro_size) < (macro_size) ? (tokens - macro_2 * macro_size) : (macro_size));
+                    macro_minis = (_min_24 + mini_size - 1) / mini_size;
+                    replay_tasks = macro_minis * mini_replay;
+                }
+                if (macro_task < replay_tasks) {
+                    mini_3 = macro_task / mini_replay;
+                    int mini_task = macro_task % mini_replay;
+                    if (mini_task < mini_down) {
+                        kind_0 = 6;
+                        task_1_1 = mini_task;
+                    } else if (mini_task < 2 * mini_down) {
+                        kind_0 = 7;
+                        task_1_1 = mini_task - mini_down;
+                    } else {
+                        kind_0 = 8;
+                        task_1_1 = mini_task - 2 * mini_down;
+                    }
+                } else {
+                    int bwd_task = macro_task - replay_tasks;
+                    if (bwd_task < macro_minis * mini_bwd) {
+                        mini_3 = bwd_task / mini_bwd;
+                        int mini_task_1 = bwd_task % mini_bwd;
+                        if (mini_task_1 < mini_down) {
+                            kind_0 = 0;
+                            task_1_1 = mini_task_1;
+                        } else if (mini_task_1 < mini_down + mini_swiglu) {
+                            kind_0 = 1;
+                            task_1_1 = mini_task_1 - mini_down;
+                        } else {
+                            kind_0 = 2;
+                            task_1_1 = mini_task_1 - mini_down - mini_swiglu;
+                        }
+                    } else {
+                        int weight_task_1 = bwd_task - macro_minis * mini_bwd;
+                        kind_0 = 3 + weight_task_1 / weight_tasks;
+                        task_1_1 = weight_task_1 % weight_tasks;
+                    }
+                }
+            }
+        }
+        kind = kind_0;
+        task_3 = task_1_1;
+        macro_1 = macro_2;
+        mini_1 = mini_3;
+        shared = shared_4;
         while (cluster >= 0 && cluster < true_clusters) {
             if (tid / 32 == 5) {
                 if (warp == 5) {
@@ -1561,93 +1647,12 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                     }
                 }
             }
-            int shared_tasks_0 = shared_down + shared_swiglu + shared_dx + 3 * shared_wgrad;
-            int mini_bwd_1 = mini_down + mini_swiglu + mini_dx;
-            int mini_replay_2 = 2 * mini_down + mini_replay_swiglu;
-            int weight_tasks = experts * shared_wgrad;
-            int _min_24 = ((tokens) < (macro_size) ? (tokens) : (macro_size));
-            int saved_minis_3 = (_min_24 + mini_size - 1) / mini_size;
-            int saved_tasks = saved_minis_3 * mini_bwd_1 + 3 * weight_tasks;
-            int replay_macro_tasks = macro_size / mini_size * (mini_replay_2 + mini_bwd_1) + 3 * weight_tasks;
-            int kind = -1;
-            int task_3 = 0;
-            int macro_1 = 0;
-            int mini_1 = 0;
-            int shared = 0;
-            if (cluster - comm_clusters >= 0 && true_compute > cluster - comm_clusters) {
-                if (shared_tasks_0 > cluster - comm_clusters) {
-                    shared = 1;
-                    if (shared_down > cluster - comm_clusters) {
-                        kind = 0;
-                        task_3 = cluster - comm_clusters;
-                    } else if (cluster - comm_clusters < shared_down + shared_swiglu) {
-                        kind = 1;
-                        task_3 = cluster - comm_clusters - shared_down;
-                    } else {
-                        if (cluster - comm_clusters < shared_down + shared_swiglu + shared_dx) {
-                            kind = 2;
-                            task_3 = cluster - comm_clusters - shared_down - shared_swiglu;
-                        } else {
-                            int weight_task = cluster - comm_clusters - shared_down - shared_swiglu - shared_dx;
-                            kind = 3 + weight_task / shared_wgrad;
-                            task_3 = weight_task % shared_wgrad;
-                        }
-                    }
-                } else {
-                    int routed = cluster - comm_clusters - shared_tasks_0;
-                    int macro_task = routed;
-                    int replay_tasks = 0;
-                    if (routed >= saved_tasks) {
-                        macro_1 = 1 + (routed - saved_tasks) / replay_macro_tasks;
-                        macro_task = (routed - saved_tasks) % replay_macro_tasks;
-                        int _min_25 = ((tokens - macro_1 * macro_size) < (macro_size) ? (tokens - macro_1 * macro_size) : (macro_size));
-                        int macro_minis = (_min_25 + mini_size - 1) / mini_size;
-                        replay_tasks = macro_minis * mini_replay_2;
-                    }
-                    int _min_26 = ((tokens - macro_1 * macro_size) < (macro_size) ? (tokens - macro_1 * macro_size) : (macro_size));
-                    int macro_minis_1 = (_min_26 + mini_size - 1) / mini_size;
-                    if (macro_task < replay_tasks) {
-                        mini_1 = macro_task / mini_replay_2;
-                        int mini_task = macro_task % mini_replay_2;
-                        if (mini_task < mini_down) {
-                            kind = 6;
-                            task_3 = mini_task;
-                        } else if (mini_task < 2 * mini_down) {
-                            kind = 7;
-                            task_3 = mini_task - mini_down;
-                        } else {
-                            kind = 8;
-                            task_3 = mini_task - 2 * mini_down;
-                        }
-                    } else {
-                        int bwd_task = macro_task - replay_tasks;
-                        if (bwd_task < macro_minis_1 * mini_bwd_1) {
-                            mini_1 = bwd_task / mini_bwd_1;
-                            int mini_task_1 = bwd_task % mini_bwd_1;
-                            if (mini_task_1 < mini_down) {
-                                kind = 0;
-                                task_3 = mini_task_1;
-                            } else if (mini_task_1 < mini_down + mini_swiglu) {
-                                kind = 1;
-                                task_3 = mini_task_1 - mini_down;
-                            } else {
-                                kind = 2;
-                                task_3 = mini_task_1 - mini_down - mini_swiglu;
-                            }
-                        } else {
-                            int weight_task_1 = bwd_task - macro_minis_1 * mini_bwd_1;
-                            kind = 3 + weight_task_1 / weight_tasks;
-                            task_3 = weight_task_1 % weight_tasks;
-                        }
-                    }
-                }
-            }
             unsigned int gemm_phase = gemm_bits;
             unsigned int swiglu_phase = swiglu_bits;
             unsigned int replay_phase = replay_bits;
             int row_count = 2 * (intermediate / 128);
             int shared_rows = (local_tokens + 255) / 256;
-            int shared_down_4 = shared_rows * (intermediate / 256);
+            int shared_down_0 = shared_rows * (intermediate / 256);
             if (shared != 0) {
                 if (kind == 0) {
                     int col_blocks_3 = hidden / 256;
@@ -1691,8 +1696,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         if (warp == 7) {
                             if (elect_sync()) {
                                 {
-                                    int _min_27 = ((mini_size) < (tokens - global_mini * mini_size) ? (mini_size) : (tokens - global_mini * mini_size));
-                                    int _max_6 = ((0) > (_min_27) ? (0) : (_min_27));
+                                    int _min_25 = ((mini_size) < (tokens - global_mini * mini_size) ? (mini_size) : (tokens - global_mini * mini_size));
+                                    int _max_6 = ((0) > (_min_25) ? (0) : (_min_25));
                                     int mini_rows_4 = _max_6;
                                     int required_3 = (mini_rows_4 + 127) / 128 * ((hidden + 511) / 512);
                                 }
@@ -1800,8 +1805,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     :: "r"((output_finished_addr) & 0xFEFFFFFF) : "memory");
                                 int previous_offset_3 = macro_size;
                                 int output_row = x * 256 + cta_rank_0 * 128;
-                                int _min_28 = ((macro_size) < (tokens - previous_offset_3) ? (macro_size) : (tokens - previous_offset_3));
-                                if (output_row < _min_28) {
+                                int _min_26 = ((macro_size) < (tokens - previous_offset_3) ? (macro_size) : (tokens - previous_offset_3));
+                                if (output_row < _min_26) {
                                 }
                             }
                             #pragma unroll
@@ -1978,11 +1983,11 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         float dh = dhidden[elem];
                                         bool gate_mask = g <= swiglu_limit;
                                         bool up_mask = u >= -swiglu_limit && u <= swiglu_limit;
-                                        float _min_30 = fminf(g, swiglu_limit);
-                                        float g_c = _min_30;
+                                        float _min_28 = fminf(g, swiglu_limit);
+                                        float g_c = _min_28;
                                         float _max_7 = max_noftz(u, -swiglu_limit);
-                                        float _min_31 = fminf(_max_7, swiglu_limit);
-                                        float u_c = _min_31;
+                                        float _min_29 = fminf(_max_7, swiglu_limit);
+                                        float u_c = _min_29;
                                         float _exp_0 = expf(-g_c);
                                         float sigmoid = 1.0f / (1.0f + _exp_0);
                                         float silu = g_c * sigmoid;
@@ -2244,8 +2249,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             }
                                             asm volatile("fence.acquire.gpu;" ::: "memory");
                                         }
-                                        int _min_32 = ((mini_size) < (tokens - global_mini_1 * mini_size) ? (mini_size) : (tokens - global_mini_1 * mini_size));
-                                        int _max_8 = ((0) > (_min_32) ? (0) : (_min_32));
+                                        int _min_30 = ((mini_size) < (tokens - global_mini_1 * mini_size) ? (mini_size) : (tokens - global_mini_1 * mini_size));
+                                        int _max_8 = ((0) > (_min_30) ? (0) : (_min_30));
                                         int mini_rows_5 = _max_8;
                                         int required_4 = (mini_rows_5 + 127) / 128 * ((intermediate + 511) / 512);
                                     }
@@ -2366,8 +2371,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         :: "r"((output_finished_addr) & 0xFEFFFFFF) : "memory");
                                     int previous_offset_4 = macro_size;
                                     int output_row_1 = x_1 * 256 + cta_rank_0 * 128;
-                                    int _min_33 = ((macro_size) < (tokens - previous_offset_4) ? (macro_size) : (tokens - previous_offset_4));
-                                    if (output_row_1 < _min_33) {
+                                    int _min_31 = ((macro_size) < (tokens - previous_offset_4) ? (macro_size) : (tokens - previous_offset_4));
+                                    if (output_row_1 < _min_31) {
                                     }
                                 }
                                 #pragma unroll
@@ -2470,8 +2475,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         }
                                         if (idx_4 == 0 || token_row % mini_size == 0) {
                                             int input_mini = token_row / mini_size;
-                                            int _min_35 = ((mini_size) < (tokens - input_mini * mini_size) ? (mini_size) : (tokens - input_mini * mini_size));
-                                            int input_rows = _min_35;
+                                            int _min_33 = ((mini_size) < (tokens - input_mini * mini_size) ? (mini_size) : (tokens - input_mini * mini_size));
+                                            int input_rows = _min_33;
                                             int input_count = (input_rows + 127) / 128 * ((hidden + 511) / 512);
                                         }
                                         mbarrier_wait(gemm_finished_addr + (ring_4) * 8, phase_bits_6 >> (unsigned int)(16 + ring_4) & 1);
@@ -2576,8 +2581,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         :: "r"((output_finished_addr) & 0xFEFFFFFF) : "memory");
                                     int previous_offset_5 = macro_size;
                                     int output_row_2 = x_2 * 256 + cta_rank_0 * 128;
-                                    int _min_36 = ((macro_size) < (tokens - previous_offset_5) ? (macro_size) : (tokens - previous_offset_5));
-                                    if (output_row_2 < _min_36) {
+                                    int _min_34 = ((macro_size) < (tokens - previous_offset_5) ? (macro_size) : (tokens - previous_offset_5));
+                                    if (output_row_2 < _min_34) {
                                     }
                                 }
                                 #pragma unroll
@@ -2704,8 +2709,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             }
                                             if (idx_6 == 0 || token_row_1 % mini_size == 0) {
                                                 int input_mini_1 = token_row_1 / mini_size;
-                                                int _min_38 = ((mini_size) < (tokens - input_mini_1 * mini_size) ? (mini_size) : (tokens - input_mini_1 * mini_size));
-                                                int input_rows_1 = _min_38;
+                                                int _min_36 = ((mini_size) < (tokens - input_mini_1 * mini_size) ? (mini_size) : (tokens - input_mini_1 * mini_size));
+                                                int input_rows_1 = _min_36;
                                                 int input_count_1 = (input_rows_1 + 127) / 128 * ((hidden + 511) / 512);
                                             }
                                             mbarrier_wait(gemm_finished_addr + (ring_6) * 8, phase_bits_7 >> (unsigned int)(16 + ring_6) & 1);
@@ -2810,8 +2815,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             :: "r"((output_finished_addr) & 0xFEFFFFFF) : "memory");
                                         int previous_offset_6 = macro_size;
                                         int output_row_3 = x_3 * 256 + cta_rank_0 * 128;
-                                        int _min_39 = ((macro_size) < (tokens - previous_offset_6) ? (macro_size) : (tokens - previous_offset_6));
-                                        if (output_row_3 < _min_39) {
+                                        int _min_37 = ((macro_size) < (tokens - previous_offset_6) ? (macro_size) : (tokens - previous_offset_6));
+                                        if (output_row_3 < _min_37) {
                                         }
                                     }
                                     #pragma unroll
@@ -2937,8 +2942,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             }
                                             if (idx_8 == 0 || token_row_2 % mini_size == 0) {
                                                 int input_mini_2 = token_row_2 / mini_size;
-                                                int _min_41 = ((mini_size) < (tokens - input_mini_2 * mini_size) ? (mini_size) : (tokens - input_mini_2 * mini_size));
-                                                int input_rows_2 = _min_41;
+                                                int _min_39 = ((mini_size) < (tokens - input_mini_2 * mini_size) ? (mini_size) : (tokens - input_mini_2 * mini_size));
+                                                int input_rows_2 = _min_39;
                                                 int input_count_2 = (input_rows_2 + 127) / 128 * ((hidden + 511) / 512);
                                             }
                                             mbarrier_wait(gemm_finished_addr + (ring_8) * 8, phase_bits_8 >> (unsigned int)(16 + ring_8) & 1);
@@ -3043,8 +3048,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             :: "r"((output_finished_addr) & 0xFEFFFFFF) : "memory");
                                         int previous_offset_7 = macro_size;
                                         int output_row_4 = x_4 * 256 + cta_rank_0 * 128;
-                                        int _min_42 = ((macro_size) < (tokens - previous_offset_7) ? (macro_size) : (tokens - previous_offset_7));
-                                        if (output_row_4 < _min_42) {
+                                        int _min_40 = ((macro_size) < (tokens - previous_offset_7) ? (macro_size) : (tokens - previous_offset_7));
+                                        if (output_row_4 < _min_40) {
                                         }
                                     }
                                     #pragma unroll
@@ -3122,8 +3127,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                     int blocks = counts[index] / 256;
                     int _max_12 = ((first_block) > (offset_7) ? (first_block) : (offset_7));
                     int first_row_2 = _max_12;
-                    int _min_43 = ((first_block + mini_size / 256) < (offset_7 + blocks) ? (first_block + mini_size / 256) : (offset_7 + blocks));
-                    int _max_13 = ((0) > (_min_43 - first_row_2) ? (0) : (_min_43 - first_row_2));
+                    int _min_41 = ((first_block + mini_size / 256) < (offset_7 + blocks) ? (first_block + mini_size / 256) : (offset_7 + blocks));
+                    int _max_13 = ((0) > (_min_41 - first_row_2) ? (0) : (_min_41 - first_row_2));
                     int rows_3 = _max_13;
                     int tasks = rows_3 * col_blocks_9;
                     if (remaining < tasks) {
@@ -3162,8 +3167,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                     if (warp == 7) {
                         if (elect_sync()) {
                             {
-                                int _min_44 = ((mini_size) < (tokens - global_mini_5 * mini_size) ? (mini_size) : (tokens - global_mini_5 * mini_size));
-                                int _max_14 = ((0) > (_min_44) ? (0) : (_min_44));
+                                int _min_42 = ((mini_size) < (tokens - global_mini_5 * mini_size) ? (mini_size) : (tokens - global_mini_5 * mini_size));
+                                int _max_14 = ((0) > (_min_42) ? (0) : (_min_42));
                                 int mini_rows_6 = _max_14;
                                 int required_5 = (mini_rows_6 + 127) / 128 * ((hidden + 511) / 512);
                                 bool enabled_value_6 = 1;
@@ -3204,8 +3209,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         if (warp == 6) {
                             if (elect_sync()) {
                                 {
-                                    int _min_45 = ((mini_size) < (tokens - global_mini_5 * mini_size) ? (mini_size) : (tokens - global_mini_5 * mini_size));
-                                    int _max_15 = ((0) > (_min_45) ? (0) : (_min_45));
+                                    int _min_43 = ((mini_size) < (tokens - global_mini_5 * mini_size) ? (mini_size) : (tokens - global_mini_5 * mini_size));
+                                    int _max_15 = ((0) > (_min_43) ? (0) : (_min_43));
                                     int mini_rows_7 = _max_15;
                                     int required_6 = (mini_rows_7 + 127) / 128 * ((hidden + 511) / 512);
                                     bool enabled_value_7 = 1;
@@ -3440,8 +3445,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         int blocks_1 = counts[index_1] / 256;
                         int _max_17 = ((first_block_1) > (offset_8) ? (first_block_1) : (offset_8));
                         int first_row_3 = _max_17;
-                        int _min_46 = ((first_block_1 + mini_size / 256) < (offset_8 + blocks_1) ? (first_block_1 + mini_size / 256) : (offset_8 + blocks_1));
-                        int _max_18 = ((0) > (_min_46 - first_row_3) ? (0) : (_min_46 - first_row_3));
+                        int _min_44 = ((first_block_1 + mini_size / 256) < (offset_8 + blocks_1) ? (first_block_1 + mini_size / 256) : (offset_8 + blocks_1));
+                        int _max_18 = ((0) > (_min_44 - first_row_3) ? (0) : (_min_44 - first_row_3));
                         int rows_4 = _max_18;
                         int tasks_1 = rows_4 * col_blocks_10;
                         if (remaining_1 < tasks_1) {
@@ -3480,8 +3485,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         if (warp == 7) {
                             if (elect_sync()) {
                                 {
-                                    int _min_47 = ((mini_size) < (tokens - global_mini_6 * mini_size) ? (mini_size) : (tokens - global_mini_6 * mini_size));
-                                    int _max_19 = ((0) > (_min_47) ? (0) : (_min_47));
+                                    int _min_45 = ((mini_size) < (tokens - global_mini_6 * mini_size) ? (mini_size) : (tokens - global_mini_6 * mini_size));
+                                    int _max_19 = ((0) > (_min_45) ? (0) : (_min_45));
                                     int mini_rows_8 = _max_19;
                                     int required_7 = (mini_rows_8 + 127) / 128 * ((hidden + 511) / 512);
                                     bool enabled_value_9 = 1;
@@ -3522,8 +3527,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             if (warp == 6) {
                                 if (elect_sync()) {
                                     {
-                                        int _min_48 = ((mini_size) < (tokens - global_mini_6 * mini_size) ? (mini_size) : (tokens - global_mini_6 * mini_size));
-                                        int _max_20 = ((0) > (_min_48) ? (0) : (_min_48));
+                                        int _min_46 = ((mini_size) < (tokens - global_mini_6 * mini_size) ? (mini_size) : (tokens - global_mini_6 * mini_size));
+                                        int _max_20 = ((0) > (_min_46) ? (0) : (_min_46));
                                         int mini_rows_9 = _max_20;
                                         int required_8 = (mini_rows_9 + 127) / 128 * ((hidden + 511) / 512);
                                         bool enabled_value_10 = 1;
@@ -3750,8 +3755,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                     int global_mini_7 = macro_1 * (macro_size / mini_size) + mini_1;
                     int mini_tiles = mini_size / 128 * col_blocks_11;
                     int first_tile_2 = task_3 * 6 + cta_rank_0 * 3 + global_mini_7 * mini_tiles;
-                    int _min_49 = ((num_tiles_1) < ((global_mini_7 + 1) * mini_tiles) ? (num_tiles_1) : ((global_mini_7 + 1) * mini_tiles));
-                    int tile_end_1 = _min_49;
+                    int _min_47 = ((num_tiles_1) < ((global_mini_7 + 1) * mini_tiles) ? (num_tiles_1) : ((global_mini_7 + 1) * mini_tiles));
+                    int tile_end_1 = _min_47;
                     if (first_tile_2 < tile_end_1) {
                         int first_row_4 = first_tile_2 / col_blocks_11;
                         int first_col_2 = first_tile_2 % col_blocks_11;
@@ -3811,16 +3816,16 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     float ux = _cvt_f32_7.x;
                                     float uy = _cvt_f32_7.y;
                                     if (swiglu_clamped != 0) {
-                                        float _min_50 = fminf(gx, swiglu_limit);
-                                        gx = _min_50;
-                                        float _min_51 = fminf(gy, swiglu_limit);
-                                        gy = _min_51;
+                                        float _min_48 = fminf(gx, swiglu_limit);
+                                        gx = _min_48;
+                                        float _min_49 = fminf(gy, swiglu_limit);
+                                        gy = _min_49;
                                         float _max_22 = max_noftz(ux, -swiglu_limit);
-                                        float _min_52 = fminf(_max_22, swiglu_limit);
-                                        ux = _min_52;
+                                        float _min_50 = fminf(_max_22, swiglu_limit);
+                                        ux = _min_50;
                                         float _max_23 = max_noftz(uy, -swiglu_limit);
-                                        float _min_53 = fminf(_max_23, swiglu_limit);
-                                        uy = _min_53;
+                                        float _min_51 = fminf(_max_23, swiglu_limit);
+                                        uy = _min_51;
                                     }
                                     float _exp_2 = expf(gx * -1.0f);
                                     float hx = gx / (_exp_2 + 1.0f) * ux;
@@ -4026,8 +4031,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             int blocks_2 = counts[index_2] / 256;
                             int _max_26 = ((first_block_2) > (offset_9) ? (first_block_2) : (offset_9));
                             int first_row_5 = _max_26;
-                            int _min_54 = ((first_block_2 + mini_size / 256) < (offset_9 + blocks_2) ? (first_block_2 + mini_size / 256) : (offset_9 + blocks_2));
-                            int _max_27 = ((0) > (_min_54 - first_row_5) ? (0) : (_min_54 - first_row_5));
+                            int _min_52 = ((first_block_2 + mini_size / 256) < (offset_9 + blocks_2) ? (first_block_2 + mini_size / 256) : (offset_9 + blocks_2));
+                            int _max_27 = ((0) > (_min_52 - first_row_5) ? (0) : (_min_52 - first_row_5));
                             int rows_5 = _max_27;
                             int tasks_2 = rows_5 * col_blocks_12;
                             if (remaining_2 < tasks_2) {
@@ -4070,8 +4075,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             if (warp == 7) {
                                 if (elect_sync()) {
                                     {
-                                        int _min_55 = ((mini_size) < (tokens - global_mini_8 * mini_size) ? (mini_size) : (tokens - global_mini_8 * mini_size));
-                                        int _max_28 = ((0) > (_min_55) ? (0) : (_min_55));
+                                        int _min_53 = ((mini_size) < (tokens - global_mini_8 * mini_size) ? (mini_size) : (tokens - global_mini_8 * mini_size));
+                                        int _max_28 = ((0) > (_min_53) ? (0) : (_min_53));
                                         int mini_rows_10 = _max_28;
                                         int required_9 = (mini_rows_10 + 127) / 128 * ((hidden + 511) / 512);
                                         bool enabled_value_13 = 1;
@@ -4112,8 +4117,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 if (warp == 6) {
                                     if (elect_sync()) {
                                         {
-                                            int _min_56 = ((mini_size) < (tokens - global_mini_8 * mini_size) ? (mini_size) : (tokens - global_mini_8 * mini_size));
-                                            int _max_29 = ((0) > (_min_56) ? (0) : (_min_56));
+                                            int _min_54 = ((mini_size) < (tokens - global_mini_8 * mini_size) ? (mini_size) : (tokens - global_mini_8 * mini_size));
+                                            int _max_29 = ((0) > (_min_54) ? (0) : (_min_54));
                                             int mini_rows_11 = _max_29;
                                             int required_10 = (mini_rows_11 + 127) / 128 * ((hidden + 511) / 512);
                                             bool enabled_value_14 = 1;
@@ -4222,8 +4227,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             :: "r"((output_finished_addr) & 0xFEFFFFFF) : "memory");
                                         int previous_offset_8 = (macro_1 + 1) * macro_size;
                                         int output_row_5 = x_7 * 256 + cta_rank_0 * 128;
-                                        int _min_57 = ((macro_size) < (tokens - previous_offset_8) ? (macro_size) : (tokens - previous_offset_8));
-                                        if (output_row_5 < _min_57) {
+                                        int _min_55 = ((macro_size) < (tokens - previous_offset_8) ? (macro_size) : (tokens - previous_offset_8));
+                                        if (output_row_5 < _min_55) {
                                         }
                                     }
                                     #pragma unroll
@@ -4269,7 +4274,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 asm volatile("cp.async.bulk.wait_group 0;");
                                                 bool enabled_value_15 = 1;
                                                 if (enabled_value_15 != 0) {
-                                                    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(dh_ready)) + (shared_down_4 + (macro_rows_7 + x_7) * (intermediate / 256) + y_7))), "r"(static_cast<unsigned int>(1)) : "memory");
+                                                    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(dh_ready)) + (shared_down_0 + (macro_rows_7 + x_7) * (intermediate / 256) + y_7))), "r"(static_cast<unsigned int>(1)) : "memory");
                                                 }
                                                 bool enabled_value_0 = macros > 1;
                                                 if (enabled_value_0 != 0) {
@@ -4295,8 +4300,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                         int global_mini_9 = macro_1 * (macro_size / mini_size) + mini_1;
                         int mini_tiles_1 = mini_size / 128 * col_blocks_13;
                         int first_tile_3 = task_3 * 4 + cta_rank_0 * 2 + global_mini_9 * mini_tiles_1;
-                        int _min_58 = ((num_tiles_2) < ((global_mini_9 + 1) * mini_tiles_1) ? (num_tiles_2) : ((global_mini_9 + 1) * mini_tiles_1));
-                        int tile_end_2 = _min_58;
+                        int _min_56 = ((num_tiles_2) < ((global_mini_9 + 1) * mini_tiles_1) ? (num_tiles_2) : ((global_mini_9 + 1) * mini_tiles_1));
+                        int tile_end_2 = _min_56;
                         if (first_tile_3 < tile_end_2) {
                             int first_row_6 = first_tile_3 / col_blocks_13;
                             int first_col_3 = first_tile_3 % col_blocks_13;
@@ -4313,12 +4318,12 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         mbarrier_arrive_expect_tx(swiglu_arrived_addr + (stage_10) * 8, 66560);
                                         int parent_2 = row_26 / 2 * (intermediate / 256) + col_19 / 2;
                                         int32_t _relaxed_ld_34;
-                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_34) : "l"(dh_ready + (shared_down_4 + parent_2)) : "memory");
+                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_34) : "l"(dh_ready + (shared_down_0 + parent_2)) : "memory");
                                         int value_17 = _relaxed_ld_34;
                                         while (value_17 < 2) {
                                             asm volatile("nanosleep.u32 %0;" :: "r"(16));
                                             int32_t _relaxed_ld_35;
-                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_35) : "l"(dh_ready + (shared_down_4 + parent_2)) : "memory");
+                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_35) : "l"(dh_ready + (shared_down_0 + parent_2)) : "memory");
                                             value_17 = _relaxed_ld_35;
                                         }
                                         asm volatile("fence.acquire.gpu;" ::: "memory");
@@ -4402,76 +4407,137 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         up_scale = __uint_as_float(up_scale_bits);
                                         unsigned int dgate_words[16];
                                         unsigned int dup_words[16];
-                                        #pragma unroll
-                                        for (int k_18 = 0; k_18 < 8; k_18++) {
-                                            int col_idx = k_block_4 * 32 + (tile_row_2 / 4 + k_18) % 8 * 4;
-                                            unsigned int gate_word = q_words[gate_base + col_idx / 4];
-                                            unsigned int up_word = q_words[up_base + col_idx / 4];
-                                            uint32_t _q_words_reg_0[2];
-                                            uint64_t _smem_raw_11;
-                                            asm volatile("ld.weak.shared::cta.b64 %0, [%1];" : "=l"(_smem_raw_11) : "r"(q_words_addr + (dh_base + col_idx / 2) * 4) : "memory");
-                                            _q_words_reg_0[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[0];
-                                            _q_words_reg_0[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[1];
+                                        if (swiglu_clamped != 0) {
                                             #pragma unroll
-                                            for (int h = 0; h < 2; h++) {
-                                                float2 _fp8x2_decode_0;
-                                                asm("{ .reg .b32 pair; .reg .b16 lo, hi;\n"
-                                                    "cvt.rn.f16x2.e4m3x2 pair, %2;\n"
-                                                    "mov.b32 {lo, hi}, pair;\n"
-                                                    "cvt.f32.f16 %0, lo; cvt.f32.f16 %1, hi; }"
-                                                    : "=f"(_fp8x2_decode_0.x), "=f"(_fp8x2_decode_0.y) : "h"((uint16_t)(gate_word >> (unsigned int)(16 * h) & 65535)));
-                                                float2 _fp8x2_decode_1;
-                                                asm("{ .reg .b32 pair; .reg .b16 lo, hi;\n"
-                                                    "cvt.rn.f16x2.e4m3x2 pair, %2;\n"
-                                                    "mov.b32 {lo, hi}, pair;\n"
-                                                    "cvt.f32.f16 %0, lo; cvt.f32.f16 %1, hi; }"
-                                                    : "=f"(_fp8x2_decode_1.x), "=f"(_fp8x2_decode_1.y) : "h"((uint16_t)(up_word >> (unsigned int)(16 * h) & 65535)));
-                                                float2 _cvt_f32_8 = __bfloat1622float2(__as_bf16x2(_q_words_reg_0[h]));
-                                                float g_x = _fp8x2_decode_0.x * gate_scale;
-                                                float g_y = _fp8x2_decode_0.y * gate_scale;
-                                                float u_x = _fp8x2_decode_1.x * up_scale;
-                                                float u_y = _fp8x2_decode_1.y * up_scale;
-                                                bool gate_mask_x = g_x <= swiglu_limit;
-                                                bool gate_mask_y = g_y <= swiglu_limit;
-                                                bool up_mask_x = u_x >= -swiglu_limit && u_x <= swiglu_limit;
-                                                bool up_mask_y = u_y >= -swiglu_limit && u_y <= swiglu_limit;
-                                                float _min_59 = fminf(g_x, swiglu_limit);
-                                                float g_cx = ((swiglu_clamped != 0) ? _min_59 : g_x);
-                                                float _min_60 = fminf(g_y, swiglu_limit);
-                                                float g_cy = ((swiglu_clamped != 0) ? _min_60 : g_y);
-                                                float _max_30 = max_noftz(u_x, -swiglu_limit);
-                                                float _min_61 = fminf(_max_30, swiglu_limit);
-                                                float u_cx = ((swiglu_clamped != 0) ? _min_61 : u_x);
-                                                float _max_31 = max_noftz(u_y, -swiglu_limit);
-                                                float _min_62 = fminf(_max_31, swiglu_limit);
-                                                float u_cy = ((swiglu_clamped != 0) ? _min_62 : u_y);
-                                                float _exp_4 = expf(-g_cx);
-                                                float sigmoid_x = 1.0f / (1.0f + _exp_4);
-                                                float _exp_5 = expf(-g_cy);
-                                                float sigmoid_y = 1.0f / (1.0f + _exp_5);
-                                                float silu_x = g_cx * sigmoid_x;
-                                                float silu_y = g_cy * sigmoid_y;
-                                                float dsilu_x = (1.0f - silu_x) * sigmoid_x + silu_x;
-                                                float dsilu_y = (1.0f - silu_y) * sigmoid_y + silu_y;
-                                                float hidden_x = silu_x * u_cx;
-                                                float hidden_y = silu_y * u_cy;
-                                                router_gradient = router_gradient + (_cvt_f32_8.x * hidden_x + _cvt_f32_8.y * hidden_y);
-                                                float dh_x = _cvt_f32_8.x * weight;
-                                                float dh_y = _cvt_f32_8.y * weight;
-                                                float dgate_x = dsilu_x * u_cx * dh_x;
-                                                float dgate_y = dsilu_y * u_cy * dh_y;
-                                                float dup_x = silu_x * dh_x;
-                                                float dup_y = silu_y * dh_y;
-                                                if (swiglu_clamped != 0) {
+                                            for (int k_18 = 0; k_18 < 8; k_18++) {
+                                                int col_idx = k_block_4 * 32 + (tile_row_2 / 4 + k_18) % 8 * 4;
+                                                unsigned int gate_word = q_words[gate_base + col_idx / 4];
+                                                unsigned int up_word = q_words[up_base + col_idx / 4];
+                                                uint32_t _q_words_reg_0[2];
+                                                uint64_t _smem_raw_11;
+                                                asm volatile("ld.weak.shared::cta.b64 %0, [%1];" : "=l"(_smem_raw_11) : "r"(q_words_addr + (dh_base + col_idx / 2) * 4) : "memory");
+                                                _q_words_reg_0[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[0];
+                                                _q_words_reg_0[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[1];
+                                                #pragma unroll
+                                                for (int h = 0; h < 2; h++) {
+                                                    float2 _fp8x2_decode_0;
+                                                    asm("{ .reg .b32 pair; .reg .b16 lo, hi;\n"
+                                                        "cvt.rn.f16x2.e4m3x2 pair, %2;\n"
+                                                        "mov.b32 {lo, hi}, pair;\n"
+                                                        "cvt.f32.f16 %0, lo; cvt.f32.f16 %1, hi; }"
+                                                        : "=f"(_fp8x2_decode_0.x), "=f"(_fp8x2_decode_0.y) : "h"((uint16_t)(gate_word >> (unsigned int)(16 * h) & 65535)));
+                                                    float2 _fp8x2_decode_1;
+                                                    asm("{ .reg .b32 pair; .reg .b16 lo, hi;\n"
+                                                        "cvt.rn.f16x2.e4m3x2 pair, %2;\n"
+                                                        "mov.b32 {lo, hi}, pair;\n"
+                                                        "cvt.f32.f16 %0, lo; cvt.f32.f16 %1, hi; }"
+                                                        : "=f"(_fp8x2_decode_1.x), "=f"(_fp8x2_decode_1.y) : "h"((uint16_t)(up_word >> (unsigned int)(16 * h) & 65535)));
+                                                    float2 _cvt_f32_8 = __bfloat1622float2(__as_bf16x2(_q_words_reg_0[h]));
+                                                    float g_x = _fp8x2_decode_0.x * gate_scale;
+                                                    float g_y = _fp8x2_decode_0.y * gate_scale;
+                                                    float u_x = _fp8x2_decode_1.x * up_scale;
+                                                    float u_y = _fp8x2_decode_1.y * up_scale;
+                                                    float dh_x = _cvt_f32_8.x * weight;
+                                                    float dh_y = _cvt_f32_8.y * weight;
+                                                    float g_cx = g_x;
+                                                    float g_cy = g_y;
+                                                    float u_cx = u_x;
+                                                    float u_cy = u_y;
+                                                    bool gate_mask_x = g_x <= swiglu_limit;
+                                                    bool gate_mask_y = g_y <= swiglu_limit;
+                                                    bool up_mask_x = u_x >= -swiglu_limit && u_x <= swiglu_limit;
+                                                    bool up_mask_y = u_y >= -swiglu_limit && u_y <= swiglu_limit;
+                                                    float _min_57 = fminf(g_x, swiglu_limit);
+                                                    g_cx = _min_57;
+                                                    float _min_58 = fminf(g_y, swiglu_limit);
+                                                    g_cy = _min_58;
+                                                    float _max_30 = max_noftz(u_x, -swiglu_limit);
+                                                    float _min_59 = fminf(_max_30, swiglu_limit);
+                                                    u_cx = _min_59;
+                                                    float _max_31 = max_noftz(u_y, -swiglu_limit);
+                                                    float _min_60 = fminf(_max_31, swiglu_limit);
+                                                    u_cy = _min_60;
+                                                    float _exp_4 = expf(-g_cx);
+                                                    float sigmoid_x = 1.0f / (1.0f + _exp_4);
+                                                    float _exp_5 = expf(-g_cy);
+                                                    float sigmoid_y = 1.0f / (1.0f + _exp_5);
+                                                    float silu_x = g_cx * sigmoid_x;
+                                                    float silu_y = g_cy * sigmoid_y;
+                                                    float dsilu_x = (1.0f - silu_x) * sigmoid_x + silu_x;
+                                                    float dsilu_y = (1.0f - silu_y) * sigmoid_y + silu_y;
+                                                    float hidden_x = silu_x * u_cx;
+                                                    float hidden_y = silu_y * u_cy;
+                                                    float dgate_x = dsilu_x * u_cx * dh_x;
+                                                    float dgate_y = dsilu_y * u_cy * dh_y;
+                                                    float dup_x = silu_x * dh_x;
+                                                    float dup_y = silu_y * dh_y;
                                                     dgate_x = ((gate_mask_x) ? dgate_x : 0.0f);
                                                     dgate_y = ((gate_mask_y) ? dgate_y : 0.0f);
                                                     dup_x = ((up_mask_x) ? dup_x : 0.0f);
                                                     dup_y = ((up_mask_y) ? dup_y : 0.0f);
+                                                    router_gradient = router_gradient + (_cvt_f32_8.x * hidden_x + _cvt_f32_8.y * hidden_y);
+                                                    __nv_bfloat162 _bf16x2_17 = __float22bfloat162_rn(make_float2(dgate_x, dgate_y));
+                                                    dgate_words[k_18 * 2 + h] = __as_u32(_bf16x2_17);
+                                                    __nv_bfloat162 _bf16x2_18 = __float22bfloat162_rn(make_float2(dup_x, dup_y));
+                                                    dup_words[k_18 * 2 + h] = __as_u32(_bf16x2_18);
                                                 }
-                                                __nv_bfloat162 _bf16x2_17 = __float22bfloat162_rn(make_float2(dgate_x, dgate_y));
-                                                dgate_words[k_18 * 2 + h] = __as_u32(_bf16x2_17);
-                                                __nv_bfloat162 _bf16x2_18 = __float22bfloat162_rn(make_float2(dup_x, dup_y));
-                                                dup_words[k_18 * 2 + h] = __as_u32(_bf16x2_18);
+                                            }
+                                        } else {
+                                            #pragma unroll
+                                            for (int k_19 = 0; k_19 < 8; k_19++) {
+                                                int col_idx_1 = k_block_4 * 32 + (tile_row_2 / 4 + k_19) % 8 * 4;
+                                                unsigned int gate_word_1 = q_words[gate_base + col_idx_1 / 4];
+                                                unsigned int up_word_1 = q_words[up_base + col_idx_1 / 4];
+                                                uint32_t _q_words_reg_1[2];
+                                                uint64_t _smem_raw_12;
+                                                asm volatile("ld.weak.shared::cta.b64 %0, [%1];" : "=l"(_smem_raw_12) : "r"(q_words_addr + (dh_base + col_idx_1 / 2) * 4) : "memory");
+                                                _q_words_reg_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[0];
+                                                _q_words_reg_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[1];
+                                                #pragma unroll
+                                                for (int h_1 = 0; h_1 < 2; h_1++) {
+                                                    float2 _fp8x2_decode_2;
+                                                    asm("{ .reg .b32 pair; .reg .b16 lo, hi;\n"
+                                                        "cvt.rn.f16x2.e4m3x2 pair, %2;\n"
+                                                        "mov.b32 {lo, hi}, pair;\n"
+                                                        "cvt.f32.f16 %0, lo; cvt.f32.f16 %1, hi; }"
+                                                        : "=f"(_fp8x2_decode_2.x), "=f"(_fp8x2_decode_2.y) : "h"((uint16_t)(gate_word_1 >> (unsigned int)(16 * h_1) & 65535)));
+                                                    float2 _fp8x2_decode_3;
+                                                    asm("{ .reg .b32 pair; .reg .b16 lo, hi;\n"
+                                                        "cvt.rn.f16x2.e4m3x2 pair, %2;\n"
+                                                        "mov.b32 {lo, hi}, pair;\n"
+                                                        "cvt.f32.f16 %0, lo; cvt.f32.f16 %1, hi; }"
+                                                        : "=f"(_fp8x2_decode_3.x), "=f"(_fp8x2_decode_3.y) : "h"((uint16_t)(up_word_1 >> (unsigned int)(16 * h_1) & 65535)));
+                                                    float2 _cvt_f32_9 = __bfloat1622float2(__as_bf16x2(_q_words_reg_1[h_1]));
+                                                    float g_x_1 = _fp8x2_decode_2.x * gate_scale;
+                                                    float g_y_1 = _fp8x2_decode_2.y * gate_scale;
+                                                    float u_x_1 = _fp8x2_decode_3.x * up_scale;
+                                                    float u_y_1 = _fp8x2_decode_3.y * up_scale;
+                                                    float dh_x_1 = _cvt_f32_9.x * weight;
+                                                    float dh_y_1 = _cvt_f32_9.y * weight;
+                                                    float g_cx_1 = g_x_1;
+                                                    float g_cy_1 = g_y_1;
+                                                    float u_cx_1 = u_x_1;
+                                                    float u_cy_1 = u_y_1;
+                                                    float _exp_6 = expf(-g_cx_1);
+                                                    float sigmoid_x_1 = 1.0f / (1.0f + _exp_6);
+                                                    float _exp_7 = expf(-g_cy_1);
+                                                    float sigmoid_y_1 = 1.0f / (1.0f + _exp_7);
+                                                    float silu_x_1 = g_cx_1 * sigmoid_x_1;
+                                                    float silu_y_1 = g_cy_1 * sigmoid_y_1;
+                                                    float dsilu_x_1 = (1.0f - silu_x_1) * sigmoid_x_1 + silu_x_1;
+                                                    float dsilu_y_1 = (1.0f - silu_y_1) * sigmoid_y_1 + silu_y_1;
+                                                    float hidden_x_1 = silu_x_1 * u_cx_1;
+                                                    float hidden_y_1 = silu_y_1 * u_cy_1;
+                                                    float dgate_x_1 = dsilu_x_1 * u_cx_1 * dh_x_1;
+                                                    float dgate_y_1 = dsilu_y_1 * u_cy_1 * dh_y_1;
+                                                    float dup_x_1 = silu_x_1 * dh_x_1;
+                                                    float dup_y_1 = silu_y_1 * dh_y_1;
+                                                    router_gradient = router_gradient + (_cvt_f32_9.x * hidden_x_1 + _cvt_f32_9.y * hidden_y_1);
+                                                    __nv_bfloat162 _bf16x2_19 = __float22bfloat162_rn(make_float2(dgate_x_1, dgate_y_1));
+                                                    dgate_words[k_19 * 2 + h_1] = __as_u32(_bf16x2_19);
+                                                    __nv_bfloat162 _bf16x2_20 = __float22bfloat162_rn(make_float2(dup_x_1, dup_y_1));
+                                                    dup_words[k_19 * 2 + h_1] = __as_u32(_bf16x2_20);
+                                                }
                                             }
                                         }
                                         unsigned int dgate_packed[8];
@@ -4480,9 +4546,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_20) : "r"(dgate_words[0]));
                                         unsigned int amax2_10 = _bf16x2_abs_20;
                                         #pragma unroll
-                                        for (int k_19 = 1; k_19 < 16; k_19++) {
+                                        for (int k_20 = 1; k_20 < 16; k_20++) {
                                             uint32_t _bf16x2_abs_21;
-                                            asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_21) : "r"(dgate_words[k_19]));
+                                            asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_21) : "r"(dgate_words[k_20]));
                                             uint32_t _bf16x2_max_10;
                                             asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_10) : "r"(amax2_10), "r"(_bf16x2_abs_21));
                                             amax2_10 = _bf16x2_max_10;
@@ -4530,9 +4596,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_22) : "r"(dup_words[0]));
                                         unsigned int amax2_0 = _bf16x2_abs_22;
                                         #pragma unroll
-                                        for (int k_20 = 1; k_20 < 16; k_20++) {
+                                        for (int k_21 = 1; k_21 < 16; k_21++) {
                                             uint32_t _bf16x2_abs_23;
-                                            asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_23) : "r"(dup_words[k_20]));
+                                            asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_23) : "r"(dup_words[k_21]));
                                             uint32_t _bf16x2_max_11;
                                             asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_11) : "r"(amax2_0), "r"(_bf16x2_abs_23));
                                             amax2_0 = _bf16x2_max_11;
@@ -4579,12 +4645,12 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         dgate_scale_pair = dgate_scale_pair | dgate_byte << (unsigned int)(k_sub * 8);
                                         dup_scale_pair = dup_scale_pair | dup_byte << (unsigned int)(k_sub * 8);
                                         #pragma unroll
-                                        for (int k_21 = 0; k_21 < 8; k_21++) {
-                                            int col_idx_1 = k_block_4 * 32 + (tile_row_2 / 4 + k_21) % 8 * 4;
-                                            q_words[gate_base + col_idx_1 / 4] = dgate_packed[k_21];
-                                            q_words[up_base + col_idx_1 / 4] = dup_packed[k_21];
-                                            asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"(q_words_addr + (unsigned int)((dh_base + col_idx_1 / 2) * 4)), "r"(dgate_words[k_21 * 2]), "r"(dgate_words[k_21 * 2 + 1]) : "memory");
-                                            asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"(q_words_addr + (unsigned int)((dup_stage_base + col_idx_1 / 2) * 4)), "r"(dup_words[k_21 * 2]), "r"(dup_words[k_21 * 2 + 1]) : "memory");
+                                        for (int k_22 = 0; k_22 < 8; k_22++) {
+                                            int col_idx_2 = k_block_4 * 32 + (tile_row_2 / 4 + k_22) % 8 * 4;
+                                            q_words[gate_base + col_idx_2 / 4] = dgate_packed[k_22];
+                                            q_words[up_base + col_idx_2 / 4] = dup_packed[k_22];
+                                            asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"(q_words_addr + (unsigned int)((dh_base + col_idx_2 / 2) * 4)), "r"(dgate_words[k_22 * 2]), "r"(dgate_words[k_22 * 2 + 1]) : "memory");
+                                            asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"(q_words_addr + (unsigned int)((dup_stage_base + col_idx_2 / 2) * 4)), "r"(dup_words[k_22 * 2]), "r"(dup_words[k_22 * 2 + 1]) : "memory");
                                         }
                                     }
                                     q_halves[(131072 + stage_11 * 512) / 2 + scale_index * 2 + k_pair] = (uint16_t)dgate_scale_pair;
@@ -4608,21 +4674,21 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         int k_block_5 = (j_17 + rotation_7) % 4;
                                         unsigned int t_words_4[16];
                                         #pragma unroll
-                                        for (int k_22 = 0; k_22 < 16; k_22++) {
-                                            int src_row_4 = k_block_5 * 32 + (tile_row_2 * 4 + k_22 * 2) % 32;
+                                        for (int k_23 = 0; k_23 < 16; k_23++) {
+                                            int src_row_4 = k_block_5 * 32 + (tile_row_2 * 4 + k_23 * 2) % 32;
                                             float v0_16 = (float)q_flat[src_row_4 * 128 + src_offset + t_row_4];
                                             float v1_16 = (float)q_flat[(src_row_4 + 1) * 128 + src_offset + t_row_4];
-                                            __nv_bfloat162 _bf16x2_19 = __float22bfloat162_rn(make_float2(v0_16, v1_16));
-                                            t_words_4[k_22] = __as_u32(_bf16x2_19);
+                                            __nv_bfloat162 _bf16x2_21 = __float22bfloat162_rn(make_float2(v0_16, v1_16));
+                                            t_words_4[k_23] = __as_u32(_bf16x2_21);
                                         }
                                         unsigned int t_packed_4[8];
                                         uint32_t _bf16x2_abs_24;
                                         asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_24) : "r"(t_words_4[0]));
                                         unsigned int amax2_11 = _bf16x2_abs_24;
                                         #pragma unroll
-                                        for (int k_23 = 1; k_23 < 16; k_23++) {
+                                        for (int k_24 = 1; k_24 < 16; k_24++) {
                                             uint32_t _bf16x2_abs_25;
-                                            asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_25) : "r"(t_words_4[k_23]));
+                                            asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_25) : "r"(t_words_4[k_24]));
                                             uint32_t _bf16x2_max_12;
                                             asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_12) : "r"(amax2_11), "r"(_bf16x2_abs_25));
                                             amax2_11 = _bf16x2_max_12;
@@ -4733,8 +4799,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 int blocks_3 = counts[index_3] / 256;
                                 int _max_35 = ((first_block_3) > (offset_10) ? (first_block_3) : (offset_10));
                                 int first_row_7 = _max_35;
-                                int _min_63 = ((first_block_3 + mini_size / 256) < (offset_10 + blocks_3) ? (first_block_3 + mini_size / 256) : (offset_10 + blocks_3));
-                                int _max_36 = ((0) > (_min_63 - first_row_7) ? (0) : (_min_63 - first_row_7));
+                                int _min_61 = ((first_block_3 + mini_size / 256) < (offset_10 + blocks_3) ? (first_block_3 + mini_size / 256) : (offset_10 + blocks_3));
+                                int _max_36 = ((0) > (_min_61 - first_row_7) ? (0) : (_min_61 - first_row_7));
                                 int rows_6 = _max_36;
                                 int tasks_3 = rows_6 * col_blocks_14;
                                 if (remaining_3 < tasks_3) {
@@ -4790,8 +4856,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 }
                                                 asm volatile("fence.acquire.gpu;" ::: "memory");
                                             }
-                                            int _min_64 = ((mini_size) < (tokens - global_mini_10 * mini_size) ? (mini_size) : (tokens - global_mini_10 * mini_size));
-                                            int _max_37 = ((0) > (_min_64) ? (0) : (_min_64));
+                                            int _min_62 = ((mini_size) < (tokens - global_mini_10 * mini_size) ? (mini_size) : (tokens - global_mini_10 * mini_size));
+                                            int _max_37 = ((0) > (_min_62) ? (0) : (_min_62));
                                             int mini_rows_12 = _max_37;
                                             int required_11 = (mini_rows_12 + 127) / 128 * ((intermediate + 511) / 512);
                                         }
@@ -4845,8 +4911,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     }
                                                     asm volatile("fence.acquire.gpu;" ::: "memory");
                                                 }
-                                                int _min_65 = ((mini_size) < (tokens - global_mini_10 * mini_size) ? (mini_size) : (tokens - global_mini_10 * mini_size));
-                                                int _max_38 = ((0) > (_min_65) ? (0) : (_min_65));
+                                                int _min_63 = ((mini_size) < (tokens - global_mini_10 * mini_size) ? (mini_size) : (tokens - global_mini_10 * mini_size));
+                                                int _max_38 = ((0) > (_min_63) ? (0) : (_min_63));
                                                 int mini_rows_13 = _max_38;
                                                 int required_12 = (mini_rows_13 + 127) / 128 * ((intermediate + 511) / 512);
                                             }
@@ -4944,8 +5010,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     : "r"(address_24));
                                                 #pragma unroll
                                                 for (int pair_17 = 0; pair_17 < 8; pair_17++) {
-                                                    __nv_bfloat162 _bf16x2_20 = __float22bfloat162_rn(make_float2(_tmem_load_8[pair_17 * 2], _tmem_load_8[pair_17 * 2 + 1]));
-                                                    packed_18[chunk_12 * 16 + half_16 * 8 + pair_17] = __as_u32(_bf16x2_20);
+                                                    __nv_bfloat162 _bf16x2_22 = __float22bfloat162_rn(make_float2(_tmem_load_8[pair_17 * 2], _tmem_load_8[pair_17 * 2 + 1]));
+                                                    packed_18[chunk_12 * 16 + half_16 * 8 + pair_17] = __as_u32(_bf16x2_22);
                                                 }
                                             }
                                         }
@@ -4957,8 +5023,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 :: "r"((output_finished_addr) & 0xFEFFFFFF) : "memory");
                                             int previous_offset_9 = (macro_1 + 1) * macro_size;
                                             int output_row_6 = x_8 * 256 + cta_rank_0 * 128;
-                                            int _min_66 = ((macro_size) < (tokens - previous_offset_9) ? (macro_size) : (tokens - previous_offset_9));
-                                            if (output_row_6 < _min_66) {
+                                            int _min_64 = ((macro_size) < (tokens - previous_offset_9) ? (macro_size) : (tokens - previous_offset_9));
+                                            if (output_row_6 < _min_64) {
                                             }
                                         }
                                         #pragma unroll
@@ -4978,9 +5044,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     unsigned int address_25 = d_smem_addr + (unsigned int)(chunk_13 % 3 * 8192) + (unsigned int)((row_30 * 32 + col_22) * 2);
                                                     address_25 = address_25 ^ (address_25 & 511) >> 7 << 4;
                                                     int offset_0_1 = chunk_13 * 16 + half_17 * 8 + col_tile_6 * 4;
-                                                    uint32_t _stmatrix_addr_12 = static_cast<uint32_t>(address_25);
+                                                    uint32_t _stmatrix_addr_13 = static_cast<uint32_t>(address_25);
                                                     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                                                        :: "r"(_stmatrix_addr_12), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[offset_0_1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[offset_0_1 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[offset_0_1 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[offset_0_1 + 3]))
+                                                        :: "r"(_stmatrix_addr_13), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[offset_0_1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[offset_0_1 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[offset_0_1 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[offset_0_1 + 3]))
                                                         : "memory");
                                                 }
                                             }
@@ -5044,9 +5110,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             }
                             int _max_39 = ((offset_11) > (macro_1 * macro_size) ? (offset_11) : (macro_1 * macro_size));
                             k_start_9 = _max_39;
-                            int _min_67 = (((macro_1 + 1) * macro_size) < (tokens) ? ((macro_1 + 1) * macro_size) : (tokens));
-                            int _min_68 = ((offset_11 + counts[expert_idx_3]) < (_min_67) ? (offset_11 + counts[expert_idx_3]) : (_min_67));
-                            k_end_9 = _min_68;
+                            int _min_65 = (((macro_1 + 1) * macro_size) < (tokens) ? ((macro_1 + 1) * macro_size) : (tokens));
+                            int _min_66 = ((offset_11 + counts[expert_idx_3]) < (_min_65) ? (offset_11 + counts[expert_idx_3]) : (_min_65));
+                            k_end_9 = _min_66;
                             first_9 = (int)(k_start_9 == offset_11);
                             if (k_start_9 < k_end_9) {
                                 int supergroup_9 = local_task_3 / (row_blocks_5 * 8);
@@ -5106,8 +5172,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             }
                                             if (idx_22 == 0 || token_row_3 % mini_size == 0) {
                                                 int input_mini_3 = token_row_3 / mini_size;
-                                                int _min_70 = ((mini_size) < (tokens - input_mini_3 * mini_size) ? (mini_size) : (tokens - input_mini_3 * mini_size));
-                                                int input_rows_3 = _min_70;
+                                                int _min_68 = ((mini_size) < (tokens - input_mini_3 * mini_size) ? (mini_size) : (tokens - input_mini_3 * mini_size));
+                                                int input_rows_3 = _min_68;
                                                 int input_count_3 = (input_rows_3 + 127) / 128 * ((hidden + 511) / 512);
                                                 bool enabled_value_24 = 1;
                                                 if (enabled_value_24 != 0) {
@@ -5165,8 +5231,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 }
                                                 if (idx_23 == 0 || token_row_4 % mini_size == 0) {
                                                     int input_mini_4 = token_row_4 / mini_size;
-                                                    int _min_72 = ((mini_size) < (tokens - input_mini_4 * mini_size) ? (mini_size) : (tokens - input_mini_4 * mini_size));
-                                                    int input_rows_4 = _min_72;
+                                                    int _min_70 = ((mini_size) < (tokens - input_mini_4 * mini_size) ? (mini_size) : (tokens - input_mini_4 * mini_size));
+                                                    int input_rows_4 = _min_70;
                                                     int input_count_4 = (input_rows_4 + 127) / 128 * ((hidden + 511) / 512);
                                                     bool enabled_value_26 = 1;
                                                     if (enabled_value_26 != 0) {
@@ -5259,8 +5325,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     : "r"(address_26));
                                                 #pragma unroll
                                                 for (int pair_18 = 0; pair_18 < 8; pair_18++) {
-                                                    __nv_bfloat162 _bf16x2_21 = __float22bfloat162_rn(make_float2(_tmem_load_9[pair_18 * 2], _tmem_load_9[pair_18 * 2 + 1]));
-                                                    packed_19[chunk_14 * 16 + half_18 * 8 + pair_18] = __as_u32(_bf16x2_21);
+                                                    __nv_bfloat162 _bf16x2_23 = __float22bfloat162_rn(make_float2(_tmem_load_9[pair_18 * 2], _tmem_load_9[pair_18 * 2 + 1]));
+                                                    packed_19[chunk_14 * 16 + half_18 * 8 + pair_18] = __as_u32(_bf16x2_23);
                                                 }
                                             }
                                         }
@@ -5272,8 +5338,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 :: "r"((output_finished_addr) & 0xFEFFFFFF) : "memory");
                                             int previous_offset_10 = (macro_1 + 1) * macro_size;
                                             int output_row_7 = x_9 * 256 + cta_rank_0 * 128;
-                                            int _min_73 = ((macro_size) < (tokens - previous_offset_10) ? (macro_size) : (tokens - previous_offset_10));
-                                            if (output_row_7 < _min_73) {
+                                            int _min_71 = ((macro_size) < (tokens - previous_offset_10) ? (macro_size) : (tokens - previous_offset_10));
+                                            if (output_row_7 < _min_71) {
                                             }
                                         }
                                         #pragma unroll
@@ -5293,9 +5359,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     unsigned int address_27 = d_smem_addr + (unsigned int)(chunk_15 % 3 * 8192) + (unsigned int)((row_32 * 32 + col_24) * 2);
                                                     address_27 = address_27 ^ (address_27 & 511) >> 7 << 4;
                                                     int offset_0_2 = chunk_15 * 16 + half_19 * 8 + col_tile_7 * 4;
-                                                    uint32_t _stmatrix_addr_13 = static_cast<uint32_t>(address_27);
+                                                    uint32_t _stmatrix_addr_14 = static_cast<uint32_t>(address_27);
                                                     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                                                        :: "r"(_stmatrix_addr_13), "r"(*reinterpret_cast<const uint32_t*>(&packed_19[offset_0_2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_19[offset_0_2 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_19[offset_0_2 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_19[offset_0_2 + 3]))
+                                                        :: "r"(_stmatrix_addr_14), "r"(*reinterpret_cast<const uint32_t*>(&packed_19[offset_0_2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_19[offset_0_2 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_19[offset_0_2 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_19[offset_0_2 + 3]))
                                                         : "memory");
                                                 }
                                             }
@@ -5365,9 +5431,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 }
                                 int _max_42 = ((offset_12) > (macro_1 * macro_size) ? (offset_12) : (macro_1 * macro_size));
                                 k_start_10 = _max_42;
-                                int _min_74 = (((macro_1 + 1) * macro_size) < (tokens) ? ((macro_1 + 1) * macro_size) : (tokens));
-                                int _min_75 = ((offset_12 + counts[expert_idx_4]) < (_min_74) ? (offset_12 + counts[expert_idx_4]) : (_min_74));
-                                k_end_10 = _min_75;
+                                int _min_72 = (((macro_1 + 1) * macro_size) < (tokens) ? ((macro_1 + 1) * macro_size) : (tokens));
+                                int _min_73 = ((offset_12 + counts[expert_idx_4]) < (_min_72) ? (offset_12 + counts[expert_idx_4]) : (_min_72));
+                                k_end_10 = _min_73;
                                 first_10 = (int)(k_start_10 == offset_12);
                                 if (k_start_10 < k_end_10) {
                                     int supergroup_10 = local_task_4 / (row_blocks_6 * 8);
@@ -5427,8 +5493,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 }
                                                 if (idx_25 == 0 || token_row_5 % mini_size == 0) {
                                                     int input_mini_5 = token_row_5 / mini_size;
-                                                    int _min_77 = ((mini_size) < (tokens - input_mini_5 * mini_size) ? (mini_size) : (tokens - input_mini_5 * mini_size));
-                                                    int input_rows_5 = _min_77;
+                                                    int _min_75 = ((mini_size) < (tokens - input_mini_5 * mini_size) ? (mini_size) : (tokens - input_mini_5 * mini_size));
+                                                    int input_rows_5 = _min_75;
                                                     int input_count_5 = (input_rows_5 + 127) / 128 * ((hidden + 511) / 512);
                                                     bool enabled_value_30 = macro_1 > 0;
                                                     if (enabled_value_30 != 0) {
@@ -5486,8 +5552,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     }
                                                     if (idx_26 == 0 || token_row_6 % mini_size == 0) {
                                                         int input_mini_6 = token_row_6 / mini_size;
-                                                        int _min_79 = ((mini_size) < (tokens - input_mini_6 * mini_size) ? (mini_size) : (tokens - input_mini_6 * mini_size));
-                                                        int input_rows_6 = _min_79;
+                                                        int _min_77 = ((mini_size) < (tokens - input_mini_6 * mini_size) ? (mini_size) : (tokens - input_mini_6 * mini_size));
+                                                        int input_rows_6 = _min_77;
                                                         int input_count_6 = (input_rows_6 + 127) / 128 * ((hidden + 511) / 512);
                                                         bool enabled_value_32 = macro_1 > 0;
                                                         if (enabled_value_32 != 0) {
@@ -5580,8 +5646,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                         : "r"(address_28));
                                                     #pragma unroll
                                                     for (int pair_19 = 0; pair_19 < 8; pair_19++) {
-                                                        __nv_bfloat162 _bf16x2_22 = __float22bfloat162_rn(make_float2(_tmem_load_10[pair_19 * 2], _tmem_load_10[pair_19 * 2 + 1]));
-                                                        packed_20[chunk_16 * 16 + half_20 * 8 + pair_19] = __as_u32(_bf16x2_22);
+                                                        __nv_bfloat162 _bf16x2_24 = __float22bfloat162_rn(make_float2(_tmem_load_10[pair_19 * 2], _tmem_load_10[pair_19 * 2 + 1]));
+                                                        packed_20[chunk_16 * 16 + half_20 * 8 + pair_19] = __as_u32(_bf16x2_24);
                                                     }
                                                 }
                                             }
@@ -5593,8 +5659,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     :: "r"((output_finished_addr) & 0xFEFFFFFF) : "memory");
                                                 int previous_offset_11 = (macro_1 + 1) * macro_size;
                                                 int output_row_8 = x_10 * 256 + cta_rank_0 * 128;
-                                                int _min_80 = ((macro_size) < (tokens - previous_offset_11) ? (macro_size) : (tokens - previous_offset_11));
-                                                if (output_row_8 < _min_80) {
+                                                int _min_78 = ((macro_size) < (tokens - previous_offset_11) ? (macro_size) : (tokens - previous_offset_11));
+                                                if (output_row_8 < _min_78) {
                                                 }
                                             }
                                             #pragma unroll
@@ -5614,9 +5680,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                         unsigned int address_29 = d_smem_addr + (unsigned int)(chunk_17 % 3 * 8192) + (unsigned int)((row_34 * 32 + col_26) * 2);
                                                         address_29 = address_29 ^ (address_29 & 511) >> 7 << 4;
                                                         int offset_0_3 = chunk_17 * 16 + half_21 * 8 + col_tile_8 * 4;
-                                                        uint32_t _stmatrix_addr_14 = static_cast<uint32_t>(address_29);
+                                                        uint32_t _stmatrix_addr_15 = static_cast<uint32_t>(address_29);
                                                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                                                            :: "r"(_stmatrix_addr_14), "r"(*reinterpret_cast<const uint32_t*>(&packed_20[offset_0_3])), "r"(*reinterpret_cast<const uint32_t*>(&packed_20[offset_0_3 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_20[offset_0_3 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_20[offset_0_3 + 3]))
+                                                            :: "r"(_stmatrix_addr_15), "r"(*reinterpret_cast<const uint32_t*>(&packed_20[offset_0_3])), "r"(*reinterpret_cast<const uint32_t*>(&packed_20[offset_0_3 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_20[offset_0_3 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_20[offset_0_3 + 3]))
                                                             : "memory");
                                                     }
                                                 }
@@ -5685,9 +5751,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                 }
                                 int _max_45 = ((offset_13) > (macro_1 * macro_size) ? (offset_13) : (macro_1 * macro_size));
                                 k_start_11 = _max_45;
-                                int _min_81 = (((macro_1 + 1) * macro_size) < (tokens) ? ((macro_1 + 1) * macro_size) : (tokens));
-                                int _min_82 = ((offset_13 + counts[expert_idx_5]) < (_min_81) ? (offset_13 + counts[expert_idx_5]) : (_min_81));
-                                k_end_11 = _min_82;
+                                int _min_79 = (((macro_1 + 1) * macro_size) < (tokens) ? ((macro_1 + 1) * macro_size) : (tokens));
+                                int _min_80 = ((offset_13 + counts[expert_idx_5]) < (_min_79) ? (offset_13 + counts[expert_idx_5]) : (_min_79));
+                                k_end_11 = _min_80;
                                 first_11 = (int)(k_start_11 == offset_13);
                                 if (k_start_11 < k_end_11) {
                                     int supergroup_11 = local_task_5 / (row_blocks_7 * 8);
@@ -5747,8 +5813,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 }
                                                 if (idx_28 == 0 || token_row_7 % mini_size == 0) {
                                                     int input_mini_7 = token_row_7 / mini_size;
-                                                    int _min_84 = ((mini_size) < (tokens - input_mini_7 * mini_size) ? (mini_size) : (tokens - input_mini_7 * mini_size));
-                                                    int input_rows_7 = _min_84;
+                                                    int _min_82 = ((mini_size) < (tokens - input_mini_7 * mini_size) ? (mini_size) : (tokens - input_mini_7 * mini_size));
+                                                    int input_rows_7 = _min_82;
                                                     int input_count_7 = (input_rows_7 + 127) / 128 * ((hidden + 511) / 512);
                                                     bool enabled_value_36 = macro_1 > 0;
                                                     if (enabled_value_36 != 0) {
@@ -5806,8 +5872,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     }
                                                     if (idx_29 == 0 || token_row_8 % mini_size == 0) {
                                                         int input_mini_8 = token_row_8 / mini_size;
-                                                        int _min_86 = ((mini_size) < (tokens - input_mini_8 * mini_size) ? (mini_size) : (tokens - input_mini_8 * mini_size));
-                                                        int input_rows_8 = _min_86;
+                                                        int _min_84 = ((mini_size) < (tokens - input_mini_8 * mini_size) ? (mini_size) : (tokens - input_mini_8 * mini_size));
+                                                        int input_rows_8 = _min_84;
                                                         int input_count_8 = (input_rows_8 + 127) / 128 * ((hidden + 511) / 512);
                                                         bool enabled_value_38 = macro_1 > 0;
                                                         if (enabled_value_38 != 0) {
@@ -5900,8 +5966,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                         : "r"(address_30));
                                                     #pragma unroll
                                                     for (int pair_20 = 0; pair_20 < 8; pair_20++) {
-                                                        __nv_bfloat162 _bf16x2_23 = __float22bfloat162_rn(make_float2(_tmem_load_11[pair_20 * 2], _tmem_load_11[pair_20 * 2 + 1]));
-                                                        packed_21[chunk_18 * 16 + half_22 * 8 + pair_20] = __as_u32(_bf16x2_23);
+                                                        __nv_bfloat162 _bf16x2_25 = __float22bfloat162_rn(make_float2(_tmem_load_11[pair_20 * 2], _tmem_load_11[pair_20 * 2 + 1]));
+                                                        packed_21[chunk_18 * 16 + half_22 * 8 + pair_20] = __as_u32(_bf16x2_25);
                                                     }
                                                 }
                                             }
@@ -5913,8 +5979,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                     :: "r"((output_finished_addr) & 0xFEFFFFFF) : "memory");
                                                 int previous_offset_12 = (macro_1 + 1) * macro_size;
                                                 int output_row_9 = x_11 * 256 + cta_rank_0 * 128;
-                                                int _min_87 = ((macro_size) < (tokens - previous_offset_12) ? (macro_size) : (tokens - previous_offset_12));
-                                                if (output_row_9 < _min_87) {
+                                                int _min_85 = ((macro_size) < (tokens - previous_offset_12) ? (macro_size) : (tokens - previous_offset_12));
+                                                if (output_row_9 < _min_85) {
                                                 }
                                             }
                                             #pragma unroll
@@ -5934,9 +6000,9 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                         unsigned int address_31 = d_smem_addr + (unsigned int)(chunk_19 % 3 * 8192) + (unsigned int)((row_36 * 32 + col_28) * 2);
                                                         address_31 = address_31 ^ (address_31 & 511) >> 7 << 4;
                                                         int offset_0_4 = chunk_19 * 16 + half_23 * 8 + col_tile_9 * 4;
-                                                        uint32_t _stmatrix_addr_15 = static_cast<uint32_t>(address_31);
+                                                        uint32_t _stmatrix_addr_16 = static_cast<uint32_t>(address_31);
                                                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                                                            :: "r"(_stmatrix_addr_15), "r"(*reinterpret_cast<const uint32_t*>(&packed_21[offset_0_4])), "r"(*reinterpret_cast<const uint32_t*>(&packed_21[offset_0_4 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_21[offset_0_4 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_21[offset_0_4 + 3]))
+                                                            :: "r"(_stmatrix_addr_16), "r"(*reinterpret_cast<const uint32_t*>(&packed_21[offset_0_4])), "r"(*reinterpret_cast<const uint32_t*>(&packed_21[offset_0_4 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_21[offset_0_4 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_21[offset_0_4 + 3]))
                                                             : "memory");
                                                     }
                                                 }
@@ -6019,91 +6085,87 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((schedule_finished_addr) & 0xFEFFFFFF) : "memory");
             }
-            int shared_tasks_5 = shared_down + shared_swiglu + shared_dx + 3 * shared_wgrad;
-            int mini_bwd_6 = mini_down + mini_swiglu + mini_dx;
-            int mini_replay_7 = 2 * mini_down + mini_replay_swiglu;
-            int weight_tasks_8 = experts * shared_wgrad;
-            int _min_88 = ((tokens) < (macro_size) ? (tokens) : (macro_size));
-            int saved_minis_9 = (_min_88 + mini_size - 1) / mini_size;
-            int saved_tasks_10 = saved_minis_9 * mini_bwd_6 + 3 * weight_tasks_8;
-            int replay_macro_tasks_11 = macro_size / mini_size * (mini_replay_7 + mini_bwd_6) + 3 * weight_tasks_8;
-            int kind_12 = -1;
-            int task_13 = 0;
-            int macro_14 = 0;
-            int mini_15 = 0;
-            int shared_16 = 0;
+            int kind_1 = -1;
+            int task_2_1 = 0;
+            int macro_3 = 0;
+            int mini_4 = 0;
+            int shared_5 = 0;
             if (cluster - comm_clusters >= 0 && true_compute > cluster - comm_clusters) {
-                if (shared_tasks_5 > cluster - comm_clusters) {
-                    shared_16 = 1;
+                if (shared_tasks > cluster - comm_clusters) {
+                    shared_5 = 1;
                     if (shared_down > cluster - comm_clusters) {
-                        kind_12 = 0;
-                        task_13 = cluster - comm_clusters;
+                        kind_1 = 0;
+                        task_2_1 = cluster - comm_clusters;
                     } else if (cluster - comm_clusters < shared_down + shared_swiglu) {
-                        kind_12 = 1;
-                        task_13 = cluster - comm_clusters - shared_down;
+                        kind_1 = 1;
+                        task_2_1 = cluster - comm_clusters - shared_down;
                     } else {
                         if (cluster - comm_clusters < shared_down + shared_swiglu + shared_dx) {
-                            kind_12 = 2;
-                            task_13 = cluster - comm_clusters - shared_down - shared_swiglu;
+                            kind_1 = 2;
+                            task_2_1 = cluster - comm_clusters - shared_down - shared_swiglu;
                         } else {
                             int weight_task_2 = cluster - comm_clusters - shared_down - shared_swiglu - shared_dx;
-                            kind_12 = 3 + weight_task_2 / shared_wgrad;
-                            task_13 = weight_task_2 % shared_wgrad;
+                            kind_1 = 3 + weight_task_2 / shared_wgrad;
+                            task_2_1 = weight_task_2 % shared_wgrad;
                         }
                     }
                 } else {
-                    int routed_1 = cluster - comm_clusters - shared_tasks_5;
+                    int routed_1 = cluster - comm_clusters - shared_tasks;
                     int macro_task_1 = routed_1;
+                    int macro_minis_1 = saved_minis;
                     int replay_tasks_1 = 0;
-                    if (routed_1 >= saved_tasks_10) {
-                        macro_14 = 1 + (routed_1 - saved_tasks_10) / replay_macro_tasks_11;
-                        macro_task_1 = (routed_1 - saved_tasks_10) % replay_macro_tasks_11;
-                        int _min_89 = ((tokens - macro_14 * macro_size) < (macro_size) ? (tokens - macro_14 * macro_size) : (macro_size));
-                        int macro_minis_2 = (_min_89 + mini_size - 1) / mini_size;
-                        replay_tasks_1 = macro_minis_2 * mini_replay_7;
+                    if (routed_1 >= saved_tasks) {
+                        macro_3 = 1 + (routed_1 - saved_tasks) / replay_macro_tasks;
+                        macro_task_1 = (routed_1 - saved_tasks) % replay_macro_tasks;
+                        int _min_86 = ((tokens - macro_3 * macro_size) < (macro_size) ? (tokens - macro_3 * macro_size) : (macro_size));
+                        macro_minis_1 = (_min_86 + mini_size - 1) / mini_size;
+                        replay_tasks_1 = macro_minis_1 * mini_replay;
                     }
-                    int _min_90 = ((tokens - macro_14 * macro_size) < (macro_size) ? (tokens - macro_14 * macro_size) : (macro_size));
-                    int macro_minis_3 = (_min_90 + mini_size - 1) / mini_size;
                     if (macro_task_1 < replay_tasks_1) {
-                        mini_15 = macro_task_1 / mini_replay_7;
-                        int mini_task_2 = macro_task_1 % mini_replay_7;
+                        mini_4 = macro_task_1 / mini_replay;
+                        int mini_task_2 = macro_task_1 % mini_replay;
                         if (mini_task_2 < mini_down) {
-                            kind_12 = 6;
-                            task_13 = mini_task_2;
+                            kind_1 = 6;
+                            task_2_1 = mini_task_2;
                         } else if (mini_task_2 < 2 * mini_down) {
-                            kind_12 = 7;
-                            task_13 = mini_task_2 - mini_down;
+                            kind_1 = 7;
+                            task_2_1 = mini_task_2 - mini_down;
                         } else {
-                            kind_12 = 8;
-                            task_13 = mini_task_2 - 2 * mini_down;
+                            kind_1 = 8;
+                            task_2_1 = mini_task_2 - 2 * mini_down;
                         }
                     } else {
                         int bwd_task_1 = macro_task_1 - replay_tasks_1;
-                        if (bwd_task_1 < macro_minis_3 * mini_bwd_6) {
-                            mini_15 = bwd_task_1 / mini_bwd_6;
-                            int mini_task_3 = bwd_task_1 % mini_bwd_6;
+                        if (bwd_task_1 < macro_minis_1 * mini_bwd) {
+                            mini_4 = bwd_task_1 / mini_bwd;
+                            int mini_task_3 = bwd_task_1 % mini_bwd;
                             if (mini_task_3 < mini_down) {
-                                kind_12 = 0;
-                                task_13 = mini_task_3;
+                                kind_1 = 0;
+                                task_2_1 = mini_task_3;
                             } else if (mini_task_3 < mini_down + mini_swiglu) {
-                                kind_12 = 1;
-                                task_13 = mini_task_3 - mini_down;
+                                kind_1 = 1;
+                                task_2_1 = mini_task_3 - mini_down;
                             } else {
-                                kind_12 = 2;
-                                task_13 = mini_task_3 - mini_down - mini_swiglu;
+                                kind_1 = 2;
+                                task_2_1 = mini_task_3 - mini_down - mini_swiglu;
                             }
                         } else {
-                            int weight_task_3 = bwd_task_1 - macro_minis_3 * mini_bwd_6;
-                            kind_12 = 3 + weight_task_3 / weight_tasks_8;
-                            task_13 = weight_task_3 % weight_tasks_8;
+                            int weight_task_3 = bwd_task_1 - macro_minis_1 * mini_bwd;
+                            kind_1 = 3 + weight_task_3 / weight_tasks;
+                            task_2_1 = weight_task_3 % weight_tasks;
                         }
                     }
                 }
             }
-            if ((kind == 1 || kind == 8) && cluster >= 0 && kind_12 != 1 && kind_12 != 8) {
+            if ((kind == 1 || kind == 8) && cluster >= 0 && kind_1 != 1 && kind_1 != 8) {
                 asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
                 asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
             }
+            kind = kind_1;
+            task_3 = task_2_1;
+            macro_1 = macro_3;
+            mini_1 = mini_4;
+            shared = shared_5;
             iteration = iteration + 1;
         }
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");

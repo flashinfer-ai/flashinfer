@@ -216,8 +216,8 @@
       "cake_mok_backward_binding.cu"
     ],
     "sha256": [
-      "251549e57e8e304d8d06ffd3ffac76d470de0bf2c47c9fd489c3ea1815cad1dd",
-      "3f600bb08b890ef0f6a8037b71f2f7cf36adab615ad1d230e4d4df6ab372dd49"
+      "02fa62137225e1017d221c824ace8d08813312869a9320c1c15783295d8b7260",
+      "b70d0410de027d82af1e1edaee3741569be434a1abbc2b21b74e69892b22cda2"
     ],
     "arguments": [
       [
@@ -883,8 +883,8 @@
       "cake_mok_backward_mxfp8_binding.cu"
     ],
     "sha256": [
-      "7536115726c177fef169c2cfb3cc8b080d70107b9622ae141be555fe7a6212f1",
-      "9a91f8ecb28ce1575369f23a8fa25c51ada148eecf5ef224e088b4a7c8912948"
+      "9a984a4ce3160ad4771c6a955e5c8056abb43b6929ddeee3f525827195fc62ae",
+      "8369a01303ba24b41c3f179b7af5ce09e90c5a8064ea5fd907ecae9e6c665aea"
     ],
     "arguments": [
       [
@@ -1338,8 +1338,8 @@
       "cake_mok_backward_mxfp8_f32_binding.cu"
     ],
     "sha256": [
-      "8503cf24739f99695784669ad121b05ea0700717b23d6e01728efe855727174c",
-      "5e78c76cb546e29b51e5412ed273a179ebd851bf07ae0d9c6ebdcbe26e9ed151"
+      "843de8e79eebada08153b45cc496a015a92ffacbad6abef09a502690a2136081",
+      "6226bedc6fc4b74f99fb4eb72d4b648457c9445d3cedf23d8132f822d85035ce"
     ],
     "arguments": [
       [
