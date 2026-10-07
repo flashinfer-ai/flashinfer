@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, Optional
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
@@ -31,6 +34,9 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # Forwards the actual token count to the top-k function to prevent wasted work
     # when max_num_tokens is larger than the actual token count.
     use_persistent_finalize_kernel: bool = False
+    # Caller-owned CUDA int32 (1,) live-token count the reducer reads; the
+    # workspace borrows it and never writes it. Update before every forward.
+    num_valid_tokens_tensor: Optional["torch.Tensor"] = None
     # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(..., dtype="mxfp8").
@@ -38,3 +44,11 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # shim.autotune candidate set on the live problem and keep the winner
     # (one cute.compile per candidate, paid once per session).
     knobs: dict | str | None = None
+
+    def __post_init__(self) -> None:
+        if self.use_persistent_finalize_kernel and self.num_valid_tokens_tensor is None:
+            raise ValueError(
+                "use_persistent_finalize_kernel=True requires "
+                "num_valid_tokens_tensor: a caller-owned CUDA int32 tensor of "
+                "shape (1,) holding the live token count."
+            )

@@ -169,6 +169,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             use_persistent_finalize_kernel=(
                 k.use_persistent_finalize_kernel and k.do_finalize
             ),
+            num_valid_tokens_tensor=k.num_valid_tokens_tensor,
             combine_dtype=k.combine_dtype,
             fc1_alpha=k.fc1_alpha,
             fc2_alpha=k.fc2_alpha,
@@ -467,8 +468,6 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 workspace_root,
                 key[3],
             )
-        if workspace._frontend.config.use_persistent_finalize_kernel:
-            workspace.num_valid_tokens.fill_(num_tokens)
         thunk()
         if reducer_state is not None:
             reducer, partials, workspace_root, stream = reducer_state
@@ -537,6 +536,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             k.enable_in_kernel_fc2_reduce,
             k.do_finalize,
             self._uses_native_topk_reduce(fleet_params),
+            k.use_persistent_finalize_kernel,
+            epilogue_pool_key(k.num_valid_tokens_tensor),
             k.combine_dtype,
             epilogue_pool_key(k.fc1_alpha),
             epilogue_pool_key(k.fc2_alpha),

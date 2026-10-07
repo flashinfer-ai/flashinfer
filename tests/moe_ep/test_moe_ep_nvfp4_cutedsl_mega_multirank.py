@@ -1896,6 +1896,8 @@ def test_nvfp4_cutedsl_mega_kernel_is_registered():
 )
 def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
     """Caller finalization is an explicit opt-in for each CuTe-DSL backend."""
+    import torch
+
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
@@ -1918,12 +1920,21 @@ def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
     assert create_mega_kernel(cfg_unfinalized).supports_unfinalized_output
 
     if kernel_name == "sm100_nvfp4_nvfp4_bf16_cutedsl":
+        num_valid_tokens_tensor = torch.zeros(1, dtype=torch.int32)
         persistent_cfg = config_cls(
             intermediate_size=128,
             top_k=2,
             use_persistent_finalize_kernel=True,
+            num_valid_tokens_tensor=num_valid_tokens_tensor,
         )
         assert persistent_cfg.use_persistent_finalize_kernel
+        assert persistent_cfg.num_valid_tokens_tensor is num_valid_tokens_tensor
+        with pytest.raises(ValueError, match="requires num_valid_tokens_tensor"):
+            config_cls(
+                intermediate_size=128,
+                top_k=2,
+                use_persistent_finalize_kernel=True,
+            )
         assert cfg.combine_dtype == "bf16"
         cfg_q = config_cls(intermediate_size=128, top_k=2, combine_dtype="nvfp4")
         assert create_mega_kernel(cfg_q).kernel_name() == kernel_name

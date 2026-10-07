@@ -288,14 +288,23 @@ def test_mixed_backend_is_registered():
 
 @cuda_13_required
 def test_mixed_config_inherits_bf16_options():
+    import torch
+
     config = Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
         gate_up_clamp=1.5,
         enable_in_kernel_fc2_reduce=True,
         use_persistent_finalize_kernel=True,
+        num_valid_tokens_tensor=torch.zeros(1, dtype=torch.int32),
     )
     assert isinstance(config, Sm100_Bf16_Cutedsl_MegaMoeConfigBase)
     assert config.gate_up_clamp == 1.5
     assert config.enable_in_kernel_fc2_reduce
     assert config.use_persistent_finalize_kernel
+    with pytest.raises(ValueError, match="requires num_valid_tokens_tensor"):
+        Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+            use_persistent_finalize_kernel=True,
+        )

@@ -1022,6 +1022,8 @@ def test_mxfp8_cutedsl_preprocess_mega_weights_from_bf16():
 
 
 def test_mxfp8_cutedsl_mega_kernel_is_registered():
+    import torch
+
     from flashinfer.moe_ep import Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
@@ -1029,7 +1031,14 @@ def test_mxfp8_cutedsl_mega_kernel_is_registered():
         intermediate_size=128,
         top_k=2,
         use_persistent_finalize_kernel=True,
+        num_valid_tokens_tensor=torch.zeros(1, dtype=torch.int32),
     )
     kernel = create_mega_kernel(config)
     assert kernel.kernel_name() == "sm100_mxfp8_mxfp8_bf16_cutedsl"
     assert config.use_persistent_finalize_kernel
+    with pytest.raises(ValueError, match="requires num_valid_tokens_tensor"):
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+            use_persistent_finalize_kernel=True,
+        )
