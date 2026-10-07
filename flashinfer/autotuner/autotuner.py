@@ -1175,6 +1175,15 @@ def _sync_oom_across_tune_group(local_oom: bool) -> bool:
     # autotuning one rank profiles for >30 min while others block in this
     # all_reduce, exceeding the gloo/NCCL timeout and killing all workers.
     # Each rank handles its own OOM fallback instead.
+    #
+    # NOTE: independent mode trades guaranteed rank agreement for
+    # availability. On homogeneous TP (same GPU, same shapes — the
+    # standard vLLM/Megatron TP setup), local timings are near-identical
+    # and all ranks converge on the same tactic. For heterogeneous
+    # setups, or runners that require exact tactic agreement across
+    # ranks (e.g. NCCL symmetric memory allocation), keep the default
+    # synchronized mode. See the docstring on
+    # ``set_autotune_process_group`` for the caller contract.
     import os
     if os.environ.get("FLASHINFER_AUTOTUNE_INDEPENDENT", "0") == "1":
         return local_oom
