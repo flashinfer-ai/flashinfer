@@ -311,9 +311,13 @@ def test_matches_torch_cast_when_saturating():
     )
 
 
+@requires_fused_dispatch
 def test_all_bf16_patterns_byte_exact():
     """Every bf16 bit pattern through the fused kernel (saturation, NaN sign
-    dropping, subnormal RNE, -0.0) against the explicit reference."""
+    dropping, subnormal RNE, -0.0) against the explicit reference.  Fused
+    dispatch only: outside the dispatch surface the operator is the composable
+    torch path, whose fp8 cast bits on NaN / overflow / -0.0 patterns depend on
+    the torch build (that path is covered by test_matches_torch_cast_when_saturating)."""
     allb = (
         torch.arange(0, 65536, dtype=torch.int32)
         .to(torch.int16)
