@@ -1732,9 +1732,7 @@ def test_round19_rules_plan_like_the_cake_launcher(T):
         "sk_sync_m": 62,
         "sk_slab": 3,
     }
-    assert len(ROW_RULES) == 97
-    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 48
-    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 49
+    # the table size is asserted by the newest round's test (round 20: 98 = 49 + 49); round 19 shipped 97 = 48 + 49
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
     # the 32- / 128-column indexer forwards: one 128 x 128 tile per CTA, 127 tiles on 148 SMs, whole tiles, the
     # streaming A operand evict_first (one column tile, the wave's panels exceed the L2)
