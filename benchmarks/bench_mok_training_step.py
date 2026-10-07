@@ -93,9 +93,10 @@ def parse_args():
     p.add_argument("--precision", choices=("bf16", "mxfp8"), default="bf16")
     p.add_argument(
         "--mode",
-        choices=("full", "checkpoint"),
+        choices=("full", "checkpoint", "forward", "forward_recompute"),
         default="full",
-        help="full = forward+backward; checkpoint = forward+recompute_forward_context+backward",
+        help="full = forward+backward; checkpoint = forward+recompute_forward_context+backward; "
+        "forward / forward_recompute = the forward (+ recompute) phases alone (decomposition rows)",
     )
     p.add_argument("--macrobatch", type=int, default=262144)
     p.add_argument("--minibatch", type=int, default=4096)
@@ -261,8 +262,8 @@ class CakeImpl:
             )
         else:
             self.forward_weights = self.backward_weights = tuple(self.weights)
-        fwd = args.fwd_comm_sms or 40
-        bwd = args.bwd_comm_sms or 40
+        fwd = args.fwd_comm_sms or 24
+        bwd = args.bwd_comm_sms or 28
         self.config, self.workspace = create_mok_bf16_workspace(
             group=dist.group.WORLD,
             device=device,
@@ -312,7 +313,7 @@ class CakeImpl:
                 )
         return total
 
-    def step(self, checkpoint):
+    def step(self, mode):
         schedule = self.functional.build_schedule(
             self.workspace, self.config, self.ids, num_local_experts=self.local_experts
         )
@@ -325,7 +326,10 @@ class CakeImpl:
             *self.forward_weights,
             swiglu_limit=self.shape.swiglu_limit,
         )
-        if checkpoint:
+        if mode == "forward":
+            self.context = context
+            return (y,)
+        if mode in ("checkpoint", "forward_recompute"):
             context = self.functional.recompute_forward_context(
                 self.config,
                 self.workspace,
@@ -337,6 +341,9 @@ class CakeImpl:
                 self.forward_weights[4],
                 swiglu_limit=self.shape.swiglu_limit,
             )
+        if mode == "forward_recompute":
+            self.context = context
+            return (y,)
         grads = self.functional.backward(
             self.config,
             self.workspace,
@@ -419,7 +426,7 @@ class Mok17Impl:
             return gate[:2], up[:2], down[:2]
         return gate, up, down[2:]
 
-    def step(self, checkpoint):
+    def step(self, mode):
         mokf, shape = self.mokf, self.shape
         schedule = mokf.build_schedule(
             self.workspace, self.config, self.ids, num_local_experts=self.local_experts
@@ -437,7 +444,10 @@ class Mok17Impl:
             *self._routed(True),
             swiglu_limit=shape.swiglu_limit,
         )
-        if checkpoint:
+        if mode == "forward":
+            self.context = context
+            return (y,)
+        if mode in ("checkpoint", "forward_recompute"):
             rg, ru, _ = self._routed(True)
             context = mokf.recompute_forward_context(
                 self.config,
@@ -450,6 +460,9 @@ class Mok17Impl:
                 ru,
                 swiglu_limit=shape.swiglu_limit,
             )
+        if mode == "forward_recompute":
+            self.context = context
+            return (y,)
         grads = mokf.backward(
             self.config,
             self.workspace,
@@ -619,7 +632,7 @@ class DeepEPImpl:
         )
         return permuted, probs, weighted, handle
 
-    def step(self, checkpoint):
+    def step(self, mode):
         shape = self.shape
         n, x, ids, scores, dy = self._source()
         sg, su, sd = (w.detach().requires_grad_() for w in self.weights[:3])
@@ -627,7 +640,7 @@ class DeepEPImpl:
         hidden_s = _swiglu_torch(x_s @ sg.T, x_s @ su.T, shape.swiglu_limit)
         y_shared = hidden_s @ sd.T
         self._ctx_bytes = 0
-        if checkpoint:
+        if mode in ("checkpoint", "forward_recompute"):
             with torch.no_grad():
                 _, _, weighted, handle = self._routed_forward(x, ids, scores)
                 y_routed, _ = self.buffer.combine_with_unpermute(
@@ -645,6 +658,9 @@ class DeepEPImpl:
             )
         y = (y_routed[:n].float() + y_shared.detach()[:n].float()).to(torch.bfloat16)
         self._ctx_bytes += 3 * n * shape.intermediate * 2
+        if mode in ("forward", "forward_recompute"):
+            self.context = handle
+            return (y,)
         # Backward: dispatch dy into the permuted layout, autograd the expert and
         # shared graphs, combine dx and the per-route score gradient.
         d_weighted, _, _, _, _ = self.buffer.dispatch_with_permute(
@@ -721,14 +737,14 @@ def gather_max(values, device):
     return torch.stack(gathered).max(dim=0).values.tolist()
 
 
-def time_block(impl, checkpoint, warmup_ms, sample_ms, device):
+def time_block(impl, mode, warmup_ms, sample_ms, device):
     torch.cuda.synchronize()
     dist.barrier()
     # Warmup: at least warmup_ms of wall time on every rank (barrier-synchronous count).
     t0 = time.perf_counter()
     iters = 0
     while True:
-        impl.step(checkpoint)
+        impl.step(mode)
         iters += 1
         torch.cuda.synchronize()
         elapsed = torch.tensor(
@@ -747,7 +763,7 @@ def time_block(impl, checkpoint, warmup_ms, sample_ms, device):
             torch.cuda.Event(enable_timing=True),
         )
         start.record()
-        impl.step(checkpoint)
+        impl.step(mode)
         end.record()
         torch.cuda.synchronize()
         samples.append(start.elapsed_time(end))
@@ -770,12 +786,12 @@ def time_block(impl, checkpoint, warmup_ms, sample_ms, device):
     )
 
 
-def measure_memory(impl, checkpoint, device):
+def measure_memory(impl, mode, device):
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     base = torch.cuda.memory_allocated(device)
     torch.cuda.reset_peak_memory_stats(device)
-    outputs = impl.step(checkpoint)
+    outputs = impl.step(mode)
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated(device) - base
     ctx = impl.context_bytes(impl.context) if impl.context is not None else 0
@@ -841,7 +857,7 @@ def main():
         impls[name] = IMPLS[name](
             args, shape, rank, ep, rows, inputs, device, capacity, factor
         )
-    checkpoint = args.mode == "checkpoint"
+    mode = args.mode
     if rank == 0:
         print(
             f"== {shape.name} EP{ep} rows={rows} routing={args.routing} precision={args.precision} mode={args.mode} "
@@ -881,9 +897,9 @@ def main():
     )
     outputs = {}
     for name in impl_names:
-        record["memory"][name] = measure_memory(impls[name], checkpoint, device)
+        record["memory"][name] = measure_memory(impls[name], mode, device)
         if args.check:
-            outputs[name] = [o.detach().clone() for o in impls[name].step(checkpoint)]
+            outputs[name] = [o.detach().clone() for o in impls[name].step(mode)]
     if args.check and len(outputs) > 1:
         record["cross_check"] = cross_check(outputs, device)
     outputs = None
@@ -897,7 +913,7 @@ def main():
         timings = {}
         for name in order:
             timings[name] = time_block(
-                impls[name], checkpoint, args.warmup_ms, args.sample_ms, device
+                impls[name], mode, args.warmup_ms, args.sample_ms, device
             )
             if rank == 0:
                 print(
