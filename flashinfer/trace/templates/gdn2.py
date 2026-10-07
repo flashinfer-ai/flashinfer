@@ -16,6 +16,7 @@
 
 import math
 from copy import deepcopy
+from typing import cast
 
 import torch
 
@@ -325,8 +326,8 @@ _gdn2_prefill_pool_trace.init = _gdn2_prefill_pool_init
 _gdn2_prefill_pool_trace.axes["state_pool_rows"] = Var(
     description="Rows in the recurrent state pool."
 )
-_gdn2_prefill_pool_trace.axes["num_q_heads"].abbrev = "q"
-_gdn2_prefill_pool_trace.axes["num_k_heads"].abbrev = "k"
+cast(Const, _gdn2_prefill_pool_trace.axes["num_q_heads"]).abbrev = "q"
+cast(Const, _gdn2_prefill_pool_trace.axes["num_k_heads"]).abbrev = "k"
 _gdn2_prefill_pool_trace.axes["num_o_heads"] = Const(
     description="max(num_q_heads, num_v_heads).", abbrev=""
 )
@@ -336,7 +337,9 @@ for _name, _spec in _gdn2_prefill_pool_trace.inputs.items():
         _spec.dim_names = [
             "num_o_heads" if d == "num_v_heads" else d for d in _spec.dim_names
         ]
-_gdn2_prefill_pool_trace.inputs["initial_state"].dim_names[0] = "state_pool_rows"
+cast(Tensor, _gdn2_prefill_pool_trace.inputs["initial_state"]).dim_names[0] = (
+    "state_pool_rows"
+)
 _gdn2_prefill_pool_trace.inputs.update(
     state_indices=Tensor(["num_seqs"]),
     output_state=Tensor(
@@ -345,7 +348,7 @@ _gdn2_prefill_pool_trace.inputs.update(
     output_final_state=Scalar("int32", optional=True),
     use_qk_l2norm_in_kernel=Scalar("int32", optional=True),
 )
-_gdn2_prefill_pool_trace.outputs["output"].dim_names[1] = "num_o_heads"
+cast(Tensor, _gdn2_prefill_pool_trace.outputs["output"]).dim_names[1] = "num_o_heads"
 _gdn2_prefill_pool_trace.outputs["final_state"] = Tensor(
     ["state_pool_rows", "num_o_heads", "head_size", "head_size"],
     optional=True,
