@@ -311,7 +311,7 @@ def _run_kda_prefill_cute_small_bh(
     else:
         out = output
     _check_output_does_not_overlap_inputs(
-        out,
+        output,
         q=q,
         k=k,
         v=v,

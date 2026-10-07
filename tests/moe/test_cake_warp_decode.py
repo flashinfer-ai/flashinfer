@@ -282,6 +282,10 @@ def test_runner_build_passes_its_explicit_target_and_device(
         (SwiGLU(), SwiGLU(), 2048, 512, 256),
         (SwiGLU(), SwiGLU(), 4096, 1024, 512),
         (SwiGLU(), SwiGLU(), 3072, 1536, 256),
+        (SwiGLU(), SwiGLU(), 4096, 512, 512),
+        (None, SwiGLU(), 4096, 256, 512),
+        (SwiGLU(), SwiGLU(), 3072, 768, 256),
+        (None, SwiGLU(), 3072, 384, 256),
         (
             SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
             SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
@@ -346,6 +350,10 @@ def test_config_preparation_delegates_to_trtllm_physical_view(
         (SiLU(), 2048, 512, 256),
         (SiLU(), 4096, 1024, 512),
         (SiLU(), 3072, 1536, 256),
+        (SiLU(), 4096, 512, 512),
+        (SwiGLU(alpha=2.0), 4096, 256, 512),
+        (SiLU(), 3072, 768, 256),
+        (SwiGLU(alpha=2.0), 3072, 384, 256),
         (SwiGLU(), 6144, 3072, 128),
         (SwiGLU(), 3584, 3072, 896),
         (SwiGLU(alpha=1.702, beta=0.0, limit=7.0), 6144, 3072, 128),
@@ -465,6 +473,10 @@ def test_support_accepts_exact_architectures(
         (2048, 512, 256, 8),
         (4096, 1024, 512, 10),
         (3072, 1536, 256, 8),
+        (4096, 512, 512, 10),
+        (4096, 256, 512, 10),
+        (3072, 768, 256, 8),
+        (3072, 384, 256, 8),
     ],
 )
 def test_pack_reuses_prepared_workspace_and_preserves_ffi_order(
@@ -1145,6 +1157,11 @@ _GPU_GEOMETRIES = (
         (1, 2, 32),
         SiTU(gate_scale=4.0, linear_scale=25.0),
     ),
+    # Sharded per-partition slices (fused route packing on every token count).
+    _GpuGeometry("h4096_e512_i512_k10", 4096, 512, 512, 10, (1, 2, 16, 32)),
+    _GpuGeometry("h4096_e512_i256_k10", 4096, 256, 512, 10, (1, 2, 16, 32)),
+    _GpuGeometry("h3072_e256_i768_k8", 3072, 768, 256, 8, (1, 2, 16, 32)),
+    _GpuGeometry("h3072_e256_i384_k8", 3072, 384, 256, 8, (1, 2, 16, 32)),
 )
 _GPU_ROWS = [
     pytest.param(geometry, num_tokens, id=f"{geometry.name}-t{num_tokens:02d}")

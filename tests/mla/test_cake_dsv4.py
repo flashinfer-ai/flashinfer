@@ -1267,7 +1267,21 @@ def _combined_metadata(rows: int, compressed: int, *, value_base: int = 0):
 
 # Tensors run_cake_dsv4 places in the host value table that a generated TMA
 # descriptor may alias (see cake._TMA_SOURCE_ALIASES).
-_HOST_TMA_SOURCE_TENSORS = frozenset({"Q", "SWA_cache", "compressed_KV_cache", "O"})
+_HOST_TMA_SOURCE_TENSORS = frozenset(
+    {
+        "Q",
+        "SWA_cache",
+        "compressed_KV_cache",
+        "O",
+        # NVFP4 route: the partial-O tile view and the gather4 cache views are
+        # tensor values of run_cake_dsv4_nvfp4 (see _TENSOR_VALUE_NAMES).
+        "partial_O_tiles",
+        "main_cache_g4d",
+        "main_cache_g4f",
+        "extra_cache_g4d",
+        "extra_cache_g4f",
+    }
+)
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
@@ -1583,7 +1597,9 @@ def test_launch_variant_reports_unknown_retired_and_unavailable_names(monkeypatc
         launch("legacy", sparse_indices=separate.legacy_combined_table)
     launch("legacy", sparse_indices=combined.legacy_combined_table)
     assert recorder.calls[-1][0] is table
-    with pytest.raises(ValueError, match="needs ragged queries"):
+    # No host value is None for a real call (dense calls bind seq_lens in place
+    # of cum_seq_lens_q); a None value is reported as unavailable.
+    with pytest.raises(ValueError, match="not available for this call"):
         launch("ragged_only", cum_seq_lens_q=None)
     with pytest.raises(ValueError, match="TMA descriptor bytes"):
         launch("too_many_descriptors")
@@ -1834,6 +1850,18 @@ def test_workspace_formula_and_layout():
     assert get_cake_dsv4_workspace_bytes(
         1, 8, 128, torch.bfloat16
     ) < get_cake_dsv4_workspace_bytes(2, 8, 128, torch.bfloat16)
+    # One split: no partial_O region, the LSE region follows the counters; the
+    # optional offsets region of a row-tiled chunk trails the LSE region.
+    one = cake_dsv4_workspace_layout(tokens, heads, 1)
+    assert one.partial_o == (1024 + 256 * 1024, 0)
+    assert one.partial_lse == (1024 + 256 * 1024, -(-(tokens * heads * 4) // 128) * 128)
+    assert one.query_offsets == (one.partial_lse[0] + one.partial_lse[1], 0)
+    assert one.total_bytes == one.partial_lse[0] + one.partial_lse[1]
+    tiled = cake_dsv4_workspace_layout(tokens, heads, 1, num_query_offsets=5)
+    assert tiled.query_offsets == (one.total_bytes, 128)
+    assert tiled.total_bytes == one.total_bytes + 128
+    with pytest.raises(ValueError, match="num_query_offsets"):
+        cake_dsv4_workspace_layout(tokens, heads, 1, num_query_offsets=-1)
     with pytest.raises(ValueError, match="dtype"):
         get_cake_dsv4_workspace_bytes(tokens, heads, topk, torch.float16)
     with pytest.raises(ValueError, match="multiple of 4"):
@@ -1846,12 +1874,15 @@ def test_workspace_reset_zeroes_only_the_counter_region():
     total = cake._PARTIAL_OFFSET + 4096
     workspace = _aligned_u8(total)
     workspace.fill_(0xFF)
-    assert not getattr(workspace, cake._PRIMED_ATTR, False)
+    assert not cake._counters_primed(workspace, cake._workspace_bytes(workspace))
     cake_dsv4_workspace_reset(workspace)
     assert torch.all(workspace[:1024] == 0xFF)
     assert torch.all(workspace[1024 : cake._PARTIAL_OFFSET] == 0)
     assert torch.all(workspace[cake._PARTIAL_OFFSET :] == 0xFF)
-    assert getattr(workspace, cake._PRIMED_ATTR)
+    assert cake._counters_primed(workspace, cake._workspace_bytes(workspace))
+    # Views of the registered buffer share the registration (same owner).
+    view = workspace[:]
+    assert cake._counters_primed(view, cake._workspace_bytes(view))
     counters = cake._counters(workspace, 4)
     assert counters.dtype == torch.uint32 and counters.numel() == 4
     assert counters.data_ptr() == workspace.data_ptr() + 1024
@@ -1867,33 +1898,49 @@ def test_workspace_reset_zeroes_only_the_counter_region():
         cake_dsv4_workspace_reset(misaligned)
 
 
-def test_counter_initialisation_refused_during_capture(monkeypatch):
+def test_counter_zeroing_is_part_of_the_launch_and_never_raises_in_capture(monkeypatch):
+    """CAKE-939: counter zeroing is a launch-contract step, not a host priming step.
+
+    Unregistered workspace under capture: a zero fill of exactly the counters
+    the launch uses is recorded (executed here), nothing else is touched and
+    the workspace stays unregistered (the fill lives in the graph). Eager
+    first use zeroes the whole region once and registers the workspace; a
+    registered workspace is never filled again, eagerly or under capture.
+    """
     workspace = _aligned_u8(cake._PARTIAL_OFFSET)
     workspace.fill_(0xAB)
     launcher = cake._Launcher(
         arch="sm_103a", workspace=workspace, raw=workspace, values={}
     )
     monkeypatch.setattr(cake, "_is_capturing", lambda device: True)
-    with pytest.raises(RuntimeError, match="cake_dsv4_workspace_reset"):
-        launcher.counters(8)
-    assert torch.all(workspace[1024:1032] == 0xAB)  # nothing touched during capture
-    cake_dsv4_workspace_reset(workspace)
     counters = launcher.counters(8)
-    assert torch.all(counters == 0)
-    # Eager first use primes the tensor exactly once.
-    eager = cake._Launcher(
-        arch="sm_103a",
-        workspace=_aligned_u8(cake._PARTIAL_OFFSET),
-        raw=None,
-        values={},
-    )
-    eager.raw = eager.workspace
-    eager.workspace.fill_(0xAB)
+    assert counters.numel() == 8 and torch.all(counters == 0)
+    assert torch.all(workspace[:1024] == 0xAB)
+    assert torch.all(workspace[1024 + 32 : cake._PARTIAL_OFFSET] == 0xAB)
+    assert not cake._counters_primed(workspace, workspace)
     monkeypatch.setattr(cake, "_is_capturing", lambda device: False)
-    assert torch.all(eager.counters(3) == 0)
-    assert getattr(eager.workspace, cake._PRIMED_ATTR)
-    eager.workspace[1024:1036].fill_(7)
-    assert torch.all(eager.counters(3) == 0x07070707)  # primed: no second reset
+    assert torch.all(launcher.counters(3) == 0)
+    assert torch.all(workspace[1024 : cake._PARTIAL_OFFSET] == 0)
+    assert cake._counters_primed(workspace, workspace)
+    workspace[1024:1036].fill_(7)
+    assert torch.all(launcher.counters(3) == 0x07070707)  # registered: no second fill
+    monkeypatch.setattr(cake, "_is_capturing", lambda device: True)
+    assert torch.all(launcher.counters(3) == 0x07070707)  # nor under capture
+    # The registration follows the storage owner: an explicit reset registers,
+    # a freed owner invalidates the entry and the next registration prunes it.
+    other = _aligned_u8(cake._PARTIAL_OFFSET)
+    other.fill_(0xAB)
+    key = cake._primed_key(other)
+    cake_dsv4_workspace_reset(other)
+    assert cake._primed_workspaces[key]() is other._base
+    assert cake._counters_primed(other, other)
+    del other
+    import gc
+
+    gc.collect()
+    assert cake._primed_workspaces[key]() is None
+    cake._register_primed(workspace, workspace)
+    assert key not in cake._primed_workspaces
 
 
 def test_metadata_resolution_combined_table():
@@ -2516,3 +2563,399 @@ def test_fp8_h64_m64_programs_launch_one_cta_per_token(arch, route):
     assert L.calls == [
         (route, {"grid": (tokens, 1, 1), "total_work_items": tokens, **L.partials(1)})
     ]
+
+
+# --------------------------------------------------------------------------- CAKE-957 / CAKE-939: query layout, route plan, row tiling
+_QUERY_LAYOUT_PLAN = (
+    ("buffer", "seq_lens"),
+    ("buffer", "cum_seq_lens_q"),
+    ("parameter", "ragged_query"),
+    ("parameter", "max_q_len"),
+    ("parameter", "batch_size"),
+)
+# The bf16 H32 merge producer (one KV tile per split, in-kernel last-arriver
+# merge) with the five query-layout parameters of the regenerated bindings.
+_H32_MERGE_PLAN = _plan(
+    ("tma_buffer", "tmap_q"),
+    ("tma_buffer", "tmap_swa_kv"),
+    ("tma_buffer", "tmap_compressed_kv"),
+    ("buffer", "partial_O"),
+    ("buffer", "partial_lse"),
+    ("buffer", "O"),
+    ("buffer", "partition_arrivals"),
+    ("buffer", "swa_indices"),
+    ("buffer", "compressed_indices"),
+    ("buffer", "sparse_topk_lens"),
+    *_QUERY_LAYOUT_PLAN,
+    ("buffer", "sinks"),
+    ("buffer", "bmm1_scale"),
+    ("buffer", "bmm2_scale"),
+    ("parameter", "num_heads"),
+    ("parameter", "swa_index_stride"),
+    ("parameter", "compressed_index_stride"),
+    ("parameter", "sparse_topk_lens_offset"),
+    ("parameter", "sparse_topk"),
+    ("parameter", "num_splits"),
+    ("parameter", "num_head_tiles"),
+    ("parameter", "num_query_tokens"),
+    ("parameter", "has_sinks"),
+)
+
+
+def _run_fake_bf16_h32(
+    monkeypatch,
+    *,
+    rows,
+    compressed,
+    workspace,
+    cum_seq_lens_q,
+    max_q_len,
+    seq_lens,
+    query_rows=None,
+):
+    """Drive run_cake_dsv4 on CPU tensors through bf16_h32_topk128x_early_v47
+    (page-2 compressed cache: the counter route) and return the bound calls."""
+    recorder = _install_fake_variants(
+        monkeypatch, {"bf16_h32_topk128x_early_v47": _H32_MERGE_PLAN}
+    )
+    monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
+    table, lens = _combined_metadata(rows, compressed)
+    query = torch.zeros((query_rows or rows, 32, 512), dtype=torch.bfloat16)
+    out = torch.zeros((query_rows or rows, 32, 512), dtype=torch.bfloat16)
+    cake.run_cake_dsv4(
+        query=query,
+        swa_kv_cache=torch.zeros((4, 1, 256, 512), dtype=torch.bfloat16),
+        compressed_kv_cache=torch.zeros((8, 1, 2, 512), dtype=torch.bfloat16),
+        workspace_buffer=workspace,
+        out=out,
+        bmm1_scale=0.5,
+        bmm2_scale=1.0,
+        sinks=None,
+        max_q_len=max_q_len,
+        cum_seq_lens_q=cum_seq_lens_q,
+        seq_lens=seq_lens,
+        backend="cake",
+        sparse_indices=table,
+        sparse_topk_lens=lens,
+    )
+    calls = [
+        dict(zip((name for _, name in _H32_MERGE_PLAN), call, strict=True))
+        for call in recorder.calls
+    ]
+    return calls, table, lens, query, out
+
+
+def test_query_layout_params_are_bindable_and_bound_for_dense_and_ragged_calls(
+    monkeypatch,
+):
+    """Every variant can bind the five query-layout parameters; dense calls bind
+    seq_lens for the never-read cum_seq_lens_q, ragged_query 0, the dense
+    per-request length and batch_size = seq_lens.numel()."""
+    for kind, name in _QUERY_LAYOUT_PLAN:
+        assert cake.is_bindable_arg(kind, name), name
+    assert tuple(name for _, name in _QUERY_LAYOUT_PLAN) == cake.QUERY_LAYOUT_PARAMS
+    seq_lens = torch.tensor([300, 40, 7], dtype=torch.int32)
+    workspace = _aligned_u8(
+        get_cake_dsv4_workspace_bytes(6, 32, 128 + 132, torch.bfloat16)
+    )
+    (dense,), *_ = _run_fake_bf16_h32(
+        monkeypatch,
+        rows=6,
+        compressed=132,
+        workspace=workspace,
+        cum_seq_lens_q=None,
+        max_q_len=2,
+        seq_lens=seq_lens,
+    )
+    assert dense["seq_lens"] is seq_lens
+    assert dense["cum_seq_lens_q"] is seq_lens
+    assert dense["ragged_query"] == 0
+    assert dense["max_q_len"] == 2 and dense["batch_size"] == 3
+    indptr = torch.tensor([0, 1, 3, 6], dtype=torch.int32)
+    (ragged,), *_ = _run_fake_bf16_h32(
+        monkeypatch,
+        rows=6,
+        compressed=132,
+        workspace=workspace,
+        cum_seq_lens_q=indptr,
+        max_q_len=3,
+        seq_lens=seq_lens,
+    )
+    assert ragged["cum_seq_lens_q"].data_ptr() == indptr.data_ptr()
+    assert ragged["ragged_query"] == 1
+    assert ragged["max_q_len"] == 3 and ragged["batch_size"] == 3
+    # A dense layout that cannot hold the metadata rows is rejected up front.
+    with pytest.raises(ValueError, match="dense query layout"):
+        _run_fake_bf16_h32(
+            monkeypatch,
+            rows=7,
+            compressed=132,
+            workspace=_aligned_u8(
+                get_cake_dsv4_workspace_bytes(7, 32, 128 + 132, torch.bfloat16)
+            ),
+            cum_seq_lens_q=None,
+            max_q_len=2,
+            seq_lens=seq_lens,
+        )
+
+
+def test_run_cake_dsv4_tiles_rows_to_the_workspace(monkeypatch):
+    """CAKE-939: a workspace below the single-launch carve tiles the metadata
+    rows; every chunk sees row views, its own partials and counters, and the
+    chunks after the first run as ragged rows of the shifted request offsets
+    written into the workspace."""
+    rows, compressed = 10, 132  # sparse_topk 260: three KV tiles, four counters per row
+    seq_lens = torch.tensor([300, 40, 7], dtype=torch.int32)
+    indptr = torch.tensor([0, 3, 7, 10], dtype=torch.int32)
+    plan = cake._route_plan(
+        "bf16_h32_topk128x_early_v47",
+        num_query_tokens=rows,
+        num_heads=32,
+        sparse_topk=260,
+    )
+    assert plan == cake._RoutePlan(3, True, 4)
+    chunk_bytes = cake._launch_workspace_bytes(plan, 4, 32, len(indptr))
+    assert (
+        cake._rows_per_launch(
+            plan,
+            num_query_tokens=rows,
+            num_heads=32,
+            batch_size=3,
+            workspace_bytes=chunk_bytes,
+        )
+        == 4
+    )
+    workspace = _aligned_u8(chunk_bytes)
+    calls, table, lens, query, out = _run_fake_bf16_h32(
+        monkeypatch,
+        rows=rows,
+        compressed=compressed,
+        workspace=workspace,
+        cum_seq_lens_q=indptr,
+        max_q_len=4,
+        seq_lens=seq_lens,
+    )
+    assert [c["num_query_tokens"] for c in calls] == [4, 4, 2]
+    row_bytes = 32 * 512 * 2
+    for first, c in zip((0, 4, 8), calls, strict=True):
+        n = c["num_query_tokens"]
+        assert c["tmap_q"].data_ptr() == query.data_ptr() + first * row_bytes
+        assert c["tmap_q"].shape[0] == n and c["O"].shape[0] == n
+        assert c["O"].data_ptr() == out.data_ptr() + first * row_bytes
+        assert c["swa_indices"].data_ptr() == table.data_ptr() + first * 260 * 4
+        assert (
+            c["compressed_indices"].data_ptr()
+            == table.data_ptr() + (first * 260 + 128) * 4
+        )
+        assert c["swa_index_stride"] == c["compressed_index_stride"] == 260
+        assert c["sparse_topk_lens"].data_ptr() == lens.data_ptr() + first * 4
+        assert c["sparse_topk_lens"].numel() == n
+        assert c["num_splits"] == 3 and c["num_head_tiles"] == 4
+        assert c["partition_arrivals"].numel() == n * 4
+        assert torch.all(c["partition_arrivals"] == 0)
+        assert c["partial_O"].numel() == n * 32 * 3 * 512
+        assert c["partial_lse"].numel() == n * 32 * 3
+        assert (c["grid_x"], c["grid_y"], c["grid_z"]) == (n * 3 * 4, 1, 1)
+        assert c["seq_lens"] is seq_lens
+        assert c["batch_size"] == 3 and c["max_q_len"] == 4 and c["ragged_query"] == 1
+        if first == 0:
+            assert c["cum_seq_lens_q"].data_ptr() == indptr.data_ptr()
+        else:
+            layout = cake_dsv4_workspace_layout(n, 32, 3, num_query_offsets=4)
+            assert layout.total_bytes <= workspace.numel()
+            assert (
+                c["cum_seq_lens_q"].data_ptr()
+                == workspace.data_ptr() + layout.query_offsets[0]
+            )
+            assert c["cum_seq_lens_q"].dtype == torch.int32
+            assert c["cum_seq_lens_q"].tolist() == (indptr - first).tolist()
+    # Dense caller: the first chunk keeps the dense layout, the later chunks
+    # run as ragged rows of the (cached) dense request offsets minus their start.
+    seq_lens5 = torch.full((5,), 100, dtype=torch.int32)
+    calls, *_ = _run_fake_bf16_h32(
+        monkeypatch,
+        rows=rows,
+        compressed=compressed,
+        workspace=_aligned_u8(cake._launch_workspace_bytes(plan, 4, 32, 6)),
+        cum_seq_lens_q=None,
+        max_q_len=2,
+        seq_lens=seq_lens5,
+    )
+    assert [c["num_query_tokens"] for c in calls] == [4, 4, 2]
+    assert calls[0]["cum_seq_lens_q"] is seq_lens5 and calls[0]["ragged_query"] == 0
+    assert calls[1]["ragged_query"] == 1
+    assert calls[1]["cum_seq_lens_q"].tolist() == [-4, -2, 0, 2, 4, 6]
+    assert calls[2]["ragged_query"] == 1
+    assert calls[2]["cum_seq_lens_q"].tolist() == [-8, -6, -4, -2, 0, 2]
+    # A workspace that holds one launch is not tiled.
+    calls, *_ = _run_fake_bf16_h32(
+        monkeypatch,
+        rows=rows,
+        compressed=compressed,
+        workspace=_aligned_u8(
+            get_cake_dsv4_workspace_bytes(rows, 32, 260, torch.bfloat16)
+        ),
+        cum_seq_lens_q=indptr,
+        max_q_len=4,
+        seq_lens=seq_lens,
+    )
+    assert len(calls) == 1 and calls[0]["num_query_tokens"] == rows
+    # Below the one-row carve the call is rejected and names the minimum.
+    with pytest.raises(ValueError, match="needs at least"):
+        _run_fake_bf16_h32(
+            monkeypatch,
+            rows=rows,
+            compressed=compressed,
+            workspace=_aligned_u8(cake._launch_workspace_bytes(plan, 1, 32, 4) - 128),
+            cum_seq_lens_q=indptr,
+            max_q_len=4,
+            seq_lens=seq_lens,
+        )
+
+
+def test_workspace_requirement_is_exact_per_route():
+    mib128 = 128 * 1024 * 1024
+    # Routes without partial buffers need no workspace bytes.
+    swa = cake.cake_dsv4_workspace_requirement(
+        dtype=torch.bfloat16,
+        num_heads=64,
+        num_query_tokens=12,
+        sparse_topk=128,
+        compressed_page_size=256,
+        max_q_len=5,
+        batch_size=3,
+        ragged=True,
+    )
+    assert swa.route == "bf16_swa128_single_cta" and not swa.uses_workspace
+    assert swa.single_launch_bytes == swa.minimum_bytes == 0
+    assert swa.rows_per_launch(0) == 12
+    # One-split persistent route: the LSE region only, so 1024 dense FP8/H128
+    # rows run inside sglang's fixed 128 MiB buffer in one launch (the former
+    # carve asked for a 128 MiB partial_O region it never used).
+    fp8 = cake.cake_dsv4_workspace_requirement(
+        dtype=torch.float8_e4m3fn,
+        num_heads=128,
+        num_query_tokens=1024,
+        sparse_topk=128,
+        compressed_page_size=256,
+        max_q_len=1,
+        batch_size=1024,
+        ragged=False,
+    )
+    assert fp8.route == "fp8_h128_prefill_source_persistent" and fp8.num_splits == 1
+    assert fp8.single_launch_bytes == cake._PARTIAL_OFFSET + 1024 * 128 * 4
+    assert fp8.rows_per_launch(mib128) == 1024
+    # One row per launch: 128 heads x 4 B of LSE plus the 1025 shifted offsets.
+    assert fp8.minimum_bytes == cake._PARTIAL_OFFSET + 512 + -(-(1025 * 4) // 128) * 128
+    # The route-agnostic single-launch bound stays conservative (five splits).
+    assert get_cake_dsv4_workspace_bytes(1024, 128, 128, torch.float8_e4m3fn) > mib128
+    # The split route without a token bound tiles inside 128 MiB; the counter
+    # region caps one launch at 16384 rows of four counters.
+    h32 = cake.cake_dsv4_workspace_requirement(
+        dtype=torch.bfloat16,
+        num_heads=32,
+        num_query_tokens=4096,
+        sparse_topk=260,
+        compressed_page_size=2,
+        max_q_len=1,
+        batch_size=4096,
+        ragged=False,
+    )
+    assert h32.route == "bf16_h32_topk128x_early_v47" and h32.num_splits == 3
+    assert h32.single_launch_bytes > mib128
+    rows = h32.rows_per_launch(mib128)
+    assert 0 < rows < 4096
+    assert cake._launch_workspace_bytes(h32.plan, rows, 32, 4097) <= mib128
+    assert cake._launch_workspace_bytes(h32.plan, rows + 1, 32, 4097) > mib128
+    assert h32.minimum_bytes == cake._launch_workspace_bytes(h32.plan, 1, 32, 4097)
+    assert h32.rows_per_launch(h32.minimum_bytes) == 1
+    assert h32.rows_per_launch(h32.minimum_bytes - 1) == 0
+    wide = cake.cake_dsv4_workspace_requirement(
+        dtype=torch.bfloat16,
+        num_heads=32,
+        num_query_tokens=20000,
+        sparse_topk=260,
+        compressed_page_size=2,
+        max_q_len=1,
+        batch_size=20000,
+        ragged=False,
+    )
+    assert wide.rows_per_launch(1 << 40) == cake._MAX_MERGE_GROUPS // 4
+    # Shapes without a kernel are rejected like the launch would reject them.
+    with pytest.raises(ValueError, match="no BF16 kernel"):
+        cake.cake_dsv4_workspace_requirement(
+            dtype=torch.bfloat16,
+            num_heads=16,
+            num_query_tokens=4,
+            sparse_topk=260,
+            compressed_page_size=2,
+            max_q_len=1,
+            batch_size=4,
+            ragged=False,
+        )
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
+def test_route_plan_matches_the_dispatcher(monkeypatch, arch):
+    """The sizing table and the launches agree on splits, partial buffers and counters."""
+    monkeypatch.setattr(cake, "_bf16_h128_prefill_num_clusters", lambda device: 74)
+    checked = 0
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        for num_heads in (8, 16, 32, 64, 128):
+            for sparse_topk, page_size in _SWEEP_WIDTHS:
+                for batch_size, max_q_len, ragged in _SWEEP_QUERIES:
+                    tokens = _canonical_query_tokens(batch_size, max_q_len, ragged)
+                    try:
+                        route = _route(
+                            dtype=dtype,
+                            num_heads=num_heads,
+                            max_q_len=max_q_len,
+                            ragged=ragged,
+                            sparse_topk=sparse_topk,
+                            batch_size=batch_size,
+                            compressed_page_size=page_size,
+                            num_query_tokens=tokens,
+                        )
+                    except ValueError:
+                        continue
+                    plan = cake._route_plan(
+                        route,
+                        num_query_tokens=tokens,
+                        num_heads=num_heads,
+                        sparse_topk=sparse_topk,
+                    )
+                    L = _RecordingLauncher(
+                        arch,
+                        Q=torch.empty(0),
+                        num_query_tokens=tokens,
+                        num_heads=num_heads,
+                        sparse_topk=sparse_topk,
+                        max_q_len=max_q_len,
+                        batch_size=batch_size,
+                    )
+                    cake._dispatch_route(route, L)
+                    overrides = [kw for _, kw in L.calls]
+                    if plan.uses_partials:
+                        assert overrides[0]["num_splits"] == plan.num_splits, (
+                            route,
+                            tokens,
+                        )
+                        assert (
+                            overrides[0]["partial_lse"]
+                            == f"partial_lse[{plan.num_splits}]"
+                        )
+                    else:
+                        assert all(
+                            "partial_O" not in kw and "partial_lse" not in kw
+                            for kw in overrides
+                        ), route
+                    if plan.merge_groups_per_row:
+                        assert overrides[0]["partition_arrivals"] == (
+                            f"counters[{tokens * plan.merge_groups_per_row}]"
+                        ), route
+                    else:
+                        assert all(
+                            "partition_arrivals" not in kw for kw in overrides
+                        ), route
+                    checked += 1
+    assert checked > 0
