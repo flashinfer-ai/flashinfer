@@ -168,8 +168,6 @@ struct CollectiveEpilogue {
                                       /*id=*/static_cast<int>(NamedBarriers::kValueEmpty));
     cute::copy(smem_tiled_copy_O, tOrO_retile, tOsO);
     cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
-    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS,
-                                        cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
     Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr), epilogue_params.layout_LSE);
     Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
@@ -195,7 +193,8 @@ struct CollectiveEpilogue {
     }
 
     int write_warp_idx = NUM_WARPS - 1;
-    // Make sure all MMA WGs finish STSM O
+    // Arrive only once: sync also counts arrivals, so a preceding arrive can
+    // release this barrier before all MMA WGs finish STSM O.
     cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
                                       cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     TiledCopyO gmem_tiled_copy_O;
