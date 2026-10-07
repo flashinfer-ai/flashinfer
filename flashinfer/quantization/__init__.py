@@ -18,7 +18,12 @@ from .packbits import packbits, segment_packbits
 from ..jit.quantization import gen_quantization_module
 
 # Re-export FP8 quantization
-from .fp8_quantization import mxfp8_quantize, mxfp8_dequantize_host
+from .fp8_quantization import (
+    mxfp8_quantize,
+    mxfp8_grouped_quantize,
+    mxfp8_dequantize_host,
+    per_token_group_quant_8bit,
+)
 
 # Re-export FP4 quantization (all public symbols)
 from .fp4_quantization import (
@@ -35,10 +40,25 @@ from .fp4_quantization import (
     nvfp4_quantize_paged_kv_cache,
     nvfp4_kv_quantize,
     nvfp4_kv_dequantize,
+    nvfp4_kv_dequantize_paged,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
+    silu_and_mul_nvfp4_quantize,
     get_fp4_quantization_module,  # Used by activation.py
+)
+
+# Re-export the NVFP4 4over6 recipe types and helpers.  These spell the
+# ``nvfp4_4over6=`` parameter of the quantization APIs, replacing the
+# process-wide FLASHINFER_NVFP4_4OVER6* environment variables.
+from .nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    NVFP44Over6ErrMode,
+    make_nvfp4_global_scale,
+    nvfp4_4over6_code,
+    nvfp4_4over6_from_code,
+    nvfp4_e4m3_max,
+    resolve_nvfp4_4over6,
 )
 
 # CuTe-DSL kernels (conditionally exported, EXPERIMENTAL)
@@ -68,7 +88,9 @@ __all__ = [
     "gen_quantization_module",
     # FP8
     "mxfp8_quantize",
+    "mxfp8_grouped_quantize",
     "mxfp8_dequantize_host",
+    "per_token_group_quant_8bit",
     # FP4
     "SfLayout",
     "block_scale_interleave",
@@ -83,10 +105,20 @@ __all__ = [
     "nvfp4_quantize_paged_kv_cache",
     "nvfp4_kv_quantize",
     "nvfp4_kv_dequantize",
+    "nvfp4_kv_dequantize_paged",
     "shuffle_matrix_a",
     "shuffle_matrix_sf_a",
     "scaled_fp4_grouped_quantize",
+    "silu_and_mul_nvfp4_quantize",
     "get_fp4_quantization_module",
+    # NVFP4 4over6 recipe
+    "NVFP44Over6Config",
+    "NVFP44Over6ErrMode",
+    "make_nvfp4_global_scale",
+    "nvfp4_4over6_code",
+    "nvfp4_4over6_from_code",
+    "nvfp4_e4m3_max",
+    "resolve_nvfp4_4over6",
 ]
 
 if _cute_dsl_available:

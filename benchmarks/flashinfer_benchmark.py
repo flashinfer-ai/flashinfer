@@ -1,4 +1,5 @@
 import argparse
+import csv
 import sys
 
 # Only import utilities at module level - routine modules are imported lazily
@@ -6,7 +7,6 @@ import sys
 from routines.flashinfer_benchmark_utils import (
     benchmark_apis,
     full_output_columns,
-    output_column_dict,
 )
 
 
@@ -32,6 +32,10 @@ def run_test(args):
         from routines.moe import run_moe_test
 
         res = run_moe_test(args)
+    elif args.routine in benchmark_apis["unified_moe"]:
+        from routines.unified_moe import run_unified_moe_test
+
+        res = run_unified_moe_test(args)
     elif args.routine in benchmark_apis["moe_comm"]:
         from routines.moe_comm import run_moe_comm_test
 
@@ -56,6 +60,10 @@ def run_test(args):
         from routines.sampling import run_sampling_test
 
         res = run_sampling_test(args)
+    elif args.routine in benchmark_apis["topk_varlen"]:
+        from routines.topk_varlen import run_topk_varlen_test
+
+        res = run_topk_varlen_test(args)
     elif args.routine in benchmark_apis["rope"]:
         from routines.rope import run_rope_test
 
@@ -68,23 +76,32 @@ def run_test(args):
         from routines.gdn import run_gdn_test
 
         res = run_gdn_test(args)
+
+    elif args.routine in benchmark_apis["kda"]:
+        from routines.kda import run_kda_test
+
+        res = run_kda_test(args)
+    elif args.routine in benchmark_apis["sparse_attention"]:
+        from routines.sparse_attention import run_sparse_attention_test
+
+        res = run_sparse_attention_test(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
     # Write results to output file if specified
     if args.output_path is not None:
-        with open(args.output_path, "a") as fout:
+        with open(args.output_path, "a", newline="") as fout:
+            writer = csv.writer(fout)
             for cur_res in res:
-                for key in output_column_dict["general"]:
-                    # Only set from args if the routine hasn't already set a value
-                    # This preserves routine-specific formatting while providing defaults
+                for key in full_output_columns:
+                    # Backfill every output column the routine didn't set: from
+                    # args when available, else "".  Covers columns belonging to
+                    # other routines (e.g. attention's s_qo) that would otherwise
+                    # KeyError below.  Routine-set values are preserved.
                     if key not in cur_res or cur_res[key] == "":
                         cur_res[key] = getattr(args, key, "")
 
-                output_line = ",".join(
-                    [str(cur_res[col]) for col in full_output_columns]
-                )
-                fout.write(output_line + "\n")
+                writer.writerow([str(cur_res[col]) for col in full_output_columns])
             fout.flush()
     return
 
@@ -111,6 +128,7 @@ def parse_args(line=sys.argv[1:]):
         choices=list(benchmark_apis["attention"])
         + list(benchmark_apis["gemm"])
         + list(benchmark_apis["moe"])
+        + list(benchmark_apis["unified_moe"])
         + list(benchmark_apis["moe_comm"])
         + list(benchmark_apis["allreduce_comm"])
         + list(benchmark_apis["mixed_comm"])
@@ -119,7 +137,10 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["sampling"])
         + list(benchmark_apis["rope"])
         + list(benchmark_apis["mamba"])
-        + list(benchmark_apis["gdn"]),
+        + list(benchmark_apis["gdn"])
+        + list(benchmark_apis["kda"])
+        + list(benchmark_apis["sparse_attention"])
+        + list(benchmark_apis["topk_varlen"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
@@ -240,6 +261,10 @@ def parse_args(line=sys.argv[1:]):
         from routines.moe import parse_moe_args
 
         args = parse_moe_args(line, parser)
+    elif args.routine in benchmark_apis["unified_moe"]:
+        from routines.unified_moe import parse_unified_moe_args
+
+        args = parse_unified_moe_args(line, parser)
     elif args.routine in benchmark_apis["moe_comm"]:
         from routines.moe_comm import parse_moe_comm_args
 
@@ -264,6 +289,10 @@ def parse_args(line=sys.argv[1:]):
         from routines.sampling import parse_sampling_args
 
         args = parse_sampling_args(line, parser)
+    elif args.routine in benchmark_apis["topk_varlen"]:
+        from routines.topk_varlen import parse_topk_varlen_args
+
+        args = parse_topk_varlen_args(line, parser)
     elif args.routine in benchmark_apis["rope"]:
         from routines.rope import parse_rope_args
 
@@ -276,6 +305,15 @@ def parse_args(line=sys.argv[1:]):
         from routines.gdn import parse_gdn_args
 
         args = parse_gdn_args(line, parser)
+
+    elif args.routine in benchmark_apis["kda"]:
+        from routines.kda import parse_kda_args
+
+        args = parse_kda_args(line, parser)
+    elif args.routine in benchmark_apis["sparse_attention"]:
+        from routines.sparse_attention import parse_sparse_attention_args
+
+        args = parse_sparse_attention_args(line, parser)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -315,8 +353,8 @@ if __name__ == "__main__":
 
     # Setup output file if specified
     if testlist_args.output_path is not None:
-        with open(testlist_args.output_path, "w") as fout:
-            fout.write(",".join(full_output_columns) + "\n")
+        with open(testlist_args.output_path, "w", newline="") as fout:
+            csv.writer(fout).writerow(full_output_columns)
 
     # Process tests either from testlist file or command line arguments
     if testlist_args.testlist is not None:

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Any
 
 import cutlass
 import cutlass.cute as cute
@@ -10,7 +11,7 @@ class WorkDesc:
     seq_idx: cutlass.Int32
     private_q_head_idx: cutlass.Int32
     private_v_head_idx: cutlass.Int32
-    tok_offset: cutlass.Int32
+    tok_offset: Any
 
     # shape
     seq_len: cutlass.Int32

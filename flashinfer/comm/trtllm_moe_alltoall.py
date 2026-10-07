@@ -3,21 +3,67 @@ MoE All-to-All Operations (Throughput Backend)
 
 This module provides the throughput-optimized all-to-all backend for MoE expert parallelism,
 supporting multiple payloads per collective operation.
+
+The TensorRT-LLM implementation remains the default on every architecture.
+Pass ``backend="cake"`` explicitly to use the generated Blackwell implementation.
+All ranks in a collective must select the same backend. With the functional API,
+use that backend consistently for workspace sizing, initialization, dispatch,
+combine, and sanitization. ``MoeAlltoAll`` retains the selection for its lifetime.
 """
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional
+from typing import Literal, Optional, Sequence
 
 import torch
 import functools
+from typing_extensions import deprecated
 
 from ..api_logging import flashinfer_api
 
-from .mnnvl import MnnvlMemory, MnnvlConfig
+from .mnnvl import CommBackend, MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
 from ..jit.comm import gen_moe_alltoall_module
-from ..utils import register_custom_op
+from ..utils import register_custom_op, device_support_pdl
+from ..tllm_enums import SfLayout
+
+# Number of uint64 words in the active_rank_mask ABI (must match kRankMaskWords in
+# csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h, which is
+# derived from kMaxRanks there). A single word covers up to 64 ranks.
+MOE_A2A_RANK_MASK_WORDS = 1
+MoeAlltoAllTarget = Literal["legacy", "sm100a", "sm103a"]
+MoeAlltoAllBackend = Literal["trtllm", "cake"]
+
+
+def moe_a2a_active_rank_mask(active_ranks: Sequence[int], ep_size: int) -> torch.Tensor:
+    r"""Build a CPU ``uint64`` active-rank bitmask for :func:`moe_a2a_dispatch` /
+    :func:`moe_a2a_combine`'s ``active_rank_mask`` argument.
+
+    Parameters
+    ----------
+    active_ranks : Sequence[int]
+        Ranks that are alive and should participate in the collective, e.g. ``[0, 1, 3]``
+        for a 4-rank job where rank 2 has failed.  Also accepts a 1D ``torch.Tensor`` of
+        rank indices.
+    ep_size : int
+        Total expert-parallel world size (all ranks outside ``[0, ep_size)`` are ignored).
+
+    Returns
+    -------
+    torch.Tensor
+        ``[MOE_A2A_RANK_MASK_WORDS]`` ``uint64`` CPU tensor with bit ``i`` set for each
+        active rank ``i``.
+    """
+    mask = 0
+    for rank in active_ranks:
+        rank = int(rank)
+        assert 0 <= rank < ep_size, f"rank {rank} out of range [0, {ep_size})"
+        mask |= 1 << rank
+    words = [
+        (mask >> (64 * word)) & 0xFFFFFFFFFFFFFFFF
+        for word in range(MOE_A2A_RANK_MASK_WORDS)
+    ]
+    return torch.tensor(words, dtype=torch.uint64, device="cpu")
 
 
 @dataclass
@@ -27,15 +73,31 @@ class _A2AState:
     phase: str = "idle"  # idle | dispatched
     local_num_tokens: Optional[int] = None
     combine_payload_offset: Optional[int] = None
+    eplb_gathered_stats: Optional[torch.Tensor] = None
 
 
 @functools.cache
-def get_moe_alltoall_module():
-    """Get or build the MOE A2A JIT module."""
-    module = gen_moe_alltoall_module().build_and_load()
+def _moe_alltoall_target(device_index: int) -> MoeAlltoAllTarget:
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability == (10, 0):
+        return "sm100a"
+    if capability == (10, 3):
+        return "sm103a"
+    raise ValueError(
+        f'backend="cake" requires compute capability 10.0 or 10.3, got {capability}'
+    )
+
+
+@functools.cache
+def _get_moe_alltoall_module_for_target(target: MoeAlltoAllTarget):
+    """Build or load the legacy or exact-architecture all-to-all module."""
+    module = gen_moe_alltoall_module(target).build_and_load()
+    # Keep legacy names stable, but do not let loading an opt-in module replace
+    # the default backend's custom-op implementations (or captured graphs).
+    op_suffix = "" if target == "legacy" else f"_{target}"
 
     @register_custom_op(
-        "flashinfer::moe_a2a_initialize",
+        f"flashinfer::moe_a2a_initialize{op_suffix}",
         mutates_args=("workspace",),
     )
     def moe_a2a_initialize(
@@ -43,11 +105,14 @@ def get_moe_alltoall_module():
         ep_rank: int,
         ep_size: int,
         max_num_tokens: int,
+        eplb_stats_num_experts: int = 0,
     ):
-        return module.moe_a2a_initialize(workspace, ep_rank, ep_size, max_num_tokens)
+        return module.moe_a2a_initialize(
+            workspace, ep_rank, ep_size, max_num_tokens, eplb_stats_num_experts
+        )
 
     @register_custom_op(
-        "flashinfer::moe_a2a_dispatch",
+        f"flashinfer::moe_a2a_dispatch{op_suffix}",
         mutates_args=("workspace",),
     )
     def moe_a2a_dispatch(
@@ -60,6 +125,10 @@ def get_moe_alltoall_module():
         ep_size: int,
         top_k: int,
         num_experts: int,
+        enable_pdl: bool,
+        eplb_local_stats: Optional[torch.Tensor] = None,
+        enable_rank_mask: bool = False,
+        active_rank_mask: Optional[torch.Tensor] = None,
     ):
         """
         Dispatch tokens and payloads to expert ranks.
@@ -74,11 +143,26 @@ def get_moe_alltoall_module():
             ep_size: Total expert parallel size
             top_k: Number of experts per token
             num_experts: Total number of experts
+            enable_pdl: Whether to use programmatic dependent launch
+            eplb_local_stats: Optional [eplb_stats_num_experts] int32 tensor of
+                this rank's local EPLB statistics to all-gather during dispatch
+            enable_rank_mask: Whether to instantiate the kernel variant that checks
+                active_rank_mask at all. False (default) compiles out every rank-mask
+                check for the common no-fault-tolerance case and requires
+                active_rank_mask to be omitted.
+            active_rank_mask: Optional CPU uint64 tensor of shape [MOE_A2A_RANK_MASK_WORDS]
+                (see :func:`moe_a2a_active_rank_mask`). Bit i set means rank i is alive and
+                participates in this collective; tokens routed to a masked-off rank are
+                dropped. Requires enable_rank_mask=True.
 
         Returns:
             recv_offsets: List of offsets for each payload in the workspace
             recv_sizes: List of sizes for each payload in the workspace
             combine_payload_offset: Offset for combine payload region
+            eplb_gathered_stats_offset: Offset for the gathered EPLB stats
+                region, or -1 when EPLB is disabled
+            eplb_stats_num_experts: Number of experts in the EPLB stats, or 0
+                when EPLB is disabled
         """
         return module.moe_a2a_dispatch(
             token_selected_experts,
@@ -90,10 +174,14 @@ def get_moe_alltoall_module():
             ep_size,
             top_k,
             num_experts,
+            enable_pdl,
+            eplb_local_stats,
+            enable_rank_mask,
+            active_rank_mask,
         )
 
     @register_custom_op(
-        "flashinfer::moe_a2a_combine",
+        f"flashinfer::moe_a2a_combine{op_suffix}",
         mutates_args=("workspace",),
     )
     def moe_a2a_combine(
@@ -107,6 +195,14 @@ def get_moe_alltoall_module():
         top_k: int,
         combine_payload_offset: int,
         payload_in_workspace: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
+        output_scales: Optional[torch.Tensor] = None,
+        output_scalar_scale: float = 1.0,
+        sf_layout: Optional[SfLayout] = None,
+        use_low_precision: bool = False,
+        enable_pdl: bool = True,
+        enable_rank_mask: bool = False,
+        active_rank_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Combine expert outputs back to originating tokens.
@@ -122,7 +218,26 @@ def get_moe_alltoall_module():
             top_k: Number of experts per token
             combine_payload_offset: Offset from dispatch
             payload_in_workspace: If True, payload is workspace-backed
-
+            output_dtype: Optional output data type. Supported types:
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.uint8 (packed fp4)
+            output_scales: Optional output scale tensor for quantized outputs. Support types:
+                torch.uint8 (packed ue8m0), vector size of 32
+                torch.float8_e4m3fn, vector size of 16
+            output_scalar_scale: Per-tensor global scale applied before FP4 block scaling
+                (NVFP4 SFScaleVal). Defaults to 1.0; ignored by MXFP8/MXFP4 paths.
+            sf_layout: Output swizzle layout. Defaults to linear.
+            use_low_precision: If True, quantize payload to FP8 before combine
+            enable_pdl: Whether to use programmatic dependent launch
+            enable_rank_mask: Whether to instantiate the kernel variant that checks
+                active_rank_mask at all. False (default) compiles out the rank-mask checks
+                in peer synchronization for the common no-fault-tolerance case and requires
+                active_rank_mask to be omitted.
+            active_rank_mask: Optional CPU uint64 tensor of shape [MOE_A2A_RANK_MASK_WORDS]
+                (see :func:`moe_a2a_active_rank_mask`). Should match the mask passed to the
+                corresponding :func:`moe_a2a_dispatch` call (or be omitted from both). Requires
+                enable_rank_mask=True.
         Returns:
             output: [local_num_tokens, elements_per_token] tensor
         """
@@ -137,10 +252,65 @@ def get_moe_alltoall_module():
             top_k,
             combine_payload_offset,
             payload_in_workspace,
+            output_dtype,
+            output_scales,
+            output_scalar_scale,
+            sf_layout.value if sf_layout is not None else SfLayout.layout_linear.value,
+            use_low_precision,
+            enable_pdl,
+            enable_rank_mask,
+            active_rank_mask,
         )
 
     @register_custom_op(
-        "flashinfer::moe_a2a_sanitize_expert_ids",
+        f"flashinfer::moe_a2a_combine_into{op_suffix}",
+        mutates_args=("workspace", "output"),
+    )
+    def moe_a2a_combine_into(
+        payload: torch.Tensor,
+        local_num_tokens: int,
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        combine_payload_offset: int,
+        payload_in_workspace: bool,
+        output_dtype: Optional[torch.dtype],
+        output_scales: Optional[torch.Tensor],
+        output_scalar_scale: float,
+        sf_layout: Optional[SfLayout],
+        use_low_precision: bool,
+        enable_pdl: bool,
+        enable_rank_mask: bool,
+        active_rank_mask: Optional[torch.Tensor],
+        output: torch.Tensor,
+    ) -> None:
+        module.moe_a2a_combine_into(
+            payload,
+            local_num_tokens,
+            workspace,
+            metainfo,
+            runtime_max_tokens_per_rank,
+            ep_rank,
+            ep_size,
+            top_k,
+            combine_payload_offset,
+            payload_in_workspace,
+            output_dtype,
+            output_scales,
+            output_scalar_scale,
+            sf_layout.value if sf_layout is not None else SfLayout.layout_linear.value,
+            use_low_precision,
+            enable_pdl,
+            enable_rank_mask,
+            active_rank_mask,
+            output,
+        )
+
+    @register_custom_op(
+        f"flashinfer::moe_a2a_sanitize_expert_ids{op_suffix}",
         mutates_args=("expert_ids",),
     )
     def moe_a2a_sanitize_expert_ids(
@@ -149,13 +319,14 @@ def get_moe_alltoall_module():
         metainfo: torch.Tensor,
         ep_rank: int,
         invalid_expert_id: int,
+        enable_pdl: bool,
     ):
         return module.moe_a2a_sanitize_expert_ids(
-            expert_ids, workspace, metainfo, ep_rank, invalid_expert_id
+            expert_ids, workspace, metainfo, ep_rank, invalid_expert_id, enable_pdl
         )
 
     @register_custom_op(
-        "flashinfer::moe_a2a_get_metainfo_index_pairs",
+        f"flashinfer::moe_a2a_get_metainfo_index_pairs{op_suffix}",
         mutates_args=[],
     )
     def moe_a2a_get_metainfo_index_pairs():
@@ -169,12 +340,13 @@ def get_moe_alltoall_module():
         return module.moe_a2a_get_metainfo_index_pairs()
 
     @register_custom_op(
-        "flashinfer::moe_a2a_get_aux_data_size",
+        f"flashinfer::moe_a2a_get_aux_data_size{op_suffix}",
         mutates_args=[],
     )
     def moe_a2a_get_aux_data_size(
         ep_size: int,
         max_num_tokens: int,
+        eplb_stats_num_experts: int = 0,
     ):
         """
         Get the auxilary datasize per rank for the MoeAlltoAll operation.
@@ -182,20 +354,47 @@ def get_moe_alltoall_module():
         Args:
             ep_size: Total expert parallel size
             max_num_tokens: Maximum number of tokens across all ranks
+            eplb_stats_num_experts: Number of experts reserved for EPLB stats
+                (0 disables the EPLB region)
 
         Returns:
             aux_data_size: Size of the auxilary data per rank in bytes
         """
-        return module.moe_a2a_get_aux_data_size(ep_size, max_num_tokens)
+        return module.moe_a2a_get_aux_data_size(
+            ep_size, max_num_tokens, eplb_stats_num_experts
+        )
 
     return SimpleNamespace(
         moe_a2a_initialize=moe_a2a_initialize,
         moe_a2a_dispatch=moe_a2a_dispatch,
         moe_a2a_combine=moe_a2a_combine,
+        moe_a2a_combine_into=moe_a2a_combine_into,
         moe_a2a_sanitize_expert_ids=moe_a2a_sanitize_expert_ids,
         moe_a2a_get_metainfo_index_pairs=moe_a2a_get_metainfo_index_pairs,
         moe_a2a_get_aux_data_size=moe_a2a_get_aux_data_size,
     )
+
+
+def get_moe_alltoall_module(backend: MoeAlltoAllBackend = "trtllm"):
+    """Use TRT-LLM by default; exact-architecture kernels require explicit opt-in."""
+    if backend == "trtllm":
+        return _get_moe_alltoall_module_for_target("legacy")
+    if backend != "cake":
+        raise ValueError(
+            f"Unknown MoE all-to-all backend {backend!r}; expected 'trtllm' or 'cake'"
+        )
+    device_index = torch.cuda.current_device()
+    return _get_moe_alltoall_module_for_target(_moe_alltoall_target(device_index))
+
+
+def _clear_moe_alltoall_module_cache() -> None:
+    _moe_alltoall_target.cache_clear()
+    _get_moe_alltoall_module_for_target.cache_clear()
+
+
+get_moe_alltoall_module.cache_clear = (  # type: ignore[attr-defined]
+    _clear_moe_alltoall_module_cache
+)
 
 
 @flashinfer_api
@@ -204,6 +403,9 @@ def moe_a2a_initialize(
     ep_rank: int,
     ep_size: int,
     max_num_tokens: int,
+    eplb_stats_num_experts: int = 0,
+    *,
+    backend: MoeAlltoAllBackend = "trtllm",
 ):
     r"""Initialize the MoE all-to-all workspace and return a metainfo tensor.
 
@@ -224,6 +426,15 @@ def moe_a2a_initialize(
     max_num_tokens : int
         Maximum number of tokens any rank may dispatch in a single call;
         used to size the metainfo allocation.
+    eplb_stats_num_experts : int
+        Number of experts to reserve space for in the EPLB gathered-stats
+        region.  ``0`` (default) disables the EPLB region; when non-zero it
+        must match the ``eplb_local_stats`` length passed to
+        :func:`moe_a2a_dispatch`.
+    backend : {"trtllm", "cake"}
+        Defaults to ``"trtllm"`` on all architectures. ``"cake"`` explicitly
+        opts in to generated Blackwell kernels (CC 10.0/10.3). Use the same
+        backend for all operations on this workspace and on all ranks.
 
     Returns
     -------
@@ -231,8 +442,8 @@ def moe_a2a_initialize(
         Metainfo tensor opaque to callers; pass it to subsequent
         ``moe_a2a_*`` calls.
     """
-    return get_moe_alltoall_module().moe_a2a_initialize(
-        workspace, ep_rank, ep_size, max_num_tokens
+    return get_moe_alltoall_module(backend).moe_a2a_initialize(
+        workspace, ep_rank, ep_size, max_num_tokens, eplb_stats_num_experts
     )
 
 
@@ -300,6 +511,13 @@ def moe_a2a_dispatch(
     ep_size: int,
     top_k: int,
     num_experts: int,
+    enable_pdl: Optional[bool] = None,
+    eplb_local_stats: Optional[torch.Tensor] = None,
+    enable_rank_mask: bool = False,
+    active_rank_mask: Optional[torch.Tensor] = None,
+    *,
+    backend: MoeAlltoAllBackend = "trtllm",
+    recv_view_cache: Optional[dict] = None,
 ):
     r"""Dispatch tokens and payloads to their target expert ranks.
 
@@ -324,46 +542,128 @@ def moe_a2a_dispatch(
         Number of experts assigned per token.
     num_experts : int
         Total number of experts.
+    enable_pdl : Optional[bool]
+        Whether to use programmatic dependent launch.  ``None`` auto-detects
+        from the device.
+    eplb_local_stats : Optional[torch.Tensor]
+        Optional ``[eplb_stats_num_experts]`` ``int32`` tensor of this rank's
+        local EPLB statistics.  When provided, the dispatch all-gathers it
+        across ranks and returns the result as ``eplb_gathered_stats``.  The
+        length must match the ``eplb_stats_num_experts`` passed to
+        :func:`moe_a2a_initialize`.
+    enable_rank_mask : bool
+        Whether to instantiate the kernel variant that checks ``active_rank_mask`` at
+        all.  ``False`` (default) compiles out every rank-mask check for the common
+        no-fault-tolerance case and requires ``active_rank_mask`` to be omitted.
+    active_rank_mask : Optional[torch.Tensor]
+        Optional CPU ``uint64`` tensor of shape ``[MOE_A2A_RANK_MASK_WORDS]`` (see
+        :func:`moe_a2a_active_rank_mask`).  Bit ``i`` set means rank ``i`` is alive and
+        participates in this collective; tokens routed to a masked-off rank are dropped
+        instead of hanging the collective.  Requires ``enable_rank_mask=True``; the local
+        ``ep_rank``'s own bit must always be set.
+        Masking a peer does not advance that peer's transport epoch. Before a
+        skipped peer rejoins, all ranks must quiesce and coordinate workspace
+        reinitialization; merely restoring its mask bit is insufficient.
+    backend : {"trtllm", "cake"}
+        Defaults to ``"trtllm"``. Pass ``"cake"`` to opt in on CC 10.0/10.3;
+        must match workspace initialization, combine, and all peer ranks.
+    recv_view_cache : dict, optional
+        Opaque cache of receive views. Pass an empty dictionary to enable
+        caching; ``None`` (default) disables it. The cache retains a reference
+        to ``workspace`` and is cleared when a different workspace tensor is
+        passed. Keep the backing allocation alive and do not change workspace
+        or cached-view shape, strides, or storage in place. Clear the dictionary
+        to release its references; otherwise, leave its contents unchanged.
 
     Returns
     -------
-    Tuple[list[torch.Tensor], int]
-        ``(output_payloads, combine_payload_offset)``.  ``output_payloads``
-        is a list of workspace-backed views, one per ``input_payloads``
-        entry, that contains the data routed to this rank.  ``combine_payload_offset``
-        is the workspace offset reserved for the matching
-        :func:`moe_a2a_combine` call.
+    Tuple[list[torch.Tensor], int, Optional[torch.Tensor]]
+        ``(output_payloads, combine_payload_offset, eplb_gathered_stats)``.
+        ``output_payloads`` is a list of workspace-backed views, one per
+        ``input_payloads`` entry, that contains the data routed to this rank.
+        ``combine_payload_offset`` is the workspace offset reserved for the
+        matching :func:`moe_a2a_combine` call.  ``eplb_gathered_stats`` is a
+        workspace-backed ``[ep_size, eplb_stats_num_experts]`` ``int32`` view
+        (row ``r`` holds rank ``r``'s ``eplb_local_stats``) when
+        ``eplb_local_stats`` was provided, else ``None``.
     """
-    recv_offsets, recv_sizes, combine_payload_offset = (
-        get_moe_alltoall_module().moe_a2a_dispatch(
-            token_selected_experts,
-            input_payloads,
-            workspace,
-            metainfo,
-            runtime_max_tokens_per_rank,
-            ep_rank,
-            ep_size,
-            top_k,
-            num_experts,
-        )
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(token_selected_experts.device)
+    (
+        recv_offsets,
+        recv_sizes,
+        combine_payload_offset,
+        eplb_gathered_stats_offset,
+        eplb_stats_num_experts,
+    ) = get_moe_alltoall_module(backend).moe_a2a_dispatch(
+        token_selected_experts,
+        input_payloads,
+        workspace,
+        metainfo,
+        runtime_max_tokens_per_rank,
+        ep_rank,
+        ep_size,
+        top_k,
+        num_experts,
+        enable_pdl,
+        eplb_local_stats,
+        enable_rank_mask,
+        active_rank_mask,
     )
+
+    # Bind once per dispatch without pointer/device queries in the hot path.
+    if (
+        recv_view_cache is not None
+        and recv_view_cache.get("_workspace") is not workspace
+    ):
+        recv_view_cache.clear()
+        recv_view_cache["_workspace"] = workspace
 
     output_payloads = []
     for input_payload, offset, size in zip(
         input_payloads, recv_offsets, recv_sizes, strict=True
     ):
         # This uses absolute offsets in the workspace, so skip indexing into the workspace
-        output_payloads.append(
-            moe_a2a_wrap_payload_tensor_in_workspace(
+        # Reuse views to avoid four tensor constructions per payload. Cached views
+        # still observe fresh writes to the workspace bound above.
+        # ``int()`` guards the key rather than fixing an observed miss: tvm-ffi
+        # materializes an ``Array<int64_t>`` element as a real Python ``int``
+        # today, so these already hash by value. Coercing keeps that property
+        # local to this function instead of resting on an FFI implementation
+        # detail -- an int-like that hashed by identity would miss on every
+        # lookup, silently disabling the cache while the dict still grew. Same
+        # idiom as the ``int()`` on FFI scalars in ``_init_constants`` below.
+        key = (
+            ep_size,
+            runtime_max_tokens_per_rank,
+            int(offset),
+            int(size),
+            input_payload.dtype,
+        )
+        payload_view = None if recv_view_cache is None else recv_view_cache.get(key)
+        if payload_view is None:
+            payload_view = moe_a2a_wrap_payload_tensor_in_workspace(
                 workspace,
                 [ep_size, runtime_max_tokens_per_rank],
                 offset,
                 offset + size,
                 input_payload.dtype,
             )
+            if recv_view_cache is not None:
+                recv_view_cache[key] = payload_view
+        output_payloads.append(payload_view)
+
+    eplb_gathered_stats = None
+    if eplb_gathered_stats_offset >= 0:
+        eplb_gathered_stats = moe_a2a_wrap_payload_tensor_in_workspace(
+            workspace,
+            [ep_size],
+            eplb_gathered_stats_offset,
+            eplb_gathered_stats_offset + ep_size * eplb_stats_num_experts * 4,
+            torch.int32,
         )
 
-    return output_payloads, combine_payload_offset
+    return output_payloads, combine_payload_offset, eplb_gathered_stats
 
 
 @flashinfer_api
@@ -378,11 +678,26 @@ def moe_a2a_combine(
     top_k: int,
     combine_payload_offset: int,
     payload_in_workspace: bool = False,
+    output_dtype: Optional[torch.dtype] = None,
+    output_scales: Optional[torch.Tensor] = None,
+    output_scalar_scale: float = 1.0,
+    sf_layout: SfLayout = SfLayout.layout_linear,
+    output: Optional[torch.Tensor] = None,
+    *,
+    use_low_precision: bool = False,
+    enable_pdl: Optional[bool] = None,
+    enable_rank_mask: bool = False,
+    active_rank_mask: Optional[torch.Tensor] = None,
+    backend: MoeAlltoAllBackend = "trtllm",
 ) -> torch.Tensor:
     r"""Combine per-expert outputs back to the originating ranks.
 
     Inverse of :func:`moe_a2a_dispatch`: scatters the rank-local expert
     output rows back to the ranks that supplied the original tokens.
+
+    ``backend="trtllm"`` is the default, including on Blackwell. Opt in with
+    ``backend="cake"`` only for workspaces initialized and dispatched with
+    that backend; all peer ranks must use the same selection.
 
     Parameters
     ----------
@@ -412,13 +727,61 @@ def moe_a2a_combine(
     payload_in_workspace : bool
         ``True`` if ``payload`` is already a workspace-backed view (skips
         the staging copy).  Defaults to ``False``.
+    output_dtype : Optional[torch.dtype]
+        Optional output data type.  Currently supports ``torch.bfloat16``,
+        ``torch.float8_e4m3fn``, and ``torch.uint8`` (packed fp4).
+    output_scales : Optional[torch.Tensor]
+        Contiguous CUDA scale tensor for quantized outputs.  MXFP8 and MXFP4 use
+        UE8M0 scales packed in ``torch.uint8`` with vector size 32; NVFP4 uses
+        UE4M3 scales in ``torch.float8_e4m3fn`` with vector size 16.  Its extent
+        must exactly match ``sf_layout``, including layout padding.
+    output_scalar_scale : float
+        Per-tensor global scale applied before FP4 block scaling
+        (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
+        paths.
+    sf_layout : SfLayout
+        Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
+    output : Optional[torch.Tensor]
+        Caller-provided contiguous output tensor. Its shape and dtype must
+        match the requested combine output, and it must be on the same device
+        as ``payload``.
+    use_low_precision : bool
+        If ``True``, quantize the recv-buffer payload to FP8 (e4m3) before
+        accumulating; the combine upcasts to a bf16 output.
+    enable_pdl : Optional[bool]
+        Whether to use programmatic dependent launch.  ``None`` auto-detects
+        from the device.
+    enable_rank_mask : bool
+        Whether to instantiate the kernel variant that checks ``active_rank_mask`` at
+        all.  ``False`` (default) compiles out the rank-mask checks in peer
+        synchronization for the common no-fault-tolerance case and requires
+        ``active_rank_mask`` to be omitted.
+    active_rank_mask : Optional[torch.Tensor]
+        Optional CPU ``uint64`` tensor of shape ``[MOE_A2A_RANK_MASK_WORDS]`` (see
+        :func:`moe_a2a_active_rank_mask`).  Should match the mask passed to the
+        corresponding :func:`moe_a2a_dispatch` call (or be omitted from both).  Requires
+        ``enable_rank_mask=True``.
+    backend : MoeAlltoAllBackend
+        Communication backend. Defaults to ``"trtllm"``; use ``"cake"`` only
+        with a workspace initialized by the Cake backend.
 
     Returns
     -------
     torch.Tensor
         ``[local_num_tokens, *]`` tensor with the combined outputs.
     """
-    return get_moe_alltoall_module().moe_a2a_combine(
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(payload.device)
+    if output is not None:
+        if not output.is_cuda:
+            raise ValueError(
+                f"output must be a CUDA tensor, got device={output.device}"
+            )
+        if not output.is_contiguous():
+            raise ValueError(f"output must be contiguous, got stride={output.stride()}")
+
+    module = get_moe_alltoall_module(backend)
+    args = (
         payload,
         local_num_tokens,
         workspace,
@@ -429,7 +792,19 @@ def moe_a2a_combine(
         top_k,
         combine_payload_offset,
         payload_in_workspace,
+        output_dtype,
+        output_scales,
+        output_scalar_scale,
+        sf_layout,
+        use_low_precision,
+        enable_pdl,
+        enable_rank_mask,
+        active_rank_mask,
     )
+    if output is None:
+        return module.moe_a2a_combine(*args)
+    module.moe_a2a_combine_into(*args, output)
+    return output
 
 
 @flashinfer_api
@@ -439,8 +814,15 @@ def moe_a2a_sanitize_expert_ids(
     metainfo: torch.Tensor,
     ep_rank: int,
     invalid_expert_id: int,
+    enable_pdl: Optional[bool] = None,
+    *,
+    backend: MoeAlltoAllBackend = "trtllm",
 ):
-    r"""Replace expert IDs not owned by this rank with ``invalid_expert_id``.
+    r"""Sanitize invalid slots that contain no token routed to this rank by
+    setting their expert IDs to ``invalid_expert_id``.
+
+    ``backend="trtllm"`` is the default. For a workspace initialized with
+    ``backend="cake"``, explicitly pass ``backend="cake"`` here as well.
 
     Parameters
     ----------
@@ -454,11 +836,19 @@ def moe_a2a_sanitize_expert_ids(
     ep_rank : int
         Current expert-parallel rank.
     invalid_expert_id : int
-        Value to write where the original expert lies outside this rank's
-        local range.
+        Value to write into slots that received no token (per
+        ``recv_counters``, e.g. padding beyond a source rank's valid count).
+    enable_pdl : Optional[bool]
+        Whether to use programmatic dependent launch.  ``None`` auto-detects
+        from the device.
+    backend : MoeAlltoAllBackend
+        Communication backend. Defaults to ``"trtllm"``; use ``"cake"`` only
+        with a workspace initialized by the Cake backend.
     """
-    return get_moe_alltoall_module().moe_a2a_sanitize_expert_ids(
-        expert_ids, workspace, metainfo, ep_rank, invalid_expert_id
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(expert_ids.device)
+    return get_moe_alltoall_module(backend).moe_a2a_sanitize_expert_ids(
+        expert_ids, workspace, metainfo, ep_rank, invalid_expert_id, enable_pdl
     )
 
 
@@ -468,8 +858,14 @@ def moe_a2a_get_workspace_size_per_rank(
     max_num_tokens: int,
     total_dispatch_payload_size_per_token: int,
     combine_payload_size_per_token: int,
+    eplb_stats_num_experts: int = 0,
+    *,
+    backend: MoeAlltoAllBackend = "trtllm",
 ):
     r"""Compute the per-rank workspace size for the MoE all-to-all primitive.
+
+    ``backend="trtllm"`` is the default. Pass ``backend="cake"`` to size a
+    workspace for the explicitly selected Blackwell implementation.
 
     Parameters
     ----------
@@ -483,15 +879,22 @@ def moe_a2a_get_workspace_size_per_rank(
     combine_payload_size_per_token : int
         Per-token payload size (in bytes) sent back during the combine
         phase.
+    eplb_stats_num_experts : int
+        Number of experts reserved for the EPLB gathered-stats region
+        (``0`` disables it).
+    backend : MoeAlltoAllBackend
+        Communication backend used to size the workspace. Defaults to
+        ``"trtllm"``; pass ``"cake"`` for the Cake backend.
 
     Returns
     -------
     int
         Required workspace size per rank, in bytes.
     """
-    aux_data_size = get_moe_alltoall_module().moe_a2a_get_aux_data_size(
+    aux_data_size = get_moe_alltoall_module(backend).moe_a2a_get_aux_data_size(
         ep_size,
         max_num_tokens,
+        eplb_stats_num_experts,
     )
 
     def pad_up(x, y):
@@ -505,22 +908,44 @@ def moe_a2a_get_workspace_size_per_rank(
     )
 
 
+@deprecated(
+    "MoeAlltoAll is deprecated; use flashinfer.moe_ep.NVLinkOneSidedAlltoAll "
+    "(CakeAlltoAll for backend='cake'). Its implementation will "
+    "move into those classes."
+)
 class MoeAlltoAll:
     """
     Manages MoE All-to-All operations with proper workspace allocation and synchronization.
 
+    .. deprecated:: 0.7.1
+        Use :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`
+        (:class:`flashinfer.moe_ep.CakeAlltoAll` for
+        ``backend="cake"``). The implementation of this class will move into
+        them; they will no longer wrap it.
+
     This class provides the throughput-optimized backend that supports multiple payloads
     per collective operation, explicit dispatch/combine phases, and workspace-backed tensors.
+
+    ``backend="trtllm"`` is the default, including on Blackwell. To opt in to
+    the generated Blackwell kernels, pass ``backend="cake"`` at construction
+    on every rank. Unsupported architectures are rejected, not silently routed
+    to a different backend.
 
     Example:
         >>> moe_a2a = MoeAlltoAll(mapping, max_num_tokens=2048, top_k=2, num_experts=8)
         >>> recv = moe_a2a.dispatch(experts, [hidden, ids, scales], batch_size)
         >>> output = moe_a2a.combine(processed, batch_size)
+
+    Explicit Blackwell opt-in:
+        >>> moe_a2a = MoeAlltoAll(mapping, max_num_tokens=2048, top_k=2,
+        ...                      num_experts=8, hidden_size=4096, backend="cake")
     """
 
     # Single shared workspace across the process
     # _WORKSPACE: Optional[dict] = None
-    _WORKSPACE_CACHE: dict[tuple[int, int, int, int], dict] = {}
+    _WORKSPACE_CACHE: dict[
+        tuple[int, int, int, int, int, MoeAlltoAllBackend], dict
+    ] = {}
 
     @classmethod
     def get_workspace(
@@ -530,8 +955,23 @@ class MoeAlltoAll:
         ep_size: int,
         max_num_tokens: int,
         mapping: Mapping,
+        eplb_stats_num_experts: int = 0,
+        *,
+        backend: MoeAlltoAllBackend = "trtllm",
     ) -> dict:
-        key = (workspace_size_per_rank, ep_rank, ep_size, max_num_tokens)
+        """Allocate/cache a workspace for the explicitly selected backend.
+
+        All ranks must choose the same backend; defaults to ``"trtllm"``.
+        Workspaces belonging to different backends are never shared.
+        """
+        key = (
+            workspace_size_per_rank,
+            ep_rank,
+            ep_size,
+            max_num_tokens,
+            eplb_stats_num_experts,
+            backend,
+        )
         if key in cls._WORKSPACE_CACHE:
             return cls._WORKSPACE_CACHE[key]
         else:
@@ -542,12 +982,20 @@ class MoeAlltoAll:
                 ep_rank,
                 ep_size,
                 max_num_tokens,
+                eplb_stats_num_experts,
+                backend=backend,
             )
+            # ``moe_a2a_initialize`` synchronizes this rank's workspace memset.
+            # Do not let a peer publish into that workspace until every rank has
+            # completed the same initialization, or a late memset can erase the
+            # peer's first completion epoch.
+            MnnvlMemory.allocated_map[mnnvl_mem.ptr].comm.barrier()
             cls._WORKSPACE_CACHE[key] = {
                 "workspace_size_per_rank": workspace_size_per_rank,
                 "max_num_tokens": max_num_tokens,
                 "ep_rank": ep_rank,
                 "ep_size": ep_size,
+                "eplb_stats_num_experts": eplb_stats_num_experts,
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
@@ -562,6 +1010,9 @@ class MoeAlltoAll:
         max_num_tokens: int,
         hidden_size: int,
         extra_payload_bytes_per_token: int = 0,
+        eplb_stats_num_experts: int = 0,
+        *,
+        backend: MoeAlltoAllBackend = "trtllm",
     ) -> int:
         r"""Compute the per-rank workspace size for the MoE all-to-all primitive.
 
@@ -570,6 +1021,9 @@ class MoeAlltoAll:
         ``hidden_size`` and ``top_k`` assuming 16-bit hidden states.  For a
         tighter bound on quantized models use
         :func:`moe_a2a_get_workspace_size_per_rank` directly.
+
+        ``backend="trtllm"`` is the default; pass ``backend="cake"`` when
+        sizing a workspace for an opt-in ``MoeAlltoAll`` instance.
 
         Parameters
         ----------
@@ -584,6 +1038,12 @@ class MoeAlltoAll:
         extra_payload_bytes_per_token : int
             Extra payload bytes per token to reserve (e.g. for quantization
             scales).  Defaults to ``0``.
+        eplb_stats_num_experts : int
+            Number of experts reserved for the EPLB gathered-stats region
+            (``0`` disables it).
+        backend : MoeAlltoAllBackend
+            Communication backend used to size the workspace. Defaults to
+            ``"trtllm"``; pass ``"cake"`` for the Cake backend.
 
         Returns
         -------
@@ -609,6 +1069,8 @@ class MoeAlltoAll:
             max_num_tokens,
             total_dispatch_payload_size_per_token,
             combine_payload_size_per_token,
+            eplb_stats_num_experts,
+            backend=backend,
         )
 
     # Metainfo index constants (loaded dynamically from C++)
@@ -616,10 +1078,10 @@ class MoeAlltoAll:
     _METAINFO_INDEX: Optional[dict] = None
 
     @classmethod
-    def _init_constants(cls):
+    def _init_constants(cls, backend: MoeAlltoAllBackend = "trtllm"):
         """Initialize constants from C++ if not already done."""
         if cls._METAINFO_INDEX is None:
-            module = get_moe_alltoall_module()
+            module = get_moe_alltoall_module(backend)
             names, values = module.moe_a2a_get_metainfo_index_pairs()
 
             # Convert TVM arrays to Python and build dictionary
@@ -643,6 +1105,10 @@ class MoeAlltoAll:
         workspace_size_per_rank: int = None,
         hidden_size: int = None,
         mnnvl_config: Optional[MnnvlConfig] = None,
+        eplb_stats_num_experts: int = 0,
+        enable_rank_mask: bool = False,
+        *,
+        backend: MoeAlltoAllBackend = "trtllm",
     ):
         r"""Initialize :class:`MoeAlltoAll` and allocate the shared workspace.
 
@@ -668,16 +1134,45 @@ class MoeAlltoAll:
         mnnvl_config : MnnvlConfig, optional
             Optional configuration for the underlying MNNVL communication
             backend.
+        eplb_stats_num_experts : int
+            Number of experts to reserve for the EPLB gathered-stats region.
+            ``0`` (default) disables EPLB; when non-zero, pass an
+            ``eplb_local_stats`` tensor of this length to :meth:`dispatch`.
+        enable_rank_mask : bool
+            Whether :meth:`dispatch`/:meth:`combine` may be called with an
+            ``active_rank_mask``.  Fixed for the lifetime of this instance
+            (mirrors the underlying kernel's compile-time specialization):
+            ``False`` (default) compiles out every rank-mask check and
+            forbids passing ``active_rank_mask``.
+        backend : {"trtllm", "cake"}
+            Kernel implementation, fixed for this instance. ``"trtllm"``
+            preserves the default implementation on all architectures.
+            ``"cake"`` explicitly selects generated kernels and requires
+            compute capability 10.0 or 10.3. All participating ranks must
+            select the same backend.
         """
+        # Validate even when metainfo/workspace caches have already been filled
+        # by another instance. Backend selection precedes collective allocation.
+        get_moe_alltoall_module(backend)
+        self._backend = backend
         # Initialize constants from C++
-        self._init_constants()
+        self._init_constants(backend)
+
+        self.eplb_stats_num_experts = eplb_stats_num_experts
+        self.enable_eplb = eplb_stats_num_experts > 0
+        self.enable_rank_mask = enable_rank_mask
 
         if workspace_size_per_rank is None:
             assert hidden_size is not None, (
                 "hidden_size must be provided if workspace_size_per_rank is not provided"
             )
             workspace_size_per_rank = self.get_moe_workspace_size_per_rank(
-                mapping.moe_ep_size, top_k, max_num_tokens, hidden_size
+                mapping.moe_ep_size,
+                top_k,
+                max_num_tokens,
+                hidden_size,
+                eplb_stats_num_experts=eplb_stats_num_experts,
+                backend=self._backend,
             )
 
         # Initialize MNNVL memory system
@@ -704,6 +1199,8 @@ class MoeAlltoAll:
             self.ep_size,
             self.max_num_tokens,
             mapping,
+            eplb_stats_num_experts=self.eplb_stats_num_experts,
+            backend=self._backend,
         )
         # Validate workspace compatibility
         assert self._WORKSPACE["workspace_size_per_rank"] == workspace_size_per_rank, (
@@ -719,9 +1216,101 @@ class MoeAlltoAll:
         self.workspace = self._WORKSPACE["workspace"]
         self.metainfo = self._WORKSPACE["metainfo"]
         self._state = _A2AState()
+        # Keep views across combine calls while retaining the workspace and its
+        # MNNVL allocation through this instance.
+        self._recv_view_cache: dict = {"_workspace": self.workspace}
+
+    @property
+    def eplb_gathered_stats(self) -> Optional[torch.Tensor]:
+        r"""Gathered EPLB stats from the most recent :meth:`dispatch`.
+
+        Workspace-backed ``[ep_size, eplb_stats_num_experts]`` ``int32`` view
+        (row ``r`` holds rank ``r``'s ``eplb_local_stats``), or ``None`` when
+        EPLB is disabled or no ``eplb_local_stats`` was passed.  Valid only
+        between :meth:`dispatch` and :meth:`combine` (combine resets state).
+        """
+        return self._state.eplb_gathered_stats
+
+    @flashinfer_api
+    def checkpoint_prepare(self) -> None:
+        """Unmap MNNVL handles for checkpointing; repeated calls are no-ops."""
+        record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
+        if not record.mapped:
+            return
+        if self._state.phase != "idle":
+            raise RuntimeError(
+                "Cannot unmap MNNVL handles during an active all-to-all phase"
+            )
+
+        # Every rank must stop using the workspace before releasing its backing.
+        torch.cuda.synchronize()
+        record.comm.barrier()
+        MnnvlMemory._unmap_and_release_handles(record)
+        record.mem_handles = [None] * record.comm_size
+        record.mapped = False
+        # Do not return until every rank has released its handles.
+        record.comm.barrier()
+
+    @flashinfer_api
+    def checkpoint_restore(
+        self,
+        comm_backend: CommBackend,
+    ) -> None:
+        """Remap MNNVL handles after restore; repeated calls are no-ops.
+
+        Parameters
+        ----------
+        comm_backend : CommBackend
+            Communication backend used to recreate and exchange MNNVL memory
+            handles. It must have the same rank and world size as the original
+            allocation.
+        """
+        record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
+        if record.mapped:
+            return
+
+        comm_size = comm_backend.Get_size()
+        comm_rank = comm_backend.Get_rank()
+        if comm_size != record.comm_size or comm_rank != record.comm_rank:
+            raise RuntimeError(
+                "Cannot remap MNNVL handles because the communicator does not "
+                "match the graph-visible allocation layout: "
+                f"rank/size {comm_rank}/{comm_size} != "
+                f"{record.comm_rank}/{record.comm_size}"
+            )
+        # CUDA work must quiesce before the workspace is remapped.
+        torch.cuda.synchronize()
+        record.mem_handles = MnnvlMemory._create_and_map_handles(
+            comm_backend,
+            record.aligned_size,
+            record.start_address,
+            record.rank_stride,
+            record.address_offset,
+        )
+        record.comm = comm_backend
+        MnnvlMemory.comm = comm_backend
+        record.mapped = True
+        refreshed_metainfo = moe_a2a_initialize(
+            self.workspace,
+            self.ep_rank,
+            self.ep_size,
+            self.max_num_tokens,
+            self.eplb_stats_num_experts,
+            backend=self._backend,
+        )
+        if not torch.equal(refreshed_metainfo, self.metainfo):
+            raise RuntimeError(
+                "MoeAlltoAll metainfo changed during MNNVL handle remap; "
+                "existing CUDA graphs are not safe to replay"
+            )
+        torch.cuda.synchronize()
+        comm_backend.barrier()
+        self._state = _A2AState()
 
     def _reset_workspace(self):
         """Reset the workspace to free up its state. This is mainly used for testing. Use this with caution. This object is no longer usable after this."""
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         torch.cuda.synchronize()
         del self._WORKSPACE
         del self._WORKSPACE_CACHE[
@@ -730,6 +1319,8 @@ class MoeAlltoAll:
                 self.ep_rank,
                 self.ep_size,
                 self.max_num_tokens,
+                self.eplb_stats_num_experts,
+                self._backend,
             )
         ]
         self._state.phase = "deleted"
@@ -742,6 +1333,8 @@ class MoeAlltoAll:
         runtime_max_tokens_per_rank: int,
         invalid_token_expert_id: Optional[int] = None,
         expert_id_payload_index: Optional[int] = None,
+        eplb_local_stats: Optional[torch.Tensor] = None,
+        active_rank_mask: Optional[torch.Tensor] = None,
     ) -> list[torch.Tensor]:
         r"""Run the MoE all-to-all dispatch phase.
 
@@ -761,6 +1354,17 @@ class MoeAlltoAll:
         expert_id_payload_index : int, optional
             Index into ``input_payloads`` that holds the expert IDs to
             sanitize.  Required when ``invalid_token_expert_id`` is set.
+        eplb_local_stats : torch.Tensor, optional
+            ``[eplb_stats_num_experts]`` ``int32`` tensor of this rank's local
+            EPLB statistics to all-gather during dispatch.  Requires the
+            instance to have been constructed with ``eplb_stats_num_experts``
+            set.  The gathered result is available afterwards via
+            :attr:`eplb_gathered_stats`.
+        active_rank_mask : torch.Tensor, optional
+            CPU ``uint64`` tensor of shape ``[MOE_A2A_RANK_MASK_WORDS]`` (see
+            :func:`moe_a2a_active_rank_mask`).  Tokens routed to a masked-off rank are
+            dropped instead of hanging the collective.  Requires the instance to have
+            been constructed with ``enable_rank_mask=True``.
 
         Returns
         -------
@@ -768,12 +1372,28 @@ class MoeAlltoAll:
             Workspace-backed receive tensors, one per ``input_payloads``
             entry, each shaped ``[ep_size, runtime_max_tokens_per_rank, *]``.
         """
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         assert self._state.phase == "idle", "dispatch called twice without combine"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
             "runtime_max_tokens_per_rank exceeds max_num_tokens"
         )
+        if eplb_local_stats is not None:
+            assert self.enable_eplb, (
+                "eplb_local_stats provided but instance was constructed with "
+                "eplb_stats_num_experts=0"
+            )
+            assert eplb_local_stats.dim() == 1, "eplb_local_stats must be a 1D tensor"
+            assert eplb_local_stats.size(0) == self.eplb_stats_num_experts, (
+                "eplb_local_stats size must match eplb_stats_num_experts"
+            )
+        if active_rank_mask is not None and not self.enable_rank_mask:
+            raise ValueError(
+                "active_rank_mask requires the instance to have been constructed "
+                "with enable_rank_mask=True"
+            )
 
-        recv_tensors, combine_payload_offset = moe_a2a_dispatch(
+        recv_tensors, combine_payload_offset, eplb_gathered_stats = moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
             self.workspace,
@@ -783,11 +1403,17 @@ class MoeAlltoAll:
             self.ep_size,
             self.top_k,
             self.num_experts,
+            eplb_local_stats=eplb_local_stats,
+            enable_rank_mask=self.enable_rank_mask,
+            active_rank_mask=active_rank_mask,
+            backend=self._backend,
+            recv_view_cache=self._recv_view_cache,
         )
 
         # Update state
         self._state.local_num_tokens = token_selected_experts.size(0)
         self._state.combine_payload_offset = combine_payload_offset
+        self._state.eplb_gathered_stats = eplb_gathered_stats
         self._state.phase = "dispatched"
 
         # Sanitize invalid tokens if requested
@@ -802,6 +1428,7 @@ class MoeAlltoAll:
                 self.metainfo,
                 self.ep_rank,
                 invalid_token_expert_id,
+                backend=self._backend,
             )
 
         return recv_tensors
@@ -812,6 +1439,14 @@ class MoeAlltoAll:
         payload: torch.Tensor,
         runtime_max_tokens_per_rank: int,
         payload_in_workspace: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
+        output_scales: Optional[torch.Tensor] = None,
+        output_scalar_scale: float = 1.0,
+        sf_layout: SfLayout = SfLayout.layout_linear,
+        output: Optional[torch.Tensor] = None,
+        *,
+        use_low_precision: bool = False,
+        active_rank_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the MoE all-to-all combine phase.
 
@@ -826,18 +1461,48 @@ class MoeAlltoAll:
         payload_in_workspace : bool
             ``True`` if ``payload`` is already a workspace-backed view (skips
             the staging copy).  Defaults to ``False``.
+        output_dtype : Optional[torch.dtype]
+            Optional output data type.  Currently supports ``torch.bfloat16``,
+            ``torch.float8_e4m3fn``, and ``torch.uint8`` (packed fp4).
+        output_scales : Optional[torch.Tensor]
+            Optional output scale tensor for quantized outputs.  Currently
+            supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
+        output_scalar_scale : float
+            Per-tensor global scale applied before FP4 block scaling
+            (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
+            paths.
+        sf_layout : SfLayout
+            Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
+        output : Optional[torch.Tensor]
+            Caller-provided contiguous output tensor. Its shape and dtype must
+            match the requested combine output, and it must be on the same
+            device as ``payload``.
+        use_low_precision : bool
+            If ``True``, quantize the recv-buffer payload to FP8 (e4m3) before
+            accumulating; the combine upcasts to a bf16 output.
+        active_rank_mask : torch.Tensor, optional
+            CPU ``uint64`` tensor of shape ``[MOE_A2A_RANK_MASK_WORDS]``. Should match the
+            mask passed to the preceding :meth:`dispatch` call (or be omitted from both).
+            Requires the instance to have been constructed with ``enable_rank_mask=True``.
 
         Returns
         -------
         torch.Tensor
             ``[local_num_tokens, elements_per_token]`` combined tensor.
         """
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         assert self._state.phase == "dispatched", (
             "combine called before successful dispatch"
         )
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
             "runtime_max_tokens_per_rank exceeds max_num_tokens"
         )
+        if active_rank_mask is not None and not self.enable_rank_mask:
+            raise ValueError(
+                "active_rank_mask requires the instance to have been constructed "
+                "with enable_rank_mask=True"
+            )
 
         output = moe_a2a_combine(
             payload,
@@ -850,6 +1515,15 @@ class MoeAlltoAll:
             self.top_k,
             self._state.combine_payload_offset,
             payload_in_workspace,
+            output_dtype,
+            output_scales,
+            output_scalar_scale,
+            sf_layout,
+            use_low_precision=use_low_precision,
+            enable_rank_mask=self.enable_rank_mask,
+            active_rank_mask=active_rank_mask,
+            output=output,
+            backend=self._backend,
         )
 
         # Reset state for next round
@@ -891,6 +1565,8 @@ class MoeAlltoAll:
         RuntimeError
             If called before a successful :meth:`dispatch`.
         """
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         if self._state.phase != "dispatched":
             raise RuntimeError(
                 "get_combine_payload_tensor_in_workspace called before successful dispatch"
@@ -909,6 +1585,7 @@ class MoeAlltoAll:
 
 __all__ = [
     "MoeAlltoAll",
+    "moe_a2a_active_rank_mask",
     "moe_a2a_combine",
     "moe_a2a_dispatch",
     "moe_a2a_get_workspace_size_per_rank",

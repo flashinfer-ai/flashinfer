@@ -157,7 +157,7 @@ def bench_mxfp8_quantize(
     Args:
         m: Number of rows
         k: Number of columns
-        dtype: Input dtype (torch.float16 or torch.bfloat16)
+        dtype: Input dtype (torch.float16, torch.bfloat16, or torch.float32)
         sf_layout: SfLayout enum (layout_128x4, layout_8x4, or layout_linear)
         backend: "cuda" or "cute-dsl"
 
@@ -203,7 +203,7 @@ def compute_bandwidth_tb_per_sec(
     Compute achieved memory bandwidth in TB/s.
 
     Memory bandwidth calculation for mxfp8_quantize:
-    - Read: input tensor (2 bytes per element for fp16/bf16)
+    - Read: input tensor (2 bytes/elt for fp16/bf16, 4 for fp32)
     - Write: quantized tensor (1 byte per element, fp8)
     - Write: scale factors (1 byte per scale factor)
 
@@ -216,7 +216,7 @@ def compute_bandwidth_tb_per_sec(
     Returns:
         Achieved bandwidth in TB/s
     """
-    input_dtype_bytes = 2  # fp16 or bf16
+    input_dtype_bytes = dtype.itemsize  # 2 for fp16/bf16, 4 for fp32
 
     num_elements = m * k
     num_scale_factors = num_elements // SF_VEC_SIZE
@@ -620,7 +620,7 @@ def main():
         "--dtype",
         type=str,
         default="bfloat16",
-        choices=["float16", "bfloat16"],
+        choices=["float16", "bfloat16", "float32"],
         help="Input data type",
     )
     parser.add_argument(
@@ -671,7 +671,17 @@ def main():
         return
 
     # Set dtype
-    dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
+    dtype = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }[args.dtype]
+    if dtype == torch.float32 and not args.bandwidth:
+        parser.error(
+            "--dtype float32 requires --bandwidth: the backend-comparison mode "
+            "benches the CUDA backend, which does not support fp32 input "
+            "(cute-dsl only)"
+        )
     print(f"Data type: {dtype}")
 
     # Define sweep ranges (powers of 2 + common transformer hidden dimensions)

@@ -24,6 +24,25 @@ FP4 GEMM
 
     mm_fp4
 
+SVDQuant NVFP4 GEMM (SM100)
+---------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_nvfp4_svdquant
+    nvfp4_quantize_smooth
+    svdquant_linear
+
+BF16 x FP4 GEMM (W4A16)
+-----------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    prepare_bf16_fp4_weights
+    mm_bf16_fp4
+
 MXFP8 GEMM
 ----------
 
@@ -44,9 +63,22 @@ FP8 GEMM
     gemm_fp8_nt_blockscaled
     gemm_fp8_nt_groupwise
     group_gemm_fp8_nt_groupwise
+    group_gemm_fp8_nt_groupwise_contiguous
     group_deepgemm_fp8_nt_groupwise
     batch_deepgemm_fp8_nt_groupwise
     fp8_blockscale_gemm_sm90
+
+Low-latency TRT-LLM FP8 GEMM weight prep (also exported from ``flashinfer``):
+
+.. currentmodule:: flashinfer.trtllm_low_latency_gemm
+
+.. autosummary::
+    :toctree: ../generated
+
+    prepare_low_latency_gemm_weights
+
+.. currentmodule:: flashinfer.gemm
+
 
 Mixed Precision GEMM (fp8 x fp4)
 --------------------------------
@@ -57,8 +89,8 @@ Mixed Precision GEMM (fp8 x fp4)
     group_gemm_mxfp8_mxfp4_nt_groupwise
     group_gemm_nvfp4_nt_groupwise
 
-Router GEMM (DeepSeek-V3 / Mistral / GLM)
------------------------------------------
+Router GEMM (DeepSeek-V3 / Mistral / GLM / Kimi-K2 / Kimi-K3)
+-------------------------------------------------------------
 
 .. autosummary::
     :toctree: ../generated
@@ -66,6 +98,11 @@ Router GEMM (DeepSeek-V3 / Mistral / GLM)
     mm_M1_16_K7168_N128
     mm_M1_16_K7168_N256
     mm_M1_16_K6144_N256
+    mm_M1_16_K7168_N256_bf16
+    mm_M1_16_K7168_N384
+    mm_M1_16_K7168_N384_bf16
+    mm_M1_16_K7168_N896
+    mm_M1_16_K7168_N896_bf16
     tinygemm_bf16
 
 Blackwell SM100 GEMM
@@ -75,6 +112,19 @@ Blackwell SM100 GEMM
     :toctree: ../generated
 
     tgv_gemm_sm100
+
+cuTile GEMM
+-----------
+
+.. autosummary::
+    :toctree: ../generated
+
+    gemm_alpha_beta
+    masked_bmm
+    masked_scaled_bmm
+    ragged_bmm
+    ragged_block_scaled_bmm
+    ragged_scaled_bmm
 
 Grouped GEMM (CuTe-DSL, Blackwell)
 ----------------------------------
@@ -92,3 +142,16 @@ Grouped GEMM (Ampere/Hopper)
     :exclude-members: forward
 
     .. automethod:: __init__
+
+PrimsTS dense FP8 and NVFP4 GEMM (SM100, SM103, SM107)
+------------------------------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    fp8_linear
+    fp8_linear_swiglu
+    fp8_qkv_qknorm_rope
+    fp4_linear
+    fp4_linear_swiglu
+    fp4_qkv_qknorm_rope

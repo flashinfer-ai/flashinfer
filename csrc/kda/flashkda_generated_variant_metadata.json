@@ -1,0 +1,2087 @@
+{
+  "schema_version": 2,
+  "modules": [
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_bt16_chain_m64_c68ffebac9",
+      "body": "flashkda_generated_bf16_bt16_chain_m64_c68ffebac9.cu",
+      "kernel": "kernel_flashkda_bf16_bt16_chain_m64",
+      "threads": 512,
+      "smem_bytes": 138240,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "bt16_chain",
+      "abi_variant": "default",
+      "tma_tile_tokens": 16,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "bt16_prepare_chain_m64", "route_role": "main", "specialization": {"bt16_stage_count": 8, "state_dtype_is_fp32": false, "serving_native_abi": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_bt16_chain_m64_d3d65ffa34",
+      "body": "flashkda_generated_bf16_bt16_chain_m64_d3d65ffa34.cu",
+      "kernel": "kernel_flashkda_bf16_bt16_chain_m64",
+      "threads": 512,
+      "smem_bytes": 138240,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "bt16_chain",
+      "abi_variant": "default",
+      "tma_tile_tokens": 16,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "bt16_prepare_chain_m64", "route_role": "main", "specialization": {"bt16_stage_count": 8, "state_dtype_is_fp32": true, "serving_native_abi": true}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_bt16_chain_m64_fb049064fe",
+      "body": "flashkda_generated_bf16_bt16_chain_m64_fb049064fe.cu",
+      "kernel": "kernel_flashkda_bf16_bt16_chain_m64",
+      "threads": 512,
+      "smem_bytes": 153600,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "bt16_chain",
+      "abi_variant": "default",
+      "tma_tile_tokens": 16,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "bt16_prepare_chain_m64", "route_role": "main", "specialization": {"bt16_stage_count": 9, "state_dtype_is_fp32": false, "serving_native_abi": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_bt16_prepare_0d8e6c8011",
+      "body": "flashkda_generated_bf16_bt16_prepare_0d8e6c8011.cu",
+      "kernel": "kernel_flashkda_bf16_bt16_prepare",
+      "threads": 128,
+      "smem_bytes": 44032,
+      "use_pdl": false,
+      "state_mode": "none",
+      "abi_family": "bt16_prepare",
+      "abi_variant": "default",
+      "tma_tile_tokens": 16,
+      "value_rows": 0,
+      "value_tma_rank": 0,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "bt16_prepare_chain_m64", "route_role": "bt16_prepare", "specialization": {}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_07f44c1e56",
+      "body": "flashkda_generated_bf16_fused_m128_07f44c1e56.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": true,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "bf16_state_with_fp32_split_dependency",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_map", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": true, "pdl_wait_initial_state_f32": true, "pdl_publish_final_state": true, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_108ac915d1",
+      "body": "flashkda_generated_bf16_fused_m128_108ac915d1.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_13081cc606",
+      "body": "flashkda_generated_bf16_fused_m128_13081cc606.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 864,
+      "smem_bytes": 218752,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": true, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_2315c4d395",
+      "body": "flashkda_generated_bf16_fused_m128_2315c4d395.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 864,
+      "smem_bytes": 218752,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": true, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_4d394413ab",
+      "body": "flashkda_generated_bf16_fused_m128_4d394413ab.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": true,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "fp32_carry_dependency",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_correction", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": true, "pdl_wait_initial_state_f32": true, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_5ae1699f79",
+      "body": "flashkda_generated_bf16_fused_m128_5ae1699f79.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 231424,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "scalar_lpt_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "scalar_chunk_lpt_m128", "route_role": "main", "specialization": {"num_heads": 96, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_schedule": true, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_6151e2988c",
+      "body": "flashkda_generated_bf16_fused_m128_6151e2988c.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_659032466d",
+      "body": "flashkda_generated_bf16_fused_m128_659032466d.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_79d0e71824",
+      "body": "flashkda_generated_bf16_fused_m128_79d0e71824.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 231424,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "scalar_lpt_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "scalar_chunk_lpt_m128", "route_role": "main", "specialization": {"num_heads": 64, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_schedule": true, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_7bb2a02766",
+      "body": "flashkda_generated_bf16_fused_m128_7bb2a02766.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_7c0223cea8",
+      "body": "flashkda_generated_bf16_fused_m128_7c0223cea8.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 231424,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "scalar_lpt_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "scalar_chunk_lpt_m128", "route_role": "main", "specialization": {"num_heads": 96, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_schedule": true, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_7feb233c12",
+      "body": "flashkda_generated_bf16_fused_m128_7feb233c12.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "fp32_split_state",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": true, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": true, "affine_main_indexed_initial": true, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_8838afb6eb",
+      "body": "flashkda_generated_bf16_fused_m128_8838afb6eb.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": true,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "fp32_carry_dependency",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_correction", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": true, "pdl_wait_initial_state_f32": true, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_97e6762e88",
+      "body": "flashkda_generated_bf16_fused_m128_97e6762e88.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_a1418fd1ae",
+      "body": "flashkda_generated_bf16_fused_m128_a1418fd1ae.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 117376,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_a1dc60f331",
+      "body": "flashkda_generated_bf16_fused_m128_a1dc60f331.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 117376,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_a4d959590f",
+      "body": "flashkda_generated_bf16_fused_m128_a4d959590f.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_a911cb7354",
+      "body": "flashkda_generated_bf16_fused_m128_a911cb7354.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 117376,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_ac3225bbea",
+      "body": "flashkda_generated_bf16_fused_m128_ac3225bbea.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 183296,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": true, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_ace080e774",
+      "body": "flashkda_generated_bf16_fused_m128_ace080e774.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 117376,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_b11789a4e6",
+      "body": "flashkda_generated_bf16_fused_m128_b11789a4e6.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_b956ea8571",
+      "body": "flashkda_generated_bf16_fused_m128_b956ea8571.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 183296,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": true, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_be65f60442",
+      "body": "flashkda_generated_bf16_fused_m128_be65f60442.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16_f32_dependency",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "bf16_indexed_initial_fp32_final",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": true, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": true, "affine_main_indexed_initial": true, "affine_main_indexed_initial_bf16": true}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_c136c0c7f2",
+      "body": "flashkda_generated_bf16_fused_m128_c136c0c7f2.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16_f32_dependency",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "bf16_indexed_initial_fp32_final",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": true, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": true, "affine_main_indexed_initial": true, "affine_main_indexed_initial_bf16": true}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_c8af151b6d",
+      "body": "flashkda_generated_bf16_fused_m128_c8af151b6d.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 231424,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "scalar_lpt_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "scalar_chunk_lpt_m128", "route_role": "main", "specialization": {"num_heads": 64, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_schedule": true, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_d1c0d1fe67",
+      "body": "flashkda_generated_bf16_fused_m128_d1c0d1fe67.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 117376,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_d9151223cd",
+      "body": "flashkda_generated_bf16_fused_m128_d9151223cd.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 117376,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_dac5e18acb",
+      "body": "flashkda_generated_bf16_fused_m128_dac5e18acb.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": true,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "bf16_state_with_fp32_split_dependency",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_map", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": true, "pdl_wait_initial_state_f32": true, "pdl_publish_final_state": true, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_de729ccf63",
+      "body": "flashkda_generated_bf16_fused_m128_de729ccf63.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_ea99273d0c",
+      "body": "flashkda_generated_bf16_fused_m128_ea99273d0c.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_f310684769",
+      "body": "flashkda_generated_bf16_fused_m128_f310684769.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 864,
+      "smem_bytes": 218752,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": true, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m128_fca13c24e7",
+      "body": "flashkda_generated_bf16_fused_m128_fca13c24e7.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "fp32_split_state",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": true, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": true, "affine_main_indexed_initial": true, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m64_2eb7864cd4",
+      "body": "flashkda_generated_bf16_fused_m64_2eb7864cd4.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m64",
+      "threads": 1024,
+      "smem_bytes": 227328,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "m64",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "independent_dvsplit_m64", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 64, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m64_5eb5b5da39",
+      "body": "flashkda_generated_bf16_fused_m64_5eb5b5da39.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m64",
+      "threads": 1024,
+      "smem_bytes": 227328,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "m64",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "independent_dvsplit_m64", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 6, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m64_9f7512076a",
+      "body": "flashkda_generated_bf16_fused_m64_9f7512076a.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m64",
+      "threads": 1024,
+      "smem_bytes": 227328,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "m64",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "independent_dvsplit_m64", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 64, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_fused_m64_c2b2a382bb",
+      "body": "flashkda_generated_bf16_fused_m64_c2b2a382bb.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m64",
+      "threads": 1024,
+      "smem_bytes": 227328,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "m64",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "independent_dvsplit_m64", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 6, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_persistent_m128_47722a5d98",
+      "body": "flashkda_generated_bf16_persistent_m128_47722a5d98.cu",
+      "kernel": "kernel_flashkda_bf16_persistent_m128",
+      "threads": 1024,
+      "smem_bytes": 221696,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "taskized_persistent_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "piece_persistent_m128", "route_role": "main", "specialization": {"piece_tasks": true, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_persistent_m128_4b0769bf08",
+      "body": "flashkda_generated_bf16_persistent_m128_4b0769bf08.cu",
+      "kernel": "kernel_flashkda_bf16_persistent_m128",
+      "threads": 1024,
+      "smem_bytes": 221696,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "taskized_persistent_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "head_grouped_persistent_m128", "route_role": "main", "specialization": {"piece_tasks": false, "state_dtype_is_fp32": false}},
+        {"route": "lpt_persistent_m128", "route_role": "main", "specialization": {"piece_tasks": false, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_persistent_m128_c258a6e650",
+      "body": "flashkda_generated_bf16_persistent_m128_c258a6e650.cu",
+      "kernel": "kernel_flashkda_bf16_persistent_m128",
+      "threads": 1024,
+      "smem_bytes": 221696,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "taskized_persistent_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "head_grouped_persistent_m128", "route_role": "main", "specialization": {"piece_tasks": false, "state_dtype_is_fp32": true}},
+        {"route": "lpt_persistent_m128", "route_role": "main", "specialization": {"piece_tasks": false, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_persistent_m128_ddb5283bd6",
+      "body": "flashkda_generated_bf16_persistent_m128_ddb5283bd6.cu",
+      "kernel": "kernel_flashkda_bf16_persistent_m128",
+      "threads": 1024,
+      "smem_bytes": 221696,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "taskized_persistent_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "piece_persistent_m128", "route_role": "main", "specialization": {"piece_tasks": true, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_small_bh_m128_9f0e93e17e",
+      "body": "flashkda_generated_bf16_small_bh_m128_9f0e93e17e.cu",
+      "kernel": "kernel_flashkda_bf16_small_bh_m128",
+      "threads": 1024,
+      "smem_bytes": 227328,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "small_bh_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "small_bh_owner_helper_m128", "route_role": "main", "specialization": {"serving_native_abi": true, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_bf16_small_bh_m128_cdac8305c9",
+      "body": "flashkda_generated_bf16_small_bh_m128_cdac8305c9.cu",
+      "kernel": "kernel_flashkda_bf16_small_bh_m128",
+      "threads": 1024,
+      "smem_bytes": 227328,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "small_bh_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "small_bh_owner_helper_m128", "route_role": "main", "specialization": {"serving_native_abi": false, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "module_ident": "flashkda_split_scan_bf16_m128_3263b0aaf3",
+      "body": "flashkda_generated_split_scan_bf16_m128_3263b0aaf3.cu",
+      "kernel": "kernel_flashkda_split_scan_bf16_m128",
+      "threads": 128,
+      "smem_bytes": 66560,
+      "use_pdl": true,
+      "state_mode": "none",
+      "abi_family": "affine_scan",
+      "abi_variant": "default",
+      "tma_tile_tokens": 0,
+      "value_rows": 0,
+      "value_tma_rank": 0,
+      "pair_packed_beta": false,
+      "affine_dependency": "fp32_split_and_bf16_map_to_fp32_carry",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_scan", "specialization": {"use_pdl": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_bt16_chain_m64_c68ffebac9",
+      "body": "flashkda_generated_bf16_bt16_chain_m64_c68ffebac9.cu",
+      "kernel": "kernel_flashkda_bf16_bt16_chain_m64",
+      "threads": 512,
+      "smem_bytes": 138240,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "bt16_chain",
+      "abi_variant": "default",
+      "tma_tile_tokens": 16,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "bt16_prepare_chain_m64", "route_role": "main", "specialization": {"bt16_stage_count": 8, "state_dtype_is_fp32": false, "serving_native_abi": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_bt16_chain_m64_d3d65ffa34",
+      "body": "flashkda_generated_bf16_bt16_chain_m64_d3d65ffa34.cu",
+      "kernel": "kernel_flashkda_bf16_bt16_chain_m64",
+      "threads": 512,
+      "smem_bytes": 138240,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "bt16_chain",
+      "abi_variant": "default",
+      "tma_tile_tokens": 16,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "bt16_prepare_chain_m64", "route_role": "main", "specialization": {"bt16_stage_count": 8, "state_dtype_is_fp32": true, "serving_native_abi": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_bt16_chain_m64_fb049064fe",
+      "body": "flashkda_generated_bf16_bt16_chain_m64_fb049064fe.cu",
+      "kernel": "kernel_flashkda_bf16_bt16_chain_m64",
+      "threads": 512,
+      "smem_bytes": 153600,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "bt16_chain",
+      "abi_variant": "default",
+      "tma_tile_tokens": 16,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "bt16_prepare_chain_m64", "route_role": "main", "specialization": {"bt16_stage_count": 9, "state_dtype_is_fp32": false, "serving_native_abi": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_bt16_prepare_0d8e6c8011",
+      "body": "flashkda_generated_bf16_bt16_prepare_0d8e6c8011.cu",
+      "kernel": "kernel_flashkda_bf16_bt16_prepare",
+      "threads": 128,
+      "smem_bytes": 44032,
+      "use_pdl": false,
+      "state_mode": "none",
+      "abi_family": "bt16_prepare",
+      "abi_variant": "default",
+      "tma_tile_tokens": 16,
+      "value_rows": 0,
+      "value_tma_rank": 0,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "bt16_prepare_chain_m64", "route_role": "bt16_prepare", "specialization": {}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_07f44c1e56",
+      "body": "flashkda_generated_bf16_fused_m128_07f44c1e56.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": true,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "bf16_state_with_fp32_split_dependency",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_map", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": true, "pdl_wait_initial_state_f32": true, "pdl_publish_final_state": true, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_108ac915d1",
+      "body": "flashkda_generated_bf16_fused_m128_108ac915d1.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_13081cc606",
+      "body": "flashkda_generated_bf16_fused_m128_13081cc606.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 864,
+      "smem_bytes": 218752,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": true, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_2315c4d395",
+      "body": "flashkda_generated_bf16_fused_m128_2315c4d395.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 864,
+      "smem_bytes": 218752,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": true, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_388c6ad8eb",
+      "body": "flashkda_generated_bf16_fused_m128_388c6ad8eb.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": true, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_41afad3d90",
+      "body": "flashkda_generated_bf16_fused_m128_41afad3d90.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": true, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_4d394413ab",
+      "body": "flashkda_generated_bf16_fused_m128_4d394413ab.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": true,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "fp32_carry_dependency",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_correction", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": true, "pdl_wait_initial_state_f32": true, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_5ae1699f79",
+      "body": "flashkda_generated_bf16_fused_m128_5ae1699f79.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 231424,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "scalar_lpt_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "scalar_chunk_lpt_m128", "route_role": "main", "specialization": {"num_heads": 96, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_schedule": true, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_6151e2988c",
+      "body": "flashkda_generated_bf16_fused_m128_6151e2988c.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_659032466d",
+      "body": "flashkda_generated_bf16_fused_m128_659032466d.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_79d0e71824",
+      "body": "flashkda_generated_bf16_fused_m128_79d0e71824.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 231424,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "scalar_lpt_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "scalar_chunk_lpt_m128", "route_role": "main", "specialization": {"num_heads": 64, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_schedule": true, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_7bb2a02766",
+      "body": "flashkda_generated_bf16_fused_m128_7bb2a02766.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_7c0223cea8",
+      "body": "flashkda_generated_bf16_fused_m128_7c0223cea8.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 231424,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "scalar_lpt_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "scalar_chunk_lpt_m128", "route_role": "main", "specialization": {"num_heads": 96, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_schedule": true, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_7feb233c12",
+      "body": "flashkda_generated_bf16_fused_m128_7feb233c12.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "fp32_split_state",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": true, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": true, "affine_main_indexed_initial": true, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_8838afb6eb",
+      "body": "flashkda_generated_bf16_fused_m128_8838afb6eb.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": true,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "fp32_carry_dependency",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_correction", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": true, "pdl_wait_initial_state_f32": true, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_97e6762e88",
+      "body": "flashkda_generated_bf16_fused_m128_97e6762e88.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_a1418fd1ae",
+      "body": "flashkda_generated_bf16_fused_m128_a1418fd1ae.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 117376,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_a1dc60f331",
+      "body": "flashkda_generated_bf16_fused_m128_a1dc60f331.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 117376,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_a4d959590f",
+      "body": "flashkda_generated_bf16_fused_m128_a4d959590f.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_a911cb7354",
+      "body": "flashkda_generated_bf16_fused_m128_a911cb7354.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 117376,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_ac3225bbea",
+      "body": "flashkda_generated_bf16_fused_m128_ac3225bbea.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 183296,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": true, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_ace080e774",
+      "body": "flashkda_generated_bf16_fused_m128_ace080e774.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 117376,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_b11789a4e6",
+      "body": "flashkda_generated_bf16_fused_m128_b11789a4e6.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_b21b675208",
+      "body": "flashkda_generated_bf16_fused_m128_b21b675208.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": true, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_b956ea8571",
+      "body": "flashkda_generated_bf16_fused_m128_b956ea8571.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 183296,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": true, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_be65f60442",
+      "body": "flashkda_generated_bf16_fused_m128_be65f60442.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16_f32_dependency",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "bf16_indexed_initial_fp32_final",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": true, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": true, "affine_main_indexed_initial": true, "affine_main_indexed_initial_bf16": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_c136c0c7f2",
+      "body": "flashkda_generated_bf16_fused_m128_c136c0c7f2.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16_f32_dependency",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "bf16_indexed_initial_fp32_final",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": true, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": true, "affine_main_indexed_initial": true, "affine_main_indexed_initial_bf16": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_c8af151b6d",
+      "body": "flashkda_generated_bf16_fused_m128_c8af151b6d.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 231424,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "scalar_lpt_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "scalar_chunk_lpt_m128", "route_role": "main", "specialization": {"num_heads": 64, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_schedule": true, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_d1c0d1fe67",
+      "body": "flashkda_generated_bf16_fused_m128_d1c0d1fe67.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 117376,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_d506deb2ce",
+      "body": "flashkda_generated_bf16_fused_m128_d506deb2ce.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 232064,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": true, "tensor_state_decay": true, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_d9151223cd",
+      "body": "flashkda_generated_bf16_fused_m128_d9151223cd.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 117376,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 16,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128_n16", "route_role": "main", "specialization": {"chunk": 16, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": false, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_dac5e18acb",
+      "body": "flashkda_generated_bf16_fused_m128_dac5e18acb.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": true,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "bf16_state_with_fp32_split_dependency",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_map", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": true, "pdl_wait_initial_state_f32": true, "pdl_publish_final_state": true, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_de729ccf63",
+      "body": "flashkda_generated_bf16_fused_m128_de729ccf63.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_e1fe3b56a3",
+      "body": "flashkda_generated_bf16_fused_m128_e1fe3b56a3.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 232064,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": true, "tensor_state_decay": true, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_ea99273d0c",
+      "body": "flashkda_generated_bf16_fused_m128_ea99273d0c.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": true,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": true, "scalar_beta": true, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_f310684769",
+      "body": "flashkda_generated_bf16_fused_m128_f310684769.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 864,
+      "smem_bytes": 218752,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": true, "early_n32_state_pack": true, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_f4112648ad",
+      "body": "flashkda_generated_bf16_fused_m128_f4112648ad.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 232064,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "direct_m128", "route_role": "main", "specialization": {"chunk": 32, "serving_native_abi": true, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": true, "tensor_state_decay": true, "state_dtype_is_fp32": false, "n32_ft_slab": false, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": false, "affine_main_indexed_initial": false, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_fca13c24e7",
+      "body": "flashkda_generated_bf16_fused_m128_fca13c24e7.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128",
+      "threads": 1024,
+      "smem_bytes": 227968,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "direct_m128",
+      "abi_variant": "serving",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "fp32_split_state",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_main", "specialization": {"chunk": 32, "serving_native_abi": false, "gate_kind": "lower_bound", "checkpoint_tma": false, "pair_packed_beta": false, "scalar_beta": false, "early_n32_state_pack": false, "generic_register_inverse": true, "n32_prediction_first": false, "tensor_state_decay": false, "state_dtype_is_fp32": true, "n32_ft_slab": true, "pdl_wait_initial_state_f32": false, "pdl_publish_final_state": true, "affine_main_indexed_initial": true, "affine_main_indexed_initial_bf16": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_vtile_11bf731116",
+      "body": "flashkda_generated_bf16_fused_m128_vtile_11bf731116.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128_vtile",
+      "threads": 1024,
+      "smem_bytes": 226304,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "vtile_m128",
+      "abi_variant": "vtile",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "vtile_m128", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 96, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_mode": true, "persistent_six_task_schedule": true, "persistent_stride_head_aligned": false, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_vtile_4b7d3b6523",
+      "body": "flashkda_generated_bf16_fused_m128_vtile_4b7d3b6523.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128_vtile",
+      "threads": 1024,
+      "smem_bytes": 226304,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "vtile_m128",
+      "abi_variant": "vtile",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "vtile_m128", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 96, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_mode": false, "persistent_six_task_schedule": false, "persistent_stride_head_aligned": true, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_vtile_603e2d906d",
+      "body": "flashkda_generated_bf16_fused_m128_vtile_603e2d906d.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128_vtile",
+      "threads": 1024,
+      "smem_bytes": 226304,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "vtile_m128",
+      "abi_variant": "vtile",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "vtile_m128", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 64, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_mode": true, "persistent_six_task_schedule": false, "persistent_stride_head_aligned": true, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_vtile_a8f9b5a463",
+      "body": "flashkda_generated_bf16_fused_m128_vtile_a8f9b5a463.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128_vtile",
+      "threads": 1024,
+      "smem_bytes": 226304,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "vtile_m128",
+      "abi_variant": "vtile",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "vtile_m128", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 64, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_mode": true, "persistent_six_task_schedule": false, "persistent_stride_head_aligned": true, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_vtile_b784466ef6",
+      "body": "flashkda_generated_bf16_fused_m128_vtile_b784466ef6.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128_vtile",
+      "threads": 1024,
+      "smem_bytes": 226304,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "vtile_m128",
+      "abi_variant": "vtile",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "vtile_m128", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 96, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_mode": true, "persistent_six_task_schedule": true, "persistent_stride_head_aligned": false, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m128_vtile_d589dad375",
+      "body": "flashkda_generated_bf16_fused_m128_vtile_d589dad375.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m128_vtile",
+      "threads": 1024,
+      "smem_bytes": 226304,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "vtile_m128",
+      "abi_variant": "vtile",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 4,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "vtile_m128", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 96, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "persistent_mode": false, "persistent_six_task_schedule": false, "persistent_stride_head_aligned": true, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m64_2eb7864cd4",
+      "body": "flashkda_generated_bf16_fused_m64_2eb7864cd4.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m64",
+      "threads": 1024,
+      "smem_bytes": 227328,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "m64",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "independent_dvsplit_m64", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 64, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m64_5eb5b5da39",
+      "body": "flashkda_generated_bf16_fused_m64_5eb5b5da39.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m64",
+      "threads": 1024,
+      "smem_bytes": 227328,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "m64",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "independent_dvsplit_m64", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 6, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m64_9f7512076a",
+      "body": "flashkda_generated_bf16_fused_m64_9f7512076a.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m64",
+      "threads": 1024,
+      "smem_bytes": 227328,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "m64",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "independent_dvsplit_m64", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 64, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_fused_m64_c2b2a382bb",
+      "body": "flashkda_generated_bf16_fused_m64_c2b2a382bb.cu",
+      "kernel": "kernel_flashkda_bf16_fused_m64",
+      "threads": 1024,
+      "smem_bytes": 227328,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "m64",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 64,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "independent_dvsplit_m64", "route_role": "main", "specialization": {"full_n32_chunks": true, "num_heads": 6, "use_initial_state": true, "store_final_state": true, "scale": 0.08838834764831845, "lower_bound": -5.0, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_persistent_m128_47722a5d98",
+      "body": "flashkda_generated_bf16_persistent_m128_47722a5d98.cu",
+      "kernel": "kernel_flashkda_bf16_persistent_m128",
+      "threads": 1024,
+      "smem_bytes": 221696,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "taskized_persistent_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "piece_persistent_m128", "route_role": "main", "specialization": {"piece_tasks": true, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_persistent_m128_ddb5283bd6",
+      "body": "flashkda_generated_bf16_persistent_m128_ddb5283bd6.cu",
+      "kernel": "kernel_flashkda_bf16_persistent_m128",
+      "threads": 1024,
+      "smem_bytes": 221696,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "taskized_persistent_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "piece_persistent_m128", "route_role": "main", "specialization": {"piece_tasks": true, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_small_bh_m128_9f0e93e17e",
+      "body": "flashkda_generated_bf16_small_bh_m128_9f0e93e17e.cu",
+      "kernel": "kernel_flashkda_bf16_small_bh_m128",
+      "threads": 1024,
+      "smem_bytes": 227328,
+      "use_pdl": false,
+      "state_mode": "fp32",
+      "abi_family": "small_bh_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "small_bh_owner_helper_m128", "route_role": "main", "specialization": {"serving_native_abi": true, "state_dtype_is_fp32": true}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_bf16_small_bh_m128_cdac8305c9",
+      "body": "flashkda_generated_bf16_small_bh_m128_cdac8305c9.cu",
+      "kernel": "kernel_flashkda_bf16_small_bh_m128",
+      "threads": 1024,
+      "smem_bytes": 227328,
+      "use_pdl": false,
+      "state_mode": "bf16",
+      "abi_family": "small_bh_m128",
+      "abi_variant": "default",
+      "tma_tile_tokens": 32,
+      "value_rows": 128,
+      "value_tma_rank": 3,
+      "pair_packed_beta": false,
+      "affine_dependency": "none",
+      "selectors": [
+        {"route": "small_bh_owner_helper_m128", "route_role": "main", "specialization": {"serving_native_abi": false, "state_dtype_is_fp32": false}}
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "module_ident": "flashkda_split_scan_bf16_m128_3263b0aaf3",
+      "body": "flashkda_generated_split_scan_bf16_m128_3263b0aaf3.cu",
+      "kernel": "kernel_flashkda_split_scan_bf16_m128",
+      "threads": 128,
+      "smem_bytes": 66560,
+      "use_pdl": true,
+      "state_mode": "none",
+      "abi_family": "affine_scan",
+      "abi_variant": "default",
+      "tma_tile_tokens": 0,
+      "value_rows": 0,
+      "value_tma_rank": 0,
+      "pair_packed_beta": false,
+      "affine_dependency": "fp32_split_and_bf16_map_to_fp32_carry",
+      "selectors": [
+        {"route": "affine_split_m128", "route_role": "affine_scan", "specialization": {"use_pdl": true}}
+      ]
+    }
+  ]
+}

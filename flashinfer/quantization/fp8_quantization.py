@@ -5,14 +5,23 @@ from typing import Literal, Optional, Tuple
 import torch
 
 from ..api_logging import flashinfer_api
-from ..trace.templates.quantize import mxfp8_quantize_trace
+from ..cutile import is_cuda_tile_available
+from ..trace.templates.quantize import (
+    mxfp8_grouped_quantize_trace,
+    mxfp8_quantize_trace,
+)
 from ..jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from ..utils import (
     device_support_pdl,
+    get_compute_capability,
     register_custom_op,
     register_fake_op,
 )
 from ..tllm_enums import SfLayout
+
+
+def _round_up(x: int, y: int) -> int:
+    return (x + y - 1) // y * y
 
 
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
@@ -178,6 +187,8 @@ def mxfp8_quantize(
     ----------
     input : torch.Tensor
         Input tensor of shape ``[M, K]`` with dtype fp16/bf16/fp8_quantized.
+        The ``"cute-dsl"`` backend additionally supports fp32 input; the
+        ``"cuda"`` backend does not.
     is_sf_swizzled_layout : bool
         Whether to use the swizzled layout for scale factors.  Defaults to
         ``True``.
@@ -254,6 +265,288 @@ def mxfp8_quantize(
         return x_q, sf
 
 
+@functools.cache
+def get_mxfp8_grouped_quantization_module():
+    """Register the grouped MXFP8 quantization op and its fake (meta) twin.
+
+    Returns a namespace with two implementations:
+
+    - ``mxfp8_grouped_quantize_impl``: the real op, registered via
+      ``register_custom_op`` and backed by the cuTile kernel. It quantizes a
+      ``[B, M, K]`` batch to MXFP8 with UE8M0 block scales and lays out the
+      outputs for the FlashInfer masked grouped GEMM.
+    - ``_fake_mxfp8_grouped_quantize``: the metadata-only twin registered via
+      ``register_fake_op`` for tracing and shape inference; it allocates
+      outputs with the correct shapes, dtypes, and strides without launching
+      any kernel.
+
+    The factory is cached so registration happens once. The cuTile kernel is
+    arch-independent and compiles lazily on its first launch, so there is no
+    module to build and load here.
+    """
+
+    @register_custom_op(
+        "flashinfer::mxfp8_grouped_quantize",
+        mutates_args=("",),
+    )
+    def mxfp8_grouped_quantize_impl(
+        a: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the grouped MXFP8 cuTile quantizer and lay out the outputs for
+        the FlashInfer masked grouped GEMM. Assumes inputs are already
+        validated by the public ``mxfp8_grouped_quantize`` wrapper.
+        """
+        from .kernels.cutile.mxfp8_grouped_quantize_cutile import (
+            mxfp8_grouped_quantize_cutile,
+        )
+
+        b, m, k = a.shape
+        padded_k = _round_up(k, 128)
+        padded_m = _round_up(m, 128)
+        scale_k = padded_k // 32
+
+        if padded_k == k:
+            input_tensor = a.contiguous()
+        else:
+            input_tensor = a.new_zeros((b, m, padded_k))
+            input_tensor[:, :, :k] = a
+
+        output = torch.empty(
+            (b, m, padded_k),
+            dtype=torch.float8_e4m3fn,
+            device=a.device,
+        )
+        output_scales = torch.empty(
+            (b, padded_m, scale_k),
+            dtype=torch.uint8,
+            device=a.device,
+        )
+
+        problem_sizes = torch.empty((b, 3), dtype=torch.int32, device=a.device)
+        problem_sizes[:, 0] = mask
+        problem_sizes[:, 1] = 0
+        problem_sizes[:, 2] = padded_k
+        group_ids = torch.arange(b, dtype=torch.int32, device=a.device)
+        expert_offsets = group_ids * m
+        blockscale_offsets = group_ids * padded_m
+
+        mxfp8_grouped_quantize_cutile(
+            input_tensor.view(b * m, padded_k),
+            problem_sizes,
+            expert_offsets,
+            blockscale_offsets,
+            output.view(b * m, padded_k),
+            output_scales,
+        )
+
+        output = output.permute(1, 2, 0)
+        output_scales = output_scales.view(b, padded_m // 128, scale_k // 4, 32, 4, 4)
+        output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
+        return output, output_scales
+
+    @register_fake_op("flashinfer::mxfp8_grouped_quantize")
+    def _fake_mxfp8_grouped_quantize(
+        a: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Metadata only: allocate empty outputs with the same shapes, dtypes,
+        # and (post-permute) strides as the real op without launching cuTile.
+        b, m, k = a.shape
+        padded_k = _round_up(k, 128)
+        padded_m = _round_up(m, 128)
+        scale_k = padded_k // 32
+
+        output = torch.empty(
+            (b, m, padded_k),
+            dtype=torch.float8_e4m3fn,
+            device=a.device,
+        )
+        output_scales = torch.empty(
+            (b, padded_m, scale_k),
+            dtype=torch.uint8,
+            device=a.device,
+        )
+
+        output = output.permute(1, 2, 0)
+        output_scales = output_scales.view(b, padded_m // 128, scale_k // 4, 32, 4, 4)
+        output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
+        return output, output_scales
+
+    return SimpleNamespace(
+        mxfp8_grouped_quantize_impl=mxfp8_grouped_quantize_impl,
+        _fake_mxfp8_grouped_quantize=_fake_mxfp8_grouped_quantize,
+    )
+
+
+@functools.cache
+def get_cake_mxfp8_grouped_quantization_module():
+    """Register the generated Cake grouped MXFP8 op and fake metadata twin."""
+
+    @register_custom_op(
+        "flashinfer::cake_mxfp8_grouped_quantize",
+        mutates_args=(),
+    )
+    def cake_mxfp8_grouped_quantize_impl(
+        a: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from ..jit.cake_grouped_mxfp8_quantize import (
+            cake_grouped_mxfp8_quantize_launch,
+        )
+
+        b, m, k = a.shape
+        padded_k = _round_up(k, 128)
+        padded_m = _round_up(m, 128)
+        scale_k = padded_k // 32
+        output = torch.empty(
+            (b, m, padded_k),
+            dtype=torch.float8_e4m3fn,
+            device=a.device,
+        )
+        output_scales = torch.empty(
+            (b, padded_m, scale_k),
+            dtype=torch.uint8,
+            device=a.device,
+        )
+        cake_grouped_mxfp8_quantize_launch(a, mask, output, output_scales)
+
+        output = output.permute(1, 2, 0)
+        output_scales = output_scales.view(b, padded_m // 128, scale_k // 4, 32, 4, 4)
+        output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
+        return output, output_scales
+
+    @register_fake_op("flashinfer::cake_mxfp8_grouped_quantize")
+    def _fake_cake_mxfp8_grouped_quantize(
+        a: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return get_mxfp8_grouped_quantization_module()._fake_mxfp8_grouped_quantize(
+            a, mask
+        )
+
+    return SimpleNamespace(
+        cake_mxfp8_grouped_quantize_impl=cake_mxfp8_grouped_quantize_impl,
+        _fake_cake_mxfp8_grouped_quantize=_fake_cake_mxfp8_grouped_quantize,
+    )
+
+
+def _mxfp8_grouped_quantize_cake(
+    a: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    backend: Literal["cake"],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch an already validated request to the generated Cake program."""
+
+    if backend != "cake":
+        raise ValueError(f"internal Cake dispatch received backend={backend!r}")
+    from ..jit.cake_grouped_mxfp8_quantize import (
+        is_cake_grouped_mxfp8_quantize_available,
+    )
+
+    if not is_cake_grouped_mxfp8_quantize_available(a.dtype, a.device):
+        raise RuntimeError(
+            "backend='cake' requires float16 or bfloat16 input on a device of "
+            f"exact compute capability 10.0 or 10.3; got dtype={a.dtype} on "
+            f"{torch.cuda.get_device_name(a.device)}"
+        )
+    if not a.is_contiguous() or not mask.is_contiguous():
+        raise ValueError(
+            "backend='cake' requires contiguous a [B, M, K] and mask [B]; pass "
+            "a.contiguous() / mask.contiguous() explicitly instead of a view"
+        )
+    return (
+        get_cake_mxfp8_grouped_quantization_module().cake_mxfp8_grouped_quantize_impl(
+            a, mask
+        )
+    )
+
+
+@flashinfer_api(trace=mxfp8_grouped_quantize_trace)
+def mxfp8_grouped_quantize(
+    a: torch.Tensor,
+    mask: torch.Tensor,
+    backend: Literal["cutile", "cake"] = "cutile",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Quantize grouped inputs to MXFP8 with UE8M0 block scales.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Input tensor of shape ``[B, M, K]`` with dtype ``float16`` or
+        ``bfloat16``.
+    mask : torch.Tensor
+        Int32 CUDA tensor of shape ``[B]``. Each value gives the number of
+        valid rows to quantize for the corresponding group, and must satisfy
+        ``0 <= mask[i] <= M``. This precondition is the caller's
+        responsibility: it is not validated at runtime, because reading the
+        device-side ``mask`` values would force a host synchronization and break
+        CUDA-graph capture. Out-of-range values are undefined behavior. The
+        kernel writes scale factors with bounds checking disabled, so
+        ``mask[i] > M`` corrupts neighboring groups or writes out of bounds.
+    backend : {``"cutile"``, ``"cake"``}
+        Implementation backend. ``"cutile"`` remains the default and fallback
+        path. ``"cake"`` explicitly selects a generated, exact-architecture
+        Blackwell profile and raises a clear error when that profile is not
+        installed; runtime launch failures are never silently retried through a
+        different implementation.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(x_q, sf)`` where ``x_q`` has logical shape
+        ``[M, padded_K, B]`` with dtype ``float8_e4m3fn`` and ``sf`` has
+        logical shape ``[32, 4, padded_M // 128, 4, padded_K // 128, B]``
+        with dtype ``uint8``. ``padded_K`` rounds ``K`` up to a multiple
+        of 128. The physical layouts are grouped by ``B`` and then
+        permuted to match FlashInfer masked grouped GEMM conventions.
+
+        Only the first ``mask[i]`` rows of group ``i`` are written;
+        rows ``>= mask[i]`` (and their scale factors) are unspecified.
+        The consumer must use the same ``mask`` and read only the valid rows.
+    """
+
+    if backend not in ("cutile", "cake"):
+        raise ValueError(f"Unsupported backend for mxfp8_grouped_quantize: {backend!r}")
+    if a.dim() != 3:
+        raise ValueError("a must be a 3D tensor with shape [B, M, K]")
+    if not a.is_cuda:
+        raise ValueError("a must be a CUDA tensor")
+    if a.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("a dtype must be torch.float16 or torch.bfloat16")
+    if mask.dim() != 1 or mask.size(0) != a.size(0):
+        raise ValueError("mask must be a 1D tensor with one entry per group")
+    if mask.dtype != torch.int32:
+        raise ValueError("mask dtype must be torch.int32")
+    if not mask.is_cuda:
+        raise ValueError("mask must be a CUDA tensor")
+    if mask.device != a.device:
+        raise ValueError("mask must live on the same CUDA device as a")
+
+    major, _ = get_compute_capability(a.device)
+    if major < 10:
+        raise RuntimeError("mxfp8_grouped_quantize requires SM100 or newer")
+
+    if backend == "cutile":
+        if not is_cuda_tile_available():
+            raise RuntimeError(
+                "mxfp8_grouped_quantize requires the cuTile backend; install "
+                "cuda-tile>=1.4.0 and ensure the tileiras compiler is available."
+            )
+        _, _, k = a.shape
+        if k % 32 != 0:
+            raise ValueError(f"K must be divisible by 32, got {k}")
+        return get_mxfp8_grouped_quantization_module().mxfp8_grouped_quantize_impl(
+            a, mask
+        )
+
+    _, _, k = a.shape
+    if k % 32 != 0:
+        raise ValueError(f"K must be divisible by 32, got {k}")
+    return _mxfp8_grouped_quantize_cake(a, mask, backend="cake")
+
+
 @flashinfer_api
 def mxfp8_dequantize_host(
     input: torch.Tensor,
@@ -297,3 +590,68 @@ def mxfp8_dequantize_host(
         scale_tensor,
         sf_swizzle_layout,
     )
+
+
+@flashinfer_api
+def per_token_group_quant_8bit(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    dst_dtype: Optional[torch.dtype] = None,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
+    backend: Literal["cutile"] = "cutile",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Per-token group 8-bit quantization (FP8 or INT8).
+
+    Quantizes ``x`` along its last dimension in contiguous groups of
+    ``group_size`` elements, producing a quantized tensor and a per-group scale
+    tensor. This is the per-token-group quantization used by block-scaled FP8 /
+    INT8 GEMM paths (e.g. DeepGEMM-style grouped quantization).
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input tensor to quantize; the last dimension must be a multiple of
+        ``group_size``.
+    group_size : int
+        Number of elements per quantization group (along the last dimension).
+    eps : float
+        Epsilon for numerical stability when computing per-group scales.
+    dst_dtype : Optional[torch.dtype]
+        Quantized output dtype (``torch.float8_e4m3fn`` or ``torch.int8``).
+        Defaults to ``torch.float8_e4m3fn``.
+    column_major_scales : bool
+        If ``True``, return the scale tensor in column-major (Fortran) memory
+        layout. The logical shape is unchanged.
+    scale_tma_aligned : bool
+        If ``True``, pad the scale tensor's leading dimension for TMA alignment.
+    scale_ue8m0 : bool
+        If ``True``, encode scales in the UE8M0 format (Blackwell / sm100+).
+    backend : str
+        Implementation backend. Currently only ``"cutile"`` (the cuda.tile
+        Python backend) is supported.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(x_q, x_s)``: the quantized tensor (same shape as ``x``) and the
+        per-group scale tensor of shape ``(*x.shape[:-1], x.shape[-1] // group_size)``.
+    """
+    if backend == "cutile":
+        from .kernels.cutile.per_token_group_quant_8bit_cutile import (
+            per_token_group_quant_8bit_cutile,
+        )
+
+        return per_token_group_quant_8bit_cutile(
+            x,
+            group_size,
+            eps=eps,
+            dst_dtype=dst_dtype,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
+        )
+
+    raise ValueError(f"Unsupported backend for per_token_group_quant_8bit: {backend!r}")

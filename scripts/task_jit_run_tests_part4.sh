@@ -10,7 +10,7 @@ set -x
 source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
 
 if [ "$SKIP_INSTALL" = "0" ]; then
-  pip install -e . -v
+  install_flashinfer_editable
 fi
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # avoid memory fragmentation

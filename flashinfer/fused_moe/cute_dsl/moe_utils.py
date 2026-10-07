@@ -14,13 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import ctypes
 import functools
+import math
 from enum import IntEnum
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 
 from ...jit.moe_utils import gen_moe_utils_module
+from ...tllm_enums import ActivationType, is_gated_activation, normalize_activation_type
 
 
 def _get_cuda_stream_ptr() -> int:
@@ -32,7 +35,75 @@ def _get_cuda_stream_ptr() -> int:
     return torch.cuda.current_stream().cuda_stream
 
 
+def _is_finite_fp32(value: float, *, positive: bool = False) -> bool:
+    """Whether ``value`` is finite (and positive, if requested) after fp32 rounding.
+
+    The kernels consume these constants (and, for the SiTU scales, their
+    reciprocals) as fp32, so a Python float that rounds to ``0.0`` or ``inf``
+    in fp32 is unusable even though it is finite and positive in f64.
+    """
+    if not math.isfinite(value) or (positive and value <= 0):
+        return False
+    value_f32 = ctypes.c_float(value).value
+    return math.isfinite(value_f32) and (not positive or value_f32 > 0)
+
+
 # ============================ Helper Functions ============================
+
+
+SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES = (
+    ActivationType.Swiglu,
+    ActivationType.GegluTanh,
+    ActivationType.Relu2,
+)
+
+
+def normalize_cute_dsl_moe_activation_type(
+    activation_type: Union[int, ActivationType],
+) -> Tuple[ActivationType, bool]:
+    activation_type = normalize_activation_type(activation_type)
+    if activation_type not in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES:
+        expected = " or ".join(repr(t) for t in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES)
+        raise ValueError(
+            f"Unsupported activation_type {activation_type!r}; expected {expected}"
+        )
+    return activation_type, is_gated_activation(activation_type)
+
+
+def validate_cute_dsl_moe_swiglu_config(
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
+) -> None:
+    """Validate the SwiGLU epilogue constants."""
+    if not _is_finite_fp32(swiglu_alpha):
+        raise ValueError("swiglu_alpha must be finite in fp32")
+    if not _is_finite_fp32(swiglu_beta):
+        raise ValueError("swiglu_beta must be finite in fp32")
+    if not _is_finite_fp32(swiglu_limit, positive=True):
+        raise ValueError("swiglu_limit must be positive and finite in fp32")
+
+
+def validate_cute_dsl_moe_situ_config(
+    activation_type: ActivationType,
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
+) -> None:
+    """Validate the optional SiTU variant of the SwiGLU epilogue."""
+    if situ_beta is None:
+        if situ_linear_beta is not None:
+            raise ValueError("situ_linear_beta requires situ_beta")
+        return
+    if activation_type != ActivationType.Swiglu:
+        raise ValueError("SiTU parameters require ActivationType.Swiglu")
+    if not _is_finite_fp32(situ_beta, positive=True):
+        raise ValueError("situ_beta must be positive and finite in fp32")
+    if situ_linear_beta is not None and not _is_finite_fp32(
+        situ_linear_beta, positive=True
+    ):
+        raise ValueError(
+            "situ_linear_beta must be positive and finite in fp32 when set"
+        )
 
 
 def get_max_num_tiles(
@@ -207,6 +278,7 @@ def moe_permute(
         top_k,
         tile_size,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 
@@ -218,6 +290,7 @@ def moe_unpermute(
     num_tokens: int,
     top_k: int,
     enable_pdl: bool = False,
+    input_is_expanded: bool = False,
 ) -> None:
     """
     Unpermute and scale outputs after expert computation.
@@ -239,6 +312,8 @@ def moe_unpermute(
         top_k: Number of experts per token.
         enable_pdl: Enable Programmatic Dependent Launch for better kernel overlap.
                     Default is False.
+        input_is_expanded: Whether input rows use expanded (token, top-k slot)
+            order instead of expert-permuted order.
 
     Note:
         Output is the weighted sum of expert contributions:
@@ -270,7 +345,9 @@ def moe_unpermute(
         num_tokens,
         hidden_size,
         top_k,
+        input_is_expanded,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 
@@ -603,6 +680,11 @@ def moe_sort(
 
     # Use pre-allocated buffers if provided, otherwise allocate new ones
     # Pre-allocation is required for CUDA graph compatibility
+    #
+    # Entries outside the active prefix are intentionally uninitialized.
+    # Routing writes [0, num_non_exiting_tiles), and both GEMMs consume exactly
+    # that count. Rubin multi-CTA tactics, which would require rounded/padded
+    # metadata entries, are rejected before moe_sort.
     if out_tile_idx_to_expert_idx is not None:
         tile_idx_to_expert_idx = out_tile_idx_to_expert_idx
     else:

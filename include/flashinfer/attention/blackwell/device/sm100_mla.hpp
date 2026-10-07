@@ -116,9 +116,15 @@ class MLA {
     auto [H, K, D, B] = args.problem_shape;
     int sm_count = args.hw_info.sm_count;
     int max_splits = ceil_div(K, 128);
-    int sms_per_batch = max(1, sm_count / B);
+    // Each split is executed by a full CTA cluster (ClusterShape[0] CTAs — 2
+    // for this 2-SM kernel), so the per-batch split budget must count cluster
+    // slots, not raw SMs. Budgeting raw SMs over-splits ~2x: the extra splits
+    // do not fit in one wave of cluster slots and also double the LSE
+    // reduction width, costing up to ~2x MLA decode latency at DeepSeek
+    // shapes (measured on B200/B300).
+    int ctas_per_split = cute::size<0>(typename Kernel::ClusterShape{});
+    int sms_per_batch = max(1, sm_count / max(1, B * ctas_per_split));
     int split_heur = min(max_splits, sms_per_batch);
-    int waves = ceil_div(B * split_heur, sm_count);
     int k_waves = ceil_div(max_splits, split_heur);
     int split_wave_aware = ceil_div(max_splits, k_waves);
     args.split_kv = split_wave_aware;

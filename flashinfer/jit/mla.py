@@ -15,18 +15,80 @@ limitations under the License.
 """
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, current_compilation_context
+from .core import JitSpec, current_compilation_context, gen_jit_spec
 
 
 def gen_mla_module() -> JitSpec:
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
     return gen_jit_spec(
         "mla",
         [
             jit_env.FLASHINFER_CSRC_DIR / "cutlass_mla.cu",
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_mla_binding.cu",
+        ],
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_sparse_mla_nvfp4_sm120_module() -> JitSpec:
+    """Compatibility alias: the NVFP4 route lives in the unified SM120 module."""
+    return gen_sparse_mla_sm120_module()
+
+
+def gen_sparse_mla_dsv4_nvfp4_cache_ops_module() -> JitSpec:
+    """DSv4 NVFP4 cache pack / append kernels only.
+
+    The quantizer (E2M1 codes via ``cvt.rn.satfinite.e2m1x2``, E4M3 group scales, bit-exact
+    BF16 RoPE copy) is architecture-generic for compute capability 10.0 and above, so one
+    module serves SM100 / SM103 (``backend="cake"``) and SM120 / SM121 (``backend="sparse"``).
+    Unlike :func:`gen_sparse_mla_sm120_module` it does not pull in the SM120 attention
+    kernels, which do not build for ``sm_100a`` / ``sm_103a``.
+    """
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 12]
+    )
+    return gen_jit_spec(
+        "sparse_mla_dsv4_nvfp4_cache_ops",
+        [jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_cache_ops.cu"],
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_sparse_mla_nvfp4_sm120_tile_module() -> JitSpec:
+    """Compatibility alias: the MMA layout probes live in the unified module."""
+    return gen_sparse_mla_sm120_module()
+
+
+def gen_sparse_mla_sm120_module() -> JitSpec:
+    """Sparse-MLA paged attention for SM120.
+
+    Monolithic module: runtime dispatch on model type, head count, top-k,
+    page block size, and optional extra page block size happens inside the
+    orchestrator.
+    """
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+    return gen_jit_spec(
+        "sparse_mla_sm120",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv32_decode_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/decode_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv41_fp4_cache_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "sparse_mla_sm120/cake_dsv41_fp8_cache_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/nvfp4_mma_layout_probe.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_cache_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "sparse_mla_sm120/dsv4_nvfp4_attention_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_resolve.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/attention_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/attention_resolve.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
     )

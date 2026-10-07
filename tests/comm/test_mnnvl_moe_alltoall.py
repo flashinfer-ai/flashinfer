@@ -129,6 +129,8 @@ def fake_moe(
     is_ep=False,
     ep_rank=None,
     num_experts_per_rank=None,
+    lora_ids=None,
+    lora_weights=None,
 ):
     """
     Emulate MoE computation by scaling tokens based on which experts belong to this rank.
@@ -141,6 +143,8 @@ def fake_moe(
         is_ep: If true, emulate MoE on a EP rank; otherwise, emulate MoE with all experts
         ep_rank: EP rank ID
         num_experts_per_rank: Number of experts per rank
+        lora_ids: [num_tokens] int32 per-token LoRA adapter IDs, or None
+        lora_weights: [num_adapters, hidden_size, hidden_size] shared LoRA weights, or None
 
     Returns:
         processed_states: [num_tokens, hidden_size] - processed hidden states
@@ -173,7 +177,13 @@ def fake_moe(
                 expert = experts[expert_id]
 
             scale = token_final_scales[token_idx, k]
-            results.append(hidden_states[token_idx] @ expert * scale)
+            expert_out = hidden_states[token_idx] @ expert * scale
+            if lora_ids is not None and lora_weights is not None:
+                lora_id = lora_ids[token_idx].item()
+                expert_out = (
+                    expert_out + hidden_states[token_idx] @ lora_weights[lora_id]
+                )
+            results.append(expert_out)
 
         # Summing the results after is closer to the actual implementation as we do a tree reduction.
         if results:
@@ -184,14 +194,25 @@ def fake_moe(
     return processed_states
 
 
+# Number of distinct LoRA adapter IDs in tests.  Used by both
+# test_moe_a2a_dispatch and test_moe_a2a_dispatch_moe_combine.
+NUM_LORA_ADAPTERS = 4
+
+
 def make_nvfp4_payloads(
     local_num_tokens: int,
     hidden_size: int,
     top_k: int,
     rank: int,
     token_selected_experts: torch.Tensor,
+    lora_ids: torch.Tensor | None = None,
 ) -> tuple[list, int]:
-    """Create the four NV FP4 payloads exactly as in single-GPU test."""
+    """Create the production NVFP4 dispatch wire layout, with an optional
+    fifth LoRA adapter-ID payload.
+
+    Dispatch copies opaque bytes, so uint8 scale patterns avoid requiring FP8
+    arithmetic while preserving the production one-byte scale width.
+    """
     payloads = []
     # Payload 0: Packed FP4 tokens (uint8)
     packed_hidden_size = hidden_size // 2
@@ -200,21 +221,24 @@ def make_nvfp4_payloads(
     )
     payloads.append(packed_hidden_states)
 
-    # Payload 1: Scaling factors (fp8)
+    # Payload 1: One-byte scaling factors (FP8 on the production path)
     num_elts_per_sf = 16
     num_scaling_factors = hidden_size // num_elts_per_sf
-    scaling_factors = torch.randn(
-        local_num_tokens, num_scaling_factors, dtype=torch.float32, device="cuda"
-    )  #  .to(torch.float8_e4m3fn) TODO: Test failed.
-    scaling_factors += rank
+    scaling_factors = torch.randint(
+        0,
+        256,
+        (local_num_tokens, num_scaling_factors),
+        dtype=torch.uint8,
+        device="cuda",
+    )
     payloads.append(scaling_factors)
 
     # Payload 2: token_selected_experts
     payloads.append(token_selected_experts)
 
-    # Payload 3: token_final_scales (bfloat16)
+    # Payload 3: FP32 routing weights, matching the production wire width
     token_final_scales = torch.rand(
-        local_num_tokens, top_k, dtype=torch.bfloat16, device="cuda"
+        local_num_tokens, top_k, dtype=torch.float32, device="cuda"
     )
 
     # Construct the data to contain info about send rank and local_token_idx, which is used for debugging
@@ -222,6 +246,12 @@ def make_nvfp4_payloads(
     # token_final_scales[:, 1] = torch.linspace(0, local_num_tokens - 1, local_num_tokens, dtype=torch.bfloat16, device='cuda')
 
     payloads.append(token_final_scales)
+
+    # Payload 4 (optional): LoRA adapter IDs
+    if lora_ids is not None:
+        # Dispatch kernel requires 2D payloads [num_tokens, elements_per_token]
+        payloads.append(lora_ids.unsqueeze(-1))
+
     return payloads, 2
 
 
@@ -231,6 +261,7 @@ def make_bfloat16_payloads(
     top_k: int,
     rank: int,
     token_selected_experts: torch.Tensor,
+    lora_ids: torch.Tensor | None = None,
 ) -> tuple[list, int]:
     """Create bfloat16 test payloads matching nvfp4 structure but without scaling factors."""
     payloads = []
@@ -257,6 +288,12 @@ def make_bfloat16_payloads(
 
     payloads.append(token_final_scales)
 
+    # Payload 3 (optional): LoRA adapter IDs
+    if lora_ids is not None:
+        payloads.append(
+            lora_ids.unsqueeze(-1)
+        )  # [num_tokens, 1] for 2D dispatch requirement
+
     return payloads, 1
 
 
@@ -267,6 +304,7 @@ def run_moe_a2a_dispatch_single_rank(
     num_experts_per_rank,
     hidden_size,
     invalid_token_expert_id,
+    use_lora=False,
 ):
     """Worker function for MPI testing."""
     comm = MPI.COMM_WORLD
@@ -292,12 +330,21 @@ def run_moe_a2a_dispatch_single_rank(
     # Create MoeAlltoAll manager
     max_num_tokens = max(all_num_tokens)
 
+    # When use_lora is True, account for the extra int32 LoRA ID payload (4 bytes/token).
+    extra_payload_bytes = 4 if use_lora else 0
+    workspace_size_per_rank = MoeAlltoAll.get_moe_workspace_size_per_rank(
+        ep_size,
+        top_k,
+        max_num_tokens,
+        hidden_size,
+        extra_payload_bytes_per_token=extra_payload_bytes,
+    )
     moe_a2a = MoeAlltoAll(
         mapping,
         max_num_tokens,
         top_k,
         ep_size * num_experts_per_rank,
-        hidden_size=hidden_size,
+        workspace_size_per_rank=workspace_size_per_rank,
     )
 
     # Get the number of tokens for this specific rank (same as single-GPU)
@@ -307,8 +354,22 @@ def run_moe_a2a_dispatch_single_rank(
     token_selected_experts = generate_token_selected_experts(
         rank_local_tokens, ep_size, num_experts_per_rank, top_k
     )
+    lora_ids = None
+    if use_lora:
+        lora_ids = torch.randint(
+            0,
+            NUM_LORA_ADAPTERS,
+            (rank_local_tokens,),
+            dtype=torch.int32,
+            device="cuda",
+        )
     payloads, expert_id_payload_index = make_nvfp4_payloads(
-        rank_local_tokens, hidden_size, top_k, rank, token_selected_experts
+        rank_local_tokens,
+        hidden_size,
+        top_k,
+        rank,
+        token_selected_experts,
+        lora_ids=lora_ids,
     )
 
     check_any_rank_failed()
@@ -555,7 +616,7 @@ def verify_dispatch(
                     assert torch.all(token_expert_ids == invalid_token_expert_id)
 
 
-def moe_a2a_dispatch_test_impl(distribution, top_k):
+def moe_a2a_dispatch_test_impl(distribution, top_k, use_lora=False, hidden_size=1024):
     """Test MoE A2A dispatch operation."""
     comm = MPI.COMM_WORLD
     world_size = comm.Get_size()
@@ -572,13 +633,10 @@ def moe_a2a_dispatch_test_impl(distribution, top_k):
     try:
         MnnvlMemory.initialize()
         if not mnnvl_available():
-            pytest.skip(
-                "MNNVL not supported on this system or container lacks SYS_PTRACE capability"
-            )
+            pytest.skip("MNNVL not supported on this system")
     except Exception:
         pytest.skip("MNNVL not supported on this system")
 
-    hidden_size = 1024
     num_experts_per_rank = max(8, (top_k + ep_size - 1) // ep_size)
     invalid_token_expert_id = -1
 
@@ -598,6 +656,7 @@ def moe_a2a_dispatch_test_impl(distribution, top_k):
         num_experts_per_rank,
         hidden_size,
         invalid_token_expert_id,
+        use_lora=use_lora,
     )
 
     check_any_rank_failed()
@@ -639,22 +698,48 @@ def moe_a2a_dispatch_test_impl(distribution, top_k):
 
 
 @pytest.mark.parametrize(
-    "distribution,top_k",
+    "distribution,top_k,use_lora",
     [
-        ("random", 1),  # topk=1 with random distribution
-        ("uniform", 1),  # topk=1 with uniform distribution
-        ("random", 2),  # topk=2 with random distribution
-        ("uniform", 2),  # topk=2 with uniform distribution
-        ("random", 8),  # topk=8 with random distribution
-        ("uniform", 8),  # topk=8 with uniform distribution
+        ("random", 1, False),
+        ("uniform", 1, False),
+        ("random", 2, False),
+        ("uniform", 2, False),
+        ("random", 8, False),
+        ("uniform", 8, False),
+        ("random", 8, True),  # LoRA + nvfp4 payloads
+        ("uniform", 8, True),
     ],
 )
-def test_moe_a2a_dispatch(distribution, top_k):
+def test_moe_a2a_dispatch(distribution, top_k, use_lora):
     """Test MoE A2A dispatch operation."""
-    safe_run(moe_a2a_dispatch_test_impl, distribution, top_k)
+    safe_run(moe_a2a_dispatch_test_impl, distribution, top_k, use_lora)
 
 
-def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
+def test_moe_a2a_dispatch_phased_h2048_nvfp4():
+    """Exercise the specialized H2048/top-k-22 NVFP4 dispatch kernel."""
+    ep_size = MPI.COMM_WORLD.Get_size()
+    if ep_size not in (4, 8, 16):
+        pytest.skip("phased NVFP4 dispatch requires EP4, EP8, or EP16")
+    safe_run(moe_a2a_dispatch_test_impl, "uniform", 22, False, 2048)
+
+
+def create_lora_weights(num_adapters, hidden_size, device, dtype=torch.bfloat16):
+    """Create shared LoRA weights deterministically (same on all ranks).
+
+    Uses fork_rng to avoid disturbing the caller's RNG state while ensuring
+    all ranks produce identical weights from a fixed seed.
+    """
+    lora_weights = torch.empty(
+        (num_adapters, hidden_size, hidden_size), dtype=dtype, device=device
+    )
+    with torch.random.fork_rng(devices=[device]):
+        torch.manual_seed(9999)
+        for i in range(num_adapters):
+            torch.nn.init.xavier_uniform_(lora_weights[i])
+    return lora_weights
+
+
+def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k, use_lora=False):
     """Test full MoE A2A dispatch + expert processing + combine cycle."""
 
     comm = MPI.COMM_WORLD
@@ -673,9 +758,7 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
     try:
         MnnvlMemory.initialize()
         if not mnnvl_available():
-            pytest.skip(
-                "MNNVL not supported on this system or container lacks SYS_PTRACE capability"
-            )
+            pytest.skip("MNNVL not supported on this system")
     except Exception:
         pytest.skip("MNNVL not supported on this system")
 
@@ -709,8 +792,27 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
         local_num_tokens, ep_size, num_experts_per_rank, top_k
     )
 
+    lora_ids = None
+    lora_weights = None
+    if use_lora:
+        lora_ids = torch.randint(
+            0,
+            NUM_LORA_ADAPTERS,
+            (local_num_tokens,),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        lora_weights = create_lora_weights(
+            NUM_LORA_ADAPTERS, hidden_size, "cuda", dtype=torch.bfloat16
+        )
+
     payloads, expert_id_payload_index = make_bfloat16_payloads(
-        local_num_tokens, hidden_size, top_k, rank, token_selected_experts
+        local_num_tokens,
+        hidden_size,
+        top_k,
+        rank,
+        token_selected_experts,
+        lora_ids=lora_ids,
     )
 
     hidden_states = payloads[0]
@@ -737,15 +839,25 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
         token_final_scales,
         all_experts,
         is_ep=False,
+        lora_ids=lora_ids,
+        lora_weights=lora_weights,
     )
 
-    # Initialize MoeAlltoAll
+    # Initialize MoeAlltoAll — extra_payload_bytes_per_token accounts for LoRA ID
+    extra_payload_bytes = 4 if use_lora else 0
+    workspace_size_per_rank = MoeAlltoAll.get_moe_workspace_size_per_rank(
+        ep_size,
+        top_k,
+        max_num_tokens,
+        hidden_size,
+        extra_payload_bytes_per_token=extra_payload_bytes,
+    )
     moe_a2a = MoeAlltoAll(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
         num_experts=ep_size * num_experts_per_rank,
-        hidden_size=hidden_size,
+        workspace_size_per_rank=workspace_size_per_rank,
     )
 
     check_any_rank_failed()
@@ -761,6 +873,10 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
     hidden_states_recv = recv_tensors[0]  # [ep_size, max_tokens, hidden_size]
     token_selected_experts_recv = recv_tensors[1]  # [ep_size, max_tokens, top_k]
     token_final_scales_recv = recv_tensors[2]  # [ep_size, max_tokens, top_k]
+
+    recv_lora_ids = None
+    if use_lora:
+        recv_lora_ids = recv_tensors[3].flatten()  # [ep_size * max_tokens]
 
     # Get workspace-backed tensor for output
     moe_output = moe_a2a.get_combine_payload_tensor_in_workspace(
@@ -782,10 +898,12 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
             token_final_scales_recv.view(
                 ep_size * max_num_tokens, token_final_scales_recv.shape[-1]
             ),
-            rank_experts,  # experts for current rank
+            rank_experts,
             is_ep=True,
             ep_rank=rank,
             num_experts_per_rank=num_experts_per_rank,
+            lora_ids=recv_lora_ids,
+            lora_weights=lora_weights,
         ).view(ep_size, max_num_tokens, hidden_size)
     )
 
@@ -819,21 +937,23 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
 
 
 @pytest.mark.parametrize(
-    "distribution,top_k",
+    "distribution,top_k,use_lora",
     [
-        ("random", 1),  # topk=1 with random distribution
-        ("uniform", 1),  # topk=1 with uniform distribution
-        ("random", 2),  # topk=2 with random distribution
-        ("uniform", 2),  # topk=2 with uniform distribution
-        ("random", 8),  # topk=8 with random distribution
-        ("uniform", 8),  # topk=8 with uniform distribution
+        ("random", 1, False),
+        ("uniform", 1, False),
+        ("random", 2, False),
+        ("uniform", 2, False),
+        ("random", 8, False),
+        ("uniform", 8, False),
+        ("random", 2, True),  # LoRA with topk=2
+        ("uniform", 8, True),  # LoRA with topk=8
     ],
 )
-def test_moe_a2a_dispatch_moe_combine(distribution, top_k):
+def test_moe_a2a_dispatch_moe_combine(distribution, top_k, use_lora):
     """Test full MoE A2A dispatch + expert processing + combine cycle."""
-    safe_run(moe_a2a_dispatch_moe_combine_test_impl, distribution, top_k)
+    safe_run(moe_a2a_dispatch_moe_combine_test_impl, distribution, top_k, use_lora)
 
 
 if __name__ == "__main__":
-    # Run with: mpirun -n 2 python -m pytest tests/comm/test_mnnvl_a2a.py -v
+    # Run with: mpirun -n 4 python -m pytest tests/comm/test_mnnvl_moe_alltoall.py -v
     pytest.main([__file__, "-v", "-s"])

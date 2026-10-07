@@ -6,10 +6,16 @@ from dataclasses import dataclass
 
 import torch
 
+from .moe_w4a16_activations import (
+    SUPPORTED_MOE_ACTIVATIONS,
+    is_gated_moe_activation,
+    normalize_moe_activation,
+)
+
 
 _W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
 _ROUTED_SIZE_TARGET_FILL = 0.9
-_SUPPORTED_ACTIVATIONS = {"silu", "relu2"}
+_SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
 
 
 @dataclass(frozen=True)
@@ -47,9 +53,8 @@ class W4A16BufferPlan:
 
 
 def validate_activation(activation: str) -> bool:
-    if activation not in _SUPPORTED_ACTIVATIONS:
-        raise ValueError(f"unsupported activation {activation!r}")
-    return activation == "silu"
+    activation = normalize_moe_activation(activation)
+    return is_gated_moe_activation(activation)
 
 
 def validate_w4a16_packed_inputs(
@@ -109,51 +114,6 @@ def unswizzle_block_scale(
     return unswizzled[:rows, :cols_blocks].to(torch.float32)
 
 
-def normalize_expert_block_scales(
-    blockscale: torch.Tensor,
-    *,
-    num_experts: int,
-    rows: int,
-    cols: int,
-) -> torch.Tensor:
-    if cols % 16 != 0:
-        raise ValueError(
-            f"W4A16 block scales require cols to be a multiple of 16, got {cols}"
-        )
-
-    cols_blocks = int(cols) // 16
-    cols_padded = ((cols_blocks + 3) // 4) * 4
-    rows_padded = ((int(rows) + 127) // 128) * 128
-    row_groups = rows_padded // 128
-    col_groups = cols_padded // 4
-    expected_elements = int(num_experts) * rows_padded * cols_padded
-
-    # FlashInfer's existing public path passes the logical 6D MMA view from
-    # convert_sf_to_mma_layout: (32, 4, row_groups, 4, col_groups, E).
-    if tuple(blockscale.shape) == (32, 4, row_groups, 4, col_groups, int(num_experts)):
-        from flashinfer.cute_dsl.utils import convert_sf_from_mma_layout
-
-        return convert_sf_from_mma_layout(
-            blockscale,
-            m=int(rows),
-            k=int(cols),
-            num_groups=int(num_experts),
-            sf_vec_size=16,
-        ).reshape(int(num_experts), rows_padded, cols_padded)
-
-    if blockscale.numel() != expected_elements:
-        raise ValueError(
-            "W4A16 block scales must be either FlashInfer's 6D MMA layout "
-            f"{(32, 4, row_groups, 4, col_groups, int(num_experts))} or "
-            "expert-leading swizzled storage with "
-            f"{expected_elements} elements; got shape {tuple(blockscale.shape)}"
-        )
-
-    if blockscale.ndim > 0 and int(blockscale.shape[0]) == int(num_experts):
-        return blockscale
-    return blockscale.reshape(int(num_experts), rows_padded, cols_padded)
-
-
 def unswizzle_expert_scales(
     swizzled: torch.Tensor,
     *,
@@ -198,6 +158,17 @@ def max_packed_route_slots(numel: int, block_size: int, num_experts: int) -> int
             max_packed_routes,
         )
     return max_packed_routes
+
+
+def route_pack_numel_capacity(numel: int, topk: int = 1) -> int:
+    topk = max(int(topk), 1)
+    tokens = (max(int(numel), 1) + topk - 1) // topk
+    return route_pack_token_capacity(tokens, topk) * topk
+
+
+def route_pack_token_capacity(tokens: int, topk: int) -> int:
+    del topk
+    return 1 << (max(int(tokens), 1) - 1).bit_length()
 
 
 def max_w4a16_route_capacity(routed_rows: int, num_experts: int) -> tuple[int, int]:
@@ -332,20 +303,67 @@ def make_w4a16_packed_buffers(
     )
 
 
+def normalize_expert_block_scales(
+    blockscale: torch.Tensor,
+    *,
+    num_experts: int,
+    rows: int,
+    cols: int,
+) -> torch.Tensor:
+    if cols % 16 != 0:
+        raise ValueError(
+            f"W4A16 block scales require cols to be a multiple of 16, got {cols}"
+        )
+
+    cols_blocks = int(cols) // 16
+    cols_padded = ((cols_blocks + 3) // 4) * 4
+    rows_padded = ((int(rows) + 127) // 128) * 128
+    row_groups = rows_padded // 128
+    col_groups = cols_padded // 4
+    expected_elements = int(num_experts) * rows_padded * cols_padded
+
+    # FlashInfer's existing public path passes the logical 6D MMA view from
+    # convert_sf_to_mma_layout: (32, 4, row_groups, 4, col_groups, E).
+    if tuple(blockscale.shape) == (32, 4, row_groups, 4, col_groups, int(num_experts)):
+        from flashinfer.cute_dsl.utils import convert_sf_from_mma_layout
+
+        return convert_sf_from_mma_layout(
+            blockscale,
+            m=int(rows),
+            k=int(cols),
+            num_groups=int(num_experts),
+            sf_vec_size=16,
+        ).reshape(int(num_experts), rows_padded, cols_padded)
+
+    if blockscale.numel() != expected_elements:
+        raise ValueError(
+            "W4A16 block scales must be either FlashInfer's 6D MMA layout "
+            f"{(32, 4, row_groups, 4, col_groups, int(num_experts))} or "
+            "expert-leading swizzled storage with "
+            f"{expected_elements} elements; got shape {tuple(blockscale.shape)}"
+        )
+
+    if blockscale.ndim > 0 and int(blockscale.shape[0]) == int(num_experts):
+        return blockscale
+    return blockscale.reshape(int(num_experts), rows_padded, cols_padded)
+
+
 __all__ = [
     "W4A16BufferPlan",
     "W4A16PackedBuffers",
     "W4A16PackedShape",
     "make_w4a16_packed_buffers",
     "max_w4a16_route_capacity",
-    "normalize_expert_block_scales",
     "packed_gemm_scratch_elements",
     "max_packed_route_slots",
     "plan_w4a16_buffers",
     "reorder_w13_to_gate_up",
+    "route_pack_numel_capacity",
+    "route_pack_token_capacity",
     "select_route_block_size_m",
     "unswizzle_block_scale",
     "unswizzle_expert_scales",
+    "normalize_expert_block_scales",
     "validate_activation",
     "validate_w4a16_packed_inputs",
 ]

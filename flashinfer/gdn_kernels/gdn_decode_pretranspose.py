@@ -30,6 +30,10 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
+from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from .cute_dsl_cache_naming import make_kernel_name
+from .device_target import gdn_compile_options, gdn_device_target, target_arch
+
 # ============================================================================
 # Constants for PRETRANSPOSE version ([B*HV, V, K])
 # ============================================================================
@@ -62,7 +66,6 @@ def gdn_decode_kernel_small_batch_pretranspose(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -383,7 +386,6 @@ def gdn_decode_kernel_big_batch_pretranspose(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -690,7 +692,6 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -712,6 +713,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         v_dim = h0_source.layout.shape[1]
         k_dim = h0_source.layout.shape[2]
     # Grid size: use B*HV (actual batch) not h0_source.shape[0] (which may be pool_size*HV)
+    B = cute.size(q.shape[0])
     grid_batch = B * HV
 
     # Create cp.async copy with cache-global mode (bypass L1)
@@ -768,7 +770,6 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -803,7 +804,6 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -820,6 +820,7 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
     else:
         v_dim = h0_source.layout.shape[1]
         k_dim = h0_source.layout.shape[2]
+    B = cute.size(q.shape[0])
     grid_batch = B * HV
 
     # Create cp.async copy with cache-global mode (bypass L1)
@@ -876,7 +877,6 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -898,9 +898,11 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
 # ============================================================================
 
 
-@functools.cache
-def _get_compiled_decode_kernel(
-    B: int,
+_CUTE_DSL_MODULE = "gdn_decode_pretranspose"
+
+
+def _pretranspose_kernel_name(
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -910,8 +912,42 @@ def _get_compiled_decode_kernel(
     scale: float,
     use_qk_l2norm: bool,
     use_pool_indexing: bool = False,
-    pool_size: int = 0,
-    stride0: int = 0,
+    stride1: int = 0,
+    stride2: int = 0,
+    stride3: int = 0,
+) -> str:
+    """Specialization name within the gdn_decode_pretranspose module, encoding
+    every parameter that affects codegen."""
+    return make_kernel_name(
+        "decode",
+        target_arch(target_key),
+        T,
+        H,
+        HV,
+        K,
+        V,
+        dtype,
+        scale,
+        use_qk_l2norm,
+        use_pool_indexing,
+        stride1,
+        stride2,
+        stride3,
+    )
+
+
+@functools.cache
+def _get_compiled_decode_kernel(
+    target_key: tuple,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+    scale: float,
+    use_qk_l2norm: bool,
+    use_pool_indexing: bool = False,
     stride1: int = 0,
     stride2: int = 0,
     stride3: int = 0,
@@ -961,12 +997,16 @@ def run_pretranspose_decode(
     """
     # Compile kernel with TVM FFI (cached)
     if use_pool_indexing:
-        pool_size = int(h0_source.shape[0])
         stride0, stride1, stride2, stride3 = tuple(int(x) for x in h0_source.stride())
+        assert stride0 % 4 == 0, (
+            "initial_state stride(0) must be a multiple of 4 FP32 elements "
+            f"for 128-bit state copies, got stride(0)={stride0}"
+        )
     else:
-        pool_size = stride0 = stride1 = stride2 = stride3 = 0
+        stride1 = stride2 = stride3 = 0
+    target = gdn_device_target(q.device)
     cache_key = (
-        B,
+        target.compile_key,
         T,
         H,
         HV,
@@ -976,88 +1016,115 @@ def run_pretranspose_decode(
         scale,
         use_qk_l2norm,
         use_pool_indexing,
-        pool_size,
-        stride0,
         stride1,
         stride2,
         stride3,
     )
     cache = _get_compiled_decode_kernel(*cache_key)
 
-    # Get or create h0_indices and cu_seqlens (cached per config)
-    if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
-        cache["h0_indices"] = torch.zeros(B, dtype=torch.int32, device=q.device)
-        cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    aux_map = cache.setdefault("aux", {})
+    aux_key = (B, q.device)
+    if aux_key not in aux_map:
+        aux_map[aux_key] = (
+            torch.zeros(B, dtype=torch.int32, device=q.device),
+            torch.zeros(B + 1, dtype=torch.int32, device=q.device),
+        )
+    default_h0_indices, cu_seqlens = aux_map[aux_key]
 
     if use_pool_indexing and initial_state_indices is not None:
         h0_indices = initial_state_indices.to(torch.int32)
     else:
-        h0_indices = cache["h0_indices"]
+        h0_indices = default_h0_indices
     # Resolve output indices: default to same as read indices
     if use_pool_indexing and output_state_indices is not None:
         h0_out_indices = output_state_indices.to(torch.int32)
     else:
         h0_out_indices = h0_indices
-    cu_seqlens = cache["cu_seqlens"]
 
     if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
-        # Convert tensors to CuTe format for compilation only
-        # Use the actual tensor view so strided pool layouts are preserved.
-        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+        if use_pool_indexing:
+            # Pool capacity and the distance between slots do not affect codegen.
+            # Keep the inner state layout static while accepting arbitrary pool
+            # sizes and padded slot strides through the same compiled callable.
+            sym_pool_size = cute.sym_int()
+            sym_pool_stride0 = cute.sym_int64(divisibility=4)
+            h0_source_tensor = cute.runtime.make_fake_tensor(
+                cute.Float32,
+                shape=(sym_pool_size, HV, V, K),
+                stride=(sym_pool_stride0, stride1, stride2, stride3),
+                assumed_align=16,
+            )
+        else:
+            h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+            h0_source_tensor = h0_source_tensor.mark_compact_shape_dynamic(
+                mode=0, stride_order=(0, 1, 2), divisibility=1
+            )
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
-        a_tensor = from_dlpack(a, assumed_align=16)
+        # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
+        a_tensor = from_dlpack(a, assumed_align=16).mark_layout_dynamic()
         dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-        q_tensor = from_dlpack(q, assumed_align=16)
-        k_tensor = from_dlpack(k, assumed_align=16)
-        v_tensor = from_dlpack(v, assumed_align=16)
-        b_tensor = from_dlpack(b, assumed_align=16)
-        o_tensor = from_dlpack(output, assumed_align=16)
-        h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
-        h0_out_indices_tensor = from_dlpack(h0_out_indices, assumed_align=16)
-        cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
+        q_tensor = from_dlpack(q, assumed_align=16).mark_layout_dynamic()
+        k_tensor = from_dlpack(k, assumed_align=16).mark_layout_dynamic()
+        v_tensor = from_dlpack(v, assumed_align=16).mark_layout_dynamic()
+        b_tensor = from_dlpack(b, assumed_align=16).mark_layout_dynamic()
+        o_tensor = from_dlpack(output, assumed_align=16).mark_layout_dynamic()
+        h0_indices_tensor = from_dlpack(
+            h0_indices, assumed_align=16
+        ).mark_layout_dynamic()
+        h0_out_indices_tensor = from_dlpack(
+            h0_out_indices, assumed_align=16
+        ).mark_layout_dynamic()
+        cu_seqlens_tensor = from_dlpack(
+            cu_seqlens, assumed_align=16
+        ).mark_layout_dynamic()
 
         # Always use 8-CTA architecture (benchmarks show it's better for all batch sizes)
         run_func = run_gdn_decode_kernel_small_batch_pretranspose
 
         # Use TVM FFI to reduce runtime overhead
-        compiled = cute.compile(
-            run_func,
-            h0_source_tensor,
-            A_log_tensor,
-            a_tensor,
-            dt_bias_tensor,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            b_tensor,
-            o_tensor,
-            h0_indices_tensor,
-            h0_out_indices_tensor,
-            cu_seqlens_tensor,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-            scale=scale,
-            HV=HV,
-            B=B,
-            T=T,
-            H=H,
-            K=K,
-            V=V,
-            use_initial_state=True,
-            use_qk_l2norm=use_qk_l2norm,
-            use_pool_indexing=use_pool_indexing,
-            is_varlen=False,
-            stream=stream,
-            options="--enable-tvm-ffi",
+        compiled = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            _pretranspose_kernel_name(*cache_key),
+            lambda: cute.compile[
+                gdn_compile_options(q.device, cute.EnableTVMFFI(True))
+            ](
+                run_func,
+                h0_source_tensor,
+                A_log_tensor,
+                a_tensor,
+                dt_bias_tensor,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                b_tensor,
+                o_tensor,
+                h0_indices_tensor,
+                h0_out_indices_tensor,
+                cu_seqlens_tensor,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                scale=scale,
+                HV=HV,
+                T=T,
+                H=H,
+                K=K,
+                V=V,
+                use_initial_state=True,
+                use_qk_l2norm=use_qk_l2norm,
+                use_pool_indexing=use_pool_indexing,
+                is_varlen=False,
+                stream=stream,
+            ),
+            extra_key_files=(__file__,),
         )
         cache["compiled"] = compiled
     else:
         compiled = cache["compiled"]
 
     # Run kernel directly with PyTorch tensors (no from_dlpack needed)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     cache["compiled"](
         h0_source,
         A_log,

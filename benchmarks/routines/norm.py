@@ -31,6 +31,23 @@ from .flashinfer_benchmark_utils import (
 )
 
 
+def _fp8_code_stats(ref, out):
+    """Compare two fp8 tensors in code space. Returns (n_beyond_one_ulp, n_elements, pct, n_ties)."""
+
+    def order(t):
+        c = t.view(torch.uint8).to(torch.int16)
+        return torch.where(c & 0x80 != 0, -(c & 0x7F), c & 0x7F)
+
+    n = ref.numel()
+    nan = torch.isnan(ref.float()) | torch.isnan(out.float())
+    dist = (order(out) - order(ref)).abs()
+    dist = torch.where(nan, torch.zeros_like(dist), dist)
+    n_nan = int((torch.isnan(out.float()) & ~torch.isnan(ref.float())).sum())
+    n_bad = int((dist > 1).sum()) + n_nan
+    n_ties = int((dist == 1).sum())
+    return n_bad, n, n_bad / n * 100.0, n_ties
+
+
 def run_norm_test(args):
     """
     Run a norm test.
@@ -53,6 +70,8 @@ def run_norm_test(args):
         return testRmsnormQuant(args)
     elif args.routine == "fused_add_rmsnorm_quant":
         return testFusedAddRmsnormQuant(args)
+    elif args.routine == "layernorm_quant":
+        return testLayernormQuant(args)
     elif args.routine == "rmsnorm_fp4quant":
         return testRmsnormFp4quant(args)
     elif args.routine == "add_rmsnorm_fp4quant":
@@ -929,7 +948,7 @@ def testRmsnormQuant(args):
         rmsnorm_output = input_tensor.float() / rms * weight.float()
         # Quantize to output dtype
         reference_output = (
-            (rmsnorm_output * scale)
+            (rmsnorm_output / scale)
             .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
             .to(out_dtype)
         )
@@ -959,18 +978,21 @@ def testRmsnormQuant(args):
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
-                # Compare in float for FP8 outputs
-                ref_float = reference_output.float()
-                out_float = tested_outputs[i].float()
                 (
                     num_different_elements,
                     num_elements,
                     num_different_elements_percentage,
-                ) = is_close_stats(ref_float, out_float, rtol=1e-1, atol=1e-1)
+                    num_one_ulp_ties,
+                ) = _fp8_code_stats(reference_output, tested_outputs[i])
+                if num_one_ulp_ties > 0 and args.verbose >= 1:
+                    print(
+                        f"[INFO] Backend {tested_backends[i]}: {num_one_ulp_ties}/{num_elements} "
+                        f"({num_one_ulp_ties / num_elements * 100:.2f}%) elements land on an adjacent fp8 code"
+                    )
                 if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}: "
-                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ"
+                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ by more than one fp8 code"
                     )
                     if not args.allow_output_mismatch:
                         raise AssertionError(
@@ -1009,6 +1031,199 @@ def testRmsnormQuant(args):
                 cur_res["scale"] = scale.item()
                 cur_res["eps"] = eps
                 cur_res["enable_pdl"] = enable_pdl
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testLayernormQuant(args):
+    """
+    Test layernorm_quant API.
+
+    This test:
+    1. Generates random input tensors
+    2. Runs layernorm_quant with quantized output
+    3. Runs reference check
+    4. Measures performance metrics (memory bandwidth)
+
+    Note: LayerNorm is memory-bandwidth bound, so TB/sec is the primary metric.
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testLayernormQuant")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]  # Make a copy to avoid modifying the original
+
+    batch_size = args.batch_size
+    hidden_size = args.hidden_size
+    # Pre-allocate scale on device once. Passing a Python float forces flashinfer's
+    # _normalize_scale_tensor to create a tensor on each call, which triggers a
+    # host->device copy that is illegal under CUDA graph capture (and emits a
+    # FutureWarning about the deprecated float form).
+    scale = torch.tensor([args.scale], dtype=torch.float32, device=device)
+    eps = args.eps
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    if input_dtype != torch.bfloat16:
+        raise ValueError(
+            f"Unsupported input dtype: {args.input_dtype}. layernorm_quant only supports bfloat16."
+        )
+
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    if out_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        raise ValueError(
+            f"Unsupported out dtype: {args.out_dtype}. Supported dtypes are fp8_e4m3, fp8_e5m2."
+        )
+    ## Done parsing input arguments
+
+    ## Prepare input tensors (2D only for layernorm_quant)
+    input_shape = (batch_size, hidden_size)
+
+    input_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
+    gamma = torch.randn(hidden_size, dtype=torch.float32, device=device)
+    beta = torch.randn(hidden_size, dtype=torch.float32, device=device)
+    out_tensor = torch.empty(input_shape, dtype=out_dtype, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {input_tensor.shape = }")
+        print(f"[VVERBOSE] {input_tensor.dtype = }")
+        print(f"[VVERBOSE] {gamma.shape = }")
+        print(f"[VVERBOSE] {out_tensor.dtype = }")
+        print(f"[VVERBOSE] {scale = }")
+
+    def run_backend(backend, out_tensor, input_tensor, gamma, beta):
+        if backend == "cuda":
+            flashinfer.norm.layernorm_quant(
+                out_tensor,
+                input_tensor,
+                gamma,
+                beta,
+                scale=scale,
+                eps=eps,
+            )
+            return out_tensor
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Reference: PyTorch implementation of LayerNorm + quantization
+    has_reference_output = False
+    if run_refcheck:
+        layernorm_output = torch.nn.functional.layer_norm(
+            input_tensor.float(), (hidden_size,), weight=gamma, bias=beta, eps=eps
+        )
+        # The kernel rounds the normalized value to bf16 before scaling and
+        # casting to fp8; mirror that so 1-ulp fp8 differences do not trip the
+        # tight refcheck tolerance.
+        layernorm_output = layernorm_output.to(input_dtype).float()
+        reference_output = (
+            (layernorm_output / scale)
+            .to(input_dtype)
+            .float()
+            .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
+            .to(out_dtype)
+        )
+        has_reference_output = True
+
+    # Storage for timing results and outputs
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        # Create fresh output tensor for each run
+        cur_out = torch.empty(input_shape, dtype=out_dtype, device=device)
+        if run_refcheck:
+            outputs[cur_backend] = (
+                run_backend(cur_backend, cur_out, input_tensor, gamma, beta)
+                .detach()
+                .clone()
+            )
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, out_tensor, input_tensor, gamma, beta),
+        )
+
+    tested_backends = list(outputs.keys())
+    tested_outputs = list(outputs.values())
+    if len(tested_backends) > 0:
+        if run_refcheck and has_reference_output:
+            for i in range(len(tested_backends)):
+                (
+                    num_different_elements,
+                    num_elements,
+                    num_different_elements_percentage,
+                    num_one_ulp_ties,
+                ) = _fp8_code_stats(reference_output, tested_outputs[i])
+                if num_one_ulp_ties > 0 and args.verbose >= 1:
+                    print(
+                        f"[INFO] Backend {tested_backends[i]}: {num_one_ulp_ties}/{num_elements} "
+                        f"({num_one_ulp_ties / num_elements * 100:.2f}%) elements land on an adjacent fp8 code"
+                    )
+                if num_different_elements > 0:
+                    print(
+                        f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}: "
+                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ by more than one fp8 code"
+                    )
+                    if not args.allow_output_mismatch:
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
+                        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation for LayerNorm + Quant
+            # Read: input tensor + gamma/beta tensors
+            # Write: output tensor (quantized, smaller dtype)
+            num_elements = np.prod(input_shape)
+            problem_bytes = (
+                num_elements * input_dtype.itemsize  # input read
+                + 2 * hidden_size * torch.float32.itemsize  # gamma and beta read
+                + num_elements * out_dtype.itemsize  # output write (quantized)
+            )
+            problem_flops = num_elements * 7  # rough estimate
+            tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["out_dtype"] = str(out_dtype)
+                cur_res["scale"] = scale.item()
+                cur_res["eps"] = eps
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
@@ -1115,18 +1330,14 @@ def testFusedAddRmsnormQuant(args):
     # Reference: PyTorch implementation of fused add + RMSNorm + quantization
     has_reference_output = False
     if run_refcheck:
-        # Clone residual for reference computation since it gets modified
-        ref_residual = residual_tensor.clone()
-        # Step 1: residual += input
-        ref_residual = ref_residual + input_tensor
+        # Compute the add in fp32 to match the CuTe kernel and unit-test reference.
+        ref_residual = input_tensor.float() + residual_tensor.float()
         # Step 2: RMSNorm on residual
-        rms = torch.sqrt(
-            torch.mean(ref_residual.float() ** 2, dim=-1, keepdim=True) + eps
-        )
-        rmsnorm_output = ref_residual.float() / rms * weight.float()
+        rms = torch.sqrt(torch.mean(ref_residual**2, dim=-1, keepdim=True) + eps)
+        rmsnorm_output = ref_residual / rms * weight.float()
         # Quantize to output dtype
         reference_output = (
-            (rmsnorm_output * scale)
+            (rmsnorm_output / scale)
             .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
             .to(out_dtype)
         )
@@ -1166,18 +1377,21 @@ def testFusedAddRmsnormQuant(args):
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
-                # Compare in float for FP8 outputs
-                ref_float = reference_output.float()
-                out_float = tested_outputs[i].float()
                 (
                     num_different_elements,
                     num_elements,
                     num_different_elements_percentage,
-                ) = is_close_stats(ref_float, out_float, rtol=1e-1, atol=1e-1)
+                    num_one_ulp_ties,
+                ) = _fp8_code_stats(reference_output, tested_outputs[i])
+                if num_one_ulp_ties > 0 and args.verbose >= 1:
+                    print(
+                        f"[INFO] Backend {tested_backends[i]}: {num_one_ulp_ties}/{num_elements} "
+                        f"({num_one_ulp_ties / num_elements * 100:.2f}%) elements land on an adjacent fp8 code"
+                    )
                 if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}: "
-                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ"
+                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ by more than one fp8 code"
                     )
                     if not args.allow_output_mismatch:
                         raise AssertionError(
@@ -1747,6 +1961,7 @@ def testFusedDitLayernorm(args):
     hidden_dim = 3072
     eps = args.eps
     mode = args.dit_mode
+    is_cuda_graph_compatible = not args.no_cuda_graph
 
     torch.manual_seed(42)
     input_t = torch.randn(
@@ -1781,7 +1996,7 @@ def testFusedDitLayernorm(args):
 
     if mode == "gate_residual_gamma_beta":
 
-        def fused_fn():
+        def fused_fn(input_t, residual):
             return fused_dit_gate_residual_layernorm_gamma_beta(
                 input_t,
                 residual,
@@ -1792,14 +2007,14 @@ def testFusedDitLayernorm(args):
                 epsilon=eps,
             )
 
-        def eager_fn():
+        def eager_fn(input_t, residual):
             r = residual.float() + input_t.float() * (gate.float() + gate_bias.float())
             n = torch.layer_norm(r, [hidden_dim], weight=gamma, bias=beta, eps=eps)
             return r.to(torch.bfloat16), n.to(torch.bfloat16)
 
     elif mode == "gate_residual_scale_shift":
 
-        def fused_fn():
+        def fused_fn(input_t, residual):
             return fused_dit_gate_residual_layernorm_scale_shift(
                 input_t,
                 residual,
@@ -1812,7 +2027,7 @@ def testFusedDitLayernorm(args):
                 epsilon=eps,
             )
 
-        def eager_fn():
+        def eager_fn(input_t, residual):
             r = residual.float() + input_t.float() * (
                 c_gate.float() + c_gate_bias.float()
             )
@@ -1824,7 +2039,7 @@ def testFusedDitLayernorm(args):
 
     elif mode == "residual_scale_shift":
 
-        def fused_fn():
+        def fused_fn(input_t, residual):
             return fused_dit_residual_layernorm_scale_shift(
                 input_t,
                 c_scale,
@@ -1835,7 +2050,7 @@ def testFusedDitLayernorm(args):
                 epsilon=eps,
             )
 
-        def eager_fn():
+        def eager_fn(input_t, residual):
             r = residual.float() + input_t.float()
             n = torch.layer_norm(r, [hidden_dim], eps=eps)
             n = n * (1 + c_scale.float() + c_scale_bias.float()) + (
@@ -1848,10 +2063,20 @@ def testFusedDitLayernorm(args):
 
     # Warmup + benchmark
     fused_times = bench_gpu_time(
-        fused_fn, enable_cupti=True, dry_run_iters=10, repeat_iters=100
+        fused_fn,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+        input_args=(input_t, residual),
     )
     eager_times = bench_gpu_time(
-        eager_fn, enable_cupti=True, dry_run_iters=10, repeat_iters=100
+        eager_fn,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+        input_args=(input_t, residual),
     )
 
     fused_ms = float(np.median(fused_times))
@@ -1859,8 +2084,8 @@ def testFusedDitLayernorm(args):
 
     # Reference check
     if args.refcheck:
-        r_fused, n_fused = fused_fn()
-        r_eager, n_eager = eager_fn()
+        r_fused, n_fused = fused_fn(input_t, residual)
+        r_eager, n_eager = eager_fn(input_t, residual)
         torch.testing.assert_close(
             r_fused.float(), r_eager.float(), rtol=1.6e-2, atol=1e-5
         )
@@ -1874,8 +2099,10 @@ def testFusedDitLayernorm(args):
     res = []
     cur_res = defaultdict(str)
     cur_res["routine"] = args.routine
-    cur_res["median_ms"] = fused_ms
-    cur_res["std_ms"] = float(np.std(fused_times))
+    cur_res["median_time"] = fused_ms
+    cur_res["std_time"] = float(np.std(fused_times))
+    cur_res["tflops"] = 0.0
+    cur_res["tb_per_sec"] = tb_per_sec
     cur_res["batch_size"] = batch_size
     cur_res["hidden_size"] = hidden_dim
     cur_res["input_dtype"] = str(torch.bfloat16)
@@ -1892,6 +2119,7 @@ def testFusedDitLayernorm(args):
         )
 
     res.append(cur_res)
+    return res
 
 
 def testFusedQkRmsnormRope(args):
@@ -1972,7 +2200,7 @@ def testFusedQkRmsnormRope(args):
         is_qk_norm=True,
     )
 
-    def run_fused():
+    def run_fused(qkv=qkv):
         return fused_qk_rmsnorm_rope(qkv, q_weight, k_weight, **kwargs)
 
     # Reference check
@@ -2009,6 +2237,7 @@ def testFusedQkRmsnormRope(args):
         repeat_iters=args.num_iters,
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
+        input_args=(qkv,),
     )
 
     if len(backend_times) > 0:

@@ -38,14 +38,88 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
+
+from .dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
+
+
+def _per_token_fragment_plan(shape, stride, token_axis):
+    """Static analysis of a t2r fragment of the identity tensor over C.
+
+    ``shape``/``stride`` are the (hierarchical, static) layout of the
+    per-thread fragment; strides are ``ScaledBasis`` values ``k@axis`` or 0.
+    Returns ``(offsets, distinct)``: for every fragment element (in the
+    colexicographic order the fragment is indexed with) its token-axis
+    offset relative to element 0, and the sorted distinct offsets. Returns
+    ``None`` when the layout is not fully static, so the caller falls back
+    to one load per element.
+    """
+    leaves = []
+
+    def walk(sh, st):
+        if isinstance(sh, (tuple, list)):
+            if not isinstance(st, (tuple, list)) or len(sh) != len(st):
+                return False
+            return all(walk(a, b) for a, b in zip(sh, st, strict=True))
+        if not isinstance(sh, int):
+            return False
+        mode = getattr(st, "mode", None)
+        value = getattr(st, "value", st)
+        if mode is None:
+            if not isinstance(value, int) or value != 0:
+                return sh == 1 or value == 0
+            leaves.append((sh, 0))
+            return True
+        if not isinstance(value, int):
+            return False
+        leaves.append((sh, value if list(mode)[0] == token_axis else 0))
+        return True
+
+    if not walk(shape, stride):
+        return None
+    offsets = []
+    total = 1
+    for extent, _ in leaves:
+        total *= extent
+    for i in range(total):
+        rem = i
+        off = 0
+        for extent, scale in leaves:
+            off += (rem % extent) * scale
+            rem //= extent
+        offsets.append(off)
+    return offsets, sorted(set(offsets))
+
 
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 
 
-class Sm100BlockScaledPersistentDenseGemmKernel:
+@dsl_user_op
+def _l2_cache_policy(evict: str, *, loc=None, ip=None) -> cutlass.Int64:
+    """Runtime ``createpolicy`` L2 eviction policy (fraction 1.0) for TMA loads.
+
+    ``evict`` is ``"evict_first"`` (stream-once operand) or ``"evict_last"``
+    (operand re-read by every CTA). Kept a runtime instruction on purpose: a
+    constant policy makes ptxas emit an invalid encoding on some toolchains.
+    """
+    return cutlass.Int64(
+        llvm.inline_asm(
+            cutlass.Int64.mlir_type,
+            [],
+            f"createpolicy.fractional.L2::{evict}.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
     """Implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
     and Blackwell GPU architectural features, including persistent tile scheduling and warp specialization.
 
@@ -78,6 +152,23 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         >>> gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, max_active_clusters, stream)
     """
 
+    # Largest kernel N a narrow (< 64) N tile may run at. A narrow tile is a
+    # sub-tile of the 128-token SFB tile: the mainloop shifts the MMA's SFB
+    # TMEM column by tok_off // 32, and an odd shift makes tcgen05.mma fault,
+    # so every sub-tile must stay within the first 32 tokens. See can_implement.
+    NARROW_TILE_MAX_N = 32
+
+    @classmethod
+    def narrow_tile_ok(cls, tile_n: int, kernel_n: int) -> bool:
+        """Whether an MMA N tile of width ``tile_n`` may run at ``kernel_n``.
+
+        Tiles of 64 or wider are unrestricted; narrow tiles must stay within
+        ``NARROW_TILE_MAX_N`` kernel-N columns (kernel N is the token count
+        under swap_ab). Shared by can_implement and by the mm_mxfp8 / mm_fp4
+        runners, which re-check a tactic before launching it.
+        """
+        return tile_n >= 64 or kernel_n <= cls.NARROW_TILE_MAX_N
+
     def __init__(
         self,
         sf_vec_size: int,
@@ -85,6 +176,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mn: Tuple[int, int],
         use_prefetch: bool = False,
         enable_pdl: bool = True,
+        per_token_alpha: Optional[str] = None,
+        mma_inst_tile_k: int = 4,
+        a_l2_evict_first: bool = False,
+        b_l2_evict_last: bool = False,
+        b_l2_evict_first: bool = False,
+        a_l2_evict_last: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -102,8 +199,34 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             sf_vec_size (int): Scalefactor vector size.
             mma_tiler_mn (Tuple[int, int]): Shape of the Matrix Multiply-Accumulate (MMA) tile (M, N).
             cluster_shape_mn (Tuple[int, int]): Cluster dimensions (M, N) for parallel processing.
+            per_token_alpha (Optional[str]): ``None`` for a scalar alpha, else
+                the extent ``alpha`` holds one scale per coordinate of: ``"m"``
+                per row of C, ``"n"`` per column (callers that swap A and B).
+            mma_inst_tile_k (int): MMA K instructions per pipeline stage (4 or 8).
+            a_l2_evict_first (bool): issue the A (and SFA) TMA loads with an L2
+                ``evict_first`` policy: A is streamed exactly once per CTA.
+            b_l2_evict_last (bool): issue the B (and SFB) TMA loads with an L2
+                ``evict_last`` policy: every CTA of a column re-reads the tile.
+            b_l2_evict_first (bool): issue the B (and SFB) TMA loads with an L2
+                ``evict_first`` policy (B streamed once, e.g. weights without
+                swap_ab when M fits one tile). Exclusive with b_l2_evict_last.
         """
 
+        self.per_token_alpha = per_token_alpha
+        if mma_inst_tile_k not in (4, 8):
+            raise ValueError(f"mma_inst_tile_k must be 4 or 8, got {mma_inst_tile_k}")
+        # MMA K instructions per pipeline stage: 4 (K tile 256 for FP4) or 8
+        # (K tile 512, a 256 B TMA row per operand row; used for narrow N tiles
+        # whose weight stream is DRAM-efficiency bound).
+        self.mma_inst_tile_k = mma_inst_tile_k
+        if b_l2_evict_first and b_l2_evict_last:
+            raise ValueError("b_l2_evict_first and b_l2_evict_last are exclusive")
+        if a_l2_evict_first and a_l2_evict_last:
+            raise ValueError("a_l2_evict_first and a_l2_evict_last are exclusive")
+        self.a_l2_evict_last = a_l2_evict_last
+        self.a_l2_evict_first = a_l2_evict_first
+        self.b_l2_evict_last = b_l2_evict_last
+        self.b_l2_evict_first = b_l2_evict_first
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -133,6 +256,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
+        # NamedBarrier equivalents of the two ids above, for subclasses written
+        # against the newer CuTe DSL API that take the object rather than the id.
+        self.epilog_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=self.epilog_sync_bar_id,
+            num_threads=32 * len(self.epilog_warp_id),
+        )
+        self.tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=self.tmem_ptr_sync_bar_id,
+            num_threads=32 * len((self.mma_warp_id, *self.epilog_warp_id)),
+        )
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
@@ -168,6 +301,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -178,6 +312,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -187,7 +322,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
 
         # Compute mma/cluster/tile shapes
-        mma_inst_tile_k = 4
+        mma_inst_tile_k = self.mma_inst_tile_k
         self.mma_tiler = (
             self.mma_inst_shape_mnk[0],
             self.mma_inst_shape_mnk[1],
@@ -208,6 +343,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.mma_tiler_sfb[1],
             self.mma_tiler_sfb[2],
         )
+        # Number of CTA N tiles covered by one (128-wide) SFB tile
+        self.sfb_sub_tiles_per_tile = max(
+            1, self.cta_tile_shape_mnk_sfb[1] // self.cta_tile_shape_mnk[1]
+        )
+        # The S2T copy of a sub-tile starts up to 31 token rows (16 B each) into
+        # the 512 B SF block and reads the same length, so pad sSFB by one block.
+        self.sfb_smem_pad_bytes = 512 if self.cta_tile_shape_mnk[1] < 64 else 0
 
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -252,6 +394,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.sf_vec_size,
             self.smem_capacity,
             self.occupancy,
+            1024 + self.sfb_smem_pad_bytes,
         )
 
         # Compute A/B/SFA/SFB/C shared memory layout
@@ -317,7 +460,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfa_tensor: cute.Tensor,
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
-        alpha: cute.Tensor,  # Single-element tensor containing alpha value
+        alpha: cute.Tensor,  # (1,) scalar alpha, or (m,)/(n,) per-token alpha
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -342,153 +485,25 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         Raises:
             TypeError: If input data types are incompatible with the MMA instruction.
         """
-        # Setup static attributes before smem/grid/tma computation
-        self.a_dtype: Type[cutlass.Numeric] = a_tensor.element_type
-        self.b_dtype: Type[cutlass.Numeric] = b_tensor.element_type
-        self.sf_dtype: Type[cutlass.Numeric] = sfa_tensor.element_type
-        self.c_dtype: Type[cutlass.Numeric] = c_tensor.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c_tensor)
-
-        # Check if input data types are compatible with MMA instruction
-        if cutlass.const_expr(self.a_dtype != self.b_dtype):
-            raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
-
-        # Setup attributes that dependent on gemm inputs
-        self._setup_attributes()
-
-        # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
-        # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
-        sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            a_tensor.shape, self.sf_vec_size
-        )
-        sfa_tensor = cute.make_tensor(sfa_tensor.iterator, sfa_layout)
-
-        # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
-        sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_tensor.shape, self.sf_vec_size
-        )
-        sfb_tensor = cute.make_tensor(sfb_tensor.iterator, sfb_layout)
-
-        tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            self.cta_group,
-            self.mma_inst_shape_mnk[:2],
-        )
-
-        tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            cute.nvgpu.tcgen05.CtaGroup.ONE,
-            self.mma_inst_shape_mnk_sfb[:2],
-        )
-        atom_thr_size = cute.size(tiled_mma.thr_id.shape)
-
-        # Setup TMA load for A
-        a_op = sm100_utils.cluster_shape_to_tma_atom_A(
-            self.cluster_shape_mn, tiled_mma.thr_id
-        )
-        a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op,
-            a_tensor,
-            a_smem_layout,
-            self.mma_tiler,
+        (
             tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
-
-        # Setup TMA load for B
-        b_op = sm100_utils.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mn, tiled_mma.thr_id
-        )
-        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op,
-            b_tensor,
-            b_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
-
-        # Setup TMA load for SFA
-        sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(
-            self.cluster_shape_mn, tiled_mma.thr_id
-        )
-        sfa_smem_layout = cute.slice_(
-            self.sfa_smem_layout_staged, (None, None, None, 0)
-        )
-        tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
-            sfa_op,
-            sfa_tensor,
-            sfa_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Int16,
-        )
-
-        # Setup TMA load for SFB
-        sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(
-            self.cluster_shape_mn, tiled_mma.thr_id
-        )
-        sfb_smem_layout = cute.slice_(
-            self.sfb_smem_layout_staged, (None, None, None, 0)
-        )
-        tma_atom_sfb, tma_tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
-            sfb_op,
-            sfb_tensor,
-            sfb_smem_layout,
-            self.mma_tiler_sfb,
             tiled_mma_sfb,
-            self.cluster_layout_sfb_vmnk.shape,
-            internal_type=cutlass.Int16,
-        )
-        if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
-            x = tma_tensor_sfb.stride[0][1]
-            y = cute.ceil_div(tma_tensor_sfb.shape[0][1], 4)
-
-            new_shape = (
-                (tma_tensor_sfb.shape[0][0], ((2, 2), y)),
-                tma_tensor_sfb.shape[1],
-                tma_tensor_sfb.shape[2],
-            )
-            # Use right multiplication for ScaledBasis (3 * x instead of x * 3)
-            x_times_3 = 3 * x
-            new_stride = (
-                (tma_tensor_sfb.stride[0][0], ((x, x), x_times_3)),
-                tma_tensor_sfb.stride[1],
-                tma_tensor_sfb.stride[2],
-            )
-            tma_tensor_sfb_new_layout = cute.make_layout(new_shape, stride=new_stride)
-            tma_tensor_sfb = cute.make_tensor(
-                tma_tensor_sfb.iterator, tma_tensor_sfb_new_layout
-            )
-
-        a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
-        b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
-        sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
-        sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
-        self.num_tma_load_bytes = (
-            a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
-        ) * atom_thr_size
-
-        # Setup TMA store for C
-        epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
-        tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b,
+            tma_tensor_b,
+            tma_atom_sfa,
+            tma_tensor_sfa,
+            tma_atom_sfb,
+            tma_tensor_sfb,
+            tma_atom_c,
+            tma_tensor_c,
+        ) = self._prepare_tma(
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
             c_tensor,
-            epi_smem_layout,
-            self.epi_tile,
         )
 
         # Compute grid size
@@ -542,7 +557,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # (MMA, MMA_N, MMA_K, STAGE)
             sSFB: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)
+                    self.sf_dtype,
+                    cute.cosize(self.sfb_smem_layout_staged) + self.sfb_smem_pad_bytes,
                 ],
                 self.buffer_align_bytes,
             ]
@@ -619,7 +635,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
         # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
         # before multiplication could cause overflow when acc values are large.
-        alpha_value = alpha[0].to(cutlass.Float32)
+        # In per-token mode the epilogue folds the scale into the accumulators
+        # once the output coordinate is known, so this stays neutral.
+        if cutlass.const_expr(self.per_token_alpha is not None):
+            alpha_value = cutlass.Float32(1.0)
+        else:
+            alpha_value = alpha[0].to(cutlass.Float32)
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -793,6 +814,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
 
+        if cutlass.const_expr(self.per_token_alpha is not None):
+            # Identity tensor over C, partitioned like tCgC, so the epilogue can
+            # recover each accumulator element's (m, n) coordinate.
+            cC_mnl = cute.local_tile(
+                cute.make_identity_tensor(mC_mnl.shape),
+                cute.slice_(self.mma_tiler, (None, None, 0)),
+                (None, None, None),
+            )
+            # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
+            tCcC = thr_mma.partition_C(cC_mnl)
+
         #
         # Partition global/shared tensor for TMA load A/B
         #
@@ -919,6 +951,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
 
+            # L2 eviction policies for the operand streams (None = default).
+            a_cache_policy = None
+            b_cache_policy = None
+            if cutlass.const_expr(self.a_l2_evict_first):
+                a_cache_policy = _l2_cache_policy("evict_first")
+            if cutlass.const_expr(self.a_l2_evict_last):
+                a_cache_policy = _l2_cache_policy("evict_last")
+            if cutlass.const_expr(self.b_l2_evict_last):
+                b_cache_policy = _l2_cache_policy("evict_last")
+            if cutlass.const_expr(self.b_l2_evict_first):
+                b_cache_policy = _l2_cache_policy("evict_first")
+
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
@@ -947,6 +991,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 slice_n = mma_tile_coord_mnl[1]
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
                     slice_n = mma_tile_coord_mnl[1] // 2
+                elif cutlass.const_expr(self.cta_tile_shape_mnk[1] < 64):
+                    # Several narrow N tiles share one 128-wide SFB tile; the MMA
+                    # reads its sub-tile through a shifted TMEM address below.
+                    slice_n = mma_tile_coord_mnl[1] // self.sfb_sub_tiles_per_tile
                 # ((atom_v, rest_v), RestK)
                 tBgSFB_slice = tBgSFB[(None, slice_n, None, mma_tile_coord_mnl[2])]
 
@@ -995,6 +1043,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         tAsA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=a_full_mcast_mask,
+                        cache_policy=a_cache_policy,
                     )
                     cute.copy(
                         tma_atom_b,
@@ -1002,6 +1051,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         tBsB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=b_full_mcast_mask,
+                        cache_policy=b_cache_policy,
                     )
                     cute.copy(
                         tma_atom_sfa,
@@ -1009,6 +1059,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         tAsSFA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfa_full_mcast_mask,
+                        cache_policy=a_cache_policy,
                     )
                     cute.copy(
                         tma_atom_sfb,
@@ -1016,6 +1067,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         tBsSFB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfb_full_mcast_mask,
+                        cache_policy=b_cache_policy,
                     )
 
                     # Prefetch: Rolling prefetch for next tiles
@@ -1171,6 +1223,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     acc_pipeline.producer_acquire(acc_producer_state)
 
                 tCtSFB_mma = tCtSFB
+                tCsSFB_s2t_tile = tCsSFB_compact_s2t
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
                     # If this is an ODD tile, shift the TMEM start address for cta_tile_shape_n=192 case by two words (ignores first 64 columns of SFB)
                     offset = (
@@ -1197,6 +1250,35 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         dtype=self.sf_dtype,
                     )
                     tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
+                elif cutlass.const_expr(self.cta_tile_shape_mnk[1] < 64):
+                    # Sub-tile of the 128-wide SFB tile. SF for token 32*c + l
+                    # lives in TMEM column c, lane l: shift the MMA's SFB address
+                    # by one column per 32 tokens and start the S2T copy's smem
+                    # source at the remaining token row (16 B per row of the
+                    # 32x4 SF block) so the sub-tile's first token lands in lane 0.
+                    # can_implement limits narrow tiles to a kernel-N extent of
+                    # 32, so the column shift below is always 0 in practice: an
+                    # odd column shift makes tcgen05.mma fault (misaligned
+                    # address), the 64-wide tile above shifts by two columns.
+                    tok_off = (
+                        mma_tile_coord_mnl[1] % self.sfb_sub_tiles_per_tile
+                    ) * self.cta_tile_shape_mnk[1]
+                    offset = cutlass.Int32(tok_off // 32)
+                    shifted_ptr = cute.recast_ptr(
+                        acc_tmem_ptr
+                        + self.num_accumulator_tmem_cols
+                        + self.num_sfa_tmem_cols
+                        + offset,
+                        dtype=self.sf_dtype,
+                    )
+                    tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
+                    sSFB_shifted = cute.make_tensor(
+                        sSFB.iterator + cutlass.Int32(tok_off % 32) * 16,
+                        sSFB.layout,
+                    )
+                    _, tCsSFB_s2t_tile, _ = self.mainloop_s2t_copy_and_partition(
+                        sSFB_shifted, tCtSFB
+                    )
 
                 #
                 # Reset the ACCUMULATE field for each tile
@@ -1222,7 +1304,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             ab_consumer_state.index,
                         )
                         tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
-                        tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
+                        tCsSFB_compact_s2t_staged = tCsSFB_s2t_tile[s2t_stage_coord]
                         cute.copy(
                             tiled_copy_s2t_sfa,
                             tCsSFA_compact_s2t_staged,
@@ -1339,6 +1421,39 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 )
             )
 
+            if cutlass.const_expr(self.per_token_alpha is not None):
+                # Partitioned like tCgC, so this mirrors the t2r register
+                # fragment element for element.
+                # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
+                tTR_cC_partitioned = tiled_copy_t2r.get_slice(epi_tidx).partition_D(
+                    cute.flat_divide(
+                        tCcC[((None, None), 0, 0, None, None, None)], epi_tile
+                    )
+                )
+                alpha_extent = (
+                    mC_mnl.shape[0]
+                    if cutlass.const_expr(self.per_token_alpha == "m")
+                    else mC_mnl.shape[1]
+                )
+                token_axis = 0 if self.per_token_alpha == "m" else 1
+                # Static plan: which fragment elements share a token, and
+                # whether the token is constant across the epilogue subtiles.
+                _frag_layout = tTR_cC_partitioned.layout
+                _frag_shape = _frag_layout.shape
+                _frag_stride = _frag_layout.stride
+                alpha_plan = _per_token_fragment_plan(
+                    tuple(_frag_shape[0:3]), tuple(_frag_stride[0:3]), token_axis
+                )
+                _subtile_plan = _per_token_fragment_plan(
+                    tuple(_frag_shape[3:5]), tuple(_frag_stride[3:5]), token_axis
+                )
+                alpha_token_per_tile = (
+                    alpha_plan is not None
+                    and len(alpha_plan[1]) == 1
+                    and _subtile_plan is not None
+                    and _subtile_plan[1] == [0]
+                )
+
             tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                 tiled_copy_t2r, tTR_rC, epi_tidx, sC
@@ -1364,7 +1479,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # Threads/warps participating in tma store pipeline
             c_producer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                32 * len(self.epilog_warp_id),
                 32 * len(self.epilog_warp_id),
             )
             c_pipeline = pipeline.PipelineTmaStore.create(
@@ -1393,6 +1507,27 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         *mma_tile_coord_mnl,
                     )
                 ]
+
+                if cutlass.const_expr(self.per_token_alpha is not None):
+                    # (T2R, T2R_M, T2R_N, (EPI_M, EPI_N))
+                    tTR_cC = tTR_cC_partitioned[
+                        (
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            *mma_tile_coord_mnl,
+                        )
+                    ]
+                    tTR_cC = cute.group_modes(tTR_cC, 3, cute.rank(tTR_cC))
+                    if cutlass.const_expr(alpha_token_per_tile):
+                        # Every element this thread holds in this tile has
+                        # the same token: one clamped load per tile, applied
+                        # through the scalar alpha multiply below.
+                        tile_token = tTR_cC[(0, 0, 0, 0)][token_axis]
+                        tile_token = cutlass.min(tile_token, alpha_extent - 1)
+                        alpha_value = alpha[tile_token].to(cutlass.Float32)
 
                 if cutlass.const_expr(self.overlapping_accum):
                     acc_stage_index = acc_consumer_state.phase
@@ -1449,6 +1584,35 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             with cute.arch.elect_one():
                                 acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
+                    #
+                    # Fold the per-token scale into the accumulators
+                    #
+                    if cutlass.const_expr(
+                        self.per_token_alpha is not None and not alpha_token_per_tile
+                    ):
+                        tTR_cC_subtile = tTR_cC[(None, None, None, real_subtile_idx)]
+                        if cutlass.const_expr(alpha_plan is not None):
+                            # The fragment's token offsets are static: load
+                            # each distinct token once per subtile (clamped so
+                            # the rows past the token extent, which the TMA
+                            # store drops, never read alpha out of bounds).
+                            offsets, distinct = alpha_plan
+                            token0 = tTR_cC_subtile[0][token_axis]
+                            loaded = {}
+                            for d in distinct:
+                                tok = cutlass.min(token0 + d, alpha_extent - 1)
+                                loaded[d] = alpha[tok].to(cutlass.Float32)
+                            for i in cutlass.range_constexpr(len(offsets)):
+                                tTR_rAcc[i] = tTR_rAcc[i] * loaded[offsets[i]]
+                        else:
+                            for i in cutlass.range_constexpr(cute.size(tTR_cC_subtile)):
+                                coord = tTR_cC_subtile[i]
+                                token = coord[token_axis]
+                                token = cutlass.min(token, alpha_extent - 1)
+                                tTR_rAcc[i] = tTR_rAcc[i] * alpha[token].to(
+                                    cutlass.Float32
+                                )
+
                     #
                     # Convert to C type
                     #
@@ -1533,295 +1697,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             c_pipeline.producer_tail()
 
         griddepcontrol_launch_dependents()
-
-    def mainloop_s2t_copy_and_partition(
-        self,
-        sSF: cute.Tensor,
-        tSF: cute.Tensor,
-    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
-        """
-        Make tiledCopy for smem to tmem load for scale factor tensor, then use it to partition smem memory (source) and tensor memory (destination).
-
-        Args:
-            sSF (cute.Tensor): The scale factor tensor in smem
-            tSF (cute.Tensor): The scale factor tensor in tmem
-
-        Returns:
-            A tuple containing (tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t) where:
-                - tiled_copy_s2t: The tiled copy operation for smem to tmem load for scale factor tensor(s2t)
-                - tCsSF_compact_s2t: The partitioned scale factor tensor in smem
-                - tSF_compact_s2t: The partitioned scale factor tensor in tmem
-        """
-        # (MMA, MMA_MN, MMA_K, STAGE)
-        tCsSF_compact = cute.filter_zeros(sSF)
-        # (MMA, MMA_MN, MMA_K)
-        tCtSF_compact = cute.filter_zeros(tSF)
-
-        # Make S2T CopyAtom and tiledCopy
-        copy_atom_s2t = cute.make_copy_atom(
-            tcgen05.Cp4x32x128bOp(self.cta_group),
-            self.sf_dtype,
-        )
-        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSF_compact)
-        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
-
-        # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K, STAGE)
-        tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact)
-        # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K, STAGE)
-        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(
-            tiled_copy_s2t, tCsSF_compact_s2t_
-        )
-        # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K)
-        tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
-
-        return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
-
-    def epilog_tmem_copy_and_partition(
-        self,
-        tidx: cutlass.Int32,
-        tAcc: cute.Tensor,
-        gC_mnl: cute.Tensor,
-        epi_tile: cute.Tile,
-        use_2cta_instrs: Union[cutlass.Boolean, bool],
-    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
-        """
-        Make tiledCopy for tensor memory load, then use it to partition tensor memory (source) and register array (destination).
-
-        Args:
-            tidx (cutlass.Int32): The thread index in epilogue warp groups
-            tAcc (cute.Tensor): The accumulator tensor to be copied and partitioned
-            gC_mnl (cute.Tensor): The global tensor C
-            epi_tile (cute.Tile): The epilogue tiler
-            use_2cta_instrs (bool): Whether use_2cta_instrs is enabled
-
-        Returns:
-            A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc) where:
-                - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
-                - tTR_tAcc: The partitioned accumulator tensor
-                - tTR_rAcc: The accumulated tensor in register used to hold t2r results
-        """
-        # Make tiledCopy for tensor memory load
-        copy_atom_t2r = sm100_utils.get_tmem_load_op(
-            self.cta_tile_shape_mnk,
-            self.c_layout,
-            self.c_dtype,
-            self.acc_dtype,
-            epi_tile,
-            use_2cta_instrs,
-        )
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, STAGE)
-        tAcc_epi = cute.flat_divide(
-            tAcc[((None, None), 0, 0, None)],
-            epi_tile,
-        )
-        # (EPI_TILE_M, EPI_TILE_N)
-        tiled_copy_t2r = tcgen05.make_tmem_copy(
-            copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)]
-        )
-
-        thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
-        # (T2R, T2R_M, T2R_N, EPI_M, EPI_M, STAGE)
-        tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
-
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
-        gC_mnl_epi = cute.flat_divide(
-            gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile
-        )
-        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
-        tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
-        # (T2R, T2R_M, T2R_N)
-        tTR_rAcc = cute.make_rmem_tensor(
-            tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
-        )
-        return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
-
-    def epilog_smem_copy_and_partition(
-        self,
-        tiled_copy_t2r: cute.TiledCopy,
-        tTR_rC: cute.Tensor,
-        tidx: cutlass.Int32,
-        sC: cute.Tensor,
-    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
-        """
-        Make tiledCopy for shared memory store, then use it to partition register array (source) and shared memory (destination).
-
-        Args:
-            tiled_copy_t2r (cute.TiledCopy): The tiled copy operation for tmem to register copy(t2r)
-            tTR_rC (cute.Tensor): The partitioned accumulator tensor
-            tidx (cutlass.Int32): The thread index in epilogue warp groups
-            sC (cute.Tensor): The shared memory tensor to be copied and partitioned
-            sepi (cute.Tensor):
-
-        Returns:
-            A tuple containing (tiled_copy_r2s, tRS_rC, tRS_sC) where:
-                - tiled_copy_r2s: The tiled copy operation for register to smem copy(r2s)
-                - tRS_rC: The partitioned tensor C (register source)
-                - tRS_sC: The partitioned tensor C (smem destination)
-        """
-        copy_atom_r2s = sm100_utils.get_smem_store_op(
-            self.c_layout, self.c_dtype, self.acc_dtype, tiled_copy_t2r
-        )
-        tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
-        # (R2S, R2S_M, R2S_N, PIPE_D)
-        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-        tRS_sC = thr_copy_r2s.partition_D(sC)
-        # (R2S, R2S_M, R2S_N)
-        tRS_rC = tiled_copy_r2s.retile(tTR_rC)
-        return tiled_copy_r2s, tRS_rC, tRS_sC
-
-    def epilog_gmem_copy_and_partition(
-        self,
-        tidx: cutlass.Int32,
-        atom: Union[cute.CopyAtom, cute.TiledCopy],
-        gC_mnl: cute.Tensor,
-        epi_tile: cute.Tile,
-        sC: cute.Tensor,
-    ) -> Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
-        """
-        Make tiledCopy for global memory store, then use it to:
-        partition shared memory (source) and global memory (destination) for TMA store version.
-
-        Args:
-            tidx (cutlass.Int32): The thread index in epilogue warp groups
-            atom (Union[cute.CopyAtom, cute.TiledCopy]): The copy_atom_c to be used for TMA store version, or tiled_copy_t2r for none TMA store version
-            gC_mnl (cute.Tensor): The global tensor C
-            epi_tile (cute.Tile): The epilogue tiler
-            sC (cute.Tensor): The shared memory tensor to be copied and partitioned
-
-        Returns:
-            A tuple containing (tma_atom_c, bSG_sC, bSG_gC) where:
-                - tma_atom_c: The TMA copy atom
-                - bSG_sC: The partitioned shared memory tensor C
-                - bSG_gC: The partitioned global tensor C
-        """
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
-        gC_epi = cute.flat_divide(
-            gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile
-        )
-
-        tma_atom_c = atom
-        sC_for_tma_partition = cute.group_modes(sC, 0, 2)
-        gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)
-        # ((ATOM_V, REST_V), EPI_M, EPI_N)
-        # ((ATOM_V, REST_V), EPI_M, EPI_N, RestM, RestN, RestL)
-        bSG_sC, bSG_gC = cpasync.tma_partition(
-            tma_atom_c,
-            0,
-            cute.make_layout(1),
-            sC_for_tma_partition,
-            gC_for_tma_partition,
-        )
-        return tma_atom_c, bSG_sC, bSG_gC
-
-    @staticmethod
-    def _compute_stages(
-        tiled_mma: cute.TiledMma,
-        mma_tiler_mnk: Tuple[int, int, int],
-        a_dtype: Type[cutlass.Numeric],
-        a_major_mode: cute.nvgpu.OperandMajorMode,
-        b_dtype: Type[cutlass.Numeric],
-        b_major_mode: cute.nvgpu.OperandMajorMode,
-        epi_tile: cute.Tile,
-        c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        smem_capacity: int,
-        occupancy: int,
-    ) -> Tuple[int, int, int]:
-        """Computes the optimal number of pipeline stages for operands.
-
-        This method uses heuristics to determine the number of stages for the
-        accumulator (ACC), A/B operands, and C operand based on the kernel
-        configuration and available shared memory.
-
-        Args:
-            tiled_mma (cute.TiledMma): The tiled MMA object.
-            mma_tiler_mnk (Tuple[int, int, int]): The shape (M, N, K) of the
-                MMA tiler.
-            a_dtype (Type[cutlass.Numeric]): Data type of operand A.
-            a_major_mode (cute.nvgpu.OperandMajorMode): Layout of operand A.
-            b_dtype (Type[cutlass.Numeric]): Data type of operand B.
-            b_major_mode (cute.nvgpu.OperandMajorMode): Layout of operand B.
-            epi_tile (cute.Tile): The epilogue tile shape.
-            c_dtype (Type[cutlass.Numeric]): Data type of operand C.
-            c_layout (utils.LayoutEnum): Layout of operand C.
-            sf_dtype (Type[cutlass.Numeric]): Data type of the scale factors.
-            sf_vec_size (int): Vector size of the scale factors.
-            smem_capacity (int): Total available shared memory in bytes.
-            occupancy (int): Target number of CTAs per SM.
-
-        Returns:
-            Tuple[int, int, int]: A tuple containing the number of stages for
-                (ACC, A/B, C).
-        """
-        # ACC stages
-        num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
-
-        # Default C stages
-        num_c_stage = 2
-
-        # Calculate smem layout and size for one stage of A, B, SFA, SFB and C
-        a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
-            tiled_mma,
-            mma_tiler_mnk,
-            a_dtype,
-            1,  # a tmp 1 stage is provided
-        )
-        b_smem_layout_staged_one = sm100_utils.make_smem_layout_b(
-            tiled_mma,
-            mma_tiler_mnk,
-            b_dtype,
-            1,  # a tmp 1 stage is provided
-        )
-        sfa_smem_layout_staged_one = blockscaled_utils.make_smem_layout_sfa(
-            tiled_mma,
-            mma_tiler_mnk,
-            sf_vec_size,
-            1,  # a tmp 1 stage is provided
-        )
-        sfb_smem_layout_staged_one = blockscaled_utils.make_smem_layout_sfb(
-            tiled_mma,
-            mma_tiler_mnk,
-            sf_vec_size,
-            1,  # a tmp 1 stage is provided
-        )
-
-        c_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(
-            c_dtype,
-            c_layout,
-            epi_tile,
-            1,
-        )
-
-        ab_bytes_per_stage = (
-            cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
-            + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
-            + cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one)
-            + cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
-        )
-        mbar_helpers_bytes = 1024
-        c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
-        c_bytes = c_bytes_per_stage * num_c_stage
-
-        # Calculate A/B/SFA/SFB stages:
-        # Start with total smem per CTA (capacity / occupancy)
-        # Subtract reserved bytes and initial C stages bytes
-        # Divide remaining by bytes needed per A/B/SFA/SFB stage
-        num_ab_stage = (
-            smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes)
-        ) // ab_bytes_per_stage
-
-        # Refine epilogue stages:
-        # Calculate remaining smem after allocating for A/B/SFA/SFB stages and reserved bytes
-        # Add remaining unused smem to epilogue
-        num_c_stage += (
-            smem_capacity
-            - occupancy * ab_bytes_per_stage * num_ab_stage
-            - occupancy * (mbar_helpers_bytes + c_bytes)
-        ) // (occupancy * c_bytes_per_stage)
-
-        return num_acc_stage, num_ab_stage, num_c_stage
 
     @staticmethod
     def _compute_grid(
@@ -2083,128 +1958,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         ):
             can_implement = False
 
-        if mma_tiler_mn[1] < 64 and (n > mma_tiler_mn[1] or cluster_shape_mn[1] > 1):
+        # Narrow N tiles (8/16/32) read their tokens' scale factors out of the
+        # 128-wide SFB tile through the sub-tile addressing in the mainloop:
+        # the S2T copy's smem source moves by whole token rows inside the
+        # first 32-token group and the MMA's SFB TMEM address moves by one
+        # column per 32 tokens. tcgen05.mma faults with a misaligned address
+        # when that column shift is odd (offsets 1 and 3 fault; the 64-wide
+        # tile's two-column shift is fine), so every sub-tile has to stay in
+        # the first 32-token group: the kernel-N extent is limited to 32 and
+        # the SFB tile is never multicast. Wider N takes the 64-wide or
+        # 128-wide tiles. narrow_tile_ok holds the 32-column bound, shared with
+        # the mm_mxfp8 / mm_fp4 runners' pre-launch re-check of replayed tactics.
+        if not cls.narrow_tile_ok(mma_tiler_mn[1], n) or (
+            mma_tiler_mn[1] < 64 and cluster_shape_mn[1] > 1
+        ):
             can_implement = False
         return can_implement
-
-    # fully dynamic shape
-    @cute.jit
-    def wrapper(
-        self,
-        mA: cute.Tensor,
-        mB: cute.Tensor,
-        mC: cute.Tensor,
-        sf_m: cutlass.Int64,
-        sf_n: cutlass.Int64,
-        sf_k: cutlass.Int64,
-        l: cutlass.Constexpr,
-        a_sf_ptr: cute.Pointer,
-        b_sf_ptr: cute.Pointer,
-        alpha_tensor: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
-        current_stream,
-        swap_ab: cutlass.Constexpr = False,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
-    ):
-        """Executes the wrapped GEMM kernel with dynamically shaped tensors.
-
-        Uses TVM-FFI for efficient tensor passing: A, B, C, and alpha are passed
-        as cute.Tensor directly (torch tensors at runtime via TVM-FFI's C-level
-        dlpack, with negligible conversion cost). Scale factor tensors remain as
-        pointers because their 6D BlockScaledBasicChunk layout cannot be expressed
-        as a torch tensor.
-
-        Args:
-            mA (cute.Tensor): Input tensor A.
-                FP4 path: shape (m, k_packed), dtype Uint8 (2xFP4 packed per byte).
-                MXFP8 path: shape (m, k), dtype Float8.
-            mB (cute.Tensor): Input tensor B.
-                FP4 path: shape (n, k_packed), dtype Uint8.
-                MXFP8 path: shape (n, k), dtype Float8.
-            mC (cute.Tensor): Output tensor C, shape (m, n).
-            sf_m (cutlass.Int64): Scale factor M dim (ceil(m/128)).
-            sf_n (cutlass.Int64): Scale factor N dim (ceil(n/128)).
-            sf_k (cutlass.Int64): Scale factor K dim (ceil(k/sf_vec_size/4)).
-            l (cutlass.Constexpr): Batch dimension (L).
-            a_sf_ptr (cute.Pointer): Pointer to scale factor tensor for A.
-            b_sf_ptr (cute.Pointer): Pointer to scale factor tensor for B.
-            alpha_tensor (cute.Tensor): Alpha scaling factor, shape (1,), float32.
-            max_active_clusters (cutlass.Constexpr): Max active clusters.
-            current_stream: CUDA stream (managed by TVM-FFI fake stream).
-            swap_ab (cutlass.Constexpr): Whether A/B are swapped (controls C layout).
-            epilogue_op (cutlass.Constexpr): Elementwise epilogue function.
-        """
-        # A, B, C are passed as cute.Tensor via TVM-FFI.
-        # Support two input encodings:
-        # 1) FP4 packed as uint8 (recast to Float4E2M1FN, k = k_packed * 2)
-        # 2) MXFP8 as float8 (k = k_raw, no recast)
-        m = cute.size(mA, mode=[0])
-        k_raw = cute.size(mA, mode=[1])
-        n = cute.size(mB, mode=[0])
-
-        if cutlass.const_expr(
-            mA.element_type == cutlass.Uint8 and mB.element_type == cutlass.Uint8
-        ):
-            # FP4 packed path: 2 FP4 values per uint8 byte
-            k = k_raw * 2
-            a_ptr = cute.recast_ptr(mA.iterator, dtype=cutlass.Float4E2M1FN)
-            b_ptr = cute.recast_ptr(mB.iterator, dtype=cutlass.Float4E2M1FN)
-        elif cutlass.const_expr(mA.element_type != mB.element_type):
-            raise TypeError(
-                "Unsupported mixed input dtypes for block-scaled GEMM: "
-                "mA and mB must have matching element_type "
-                "(both Uint8 for FP4 path, or both FP8 for MXFP8 path)."
-            )
-        else:
-            # MXFP8 path: input tensors are already FP8.
-            k = k_raw
-            a_ptr = mA.iterator
-            b_ptr = mB.iterator
-
-        a_tensor = cute.make_tensor(
-            a_ptr,
-            layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)),
-        )
-        b_tensor = cute.make_tensor(
-            b_ptr,
-            layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)),
-        )
-        # Reshape C to (m, n, l) -- swap_ab is constexpr, determines layout at compile time
-        if cutlass.const_expr(swap_ab):
-            c_tensor = cute.make_tensor(
-                mC.iterator,
-                layout=cute.make_ordered_layout((m, n, l), order=(0, 1, 2)),
-            )
-        else:
-            c_tensor = cute.make_tensor(
-                mC.iterator,
-                layout=cute.make_ordered_layout((m, n, l), order=(1, 0, 2)),
-            )
-        # Scale factor tensors: 6D BlockScaledBasicChunk layout from pointers
-        # (32, 4, sf_m, 4, sf_k, l) with order (2, 1, 4, 0, 3, 5)
-        sfa_tensor = cute.make_tensor(
-            a_sf_ptr,
-            layout=cute.make_ordered_layout(
-                (32, 4, sf_m, 4, sf_k, l),
-                order=(2, 1, 4, 0, 3, 5),
-            ),
-        )
-        sfb_tensor = cute.make_tensor(
-            b_sf_ptr,
-            layout=cute.make_ordered_layout(
-                (32, 4, sf_n, 4, sf_k, l),
-                order=(2, 1, 4, 0, 3, 5),
-            ),
-        )
-
-        self(
-            a_tensor,
-            b_tensor,
-            sfa_tensor,
-            sfb_tensor,
-            c_tensor,
-            alpha_tensor,
-            max_active_clusters,
-            current_stream,
-            epilogue_op,
-        )

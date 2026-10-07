@@ -84,17 +84,6 @@ def unit_test(rank: int, world_size: int, port: int, dtype: torch.dtype):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_all_gather_matmul(dtype: torch.dtype):
-    import os
-    import sys
-
-    # mp.spawn starts fresh interpreters that need to re-import this module;
-    # ensure the repo root is on sys.path so 'tests.comm' is findable.
-    repo_root = os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    )
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-
     port = random.randint(30000, 60000)
     world_size = torch.cuda.device_count()
     mp.spawn(unit_test, args=(world_size, port, dtype), nprocs=world_size, join=True)

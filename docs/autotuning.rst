@@ -79,10 +79,13 @@ When a FlashInfer operation executes, the autotuner resolves the best
    process.
 2. **User-loaded file configs** — loaded via ``load_configs()`` or
    ``autotune(cache=...)``.
-3. **Bundled package configs** — legacy ``.py`` config files shipped with
+3. **Managed v2 store** — the FlashInfer-managed per-entry store attached by
+   :func:`flashinfer.autotune_v2` (experimental), consulted when a store is
+   active for the current context or attached to the process.
+4. **Bundled package configs** — legacy ``.py`` config files shipped with
    FlashInfer (only when the ``FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1``
    environment variable is set and tuning mode is off).
-4. **Fallback tactic (−1)** — a safe default that every runner must implement.
+5. **Fallback tactic (−1)** — a safe default that every runner must implement.
 
 Notably, user-loaded file configs (level 2) are
 **always consulted, even during tuning mode**, so that already-tuned shapes
@@ -97,6 +100,12 @@ Config Caching
    Single-process and multi-threaded use is fully supported.
    Multi-process and multi-node use is best-effort: concurrent writes to
    a shared cache file may result in lost updates from race conditions.
+
+   This race-condition caveat applies to the **v1 file cache** described
+   here.  The experimental :func:`flashinfer.autotune_v2` managed store
+   removes it by writing one atomically-published file per entry — there is
+   no shared file to race on, so all ranks can tune concurrently into one
+   store.
 
 By default, autotuning results live only in memory and are lost when the
 process exits.  The ``cache`` parameter on ``flashinfer.autotune`` lets you
@@ -230,12 +239,25 @@ The ``_metadata`` key records the environment that created the cache file
 
 On load, ``_metadata`` is compared against the current environment.  If any
 field differs (e.g. different GPU, FlashInfer version, or cuBLAS version),
-the **entire cache is skipped** — no configs are loaded, and the file will
-not be overwritten on exit; i.e. the autotuner would behave as if the cache
-file input was not provided (cache=None). This prevents silently using invalid
-tactics and avoids destroying configs tuned for a different environment.  A
-warning is logged with the mismatch details and a suggestion to use a
-different cache path for the current environment.
+the **entire cache is skipped** — no configs are loaded.  This prevents
+silently using invalid tactics.  A warning is logged once per process with
+the mismatch details; repeats for further cache files are logged at DEBUG.
+
+What happens to the file on the next save depends on the kind of mismatch:
+
+* The saved value is **definite** (e.g. ``"cudnn_version": "91900"`` vs
+  current ``92101``): the file belongs to a different environment sharing
+  this cache path.  It is never overwritten — the autotuner behaves as if
+  ``cache=None`` — so configs tuned for that environment survive.  Use a
+  different cache path for the current environment, or delete the file to
+  re-prime it.
+* The saved value is **indeterminate** (``"unknown"``, recorded when the
+  writer could not detect e.g. its cuDNN version, or a field missing from
+  files written by older FlashInfer versions): the file's configs cannot
+  be attributed to any environment, so the next tuned save **replaces**
+  the file with freshly tuned configs stamped with the current
+  environment's metadata.  The cache heals itself instead of forcing a
+  full re-tune on every startup forever.
 
 Advanced users can bypass individual checks by manually editing the JSON file
 and setting a metadata field to ``"*"``.  For example, setting
@@ -404,3 +426,15 @@ with ``torchrun``), you could use separate output files per rank and merge them 
    ``rename()`` syscall.  This is atomic on all local filesystems and is
    expected to be atomic on most network filesystems (NFS, Lustre) per POSIX
    semantics.  FlashInfer's cubin caching also relies on this guarantee.
+
+cuTile Autotuning
+-----------------
+
+The cuTile (``backend="cutile"``) GEMM/BMM ops autotune their tile shape,
+CTA count and occupancy on the first call for each problem shape and cache the
+result per process. To disable this and always use the built-in default config
+(e.g. for deterministic timing or to skip tuning overhead), set:
+
+.. code-block:: bash
+
+    export FLASHINFER_CUTILE_AUTOTUNE_DISABLED=1

@@ -127,6 +127,7 @@ def selective_state_update(
     dst_state_batch_indices: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
+    backend: str = "auto",
 ) -> torch.Tensor:
     r"""Selective state update operation for Mamba layers (the generation phase).
 
@@ -212,6 +213,11 @@ def selective_state_update(
         Determines which state to read as initial state for each sequence.
     algorithm : str
         Algorithm to use: "auto", "simple", "vertical", "horizontal"
+    backend : str
+        Backend to use: "auto", "flashinfer", or "cake". Both "auto" and
+        "flashinfer" use FlashInfer. Cake is an opt-in source-built backend on
+        SM100/SM103; backend="cake" falls back to FlashInfer outside Cake's
+        promoted rows.
 
     Returns
     -------
@@ -331,6 +337,41 @@ def selective_state_update(
         algorithm_int = 1
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
+
+    if backend not in {"auto", "flashinfer", "cake"}:
+        raise ValueError(f"Unknown backend: {backend}")
+    if backend == "cake":
+        from ..jit.mamba.cake_selective_state_update import (
+            try_cake_selective_state_update,
+        )
+
+        if try_cake_selective_state_update(
+            state=state,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            output=output,
+            state_batch_indices=state_batch_indices,
+            dst_state_batch_indices=dst_state_batch_indices,
+            pad_slot_id=pad_slot_id,
+            disable_state_update=disable_state_update,
+            intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_state_indices=intermediate_state_indices,
+            state_scale=state_scale,
+            intermediate_state_scales=intermediate_state_scales,
+            rand_seed=rand_seed,
+            cache_steps=cache_steps,
+            cu_seqlens=cu_seqlens,
+            num_accepted_tokens=num_accepted_tokens,
+            algorithm=algorithm,
+            dt_softplus=dt_softplus,
+        ):
+            return output
 
     _selective_state_update(
         state,
