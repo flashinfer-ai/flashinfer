@@ -24,7 +24,15 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from . import cake_concat_mla_kv_quant_fp8
 from .api_logging import flashinfer_api
+from .jit.cake_concat_mla_kv_quant_fp8 import (
+    ROUTES,
+    concat_mla_kv_quant_fp8_route_record,
+    concat_mla_kv_quant_fp8_target_for_capability,
+    load_concat_mla_kv_quant_fp8_build,
+    route_key,
+)
 from .trace.templates.attention import concat_mla_kv_quant_fp8_trace
 from .utils import get_compute_capability
 
@@ -41,6 +49,17 @@ _KV_DIM = NOPE_DIM + V_DIM
 # Largest finite float8_e4m3fn magnitude; the fused kernel saturates to it.
 _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 _QK_DIM = NOPE_DIM + ROPE_DIM
+
+# Host plan of the generated Cake programs (a replica of the Cake production
+# launcher's ``plan_head_group`` / ``plan_grid``): one warp group per token,
+# every warp owns ``head_group`` consecutive head pairs, eight warps per CTA.
+_WARPS_PER_CTA = 8
+_THREADS_PER_CTA = 32 * _WARPS_PER_CTA
+# Below this token count prefer two pairs per warp (more CTAs in the one-wave
+# regime) whenever the head-pair count is even.
+_SMALL_T_TOKENS = 2048
+# Most head pairs (4 KB of input) a warp keeps in flight within the register budget.
+_MAX_HEAD_GROUP = 4
 
 # Dispatch surface of the fused kernel (package data; see the file's note).
 _WORKLOAD_FILE = "mla_kv_pack_fp8_workloads.json"
@@ -63,7 +82,6 @@ def _load_allowlist() -> Optional[dict]:
                 int(payload["num_tokens"]["min"]),
                 int(payload["num_tokens"]["max"]),
             ),
-            "unrolled_heads": tuple(int(v) for v in payload["unrolled_num_heads"]),
         }
     except (
         FileNotFoundError,
@@ -82,9 +100,39 @@ def _load_allowlist() -> Optional[dict]:
         return None
 
 
-_module = None
+def _plan_head_group(num_tokens: int, num_heads: int) -> int:
+    """Head pairs per warp: the fewest warps per token that keep at most four
+    pairs (4 KB of loads in flight) per warp, with the pairs spread evenly over
+    those warps; two for one-wave shapes.
+
+    Exact replica of the Cake production launcher's rule, which selects the
+    generated program: ``T <= 2048`` with an even pair count takes two pairs per
+    warp (more, smaller CTAs for a one-wave launch); otherwise ``ceil(P / 4)``
+    warps share the token's ``P = ceil(H / 2)`` pairs and each warp takes
+    ``ceil(P / warps)`` of them (one pair for H <= 2, three for H in {5, 6}, for
+    H in {9, 10}: 3 + 2 rather than 4 + 1, for H in {17, 18}: 3 + 3 + 3, and
+    for H in {11, 12}: 3 + 3 rather than 4 + 2; four for H = 24 .. 128).
+    """
+    head_pairs = (int(num_heads) + 1) // 2
+    if int(num_tokens) <= _SMALL_T_TOKENS and head_pairs % 2 == 0:
+        return 2
+    warps_per_token = (head_pairs + _MAX_HEAD_GROUP - 1) // _MAX_HEAD_GROUP
+    return (head_pairs + warps_per_token - 1) // warps_per_token
+
+
+def _plan_grid(num_tokens: int, num_heads: int, head_group: int) -> Tuple[int, int]:
+    """``(grid_x, warps_per_token)``: ``ceil(P / head_group)`` warps per token, eight warps per CTA."""
+    head_pairs = (int(num_heads) + 1) // 2
+    warps_per_token = (head_pairs + int(head_group) - 1) // int(head_group)
+    grid = max(
+        1, (int(num_tokens) * warps_per_token + _WARPS_PER_CTA - 1) // _WARPS_PER_CTA
+    )
+    return grid, warps_per_token
+
+
+_modules: Dict[Tuple[str, int], Any] = {}
+_module_errors: Dict[Tuple[str, int], str] = {}
 _module_lock = threading.Lock()
-_module_error: Optional[str] = None
 _stats: Dict[str, Any] = {
     "calls": 0,
     "specialized_dispatches": 0,
@@ -102,46 +150,56 @@ def _bump_fallback(reason: str) -> None:
     reasons[reason] = reasons.get(reason, 0) + 1
 
 
-def _get_module():
-    """Build/load the JIT module once; never inside a CUDA-graph capture."""
-    global _module, _module_error
-    if _module is not None:
-        return _module
+def _get_module(target: str, head_group: int):
+    """Build/load the (target, head group) JIT module once; never inside a CUDA-graph capture."""
+    key = (target, int(head_group))
+    module = _modules.get(key)
+    if module is not None:
+        return module
     with _module_lock:
-        if _module is None and _module_error is None:
+        if key not in _modules and key not in _module_errors:
             try:
-                from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
-
-                _module = gen_mla_kv_pack_fp8_module().build_and_load()
+                _modules[key] = load_concat_mla_kv_quant_fp8_build(
+                    target, int(head_group)
+                )
                 _stats["module_loaded"] = True
             except Exception as exc:  # noqa: BLE001 - guard must never break the stock path
-                _module_error = f"{type(exc).__name__}: {exc}"[:500]
-                _stats["module_error"] = _module_error
+                error = f"{type(exc).__name__}: {exc}"[:500]
+                _module_errors[key] = error
+                _stats["module_error"] = error
                 logger.warning(
-                    "flashinfer.concat_mla_kv_quant_fp8: JIT build failed, using the "
-                    "composable torch path: %s",
-                    _module_error,
+                    "flashinfer.concat_mla_kv_quant_fp8: JIT build failed for %s head group %d, "
+                    "using the composable torch path: %s",
+                    target,
+                    int(head_group),
+                    error,
                 )
-    return _module
+    return _modules.get(key)
 
 
 def _concat_mla_kv_quant_fp8_stats() -> dict:
     """Diagnostics: dispatch counters, JIT state and the compile footprint.
 
-    The module holds exactly two kernel instantiations for the whole allowlist
-    (12 heads unrolled + runtime head count); nothing is compiled per shape,
-    so one JIT build (first non-capturing dispatch) precompiles everything.
+    The fused kernel is one generated Cake program per head group (1, 2, 3 or 4
+    head pairs per warp, planned from ``(num_tokens, num_heads)`` on the host);
+    token and head counts are runtime launch arguments, so nothing is compiled
+    per shape.  ``compiled_variants`` counts the (target, head group) modules
+    loaded so far; ``distinct_kernels_for_allowlist`` is the delivered program
+    count of the route table.
     """
     allowlist = _load_allowlist()
     return {
         **_stats,
         "fallback_reasons": dict(_stats["fallback_reasons"]),
+        "module_errors": dict(_module_errors),
         "allowlist_loaded": allowlist is not None,
         "allowlist": allowlist,
-        "compiled_variants": 2 if _stats["module_loaded"] else 0,
-        "distinct_kernels_for_allowlist": 2,
-        "distinct_kernels": "num_heads==12 (unrolled) + runtime-heads variant",
-        "precompiled": _stats["module_loaded"],
+        "compiled_variants": len(_modules),
+        "distinct_kernels_for_allowlist": len(ROUTES),
+        "distinct_kernels": "one generated Cake program per head group "
+        + ", ".join(sorted(ROUTES))
+        + " (head group planned from num_tokens and num_heads; T and H are runtime arguments)",
+        "precompiled": bool(_modules),
     }
 
 
@@ -212,11 +270,21 @@ def _specialized_supported(
         return "num_heads_not_allowlisted"
     if not allowlist["tokens"][0] <= num_tokens <= allowlist["tokens"][1]:
         return "num_tokens_not_allowlisted"
+    if route_key(_plan_head_group(num_tokens, num_heads)) not in ROUTES:
+        return "head_group_route"
     if not kv_nope.is_cuda:
         return "device"
-    if get_compute_capability(kv_nope.device) < allowlist["min_cc"]:
+    capability = get_compute_capability(kv_nope.device)
+    if capability < allowlist["min_cc"]:
         return "compute_capability"
-    if torch.cuda.is_current_stream_capturing() and _module is None:
+    target = concat_mla_kv_quant_fp8_target_for_capability(capability)
+    if target is None:
+        # A 10.x / 12.x part the exact sm_100a / sm_103a programs are not built for.
+        return "exact_target"
+    if (
+        torch.cuda.is_current_stream_capturing()
+        and _modules.get((target, _plan_head_group(num_tokens, num_heads))) is None
+    ):
         # Never compile/load inside a capture; the stock path is capture-safe.
         return "capturing_before_jit"
     return None
@@ -244,12 +312,13 @@ def concat_mla_kv_quant_fp8(
     is what ``Tensor.to(torch.float8_e4m3fn)`` produces on the GPU since
     torch 2.13. Output is bit-exact with that cast plus slice copies.
 
-    The fused kernel serves bf16 inputs with head geometry
-    ``nope_dim=128, rope_dim=64, v_dim=128`` on contiguous, 16-byte-aligned
-    tensors, on compute capability 10.0+ devices, within the head-count and
-    token-count surface of the package's ``mla_kv_pack_fp8_workloads.json``
-    (1..128 heads with 12 local heads as the unrolled fast path, 1..131072
-    tokens); every other call takes the composable torch path.
+    The fused kernel is a generated Cake program (one per head group, i.e. the
+    number of head pairs a warp owns, planned from the token and head counts)
+    built for the exact compute capabilities 10.0 and 10.3. It serves bf16
+    inputs with head geometry ``nope_dim=128, rope_dim=64, v_dim=128`` on
+    contiguous, 16-byte-aligned tensors within the head-count and token-count
+    surface of the package's ``mla_kv_pack_fp8_workloads.json`` (1..128 heads,
+    1..131072 tokens); every other call takes the composable torch path.
     ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` forces the composable path
     (read at call time).
 
@@ -313,8 +382,13 @@ def concat_mla_kv_quant_fp8(
 
     _stats["calls"] += 1
     reason = _specialized_supported(kv_nope, k_pe, key, value, nope_dim)
+    module = record = None
+    head_group = 0
     if reason is None and num_tokens > 0:
-        module = _get_module()
+        head_group = _plan_head_group(int(num_tokens), int(num_heads))
+        route = concat_mla_kv_quant_fp8_route_record(kv_nope.device, head_group)
+        record = route["module"]
+        module = _get_module(route["target"], head_group)
         if module is None:
             reason = "jit_unavailable"
     if reason is not None:
@@ -322,14 +396,26 @@ def concat_mla_kv_quant_fp8(
         return _fallback(kv_nope, k_pe, key, value, nope_dim)
     if num_tokens == 0:
         return key, value
-    module.concat_mla_kv_quant_fp8(kv_nope, k_pe, key, value)
+    grid, warps_per_token = _plan_grid(int(num_tokens), int(num_heads), head_group)
+    cake_concat_mla_kv_quant_fp8.launch(
+        kv_nope,
+        k_pe,
+        key,
+        value,
+        head_group=head_group,
+        warps_per_token=warps_per_token,
+        grid=grid,
+        module=module,
+        record=record,
+    )
     _stats["specialized_dispatches"] += 1
     if not _marker_logged:
         _marker_logged = True
         logger.info(
-            "flashinfer.concat_mla_kv_quant_fp8: fused kernel dispatched "
-            "(num_heads=%d, num_tokens=%d)",
+            "flashinfer.concat_mla_kv_quant_fp8: fused Cake kernel dispatched "
+            "(num_heads=%d, num_tokens=%d, head_group=%d)",
             num_heads,
             num_tokens,
+            head_group,
         )
     return key, value

@@ -1,32 +1,37 @@
 """
 Tests for concat_mla_kv_quant_fp8 — the fused bf16 -> fp8 e4m3 MLA context K/V
-pack. It is a saturating cast plus pure memory movement, so the output must be
-**byte-exact** against the explicit saturating reference (and against torch's
-own GPU cast on torch >= 2.13).
+pack (one generated Cake program per head group). It is a saturating cast plus
+pure memory movement, so the output must be **byte-exact** against the explicit
+saturating reference (and against torch's own GPU cast on torch >= 2.13).
 """
 
 import pytest
 import torch
 
 import flashinfer
-from flashinfer import mla_kv_pack
+from flashinfer import cake_concat_mla_kv_quant_fp8, mla_kv_pack
+from flashinfer.jit import cake_concat_mla_kv_quant_fp8 as mla_kv_pack_jit
 from flashinfer.utils import get_compute_capability
 
 NOPE, ROPE, V = 128, 64, 128
 
 
 def _fused_kernel_dispatches_here() -> bool:
-    """The shipped allowlist dispatches the fused kernel on CC 10.0+ only; older
-    GPUs take the PyTorch fallback (covered by the fallback tests below)."""
-    return torch.cuda.is_available() and get_compute_capability(
-        torch.device("cuda")
-    ) >= (10, 0)
+    """The Cake programs are built for the exact compute capabilities 10.0 and
+    10.3; every other GPU takes the PyTorch fallback (covered by the fallback
+    tests below)."""
+    return torch.cuda.is_available() and (
+        mla_kv_pack_jit.concat_mla_kv_quant_fp8_target_for_capability(
+            get_compute_capability(torch.device("cuda"))
+        )
+        is not None
+    )
 
 
 requires_fused_dispatch = pytest.mark.skipif(
     not _fused_kernel_dispatches_here(),
     reason="fused concat_mla_kv_quant_fp8 kernel dispatches on compute capability "
-    "10.0+ only; this GPU takes the fallback path",
+    "10.0 / 10.3 only; this GPU takes the fallback path",
 )
 
 
@@ -116,20 +121,177 @@ def _assert_fused_byte_exact(T, H):
     assert stats["specialized_dispatches"] == before + 1, stats
 
 
+# ---------------------------------------------------------------------------
+# Host-only tests (no GPU)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("T", "H", "head_group", "grid", "warps_per_token"),
+    [
+        # Frozen from the Cake production launcher (_plan_head_group / _plan_grid).
+        (1, 1, 1, 1, 1),
+        (131072, 1, 1, 16384, 1),
+        (1024, 1, 1, 128, 1),
+        (127, 3, 2, 16, 1),
+        (1, 6, 3, 1, 1),
+        (1536, 6, 3, 192, 1),
+        (65536, 6, 3, 8192, 1),
+        (1, 12, 2, 1, 3),
+        (1536, 12, 2, 576, 3),
+        (2048, 12, 2, 768, 3),
+        (2049, 12, 3, 513, 2),  # 6 pairs: three per warp (3 + 3, not 4 + 2)
+        (66048, 12, 3, 16512, 2),
+        (4096, 18, 3, 1536, 3),  # 9 pairs: three per warp over three warps
+        (1536, 24, 2, 1152, 6),
+        (16384, 24, 4, 6144, 3),
+        (65536, 96, 4, 98304, 12),
+        (1, 128, 2, 4, 32),
+        (65536, 128, 4, 131072, 16),
+        (131072, 128, 4, 262144, 16),
+        (4096, 10, 3, 1024, 2),  # 5 pairs: three then two per warp (not 4 + 1)
+        (4096, 13, 4, 1024, 2),  # 7 pairs, odd head count (last pair half predicated)
+    ],
+)
+def test_head_group_plan_matches_the_cake_launcher(
+    T, H, head_group, grid, warps_per_token
+):
+    assert mla_kv_pack._plan_head_group(T, H) == head_group
+    assert mla_kv_pack._plan_grid(T, H, head_group) == (grid, warps_per_token)
+
+
+def test_every_head_count_has_a_delivered_route():
+    """Every H in the allowlist resolves to a delivered program at every token count."""
+    for T in (1, 2048, 2049, 131072):
+        for H in range(1, 129):
+            key = mla_kv_pack_jit.route_key(mla_kv_pack._plan_head_group(T, H))
+            assert key in mla_kv_pack_jit.ROUTES, (T, H, key)
+    assert mla_kv_pack_jit.head_groups() == (1, 2, 3, 4)
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [((10, 0), "sm100a"), ((10, 3), "sm103a"), ((9, 0), None), ((12, 0), None)],
+)
+def test_exact_architecture_router(capability, expected):
+    assert (
+        mla_kv_pack_jit.concat_mla_kv_quant_fp8_target_for_capability(capability)
+        == expected
+    )
+
+
+def test_architecture_router_rejects_cross_routing(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+    with pytest.raises(RuntimeError, match="exact compute capability 10.0 or 10.3"):
+        mla_kv_pack_jit.concat_mla_kv_quant_fp8_target(torch.device("cuda"))
+
+
+def test_launch_args_follow_the_generated_arg_plan():
+    record = {
+        "arg_plan": [
+            ["buffer", "kv_nope"],
+            ["buffer", "k_pe"],
+            ["buffer", "key"],
+            ["buffer", "value"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "head_pairs"],
+            ["parameter", "warps_per_token"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ]
+    }
+    values = {
+        "kv_nope": "kv",
+        "k_pe": "pe",
+        "key": "k",
+        "value": "v",
+        "num_tokens": 7,
+        "num_heads": 12,
+        "head_pairs": 6,
+        "warps_per_token": 2,
+    }
+    assert cake_concat_mla_kv_quant_fp8.launch_args(record, values, (2, 1, 1)) == (
+        "kv",
+        "pe",
+        "k",
+        "v",
+        7,
+        12,
+        6,
+        2,
+        2,
+        1,
+        1,
+    )
+    with pytest.raises(RuntimeError, match="unsupported argument"):
+        cake_concat_mla_kv_quant_fp8.launch_args(
+            {"arg_plan": [["tma_buffer", "kv_nope"]]}, values, (1, 1, 1)
+        )
+
+
+def test_allowlist_guards_are_gpu_free():
+    """The allowlist is checked before the device: exercisable on CPU tensors."""
+    allowlist = mla_kv_pack._load_allowlist()
+    assert allowlist is not None
+    assert allowlist["heads"] == (1, 128) and allowlist["tokens"] == (1, 131072)
+    assert allowlist["min_cc"] == (10, 0)
+    fp8 = torch.float8_e4m3fn
+
+    def reason(T, H):
+        kv = torch.empty(T, H, NOPE + V, dtype=torch.bfloat16)
+        pe = torch.empty(T, ROPE, dtype=torch.bfloat16)
+        key = torch.empty(T, H, NOPE + ROPE, dtype=fp8)
+        value = torch.empty(T, H, V, dtype=fp8)
+        return mla_kv_pack._specialized_supported(kv, pe, key, value, NOPE)
+
+    assert reason(1024, 12) == "device"  # every GPU-free guard passed
+    assert reason(1024, 129) == "num_heads_not_allowlisted"
+    assert reason(131073, 12) == "num_tokens_not_allowlisted"
+    kv = torch.empty(8, 12, NOPE + V, dtype=torch.bfloat16)
+    pe = torch.empty(8, ROPE, dtype=torch.bfloat16)
+    key = torch.empty(8, 12, NOPE + ROPE, dtype=fp8)
+    bad_value = torch.empty(8, 12, V, dtype=torch.float8_e5m2)
+    assert mla_kv_pack._specialized_supported(kv, pe, key, bad_value, NOPE) == (
+        "output_dtype"
+    )
+    assert mla_kv_pack._specialized_supported(kv, pe, key, key, NOPE) == (
+        "output_geometry"
+    )
+
+
+# ---------------------------------------------------------------------------
+# GPU tests
+# ---------------------------------------------------------------------------
+
+
 @requires_fused_dispatch
 @pytest.mark.parametrize("T", [1, 7, 1536, 66038, 66048])
 @pytest.mark.parametrize("H", [12, 8])
 def test_byte_exact(T, H):
-    """12 heads takes the unrolled kernel, 8 heads the runtime-head-count one."""
+    """12 heads: two pairs per warp up to 2048 tokens, three above; 8 heads: two
+    pairs per warp up to 2048 tokens, four above."""
     _assert_fused_byte_exact(T, H)
 
 
 @requires_fused_dispatch
-@pytest.mark.parametrize("T,H", [(129, 1), (127, 3), (1536, 13), (2048, 128)])
+@pytest.mark.parametrize(
+    "T,H", [(129, 1), (127, 3), (1536, 13), (4096, 10), (2048, 128)]
+)
 def test_byte_exact_odd_head_counts(T, H):
-    """Runtime head count: heads below the 2-way / 4-way lane strides and the
-    allowlist's largest head count."""
+    """One pair per warp (H <= 2), odd head counts (half-predicated last pair),
+    pair counts four does not divide, and the allowlist's largest head count."""
     _assert_fused_byte_exact(T, H)
+
+
+@requires_fused_dispatch
+@pytest.mark.parametrize("H", [1, 6, 12, 24])
+def test_byte_exact_every_head_group(H):
+    """Every delivered program (head group 1, 3, 2 and 4) at a token count above
+    the small-T threshold and at one below it."""
+    for T in (2048, 2049):
+        _assert_fused_byte_exact(T, H)
 
 
 def test_matches_torch_cast_when_saturating():
@@ -214,36 +376,6 @@ def test_non_contiguous_takes_fallback():
         assert torch.equal(value.view(torch.uint8), ref_value)
 
 
-def test_allowlist_guards_are_gpu_free():
-    """The allowlist is checked before the device: exercisable on CPU tensors."""
-    allowlist = mla_kv_pack._load_allowlist()
-    assert allowlist is not None
-    assert allowlist["heads"] == (1, 128) and allowlist["tokens"] == (1, 131072)
-    assert allowlist["min_cc"] == (10, 0)
-    fp8 = torch.float8_e4m3fn
-
-    def reason(T, H):
-        kv = torch.empty(T, H, NOPE + V, dtype=torch.bfloat16)
-        pe = torch.empty(T, ROPE, dtype=torch.bfloat16)
-        key = torch.empty(T, H, NOPE + ROPE, dtype=fp8)
-        value = torch.empty(T, H, V, dtype=fp8)
-        return mla_kv_pack._specialized_supported(kv, pe, key, value, NOPE)
-
-    assert reason(1024, 12) == "device"  # every GPU-free guard passed
-    assert reason(1024, 129) == "num_heads_not_allowlisted"
-    assert reason(131073, 12) == "num_tokens_not_allowlisted"
-    kv = torch.empty(8, 12, NOPE + V, dtype=torch.bfloat16)
-    pe = torch.empty(8, ROPE, dtype=torch.bfloat16)
-    key = torch.empty(8, 12, NOPE + ROPE, dtype=fp8)
-    bad_value = torch.empty(8, 12, V, dtype=torch.float8_e5m2)
-    assert mla_kv_pack._specialized_supported(kv, pe, key, bad_value, NOPE) == (
-        "output_dtype"
-    )
-    assert mla_kv_pack._specialized_supported(kv, pe, key, key, NOPE) == (
-        "output_geometry"
-    )
-
-
 def test_rejects_non_fp8_output_buffers():
     """Caller-provided outputs must honour the float8_e4m3fn contract; a wrong
     dtype is an error, never a silent fallback into that buffer."""
@@ -274,14 +406,32 @@ def test_pre_blackwell_device_takes_fallback(monkeypatch):
         assert torch.equal(value.view(torch.uint8), ref_value)
 
 
+def test_unbuilt_exact_target_takes_fallback(monkeypatch):
+    """A 10.x / 12.x part without a built program takes the composable path, byte-exactly."""
+    monkeypatch.setattr(mla_kv_pack, "get_compute_capability", lambda device: (12, 0))
+    kv, pe = _inputs(512, 12)
+    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
+    key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe)
+    after = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
+    assert after["specialized_dispatches"] == before["specialized_dispatches"]
+    assert after["fallback_reasons"]["exact_target"] == (
+        before["fallback_reasons"].get("exact_target", 0) + 1
+    )
+    if _torch_cast_saturates():
+        ref_key, ref_value = _reference(kv, pe)
+        assert torch.equal(key.view(torch.uint8), ref_key)
+        assert torch.equal(value.view(torch.uint8), ref_value)
+
+
 @requires_fused_dispatch
 def test_stats_hook_reports_compile_footprint():
     flashinfer.concat_mla_kv_quant_fp8(*_inputs(64, 12))
     stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
     assert stats["module_loaded"] and stats["precompiled"]
-    assert stats["compiled_variants"] == 2
-    assert stats["distinct_kernels_for_allowlist"] == 2
+    assert stats["compiled_variants"] >= 1
+    assert stats["distinct_kernels_for_allowlist"] == len(mla_kv_pack_jit.ROUTES) == 4
     assert stats["allowlist_loaded"]
+    assert not stats["module_errors"]
 
 
 def test_zero_tokens():
@@ -315,3 +465,46 @@ def test_cuda_graph_capture_after_warmup():
     ref_key, ref_value = _reference(kv, pe)
     assert torch.equal(key.view(torch.uint8), ref_key)
     assert torch.equal(value.view(torch.uint8), ref_value)
+    # Same graph, new source contents: the replay must follow the data.
+    kv.mul_(-0.5)
+    pe.mul_(-0.5)
+    g.replay()
+    torch.cuda.synchronize()
+    ref_key, ref_value = _reference(kv, pe)
+    assert torch.equal(key.view(torch.uint8), ref_key)
+    assert torch.equal(value.view(torch.uint8), ref_value)
+
+
+@requires_fused_dispatch
+def test_capture_before_jit_takes_fallback():
+    """Capturing a head group whose module is not loaded yet must not JIT inside
+    the capture: the stock path serves that capture, byte-exactly."""
+    stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
+    target = mla_kv_pack_jit.concat_mla_kv_quant_fp8_target(torch.device("cuda"))
+    # Head group 1 (H <= 2) is rarely warmed by the other tests; force the cold state.
+    head_group = mla_kv_pack._plan_head_group(256, 1)
+    saved = mla_kv_pack._modules.pop((target, head_group), None)
+    try:
+        kv, pe = _inputs(256, 1)
+        key = torch.empty(256, 1, NOPE + ROPE, dtype=torch.float8_e4m3fn, device="cuda")
+        value = torch.empty(256, 1, V, dtype=torch.float8_e4m3fn, device="cuda")
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                flashinfer.concat_mla_kv_quant_fp8(kv, pe, key, value)
+        torch.cuda.current_stream().wait_stream(s)
+        after = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
+        assert after["fallback_reasons"]["capturing_before_jit"] == (
+            stats["fallback_reasons"].get("capturing_before_jit", 0) + 1
+        )
+        g.replay()
+        torch.cuda.synchronize()
+        if _torch_cast_saturates():
+            ref_key, ref_value = _reference(kv, pe)
+            assert torch.equal(key.view(torch.uint8), ref_key)
+            assert torch.equal(value.view(torch.uint8), ref_value)
+    finally:
+        if saved is not None:
+            mla_kv_pack._modules[(target, head_group)] = saved
