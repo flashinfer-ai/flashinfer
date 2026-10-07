@@ -316,15 +316,17 @@ def test_mm_mxfp8_b12x_decode_m(m, n, k):
     )
 
 
+@pytest.mark.parametrize("auto_tuning", [False, True])
 @pytest.mark.parametrize(
     "m,k",
     [
         (1, 768),
+        (8, 4096),
         (16, 1536),
         (32, 2048),
     ],
 )
-def test_mm_mxfp8_cute_dsl_low_m(m, k):
+def test_mm_mxfp8_cute_dsl_low_m(m, k, auto_tuning):
     _run_mm_mxfp8(
         m,
         256,
@@ -332,7 +334,7 @@ def test_mm_mxfp8_cute_dsl_low_m(m, k):
         torch.bfloat16,
         torch.bfloat16,
         "cute-dsl",
-        auto_tuning=True,
+        auto_tuning=auto_tuning,
         provide_out=True,
     )
 
