@@ -473,7 +473,17 @@ class DeepEPImpl:
         self.local_experts = shape.experts // ep
         self.capacity = capacity
         self.precision = args.precision
-        self.utils = _mok_impl_utils()
+        # torchao's MXFP8 kernels are needed only for the MXFP8 arm; the BF16 arm uses torch's grouped GEMM directly
+        # (MoK impl_utils.grouped_mm's BF16 branch) so an older torchao does not block BF16 rows.
+        if self.precision == "mxfp8":
+            try:
+                self.utils = _mok_impl_utils()
+            except ImportError as error:
+                raise RuntimeError(
+                    f"deepep mxfp8 unavailable (torchao MXFP8 kernels): {error}"
+                ) from error
+        else:
+            self.utils = None
         # MoK #17 pads MXFP8 expert groups to 128 rows (scaled grouped GEMM alignment).
         self.pad = 128 if self.precision == "mxfp8" else None
         free_before = torch.cuda.mem_get_info(device)[0]
@@ -488,6 +498,9 @@ class DeepEPImpl:
         )
         torch.cuda.synchronize(device)
         self._buffer_bytes = max(0, free_before - torch.cuda.mem_get_info(device)[0])
+        # Padded permuted row count of the live handle; cached-handle dispatches
+        # skip the metadata pass that derives it, so the caller supplies it.
+        self.num_permuted = None
         wg, wu, wd = self.weights[3:]
         self.w_gate_t = wg.detach().transpose(1, 2).requires_grad_()
         self.w_up_t = wu.detach().transpose(1, 2).requires_grad_()
@@ -539,10 +552,11 @@ class DeepEPImpl:
                 num_of_experts_per_rank=self.local_experts,
             )
         else:
-            kwargs["handle"] = handle
+            kwargs.update(handle=handle, num_permuted_tokens=self.num_permuted)
         permuted, probs, _, padded_counts, handle = self.buffer.dispatch_with_permute(
             **kwargs
         )
+        self.num_permuted = permuted.shape[0]
         if self.pad is not None:
             # Padding rows hold no token: zero them so the weight gradients (K =
             # permuted rows) stay exact; the combine ignores them anyway.
@@ -560,7 +574,7 @@ class DeepEPImpl:
         offsets = torch.cumsum(padded_counts, 0, dtype=torch.int32).to(permuted.device)
         permuted = permuted.detach().requires_grad_()
         probs = probs.detach().float().requires_grad_()
-        gmm = self.utils.grouped_mm
+        gmm = self.utils.grouped_mm if self.utils is not None else _grouped_mm_bf16
         gate = gmm(permuted, self.w_gate_t, self.w_mx[0], offsets)
         up = gmm(permuted, self.w_up_t, self.w_mx[1], offsets)
         hidden = _swiglu_torch(gate, up, self.shape.swiglu_limit)
@@ -605,6 +619,7 @@ class DeepEPImpl:
             handle=handle,
             pad_multiple=self.pad,
             num_of_tokens_per_rank=self.capacity,
+            num_permuted_tokens=self.num_permuted,
         )
         d_x_s, d_sg, d_su, d_sd = torch.autograd.grad(y_shared, (x_s, sg, su, sd), dy)
         d_permuted, d_wg_t, d_wu_t, d_wd_t, d_probs = torch.autograd.grad(
@@ -635,6 +650,12 @@ class DeepEPImpl:
 
     def teardown(self):
         self.context = None
+
+
+def _grouped_mm_bf16(x, weight_t, weight_mxfp8, offsets):
+    """BF16 branch of MoK impl_utils.grouped_mm: torch grouped GEMM over cumulative group offsets."""
+    assert weight_mxfp8 is None
+    return torch.nn.functional.grouped_mm(x, weight_t, offs=offsets)
 
 
 def _mok_impl_utils():
