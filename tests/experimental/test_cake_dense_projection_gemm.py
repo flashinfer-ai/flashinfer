@@ -1825,9 +1825,7 @@ def test_round20_rules_plan_like_the_cake_launcher(T):
     assert ROW_RULES[
         ("sm_100a", False, True, False, False, False, 6144, 2048, None)
     ] == {"group_m": 8}
-    assert len(ROW_RULES) == 98
-    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 49
-    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 49
+    # the table size is asserted by the newest round's test (round 21: 98 = 49 + 49); round 20 shipped 98 = 49 + 49
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
     v = _views("proj", "shared_down", "dgrad", "bf16", T)
     plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
@@ -1843,6 +1841,64 @@ def test_round20_rules_plan_like_the_cake_launcher(T):
     f = _views("proj", "shared_down", "fwd", "bf16", T)
     fwd, *_ = plan_dense_projection_gemm(f["A"], f["B"], f["out"], **kw)
     assert fwd.group_m == 16 and fwd.template == "dense_proj_gemm_kk_n256"
+
+
+@pytest.mark.parametrize("T", [16172, 16231])
+def test_round21_rules_plan_like_the_cake_launcher(T):
+    # the round-21 sm_100a rule (Cake e3e42a19d84; W2, lever A): the kv_a input gradient bf16 (G @ W, 6144 x 576 x T) leaves the
+    # six-stage 128-row quad register epilogue (``kn_n256_q_s6``: epi reg, stages 6, quad_store) for the one-slot TMA-store epilogue
+    # with the two-chunk cross-tile pipelined TMEM drain (``kn_n256_tma1_pd2``); the raster group 8 is kept.  A zero-code instance
+    # change: no instance-key field is added; sm_107a keeps its round-20 rules (the kv_a row there stays on the quad stores + pd 1)
+    key = ("sm_100a", False, True, False, False, False, 6144, 576, None)
+    assert ROW_RULES[key] == {"group_m": 8, "slots": 1, "epi": "tma", "pd": 2}
+    assert ROW_RULES[
+        ("sm_107a", False, True, False, False, False, 6144, 576, None)
+    ] == {
+        "group_m": 8,
+        "epi": "reg",
+        "quad_store": True,
+        "pd": 1,
+    }
+    assert ROW_RULES[("sm_100a", False, True, True, False, False, 6144, 576, None)] == {
+        "group_m": 8,
+        "promo": "l2_256b",
+    }
+    # the table size belongs to the newest round's test: round 21 changes one rule's knobs and adds none (round 20 shipped 98 = 49 + 49)
+    assert len(ROW_RULES) == 98
+    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 49
+    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 49
+    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
+    v = _views("proj", "kv_a", "dgrad", "bf16", T)
+    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+    assert plan.template == "dense_proj_gemm_kn_n256_tma1_pd2" and not plan.cta1
+    assert (
+        plan.epi,
+        plan.slots,
+        plan.pd,
+        plan.group_m,
+        plan.cta_rows,
+        plan.block_n,
+    ) == ("tma", 1, 2, 8, 128, 256)
+    # a caller forcing the former form still plans the round-20 program of the row
+    old, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], epi="reg", quad_store=True, stages=6, **kw
+    )
+    assert (
+        old.template == "dense_proj_gemm_kn_n256_q_s6"
+        and old.pd == 0
+        and old.group_m == 8
+    )
+    # the sibling rows keep their programs: the sm_107a kv_a bf16 input gradient (quad stores + in-tile drain), the fp32 kv_a input
+    # gradient (one-slot TMA store, no drain) and the indexer_hw bf16 input gradient (two-slot TMA store + the cross-tile drain)
+    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
+    p107, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw107)
+    assert p107.template == "dense_proj_gemm_kn_n256_q_pd1" and p107.group_m == 8
+    f = _views("proj", "kv_a", "dgrad", "f32", T)
+    pf, *_ = plan_dense_projection_gemm(f["A"], f["B"], f["out"], **kw)
+    assert pf.template == "dense_proj_gemm_kn_n256_f32_tma1" and pf.pd == 0
+    h = _views("proj", "indexer_hw", "dgrad", "bf16", T)
+    ph, *_ = plan_dense_projection_gemm(h["A"], h["B"], h["out"], **kw)
+    assert ph.template == "dense_proj_gemm_kn_n256_tma2_pd2"
 
 
 def test_wave_working_set_and_hint_rule():
