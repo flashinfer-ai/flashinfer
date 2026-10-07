@@ -22,9 +22,8 @@ from flashinfer.cake_dcp import (
     DCP_BALANCED_D256_MAX_Q_LEN,
     DCP_BALANCED_D256_MIN_ITEMS,
     DCP_BALANCED_D256_MIN_Q_LEN,
-    DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS,
-    DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS_BY_ARCH,
-    DCP_BALANCED_D256_ONE_WAVE_MIN_Q_LEN,
+    DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES,
+    DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH,
     DCP_BALANCED_FP8_LONG_TILE_BLOCKS,
     DCP_BALANCED_FP8_LONG_TILE_BLOCKS_BY_ARCH,
     DCP_BALANCED_FP8_MAX_Q_LEN,
@@ -129,11 +128,10 @@ def test_balanced_band_constants_match_the_cake_dispatcher() -> None:
     assert (DCP_BALANCED_D256_MIN_Q_LEN, DCP_BALANCED_D256_MAX_Q_LEN) == (1, 8)
     assert DCP_BALANCED_D256_MIN_ITEMS == 160
     assert DCP_BALANCED_D256_LONG_TILE_BLOCKS == 96
-    assert DCP_BALANCED_D256_ONE_WAVE_MIN_Q_LEN == 3
-    assert DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS == 22
-    assert DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS_BY_ARCH == {
-        "sm_100a": 22,
-        "sm_103a": 22,
+    assert DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES == ((22, 3),)
+    assert DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH == {
+        "sm_100a": ((22, 3), (16, 4)),
+        "sm_103a": ((16, 3),),
     }
 
 
@@ -284,7 +282,16 @@ _ROUTE_ROWS = [
     ("dcp_fp8_agentx_b16_q4_cp4_r0", "fp8_p64", 16, 4, AGENTX, 4, 0, "balanced"),
     # fp8 e4m3 / page 64 / D256 GQA-16: the 15 production rows and the ragged rows
     ("prod_d256_b1_ctx32768_q4_cp4_graph", "fp8_p64_d256", 1, 4, 32764, 4, 0, "static"),
-    ("prod_d256_b8_ctx32768_q4_cp4_graph", "fp8_p64_d256", 8, 4, 32764, 4, 0, "static"),
+    (
+        "prod_d256_b8_ctx32768_q4_cp4_graph",
+        "fp8_p64_d256",
+        8,
+        4,
+        32764,
+        4,
+        0,
+        "balanced",
+    ),  # 16 blocks per CTA: 1.138 GB300 / 1.101 B200 vs the static route (1.037 / 1.000 vs FlashInfer main, 10 rounds)
     (
         "prod_d256_b16_ctx32768_q4_cp4_graph",
         "fp8_p64_d256",
@@ -464,8 +471,10 @@ def test_d256_one_wave_row_tile_regime(arch) -> None:
     # tile): the static route streams each request's KV once per speculative row, the
     # balanced row tile of up to four rows once per tile -- rows at q_len >= 3 whose static
     # tile streams >= 22 blocks per CTA route balanced (b12 / b16 / b32 at q_len 4, b16 at
-    # q_len 3, b16 at q_len 5 and 8, b8 at q_len 8); the b8 tie band (16 blocks) and b1 stay
-    # static, q_len 1 (no sharing) and q_len 2 (two rows per tile, <= 6 %) stay static.
+    # q_len 3, b16 at q_len 5 and 8, b8 at q_len 8); the 16-block class (static split 4)
+    # routes balanced from q_len 4 on sm_100a and from q_len 3 on sm_103a (unit 88); b1 and
+    # the 8-block class stay static, q_len 1 (no sharing) and q_len 2 (two rows per tile,
+    # <= 7 %) stay static.
     def band(batch, q_len):
         return _band(
             "fp8_p64_d256",
@@ -496,11 +505,28 @@ def test_d256_one_wave_row_tile_regime(arch) -> None:
         "balanced",
         "one_wave_row_tiles",
     )
+    # the 16-block class (static split 4): 1.138 / 1.101 vs the static route and
+    # 1.037 / 1.000 vs the public path (GB300 / B200, 10 rounds)
     assert (band(8, 4).blocks_per_cta, band(8, 4).route, band(8, 4).reason) == (
         16,
+        "balanced",
+        "one_wave_row_tiles",
+    )
+    for batch in (5, 6, 7, 9):
+        assert (band(batch, 4).blocks_per_cta, band(batch, 4).route) == (16, "balanced")
+    for batch in (9, 11, 12):
+        # q_len 3 at 16 blocks: 1.007-1.043 vs the public path on GB300, 0.971-1.020 on B200
+        q3 = band(batch, 3)
+        assert (q3.blocks_per_cta, q3.route, q3.reason) == (
+            (16, "balanced", "one_wave_row_tiles")
+            if arch == "sm_103a"
+            else (16, "static", "one_wave")
+        )
+    assert (band(4, 4).blocks_per_cta, band(4, 4).route, band(4, 4).reason) == (
+        8,
         "static",
         "one_wave",
-    )  # tie band 1.005 / 1.041
+    )  # 8 blocks per CTA (static split 8): 0.91 / 0.88
     assert (band(1, 4).route, band(1, 4).reason) == ("static", "one_wave")
     assert (band(16, 3).blocks_per_cta, band(16, 3).route, band(16, 3).reason) == (
         22,
@@ -1169,20 +1195,15 @@ def test_balanced_route_constants_match_the_shipped_manifest() -> None:
         else:
             assert "whole_tile_one_wave_n_rows" not in band["band"]
         if kind == "fp8_p64_d256":
-            assert (
-                band["band"]["one_wave_min_q_len"]
-                == DCP_BALANCED_D256_ONE_WAVE_MIN_Q_LEN
-            )
-            assert (
-                band["band"]["one_wave_long_tile_blocks"]
-                == DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS
-            )
-            assert (
-                band["band"]["one_wave_long_tile_blocks_by_arch"]
-                == DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS_BY_ARCH
-            )
+            assert band["band"]["one_wave_row_tile_classes"] == [
+                list(c) for c in DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES
+            ]
+            assert band["band"]["one_wave_row_tile_classes_by_arch"] == {
+                arch: [list(c) for c in classes]
+                for arch, classes in DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH.items()
+            }
         else:
-            assert "one_wave_long_tile_blocks" not in band["band"]
+            assert "one_wave_row_tile_classes" not in band["band"]
         contract = band["contract"]
         assert (contract["min_q_len"], contract["max_q_len"]) == (min_q_len, max_q_len)
         assert contract["max_requests"] == DCP_BALANCED_MAX_REQUESTS
@@ -1644,12 +1665,33 @@ def test_d256_band_row_launches_the_gqa16_program(monkeypatch) -> None:
     assert not calls["static"]
     (args,) = launches["balanced"]
     assert args[10] == pytest.approx(0.5) and args[11:] == (0, 4, 16, 1, 64, 5, 148)
-    # b8 q4 at ctx 32768 stays on the static D256 family (one wave of split-4 tiles).
+    # b8 q4 at ctx 32768 (one wave of split-4 tiles, 16 blocks per CTA) routes to the balanced kernel
+    # from q_len 4 on sm_100a: the one-wave row-tile class table.
     inputs = _rank_inputs(
         "fp8_p64_d256", batch=8, q_len=4, prefixes=[32764] * 8, cp_world=4, cp_rank=0
     )
     run_dcp_spec_decode(**inputs)
-    assert len(calls["balanced"]) == 1
+    assert calls["balanced"][1] == (
+        "dcp_spec_bf16_fp8_d256_balanced",
+        "sm100a",
+        dcp_balanced_n_rows("fp8_p64_d256", 4),
+        dcp_balanced_program(
+            "fp8_p64_d256",
+            batch_size=8,
+            num_kv_heads=1,
+            max_pages_per_seq=int(inputs["block_tables"].shape[1]),
+            sm_count=148,
+        ),
+    )
+    assert not calls["static"]
+    assert launches["balanced"][1][11:] == (0, 4, 16, 1, 8, 4, 148)
+    # b16 q2 at ctx 32768 stays on the static D256 family (one wave of split-4 tiles: two rows per
+    # tile at 16 blocks per CTA lose against the public path).
+    inputs = _rank_inputs(
+        "fp8_p64_d256", batch=16, q_len=2, prefixes=[32764] * 16, cp_world=4, cp_rank=0
+    )
+    run_dcp_spec_decode(**inputs)
+    assert len(calls["balanced"]) == 2
     assert calls["static"][0][:2] == ("fp8_d256", "splitn")
     # compile-line split count of the one-wave split-4 launch
     assert calls["static"][0][3]["NUM_SPLIT"] == 4

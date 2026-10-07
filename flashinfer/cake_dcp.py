@@ -316,18 +316,30 @@ DCP_BALANCED_D256_LONG_TILE_BLOCKS = 96
 # One-wave row-tile regime of the D256 family (round 5): the static D256 route
 # streams a request's KV once per speculative row (one Q16 tile per (request,
 # row)), the balanced row tile of up to four rows streams it once per tile, so
-# one static wave at q_len >= 3 re-reads every request's KV 2.5-4x and the
-# balanced program wins once the static tile streams 22 or more blocks per
-# CTA (round-5 band probe, static / forced balanced, GB300 | B200: q4 b12 at
-# 22 blocks 1.11 | 1.14, b16 1.22 | 1.28, b32 1.42 | 1.43; q3 b16 at 22
-# blocks 1.07 | 1.06; q5 / q8 1.45-1.79).  Below 22 blocks the plan + fold are
-# not amortised (q4 b8 at 16 blocks 1.00 | 1.04 tie band, b4 / b1 0.80 /
-# 0.90); q_len 1 reads KV once on both routes (0.89-0.97) and q_len 2 gains
-# at most 4-6 % (16 blocks: 0.91-0.94), both stay static.  Per-architecture
-# floor (the parts agree); the scalar is the default for unmeasured targets.
-DCP_BALANCED_D256_ONE_WAVE_MIN_Q_LEN = 3
-DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS = 22
-DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS_BY_ARCH = {"sm_100a": 22, "sm_103a": 22}
+# one static wave re-reads every request's KV q_len / ceil(q_len / 4) times and
+# the balanced program wins once the static tile streams enough blocks per CTA
+# for enough rows.  The classes are (blocks per CTA of the static tile, minimum
+# q_len) pairs per architecture; one static wave routes balanced when some
+# class admits it.  The static split family at 64 local blocks is 8 / 4 / 3 / 2
+# / 1 = 8 / 16 / 22 / 32 / 64 blocks per CTA, so nothing sits between 8 and 16
+# or between 16 and 22.  Round-5 band probes (static / forced balanced, GB300 |
+# B200): q4 b12 at 22 blocks 1.11 | 1.14, b16 1.22 | 1.28, b32 1.42 | 1.43; q3
+# b16 at 22 blocks 1.07 | 1.06; q5 / q8 1.45-1.79.  The 16-block class (static
+# split 4), against the static route and against the FlashInfer public path
+# (GB300 / B200): q4 b8 1.138 / 1.101 and 1.037 / 1.000 (10 rounds), q4 b5-b9
+# 1.08-1.16 / 1.11-1.21 and 1.00-1.08 / 1.01-1.11; q3 b9-b12 1.08-1.14 /
+# 1.06-1.12 against the static route but 1.007-1.043 / 0.971-1.020 against the
+# public path -- a tie or a loss at q_len 3 on B200, so sm_100a admits the
+# class from q_len 4 and sm_103a from q_len 3.  At 8 blocks the plan + fold are
+# not amortised (b4 q4 0.91 | 0.88, b1 1.04 | 0.96); q_len 1 reads KV once on
+# both routes (0.92-0.98) and q_len 2 gains at most 2-7 % at 32+ blocks (16
+# blocks: 0.94 | 0.92 against the public path), both stay static.  The scalar
+# tuple is the default for unmeasured targets.
+DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES = ((22, 3),)
+DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH = {
+    "sm_100a": ((22, 3), (16, 4)),
+    "sm_103a": ((16, 3),),
+}
 _DCP_BALANCED_Q_LEN_RANGE = {
     "bf16_p16": (DCP_BALANCED_BF16_MIN_Q_LEN, DCP_BALANCED_BF16_MAX_Q_LEN),
     "fp8_p64": (DCP_BALANCED_FP8_MIN_Q_LEN, DCP_BALANCED_FP8_MAX_Q_LEN),
@@ -644,9 +656,9 @@ def dcp_balanced_band(
     second wave of tiles and the chunk-pair work bound reaches the items floor
     (times the row tiles per request on D256), or one static wave streams the
     long-tile block count or more per CTA (per ``arch`` on the FP8 D128
-    family), or (D256 only) one static wave whose speculative rows share a
-    balanced row tile (``q_len >= DCP_BALANCED_D256_ONE_WAVE_MIN_Q_LEN``)
-    streams the ``arch``'s one-wave long-tile block count or more per CTA.  On
+    family), or (D256 only) one static wave whose (blocks per CTA, q_len)
+    reaches one of the ``arch``'s one-wave row-tile classes
+    (``DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH``).  On
     the FP8 D128 family a row at exactly two static waves must reach the
     ``arch``'s two-wave items floor.  On the BF16 family one static wave
     serving a single request whose page-table width (``max_pages_per_seq``,
@@ -702,12 +714,10 @@ def dcp_balanced_band(
     if blocks_per_cta >= long_tile_blocks:
         return decide("balanced", "long_tile")
     if waves < 2:
-        if (
-            kind == "fp8_p64_d256"
-            and q_len >= DCP_BALANCED_D256_ONE_WAVE_MIN_Q_LEN
-            and blocks_per_cta
-            >= DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS_BY_ARCH.get(
-                arch, DCP_BALANCED_D256_ONE_WAVE_LONG_TILE_BLOCKS
+        if kind == "fp8_p64_d256" and any(
+            blocks_per_cta >= min_blocks and q_len >= min_q_len
+            for min_blocks, min_q_len in DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES_BY_ARCH.get(
+                arch, DCP_BALANCED_D256_ONE_WAVE_ROW_TILE_CLASSES
             )
         ):
             return decide("balanced", "one_wave_row_tiles")
