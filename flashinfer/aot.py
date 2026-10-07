@@ -679,6 +679,12 @@ def gen_all_modules(
         jit_specs.append(gen_cake_fmha_compat_module("sm100a"))
     if has_sm103a_exact:
         jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
+    # Cake fused MLA context K/V pack (attention side, not MoE): one build per
+    # (exact target, head group).
+    if has_sm100a_exact:
+        jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm103a"))
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
@@ -914,11 +920,6 @@ def gen_all_modules(
         )
         if has_sm100a_exact or has_sm103a_exact:
             jit_specs.append(gen_alphamoe_sm100_module())
-        if has_sm100a_exact:
-            # Cake fused MLA context K/V pack: one build per (exact target, head group).
-            jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm100a"))
-        if has_sm103a_exact:
-            jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm103a"))
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())

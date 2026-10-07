@@ -212,22 +212,33 @@ def _fallback(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Composable stock path: two casts + two strided copies (any geometry).
 
-    Finite values are clamped to the e4m3fn range before ``Tensor.to``: torch
-    < 2.13 encodes finite overflow as NaN, while the fused kernel saturates to
-    +/-448. NaN passes through the clamp unchanged (both encode it as 0x7F), so
-    the fallback is byte-identical to the kernel on every supported torch.
+    Byte-identical to the fused kernel's saturating cast on every supported
+    torch: NaN payloads lose their sign bit (torch < 2.13's software cast keeps
+    it and encodes ``-NaN`` as ``0xFF``; the kernel and torch >= 2.13 emit the
+    canonical ``0x7F``) and finite values are clamped to the e4m3fn range
+    before ``Tensor.to`` (torch < 2.13 encodes finite overflow and ``+-inf`` as
+    NaN, while the kernel saturates to ``+-448``).
     """
     num_tokens = kv_nope.shape[0]
-    kv_fp8 = kv_nope.clamp(-_FP8_MAX, _FP8_MAX).to(key.dtype)
+    kv_fp8 = _saturating_cast(kv_nope, key.dtype)
     key[..., :nope_dim].copy_(kv_fp8[..., :nope_dim])
     key[..., nope_dim:].copy_(
-        k_pe.clamp(-_FP8_MAX, _FP8_MAX)
+        _saturating_cast(k_pe, key.dtype)
         .reshape(num_tokens, 1, k_pe.shape[-1])
-        .to(key.dtype)
         .expand(num_tokens, kv_nope.shape[1], k_pe.shape[-1])
     )
     value.copy_(kv_fp8[..., nope_dim:])
     return key, value
+
+
+def _saturating_cast(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """``x.to(dtype)`` with the fused kernel's NaN and overflow encoding on any
+    torch build: every NaN (either sign) -> canonical ``0x7F``, finite overflow
+    and ``+-inf`` -> ``+-448``."""
+    if x.dtype == dtype:
+        return x
+    x = torch.where(torch.isnan(x), x.abs(), x)
+    return x.clamp(-_FP8_MAX, _FP8_MAX).to(dtype)
 
 
 def _k_pe_rows_admissible(k_pe: torch.Tensor) -> bool:
@@ -330,9 +341,12 @@ def concat_mla_kv_quant_fp8(
     number of head pairs a warp owns, planned from the token and head counts)
     built for the exact compute capabilities 10.0 and 10.3. It serves bf16
     inputs with head geometry ``nope_dim=128, rope_dim=64, v_dim=128`` on
-    contiguous, 16-byte-aligned tensors within the head-count and token-count
-    surface of the package's ``mla_kv_pack_fp8_workloads.json`` (1..128 heads,
-    1..131072 tokens); every other call takes the composable torch path.
+    32-byte-aligned tensors (``kv_nope``, ``key`` and ``value`` contiguous;
+    ``k_pe`` contiguous or a row-strided column slice of a wider row-major
+    workspace: unit last stride, row stride a multiple of 16 elements and at
+    least ``rope_dim``) within the head-count and token-count surface of the
+    package's ``mla_kv_pack_fp8_workloads.json`` (1..128 heads, 1..131072
+    tokens); every other call takes the composable torch path.
     ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` forces the composable path
     (read at call time).
 
@@ -343,7 +357,9 @@ def concat_mla_kv_quant_fp8(
         fused path).
     k_pe : torch.Tensor
         ``[num_tokens, rope_dim]`` or ``[num_tokens, 1, rope_dim]`` bf16,
-        shared across heads.
+        shared across heads; for the fused path contiguous or a column slice
+        of a row-major workspace whose row stride is a multiple of 16 elements
+        (e.g. ``latent[:, 512:]`` of a ``[num_tokens, 576]`` buffer).
     key : Optional[torch.Tensor]
         ``[num_tokens, num_heads, nope_dim + rope_dim]`` float8_e4m3fn output;
         allocated when ``None``.

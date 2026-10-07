@@ -344,10 +344,47 @@ def test_kill_switch_takes_fallback(monkeypatch):
     stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
     assert stats["specialized_dispatches"] == before
     assert stats["fallback_reasons"].get("kill_switch", 0) >= 1
-    # Fallback is torch's cast: byte-exact with the kernel only where the cast saturates.
+    # Random data: compared where torch's own cast saturates (torch >= 2.13); the
+    # fallback's NaN / overflow encoding is pinned on any torch build by
+    # test_fallback_encodes_nan_and_overflow_like_the_kernel.
     if _torch_cast_saturates():
         assert torch.equal(key.view(torch.uint8), ref_key)
         assert torch.equal(value.view(torch.uint8), ref_value)
+
+
+def test_fallback_encodes_nan_and_overflow_like_the_kernel(monkeypatch):
+    """The composable path matches the fused kernel's saturating cast on every
+    torch build: finite overflow and +-inf saturate to +-448 and every NaN,
+    either sign, encodes as 0x7F.  torch < 2.13's software cast alone does
+    neither (NaN on overflow, 0xFF for -NaN)."""
+    # bf16 bit patterns: +NaN, -NaN, +inf, -inf, -0.0, 0.0 (as signed int16)
+    bits = torch.tensor([0x7FC0, -64, 0x7F80, -128, -32768, 0], dtype=torch.int16)
+    edge = torch.cat(
+        [
+            bits.view(torch.bfloat16),
+            torch.tensor(
+                [1e4, -1e4, 466.0, -466.0, 480.0, 448.0, -448.0, 2.0**-10],
+                dtype=torch.bfloat16,
+            ),
+        ]
+    ).cuda()
+    T, H = 64, 12
+    n_kv, n_pe = T * H * (NOPE + V), T * ROPE
+    kv = edge.repeat(n_kv // edge.numel() + 1)[:n_kv].view(T, H, NOPE + V).clone()
+    pe = edge.repeat(n_pe // edge.numel() + 1)[:n_pe].view(T, ROPE).clone()
+    monkeypatch.setenv("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", "1")
+    before = mla_kv_pack._concat_mla_kv_quant_fp8_stats()["specialized_dispatches"]
+    key, value = flashinfer.concat_mla_kv_quant_fp8(kv, pe)
+    stats = mla_kv_pack._concat_mla_kv_quant_fp8_stats()
+    assert stats["specialized_dispatches"] == before
+    ref_key, ref_value = _reference(kv, pe)
+    assert torch.equal(key.view(torch.uint8), ref_key)
+    assert torch.equal(value.view(torch.uint8), ref_value)
+    # Every NaN input (both signs) -> 0x7F, in the nope, rope and value columns.
+    key_u8, value_u8 = key.view(torch.uint8), value.view(torch.uint8)
+    assert (key_u8[..., :NOPE][torch.isnan(kv[..., :NOPE])] == 0x7F).all()
+    assert (value_u8[torch.isnan(kv[..., NOPE:])] == 0x7F).all()
+    assert (key_u8[:, 0, NOPE:][torch.isnan(pe)] == 0x7F).all()
 
 
 def test_k_pe_3d_and_preallocated_outputs():
