@@ -24,6 +24,8 @@ decode and speculative decode retain the backend exposed by
 ``flashinfer.kda_decode``.
 """
 
+import functools
+import math
 from typing import Literal, Optional
 
 import torch
@@ -36,6 +38,103 @@ from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .cute_dsl.availability import is_cute_dsl_available
 from .trace.templates.kda import recurrent_kda_trace
 from .utils import get_compute_capability
+
+
+@functools.cache
+def _cudnn_kda_prefill_available() -> bool:
+    """Probe optional packages once; per-call eligibility stays with native KDA."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    from packaging.version import InvalidVersion, Version
+
+    from .cudnn import linear_attention
+
+    if not linear_attention.CUDNN_AVAILABLE:
+        return False
+    try:
+        return Version(linear_attention.cudnn.__version__) >= Version("1.31") and (
+            Version(version("nvidia-cutlass-dsl")) >= Version("4.7")
+        )
+    except (AttributeError, InvalidVersion, PackageNotFoundError):
+        return False
+
+
+def _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens) -> bool:
+    """Measured performance policy, separate from native numerical eligibility."""
+    # B200 matched public-call benchmarks win both completed-call and replay
+    # time for this bounded region. H32 and ragged batches can lose despite
+    # faster host enqueue. Do not extrapolate this policy to SM103 or other
+    # shapes; refresh with benchmarks/bench_cudnn_linear_attention.py.
+    return (
+        q.is_cuda
+        and q.dtype == torch.bfloat16
+        and q.shape[0] == 1
+        and q.shape[-1] == 128
+        and 1 <= q.shape[2] <= 16
+        and 8192 <= q.shape[1] <= 16384
+        and cu_seqlens.numel() == 2
+        and initial_state is not None
+        and initial_state.dtype in (torch.bfloat16, torch.float32)
+        and not initial_state.requires_grad
+        and (not initial_state.is_inference() or torch.is_inference_mode_enabled())
+        and get_compute_capability(q.device) == (10, 0)
+    )
+
+
+def _try_cudnn_kda_prefill(
+    *,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    A_log,
+    dt_bias,
+    scale,
+    initial_state,
+    output_final_state,
+    lower_bound,
+    cu_seqlens,
+    output,
+    additive_epsilon,
+):
+    """Substitute an eligible native prefill without changing its math or aliases."""
+    from .cudnn import cudnn_recurrent_kda
+    from .cudnn.linear_attention import _LINEAR_ATTENTION_BUILD_ERRORS
+
+    # Native launchers check these after eligibility. Keep that contract even
+    # when auto replaces the launcher; FE descriptor checks do not check aliasing.
+    _kda_prefill._check_output_does_not_overlap_inputs(
+        output, q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state
+    )
+    if scale is not None and not math.isfinite(float(scale)):
+        raise ValueError(f"scale must be finite, got {scale}")
+    try:
+        return cudnn_recurrent_kda(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            beta_is_logit=True,
+            output=output,
+            qk_l2norm_additive_epsilon=additive_epsilon,
+        )
+    except _LINEAR_ATTENTION_BUILD_ERRORS as exc:
+        # This signal is raised only before execute. An execution error must
+        # propagate because the incoming state may already have been advanced.
+        if not getattr(exc, "_fi_la_build_unsupported", False):
+            raise
+        return None
 
 
 @flashinfer_api(trace=recurrent_kda_trace)
@@ -97,10 +196,15 @@ def recurrent_kda(
     can use either the frozen Cake schedules or the source-level CuTe DSL BT=16
     kernel. The Cake backend includes a generated two-stage BT=16
     prepare/chain portfolio with device- and shape-specific S7/S8/S9 pipeline
-    selection. ``backend="auto"`` prefers CuTe DSL for supported plain prefill
-    contracts and keeps Cake as the feature-complete fallback; use
+    selection. ``backend="auto"`` selects between CuTe DSL and cuDNN for supported
+    plain prefill contracts and keeps Cake as the feature-complete fallback; use
     ``backend="cake"`` to select and benchmark the generated portfolio
     explicitly, and ``backend="cudnn"`` to run cuDNN's fused SM100 engine.
+    Automatic cuDNN selection preserves the native route's Q/K normalization
+    formula and requires cuDNN frontend 1.31 GA and CuTe DSL 4.7 or newer.
+    Automatic cuDNN selection may ignore a valid ``seq_order`` scheduling hint.
+    Passing ``prefill_workspace`` retains the native provider, including captured
+    calls that use a native workspace.
     Compatible equal-head D128 unbounded-softplus T=1 decode calls use their
     frozen Cake specialization automatically. The Cake path accepts any
     positive runtime head count, so Kimi-Linear tensor parallelism maps global
@@ -230,6 +334,9 @@ def recurrent_kda(
             disables persistent host task-bin planning but does not force direct
             M128; the selected non-persistent route may still be BT16
             prepare/chain, M64, small-BH, or direct according to the input shape.
+            Automatic cuDNN selection validates this scheduling hint through the
+            native eligibility checks and may ignore it; output sequence order
+            is unchanged.
             Fixed-layout prefill and decode calls must leave it as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
             Caller-owned workspace for SM100-family and SM120 prefill backends.
@@ -306,12 +413,13 @@ def recurrent_kda(
             ``"cudnn"`` runs cuDNN's fused SM100 linear-attention engine
             through :func:`flashinfer.cudnn.cudnn_recurrent_kda`, and raises
             ``NotImplementedError`` carrying the reason when that engine cannot
-            serve the call. It is never selected implicitly, and it covers
+            serve the call. It covers
             ordinary multi-token prefill only: no speculative decode, no
             ``initial_state_source``, no state checkpoints. With a cuDNN frontend
             supporting state pools, ``ssm_state_indices`` reads and updates the
             selected slots of ``initial_state`` in place. ``output_final_state``
-            returns that pool, not a gathered per-sequence copy.
+            returns that pool, not a gathered per-sequence copy. State-pool calls
+            are not automatically selected for cuDNN.
         qk_l2norm_additive_epsilon (Optional[float]):
             Explicit Q/K normalization denominator ``sqrt(sum(x*x) + epsilon)``.
             Currently supported only by ``backend="cudnn"`` ordinary prefill
@@ -605,6 +713,39 @@ def recurrent_kda(
     is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
         q, cu_seqlens, num_spec_tokens
     )
+    # Reuse the native eligibility checks below to select the numerical contract.
+    # A scheduler workspace, pool or checkpoint keeps its native
+    # provider. Strided Q/K remain supported by explicit cuDNN without packing.
+    cudnn_auto = (
+        backend == "auto"
+        and is_plain_prefill
+        and cu_seqlens is not None
+        and q.is_contiguous()
+        and isinstance(k, torch.Tensor)
+        and k.is_contiguous()
+        and prefill_workspace is None
+        and ssm_state_indices is None
+        and initial_state_source is None
+        and initial_state_indices is None
+        and num_accepted_tokens is None
+        and state_checkpoints is None
+        and checkpoint_cu_starts is None
+        and checkpoint_state_indices is None
+        and checkpoint_every_n_tokens == 0
+        and (
+            initial_state is None
+            or (
+                isinstance(initial_state, torch.Tensor)
+                and initial_state.is_contiguous()
+            )
+        )
+        and isinstance(g, torch.Tensor)
+        and g.shape == q.shape
+        and isinstance(beta, torch.Tensor)
+        and beta.shape == q.shape[:-1]
+        and _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens)
+        and _cudnn_kda_prefill_available()
+    )
     original_q, original_k = q, k
     if (
         is_plain_prefill
@@ -679,6 +820,25 @@ def recurrent_kda(
         if eligible and use_small_bh:
             assert A_log is not None
             assert dt_bias is not None
+            if cudnn_auto:
+                result = _try_cudnn_kda_prefill(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    lower_bound=lower_bound,
+                    cu_seqlens=cu_seqlens,
+                    output=output,
+                    additive_epsilon=1e-6,
+                )
+                if result is not None:
+                    return result
             return _kda_prefill_cute_small_bh._run_kda_prefill_cute_small_bh(
                 q=q,
                 k=k,
@@ -807,6 +967,25 @@ def recurrent_kda(
             assert A_log is not None
             assert dt_bias is not None
             assert lower_bound is not None
+            if cudnn_auto:
+                result = _try_cudnn_kda_prefill(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    lower_bound=lower_bound,
+                    cu_seqlens=cu_seqlens,
+                    output=output,
+                    additive_epsilon=None,
+                )
+                if result is not None:
+                    return result
             return _kda_prefill_cute._run_cute_dsl_kda_prefill(
                 q=q,
                 k=k,

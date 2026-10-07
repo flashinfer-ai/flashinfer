@@ -49,6 +49,14 @@ def _linear_gate(g: Optional[torch.Tensor], ones_shape, dtype, device):
 _cudnn_handles: dict = {}
 
 
+# Auto may recover from marked build failures; explicit APIs retain the exact
+# original exception type, object and traceback. The marker is never set by
+# execute, where retrying could advance a recurrent state twice.
+_LINEAR_ATTENTION_BUILD_ERRORS = (NotImplementedError, TypeError) + (
+    (cudnn.cudnnGraphNotSupportedError,) if CUDNN_AVAILABLE else ()
+)
+
+
 def _check_cudnn_frontend(feature: str, minimum=_MIN_FRONTEND_VERSION) -> None:
     """Fail fast on a frontend that has no linear-attention graph node."""
     if not CUDNN_AVAILABLE:
@@ -366,32 +374,44 @@ def _run_la_graph(
     qk_l2norm_additive_epsilon: Optional[float] = None,
     state_indices: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
-    graph, _ = _build_la_graph(
-        family,
-        q,
-        k,
-        v,
-        g,
-        beta,
-        cu_seqlens,
-        o,
-        w=w,
-        a_log=a_log,
-        dt_bias=dt_bias,
-        initial_state=initial_state,
-        final_state=final_state,
-        num_householder=num_householder,
-        scale=scale,
-        use_qk_l2norm=use_qk_l2norm,
-        use_beta_sigmoid=use_beta_sigmoid,
-        safe_gate=safe_gate,
-        gate_lower_bound=gate_lower_bound,
-        batch_invariant=batch_invariant,
-        gate_domain=gate_domain,
-        overwrite_initial_state=overwrite_initial_state,
-        qk_l2norm_additive_epsilon=qk_l2norm_additive_epsilon,
-        state_indices=state_indices,
-    )
+    try:
+        graph, _ = _build_la_graph(
+            family,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens,
+            o,
+            w=w,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
+            final_state=final_state,
+            num_householder=num_householder,
+            scale=scale,
+            use_qk_l2norm=use_qk_l2norm,
+            use_beta_sigmoid=use_beta_sigmoid,
+            safe_gate=safe_gate,
+            gate_lower_bound=gate_lower_bound,
+            batch_invariant=batch_invariant,
+            gate_domain=gate_domain,
+            overwrite_initial_state=overwrite_initial_state,
+            qk_l2norm_additive_epsilon=qk_l2norm_additive_epsilon,
+            state_indices=state_indices,
+        )
+    except TypeError as exc:
+        if (
+            qk_l2norm_additive_epsilon is not None
+            and "qk_l2norm_additive_epsilon" in str(exc)
+            and "unexpected" in str(exc)
+        ):
+            exc.__dict__["_fi_la_build_unsupported"] = True
+        raise
+    except (cudnn.cudnnGraphNotSupportedError, NotImplementedError) as exc:
+        exc.__dict__["_fi_la_build_unsupported"] = True
+        raise
 
     if overwrite_initial_state and not graph._fi_la_overwrite:
         # The overwrite candidate has a compact state descriptor. Older FE or

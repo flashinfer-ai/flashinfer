@@ -14,6 +14,7 @@
 
 import pytest
 import torch
+from types import SimpleNamespace
 
 from flashinfer.gdn_kernels.gates import materialize_gates, validate_gate_inputs
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
@@ -260,3 +261,77 @@ def test_pool_only_trace_selects_slot_aware_schema_and_reference():
     torch.testing.assert_close(actual, expected.to(actual.dtype), rtol=0, atol=0)
     torch.testing.assert_close(pool[indices], state)
     torch.testing.assert_close(pool[[0, 2, 3, 4]], args["output_state"][[0, 2, 3, 4]])
+
+
+def test_auto_fallback_signal_is_limited_to_plan_build(monkeypatch):
+    from flashinfer.cudnn import linear_attention as adapter
+
+    if not adapter.CUDNN_AVAILABLE:
+        pytest.skip("requires the cuDNN Python package")
+    q, g = torch.ones(2, 1, 4), torch.ones(2, 1)
+    cu = torch.tensor([0, 2], dtype=torch.int32)
+
+    def run(epsilon=None):
+        return adapter._run_la_graph(
+            "gdn",
+            q,
+            q,
+            q,
+            g,
+            g,
+            cu,
+            torch.empty_like(q),
+            scale=0.5,
+            use_qk_l2norm=False,
+            use_beta_sigmoid=False,
+            safe_gate=False,
+            gate_lower_bound=None,
+            batch_invariant=False,
+            qk_l2norm_additive_epsilon=epsilon,
+        )
+
+    for error_type in (NotImplementedError, adapter.cudnn.cudnnGraphNotSupportedError):
+        original = error_type("unsupported plan")
+
+        def rejected(*args, **kwargs):
+            raise original
+
+        monkeypatch.setattr(adapter, "_build_la_graph", rejected)
+        with pytest.raises(error_type) as caught:
+            run()
+        assert caught.value is original
+        assert type(caught.value) is error_type
+        assert caught.value._fi_la_build_unsupported
+
+    def old_builder(*args, **kwargs):
+        raise TypeError("got unexpected arguments ['qk_l2norm_additive_epsilon']")
+
+    monkeypatch.setattr(adapter, "_build_la_graph", old_builder)
+    with pytest.raises(TypeError) as attribute:
+        run(epsilon=1e-6)
+    assert type(attribute.value) is TypeError
+    assert attribute.value._fi_la_build_unsupported
+    with pytest.raises(TypeError) as unrelated:
+        run()
+    assert not getattr(unrelated.value, "_fi_la_build_unsupported", False)
+
+    def failed_execute(*args, **kwargs):
+        raise NotImplementedError("execution failed")
+
+    graph = SimpleNamespace(
+        _fi_la_workspace_size=1,
+        _fi_la_ordered=True,
+        _fi_la_uids=(1, 2, 3, 10, 11, 100, 1000),
+        execute=failed_execute,
+    )
+    monkeypatch.setattr(adapter, "_build_la_graph", lambda *args, **kwargs: (graph, ()))
+    monkeypatch.setattr(adapter, "_get_cache_buf", lambda *args: torch.empty(1))
+    monkeypatch.setattr(adapter, "_create_cudnn_handle", lambda *args: 0)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda *args: SimpleNamespace(cuda_stream=1)
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    with pytest.raises(NotImplementedError, match="execution failed") as caught:
+        run()
+    assert not getattr(caught.value, "_fi_la_build_unsupported", False)
