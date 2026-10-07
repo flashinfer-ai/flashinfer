@@ -6,7 +6,7 @@ from .api_logging import flashinfer_experimental_api
 
 
 @flashinfer_experimental_api
-def prepare_mok_bf16(*, ep_size=16, local_experts=16, topk=8):
+def prepare_mok_bf16(*, ep_size=16, local_experts=16, topk=8, mxfp8=False):
     """Prepare the explicit Cake BF16 MoK toy training backend.
 
     Returns an adapter with ``build_schedule``, ``forward``,
@@ -26,12 +26,39 @@ def prepare_mok_bf16(*, ep_size=16, local_experts=16, topk=8):
     intermediate sizes must be multiples of 256. ``forward``/``backward``
     accept ``swiglu_limit`` (``None`` = plain SwiGLU, a positive float =
     clamped ``silu(min(gate, L)) * clamp(up, -L, L)`` for both experts).
-    This is a synthetic training experiment, with no full-model or optimizer
-    integration.
+    Routed expert weights may be MXFP8 tuples from :func:`mxfp8_quantize`
+    (MoK's conventions: ``(w_fp8, w_sc)`` pairs for ``forward`` and
+    ``recompute_forward_context``, the gate/up 4-tuples and the down
+    ``(w_t_fp8, w_t_sc)`` pair for ``backward``), which selects the native
+    MXFP8 kernels (block-scaled tcgen05 MMA with FP32 accumulation, fused
+    activation/gradient quantization, BF16 shared experts); ``backward(...,
+    wgrad_f32=True)`` returns FP32 routed weight gradients. ``mxfp8=True``
+    precompiles those kernels; otherwise they compile on first use, outside
+    CUDA Graph capture. This is a synthetic training experiment, with no
+    full-model or optimizer integration.
     """
     from .experimental.cake_mok_bf16.backend import MoKFunctional
 
-    return MoKFunctional(ep_size, local_experts, topk)
+    return MoKFunctional(ep_size, local_experts, topk, mxfp8=mxfp8)
+
+
+@flashinfer_experimental_api
+def mxfp8_quantize(x_bf16, return_normal=True, return_transposed=True):
+    """Quantize BF16 expert weights with MoK's MXFP8 recipe.
+
+    Returns ``(x_fp8, x_sc, x_fp8_t, x_sc_t)``: E4M3 data ``[E, M, N]`` with
+    E8M0 scale tiles ``[E * M / 128, N / 128, 32, 16]`` (one scale per 32-element
+    block along the last axis; ``amax / 448`` rounded up to a power of two, floor
+    ``1e-12``), plus the transposed layout ``[E, N, M]`` / ``[E * N / 128, M / 128,
+    32, 16]``. Layouts not requested are ``None``; a 2-D input returns 2-D data.
+    Dimensions must be multiples of 128. Prequantize the routed expert weights
+    once per optimizer step and pass the tuples to the adapter from
+    :func:`prepare_mok_bf16`. Compiles on first use per device (outside CUDA
+    Graph capture).
+    """
+    from .experimental.cake_mok_bf16.backend import mxfp8_quantize as quantize
+
+    return quantize(x_bf16, return_normal, return_transposed)
 
 
 @flashinfer_experimental_api

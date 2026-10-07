@@ -5,6 +5,14 @@
 
 Run: torchrun --standalone --nproc-per-node=4 examples/mok_bf16_toy.py
 Requires peer-accessible GPUs and PyTorch symmetric-memory multicast.
+
+``MOK_TOY_PRECISION=mxfp8`` runs the native MXFP8 routed experts instead: the
+routed weights are prequantized with ``flashinfer.mok.mxfp8_quantize`` and the
+outputs are checked against the same recipe in FP32 PyTorch arithmetic (fake
+quantization of the dispatched rows, the saved gate/up and the hidden and
+gradient tiles, per row), the routed weight gradients against the plain FP32
+reference with a relative-L1 bound (their token-axis block scales follow the
+kernel's dispatch order, which the independent reference does not reproduce).
 """
 
 import datetime
@@ -13,9 +21,14 @@ import os
 
 import torch
 import torch.distributed as dist
+from flashinfer.experimental.cake_mok_bf16.mxfp8_reference import (
+    dequantize_mxfp8,
+    mxfp8_quantize_reference,
+)
 from flashinfer.mok import (
     context_defined_rows,
     create_mok_bf16_workspace,
+    mxfp8_quantize,
     prepare_mok_bf16,
 )
 
@@ -96,13 +109,128 @@ def reference(
     return (y, dx, dscores[own_rows], *dw, *shared_grads[1:])
 
 
+def _fake_quant_rows(rows_bf16):
+    """Dequantized MXFP8 values of BF16 rows (per-row 32-element blocks, as the kernels)."""
+    padded = (rows_bf16.shape[0] + 127) // 128 * 128
+    buffer = torch.zeros(
+        padded, rows_bf16.shape[1], dtype=torch.bfloat16, device=rows_bf16.device
+    )
+    buffer[: rows_bf16.shape[0]] = rows_bf16
+    fp8, sc, _, _ = mxfp8_quantize_reference(buffer, True, False)
+    return dequantize_mxfp8(fp8, sc)[: rows_bf16.shape[0]]
+
+
+def _dequant_experts(quantized, index):
+    """Dequantized FP32 weights of one ``mxfp8_quantize`` tuple member (0: normal, 2: transposed)."""
+    data, scales = quantized[index], quantized[index + 1]
+    tiles = scales.view(data.shape[0], -1, *scales.shape[1:])
+    return [dequantize_mxfp8(data[e], tiles[e]) for e in range(data.shape[0])]
+
+
+def reference_mxfp8(
+    global_data, weights, quantized, *, source_counts=None, swiglu_limit=None
+):
+    """Fake-quant FP32 reference of the MXFP8 routed experts; the shared experts and the
+    routed weight gradients come from :func:`reference` (BF16 and FP32 respectively)."""
+    rank, ep = dist.get_rank(), dist.get_world_size()
+    device = weights[0].device
+    x = global_data["x"].to(device)
+    dy = global_data["d_output"].to(device)
+    ids = global_data["expert_ids"].to(device)
+    scores = global_data["scores"].to(device)
+    t, h = x.shape
+    local = t // ep
+    if source_counts is None:
+        source_counts = [local] * ep
+    start = sum(source_counts[:rank])
+    own_rows = slice(start, start + source_counts[rank])
+    local_experts = weights[3].shape[0]
+    wg, wu, wd = (_dequant_experts(q, 0) for q in quantized)
+    wg_t, wu_t, wd_t = (_dequant_experts(q, 2) for q in quantized)
+    y_sum = torch.zeros((t, h), dtype=torch.float32, device=device)
+    dx_sum = torch.zeros_like(y_sum)
+    dscores = torch.zeros_like(scores)
+    for e in range(local_experts):
+        rows, slots = (ids == rank * local_experts + e).nonzero(as_tuple=True)
+        if rows.numel() == 0:
+            continue
+        xq = _fake_quant_rows(x[rows])
+        gate = (xq @ wg[e].T).bfloat16()
+        up = (xq @ wu[e].T).bfloat16()
+        # The saved context holds gate/up as E4M3 (per-row blocks of the BF16 values).
+        gate_f, up_f = _fake_quant_rows(gate), _fake_quant_rows(up)
+        if swiglu_limit is not None:
+            gate_mask = gate_f <= swiglu_limit
+            up_mask = (up_f >= -swiglu_limit) & (up_f <= swiglu_limit)
+            gate_f = torch.clamp(gate_f, max=swiglu_limit)
+            up_f = torch.clamp(up_f, min=-swiglu_limit, max=swiglu_limit)
+        gate_b, up_b = gate.float(), up.float()
+        if swiglu_limit is not None:
+            gate_b = torch.clamp(gate_b, max=swiglu_limit)
+            up_b = torch.clamp(up_b, min=-swiglu_limit, max=swiglu_limit)
+        hidden = (gate_b * torch.sigmoid(gate_b) * up_b).bfloat16()
+        se = scores[rows, slots]
+        # Per-expert outputs are BF16 ring rows; the combine scales and sums them in FP32.
+        y_e = (_fake_quant_rows(hidden) @ wd[e].T).bfloat16().float()
+        y_sum.index_add_(0, rows, y_e * se[:, None])
+        dh = (_fake_quant_rows(dy[rows]) @ wd_t[e].T).bfloat16().float()
+        sigmoid = torch.sigmoid(gate_f)
+        silu = gate_f * sigmoid
+        dscores[rows, slots] = (dh * (silu * up_f)).sum(-1)
+        dhs = dh * se[:, None]
+        dg = ((1.0 - silu) * sigmoid + silu) * up_f * dhs
+        du = silu * dhs
+        if swiglu_limit is not None:
+            dg = torch.where(gate_mask, dg, torch.zeros_like(dg))
+            du = torch.where(up_mask, du, torch.zeros_like(du))
+        dgq, duq = _fake_quant_rows(dg.bfloat16()), _fake_quant_rows(du.bfloat16())
+        dx_sum.index_add_(
+            0, rows, (dgq @ wg_t[e].T + duq @ wu_t[e].T).bfloat16().float()
+        )
+    for tensor in (y_sum, dx_sum, dscores):
+        dist.all_reduce(tensor)
+    xs = x[own_rows].detach().requires_grad_()
+    ws = [w.detach().requires_grad_() for w in weights[:3]]
+    ys = expert(xs, *ws, swiglu_limit=swiglu_limit)
+    shared_grads = torch.autograd.grad(ys, (xs, *ws), dy[own_rows])
+    y = (y_sum[own_rows] + ys.detach().float()).bfloat16()
+    dx = (dx_sum[own_rows] + shared_grads[0].float()).bfloat16()
+    # Routed weight gradients: plain FP32 reference (relative-L1 gate).
+    oracle = reference(
+        global_data,
+        weights,
+        fp32=True,
+        source_counts=source_counts,
+        swiglu_limit=swiglu_limit,
+    )
+    return (y, dx, dscores[own_rows], *oracle[3:6], *shared_grads[1:])
+
+
+# Gates per output. BF16: exact elementwise atol/rtol. MXFP8: the same rule with the
+# ``max(4, 2e-7 * numel)`` exception allowance of the fake-quant reference, and a
+# relative-L1 bound for the routed weight gradients against the FP32 reference.
+BF16_GATE = dict(atol=1e-2, rtol=1e-2)
+MXFP8_GATES = {
+    name: (
+        dict(relative_l1=0.12)
+        if name.startswith("d_w_routed")
+        else dict(atol=1e-2, rtol=1e-2, exceptions=True)
+        if name in ("y", "d_x", "d_router_weights")
+        else BF16_GATE  # shared experts stay BF16: exact rule as in BF16 mode
+    )
+    for name in RESULT_NAMES
+}
+
+
 def error_report(actual, expected, gate):
-    """Apply elementwise atol/rtol on every rank; retain aggregate diagnostics."""
-    atol, rtol = float(gate["atol"]), float(gate["rtol"])
-    if not (0 < atol < float("inf") and 0 <= rtol < float("inf")):
-        raise ValueError("Require finite atol > 0 and rtol >= 0")
+    """Apply the per-output gates on every rank; retain aggregate diagnostics."""
+    gates = gate if set(gate) == set(RESULT_NAMES) else {n: gate for n in RESULT_NAMES}
     reports = {}
     for name, a, b in zip(RESULT_NAMES, actual, expected, strict=True):
+        rule = gates[name]
+        atol, rtol = float(rule.get("atol", 1e-2)), float(rule.get("rtol", 1e-2))
+        if not (0 < atol < float("inf") and 0 <= rtol < float("inf")):
+            raise ValueError("Require finite atol > 0 and rtol >= 0")
         assert a.shape == b.shape, (name, a.shape, b.shape)
         # First three fields use MAX; the remaining five use SUM across ranks.
         # Chunking bounds temporary storage for full expert weight gradients.
@@ -186,8 +314,15 @@ def error_report(actual, expected, gate):
             "global_nonfinite": int(nonfinite),
             "global_mismatched": int(mismatched),
             "global_elements": int(elements),
-            "pass": nonfinite == 0 and mismatched == 0,
         }
+        if "relative_l1" in rule:
+            passed = nonfinite == 0 and relative <= float(rule["relative_l1"])
+            reports[name]["relative_l1_bound"] = float(rule["relative_l1"])
+        else:
+            allowed = max(4, 2e-7 * elements) if rule.get("exceptions") else 0
+            passed = nonfinite == 0 and mismatched <= allowed
+            reports[name]["allowed_mismatches"] = int(allowed)
+        reports[name]["pass"] = bool(passed)
     return reports
 
 
@@ -205,7 +340,12 @@ class TrainingIteration:
         functional,
         swiglu_limit=None,
         recompute=False,
+        forward_weights=None,
+        backward_weights=None,
     ):
+        """``weights`` are the six BF16 reference weights; ``forward_weights`` /
+        ``backward_weights`` (MXFP8: MoK's tuple conventions) override what the
+        kernels receive."""
         if (
             x.dtype != torch.bfloat16
             or dy.dtype != torch.bfloat16
@@ -232,6 +372,8 @@ class TrainingIteration:
         self.functional = functional
         self.x, self.ids, self.scores, self.dy = x, ids, scores, dy
         self.weights = weights
+        self.forward_weights = forward_weights or weights
+        self.backward_weights = backward_weights or weights
         self.swiglu_limit = swiglu_limit
         # ``recompute``: checkpoint step = forward + recompute_forward_context
         # + backward from the recomputed context (asserted bitwise equal).
@@ -252,7 +394,7 @@ class TrainingIteration:
             self.schedule,
             self.x,
             self.scores,
-            *self.weights,
+            *self.forward_weights,
             swiglu_limit=self.swiglu_limit,
         )
         context = self.context
@@ -262,10 +404,10 @@ class TrainingIteration:
                 self.workspace,
                 self.schedule,
                 self.x,
-                self.weights[0],
-                self.weights[1],
-                self.weights[3],
-                self.weights[4],
+                self.forward_weights[0],
+                self.forward_weights[1],
+                self.forward_weights[3],
+                self.forward_weights[4],
                 swiglu_limit=self.swiglu_limit,
             )
             if not torch.cuda.is_current_stream_capturing():
@@ -273,15 +415,29 @@ class TrainingIteration:
                 # retained macrobatch / real source rows are never written).
                 routed_rows, shared_rows = context_defined_rows(self.config, context)
 
+                def rows(value, count, transposed):
+                    # MXFP8 context entries are (E4M3, scale tiles) pairs; ``x`` and
+                    # ``hidden`` are stored transposed, scale tiles per 128-row block.
+                    if not isinstance(value, tuple):
+                        return (value[:count],)
+                    data, scales = value
+                    blocks = count // 128
+                    if transposed:
+                        return (
+                            data[:, :count],
+                            scales.view(data.shape[0] // 128, -1, 32, 16)[:, :blocks],
+                        )
+                    return (data[:count], scales[: blocks * (data.shape[1] // 128)])
+
                 def defined(ctx):
                     return (
-                        ctx.x_routed[:routed_rows],
+                        *rows(ctx.x_routed, routed_rows, True),
                         ctx.gate_shared[:shared_rows],
-                        ctx.gate_routed[:routed_rows],
+                        *rows(ctx.gate_routed, routed_rows, False),
                         ctx.up_shared[:shared_rows],
-                        ctx.up_routed[:routed_rows],
+                        *rows(ctx.up_routed, routed_rows, False),
                         ctx.hidden_shared[:shared_rows],
-                        ctx.hidden_routed[:routed_rows],
+                        *rows(ctx.hidden_routed, routed_rows, True),
                     )
 
                 saved, rebuilt = defined(self.context), defined(context)
@@ -297,7 +453,7 @@ class TrainingIteration:
             self.dy,
             self.x,
             self.scores,
-            *self.weights,
+            *self.backward_weights,
             swiglu_limit=self.swiglu_limit,
         )
         self.outputs = (y, *gradients)
@@ -347,8 +503,11 @@ def main():
     tokens = 512
     topk, local_experts = (2, 4) if ep in (1, 4) else (8, 256 // ep)
     total_experts = ep * local_experts
-    functional = prepare_mok_bf16(ep_size=ep, local_experts=local_experts, topk=topk)
-    gate = dict(atol=1e-2, rtol=1e-2)
+    mxfp8 = os.environ.get("MOK_TOY_PRECISION", "bf16") == "mxfp8"
+    functional = prepare_mok_bf16(
+        ep_size=ep, local_experts=local_experts, topk=topk, mxfp8=mxfp8
+    )
+    gate = MXFP8_GATES if mxfp8 else BF16_GATE
     cases = []
     for hidden, intermediate in ((256, 256), (512, 512)):
         config, workspace = create_mok_bf16_workspace(
@@ -389,8 +548,39 @@ def main():
         )
         ids = torch.empty(tokens, topk, dtype=torch.int64, device=device)
         scores = torch.empty(tokens, topk, device=device)
+        if mxfp8:
+            # MoK's conventions: forward (w_fp8, w_sc) pairs; backward gate/up 4-tuples
+            # and the down (w_t_fp8, w_t_sc) pair.
+            quantized = [mxfp8_quantize(w, True, True) for w in weights[3:]]
+            kernel_weights = dict(
+                forward_weights=(*weights[:3], *((q[0], q[1]) for q in quantized)),
+                backward_weights=(
+                    *weights[:3],
+                    quantized[0],
+                    quantized[1],
+                    (quantized[2][2], quantized[2][3]),
+                ),
+            )
+
+            def expected_outputs(data):
+                return reference_mxfp8(data, weights, quantized)
+
+        else:
+            kernel_weights = {}
+
+            def expected_outputs(data):
+                return reference(data, weights)
+
         iteration = TrainingIteration(
-            config, workspace, x, ids, scores, dy, weights, functional=functional
+            config,
+            workspace,
+            x,
+            ids,
+            scores,
+            dy,
+            weights,
+            functional=functional,
+            **kernel_weights,
         )
 
         def fill(generation, empty):
@@ -437,7 +627,7 @@ def main():
 
         for generation, empty in ((0, False), (1, True), (2, False)):
             data = fill(generation, empty)
-            expected = reference(data, weights)
+            expected = expected_outputs(data)
             check(iteration.run(), expected, generation, empty)
         iteration.capture()
         saved = []
@@ -449,7 +639,7 @@ def main():
             (23, False),
         ):
             data = fill(generation, empty)
-            expected = reference(data, weights)
+            expected = expected_outputs(data)
             actual = iteration.run()
             check(actual, expected, generation, empty)
             if generation == 11:
@@ -471,6 +661,7 @@ def main():
             weights,
             functional=functional,
             recompute=True,
+            **kernel_weights,
         )
         fill(11, False)
         for _ in range(2):
@@ -485,6 +676,7 @@ def main():
             dict(
                 hidden=hidden,
                 intermediate=intermediate,
+                precision="mxfp8" if mxfp8 else "bf16",
                 source_tokens_per_rank=tokens,
                 global_source_tokens=tokens * ep,
                 topk=topk,

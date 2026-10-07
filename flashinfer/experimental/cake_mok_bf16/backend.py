@@ -17,6 +17,9 @@ from ._kernels import (
     MoKForward,
     MoKBackward,
     MoKEpilogues,
+    MoKForwardMxfp8,
+    MoKBackwardMxfp8,
+    MoKMxfp8Quantize,
 )
 
 
@@ -76,10 +79,44 @@ SUPPORTED_LAYOUTS = (
 )
 
 
-class MoKFunctional:
-    """Precompile kernels before capture; retain native function signatures."""
+_MXFP8_KERNELS = {
+    "forward": MoKForwardMxfp8,
+    "backward": MoKBackwardMxfp8,
+    "backward_f32": lambda: MoKBackwardMxfp8(wgrad_f32=True),
+}
+_QUANTIZERS = {}
 
-    def __init__(self, ep, local_experts, topk):
+
+def mxfp8_quantize(x_bf16, return_normal=True, return_transposed=True):
+    """MoK's ``ops.mxfp8_quantize`` (E4M3 data, E8M0 scales per 32-element K block).
+
+    Returns ``(x_fp8, x_sc, x_fp8_t, x_sc_t)`` with ``None`` for layouts not
+    requested: ``[E, M, N]`` E4M3 data with ``[E * M / 128, N / 128, 32, 16]``
+    scale tiles, and the transposed ``[E, N, M]`` / ``[E * N / 128, M / 128, 32, 16]``
+    pair. A 2-D input returns 2-D data. Compiles on first use per device
+    (outside CUDA Graph capture).
+    """
+    if not isinstance(x_bf16, torch.Tensor) or not x_bf16.is_cuda:
+        raise ValueError("x_bf16 must be a CUDA tensor")
+    key = x_bf16.device.index
+    if key not in _QUANTIZERS:
+        with torch.cuda.device(x_bf16.device):
+            _QUANTIZERS[key] = MoKMxfp8Quantize()
+    return _QUANTIZERS[key](x_bf16, return_normal, return_transposed)
+
+
+class MoKFunctional:
+    """Precompile kernels before capture; retain native function signatures.
+
+    Routed expert weights follow MoK's conventions: BF16 tensors select the
+    BF16 kernels; MXFP8 tensor tuples from :func:`mxfp8_quantize` select the
+    native MXFP8 kernels (``forward``/``recompute_forward_context`` take the
+    ``(w_fp8, w_sc)`` pairs, ``backward`` the gate/up 4-tuples and the down
+    ``(w_t_fp8, w_t_sc)`` pair). ``mxfp8=True`` precompiles the MXFP8 kernels;
+    otherwise they load on first use, outside CUDA Graph capture.
+    """
+
+    def __init__(self, ep, local_experts, topk, mxfp8=False):
         if (ep, local_experts, topk) not in SUPPORTED_LAYOUTS:
             raise ValueError("Unsupported exported (EP, local experts, top-k) layout")
         self.ep, self.local_experts, self.topk = ep, local_experts, topk
@@ -89,6 +126,49 @@ class MoKFunctional:
         self.forward_kernel = MoKForward()
         self.backward_kernel = MoKBackward()
         self.epilogues = MoKEpilogues(topk)
+        self._mxfp8 = {}
+        if mxfp8:
+            for role in ("forward", "backward"):
+                self._mxfp8_kernel(role)
+
+    def _mxfp8_kernel(self, role):
+        if role not in self._mxfp8:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Prepare the MXFP8 MoK kernels before CUDA Graph capture "
+                    "(prepare_mok_bf16(..., mxfp8=True) or one eager call)"
+                )
+            self._mxfp8[role] = _MXFP8_KERNELS[role]()
+        return self._mxfp8[role]
+
+    @staticmethod
+    def _is_mxfp8(*routed_weights):
+        """MoK's signature: MXFP8 routed weights arrive as tensor tuples."""
+        flags = [isinstance(w, (tuple, list)) for w in routed_weights]
+        if any(flags) and not all(flags):
+            raise ValueError(
+                "Routed expert weights must all be BF16 tensors or all MXFP8 tuples"
+            )
+        return all(flags)
+
+    def _mxfp8_weights(self, x, shared_weights, routed_weights):
+        """Shared BF16 weights plus MXFP8 tuples; the kernels validate the exact
+        tuple arity and the E4M3/scale-tile shapes."""
+        self._weights(x, *shared_weights, None, None, None)
+        for weights in routed_weights:
+            for member in weights:
+                if member is None:
+                    continue
+                if (
+                    not isinstance(member, torch.Tensor)
+                    or member.device != x.device
+                    or not member.is_contiguous()
+                    or member.dtype not in (torch.float8_e4m3fn, torch.uint8)
+                ):
+                    raise ValueError(
+                        "MXFP8 routed weights must be contiguous CUDA E4M3 data and "
+                        "uint8 scale tiles from mxfp8_quantize"
+                    )
 
     def create_workspace(
         self,
@@ -282,12 +362,14 @@ class MoKFunctional:
         )
 
     def _weights(self, x, *weights):
+        """BF16 weight checks; ``None`` routed entries are validated by the MXFP8 path."""
         if any(
             not isinstance(weight, torch.Tensor)
             or weight.dtype != torch.bfloat16
             or weight.device != x.device
             or not weight.is_contiguous()
             for weight in weights
+            if weight is not None
         ):
             raise ValueError(
                 "The Cake training path requires contiguous CUDA BF16 expert weights"
@@ -308,7 +390,7 @@ class MoKFunctional:
             or intermediate <= 0
             or intermediate % 256
             or any(
-                tuple(w.shape) != shape
+                w is not None and tuple(w.shape) != shape
                 for w, shape in zip(weights, shapes, strict=True)
             )
         ):
@@ -335,19 +417,18 @@ class MoKFunctional:
             config, workspace, schedule, x, router_weights
         )
         self._check_device(workspace)
-        self._weights(
-            x,
-            shared_gate_weights,
-            shared_up_weights,
-            shared_down_weights,
-            routed_gate_weights,
-            routed_up_weights,
-            routed_down_weights,
-        )
+        shared = (shared_gate_weights, shared_up_weights, shared_down_weights)
+        routed = (routed_gate_weights, routed_up_weights, routed_down_weights)
+        mxfp8 = self._is_mxfp8(*routed)
+        if mxfp8:
+            self._mxfp8_weights(x, shared, routed)
+        else:
+            self._weights(x, *shared, *routed)
         self._copy_source(workspace.x_buffer, x)
         self._copy_source(workspace.router_weight_buffer, router_weights)
         self._barrier(workspace)
-        values = self.forward_kernel(
+        kernel = self._mxfp8_kernel("forward") if mxfp8 else self.forward_kernel
+        values = kernel(
             self._rows(workspace.x_buffer, source_count),
             workspace.x_buffer_ptrs,
             workspace.combine_buffer,
@@ -366,7 +447,33 @@ class MoKFunctional:
             config.minibatch_size,
             source_rows=source_count,
         )
-        context = MoKForwardContext(
+        context = self._context(values, schedule, mxfp8)
+        self._barrier(workspace)
+        if source_count == 0:
+            return x.new_empty((0, workspace.hidden_size)), context
+        output = self.epilogues.forward(
+            values[11 if mxfp8 else 7][:source_count],
+            workspace.combine_buffer[: source_count * workspace.topk],
+            workspace.router_weight_buffer[:source_count],
+        )
+        return output, context
+
+    @staticmethod
+    def _context(values, schedule, mxfp8):
+        """MoK's context: BF16 rings, or MXFP8 ``(E4M3, scale tiles)`` pairs (``x`` and
+        ``hidden`` transposed, ``gate``/``up`` normal) as the native MXFP8 functional layer."""
+        if mxfp8:
+            return MoKForwardContext(
+                x_routed=(values[0], values[1]),
+                gate_shared=values[2],
+                gate_routed=(values[3], values[4]),
+                up_shared=values[5],
+                up_routed=(values[6], values[7]),
+                hidden_shared=values[8],
+                hidden_routed=(values[9], values[10]),
+                schedule=schedule,
+            )
+        return MoKForwardContext(
             x_routed=values[0],
             gate_shared=values[1],
             gate_routed=values[2],
@@ -376,15 +483,6 @@ class MoKFunctional:
             hidden_routed=values[6],
             schedule=schedule,
         )
-        self._barrier(workspace)
-        if source_count == 0:
-            return x.new_empty((0, workspace.hidden_size)), context
-        output = self.epilogues.forward(
-            values[7][:source_count],
-            workspace.combine_buffer[: source_count * workspace.topk],
-            workspace.router_weight_buffer[:source_count],
-        )
-        return output, context
 
     def recompute_forward_context(
         self,
@@ -407,25 +505,43 @@ class MoKFunctional:
         """
         workspace, source_count = self._inputs(config, workspace, schedule, x, None)
         self._check_device(workspace)
-        # Shape checks reuse the six-weight rule with the gate/up weights
-        # standing in for the unused down projections.
-        self._weights(
-            x,
-            shared_gate_weights,
-            shared_up_weights,
-            shared_gate_weights.transpose(0, 1).contiguous()
-            if shared_gate_weights.ndim == 2
-            else shared_gate_weights,
-            routed_gate_weights,
-            routed_up_weights,
-            routed_gate_weights.transpose(1, 2).contiguous()
-            if routed_gate_weights.ndim == 3
-            else routed_gate_weights,
-        )
+        mxfp8 = self._is_mxfp8(routed_gate_weights, routed_up_weights)
+        if mxfp8:
+            self._mxfp8_weights(
+                x,
+                (
+                    shared_gate_weights,
+                    shared_up_weights,
+                    shared_gate_weights.transpose(0, 1).contiguous()
+                    if shared_gate_weights.ndim == 2
+                    else shared_gate_weights,
+                ),
+                (routed_gate_weights, routed_up_weights),
+            )
+            # The MXFP8 kernel takes no down weights in recompute mode.
+            routed_down_weights = None
+        else:
+            # Shape checks reuse the six-weight rule with the gate/up weights
+            # standing in for the unused down projections.
+            self._weights(
+                x,
+                shared_gate_weights,
+                shared_up_weights,
+                shared_gate_weights.transpose(0, 1).contiguous()
+                if shared_gate_weights.ndim == 2
+                else shared_gate_weights,
+                routed_gate_weights,
+                routed_up_weights,
+                routed_gate_weights.transpose(1, 2).contiguous()
+                if routed_gate_weights.ndim == 3
+                else routed_gate_weights,
+            )
+            routed_down_weights = routed_gate_weights
         self._copy_source(workspace.x_buffer, x)
         self._barrier(workspace)
         # The down weights are unused placeholders in recompute mode.
-        values = self.forward_kernel(
+        kernel = self._mxfp8_kernel("forward") if mxfp8 else self.forward_kernel
+        values = kernel(
             self._rows(workspace.x_buffer, source_count),
             workspace.x_buffer_ptrs,
             workspace.combine_buffer,
@@ -435,7 +551,7 @@ class MoKFunctional:
             shared_up_weights,
             routed_up_weights,
             shared_gate_weights,
-            routed_gate_weights,
+            routed_down_weights,
             *self._schedule(schedule),
             workspace.topk,
             swiglu_limit,
@@ -445,16 +561,7 @@ class MoKFunctional:
             source_rows=source_count,
             recompute_only=True,
         )
-        context = MoKForwardContext(
-            x_routed=values[0],
-            gate_shared=values[1],
-            gate_routed=values[2],
-            up_shared=values[3],
-            up_routed=values[4],
-            hidden_shared=values[5],
-            hidden_routed=values[6],
-            schedule=schedule,
-        )
+        context = self._context(values, schedule, mxfp8)
         self._barrier(workspace)
         return context
 
@@ -474,7 +581,10 @@ class MoKFunctional:
         routed_up_weights,
         routed_down_weights,
         swiglu_limit=None,
+        wgrad_f32=False,
     ):
+        """MoK ``backward``; ``wgrad_f32`` (MXFP8 only) returns the routed weight
+        gradients in FP32 with FP32 accumulation across macrobatches."""
         workspace, source_count = self._inputs(
             config, workspace, schedule, x, router_weights, grad_output
         )
@@ -486,19 +596,36 @@ class MoKFunctional:
                 "Backward requires the matching forward context and schedule"
             )
         self._check_device(workspace)
-        self._weights(
-            x,
-            shared_gate_weights,
-            shared_up_weights,
-            shared_down_weights,
-            routed_gate_weights,
-            routed_up_weights,
-            routed_down_weights,
-        )
+        shared = (shared_gate_weights, shared_up_weights, shared_down_weights)
+        routed = (routed_gate_weights, routed_up_weights, routed_down_weights)
+        mxfp8 = self._is_mxfp8(*routed)
+        if mxfp8 != isinstance(forward_context.x_routed, tuple):
+            raise ValueError(
+                "The forward context precision must match the routed weights"
+            )
+        if wgrad_f32 and not mxfp8:
+            raise ValueError("wgrad_f32 requires MXFP8 routed weights")
+        if mxfp8:
+            self._mxfp8_weights(x, shared, routed)
+        else:
+            self._weights(x, *shared, *routed)
         self._copy_source(workspace.d_y_buffer, grad_output)
         self._copy_source(workspace.x_buffer, x)
         self._copy_source(workspace.router_weight_buffer, router_weights)
         self._barrier(workspace)
+        if mxfp8:
+            return self._backward_mxfp8(
+                config,
+                workspace,
+                schedule,
+                forward_context,
+                x,
+                source_count,
+                shared,
+                routed,
+                swiglu_limit,
+                wgrad_f32,
+            )
         values = self.backward_kernel(
             self._rows(workspace.d_y_buffer, source_count),
             workspace.d_y_buffer_ptrs,
@@ -549,6 +676,73 @@ class MoKFunctional:
             values[9],
             values[11],
             values[13],
+        )
+
+    def _backward_mxfp8(
+        self,
+        config,
+        workspace,
+        schedule,
+        forward_context,
+        x,
+        source_count,
+        shared,
+        routed,
+        swiglu_limit,
+        wgrad_f32,
+    ):
+        kernel = self._mxfp8_kernel("backward_f32" if wgrad_f32 else "backward")
+        values = kernel(
+            self._rows(workspace.d_y_buffer, source_count),
+            workspace.d_y_buffer_ptrs,
+            workspace.d_x_routed_buffer,
+            workspace.d_x_routed_buffer_ptrs,
+            workspace.router_weight_buffer,
+            workspace.router_weight_buffer_ptrs,
+            workspace.d_router_weight_buffer,
+            workspace.d_router_weight_buffer_ptrs,
+            shared[0],
+            routed[0],
+            shared[1],
+            routed[1],
+            shared[2],
+            routed[2],
+            *forward_context.x_routed,
+            forward_context.gate_shared,
+            *forward_context.gate_routed,
+            forward_context.up_shared,
+            *forward_context.up_routed,
+            forward_context.hidden_shared,
+            *forward_context.hidden_routed,
+            self._rows(workspace.x_buffer, source_count),
+            workspace.x_buffer_ptrs,
+            *self._schedule(schedule),
+            workspace.topk,
+            swiglu_limit,
+            config.bwd_num_comm_sms,
+            config.macrobatch_size,
+            config.minibatch_size,
+            source_rows=source_count,
+        )
+        self._barrier(workspace)
+        if source_count == 0:
+            dx = x.new_empty((0, workspace.hidden_size))
+        else:
+            dx = self.epilogues.backward(
+                values[0][:source_count],
+                workspace.d_x_routed_buffer[: source_count * workspace.topk],
+            )
+        dscores = workspace.d_router_weight_buffer[:source_count].clone()
+        # MoK's 18-output order: routed gradients at 13/15/17, shared at 12/14/16.
+        return (
+            dx,
+            dscores,
+            values[13],
+            values[15],
+            values[17],
+            values[12],
+            values[14],
+            values[16],
         )
 
 

@@ -228,14 +228,39 @@ class CakeImpl:
     name = "cake"
 
     def __init__(self, args, shape, rank, ep, rows, inputs, device, capacity, factor):
-        from flashinfer.mok import create_mok_bf16_workspace, prepare_mok_bf16
+        from flashinfer.mok import (
+            create_mok_bf16_workspace,
+            mxfp8_quantize,
+            prepare_mok_bf16,
+        )
 
         self.shape, self.rank, self.ep = shape, rank, ep
         self.x, self.ids, self.scores, self.dy, self.weights = inputs
         self.local_experts = shape.experts // ep
+        self.precision = args.precision
         self.functional = prepare_mok_bf16(
-            ep_size=ep, local_experts=self.local_experts, topk=shape.topk
+            ep_size=ep,
+            local_experts=self.local_experts,
+            topk=shape.topk,
+            mxfp8=self.precision == "mxfp8",
         )
+        if self.precision == "mxfp8":
+            # MoK's recipe: the caller prequantizes the routed weights once; forward
+            # takes (w_fp8, w_sc) pairs, backward the gate/up 4-tuples and the down
+            # (w_t_fp8, w_t_sc) pair. The shared experts stay BF16.
+            quantized = [mxfp8_quantize(w, True, True) for w in self.weights[3:]]
+            self.forward_weights = (
+                *self.weights[:3],
+                *((q[0], q[1]) for q in quantized),
+            )
+            self.backward_weights = (
+                *self.weights[:3],
+                quantized[0],
+                quantized[1],
+                (quantized[2][2], quantized[2][3]),
+            )
+        else:
+            self.forward_weights = self.backward_weights = tuple(self.weights)
         fwd = args.fwd_comm_sms or 40
         bwd = args.bwd_comm_sms or 40
         self.config, self.workspace = create_mok_bf16_workspace(
@@ -259,6 +284,7 @@ class CakeImpl:
             schedule_capacity_multiplier=factor / ep,
             source_capacity=self.workspace.source_capacity,
             schedule_capacity=self.workspace.storage.schedule_capacity,
+            precision=self.precision,
         )
         self.context = None
 
@@ -296,7 +322,7 @@ class CakeImpl:
             schedule,
             self.x,
             self.scores,
-            *self.weights,
+            *self.forward_weights,
             swiglu_limit=self.shape.swiglu_limit,
         )
         if checkpoint:
@@ -305,10 +331,10 @@ class CakeImpl:
                 self.workspace,
                 schedule,
                 self.x,
-                self.weights[0],
-                self.weights[1],
-                self.weights[3],
-                self.weights[4],
+                self.forward_weights[0],
+                self.forward_weights[1],
+                self.forward_weights[3],
+                self.forward_weights[4],
                 swiglu_limit=self.shape.swiglu_limit,
             )
         grads = self.functional.backward(
@@ -319,7 +345,7 @@ class CakeImpl:
             self.dy,
             self.x,
             self.scores,
-            *self.weights,
+            *self.backward_weights,
             swiglu_limit=self.shape.swiglu_limit,
         )
         self.context = context
