@@ -244,3 +244,228 @@ gdp_prefill_trace = TraceTemplate(
     reference=_gdp_prefill_reference,
     init=_gdp_prefill_init,
 )
+
+
+@torch.no_grad()
+def _gdp_decode_reference(
+    q,
+    k,
+    v,
+    initial_state,
+    initial_state_indices,
+    A_log,
+    a,
+    dt_bias,
+    b,
+    scale=None,
+    output=None,
+    ssm_state_indices=None,
+    disable_state_update=None,
+    use_qk_l2norm=True,
+    output_state_indices=None,
+):
+    """Direct GDP decode recurrence, in fp64.
+
+    Per real token the state decays once, then takes ``n_h`` Householder
+    updates; the readout follows the last one.  ``k``/``v``/``b`` carry the
+    householder axis at dim 2, ``q``/``a`` do not.
+    """
+    B, T, H, K = q.shape
+    n_h = k.shape[2]
+    HV = v.shape[3]
+    scale = K**-0.5 if scale is None else scale
+    raw_q, raw_k, raw_v, raw_a, raw_b = (
+        x.to(torch.bfloat16).double() for x in (q, k, v, a, b)
+    )
+    query, key = raw_q, raw_k
+    if use_qk_l2norm:
+        query = query * torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)
+        key = key * torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
+    query = query.repeat_interleave(HV // H, dim=2) * scale
+    key = key.repeat_interleave(HV // H, dim=3)
+    log_g = -A_log.double().exp() * torch.nn.functional.softplus(
+        raw_a + dt_bias.double()
+    )
+    beta = raw_b.sigmoid()
+    out = torch.zeros(B, T, HV, v.shape[-1], dtype=v.dtype, device=v.device)
+    final_state = initial_state.clone()
+    for row, slot in enumerate(initial_state_indices.tolist()):
+        if slot < 0:
+            continue
+        state = initial_state[slot].double()
+        for step in range(T):
+            # the gate models time passing, so it applies once per real token
+            state *= log_g[row, step, :, None, None].exp()
+            for j in range(n_h):
+                kt = key[row, step, j]
+                prediction = (state * kt[:, None, :]).sum(-1)
+                delta = (raw_v[row, step, j] - prediction) * beta[row, step, j, :, None]
+                state += delta[..., None] * kt[:, None, :]
+            out[row, step] = (
+                (state * query[row, step, :, None, :]).sum(-1).to(out.dtype)
+            )
+            if ssm_state_indices is not None:
+                token_slot = int(ssm_state_indices[row, step])
+                if token_slot >= 0:
+                    final_state[token_slot] = state.float()
+        if not disable_state_update and ssm_state_indices is None:
+            final_state[slot] = state.float()
+    return out, final_state
+
+
+def _gdp_decode_init(
+    *,
+    batch_size: int,
+    seq_len: int = 2,
+    num_householder: int = 2,
+    num_q_heads: int = 4,
+    num_k_heads: int = 4,
+    num_v_heads: int = 8,
+    head_size: int = 128,
+    pool_size: int = 8,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gdp_decode.gated_delta_product_mtp``.
+
+    Mirrors the GDN MTP fixture, with a householder axis on ``k``/``v``/``b``:
+    ``k`` L2-normalized, ``A_log``/``dt_bias``/``a`` scaled by 0.1, and
+    ``initial_state_indices`` mapping each batch row to a distinct pool slot.
+    """
+    torch.manual_seed(seed)
+    bf16 = dict(dtype=torch.bfloat16, device=device)
+    fp32 = dict(dtype=torch.float32, device=device)
+    q = torch.randn(batch_size, seq_len, num_q_heads, head_size, **bf16)
+    k = torch.randn(
+        batch_size, seq_len, num_householder, num_k_heads, head_size, **bf16
+    )
+    k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+    v = torch.randn(
+        batch_size, seq_len, num_householder, num_v_heads, head_size, **bf16
+    )
+    initial_state = torch.randn(pool_size, num_v_heads, head_size, head_size, **fp32)
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "initial_state": initial_state,
+        "initial_state_indices": torch.arange(
+            batch_size, dtype=torch.int32, device=device
+        ),
+        "A_log": torch.randn(num_v_heads, **fp32) * 0.1,
+        "a": torch.randn(batch_size, seq_len, num_v_heads, **bf16) * 0.1,
+        "dt_bias": torch.randn(num_v_heads, **fp32) * 0.1,
+        "b": torch.randn(batch_size, seq_len, num_householder, num_v_heads, **bf16),
+        "scale": head_size**-0.5,
+    }
+
+
+gdp_decode_trace = TraceTemplate(
+    op_type="gdp",
+    name_prefix="gdp_decode",
+    description=(
+        "Gated DeltaProduct decode / MTP: num_householder Householder updates "
+        "per real token on the GDN MTP kernel. k/v/b carry the householder "
+        "axis next to the token axis; q, the decay logits and the output carry "
+        "one row per real token. State layout is k-last [pool_size, H, V, K]."
+    ),
+    axes={
+        "batch_size": Var(description="Number of sequences decoded concurrently."),
+        "seq_len": Var(
+            description="Real tokens per sequence (T > 1 under speculative decoding)."
+        ),
+        "num_householder": Const(
+            description="Householder updates per real token. 1 is plain GDN.",
+            abbrev="nh",
+        ),
+        "num_q_heads": Const(
+            description="Number of query heads (same as key heads in GVA mode).",
+            abbrev="qk",
+        ),
+        "num_k_heads": Const(description="Number of key heads.", abbrev=""),
+        "num_v_heads": Const(
+            description="Number of value heads (GVA: more value heads than query heads).",
+            abbrev="v",
+        ),
+        "head_size": Const(
+            description="Dimension of each attention head (K in query/key space, V in value space).",
+            abbrev="d",
+        ),
+        "pool_size": Var(description="Size of the state pool for efficient batching."),
+    },
+    inputs={
+        "q": Tensor(
+            ["batch_size", "seq_len", "num_q_heads", "head_size"],
+            description="Query tensor, one row per real token.",
+        ),
+        "k": Tensor(
+            ["batch_size", "seq_len", "num_householder", "num_k_heads", "head_size"],
+            description="Key tensor, one row per (token, Householder).",
+        ),
+        "v": Tensor(
+            ["batch_size", "seq_len", "num_householder", "num_v_heads", "head_size"],
+            description="Value tensor, one row per (token, Householder).",
+        ),
+        "initial_state": Tensor(
+            ["pool_size", "num_v_heads", "head_size", "head_size"],
+            description="Initial recurrent state pool in k-last layout [pool_size, H, V, K].",
+        ),
+        "initial_state_indices": Tensor(
+            ["batch_size"],
+            description="Pool slot each batch row reads. Negative rows are skipped.",
+        ),
+        "A_log": Tensor(
+            ["num_v_heads"],
+            description="Log decay parameter (learnable). Used to compute g = exp(-exp(A_log) * softplus(a + dt_bias)).",
+        ),
+        "a": Tensor(
+            ["batch_size", "seq_len", "num_v_heads"],
+            description="Input-dependent decay from projection, one row per real token.",
+        ),
+        "dt_bias": Tensor(
+            ["num_v_heads"],
+            description="Decay bias (learnable). Added to 'a' before softplus.",
+        ),
+        "b": Tensor(
+            ["batch_size", "seq_len", "num_householder", "num_v_heads"],
+            description="Update gate input per (token, Householder). beta = sigmoid(b).",
+        ),
+        "scale": Scalar(
+            "float32",
+            optional=True,
+            description="Scale factor. Default is 1/sqrt(head_size).",
+        ),
+        "ssm_state_indices": Tensor(
+            ["batch_size", "seq_len"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Per-real-token scatter slot, written after the final Householder "
+                "update. Negative entries skip the write."
+            ),
+        ),
+        "disable_state_update": Scalar("bool", optional=True),
+        "use_qk_l2norm": Scalar("bool", optional=True),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "seq_len", "num_v_heads", "head_size"],
+            dtype="bfloat16",
+            description="Attention output, one row per real token. Shape follows num_v_heads in GVA mode.",
+        ),
+        "final_state": Tensor(
+            ["pool_size", "num_v_heads", "head_size", "head_size"],
+            dtype="float32",
+            description="Updated recurrent state pool in k-last layout [pool_size, H, V, K].",
+        ),
+    },
+    constraints=[
+        "num_householder >= 1",
+        "num_v_heads >= num_q_heads",
+        "num_v_heads % num_q_heads == 0",
+        "num_k_heads == num_q_heads",
+    ],
+    tags=["stage:mtp", "status:verified"],
+    reference=_gdp_decode_reference,
+    init=_gdp_decode_init,
+)

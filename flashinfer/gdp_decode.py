@@ -21,8 +21,11 @@ from typing import Optional, Tuple
 import torch
 
 from .gdn_decode import gated_delta_rule_mtp
+from .api_logging import flashinfer_api
+from .trace.templates.gdp import gdp_decode_trace
 
 
+@flashinfer_api(trace=gdp_decode_trace)
 def gated_delta_product_mtp(
     q: torch.Tensor,  # [B, T,      num_q_heads, K]
     k: torch.Tensor,  # [B, T, n_h, num_k_heads, K]
@@ -49,8 +52,7 @@ def gated_delta_product_mtp(
 
     ``k``, ``v`` and ``beta`` carry the householder axis next to the token axis,
     so reshaping them to the micro-step timeline is free.  ``q`` and ``a`` stay
-    one row per REAL token and the kernel indexes them directly, so this
-    allocates no scratch that scales with ``n_h``.
+    one row per REAL token; the kernel indexes them directly.
 
     **The gate is fused**, unlike the prefill kernel. Prefill takes ``g``
     directly; here the kernel derives alpha from ``A_log``/``a``/``dt_bias``,
@@ -58,13 +60,35 @@ def gated_delta_product_mtp(
 
     Parameters
     ----------
+    q : torch.Tensor
+        Queries ``[B, T, HQ, K]``, one row per REAL token.
     k, v, b : torch.Tensor
-        Carry a householder axis at dim 2. ``q`` and ``a`` do not: one query and
-        one gate per REAL token.
+        ``[B, T, n_h, H, *]`` -- a householder axis at dim 2. ``b`` is the
+        update-gate logit per (token, householder).
+    initial_state : torch.Tensor
+        State pool ``[pool_size, HV, V, K]``, float32.
+    initial_state_indices : torch.Tensor
+        ``[B]`` int32, the pool slot each batch row reads. Negative rows are
+        skipped.
+    A_log, dt_bias : torch.Tensor
+        ``[HV]`` float32 fused-gate parameters.
+    a : torch.Tensor
+        Decay logits ``[B, T, HV]``, one per REAL token.
+    scale : float, optional
+        Query scale; ``1 / sqrt(K)`` when ``None``.
+    output : torch.Tensor, optional
+        Pre-allocated output ``[B, T, HV, V]``, written in place.
     ssm_state_indices : torch.Tensor, optional
         ``[B, T]`` int32, one pool slot per REAL token, as for GDN MTP. The
         state is written after the final micro-step of each token, so the slot
-        holds the state with all ``n_h`` householder updates applied.
+        holds the state with all ``n_h`` householder updates applied. A
+        negative entry skips that write.
+    disable_state_update : bool, optional
+        Skip the end-of-sequence state writeback.
+    use_qk_l2norm : bool
+        L2-normalize q/k inside the kernel. Default ``True``.
+    output_state_indices : torch.Tensor, optional
+        ``[B]`` int32 write slots; defaults to ``initial_state_indices``.
 
     Returns
     -------
@@ -123,8 +147,7 @@ def gated_delta_product_mtp(
 
     # k/v/b already carry the householder axis next to the token axis, so the
     # micro-step view is a free reshape.  q, a and the output stay one row per
-    # REAL token: the kernel indexes them directly, so GDP allocates no
-    # expansion scratch at all.
+    # REAL token: the kernel indexes them directly.
     return gated_delta_rule_mtp(
         q,
         k,
