@@ -1,7 +1,8 @@
 """Tests for Philox PRNG and stochastic rounding primitives.
 
 Test 1: CUDA vs Triton Philox randint — bitwise comparison (any GPU).
-Test 2: CUDA vs Triton stochastic rounding (cvt.rs.f16x2.f32) — bitwise comparison (sm_100a+).
+Test 2: CUDA vs Triton stochastic rounding (cvt.rs.f16x2.f32) — bitwise comparison
+        on GPUs with native hardware stochastic rounding.
 """
 
 import pathlib
@@ -12,7 +13,11 @@ import triton
 import triton.language as tl
 from torch.utils.cpp_extension import load_inline
 
-from flashinfer.utils import get_compute_capability, is_cvt_rs_supported
+from flashinfer.utils import (
+    cvt_rs_supported_arches_text,
+    get_compute_capability,
+    is_cvt_rs_supported,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -386,10 +391,13 @@ def philox_module():
 
 @pytest.fixture(scope="module")
 def stochastic_round_module():
-    """Compile cvt_rs_f16x2_f32 test kernel with sm_100a (hardware PTX path)."""
+    """Compile the FP16 test kernel for the native hardware stochastic path."""
     major, minor = get_compute_capability(torch.device("cuda"))
     if not is_cvt_rs_supported(torch.device("cuda")):
-        pytest.skip("cvt.rs.f16x2.f32 requires sm_100a; not supported on this GPU")
+        pytest.skip(
+            "Hardware stochastic rounding requires one of: "
+            f"{cvt_rs_supported_arches_text()}"
+        )
     # Append 'a' suffix for SM >= 9, matching flashinfer/compilation_context.py:44-45
     minor_str = f"{minor}a" if major >= 9 else str(minor)
     gencode = f"-gencode=arch=compute_{major}{minor_str},code=sm_{major}{minor_str}"
@@ -432,11 +440,12 @@ def stochastic_round_single_module():
 
 @pytest.fixture(scope="module")
 def stochastic_round_e4m3_module():
-    """Compile cvt_rs_e4m3x4_f32 test kernel with sm_100a (hardware PTX path)."""
+    """Compile the E4M3 test kernel for the native hardware stochastic path."""
     major, minor = get_compute_capability(torch.device("cuda"))
     if not is_cvt_rs_supported(torch.device("cuda")):
         pytest.skip(
-            "cvt.rs.satfinite.e4m3x4.f32 requires sm_100a; not supported on this GPU"
+            "Hardware stochastic rounding requires one of: "
+            f"{cvt_rs_supported_arches_text()}"
         )
     minor_str = f"{minor}a" if major >= 9 else str(minor)
     gencode = f"-gencode=arch=compute_{major}{minor_str},code=sm_{major}{minor_str}"

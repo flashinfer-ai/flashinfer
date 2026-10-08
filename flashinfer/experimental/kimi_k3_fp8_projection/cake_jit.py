@@ -23,37 +23,47 @@ from typing import Any
 from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
-# Explicit target-owned registration of the generated programs of the Kimi-K3
-# serialized ``FP8_PB_WO`` projection GEMMs (SM100 / SM103).
+# Registration of the generated programs of the Kimi-K3 serialized ``FP8_PB_WO``
+# projection GEMMs (SM100 / SM103).
 #
-# ``MODULES`` holds one record per physical generated module (a kernel plus
-# its host binding): translation units, compile flags, FFI entry, argument
-# plan and closure identity.  ``KERNELS`` maps ``"<arch>"`` to the logical
-# kernel key -> module assignment the host dispatcher resolves at preparation:
+# ``MODULES`` holds one record per physical program (a kernel source plus its
+# host launcher): the two translation units under ``csrc/``, the architectures
+# the source compiles for, compile flags, FFI entry, argument plan and the
+# closure identity (SHA-256 over the translation units and the shared device /
+# host headers they include).  One source serves every listed architecture;
+# the architecture-specific lowering lines sit behind ``__CUDA_ARCH__`` guards
+# inside the source, and the loader compiles it with the exact flag set of the
+# device it runs on.
+#
+# ``KERNELS`` maps the logical kernel key the host dispatcher resolves at
+# preparation to its program and the compile-line ``defines`` of that
+# instantiation (``-DNAME=value``):
 #
 # * ``quant:u<units>``                 the per-token 1x128 E4M3 / UE8M0
-#   quantization launch with ``units`` K blocks per half warp (1 for M <= 256,
-#   2 / 4 for the large-M rows, chosen by ``cake_backend.quant_units``);
-# * ``gemm``                            the persistent 2-CTA block-scaled
-#   tcgen05 GEMM (256 output columns per CTA pair, M > 256);
-# * ``decode:t<tok>_p<stages>[_fused][_res][_r<xb>][_q<lanes>]``   the swap-AB
-#   split-K decode kernel for one token-tile width, TMA pipeline depth, in-CTA
-#   quantization (``_fused``), resident token tiles (``_res``), a decoupled
-#   ``xb``-deep BF16 token ring (``_r``) and narrow quantization units of
-#   ``lanes`` lanes (``_q``; absent = half-warp units), as the measured dispatch
+#   quantization launch; one program, ``units`` K blocks per half warp is the
+#   ``QUANT_UNITS`` define (1 for M <= 256, 2 / 4 for the large-M rows, chosen
+#   by ``cake_backend.quant_units``);
+# * ``gemm`` / ``gemm_rstaged`` / ``gemm_tstore``   the persistent 2-CTA
+#   block-scaled tcgen05 GEMM (256 output columns per CTA pair, M > 256) with
+#   the register, staged-register or TMA-store epilogue;
+# * ``decode:t<tok>_p<stages>[_fused][_res][_r<xb>][_q<lanes>][_cs<C>]``   the
+#   swap-AB split-K decode kernel for one token-tile width, TMA pipeline
+#   depth, in-CTA quantization (``_fused``), resident token tiles (``_res``),
+#   a decoupled ``xb``-deep BF16 token ring (``_r``), narrow quantization
+#   units of ``lanes`` lanes (``_q``; absent = half-warp units) and a
+#   ``C``-CTA cluster split-K exchange (``_cs``), as the measured dispatch
 #   table selects per ``(N, K, M bucket)``.
 #
-# Every module is an exact-architecture program (tcgen05 / TMEM, ``cta_group::2``
-# for the GEMM).  Both literals are populated verbatim by the generated-program
-# export; do not edit them by hand.
+# Both literals are populated by the generated-program export; do not edit
+# them by hand.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_kimi_k3_fp8_projection_00739ad64bc792e627df": {
-        "arch": "sm_100a",
+    "cake_kimi_k3_fp8_projection_03f726cfdc973f16fd9d": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_00739ad64bc792e627df_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_00739ad64bc792e627df_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_03f726cfdc973f16fd9d_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_03f726cfdc973f16fd9d_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -81,127 +91,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "8ff4fba37c258215aa142d605594a1c68ed385fcb071b786069e0ccb98fb0fef",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "2285697422607f528085b859004fe9bf274048839b2ffebdd4a94f383ea292b2",
     },
-    "cake_kimi_k3_fp8_projection_055d89bbf1c9a2ed23f6": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_fp8_projection_0431fdb872bed128b6e0": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_055d89bbf1c9a2ed23f6_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_055d89bbf1c9a2ed23f6_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_0431fdb872bed128b6e0_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_0431fdb872bed128b6e0_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "W"],
-            ["tma_buffer", "X"],
-            ["tma_buffer", "SFW"],
-            ["tma_buffer", "SFX"],
-            ["buffer", "out"],
-            ["buffer", "partials"],
-            ["buffer", "counters"],
-            ["parameter", "M"],
-            ["parameter", "n_tiles"],
-            ["parameter", "n_valid"],
-            ["parameter", "ldo"],
-            ["parameter", "num_k_iters"],
-            ["parameter", "sf_k_tiles"],
-            ["parameter", "split"],
-            ["parameter", "tok_per_cta"],
-            ["parameter", "total_work"],
-            ["parameter", "store_vec"],
-            ["buffer", "x"],
-            ["parameter", "K"],
-            ["tma_buffer", "XB"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "7a77b7cbc2f3d31f6464deaf3b5b1bcc33d3338142558d5b93208e70b25bbd2e",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_kimi_k3_fp8_projection_07858805ef7c25803dbe": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_07858805ef7c25803dbe_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_07858805ef7c25803dbe_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "W"],
-            ["tma_buffer", "X"],
-            ["tma_buffer", "SFW"],
-            ["tma_buffer", "SFX"],
-            ["buffer", "out"],
-            ["buffer", "partials"],
-            ["buffer", "counters"],
-            ["parameter", "M"],
-            ["parameter", "n_tiles"],
-            ["parameter", "n_valid"],
-            ["parameter", "ldo"],
-            ["parameter", "num_k_iters"],
-            ["parameter", "sf_k_tiles"],
-            ["parameter", "split"],
-            ["parameter", "tok_per_cta"],
-            ["parameter", "total_work"],
-            ["parameter", "store_vec"],
-            ["buffer", "x"],
-            ["parameter", "K"],
-            ["tma_buffer", "XB"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "6991efe08d6e2ef2e0012708744d3768fdccf8f0d675ccfb2910885927e14a9a",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_kimi_k3_fp8_projection_0d1f3e1fce0542d045a7": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_0d1f3e1fce0542d045a7_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_0d1f3e1fce0542d045a7_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "W"],
-            ["tma_buffer", "X"],
-            ["tma_buffer", "SFW"],
-            ["tma_buffer", "SFX"],
-            ["buffer", "out"],
-            ["buffer", "partials"],
-            ["buffer", "counters"],
-            ["parameter", "M"],
-            ["parameter", "n_tiles"],
-            ["parameter", "n_valid"],
-            ["parameter", "ldo"],
-            ["parameter", "num_k_iters"],
-            ["parameter", "sf_k_tiles"],
-            ["parameter", "split"],
-            ["parameter", "tok_per_cta"],
-            ["parameter", "total_work"],
-            ["parameter", "store_vec"],
-            ["buffer", "x"],
-            ["parameter", "K"],
-            ["tma_buffer", "XB"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "df97012f9bcb8fb30fb17d7184922e68deac775ff4087ebbe4aa7c66f11588bc",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_kimi_k3_fp8_projection_10e9c8285c31ff891e3d": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_10e9c8285c31ff891e3d_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_10e9c8285c31ff891e3d_binding.cu",
-        ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -221,45 +119,25 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "sf_k_tiles"],
             ["buffer", "x"],
             ["parameter", "K"],
+            ["buffer", "sk_partials"],
+            ["buffer", "sk_flags"],
+            ["parameter", "sk_pairs"],
+            ["parameter", "sk_rem"],
+            ["parameter", "sk_ksplit"],
+            ["parameter", "sk_dp"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "310a2432570079688db81358633ecedcb814335cfd3f50fd881abd076f3fe8cb",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "ff402f6fee31404ce9e64ea8eebf7ae01118213dd386c0c72f3988d98460b936",
     },
-    "cake_kimi_k3_fp8_projection_138c7e2e869a32d57e0a": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_fp8_projection_05eda9bf9571be77055d": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_138c7e2e869a32d57e0a_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_138c7e2e869a32d57e0a_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_05eda9bf9571be77055d_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_05eda9bf9571be77055d_binding.cu",
         ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "a_q"],
-            ["buffer", "a_sf"],
-            ["parameter", "M"],
-            ["parameter", "K"],
-            ["parameter", "units_per_row"],
-            ["parameter", "sf_k_sets"],
-            ["parameter", "sf_rows"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "0f245f61c801932edc902c632d26b4c99d175329b8fe9b9166e4d0d49bec59cc",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_kimi_k3_fp8_projection_1854b1b35222ad1788bf": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_1854b1b35222ad1788bf_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_1854b1b35222ad1788bf_binding.cu",
-        ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -287,16 +165,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "6f7c1bd7246e20950b2815c2fc53d2f8d23c33a02a4453373ca3357e00732cd7",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "c4522841ca0a4d9839d402f10ab52718d0b51f9b02c901399c8882a093b9bec8",
     },
-    "cake_kimi_k3_fp8_projection_1c708dfcbfe9c984f9c1": {
-        "arch": "sm_100a",
+    "cake_kimi_k3_fp8_projection_0a04eb9cd7712a47fa77": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_1c708dfcbfe9c984f9c1_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_1c708dfcbfe9c984f9c1_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_0a04eb9cd7712a47fa77_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_0a04eb9cd7712a47fa77_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -324,66 +201,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "74dfe2fb9ff0a41f43b8636b3f2ff419e330ebb27c9e836dd8d7c9ca2a82235b",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "5b4e238f5310b2f7c2da04b316ac531c7b76e7e7dd0484f4dd6e7515f1274144",
     },
-    "cake_kimi_k3_fp8_projection_2d05aaceaff566db5e6f": {
-        "arch": "sm_100a",
+    "cake_kimi_k3_fp8_projection_0f462c6967931bc94554": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_2d05aaceaff566db5e6f_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_2d05aaceaff566db5e6f_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_0f462c6967931bc94554_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_0f462c6967931bc94554_binding.cu",
         ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "a_q"],
-            ["buffer", "a_sf"],
-            ["parameter", "M"],
-            ["parameter", "K"],
-            ["parameter", "units_per_row"],
-            ["parameter", "sf_k_sets"],
-            ["parameter", "sf_rows"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "68b1515d7ffaccc9dea1cf63f873308c918ad28e57285b641da2a4a636e8f8b0",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_kimi_k3_fp8_projection_2d4792b887fd11182967": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_2d4792b887fd11182967_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_2d4792b887fd11182967_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "a_q"],
-            ["buffer", "a_sf"],
-            ["parameter", "M"],
-            ["parameter", "K"],
-            ["parameter", "units_per_row"],
-            ["parameter", "sf_k_sets"],
-            ["parameter", "sf_rows"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "2830e7a1102db82737173dfbaa0334591cf6d4009604517e84fa669d3f031ad7",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_kimi_k3_fp8_projection_51111fd6e2d6560472d3": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_51111fd6e2d6560472d3_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_51111fd6e2d6560472d3_binding.cu",
-        ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -411,16 +237,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "46394985cf5f5fb5387e55784db94ff6821bcb01971772f899259774d359bd8f",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "fc0d74c829c257c1cc316fe017c1784b97b3be52823d740551d5fb6db3ef9bc8",
     },
-    "cake_kimi_k3_fp8_projection_56e0f36deb71d340ce0d": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_fp8_projection_1370d8c1f0b50d6fc275": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_56e0f36deb71d340ce0d_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_56e0f36deb71d340ce0d_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_1370d8c1f0b50d6fc275_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_1370d8c1f0b50d6fc275_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -448,16 +273,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "8961db53b71b5aef8efcff3b95a24a564150cde0e3c0a6d97bc86f73309079f0",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "1f0ef568783847fcfee6ba4b84a6926b1040766c236efee5f14607cdc828bc2f",
     },
-    "cake_kimi_k3_fp8_projection_57561222edd2b892d6cc": {
-        "arch": "sm_100a",
+    "cake_kimi_k3_fp8_projection_17e043fc7b1b20f9684b": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_57561222edd2b892d6cc_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_57561222edd2b892d6cc_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_17e043fc7b1b20f9684b_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_17e043fc7b1b20f9684b_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -485,53 +309,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "2cebebce79faa2c629b9d6626f9b778460cb7b5cc866d44ff1a76876e74cdc7f",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "c408ca8f5f112a09915be080cb3ceb4bee09934854f2fd50b7509d8da99ab3e6",
     },
-    "cake_kimi_k3_fp8_projection_59eaf113c1017ac11185": {
-        "arch": "sm_100a",
+    "cake_kimi_k3_fp8_projection_1b87dd451d08890a1dfd": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_59eaf113c1017ac11185_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_59eaf113c1017ac11185_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_1b87dd451d08890a1dfd_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_1b87dd451d08890a1dfd_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "W"],
-            ["tma_buffer", "X"],
-            ["tma_buffer", "SFW"],
-            ["tma_buffer", "SFX"],
-            ["buffer", "out"],
-            ["buffer", "partials"],
-            ["buffer", "counters"],
-            ["parameter", "M"],
-            ["parameter", "n_tiles"],
-            ["parameter", "n_valid"],
-            ["parameter", "ldo"],
-            ["parameter", "num_k_iters"],
-            ["parameter", "sf_k_tiles"],
-            ["parameter", "split"],
-            ["parameter", "tok_per_cta"],
-            ["parameter", "total_work"],
-            ["parameter", "store_vec"],
-            ["buffer", "x"],
-            ["parameter", "K"],
-            ["tma_buffer", "XB"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "fa14fe2bfac99001b7f0c3c9b8a4fa5d0257a954e2fb9d1b5fe976391b44cd8d",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_kimi_k3_fp8_projection_614b479ad56eced96ef2": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_614b479ad56eced96ef2_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_614b479ad56eced96ef2_binding.cu",
-        ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -551,20 +337,25 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "sf_k_tiles"],
             ["buffer", "x"],
             ["parameter", "K"],
+            ["buffer", "sk_partials"],
+            ["buffer", "sk_flags"],
+            ["parameter", "sk_pairs"],
+            ["parameter", "sk_rem"],
+            ["parameter", "sk_ksplit"],
+            ["parameter", "sk_dp"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "98468f8cacc456369b130ed2a14510bac1ba9e7d3c11cdc874875907b3a9ec3c",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "6265fdd5a70ef9c8e8257ff15785e8831341b2436b9520b0bc4f065a7740dfb6",
     },
-    "cake_kimi_k3_fp8_projection_69dbd7f54be92e929682": {
-        "arch": "sm_100a",
+    "cake_kimi_k3_fp8_projection_229e89058afa5fbc8242": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_69dbd7f54be92e929682_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_69dbd7f54be92e929682_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_229e89058afa5fbc8242_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_229e89058afa5fbc8242_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -592,41 +383,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "1bd9ce9d338cf556828ab3890a1345690c453d48d34bf538e9e18b6b5c7a0a3a",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "cb58c2162941f56133ff5534bd2b71f5b326d1ccfc994638780ad0c010ce28b3",
     },
-    "cake_kimi_k3_fp8_projection_74d5179e703e2a8fd363": {
-        "arch": "sm_100a",
+    "cake_kimi_k3_fp8_projection_27fbd0e005bcb628b763": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_74d5179e703e2a8fd363_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_74d5179e703e2a8fd363_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_27fbd0e005bcb628b763_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_27fbd0e005bcb628b763_binding.cu",
         ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "a_q"],
-            ["buffer", "a_sf"],
-            ["parameter", "M"],
-            ["parameter", "K"],
-            ["parameter", "units_per_row"],
-            ["parameter", "sf_k_sets"],
-            ["parameter", "sf_rows"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "9e53942a8a8e8f11df2b457cfb1c11af7f7da8591fd82316a97180e1835c973d",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_kimi_k3_fp8_projection_7596d4f5170c8d2b3517": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_7596d4f5170c8d2b3517_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_7596d4f5170c8d2b3517_binding.cu",
-        ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -650,20 +415,20 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "x"],
             ["parameter", "K"],
             ["tma_buffer", "XB"],
+            ["tma_buffer", "OUT"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "ddaefb5fdb0fe04f4639769676611a4b5e334759560955d2fe8cdcf625899f4a",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "c9e192d747d3f8c02f142afecc6c47ed19a2da37142b6458e434652f5dbcc2cb",
     },
-    "cake_kimi_k3_fp8_projection_8a3827518db03a3df438": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_fp8_projection_2857d054bae1cb1acd9f": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_8a3827518db03a3df438_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_8a3827518db03a3df438_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_2857d054bae1cb1acd9f_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_2857d054bae1cb1acd9f_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -687,119 +452,20 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "x"],
             ["parameter", "K"],
             ["tma_buffer", "XB"],
+            ["tma_buffer", "OUT"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "c3571fe58594712a4cba701c60a8ca63f522b298df9ed755ad920c113c5e70e2",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "68f8183c2be06bb5251e100d1e3dbc955b9e8a7a3580bd7c84a8471bc9d0f1dd",
     },
-    "cake_kimi_k3_fp8_projection_8d08ed15707e24cd6dac": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_fp8_projection_380e817d9cbe0ca65b05": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_8d08ed15707e24cd6dac_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_8d08ed15707e24cd6dac_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_380e817d9cbe0ca65b05_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_380e817d9cbe0ca65b05_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "W"],
-            ["tma_buffer", "X"],
-            ["tma_buffer", "SFW"],
-            ["tma_buffer", "SFX"],
-            ["buffer", "out"],
-            ["buffer", "partials"],
-            ["buffer", "counters"],
-            ["parameter", "M"],
-            ["parameter", "n_tiles"],
-            ["parameter", "n_valid"],
-            ["parameter", "ldo"],
-            ["parameter", "num_k_iters"],
-            ["parameter", "sf_k_tiles"],
-            ["parameter", "split"],
-            ["parameter", "tok_per_cta"],
-            ["parameter", "total_work"],
-            ["parameter", "store_vec"],
-            ["buffer", "x"],
-            ["parameter", "K"],
-            ["tma_buffer", "XB"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "7183436528d8ad76bb1cd90fb9664f71acb6ebe4f4932d66b52dffe5ae7e7eac",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_kimi_k3_fp8_projection_8f6b39413714926d59be": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_8f6b39413714926d59be_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_8f6b39413714926d59be_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "a_q"],
-            ["buffer", "a_sf"],
-            ["parameter", "M"],
-            ["parameter", "K"],
-            ["parameter", "units_per_row"],
-            ["parameter", "sf_k_sets"],
-            ["parameter", "sf_rows"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "61f512f1d8f0fb43d13420b5274c31610531ef3f29370a3cd508aff8f0bfc387",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_kimi_k3_fp8_projection_a7c4b9a2116fb996b2c4": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_a7c4b9a2116fb996b2c4_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_a7c4b9a2116fb996b2c4_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "W"],
-            ["tma_buffer", "X"],
-            ["tma_buffer", "SFW"],
-            ["tma_buffer", "SFX"],
-            ["buffer", "out"],
-            ["buffer", "partials"],
-            ["buffer", "counters"],
-            ["parameter", "M"],
-            ["parameter", "n_tiles"],
-            ["parameter", "n_valid"],
-            ["parameter", "ldo"],
-            ["parameter", "num_k_iters"],
-            ["parameter", "sf_k_tiles"],
-            ["parameter", "split"],
-            ["parameter", "tok_per_cta"],
-            ["parameter", "total_work"],
-            ["parameter", "store_vec"],
-            ["buffer", "x"],
-            ["parameter", "K"],
-            ["tma_buffer", "XB"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "2a0866eb945de787499434157044f7e0becfb5b8d1b7589db432e4cae42b6cd5",
-        "tma_workspace_bytes": 0,
-    },
-    "cake_kimi_k3_fp8_projection_ada8d32600e57c228b66": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_ada8d32600e57c228b66_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_100a/cake_kimi_k3_fp8_projection_ada8d32600e57c228b66_binding.cu",
-        ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -819,20 +485,134 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "sf_k_tiles"],
             ["buffer", "x"],
             ["parameter", "K"],
+            ["buffer", "sk_partials"],
+            ["buffer", "sk_flags"],
+            ["parameter", "sk_pairs"],
+            ["parameter", "sk_rem"],
+            ["parameter", "sk_ksplit"],
+            ["parameter", "sk_dp"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "97e0b164d3bf180979dea81440c83a25f51c8372f1e871de291126060a683495",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "67997b05d3e41a507f5405fc4da05deb2ad421e1c99329d070fbd5e6c9a50747",
     },
-    "cake_kimi_k3_fp8_projection_b0e896ab028b7e06cbd8": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_fp8_projection_3d6d2008e222e7c7071c": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_b0e896ab028b7e06cbd8_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_b0e896ab028b7e06cbd8_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_3d6d2008e222e7c7071c_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_3d6d2008e222e7c7071c_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "63a8055393d6e0f1db039bdc89b124fe4ed0a4c7d2cedecc8a564bcc82135e0b",
+    },
+    "cake_kimi_k3_fp8_projection_40353676ddba08ed996e": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_40353676ddba08ed996e_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_40353676ddba08ed996e_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "679ce3bdf78cff9166338bd001ecd64ab3b5e8757ba9c71e40578510c61fe116",
+    },
+    "cake_kimi_k3_fp8_projection_43fae6dbedc4b839304c": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_43fae6dbedc4b839304c_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_43fae6dbedc4b839304c_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["tma_buffer", "OUT"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "2cfdf06a960dd5830d23df9e0953dec4db8e3a426da6189d9dd7b4272677927a",
+    },
+    "cake_kimi_k3_fp8_projection_4431ecfa7ad1e89772c3": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_4431ecfa7ad1e89772c3_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_4431ecfa7ad1e89772c3_binding.cu",
+        ],
+        "arches": ["sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -852,20 +632,25 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "sf_k_tiles"],
             ["buffer", "x"],
             ["parameter", "K"],
+            ["buffer", "sk_partials"],
+            ["buffer", "sk_flags"],
+            ["parameter", "sk_pairs"],
+            ["parameter", "sk_rem"],
+            ["parameter", "sk_ksplit"],
+            ["parameter", "sk_dp"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "05eb78cf99ae9f56043ce5007d85d3f93d2b12a92ebecc1bf213f758dcb5eeed",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "b2702f731fdd375b3560663a262da5330ea98eb0401ad509436e00c73466393e",
     },
-    "cake_kimi_k3_fp8_projection_bb073dff237d9efa1adc": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_fp8_projection_4a78fa7e772470225540": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_bb073dff237d9efa1adc_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_bb073dff237d9efa1adc_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_4a78fa7e772470225540_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_4a78fa7e772470225540_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -893,16 +678,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "dc4561e48d2e855305e6a7bdd4000a32addd5a995c9e32c8e3888cf4e9bf1d92",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "9e9573790c8d1d81fb6c61e35529e64da5d6450712412b30723dec74c7e9ef78",
     },
-    "cake_kimi_k3_fp8_projection_c4c3bf6737661af0248e": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_fp8_projection_52545f77975f26e5283a": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_c4c3bf6737661af0248e_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_c4c3bf6737661af0248e_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_52545f77975f26e5283a_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_52545f77975f26e5283a_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -930,16 +714,53 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "a20e3dc4b88d7f0c1bfd8b4b805130aa962d279c109c260e1fe77dab8a32f7aa",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "e20beb2a0af7e3cdd20c0bc9644f1ca29bc3898f18e815523070941cc5053df9",
     },
-    "cake_kimi_k3_fp8_projection_d7c1caa7b0f67ad250df": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_fp8_projection_57a407f09cce1e2c97fe": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_d7c1caa7b0f67ad250df_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_d7c1caa7b0f67ad250df_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_57a407f09cce1e2c97fe_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_57a407f09cce1e2c97fe_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["buffer", "out"],
+            ["tma_buffer", "OUT"],
+            ["parameter", "M"],
+            ["parameter", "m_tiles"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "store_vec"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["buffer", "sk_partials"],
+            ["buffer", "sk_flags"],
+            ["parameter", "sk_pairs"],
+            ["parameter", "sk_rem"],
+            ["parameter", "sk_ksplit"],
+            ["parameter", "sk_dp"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "ffb75b24be51bba624c63bb3726567932e85769f2143b99fe9efb80143fb3d5b",
+    },
+    "cake_kimi_k3_fp8_projection_61ed8c7386d2651f09ca": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_61ed8c7386d2651f09ca_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_61ed8c7386d2651f09ca_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -967,16 +788,598 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "7220803adee43616c452bffbe06e5c3938ee6fe084eafc7683f9d5116b96608e",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "16ac81876316592e0b62eaf200c6af873b5721b14cdfae1aeab6e3535fc0d881",
     },
-    "cake_kimi_k3_fp8_projection_dde80e626d9e542b79e6": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_fp8_projection_642d5366857583db9d84": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_dde80e626d9e542b79e6_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_dde80e626d9e542b79e6_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_642d5366857583db9d84_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_642d5366857583db9d84_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "9f4cc59b280046dff7d58d335d745f4b4121ec5072d00607474ee7a5b5a2ee5e",
+    },
+    "cake_kimi_k3_fp8_projection_6b49b046ce902831ff39": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_6b49b046ce902831ff39_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_6b49b046ce902831ff39_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["tma_buffer", "OUT"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "b9928f08817f14cd0e837a3cd7cef6f2a284c06f677d8d0482ca76fca3d8c533",
+    },
+    "cake_kimi_k3_fp8_projection_72d89f8c1f8253b3d7bf": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_72d89f8c1f8253b3d7bf_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_72d89f8c1f8253b3d7bf_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "b665b6d119c43f049d71c70daed5a3c0b9d4e447f8fc2d78542496ca3cf5723a",
+    },
+    "cake_kimi_k3_fp8_projection_79b0e68e502b528a5e27": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_79b0e68e502b528a5e27_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_79b0e68e502b528a5e27_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "78cb05a6e697fd8a61e8bcedbd900cd1b40f0132064d89ce46a3e5dceee336d6",
+    },
+    "cake_kimi_k3_fp8_projection_7f71bc9bf38c38c3c45c": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_7f71bc9bf38c38c3c45c_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_7f71bc9bf38c38c3c45c_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["buffer", "out"],
+            ["tma_buffer", "OUT"],
+            ["parameter", "M"],
+            ["parameter", "m_tiles"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "store_vec"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["buffer", "sk_partials"],
+            ["buffer", "sk_flags"],
+            ["parameter", "sk_pairs"],
+            ["parameter", "sk_rem"],
+            ["parameter", "sk_ksplit"],
+            ["parameter", "sk_dp"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "eaa5b5dddf568c89285e636b2804138b427e393561316e69fc233eb4346e857b",
+    },
+    "cake_kimi_k3_fp8_projection_8496db3154d8daa04c65": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_8496db3154d8daa04c65_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_8496db3154d8daa04c65_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "7cf2bad7ee9c5a8f2dd0afb8235ac38df17832cd6fb4e7b1a92e0d616f684691",
+    },
+    "cake_kimi_k3_fp8_projection_8927e7dec2bccdc7999f": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_8927e7dec2bccdc7999f_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_8927e7dec2bccdc7999f_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "25c1d9e1ced59fcbed193f96e98c96d1899400701d873ba2098642e209df0073",
+    },
+    "cake_kimi_k3_fp8_projection_929ffd187d3adbf2fa06": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_929ffd187d3adbf2fa06_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_929ffd187d3adbf2fa06_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "179179da028e6444b191cbd8f1ca528cc02664abd3ce4bd847b556c87196c922",
+    },
+    "cake_kimi_k3_fp8_projection_93054d73a4b4e6ac4f14": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_93054d73a4b4e6ac4f14_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_93054d73a4b4e6ac4f14_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "ba0881ca6045094cbedcc733267e408d3911ec6c8673adc1f0ace86bdd7c3c3b",
+    },
+    "cake_kimi_k3_fp8_projection_9b3d1ed423ed66668dca": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_9b3d1ed423ed66668dca_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_9b3d1ed423ed66668dca_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["buffer", "out"],
+            ["tma_buffer", "OUT"],
+            ["parameter", "M"],
+            ["parameter", "m_tiles"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "store_vec"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["buffer", "sk_partials"],
+            ["buffer", "sk_flags"],
+            ["parameter", "sk_pairs"],
+            ["parameter", "sk_rem"],
+            ["parameter", "sk_ksplit"],
+            ["parameter", "sk_dp"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "d46e803597d42f66eb3006ea304091cca8ca302ef71cf8c261e478e1be7f77f6",
+    },
+    "cake_kimi_k3_fp8_projection_9c165854c3ad9e9f8946": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_9c165854c3ad9e9f8946_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_9c165854c3ad9e9f8946_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["tma_buffer", "OUT"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "7ed068f8ceebd7b11dfb4a2717f4071521ecdd1964cfad16aa0a2e0ff551ebc0",
+    },
+    "cake_kimi_k3_fp8_projection_a0d42384e4c473bf0175": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_a0d42384e4c473bf0175_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_a0d42384e4c473bf0175_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "41e625186b5e48174c1432846d233b9dd0a0211216c6048e035e9bf7c9b0ef86",
+    },
+    "cake_kimi_k3_fp8_projection_a2e6c842fd69d889e9d1": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_a2e6c842fd69d889e9d1_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_a2e6c842fd69d889e9d1_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "6a5cefaa150a25d809a6f0c544d3cded2e9f40893d8bdadb43cfd894bc98573c",
+    },
+    "cake_kimi_k3_fp8_projection_ac5700edd121a98870b3": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_ac5700edd121a98870b3_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_ac5700edd121a98870b3_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "cdb3ca747759198495335781693d186a8cde7135c175f1afc0a54adeef3d40d1",
+    },
+    "cake_kimi_k3_fp8_projection_ace1f72e54b40304cf59": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_ace1f72e54b40304cf59_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_ace1f72e54b40304cf59_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "81792181a6ad87f8c061b002c7fc8ef00a8ee0d1655831d17b1f2edc276167bd",
+    },
+    "cake_kimi_k3_fp8_projection_ae0a9ad32f21cca181b4": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_ae0a9ad32f21cca181b4_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_ae0a9ad32f21cca181b4_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["tma_buffer", "OUT"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "7022dbf4dad01e036e30fcaf5a59e3726da4567f99da535e9061c6acbd5c73b9",
+    },
+    "cake_kimi_k3_fp8_projection_b09e4e41eccd3443a898": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_b09e4e41eccd3443a898_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_b09e4e41eccd3443a898_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": [],
         "ffi_entry": "run",
         "arg_plan": [
@@ -992,16 +1395,53 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "14c71a8e4413f10f1a2f230632082493f512fc7a9cf9d41e2339633996e90c8b",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "7908dd63d782dee73ef8632ad442f6fdef49224b68dd0427822f97db1f6ef980",
     },
-    "cake_kimi_k3_fp8_projection_e4f401c8686b0a1990ec": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_fp8_projection_bfac46f1c635d7974bc7": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_e4f401c8686b0a1990ec_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_e4f401c8686b0a1990ec_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_bfac46f1c635d7974bc7_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_bfac46f1c635d7974bc7_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["buffer", "out"],
+            ["tma_buffer", "OUT"],
+            ["parameter", "M"],
+            ["parameter", "m_tiles"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "store_vec"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["buffer", "sk_partials"],
+            ["buffer", "sk_flags"],
+            ["parameter", "sk_pairs"],
+            ["parameter", "sk_rem"],
+            ["parameter", "sk_ksplit"],
+            ["parameter", "sk_dp"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "a974f58f4f6ebea63fa20290cab4ea3ec3481aa2a431baec34673549d3c515de",
+    },
+    "cake_kimi_k3_fp8_projection_c66f19a83da3330e71de": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_c66f19a83da3330e71de_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_c66f19a83da3330e71de_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -1029,16 +1469,202 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "a922eaaadc5fc216f9f802bcf17f037e66a768560ea2d77f64f93818533a8555",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "3550f2fc0c245e9b3f2edaea8d9e3337c0f796e22743555cc2d82284fd3656fc",
     },
-    "cake_kimi_k3_fp8_projection_f8a70558689c2bbf9c57": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_fp8_projection_cb92872d3fa1b0f7a1a6": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_f8a70558689c2bbf9c57_kernel.cu",
-            "cake_kimi_k3_fp8_projection/sm_103a/cake_kimi_k3_fp8_projection_f8a70558689c2bbf9c57_binding.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_cb92872d3fa1b0f7a1a6_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_cb92872d3fa1b0f7a1a6_binding.cu",
         ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["tma_buffer", "OUT"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "cb6dfb4fb96bc165d69806fbeffd117c77c78954eaa30012e23540da3951c756",
+    },
+    "cake_kimi_k3_fp8_projection_cc2a594bcd7649dd4e16": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_cc2a594bcd7649dd4e16_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_cc2a594bcd7649dd4e16_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["tma_buffer", "OUT"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "784ab9727cd92f20a85477e881ec360899cbd2cf7767498f403543750a6b17bc",
+    },
+    "cake_kimi_k3_fp8_projection_cc75a6d7ba4c2003cbde": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_cc75a6d7ba4c2003cbde_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_cc75a6d7ba4c2003cbde_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["tma_buffer", "OUT"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "d3dea532e90619033f1b25ac54436753dcdc87d442086da0d400aa8503f42a03",
+    },
+    "cake_kimi_k3_fp8_projection_d02c35c4da93dfbbe50f": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_d02c35c4da93dfbbe50f_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_d02c35c4da93dfbbe50f_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["buffer", "out"],
+            ["tma_buffer", "OUT"],
+            ["parameter", "M"],
+            ["parameter", "m_tiles"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "store_vec"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["buffer", "sk_partials"],
+            ["buffer", "sk_flags"],
+            ["parameter", "sk_pairs"],
+            ["parameter", "sk_rem"],
+            ["parameter", "sk_ksplit"],
+            ["parameter", "sk_dp"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "2143c0bef9a11c2e840b480d76fc8a1b5893ffc025b3238a0f9015acdb552bd3",
+    },
+    "cake_kimi_k3_fp8_projection_d47ee97242dc5522c7d7": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_d47ee97242dc5522c7d7_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_d47ee97242dc5522c7d7_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["buffer", "out"],
+            ["tma_buffer", "OUT"],
+            ["parameter", "M"],
+            ["parameter", "m_tiles"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "store_vec"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["buffer", "sk_partials"],
+            ["buffer", "sk_flags"],
+            ["parameter", "sk_pairs"],
+            ["parameter", "sk_rem"],
+            ["parameter", "sk_ksplit"],
+            ["parameter", "sk_dp"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "4e78fd67145ffda53893ef6b3a5348d38bdb50bbae2b4ff563fa2f60a03041cb",
+    },
+    "cake_kimi_k3_fp8_projection_d8873ecda2e2c0143f96": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_d8873ecda2e2c0143f96_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_d8873ecda2e2c0143f96_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
@@ -1066,44 +1692,277 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "5e49837a99c49e6f10a49dd7fd7548c058032beba49ce6560fe2be3a24c22fc6",
-        "tma_workspace_bytes": 0,
+        "closure_sha256": "3d6a295a208dcb4aeb99fb6712f69734ce86456f603391fe414d29bf5c9231e6",
+    },
+    "cake_kimi_k3_fp8_projection_dc496e474d6f2deb4d75": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_dc496e474d6f2deb4d75_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_dc496e474d6f2deb4d75_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "15fb5f4cca369474f26dd23e049b678d77112a0a09a6f8e6302a0babc6ff7b82",
+    },
+    "cake_kimi_k3_fp8_projection_e5e56bceaae45bb4f39b": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_e5e56bceaae45bb4f39b_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_e5e56bceaae45bb4f39b_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "W"],
+            ["tma_buffer", "X"],
+            ["tma_buffer", "SFW"],
+            ["tma_buffer", "SFX"],
+            ["buffer", "out"],
+            ["buffer", "partials"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "n_tiles"],
+            ["parameter", "n_valid"],
+            ["parameter", "ldo"],
+            ["parameter", "num_k_iters"],
+            ["parameter", "sf_k_tiles"],
+            ["parameter", "split"],
+            ["parameter", "tok_per_cta"],
+            ["parameter", "total_work"],
+            ["parameter", "store_vec"],
+            ["buffer", "x"],
+            ["parameter", "K"],
+            ["tma_buffer", "XB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "0b649bdc74e9f1ac490b18a46d2079880ec208b931100537558e2bcf210a73ad",
     },
 }
-KERNELS: dict[str, dict[str, str]] = {
-    "sm_100a": {
-        "decode:t128_p3": "cake_kimi_k3_fp8_projection_1c708dfcbfe9c984f9c1",
-        "decode:t16_p4": "cake_kimi_k3_fp8_projection_59eaf113c1017ac11185",
-        "decode:t16_p4_fused": "cake_kimi_k3_fp8_projection_00739ad64bc792e627df",
-        "decode:t16_p4_fused_q8": "cake_kimi_k3_fp8_projection_69dbd7f54be92e929682",
-        "decode:t32_p3_fused_r5_q4": "cake_kimi_k3_fp8_projection_07858805ef7c25803dbe",
-        "decode:t32_p3_fused_res": "cake_kimi_k3_fp8_projection_0d1f3e1fce0542d045a7",
-        "decode:t32_p4": "cake_kimi_k3_fp8_projection_1854b1b35222ad1788bf",
-        "decode:t64_p2_fused_r3_q4": "cake_kimi_k3_fp8_projection_57561222edd2b892d6cc",
-        "decode:t64_p2_fused_res": "cake_kimi_k3_fp8_projection_51111fd6e2d6560472d3",
-        "decode:t64_p4": "cake_kimi_k3_fp8_projection_7596d4f5170c8d2b3517",
-        "gemm": "cake_kimi_k3_fp8_projection_ada8d32600e57c228b66",
-        "gemm_tstore": "cake_kimi_k3_fp8_projection_10e9c8285c31ff891e3d",
-        "quant:u1": "cake_kimi_k3_fp8_projection_8f6b39413714926d59be",
-        "quant:u2": "cake_kimi_k3_fp8_projection_2d05aaceaff566db5e6f",
-        "quant:u4": "cake_kimi_k3_fp8_projection_74d5179e703e2a8fd363",
+KERNELS: dict[str, dict[str, Any]] = {
+    "decode:t128_p3": {
+        "module": "cake_kimi_k3_fp8_projection_03f726cfdc973f16fd9d",
+        "defines": {},
     },
-    "sm_103a": {
-        "decode:t128_p3": "cake_kimi_k3_fp8_projection_d7c1caa7b0f67ad250df",
-        "decode:t16_p4": "cake_kimi_k3_fp8_projection_56e0f36deb71d340ce0d",
-        "decode:t16_p4_fused": "cake_kimi_k3_fp8_projection_e4f401c8686b0a1990ec",
-        "decode:t16_p4_fused_q8": "cake_kimi_k3_fp8_projection_a7c4b9a2116fb996b2c4",
-        "decode:t32_p3_fused_r5_q4": "cake_kimi_k3_fp8_projection_bb073dff237d9efa1adc",
-        "decode:t32_p3_fused_res": "cake_kimi_k3_fp8_projection_c4c3bf6737661af0248e",
-        "decode:t32_p4": "cake_kimi_k3_fp8_projection_8d08ed15707e24cd6dac",
-        "decode:t64_p2_fused_r3_q4": "cake_kimi_k3_fp8_projection_f8a70558689c2bbf9c57",
-        "decode:t64_p2_fused_res": "cake_kimi_k3_fp8_projection_8a3827518db03a3df438",
-        "decode:t64_p4": "cake_kimi_k3_fp8_projection_055d89bbf1c9a2ed23f6",
-        "gemm": "cake_kimi_k3_fp8_projection_b0e896ab028b7e06cbd8",
-        "gemm_tstore": "cake_kimi_k3_fp8_projection_614b479ad56eced96ef2",
-        "quant:u1": "cake_kimi_k3_fp8_projection_138c7e2e869a32d57e0a",
-        "quant:u2": "cake_kimi_k3_fp8_projection_dde80e626d9e542b79e6",
-        "quant:u4": "cake_kimi_k3_fp8_projection_2d4792b887fd11182967",
+    "decode:t128_p3_mc2_pf3": {
+        "module": "cake_kimi_k3_fp8_projection_c66f19a83da3330e71de",
+        "defines": {},
+    },
+    "decode:t128_p3_mc2_pf3_tso": {
+        "module": "cake_kimi_k3_fp8_projection_cb92872d3fa1b0f7a1a6",
+        "defines": {},
+    },
+    "decode:t128_p3_tso": {
+        "module": "cake_kimi_k3_fp8_projection_6b49b046ce902831ff39",
+        "defines": {},
+    },
+    "decode:t16_p3_fused_cs14_px1": {
+        "module": "cake_kimi_k3_fp8_projection_8927e7dec2bccdc7999f",
+        "defines": {},
+    },
+    "decode:t16_p3_fused_cs14_px1_xp": {
+        "module": "cake_kimi_k3_fp8_projection_929ffd187d3adbf2fa06",
+        "defines": {},
+    },
+    "decode:t16_p3_fused_cs14_xp": {
+        "module": "cake_kimi_k3_fp8_projection_17e043fc7b1b20f9684b",
+        "defines": {},
+    },
+    "decode:t16_p3_fused_cs7": {
+        "module": "cake_kimi_k3_fp8_projection_8496db3154d8daa04c65",
+        "defines": {},
+    },
+    "decode:t16_p4": {
+        "module": "cake_kimi_k3_fp8_projection_ac5700edd121a98870b3",
+        "defines": {},
+    },
+    "decode:t16_p4_fused": {
+        "module": "cake_kimi_k3_fp8_projection_e5e56bceaae45bb4f39b",
+        "defines": {},
+    },
+    "decode:t16_p4_fused_cs2": {
+        "module": "cake_kimi_k3_fp8_projection_40353676ddba08ed996e",
+        "defines": {},
+    },
+    "decode:t16_p4_fused_cs4": {
+        "module": "cake_kimi_k3_fp8_projection_ace1f72e54b40304cf59",
+        "defines": {},
+    },
+    "decode:t16_p4_fused_cs4_px1": {
+        "module": "cake_kimi_k3_fp8_projection_4a78fa7e772470225540",
+        "defines": {},
+    },
+    "decode:t16_p4_fused_pf1": {
+        "module": "cake_kimi_k3_fp8_projection_79b0e68e502b528a5e27",
+        "defines": {},
+    },
+    "decode:t16_p4_fused_px1": {
+        "module": "cake_kimi_k3_fp8_projection_61ed8c7386d2651f09ca",
+        "defines": {},
+    },
+    "decode:t16_p4_fused_r4_x4_cs4": {
+        "module": "cake_kimi_k3_fp8_projection_dc496e474d6f2deb4d75",
+        "defines": {},
+    },
+    "decode:t32_p3_fused_r5_q4": {
+        "module": "cake_kimi_k3_fp8_projection_72d89f8c1f8253b3d7bf",
+        "defines": {},
+    },
+    "decode:t32_p3_fused_r5_q4_tso": {
+        "module": "cake_kimi_k3_fp8_projection_27fbd0e005bcb628b763",
+        "defines": {},
+    },
+    "decode:t32_p3_fused_res": {
+        "module": "cake_kimi_k3_fp8_projection_a0d42384e4c473bf0175",
+        "defines": {},
+    },
+    "decode:t32_p3_fused_res_tso": {
+        "module": "cake_kimi_k3_fp8_projection_9c165854c3ad9e9f8946",
+        "defines": {},
+    },
+    "decode:t32_p4": {
+        "module": "cake_kimi_k3_fp8_projection_05eda9bf9571be77055d",
+        "defines": {},
+    },
+    "decode:t32_p4_cs2": {
+        "module": "cake_kimi_k3_fp8_projection_93054d73a4b4e6ac4f14",
+        "defines": {},
+    },
+    "decode:t32_p4_cs4": {
+        "module": "cake_kimi_k3_fp8_projection_1370d8c1f0b50d6fc275",
+        "defines": {},
+    },
+    "decode:t32_p4_cs8_xp": {
+        "module": "cake_kimi_k3_fp8_projection_d8873ecda2e2c0143f96",
+        "defines": {},
+    },
+    "decode:t32_p4_tso": {
+        "module": "cake_kimi_k3_fp8_projection_ae0a9ad32f21cca181b4",
+        "defines": {},
+    },
+    "decode:t32_p5_c16": {
+        "module": "cake_kimi_k3_fp8_projection_52545f77975f26e5283a",
+        "defines": {},
+    },
+    "decode:t32_p5_c16_pf2": {
+        "module": "cake_kimi_k3_fp8_projection_3d6d2008e222e7c7071c",
+        "defines": {},
+    },
+    "decode:t32_p5_c16_pf2_tso": {
+        "module": "cake_kimi_k3_fp8_projection_cc2a594bcd7649dd4e16",
+        "defines": {},
+    },
+    "decode:t32_p5_c16_tso": {
+        "module": "cake_kimi_k3_fp8_projection_cc75a6d7ba4c2003cbde",
+        "defines": {},
+    },
+    "decode:t64_p2_fused": {
+        "module": "cake_kimi_k3_fp8_projection_a2e6c842fd69d889e9d1",
+        "defines": {},
+    },
+    "decode:t64_p2_fused_res": {
+        "module": "cake_kimi_k3_fp8_projection_229e89058afa5fbc8242",
+        "defines": {},
+    },
+    "decode:t64_p2_fused_res_tso": {
+        "module": "cake_kimi_k3_fp8_projection_43fae6dbedc4b839304c",
+        "defines": {},
+    },
+    "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_pi2": {
+        "module": "cake_kimi_k3_fp8_projection_0f462c6967931bc94554",
+        "defines": {},
+    },
+    "decode:t64_p4": {
+        "module": "cake_kimi_k3_fp8_projection_0a04eb9cd7712a47fa77",
+        "defines": {},
+    },
+    "decode:t64_p4_cs2a": {
+        "module": "cake_kimi_k3_fp8_projection_642d5366857583db9d84",
+        "defines": {},
+    },
+    "decode:t64_p4_tso": {
+        "module": "cake_kimi_k3_fp8_projection_2857d054bae1cb1acd9f",
+        "defines": {},
+    },
+    "gemm": {
+        "module": "cake_kimi_k3_fp8_projection_d47ee97242dc5522c7d7",
+        "defines": {},
+    },
+    "gemm_rstaged": {
+        "module": "cake_kimi_k3_fp8_projection_0431fdb872bed128b6e0",
+        "defines": {},
+    },
+    "gemm_rstaged_n192": {
+        "module": "cake_kimi_k3_fp8_projection_57a407f09cce1e2c97fe",
+        "defines": {},
+    },
+    "gemm_tstore": {
+        "module": "cake_kimi_k3_fp8_projection_1b87dd451d08890a1dfd",
+        "defines": {},
+    },
+    "gemm_tstore_n192": {
+        "module": "cake_kimi_k3_fp8_projection_380e817d9cbe0ca65b05",
+        "defines": {},
+    },
+    "gemm_tstore_n192_skf": {
+        "module": "cake_kimi_k3_fp8_projection_7f71bc9bf38c38c3c45c",
+        "defines": {},
+    },
+    "gemm_tstore_pf2": {
+        "module": "cake_kimi_k3_fp8_projection_bfac46f1c635d7974bc7",
+        "defines": {},
+    },
+    "gemm_tstore_pf4": {
+        "module": "cake_kimi_k3_fp8_projection_4431ecfa7ad1e89772c3",
+        "defines": {},
+    },
+    "gemm_tstore_sk": {
+        "module": "cake_kimi_k3_fp8_projection_9b3d1ed423ed66668dca",
+        "defines": {},
+    },
+    "gemm_tstore_skf": {
+        "module": "cake_kimi_k3_fp8_projection_d02c35c4da93dfbbe50f",
+        "defines": {},
+    },
+    "quant:u1": {
+        "module": "cake_kimi_k3_fp8_projection_b09e4e41eccd3443a898",
+        "defines": {"QUANT_UNITS": 1},
+    },
+    "quant:u2": {
+        "module": "cake_kimi_k3_fp8_projection_b09e4e41eccd3443a898",
+        "defines": {"QUANT_UNITS": 2},
+    },
+    "quant:u4": {
+        "module": "cake_kimi_k3_fp8_projection_b09e4e41eccd3443a898",
+        "defines": {"QUANT_UNITS": 4},
     },
 }
 
@@ -1114,9 +1973,12 @@ ARCH_NVCC_FLAGS = {
 }
 
 GEMM_KERNEL_KEY = "gemm"  # register epilogue (any even output row stride)
+GEMM_RSTAGED_KERNEL_KEY = "gemm_rstaged"  # staged row-coalesced register epilogue (8-byte aligned output rows)
 GEMM_TSTORE_KERNEL_KEY = (
     "gemm_tstore"  # TMA-store epilogue (16-byte output base, row stride, column edge)
 )
+
+Defines = tuple[tuple[str, int], ...]
 
 
 def quant_kernel_key(units: int) -> str:
@@ -1130,45 +1992,91 @@ def decode_kernel_key(
     resident: bool,
     xb_stages: int = 0,
     qlanes: int = 16,
+    csplit: int = 1,
+    cs_alias: bool = False,
+    epi_chunk: int = 0,
+    pf: int = 0,
+    mc: int = 1,
+    tstore: bool = False,
+    pfx: int = 0,
+    pfi: int = 0,
+    qwarps: int = 8,
+    xbh: bool = False,
+    qer: bool = False,
+    xp: bool = False,
+    xq_stages: int = 0,
 ) -> str:
     key = f"decode:t{int(tok)}_p{int(stages)}"
     if fused:
         key += "_fused"
+        if int(qwarps) != 8:
+            key += f"_w{int(qwarps)}"  # round 6 continuation 8 (lever QW16): quantizing warps of the fused instance (table key ``qwarps``; 8 = default)
     if resident:
         key += "_res"
     if xb_stages:
         key += f"_r{int(xb_stages)}"
+        if xbh:
+            key += "_xh"  # round 6 continuation 9 (lever XBH): half-slot BF16 ring (table key ``xbh``; per-128-K-block loads and releases)
+            if qer:
+                key += "_qe"  # round 6 continuation 10 (lever QER): the quantizing warps release each half slot right after their register loads (table key ``qer``)
+    if xb_stages and xq_stages:
+        key += f"_x{int(xq_stages)}"  # round 4 (lever F): the FP8 token tiles stream through their own ring (table key ``xq_stages``; needs the BF16 ring)
     if qlanes != 16:
         key += f"_q{int(qlanes)}"
+    if epi_chunk and int(epi_chunk) != min(32, int(tok)):
+        key += f"_c{int(epi_chunk)}"  # round 6: epilogue staging rows per flush (a 16-row chunk frees SMEM for a 5th stage)
+    if int(csplit) > 1:
+        key += f"_cs{int(csplit)}"  # round 5: K split across the CTAs of one cluster, DSM partial exchange
+        if cs_alias:
+            key += "a"  # the exchange inbox aliases the dead pipeline stages (one round; one work item per CTA)
+    if int(mc) > 1:
+        key += f"_mc{int(mc)}"  # round 6 (lever M): the C m tiles of one N tile run as a cluster and share the W stage (TMA multicast)
+    if int(pf) > 0:
+        key += f"_pf{int(pf)}"  # round 6 (lever P): weight tiles prefetched into L2 pf stages ahead of their TMA load
+    if int(pfx) > 0:
+        key += f"_px{int(pfx)}"  # round 6 next loop (lever PX): the BF16 token tile prefetched into L2 pfx stages ahead of its TMA load
+    if tstore:
+        key += "_tso"  # round 6 (lever E1): the split-1 epilogue stores BF16 through TMA (16-byte-aligned output views)
+    if int(pfi) > 0:
+        key += f"_pi{int(pfi)}"  # round 6 continuation 7 (lever PI-W): the load warp prefetches the next work item's first W/SFW tiles into L2 (needs pf > 0)
+    if xp and int(csplit) > 1:
+        key += "_xp"  # round 7 (lever XP): the cluster split-K exchange issues its DSM copies from one lane per peer in parallel (table key ``xp``)
     return key
 
 
+def gemm_kernel_key(base: str, pf: int = 0) -> str:
+    """``gemm`` / ``gemm_tstore`` / ``gemm_rstaged`` (with the ``_n192`` / ``_sk`` / ``_skf`` instance suffixes) plus
+    ``_pf<D>`` when the shape's table row prefetches the weight tiles ``D`` stages ahead (round 6, lever GP; table key
+    ``gemm_pf``)."""
+    return base + (f"_pf{int(pf)}" if int(pf) > 0 else "")
+
+
+def kernel_program(arch: str, key: str) -> tuple[str, Defines]:
+    """``(program, compile-line defines)`` of logical kernel ``key`` on ``arch``."""
+    entry = KERNELS.get(key)
+    if entry is None:
+        raise NotImplementedError(
+            f"The generated Kimi-K3 FP8 projection kernel {key!r} is not registered "
+            "in this checkout (see flashinfer-ai/flashinfer#4568)"
+        )
+    name = entry["module"]
+    if arch not in MODULES[name]["arches"]:
+        raise NotImplementedError(
+            f"The generated Kimi-K3 FP8 projection program of {key!r} is not built "
+            f"for {arch} (registered: {MODULES[name]['arches']})"
+        )
+    return name, tuple(sorted((str(k), int(v)) for k, v in entry["defines"].items()))
+
+
 def route_available(arch: str, required_keys: tuple[str, ...] = ()) -> bool:
-    """True when ``arch`` is registered and carries every key in ``required_keys``."""
-    table = KERNELS.get(arch)
-    return table is not None and all(key in table for key in required_keys)
-
-
-def kernel_module_name(arch: str, key: str) -> str:
-    """Return the registered physical module for ``key`` on ``arch``."""
-    table = KERNELS.get(arch)
-    if table is None:
-        raise NotImplementedError(
-            f"The generated Kimi-K3 FP8 projection programs for {arch} are not "
-            "registered in this checkout yet (see flashinfer-ai/flashinfer#4568)"
-        )
-    name = table.get(key)
-    if name is None:
-        raise NotImplementedError(
-            f"The generated Kimi-K3 FP8 projection kernel {key!r} for {arch} is not "
-            "registered in this checkout (see flashinfer-ai/flashinfer#4568)"
-        )
-    record = MODULES[name]
-    if record["arch"] != arch:
-        raise RuntimeError(
-            f"registered module {name!r} is an {record['arch']} program bound to {arch}"
-        )
-    return name
+    """True when every key in ``required_keys`` has a program built for ``arch``."""
+    if arch not in ARCHES:
+        return False
+    for key in required_keys:
+        entry = KERNELS.get(key)
+        if entry is None or arch not in MODULES[entry["module"]]["arches"]:
+            return False
+    return True
 
 
 def _header_dirs():
@@ -1187,23 +2095,40 @@ def _header_dirs():
 
 
 @functools.cache
-def gen_cake_kimi_k3_fp8_projection_module(name: str):
+def gen_cake_kimi_k3_fp8_projection_module(name: str, arch: str, defines: Defines = ()):
+    """JIT spec of program ``name`` compiled for ``arch`` with the compile-line ``defines``.
+
+    The architecture and the defines are part of the spec name, so two
+    architectures (or two instantiations) never share one cached library; the
+    closure digest covers the translation units and their shared headers."""
     record = MODULES[name]
+    if arch not in record["arches"]:
+        raise ValueError(
+            f"program {name!r} is not built for {arch} ({record['arches']})"
+        )
     root = Path(__file__).resolve().parent / "csrc"
     sources = [root / relative for relative in record["sources"]]
+    suffix = "".join(f"_{key}{value}" for key, value in defines)
     return gen_jit_spec(
-        name=f"{name}_" + record["closure_sha256"][:20],
+        name=f"{name}_{arch}{suffix}_" + record["closure_sha256"][:20],
         sources=sources,
         extra_cuda_cflags=[
-            *ARCH_NVCC_FLAGS[record["arch"]],
+            *ARCH_NVCC_FLAGS[arch],
             *record["compile_flags"],
+            *[f"-D{key}={value}" for key, value in defines],
         ],
         extra_ldflags=["-lcuda"],
-        extra_include_paths=[root, *[p.parent for p in sources], *_header_dirs()],
+        extra_include_paths=[
+            root,
+            *dict.fromkeys(p.parent for p in sources),
+            *_header_dirs(),
+        ],
         use_fast_math=False,
     )
 
 
 @functools.cache
-def load_cake_kimi_k3_fp8_projection_module(name: str):
-    return gen_cake_kimi_k3_fp8_projection_module(name).build_and_load()
+def load_cake_kimi_k3_fp8_projection_module(
+    name: str, arch: str, defines: Defines = ()
+):
+    return gen_cake_kimi_k3_fp8_projection_module(name, arch, defines).build_and_load()

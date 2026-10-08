@@ -24,16 +24,37 @@ limitations under the License.
 #     out    = BF16(latent @ up_weight.T + sum_r shared_partial_r)  [M, 7168]
 #
 # ``out`` is replicated and bitwise identical on every rank.  The fused tail
-# is three launches per rank on the current stream (CUDA-Graph capturable):
+# is two generated launches per rank on the current stream (CUDA-Graph
+# capturable), with cuBLAS between them for ``M > K23_MAX_TOKENS``:
 #
 # * ``K1``  Lamport all-reduce of ``routed_partial`` fused with KimiRMSNorm ->
 #   the normalised latent ``y`` on every rank (one-shot for ``M <= 16``, the
-#   token-sliced two-shot form above);
-# * ``K2``  cuBLAS (``torch.mm``) on this rank's contiguous 640 / 512-row slice
-#   of ``up_weight`` (``7168 = 8 x 640 + 4 x 512``: 7168 is not divisible by 12);
-# * ``K3``  column reduce-scatter of ``shared_partial`` to the owner rank, add of
+#   token-sliced two-shot form above).  Below ``K3_PERSIST_MIN_TOKENS`` the
+#   early-shared-scatter (ESS) forms ``k1_oneshot_ess`` and
+#   ``k1_twoshot_ess:grouped`` also scatter this rank's ``shared_partial``
+#   columns into the K3 workspace slots of their owner ranks, so the tail
+#   kernel of that range has no scatter stage of its own;
+# * the up-projection of ``y`` with this rank's contiguous 640 / 512-row slice
+#   of ``up_weight`` (``7168 = 8 x 640 + 4 x 512``: 7168 is not divisible by
+#   12): fused into the tail kernel for ``M <= K23_MAX_TOKENS``, cuBLAS
+#   (``torch.mm``, BF16 slice) above;
+# * the tail  owner reduce of the scattered ``shared_partial`` columns, add of
 #   the up-projection slice, one BF16 rounding, multicast all-gather into the
-#   caller-owned ``out``.
+#   caller-owned ``out``: ``k23:c<capacity>`` (the fp32 slice GEMM in
+#   the K2-stream summation order fused with the K3-ESS reduce / add /
+#   all-gather, one CTA per ``K23_ROWS`` output columns; the four-token program
+#   for ``M <= 4``, the eight-token program for ``5 <= M <= 8``; the rank's
+#   column width only sizes the grid) for ``M <= 8``;
+#   ``k3_ess:grouped`` (one CTA per token and column half) for ``8 < M < 256``; the persistent
+#   token pipeline (``min(M, SM count)`` CTAs per column half, own scatter of
+#   ``shared_partial``) as ``k3_persist:grouped`` at 256 tokens and as
+#   ``k3_persist_bulk:pinned`` (``cp.async.bulk`` reduce-scatter pushes) above.
+#
+# Rows ``M <= 4`` and ``M > 8`` are bitwise identical to the round-4 / round-5
+# routes (K23 keeps the numerics of the round-4 K2-stream + fp32-add K3 pair);
+# ``5 <= M <= 8`` (round 6) round once instead of twice -- a strict error
+# reduction against the fp64 reference.  The thresholds are pinned by the
+# round-5 / round-6 paired A/Bs on GB200 and GB300 NVL72.
 #
 # The three Lamport workspaces are FlashInfer's own MNNVL all-reduce
 # workspaces (``MNNVLAllReduceFusionWorkspace``: three rotating symmetric
@@ -73,6 +94,28 @@ GROUPED_MAX_TOKENS = 256
 #: One 16-byte packet per thread covers one 3584-wide row (K1) or one 3584-wide half row (K3).
 THREADS = 448
 K3_GRID_Y = 2
+#: The fused K23 tail (``k23:c<capacity>``: this rank's fp32 up-projection slice GEMM in the K2-stream summation
+#: order fused with the owner reduce, add, BF16 rounding and multicast all-gather; no ``torch.mm``) up to this many
+#: tokens; cuBLAS (``torch.mm`` on the contiguous weight-row slice, BF16) plus a separate tail kernel above.
+K23_MAX_TOKENS = 8
+#: K23 accumulator capacities compiled side by side (round 6): ``M`` runs on the smallest capacity ``>= M``, so
+#: ``M <= 4`` keeps the round-5 four-token module bit for bit and ``5 <= M <= 8`` takes the eight-token module.  The
+#: eight-token rows round once (fp32 slice + shared sum -> BF16) where the round-5 chain rounded twice (cuBLAS BF16 slice,
+#: then the add): paired against an fp64 reference their mean / max absolute error is 0.78x / 0.64-0.93x of the round-5
+#: chain on every correctness shape (Cake design doc, round 6).
+K23_LADDER = (4, 8)
+#: Up-projection weight rows (= output columns) per K23 CTA: grid ``(cols / K23_ROWS, 1, 1)``, 80 CTAs on a 640-column
+#: rank, 64 on a 512-column rank.
+K23_ROWS = 8
+#: The tail runs the persistent token pipeline (``k3_persist*:*``, grid ``(min(M, SM count), 2, 1)``: CTA ``b`` walks
+#: tokens ``b, b + P, ...`` scattering token ``t_k`` while reducing ``t_{k-1}`` and gathering ``t_{k-2}``) from this many
+#: tokens on; below it an early-shared-scatter K1 (``k1_*_ess``) scatters ``shared_partial`` and the one-CTA-per-token
+#: K3-ESS form (``k3_ess:grouped``, grid ``(M, 2, 1)``) reduces, adds and gathers.
+K3_PERSIST_MIN_TOKENS = 256
+#: The persistent tail pushes its reduce-scatter stage with ``cp.async.bulk`` (``k3_persist_bulk:pinned``) from this many
+#: tokens on, i.e. over the whole pinned poll-schedule range; the plain ``k3_persist:grouped`` serves exactly 256 tokens.
+#: Every threshold is pinned by the round-5 paired A/B on GB200 and GB300 NVL72.
+BULK_MIN_TOKENS = GROUPED_MAX_TOKENS + 1
 DEFAULT_MAX_TOKENS = 4096
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
@@ -93,23 +136,74 @@ COL_BEGIN = col_begin(PARTITION)
 
 
 def poll_schedule_for(num_tokens: int) -> str:
-    """Owner poll-reduce schedule of the two-shot K1 and of K3 for ``num_tokens``."""
+    """Owner poll-reduce schedule of the two-shot K1 and of the tail for ``num_tokens``."""
     return "grouped" if num_tokens <= GROUPED_MAX_TOKENS else "pinned"
 
 
 def k1_kernel_key(num_tokens: int, rank: int) -> str:
+    """The K1 kernel key: the early-shared-scatter (ESS) forms below ``K3_PERSIST_MIN_TOKENS``, plain two-shot above."""
     if num_tokens <= ONESHOT_MAX_TOKENS:
-        return f"k1_oneshot:r{rank}"
+        return "k1_oneshot_ess"
+    if num_tokens < K3_PERSIST_MIN_TOKENS:
+        return f"k1_twoshot_ess:{poll_schedule_for(num_tokens)}"
     return f"k1_twoshot:{poll_schedule_for(num_tokens)}"
 
 
-def k3_kernel_key(num_tokens: int) -> str:
-    return f"k3:{poll_schedule_for(num_tokens)}"
+def up_proj_form_for(num_tokens: int) -> str:
+    """``"k23"`` (slice GEMM fused into the tail kernel) for ``num_tokens <= K23_MAX_TOKENS``, else ``"cublas"``."""
+    return "k23" if num_tokens <= K23_MAX_TOKENS else "cublas"
+
+
+def k23_capacity_for(num_tokens: int) -> int:
+    """The K23 accumulator capacity serving ``num_tokens`` (``<= K23_MAX_TOKENS``): the smallest ladder rung ``>= M``."""
+    if not 1 <= num_tokens <= K23_MAX_TOKENS:
+        raise ValueError(
+            f"num_tokens must be in [1, {K23_MAX_TOKENS}] for the fused K23 tail, got {num_tokens}"
+        )
+    return next(c for c in K23_LADDER if c >= num_tokens)
+
+
+def k3_form_for(num_tokens: int) -> str:
+    """Tail form for ``num_tokens``: ``"k23"`` (fused up-projection + tail, ``M <= K23_MAX_TOKENS``), ``"ess"`` (one CTA
+    per token and column half after an ESS K1, ``M < K3_PERSIST_MIN_TOKENS``), ``"persist"`` (persistent token
+    pipeline, ``M < BULK_MIN_TOKENS``) or ``"persist_bulk"`` (persistent pipeline with ``cp.async.bulk`` pushes)."""
+    if num_tokens <= K23_MAX_TOKENS:
+        return "k23"
+    if num_tokens < K3_PERSIST_MIN_TOKENS:
+        return "ess"
+    if num_tokens < BULK_MIN_TOKENS:
+        return "persist"
+    return "persist_bulk"
+
+
+def k3_kernel_key(num_tokens: int, rank: int) -> str:
+    """The tail kernel key for ``num_tokens`` (the K23 program is selected by its accumulator capacity; the rank's
+    column width only sizes its grid)."""
+    form = k3_form_for(num_tokens)
+    if form == "k23":
+        return f"k23:c{k23_capacity_for(num_tokens)}"
+    return f"k3_{form}:{poll_schedule_for(num_tokens)}"
+
+
+def k3_grid(num_tokens: int, sm_count: int, rank: int) -> tuple[int, int, int]:
+    """Launch grid of the tail kernel for ``num_tokens`` on ``rank`` and a device with ``sm_count`` SMs."""
+    if not isinstance(sm_count, int) or sm_count <= 0:
+        raise ValueError(f"sm_count must be a positive integer, got {sm_count!r}")
+    form = k3_form_for(num_tokens)
+    if form == "k23":
+        # one CTA per K23_ROWS output columns of this rank
+        return (PARTITION[rank] // K23_ROWS, 1, 1)
+    if form == "ess":
+        # one CTA per token and column half
+        return (num_tokens, K3_GRID_Y, 1)
+    # persistent pipeline: one CTA per SM and column half, at most one per token
+    return (min(num_tokens, sm_count), K3_GRID_Y, 1)
 
 
 def route_kernel_keys(num_tokens: int, rank: int) -> tuple[str, str]:
-    """``(K1 key, K3 key)`` the runtime launches for ``num_tokens`` on ``rank``."""
-    return k1_kernel_key(num_tokens, rank), k3_kernel_key(num_tokens)
+    """The generated kernels the runtime launches for ``num_tokens`` on ``rank``, in launch order: ``(K1, tail)``;
+    cuBLAS runs between them for ``num_tokens > K23_MAX_TOKENS``."""
+    return k1_kernel_key(num_tokens, rank), k3_kernel_key(num_tokens, rank)
 
 
 def workspace_buffer_bytes(max_tokens: int) -> dict[str, int]:
@@ -206,6 +300,9 @@ class KimiK3Tp12TailWorkspace:
         if device.index is not None:
             torch.cuda.set_device(device.index)
         self.device = torch.device("cuda", torch.cuda.current_device())
+        # persistent K3 grid: one CTA per SM and column half (the Cake runtime's default k3p_ctas)
+        props = torch.cuda.get_device_properties(self.device)
+        self.sm_count = int(props.multi_processor_count)
         self.rank = rank
         self.world_size = WORLD_SIZE
         self.max_tokens = int(max_tokens)
@@ -300,8 +397,12 @@ class _Launch:
 class KimiK3Tp12TailRunner:
     """The prepared launch sequence of one fused tail call on one rank.
 
-    ``launch()`` submits K1, the cuBLAS up-projection slice and K3 in order on
-    the current torch stream with no CUDA allocation and no host
+    ``launch()`` submits K1 (the early-shared-scatter form below 256 tokens),
+    cuBLAS for the up-projection slice when ``cublas`` is set
+    (``M > K23_MAX_TOKENS``) and the tail kernel -- the fused K23 for
+    ``M <= K23_MAX_TOKENS``, K3-ESS below ``K3_PERSIST_MIN_TOKENS``, the
+    persistent K3 (plain at 256 tokens, ``cp.async.bulk`` pushes above) -- in
+    order on the current torch stream with no CUDA allocation and no host
     synchronisation; the kernels read every operand on device at launch, so
     the runner (or a CUDA Graph capturing it) replays for new values written
     into the same buffers.  Every rank of the group must launch the same
@@ -318,9 +419,12 @@ class KimiK3Tp12TailRunner:
     gemm: torch.Tensor
     up_weight_slice: torch.Tensor
     out: torch.Tensor
+    #: cuBLAS ``torch.mm`` between K1 and the tail (``M > K23_MAX_TOKENS``); False = the tail is the fused K23
+    cublas: bool
 
     @property
     def kernel_keys(self) -> tuple[str, str]:
+        """Generated-kernel keys in launch order ``(K1, tail)``."""
         return (self.k1.key, self.k3.key)
 
     @property
@@ -329,12 +433,14 @@ class KimiK3Tp12TailRunner:
 
     @property
     def launch_count(self) -> int:
-        return 3
+        """Launches per call: K1 and the tail, plus cuBLAS for ``M > K23_MAX_TOKENS``."""
+        return 3 if self.cublas else 2
 
     def launch(self) -> torch.Tensor:
         with tvm_ffi.use_torch_stream():
             self.k1()
-            torch.mm(self.y, self.up_weight_slice.t(), out=self.gemm)
+            if self.cublas:
+                torch.mm(self.y, self.up_weight_slice.t(), out=self.gemm)
             self.k3()
         return self.out
 
@@ -354,6 +460,140 @@ def _check(
             f"{name} must be a contiguous {dtype} tensor of shape {tuple(shape)}, "
             f"got {tuple(t.shape)} {t.dtype}"
         )
+
+
+def _k1_launch_kwargs(
+    k1_key: str,
+    *,
+    M: int,
+    rank: int,
+    workspace: Any,
+    routed_partial: Any,
+    shared_partial: Any,
+    y: Any,
+    norm_weight: Any,
+) -> tuple[str, dict[str, Any]]:
+    """The K1 launch arguments for ``k1_key`` (exact-key dispatch; ``name`` is the workspace buffer set).
+
+    ``k1_oneshot_ess`` (``M <= ONESHOT_MAX_TOKENS``) carries no poll-schedule suffix; the two-shot keys do.
+    """
+    if k1_key == "k1_oneshot_ess":
+        # early shared scatter: K1 also scatters shared_partial into the "k3" workspace slots
+        name = "k1_oneshot"
+        k1_kwargs: dict[str, Any] = dict(
+            routed=routed_partial,
+            shared=shared_partial,
+            y_out=y,
+            gamma=norm_weight,
+            mcast_ptr=workspace.multicast_ptr(name),
+            local_unicast_ptr=workspace.local_unicast_ptr(name),
+            buffer_flags=workspace.flags(name),
+            k3_peer_ptrs=workspace.peer_ptrs["k3"],
+            k3_mcast_ptr=workspace.multicast_ptr("k3"),
+            k3_flags=workspace.flags("k3"),
+            num_tokens=M,
+            rank=rank,
+            epsilon=float(RMS_EPS),
+            grid=(M, 1, 1),
+        )
+    elif k1_key.startswith("k1_twoshot_ess:"):
+        name = "k1_twoshot"
+        k1_kwargs = dict(
+            routed=routed_partial,
+            shared=shared_partial,
+            y_out=y,
+            gamma=norm_weight,
+            peer_ptrs=workspace.peer_ptrs[name],
+            mcast_ptr=workspace.multicast_ptr(name),
+            buffer_flags=workspace.flags(name),
+            k3_peer_ptrs=workspace.peer_ptrs["k3"],
+            k3_mcast_ptr=workspace.multicast_ptr("k3"),
+            k3_flags=workspace.flags("k3"),
+            num_tokens=M,
+            rank=rank,
+            epsilon=float(RMS_EPS),
+            grid=(M, 1, 1),
+        )
+    else:
+        # plain two-shot K1 (M >= K3_PERSIST_MIN_TOKENS): the persistent tail scatters shared_partial itself
+        name = "k1_twoshot"
+        k1_kwargs = dict(
+            routed=routed_partial,
+            y_out=y,
+            gamma=norm_weight,
+            peer_ptrs=workspace.peer_ptrs[name],
+            mcast_ptr=workspace.multicast_ptr(name),
+            buffer_flags=workspace.flags(name),
+            num_tokens=M,
+            rank=rank,
+            epsilon=float(RMS_EPS),
+            grid=(M, 1, 1),
+        )
+    return name, k1_kwargs
+
+
+def _k3_launch_kwargs(
+    k3_key: str,
+    *,
+    M: int,
+    rank: int,
+    workspace: Any,
+    grid: tuple[int, int, int],
+    shared_partial: Any,
+    y: Any,
+    gemm: Any,
+    up_weight_slice: Any,
+    out: Any,
+) -> dict[str, Any]:
+    """The tail launch arguments for ``k3_key`` (``k23:c<capacity>``, ``k3_ess:<schedule>`` or the persistent K3)."""
+    if k3_key.startswith("k23:"):
+        # fused up-projection + tail: the slice GEMM reads y and the weight slice itself
+        k3_kwargs: dict[str, Any] = dict(
+            y=y,
+            w_slice=up_weight_slice,
+            out=out,
+            peer_ptrs=workspace.peer_ptrs["k3"],
+            mcast_ptr=workspace.multicast_ptr("k3"),
+            buffer_flags=workspace.flags("k3"),
+            num_tokens=M,
+            rank=rank,
+            my_col_begin=workspace.my_col_begin,
+            grid=grid,
+        )
+    elif k3_key.startswith("k3_ess:"):
+        # K3-ESS: no shared operand, the ESS K1 already scattered it
+        k3_kwargs = dict(
+            gemm_slice=gemm,
+            out=out,
+            peer_ptrs=workspace.peer_ptrs["k3"],
+            mcast_ptr=workspace.multicast_ptr("k3"),
+            buffer_flags=workspace.flags("k3"),
+            num_tokens=M,
+            rank=rank,
+            my_col_begin=workspace.my_col_begin,
+            my_cols=workspace.my_cols,
+            gemm_plane_stride=M * workspace.my_cols,
+            num_gemm_splits=1,
+            grid=grid,
+        )
+    else:
+        # persistent K3 (plain at 256 tokens, cp.async.bulk pushes above): scatters shared_partial itself
+        k3_kwargs = dict(
+            shared=shared_partial,
+            gemm_slice=gemm,
+            out=out,
+            peer_ptrs=workspace.peer_ptrs["k3"],
+            mcast_ptr=workspace.multicast_ptr("k3"),
+            buffer_flags=workspace.flags("k3"),
+            num_tokens=M,
+            rank=rank,
+            my_col_begin=workspace.my_col_begin,
+            my_cols=workspace.my_cols,
+            gemm_plane_stride=M * workspace.my_cols,
+            num_gemm_splits=1,
+            grid=grid,
+        )
+    return k3_kwargs
 
 
 def prepare_kimi_k3_tp12_tail(
@@ -405,52 +645,35 @@ def prepare_kimi_k3_tp12_tail(
     k1_key, k3_key = route_kernel_keys(M, rank)
     k1_module = kernel_module_name(arch, k1_key)
     k3_module = kernel_module_name(arch, k3_key)
+    cublas = up_proj_form_for(M) == "cublas"
     y = workspace.y[:M]
+    # cuBLAS's BF16 up-projection slice (M > K23_MAX_TOKENS); the fused K23 needs no GEMM buffer
     gemm = workspace.gemm[:M]
     up_weight_slice = up_weight[
         workspace.my_col_begin : workspace.my_col_begin + workspace.my_cols
     ]
-    if k1_key.startswith("k1_oneshot:"):
-        name = "k1_oneshot"
-        k1_kwargs: dict[str, Any] = dict(
-            routed=routed_partial,
-            y_out=y,
-            gamma=norm_weight,
-            mcast_ptr=workspace.multicast_ptr(name),
-            local_unicast_ptr=workspace.local_unicast_ptr(name),
-            buffer_flags=workspace.flags(name),
-            num_tokens=M,
-            epsilon=float(RMS_EPS),
-            grid=(M, 1, 1),
-        )
-    else:
-        name = "k1_twoshot"
-        k1_kwargs = dict(
-            routed=routed_partial,
-            y_out=y,
-            gamma=norm_weight,
-            peer_ptrs=workspace.peer_ptrs[name],
-            mcast_ptr=workspace.multicast_ptr(name),
-            buffer_flags=workspace.flags(name),
-            num_tokens=M,
-            rank=rank,
-            epsilon=float(RMS_EPS),
-            grid=(M, 1, 1),
-        )
-    k3_kwargs: dict[str, Any] = dict(
-        shared=shared_partial,
-        gemm_slice=gemm,
-        out=out,
-        peer_ptrs=workspace.peer_ptrs["k3"],
-        mcast_ptr=workspace.multicast_ptr("k3"),
-        buffer_flags=workspace.flags("k3"),
-        num_tokens=M,
+    _, k1_kwargs = _k1_launch_kwargs(
+        k1_key,
+        M=M,
         rank=rank,
-        my_col_begin=workspace.my_col_begin,
-        my_cols=workspace.my_cols,
-        gemm_plane_stride=M * workspace.my_cols,
-        num_gemm_splits=1,
-        grid=(M, K3_GRID_Y, 1),
+        workspace=workspace,
+        routed_partial=routed_partial,
+        shared_partial=shared_partial,
+        y=y,
+        norm_weight=norm_weight,
+    )
+    grid = k3_grid(M, workspace.sm_count, rank)
+    k3_kwargs = _k3_launch_kwargs(
+        k3_key,
+        M=M,
+        rank=rank,
+        workspace=workspace,
+        grid=grid,
+        shared_partial=shared_partial,
+        y=y,
+        gemm=gemm,
+        up_weight_slice=up_weight_slice,
+        out=out,
     )
     k1_entry, k1_args = _bind(k1_module, k1_kwargs)
     k3_entry, k3_args = _bind(k3_module, k3_kwargs)
@@ -464,13 +687,19 @@ def prepare_kimi_k3_tp12_tail(
         gemm=gemm,
         up_weight_slice=up_weight_slice,
         out=out,
+        cublas=cublas,
     )
 
 
 __all__ = [
+    "BULK_MIN_TOKENS",
     "COL_BEGIN",
     "DEFAULT_MAX_TOKENS",
     "GROUPED_MAX_TOKENS",
+    "K23_LADDER",
+    "K23_MAX_TOKENS",
+    "K23_ROWS",
+    "K3_PERSIST_MIN_TOKENS",
     "HIDDEN",
     "KERNELS",
     "KimiK3Tp12TailRunner",
@@ -486,9 +715,13 @@ __all__ = [
     "col_begin",
     "generated_program_available",
     "k1_kernel_key",
+    "k3_form_for",
+    "k3_grid",
+    "k23_capacity_for",
     "k3_kernel_key",
     "poll_schedule_for",
     "prepare_kimi_k3_tp12_tail",
     "route_kernel_keys",
+    "up_proj_form_for",
     "workspace_buffer_bytes",
 ]

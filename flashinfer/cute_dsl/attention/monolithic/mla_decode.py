@@ -28,13 +28,14 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
 
-from flashinfer.utils import device_support_pdl
+from flashinfer.utils import device_support_pdl, get_compute_capability
 
 from .mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
 from .mla_helpers import MAX_SPLITS, ceil_div, compute_q_tile_layout, LOG2_E
 from flashinfer.cute_dsl.utils import (
     _as_cute_dsl_workspace_i8,
+    cute_dsl_compile_arch,
     get_max_active_clusters,
     get_num_sm,
     torch_to_cutlass_dtype,
@@ -42,8 +43,7 @@ from flashinfer.cute_dsl.utils import (
 
 
 _CUDA_GRID_Y_MAX = 65_535
-_REDUCER_D_TILE_CANDIDATES = (1, 2, 4)
-_STATIC_REDUCER_MAX_SPLITS = 32
+_STATIC_REDUCER_MAX_SPLITS = 48
 
 
 def _validate_nonpersistent_grid_y(
@@ -66,33 +66,25 @@ def _get_reducer_d_tiles(
     num_sms: int,
     effective_split_kv: int,
 ) -> int:
-    """Choose output-side reducer parallelism for an underfilled row grid.
+    """Reducer D bands: two while the row count fits a quarter of the SMs, else one.
 
-    A reducer CTA normally owns one D512 row.  When the real row grid does not
-    cover one resident wave, compare the conservative wave count for one, two,
-    or four equal D bands and keep the smallest topology with the shortest
-    per-band critical path.  Once rows already cover every SM, retain one CTA
-    per row and avoid duplicated LSE work.
+    Each reducer thread keeps its band columns for a set of splits in
+    registers; a four-band thread would hold a single column.
     """
     reducer_rows = batch_size * seq_len_q * num_heads
-    if (
-        reducer_rows <= 0
-        or num_sms <= 0
-        or reducer_rows >= num_sms
-        or effective_split_kv <= 1
-    ):
-        return 1
+    if effective_split_kv > 1 and 0 < reducer_rows * 4 <= num_sms:
+        return 2
+    return 1
 
-    best_tiles = 1
-    best_waves = ceil_div(reducer_rows, num_sms)
-    for d_tiles in _REDUCER_D_TILE_CANDIDATES[1:]:
-        if d_tiles > effective_split_kv:
-            continue
-        waves = ceil_div(reducer_rows * d_tiles, num_sms)
-        if waves * best_tiles < best_waves * d_tiles:
-            best_tiles = d_tiles
-            best_waves = waves
-    return best_tiles
+
+@functools.cache
+def _get_reducer_max_splits(split_kv: int) -> int:
+    """Reducer capacity for ``split_kv``: the covering power of two (at least 4), capped.
+
+    The reducer keeps a set of splits' partials in registers per thread, so
+    sizing it to the launch avoids wasting registers when few splits run.
+    """
+    return min(_STATIC_REDUCER_MAX_SPLITS, max(4, 1 << (split_kv - 1).bit_length()))
 
 
 @functools.cache
@@ -132,7 +124,7 @@ def _get_split_kv_and_workspace_size(
             f"[1, {rectangular_q_tiles}], got {occupancy_q_tiles}"
         )
     split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
-        1, occupancy_q_tiles, max_active_blocks
+        1, occupancy_q_tiles, max_active_blocks, _STATIC_REDUCER_MAX_SPLITS
     )
     if max_seq_len is not None:
         if max_seq_len <= 0:
@@ -209,6 +201,7 @@ def _check_can_implement(
 
 @functools.cache
 def _get_compiled_mla_kernel(
+    arch: str,
     torch_dtype: torch.dtype,
     torch_out_dtype: torch.dtype,
     page_size: int,
@@ -274,6 +267,7 @@ def _get_compiled_mla_kernel(
         reducer_max_splits=reducer_max_splits,
         enable_dcp=enable_dcp,
         cp_world=cp_world,
+        arch=arch,
     )
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -443,7 +437,7 @@ def _get_compiled_mla_kernel(
         Float32(1.0),  # output_scale placeholder
         Float32(1.0),  # lse_scale placeholder
         stream_fake,
-        options="--enable-tvm-ffi --opt-level 2",
+        options=f"--enable-tvm-ffi --opt-level 2 --gpu-arch {arch}",
     )
 
     return compiled_kernel
@@ -831,6 +825,7 @@ def cute_dsl_mla_decode(
     # Note: when is_workspace_size_zero is True, workspace_bytes is None and it will launch one kernel without workspace.
     # Otherwise, workspace_bytes is not None and it will launch two kernels.
     compiled_kernel = _get_compiled_mla_kernel(
+        arch=cute_dsl_compile_arch(*get_compute_capability(query.device)),
         torch_dtype=q_dtype,
         torch_out_dtype=o_dtype,
         page_size=page_size,
@@ -843,7 +838,7 @@ def cute_dsl_mla_decode(
         is_var_q=is_var_q,
         is_var_split_kv=is_var_split_kv,
         reducer_d_tiles=reducer_d_tiles,
-        reducer_max_splits=_STATIC_REDUCER_MAX_SPLITS,
+        reducer_max_splits=_get_reducer_max_splits(split_kv),
         skip_correction_threshold=skip_correction_threshold,
         is_workspace_size_zero=is_workspace_size_zero,
         enable_pdl=enable_pdl,

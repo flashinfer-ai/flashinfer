@@ -1751,7 +1751,7 @@ def kernel_vsa_sm90_bf16_small_k1s(Q: cutlass.GridConstant[TensorMap], K: cutlas
             prims.store_ext(cutlass.Float32(row_sum1[0]).ir_value(), (Ws + ((stats_base + (m1_local * 2)) + 1) + (0)))
         prims.barrier_cta_sync(8, thread_count=128)
         if (tid == 0):
-            _atomic_old_0 = cute.arch.atomic_add(Wc + tile, cutlass.Uint32(1), sem='relaxed', scope='gpu')
+            _atomic_old_0 = cute.arch.atomic_add(Wc + tile, cutlass.Uint32(1), sem='acq_rel', scope='gpu')
             old_count = cutlass.Uint32(_atomic_old_0)
             prims.store_ext(cutlass.Int32((1 if ((old_count + 1) == cutlass.Uint32(nsplit)) else 0)).ir_value(), (flag + (0)))
         prims.barrier_cta_sync(8, thread_count=128)

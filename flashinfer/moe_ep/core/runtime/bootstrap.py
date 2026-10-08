@@ -119,11 +119,12 @@ def _ensure_torch_dist(bootstrap: BootstrapConfig) -> bool:
             device = torch.device(f"cuda:{_resolve_local_device(bootstrap)}")
             dist.init_process_group(backend="nccl", device_id=device)
     elif bootstrap.world_size == 1:
+        # Standalone EP1 has no peer processes to discover.
         dist.init_process_group(
             backend="gloo",
             rank=bootstrap.rank,
             world_size=bootstrap.world_size,
-            init_method="tcp://127.0.0.1:29500",
+            store=dist.HashStore(),
         )
     else:
         raise RuntimeError(
@@ -305,8 +306,18 @@ def finalize_moe_ep_runtime(handle: MoEEpRuntimeHandle | None) -> None:
 
 
 def split_comm_runtime_requirements(comm_backend_name: str) -> FrozenSet[str]:
-    """Runtime needs for a split-path comm backend."""
-    if comm_backend_name in ("nccl_ep", "nixl_ep"):
+    """Runtime needs for a split-path comm backend.
+
+    The NVLink backends exchange their symmetric-memory handles over
+    torch.distributed.
+    """
+    if comm_backend_name in (
+        "nccl_ep",
+        "nixl_ep",
+        "nvlink_one_sided",
+        "cake",
+        "nvlink_two_sided",
+    ):
         return frozenset({TORCH_DIST})
     return frozenset()
 

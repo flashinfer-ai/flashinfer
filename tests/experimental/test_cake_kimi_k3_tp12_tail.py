@@ -16,9 +16,11 @@ limitations under the License.
 Kimi-K3 TP12 fused LatentMoE tail (Cake backend).
 
 The CPU tests check the host runtime (partition, route selection, generated
-module inventory) on any machine.  The GPU test needs the operator's real
-platform, a twelve-rank multi-node NVLink domain (three GB200 / GB300 NVL72
-compute trays); launch it with torchrun over the three nodes::
+program inventory) on any machine.  The single-GPU test builds and loads every
+registered program for the device's architecture (SM100 / SM103, no process
+group).  The numerical GPU test needs the operator's real platform, a
+twelve-rank multi-node NVLink domain (three GB200 / GB300 NVL72 compute
+trays); launch it with torchrun over the three nodes::
 
     torchrun --nnodes 3 --nproc-per-node 4 --node-rank <n> --master-addr <host> \
         -m pytest tests/experimental/test_cake_kimi_k3_tp12_tail.py -k twelve_ranks
@@ -36,8 +38,9 @@ from flashinfer.experimental.kimi_k3_tp12_tail import cake_jit
 
 ATOL = RTOL = 1e-2
 SEED = 620
-# One-shot rows, two-shot grouped rows and one pinned row (M > 256).
-GPU_ROWS = (1, 8, 16, 32, 128, 300)
+# Fused K23 rows (M <= 8: the four-token module at 1 / 4, the eight-token module at 6 / 8), K3-ESS rows with the
+# one-shot / two-shot ESS K1, the plain persistent K3 at 256 and one cp.async.bulk pinned row (M > 256).
+GPU_ROWS = (1, 4, 6, 8, 16, 32, 128, 256, 300)
 GPU_MAX_TOKENS = 512
 
 
@@ -52,22 +55,69 @@ def test_partition_covers_hidden_in_128_column_blocks():
 
 
 def test_route_selection_by_token_count():
-    for M in (1, 2, 8, 16):
+    # fused K23 regime: ESS one-shot K1 + fused slice GEMM / tail, module by the rank's column width and by the
+    # accumulator capacity ladder (the four-token module for M <= 4, the eight-token module for 5 <= M <= 8)
+    assert cb.K23_MAX_TOKENS == 8 and cb.K23_ROWS == 8 and cb.K23_LADDER == (4, 8)
+    for M in (1, 2, 3, 4, 5, 6, 7, 8):
+        capacity = 4 if M <= 4 else 8
+        assert cb.k23_capacity_for(M) == capacity
         for rank in range(cb.WORLD_SIZE):
+            # one program per capacity on every rank: the rank is a launch argument, the column width a grid size
             assert cb.route_kernel_keys(M, rank) == (
-                f"k1_oneshot:r{rank}",
-                "k3:grouped",
+                "k1_oneshot_ess",
+                f"k23:c{capacity}",
             )
-    for M in (17, 32, 128, 256):
-        assert cb.route_kernel_keys(M, 3) == ("k1_twoshot:grouped", "k3:grouped")
+    assert cb.up_proj_form_for(8) == "k23" and cb.up_proj_form_for(9) == "cublas"
+    assert cb.k3_kernel_key(4, 0) == "k23:c4"
+    assert cb.k3_kernel_key(5, 0) == "k23:c8"
+    assert cb.k3_kernel_key(8, 11) == "k23:c8"
+    with pytest.raises(ValueError):
+        cb.k23_capacity_for(9)
+    # cuBLAS + K3-ESS regime: the ESS K1 scattered the shared partial, one CTA per token and column half
+    for M in (9, 12, 16):
+        for rank in range(cb.WORLD_SIZE):
+            assert cb.route_kernel_keys(M, rank) == ("k1_oneshot_ess", "k3_ess:grouped")
+    for M in (17, 32, 128, 255):
+        assert cb.route_kernel_keys(M, 3) == (
+            "k1_twoshot_ess:grouped",
+            "k3_ess:grouped",
+        )
+    # persistent K3 pipeline from K3_PERSIST_MIN_TOKENS on: plain at 256 (grouped), cp.async.bulk pushes above (pinned)
+    assert cb.K3_PERSIST_MIN_TOKENS == 256 and cb.BULK_MIN_TOKENS == 257
+    assert cb.route_kernel_keys(256, 3) == ("k1_twoshot:grouped", "k3_persist:grouped")
     for M in (257, 512, 4096):
-        assert cb.route_kernel_keys(M, 3) == ("k1_twoshot:pinned", "k3:pinned")
+        assert cb.route_kernel_keys(M, 3) == (
+            "k1_twoshot:pinned",
+            "k3_persist_bulk:pinned",
+        )
+    for M in (1, 4, 5, 255, 256, 257, 4096):
+        assert len(cb.route_kernel_keys(M, 0)) == 2
+    assert cb.k3_form_for(8) == "k23" and cb.k3_form_for(9) == "ess"
+    assert cb.k3_form_for(255) == "ess" and cb.k3_form_for(256) == "persist"
+    assert cb.k3_form_for(257) == "persist_bulk"
+    # K23: one CTA per K23_ROWS output columns of the rank (80 for 640, 64 for 512)
+    assert cb.k3_grid(1, 152, 0) == (80, 1, 1)
+    assert cb.k3_grid(4, 148, 11) == (64, 1, 1)
+    assert cb.k3_grid(8, 152, 0) == (80, 1, 1)
+    # K3-ESS: one CTA per token and column half; persistent forms: min(M, SM count)
+    assert cb.k3_grid(9, 152, 0) == (9, 2, 1)
+    assert cb.k3_grid(100, 152, 3) == (100, 2, 1)
+    assert cb.k3_grid(255, 152, 3) == (255, 2, 1)
+    assert cb.k3_grid(256, 152, 3) == (152, 2, 1)
+    assert cb.k3_grid(4096, 148, 3) == (148, 2, 1)
+    with pytest.raises(ValueError):
+        cb.k3_grid(4096, 0, 3)
+    assert len(cake_jit.required_kernel_keys()) == 9
     assert set(cake_jit.required_kernel_keys()) == {
-        *(f"k1_oneshot:r{r}" for r in range(12)),
+        "k1_oneshot_ess",
+        "k1_twoshot_ess:grouped",
         "k1_twoshot:grouped",
         "k1_twoshot:pinned",
-        "k3:grouped",
-        "k3:pinned",
+        "k23:c4",
+        "k23:c8",
+        "k3_ess:grouped",
+        "k3_persist:grouped",
+        "k3_persist_bulk:pinned",
     }
 
 
@@ -100,55 +150,125 @@ def test_generated_module_inventory():
             "no generated Kimi-K3 TP12 tail program is registered in this checkout"
         )
     required = set(cake_jit.required_kernel_keys())
-    for arch, table in cake_jit.KERNELS.items():
-        assert arch in cake_jit.ARCHES
-        assert set(table) == required
-        for key, name in table.items():
-            record = cake_jit.MODULES[name]
-            assert record["arch"] == arch
-            assert record["ffi_entry"] == "run"
-            assert len(record["sources"]) == 2
-            kinds = {kind for kind, _ in record["arg_plan"]}
-            assert kinds <= {"buffer", "raw_pointer", "parameter", "grid"}
-            names = {n for _, n in record["arg_plan"]}
-            raw = {n for kind, n in record["arg_plan"] if kind == "raw_pointer"}
-            assert record["launch"]["use_pdl"] is True
-            assert tuple(record["launch"]["block"]) == (cb.THREADS, 1, 1)
-            if key.startswith("k1_oneshot:"):
-                assert raw == {"mcast_ptr", "local_unicast_ptr"}
-                assert {
-                    "routed",
-                    "y_out",
-                    "gamma",
-                    "buffer_flags",
-                    "num_tokens",
-                    "epsilon",
-                } <= names
-            elif key.startswith("k1_twoshot:"):
-                assert raw == {"mcast_ptr"}
-                assert {
-                    "routed",
-                    "y_out",
-                    "gamma",
-                    "peer_ptrs",
-                    "buffer_flags",
-                    "rank",
-                } <= names
-            else:
-                assert raw == {"mcast_ptr"}
-                assert {
-                    "shared",
-                    "gemm_slice",
-                    "out",
-                    "peer_ptrs",
-                    "buffer_flags",
-                    "my_col_begin",
-                    "my_cols",
-                    "gemm_plane_stride",
-                    "num_gemm_splits",
-                } <= names
-    for arch in cake_jit.KERNELS:
+    # one program per logical kernel, each built for both architectures, launched with PDL
+    assert set(cake_jit.KERNELS) == required
+    assert len(set(cake_jit.KERNELS.values())) == len(cake_jit.MODULES)
+    for key, name in cake_jit.KERNELS.items():
+        record = cake_jit.MODULES[name]
+        assert set(record["arches"]) == set(cake_jit.ARCHES), key
+        assert record["ffi_entry"] == "run"
+        assert len(record["sources"]) == 2
+        assert {kind for kind, _ in record["arg_plan"]} <= {
+            "buffer",
+            "raw_pointer",
+            "parameter",
+            "grid",
+        }
+        assert record["launch"]["use_pdl"] is True
+        assert tuple(record["launch"]["block"]) == (cb.THREADS, 1, 1)
+    for arch in cake_jit.ARCHES:
         assert cake_jit.route_available(arch, tuple(required))
+        for key in required:
+            assert cake_jit.kernel_module_name(arch, key) == cake_jit.KERNELS[key]
+
+
+class _LaunchKwargsWorkspace:
+    """A host-only stand-in for ``KimiK3Tp12TailWorkspace``: every buffer-set accessor the launch-argument
+    builders use, with placeholder values (the arguments are never launched)."""
+
+    sm_count = 148
+    my_col_begin = 0
+    my_cols = cb.HIDDEN // cb.WORLD_SIZE
+    peer_ptrs = {"k1_oneshot": None, "k1_twoshot": None, "k3": None}
+
+    @staticmethod
+    def multicast_ptr(name):
+        return name
+
+    @staticmethod
+    def local_unicast_ptr(name):
+        return name
+
+    @staticmethod
+    def flags(name):
+        return name
+
+
+def test_launch_kwargs_cover_every_generated_argument_plan():
+    """Every route key's host-built launch arguments satisfy the generated program's argument plan (CPU only).
+
+    Guards the key -> kwargs dispatch against the registered ``arg_plan`` (the one-shot ESS key carries no
+    poll-schedule suffix, so an exact-key test is required there)."""
+    if not cake_jit.MODULES:
+        pytest.skip(
+            "no generated Kimi-K3 TP12 tail program is registered in this checkout"
+        )
+    workspace = _LaunchKwargsWorkspace()
+    seen: set[str] = set()
+    for M in (1, 4, 5, 8, 9, 16, 17, 32, 128, 255, 256, 300, 1024):
+        for rank in (0, 5, 11):
+            k1_key, k3_key = cb.route_kernel_keys(M, rank)
+            name, k1_kwargs = cb._k1_launch_kwargs(
+                k1_key,
+                M=M,
+                rank=rank,
+                workspace=workspace,
+                routed_partial=None,
+                shared_partial=None,
+                y=None,
+                norm_weight=None,
+            )
+            assert name == (
+                "k1_oneshot" if M <= cb.ONESHOT_MAX_TOKENS else "k1_twoshot"
+            )
+            grid = cb.k3_grid(M, workspace.sm_count, rank)
+            k3_kwargs = cb._k3_launch_kwargs(
+                k3_key,
+                M=M,
+                rank=rank,
+                workspace=workspace,
+                grid=grid,
+                shared_partial=None,
+                y=None,
+                gemm=None,
+                up_weight_slice=None,
+                out=None,
+            )
+            for key, kwargs in ((k1_key, k1_kwargs), (k3_key, k3_kwargs)):
+                record = cake_jit.MODULES[cake_jit.KERNELS[key]]
+                expected = {name for kind, name in record["arg_plan"] if kind != "grid"}
+                assert expected <= set(kwargs), (key, sorted(expected - set(kwargs)))
+                assert len(kwargs["grid"]) == 3, key
+                seen.add(key)
+    assert seen == set(cake_jit.required_kernel_keys())
+
+
+def _single_gpu_platform() -> str:
+    if not torch.cuda.is_available():
+        return "requires CUDA"
+    if torch.cuda.get_device_capability(0) not in cb.SUPPORTED_COMPUTE_CAPABILITIES:
+        return "generated kernels target Blackwell SM100 / SM103"
+    return ""
+
+
+@pytest.mark.skipif(bool(_single_gpu_platform()), reason=_single_gpu_platform() or "")
+def test_registered_programs_compile_on_this_device():
+    """Every registered program builds and loads for this device's architecture (one GPU, no process group)."""
+    if not cake_jit.MODULES:
+        pytest.skip(
+            "no generated Kimi-K3 TP12 tail program is registered in this checkout"
+        )
+    arch = cb.SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(0)]
+    names = sorted(
+        {
+            cake_jit.kernel_module_name(arch, key)
+            for key in cake_jit.required_kernel_keys()
+        }
+    )
+    assert set(names) == set(cake_jit.MODULES)
+    for name in names:
+        module = cake_jit.load_cake_kimi_k3_tp12_tail_module(name)
+        assert callable(getattr(module, cake_jit.MODULES[name]["ffi_entry"]))
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +364,9 @@ def test_tail_matches_reference_on_twelve_ranks():
                 workspace=workspace,
             )
             assert runner.kernel_keys == cb.route_kernel_keys(M, rank)
+            assert runner.k3.kwargs["grid"] == cb.k3_grid(M, workspace.sm_count, rank)
+            assert runner.cublas == (M > cb.K23_MAX_TOKENS)
+            assert runner.launch_count == (2 if M <= cb.K23_MAX_TOKENS else 3)
             inp["out"].fill_(float("nan"))
             runner()
             torch.cuda.synchronize()
