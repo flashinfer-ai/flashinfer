@@ -1995,13 +1995,16 @@ def run_gdn_verify_kernel_mtp(
     grid_size = q.shape[0] * HV * num_v_tiles
 
     # Shared memory for pre-computed q, k, g, beta, preloaded v data, and output
+    # Must match the allocate_tensor layouts below, which are sized by CHUNK:
+    # reserving T here would hold the full footprint whatever the staging does,
+    # and the occupancy chunking exists to win would never materialise.
     smem_bytes = (
-        4 * T * (k_dim + 8)  # sQ
-        + 4 * T * (k_dim + 8)  # sK
-        + 4 * T  # sG
-        + 4 * T  # sBeta
-        + 4 * T * tile_v  # sVdata (v values for all timesteps)
-        + 2 * T * tile_v  # sOutput (output accumulation in BF16)
+        4 * CHUNK * (k_dim + 8)  # sQ
+        + 4 * CHUNK * (k_dim + 8)  # sK
+        + 4 * CHUNK  # sG
+        + 4 * CHUNK  # sBeta
+        + 4 * CHUNK * tile_v  # sVdata (v values for all timesteps)
+        + 2 * CHUNK * tile_v  # sOutput (output accumulation in BF16)
         + 128  # alignment
     )
 
