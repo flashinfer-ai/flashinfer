@@ -173,8 +173,8 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
 
 # Aligned-row selector bands per compute capability: ``(max_batch, variant)``
 # with an open last band.  SM100 (10.0 / 10.3) keeps the bands qualified on
-# B200.  SM107 (10.7, 212 SMs) is re-banded from the R200 variant sweep
-# (CAKE-1096): the register tile-16 kernel stays ahead through B18, the
+# B200.  SM107 (10.7, 212 SMs) is re-banded from the R200 variant
+# sweep: the register tile-16 kernel stays ahead through B18, the
 # cp.async tile-64 register pipeline carries the mid batches, and the tile-128
 # register pipeline takes over from B64, where the two tie.  Every variant is
 # an exact kernel; the selector only moves the batch bands.

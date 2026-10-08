@@ -128,7 +128,7 @@ def _cake_gdn_sentinel(device_index: int, dtype: torch.dtype) -> torch.Tensor:
 # for int64 callers.
 _CAKE_GDN_I32_COPIES: collections.OrderedDict[
     tuple[int, int, Optional[int], int],
-    tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor, int],
+    tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor, int, torch.cuda.Event],
 ] = collections.OrderedDict()
 
 _cake_gdn_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
@@ -151,7 +151,8 @@ def _cake_gdn_i32(values: torch.Tensor) -> torch.Tensor:
     the graph's private pool owns the int32 copy and replay re-reads the live tensor;
     the cache is neither consulted nor filled then.  Eagerly, the copy is reused while
     the same tensor object (same storage, same version for non-inference tensors) is
-    passed again.  A copy consumed on a stream other than the one that produced it is
+    passed again.  A copy consumed on a stream other than the one that produced it
+    first waits for the producing cast (an event recorded right after it) and is
     recorded on the consuming stream, so the bounded LRU can drop it safely.
     """
 
@@ -168,10 +169,14 @@ def _cake_gdn_i32(values: torch.Tensor) -> torch.Tensor:
         _CAKE_GDN_I32_COPIES.move_to_end(key)
         converted = cached[1]
         if cached[2] != raw_stream:
-            converted.record_stream(torch.cuda.current_stream(device_index))
+            consumer = torch.cuda.current_stream(device_index)
+            consumer.wait_event(cached[3])
+            converted.record_stream(consumer)
         return converted
     converted = values.to(torch.int32)
-    _CAKE_GDN_I32_COPIES[key] = (weakref.ref(values), converted, raw_stream)
+    ready = torch.cuda.Event()
+    ready.record(torch.cuda.current_stream(device_index))
+    _CAKE_GDN_I32_COPIES[key] = (weakref.ref(values), converted, raw_stream, ready)
     while len(_CAKE_GDN_I32_COPIES) > _CAKE_GDN_HOST_INTS_MAX:
         _CAKE_GDN_I32_COPIES.popitem(last=False)
     return converted
@@ -512,7 +517,7 @@ def _run_cake_gdn_prefill(
         if max_chunks <= 8:
             grid_x = min(128, total_tiles)
         elif active_clusters in (148, 160, 212) and total_tiles == 256:
-            # 212 = Rubin R200 (CAKE-1096); balanced two tiles per CTA.
+            # 212 = Rubin R200; balanced two tiles per CTA.
             grid_x = 128
         else:
             grid_x = min(active_clusters, total_tiles)

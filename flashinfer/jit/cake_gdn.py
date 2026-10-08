@@ -576,7 +576,7 @@ CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES: dict[str, dict[int, str]] = {
 # complete band table of their own (mirrors Cake's ``BF16_T1_ROUTE_ARCH_BANDS``).
 # sm_107a (Rubin R200, 212 SMs): calibrated on R200 against the per-row fastest
 # of the ten admitted (body, TILE_V) instances over the 94 Qwen3.5 serving rows
-# plus 17 synthetic batches (CAKE-1096); the shared table costs 1.064x of the
+# plus 17 synthetic batches; the shared table costs 1.064x of the
 # per-row fastest there (1.268x at 1536 state heads), this table 1.001x.  The
 # ``vec8occ`` instance at TILE_V=16 leads below 192 heads (one wave of 128-row
 # CTAs; ``vec8``/``vec8r56`` 0.4-3.3 % behind), TILE_V=32 takes over at 193-256

@@ -279,7 +279,7 @@ def _launch_raw_indexed_prefill(case):
         if max_chunks <= 8:
             grid_x = min(128, total_tiles)
         elif active_clusters in (148, 160, 212) and total_tiles == 256:
-            # 212 = Rubin R200 (CAKE-1096); balanced two tiles per CTA.
+            # 212 = Rubin R200; balanced two tiles per CTA.
             grid_x = 128
         else:
             grid_x = min(active_clusters, total_tiles)
@@ -632,13 +632,18 @@ def test_public_cake_gdn_prefill_int64_metadata_is_converted_once():
     assert torch.equal(case["output_state"], state_i32)
     cached = {
         key: value
-        for key, (ref, value, _stream) in prefill_mod._CAKE_GDN_I32_COPIES.items()
+        for key, (
+            ref,
+            value,
+            _stream,
+            _ready,
+        ) in prefill_mod._CAKE_GDN_I32_COPIES.items()
         if ref() is cu64
     }
     assert len(cached) == 1, sorted(prefill_mod._CAKE_GDN_I32_COPIES)
     assert not any(
         ref() is slots64
-        for ref, _value, _stream in prefill_mod._CAKE_GDN_I32_COPIES.values()
+        for ref, _value, _stream, _ready in prefill_mod._CAKE_GDN_I32_COPIES.values()
     ), "state_indices must not be cached"
     first_copies = {id(value) for value in cached.values()}
 
@@ -650,12 +655,28 @@ def test_public_cake_gdn_prefill_int64_metadata_is_converted_once():
     assert torch.equal(case["output_state"], state_i32)
     again = {
         id(value)
-        for ref, value, _stream in prefill_mod._CAKE_GDN_I32_COPIES.values()
+        for ref, value, _stream, _ready in prefill_mod._CAKE_GDN_I32_COPIES.values()
         if ref() is cu64
     }
     assert again == first_copies, (
         "the second int64 call must reuse the cached int32 copy"
     )
+
+    # A call on another stream reuses the copy after waiting for its cast.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        case["initial_state"].copy_(initial_state)
+        case["output"].zero_()
+        _launch(case)
+    side.synchronize()
+    assert torch.equal(case["output"], out_i32)
+    assert torch.equal(case["output_state"], state_i32)
+    assert {
+        id(value)
+        for ref, value, _stream, _ready in prefill_mod._CAKE_GDN_I32_COPIES.values()
+        if ref() is cu64
+    } == first_copies, "a call on another stream must reuse the cached int32 copy"
 
     # A fresh int64 tensor (new identity) converts again; the stale entry is not reused.
     cu64_again = cu64.clone()
@@ -667,7 +688,7 @@ def test_public_cake_gdn_prefill_int64_metadata_is_converted_once():
     assert torch.equal(case["output"], out_i32)
     assert any(
         ref() is cu64_again
-        for ref, _value, _stream in prefill_mod._CAKE_GDN_I32_COPIES.values()
+        for ref, _value, _stream, _ready in prefill_mod._CAKE_GDN_I32_COPIES.values()
     )
 
 
@@ -747,7 +768,7 @@ def test_public_cake_gdn_prefill_int64_metadata_graph_owns_its_copy():
     state_eager = case["output_state"].clone()
     assert any(
         ref() is case["cu_seqlens"]
-        for ref, _value, _stream in prefill_mod._CAKE_GDN_I32_COPIES.values()
+        for ref, _value, _stream, _ready in prefill_mod._CAKE_GDN_I32_COPIES.values()
     ), "the eager call must populate the int32 copy cache"
     with torch.cuda.stream(stream):
         case["initial_state"].copy_(initial_state)

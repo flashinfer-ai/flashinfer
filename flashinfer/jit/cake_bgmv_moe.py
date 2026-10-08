@@ -507,7 +507,7 @@ CAKE_BGMV_MOE_SPECIALIZED_TOKEN_WINDOW: Dict[
     "sm90a": None,
     "sm100a": (32, 1024),
     "sm103a": (32, 1024),
-    # Rubin: inherits the Blackwell window pending R200 measurement (CAKE-1096)
+    # Rubin: inherits the Blackwell window pending R200 measurement
     "sm107a": (32, 1024),
 }
 
@@ -524,7 +524,7 @@ CAKE_BGMV_MOE_PDL_SMALL_EXPAND_CTAS_PER_SM: Dict[CakeBGMVMoEArch, int] = {
     "sm90a": 12,
     "sm100a": 8,
     "sm103a": 8,
-    # Rubin: inherits the Blackwell window pending R200 measurement (CAKE-1096)
+    # Rubin: inherits the Blackwell window pending R200 measurement
     "sm107a": 8,
 }
 CAKE_BGMV_MOE_PDL_EXPAND_COLS_NOMINAL = 128
