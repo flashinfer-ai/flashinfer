@@ -1,3 +1,5 @@
+import gc
+
 import pytest
 import torch
 
@@ -14,7 +16,15 @@ def is_cute_dsl_available():
     try:
         from flashinfer.cute_dsl import is_cute_dsl_available as _is_available
 
-        return _is_available()
+        if not _is_available():
+            return False
+        import torch as _torch
+
+        if _torch.cuda.is_available():
+            from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+            return is_cute_dsl_arch_supported(*_torch.cuda.get_device_capability(0))
+        return True
     except ImportError:
         return False
 
@@ -26,6 +36,22 @@ def is_cutile_available():
 
         return is_cuda_tile_available()
     except ImportError:
+        return False
+
+
+def is_cake_grouped_mxfp8_available(dtype):
+    """Check whether a generated Cake profile is installed for this GPU."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        from flashinfer.jit.cake_grouped_mxfp8_quantize import (
+            is_cake_grouped_mxfp8_quantize_available,
+        )
+
+        return is_cake_grouped_mxfp8_quantize_available(
+            dtype, torch.device("cuda", torch.cuda.current_device())
+        )
+    except (ImportError, RuntimeError):
         return False
 
 
@@ -56,7 +82,7 @@ def _unswizzle_mxfp8_scales_128x4(
 
 @pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
 @pytest.mark.parametrize("k", [128, 1024, 8192])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
@@ -70,6 +96,9 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backen
             pytest.skip("cute-dsl backend only supports CUDA")
         if not is_cute_dsl_available():
             pytest.skip("CuTe-DSL is not available")
+
+    if dtype == torch.float32 and backend == "cuda" and device == "cuda":
+        pytest.skip("fp32 input is only supported by the cute-dsl backend")
 
     a = 16 * torch.randn([m, k], dtype=dtype).to(device).contiguous()
 
@@ -198,6 +227,91 @@ def test_mxfp8_grouped_quantize_empty_group(dtype):
     torch.cuda.synchronize()
 
 
+# Regression for int32 element-offset overflow. Top groups start past 2**31
+# elements, so input and output base offsets require int64 indexing.
+# K and M are 128-aligned, avoiding a padded-input copy.
+_OVERFLOW_B = 64
+_OVERFLOW_M = 2176
+_OVERFLOW_K = 16384
+_OVERFLOW_DTYPE = torch.bfloat16
+assert _OVERFLOW_M % 128 == 0 and _OVERFLOW_K % 128 == 0
+assert (_OVERFLOW_B - 1) * _OVERFLOW_M * _OVERFLOW_K > 2**31
+
+
+def _skip_if_low_vram_for_grouped_overflow():
+    """Skip when free VRAM cannot hold the grouped overflow buffers."""
+    elems = _OVERFLOW_B * _OVERFLOW_M * _OVERFLOW_K
+    scale_bytes = _OVERFLOW_B * _OVERFLOW_M * (_OVERFLOW_K // 32)
+    # bf16 input + fp8 output + uint8 scales.
+    need = elems * 3 + scale_bytes
+    # Drop cached blocks so mem_get_info sees driver-level free memory.
+    gc.collect()
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    if free < int(need * 1.2):
+        pytest.skip(
+            f"Requires ~{need / 1024**3:.1f}GB free VRAM, "
+            f"only {free / 1024**3:.1f}GB available"
+        )
+
+
+@pytest.mark.parametrize("backend", ["cutile", "cake"])
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize_int32_offset_overflow(backend):
+    """Grouped MXFP8 quantize must handle group bases above 2**31 elements."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
+        pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
+    if backend == "cutile" and not is_cutile_available():
+        pytest.skip("cuda.tile is not available")
+    if backend == "cake" and not is_cake_grouped_mxfp8_available(_OVERFLOW_DTYPE):
+        pytest.skip("a generated Cake BF16 grouped MXFP8 profile is not installed")
+    _skip_if_low_vram_for_grouped_overflow()
+
+    torch.manual_seed(0)
+    b, m, k = _OVERFLOW_B, _OVERFLOW_M, _OVERFLOW_K
+    padded_k = k  # K is 128-aligned.
+    x = torch.randn((b, m, k), dtype=_OVERFLOW_DTYPE, device="cuda")
+    x.mul_(16.0)
+    # Full masks make the overflowing groups write output.
+    mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
+
+    out, _out_scale = mxfp8_grouped_quantize(x, mask, backend=backend)
+    out = out.permute(2, 0, 1)  # -> [b, m, padded_k]
+    torch.cuda.synchronize()  # Surface async illegal-address errors.
+    assert out.shape == (b, m, padded_k)
+
+    # Check a control row, the first overflowing group, and the last row.
+    group_stride = m * padded_k
+    first_overflow_group = (2**31 + group_stride - 1) // group_stride
+    assert first_overflow_group < b
+    candidate_rows = sorted(
+        {
+            0,
+            first_overflow_group * m,
+            first_overflow_group * m + 1,
+            b * m - 1,
+        }
+    )
+    for global_row in candidate_rows:
+        g, local = divmod(global_row, m)
+        # A single-row reference is enough because quantization is row-local.
+        single_out, _single_scale = mxfp8_quantize_reference(
+            x[g, local : local + 1],
+            alignment=128,
+            sf_swizzle_layout=SfLayout.layout_128x4,
+        )
+        torch.testing.assert_close(
+            out[g, local : local + 1].contiguous().view(torch.uint8),
+            single_out.contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("batch_shape", [(2, 128, 256), (3, 256, 128)])
 @torch.inference_mode()
 def test_mxfp8_grouped_quantize_cuda_graph(batch_shape):
@@ -210,7 +324,7 @@ def test_mxfp8_grouped_quantize_cuda_graph(batch_shape):
         pytest.skip("cuda.tile is not available")
 
     torch.manual_seed(0)
-    b, m, k = batch_shape
+    b, m, _ = batch_shape
     x = torch.randn(batch_shape, dtype=torch.bfloat16, device="cuda")
     mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
@@ -259,7 +373,7 @@ def test_mxfp8_grouped_quantize_cuda_graph_pool_reuse(batch_shape):
     )
 
     torch.manual_seed(0)
-    b, m, k = batch_shape
+    b, m, _ = batch_shape
     x = torch.randn(batch_shape, dtype=torch.bfloat16, device="cuda")
     mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
@@ -467,6 +581,124 @@ def test_mxfp8_grouped_quantize_fake_op_metadata(batch_shape):
     assert sf.dtype == torch.uint8
 
 
+def test_mxfp8_grouped_quantize_backend_validation():
+    """Reject unknown backends before attempting device-specific dispatch."""
+    a = torch.empty((2, 4, 32), dtype=torch.bfloat16, device="meta")
+    mask = torch.empty((2,), dtype=torch.int32, device="meta")
+    with pytest.raises(ValueError, match="Unsupported backend"):
+        mxfp8_grouped_quantize(a, mask, backend="unknown")
+
+
+@pytest.mark.parametrize("batch_shape", [(1, 120, 64), (2, 256, 4096), (3, 200, 160)])
+def test_mxfp8_grouped_quantize_cake_fake_op_metadata(batch_shape):
+    """The Cake registered fake preserves the public grouped-GEMM ABI."""
+    from flashinfer.quantization.fp8_quantization import (
+        get_cake_mxfp8_grouped_quantization_module,
+    )
+
+    b, m, k = batch_shape
+    a = torch.empty((b, m, k), dtype=torch.bfloat16, device="meta")
+    mask = torch.empty((b,), dtype=torch.int32, device="meta")
+    out, sf = (
+        get_cake_mxfp8_grouped_quantization_module()._fake_cake_mxfp8_grouped_quantize(
+            a, mask
+        )
+    )
+
+    padded_k = (k + 127) // 128 * 128
+    padded_m = (m + 127) // 128 * 128
+    assert out.shape == (m, padded_k, b)
+    assert out.dtype == torch.float8_e4m3fn
+    assert out.stride() == (padded_k, 1, m * padded_k)
+    assert sf.shape == (32, 4, padded_m // 128, 4, padded_k // 128, b)
+    assert sf.dtype == torch.uint8
+
+
+@pytest.mark.parametrize("batch_shape", [(2, 256, 4096), (3, 200, 160)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize_cake_exact(batch_shape, dtype):
+    """Generated Cake profiles must match valid output bits and scale bytes."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if not is_cake_grouped_mxfp8_available(dtype):
+        pytest.skip(
+            f"a generated Cake grouped MXFP8 profile for {dtype} is not installed"
+        )
+
+    torch.manual_seed(20260829)
+    b, m, k = batch_shape
+    x = (torch.randn(batch_shape, dtype=torch.float32, device="cuda") * 16).to(dtype)
+    mask_values = [0, m] if b == 2 else [m, m // 2, max(1, m - 7)]
+    mask = torch.tensor(mask_values, dtype=torch.int32, device="cuda")
+    out, out_scale = mxfp8_grouped_quantize(x, mask, backend="cake")
+    out = out.permute(2, 0, 1)
+    out_scale = out_scale.permute(5, 2, 4, 0, 1, 3)
+    padded_k = (k + 127) // 128 * 128
+
+    for group, valid_rows in enumerate(mask_values):
+        if valid_rows == 0:
+            continue
+        ref, ref_scale = mxfp8_quantize_reference(
+            x[group], alignment=128, sf_swizzle_layout=SfLayout.layout_128x4
+        )
+        torch.testing.assert_close(
+            out[group, :valid_rows].contiguous().view(torch.uint8),
+            ref[:valid_rows].contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        got_scale = _unswizzle_mxfp8_scales_128x4(out_scale[group], m, padded_k)
+        expected_scale = _unswizzle_mxfp8_scales_128x4(ref_scale, m, padded_k)
+        torch.testing.assert_close(
+            got_scale[:valid_rows], expected_scale[:valid_rows], rtol=0, atol=0
+        )
+
+
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize_cake_cuda_graph_and_streams():
+    """Cake launches use the caller stream and remain CUDA-graph replay safe."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if not is_cake_grouped_mxfp8_available(torch.bfloat16):
+        pytest.skip("a generated Cake BF16 grouped MXFP8 profile is not installed")
+
+    torch.manual_seed(20260829)
+    shape = (2, 256, 4096)
+    x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    mask = torch.full((shape[0],), shape[1], dtype=torch.int32, device="cuda")
+    eager_q, eager_sf = mxfp8_grouped_quantize(x, mask, backend="cake")
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_q, graph_sf = mxfp8_grouped_quantize(x, mask, backend="cake")
+    graph.replay()
+
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    with torch.cuda.stream(stream_a):
+        stream_a_q, stream_a_sf = mxfp8_grouped_quantize(x, mask, backend="cake")
+    with torch.cuda.stream(stream_b):
+        stream_b_q, stream_b_sf = mxfp8_grouped_quantize(x, mask, backend="cake")
+    torch.cuda.synchronize()
+
+    for got, expected in (
+        (graph_q, eager_q),
+        (graph_sf, eager_sf),
+        (stream_a_q, eager_q),
+        (stream_a_sf, eager_sf),
+        (stream_b_q, eager_q),
+        (stream_b_sf, eager_sf),
+    ):
+        torch.testing.assert_close(
+            got.contiguous().view(torch.uint8),
+            expected.contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+
+
 @pytest.mark.parametrize("batch_shape", [(2, 128, 128), (3, 256, 160)])
 @torch.inference_mode()
 def test_mxfp8_grouped_quantize_fake_op_matches_real(batch_shape):
@@ -487,7 +719,7 @@ def test_mxfp8_grouped_quantize_fake_op_matches_real(batch_shape):
     )
 
     torch.manual_seed(0)
-    b, m, k = batch_shape
+    b, m, _ = batch_shape
     x = torch.randn(batch_shape, dtype=torch.bfloat16, device="cuda")
     mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
@@ -518,9 +750,36 @@ def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("elem_offset", [1, 4, 8])
+def test_mxfp8_quantize_cute_dsl_underaligned_view(dtype, elem_offset):
+    """Contiguous views with a storage offset must not fault the vector loads.
+
+    `.contiguous()` preserves contiguous views whose data_ptr is only
+    element-aligned (e.g. ``pool[off:off + m * k].view(m, k)``); the CuTe-DSL
+    kernels use 16B (fp16/bf16) or 32B (fp32) vectorized loads, so the wrapper
+    must materialize an aligned copy for such inputs.
+    """
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    torch.random.manual_seed(0)
+    m, k = 128, 1024
+    pool = (torch.randn(m * k + 64, dtype=torch.float) * 16).to(dtype).cuda()
+    a = pool[elem_offset : elem_offset + m * k].view(m, k)
+    assert a.is_contiguous()
+
+    a_fp8, a_sf = mxfp8_quantize(a, True, 32, backend="cute-dsl")
+
+    _assert_mxfp8_quantize_exact(a, a_fp8, a_sf, is_sf_swizzled_layout=True)
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("m", [1, 2, 3, 16, 64, 1024])
 @pytest.mark.parametrize("k", [128, 512, 1024, 8192])
-@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout, backend):
@@ -529,6 +788,9 @@ def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout, backend
 
     if backend == "cute-dsl" and not is_cute_dsl_available():
         pytest.skip("CuTe-DSL is not available")
+
+    if dtype == torch.float32 and backend == "cuda":
+        pytest.skip("fp32 input is only supported by the cute-dsl backend")
 
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
@@ -543,7 +805,7 @@ def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout, backend
 
 @pytest.mark.parametrize("m", [1, 2, 16, 1024])
 @pytest.mark.parametrize("k", [1568])
-@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("alignment", [64, 128])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
@@ -555,6 +817,9 @@ def test_mxfp8_quantize_alignment_torch_device(
 
     if backend == "cute-dsl" and not is_cute_dsl_available():
         pytest.skip("CuTe-DSL is not available")
+
+    if dtype == torch.float32 and backend == "cuda":
+        pytest.skip("fp32 input is only supported by the cute-dsl backend")
 
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()

@@ -1064,10 +1064,6 @@ def decode_delta_rule(
     num_k_heads = k.size(1)
     num_v_heads = v.size(1)
     K = q.size(2)
-    V = v.size(2)
-
-    # State and output are always based on num_v_heads (matches kernel's HV dimension)
-    num_heads = num_v_heads
 
     device = q.device
     dtype = torch.float32
@@ -1134,66 +1130,26 @@ def decode_delta_rule(
     # ============================================
     # Process each batch and head
     # ============================================
-    new_state = torch.zeros(B, num_heads, K, V, device=device, dtype=state_dtype)
-    output = torch.zeros(B, num_heads, V, device=device, dtype=dtype)
+    # All (batch, head) pairs are independent, so the recurrent update below is
+    # vectorized over [B, num_heads].
 
-    for b_idx in range(B):
-        for h_idx in range(num_heads):
-            # Get current vectors
-            q_h = q[b_idx, h_idx]  # [K]
-            k_h = k[b_idx, h_idx]  # [K]
-            v_h = v[b_idx, h_idx]  # [V]
-            h_state = (
-                state[b_idx, h_idx].clone().to(torch.float32)
-            )  # [K, V] read as fp32
+    # Step 1: Apply gating to hidden state: h *= exp(g)
+    h_state = state.to(torch.float32) * torch.exp(g)[:, :, None, None]  # [B,H,K,V]
 
-            # Get gating values for this batch and head
-            g_val = g[b_idx, h_idx]  # scalar
-            beta_val = beta[b_idx, h_idx]  # scalar
+    # Step 2: Delta rule: v -= k^T @ h  ([B,H,K] x [B,H,K,V] -> [B,H,V])
+    v_new = v - torch.einsum("bhk,bhkv->bhv", k, h_state)
 
-            # ============================================
-            # Recurrent update (following Triton kernel lines 121-134)
-            # ============================================
+    # Step 3: Apply beta gating: v *= beta
+    v_new = v_new * beta[:, :, None]
 
-            # Step 1: Apply gating to hidden state: h *= exp(g)
-            # Triton kernel line 122: b_h *= tl.exp(b_g)
-            h_state = h_state * torch.exp(g_val)
+    # Step 4: Update hidden state with outer product: h += k ⊗ v_new
+    h_state = h_state + k.unsqueeze(-1) * v_new.unsqueeze(-2)
 
-            # Step 2: Delta rule: v -= sum(h * k, dim=0)
-            # Triton kernel line 125: b_v -= tl.sum(b_h * b_k[:, None], 0)
-            # Triton: b_h is [BK, BV], b_k is [BK]
-            # b_k[:, None] makes it [BK, 1]
-            # b_h * b_k[:, None] gives [BK, BV] (element-wise per row)
-            # tl.sum(..., 0) sums over BK dimension -> [BV]
-            #
-            # Equivalent to: k^T @ h where h is [K, V]
-            # [K] @ [K, V] = [V]
-            v_new = v_h - (k_h @ h_state)
+    # Step 5: Compute output: o = q^T @ h
+    output = torch.einsum("bhk,bhkv->bhv", q, h_state).to(dtype)
 
-            # Step 3: Apply beta gating: v *= beta
-            # Triton kernel line 128: b_v *= b_beta
-            v_new = v_new * beta_val
-
-            # Step 4: Update hidden state: h += k[:, None] * v[None, :]
-            # Triton kernel line 131: b_h += b_k[:, None] * b_v[None, :]
-            # Triton: [BK, BV] += [BK, 1] * [1, BV]
-            # This is outer product: k @ v^T
-            # [K, V] += [K, 1] @ [1, V]
-            h_state = h_state + k_h.unsqueeze(1) @ v_new.unsqueeze(0)
-
-            # Step 5: Compute output: o = sum(h * q, dim=0)
-            # Triton kernel line 134: b_o = tl.sum(b_h * b_q[:, None], 0)
-            # Triton: b_h is [BK, BV], b_q is [BK]
-            # b_q[:, None] makes it [BK, 1]
-            # b_h * b_q[:, None] gives [BK, BV] (element-wise per row)
-            # tl.sum(..., 0) sums over BK dimension -> [BV]
-            #
-            # Equivalent to: q^T @ h where h is [K, V]
-            # [K] @ [K, V] = [V]
-            output[b_idx, h_idx] = q_h @ h_state
-
-            # Store updated state (cast back to state_dtype)
-            new_state[b_idx, h_idx] = h_state.to(state_dtype)
+    # Store updated state (cast back to state_dtype)
+    new_state = h_state.to(state_dtype)
 
     return output, new_state
 
@@ -1311,50 +1267,30 @@ def verify_delta_rule(
     else:
         intermediate_states = None
 
-    # Process each time step sequentially
+    # Process each time step sequentially (only t carries a dependency; the
+    # per-(batch, head) updates are independent and vectorized over [B, H]).
     for t in range(T):
-        q_t = q[:, t]  # [B, num_heads, K]
-        k_t = k[:, t]  # [B, num_heads, K]
-        v_t = v[:, t]  # [B, num_heads, V]
-        g_t = g[:, t]  # [B, num_heads]
-        beta_t = beta[:, t]  # [B, num_heads]
+        # Recurrent update
+        # 1. Apply decay (state read as fp32)
+        h_state = current_state.to(torch.float32) * g[:, t, :, None, None]
 
-        # Process each batch and head
-        for b_idx in range(B):
-            for h_idx in range(num_heads):
-                q_h = q_t[b_idx, h_idx]  # [K]
-                k_h = k_t[b_idx, h_idx]  # [K]
-                v_h = v_t[b_idx, h_idx]  # [V]
-                h_state = (
-                    current_state[b_idx, h_idx].clone().to(torch.float32)
-                )  # [K, V] read as fp32
-                g_val = g_t[b_idx, h_idx]
-                beta_val = beta_t[b_idx, h_idx]
+        # 2. Compute prediction error: v - k^T @ h
+        v_new = v[:, t] - torch.einsum("bhk,bhkv->bhv", k[:, t], h_state)
 
-                # Recurrent update (following Triton kernel)
-                # 1. Apply decay
-                h_state = h_state * g_val
+        # 3. Apply gating
+        v_new = v_new * beta[:, t, :, None]
 
-                # 2. Compute prediction error: v - k^T @ h
-                v_pred = k_h @ h_state  # [K] @ [K, V] = [V]
-                v_new = v_h - v_pred
+        # 4. Update state with outer product: h = h + k ⊗ v_new
+        h_state = h_state + k[:, t].unsqueeze(-1) * v_new.unsqueeze(-2)
 
-                # 3. Apply gating
-                v_new = v_new * beta_val
+        # 5. Compute output: o = q^T @ h
+        output[:, t] = torch.einsum("bhk,bhkv->bhv", q[:, t], h_state)
 
-                # 4. Update state: h = h + k ⊗ v_new
-                h_state = h_state + k_h.unsqueeze(1) @ v_new.unsqueeze(
-                    0
-                )  # [K, V] + [K, 1] @ [1, V]
+        # Update current state (cast back to state_dtype)
+        current_state = h_state.to(state_dtype)
 
-                # 5. Compute output: o = q^T @ h
-                output[b_idx, t, h_idx] = q_h @ h_state  # [K] @ [K, V] = [V]
-
-                # Update current state (cast back to state_dtype)
-                current_state[b_idx, h_idx] = h_state.to(state_dtype)
-
-                # Cache intermediate state if requested
-                if cache_intermediate_states:
-                    intermediate_states[b_idx, t, h_idx] = h_state.to(state_dtype)
+        # Cache intermediate state if requested
+        if cache_intermediate_states:
+            intermediate_states[:, t] = current_state
 
     return output, current_state, intermediate_states

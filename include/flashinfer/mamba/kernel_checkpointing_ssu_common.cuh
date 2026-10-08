@@ -49,25 +49,6 @@ constexpr unsigned int MASK_ALL_LANES = 0xFFFFFFFFu;
 constexpr unsigned int num_bits_uint32 = 32u;
 }  // namespace constants
 
-// ── Programmatic Dependent Launch (PDL) helpers ────────────────────────────
-// `gdc_wait` enforces no gmem access before the upstream PDL-paired kernel
-// has signaled.  `gdc_launch_dependents` hints the downstream PDL-paired
-// kernel to launch early.  Both are no-ops on SM<90 and harmless without
-// the launch-time `cudaLaunchAttributeProgrammaticStreamSerialization`
-// attribute, so the kernel can always emit them; the host-side `enable_pdl`
-// toggle is what flips the launch attribute.
-__forceinline__ __device__ void gdc_wait() {
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-#endif
-}
-
-__forceinline__ __device__ void gdc_launch_dependents() {
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
-#endif
-}
-
 // Round x up to the next multiple of Y (Y must be a power of 2).
 template <int Y>
 constexpr int next_multiple_of(int x) {
@@ -167,6 +148,9 @@ __device__ __forceinline__ Pair<__nv_bfloat16> pack_float2<__nv_bfloat16>(float2
 struct Copy_prop {
   using Atom = cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>;
   using AtomZFill = cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<cute::uint128_t>;
+  // L2-only (.cg) variant for read-once streams: the state cache is touched
+  // exactly once per step, so pulling it through L1 evicts the reused tiles.
+  using AtomCG = cute::SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
   static constexpr int vec_bytes = sizeof(std::remove_extent_t<typename Atom::SRegisters>);
 };
 
@@ -194,14 +178,23 @@ struct MMA_prop {
 // Swizzled smem layout for mma.sync operands (row-major).
 // =============================================================================
 // The swizzle picks the `M` parameter to make each ldmatrix / cp.async atom
-// exactly 16 bytes of contiguous element data (one 128-bit vector), and keeps
+// at least 16 bytes of contiguous element data (one 128-bit vector), and keeps
 // B = S = 3 so that each 8-row block XORs row↔column bits to stay
 // bank-conflict-free on the 128-byte bank cycle.
 //
 //   sizeof(T)  Swizzle<B,M,S>     atom rows × cols    row bytes
 //     2B       Swizzle<3, 3, 3>       8  × 64             128
-//     4B       Swizzle<3, 2, 3>       8  × 32             128
+//     4B       Swizzle<3, 3, 3>       8  × 64             256
 //     1B       Swizzle<3, 4, 3>       8  × 128            128
+//
+// M is floored at 3 (8 contiguous elements).  For 4-byte elements the natural
+// M=2 (16B chunks) is NOT conflict-free for the fragment loads the f32 state
+// path emits: an LDS.64 float2 wavefront phase is 16 lanes = 4 fragment rows,
+// and the M=2 XOR moves each row's pair-set within an XOR-closed 16B-chunk set
+// — two rows per phase land on the same 16 banks (2-way, every access).  M=3
+// rotates 32B chunks, mapping the 4 rows of a phase onto 4 disjoint 32B bank
+// ranges (verified in tiler.py's fragment-map bank simulator).  16B cp.async /
+// LDS vectors stay intact under M=3 (32B ⊃ 16B).
 //
 // The MMA operand element type dictates the smem buffer element type, which in
 // turn dictates the swizzle — so every call site passes its own element type.
@@ -219,7 +212,8 @@ struct SmemSwizzle {
   static_assert(Copy_prop::vec_bytes % sizeof(Elem) == 0,
                 "element size must divide LDSM atom (16 bytes)");
   static constexpr int ELEMS_PER_ATOM = Copy_prop::vec_bytes / sizeof(Elem);
-  using type = cute::Swizzle<3, log2_pow2(ELEMS_PER_ATOM), 3>;
+  static constexpr int SWIZZLE_BASE = log2_pow2(ELEMS_PER_ATOM) < 3 ? 3 : log2_pow2(ELEMS_PER_ATOM);
+  using type = cute::Swizzle<3, SWIZZLE_BASE, 3>;
   static constexpr int ATOM_ROWS = 1 << type::num_bits;
   static constexpr int ATOM_COLS = 1 << (type::num_base + type::num_shft);
 };
@@ -332,11 +326,17 @@ __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
 // the predicate from `< NPREDICTED` to `< seq_len`.  When the caller omits it,
 // the default is the constexpr `VALID_ROWS` so non-varlen call sites fold to
 // the same SASS as before.
-template <typename SmemShape, int VALID_ROWS, typename input_t>
+// `ZFILL` selects the cp.async variant: true (default) writes ZEROS wherever
+// the predicate is false (rows ≥ valid, padded cols) — the legacy contract;
+// false SKIPS false-predicate elements entirely (plain cp.async), which the
+// ring gather's second segment needs so it can't clobber the first segment's
+// rows.  `first_valid_row` tightens the predicate from below (default 0).
+template <typename SmemShape, int VALID_ROWS, bool ZFILL = true, typename input_t>
 __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
                                                 input_t const* __restrict__ gmem_src,
                                                 int gmem_row_stride, int lane,
-                                                int valid_rows_rt = VALID_ROWS) {
+                                                int valid_rows_rt = VALID_ROWS,
+                                                int first_valid_row = 0) {
   using namespace cute;
   constexpr int ROWS_PAD = size<0>(SmemShape{});
   constexpr int VALID_COLS = size<1>(SmemShape{});
@@ -364,7 +364,9 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   using ThrLayout = Layout<Shape<_4, _8>, Stride<_8, _1>>;
   static_assert(size<1>(ThrLayout{}) * VAL_COLS_PER_THREAD == SmemSwizzle<input_t>::ATOM_COLS,
                 "wide thread layout must cover one full swizzle atom width per row");
-  auto g2s = make_tiled_copy(Copy_Atom<Copy_prop::AtomZFill, input_t>{}, ThrLayout{},
+  using CopyAtomT =
+      std::conditional_t<ZFILL, typename Copy_prop::AtomZFill, typename Copy_prop::Atom>;
+  auto g2s = make_tiled_copy(Copy_Atom<CopyAtomT, input_t>{}, ThrLayout{},
                              Layout<Shape<_1, Int<VAL_COLS_PER_THREAD>>>{});
   auto thr = g2s.get_slice(lane);
 
@@ -373,9 +375,59 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   auto pred = make_tensor<bool>(shape(thr_id));
   CUTE_UNROLL
   for (int i = 0; i < size(pred); ++i) {
-    pred(i) = (get<0>(thr_id(i)) < valid_rows_rt) && (get<1>(thr_id(i)) < VALID_COLS);
+    pred(i) = (get<0>(thr_id(i)) >= first_valid_row) && (get<0>(thr_id(i)) < valid_rows_rt) &&
+              (get<1>(thr_id(i)) < VALID_COLS);
   }
   copy_if(g2s, pred, thr.partition_S(g_full), thr.partition_D(s_full));
+}
+
+// Ring gather: smem rows j ∈ [0, count_rt) come from gmem ring row
+// (start + j) mod ring_len (row stride `gmem_row_stride`); rows
+// [count_rt, ROWS_PAD) end up zero (the MMA K-pad contract).  Hand-rolled
+// version of load_tile_async's wide tiled copy (same 4×8 thread layout, same
+// swizzled dst addresses) with two differences:
+//   - the per-row source is the RING row (one cond-subtract per row — the
+//     tiled copy can't express the mod in an affine gmem layout), and
+//   - each 16B element is issued as ONE cp.async whose src-size operand is 0
+//     when predicated off (the ZFILL mechanism), so pad rows zero-fill through
+//     the async path instead of synchronous smem stores.  (A two-segment
+//     copy_if + STS tail was tried first: the tail stores dominated no-write
+//     units — 14× smem-store wavefronts, +22% main at pnat=4, ncu 2026-07-10.)
+// Every element is written by exactly one cp.async — no same-address ordering
+// hazard.  count_rt may be ≤ 0 (callers pass prev_k−8 residues): all rows
+// predicate off and the whole tile zero-fills.
+template <typename SmemShape, int COUNT, typename input_t>
+__device__ __forceinline__ void load_ring_tile_async(input_t* __restrict__ smem_dst,
+                                                     input_t const* __restrict__ gmem_base,
+                                                     int gmem_row_stride, int lane, int ring_start,
+                                                     int ring_len, int count_rt = COUNT) {
+  using namespace cute;
+  constexpr int ROWS_PAD = size<0>(SmemShape{});
+  constexpr int VALID_COLS = size<1>(SmemShape{});
+  constexpr int SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(VALID_COLS);
+  constexpr int VAL = Copy_prop::vec_bytes / sizeof(input_t);  // elems per 16B cp.async
+  static_assert(Copy_prop::vec_bytes == 16, "the inline cp.async hardcodes 16B atoms");
+  constexpr int THR_ROWS = 4, THR_COLS = 8;  // wide layout (see load_tile_async)
+  static_assert(SMEM_COLS % (THR_COLS * VAL) == 0, "col passes must tile SMEM_COLS");
+  static_assert(ROWS_PAD % THR_ROWS == 0, "row passes must tile ROWS_PAD");
+  auto s_full =
+      make_tensor(make_smem_ptr(smem_dst), make_swizzled_layout_rc<input_t, ROWS_PAD, SMEM_COLS>());
+  int const tr = lane >> 3, tc = lane & 7;
+  CUTE_UNROLL
+  for (int rp = 0; rp < ROWS_PAD / THR_ROWS; ++rp) {
+    int const r = rp * THR_ROWS + tr;
+    int rr = ring_start + r;
+    if (rr >= ring_len) rr -= ring_len;
+    auto const* src_row = gmem_base + (int64_t)rr * gmem_row_stride;
+    CUTE_UNROLL
+    for (int cp = 0; cp < SMEM_COLS / (THR_COLS * VAL); ++cp) {
+      int const c = (cp * THR_COLS + tc) * VAL;
+      bool const valid = (r < count_rt) && (c < VALID_COLS);
+      uint32_t const dst = cast_smem_ptr_to_uint(&s_full(r, c));
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src_row + c),
+                   "r"(valid ? 16 : 0));
+    }
+  }
 }
 
 // State load — D_SPLIT-conditional dispatch:
@@ -398,16 +450,22 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
 template <typename state_t, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
                                                     state_t const* __restrict__ state_ptr,
-                                                    int64_t state_base, int warp, int lane) {
+                                                    int64_t state_base, int warp, int lane,
+                                                    int state_buf = 0) {
   using namespace cute;
-  static_assert(NUM_WARPS == 4, "Expected 4 warps");
   static_assert(D_PER_CTA % NUM_WARPS == 0, "D_PER_CTA must be divisible by NUM_WARPS");
   constexpr int DIM_PER_WARP = D_PER_CTA / NUM_WARPS;
+  // Each warp loads its DIM_PER_WARP-row slice with the (4,8) thread tile (4 rows/pass), so
+  // DIM_PER_WARP must be a multiple of 4.  NUM_WARPS=4 → 16 rows/warp (4 passes); 8 → 8 (2).
+  static_assert(DIM_PER_WARP % 4 == 0,
+                "DIM_PER_WARP (D_PER_CTA/NUM_WARPS) must be a multiple of 4 for the (4,8) load");
 
-  // Single-local_tile path — swizzle layout sized to this CTA's
-  // D_PER_CTA slice; one local_tile splits it directly per-warp.
-  Tensor sState_full = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(smem.state)),
-                                   make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>());
+  // Single-local_tile path — swizzle layout sized to this CTA's D_PER_CTA slice; one local_tile
+  // splits it directly per-warp.  state_buf selects the double-buffered state slot (cross-head
+  // prefetch); state_buf=0 ⇒ the single original buffer.
+  Tensor sState_full = make_tensor(
+      make_smem_ptr(reinterpret_cast<state_t*>(smem.state) + state_buf * D_PER_CTA * DSTATE),
+      make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>());
   Tensor gState_full = make_tensor(make_gmem_ptr(state_ptr + state_base),
                                    make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
                                                make_stride(Int<DSTATE>{}, Int<1>{})));
@@ -419,7 +477,7 @@ __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
 
   constexpr int VAL_COLS = Copy_prop::vec_bytes / sizeof(state_t);
   auto g2s =
-      make_tiled_copy(Copy_Atom<Copy_prop::Atom, state_t>{},
+      make_tiled_copy(Copy_Atom<Copy_prop::AtomCG, state_t>{},
                       Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<VAL_COLS>>>{});
   auto thr = g2s.get_slice(lane);
   copy(g2s, thr.partition_S(gState), thr.partition_D(sState));
@@ -427,12 +485,13 @@ __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
 
 template <typename state_t, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_state_cta(SmemT& smem, state_t const* __restrict__ state_ptr,
-                                               int64_t state_base, int tid) {
+                                               int64_t state_base, int tid, int state_buf = 0) {
   using namespace cute;
   static_assert(NUM_WARPS == 4, "Expected 4 warps");
 
-  Tensor sState = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(smem.state)),
-                              make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>());
+  Tensor sState = make_tensor(
+      make_smem_ptr(reinterpret_cast<state_t*>(smem.state) + state_buf * D_PER_CTA * DSTATE),
+      make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>());
   Tensor gState = make_tensor(make_gmem_ptr(state_ptr + state_base),
                               make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
                                           make_stride(Int<DSTATE>{}, Int<1>{})));
@@ -442,7 +501,7 @@ __device__ __forceinline__ void load_state_cta(SmemT& smem, state_t const* __res
   constexpr int THR_ROWS = decltype(size<0>(ThrLayout{}))::value;
   static_assert(D_PER_CTA % THR_ROWS == 0,
                 "D_PER_CTA must be divisible by the thread layout's row count");
-  auto g2s = make_tiled_copy(Copy_Atom<Copy_prop::Atom, state_t>{}, ThrLayout{},
+  auto g2s = make_tiled_copy(Copy_Atom<Copy_prop::AtomCG, state_t>{}, ThrLayout{},
                              Layout<Shape<_1, Int<VAL_COLS>>>{});
   auto thr = g2s.get_slice(tid);
   copy(g2s, thr.partition_S(gState), thr.partition_D(sState));
@@ -479,6 +538,40 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
     if constexpr (detail::has_decay<SmemT>::value) {
       smem.decay[lane] = __expf(val);
     }
+  }
+}
+
+// Load this head's old dt from the RING (row (start+t) % L) and recompute its
+// decay into the caller's smem slices (dt_dst / ca_dst).  The ring caches only
+// dt: cumAdt (prefix sums) is not ring-shift-invariant — a flush would
+// invalidate every cached entry — so it is recomputed here as
+// A · inclusive_scan(dt) over the window (≤ 16 lanes, 4 shfl steps).  All 32
+// lanes join the scan (lanes ≥ count contribute masked zeros) so the shuffles
+// stay convergent; only lanes < count write.  Used by the MONOLITH — the
+// two-kernel main runs its own in-register recompute (warp_scan_old_cumAdt).
+__device__ __forceinline__ void load_old_dt_cumAdt(CheckpointingSsuParams const& params, int lane,
+                                                   int64_t cache_slot, int ring_start, int head,
+                                                   int count, float A_val,
+                                                   float* __restrict__ dt_dst,
+                                                   float* __restrict__ ca_dst) {
+  auto const* __restrict__ dt_cache_ptr = reinterpret_cast<float const*>(params.dt_cache);
+  // head·head_stride is an index into a contiguous inner dim → 32-bit;
+  // slot-distance stride (*_stride_seq) stays 64-bit.
+  int64_t const dt_base =
+      cache_slot * params.dt_cache_stride_seq + (int64_t)(head * (int)params.dt_cache_stride_head);
+  int ring_row = ring_start + lane;
+  if (ring_row >= params.ring_buffer_len) ring_row -= params.ring_buffer_len;
+  float dt_v = (lane < count) ? dt_cache_ptr[dt_base + ring_row] : 0.f;
+  // Inclusive scan over the first 16 lanes (count ≤ MAX_WINDOW ≤ 16).
+  float scan = dt_v;
+#pragma unroll
+  for (int off = 1; off < 16; off <<= 1) {
+    float const up = __shfl_up_sync(0xffffffffu, scan, off);
+    if ((lane & 15) >= off) scan += up;
+  }
+  if (lane < count) {
+    dt_dst[lane] = dt_v;
+    ca_dst[lane] = A_val * scan;
   }
 }
 
@@ -523,7 +616,7 @@ template <typename input_t, typename dt_t, typename state_t, int NPREDICTED, int
           int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_pre_pdl_wait_data(
     SmemT& smem, CheckpointingSsuParams const& params, int lane, int warp, int d_tile, int head,
-    int group_idx, int64_t cache_slot, int buf_read, float A_val, float dt_bias_val,
+    int group_idx, int64_t cache_slot, int ring_start, float A_val, float dt_bias_val,
     int64_t dt_seq_base, int64_t z_seq_base, int seq_len) {
   constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
   static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
@@ -532,15 +625,14 @@ __device__ __forceinline__ void load_pre_pdl_wait_data(
   int const d_tile_off = d_tile * D_PER_CTA;
 
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
-  auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.old_x);
-  auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.old_B);
-  auto const* __restrict__ old_dt_ptr = reinterpret_cast<float const*>(params.old_dt);
-  auto const* __restrict__ old_cumAdt_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
+  auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.x_cache);
+  auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.B_cache);
   auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
 
-  int64_t const ox_base = cache_slot * params.old_x_stride_seq + head * DIM + d_tile_off;
-  int64_t const oB_base = cache_slot * params.old_B_stride_seq +
-                          buf_read * params.old_B_stride_dbuf + group_idx * DSTATE;
+  int64_t const ox_base = cache_slot * params.x_cache_stride_seq +
+                          (int64_t)head * params.x_cache_stride_head + d_tile_off;
+  int64_t const oB_base =
+      cache_slot * params.B_cache_stride_seq + (int64_t)group_idx * params.B_cache_stride_group;
 
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
@@ -574,13 +666,15 @@ __device__ __forceinline__ void load_pre_pdl_wait_data(
   // ── old_B: redundant on all 4 warps (each warp's replay consumes full
   // DSTATE).  Identical payloads to same smem dest — final bytes
   // deterministic.  VALID_ROWS = MAX_WINDOW (cache rows). ──
-  load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base, params.old_B_stride_token,
-                                         lane);
+  load_ring_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base,
+                                              (int)params.B_cache_stride_pos, lane, ring_start,
+                                              params.ring_buffer_len);
 
   // ── old_x: redundant on all 4 warps (small, simpler than partitioning).
   // VALID_ROWS = MAX_WINDOW (cache rows). ──
-  load_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base, params.old_x_stride_token,
-                                       lane);
+  load_ring_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base,
+                                            (int)params.x_cache_stride_pos, lane, ring_start,
+                                            params.ring_buffer_len);
 
   // ── z: W3 only (Phase-2 read, final __syncthreads makes it visible).
   // Sourced from in_proj — not from conv1d — so safe to issue pre-wait. ──
@@ -605,18 +699,8 @@ __device__ __forceinline__ void load_pre_pdl_wait_data(
   // dt_proc: load up to NPREDICTED lanes (new-token scalars from in_proj).
   // Synchronous LDG + plain smem stores — no cp.async.  Writes from 4
   // warps to the same slots are idempotent (same payloads). ──
-  static_assert(MAX_WINDOW <= warpSize, "MAX_WINDOW must fit in a single warp");
-  if (lane < MAX_WINDOW) {
-    int64_t const dt_rd_base = cache_slot * params.old_dt_stride_seq +
-                               buf_read * params.old_dt_stride_dbuf +
-                               head * params.old_dt_stride_head;
-    smem.old_dt[lane] = old_dt_ptr[dt_rd_base + lane];
-
-    int64_t const ca_rd_base = cache_slot * params.old_cumAdt_stride_seq +
-                               buf_read * params.old_cumAdt_stride_dbuf +
-                               head * params.old_cumAdt_stride_head;
-    smem.old_cumAdt[lane] = old_cumAdt_ptr[ca_rd_base + lane];
-  }
+  load_old_dt_cumAdt(params, lane, cache_slot, ring_start, head, MAX_WINDOW, A_val, smem.old_dt,
+                     smem.old_cumAdt);
   // dt → softplus → smem.dt_proc.  Under varlen the active lane range is
   // `[0, seq_len)`; lanes `[seq_len, NPREDICTED)` are left uninitialized —
   // `compute_cumAdt` will scan over them and produce garbage in the
@@ -723,7 +807,7 @@ template <typename input_t, typename dt_t, typename state_t, int NPREDICTED, int
           int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams const& params,
                                           int lane, int warp, int d_tile, int head, int group_idx,
-                                          int64_t cache_slot, int buf_read, float A_val,
+                                          int64_t cache_slot, int ring_start, float A_val,
                                           float dt_bias_val, int64_t outer, int seq_len) {
   constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
   static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
@@ -735,18 +819,17 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
   auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
-  auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.old_x);
-  auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.old_B);
-  auto const* __restrict__ old_dt_ptr = reinterpret_cast<float const*>(params.old_dt);
-  auto const* __restrict__ old_cumAdt_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
+  auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.x_cache);
+  auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.B_cache);
   auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
 
   int64_t const B_base = outer * params.B_stride_seq + (int64_t)group_idx * DSTATE;
   int64_t const C_base = outer * params.C_stride_seq + (int64_t)group_idx * DSTATE;
   int64_t const x_base = outer * params.x_stride_seq + head * DIM + d_tile_off;
-  int64_t const ox_base = cache_slot * params.old_x_stride_seq + head * DIM + d_tile_off;
-  int64_t const oB_base = cache_slot * params.old_B_stride_seq +
-                          buf_read * params.old_B_stride_dbuf + group_idx * DSTATE;
+  int64_t const ox_base = cache_slot * params.x_cache_stride_seq +
+                          (int64_t)head * params.x_cache_stride_head + d_tile_off;
+  int64_t const oB_base =
+      cache_slot * params.B_cache_stride_seq + (int64_t)group_idx * params.B_cache_stride_group;
 
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int NPREDICTED_PAD_MMA_N = SmemT::NPREDICTED_PAD_MMA_N;
@@ -778,10 +861,12 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   }
   load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane, seq_len);
 
-  load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base, params.old_B_stride_token,
-                                         lane);
-  load_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base, params.old_x_stride_token,
-                                       lane);
+  load_ring_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base,
+                                              (int)params.B_cache_stride_pos, lane, ring_start,
+                                              params.ring_buffer_len);
+  load_ring_tile_async<OxShape, MAX_WINDOW>(smem.old_x, old_x_ptr + ox_base,
+                                            (int)params.x_cache_stride_pos, lane, ring_start,
+                                            params.ring_buffer_len);
 
   if (warp == 2) {
     load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_token, lane,
@@ -794,18 +879,8 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   }
 
   // ── Scalar loads (overlap with cp.async) + cumAdt cumsum ──
-  static_assert(MAX_WINDOW <= warpSize, "MAX_WINDOW must fit in a single warp");
-  if (lane < MAX_WINDOW) {
-    int64_t const dt_rd_base = cache_slot * params.old_dt_stride_seq +
-                               buf_read * params.old_dt_stride_dbuf +
-                               head * params.old_dt_stride_head;
-    smem.old_dt[lane] = old_dt_ptr[dt_rd_base + lane];
-
-    int64_t const ca_rd_base = cache_slot * params.old_cumAdt_stride_seq +
-                               buf_read * params.old_cumAdt_stride_dbuf +
-                               head * params.old_cumAdt_stride_head;
-    smem.old_cumAdt[lane] = old_cumAdt_ptr[ca_rd_base + lane];
-  }
+  load_old_dt_cumAdt(params, lane, cache_slot, ring_start, head, MAX_WINDOW, A_val, smem.old_dt,
+                     smem.old_cumAdt);
   int64_t const dt_seq_base_local = outer * params.dt_stride_seq + head;
   if (lane < seq_len) {
     float dt_val = toFloat(dt_ptr[dt_seq_base_local + (int64_t)lane * params.dt_stride_token]);
@@ -1094,10 +1169,10 @@ __device__ __forceinline__ void compute_CB_old_2warp(SmemT& smem, int warp, int 
 //   m16n8k16 B frag (4 elts): 0→K_base, 1→K_base+1, 2→K_base+8, 3→K_base+9
 //   m16n8k8  B frag (2 elts): 0→K_base, 1→K_base+1
 // =============================================================================
-template <int DB_COEFFS_PER_LANE, typename SmemT>
+template <int DB_COEFFS_PER_LANE>
 __device__ __forceinline__ void precompute_dB_coeff(float coeff[DB_COEFFS_PER_LANE],
-                                                    SmemT const& smem, float total_cumAdt,
-                                                    int prev_k, int lane) {
+                                                    float const* old_cumAdt, float const* old_dt,
+                                                    float total_cumAdt, int prev_k, int lane) {
   static_assert(DB_COEFFS_PER_LANE == 2 || DB_COEFFS_PER_LANE == 4,
                 "DB_COEFFS_PER_LANE must be 2 (k8) or 4 (k16)");
   int const K_base = (lane % 4) * 2;
@@ -1106,7 +1181,7 @@ __device__ __forceinline__ void precompute_dB_coeff(float coeff[DB_COEFFS_PER_LA
     // m16n8k_ V-index → K-offset: (V & 1) is the col-pair offset; (V & 2) ? 8 : 0
     // covers the second K-tile inside the K_BIG (k16) atom.
     int const k = K_base + (i & 1) + ((i & 2) << 2);
-    coeff[i] = (k < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt[k] : 0.f;
+    coeff[i] = (k < prev_k) ? __expf(total_cumAdt - old_cumAdt[k]) * old_dt[k] : 0.f;
   }
 }
 
@@ -1143,9 +1218,10 @@ __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B,
 //            frag (8 elts): {0,2}→K_base, {1,3}→K_base+1,
 //                           {4,6}→K_base+8, {5,7}→K_base+9  (4 unique K)
 // =============================================================================
-template <int MAX_WINDOW_PAD_MMA_K, typename FragA, typename SmemT>
-__device__ __forceinline__ void apply_dA_coeff(FragA& frag_A, SmemT const& smem, float total_cumAdt,
-                                               int prev_k, int lane) {
+template <int MAX_WINDOW_PAD_MMA_K, typename FragA>
+__device__ __forceinline__ void apply_dA_coeff(FragA& frag_A, float const* old_cumAdt,
+                                               float const* old_dt, float total_cumAdt, int prev_k,
+                                               int lane) {
   using namespace cute;
   constexpr int FRAG_A_SIZE = size(FragA{});
   static_assert((MAX_WINDOW_PAD_MMA_K == 16 && FRAG_A_SIZE == 8) ||
@@ -1156,12 +1232,11 @@ __device__ __forceinline__ void apply_dA_coeff(FragA& frag_A, SmemT const& smem,
   int const K_base = (lane % 4) * 2;
 
   if constexpr (MAX_WINDOW_PAD_MMA_K == 8) {
-    float const c0 = (K_base < prev_k)
-                         ? __expf(total_cumAdt - smem.old_cumAdt[K_base]) * smem.old_dt[K_base]
+    float const c0 =
+        (K_base < prev_k) ? __expf(total_cumAdt - old_cumAdt[K_base]) * old_dt[K_base] : 0.f;
+    float const c1 = (K_base + 1 < prev_k)
+                         ? __expf(total_cumAdt - old_cumAdt[K_base + 1]) * old_dt[K_base + 1]
                          : 0.f;
-    float const c1 = (K_base + 1 < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[K_base + 1]) *
-                                                 smem.old_dt[K_base + 1]
-                                           : 0.f;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       frag_A(i) = frag_t(toFloat(frag_A(i)) * ((i & 1) ? c1 : c0));
@@ -1171,7 +1246,7 @@ __device__ __forceinline__ void apply_dA_coeff(FragA& frag_A, SmemT const& smem,
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       int const k = K_base + (j & 1) + ((j & 2) ? 8 : 0);
-      c[j] = (k < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt[k] : 0.f;
+      c[j] = (k < prev_k) ? __expf(total_cumAdt - old_cumAdt[k]) * old_dt[k] : 0.f;
     }
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -1216,6 +1291,28 @@ __device__ __forceinline__ auto make_state_b_s2r(TiledMma const& tm) {
   }
 }
 
+// MMA A operand: dtype-aware TiledCopy.  A = C in the monolith's matmul 3
+// (always 2-byte) and A = state in the persistent main's operand-swapped OUT.1
+// (2- or 4-byte f32 cache).
+//   2-byte smem: LDSM (SM75_U32x4_LDSM_N) — vectorized 16-bit ldmatrix.
+//   4-byte smem: UniversalCopy<uint64_t> — one LDS.64 per k-adjacent float2
+//     pair (the fragment's innermost value mode).  ldmatrix cannot feed a
+//     16-bit MMA from 32-bit elements: its fixed distribution hands each lane
+//     ONE whole f32 (the tf32 fragment layout), not the k-adjacent pair the
+//     bf16 fragment wants — repairing that costs cross-lane shfl chains that
+//     exceed the LDS path.  Pairs are narrowed to bf16 in registers by
+//     `convert_frag` after the load (mirrors the B side).
+template <typename state_t, typename MmaT, typename TiledMma>
+__device__ __forceinline__ auto make_a_s2r(TiledMma const& tm) {
+  using namespace cute;
+  if constexpr (sizeof(state_t) == 2) {
+    return make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, MmaT>{}, tm);
+  } else {
+    static_assert(sizeof(state_t) == 4, "wide state path expects 4-byte smem");
+    return make_tiled_copy_A(Copy_Atom<UniversalCopy<uint64_t>, state_t>{}, tm);
+  }
+}
+
 // Src → dst fragment conversion — a strict superset of the in-place overload
 // above: supports narrowing (e.g. f32 → bf16) via a separate src fragment.
 // Three paths:
@@ -1248,8 +1345,28 @@ __device__ __forceinline__ void convert_frag(SrcFrag const& src, DstFrag& dst) {
   }
 }
 
+// Load a lane's REGS-element fragA chunk from gmem (fragA-native cb_scaled /
+// cb_old) straight into a matmul-4 A-operand fragment — one vectorized LDG, no
+// smem / LDSM / swizzle.  The two-kernel main's substitute for the monolithic's
+// LDSM of the smem-computed CB: the precompute STG'd each lane's fragA, so the
+// reverse LDG repopulates the identical fragment.  REGS = M·K/32 = K/2 (M=16):
+// m16n8k16 → 8 (LDG.128), m16n8k8 → 4 (LDG.64).  cb_head = &cb[batch_slot, head, 0].
+template <int REGS, typename input_t, typename FragCB>
+__device__ __forceinline__ void load_cb_fragA(FragCB& frag_CB, int lane,
+                                              input_t const* __restrict__ cb_head) {
+  // The fragment element is the MMA operand type (bit-compatible with input_t
+  // but a distinct C++ type — e.g. cutlass bf16 vs nv_bfloat16).  Read the gmem
+  // bytes AS that type so the per-element assignment is well-typed (no cast).
+  using frag_t = cute::remove_cvref_t<decltype(frag_CB(0))>;
+  using Pack = PackedAligned<frag_t, REGS>;
+  Pack const packed = reinterpret_cast<Pack const*>(cb_head)[lane];  // one vectorized LDG
+#pragma unroll
+  for (int e = 0; e < REGS; ++e) frag_CB(e) = packed.val[e];
+}
+
 // 2b. frag_y += CB_scaled @ x  (matmul 4, single K-tile)
-//     CB_scaled A operand loaded from swizzled smem via LDSM (precomputed by warps 0,1).
+//     CB_scaled A operand: monolithic LDSMs swizzled smem; two-kernel main does
+//     one LDG.128 via load_cb_fragA — either way frag_CB is in registers here.
 //     x B operand loaded from smem via ldmatrix.trans.
 template <typename input_t, typename MmaT, int N_TILE, int NPREDICTED_PAD_MMA_M, typename FragY,
           typename FragCB, typename SmemXTrans, typename S2RBTrans, typename S2RThrBTrans,
@@ -1338,6 +1455,19 @@ __device__ __forceinline__ void compute_z_gating(FragY& frag_y, SmemZ const& sme
   }
 }
 
+// x4 ldmatrix at a precomputed swizzled smem address (uint).  Mirrors cute's
+// SM75_U32x4_LDSM_N::copy but takes the address directly, so the caller supplies
+// a precomputed (off0 + Δk) ^ swizzle_mask offset instead of re-deriving the
+// swizzle per access (see pipelined_kloop_gemm's hand-rolled A path).
+__device__ __forceinline__ void ldmatrix_x4_addr(uint32_t addr, uint32_t& d0, uint32_t& d1,
+                                                 uint32_t& d2, uint32_t& d3) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+  asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+               : "r"(addr));
+#endif
+}
+
 // =============================================================================
 // Pipelined K-loop GEMM
 // =============================================================================
@@ -1369,7 +1499,7 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
   constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
 
   // ── S2R copies ──
-  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, MmaT>{}, tiled_mma);
+  auto s2r_A = make_a_s2r<ATypeIn, MmaT>(tiled_mma);
   auto s2r_thr_A = s2r_A.get_slice(tid);
   auto s2r_B = make_state_b_s2r<BTypeIn, MmaT>(tiled_mma);
   auto s2r_thr_B = s2r_B.get_slice(tid);
@@ -1387,12 +1517,26 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
     smem_B_s2r[n] = s2r_thr_B.partition_S(smem_B_tiled(_, _, n, _));
   }
 
+  // A staging is only live when ATypeIn is wider than MmaT (f32 state as the
+  // swapped OUT.1 A operand): the LDS.64 copy lands raw f32 pairs in FragAStg
+  // and `convert_frag` narrows them into the MMA fragment.  2-byte ATypeIn
+  // keeps the landed direct-load + in-place-convert path bit-identical (the
+  // staging arrays below are dead and eliminated).
+  constexpr bool kWideA = sizeof(ATypeIn) != sizeof(MmaT);
+
   // ── Fragment / view types ──
   using FragA = decltype(thr_mma.partition_fragment_A(smem_A_ktiled(_, _, _0{})));
   using FragB = decltype(thr_mma.partition_fragment_B(sample_smem_B_n(_, _, _0{})));
+  using a_view_t = std::conditional_t<sizeof(ATypeIn) == sizeof(MmaT), MmaT, ATypeIn>;
   using b_view_t = std::conditional_t<sizeof(BTypeIn) == sizeof(MmaT), MmaT, BTypeIn>;
+  using FragAStg = decltype(make_fragment_like<a_view_t>(std::declval<FragA>()));
   using FragBStg = decltype(make_fragment_like<b_view_t>(std::declval<FragB>()));
-  using FragAView = decltype(s2r_thr_A.retile_D(std::declval<FragA&>()));
+  // The direct A view only exists on the 2-byte path (retiling the MmaT
+  // fragment against the wide copy atom would be ill-formed) — resolve the
+  // conditional BEFORE taking the decltype so it is never instantiated.
+  using FragAView =
+      decltype(s2r_thr_A.retile_D(std::declval<std::conditional_t<kWideA, FragAStg, FragA>&>()));
+  using FragAStgView = decltype(s2r_thr_A.retile_D(std::declval<FragAStg&>()));
   using FragBStgView = decltype(s2r_thr_B.retile_D(std::declval<FragBStg&>()));
 
   // ── Multi-stage register fragments ──
@@ -1402,12 +1546,18 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
   // in-place reinterpret).
   FragA frag_A[NumStages];
   FragB frag_B[NumNTiles][NumStages];
+  FragAStg frag_A_stg[NumStages];
   FragBStg frag_B_stg[NumNTiles][NumStages];
   FragAView frag_A_view[NumStages];
+  FragAStgView frag_A_stg_view[NumStages];
   FragBStgView frag_B_stg_view[NumNTiles][NumStages];
   CUTE_UNROLL
   for (int s = 0; s < NumStages; ++s) {
-    frag_A_view[s] = s2r_thr_A.retile_D(frag_A[s]);
+    if constexpr (!kWideA) {
+      frag_A_view[s] = s2r_thr_A.retile_D(frag_A[s]);
+    } else {
+      frag_A_stg_view[s] = s2r_thr_A.retile_D(frag_A_stg[s]);
+    }
     CUTE_UNROLL
     for (int n = 0; n < NumNTiles; ++n) {
       frag_B_stg_view[n][s] = s2r_thr_B.retile_D(frag_B_stg[n][s]);
@@ -1420,31 +1570,97 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
                 "all FragY parameters must be the same type");
   FragY0* frag_y_p[NumNTiles] = {(&frag_y)...};
 
+  // ── Hand-rolled A-operand (C) LDSM source addressing ──
+  // The LDSM source for k-tile k is A_base + byteoffA[k].  byteoffA[k] is the
+  // swizzled byte offset of this lane's k-tile *relative to the C slot base* — a
+  // pure function of (lane, k): the ring-slot pointer lives in A_base (the engine
+  // .data()), not in the layout, so byteoffA is invariant across heads.  Computing
+  // it from the static swizzled layout lets LICM hoist the 8 swizzle evals out of
+  // the head loop (once per thread) instead of cute re-deriving them per access,
+  // bundled with the per-head base pointer.  recast<uint32_t> of the retiled
+  // fragment matches what cute::copy writes internally, so the dst register order
+  // is identical — only the source-address path is replaced.
+  using SwizA = decltype(get_swizzle_portion(smem_A_ktiled.layout()));
+#if defined(SSU_NO_HANDROLL_A)
+  constexpr bool kHandrollA = false;  // A/B switch: -DSSU_NO_HANDROLL_A reverts to cute::copy
+#else
+  // Hand-rolled addressing is the ldmatrix path — 2-byte A only (wide f32 A
+  // loads via the LDS.64 tiled copy below).
+  constexpr bool kHandrollA = (SwizA::num_bits > 0) && (sizeof(MmaT) == 2) && !kWideA;
+#endif
+  uint32_t const A_base = cast_smem_ptr_to_uint(raw_pointer_cast(smem_A_s2r.data()));
+  // byteoffA[k] is the stored swizzled byte offset (swizzle + offset baked in); per
+  // access we only add A_base.  Computed via the explicit closed form: off0 + Ck
+  // (compile-time k-delta) swizzled by the invariant mask X_A = (row&7)<<3 — cheap
+  // integer ALU rather than cute's per-k layout machinery.  off0_A recovered by the
+  // involution SwizA{}(swizzled) == unswizzled (Swizzle is its own inverse).
+  int const swz0_A = smem_A_s2r.layout()(make_coord(_0{}, _0{}, _0{}, _0{}));
+  int const off0_A = SwizA{}(swz0_A);
+  int const X_A = swz0_A ^ off0_A;
+  auto const plainA = get_nonswizzle_portion(smem_A_s2r.layout());
+  uint32_t byteoffA[NumKTiles];
+  CUTE_UNROLL
+  for (int k = 0; k < NumKTiles; ++k)
+    byteoffA[k] = uint32_t((off0_A + int(plainA(make_coord(_0{}, _0{}, _0{}, k)))) ^ X_A) *
+                  uint32_t(sizeof(MmaT));
+
+  // NOTE: the state (B) operand was tried with the same hand-rolled precomputed
+  // addressing (2D table, inline layout-eval, and off0+invariant-mask forms — all
+  // measured) and consistently regressed ~1-1.5us at b1024: unlike A's swizzle (a
+  // hoistable per-access recompute), B's LDSM is not the bottleneck, and the
+  // just-in-time address compute only lengthens the load→HMMA dependency chain in
+  // the software pipeline.  B stays on cute::copy.
+
   // ── Per-stage operations (slot is constant after #pragma unroll) ──
   auto load_one = [&](int k_src, int slot) {
-    cute::copy(s2r_A, smem_A_s2r(_, _, _, k_src), frag_A_view[slot]);
+    if constexpr (kHandrollA) {
+      auto rA = recast<uint32_t>(frag_A_view[slot]);
+      ldmatrix_x4_addr(A_base + byteoffA[k_src], rA(0), rA(1), rA(2), rA(3));
+#if defined(SSU_VERIFY_LDSM)
+      assert(A_base + byteoffA[k_src] ==
+             cast_smem_ptr_to_uint(&smem_A_s2r(_0{}, _0{}, _0{}, k_src)));
+#endif
+    } else if constexpr (kWideA) {
+      cute::copy(s2r_A, smem_A_s2r(_, _, _, k_src), frag_A_stg_view[slot]);
+    } else {
+      cute::copy(s2r_A, smem_A_s2r(_, _, _, k_src), frag_A_view[slot]);
+    }
     CUTE_UNROLL
     for (int n = 0; n < NumNTiles; ++n) {
       cute::copy(s2r_B, smem_B_s2r[n](_, _, _, k_src), frag_B_stg_view[n][slot]);
     }
   };
   auto convert_one = [&](int slot) {
-    convert_frag<ATypeIn, MmaT>(frag_A[slot]);
+    if constexpr (kWideA) {
+      convert_frag<ATypeIn, MmaT>(frag_A_stg[slot], frag_A[slot]);
+    } else {
+      convert_frag<ATypeIn, MmaT>(frag_A[slot]);
+    }
     CUTE_UNROLL
     for (int n = 0; n < NumNTiles; ++n) {
       convert_frag<BTypeIn, MmaT>(frag_B_stg[n][slot], frag_B[n][slot]);
     }
   };
-  auto compute_one = [&](int slot) {
-    CUTE_UNROLL
-    for (int n = 0; n < NumNTiles; ++n) {
-      cute::gemm(tiled_mma, *frag_y_p[n], frag_A[slot], frag_B[n][slot], *frag_y_p[n]);
-    }
-  };
+  // ── 2-way accumulator split (C@state, ≥2 k-tiles) ──
+  // frag_y += A[k]@B[k] is a serial chain: HMMA[k] reads HMMA[k-1]'s frag_y.
+  // Routing odd-k tiles into a second accumulator gives two independent chains → 2
+  // HMMAs in flight, filling the tensor pipe (otherwise ~10% utilized) via per-warp
+  // ILP — needed because occupancy is only ~0.95 eligible warps/cycle, too low to
+  // hide HMMA latency across warps.  Reduced into frag_y_p after the loop.  Single-
+  // k-tile matmuls have no chain to break.
+#if defined(SSU_NO_ACC_SPLIT)
+  constexpr bool kSplitAcc = false;  // A/B switch: -DSSU_NO_ACC_SPLIT keeps one accumulator
+#else
+  constexpr bool kSplitAcc = (NumKTiles >= 2);
+#endif
+  FragY0 acc2[NumNTiles];
 
   // ── Clear accumulators ──
   CUTE_UNROLL
-  for (int n = 0; n < NumNTiles; ++n) clear(*frag_y_p[n]);
+  for (int n = 0; n < NumNTiles; ++n) {
+    clear(*frag_y_p[n]);
+    if constexpr (kSplitAcc) clear(acc2[n]);
+  }
 
   // ── Prologue: load + convert stages 0..NumStages-2 ──
   CUTE_UNROLL
@@ -1460,8 +1676,31 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
     int const slot_load = k_load % NumStages;
     int const slot_compute = k % NumStages;
     if (k_load < NumKTiles) load_one(k_load, slot_load);
-    compute_one(slot_compute);
+    CUTE_UNROLL
+    for (int n = 0; n < NumNTiles; ++n) {
+      if constexpr (kSplitAcc) {
+        // (k & 1) folds at compile time (loop fully unrolled) → one static
+        // accumulator per tile; even→frag_y, odd→acc2 are independent chains.
+        if (k & 1)
+          cute::gemm(tiled_mma, acc2[n], frag_A[slot_compute], frag_B[n][slot_compute], acc2[n]);
+        else
+          cute::gemm(tiled_mma, *frag_y_p[n], frag_A[slot_compute], frag_B[n][slot_compute],
+                     *frag_y_p[n]);
+      } else {
+        cute::gemm(tiled_mma, *frag_y_p[n], frag_A[slot_compute], frag_B[n][slot_compute],
+                   *frag_y_p[n]);
+      }
+    }
     if (k_load < NumKTiles) convert_one(slot_load);
+  }
+
+  // ── Reduce the odd-k accumulator into frag_y_p ──
+  if constexpr (kSplitAcc) {
+    CUTE_UNROLL
+    for (int n = 0; n < NumNTiles; ++n) {
+      CUTE_UNROLL
+      for (int i = 0; i < cute::size(*frag_y_p[n]); ++i) (*frag_y_p[n])(i) += acc2[n](i);
+    }
   }
 }
 
@@ -1477,7 +1716,8 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
 template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
           typename TiledMma, typename ThrMma, typename... FragY>
 __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& tiled_mma,
-                                             ThrMma const& thr_mma, int tid, FragY&... frag_y) {
+                                             ThrMma const& thr_mma, int tid, int state_buf,
+                                             FragY&... frag_y) {
   using namespace cute;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
@@ -1502,11 +1742,114 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
 
   // Swizzle layout matches the dtype of the buffer being viewed.
   auto const layout_state_swz = make_swizzled_layout_rc<BTypeIn, D_PER_CTA, DSTATE>();
-  state_view_t const* smem_state_ptr = reinterpret_cast<state_view_t const*>(smem.state);
+  // state_buf selects the double-buffered slot; offset in state_t units before the view cast.
+  state_view_t const* smem_state_ptr = reinterpret_cast<state_view_t const*>(
+      reinterpret_cast<state_t const*>(smem.state) + state_buf * D_PER_CTA * DSTATE);
   Tensor smem_state = make_tensor(make_smem_ptr(smem_state_ptr), layout_state_swz);
 
   pipelined_kloop_gemm<3, NUM_K_TILES, input_t, BTypeIn, MMA_prop::operand_t>(
       tiled_mma, thr_mma, tid, smem_C_ktiled, smem_state, frag_y...);
+}
+
+// ── Matmul 3 (OPERAND SWAP): init_out^T = state @ C^T ────────────────────────
+// frag_y[d, t] = Σ_n state[d,n]·C[t,n].  A = state (K-major smem; 2-byte via
+// LDSM, 4-byte f32 via LDS.64 — dispatched inside pipelined_kloop_gemm by
+// make_a_s2r), B = C (aliased swizzled view, LDSM_N, broadcast across the
+// M-warps).  The monolith counterpart of the main's add_init_out_main; the
+// caller's tiled_mma splits M = D_PER_CTA across warps (Shape<M_WARPS, 1>).
+// NumStages = 2 (not the main's 3): the monolith's register context is fatter
+// (replay + CB compute inline, no maxnreg cap), and the f32 wide-A staging at
+// depth 3 (3×8 f32 + 3×4 u32 per thread) tips it over — depth 2 halves that.
+template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
+          typename TiledMma, typename ThrMma, typename... FragY>
+__device__ __forceinline__ void add_init_out_swapped(SmemT const& smem, TiledMma const& tiled_mma,
+                                                     ThrMma const& thr_mma, int tid, int state_buf,
+                                                     FragY&... frag_y) {
+  using namespace cute;
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
+  constexpr int NUM_K_TILES = DSTATE / K_TILE;
+  constexpr int M_TILE = cute::tile_size<0>(TiledMma{});
+  static_assert(sizeof(state_t) != 1, "8-bit state goes through the dedicated 8-bit kernel");
+  using AView = std::conditional_t<sizeof(state_t) == 2, MMA_prop::operand_t, state_t>;
+  auto const layout_state = make_swizzled_layout_rc<AView, D_PER_CTA, DSTATE>();
+  Tensor smem_state = make_tensor(
+      make_smem_ptr(reinterpret_cast<AView const*>(reinterpret_cast<state_t const*>(smem.state) +
+                                                   state_buf * D_PER_CTA * DSTATE)),
+      layout_state);
+  Tensor smem_state_ktiled =
+      local_tile(smem_state, make_tile(Int<M_TILE>{}, Int<K_TILE>{}), make_coord(_0{}, _));
+  auto const layout_C =
+      make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, DSTATE, SmemT::NPREDICTED>();
+  Tensor smem_C =
+      make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.C)), layout_C);
+  pipelined_kloop_gemm<2, NUM_K_TILES, state_t, input_t, MMA_prop::operand_t>(
+      tiled_mma, thr_mma, tid, smem_state_ktiled, smem_C, frag_y...);
+}
+
+// ── OPERAND-SWAP output helpers ([DIM,NPRED]) ────────────────────────────────
+// x / old_x are the A-operands (transpose ldmatrix from the [token,d] smem via the [d,token]
+// view); CB / CB_old are the B-operands (fragB, in registers).  Kept separate from the shared
+// add_cb_x / add_D_skip / compute_z_gating (the 8-bit kernel still uses those, unswapped).
+
+// OUT.2/3 (swap): frag_y[d,t] += Σ_c operand[c,d]·CB[t,c].  A = operand [M=d, K=c] via transpose
+// LDSM (operand smem is [token,d]; smem_trans is the [d,token] view), B = CB (fragB).  Single
+// K-tile (K = NPREDICTED_PAD_MMA_M for new, MAX_WINDOW_PAD_MMA_K for old).  n = output N-tile (t).
+template <typename MmaT, int M_TILE, int K_CONTRACT, typename FragY, typename FragCB,
+          typename SmemTrans, typename S2RA, typename S2RThrA, typename ThrMma, typename TiledMma>
+__device__ __forceinline__ void add_cbx_swapped(FragY& frag_y, FragCB const& frag_CB,
+                                                SmemTrans const& smem_trans, S2RA const& s2r_A,
+                                                S2RThrA const& s2r_thr_A, ThrMma const& thr_mma,
+                                                TiledMma const& tiled_mma, int n) {
+  using namespace cute;
+  Tensor a_tile =
+      local_tile(smem_trans, make_tile(Int<M_TILE>{}, Int<K_CONTRACT>{}), make_coord(_0{}, _0{}));
+  auto a_s2r = s2r_thr_A.partition_S(a_tile);
+  auto frag_A = thr_mma.partition_fragment_A(
+      make_tensor((MmaT*)0x0, make_shape(Int<M_TILE>{}, Int<K_CONTRACT>{})));
+  auto frag_A_view = s2r_thr_A.retile_D(frag_A);
+  cute::copy(s2r_A, a_s2r, frag_A_view);
+  // frag_CB is the caller's pre-selected output-N-tile B-fragment (frag_CB_new[n]/frag_CB_old[n]);
+  // x (frag_A) is the same for all output N-tiles, so n only selects which t-tile accumulates here.
+  (void)n;
+  cute::gemm(tiled_mma, frag_y, frag_A, frag_CB, frag_y);
+}
+
+// OUT.4 (swap): frag_y[d,t] += D·x[t,d].  Read x at the output (d,t) via the transpose view
+// smem_x_trans[d,token] (== x[token,d]).  Scalar: adjacent frag elems are adjacent tokens (strided
+// by out_stride_token / D_SMEM_COLS), so no float2.
+template <typename input_t, int M_TILE, int N_TILE, typename FragY, typename SmemXTrans,
+          typename ThrMma>
+__device__ __forceinline__ void add_D_skip_swapped(FragY& frag_y, SmemXTrans const& smem_x_trans,
+                                                   ThrMma const& thr_mma, float D_val, int n) {
+  using namespace cute;
+  static_assert(sizeof(input_t) == 2, "swapped D_skip requires 2-byte input_t");
+  if (D_val == 0.f) return;
+  Tensor x_tile =
+      local_tile(smem_x_trans, make_tile(Int<M_TILE>{}, Int<N_TILE>{}), make_coord(_0{}, n));
+  Tensor x_part = thr_mma.partition_C(x_tile);
+#pragma unroll
+  for (int i = 0; i < size(frag_y); ++i) frag_y(i) += D_val * static_cast<float>(x_part(i));
+}
+
+// z-gate (swap): frag_y[d,t] *= z·sigmoid(z), z read at (d,t) via smem_z_trans[d,token].  Scalar.
+template <typename input_t, int M_TILE, int N_TILE, typename FragY, typename SmemZTrans,
+          typename ThrMma>
+__device__ __forceinline__ void compute_z_gating_swapped(FragY& frag_y,
+                                                         SmemZTrans const& smem_z_trans,
+                                                         ThrMma const& thr_mma, void const* z_ptr,
+                                                         int n) {
+  using namespace cute;
+  static_assert(sizeof(input_t) == 2, "swapped z-gate requires 2-byte input_t");
+  if (!z_ptr) return;
+  Tensor z_tile =
+      local_tile(smem_z_trans, make_tile(Int<M_TILE>{}, Int<N_TILE>{}), make_coord(_0{}, n));
+  Tensor z_part = thr_mma.partition_C(z_tile);
+#pragma unroll
+  for (int i = 0; i < size(frag_y); ++i) {
+    float const z = static_cast<float>(z_part(i));
+    frag_y(i) *= z * __fdividef(1.f, (1.f + __expf(-z)));
+  }
 }
 
 // store_state: vectorized smem → gmem state writeback (128 threads).
@@ -1518,28 +1861,38 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
 template <typename state_t, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void store_state(SmemT& smem, CheckpointingSsuParams const& params,
                                             int warp, int lane, int d_tile, int head,
-                                            int64_t cache_slot) {
+                                            int64_t cache_slot, int state_buf = 0) {
   using namespace cute;
-  int const flat_tid = warp * warpSize + lane;
+  static_assert(D_PER_CTA % NUM_WARPS == 0, "D_PER_CTA must be divisible by NUM_WARPS");
+  constexpr int DIM_PER_WARP = D_PER_CTA / NUM_WARPS;
+  static_assert(DIM_PER_WARP % 4 == 0,
+                "DIM_PER_WARP (D_PER_CTA/NUM_WARPS) must be a multiple of 4 for the (4,8) store");
   auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
   // gmem dest = head's full state base + d_tile's row slice.
-  int64_t const state_base = cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE +
-                             (int64_t)d_tile * D_PER_CTA * DSTATE;
+  int64_t const state_base = cache_slot * params.state_stride_seq +
+                             (int64_t)(head * DIM * DSTATE + d_tile * D_PER_CTA * DSTATE);
 
-  // ── Per-CTA smem swizzle layout [D_PER_CTA, DSTATE]. ──
+  // Per-warp D-slice store — the exact inverse of load_state_per_warp: each warp writes its
+  // own DIM_PER_WARP rows with a 32-thread (4,8) copy, so ALL NUM_WARPS warps participate
+  // (symmetric with the load; no 128-thread cap, no idle warps).  NUM_WARPS=4 → 16 rows/warp
+  // (byte-identical gmem result to the old cooperative copy); 8 → 8 rows/warp.
   auto layout_smem_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
-  state_t const* smem_state_base = reinterpret_cast<state_t const*>(smem.state);
-
-  Tensor sState = make_tensor(make_smem_ptr(smem_state_base), layout_smem_swz);
-  Tensor gState = make_tensor(make_gmem_ptr(state_w + state_base),
-                              make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
-                                          make_stride(Int<DSTATE>{}, Int<1>{})));
+  Tensor sState_full = make_tensor(
+      make_smem_ptr(reinterpret_cast<state_t const*>(smem.state) + state_buf * D_PER_CTA * DSTATE),
+      layout_smem_swz);
+  Tensor gState_full = make_tensor(make_gmem_ptr(state_w + state_base),
+                                   make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
+                                               make_stride(Int<DSTATE>{}, Int<1>{})));
+  Tensor sState = local_tile(sState_full, make_shape(Int<DIM_PER_WARP>{}, Int<DSTATE>{}),
+                             make_coord(warp, _0{}));
+  Tensor gState = local_tile(gState_full, make_shape(Int<DIM_PER_WARP>{}, Int<DSTATE>{}),
+                             make_coord(warp, _0{}));
   // Each store is 16 bytes — adjust val cols to the dtype.
   constexpr int VAL_COLS = Copy_prop::vec_bytes / sizeof(state_t);
   auto s2g =
       make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, state_t>{},
-                      Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<VAL_COLS>>>{});
-  auto thr = s2g.get_slice(flat_tid);
+                      Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<VAL_COLS>>>{});
+  auto thr = s2g.get_slice(lane);
   copy(s2g, thr.partition_S(sState), thr.partition_D(gState));
 }
 
@@ -1550,16 +1903,21 @@ __device__ __forceinline__ void store_state(SmemT& smem, CheckpointingSsuParams 
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, typename SmemT>
 __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams const& params,
                                             int warp, int lane, int d_tile, int head,
-                                            int64_t cache_slot, int write_offset, int seq_len) {
+                                            int64_t cache_slot, int ring_start, int write_offset,
+                                            int seq_len, int tile_buf = 0) {
   using namespace cute;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   int const flat_tid = warp * warpSize + lane;
 
-  auto* __restrict__ old_x_w = reinterpret_cast<input_t*>(params.old_x);
-  // gmem dest = head's full slot + d_tile's D-slice offset, shifted by
-  // `write_offset` along the T-axis (must_checkpoint ? 0 : prev_k).
-  int64_t const ox_w_base = cache_slot * params.old_x_stride_seq +
-                            (int64_t)write_offset * params.old_x_stride_token + head * DIM +
+  auto* __restrict__ old_x_w = reinterpret_cast<input_t*>(params.x_cache);
+  // gmem dest = ring rows (ring_start + write_offset + i) % RING_BUFFER_LEN;
+  // write_offset is the LOGICAL append offset (= prev_k on both branches —
+  // a flush only advances ring_start, host-side, after the call).
+  int r0 = ring_start + write_offset;
+  if (r0 >= params.ring_buffer_len) r0 -= params.ring_buffer_len;
+  int const n1 = params.ring_buffer_len - r0 >= seq_len ? seq_len : params.ring_buffer_len - r0;
+  int64_t const ox_w_base = cache_slot * params.x_cache_stride_seq +
+                            (int64_t)head * params.x_cache_stride_head +
                             (int64_t)d_tile * D_PER_CTA;
 
   // Smem and gmem are both viewed at the full atom-padded width D_SMEM_COLS.
@@ -1573,29 +1931,44 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams 
   // next d_tile / next head's gmem region.
   constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
   auto layout_x_swz = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS>();
-  Tensor sX = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.x)), layout_x_swz);
-  Tensor gX = make_tensor(make_gmem_ptr(old_x_w + ox_w_base),
-                          make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<D_SMEM_COLS>{}),
-                                      make_stride(params.old_x_stride_token, Int<1>{})));
+  auto const* x_base = smem.x + tile_buf * NPREDICTED_PAD_MMA_M * D_SMEM_COLS;
+  Tensor sX = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(x_base)), layout_x_swz);
 
+  // Wide layout (16×8 threads): uses all 128 threads for maximum STG.128 bandwidth.
+  // UniversalCopy<uint128_t> has no .with(bool) → copy_if falls back to software predication
+  // at copy_atom.hpp:149, which produces 4-way LDS.128 bank conflicts (Swizzle<3,3,3> is
+  // designed for ldmatrix, not plain LDS.128, and 4 rows-per-warp always hit the same 8 bank
+  // groups).  The conflicts are intentional: switching to ldmatrix would require a full
+  // MMA-layout writeback and lose the wide STG.128 path.  NCU will show excess wavefronts here.
   using ThrLayoutX = Layout<Shape<_16, _8>, Stride<_8, _1>>;
   auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{}, ThrLayoutX{},
                              Layout<Shape<_1, _8>>{});
   auto thr_s2g = s2g.get_slice(flat_tid);
-
   auto tSsX = thr_s2g.partition_S(sX);
-  auto tSgX = thr_s2g.partition_D(gX);
-
-  // Per-(row, col) predicate: skip rows ≥ NPREDICTED (m-padding) and cols ≥
-  // D_PER_CTA (atom-padding past the d_tile's data).
   auto cX = make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<D_SMEM_COLS>{}));
   auto tScX = thr_s2g.partition_D(cX);
-  auto pred = make_tensor<bool>(shape(tScX));
+
+  // Two disjoint-row segments cover the ring wrap: smem rows [0, n1) land at
+  // ring rows r0+…, rows [n1, seq_len) at ring rows 0+… (base − n1·stride).
+  int const seg_lo[2] = {0, n1};
+  int const seg_hi[2] = {n1, seq_len};
+  int64_t const seg_base[2] = {(int64_t)r0, -(int64_t)n1};
   CUTE_UNROLL
-  for (int i = 0; i < size(pred); ++i) {
-    pred(i) = (get<0>(tScX(i)) < seq_len) && (get<1>(tScX(i)) < D_PER_CTA);
+  for (int sg = 0; sg < 2; ++sg) {
+    if (seg_lo[sg] >= seg_hi[sg]) continue;
+    Tensor gX =
+        make_tensor(make_gmem_ptr(old_x_w + ox_w_base + seg_base[sg] * params.x_cache_stride_pos),
+                    make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<D_SMEM_COLS>{}),
+                                make_stride(params.x_cache_stride_pos, Int<1>{})));
+    auto tSgX = thr_s2g.partition_D(gX);
+    auto pred = make_tensor<bool>(shape(tScX));
+    CUTE_UNROLL
+    for (int i = 0; i < size(pred); ++i) {
+      pred(i) = (get<0>(tScX(i)) >= seg_lo[sg]) && (get<0>(tScX(i)) < seg_hi[sg]) &&
+                (get<1>(tScX(i)) < D_PER_CTA);
+    }
+    copy_if(s2g, pred, tSsX, tSgX);
   }
-  copy_if(s2g, pred, tSsX, tSgX);
 }
 
 // store_old_B runs on W0, W1 only (64 threads).  Caller must gate
@@ -1604,7 +1977,7 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams 
 // overlap (writeback fires before CB+replay consume smem.B).
 //
 // Source: smem.B with NPREDICTED_PAD_MMA_N rows.
-// Destination: gmem old_B[buf_write][write_offset:write_offset+NPREDICTED, :].
+// Destination: B_cache ring rows (ring_start + write_offset + i) % RING_BUFFER_LEN.
 // The `write_offset` argument shifts the gmem T-axis base — it's added to the
 // base pointer below; the per-element predicate masks rows ≥ NPREDICTED.
 //
@@ -1617,7 +1990,7 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams 
 template <typename input_t, int NPREDICTED, int DSTATE, int HEADS_PER_GROUP, typename SmemT>
 __device__ __forceinline__ void store_old_B(SmemT& smem, CheckpointingSsuParams const& params,
                                             int warp, int lane, int head, int group_idx,
-                                            int64_t cache_slot, int buf_write, int write_offset,
+                                            int64_t cache_slot, int ring_start, int write_offset,
                                             int seq_len) {
   using namespace cute;
   if (head % HEADS_PER_GROUP != 0) return;
@@ -1625,45 +1998,45 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, CheckpointingSsuParams 
   // Called only from warps 0, 1 — flat_tid ∈ [0, 64).
   int const flat_tid = warp * warpSize + lane;
 
-  auto* __restrict__ old_B_w = reinterpret_cast<input_t*>(params.old_B);
-  int64_t const oB_base = cache_slot * params.old_B_stride_seq +
-                          buf_write * params.old_B_stride_dbuf +
-                          (int64_t)write_offset * params.old_B_stride_token + group_idx * DSTATE;
+  auto* __restrict__ old_B_w = reinterpret_cast<input_t*>(params.B_cache);
+  int r0 = ring_start + write_offset;
+  if (r0 >= params.ring_buffer_len) r0 -= params.ring_buffer_len;
+  int const n1 = params.ring_buffer_len - r0 >= seq_len ? seq_len : params.ring_buffer_len - r0;
+  int64_t const oB_base =
+      cache_slot * params.B_cache_stride_seq + (int64_t)group_idx * params.B_cache_stride_group;
 
   auto layout_B_swz = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_N, DSTATE>();
   Tensor sB = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.B)), layout_B_swz);
-  Tensor gB = make_tensor(make_gmem_ptr(old_B_w + oB_base),
-                          make_layout(make_shape(Int<NPREDICTED_PAD_MMA_N>{}, Int<DSTATE>{}),
-                                      make_stride(params.old_B_stride_token, Int<1>{})));
 
   // 64 threads, (8, 8) × (1, 8) = atom-aligned per-tile (8, 64).
   auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{},
                              Layout<Shape<_8, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
   auto thr_s2g = s2g.get_slice(flat_tid);
   auto tSsB = thr_s2g.partition_S(sB);
-  auto tSgB = thr_s2g.partition_D(gB);
-
-  // Fast path: no smem-side row padding AND no varlen-side truncation.
-  // The runtime `seq_len == NPREDICTED` is a constexpr-foldable compare in
-  // the non-varlen path (kernel prologue assigns `seq_len = NPREDICTED`),
-  // so it eliminates at -O3.  In varlen with `seq_len == NPREDICTED` it's
-  // a runtime check that picks the cheaper unpredicated STG.
-  if constexpr (NPREDICTED == NPREDICTED_PAD_MMA_N) {
-    if (seq_len == NPREDICTED) {
-      copy(s2g, tSsB, tSgB);
-      return;
-    }
-  }
-  // Predicated: either smem rows > NPREDICTED (m-padding) OR varlen with
-  // seq_len < NPREDICTED.  Mask each iter against `seq_len`.
   auto cB = make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_N>{}, Int<DSTATE>{}));
   auto tScB = thr_s2g.partition_D(cB);
-  auto pred = make_tensor<bool>(shape(tScB));
+
+  // Two disjoint-row segments cover the ring wrap (see store_old_x).  The
+  // pre-ring seq_len == NPREDICTED unpredicated fast path is subsumed: the
+  // no-wrap case is a single predicated pass with rows [0, seq_len).
+  int const seg_lo[2] = {0, n1};
+  int const seg_hi[2] = {n1, seq_len};
+  int64_t const seg_base[2] = {(int64_t)r0, -(int64_t)n1};
   CUTE_UNROLL
-  for (int i = 0; i < size(pred); ++i) {
-    pred(i) = get<0>(tScB(i)) < seq_len;
+  for (int sg = 0; sg < 2; ++sg) {
+    if (seg_lo[sg] >= seg_hi[sg]) continue;
+    Tensor gB =
+        make_tensor(make_gmem_ptr(old_B_w + oB_base + seg_base[sg] * params.B_cache_stride_pos),
+                    make_layout(make_shape(Int<NPREDICTED_PAD_MMA_N>{}, Int<DSTATE>{}),
+                                make_stride(params.B_cache_stride_pos, Int<1>{})));
+    auto tSgB = thr_s2g.partition_D(gB);
+    auto pred = make_tensor<bool>(shape(tScB));
+    CUTE_UNROLL
+    for (int i = 0; i < size(pred); ++i) {
+      pred(i) = (get<0>(tScB(i)) >= seg_lo[sg]) && (get<0>(tScB(i)) < seg_hi[sg]);
+    }
+    copy_if(s2g, pred, tSsB, tSgB);
   }
-  copy_if(s2g, pred, tSsB, tSgB);
 }
 
 }  // namespace flashinfer::mamba::checkpointing

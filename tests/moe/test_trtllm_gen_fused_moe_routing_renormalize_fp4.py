@@ -1,3 +1,9 @@
+# NOTE for future contributors (incl. AI agents): keep this file lean. Randomized
+# breadth (shapes, token counts) belongs in tests/moe/test_unified_moe_fuzz.py --
+# extend its axes/adapters. This file exists for the quant x routing x layout
+# kernel-selection matrix and for paths the fuzzer cannot express; add cases only
+# as deliberate regression anchors.
+
 """
 Copyright (c) 2025 by FlashInfer team.
 
@@ -29,6 +35,8 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     RENORMALIZE_ZERO_HIDDEN_STATES,
     run_moe_test,
 )
+
+pytestmark = pytest.mark.long_running
 
 
 @pytest.fixture(scope="module")

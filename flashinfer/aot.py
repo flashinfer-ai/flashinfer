@@ -35,23 +35,27 @@ from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit.activation import act_func_def_str, gen_act_and_mul_module
 from .jit.attention import (
-    gen_batch_attention_module,
     gen_batch_decode_module,
     gen_batch_mla_module,
     gen_batch_prefill_module,
     gen_cudnn_fmha_module,
     gen_fmha_cutlass_sm100a_module,
-    gen_single_decode_module,
-    gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
     gen_trtllm_fmha_v2_sm120_module,
 )
+from .jit.attention.modules import (
+    _gen_batch_attention_primary_module,
+    _gen_batch_prefill_primary_module,
+)
+from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
+from .jit.cake_fmha import gen_cake_fmha_compat_module
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
     gen_fp4_quantization_sm90_module,
     gen_fp4_quantization_sm100_module,
     gen_fp4_quantization_sm103_module,
+    gen_fp4_quantization_sm107_module,
     gen_fp4_quantization_sm110_module,
     gen_fp4_quantization_sm120_module,
     gen_fp4_quantization_sm120f_module,
@@ -59,25 +63,82 @@ from .jit.fp4_quantization import (
 )
 from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
+from .jit.blackwell_msa import (
+    BLACKWELL_MSA_VARIANTS_BY_TARGET,
+    BlackwellMSATarget,
+    gen_blackwell_msa_module,
+)
+from .jit.cake_kda import (
+    CAKE_KDA_AFFINE_ROLES,
+    CakeKDATarget,
+    cake_kda_affine_is_available,
+    gen_cake_kda_affine_module,
+    gen_cake_kda_m128_unbounded_softplus_module,
+)
+from .jit.cake_kda_decode import (
+    CAKE_KDA_DECODE_DIRECT_VARIANTS,
+    gen_cake_kda_decode_module,
+)
+from .jit.flash_kda import (
+    GeneratedFlashKDATarget,
+    gen_flash_kda_generated_module,
+    gen_flash_kda_m128_n16_checkpoint_module,
+    get_flash_kda_generated_variant_ids,
+)
+from .jit.flash_kda_decode import (
+    FLASH_KDA_DECODE_DIRECT_VARIANTS,
+    FLASH_KDA_DECODE_VARIANTS,
+    gen_flash_kda_decode_module,
+)
+from .jit.cake_flash_kda_packed_t1 import (
+    FLASH_KDA_PACKED_T1_VARIANTS,
+    gen_flash_kda_packed_t1_module,
+)
+from .jit.cake_kda_packed_t1 import (
+    CAKE_KDA_PACKED_T1_VARIANTS,
+    gen_cake_kda_packed_t1_module,
+)
+from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.cudnn_frost import FROST_DTYPES, gen_cudnn_frost_moe_module
 from .jit.fused_moe import (
+    gen_alphamoe_fused_router_module,
+    gen_alphamoe_sm100_module,
+    gen_alphamoe_nvfp4_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm120_module,
     gen_trtllm_gen_fused_moe_sm100_module,
+    gen_trtllm_gen_routing_module,
 )
-from .jit.bgmv_moe import gen_bgmv_moe_module
-from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
+from .jit.cake_fused_moe_warp_decode import (
+    gen_cake_fused_moe_warp_decode_module,
+)
+from .jit.bgmv_moe import (
+    BGMV_MOE_SUPPORTED_MAJOR_VERSIONS,
+    gen_bgmv_moe_module,
+)
+from .jit.cake_bgmv_moe import (
+    CAKE_BGMV_MOE_DTYPES,
+    CAKE_BGMV_MOE_GENERIC_RANKS,
+    CAKE_BGMV_MOE_HIDDEN_SIZES,
+    gen_cake_bgmv_moe_generic_module,
+    gen_cake_bgmv_moe_module,
+)
+from .jit.monomoe import gen_monomoe_module
+from .jit.cute_sm12x_gemm import gen_gemm_sm120_module_cute
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_module,
     gen_gemm_sm90_module,
     gen_gemm_sm100_module,
     gen_gemm_sm100_module_cutlass_fp4,
+    gen_gemm_sm100_module_cutlass_nvfp4_svdquant,
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_cutlass_mxfp8,
+    gen_gemm_sm103_module_cutlass_fp4,
     gen_gemm_sm120_module,
     gen_gemm_sm120_module_cutlass_fp4,
     gen_mm_bf16_cublaslt_module,
@@ -85,13 +146,52 @@ from .jit.gemm import (
     gen_tgv_gemm_sm10x_module,
     gen_trtllm_gen_gemm_module,
     gen_trtllm_low_latency_gemm_module,
+    gen_blackwell_bf16_bmm_module,
+)
+from .jit.gemm.cake_blackwell_bf16_bmm import BlackwellBf16BmmTarget
+from .jit.gemm.cake_grouped_fp8_gemm import (
+    MODULES as CAKE_GROUPED_FP8_GEMM_MODULES,
+    gen_cake_grouped_fp8_gemm_module,
+)
+from .jit.gemm.cake_grouped_fp8_fused_silu_quant import (
+    MODULES as CAKE_GROUPED_FP8_FUSED_SILU_QUANT_MODULES,
+    gen_cake_grouped_fp8_fused_silu_quant_module,
 )
 from .jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
 )
+from .jit.mamba.cake_selective_state_update import (
+    gen_cake_selective_state_update_modules,
+)
 from .jit.mhc import gen_mhc_module
-from .jit.mla import gen_mla_module, gen_sparse_mla_sm120_module
+from .jit.cake_minimax_h3_mxfp8 import (
+    MiniMaxH3Mxfp8Target,
+    gen_minimax_h3_mxfp8_aot_modules,
+)
+from .jit.cake_minimax_h3_nvfp4 import (
+    MiniMaxH3Nvfp4Target,
+    gen_minimax_h3_nvfp4_aot_modules,
+)
+from .jit.cake_minimax_h3_qkv_pack import (
+    MiniMaxH3QkvPackTarget,
+    gen_minimax_h3_qkv_pack_aot_modules,
+)
+from .jit.mla import (
+    gen_mla_module,
+    gen_sparse_mla_sm120_module,
+)
+from .jit.cake_sparse_mla_sm120_dsv4_nvfp4 import (
+    gen_cake_sparse_mla_sm120_dsv4_nvfp4_module,
+)
+from .jit.cake_dsv4_nvfp4_rope_insert import (
+    cake_dsv4_nvfp4_rope_insert_available,
+    gen_cake_dsv4_nvfp4_rope_insert_module,
+)
+from .jit.cake_sparse_mla_sm120_dsv41_mixed import (
+    cake_sparse_mla_sm120_dsv41_mixed_available,
+    gen_cake_sparse_mla_sm120_dsv41_mixed_module,
+)
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
@@ -105,11 +205,14 @@ from .jit.rmsnorm_silu import (
 from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
 from .jit.rope import gen_rope_module
+from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
+from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
+from .jit.cake_sampling import gen_cake_sampling_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
@@ -120,26 +223,14 @@ def gen_fa2(
     head_dim_vo: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    prefill_only: bool = False,
 ) -> Iterator[JitSpec]:
     if dtype_qo.itemsize == dtype_kv.itemsize and dtype_qo != dtype_kv:
         return
     if dtype_qo.itemsize == 1:
         return  # fp8 tensor cores not supported in fa2
 
-    yield gen_single_prefill_module(
-        backend="fa2",
-        dtype_q=dtype_qo,
-        dtype_kv=dtype_kv,
-        dtype_o=dtype_qo,
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        pos_encoding_mode=0,
-        use_sliding_window=use_sliding_window,
-        use_logits_soft_cap=use_logits_soft_cap,
-        use_fp16_qk_reduction=False,
-    )
-
-    yield gen_batch_prefill_module(
+    yield _gen_batch_prefill_primary_module(
         backend="fa2",
         dtype_q=dtype_qo,
         dtype_kv=dtype_kv,
@@ -153,28 +244,18 @@ def gen_fa2(
         use_fp16_qk_reduction=False,
     )
 
-    yield gen_single_decode_module(
-        dtype_q=dtype_qo,
-        dtype_kv=dtype_kv,
-        dtype_o=dtype_qo,
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        pos_encoding_mode=0,
-        use_sliding_window=use_sliding_window,
-        use_logits_soft_cap=use_logits_soft_cap,
-    )
-
-    yield gen_batch_decode_module(
-        dtype_q=dtype_qo,
-        dtype_kv=dtype_kv,
-        dtype_o=dtype_qo,
-        dtype_idx=torch.int32,
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        pos_encoding_mode=0,
-        use_sliding_window=use_sliding_window,
-        use_logits_soft_cap=use_logits_soft_cap,
-    )
+    if not prefill_only:
+        yield gen_batch_decode_module(
+            dtype_q=dtype_qo,
+            dtype_kv=dtype_kv,
+            dtype_o=dtype_qo,
+            dtype_idx=torch.int32,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            pos_encoding_mode=0,
+            use_sliding_window=use_sliding_window,
+            use_logits_soft_cap=use_logits_soft_cap,
+        )
 
 
 def gen_fa3(
@@ -220,20 +301,24 @@ def gen_attention(
     use_logits_soft_cap_: List[bool],
     has_sm90: bool,
     has_sm100: bool,
+    has_sm103: bool,
     add_gemma: bool,
     add_oai_oss: bool,
 ) -> Iterator[JitSpec]:
     head_dim_ckv = 512
     head_dim_kpe = 64
 
-    # head_dim > 256 FA2 modules are SM100+-only; skip them entirely when no
-    # SM100+ architecture is being targeted.
+    # For 16-bit and FP8 KV, head_dim > 256 FA2 modules use the Ampere+
+    # large-head path. NVFP4 KV large-head is validated for FA2 batch prefill
+    # on SM8+, while NVFP4 decode remains SM100+-only.
     from .jit.core import current_compilation_context
 
-    has_sm100_or_newer = any(
+    has_sm8_or_newer = any(
+        major >= 8 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+    )
+    has_sm10_or_newer = any(
         major >= 10 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
     )
-
     # FA2 MHA / MQA / GQA
     for (
         (head_dim_qk, head_dim_vo),
@@ -248,7 +333,9 @@ def gen_attention(
         use_sliding_window_,
         use_logits_soft_cap_,
     ):
-        if (head_dim_qk > 256 or head_dim_vo > 256) and not has_sm100_or_newer:
+        large_head = head_dim_qk > 256 or head_dim_vo > 256
+        nvfp4_large_head = large_head and _is_nvfp4_kv_dtype(dtype_kv)
+        if large_head and not has_sm8_or_newer:
             continue
         yield from gen_fa2(
             dtype_qo=dtype_qo,
@@ -257,11 +344,12 @@ def gen_attention(
             head_dim_vo=head_dim_vo,
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
+            prefill_only=nvfp4_large_head and not has_sm10_or_newer,
         )
         # The holistic (persistent) batch-attention kernel
         # does not support head_dim=512.
         if head_dim_qk <= 256 and head_dim_vo <= 256:
-            yield gen_batch_attention_module(
+            yield _gen_batch_attention_primary_module(
                 dtype_q=dtype_qo,
                 dtype_kv=dtype_kv,
                 dtype_o=dtype_qo,
@@ -343,7 +431,7 @@ def gen_attention(
         from .jit.attention import gen_batch_prefill_attention_sink_module
 
         for dtype in f16_dtype_:
-            for backend in ["fa2", "fa3"]:
+            for backend in ["fa2"] + (["fa3"] if has_sm90 else []):
                 for use_swa in [True, False]:
                     yield gen_batch_prefill_attention_sink_module(
                         backend=backend,
@@ -359,7 +447,7 @@ def gen_attention(
 
     # fmha_cutlass_sm100a
     # NOTE: currently there's only one uri.
-    if has_sm100:
+    if has_sm100 or has_sm103:
         yield gen_fmha_cutlass_sm100a_module(
             dtype_q=torch.bfloat16,
             dtype_kv=torch.bfloat16,
@@ -392,7 +480,7 @@ def gen_attention(
             )
 
     # MLA SM100
-    if has_sm100:
+    if has_sm100 or has_sm103:
         yield gen_mla_module()
 
 
@@ -405,11 +493,12 @@ def gen_xqa(
     use_sliding_window_: List[bool],
     has_sm90: bool,
     has_sm100: bool,
+    has_sm103: bool,
     has_sm120: bool,
     has_sm121: bool,
 ) -> Iterator[JitSpec]:
     """Generate XQA modules for various configurations."""
-    if not has_sm90 and not has_sm100 and not has_sm120 and not has_sm121:
+    if not any((has_sm90, has_sm100, has_sm103, has_sm120, has_sm121)):
         return  # XQA requires SM90+
 
     for (
@@ -460,6 +549,39 @@ def gen_xqa(
             )
 
 
+def _gen_cake_grouped_fp8_gemm_aot_specs(sm_capabilities: dict) -> List[JitSpec]:
+    """Generated contiguous grouped FP8 GEMM programs (SM100a only)."""
+    if not sm_capabilities.get("sm100a_exact", False):
+        return []
+    return [
+        gen_cake_grouped_fp8_gemm_module(name)
+        for name, record in sorted(CAKE_GROUPED_FP8_GEMM_MODULES.items())
+        if record["arch"] == "sm_100a"
+    ]
+
+
+def _gen_cake_grouped_fp8_fused_silu_quant_aot_specs(
+    sm_capabilities: dict,
+) -> List[JitSpec]:
+    """Generated fused grouped FP8 gate_up GEMM + SwiGLU + FP8 quant programs (SM100a only)."""
+    if not sm_capabilities.get("sm100a_exact", False):
+        return []
+    return [
+        gen_cake_grouped_fp8_fused_silu_quant_module(name)
+        for name, record in sorted(CAKE_GROUPED_FP8_FUSED_SILU_QUANT_MODULES.items())
+        if record["arch"] == "sm_100a"
+    ]
+
+
+def _gen_blackwell_bf16_bmm_aot_specs(sm_capabilities: dict) -> List[JitSpec]:
+    targets: List[BlackwellBf16BmmTarget] = []
+    if sm_capabilities.get("sm100a_exact", False):
+        targets.append("sm100a")
+    if sm_capabilities.get("sm103a_exact", False):
+        targets.append("sm103a")
+    return [gen_blackwell_bf16_bmm_module(target) for target in targets]
+
+
 def gen_all_modules(
     f16_dtype_: List[torch.dtype],
     f8_dtype_: List[torch.dtype],
@@ -478,11 +600,57 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
+    has_bgmv_moe = sm_capabilities.get("bgmv_moe", False)
     has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
+    has_blackwell_msa_sm100a = sm_capabilities.get("blackwell_msa_sm100a", False)
+    has_blackwell_msa_sm103a = sm_capabilities.get("blackwell_msa_sm103a", False)
+    has_sm100a_exact = sm_capabilities.get("sm100a_exact", False)
+    has_flash_kda_prefill_sm100a = sm_capabilities.get(
+        "flash_kda_prefill_sm100a", False
+    )
+    has_flash_kda_prefill_sm103a = sm_capabilities.get(
+        "flash_kda_prefill_sm103a", False
+    )
+    has_cake_kda_prefill_sm100a = sm_capabilities.get("cake_kda_prefill_sm100a", False)
+    has_cake_kda_prefill_sm103a = sm_capabilities.get("cake_kda_prefill_sm103a", False)
+    has_flash_kda_decode_sm100a_legacy = sm_capabilities.get(
+        "flash_kda_decode_sm100a_legacy", False
+    )
+    has_flash_kda_decode_sm100f = sm_capabilities.get("flash_kda_decode_sm100f", False)
+    has_flash_kda_decode_sm103a_direct = sm_capabilities.get(
+        "flash_kda_decode_sm103a_direct", False
+    )
+    has_cake_kda_decode_sm100a_legacy = sm_capabilities.get(
+        "cake_kda_decode_sm100a_legacy", False
+    )
+    has_cake_kda_decode_sm100f = sm_capabilities.get("cake_kda_decode_sm100f", False)
+    has_cake_kda_decode_sm103a_direct = sm_capabilities.get(
+        "cake_kda_decode_sm103a_direct", False
+    )
+    has_flash_kda_packed_t1_sm100a = sm_capabilities.get(
+        "flash_kda_packed_t1_sm100a", False
+    )
+    has_flash_kda_packed_t1_sm100f = sm_capabilities.get(
+        "flash_kda_packed_t1_sm100f", False
+    )
+    has_cake_megamoe_topk_reduce_sm100a = sm_capabilities.get(
+        "cake_megamoe_topk_reduce_sm100a", False
+    )
+    has_cake_megamoe_topk_reduce_sm103a = sm_capabilities.get(
+        "cake_megamoe_topk_reduce_sm103a", False
+    )
+    has_cake_selective_state_update_sm100a = sm_capabilities.get(
+        "cake_selective_state_update_sm100a", False
+    )
+    has_cake_selective_state_update_sm103a = sm_capabilities.get(
+        "cake_selective_state_update_sm103a", False
+    )
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
+    has_sm103a_exact = sm_capabilities.get("sm103a_exact", False)
+    has_sm107 = sm_capabilities.get("sm107", False)
     has_sm110 = sm_capabilities.get("sm110", False)
     has_sm120 = sm_capabilities.get("sm120", False)
     has_sm120f = sm_capabilities.get("sm120f", False)
@@ -498,12 +666,157 @@ def gen_all_modules(
             use_logits_soft_cap_,
             has_sm90,
             has_sm100,
+            has_sm103,
             add_gemma,
             add_oai_oss,
         )
     )
-    if has_sm120:
+    # Cake FMHA packages exact tcgen05/TMEM cubins for B200 and B300.  Do not
+    # compile a family target here: the standalone manifest authenticates one
+    # architecture-specific source payload and ABI for each exact target.
+    if has_sm100a_exact:
+        jit_specs.append(gen_cake_fmha_compat_module("sm100a"))
+    if has_sm103a_exact:
+        jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
+    if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
+    blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
+        ("sm100a", has_blackwell_msa_sm100a),
+        ("sm103a", has_blackwell_msa_sm103a),
+    )
+    for blackwell_msa_target, enabled in blackwell_msa_targets:
+        if enabled:
+            jit_specs.extend(
+                gen_blackwell_msa_module(variant, blackwell_msa_target)
+                for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]
+            )
+
+    minimax_h3_targets: tuple[tuple[MiniMaxH3Mxfp8Target, bool], ...] = (
+        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
+        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
+    )
+    for minimax_h3_target, enabled in minimax_h3_targets:
+        if enabled:
+            jit_specs.extend(gen_minimax_h3_mxfp8_aot_modules(minimax_h3_target))
+
+    minimax_h3_nvfp4_targets: tuple[tuple[MiniMaxH3Nvfp4Target, bool], ...] = (
+        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
+        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
+    )
+    for minimax_h3_nvfp4_target, enabled in minimax_h3_nvfp4_targets:
+        if enabled:
+            jit_specs.extend(gen_minimax_h3_nvfp4_aot_modules(minimax_h3_nvfp4_target))
+
+    minimax_h3_qkv_pack_targets: tuple[tuple[MiniMaxH3QkvPackTarget, bool], ...] = (
+        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
+        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
+    )
+    for minimax_h3_qkv_pack_target, enabled in minimax_h3_qkv_pack_targets:
+        if enabled:
+            jit_specs.extend(
+                gen_minimax_h3_qkv_pack_aot_modules(minimax_h3_qkv_pack_target)
+            )
+
+    # Register the physical source-closed portfolio independently for each
+    # exact Blackwell target. Each JitSpec contains one generated selector TU.
+    # The checkpoint route remains as the only legacy fallback because it is
+    # intentionally outside the generated portfolio.
+    flash_kda_targets: tuple[tuple[GeneratedFlashKDATarget, bool], ...] = (
+        ("sm100a", has_flash_kda_prefill_sm100a),
+        ("sm103a", has_flash_kda_prefill_sm103a),
+    )
+    for flash_kda_target, enabled in flash_kda_targets:
+        if enabled:
+            jit_specs.extend(
+                gen_flash_kda_generated_module(variant_id)
+                for variant_id in get_flash_kda_generated_variant_ids(flash_kda_target)
+            )
+            jit_specs.append(gen_flash_kda_m128_n16_checkpoint_module(flash_kda_target))
+
+    # The Cake-owned unbounded-softplus export remains an exact-architecture
+    # artifact on B200 and B300.
+    cake_kda_targets: tuple[tuple[CakeKDATarget, bool], ...] = (
+        ("sm100a", has_cake_kda_prefill_sm100a),
+        ("sm103a", has_cake_kda_prefill_sm103a),
+    )
+    for cake_kda_target, enabled in cake_kda_targets:
+        if enabled:
+            jit_specs.append(
+                gen_cake_kda_m128_unbounded_softplus_module(cake_kda_target)
+            )
+            if cake_kda_affine_is_available():
+                jit_specs.extend(
+                    gen_cake_kda_affine_module(cake_kda_target, role)
+                    for role in CAKE_KDA_AFFINE_ROLES
+                )
+
+    # CUDA 12.8 predates the SM100-family target, so B200 keeps one exact
+    # SM100a module for every frozen body. CUDA 12.9+ builds the 23-body
+    # family portfolio once for both CC 10.0 and CC 10.3. GB300 additionally
+    # retains only the two exact-SM103a direct-T1 modules whose family-target
+    # latency regressed in the measured A/B.
+    if has_flash_kda_decode_sm100a_legacy:
+        jit_specs.extend(
+            gen_flash_kda_decode_module(variant, "sm100a")
+            for variant in FLASH_KDA_DECODE_VARIANTS
+        )
+    if has_flash_kda_decode_sm100f:
+        jit_specs.extend(
+            gen_flash_kda_decode_module(variant, "sm100f")
+            for variant in FLASH_KDA_DECODE_VARIANTS
+        )
+    if has_flash_kda_decode_sm103a_direct:
+        jit_specs.extend(
+            gen_flash_kda_decode_module(variant, "sm103a")
+            for variant in FLASH_KDA_DECODE_DIRECT_VARIANTS
+        )
+    # The Cake-owned direct T1 kernels follow the same legacy/family/exact
+    # target policy as the provenanced FlashKDA decode portfolio.
+    if has_cake_kda_decode_sm100a_legacy:
+        jit_specs.extend(
+            gen_cake_kda_decode_module(variant, "sm100a")
+            for variant in CAKE_KDA_DECODE_DIRECT_VARIANTS
+        )
+    if has_cake_kda_decode_sm100f:
+        jit_specs.extend(
+            gen_cake_kda_decode_module(variant, "sm100f")
+            for variant in CAKE_KDA_DECODE_DIRECT_VARIANTS
+        )
+    if has_cake_kda_decode_sm103a_direct:
+        jit_specs.extend(
+            gen_cake_kda_decode_module(variant, "sm103a")
+            for variant in CAKE_KDA_DECODE_DIRECT_VARIANTS
+        )
+
+    # Packed Kimi K3 decode follows the same legacy-exact/family split.
+    if has_flash_kda_packed_t1_sm100a:
+        jit_specs.extend(
+            gen_flash_kda_packed_t1_module(variant, "sm100a")
+            for variant in FLASH_KDA_PACKED_T1_VARIANTS
+        )
+        jit_specs.extend(
+            gen_cake_kda_packed_t1_module(variant, "sm100a")
+            for variant in CAKE_KDA_PACKED_T1_VARIANTS
+        )
+    if has_flash_kda_packed_t1_sm100f:
+        jit_specs.extend(
+            gen_flash_kda_packed_t1_module(variant, "sm100f")
+            for variant in FLASH_KDA_PACKED_T1_VARIANTS
+        )
+        jit_specs.extend(
+            gen_cake_kda_packed_t1_module(variant, "sm100f")
+            for variant in CAKE_KDA_PACKED_T1_VARIANTS
+        )
+
+    # The experimental fused GDN decode step is deliberately NOT built here.
+    # Its preferred backend is CuTe-DSL, which this AOT pass does not cover at
+    # all, so an AOT entry could only ever pre-build the second-choice CUDA
+    # impl -- which never serves a registered geometry on an install where the
+    # CuTe-DSL one loads.  Paying jit-cache size for a kernel that does not run
+    # is the wrong trade when that budget is shared with kernels that do.  It
+    # JIT-compiles on first eager dispatch instead, which is already how the
+    # CuTe-DSL impl reaches the CUDA-graph capture phase warm.  See
+    # flashinfer/gdn_kernels/experimental/README.md.
 
     if add_act:
         for act_name in act_func_def_str:
@@ -511,21 +824,59 @@ def gen_all_modules(
 
     if add_moe:
         jit_specs.append(gen_gemm_module())
+        if has_sm100a_exact or has_sm103a_exact:
+            jit_specs.append(gen_alphamoe_nvfp4_sm100_module())
         # Multi-LoRA MoE BGMV kernel
-        jit_specs.append(gen_bgmv_moe_module())
+        if has_bgmv_moe:
+            jit_specs.append(gen_bgmv_moe_module())
+        for cake_bgmv_arch, cake_bgmv_flag in (
+            ("sm90a", "sm90a_exact"),
+            ("sm100a", "sm100a_exact"),
+            ("sm103a", "sm103a_exact"),
+        ):
+            if sm_capabilities.get(cake_bgmv_flag, False):
+                jit_specs.extend(
+                    gen_cake_bgmv_moe_module(hidden_size, dtype, cake_bgmv_arch)
+                    for hidden_size in CAKE_BGMV_MOE_HIDDEN_SIZES
+                    for dtype in CAKE_BGMV_MOE_DTYPES
+                )
+                jit_specs.extend(
+                    gen_cake_bgmv_moe_generic_module(rank, dtype, cake_bgmv_arch)
+                    for rank in CAKE_BGMV_MOE_GENERIC_RANKS
+                    for dtype in CAKE_BGMV_MOE_DTYPES
+                )
+        if sm_capabilities.get("sm100a_exact", False):
+            jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm100a"))
+        # DSv4 hash-based MoE routing (SM-portable)
+        jit_specs.append(gen_hash_topk_module())
+        if has_cake_megamoe_topk_reduce_sm100a:
+            jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_100a"))
+        if has_cake_megamoe_topk_reduce_sm103a:
+            jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_103a"))
+        # Cake selective state update: every delivered program instantiation per architecture.
+        if has_cake_selective_state_update_sm100a:
+            jit_specs.extend(gen_cake_selective_state_update_modules("sm_100a"))
+        if has_cake_selective_state_update_sm103a:
+            jit_specs.extend(gen_cake_selective_state_update_modules("sm_103a"))
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
+            # MonoMoe kernel: single-kernel block-FP8 top-K MoE, Hopper
+            # (SM90a) only (uses wgmma.mma_async + TMA).  Hard-specialized to
+            # the fixed E=256/N=512/K=2048 shape (BS8).
+            jit_specs.append(gen_monomoe_module())
         if has_sm100:
+            # SM103 registers its own FP4 quantization, CUTLASS fused MoE and FP4 GEMM
+            # below, and takes the SM100f TGV GEMMs instead of these sm_100a ones.
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
-            jit_specs.append(gen_gemm_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
-            jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
-            jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
+        # Both TGV variants share a module name, so a build that also targets SM103
+        # must keep only the SM100f one, which runs on both.
+        if has_sm100 and not has_sm103:
             # Add TGV GEMM modules for both bf16 and fp16
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=False)
@@ -533,25 +884,56 @@ def gen_all_modules(
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=False)
             )
-            jit_specs.append(gen_mxfp8_quantization_sm100_module())
+        if has_sm100 or has_sm103:
+            # SM103 loads these SM100-named modules too; they build for the targeted SM10x arch.
             jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_low_latency_gemm_module())
+            jit_specs.append(gen_gemm_sm100_module())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_nvfp4_svdquant())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
+            jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
-        if has_sm100f:
+            jit_specs.append(gen_trtllm_gen_routing_module())
+        if has_sm100f or has_sm103:
             # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=True)
             )
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
             jit_specs.append(gen_moe_utils_module())
+        if has_sm100a_exact or has_sm103a_exact:
+            jit_specs.append(gen_alphamoe_fused_router_module())
         if has_sm100 or has_sm103:
             jit_specs.append(gen_mm_bf16_cublaslt_module())
+        jit_specs.extend(_gen_blackwell_bf16_bmm_aot_specs(sm_capabilities))
+        jit_specs.extend(_gen_cake_grouped_fp8_gemm_aot_specs(sm_capabilities))
+        jit_specs.extend(
+            _gen_cake_grouped_fp8_fused_silu_quant_aot_specs(sm_capabilities)
+        )
+        if has_sm100a_exact or has_sm103a_exact:
+            jit_specs.append(gen_alphamoe_sm100_module())
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
+            jit_specs.append(gen_gemm_sm103_module_cutlass_fp4())
+        if sm_capabilities.get("sm103a_exact", False):
+            jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm103a"))
+        if has_sm107:
+            jit_specs.extend(
+                gen_cudnn_frost_moe_module(dtype) for dtype in FROST_DTYPES
+            )
+            jit_specs.append(gen_fp4_quantization_sm107_module())
+            jit_specs.append(gen_trtllm_gen_gemm_module(enable_rubin=True))
+            jit_specs.append(gen_trtllm_low_latency_gemm_module(enable_rubin=True))
+            jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
+            # fused_moe_100 also targets SM110 and must ship in its provider.
+            if not has_sm100:
+                jit_specs.append(gen_cutlass_fused_moe_sm100_module())
         if has_sm120:
+            jit_specs.append(gen_cudnn_frost_moe_module("bf16", "sm_120a"))
             jit_specs.append(gen_fp4_quantization_sm120_module())
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())
@@ -561,7 +943,7 @@ def gen_all_modules(
             # compiles for all SM12x targets.
             jit_specs.append(gen_cutlass_fused_moe_sm120_module())
             jit_specs.append(gen_gemm_sm120_module())
-            jit_specs.append(gen_gemm_sm120_module_cute_mxfp8())
+            jit_specs.append(gen_gemm_sm120_module_cute())
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
             jit_specs.append(gen_trtllm_fmha_v2_sm120_module())
@@ -572,23 +954,55 @@ def gen_all_modules(
         from .jit.comm import (
             gen_comm_alltoall_module,
             gen_dcp_alltoall_module,
+            gen_dcp_lse_reduce_module,
             gen_moe_alltoall_module,
+            gen_pcie_ipc_ag_rs_module,
+            gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
             gen_trtllm_mnnvl_comm_module,
             gen_vllm_comm_module,
         )
 
         jit_specs.append(gen_comm_alltoall_module())
-        if has_sm100:
+        if (
+            has_sm90
+            or has_sm100
+            or has_sm100f
+            or has_sm103
+            or has_sm120
+            or has_sm120f
+            or has_sm121
+        ):
             jit_specs.append(gen_trtllm_comm_module())
+        if has_sm100 or has_sm103:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
-            jit_specs.append(gen_moe_alltoall_module())
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
             # a known state-space inference bug on cp.async.bulk that aborts
-            # compilation. has_sm100 implies CUDA >= 12.8, which avoids the bug.
+            # compilation. has_sm100/has_sm103 imply CUDA >= 12.8, which avoids the bug.
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
+        if (
+            has_sm90
+            or has_sm100
+            or has_sm100f
+            or has_sm103
+            or has_sm107
+            or has_sm110
+            or has_sm120
+            or has_sm120f
+            or has_sm121
+        ):
+            jit_specs.append(gen_dcp_lse_reduce_module())
+        if has_sm100a_exact:
+            jit_specs.append(gen_moe_alltoall_module("sm100a"))
+        if has_sm103a_exact:
+            jit_specs.append(gen_moe_alltoall_module("sm103a"))
         jit_specs.append(gen_vllm_comm_module())
+        # No architecture gate: the kernels use only plain PTX loads/stores
+        # and CUDA IPC, and target PCIe machines without NVLink, which is
+        # orthogonal to the SM version.
+        jit_specs.append(gen_pcie_ipc_comm_module())
+        jit_specs.append(gen_pcie_ipc_ag_rs_module())
 
     if add_misc:
         jit_specs += [
@@ -602,8 +1016,15 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
+        if has_sm100 or has_sm103:
+            jit_specs.append(gen_blackwell_softmax_module())
+        # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).
+        if any(
+            (has_sm90, has_sm100, has_sm103, has_sm107, has_sm110, has_sm120, has_sm121)
+        ):
+            jit_specs.append(gen_cake_sampling_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
-        if has_sm100:
+        if has_sm100 or has_sm103:
             for C in _SUPPORTED_C:
                 for tokens in _SUPPORTED_TOKENS:
                     for dtype in ["bf16", "fp8", "nvfp4"]:
@@ -674,9 +1095,7 @@ def gen_all_modules(
         _ssu_ntokens = [1, 4, 6, 8]
         _ssu_cu_seqlens_dtypes = [torch.int32, torch.int64]
         _ssu_num_accepted_dtypes = [torch.int32, torch.int64]
-        # Default SSU MTP-simple module requires sm_80+ (uses cp.async).  If
-        # the AOT build target has no Ampere-or-newer arch, skip it silently.
-        if has_sm80 or has_sm90 or has_sm100:
+        if has_sm80:
             for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
                 _ssu_dtype_combos,
                 _ssu_dims,
@@ -692,7 +1111,7 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )  # type: ignore[call-arg]
                 )
-        if has_sm90 or has_sm100:
+        if has_sm90:
             for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
                 _ssu_dtype_combos,
                 _ssu_dims,
@@ -707,6 +1126,7 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )
                 )
+        if has_sm90 or has_sm100 or has_sm103:
             jit_specs.append(gen_trtllm_utils_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())
@@ -733,6 +1153,7 @@ def gen_all_modules(
                 use_sliding_window_,
                 has_sm90,
                 has_sm100,
+                has_sm103,
                 has_sm120,
                 has_sm121,
             )
@@ -741,6 +1162,16 @@ def gen_all_modules(
     # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
     if has_sm120 or has_sm121:
         jit_specs.append(gen_sparse_mla_sm120_module())
+        # Cake DSv4 NVFP4 sparse-MLA decode + prefill (backend="cake" on SM120/SM121).
+        jit_specs.append(gen_cake_sparse_mla_sm120_dsv4_nvfp4_module())
+        # Cake DSv4 NVFP4 cache writers (fused GPT-J RoPE + quantize + paged insert
+        # for the backend="cake" / kv_cache_format="nvfp4" route); present once exported.
+        if cake_dsv4_nvfp4_rope_insert_available():
+            jit_specs.append(gen_cake_dsv4_nvfp4_rope_insert_module())
+        # Cake DSv4.1 mixed-cache sparse-MLA decode (backend="cake",
+        # kv_cache_format="fp8_dsv41_fp4_ca"); present once the family is exported.
+        if cake_sparse_mla_sm120_dsv41_mixed_available():
+            jit_specs.append(gen_cake_sparse_mla_sm120_dsv41_mixed_module())
 
     # Add cuDNN FMHA module
     jit_specs.append(gen_cudnn_fmha_module())
@@ -892,8 +1323,9 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
 def get_default_config():
     """Get default AOT configuration"""
     return {
-        # Note: (512, 512): FA2 prefill/decode only; no holistic batch-attention kernel.
-        "fa2_head_dim": [(64, 64), (128, 128), (256, 256), (512, 512)],
+        # Note: head_dim=512 (FA2 prefill/decode, SM80+) excluded to reduce
+        # space in the jit-cache wheel.
+        "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
         "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],
         "f16_dtype": [torch.float16, torch.bfloat16],
         "f8_dtype": [torch.float8_e4m3fn],
@@ -926,12 +1358,101 @@ def detect_sm_capabilities():
     # `sm80` is true if any 8.x arch (sm_80/sm_86/sm_89) is in the build —
     # all support cp.async, which the SSU MTP-simple kernel requires.
     has_any_sm8x = any(major == 8 for major, _ in compilation_context.TARGET_CUDA_ARCHS)
+    cuda_version = get_cuda_version()
+    flash_kda_family_arches = {
+        (10, "0a"),
+        (10, "0f"),
+        (10, "3a"),
+        (10, "3f"),
+    }
+    flash_kda_decode_sm103_arches = {(10, "3a"), (10, "3f")}
     return {
-        "sm80": has_any_sm8x and get_cuda_version() >= Version("11.0"),
+        "bgmv_moe": any(
+            major in BGMV_MOE_SUPPORTED_MAJOR_VERSIONS
+            for major, _ in compilation_context.TARGET_CUDA_ARCHS
+        ),
+        "sm80": has_any_sm8x and cuda_version >= Version("11.0"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
+        "sm100a_exact": (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+        and cuda_version >= Version("12.8"),
+        "blackwell_msa_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
+        ),
+        "blackwell_msa_sm103a": (
+            bool({(10, "3a"), (10, "3f")} & compilation_context.TARGET_CUDA_ARCHS)
+            and cuda_version >= Version("12.9")
+        ),
+        "flash_kda_prefill_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
+        ),
+        "flash_kda_prefill_sm103a": (
+            (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.9")
+        ),
+        "cake_kda_prefill_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
+        ),
+        "cake_kda_prefill_sm103a": (
+            (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.9")
+        ),
         "sm100f": has_sm("compute_100", "12.9"),
+        "flash_kda_decode_sm100a_legacy": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and Version("12.8") <= cuda_version < Version("12.9")
+        ),
+        "flash_kda_decode_sm100f": bool(
+            flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS
+        )
+        and cuda_version >= Version("12.9"),
+        "flash_kda_decode_sm103a_direct": bool(
+            flash_kda_decode_sm103_arches & compilation_context.TARGET_CUDA_ARCHS
+        )
+        and cuda_version >= Version("12.9"),
+        "cake_kda_decode_sm100a_legacy": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and Version("12.8") <= cuda_version < Version("12.9")
+        ),
+        "cake_kda_decode_sm100f": bool(
+            flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS
+        )
+        and cuda_version >= Version("12.9"),
+        "cake_kda_decode_sm103a_direct": bool(
+            flash_kda_decode_sm103_arches & compilation_context.TARGET_CUDA_ARCHS
+        )
+        and cuda_version >= Version("12.9"),
+        "flash_kda_packed_t1_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and Version("12.8") <= cuda_version < Version("12.9")
+        ),
+        "flash_kda_packed_t1_sm100f": (
+            bool(flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS)
+            and cuda_version >= Version("12.9")
+        ),
+        "cake_megamoe_topk_reduce_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
+        ),
+        "cake_megamoe_topk_reduce_sm103a": (
+            (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.9")
+        ),
+        "cake_selective_state_update_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
+        ),
+        "cake_selective_state_update_sm103a": (
+            (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.9")
+        ),
         "sm103": has_sm("compute_103", "12.9"),
+        "sm103a_exact": (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
+        and cuda_version >= Version("12.9"),
+        "sm107": has_sm("compute_107", "12.9"),
         "sm110": has_sm("compute_110", "13.0"),
         "sm120": has_sm("compute_120", "12.8"),
         "sm120f": has_sm("compute_120f", "12.9"),
@@ -998,7 +1519,7 @@ def main():
     parser.add_argument(
         "--add-comm",
         type=parse_bool,
-        help="Add communication kernels (trtllm_comm, vllm_comm)",
+        help="Add communication kernels (trtllm_comm, vllm_comm, pcie_ipc_comm, pcie_ipc_ag_rs)",
     )
     parser.add_argument(
         "--add-gemma",

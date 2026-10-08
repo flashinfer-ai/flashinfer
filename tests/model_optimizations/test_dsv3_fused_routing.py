@@ -116,9 +116,11 @@ accumulating more numerical error.
 ================================================================================
 """
 
-import torch
 import pytest
+import torch
+
 from flashinfer.dsv3_ops import fused_topk_deepseek
+
 # from flashinfer.utils import get_compute_capability
 
 
@@ -200,12 +202,14 @@ class DSv3RoutingGroundTruth:
 
         for token_idx in range(self.num_tokens):
             # Create mask for selected groups
-            group_mask = torch.zeros(n_group, dtype=torch.float32, device=self.device)
-            group_mask[self.ref_group_indices[token_idx]] = 1.0
+            group_mask = torch.zeros(n_group, dtype=torch.bool, device=self.device)
+            group_mask[self.ref_group_indices[token_idx]] = True
             expert_mask = group_mask.repeat_interleave(self.experts_per_group)
 
             # Mask and select top-k experts
-            masked_biased_scores = self.biased_scores[token_idx] * expert_mask
+            masked_biased_scores = self.biased_scores[token_idx].masked_fill(
+                ~expert_mask, float("-inf")
+            )
             _, topk_idx = torch.topk(
                 masked_biased_scores, k=topk, dim=-1, largest=True, sorted=True
             )
@@ -316,18 +320,42 @@ class DSv3RoutingGroundTruth:
         This computes what experts SHOULD be selected if these groups were chosen.
         """
         # Create mask for specified groups
-        group_mask = torch.zeros(self.n_group, dtype=torch.float32, device=self.device)
+        group_mask = torch.zeros(self.n_group, dtype=torch.bool, device=self.device)
         for g in groups:
-            group_mask[g] = 1.0
+            group_mask[g] = True
         expert_mask = group_mask.repeat_interleave(self.experts_per_group)
 
         # Mask and select top-k experts
-        masked_biased_scores = self.biased_scores[token_idx] * expert_mask
+        masked_biased_scores = self.biased_scores[token_idx].masked_fill(
+            ~expert_mask, float("-inf")
+        )
         _, topk_idx = torch.topk(
             masked_biased_scores, k=self.topk, dim=-1, largest=True, sorted=True
         )
 
         return set(topk_idx.tolist())
+
+
+def test_ground_truth_excludes_unselected_groups_with_negative_scores():
+    scores = torch.zeros((1, 8), dtype=torch.float32)
+    bias = torch.tensor(
+        [[2.5, 1.5, 0.5, -1.5, 0.0, -0.1, -0.2, -0.3]],
+        dtype=torch.float32,
+    )
+
+    ground_truth = DSv3RoutingGroundTruth(
+        scores,
+        bias,
+        n_group=2,
+        topk_group=1,
+        topk=4,
+        routed_scaling_factor=1.0,
+        data_type=torch.float32,
+    )
+
+    expected = {0, 1, 2, 3}
+    assert set(ground_truth.ref_expert_indices[0].tolist()) == expected
+    assert ground_truth._get_topk_experts_from_groups(0, [0]) == expected
 
 
 def validate_expert_selection(ground_truth, topk_indices_kernel, topk_values_kernel):
@@ -416,6 +444,137 @@ def validate_values(ground_truth, topk_values_kernel, tokens_to_skip, data_type)
                 break
 
         raise
+
+
+@pytest.mark.parametrize("backend", ["default", "cake"])
+@pytest.mark.parametrize(
+    "num_experts,n_group,topk_group,topk",
+    [
+        pytest.param(256, 8, 4, 8, id="grouped-k8g4"),
+        pytest.param(128, 4, 2, 4, id="grouped-general"),
+        pytest.param(128, 1, 1, 1, id="single128"),
+        pytest.param(384, 1, 1, 1, id="single384"),
+    ],
+)
+@pytest.mark.parametrize("data_type", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias_type", [torch.float32, torch.float16, torch.bfloat16])
+def test_dsv3_fused_routing_backend_correctness(
+    backend, num_experts, n_group, topk_group, topk, data_type, bias_type
+):
+    """Exercise every Cake schedule and dtype pair alongside the default backend."""
+
+    if backend == "cake" and torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Cake fused routing requires SM100 or SM103")
+
+    num_tokens = 7
+    torch.manual_seed(42)
+    scores = torch.randn(num_tokens, num_experts, device="cuda", dtype=data_type)
+    bias = torch.randn(num_experts, device="cuda", dtype=bias_type)
+    routed_scaling_factor = 1.0
+    ground_truth = DSv3RoutingGroundTruth(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        routed_scaling_factor,
+        data_type,
+    )
+
+    topk_values = torch.empty(num_tokens, topk, device="cuda", dtype=data_type)
+    topk_indices = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int32)
+    routing_replay_out = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int16)
+    fused_topk_deepseek(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        routed_scaling_factor,
+        topk_values,
+        topk_indices,
+        routing_replay_out=routing_replay_out,
+        backend=backend,
+    )
+
+    for token_idx in range(num_tokens):
+        assert set(routing_replay_out[token_idx].tolist()) == set(
+            topk_indices[token_idx].tolist()
+        )
+
+    sorted_values, sorted_order = torch.sort(topk_values, dim=-1, descending=True)
+    sorted_indices = topk_indices.gather(1, sorted_order)
+    all_valid, tokens_with_different_experts = validate_expert_selection(
+        ground_truth, sorted_indices, sorted_values
+    )
+    assert all_valid
+    validate_values(
+        ground_truth, sorted_values, tokens_with_different_experts, data_type
+    )
+
+
+@pytest.mark.parametrize("backend", ["default", "cake"])
+@pytest.mark.parametrize(
+    "strided", ["scores", "bias", "topk_values", "topk_indices", "routing_replay_out"]
+)
+def test_dsv3_fused_routing_rejects_strided_views(backend, strided):
+    """Every tensor argument must be contiguous; a strided view is rejected, not misread."""
+
+    if backend == "cake" and torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Cake fused routing requires SM100 or SM103")
+
+    num_tokens, num_experts, topk = 4, 256, 8
+
+    def dense_or_strided(name, *shape, dtype):
+        if name != strided:
+            return torch.zeros(*shape, device="cuda", dtype=dtype)
+        wide = torch.zeros(*shape[:-1], 2 * shape[-1], device="cuda", dtype=dtype)
+        return wide[..., ::2]
+
+    scores = dense_or_strided("scores", num_tokens, num_experts, dtype=torch.bfloat16)
+    bias = dense_or_strided("bias", num_experts, dtype=torch.bfloat16)
+    topk_values = dense_or_strided(
+        "topk_values", num_tokens, topk, dtype=torch.bfloat16
+    )
+    topk_indices = dense_or_strided("topk_indices", num_tokens, topk, dtype=torch.int32)
+    routing_replay_out = dense_or_strided(
+        "routing_replay_out", num_tokens, topk, dtype=torch.int16
+    )
+
+    with pytest.raises(ValueError, match="contiguous"):
+        fused_topk_deepseek(
+            scores,
+            bias,
+            8,
+            4,
+            topk,
+            1.0,
+            topk_values,
+            topk_indices,
+            routing_replay_out=routing_replay_out,
+            backend=backend,
+        )
+    # The binding enforces the same contract when the Python checks are skipped.
+    with pytest.raises(Exception, match="contiguous"):
+        fused_topk_deepseek(
+            scores,
+            bias,
+            8,
+            4,
+            topk,
+            1.0,
+            topk_values,
+            topk_indices,
+            routing_replay_out=routing_replay_out,
+            backend=backend,
+            skip_check=True,
+        )
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 16, 64])
@@ -674,3 +833,165 @@ def test_routing_replay_out(
 
     torch.testing.assert_close(topk_values, topk_values_no_replay)
     torch.testing.assert_close(topk_indices, topk_indices_no_replay)
+
+
+# ---------------------------------------------------------------------------
+# backend="cake" vs backend="default" on correlated, tie-heavy and large-T inputs
+# ---------------------------------------------------------------------------
+#
+# Both backends evaluate the same sigmoid, add the same bias and select groups
+# and experts on identical FP32 values, so expert ids, their order and
+# ``routing_replay_out`` must be identical.  Only the normalisation
+# ``sigmoid * routed_scaling_factor / sum`` differs (FP32 reciprocal in the
+# Cake kernels, FP64 division in the default kernel), so the weights are
+# compared within one ulp of the output dtype (|dw| <= 1e-6 for float32).
+# The e2e DeepSeek-V3 run that motivated this (sglang, TP4) found the existing
+# cross-backend check clean only on i.i.d. normal rows at T <= 64; the profiles
+# below add correlated ("real-logit-like") logits, coarse value grids with many
+# exact ties, very negative logits where the +1e-20 term matters, and token
+# counts up to 65536.
+
+
+def _routing_inputs(profile, num_tokens, num_experts, score_dtype, bias_dtype, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    dev = "cuda"
+    if profile == "randn":
+        scores = torch.randn(num_tokens, num_experts, device=dev, generator=gen)
+        bias = torch.randn(num_experts, device=dev, generator=gen)
+    elif profile == "reallike":
+        # Token-correlated router logits: RMS-normalised hidden states times a gate
+        # weight plus a per-expert popularity offset; fp32 correction bias of O(1).
+        hidden_dim = 1024
+        hidden = torch.randn(num_tokens, hidden_dim, device=dev, generator=gen)
+        hidden = hidden * torch.rsqrt(hidden.pow(2).mean(-1, keepdim=True) + 1e-6)
+        gate = torch.randn(num_experts, hidden_dim, device=dev, generator=gen) * (
+            1.7 / hidden_dim**0.5
+        )
+        offsets = torch.randn(num_experts, device=dev, generator=gen) * 0.5
+        scores = hidden @ gate.t() + offsets
+        bias = torch.randn(num_experts, device=dev, generator=gen) * 0.6 + 0.3
+    elif profile == "tie":
+        # Coarse value grids: many exactly equal sigmoid and biased scores.
+        scores = (
+            torch.randn(num_tokens, num_experts, device=dev, generator=gen) * 2
+        ).round() * 0.5
+        bias = (
+            torch.randint(0, 5, (num_experts,), device=dev, generator=gen).float()
+            * 0.25
+        )
+    elif profile == "extreme":
+        # Every logit very negative: the selected sigmoid sum is ~1e-11..1e-15, so
+        # the +1e-20 term is observable; some rows are exactly zero.
+        scores = -25.0 - 10.0 * torch.rand(
+            num_tokens, num_experts, device=dev, generator=gen
+        )
+        scores[: max(1, num_tokens // 8)] = -100.0
+        bias = torch.randn(num_experts, device=dev, generator=gen) * 1e-3
+    else:
+        raise ValueError(profile)
+    return scores.to(score_dtype).contiguous(), bias.to(bias_dtype).contiguous()
+
+
+_ROUTING_CONFIGS = [
+    pytest.param(256, 8, 4, 8, id="grouped-k8g4"),
+    pytest.param(128, 4, 2, 4, id="grouped-general"),
+    pytest.param(96, 3, 2, 5, id="grouped-odd"),
+    pytest.param(128, 1, 1, 1, id="single128"),
+    # No single-group config with num_experts > 128: the default backend's 384/256-expert
+    # instances reduce NumExpertWarps * 8 intermediate shared slots of which only `topk`
+    # per warp are written, so with the only admissible topk (1) their output depends on
+    # stale shared memory and is not a usable reference.
+]
+_ROUTING_DTYPE_PAIRS = [
+    pytest.param(torch.float32, torch.float32, id="f32-f32"),
+    pytest.param(torch.float32, torch.bfloat16, id="f32-bf16"),
+    pytest.param(torch.bfloat16, torch.bfloat16, id="bf16-bf16"),
+    pytest.param(torch.bfloat16, torch.float32, id="bf16-f32"),
+    pytest.param(torch.float16, torch.float16, id="f16-f16"),
+    pytest.param(torch.float16, torch.bfloat16, id="f16-bf16"),
+    pytest.param(torch.bfloat16, torch.float16, id="bf16-f16"),
+    pytest.param(torch.float32, torch.float16, id="f32-f16"),
+    pytest.param(torch.float16, torch.float32, id="f16-f32"),
+]
+
+
+@pytest.mark.parametrize("profile", ["randn", "reallike", "tie", "extreme"])
+@pytest.mark.parametrize("num_tokens", [1, 64, 4096, 65536])
+@pytest.mark.parametrize("score_dtype,bias_dtype", _ROUTING_DTYPE_PAIRS)
+@pytest.mark.parametrize("num_experts,n_group,topk_group,topk", _ROUTING_CONFIGS)
+def test_cake_backend_matches_default(
+    num_experts, n_group, topk_group, topk, score_dtype, bias_dtype, num_tokens, profile
+):
+    """backend="cake" selects the same experts as backend="default"; weights within 1 ulp."""
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake fused routing requires SM100 or SM103")
+    if num_tokens >= 4096 and (score_dtype, bias_dtype) not in (
+        (torch.float32, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float16, torch.float32),
+    ):
+        pytest.skip("large-T rows cover one pair per score dtype")
+
+    seed = (
+        hash(
+            (
+                num_experts,
+                n_group,
+                topk,
+                str(score_dtype),
+                str(bias_dtype),
+                num_tokens,
+                profile,
+            )
+        )
+        & 0x7FFFFFFF
+    )
+    scores, bias = _routing_inputs(
+        profile, num_tokens, num_experts, score_dtype, bias_dtype, seed
+    )
+    routed_scaling_factor = 2.5 if topk > 1 else 1.0
+    launch_with_pdl = num_tokens % 2 == 0
+    replay_rows = num_tokens + (5 if num_tokens % 3 == 0 else 0)
+
+    outputs = {}
+    for backend in ("default", "cake"):
+        values = torch.empty(num_tokens, topk, device="cuda", dtype=score_dtype)
+        indices = torch.full((num_tokens, topk), -7, device="cuda", dtype=torch.int32)
+        replay = torch.full((replay_rows, topk), -1, device="cuda", dtype=torch.int16)
+        fused_topk_deepseek(
+            scores,
+            bias,
+            n_group,
+            topk_group,
+            topk,
+            routed_scaling_factor,
+            values,
+            indices,
+            launch_with_pdl,
+            replay,
+            backend=backend,
+        )
+        torch.cuda.synchronize()
+        outputs[backend] = (values, indices, replay)
+
+    default_values, default_indices, default_replay = outputs["default"]
+    cake_values, cake_indices, cake_replay = outputs["cake"]
+    assert torch.equal(cake_indices, default_indices), (
+        "expert ids (and their order) differ"
+    )
+    assert torch.equal(cake_replay, default_replay), "routing_replay_out differs"
+    ulp_rtol = {torch.float32: 0.0, torch.float16: 2.0**-10, torch.bfloat16: 2.0**-7}[
+        score_dtype
+    ]
+    default_f = default_values.float()
+    cake_f = cake_values.float()
+    delta = (cake_f - default_f).abs()
+    bad = delta > 1e-6 + ulp_rtol * default_f.abs()
+    if bool(bad.any()):
+        rows = bad.any(dim=1).nonzero().flatten()[:4].tolist()
+        detail = [(row, default_f[row].tolist(), cake_f[row].tolist()) for row in rows]
+        raise AssertionError(
+            f"{int(bad.sum())} of {bad.numel()} weights differ by more than one ulp "
+            f"(max |dw| {float(delta.max()):.3e}); first rows {detail}"
+        )

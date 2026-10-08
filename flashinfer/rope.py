@@ -20,6 +20,12 @@ from typing import Optional, Tuple
 import torch
 
 from .api_logging import flashinfer_api
+from .cake_fused_qk_rope_append import (  # noqa: F401  (re-exported Cake fused route)
+    cake_fused_qk_rmsnorm_rope_append_paged_kv_cache,
+)
+from .cake_fused_qk_rope_fp8_append import (  # noqa: F401  (re-exported Cake fused FP8 route)
+    cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache,
+)
 from .trace.templates.rope import (
     apply_llama31_rope_inplace_trace,
     apply_llama31_rope_pos_ids_inplace_trace,
@@ -36,7 +42,7 @@ from .trace.templates.rope import (
     rope_quantize_fp8_trace,
 )
 from .jit.rope import gen_rope_module
-from .utils import register_custom_op, register_fake_op
+from .utils import get_compute_capability, register_custom_op, register_fake_op
 
 
 @functools.cache
@@ -1377,6 +1383,7 @@ def rope_quantize_fp8(
     q_nope_out: Optional[torch.Tensor] = None,
     k_nope_out: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
+    backend: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Apply RoPE (Rotary Positional Embeddings) and quantize to FP8 format.
 
@@ -1423,12 +1430,67 @@ def rope_quantize_fp8(
         Pre-allocated output tensor for quantized key (non-rotary). If ``None``, allocated automatically.
     enable_pdl : bool
         Whether to enable PDL (Programmatic Dependent Launch). Default: ``False``.
+    backend : str
+        Implementation backend. ``"cuda"`` (default) uses the fused CUDA kernel;
+        ``"cutile"`` uses the cuda.tile Python kernel and requires SM89 or newer.
 
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         Quantized tensors: (q_rope_out, k_rope_out, q_nope_out, k_nope_out).
     """
+    if backend not in ("cuda", "cutile"):
+        raise ValueError(
+            f"Unsupported backend for rope_quantize_fp8: {backend!r}; "
+            "expected 'cuda' or 'cutile'."
+        )
+    if backend == "cutile":
+        if is_neox:
+            # The cuTile kernel implements only the interleaved (GPT-J) rotary
+            # layout. is_neox defaults to True, so surface a clear error instead
+            # of the kernel's bare AssertionError (which -O would also strip).
+            raise NotImplementedError(
+                "backend='cutile' supports is_neox=False (interleaved/GPT-J "
+                "rotary) only; got is_neox=True."
+            )
+        if k_rope.ndim != 2:
+            # The kernel addresses the key as 2D [tokens, rope_dim] (single
+            # shared latent K head, the MLA use case). A 3D GQA/MHA key would
+            # fail deep in autotune with an opaque TileTypeError.
+            raise NotImplementedError(
+                "backend='cutile' rope_quantize_fp8 supports MLA-style 2D key "
+                f"tensors (single shared K head) only; got {k_rope.ndim}D key "
+                "(GQA/MHA multi-head K is not supported)."
+            )
+        if cos_sin_cache.dtype != torch.float32:
+            raise ValueError("cos_sin_cache should be float32")
+        capability = get_compute_capability(q_rope.device)
+        if capability < (8, 9):
+            raise NotImplementedError(
+                "backend='cutile' rope_quantize_fp8 requires SM89 or newer "
+                f"for FP8 output; got SM{capability[0]}{capability[1]}."
+            )
+        from .quantization.kernels.cutile.rope_quantize_fp8_cutile import (
+            rope_quantize_fp8_cutile,
+        )
+
+        return rope_quantize_fp8_cutile(
+            q_rope,
+            k_rope,
+            q_nope,
+            k_nope,
+            cos_sin_cache,
+            pos_ids,
+            is_neox=is_neox,
+            quantize_dtype=quantize_dtype,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
+            q_rope_out=q_rope_out,
+            k_rope_out=k_rope_out,
+            q_nope_out=q_nope_out,
+            k_nope_out=k_nope_out,
+        )
+
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 

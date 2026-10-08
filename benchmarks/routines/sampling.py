@@ -182,7 +182,7 @@ def parse_sampling_args(line, parser):
         nargs="+",
         default=["cuda"],
         choices=["cuda"],
-        help="Kernel backends to test. Default: cuda",
+        help="Kernel backends to test. Default: cuda.",
     )
 
     args = parser.parse_args(line)

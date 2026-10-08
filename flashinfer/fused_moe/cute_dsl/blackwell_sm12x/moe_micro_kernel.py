@@ -1,5 +1,5 @@
 """
-MoEMicroKernel — micro-scheduled routed NVFP4 MoE kernel for SM120/SM121 (Blackwell).
+MoEMicroKernel — micro-scheduled routed W4A4 MoE kernel for SM120/SM121.
 
 Ported from the b12x kernel library to FlashInfer.
 
@@ -114,6 +114,7 @@ from flashinfer.cute_dsl.fp4_common import (
     rcp_approx_ftz,
     quantize_block_fp4,
     quantize_block_fp4_fast,
+    quantize_block_mxfp4,
     get_ptr_as_int64,
     st_global_f32,
     st_global_i32,
@@ -125,6 +126,7 @@ from flashinfer.cute_dsl.fp4_common import (
 from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
     Sm120B12xBlockScaledDenseGemmKernel as DenseGemmKernel,
 )
+from .moe_activation import gated_activation_f32, is_gated_activation
 
 
 _SF_VEC_SIZE = 16
@@ -366,19 +368,26 @@ class MoEMicroKernel:
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
+        swiglu_alpha: float = 1.702,
+        swiglu_beta: float = 1.0,
+        swiglu_limit: float | None = None,
         share_input_across_experts: bool = False,
         share_expert_scales: bool = False,
         single_token: bool = False,
     ):
-        if activation not in {"silu", "relu2"}:
+        if activation not in {"silu", "relu2", "gelu_tanh", "swigluoai_uninterleave"}:
             raise ValueError(f"unsupported activation {activation!r}")
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
-        self.fast_math = fast_math
         self.activation = activation
-        self.is_gated = activation == "silu"
+        self.is_gated = is_gated_activation(activation)
+        # relu2's squared outputs need the exact quantizer and scale math.
+        self.fast_math = bool(fast_math) and self.is_gated
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
+        self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else None
         # For m=1 with a shared input scale, the quantized activation is
         # identical across all K top-k experts. When set, only pair_idx==0
         # does the quantize and all pairs read from a single shared slot
@@ -386,7 +395,7 @@ class MoEMicroKernel:
         self.share_input_across_experts = share_input_across_experts
         self.share_expert_scales = share_expert_scales
         self.single_token = single_token
-        tile_k = sf_vec_size * 8
+        tile_k = 128 if sf_vec_size == 32 else sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         self.sa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
         self.sa_tiles_per_block = self.sa_tile_shape_mk[0] // mma_tiler_mn[0]
@@ -518,12 +527,20 @@ class MoEMicroKernel:
 
         self._hidden_size = hidden_size
 
-        mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
-            self.a_dtype,
-            self.acc_dtype,
-            self.sf_dtype,
-        )
-        atom_layout = cute.make_layout((2, 2, 1))
+        if self.sf_vec_size == 32:
+            mma_op = cute.nvgpu.warp.MmaMXF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+        else:
+            mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+        atom_shape = (2, 2, 1)
+        atom_layout = cute.make_layout(atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
             self.sf_vec_size,
@@ -536,8 +553,8 @@ class MoEMicroKernel:
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
-        self.num_m_tiles = self.tile_shape_mnk[0] // (16 * 4)
-        self.num_n_tiles = self.tile_shape_mnk[1] // (8 * 2)
+        self.num_m_tiles = self.tile_shape_mnk[0] // (16 * atom_shape[0])
+        self.num_n_tiles = self.tile_shape_mnk[1] // (8 * atom_shape[1])
         self.num_k_blocks = self.tile_shape_mnk[2] // 64
 
         sfa_smem = sm120_make_smem_layout_sfa(
@@ -764,6 +781,9 @@ class MoEMicroKernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
+            # A regular launch beside other stream work can admit only part
+            # of the grid, deadlocking the software grid barriers below.
+            cooperative=True,
             stream=stream,
         )
 
@@ -817,7 +837,7 @@ class MoEMicroKernel:
         _, _, gdim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        is_cta_leader = Int32(1) if Int32(tidx) == Int32(0) else Int32(0)
+        is_cta_leader = Int32(Int32(tidx) == Int32(0))
 
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_a)
@@ -991,7 +1011,7 @@ class MoEMicroKernel:
         num_tokens = Int32(a_input.shape[0])
         cols = Int32(a_input.shape[1])
         num_experts = Int32(row_counts.shape[0])
-        sf_blocks_per_row = cols // Int32(16)
+        sf_blocks_per_row = cols // Int32(self.sf_vec_size)
         output_bytes_per_row = cols // Int32(2)
         max_rows = Int32(token_map.shape[1])
         total_pairs = Int32(topk_ids.shape[0])
@@ -999,7 +1019,8 @@ class MoEMicroKernel:
         expert_scale_stride = Int32(scale_storage.shape[0]) // num_experts
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
-        num_k_tiles = (cols + Int32(63)) // Int32(64)
+        sf_k_tile = Int32(self.sf_vec_size * 4)
+        num_k_tiles = (cols + sf_k_tile - Int32(1)) // sf_k_tile
 
         # Phase 0: cooperative init — set row_counts and zero scatter_output.
         # The Triton compact pre-pass has already populated
@@ -1048,17 +1069,24 @@ class MoEMicroKernel:
                     expert_id = weight_expert_ids[local_expert_id].to(Int32)
                 else:
                     expert_id = topk_ids[local_expert_id].to(Int32)
+                # The dense single-token layout keeps a slot for an unrouted
+                # (negative) pair: quantize it against expert 0 so its row is
+                # well defined; the FC2 epilogue zeroes its routing weight.
+                if expert_id < Int32(0):
+                    expert_id = Int32(0)
             else:
                 if is_cta_leader > Int32(0):
                     local_expert_id = topk_ids[pair_idx].to(Int32)
-                    expert_id = weight_expert_ids[local_expert_id].to(Int32)
-                    row = atomic_add_global_i32(
-                        get_ptr_as_int64(row_counts, local_expert_id),
-                        Int32(1),
-                    )
-                    map_idx = local_expert_id * max_rows + row
-                    st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
-                    st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
+                    # Compact id -1 marks an unrouted pair (see triton_compact).
+                    if local_expert_id >= Int32(0):
+                        expert_id = weight_expert_ids[local_expert_id].to(Int32)
+                        row = atomic_add_global_i32(
+                            get_ptr_as_int64(row_counts, local_expert_id),
+                            Int32(1),
+                        )
+                        map_idx = local_expert_id * max_rows + row
+                        st_global_i32(get_ptr_as_int64(token_map, map_idx), token_idx)
+                        st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
                     _st_shared_i32(ctrl_base_addr + Int32(0), local_expert_id)
                     _st_shared_i32(ctrl_base_addr + Int32(4), row)
                     _st_shared_i32(ctrl_base_addr + Int32(8), expert_id)
@@ -1068,8 +1096,11 @@ class MoEMicroKernel:
                 expert_id = _ld_shared_i32(ctrl_base_addr + Int32(8))
 
             # Distribute quantization across all CTA threads. Each FP4 block
-            # covers 16 elements and can be packed independently.
+            # covers one scale-vector and can be packed independently.
             should_quantize = Int32(1)
+            if cutlass.const_expr(not self.single_token):
+                if local_expert_id < Int32(0):
+                    should_quantize = Int32(0)
             packed_local_expert_id = local_expert_id
             packed_row = row
             quant_expert_id = expert_id
@@ -1083,6 +1114,8 @@ class MoEMicroKernel:
                         quant_expert_id = topk_ids[Int32(0)].to(Int32)
                     else:
                         quant_expert_id = weight_expert_ids[Int32(0)]
+                    if quant_expert_id < Int32(0):
+                        quant_expert_id = Int32(0)
                     packed_local_expert_id = Int32(0)
                     packed_row = Int32(0)
                 else:
@@ -1105,34 +1138,47 @@ class MoEMicroKernel:
                         gs_value = cutlass.Float32(1.0) / gs_value
                 sf_idx = Int32(tidx)
                 while sf_idx < sf_blocks_per_row:
-                    block_start = sf_idx * Int32(16)
-                    values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                    block_start = sf_idx * Int32(self.sf_vec_size)
+                    values = cute.make_rmem_tensor((self.sf_vec_size,), cutlass.Float32)
                     block_max = cutlass.Float32(0.0)
-                    for elem_idx in cutlass.range_constexpr(16):
+                    for elem_idx in cutlass.range_constexpr(self.sf_vec_size):
                         value = cutlass.Float32(
                             a_input[token_idx, block_start + Int32(elem_idx)]
                         )
                         values[elem_idx] = value
                         block_max = fmax_f32(block_max, fabs_f32(value))
-                    packed64 = Uint64(0)
                     scale_byte = Uint8(0)
-                    if self.fast_math:
-                        packed64, scale_byte = quantize_block_fp4_fast(
-                            values, block_max, gs_value
+                    if cutlass.const_expr(self.sf_vec_size == 32):
+                        packed_lo, packed_hi, scale_byte = quantize_block_mxfp4(
+                            values, block_max
                         )
                     else:
-                        packed64, scale_byte = quantize_block_fp4(
-                            values, block_max, gs_value
-                        )
+                        packed_lo = Uint64(0)
+                        packed_hi = Uint64(0)
+                        if self.fast_math:
+                            packed_lo, scale_byte = quantize_block_fp4_fast(
+                                values, block_max, gs_value
+                            )
+                        else:
+                            packed_lo, scale_byte = quantize_block_fp4(
+                                values, block_max, gs_value
+                            )
 
                     output_offset = (
                         packed_local_expert_id * max_rows * output_bytes_per_row
                         + packed_row * output_bytes_per_row
-                        + sf_idx * Int32(8)
+                        + sf_idx * Int32(self.sf_vec_size // 2)
                     )
                     st_global_u64(
-                        get_ptr_as_int64(packed_a_storage, output_offset), packed64
+                        get_ptr_as_int64(packed_a_storage, output_offset), packed_lo
                     )
+                    if cutlass.const_expr(self.sf_vec_size == 32):
+                        st_global_u64(
+                            get_ptr_as_int64(
+                                packed_a_storage, output_offset + Int32(8)
+                            ),
+                            packed_hi,
+                        )
 
                     m_tile_idx = packed_row // Int32(32 * 4)
                     k_tile_idx = sf_idx // Int32(4)
@@ -1420,12 +1466,20 @@ class MoEMicroKernel:
             while is_valid_tile:
                 # tile_coord = (m_tile, intermediate_slice, local_expert_idx)
                 local_expert_idx = tile_coord[2]
+                route_masked = Int32(0)
                 if cutlass.const_expr(self.single_token):
                     if cutlass.const_expr(not self.is_gated):
                         weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
                     else:
                         weight_expert_idx = weight_expert_ids[local_expert_idx]
                     valid_rows = Int32(1)
+                    # Unrouted pair: compute expert 0 with a zero routing weight.
+                    # Assumes its FC2 output is finite: 0.0 * inf/NaN would poison
+                    # the token row. Skipping unrouted pairs' tiles (follow-up)
+                    # drops this.
+                    if weight_expert_idx < Int32(0):
+                        route_masked = Int32(1)
+                        weight_expert_idx = Int32(0)
                 else:
                     weight_expert_idx = weight_expert_ids[local_expert_idx]
                     valid_rows = row_counts[local_expert_idx]
@@ -1558,6 +1612,8 @@ class MoEMicroKernel:
                 if cutlass.const_expr(self.single_token):
                     unique_tok = local_expert_idx // num_topk
                     unique_wv = topk_weights[local_expert_idx].to(cutlass.Float32)
+                    if route_masked > Int32(0):
+                        unique_wv = cutlass.Float32(0.0)
 
                 epi_rest_m = self.tile_shape_mnk[0] // self.epi_tile[0]
                 MmaMPerEpiM = self.epi_tile[0] // mma_tile_m
@@ -1828,7 +1884,7 @@ class MoEMicroKernel:
                 # Activation + quant into sA
                 sA_u8 = cute.recast_tensor(sA[None, None, 0], cutlass.Uint8)
                 packed_cols = Int32(self.tile_shape_mnk[2] // 2)
-                sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 16)
+                sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // self.sf_vec_size)
                 scale_idx = (
                     Int32(0)
                     if cutlass.const_expr(self.share_expert_scales)
@@ -1866,13 +1922,15 @@ class MoEMicroKernel:
                                     ):
                                         g = alpha_value * gate_slice[elem_idx]
                                         u = alpha_value * up_slice[elem_idx]
-                                        sigmoid_g = cute.arch.rcp_approx(
-                                            cutlass.Float32(1.0)
-                                            + cute.math.exp(
-                                                -g, fastmath=self.fast_math
-                                            ),
+                                        tRS_rD_slice[elem_idx] = gated_activation_f32(
+                                            g,
+                                            u,
+                                            activation=self.activation,
+                                            limit=self.swiglu_limit,
+                                            alpha=self.swiglu_alpha,
+                                            beta=self.swiglu_beta,
+                                            fast_math=self.fast_math,
                                         )
-                                        tRS_rD_slice[elem_idx] = g * sigmoid_g * u
                                 else:
                                     for elem_idx in cutlass.range_constexpr(
                                         cute.size(tRS_rD_slice)
@@ -1903,38 +1961,52 @@ class MoEMicroKernel:
                         local_row = quant_idx // sf_blocks_per_row
                         row = sa_row_base + rows_offset + local_row
                         sf_block = quant_idx - local_row * sf_blocks_per_row
-                        block_start = sf_block * Int32(16)
+                        block_start = sf_block * Int32(self.sf_vec_size)
 
-                        values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                        values = cute.make_rmem_tensor(
+                            (self.sf_vec_size,), cutlass.Float32
+                        )
                         block_max = cutlass.Float32(0.0)
-                        for elem_idx in cutlass.range_constexpr(16):
+                        for elem_idx in cutlass.range_constexpr(self.sf_vec_size):
                             value = cutlass.Float32(
                                 sC[local_row, block_start + elem_idx, silu_epi_buffer]
                             )
                             values[elem_idx] = value
                             block_max = fmax_f32(block_max, fabs_f32(value))
 
-                        packed64 = Uint64(0)
                         scale_byte = Uint8(0)
-                        if self.fast_math:
-                            packed64, scale_byte = quantize_block_fp4_fast(
-                                values, block_max, gs_value
+                        if cutlass.const_expr(self.sf_vec_size == 32):
+                            packed_lo, packed_hi, scale_byte = quantize_block_mxfp4(
+                                values, block_max
                             )
                         else:
-                            packed64, scale_byte = quantize_block_fp4(
-                                values, block_max, gs_value
-                            )
-                        packed_base = sf_block << Int32(3)
+                            packed_lo = Uint64(0)
+                            packed_hi = Uint64(0)
+                            if self.fast_math:
+                                packed_lo, scale_byte = quantize_block_fp4_fast(
+                                    values, block_max, gs_value
+                                )
+                            else:
+                                packed_lo, scale_byte = quantize_block_fp4(
+                                    values, block_max, gs_value
+                                )
+                        packed_base = sf_block * Int32(self.sf_vec_size // 2)
                         dst_pcol = row & Int32(63)
                         xor_bits = ((dst_pcol >> Int32(1)) & Int32(0x3)) << Int32(4)
                         row_high = row >> Int32(6)
-                        for byte_idx in cutlass.range_constexpr(8):
+                        for byte_idx in cutlass.range_constexpr(self.sf_vec_size // 2):
                             src_pcol = packed_base + Int32(byte_idx)
                             dst_row = ((src_pcol ^ xor_bits) << Int32(1)) + row_high
                             dst_flat = dst_row * packed_cols + dst_pcol
-                            byte_val = Uint8(
-                                (packed64 >> Uint64(byte_idx * 8)) & Uint64(0xFF)
-                            )
+                            if cutlass.const_expr(byte_idx < 8):
+                                byte_val = Uint8(
+                                    (packed_lo >> Uint64(byte_idx * 8)) & Uint64(0xFF)
+                                )
+                            else:
+                                byte_val = Uint8(
+                                    (packed_hi >> Uint64((byte_idx - 8) * 8))
+                                    & Uint64(0xFF)
+                                )
                             sA_u8[dst_flat] = byte_val
 
                         outer_m_idx = row % Int32(32)
@@ -2259,6 +2331,8 @@ class MoEMicroKernel:
                         weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
                     else:
                         weight_expert_idx = weight_expert_ids[local_expert_idx]
+                    if weight_expert_idx < Int32(0):
+                        weight_expert_idx = Int32(0)
                 else:
                     weight_expert_idx = weight_expert_ids[local_expert_idx]
                 input_local_expert_idx = (

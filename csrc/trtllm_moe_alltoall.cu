@@ -25,7 +25,9 @@
 #include <vector>
 
 #include "flashinfer/utils.cuh"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/thop/moeAlltoAllMeta.h"
 #include "tvm_ffi_utils.h"
@@ -50,7 +52,59 @@ inline size_t alignOffset(size_t offset, size_t alignment = kCachelineAlignment)
   return (offset + alignment - 1) & ~(alignment - 1);
 }
 
-fi_throughput::MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens) {
+inline int64_t outputScaleExtent(int64_t numRows, int64_t elementsPerToken,
+                                 tl_throughput::MoeA2ACombineQuantMode quantMode,
+                                 tl_throughput::MoeA2ACombineSwizzleSFMode swizzleMode) {
+  using tl_throughput::MoeA2ACombineQuantMode;
+  using tl_throughput::MoeA2ACombineSwizzleSFMode;
+  int64_t const blockSize = quantMode == MoeA2ACombineQuantMode::NVFP4 ? 16 : 32;
+  int64_t const scaleColumns = (elementsPerToken + blockSize - 1) / blockSize;
+  switch (swizzleMode) {
+    case MoeA2ACombineSwizzleSFMode::LINEAR:
+      return numRows * scaleColumns;
+    case MoeA2ACombineSwizzleSFMode::SWIZZLE_128x4:
+      return ((numRows + 127) / 128 * 128) * ((scaleColumns + 3) / 4 * 4);
+    case MoeA2ACombineSwizzleSFMode::SWIZZLE_8x4:
+      return ((numRows + 7) / 8 * 8) * ((scaleColumns + 3) / 4 * 4);
+  }
+  TVM_FFI_ICHECK(false) << "Unsupported output scale-factor layout";
+  return 0;
+}
+
+inline bool hasActiveRankMask(Optional<TensorView> const& maskTensor) {
+  return maskTensor.has_value();
+}
+
+// Resolve a provided rank-mask tensor into a fixed-width uint64 array. Only called when
+// enable_rank_mask is true; the caller must supply a mask in that case (no silent default),
+// since a caller that opted into rank-mask mode without specifying which ranks are alive is
+// almost certainly a bug.
+inline void resolveActiveRankMask(Optional<TensorView> maskTensor, int64_t epRank,
+                                  uint64_t (&out)[tl_throughput::kRankMaskWords]) {
+  using tl_throughput::kMaxRanks;
+  using tl_throughput::kRankMaskWords;
+  TVM_FFI_ICHECK(epRank >= 0 && epRank < kMaxRanks)
+      << "epRank must be in the range [0, " << kMaxRanks << ") for active_rank_mask";
+  TVM_FFI_ICHECK(hasActiveRankMask(maskTensor))
+      << "active_rank_mask must be defined when enable_rank_mask=True";
+  TensorView const& t = maskTensor.value();
+  CHECK_CPU(t);
+  CHECK_CONTIGUOUS(t);
+  CHECK_INPUT_TYPE(t, dl_uint64);
+  TVM_FFI_ICHECK_EQ(t.ndim(), 1) << "active_rank_mask must be a 1D tensor";
+  TVM_FFI_ICHECK_EQ(t.size(0), kRankMaskWords)
+      << "active_rank_mask must have exactly " << kRankMaskWords << " uint64 elements";
+  auto const* src = static_cast<uint64_t const*>(t.data_ptr());
+  for (int w = 0; w < kRankMaskWords; ++w) {
+    out[w] = src[w];
+  }
+  // Local rank's bit must be set; otherwise the kernel would be running on a "dead" rank.
+  TVM_FFI_ICHECK((out[epRank >> 6] >> (epRank & 63)) & 1ULL)
+      << "active_rank_mask must mark the local ep_rank (" << epRank << ") as active";
+}
+
+fi_throughput::MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens,
+                                                  int eplbStatsNumExperts) {
   fi_throughput::MoeA2ADataOffsets offsets{};
   size_t offset = 0;
 
@@ -83,17 +137,22 @@ fi_throughput::MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens) 
   offset += static_cast<size_t>(maxNumTokens) * tl_throughput::kMaxTopK * kInt32Bytes;
 
   offset = alignOffset(offset);
+  offsets[fi_throughput::EPLB_GATHERED_STATS_OFFSET_INDEX] = offset;
+  offset += static_cast<size_t>(epSize) * static_cast<size_t>(eplbStatsNumExperts) * kInt32Bytes;
+
+  offset = alignOffset(offset);
   offsets[fi_throughput::PAYLOAD_DATA_OFFSET_INDEX] = offset;
   return offsets;
 }
 
-int64_t getMoeA2AAuxDataSize(int64_t epSize, int64_t maxNumTokens) {
-  return calculateOffsets(static_cast<int>(epSize),
-                          static_cast<int>(maxNumTokens))[fi_throughput::PAYLOAD_DATA_OFFSET_INDEX];
+int64_t getMoeA2AAuxDataSize(int64_t epSize, int64_t maxNumTokens, int64_t eplbStatsNumExperts) {
+  return calculateOffsets(
+      static_cast<int>(epSize), static_cast<int>(maxNumTokens),
+      static_cast<int>(eplbStatsNumExperts))[fi_throughput::PAYLOAD_DATA_OFFSET_INDEX];
 }
 
 Tensor moeA2AInitializeOp(TensorView workspace, int64_t epRank, int64_t epSize,
-                          int64_t maxNumTokens) {
+                          int64_t maxNumTokens, int64_t eplbStatsNumExperts) {
   CHECK_INPUT_TYPE(workspace, dl_uint8);
   TVM_FFI_ICHECK_EQ(workspace.ndim(), 2) << "workspace must be a 2D tensor";
   TVM_FFI_ICHECK_EQ(workspace.size(0), epSize) << "workspace first dim must equal ep_size";
@@ -105,7 +164,9 @@ Tensor moeA2AInitializeOp(TensorView workspace, int64_t epRank, int64_t epSize,
   auto result = cudaMemsetAsync(rankPtr, 0, workspace.size(1), stream);
   TVM_FFI_ICHECK(result == cudaSuccess) << "cudaMemsetAsync failed";
 
-  auto offsets = calculateOffsets(static_cast<int>(epSize), static_cast<int>(maxNumTokens));
+  TVM_FFI_ICHECK(eplbStatsNumExperts >= 0) << "eplb_stats_num_experts must be non-negative";
+  auto offsets = calculateOffsets(static_cast<int>(epSize), static_cast<int>(maxNumTokens),
+                                  static_cast<int>(eplbStatsNumExperts));
   Tensor metainfo = alloc_tensor({fi_throughput::NUM_METAINFO_FIELDS}, dl_int64, cpu);
   auto* metaPtr = static_cast<int64_t*>(metainfo.data_ptr());
   std::copy(offsets.begin(), offsets.end(), metaPtr);
@@ -116,10 +177,13 @@ Tensor moeA2AInitializeOp(TensorView workspace, int64_t epRank, int64_t epSize,
   return metainfo;
 }
 
-Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
+// Returns (recv_offsets, recv_byte_sizes, combine_payload_offset, eplb_gathered_stats_offset,
+// eplb_stats_num_experts); the last two are -1 and 0 when EPLB is disabled.
+Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchOp(
     TensorView tokenSelectedExperts, Array<Tensor> inputPayloads, TensorView workspace,
     TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize,
-    int64_t topK, int64_t numExperts) {
+    int64_t topK, int64_t numExperts, bool enablePdl, Optional<TensorView> eplbLocalStats,
+    bool enableRankMask, Optional<TensorView> activeRankMask) {
   using tl_throughput::PayloadDescriptor;
 
   CHECK_INPUT(tokenSelectedExperts);
@@ -155,11 +219,33 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
   CHECK_INPUT_TYPE(workspace, dl_uint8);
   TVM_FFI_ICHECK_EQ(workspace.ndim(), 2);
   TVM_FFI_ICHECK_EQ(workspace.size(0), epSize);
+  TVM_FFI_ICHECK(epSize > 0 && epSize <= tl_throughput::kMaxRanks)
+      << "epSize must be in the range (0, " << tl_throughput::kMaxRanks << "]";
   TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize);
   TVM_FFI_ICHECK(runtimeMaxTokensPerRank > 0);
-  TVM_FFI_ICHECK(numExperts >= epSize && numExperts % epSize == 0)
-      << "num_experts must be divisible by ep_size";
+  // Non-divisible num_experts % ep_size is supported via ceil/floor expert-to-rank partitioning.
+  TVM_FFI_ICHECK(numExperts >= epSize) << "num_experts must be >= ep_size";
   TVM_FFI_ICHECK(topK > 0 && topK <= tl_throughput::kMaxTopK);
+
+  // Optional EPLB stats: the dispatch kernel all-gathers each rank's eplb_local_stats.
+  bool const enableEplb = eplbLocalStats.has_value();
+  int64_t eplbStatsNumExperts = 0;
+  if (enableEplb) {
+    auto const& localStats = eplbLocalStats.value();
+    CHECK_INPUT(localStats);
+    CHECK_INPUT_TYPE(localStats, dl_int32);
+    TVM_FFI_ICHECK_EQ(localStats.ndim(), 1) << "eplb_local_stats must be a 1D tensor";
+    eplbStatsNumExperts = localStats.size(0);
+    TVM_FFI_ICHECK(eplbStatsNumExperts > 0) << "eplb_local_stats must not be empty";
+    TVM_FFI_ICHECK(eplbStatsNumExperts <= numExperts)
+        << "eplb_local_stats size must be <= num_experts";
+    // Must fit in the space reserved at initialize time (not overflow into the payload region).
+    int64_t gatheredEnd = offsets[fi_throughput::EPLB_GATHERED_STATS_OFFSET_INDEX] +
+                          epSize * eplbStatsNumExperts * static_cast<int64_t>(kInt32Bytes);
+    TVM_FFI_ICHECK(gatheredEnd <= offsets[fi_throughput::PAYLOAD_DATA_OFFSET_INDEX])
+        << "eplb_local_stats size (" << eplbStatsNumExperts
+        << ") exceeds the eplb_stats_num_experts reserved at initialize time";
+  }
 
   // Calculate payload descriptors and sizes from input tensors
   std::vector<PayloadDescriptor> payloadDescriptors(numPayloads);
@@ -196,15 +282,30 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
                                               << requiredSize << " bytes but has " << sizePerRank;
 
   tl_throughput::MoeA2ADispatchParams params{};
+  params.enable_pdl = enablePdl;
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
-  params.num_experts_per_rank = static_cast<int>(numExperts / epSize);
+  params.num_experts = static_cast<int>(numExperts);
   params.local_num_tokens = localNumTokens;
   params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
   params.top_k = static_cast<int>(topK);
+  params.workspace = workspaceBase;
+  params.workspace_stride_bytes = static_cast<uint64_t>(strideBytes);
+  params.enable_eplb = enableEplb;
+  params.eplb_stats_num_experts = static_cast<int>(eplbStatsNumExperts);
+  params.eplb_local_stats =
+      enableEplb ? static_cast<int32_t const*>(eplbLocalStats.value().data_ptr()) : nullptr;
   params.token_selected_experts = static_cast<int32_t const*>(tokenSelectedExperts.data_ptr());
   params.num_payloads = numPayloads;
   std::copy(payloadDescriptors.begin(), payloadDescriptors.end(), params.payloads);
+
+  params.enable_rank_mask = enableRankMask;
+  if (params.enable_rank_mask) {
+    resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+  } else {
+    TVM_FFI_ICHECK(!hasActiveRankMask(activeRankMask))
+        << "active_rank_mask requires enable_rank_mask=True";
+  }
 
   params.flag_val =
       reinterpret_cast<uint32_t*>(rankWorkspacePtr + offsets[fi_throughput::FLAG_VAL_OFFSET_INDEX]);
@@ -223,6 +324,11 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
         targetWorkspacePtr + offsets[fi_throughput::RECV_COUNTERS_OFFSET_INDEX]);
     params.completion_flags[targetRank] = reinterpret_cast<uint32_t*>(
         targetWorkspacePtr + offsets[fi_throughput::DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX]);
+    params.eplb_gathered_stats[targetRank] =
+        enableEplb
+            ? reinterpret_cast<int*>(targetWorkspacePtr +
+                                     offsets[fi_throughput::EPLB_GATHERED_STATS_OFFSET_INDEX])
+            : nullptr;
 
     size_t offset = static_cast<size_t>(offsets[fi_throughput::PAYLOAD_DATA_OFFSET_INDEX]);
     for (int payloadIdx = 0; payloadIdx < numPayloads; ++payloadIdx) {
@@ -250,7 +356,14 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
   }
 
   int64_t combinePayloadOffset = static_cast<int64_t>(alignOffset(localOffset));
-  return Tuple(recvOffsets, recvByteSizes, combinePayloadOffset);
+
+  // Absolute workspace offset (this rank) of the gathered-stats region, or -1 when disabled.
+  int64_t eplbGatheredStatsOffset =
+      enableEplb ? static_cast<int64_t>(rankWorkspaceOffset +
+                                        offsets[fi_throughput::EPLB_GATHERED_STATS_OFFSET_INDEX])
+                 : -1;
+  return Tuple(recvOffsets, recvByteSizes, combinePayloadOffset, eplbGatheredStatsOffset,
+               eplbStatsNumExperts);
 }
 
 nvinfer1::DataType toNvDataType(DLDataType dtype) {
@@ -271,11 +384,14 @@ nvinfer1::DataType toNvDataType(DLDataType dtype) {
   return nvinfer1::DataType::kFLOAT;
 }
 
-Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
-                       TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
-                       int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
-                       bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
-                       Optional<TensorView> outputScales, int64_t sfLayout) {
+void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
+                         TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
+                         int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
+                         bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
+                         Optional<TensorView> outputScales, double outputScalarScale,
+                         int64_t sfLayout, bool useLowPrecision, bool enablePdl,
+                         bool enableRankMask, Optional<TensorView> activeRankMask,
+                         TensorView output) {
   using tl_throughput::MoeA2ACombineParams;
   using tl_throughput::MoeA2ACombineQuantMode;
   using tl_throughput::MoeA2ACombineSwizzleSFMode;
@@ -284,6 +400,8 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
       << "payload must be [ep_size, runtime_max_tokens_per_rank, hidden]";
   TVM_FFI_ICHECK_EQ(payload.size(0), epSize);
   TVM_FFI_ICHECK_EQ(payload.size(1), runtimeMaxTokensPerRank);
+  TVM_FFI_ICHECK(epSize > 0 && epSize <= tl_throughput::kMaxRanks)
+      << "epSize must be in the range (0, " << tl_throughput::kMaxRanks << "]";
   TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize);
   TVM_FFI_ICHECK(topK > 0 && topK <= tl_throughput::kMaxTopK);
   TVM_FFI_ICHECK(localNumTokens >= 0);
@@ -319,36 +437,112 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
   }
 
   auto stream = get_current_stream();
+
+  // Output dtype precedence:
+  //   - explicit outputDtype_ (e.g. MXFP8/FP4 output quantization) wins;
+  //   - else low-precision combine upcasts the FP8 recv buffers to BF16;
+  //   - else matches the payload dtype.
+  DLDataType outputDtype = outputDtype_.has_value()
+                               ? outputDtype_.value()
+                               : (useLowPrecision ? dl_bfloat16 : payload.dtype());
+  // FP4 output packs two e2m1 values per byte, so its row is half as wide.
+  auto const output_shape = outputDtype == dl_uint8
+                                ? tvm::ffi::Shape{localNumTokens, elementsPerToken / 2}
+                                : tvm::ffi::Shape{localNumTokens, elementsPerToken};
+  CHECK_INPUT(output);
+  CHECK_DEVICE(payload, output);
+  TVM_FFI_ICHECK_EQ(output.ndim(), 2) << "output must be a 2D tensor";
+  TVM_FFI_ICHECK_EQ(output.size(0), output_shape[0]);
+  TVM_FFI_ICHECK_EQ(output.size(1), output_shape[1]);
+  TVM_FFI_ICHECK(output.dtype() == outputDtype)
+      << "output dtype must match "
+      << (outputDtype_.has_value() ? "output_dtype"
+          : useLowPrecision        ? "bf16 (use_low_precision)"
+                                   : "payload dtype")
+      << " (expected " << outputDtype << ", got " << output.dtype() << ")";
+
   MoeA2ACombineParams params{};
-  Tensor output = alloc_tensor({localNumTokens, elementsPerToken},
-                               outputDtype_.value_or(payload.dtype()), payload.device());
+  params.enable_pdl = enablePdl;
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
   params.local_num_tokens = static_cast<int>(localNumTokens);
   params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
   params.top_k = static_cast<int>(topK);
+  params.workspace = workspaceBase;
+  params.workspace_stride_bytes = static_cast<uint64_t>(strideBytes);
+  params.use_low_precision = useLowPrecision;
   params.prepare_payload = payloadInWorkspace ? nullptr : payload.data_ptr();
   params.output_data = output.data_ptr();
   params.elements_per_token = static_cast<int>(elementsPerToken);
   params.dtype = toNvDataType(payload.dtype());
   params.swizzle_mode = static_cast<MoeA2ACombineSwizzleSFMode>(sfLayout);
+  params.output_scalar_scale = static_cast<float>(outputScalarScale);
 
+  // Keep the intermediate alive until both the accumulation and quantization
+  // launches have been enqueued on the caller's current stream.
+  Tensor accumulationStorage;
+
+  // Handle quantization parameters if output scales are provided
   if (outputScales.has_value()) {
-    CHECK_INPUT_AND_TYPE(outputScales.value(), dl_uint8);
     TVM_FFI_ICHECK(payload.dtype() == dl_bfloat16 || payload.dtype() == dl_float16)
-        << "Quantization only supported for fp16 or bf16 inputs";
+        << "Quantization only supports for fp16 or bf16 inputs";
+    TensorView const& scales = outputScales.value();
+    CHECK_INPUT(scales);
+    CHECK_DEVICE(payload, scales);
+
     if (output.dtype() == dl_float8_e4m3fn) {
       // TODO(siyuan): currently only support MXFP8 quantization
+      CHECK_INPUT_TYPE(scales, dl_uint8);
       params.quant_mode = MoeA2ACombineQuantMode::MXFP8;
-      params.output_scales = outputScales.value().data_ptr();
+    } else if (output.dtype() == dl_uint8) {
+      // packed fp4
+      TVM_FFI_ICHECK(scales.dtype() == dl_uint8 || scales.dtype() == dl_float8_e4m3fn)
+          << "packed fp4 output_scales must have uint8 (MXFP4) or float8_e4m3fn (NVFP4) "
+             "dtype";
+      params.quant_mode = scales.dtype() == dl_uint8 ? MoeA2ACombineQuantMode::MXFP4
+                                                     : MoeA2ACombineQuantMode::NVFP4;
     } else {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "Quantization not supported for output dtype: " << output.dtype();
     }
+
+    TVM_FFI_ICHECK(sfLayout >= static_cast<int64_t>(MoeA2ACombineSwizzleSFMode::SWIZZLE_128x4) &&
+                   sfLayout <= static_cast<int64_t>(MoeA2ACombineSwizzleSFMode::LINEAR))
+        << "sf_layout must be layout_128x4, layout_8x4, or layout_linear";
+    auto const swizzleMode = static_cast<MoeA2ACombineSwizzleSFMode>(sfLayout);
+    int64_t const expectedScales =
+        outputScaleExtent(localNumTokens, elementsPerToken, params.quant_mode, swizzleMode);
+    TVM_FFI_ICHECK_EQ(scales.numel(), expectedScales)
+        << "output_scales extent does not match the requested quantization layout";
+
+    // Quantized combine (MXFP8/MXFP4/NVFP4) relies on Blackwell-only conversion instructions.
+    // Validate the public tensor contract first so malformed inputs report their causal error
+    // consistently on every architecture.
+    auto const sm_version = tensorrt_llm::common::getSMVersion();
+    TVM_FFI_ICHECK(sm_version >= 100)
+        << "Quantized moe_a2a_combine requires SM>=100 (Blackwell), but got SM" << sm_version;
+    params.output_scales = scales.data_ptr();
+    // Preserve the public physical payload boundary through the inverse
+    // combine: each owner stores one BF16/FP16 partial before the final
+    // quantizer reads the byte-carried intermediate.
+    accumulationStorage =
+        alloc_tensor({localNumTokens, elementsPerToken}, payload.dtype(), payload.device());
+    params.accumulation_data = accumulationStorage.data_ptr();
+  } else if (useLowPrecision) {
+    // Low-precision combine upcasts the FP8 recv buffers to a BF16 output; no output scales.
+    TVM_FFI_ICHECK(output.dtype() == dl_bfloat16)
+        << "low-precision combine must produce a bf16 output";
+    params.quant_mode = MoeA2ACombineQuantMode::NONE;
   } else {
     TVM_FFI_ICHECK(output.dtype() == payload.dtype())
         << "output_dtype without output_scales must match payload dtype";
     params.quant_mode = MoeA2ACombineQuantMode::NONE;
+  }
+
+  if (params.quant_mode != MoeA2ACombineQuantMode::NVFP4 && outputScalarScale != 1.0) {
+    TLLM_LOG_WARNING(
+        "moe_a2a_combine: output_scalar_scale=%f is ignored unless output quantization is NVFP4",
+        outputScalarScale);
   }
 
   params.flag_val =
@@ -366,6 +560,15 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
         targetWorkspacePtr + offsets[fi_throughput::COMBINE_COMPLETION_FLAGS_OFFSET_INDEX]);
     params.recv_buffers[targetRank] = targetWorkspacePtr + combinePayloadOffset;
   }
+
+  params.enable_rank_mask = enableRankMask;
+  if (params.enable_rank_mask) {
+    resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+  } else {
+    TVM_FFI_ICHECK(!hasActiveRankMask(activeRankMask))
+        << "active_rank_mask requires enable_rank_mask=True";
+  }
+
   params.stream = stream;
 
   tl_throughput::moe_a2a_prepare_combine_launch(params);
@@ -373,11 +576,35 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
   auto err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess)
       << "moe_a2a_combine launch failed: " << cudaGetErrorString(err);
+}
+
+Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
+                       TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
+                       int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
+                       bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
+                       Optional<TensorView> outputScales, double outputScalarScale,
+                       int64_t sfLayout, bool useLowPrecision, bool enablePdl, bool enableRankMask,
+                       Optional<TensorView> activeRankMask) {
+  CHECK_INPUT(payload);
+  TVM_FFI_ICHECK_EQ(payload.ndim(), 3)
+      << "payload must be [ep_size, runtime_max_tokens_per_rank, hidden]";
+  int64_t const elementsPerToken = payload.size(2);
+  DLDataType const outputDtype = outputDtype_.has_value()
+                                     ? outputDtype_.value()
+                                     : (useLowPrecision ? dl_bfloat16 : payload.dtype());
+  auto const outputShape = outputDtype == dl_uint8
+                               ? tvm::ffi::Shape{localNumTokens, elementsPerToken / 2}
+                               : tvm::ffi::Shape{localNumTokens, elementsPerToken};
+  Tensor output = alloc_tensor(outputShape, outputDtype, payload.device());
+  moeA2ACombineIntoOp(payload, localNumTokens, workspace, metainfo, runtimeMaxTokensPerRank, epRank,
+                      epSize, topK, combinePayloadOffset, payloadInWorkspace, outputDtype_,
+                      outputScales, outputScalarScale, sfLayout, useLowPrecision, enablePdl,
+                      enableRankMask, activeRankMask, output);
   return output;
 }
 
 void moeA2ASanitizeExpertIdsOp(TensorView expertIds, TensorView workspace, TensorView metainfo,
-                               int64_t epRank, int64_t invalidExpertId) {
+                               int64_t epRank, int64_t invalidExpertId, bool enablePdl) {
   CHECK_INPUT(expertIds);
   CHECK_INPUT_TYPE(expertIds, dl_int32);
   TVM_FFI_ICHECK_EQ(expertIds.ndim(), 3);
@@ -403,7 +630,8 @@ void moeA2ASanitizeExpertIdsOp(TensorView expertIds, TensorView workspace, Tenso
   tl_throughput::moe_a2a_sanitize_expert_ids_launch(
       static_cast<int32_t*>(expertIds.data_ptr()), recvCounters,
       static_cast<int32_t>(invalidExpertId), static_cast<int>(epSize),
-      static_cast<int>(runtimeMaxTokensPerRank), static_cast<int>(topK), get_current_stream());
+      static_cast<int>(runtimeMaxTokensPerRank), static_cast<int>(topK), get_current_stream(),
+      enablePdl);
 
   auto err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess)
@@ -432,5 +660,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_aux_data_size, getMoeA2AAuxDataSize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_initialize, moeA2AInitializeOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_dispatch, moeA2ADispatchOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_combine, moeA2ACombineOp);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_combine_into, moeA2ACombineIntoOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_sanitize_expert_ids, moeA2ASanitizeExpertIdsOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_metainfo_index_pairs, getMoeA2AMetaInfoIndexPairs);

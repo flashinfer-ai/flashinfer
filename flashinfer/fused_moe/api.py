@@ -26,48 +26,77 @@ configuration.  They group related tensors for ergonomics (no more counting
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+import math
+from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum
-from typing import ClassVar, Dict, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, Literal, Optional, Tuple, Union
 
+import torch
 from torch import Tensor
 
-from ..tllm_enums import ActivationType, RoutingMethodType
+from ..tllm_enums import (
+    DEFAULT_SITU_BETA,
+    DEFAULT_SITU_LINEAR_BETA,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    ActivationType,
+    RoutingInputMode,
+    RoutingMethodType,
+)
+
+# ``NVFP44Over6Config`` / ``NVFP44Over6ErrMode`` are imported for their names
+# alone: ``QuantConfig.__repr__`` can emit either, and the ``eval(repr(cfg))``
+# round-trip this module guarantees is evaluated in *this* module's namespace.
+from ..quantization.nvfp4_quantization_utils import (
+    _UNSET,
+    NVFP44Over6Config,  # noqa: F401
+    NVFP44Over6ErrMode,  # noqa: F401
+    resolve_nvfp4_4over6,
+)
+
+# ---------------------------------------------------------------------------
+# Kernel ceilings
+# ---------------------------------------------------------------------------
+# Mirrored from MaxSupportedTopExperts and NumNemotronExperts in the
+# trtllm-gen DeepSeek router. These limits apply after adding shared experts.
+MAX_SUPPORTED_TOP_EXPERTS = 32
+MAX_SUPPORTED_TOTAL_EXPERTS = 512
 
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
-# Routing and activation reuse the shared kernel-level enums directly
-# (``RoutingMethodType`` / ``ActivationType`` from ``tllm_enums``): the API
-# speaks the kernels' vocabulary rather than mirroring it, so there is a single
-# source of truth (PR #3093 review G1).  Both are ``IntEnum`` — the value *is*
-# the kernel ABI int — and carry an eval-safe ``__repr__`` (defined in
-# ``tllm_enums``) plus ``ActivationType.is_gated`` for the repro round-trip and
-# config helpers.
+# Routing reuses the shared kernel-level ``RoutingMethodType`` enum directly.
+# Typed ActivationConfig values retain an accessible shared ``ActivationType``
+# for the kernel ABI while also carrying activation-specific scalar semantics.
 #
-# ``QuantVariant`` below is the one genuinely API-level enum: it has no single
-# kernel counterpart (the quant path is selected by dtype/scale wiring in the
-# runners, not one enum), so it is defined here as a plain ``Enum``.
+# ``QuantFormat`` is the per-operand MMA numeric format. Axes describe the
+# format consumed by the MMA, not the dtype of the tensor that crosses the
+# Python API. A b12x / cuTile NVFP4 runner that takes BF16 activations and
+# quantizes in-kernel is still ``(NVFP4, NVFP4)``.
 
 
-class QuantVariant(Enum):
-    """Quantization variant — single knob for dtype + granularity + scale convention."""
+class QuantFormat(Enum):
+    """Numeric format of one MMA operand or of the MoE layer output.
+
+    Axes describe the format consumed by the MMA, not the dtype of the tensor
+    that crosses the Python API. A b12x / cuTile NVFP4 runner that takes BF16
+    activations and quantizes in-kernel is still ``(NVFP4, NVFP4)``.
+    """
 
     BF16 = 0
-    FP8PerTensor = 1
-    DeepSeekFp8 = 2
-    MxFp8 = 3
-    NVFP4 = 4  # day-1 MVP target
-    MXFP4 = 5
-    MxInt4 = 6
+    FP16 = 1
+    FP8PerTensor = 2
+    DeepSeekFp8 = 3  # e4m3 + fp32 block scales (128x128 weight, 1x128 activation)
+    MXFP8 = 4
+    NVFP4 = 5
+    MXFP4 = 6
+    MXINT4 = 7
+    INT4 = 8
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}.{self.name}"
-
-
-# ---------------------------------------------------------------------------
-# Component configs — each owns one concern
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -96,6 +125,13 @@ class RoutingConfig:
     n_group: Optional[int] = None
     topk_group: Optional[int] = None
     routed_scaling_factor: Optional[float] = None
+    # Append new fields BELOW this KW_ONLY sentinel. ``_: KW_ONLY`` is a
+    # ``dataclasses`` marker, not a real field -- every field declared after it
+    # becomes keyword-only. That way a field added later can never silently
+    # rebind an existing positional argument at a call site that still looks
+    # correct. The fields above keep their current binding, so adding this
+    # changes nothing for existing callers.
+    _: KW_ONLY
 
     def __repr__(self) -> str:
         parts = [f"num_experts={self.num_experts!r}", f"top_k={self.top_k!r}"]
@@ -112,12 +148,22 @@ class RoutingConfig:
 
 @dataclass(frozen=True)
 class QuantConfig:
-    """Quantization scheme.
+    """Quantization scheme: MMA weight/activation formats plus the result format.
+
+    ``QuantConfig`` only checks that each axis is a :class:`QuantFormat`. Legal
+    combinations are runner capabilities (``supported_quant_variants`` and
+    ``supported_output_formats``), not an allow-list in this dataclass.
 
     Parameters
     ----------
-    variant : QuantVariant
-        Single knob for dtype + granularity + scale convention.
+    weight, activation : QuantFormat
+        MMA weight and activation formats. An omitted axis is BF16, i.e.
+        unquantized: ``QuantConfig()`` is BF16×BF16 and ``QuantConfig(weight=MXFP4)``
+        is MXFP4 weights with BF16 activations (W4A16). MXFP4×MXFP8 must be
+        spelled with both axes.
+    output : QuantFormat
+        Layer output format. Default BF16. Pass ``QuantFormat.FP16``, not
+        ``torch.float16``.
     swizzled_scale_factors : bool or None
         Whether block scale factors use the swizzled (vs linear) layout.
         ``None`` → backend default.  Mirrors core's ``swizzled_input_sf``.  Finer
@@ -128,37 +174,210 @@ class QuantConfig:
     per_token_scale : bool or None
         Whether activations carry a per-token scale (vs per-tensor / block).
         ``None`` → backend default.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search for the **activation**
+        quantization the kernels perform at runtime. Weights are quantized
+        by the caller ahead of the call and are not affected.
+
+        - unset (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables on every call (byte-for-byte the old
+          behaviour).
+        - ``None``: 4over6 off. The environment is ignored.
+        - ``NVFP44Over6Config(...)``: on with exactly that recipe. The
+          environment is ignored, with no per-field merge.
+
+        Only NVFP4 activations accept an explicit value (``__post_init__``
+        raises otherwise). A runner that has not threaded the setting into
+        its quantizer rejects an explicit value instead of dropping it; see
+        ``MoERunner.supports_nvfp4_4over6``. A pinned recipe also pins the
+        GEMM2-input scale of the weight pack: build it with
+        ``CuteDslConfig.prepare_weights(..., nvfp4_4over6=<the same value>)``
+        or the call raises ``ValueError``. An unset field is not emitted by
+        ``__repr__``, so the ``eval(repr(cfg))`` round-trip still holds.
+
+    Raises
+    ------
+    ValueError
+        If ``nvfp4_4over6`` is set (to ``None`` or a config) when
+        ``activation`` is not ``QuantFormat.NVFP4``.
+    TypeError
+        If ``nvfp4_4over6`` is neither ``None`` nor an
+        :class:`NVFP44Over6Config`.
     """
 
-    variant: QuantVariant = QuantVariant.BF16
+    weight: QuantFormat = QuantFormat.BF16
+    activation: QuantFormat = QuantFormat.BF16
+    output: QuantFormat = QuantFormat.BF16
+    # The three axes stay positional; the remaining knobs are keyword-only.
+    _: KW_ONLY
     swizzled_scale_factors: Optional[bool] = None
     per_token_scale: Optional[bool] = None
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET
+
+    def __post_init__(self) -> None:
+        for name in ("weight", "activation", "output"):
+            value = getattr(self, name)
+            if not isinstance(value, QuantFormat):
+                raise TypeError(
+                    f"QuantConfig.{name} must be a QuantFormat, got {value!r}. "
+                    "Pass QuantFormat.FP16 rather than torch.float16."
+                )
+        if self.nvfp4_4over6 is _UNSET:
+            return
+        # Type-check where the value is written, not at launch.
+        resolve_nvfp4_4over6(self.nvfp4_4over6)
+        # Checked here rather than in a runner's _check_support(): MoELayer
+        # swallows those to filter candidates, which would report "no backend
+        # available" instead of naming the mistake.
+        if self.activation is not QuantFormat.NVFP4:
+            raise ValueError(
+                f"nvfp4_4over6={self.nvfp4_4over6!r} applies only to "
+                f"activation=QuantFormat.NVFP4, got "
+                f"activation=QuantFormat.{self.activation.name}."
+            )
+
+    @property
+    def pair(self) -> Tuple[QuantFormat, QuantFormat]:
+        """MMA ``(weight, activation)`` pair used for runner matching."""
+        return (self.weight, self.activation)
+
+    def __repr__(self) -> str:
+        parts = [
+            f"weight={self.weight!r}",
+            f"activation={self.activation!r}",
+            f"output={self.output!r}",
+        ]
+        if self.swizzled_scale_factors is not None:
+            parts.append(f"swizzled_scale_factors={self.swizzled_scale_factors!r}")
+        if self.per_token_scale is not None:
+            parts.append(f"per_token_scale={self.per_token_scale!r}")
+        # An unset field is not emitted; an explicit ``None`` is, because it
+        # means "4over6 off" and eliding it would break the round-trip.
+        if self.nvfp4_4over6 is not _UNSET:
+            parts.append(f"nvfp4_4over6={self.nvfp4_4over6!r}")
+        return f"QuantConfig({', '.join(parts)})"
 
 
 @dataclass(frozen=True)
 class ActivationConfig:
-    """Fused activation between GEMM1 and GEMM2."""
+    """Typed fused activation value accepted by :class:`MoEConfig`.
 
-    # Convenience singletons — populated after class definition
-    swiglu: ClassVar[ActivationConfig]
-    geglu: ClassVar[ActivationConfig]
-    relu2: ClassVar[ActivationConfig]
-    identity: ClassVar[ActivationConfig]
+    Concrete subclasses combine the activation identity with every scalar that
+    changes its semantics. Per-expert tensor overrides remain properties of a
+    backend-native weight view.
+    """
 
-    type: ActivationType = ActivationType.Swiglu
+    type: ClassVar[ActivationType]
 
-    def __repr__(self) -> str:
-        return f"ActivationConfig(type={self.type!r})"
+    def __post_init__(self) -> None:
+        if type(self) is ActivationConfig:
+            raise TypeError(
+                "ActivationConfig is a common base; construct a typed activation "
+                "such as SwiGLU(), GeGLU(), or ReLU2()."
+            )
 
     @property
     def is_gated(self) -> bool:
         return self.type.is_gated
 
 
-ActivationConfig.swiglu = ActivationConfig(ActivationType.Swiglu)
-ActivationConfig.geglu = ActivationConfig(ActivationType.Geglu)
-ActivationConfig.relu2 = ActivationConfig(ActivationType.Relu2)
-ActivationConfig.identity = ActivationConfig(ActivationType.Identity)
+def _validate_finite(name: str, value: float, *, positive: bool = False) -> None:
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite scalar, got {value!r}.")
+    if positive and value <= 0:
+        raise ValueError(f"{name} must be positive, got {value!r}.")
+
+
+@dataclass(frozen=True)
+class SwiGLU(ActivationConfig):
+    """SwiGLU/OA activation.
+
+    The linear branch is clamped to ``[-limit, limit]`` and the gate branch to
+    ``(-inf, limit]`` before evaluating
+    ``gate * sigmoid(alpha * gate) * (linear + beta)``.
+    """
+
+    type: ClassVar[ActivationType] = ActivationType.Swiglu
+    alpha: float = DEFAULT_SWIGLU_ALPHA
+    beta: float = DEFAULT_SWIGLU_BETA
+    limit: float = DEFAULT_SWIGLU_LIMIT
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _validate_finite("alpha", self.alpha)
+        _validate_finite("beta", self.beta)
+        _validate_finite("limit", self.limit, positive=True)
+
+
+@dataclass(frozen=True)
+class SiTU(ActivationConfig):
+    """SiTU v2 with canonical gate, linear, and optional clamp scales.
+
+    ``linear_scale`` applies
+    ``linear_scale * tanh(linear / linear_scale)``; ``None`` selects an
+    unclamped linear branch, currently expressible only by CuTe-DSL. The
+    defaults are the canonical SiTU (Kimi-K3) scales. Backend adapters must
+    lower these exact values or reject unsupported semantics rather than rely
+    on different native defaults.
+    """
+
+    type: ClassVar[ActivationType] = ActivationType.Situ
+    gate_scale: float = DEFAULT_SITU_BETA
+    linear_scale: Optional[float] = DEFAULT_SITU_LINEAR_BETA
+    clamp_limit: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _validate_finite("gate_scale", self.gate_scale, positive=True)
+        if self.linear_scale is not None:
+            _validate_finite("linear_scale", self.linear_scale, positive=True)
+        if self.clamp_limit is not None:
+            _validate_finite("clamp_limit", self.clamp_limit, positive=True)
+
+
+@dataclass(frozen=True)
+class GeGLU(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Geglu
+
+
+@dataclass(frozen=True)
+class ReLU2(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Relu2
+
+
+@dataclass(frozen=True)
+class GeGLUTanh(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.GegluTanh
+
+
+@dataclass(frozen=True)
+class SwiGLUStep(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.SwigluStep
+    limit: float = 7.0
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _validate_finite("limit", self.limit, positive=True)
+
+
+@dataclass(frozen=True)
+class Identity(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Identity
+
+
+@dataclass(frozen=True)
+class GELU(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Gelu
+
+
+@dataclass(frozen=True)
+class ReLU(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Relu
+
+
+@dataclass(frozen=True)
+class SiLU(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Silu
 
 
 @dataclass(frozen=True)
@@ -173,11 +392,31 @@ class ExpertConfig:
         Start index for expert-parallel sharding.
     local_num_experts : int or None
         Number of experts on this rank.  ``None`` → ``num_experts`` at runtime.
+    num_fused_shared_experts : int
+        Number of shared experts run for every token. Their rows follow the
+        routed experts, so weights have ``E + S`` rows while routing fields
+        remain routed-only. Cross-field constraints are checked by
+        :class:`MoEConfig`.
     """
 
     intermediate_size: int
     local_expert_offset: int = 0
     local_num_experts: Optional[int] = None
+    num_fused_shared_experts: int = 0
+    # Append new fields BELOW this KW_ONLY sentinel. ``_: KW_ONLY`` is a
+    # ``dataclasses`` marker, not a real field -- every field declared after it
+    # becomes keyword-only. That way a field added later can never silently
+    # rebind an existing positional argument at a call site that still looks
+    # correct. The fields above keep their current binding, so adding this
+    # changes nothing for existing callers.
+    _: KW_ONLY
+
+    def __post_init__(self) -> None:
+        if self.num_fused_shared_experts < 0:
+            raise ValueError(
+                "num_fused_shared_experts must be >= 0, got "
+                f"{self.num_fused_shared_experts}."
+            )
 
     def __repr__(self) -> str:
         parts = [f"intermediate_size={self.intermediate_size!r}"]
@@ -185,7 +424,53 @@ class ExpertConfig:
             parts.append(f"local_expert_offset={self.local_expert_offset!r}")
         if self.local_num_experts is not None:
             parts.append(f"local_num_experts={self.local_num_experts!r}")
+        if self.num_fused_shared_experts != 0:
+            parts.append(f"num_fused_shared_experts={self.num_fused_shared_experts!r}")
         return f"ExpertConfig({', '.join(parts)})"
+
+
+@dataclass(frozen=True)
+class MoEFinalizeConfig:
+    """How the finalize (combine) step behaves.
+
+    Split out of ``ExecutionConfig`` for the same reason ``RoutingConfig`` is
+    its own config: finalize is a distinct architectural concern (how the
+    per-expert partials are reduced back into one row per token), not a
+    runtime knob like PDL or the autotuner token budget.
+
+    Parameters
+    ----------
+    do_finalize : bool
+        Whether to apply routing-weight scaling and accumulate the per-expert
+        partial results into the output.  ``False`` returns the unreduced
+        intermediates as ``[gemm2_output, expert_weights,
+        expanded_idx_to_permuted_idx]``, leaving the combine to the caller:
+        ``expanded_idx_to_permuted_idx[token * top_k + slot]`` is the row of
+        ``gemm2_output`` holding that assignment, or ``-1`` when its expert
+        is not local.
+        For FromLogits routing, the routing kernel emits ``expert_weights`` in
+        bfloat16 regardless of the routing-logits dtype. ``PackedPrecomputed``
+        routing also yields bfloat16 weights: the caller's values are narrowed
+        to bfloat16 when packed into the top-k ids. Only
+        ``UnpackedPrecomputed`` routing preserves the caller-provided weights
+        dtype, since it forwards ``topk_weights`` to the kernel unchanged.
+        Only backends that advertise unfinalized output support this mode.
+    use_fused_finalize : bool
+        Whether supported backends reduce routed outputs in the GEMM2 epilogue
+        (atomic accumulation) instead of running a separate reduction kernel.
+        Backends that do not support it ignore the flag.
+    """
+
+    do_finalize: bool = True
+    use_fused_finalize: bool = True
+
+    def __repr__(self) -> str:
+        parts = []
+        if not self.do_finalize:
+            parts.append(f"do_finalize={self.do_finalize!r}")
+        if not self.use_fused_finalize:
+            parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
+        return f"MoEFinalizeConfig({', '.join(parts)})"
 
 
 @dataclass(frozen=True)
@@ -194,22 +479,17 @@ class ExecutionConfig:
 
     Parameters
     ----------
-    do_finalize : bool
-        Whether to apply routing-weight scaling and accumulate into output.
     enable_pdl : bool or None
         Persistent device launch.  ``None`` → auto (True for sm90+).
     tune_max_num_tokens : int
         Token budget hint for autotuner / CUDA graph capture.
     """
 
-    do_finalize: bool = True
     enable_pdl: Optional[bool] = None
     tune_max_num_tokens: int = 8192
 
     def __repr__(self) -> str:
         parts = []
-        if not self.do_finalize:
-            parts.append(f"do_finalize={self.do_finalize!r}")
         if self.enable_pdl is not None:
             parts.append(f"enable_pdl={self.enable_pdl!r}")
         if self.tune_max_num_tokens != 8192:
@@ -221,49 +501,468 @@ class ExecutionConfig:
 # Backend configs — each declares hardware preconditions
 # ---------------------------------------------------------------------------
 
+# Architectures the TRT-LLM routed-MoE cubin manifest ships kernels for.  The
+# manifest is a downloaded artifact, so this cannot be derived at import time and
+# has to be kept in sync with the cubin-arch compatibility rules in
+# csrc/trtllm_batched_gemm_runner.cu.  SM110/120/121 need upstream cubins first;
+# claiming them here makes the batched-GEMM runner abort at dispatch (#4107).
+_TRTLLM_ROUTED_ARCHS = (100, 103, 107)
+
+# The FP8 kernels are validated on the SM100 family only — the outer JIT module
+# compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
+_TRTLLM_ROUTED_FP8_ARCHS = (100, 103, 107)
+
+# Prims-TS (CUTLASS primitives + task scheduling) GEMMs are SM100/SM103 only.
+_PRIMS_TS_ARCHS = (100, 103)
+
+# Dense BF16 follows the architecture dispatch already exposed by the flat
+# CUTLASS API.
+_CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
+
+# W4A16 uses Hopper-specific mixed-input weight and scale layouts.
+_CUTLASS_W4A16_ARCHS = (90,)
+
+_CUTILE_BF16_ARCHS = (89, 90, 120, 121)
+_CUTILE_NVFP4_ARCHS = (120, 121)
+_CUTILE_MXFP4_ARCHS = (120, 121)
+_CUTILE_W4A16_ARCHS = (89, 90, 120, 121)
+_CUTILE_FP8_ARCHS = (90, 120, 121)
+_CUTILE_MXFP8_ARCHS = (120, 121)
+_CUTILE_SUPPORTED_ACTIVATIONS = (
+    ActivationType.Swiglu,
+    ActivationType.SwigluStep,
+    ActivationType.Geglu,
+    ActivationType.GegluTanh,
+    ActivationType.Situ,
+    ActivationType.Relu2,
+    ActivationType.Identity,
+    ActivationType.Gelu,
+    ActivationType.Relu,
+    ActivationType.Silu,
+)
+
+# NVFP4 CUTLASS fused MoE matches the flat-API skip: SM100/SM110/SM12x.
+# Major 10/11/12 covers SM100/103/107, SM110, and SM120/121.
+_CUTLASS_NVFP4_ARCHS = (100, 103, 107, 110, 120, 121)
+
+# Per-tensor FP8 follows the dense CUTLASS architecture list.
+_CUTLASS_FP8_ARCHS = _CUTLASS_BF16_ARCHS
+
+# DeepSeek-style 128x128 FP8 block scaling is Hopper-only in the flat API.
+_CUTLASS_FP8_BLOCK_ARCHS = (90,)
+
+# MXFP8 activations x MXFP4 weights matches a *wider* flat-API skip than
+# MXFP8 x MXFP8: ``capability[0] not in [10, 11, 12]`` (SM100/103/107, SM110,
+# SM120/121). Do not collapse this to ``_CUTLASS_MXFP8_ARCHS``.
+_CUTLASS_MXFP8_MXFP4_ARCHS = (100, 103, 107, 110, 120, 121)
+
+# MXFP8 x MXFP8 follows the narrower flat skip: ``capability[0] not in [10]``
+# (SM10x only, including B300 SM103). Not claimed on SM11x/SM12x.
+_CUTLASS_MXFP8_ARCHS = (100, 103, 107)
+
+# INT4 W4A8 and Humming MXFP4 x FP8 are Hopper mixed-input paths.
+_CUTLASS_W4A8_ARCHS = (90,)
+_CUTLASS_HUMMING_ARCHS = (90,)
+
+_CUDNN_GROUPED_GEMM_BF16_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
+_CUDNN_GROUPED_GEMM_FP8_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
+_CUDNN_GROUPED_GEMM_MXFP8_ARCHS = (100, 103, 107, 110, 120, 121)
+_CUDNN_GROUPED_GEMM_FP4_ARCHS = (100, 103, 107, 110, 120, 121)
+
+
+# Default MMA pair shared by the FP4 ``prepare_*`` helpers
+# (TrtllmFp4Config, CakeWarpDecodeConfig, CuteDslConfig).
+_NVFP4_NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+
 
 @dataclass(frozen=True)
 class TrtllmFp4Config:
-    """TensorRT-LLM FP4 block-scale backend."""
+    """TensorRT-LLM FP4 backend for NVFP4 and MXFP4 mixed-precision modes.
+
+    ``supported(arch)`` reflects the routed-MoE cubin manifest. Variant-specific
+    restrictions are applied by ``TrtllmFp4RoutedRunner.check_support()``:
+    NVFP4/MXFP4 support SM100/SM103/SM107, while W4A16 supports SM100/SM107
+    and remains disabled on SM103.
+    """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM100+ only: the routed runner delegates to the trtllm-gen sm100
-        # module, which core.is_trtllm_moe_supported() gates on major >= 10.
-        # Returning True on SM90 would mark the backend available on H100 and
-        # then fail at dispatch.
-        return arch >= 100
+        return arch in _TRTLLM_ROUTED_ARCHS
 
     @staticmethod
     def prepare_weights(
         w1_bf16,
         w2_bf16,
         *,
+        quant: QuantConfig = _NVFP4_NVFP4,
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
         permute_cache=None,
     ):
-        """Build the ``trtllm_fp4_routed`` weight view from canonical bf16 weights.
+        """Build a ``trtllm_fp4_routed`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("trtllm_fp4_routed", ...)``.
+        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or MXFP4×BF16 (TRTLLM W4A16).
+        Defaults to NVFP4×NVFP4.
         See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_fp4_weights`.
+
+        .. warning::
+           ``num_local_experts`` is the physical row count: ``E_local + S``
+           when fused shared experts are present. :class:`ExpertConfig` keeps
+           ``local_num_experts`` as the routed-only count ``E_local``.
         """
         from .prepare import prepare_trtllm_fp4_weights
 
         return prepare_trtllm_fp4_weights(
             w1_bf16,
             w2_bf16,
+            quant=quant,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
             permute_cache=permute_cache,
         )
 
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+    ):
+        """Prepare activations for NVFP4×NVFP4, MXFP4×MXFP8, or MXFP4×BF16.
+
+        MXFP4×BF16 (TRTLLM W4A16) returns raw BF16 activations without an
+        activation scale. Defaults to NVFP4×NVFP4.
+        """
+        from .prepare import prepare_trtllm_fp4_activations
+
+        return prepare_trtllm_fp4_activations(
+            hidden_states_bf16,
+            quant=quant,
+        )
+
     def __repr__(self) -> str:
         return "TrtllmFp4Config()"
+
+
+@dataclass(frozen=True)
+class CakeWarpDecodeConfig:
+    """Explicit Cake NVFP4 warp-decode backend for exact SM100 and SM103.
+
+    This backend is intentionally narrow: it accepts only the
+    activation-qualified expert geometries documented by
+    :class:`CakeWarpDecodeRunner`, 1--32 tokens, and unpacked precomputed routing.
+    It is never part of the default backend list; users opt in with
+    ``CakeWarpDecodeConfig(backend="cake")``.
+
+    The physical weight and activation layouts are exactly those produced by
+    :class:`TrtllmFp4Config` for NVFP4×NVFP4. This keeps one quantized
+    representation usable by both runners.
+
+    CUDA Graph capture requires a warmed workspace. Graph replays and eager
+    calls that share a workspace must be ordered by the caller; captured calls
+    do not insert a wait for another graph using that workspace. Use separate
+    MoELayer instances for graphs that need to execute concurrently.
+    """
+
+    backend: Literal["cake"] = "cake"
+
+    def __post_init__(self) -> None:
+        if self.backend != "cake":
+            raise ValueError(
+                f"CakeWarpDecodeConfig backend must be 'cake', got {self.backend!r}."
+            )
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build the shared TRTLLM NVFP4 physical weight view.
+
+        Register the returned dictionary with
+        ``MoEWeightPack.prepare_for("cake", view)``. Default SwiGLU and SiTU
+        may register that dictionary for ``"trtllm_fp4_routed"`` as well.
+        SwiGLU(limit=10.0) on H4096/I2048/E256 keeps raw-accumulator beta/clamp
+        and shares the same prepared dictionary with the official runner. Other
+        parameterized SwiGLU consumes logical beta/clamp here; the official
+        runner requires each divided by ``output1_scale_gate_scalar``. For
+        non-unit gate scales, prepare a separate official dictionary with those
+        derived FP32 per-expert buffers, keeping alpha and physical tensors
+        shared. Refresh the derived buffers outside timing/capture when logical
+        beta, clamp, or gate scale changes, preserving captured addresses.
+        """
+        if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            raise ValueError(
+                "Cake warp decode weight preparation requires "
+                f"NVFP4×NVFP4, got {quant!r}."
+            )
+        activation = SwiGLU() if activation is None else activation
+        geometry = (hidden_size, intermediate_size, num_local_experts)
+        supported = (
+            (SwiGLU(), (2048, 512, 512)),
+            (SwiGLU(), (2048, 1536, 60)),
+            (SwiGLU(), (2560, 768, 384)),
+            (SiLU(), (6144, 1536, 192)),
+            (SwiGLU(limit=10.0), (4096, 2048, 256)),
+            (SwiGLU(), (2048, 768, 128)),
+            (SwiGLU(), (4096, 1536, 128)),
+            (SwiGLU(), (2048, 512, 256)),
+            (SwiGLU(), (4096, 1024, 512)),
+            (SwiGLU(), (3072, 1536, 256)),
+            (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), (6144, 3072, 128)),
+            (SiTU(gate_scale=4.0, linear_scale=25.0), (3584, 3072, 896)),
+            (SwiGLU(), (4096, 512, 512)),
+            (SwiGLU(), (4096, 256, 512)),
+            (SwiGLU(), (3072, 768, 256)),
+            (SwiGLU(), (3072, 384, 256)),
+        )
+        if not any(
+            activation == supported_activation and geometry == supported_geometry
+            for supported_activation, supported_geometry in supported
+        ):
+            raise ValueError(
+                "Cake warp decode weight preparation supports only default "
+                "SwiGLU() with (hidden_size, intermediate_size, num_local_experts) "
+                "= (2048, 512, 512), (2048, 1536, 60), (2560, 768, 384), "
+                "(2048, 768, 128), (4096, 1536, 128), (2048, 512, 256), "
+                "(4096, 1024, 512), (3072, 1536, 256), (4096, 512, 512), "
+                "(4096, 256, 512), (3072, 768, 256), or (3072, 384, 256), "
+                "and SiLU() with "
+                "(6144, 1536, 192), SwiGLU(alpha=1.702, beta=1.0, limit=7.0) "
+                "with (6144, 3072, 128), or SiTU(gate_scale=4.0, linear_scale=25.0) "
+                "with (3584, 3072, 896), or SwiGLU(limit=10.0) with "
+                "(4096, 2048, 256) on SM100; got "
+                f"activation={activation!r}, geometry={geometry}."
+            )
+        return TrtllmFp4Config.prepare_weights(
+            w1_bf16,
+            w2_bf16,
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+            permute_cache=permute_cache,
+        )
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+    ):
+        """Build the shared TRTLLM NVFP4 packed activation view."""
+        if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            raise ValueError(
+                "Cake warp decode activation preparation requires "
+                f"NVFP4×NVFP4, got {quant!r}."
+            )
+        return TrtllmFp4Config.prepare_activations(
+            hidden_states_bf16,
+            quant=quant,
+        )
+
+    def __repr__(self) -> str:
+        return "CakeWarpDecodeConfig(backend='cake')"
+
+
+def _shuffle_deepseek_prims_ts_weights(view: dict) -> dict:
+    """Shuffle DeepSeek FP8 weight payloads for the Prims-TS block-scale path.
+
+    ``TrtllmFp8BlockConfig`` leaves DeepSeek weights unshuffled. Prims-TS
+    requires ``use_shuffled_weight`` and the flat DeepSeek tests shuffle the
+    E4M3 payloads with epilogue tile 64, leaving the FP32 128x128 block scales
+    in the TRT-LLM layout. Activations stay on that same unshuffled layout.
+    """
+    from ..quantization.fp4_quantization import shuffle_matrix_a
+
+    shuffled = dict(view)
+    for name in ("gemm1_weights", "gemm2_weights"):
+        weights = view[name]
+        rows = [
+            shuffle_matrix_a(weights[expert].view(torch.uint8), 64)
+            .contiguous()
+            .view(weights.dtype)
+            for expert in range(weights.shape[0])
+        ]
+        shuffled[name] = torch.stack(rows)
+    return shuffled
+
+
+@dataclass(frozen=True)
+class PrimsTsConfig:
+    """Explicit Prims-TS backend for SM100 and SM103.
+
+    Opt-in only: this config is never part of the default backend list.
+    NVFP4×NVFP4, MXFP4×MXFP8, and MXFP4×BF16 reuse
+    :class:`TrtllmFp4Config`. BF16×BF16 reuses :class:`TrtllmBf16Config`.
+    MXFP8×MXFP8 and FP8PerTensor×FP8PerTensor reuse
+    :class:`TrtllmFp8BlockConfig` and :class:`TrtllmFp8PerTensorConfig`.
+    DeepSeekFp8×DeepSeekFp8 reuses the TRT-LLM scales and activations, then
+    shuffles the weight payloads (epilogue tile 64); do not register that
+    dictionary under ``"trtllm_fp8_block"``.
+
+    The GEMM middle stage is Prims-TS; routing and finalize stay on the
+    TRT-LLM Gen path.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _PRIMS_TS_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        permute_cache=None,
+        hidden_states_scale_global=None,
+        intermediate_scale_global=None,
+    ):
+        """Build the Prims-TS weight view for one supported quant pair.
+
+        Register the returned dictionary with
+        ``MoEWeightPack.prepare_for("prims_ts", view)``. Except for
+        DeepSeekFp8, the same dictionary may also be registered for the
+        matching TRT-LLM backend key.
+        """
+        pair = quant.pair
+        if pair in (
+            (QuantFormat.NVFP4, QuantFormat.NVFP4),
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            (QuantFormat.MXFP4, QuantFormat.BF16),
+        ):
+            return TrtllmFp4Config.prepare_weights(
+                w1_bf16,
+                w2_bf16,
+                quant=quant,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation=activation,
+                device=device,
+                permute_cache=permute_cache,
+            )
+        if pair == (QuantFormat.BF16, QuantFormat.BF16):
+            return TrtllmBf16Config.prepare_weights(
+                w1_bf16,
+                w2_bf16,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation=activation,
+                device=device,
+                permute_cache=permute_cache,
+            )
+        if pair in (
+            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8),
+        ):
+            view = TrtllmFp8BlockConfig.prepare_weights(
+                w1_bf16,
+                w2_bf16,
+                quant=quant,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation=activation,
+                device=device,
+            )
+            if pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
+                return _shuffle_deepseek_prims_ts_weights(view)
+            return view
+        if pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor):
+            if hidden_states_scale_global is None or intermediate_scale_global is None:
+                raise ValueError(
+                    "FP8PerTensor×FP8PerTensor preparation requires "
+                    "hidden_states_scale_global and intermediate_scale_global."
+                )
+            return TrtllmFp8PerTensorConfig.prepare_weights(
+                w1_bf16,
+                w2_bf16,
+                hidden_states_scale_global=hidden_states_scale_global,
+                intermediate_scale_global=intermediate_scale_global,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation=activation,
+                device=device,
+            )
+        raise ValueError(f"Prims-TS weight preparation does not support {quant!r}.")
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        quant: QuantConfig,
+        hidden_states_scale_global=None,
+    ):
+        """Build activations for the matching physical layout.
+
+        BF16×BF16 and MXFP4×BF16 return ``(hidden_states, None)``.
+        FP8PerTensor×FP8PerTensor quantizes with ``hidden_states_scale_global``
+        and returns a ``None`` pack scale. Every other supported pair returns
+        ``(hidden_states_q, hidden_states_scale)``.
+        """
+        pair = quant.pair
+        if pair in (
+            (QuantFormat.NVFP4, QuantFormat.NVFP4),
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            (QuantFormat.MXFP4, QuantFormat.BF16),
+        ):
+            return TrtllmFp4Config.prepare_activations(
+                hidden_states_bf16,
+                quant=quant,
+            )
+        if pair == (QuantFormat.BF16, QuantFormat.BF16):
+            return hidden_states_bf16, None
+        if pair in (
+            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8),
+        ):
+            return TrtllmFp8BlockConfig.prepare_activations(
+                hidden_states_bf16,
+                quant=quant,
+            )
+        if pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor):
+            if hidden_states_scale_global is None:
+                raise ValueError(
+                    "FP8PerTensor×FP8PerTensor activation preparation requires "
+                    "hidden_states_scale_global."
+                )
+            return TrtllmFp8PerTensorConfig.prepare_activations(
+                hidden_states_bf16,
+                hidden_states_scale_global=hidden_states_scale_global,
+            )
+        raise ValueError(f"Prims-TS activation preparation does not support {quant!r}.")
+
+    def __repr__(self) -> str:
+        return "PrimsTsConfig()"
 
 
 @dataclass(frozen=True)
@@ -272,7 +971,53 @@ class TrtllmFp8BlockConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 80
+        return arch in _TRTLLM_ROUTED_FP8_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the ``trtllm_fp8_block`` weight view from canonical BF16.
+
+        ``quant`` must be DeepSeekFp8×DeepSeekFp8 or MXFP8×MXFP8; their scale
+        formats are intentionally prepared by separate paths. The shuffled MXFP8
+        view requires both
+        ``hidden_size`` and ``intermediate_size`` to be divisible by 128 so its
+        scale tensors fit TRTLLM's unpadded 128x4 physical layout.
+
+        .. warning::
+           ``num_local_experts`` here is the **physical row count** of
+           ``w1_bf16`` / ``w2_bf16``: ``E_local + S`` with shared experts.
+           :attr:`ExpertConfig.local_num_experts` remains routed-only
+           (``E_local``).
+        """
+        from .prepare import prepare_trtllm_fp8_block_weights
+
+        return prepare_trtllm_fp8_block_weights(
+            w1_bf16,
+            w2_bf16,
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, quant: QuantConfig):
+        """Quantize BF16 activations for the selected block-FP8 convention."""
+        from .prepare import prepare_trtllm_fp8_block_activations
+
+        return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
 
     def __repr__(self) -> str:
         return "TrtllmFp8BlockConfig()"
@@ -284,7 +1029,45 @@ class TrtllmFp8PerTensorConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 80
+        return arch in _TRTLLM_ROUTED_FP8_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the ``trtllm_fp8_per_tensor`` MajorK weight view."""
+        from .prepare import prepare_trtllm_fp8_per_tensor_weights
+
+        return prepare_trtllm_fp8_per_tensor_weights(
+            w1_bf16,
+            w2_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+            intermediate_scale_global=intermediate_scale_global,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, hidden_states_scale_global):
+        """Quantize BF16 activations with one calibrated E4M3 multiplier."""
+        from .prepare import prepare_trtllm_fp8_per_tensor_activations
+
+        return prepare_trtllm_fp8_per_tensor_activations(
+            hidden_states_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+        )
 
     def __repr__(self) -> str:
         return "TrtllmFp8PerTensorConfig()"
@@ -296,7 +1079,37 @@ class TrtllmBf16Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 100
+        return arch in _TRTLLM_ROUTED_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build the ``trtllm_bf16_routed`` weight view from canonical bf16 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("trtllm_bf16_routed", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_bf16_weights`.
+        """
+        from .prepare import prepare_trtllm_bf16_weights
+
+        return prepare_trtllm_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+            permute_cache=permute_cache,
+        )
 
     def __repr__(self) -> str:
         return "TrtllmBf16Config()"
@@ -308,35 +1121,9 @@ class TrtllmMxInt4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 100
-
-    def __repr__(self) -> str:
-        return "TrtllmMxInt4Config()"
-
-
-@dataclass(frozen=True)
-class CutlassConfig:
-    """CUTLASS backend — broadest architecture support."""
-
-    @classmethod
-    def supported(cls, arch: int) -> bool:
-        return True  # universal fallback
-
-    def __repr__(self) -> str:
-        return "CutlassConfig()"
-
-
-@dataclass(frozen=True)
-class CuteDslConfig:
-    """CuteDSL NVFP4 backend — SM100 family only (Blackwell SM100, SM103).
-
-    The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
-    """
-
-    @classmethod
-    def supported(cls, arch: int) -> bool:
-        # SM100, SM103 — tighten when CuteDSL adds more targets
-        return arch in (100, 103)
+        # SM100/SM103 use the forward-compatible sm100f cubins; SM107 selects
+        # the dedicated Rubin artifact.
+        return arch in _TRTLLM_ROUTED_ARCHS
 
     @staticmethod
     def prepare_weights(
@@ -346,47 +1133,1504 @@ class CuteDslConfig:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
+        permute_cache=None,
     ):
-        """Build the ``cute_dsl_nvfp4`` weight view from canonical bf16 weights.
+        """Build a ``trtllm_mxint4_routed`` view from canonical BF16 weights."""
+        from .prepare import prepare_trtllm_mxint4_weights
 
-        Register the result with ``MoEWeightPack.prepare_for("cute_dsl_nvfp4", ...)``.
-        See :func:`flashinfer.fused_moe.prepare.prepare_cute_dsl_nvfp4_weights`.
-        """
-        from .prepare import prepare_cute_dsl_nvfp4_weights
-
-        return prepare_cute_dsl_nvfp4_weights(
+        return prepare_trtllm_mxint4_weights(
             w1_bf16,
             w2_bf16,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
+            permute_cache=permute_cache,
+        )
+
+    def __repr__(self) -> str:
+        return "TrtllmMxInt4Config()"
+
+
+@dataclass(frozen=True)
+class CutlassBf16Config:
+    """CUTLASS BF16 backend for the unified MoE API.
+
+    Architecture coverage follows the dense-BF16 legacy flat API. The unified
+    GPU tests currently exercise SM90.
+
+    This backend supports packed precomputed routing with all flat CUTLASS
+    activation semantics and requires ``do_finalize=True``.
+    Expert parallelism and shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_BF16_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the ``cutlass_bf16`` canonical BF16 weight view.
+
+        GEMM1 uses the public ``[up, gate]`` row convention.  Unlike TRTLLM's
+        BlockMajorK path, CUTLASS BF16 kernels consume these weights directly
+        and need no physical reordering.
+        """
+        from .prepare import prepare_cutlass_bf16_weights
+
+        return prepare_cutlass_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CutlassBf16Config()"
+
+
+@dataclass(frozen=True)
+class CuTileBf16Config:
+    """cuTile BF16 backend.
+
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_BF16_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the ``cutile_bf16`` weight view from canonical BF16 weights."""
+        from .prepare import prepare_cutile_bf16_weights
+
+        return prepare_cutile_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=(activation or SwiGLU()).type,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileBf16Config()"
+
+
+@dataclass(frozen=True)
+class CuTileNvfp4Config:
+    """cuTile NVFP4-weight x NVFP4-activation backend.
+
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_NVFP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w1_global_scale,
+        w2_fp4,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+        device=None,
+    ):
+        """Build the ``cutile_nvfp4`` view from checkpoint NVFP4 weights.
+
+        Set ``device`` to the execution GPU when loading CPU checkpoint tensors.
+        Prepared scale layouts are architecture-specific and must be rebuilt
+        when moving between SM89/90 and SM12x.
+        """
+        from .prepare import prepare_cutile_nvfp4_weights
+
+        return prepare_cutile_nvfp4_weights(
+            w1_fp4,
+            w1_block_scale,
+            w1_global_scale,
+            w2_fp4,
+            w2_block_scale,
+            w2_global_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=(activation or SwiGLU()).type,
+            source_format=source_format,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileNvfp4Config()"
+
+
+@dataclass(frozen=True)
+class CuTileNvfp4Bf16Config(CuTileNvfp4Config):
+    """cuTile NVFP4-weight x BF16-activation backend.
+
+    Uses the same prepared weight view as :class:`CuTileNvfp4Config`.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_W4A16_ARCHS
+
+    def __repr__(self) -> str:
+        return "CuTileNvfp4Bf16Config()"
+
+
+@dataclass(frozen=True)
+class CuTileMxfp4Config:
+    """cuTile MXFP4-weight x MXFP4-activation backend.
+
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_MXFP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w2_fp4,
+        w2_block_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the shared ``cutile_mxfp4`` weight view.
+
+        Set ``device`` to the execution GPU when loading CPU checkpoint tensors.
+        Prepared scale layouts are architecture-specific and must be rebuilt
+        when moving between SM89/90 and SM12x.
+        """
+        from .prepare import prepare_cutile_mxfp4_weights
+
+        return prepare_cutile_mxfp4_weights(
+            w1_fp4,
+            w1_block_scale,
+            w2_fp4,
+            w2_block_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=(activation or SwiGLU()).type,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileMxfp4Config()"
+
+
+@dataclass(frozen=True)
+class CuTileMxfp4Bf16Config(CuTileMxfp4Config):
+    """cuTile MXFP4-weight x BF16-activation backend.
+
+    Uses the same prepared weight view as :class:`CuTileMxfp4Config`.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_W4A16_ARCHS
+
+    def __repr__(self) -> str:
+        return "CuTileMxfp4Bf16Config()"
+
+
+@dataclass(frozen=True)
+class CuTileFp8PerTensorConfig:
+    """cuTile per-tensor E4M3 weights and activations.
+
+    Inputs are BF16; both GEMM inputs are dynamically quantized to E4M3.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_FP8_ARCHS
+
+    @classmethod
+    def prepare_weights(
+        cls,
+        w1_fp8,
+        w1_scale,
+        w2_fp8,
+        w2_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Prepare E4M3 weights with one FP32 dequantization scale per expert.
+
+        GEMM1 uses canonical ``[up, gate]`` rows for gated activations.
+        The result is shared with :class:`CuTileFp8PerTensorBf16Config`.
+        """
+        from .prepare import prepare_cutile_fp8_weights
+
+        return prepare_cutile_fp8_weights(
+            w1_fp8,
+            w1_scale,
+            w2_fp8,
+            w2_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            block_scaled=False,
+            activation_type=(activation or SwiGLU()).type,
+            device=device,
+        )
+
+
+@dataclass(frozen=True)
+class CuTileFp8PerTensorBf16Config(CuTileFp8PerTensorConfig):
+    """cuTile per-tensor E4M3 weights with BF16 inputs to both GEMMs.
+
+    Shares prepared weights with :class:`CuTileFp8PerTensorConfig`.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_BF16_ARCHS
+
+
+@dataclass(frozen=True)
+class CuTileMxfp8Config:
+    """cuTile MXFP8 weights and activations, with E8M0 scales per 32 values.
+
+    Inputs are BF16; both GEMM inputs are dynamically quantized to MXFP8.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_MXFP8_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp8,
+        w1_scale,
+        w2_fp8,
+        w2_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Prepare E4M3 weights with logical ``[E, N, K/32]`` E8M0 scales.
+
+        The result is shared with :class:`CuTileMxfp8Bf16Config`.
+        """
+        from .prepare import prepare_cutile_fp8_weights
+
+        return prepare_cutile_fp8_weights(
+            w1_fp8,
+            w1_scale,
+            w2_fp8,
+            w2_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            block_scaled=True,
+            activation_type=(activation or SwiGLU()).type,
+            device=device,
+        )
+
+
+@dataclass(frozen=True)
+class CuTileMxfp8Bf16Config(CuTileMxfp8Config):
+    """cuTile MXFP8 weights with BF16 inputs to both GEMMs.
+
+    Shares prepared weights with :class:`CuTileMxfp8Config`.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_BF16_ARCHS
+
+
+@dataclass(frozen=True)
+class CuTileMxfp4Mxfp8Config(CuTileMxfp4Config):
+    """cuTile MXFP4 weights with MXFP8 inputs to both GEMMs.
+
+    BF16 API inputs are dynamically quantized. Shares packed weights and scales
+    with :class:`CuTileMxfp4Config` and :class:`CuTileMxfp4Bf16Config` on SM12x.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_MXFP8_ARCHS
+
+    def __repr__(self) -> str:
+        return "CuTileMxfp4Mxfp8Config()"
+
+
+@dataclass(frozen=True)
+class CudnnGroupedGemmBf16Config:
+    """cuDNN grouped-GEMM BF16 backend (``grouped_mm_bf16``).
+
+    - Pipeline: sort the pre-routed assignments by expert into a contiguous
+      ``m_indptr`` layout, gather the activations, GEMM1, the typed activation,
+      GEMM2 and the finalize, on :func:`flashinfer.grouped_mm.grouped_mm_bf16`.
+    - Activations: raw ``bfloat16 [M, H]`` (``M`` tokens of hidden size ``H``).
+    - Weights: :meth:`prepare_weights` takes the canonical ``[up, gate]`` BF16
+      weights and stores the fc1 rows as ``[gate, up]``.
+    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM90, SM100,
+      SM103 and SM107, torch ops elsewhere.
+    - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
+      ``[gemm2_out, expert_weights, token_to_row]`` for the caller to combine.
+    - Expert parallelism: assignments to non-local experts are masked out.
+    - Routing weights: packed, or unpacked FP32 / BF16.
+    - Each token's ``topk_ids`` must name distinct experts.
+    - Not in the default backend list, since cuDNN builds one execution plan per
+      token bucket: select it with ``BackendOptions((CudnnGroupedGemmBf16Config(),))``.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUDNN_GROUPED_GEMM_BF16_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the ``cudnn_grouped_gemm_bf16`` weight view from canonical BF16 weights.
+
+        Register the result with
+        ``MoEWeightPack.prepare_for("cudnn_grouped_gemm_bf16", ...)``. See
+        :func:`flashinfer.fused_moe.prepare.prepare_cudnn_grouped_gemm_bf16_weights`.
+        """
+        from .prepare import prepare_cudnn_grouped_gemm_bf16_weights
+
+        return prepare_cudnn_grouped_gemm_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CudnnGroupedGemmBf16Config()"
+
+
+@dataclass(frozen=True)
+class CudnnGroupedGemmFp8PerTensorConfig:
+    """cuDNN grouped-GEMM FP8 per-tensor backend (``grouped_mm_fp8``).
+
+    - Pipeline: expert-sorted permutation, GEMM1, the typed activation, GEMM2 and
+      the finalize, on :func:`flashinfer.grouped_mm.grouped_mm_fp8`.
+    - Activations: the canonical per-tensor FP8 pack, E4M3 quantized with the
+      static ``hidden_states_scale_global`` multiplier and
+      ``hidden_states_scale=None``.
+    - Weights: :meth:`prepare_weights` takes both static multipliers and folds
+      them into the view.
+    - The fused Triton SwiGLU kernel requantizes the intermediate, so SwiGLU with
+      default scalars is the only supported activation.
+    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM90, SM100,
+      SM103 and SM107, torch ops elsewhere.
+    - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
+      ``[gemm2_out, expert_weights, token_to_row]``.
+    - Expert parallelism: assignments to non-local experts are masked out.
+    - Routing weights: packed, or unpacked FP32 / BF16.
+    - Each token's ``topk_ids`` must name distinct experts.
+    - Not in the default backend list.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUDNN_GROUPED_GEMM_FP8_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize canonical BF16 weights to per-expert E4M3 with the static
+        multipliers folded in. Register the result with
+        ``MoEWeightPack.prepare_for("cudnn_grouped_gemm_fp8_per_tensor", ...)``. See
+        :func:`flashinfer.fused_moe.prepare.prepare_cudnn_grouped_gemm_fp8_per_tensor_weights`.
+        """
+        from .prepare import prepare_cudnn_grouped_gemm_fp8_per_tensor_weights
+
+        return prepare_cudnn_grouped_gemm_fp8_per_tensor_weights(
+            w1_bf16,
+            w2_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+            intermediate_scale_global=intermediate_scale_global,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    prepare_activations = staticmethod(TrtllmFp8PerTensorConfig.prepare_activations)
+
+    def __repr__(self) -> str:
+        return "CudnnGroupedGemmFp8PerTensorConfig()"
+
+
+@dataclass(frozen=True)
+class CudnnGroupedGemmMxfp8Config:
+    """cuDNN grouped-GEMM MXFP8 backend (``grouped_mm_mxfp8``).
+
+    - Pipeline: expert-sorted permutation, GEMM1, the typed activation, GEMM2 and
+      the finalize, on :func:`flashinfer.grouped_mm.grouped_mm_mxfp8`.
+    - Activations: the MXFP8 activation pack, E4M3 ``[M, H]`` values (``M`` tokens
+      of hidden size ``H``) with token-major ``uint8 [M, H/32]`` UE8M0 block
+      scales (see :meth:`prepare_activations`).
+    - Rows and scale rows are permuted into expert order, each expert segment
+      padded to a multiple of 128 rows; the permuted scale rows are swizzled into
+      the GEMM's block-scale layout, and the BF16 intermediate is quantized
+      straight into that layout before GEMM2.
+    - Weights: E4M3 with UE8M0 block scales per expert (see
+      :meth:`prepare_weights`).
+    - ``hidden_size`` and ``intermediate_size`` must be multiples of 128.
+    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM100, SM103 and
+      SM107, torch ops elsewhere.
+    - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
+      ``[gemm2_out, expert_weights, token_to_row]``.
+    - Expert parallelism: assignments to non-local experts are masked out.
+    - Routing weights: packed, or unpacked FP32 / BF16.
+    - Each token's ``topk_ids`` must name distinct experts.
+    - Not in the default backend list.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUDNN_GROUPED_GEMM_MXFP8_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize canonical BF16 weights to per-expert MXFP8 with swizzled block scales.
+
+        Register the result with
+        ``MoEWeightPack.prepare_for("cudnn_grouped_gemm_mxfp8", ...)``. See
+        :func:`flashinfer.fused_moe.prepare.prepare_cudnn_grouped_gemm_mxfp8_weights`.
+        """
+        from .prepare import prepare_cudnn_grouped_gemm_mxfp8_weights
+
+        return prepare_cudnn_grouped_gemm_mxfp8_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16):
+        """Quantize BF16 activations to E4M3 plus token-major UE8M0 block scales.
+
+        See :func:`flashinfer.fused_moe.prepare.prepare_cudnn_grouped_gemm_mxfp8_activations`.
+        """
+        from .prepare import prepare_cudnn_grouped_gemm_mxfp8_activations
+
+        return prepare_cudnn_grouped_gemm_mxfp8_activations(hidden_states_bf16)
+
+    def __repr__(self) -> str:
+        return "CudnnGroupedGemmMxfp8Config()"
+
+
+@dataclass(frozen=True)
+class CudnnGroupedGemmNvfp4Config:
+    """cuDNN grouped-GEMM NVFP4 backend (``grouped_mm_fp4`` with 16-wide blocks).
+
+    - Pipeline: expert-sorted permutation, GEMM1, the typed activation, GEMM2 and
+      the finalize, on :func:`flashinfer.grouped_mm.grouped_mm_fp4`.
+    - Activations: the NVFP4 activation pack, packed E2M1 ``uint8 [M, H/2]``
+      values (``M`` tokens of hidden size ``H``) with token-major
+      ``float8_e4m3fn [M, H/16]`` block scales and a global scale of one (see
+      :meth:`prepare_activations` for the magnitude range that encoding
+      resolves).
+    - Rows and scale rows are permuted into expert order, each expert segment
+      padded to a multiple of 128 rows; the permuted scale rows are swizzled into
+      the GEMM's block-scale layout, and the BF16 intermediate is quantized to
+      NVFP4 with a global scale of one, straight into that layout, before GEMM2.
+    - Weights: packed E2M1 with E4M3 block scales and one global scale per expert
+      (see :meth:`prepare_weights`). GEMM1's output rows are multiplied by their
+      expert's global dequant; GEMM2's is applied by the finalize, or to the
+      unfinalized rows.
+    - ``hidden_size`` and ``intermediate_size`` must be multiples of 128.
+    - Permute and finalize: FlashInfer's ``moe_utils`` kernels on SM100, SM103 and
+      SM107, torch ops elsewhere.
+    - ``MoEFinalizeConfig(do_finalize=False)`` returns the unfinalized
+      ``[gemm2_out, expert_weights, token_to_row]``.
+    - Expert parallelism: assignments to non-local experts are masked out.
+    - Routing weights: packed, or unpacked FP32 / BF16.
+    - Each token's ``topk_ids`` must name distinct experts.
+    - Not in the default backend list.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUDNN_GROUPED_GEMM_FP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize canonical BF16 weights to per-expert NVFP4 with swizzled block scales.
+
+        Register the result with
+        ``MoEWeightPack.prepare_for("cudnn_grouped_gemm_nvfp4", ...)``. See
+        :func:`flashinfer.fused_moe.prepare.prepare_cudnn_grouped_gemm_nvfp4_weights`.
+        """
+        from .prepare import prepare_cudnn_grouped_gemm_nvfp4_weights
+
+        return prepare_cudnn_grouped_gemm_nvfp4_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16):
+        """Quantize BF16 activations to packed E2M1 plus token-major E4M3 block scales.
+
+        See :func:`flashinfer.fused_moe.prepare.prepare_cudnn_grouped_gemm_nvfp4_activations`.
+        """
+        from .prepare import prepare_cudnn_grouped_gemm_nvfp4_activations
+
+        return prepare_cudnn_grouped_gemm_nvfp4_activations(hidden_states_bf16)
+
+    def __repr__(self) -> str:
+        return "CudnnGroupedGemmNvfp4Config()"
+
+
+@dataclass(frozen=True)
+class CutlassW4A16Config:
+    """CUTLASS MXFP4-weight x BF16-activation backend for SM90.
+
+    This backend supports packed precomputed routing with all flat CUTLASS
+    activation semantics and requires ``do_finalize=True``.
+    Expert parallelism and shared experts are not supported. Both
+    ``hidden_size`` and ``intermediate_size`` must be divisible by 128.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_W4A16_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize and interleave canonical BF16 weights for SM90 W4A16."""
+        from .prepare import prepare_cutlass_w4a16_weights
+
+        return prepare_cutlass_w4a16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CutlassW4A16Config()"
+
+
+@dataclass(frozen=True)
+class CutlassNvfp4Config:
+    """CUTLASS NVFP4 backend for SM100 / SM110 / SM12x.
+
+    Packed precomputed routing with all flat CUTLASS activation semantics and
+    ``do_finalize=True``. Expert parallelism and shared experts are not
+    supported. ``hidden_size`` must be divisible by 64 (the kernel reads the
+    linear activation block scale with a 64-element-aligned row stride) and
+    ``intermediate_size`` by 16 (the NVFP4 scale-vector size).
+
+    Activations follow the TRTLLM canonical NVFP4 pack (packed E2M1 ``uint8
+    [M, H // 2]`` plus a linear E4M3 block scale ``[M, H // 16]`` with unit
+    global scale), so the same ``MoEActivationPack`` feeds this backend,
+    ``TrtllmFp4Config``, ``CuteDslConfig``, and the Cake NVFP4 backends.
+    ``prepare_activations`` here is the same helper as
+    ``TrtllmFp4Config.prepare_activations``.
+
+    This config is not in the default backend search list. Select it
+    explicitly with ``BackendOptions((CutlassNvfp4Config(),))``.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_NVFP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize canonical BF16 weights into CUTLASS-swizzled NVFP4.
+
+        Uses the flat CUTLASS scale layout (``fp4_quantize`` with swizzled
+        scales), not the TRTLLM shuffle / BlockMajorK path.
+        """
+        from .prepare import prepare_cutlass_nvfp4_weights
+
+        return prepare_cutlass_nvfp4_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    # The canonical NVFP4 pack: packed E2M1 ``uint8 [M, H // 2]`` and a linear
+    # E4M3 block scale ``[M, H // 16]`` with a unit global scale.
+    prepare_activations = staticmethod(TrtllmFp4Config.prepare_activations)
+
+    def __repr__(self) -> str:
+        return "CutlassNvfp4Config()"
+
+
+@dataclass(frozen=True)
+class CutlassFp8PerTensorConfig:
+    """CUTLASS per-tensor FP8 backend.
+
+    Activations follow the TRTLLM canonical per-tensor FP8 pack: E4M3
+    quantized with the static ``hidden_states_scale_global`` multiplier and
+    ``hidden_states_scale=None``. Both static multipliers are
+    ``prepare_weights`` inputs (as in ``TrtllmFp8PerTensorConfig``), so one
+    ``MoEActivationPack`` feeds both backends. Weights stay unshuffled; this
+    is not the TRTLLM MajorK view. Packed precomputed routing with all flat
+    CUTLASS activation semantics and ``do_finalize=True``. Not in the default
+    backend search list; opt in through ``BackendOptions``.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_FP8_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize canonical BF16 weights into unshuffled per-tensor FP8.
+
+        ``hidden_states_scale_global`` / ``intermediate_scale_global`` are the
+        same static calibration multipliers ``TrtllmFp8PerTensorConfig``
+        takes. The flat CUTLASS ``quant_scales`` are folded from them here;
+        re-calibrating means calling ``prepare_weights`` again.
+        """
+        from .prepare import prepare_cutlass_fp8_per_tensor_weights
+
+        return prepare_cutlass_fp8_per_tensor_weights(
+            w1_bf16,
+            w2_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+            intermediate_scale_global=intermediate_scale_global,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    # Same canonical pack as TRT-LLM: ``(q, None)``, the scale lives in the view.
+    prepare_activations = staticmethod(TrtllmFp8PerTensorConfig.prepare_activations)
+
+    def __repr__(self) -> str:
+        return "CutlassFp8PerTensorConfig()"
+
+
+@dataclass(frozen=True)
+class CutlassFp8BlockConfig:
+    """CUTLASS DeepSeek-style 128x128 FP8 block-scale backend (SM90).
+
+    Activations stay BF16; the kernel quantizes them internally. This is not
+    the TRTLLM block-FP8 activation pack. Packed precomputed routing with
+    all flat CUTLASS activation semantics and ``do_finalize=True``.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_FP8_BLOCK_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize canonical BF16 weights into 128x128 FP8 block scales."""
+        from .prepare import prepare_cutlass_fp8_block_weights
+
+        return prepare_cutlass_fp8_block_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CutlassFp8BlockConfig()"
+
+
+def _mxfp8_activation_quant(
+    quant: Optional[QuantConfig],
+    pair: tuple[QuantFormat, QuantFormat],
+    owner: str,
+) -> QuantConfig:
+    """Default and validate the ``quant`` passed to a CUTLASS MXFP8 preparer.
+
+    ``None`` means the pair's canonical linear pack. An explicit ``quant`` must
+    spell the same pair, so a config prepared for another layer cannot be passed
+    by accident; only ``swizzled_scale_factors`` is read from it.
+    """
+    if quant is None:
+        return QuantConfig(weight=pair[0], activation=pair[1])
+    if quant.pair != pair:
+        raise ValueError(
+            f"{owner}.prepare_activations requires {pair[0].name}×{pair[1].name}, "
+            f"got {quant!r}."
+        )
+    return quant
+
+
+@dataclass(frozen=True)
+class CutlassMxfp8Mxfp4Config:
+    """CUTLASS MXFP8-activation x MXFP4-weight backend for SM100 / SM110 / SM12x.
+
+    Activations follow the TRTLLM canonical MXFP8 pack (E4M3 ``[M, H]`` plus a
+    linear E8M0 block scale ``[M, H // 32]``), so one ``MoEActivationPack``
+    feeds this backend, ``TrtllmFp4Config`` and ``CuteDslConfig`` for
+    MXFP4×MXFP8. ``QuantConfig(swizzled_scale_factors=True)`` selects the flat
+    CUTLASS swizzled ``input_sf`` instead. Weights are packed MXFP4 viewed as
+    int64 at launch. Packed precomputed routing with all flat CUTLASS
+    activation semantics and ``do_finalize=True``. Both ``hidden_size`` and
+    ``intermediate_size`` must be divisible by 128.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_MXFP8_MXFP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize canonical BF16 weights into CUTLASS MXFP4."""
+        from .prepare import prepare_cutlass_mxfp8_mxfp4_weights
+
+        return prepare_cutlass_mxfp8_mxfp4_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, quant: Optional[QuantConfig] = None):
+        """Quantize BF16 activations to MXFP8 for MXFP4×MXFP8.
+
+        Pass the layer's ``MoEConfig.quant`` so the pack layout follows the
+        declaration: the default (``None`` or ``swizzled_scale_factors`` unset /
+        ``False``) is the canonical linear pack shared with
+        ``TrtllmFp4Config.prepare_activations``; ``swizzled_scale_factors=True``
+        produces the flat CUTLASS swizzled 1-D ``input_sf``.
+        """
+        from .prepare import (
+            prepare_cutlass_mxfp8_activations,
+            prepare_trtllm_fp4_activations,
+        )
+
+        pair = (QuantFormat.MXFP4, QuantFormat.MXFP8)
+        quant = _mxfp8_activation_quant(quant, pair, "CutlassMxfp8Mxfp4Config")
+        if quant.swizzled_scale_factors is True:
+            return prepare_cutlass_mxfp8_activations(hidden_states_bf16)
+        return prepare_trtllm_fp4_activations(hidden_states_bf16, quant=quant)
+
+    def __repr__(self) -> str:
+        return "CutlassMxfp8Mxfp4Config()"
+
+
+@dataclass(frozen=True)
+class CutlassMxfp8Config:
+    """CUTLASS MXFP8-activation x MXFP8-weight backend (SM100 / SM103 / SM107).
+
+    Activations follow the TRTLLM canonical MXFP8 pack (E4M3 ``[M, H]`` plus a
+    linear E8M0 block scale ``[M, H // 32]``) shared with
+    ``TrtllmFp8BlockConfig`` for MXFP8×MXFP8;
+    ``QuantConfig(swizzled_scale_factors=True)`` selects the flat CUTLASS
+    swizzled ``input_sf`` instead. Weights stay E4M3 with
+    packed int32 scale tiles. ``hidden_size`` and ``intermediate_size`` must be
+    divisible by 128 so the gated fc1 scale layout matches the binding.
+    Packed precomputed routing with all flat CUTLASS activation semantics and
+    ``do_finalize=True``.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_MXFP8_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize canonical BF16 weights into CUTLASS MXFP8."""
+        from .prepare import prepare_cutlass_mxfp8_weights
+
+        return prepare_cutlass_mxfp8_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, quant: Optional[QuantConfig] = None):
+        """Quantize BF16 activations to MXFP8 for MXFP8×MXFP8.
+
+        Pass the layer's ``MoEConfig.quant`` so the pack layout follows the
+        declaration: the default (``None`` or ``swizzled_scale_factors`` unset /
+        ``False``) is the canonical linear pack shared with
+        ``TrtllmFp8BlockConfig.prepare_activations``;
+        ``swizzled_scale_factors=True`` produces the flat CUTLASS swizzled 1-D
+        ``input_sf``.
+        """
+        from .prepare import (
+            prepare_cutlass_mxfp8_activations,
+            prepare_trtllm_fp8_block_activations,
+        )
+
+        pair = (QuantFormat.MXFP8, QuantFormat.MXFP8)
+        quant = _mxfp8_activation_quant(quant, pair, "CutlassMxfp8Config")
+        if quant.swizzled_scale_factors is True:
+            return prepare_cutlass_mxfp8_activations(hidden_states_bf16)
+        return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
+
+    def __repr__(self) -> str:
+        return "CutlassMxfp8Config()"
+
+
+@dataclass(frozen=True)
+class CutlassW4A8Config:
+    """CUTLASS INT4-weight x FP8-activation backend for SM90.
+
+    Activations stay BF16; the kernel quantizes them internally with the packed
+    mixed-input INT4 layout. Packed precomputed routing with all flat CUTLASS
+    activation semantics and
+    ``do_finalize=True``.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_W4A8_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize canonical BF16 weights into SM90 interleaved INT4."""
+        from .prepare import prepare_cutlass_w4a8_weights
+
+        return prepare_cutlass_w4a8_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CutlassW4A8Config()"
+
+
+@dataclass(frozen=True)
+class CutlassHummingConfig:
+    """CUTLASS Humming MXFP4-weight x FP8-activation backend for SM90.
+
+    Activations stay BF16; weights use Humming pre-MMA E8M0 fusion plus the
+    SM90 mixed-input interleave. Packed precomputed routing with all flat
+    CUTLASS activation semantics and
+    ``do_finalize=True``.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_HUMMING_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Quantize canonical BF16 weights into the Humming mixed-input layout."""
+        from .prepare import prepare_cutlass_humming_weights
+
+        return prepare_cutlass_humming_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CutlassHummingConfig()"
+
+
+@dataclass(frozen=True)
+class CuteDslConfig:
+    """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
+
+    The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        # SM100, SM103 (Blackwell) + SM107 (Rubin) — tighten when CuteDSL adds more targets
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        nvfp4_4over6: Optional[NVFP44Over6Config] = None,
+    ):
+        """Build the ``cute_dsl`` weight view from canonical BF16 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
+        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
+        Defaults to NVFP4×NVFP4.
+
+        ``nvfp4_4over6`` must equal the layer's ``QuantConfig.nvfp4_4over6``
+        (see that field): it selects the NVFP4×NVFP4 pack's
+        ``fc2_input_scale``. The default keeps the historical
+        ``fc2_input_scale = 1.0``.
+        """
+        from .prepare import prepare_cute_dsl_weights
+
+        return prepare_cute_dsl_weights(
+            w1_bf16,
+            w2_bf16,
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+            nvfp4_4over6=nvfp4_4over6,
         )
 
     def __repr__(self) -> str:
         return "CuteDslConfig()"
 
 
+@dataclass(frozen=True)
+class SM12xFp8Config:
+    """SM120/SM121 CuTe-DSL DeepSeek FP8 backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(w1_weight, w1_weight_sf, w2_weight, w2_weight_sf):
+        """Build the native SM12x weight view from block-scaled FP8 tensors."""
+        return {
+            "w1_weight": w1_weight,
+            "w1_weight_sf": w1_weight_sf,
+            "w2_weight": w2_weight,
+            "w2_weight_sf": w2_weight_sf,
+        }
+
+    def __repr__(self) -> str:
+        return "SM12xFp8Config()"
+
+
+@dataclass(frozen=True)
+class SM12xMxfp8Mxfp4Config:
+    """SM120/SM121 CuTe-DSL MXFP8 x MXFP4 backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(w1_weight, w1_weight_sf, w2_weight, w2_weight_sf):
+        """Build the native SM12x weight view from packed checkpoint tensors."""
+        return {
+            "w1_weight": w1_weight,
+            "w1_weight_sf": w1_weight_sf,
+            "w2_weight": w2_weight,
+            "w2_weight_sf": w2_weight_sf,
+        }
+
+    def __repr__(self) -> str:
+        return "SM12xMxfp8Mxfp4Config()"
+
+
+@dataclass(frozen=True)
+class SM12xNvfp4Bf16Config:
+    """SM120/SM121 CuTe-DSL NVFP4-weight x BF16-activation backend.
+
+    Reads the prepared cuTile NVFP4 weight view in place: packed E2M1 weights,
+    128x4-swizzled E4M3 block scales and per-expert FP32 global scales. The
+    same view serves :class:`CuTileNvfp4Config` (W4A4) and
+    :class:`CuTileNvfp4Bf16Config`, so no second weight copy is needed.
+    Supports ``SwiGLU`` with default scalars and ``ReLU2``. Expert
+    parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w1_global_scale,
+        w2_fp4,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+        device=None,
+    ):
+        """Build the shared cuTile NVFP4 view from checkpoint NVFP4 weights.
+
+        Register it with ``MoEWeightPack.prepare_for("sm12x_nvfp4_bf16", ...)``,
+        or reuse a view already registered for ``"cutile_nvfp4"``.
+        """
+        return CuTileNvfp4Config.prepare_weights(
+            w1_fp4,
+            w1_block_scale,
+            w1_global_scale,
+            w2_fp4,
+            w2_block_scale,
+            w2_global_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            source_format=source_format,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "SM12xNvfp4Bf16Config()"
+
+
+@dataclass(frozen=True)
+class B12xNvfp4Config:
+    """SM120/SM121 CuTe-DSL b12x NVFP4/W4A4 backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the ``b12x_nvfp4`` weight view from canonical bf16 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("b12x_nvfp4", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_b12x_nvfp4_weights`.
+        """
+        from .prepare import prepare_b12x_nvfp4_weights
+        from .utils import resolve_b12x_activation_name
+
+        return prepare_b12x_nvfp4_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=resolve_b12x_activation_name(activation),
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "B12xNvfp4Config()"
+
+
+@dataclass(frozen=True)
+class B12xW4A16Config:
+    """SM120/SM121 CuTe-DSL b12x W4A16 backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_blockscale,
+        w1_global_scale,
+        w2_fp4,
+        w2_blockscale,
+        w2_global_scale,
+        *,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+    ):
+        """Build the ``b12x_w4a16`` weight view from checkpoint fp4 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("b12x_w4a16", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_b12x_w4a16_weights`.
+        """
+        from .prepare import prepare_b12x_w4a16_weights
+        from .utils import resolve_b12x_activation_name
+
+        return prepare_b12x_w4a16_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_global_scale,
+            w2_fp4,
+            w2_blockscale,
+            w2_global_scale,
+            activation=resolve_b12x_activation_name(activation),
+            source_format=source_format,
+        )
+
+    def __repr__(self) -> str:
+        return "B12xW4A16Config()"
+
+
+@dataclass(frozen=True)
+class CudnnFrostBf16Config:
+    """Frost BF16 MoE on SM107 and SM120, with packed precomputed routing.
+
+    Register prepared weights under ``cudnn_frost_bf16``. The canonical
+    ``cutlass_bf16`` view is also accepted without conversion. Supported model
+    geometries follow the backend's measured BF16 shortlist.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (107, 120)
+
+    prepare_weights = staticmethod(CutlassBf16Config.prepare_weights)
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, quant: Optional[QuantConfig] = None):
+        """Return contiguous BF16 activations and no block scales."""
+        if hidden_states_bf16.dtype != torch.bfloat16:
+            raise ValueError("CudnnFrostBf16Config requires BF16 activations")
+        if quant is not None and quant.pair != (QuantFormat.BF16, QuantFormat.BF16):
+            raise ValueError(
+                "CudnnFrostBf16Config requires BF16 weights and activations"
+            )
+        return hidden_states_bf16.contiguous(), None
+
+
+@dataclass(frozen=True)
+class CudnnFrostMxfp8Config:
+    """Frost MXFP8 MoE on SM107, with packed precomputed routing.
+
+    Register prepared weights under ``cudnn_frost_mxfp8``. The canonical
+    ``cutlass_mxfp8`` view is also accepted without conversion. H/I must be
+    multiples of 128. Pass the layer's quant config to prepare_activations.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 107
+
+    prepare_weights = staticmethod(CutlassMxfp8Config.prepare_weights)
+    prepare_activations = staticmethod(CutlassMxfp8Config.prepare_activations)
+
+
+@dataclass(frozen=True)
+class CudnnFrostNvfp4Config:
+    """Frost NVFP4 MoE on SM107, with packed precomputed routing.
+
+    Register prepared weights under ``cudnn_frost_nvfp4``. The canonical
+    ``cutlass_nvfp4`` view is also accepted without conversion. H/I must be
+    multiples of 128. Pass the layer's quant config to prepare_activations.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 107
+
+    prepare_weights = staticmethod(CutlassNvfp4Config.prepare_weights)
+    prepare_activations = staticmethod(CutlassNvfp4Config.prepare_activations)
+
+
+@dataclass(frozen=True)
+class CudnnFrostMxfp8Mxfp4Config:
+    """Frost MXFP8-activation / MXFP4-weight MoE on SM107.
+
+    Requires packed precomputed routing and H/I divisible by 128. Register
+    prepared weights under ``cudnn_frost_mxfp8_mxfp4``; the canonical
+    ``cutlass_mxfp8_mxfp4`` view is also accepted without conversion.
+    Pass the layer's quant config to prepare_activations.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 107
+
+    prepare_weights = staticmethod(CutlassMxfp8Mxfp4Config.prepare_weights)
+    prepare_activations = staticmethod(CutlassMxfp8Mxfp4Config.prepare_activations)
+
+
 # Union type for backend config
 BackendConfigType = Union[
+    CudnnFrostBf16Config,
+    CudnnFrostMxfp8Config,
+    CudnnFrostNvfp4Config,
+    CudnnFrostMxfp8Mxfp4Config,
+    CakeWarpDecodeConfig,
+    PrimsTsConfig,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
     TrtllmBf16Config,
     TrtllmMxInt4Config,
-    CutlassConfig,
+    CutlassBf16Config,
+    CuTileBf16Config,
+    CuTileFp8PerTensorBf16Config,
+    CuTileFp8PerTensorConfig,
+    CuTileMxfp4Bf16Config,
+    CuTileMxfp4Config,
+    CuTileMxfp4Mxfp8Config,
+    CuTileMxfp8Bf16Config,
+    CuTileMxfp8Config,
+    CuTileNvfp4Bf16Config,
+    CuTileNvfp4Config,
+    CudnnGroupedGemmBf16Config,
+    CudnnGroupedGemmFp8PerTensorConfig,
+    CudnnGroupedGemmMxfp8Config,
+    CudnnGroupedGemmNvfp4Config,
+    CutlassW4A16Config,
+    CutlassNvfp4Config,
+    CutlassFp8PerTensorConfig,
+    CutlassFp8BlockConfig,
+    CutlassMxfp8Mxfp4Config,
+    CutlassMxfp8Config,
+    CutlassW4A8Config,
+    CutlassHummingConfig,
     CuteDslConfig,
+    SM12xFp8Config,
+    SM12xMxfp8Mxfp4Config,
+    SM12xNvfp4Bf16Config,
+    B12xNvfp4Config,
+    B12xW4A16Config,
 ]
 
 ALL_BACKEND_CONFIGS = (
+    CudnnFrostBf16Config,
+    CudnnFrostMxfp8Config,
+    CudnnFrostNvfp4Config,
+    CudnnFrostMxfp8Mxfp4Config,
+    CakeWarpDecodeConfig,
+    PrimsTsConfig,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
     TrtllmBf16Config,
     TrtllmMxInt4Config,
-    CutlassConfig,
+    CutlassBf16Config,
+    CuTileBf16Config,
+    CuTileFp8PerTensorBf16Config,
+    CuTileFp8PerTensorConfig,
+    CuTileMxfp4Bf16Config,
+    CuTileMxfp4Config,
+    CuTileMxfp4Mxfp8Config,
+    CuTileMxfp8Bf16Config,
+    CuTileMxfp8Config,
+    CuTileNvfp4Bf16Config,
+    CuTileNvfp4Config,
+    CudnnGroupedGemmBf16Config,
+    CudnnGroupedGemmFp8PerTensorConfig,
+    CudnnGroupedGemmMxfp8Config,
+    CudnnGroupedGemmNvfp4Config,
+    CutlassW4A16Config,
+    CutlassNvfp4Config,
+    CutlassFp8PerTensorConfig,
+    CutlassFp8BlockConfig,
+    CutlassMxfp8Mxfp4Config,
+    CutlassMxfp8Config,
+    CutlassW4A8Config,
+    CutlassHummingConfig,
     CuteDslConfig,
+    SM12xFp8Config,
+    SM12xMxfp8Mxfp4Config,
+    SM12xNvfp4Bf16Config,
+    B12xNvfp4Config,
+    B12xW4A16Config,
 )
 
 
@@ -397,12 +2641,26 @@ ALL_BACKEND_CONFIGS = (
 
 @dataclass(frozen=True)
 class BackendOptions:
-    """Ordered list of backend candidates for dispatch / autotuning."""
+    """Ordered list of backend candidates for dispatch and autotuning.
+
+    Each backend config implements ``supported(arch)``, where ``arch`` uses the
+    CUDA compute-capability encoding documented by :meth:`valid_for`.
+    """
 
     candidates: Tuple[BackendConfigType, ...] = ()  # type: ignore[type-arg]
 
     def valid_for(self, arch: int) -> list:
-        """Return candidates whose hardware preconditions are met."""
+        """Return candidates whose hardware preconditions are met.
+
+        Parameters
+        ----------
+        arch : int
+            CUDA compute capability encoded as ``major * 10 + minor``. For
+            example, SM90 is ``90``, SM100 is ``100``, and SM103 is ``103``.
+            :class:`MoELayer` derives it from its selected CUDA device via
+            ``get_compute_capability(self.device)``. This is not a CUDA device
+            ordinal or CUDA toolkit version.
+        """
         return [c for c in self.candidates if c.__class__.supported(arch)]
 
     def __len__(self) -> int:
@@ -424,8 +2682,16 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmFp8PerTensorConfig(),
         TrtllmBf16Config(),
         TrtllmMxInt4Config(),
-        CutlassConfig(),
+        CutlassBf16Config(),
+        CutlassW4A16Config(),
         CuteDslConfig(),
+        CuTileMxfp4Bf16Config(),
+        CuTileFp8PerTensorBf16Config(),
+        CuTileFp8PerTensorConfig(),
+        CuTileMxfp4Mxfp8Config(),
+        CuTileMxfp8Bf16Config(),
+        CuTileMxfp8Config(),
+        CuTileNvfp4Bf16Config(),
     )
 )
 
@@ -442,7 +2708,7 @@ class MoEConfig:
     >>> config = MoEConfig(
     ...     routing=RoutingConfig(num_experts=64, top_k=8,
     ...                           method=RoutingMethodType.DeepSeekV3),
-    ...     quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+    ...     quant=QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
     ...     experts=ExpertConfig(intermediate_size=2048),
     ... )
     >>> output = fused_moe(tensors, **config)
@@ -451,11 +2717,64 @@ class MoEConfig:
     routing: RoutingConfig
     quant: QuantConfig
     experts: ExpertConfig
-    activation: ActivationConfig = field(
-        default_factory=lambda: ActivationConfig(ActivationType.Swiglu)
-    )
+    activation: ActivationConfig = field(default_factory=SwiGLU)
     backend: BackendOptions = field(default_factory=lambda: _DEFAULT_BACKEND)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    # Appended last so existing positional construction keeps working.
+    finalize: MoEFinalizeConfig = field(default_factory=MoEFinalizeConfig)
+
+    def __post_init__(self) -> None:
+        # Not in check_support(): MoELayer swallows its exceptions to filter
+        # backends, so errors raised there surface as "no backend available".
+        self._validate_fused_shared_experts()
+
+    def _validate_fused_shared_experts(self) -> None:
+        s = self.experts.num_fused_shared_experts
+        if s == 0:
+            return
+
+        # Only DeepSeekV3 routing emits shared-expert slots.
+        if self.routing.method is not RoutingMethodType.DeepSeekV3:
+            raise ValueError(
+                "num_fused_shared_experts > 0 requires DeepSeekV3 routing, got "
+                f"method={self.routing.method!r}."
+            )
+
+        # Kernel limits apply to the fused totals.
+        total_top_k = self.routing.top_k + s
+        if total_top_k > MAX_SUPPORTED_TOP_EXPERTS:
+            raise ValueError(
+                f"top_k + num_fused_shared_experts must be <= "
+                f"{MAX_SUPPORTED_TOP_EXPERTS}, got {self.routing.top_k} + {s} = "
+                f"{total_top_k}."
+            )
+        total_experts = self.routing.num_experts + s
+        if total_experts > MAX_SUPPORTED_TOTAL_EXPERTS:
+            raise ValueError(
+                f"num_experts + num_fused_shared_experts must be <= "
+                f"{MAX_SUPPORTED_TOTAL_EXPERTS}, got {self.routing.num_experts} "
+                f"+ {s} = {total_experts}."
+            )
+
+        # The kernel maps a shared id to a weight row as
+        # (global_id - local_expert_offset), so all routed experts must be local.
+        local_num_experts = (
+            self.experts.local_num_experts
+            if self.experts.local_num_experts is not None
+            else self.routing.num_experts
+        )
+        if self.experts.local_expert_offset != 0 or (
+            local_num_experts != self.routing.num_experts
+        ):
+            raise ValueError(
+                "num_fused_shared_experts > 0 does not support expert "
+                "parallelism: require local_expert_offset == 0 and "
+                "local_num_experts == num_experts. Got "
+                f"num_fused_shared_experts={s}, "
+                f"local_expert_offset={self.experts.local_expert_offset}, "
+                f"local_num_experts={local_num_experts}, "
+                f"num_experts={self.routing.num_experts}."
+            )
 
     # --- Dict-unpacking protocol: enables ``**config`` at call sites ---
 
@@ -477,13 +2796,13 @@ class MoEConfig:
 
 
 # ---------------------------------------------------------------------------
-# Activation / weight packs for the autotuned pre-routed path
+# Activation / weight packs for autotuned pre-routed and FromLogits paths
 # ---------------------------------------------------------------------------
 # These are the runner-level inputs used by MoELayer (plan §1).
 #
 # Why two packs instead of one tensor bundle (PR #3093 review G5): the grouping
 # axis is *lifetime/role*, which is invariant across backends —
-#   * MoEActivationPack: per-call transient data (pre-routed activations),
+#   * MoEActivationPack: per-call transient activation/routing data,
 #     rebuilt every forward;
 #   * MoEWeightPack:     long-lived weights, materialized once at load and read
 #     every call, holding one native view *per backend* (the price of
@@ -497,18 +2816,240 @@ class MoEConfig:
 # backend-specific layout logic out of the dispatch hot-path.
 
 
+def _tensor_summary(value: Any) -> str:
+    """Shape/dtype/device summary of a tensor; ``repr`` for anything else.
+
+    The packs define ``__repr__`` in terms of this rather than inheriting the
+    dataclass default, which would call ``repr()`` on each tensor field and so
+    read device memory. That matters because the packs are the arguments of
+    ``MoELayer.__call__``, which is decorated with ``@flashinfer_api``; see
+    ``_serialize_value`` in ``flashinfer/api_logging.py`` for why tensor-bearing
+    containers must not be stringified, and the Release Gates section of
+    ``docs/design_docs/flashinfer_moe_api.md`` for the decision to fix it here
+    rather than special-case the pack types inside the shared logger.
+
+    Non-tensor values are rendered with ``repr`` rather than assumed to have
+    ``.shape``: a ``__repr__`` that raises turns an unrelated pytest assertion
+    or debugger inspection into a confusing ``AttributeError``.
+    """
+    if value is None:
+        return "None"
+    if not isinstance(value, Tensor):
+        return repr(value)
+    return f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device})"
+
+
 @dataclass
 class MoEActivationPack:
-    """Per-call transient data — pre-quantized NVFP4 activations + pre-routed indices."""
+    """Per-call backend-native activations plus routing inputs.
 
-    hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4)
-    hidden_states_scale: Tensor  # [M, H//16] float8_e4m3fn
-    selected_experts: Tensor  # [M, top_k] int32
-    final_scales: Tensor  # [M, top_k] float32
+    Activation encoding depends on the MMA pair on ``QuantConfig``:
+
+    * NVFP4×NVFP4 (``TrtllmFp4Config``, ``CuteDslConfig``, ``CutlassNvfp4Config``,
+      ``CudnnGroupedGemmNvfp4Config``, Cake): packed ``uint8 [M, H/2]`` values
+      with linear ``float8_e4m3fn [M, H/16]`` block scales and unit global
+      scale. b12x / cuTile NVFP4 take raw ``bfloat16 [M, H]`` and quantize
+      in-kernel.
+    * MXFP4×MXFP8 (W4A8; ``TrtllmFp4Config``, ``CuteDslConfig``,
+      ``CutlassMxfp8Mxfp4Config``): ``float8_e4m3fn [M, H]`` MXFP8 values with
+      token-major ``float8_e4m3fn [M, H/32]`` tensors carrying UE8M0 scale
+      bytes, matching the TRTLLM FP4 launcher ABI.
+    * MXFP4 x MXFP8 with ``SM12xMxfp8Mxfp4Config``: raw ``bfloat16 [M, H]``
+      values without an activation scale; K128 MXFP8 quantization runs internally.
+    * DeepSeek FP8 with ``SM12xFp8Config``: raw ``bfloat16 [M, H]`` values
+      without an activation scale; K128 FP8 quantization runs internally.
+    * MXFP4×BF16 (TRTLLM W4A16): raw ``bfloat16 [M, H]`` values with no
+      activation scale; weights use the MXFP4 preparation contract.
+    * NVFP4×BF16 (CuTe-DSL / b12x W4A16): raw ``bfloat16 [M, H]`` values with no
+      activation scale; weights use the NVFP4 preparation contract.
+    * BF16: raw ``bfloat16 [M, H]`` values with no scale tensor.
+    * MxInt4: raw ``bfloat16 [M, H]`` values with no scale tensor; weights are
+      packed signed INT4 with BF16 block scales.
+    * DeepSeek FP8: ``float8_e4m3fn [M, H]`` values with transposed
+      ``float32 [H/128, M]`` block scales.
+    * MXFP8 (``TrtllmFp8BlockConfig``, ``CutlassMxfp8Config``,
+      ``CudnnGroupedGemmMxfp8Config``): ``float8_e4m3fn [M, H]`` values with
+      token-major ``uint8 [M, H/32]`` UE8M0 scales. CUTLASS MXFP8 runners
+      accept the flat swizzled 1-D ``input_sf`` instead when
+      ``QuantConfig(swizzled_scale_factors=True)``.
+    * FP8 per-tensor (``TrtllmFp8PerTensorConfig``, ``CutlassFp8PerTensorConfig``,
+      ``CudnnGroupedGemmFp8PerTensorConfig``): ``float8_e4m3fn [M, H]`` values
+      with no activation scale; the static calibration multipliers live in
+      each backend's weight view.
+
+    ``routing_input_mode`` selects how routing reaches the kernel (the runner reads it directly):
+
+    * ``PackedPrecomputed`` (default) — **pre-routed**: the caller computes expert
+      selection on the host and passes ``topk_ids`` + ``topk_weights``.
+      The TRTLLM runners normally combine both fields into one packed ``int32``
+      tensor before launch.
+    * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: supported
+      by the TRTLLM and cuDNN grouped-GEMM runners. The caller supplies ``int32``
+      ids and BF16 or FP32 weights directly, avoiding packed-id construction.
+      The launcher consumes the weights in their native dtype.
+    * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
+      methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
+      itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
+      runner allocates internal kernel-filled buffers, and the routing result is not surfaced
+      back through the pack (routing replay is a separate, future capability). TRTLLM FP4,
+      BF16, block-FP8, per-tensor-FP8, and MxInt4 runners support this mode;
+      ``MoELayer`` dispatches a logits pack only to capable backends (see each runner's
+      ``supported_routing_modes``).
+
+    ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
+    keep the field positions of the former ``selected_experts`` / ``final_scales``, so
+    positional construction of pre-routed packs is unchanged. Additional activation metadata
+    and the in-kernel routing fields are keyword-only.
+    """
+
+    # Backend-native activation payload; layouts documented above.
+    hidden_states_q: Tensor
+    # Pair-specific scales documented above; None for BF16 and per-tensor FP8.
+    hidden_states_scale: Optional[Tensor]
+    # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
+    # A negative id marks an unrouted slot (e.g. CUDA-graph padding) only on
+    # b12x for now; other backends define no behavior for negative ids.
+    topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
+    # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
+    # float32 for TRTLLM UnpackedPrecomputed.
+    topk_weights: Optional[Tensor] = None
+    # Per-token NVFP4 row scale, shape [M].
+    per_token_scale: Optional[Tensor] = field(default=None, kw_only=True)
+    # In-kernel routing inputs (FromLogits) — keyword-only so a stale positional
+    # call site fails loudly instead of silently binding a tensor to the mode.
+    routing_input_mode: RoutingInputMode = field(
+        default=RoutingInputMode.PackedPrecomputed, kw_only=True
+    )
+    routing_logits: Optional[Tensor] = field(
+        default=None, kw_only=True
+    )  # [M, num_experts] float32 or bfloat16
+    routing_bias: Optional[Tensor] = field(
+        default=None, kw_only=True
+    )  # [num_experts] bfloat16 or float32 (independent of logits dtype)
+
+    def __post_init__(self) -> None:
+        """Fail fast on mode/field mismatches at construction time.
+
+        Raises (not asserts) so the checks survive ``python -O``; catching the
+        mismatch here names the offending field instead of a later failure deep
+        in ``pack_inputs`` or a C++ ICHECK.
+        """
+        mode = self.routing_input_mode
+        if mode == RoutingInputMode.FromLogits:
+            if self.routing_logits is None:
+                raise ValueError(
+                    "routing_input_mode=FromLogits requires routing_logits."
+                )
+            if self.topk_ids is not None or self.topk_weights is not None:
+                raise ValueError(
+                    "FromLogits computes topk_ids/topk_weights in-kernel; "
+                    "leave them None."
+                )
+        elif mode == RoutingInputMode.PackedPrecomputed:
+            if self.topk_ids is None or self.topk_weights is None:
+                raise ValueError(
+                    "routing_input_mode=PackedPrecomputed requires "
+                    "topk_ids + topk_weights."
+                )
+            if self.routing_logits is not None or self.routing_bias is not None:
+                raise ValueError(
+                    "routing_logits/routing_bias are only consumed by "
+                    "in-kernel (FromLogits) routing."
+                )
+            if self.topk_ids.dtype != torch.int32:
+                raise TypeError(
+                    f"topk_ids must be torch.int32 (got {self.topk_ids.dtype}); "
+                    "torch.topk returns int64 — cast before constructing the pack."
+                )
+        elif mode == RoutingInputMode.UnpackedPrecomputed:
+            if self.topk_ids is None or self.topk_weights is None:
+                raise ValueError(
+                    "routing_input_mode=UnpackedPrecomputed requires "
+                    "topk_ids + topk_weights."
+                )
+            if self.routing_logits is not None or self.routing_bias is not None:
+                raise ValueError(
+                    "routing_logits/routing_bias are only consumed by "
+                    "in-kernel (FromLogits) routing."
+                )
+            if self.topk_ids.dtype != torch.int32:
+                raise TypeError(
+                    f"topk_ids must be torch.int32 (got {self.topk_ids.dtype}); "
+                    "torch.topk returns int64 — cast before constructing the pack."
+                )
+            if self.topk_weights.dtype not in (torch.bfloat16, torch.float32):
+                raise TypeError(
+                    "UnpackedPrecomputed topk_weights must be torch.bfloat16 "
+                    "or torch.float32 "
+                    f"(got {self.topk_weights.dtype})."
+                )
+            expected = (self.hidden_states_q.shape[0],)
+            if self.topk_ids.ndim != 2 or self.topk_weights.ndim != 2:
+                raise ValueError(
+                    "UnpackedPrecomputed topk_ids/topk_weights must both be 2-D "
+                    f"[num_tokens, top_k], got {tuple(self.topk_ids.shape)} and "
+                    f"{tuple(self.topk_weights.shape)}."
+                )
+            if (
+                self.topk_ids.shape != self.topk_weights.shape
+                or self.topk_ids.shape[:1] != expected
+            ):
+                raise ValueError(
+                    "UnpackedPrecomputed topk_ids/topk_weights must have matching "
+                    f"[num_tokens, top_k] shapes, got {tuple(self.topk_ids.shape)} "
+                    f"and {tuple(self.topk_weights.shape)} for "
+                    f"num_tokens={expected[0]}."
+                )
+            if (
+                not self.topk_ids.is_contiguous()
+                or not self.topk_weights.is_contiguous()
+            ):
+                raise ValueError(
+                    "UnpackedPrecomputed topk_ids/topk_weights must be contiguous."
+                )
+        else:
+            raise ValueError(f"Unsupported routing_input_mode={mode!r}.")
+
+        # All routing tensors must live with the activations; a stray CPU
+        # tensor otherwise surfaces as a cryptic launch/ICHECK failure.
+        dev = self.hidden_states_q.device
+        for name in (
+            "hidden_states_scale",
+            "topk_ids",
+            "topk_weights",
+            "per_token_scale",
+            "routing_logits",
+            "routing_bias",
+        ):
+            t = getattr(self, name)
+            if t is not None and t.device != dev:
+                raise ValueError(
+                    f"{name} is on {t.device} but hidden_states_q is on {dev}; "
+                    "all pack tensors must be on the same device."
+                )
 
     @property
     def num_tokens(self) -> int:
         return self.hidden_states_q.shape[0]
+
+    def __repr__(self) -> str:
+        """Metadata-only repr -- never reads device memory.
+
+        Driven off ``dataclasses.fields`` rather than a hand-written field list
+        so a tensor field added later is summarized automatically instead of
+        silently vanishing from the log. The two required fields are always
+        shown (``hidden_states_scale=None`` is meaningful -- it is how BF16 and
+        TRT-LLM FP8 packs are distinguished); optional fields left at ``None``
+        are omitted to keep the line readable.
+        """
+        required = ("hidden_states_q", "hidden_states_scale")
+        parts = []
+        for f in dataclasses.fields(self):
+            value = getattr(self, f.name)
+            if value is None and f.name not in required:
+                continue
+            parts.append(f"{f.name}={_tensor_summary(value)}")
+        return f"MoEActivationPack({', '.join(parts)})"
 
 
 @dataclass
@@ -523,6 +3064,12 @@ class MoEWeightPack:
     Holding multiple materializations is intentional — that's the memory cost
     the user pays for cross-backend autotune.  Each view is the exact kwargs
     dict that runner's ``forward`` expects for weight-side arguments.
+
+    Every ``XxxConfig.prepare_weights`` takes the same canonical source
+    layout: ``w1`` is ``[E, 2I, H]`` for gated activations with rows in
+    ``[up, gate]`` order (``act(x @ w1[I:].T) * (x @ w1[:I].T)``), or
+    ``[E, I, H]`` for non-gated ones; ``w2`` is ``[E, H, I]``.  Backends that
+    want ``[gate, up]`` swap halves inside their prepare helper.
     """
 
     native_views: Dict[str, Dict[str, Tensor]] = field(default_factory=dict)
@@ -539,3 +3086,19 @@ class MoEWeightPack:
                 f"Available: {list(self.native_views)}"
             )
         return self.native_views[backend_key]
+
+    def __repr__(self) -> str:
+        def _view_summary(view: Any) -> str:
+            # ``prepare_for`` stores whatever it is handed and ``native_views``
+            # is public, so a view is not guaranteed to be a mapping. Fall back
+            # rather than raise: a ``__repr__`` that throws turns an unrelated
+            # debugger inspection or pytest assertion into an AttributeError.
+            if not isinstance(view, Mapping):
+                return _tensor_summary(view)
+            inner = ", ".join(f"{n}: {_tensor_summary(t)}" for n, t in view.items())
+            return "{" + inner + "}"
+
+        views = ", ".join(
+            f"{key!r}: {_view_summary(view)}" for key, view in self.native_views.items()
+        )
+        return f"MoEWeightPack(native_views={{{views}}})"

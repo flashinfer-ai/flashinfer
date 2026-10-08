@@ -1,6 +1,8 @@
 from enum import IntEnum
 import torch
-from typing import Optional
+from typing import Optional, Union
+
+from .api_logging import flashinfer_api
 
 
 # The type of method in top-K routing, for use in torch custom op
@@ -24,12 +26,40 @@ class RoutingMethodType(IntEnum):
     MiniMax2 = (7,)
     # Sigmoid: Sigmoid -> TopK (no renormalization)
     Sigmoid = (8,)
+    # TopKSigmoid: TopK -> Sigmoid (no renormalization)
+    TopKSigmoid = (9,)
     # Unspecified
-    Unspecified = (9,)
+    Unspecified = (10,)
 
     # Eval-safe repr (``RoutingMethodType.Default`` rather than IntEnum's default
     # ``<RoutingMethodType.Default: 0>``) so configs that embed this member
     # round-trip through ``eval(repr(cfg))`` — relied on by the unified MoE API.
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}.{self.name}"
+
+
+# Routing input modes for FusedMoE launcher
+# Please keep this in sync with the counterpart defined in csrc/trtllm_fused_moe_kernel_launcher.cu
+class RoutingInputMode(IntEnum):
+    # Mode 1: Compute routing from logits
+    # - Input: routing_logits tensor provided
+    # - topk_ids: OUTPUT buffer for computed expert indices
+    # - topk_weights: OUTPUT buffer for computed weights
+    FromLogits = 0
+    # Mode 2: Pre-computed routing with packed format
+    # - Input: topk_ids contains packed ``(expert_id << 16) | weight`` (high
+    #   16 bits = int16 expert id, low 16 bits = float16/bfloat16 weight, see
+    #   PackedScoreIdx in include/flashinfer/trtllm/fused_moe/RoutingKernel.h)
+    # - topk_ids: INPUT with packed values
+    # - topk_weights: OUTPUT buffer for extracted weights
+    PackedPrecomputed = 1
+    # Mode 3: Pre-computed routing with separate tensors
+    # - Input: separate topk_ids (expert indices) and topk_weights (routing weights)
+    # - topk_ids: INPUT - pre-computed expert indices
+    # - topk_weights: INPUT - pre-computed routing weights
+    UnpackedPrecomputed = 2
+
+    # Eval-safe repr — see ``RoutingMethodType.__repr__``.
     def __repr__(self) -> str:
         return f"{type(self).__name__}.{self.name}"
 
@@ -46,7 +76,8 @@ class ActivationType(IntEnum):
     SwigluStep = 7
     GegluTanh = 8
     Identity = 9
-    InvalidType = 10
+    Situ = 10
+    InvalidType = 11
 
     # Eval-safe repr — see ``RoutingMethodType.__repr__``.
     def __repr__(self) -> str:
@@ -55,11 +86,70 @@ class ActivationType(IntEnum):
     @property
     def is_gated(self) -> bool:
         """True for activations that consume a gate branch (SwiGLU family)."""
-        return self in (
-            ActivationType.Swiglu,
-            ActivationType.Geglu,
-            ActivationType.SwigluBias,
-        )
+        return self in _GATED_ACTIVATION_TYPES
+
+
+_GATED_ACTIVATION_TYPES = (
+    ActivationType.Swiglu,
+    ActivationType.Geglu,
+    ActivationType.SwigluBias,
+    ActivationType.SwigluStep,
+    ActivationType.GegluTanh,
+    ActivationType.Situ,
+)
+
+
+DEFAULT_SWIGLU_ALPHA = 1.0
+DEFAULT_SWIGLU_BETA = 0.0
+DEFAULT_SWIGLU_LIMIT = torch.finfo(torch.float32).max
+
+# SiTU-GLU tanh scales. Must match the SituAdaptor defaults in
+# csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh.
+DEFAULT_SITU_BETA = 4.0
+DEFAULT_SITU_LINEAR_BETA = 25.0
+
+
+def normalize_activation_type(
+    activation_type: Union[int, ActivationType],
+) -> ActivationType:
+    try:
+        return ActivationType(activation_type)
+    except ValueError as err:
+        raise ValueError(f"Unsupported activation_type {activation_type!r}") from err
+
+
+@flashinfer_api
+def is_gated_activation(activation_type: Union[int, ActivationType]) -> bool:
+    """Return whether the given activation type is a gated activation (e.g. SwiGLU family).
+
+    Gated activations split their input along the feature dimension into a *gate* branch
+    and a *value* branch; the two are combined element-wise before being passed to the
+    next layer.  This helper mirrors the C++ ``isGatedActivation()`` predicate defined in
+    ``include/flashinfer/trtllm/fused_moe/runner.h``.
+
+    Parameters
+    ----------
+    activation_type : Union[int, ActivationType]
+        The activation type to query.  May be an :class:`ActivationType` member or its
+        integer value.
+
+    Returns
+    -------
+    bool
+        ``True`` if ``activation_type`` belongs to the gated activation family
+        (``Swiglu``, ``Geglu``, ``SwigluBias``, ``SwigluStep``, ``GegluTanh``, ``Situ``);
+        ``False`` otherwise.
+
+    Examples
+    --------
+    >>> from flashinfer.tllm_enums import ActivationType, is_gated_activation
+    >>> is_gated_activation(ActivationType.Swiglu)
+    True
+    >>> is_gated_activation(ActivationType.Relu)
+    False
+    """
+    # Keep this in sync with isGatedActivation() in include/flashinfer/trtllm/fused_moe/runner.h.
+    return normalize_activation_type(activation_type) in _GATED_ACTIVATION_TYPES
 
 
 class DtypeTrtllmGen(IntEnum):
@@ -175,3 +265,7 @@ class Fp8QuantizationType(IntEnum):
     DeepSeekFp8 = 1
     # MxFp8 x MxFp8
     MxFp8 = 2
+    # Per-tensor FP8
+    PerTensorFp8 = 3
+    # Per-channel FP8
+    PerChannelFp8 = 4

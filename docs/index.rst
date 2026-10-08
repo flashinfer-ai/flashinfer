@@ -20,6 +20,7 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
    fi_trace
    trace_apply
    autotuning
+   experimental
 
 .. toctree::
    :maxdepth: 2
@@ -34,6 +35,11 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
    :caption: PyTorch API Reference
 
    api/attention
+   api/attn_scores
+   api/cake_fmha
+   api/cake_moe_grouped_gemm
+   api/cake_mxfp4_situ_moe
+   api/cake_sampling
    api/gemm
    api/grouped_mm
    api/fused_moe
@@ -43,6 +49,8 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
    api/pod
    api/cudnn
    api/cute_dsl
+   api/concat_ops
+   api/diffusion_ops
    api/page
    api/sampling
    api/topk
@@ -51,8 +59,13 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
    api/rope
    api/activation
    api/gdn_decode
+   api/gdn_fused_decode
    api/gdn_prefill
+   api/gdn2_prefill
+   api/gdp_prefill
+   api/kda
    api/mamba
+   api/mhc
    api/quantization
    api/green_ctx
    api/fp4_quantization

@@ -68,6 +68,11 @@ class MBarrier  // rename this to MBarrier
   __device__ inline mha::conditional_t<scope == Scope::CTA, ArrivalToken, void> arrive(
       uint32_t update = 1) {
     ArrivalToken token{};
+#if __CUDA_ARCH__ == 1210
+    // GB10 (sm121) does not reliably honor the mbarrier release ordering under
+    // tight scheduling: make prior writes visible before the arrival is observed.
+    __threadfence_block();
+#endif
 #if __CUDA_ARCH__ >= 900
     if constexpr (scope == Scope::CTA) {
       switch (order) {

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+import torch
 import cutlass
 import cutlass.cute as cute
 import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
@@ -13,6 +14,22 @@ from cutlass._mlir.dialects import llvm
 
 def round_down(a: int, b: int) -> int:
     return (a // b) * b
+
+
+def state_dtype_to_cutlass(dtype: torch.dtype) -> type[cutlass.Numeric]:
+    state_dtypes = {
+        torch.float32: cutlass.Float32,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float16: cutlass.Float16,
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+    }
+    if dtype not in state_dtypes:
+        raise ValueError(
+            f"Unsupported state dtype {dtype}, expected float32, bfloat16, "
+            "float16, float8_e4m3fn, or float8_e5m2"
+        )
+    return state_dtypes[dtype]
 
 
 @dataclass(frozen=True)
@@ -207,6 +224,40 @@ def load_tensor_as_a(
     for i in cutlass.range(cute.size(tArA), unroll_full=True):
         tArA[i] = dst_dtype(tArSrc[i])
     return tArA
+
+
+@cute.jit
+def load_tensor_as_b(
+    sTensor: cute.Tensor,
+    tiled_mma,
+    thread_idx: cutlass.Int32,
+    b_shape,
+    src_dtype,
+    is_src_k_major: bool,
+    dst_dtype=None,
+) -> cute.Tensor:
+    if cutlass.const_expr(dst_dtype is None):
+        dst_dtype = src_dtype
+    if cutlass.const_expr(is_src_k_major):
+        ldsm_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), src_dtype
+        )
+    else:
+        ldsm_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), src_dtype
+        )
+    tiled_copy = cute.make_tiled_copy_B(ldsm_atom, tiled_mma)
+    thr_copy = tiled_copy.get_slice(thread_idx)
+    tBrSrc = cute.make_rmem_tensor(tiled_mma.partition_shape_B(b_shape), src_dtype)
+    tBrSrc_cv = thr_copy.retile(tBrSrc)
+    tBsB = thr_copy.partition_S(sTensor)
+    cute.copy(tiled_copy, tBsB, tBrSrc_cv)
+    if cutlass.const_expr(dst_dtype is src_dtype):
+        return tBrSrc
+    tBrB = cute.make_rmem_tensor_like(tBrSrc, dst_dtype)
+    for i in cutlass.range(cute.size(tBrB), unroll_full=True):
+        tBrB[i] = dst_dtype(tBrSrc[i])
+    return tBrB
 
 
 class SM80:

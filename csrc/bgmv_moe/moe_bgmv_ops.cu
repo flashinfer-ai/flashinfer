@@ -22,19 +22,20 @@ inline constexpr uint64_t pack_u32(uint32_t a, uint32_t b) {
 
 // ====== MoE BGMV Shrink Launcher ======
 
-template <typename T>
+template <typename T, bool PER_PAIR_INPUT>
 inline bool launch_moe_shrink_sliced_kernel(T* Y, const T* X, T** w_ptr,
                                             const int64_t* sorted_token_ids,
                                             const int64_t* expert_ids, const int64_t* lora_indices,
                                             uint32_t feat_in, uint32_t feat_out, int64_t num_pairs,
                                             int64_t num_slices, int64_t num_experts,
-                                            int64_t num_tokens, int64_t lora_stride) {
+                                            int64_t num_tokens, int64_t lora_stride,
+                                            cudaStream_t stream) {
   switch (pack_u32(feat_in, feat_out)) {
 #define CASE_MOE_SHRINK(in_T, out_T, W_T, narrow, wide)                                 \
   case pack_u32(wide, narrow):                                                          \
-    moe_bgmv_shrink_sliced<wide, narrow, in_T, out_T, W_T>(                             \
+    moe_bgmv_shrink_sliced<wide, narrow, in_T, out_T, W_T, PER_PAIR_INPUT>(             \
         Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices, num_pairs, num_slices, \
-        num_experts, num_tokens, lora_stride, 1.0f);                                    \
+        num_experts, num_tokens, lora_stride, 1.0f, stream);                            \
     return true;
     FOR_MOE_ALL_WIDE_NARROW(CASE_MOE_SHRINK, T, T, T)
 #undef CASE_MOE_SHRINK
@@ -45,18 +46,19 @@ inline bool launch_moe_shrink_sliced_kernel(T* Y, const T* X, T** w_ptr,
 
 // ====== MoE BGMV Expand Launcher ======
 
-template <typename T>
+template <typename T, bool FINALIZE>
 inline bool launch_moe_expand_sliced_kernel(
     float* Y, const T* X, T** w_ptr, const int64_t* sorted_token_ids, const int64_t* expert_ids,
     const int64_t* lora_indices, const float* topk_weights, const int64_t* slice_start_loc,
     uint32_t feat_in, uint32_t feat_out, int64_t num_pairs, int64_t num_slices, int64_t num_experts,
-    int64_t total_feat_out, int64_t num_tokens, int64_t lora_stride) {
+    int64_t total_feat_out, int64_t num_tokens, int64_t lora_stride, cudaStream_t stream) {
   switch (pack_u32(feat_in, feat_out)) {
-#define CASE_MOE_EXPAND(in_T, out_T, W_T, narrow, wide)                                           \
-  case pack_u32(narrow, wide):                                                                    \
-    moe_bgmv_expand_sliced<narrow, wide, in_T, W_T>(                                              \
-        Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices, topk_weights, slice_start_loc,   \
-        num_pairs, num_slices, num_experts, total_feat_out, wide, num_tokens, lora_stride, 1.0f); \
+#define CASE_MOE_EXPAND(in_T, out_T, W_T, narrow, wide)                                          \
+  case pack_u32(narrow, wide):                                                                   \
+    moe_bgmv_expand_sliced<narrow, wide, in_T, W_T, FINALIZE>(                                   \
+        Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices, topk_weights, slice_start_loc,  \
+        num_pairs, num_slices, num_experts, total_feat_out, wide, num_tokens, lora_stride, 1.0f, \
+        stream);                                                                                 \
     return true;
     FOR_MOE_ALL_WIDE_NARROW(CASE_MOE_EXPAND, T, T, T)
 #undef CASE_MOE_EXPAND
@@ -68,7 +70,8 @@ inline bool launch_moe_expand_sliced_kernel(
 // ====== TVM-FFI dispatch: MoE Shrink ======
 
 void bgmv_moe_shrink(TensorView y, TensorView x, TensorView w_ptr, TensorView sorted_token_ids,
-                     TensorView expert_ids, TensorView lora_indices, int64_t lora_stride) {
+                     TensorView expert_ids, TensorView lora_indices, int64_t lora_stride,
+                     bool per_pair_input) {
   CHECK_INPUT(y);
   CHECK_INPUT(x);
   CHECK_INPUT(w_ptr);
@@ -96,28 +99,39 @@ void bgmv_moe_shrink(TensorView y, TensorView x, TensorView w_ptr, TensorView so
   TVM_FFI_ICHECK(lora_indices.dtype() == dl_int64) << "lora_indices must be int64";
 
   ffi::CUDADeviceGuard guard(x.device().device_id);
+  // Launch on the caller's current stream so the kernels order correctly behind
+  // producers on non-default streams and are recorded by CUDA Graph capture.
+  const cudaStream_t stream = get_stream(x.device());
   bool ok = false;
 
+// File scope: a #define can't live in the DISPATCH macro arg; expands where DType is in scope.
+#define LAUNCH_SHRINK(PPI)                                                                      \
+  launch_moe_shrink_sliced_kernel<DType, PPI>(                                                  \
+      static_cast<DType*>(y.data_ptr()), static_cast<DType*>(x.data_ptr()),                     \
+      reinterpret_cast<DType**>(static_cast<int64_t*>(w_ptr.data_ptr())),                       \
+      static_cast<int64_t*>(sorted_token_ids.data_ptr()),                                       \
+      static_cast<int64_t*>(expert_ids.data_ptr()),                                             \
+      static_cast<int64_t*>(lora_indices.data_ptr()), feat_in, feat_out, num_pairs, num_slices, \
+      num_experts, num_tokens, lora_stride, stream)
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(x.dtype(), DType, [&] {
-    ok = launch_moe_shrink_sliced_kernel(
-        static_cast<DType*>(y.data_ptr()), static_cast<DType*>(x.data_ptr()),
-        reinterpret_cast<DType**>(static_cast<int64_t*>(w_ptr.data_ptr())),
-        static_cast<int64_t*>(sorted_token_ids.data_ptr()),
-        static_cast<int64_t*>(expert_ids.data_ptr()),
-        static_cast<int64_t*>(lora_indices.data_ptr()), feat_in, feat_out, num_pairs, num_slices,
-        num_experts, num_tokens, lora_stride);
+    ok = per_pair_input ? LAUNCH_SHRINK(true) : LAUNCH_SHRINK(false);
     return true;
   });
+#undef LAUNCH_SHRINK
 
   TVM_FFI_ICHECK(ok) << "BGMV MoE shrink failed. feat_in=" << feat_in << " feat_out=" << feat_out
                      << ". Dimension pair not compiled.";
+  const cudaError_t status = cudaGetLastError();
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "BGMV MoE shrink launch failed: " << cudaGetErrorString(status);
 }
 
 // ====== TVM-FFI dispatch: MoE Expand ======
 
 void bgmv_moe_expand(TensorView y, TensorView x, TensorView w_ptr, TensorView sorted_token_ids,
                      TensorView expert_ids, TensorView topk_weights, TensorView lora_indices,
-                     TensorView slice_start_loc, int64_t first_feat_out, int64_t lora_stride) {
+                     TensorView slice_start_loc, int64_t first_feat_out, int64_t lora_stride,
+                     bool finalize) {
   CHECK_INPUT(y);
   CHECK_INPUT(x);
   CHECK_INPUT(w_ptr);
@@ -153,22 +167,29 @@ void bgmv_moe_expand(TensorView y, TensorView x, TensorView w_ptr, TensorView so
   TVM_FFI_ICHECK(first_feat_out > 0) << "first_feat_out must be positive";
 
   ffi::CUDADeviceGuard guard(x.device().device_id);
+  const cudaStream_t stream = get_stream(x.device());
   bool ok = false;
 
+#define LAUNCH_EXPAND(FIN)                                                                      \
+  launch_moe_expand_sliced_kernel<DType, FIN>(                                                  \
+      static_cast<float*>(y.data_ptr()), static_cast<DType*>(x.data_ptr()),                     \
+      reinterpret_cast<DType**>(static_cast<int64_t*>(w_ptr.data_ptr())),                       \
+      static_cast<int64_t*>(sorted_token_ids.data_ptr()),                                       \
+      static_cast<int64_t*>(expert_ids.data_ptr()),                                             \
+      static_cast<int64_t*>(lora_indices.data_ptr()),                                           \
+      static_cast<float*>(topk_weights.data_ptr()),                                             \
+      static_cast<int64_t*>(slice_start_loc.data_ptr()), feat_in,                               \
+      static_cast<int32_t>(first_feat_out), num_pairs, num_slices, num_experts, total_feat_out, \
+      num_tokens, lora_stride, stream)
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(x.dtype(), DType, [&] {
-    ok = launch_moe_expand_sliced_kernel(
-        static_cast<float*>(y.data_ptr()), static_cast<DType*>(x.data_ptr()),
-        reinterpret_cast<DType**>(static_cast<int64_t*>(w_ptr.data_ptr())),
-        static_cast<int64_t*>(sorted_token_ids.data_ptr()),
-        static_cast<int64_t*>(expert_ids.data_ptr()),
-        static_cast<int64_t*>(lora_indices.data_ptr()),
-        static_cast<float*>(topk_weights.data_ptr()),
-        static_cast<int64_t*>(slice_start_loc.data_ptr()), feat_in,
-        static_cast<int32_t>(first_feat_out), num_pairs, num_slices, num_experts, total_feat_out,
-        num_tokens, lora_stride);
+    ok = finalize ? LAUNCH_EXPAND(true) : LAUNCH_EXPAND(false);
     return true;
   });
+#undef LAUNCH_EXPAND
 
   TVM_FFI_ICHECK(ok) << "BGMV MoE expand failed. feat_in=" << feat_in
                      << " feat_out=" << first_feat_out << ". Dimension pair not compiled.";
+  const cudaError_t status = cudaGetLastError();
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "BGMV MoE expand launch failed: " << cudaGetErrorString(status);
 }

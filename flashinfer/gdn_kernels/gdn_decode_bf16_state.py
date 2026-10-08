@@ -47,21 +47,35 @@ import cuda.bindings.driver as cuda
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from .device_target import gdn_compile_options, gdn_device_target, target_arch
+from .dtype_compat import as_bf16
+from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from .cute_dsl_cache_naming import make_kernel_name
+
 
 def _mark_batch_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
-    # PyTorch's `.contiguous()` does NOT repack a slice whose leading dim has
-    # size 1 — size-1 dims don't affect PyTorch's contiguity check, so the
-    # parent's stride[0] survives. CUTE's mark_compact_shape_dynamic is
-    # stricter: it requires stride[0] == stride[1] * shape[1] (canonical
-    # compact). Detect the mismatch and rebuild with `.clone()` (forces
-    # contiguous-format allocation with canonical strides).
-    if torch_t.dim() > 1 and torch_t.stride(0) != torch_t.stride(1) * torch_t.size(1):
-        torch_t = torch_t.clone(memory_format=torch.contiguous_format)
-    # explicit stride_order: auto-deduction is ambiguous at B=1/T=1.
+    # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
+    return from_dlpack(
+        torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
+    ).mark_layout_dynamic()
+
+
+def _mark_slot_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
+    # Only the leading (mode 0) dim dynamic; inner dims stay static so launchers
+    # can derive constexpr tile counts (num_v_tiles) from the pool/cache shape.
+    stride_order = tuple(range(torch_t.dim()))
+    return from_dlpack(
+        torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
+    ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order, divisibility=1)
+
+
+def _mark_index_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
+    # Batch-dynamic compact marking for contiguous index/step tensors; explicit
+    # stride_order disambiguates size-1 dims that mark_layout_dynamic cannot.
     stride_order = tuple(sorted(range(torch_t.dim()), key=lambda d: -torch_t.stride(d)))
     return from_dlpack(
         torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
-    ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order)
+    ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order, divisibility=1)
 
 
 # ==============================================================================
@@ -2688,13 +2702,11 @@ def _run_wide_vec_t1(
 # ==============================================================================
 # PUBLIC API
 # ==============================================================================
-# Number of SMs on target GPU (detected dynamically)
-NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
-
-# GPU architecture detected once at import time — avoids per-call
-# torch.cuda.get_device_capability() in the hot path.
-_GPU_MAJOR, _ = torch.cuda.get_device_capability(0)
-_USE_PACKED_FMA = _GPU_MAJOR >= 10
+_BF16_STATE_COMPILE_OPTS = (
+    cute.EnableTVMFFI(True),
+    cute.GenerateLineInfo(True),
+    cute.OptLevel(3),
+)
 
 
 def gated_delta_rule(
@@ -2832,8 +2844,36 @@ def gated_delta_rule(
 _compiled_kernels_mtp: dict = {}
 _compiled_kernels_wide_vec: dict = {}
 
+_CUTE_DSL_MODULE = "gdn_decode_bf16_state"
 
-def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
+
+def _bf16_state_kernel_name(variant: str, cache_key: tuple) -> str:
+    """Specialization name within the gdn_decode_bf16_state module.
+
+    ``variant`` distinguishes the compiled entry points sharing this module
+    ("wide_vec", "wide_vec_t1", "mtp_ilp4"); ``cache_key`` is the in-process
+    cache tuple, which already encodes every parameter that affects codegen.
+    Its last component is the compile target, of which only the arch names an
+    artifact.
+    """
+    *codegen, target_key = cache_key
+    return make_kernel_name(variant, target_arch(target_key), *codegen)
+
+
+def _dtype_key(
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    indices: Optional[torch.Tensor],
+) -> tuple:
+    """Dtypes that vary across calls and are baked into the compile signature."""
+    return (
+        A_log.dtype,
+        dt_bias.dtype,
+        torch.int32 if indices is None else indices.dtype,
+    )
+
+
+def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1, *, num_sms: int) -> int:
     """Select optimal tile_v for the MTP BF16 kernel based on batch size and T.
 
     tile_v must be a multiple of 4 * MTP_ILP4_ROWS (= 16) and divide V=128.
@@ -2845,13 +2885,13 @@ def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
         num_v_tiles = V // tv
         grid_size = B * HV * num_v_tiles
         # Want at least 4 waves for good occupancy
-        if grid_size >= 4 * NUM_SMS:
+        if grid_size >= 4 * num_sms:
             return tv
     return 32  # Minimum tile_v for maximum parallelism
 
 
 def _get_bf16_mtp_config(
-    batch_size: int, seq_len: int, num_v_heads: int, v_dim: int
+    batch_size: int, seq_len: int, num_v_heads: int, v_dim: int, *, num_sms: int
 ) -> tuple:
     """Select ``(tile_v, ilp_rows)`` for the BF16 MTP kernel.
 
@@ -2871,7 +2911,12 @@ def _get_bf16_mtp_config(
     if work_units <= 128:
         # Tiny grid: small tile_v gives more CTAs to fill SMs.
         return min(16, v_dim), 4
-    return _select_tile_v_for_mtp(batch_size, num_v_heads, v_dim, seq_len), 4
+    return (
+        _select_tile_v_for_mtp(
+            batch_size, num_v_heads, v_dim, seq_len, num_sms=num_sms
+        ),
+        4,
+    )
 
 
 # Threshold above which `gated_delta_rule_mtp` dispatches to the wide_vec
@@ -2962,6 +3007,12 @@ def gated_delta_rule_mtp_wide_vec(
     assert q is not None and k is not None and v is not None
     assert b is not None and initial_state_source is not None
 
+    # bf16-only kernel: any other dtype would be reinterpreted, not converted.
+    q, k, v, a, b = as_bf16(q, k, v, a, b)
+    assert output is None or output.dtype == torch.bfloat16, (
+        f"output must be bf16; got {output.dtype}"
+    )
+
     B_val, T_val, H_val, K_val = q.shape
     HV_val = v.shape[2]
     V_val = v.shape[3]
@@ -3036,8 +3087,9 @@ def gated_delta_rule_mtp_wide_vec(
         intermediate_states = h0_source[:1, :1, :1]
         effective_disable_final = disable_state_update
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    target = gdn_device_target(q.device)
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
+    use_packed_fma = target.use_packed_fma
     # Single-pool callers either pass output_state_indices=None (defaults to
     # initial_state_indices below) or pass the same tensor for both. In both
     # cases the kernel can elide write-side base-pointer arithmetic via the
@@ -3143,6 +3195,8 @@ def gated_delta_rule_mtp_wide_vec(
         per_request_accepted_steps,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
+        _dtype_key(A_log, dt_bias, initial_state_indices),
+        target.compile_key,
     )
 
     if cache_key not in _compiled_kernels_wide_vec:
@@ -3160,15 +3214,14 @@ def gated_delta_rule_mtp_wide_vec(
         )
 
         if contiguous_pool:
-            h_ = _mark_batch_dynamic(h0_source)
+            h_ = _mark_slot_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        # Mark the flat-3D view's slot dim dynamic so the cubin works across
-        # pool_size variations (FLA-flat aliases h0_source as a flat [pool*HV,
-        # V, K] view whose slot dim varies with pool_size).
+        # Mark the flat-3D view's slot dim dynamic (mode 0 only; inner dims stay
+        # static) so the cubin works across pool_size variations.
         if cache_intermediate_states or per_token_pool_scatter_flat:
-            inter_ = _mark_batch_dynamic(intermediate_states)
+            inter_ = _mark_slot_dynamic(intermediate_states)
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
@@ -3177,61 +3230,67 @@ def gated_delta_rule_mtp_wide_vec(
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
-        h0_idx_ = _mark_batch_dynamic(
+        h0_idx_ = _mark_index_dynamic(
             initial_state_indices
             if initial_state_indices is not None
             else _placeholder_indices
         )
         h0_out_idx_ = h0_idx_
-        acc_steps_ = _mark_batch_dynamic(
+        acc_steps_ = _mark_index_dynamic(
             accepted_steps
             if accepted_steps is not None
             else _placeholder_accepted_steps
         )
-        ssm_idx_ = _mark_batch_dynamic(
+        ssm_idx_ = _mark_index_dynamic(
             ssm_state_indices
             if ssm_state_indices is not None
             else _placeholder_ssm_state_indices
         )
 
         _compiled_kernels_wide_vec[cache_key] = {
-            "compiled": cute.compile(
-                _run_wide_vec,
-                h_,
-                inter_,
-                A_log_,
-                a_,
-                dt_bias_,
-                q_,
-                k_,
-                v_,
-                b_,
-                o_,
-                h0_idx_,
-                h0_out_idx_,
-                acc_steps_,
-                ssm_idx_,
-                softplus_beta,
-                softplus_threshold,
-                scale,
-                HV_val,
-                T_val,
-                H_val,
-                K_val,
-                V_val,
-                tile_v,
-                use_qk_l2norm_in_kernel,
-                effective_disable_final,
-                cache_intermediate_states,
-                use_packed_fma,
-                same_pool,
-                disable_output,
-                recovery_steps,
-                per_request_accepted_steps,
-                per_token_pool_scatter,
-                per_token_pool_scatter_flat,
-                stream,
-                options="--enable-tvm-ffi --generate-line-info --opt-level 3",
+            "compiled": build_and_load_cute_dsl_kernel(
+                _CUTE_DSL_MODULE,
+                _bf16_state_kernel_name("wide_vec", cache_key),
+                lambda: cute.compile[
+                    gdn_compile_options(q.device, *_BF16_STATE_COMPILE_OPTS)
+                ](
+                    _run_wide_vec,
+                    h_,
+                    inter_,
+                    A_log_,
+                    a_,
+                    dt_bias_,
+                    q_,
+                    k_,
+                    v_,
+                    b_,
+                    o_,
+                    h0_idx_,
+                    h0_out_idx_,
+                    acc_steps_,
+                    ssm_idx_,
+                    softplus_beta,
+                    softplus_threshold,
+                    scale,
+                    HV_val,
+                    T_val,
+                    H_val,
+                    K_val,
+                    V_val,
+                    tile_v,
+                    use_qk_l2norm_in_kernel,
+                    effective_disable_final,
+                    cache_intermediate_states,
+                    use_packed_fma,
+                    same_pool,
+                    disable_output,
+                    recovery_steps,
+                    per_request_accepted_steps,
+                    per_token_pool_scatter,
+                    per_token_pool_scatter_flat,
+                    stream,
+                ),
+                extra_key_files=(__file__,),
             ),
             # Per-B default tensors (B-dependent shapes; can't be shared
             # across batch sizes — see #L bug at cache_key without B).
@@ -3243,9 +3302,6 @@ def gated_delta_rule_mtp_wide_vec(
     if B_val not in defaults_by_B:
         defaults_by_B[B_val] = {
             "indices": torch.arange(B_val, dtype=torch.int32, device=q.device),
-            "output": torch.empty(
-                B_val, T_val, HV_val, V_val, device=q.device, dtype=q.dtype
-            ),
             "accepted_steps": torch.zeros(B_val, dtype=torch.int32, device=q.device),
             "ssm_state_indices": torch.zeros(
                 B_val, T_val, dtype=torch.int32, device=q.device
@@ -3259,7 +3315,11 @@ def gated_delta_rule_mtp_wide_vec(
         # allocation, kernel still produces the same address for both slots.
         output_state_indices = initial_state_indices
     if output is None:
-        output = defs["output"]
+        # Must be a fresh allocation: this tensor is returned to the caller, so a
+        # cached per-B buffer would let a later call overwrite an earlier result.
+        output = torch.empty(
+            B_val, T_val, HV_val, V_val, device=q.device, dtype=torch.bfloat16
+        )
     accepted_steps_arg = (
         accepted_steps if accepted_steps is not None else defs["accepted_steps"]
     )
@@ -3336,6 +3396,12 @@ def gated_delta_rule_t1_wide_vec(
     assert q is not None and k is not None and v is not None
     assert b is not None and initial_state_source is not None
 
+    # bf16-only kernel: any other dtype would be reinterpreted, not converted.
+    q, k, v, a, b = as_bf16(q, k, v, a, b)
+    assert output is None or output.dtype == torch.bfloat16, (
+        f"output must be bf16; got {output.dtype}"
+    )
+
     B_val, T_val, H_val, K_val = q.shape
     HV_val = v.shape[2]
     V_val = v.shape[3]
@@ -3381,8 +3447,9 @@ def gated_delta_rule_t1_wide_vec(
         intermediate_states = h0_source[:1, :1, :1]
         effective_disable_final = disable_state_update
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    target = gdn_device_target(q.device)
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
+    use_packed_fma = target.use_packed_fma
     # Single-pool callers either pass output_state_indices=None (defaults to
     # initial_state_indices below) or pass the same tensor for both. In both
     # cases the kernel can elide write-side base-pointer arithmetic via the
@@ -3418,6 +3485,8 @@ def gated_delta_rule_t1_wide_vec(
         softplus_threshold,
         use_packed_fma,
         same_pool,
+        _dtype_key(A_log, dt_bias, initial_state_indices),
+        target.compile_key,
     )
 
     if cache_key not in _compiled_kernels_wide_vec:
@@ -3430,13 +3499,16 @@ def gated_delta_rule_t1_wide_vec(
         )
 
         if contiguous_pool:
-            h_ = _mark_batch_dynamic(h0_source)
+            h_ = _mark_slot_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
-        inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
         if cache_intermediate_states:
-            # Dummy [1,1,1] tensor (caching off) has no unique stride-1 dim.
-            inter_ = _mark_batch_dynamic(intermediate_states)
+            inter_ = _mark_slot_dynamic(intermediate_states)
+        else:
+            # Caching-off dummy ([1,1,1]) is never read; don't mark it.
+            inter_ = from_dlpack(
+                intermediate_states, assumed_align=32, enable_tvm_ffi=True
+            )
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
@@ -3445,7 +3517,7 @@ def gated_delta_rule_t1_wide_vec(
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
-        h0_idx_ = _mark_batch_dynamic(
+        h0_idx_ = _mark_index_dynamic(
             initial_state_indices
             if initial_state_indices is not None
             else _placeholder_indices
@@ -3453,36 +3525,42 @@ def gated_delta_rule_t1_wide_vec(
         h0_out_idx_ = h0_idx_
 
         _compiled_kernels_wide_vec[cache_key] = {
-            "compiled": cute.compile(
-                _run_wide_vec_t1,
-                h_,
-                inter_,
-                A_log_,
-                a_,
-                dt_bias_,
-                q_,
-                k_,
-                v_,
-                b_,
-                o_,
-                h0_idx_,
-                h0_out_idx_,
-                softplus_beta,
-                softplus_threshold,
-                scale,
-                HV_val,
-                T_val,
-                H_val,
-                K_val,
-                V_val,
-                tile_v,
-                use_qk_l2norm_in_kernel,
-                effective_disable_final,
-                cache_intermediate_states,
-                use_packed_fma,
-                same_pool,
-                stream,
-                options="--enable-tvm-ffi --generate-line-info --opt-level 3",
+            "compiled": build_and_load_cute_dsl_kernel(
+                _CUTE_DSL_MODULE,
+                _bf16_state_kernel_name("wide_vec_t1", cache_key),
+                lambda: cute.compile[
+                    gdn_compile_options(q.device, *_BF16_STATE_COMPILE_OPTS)
+                ](
+                    _run_wide_vec_t1,
+                    h_,
+                    inter_,
+                    A_log_,
+                    a_,
+                    dt_bias_,
+                    q_,
+                    k_,
+                    v_,
+                    b_,
+                    o_,
+                    h0_idx_,
+                    h0_out_idx_,
+                    softplus_beta,
+                    softplus_threshold,
+                    scale,
+                    HV_val,
+                    T_val,
+                    H_val,
+                    K_val,
+                    V_val,
+                    tile_v,
+                    use_qk_l2norm_in_kernel,
+                    effective_disable_final,
+                    cache_intermediate_states,
+                    use_packed_fma,
+                    same_pool,
+                    stream,
+                ),
+                extra_key_files=(__file__,),
             ),
             # Per-B default tensors (B-dependent shapes — see batch-dynamic
             # correctness note in gated_delta_rule_mtp_wide_vec).
@@ -3494,9 +3572,6 @@ def gated_delta_rule_t1_wide_vec(
     if B_val not in defaults_by_B:
         defaults_by_B[B_val] = {
             "indices": torch.arange(B_val, dtype=torch.int32, device=q.device),
-            "output": torch.empty(
-                B_val, T_val, HV_val, V_val, device=q.device, dtype=q.dtype
-            ),
         }
     defs = defaults_by_B[B_val]
     if initial_state_indices is None:
@@ -3506,7 +3581,11 @@ def gated_delta_rule_t1_wide_vec(
         # allocation, kernel still produces the same address for both slots.
         output_state_indices = initial_state_indices
     if output is None:
-        output = defs["output"]
+        # Must be a fresh allocation: this tensor is returned to the caller, so a
+        # cached per-B buffer would let a later call overwrite an earlier result.
+        output = torch.empty(
+            B_val, T_val, HV_val, V_val, device=q.device, dtype=torch.bfloat16
+        )
 
     cache["compiled"](
         h0_source,
@@ -3582,6 +3661,12 @@ def gated_delta_rule_mtp(
 
     assert q is not None and k is not None and v is not None
     assert b is not None and initial_state_source is not None
+
+    # bf16-only kernel: any other dtype would be reinterpreted, not converted.
+    q, k, v, a, b = as_bf16(q, k, v, a, b)
+    assert output is None or output.dtype == torch.bfloat16, (
+        f"output must be bf16; got {output.dtype}"
+    )
 
     B, T, H, K = q.shape
     HV = v.shape[2]
@@ -3732,10 +3817,11 @@ def gated_delta_rule_mtp(
     # redirected here). Falls to the ILP=4 MTP path
     # (mtp_ilp4_kernel), which natively supports both single- and
     # split-pool, so the config picker is independent of pool mode.
-    tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
+    target = gdn_device_target(q.device)
+    tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V, num_sms=target.num_sms)
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
+    use_packed_fma = target.use_packed_fma
     # Set same_pool=True when reads and writes alias (single-pool); the
     # kernel then DCEs write-side base-pointer arithmetic.
     same_pool = (
@@ -3785,6 +3871,8 @@ def gated_delta_rule_mtp(
         per_request_accepted_steps,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
+        _dtype_key(A_log, dt_bias, initial_state_indices),
+        target.compile_key,
     )
 
     if cache_key not in _compiled_kernels_mtp:
@@ -3799,15 +3887,17 @@ def gated_delta_rule_mtp(
         )
 
         if contiguous_pool:
-            h_ = _mark_batch_dynamic(h0_source)
+            h_ = _mark_slot_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
-        inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        # Mark the flat-3D view's slot dim dynamic so the cubin works across
-        # pool_size variations (FLA-flat aliases h0_source as a flat [pool*HV,
-        # V, K] view whose slot dim varies with pool_size).
+        # Slot dim dynamic (mode 0 only) for the caching/scatter path; the
+        # caching-off dummy is never read so convert it directly.
         if cache_intermediate_states or per_token_pool_scatter_flat:
-            inter_ = _mark_batch_dynamic(intermediate_states)
+            inter_ = _mark_slot_dynamic(intermediate_states)
+        else:
+            inter_ = from_dlpack(
+                intermediate_states, assumed_align=32, enable_tvm_ffi=True
+            )
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
@@ -3816,60 +3906,66 @@ def gated_delta_rule_mtp(
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
-        h0_idx_ = _mark_batch_dynamic(
+        h0_idx_ = _mark_index_dynamic(
             initial_state_indices
             if initial_state_indices is not None
             else _placeholder_indices
         )
         h0_out_idx_ = h0_idx_
-        acc_steps_ = _mark_batch_dynamic(
+        acc_steps_ = _mark_index_dynamic(
             accepted_steps
             if accepted_steps is not None
             else _placeholder_accepted_steps
         )
-        ssm_idx_ = _mark_batch_dynamic(
+        ssm_idx_ = _mark_index_dynamic(
             ssm_state_indices
             if ssm_state_indices is not None
             else _placeholder_ssm_state_indices
         )
 
         _compiled_kernels_mtp[cache_key] = {
-            "compiled": cute.compile(
-                run_gdn_decode_bf16state_mtp_ilp4,
-                h_,
-                inter_,
-                A_log_,
-                a_,
-                dt_bias_,
-                q_,
-                k_,
-                v_,
-                b_,
-                o_,
-                h0_idx_,
-                h0_out_idx_,
-                acc_steps_,
-                ssm_idx_,
-                softplus_beta,
-                softplus_threshold,
-                scale,
-                HV,
-                T,
-                H,
-                K,
-                V,
-                tile_v,
-                use_qk_l2norm_in_kernel,
-                disable_state_update,
-                cache_intermediate_states,
-                use_packed_fma,
-                same_pool,
-                disable_output,
-                per_request_accepted_steps,
-                per_token_pool_scatter,
-                per_token_pool_scatter_flat,
-                stream,
-                options="--enable-tvm-ffi --generate-line-info --opt-level 3",
+            "compiled": build_and_load_cute_dsl_kernel(
+                _CUTE_DSL_MODULE,
+                _bf16_state_kernel_name("mtp_ilp4", cache_key),
+                lambda: cute.compile[
+                    gdn_compile_options(q.device, *_BF16_STATE_COMPILE_OPTS)
+                ](
+                    run_gdn_decode_bf16state_mtp_ilp4,
+                    h_,
+                    inter_,
+                    A_log_,
+                    a_,
+                    dt_bias_,
+                    q_,
+                    k_,
+                    v_,
+                    b_,
+                    o_,
+                    h0_idx_,
+                    h0_out_idx_,
+                    acc_steps_,
+                    ssm_idx_,
+                    softplus_beta,
+                    softplus_threshold,
+                    scale,
+                    HV,
+                    T,
+                    H,
+                    K,
+                    V,
+                    tile_v,
+                    use_qk_l2norm_in_kernel,
+                    disable_state_update,
+                    cache_intermediate_states,
+                    use_packed_fma,
+                    same_pool,
+                    disable_output,
+                    per_request_accepted_steps,
+                    per_token_pool_scatter,
+                    per_token_pool_scatter_flat,
+                    stream,
+                ),
+                extra_key_files=(__file__,),
             ),
             # Per-B default tensors (B-dependent shapes — see batch-dynamic
             # correctness note in gated_delta_rule_mtp_wide_vec).
@@ -3881,7 +3977,6 @@ def gated_delta_rule_mtp(
     if B not in defaults_by_B:
         defaults_by_B[B] = {
             "indices": torch.arange(B, dtype=torch.int32, device=q.device),
-            "output": torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype),
             "accepted_steps": torch.zeros(B, dtype=torch.int32, device=q.device),
             "ssm_state_indices": torch.zeros(B, T, dtype=torch.int32, device=q.device),
         }
@@ -3889,7 +3984,9 @@ def gated_delta_rule_mtp(
     if initial_state_indices is None:
         initial_state_indices = defs["indices"]
     if output is None:
-        output = defs["output"]
+        # Must be a fresh allocation: this tensor is returned to the caller, so a
+        # cached per-B buffer would let a later call overwrite an earlier result.
+        output = torch.empty(B, T, HV, V, device=q.device, dtype=torch.bfloat16)
     if output_state_indices is None:
         output_state_indices = initial_state_indices
     accepted_steps_arg = (

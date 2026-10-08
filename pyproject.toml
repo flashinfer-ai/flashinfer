@@ -16,32 +16,38 @@
 name = "flashinfer-python"
 dynamic = ["version", "dependencies"]
 description = "FlashInfer: Kernel Library for LLM Serving"
+# Keep the lower bound in sync with .python-version.
 requires-python = ">=3.10,<4.0"
 authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-license-files = ["LICENSE", "LICENSE*.txt"]
+license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda"]
 
 [project.optional-dependencies]
-cu12 = ["nvidia-cutlass-dsl>=4.5.0"]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.0"]
-# Runtime deps for the moe_ep transport backends. Pair with the BUILD_NVEP=1
-# env var at install time: `BUILD_NVEP=1 pip install -e ".[nvep]"`. The env var
-# triggers the in-tree submodule build (NIXL meson + NCCL make) and the
-# build_backend.py hook also pip-installs `nixl-cu13>=1.0.1` and
-# `nvidia-nccl-cu13>=2.30.4` with --no-deps (matching SGLang's Dockerfile
-# pattern) so they don't drag transitive constraints that downgrade torch.
-# Only cuda-python is listed here because it has no torch-conflicting deps.
-nvep = [
-  "cuda-python>=13.0",
-]
+b12x = ["torch>=2.12.0", "nvidia-cutlass-dsl==4.7.1", "nvidia-cutlass-dsl-libs-base==4.7.1", "nvidia-cutlass-dsl-libs-core==4.7.1", "nvidia-cutlass-dsl-libs-cu12==4.7.1", "nvidia-cutlass-dsl-libs-cu13==4.7.1", "rich>=13", "safetensors>=0.6"]
+# Static SM103a KDA PTX uses ISA 9.2 and embedded-cubin TVM FFI shims.
+ptx = ["nvidia-cuda-nvcc>=13.2", "apache-tvm-ffi>=0.1.12,<0.2"]
+# Keep these CUDA-extra floors in sync with ci/cuda-versions.json.
+cu12 = ["nvidia-cutlass-dsl>=4.7.0a0"]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7.0a0"]
+# Native Rubin MegaMoE uses APIs absent from the general CUDA-extra floor.
+sm107 = ["nvidia-cutlass-dsl[cu13]>=4.8.0.dev0", "nvshmem4py-cu13>=0.3.1", "torch>=2.8"]
+# DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
+# working. The moe_ep runtime deps (cuda-python, nccl-extensions) are now part of the
+# BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
+# default (best-effort) on `pip install .` — see the moe_ep section at the top
+# of build_backend.py. libnccl comes from torch's own nvidia-nccl-cu13 pin;
+# the >=2.30.7 B200 floor is enforced at runtime (moe_ep/core/validation/
+# common.py) and upgraded --no-deps by the build hook on source installs. Opt
+# out of the native build with BUILD_NVEP=0 (or BUILD_NIXL_EP=0 / BUILD_NCCL_EP=0).
+nvep = []
 
 [project.scripts]
 flashinfer = "flashinfer.__main__:cli"
 
 [build-system]
-requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2"]
+requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1.11,<0.2"]
 build-backend = "build_backend"
 backend-path = ["."]
 
@@ -58,31 +64,87 @@ version = { attr = "flashinfer._build_meta.__version__" }
 dependencies = { file = ["requirements.txt"] }
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["flashinfer*"]
-exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
+where = [".", "flashinfer/experimental/b12x/_compat"]
+include = ["flashinfer*", "b12x"]
+exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimental.b12x._compat*"]
 
 [tool.setuptools.package-dir]
+"b12x" = "flashinfer/experimental/b12x/_compat/b12x"
 "flashinfer.data" = "."
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
 "flashinfer.data.spdlog" = "3rdparty/spdlog"
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.experimental.b12x.comm.roce" = ["*.c"]
+"flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
+"flashinfer.experimental.cake_lm_head_loss" = ["csrc/**"]
+"flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
+"flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
+"flashinfer.experimental.msa_nvfp4_decode" = ["csrc/**"]
+"flashinfer.experimental.nvfp4_mla_decode" = ["csrc/**"]
+"flashinfer.experimental.cake_dsa_indexer" = ["csrc/**"]
+# Route catalog of the experimental SM120 paged MQA-logits export, read at runtime next to its module.
+"flashinfer.experimental.deepgemm_sm120_paged_mqa_logits" = ["*.json"]
 "flashinfer" = ["_build_meta.py"]
+"flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
+"flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
+"flashinfer.prims_ts.moe" = ["prims_ts_moe_configs.json"]
+# Capability surface of the NVFP4 MSA decode and prefill kernels, loaded at runtime via
+# importlib.resources.
+"flashinfer.msa_ops" = ["*.json"]
+# Workload registry of the experimental fused GDN decode backends, loaded at
+# runtime via importlib.resources.
+"flashinfer.gdn_kernels.experimental" = ["*.json"]
+# Their in-package JIT kernel source, compiled on demand by
+# flashinfer/jit/gdn_fused_decode.py.
+"flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
+# Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
+"flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
+# Generated sources for the experimental exact-SM100a/SM103a/SM107a ragged BF16 MoE grouped GEMM backend.
+"flashinfer.experimental.cake_moe_grouped_gemm" = ["csrc/**"]
+# Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.
+"flashinfer.fused_moe.backends.cudnn_frost" = ["artifacts/*/*.json", "artifacts/*/sources/*.py", "csrc/**"]
+# Generated sources for the experimental exact-SM110 GQA decode backend.
+"flashinfer.experimental.sm110_gqa_decode" = ["csrc/**"]
+# Frozen native sources and manifest for the exact-SM110 XQA backend.
+"flashinfer.experimental.sm110_xqa" = ["csrc/**"]
+# Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
+# runtime; registered so non-editable installs ship them (PR #4069).
+"flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
+  "*.md",
+  "src/a2a/*.cu",
+  "src/a2a/*.cuh",
+  "src/fp8_gemm/*.cu",
+  "src/fp8_gemm/*.cuh",
+]
+# Generated SM90 BF16 Cake MegaMoE sources and manifest, compiled on demand.
+"flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe" = [
+  "src/*.cu",
+  "src/*.json",
+]
+# Generated SM100 BF16 rank-major mega-MoE CUDA bundle. The runtime validates
+# the manifest checksum before compiling the source on demand.
+"flashinfer.moe_ep.kernel_src.blackwell_bf16_rank_major" = [
+  "*.md",
+  "src/*.cu",
+  "src/*.json",
+]
 "flashinfer.data" = ["csrc/**", "include/**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.spdlog" = ["include/**"]
 "flashinfer.data.cccl" = ["cub/cub/**", "libcudacxx/include/**", "thrust/thrust/**"]
-# EP backend shared libraries built in-tree from 3rdparty/{nixl,nccl} when
-# BUILD_NVEP=1 is set during `pip install`. The .so files live under
-# flashinfer/moe_ep/{nixl_ep,nccl_ep}/_libs/ (gitignored; populated by
-# build_backend._build_nvep_if_enabled).
-"flashinfer.moe_ep.nixl_ep" = ["_libs/**"]
-"flashinfer.moe_ep.nccl_ep" = ["_libs/*.so*"]
+# EP backend shared libraries built in-tree from 3rdparty/nixl by default
+# during `pip install` (opt out with BUILD_NIXL_EP=0). The .so files live under
+# flashinfer/moe_ep/backends/split/comm/{nccl,nixl}_ep/_libs/ (gitignored;
+# populated by build_backend._build_nvep_if_enabled).
+"flashinfer.moe_ep.backends.split.comm.nixl_ep" = ["_libs/**", "_vendored/**"]
+"flashinfer.moe_ep.backends.split.comm.nccl_ep" = ["_libs/*.so*"]
 
 [tool.mypy]
 files = ["flashinfer"]
+# Keep this literal in sync with .python-version.
+python_version = "3.10"
 ignore_missing_imports = true
 show_column_numbers = true
 show_error_context = true
@@ -90,13 +152,74 @@ follow_imports = "skip"
 ignore_errors = false
 strict_optional = false
 exclude = [
+  "flashinfer/fused_moe/backends/cudnn_frost/artifacts/.*/sources/",
   "flashinfer-cubin/",
   "flashinfer-jit-cache/",
+  # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
+  "flashinfer/attention/prims_ts/kernels/",
   "3rdparty/",
   "flashinfer/data/cutlass/",
+  "flashinfer/cute_dsl/attention/fmha/fmha.py",
+  "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
+  "flashinfer/cute_dsl/attention/fmha/helpers/",
+  "flashinfer/prims_ts/",
+  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
+  "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/",
+  "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
+  "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/",
+  "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
+  "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
+  "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
+  # DKG filtered top-k kernels, vendored verbatim from dynamic-kernel-generator
+  # (see the provenance header in each file). Kept byte-faithful so upstream
+  # fixes can be re-applied by re-vendoring. The two reported errors are typing
+  # artifacts, not defects: `_get_num_sms` memoises via a function attribute,
+  # and `compiled_filter_topk_dict` is an untyped dict holding two distinct key
+  # shapes that cannot collide (each leads with a different wrapper-mode string
+  # and they differ in length).
+  "flashinfer/topk_varlen/kernels/filtered_topk_util.py",
+  "flashinfer/topk_varlen/kernels/filtered_topk_decode.py",
+  # Self-sampling GVR V2: verbatim TRT-LLM drops (see the ruff exclude note).
+  "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",
+  "flashinfer/topk_varlen/kernels/gvr2_topk_host.py",
+  # Same class: a CuTe DSL kernel body, kept byte-faithful to the artifact its
+  # kernel-level numbers were measured on.
+  "flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100.py",
   "build/",
 ]
 
+# CuTe DSL FMHA kernels from TRTLLM VisualGen; kept as-is for clean re-sync.
+# cutedsl_megamoe/src kernels are maintained upstream and re-dropped
+# periodically; excluded so lint churn doesn't block syncs. The shim/ layer
+# next to it is ours and stays linted.
+# The GVR top-k kernels are CuTe-DSL device code ported verbatim from
+# TensorRT-LLM. Exclude them from ruff (both lint and format) so the port stays
+# byte-faithful to upstream and future syncs stay clean -- reflowing or
+# "simplifying" DSL code can also change traced semantics (e.g. SIM109's
+# `x in (a, b)` yields a Python bool, not the DSL Boolean predicate that
+# `x == a or x == b` produces).
+[tool.ruff]
+# Ruff infers the target from project.requires-python.
+extend-exclude = [
+  "flashinfer/fused_moe/backends/cudnn_frost/artifacts/*/sources/",
+  "flashinfer/cute_dsl/attention/fmha/fmha.py",
+  "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
+  "flashinfer/cute_dsl/attention/fmha/helpers",
+  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
+  "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src",
+  "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",
+  "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
+  "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",
+  "flashinfer/topk_varlen/kernels/gvr2_topk_host.py",
+  "flashinfer/topk_varlen/kernels/block_scan.py",
+  "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src",
+  "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src",
+  "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
+  "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
+  "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
+  "flashinfer/experimental/cake_vsa_sm90_cute/attention_queue.py",
+]
+force-exclude = true
 
 [tool.ruff.lint]
 select = [
@@ -144,3 +267,9 @@ ignore = [
 ]
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+# b12x was migrated wholesale (#5767); its pre-existing lint debt is waived here
+# rather than auto-fixed, because F401 fixes would strip re-exports from its
+# api.py op surfaces. Undefined names (F821) stay enforced.
+"flashinfer/experimental/b12x/**" = ["B007", "B008", "B009", "B010", "B011", "B018", "B905", "F401", "F811", "F841", "SIM105", "SIM114", "SIM115", "SIM117", "SIM300"]
+"tests/experimental/b12x/**" = ["B007", "B008", "B009", "B010", "B011", "B018", "B905", "F401", "F811", "F841", "SIM105", "SIM114", "SIM115", "SIM117", "SIM300"]
+"benchmarks/experimental/b12x/**" = ["B007", "B008", "B009", "B010", "B011", "B018", "B905", "F401", "F811", "F841", "SIM105", "SIM114", "SIM115", "SIM117", "SIM300"]
