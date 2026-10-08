@@ -338,11 +338,15 @@ def test_mm_mxfp8_cute_dsl_low_m(m, k):
 
 
 def _sm107_mxfp8_runner():
-    """The SM107 cute-dsl runner; skips off SM107 or without the SM107 kernel."""
+    """The SM107 cute-dsl runner; skips if the CuTe DSL has no Rubin support."""
     _skip_if_unsupported("cute-dsl")
-    if get_compute_capability(torch.device("cuda")) != (10, 7):
-        pytest.skip("The SM107 CuTe-DSL MXFP8 kernel is SM107-only")
-    pytest.importorskip("flashinfer.gemm.kernels.dense_blockscaled_gemm_sm107")
+    from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
+
+    if not is_rubin_cute_dsl_available():
+        pytest.skip(
+            "The SM107 cute-dsl mm_mxfp8 path requires CuTe DSL >= 4.8 "
+            "(cutlass.utils.rubin_helpers)."
+        )
     return gemm_base._cute_dsl_gemm_mxfp8_sm107_runner(  # pyright: ignore[reportPrivateUsage]
         torch.bfloat16
     )
@@ -368,6 +372,7 @@ def _sm107_mxfp8_inputs(m, n, k):
     return inputs, torch.mm(input, weight.T)
 
 
+@pytest.mark.arch_rubin
 def test_mm_mxfp8_cute_dsl_offers_sm107_tactics():
     runner = _sm107_mxfp8_runner()
     inputs, _ = _sm107_mxfp8_inputs(256, 1536, 6144)
@@ -381,6 +386,7 @@ def test_mm_mxfp8_cute_dsl_offers_sm107_tactics():
     assert {t[2] for t in runner.get_valid_tactics(inputs, None)} == {False, True}
 
 
+@pytest.mark.arch_rubin
 def test_mm_mxfp8_cute_dsl_sm107_runner_selection():
     """mm_mxfp8(backend="cute-dsl") uses the SM107 kernel unless it cannot run."""
     _sm107_mxfp8_runner()
@@ -394,6 +400,7 @@ def test_mm_mxfp8_cute_dsl_sm107_runner_selection():
     assert not use(10, 0, a, b, out)
 
 
+@pytest.mark.arch_rubin
 @pytest.mark.parametrize(
     "m,n,k",
     [
@@ -418,9 +425,10 @@ def test_mm_mxfp8_cute_dsl_sm107_tactics(m, n, k):
         _assert_cosine_similarity(reference, out)
 
 
+@pytest.mark.arch_rubin
 @pytest.mark.parametrize("m", [1, 100, 256, 4096])
 @pytest.mark.parametrize("k", [1024, 544])
-def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m, k):
+def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m, k, monkeypatch):
     """Without autotuning, SM107 runs the SM107 kernel and never an SM100 one."""
     n = 1536
     _sm107_mxfp8_runner()
@@ -433,8 +441,11 @@ def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m, k):
         )
         is not None
     )
-    sm100_cache = gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE  # pyright: ignore[reportPrivateUsage]
-    cached = set(sm100_cache)
+
+    def no_sm100_runner(*args, **kwargs):
+        raise AssertionError("SM107 mm_mxfp8 fell back to the SM100 runner")
+
+    monkeypatch.setattr(gemm_base, "_cute_dsl_gemm_mxfp8_runner", no_sm100_runner)
     _run_mm_mxfp8(
         m,
         n,
@@ -445,9 +456,9 @@ def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m, k):
         auto_tuning=False,
         provide_out=True,
     )
-    assert set(sm100_cache) == cached, "untuned SM107 call compiled an SM100 kernel"
 
 
+@pytest.mark.arch_rubin
 @pytest.mark.parametrize("m", [1, 3, 100, 129])
 def test_mm_mxfp8_cute_dsl_sm107_swap_ab_any_m(m):
     """Swap-AB SM107 tactics run at any M, including M % 8 != 0."""

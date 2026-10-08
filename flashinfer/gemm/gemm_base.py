@@ -6649,14 +6649,16 @@ def _cute_dsl_gemm_mxfp8_runner(
 
 @functools.cache
 def _sm107_mxfp8_cute_dsl_kernel():
-    """The SM107 CuTe-DSL block-scaled GEMM kernel class, or None if this
-    nvidia-cutlass-dsl wheel lacks the Rubin helpers it needs."""
-    try:
-        from .kernels.dense_blockscaled_gemm_sm107 import (
-            Sm107BlockScaledPersistentDenseGemmKernel,
-        )
-    except ImportError:
+    """The SM107 CuTe-DSL block-scaled GEMM kernel class, or None if the installed
+    CuTe DSL lacks the Rubin API it is built on (CuTe DSL >= 4.8)."""
+    from ..cute_dsl.availability import is_rubin_cute_dsl_available
+
+    if not is_rubin_cute_dsl_available():
         return None
+    from .kernels.dense_blockscaled_gemm_sm107 import (
+        Sm107BlockScaledPersistentDenseGemmKernel,
+    )
+
     return Sm107BlockScaledPersistentDenseGemmKernel
 
 
