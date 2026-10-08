@@ -151,24 +151,25 @@ def _decode_default(m, n, k):
 def _decode_candidates(m, n, k):
     b = _bucket(m)
     out = [_decode_default(m, n, k)]
-    if b <= 4 or (b == 8 and n * k >= 8 * 1024 * 1024 and k <= 2560):
-        for warps, cps in ((8, 4), (4, 8), (2, 16)):
-            out.append(gemv(b, k, warps, cps))
-        for ks in (2, 4, 8):
-            out.append(gemv(b, k, 8, 4, ks))
-            out.append(gemv(b, k, 16, 2, ks))
-    if b in (8, 16):
-        out += [skinny(b, 1), skinny(b, 2), skinny(b, 1, min_units=2)]
+    if b <= 4:
+        out += [
+            gemv(b, k),
+            gemv(b, k, 4, 8),
+            gemv(b, k, 16, 2, 2),
+            gemv(b, k, 16, 2, 4),
+        ]
+        if k >= 4096:
+            # Deep K: an 8-way split keeps enough rows in flight per SM.
+            out += [gemv(b, k, 8, 4, 8), gemv(b, k, 16, 2, 8)]
+    elif b <= 16:
+        out += [skinny(b, 1), skinny(b, 2)]
         if (k // 32) % 4:
-            out += [skinny(b, 2, min_units=2, ku=2, p=4), skinny(b, 2, ku=2, p=2)]
-    if b >= 16:
+            out.append(skinny(b, 2, min_units=2, ku=2, p=4))
+    else:
         out += [
             skinny(32, 2, min_units=2),
             skinny(32, 1, ctas_per_sm=2, min_units=2),
             skinny(32, 1),
-            skinny(32, 1, warps=8, ctas_per_sm=1),
-            skinny(32, 1, min_units=2, cta_wide=True, p=2),
-            skinny(32, 2, warps=8, ctas_per_sm=2, min_units=2, cta_wide=True, p=2),
         ]
     return out
 
@@ -222,30 +223,20 @@ def _stream_tile_candidates(m, n):
 
 def _persistent_candidates(m, n, k, dev):
     p, sk = persistent, "streamk"
-    if m <= 32:
-        out = [p(32, 64, 1, 4, 2), p(32, 64, 2, 4), p(32, 64, 2, 2)]
-        out += [p(32, 64, 2, 4, sched=sk), p(32, 64, 1, 4, 2, sched=sk)]
-        out += [p(32, 128, 1, 4), p(32, 32, 2, 2)]
-    elif m <= 64:
-        out = [p(32, 64, 1, 4, 2), p(32, 64, 2, 4, sched=sk), p(64, 64, 2, 4)]
-        out += [p(32, 64, 2, 2), p(32, 64, 1, 4, 2, sched=sk)]
-        out += [p(64, 32, 4, 1), p(64, 128, 2, 4), p(32, 128, 1, 4)]
-    elif m <= 128:
-        out = [p(32, 64, 1, 4, 2), p(32, 64, 2, 4, sched=sk), p(128, 64, 1, 4)]
-        out += [p(32, 64, 1, 4, 2, sched=sk), p(64, 64, 2, 4), p(64, 64, 2, 2)]
-        out += [p(128, 64, 4, 2), p(64, 32, 4, 1), p(64, 128, 2, 4)]
+    out = [p(32, 64, 1, 4, 2)]
+    if m <= 128:
+        out += [
+            p(64, 64, 2, 2),
+            p(128, 64, 4, 2),
+            p(32, 64, 1, 4, 2, sched=sk),
+            p(32, 64, 2, 4, sched=sk),
+        ]
     elif m <= 256:
-        out = [p(64, 128, 2, 4), p(128, 128, 2, 4), p(64, 64, 2, 4, sa=3)]
-        out += [p(128, 64, 2, 2), p(64, 128, 1, 4)]
-        out += [p(32, 64, 1, 4, 2), p(32, 64, 1, 4, 2, sched=sk), p(64, 64, 2, 2)]
-    elif m <= 512:
-        out = [p(128, 128, 2, 4), p(128, 128, 2, 4, sched=sk), p(64, 128, 1, 4)]
-        out += [p(64, 64, 2, 2), p(32, 64, 1, 4, 2)]
-        out += [p(128, 64, 2, 2)]
+        out += [p(64, 128, 1, 4), p(32, 64, 1, 4, 2, sched=sk)]
     else:
-        out = [p(128, 128, 2, 4), p(128, 128, 2, 4, sched=sk)]
-        out += [p(64, 128, 1, 4), p(64, 128, 2, 4), p(128, 64, 2, 2), p(64, 64, 2, 2)]
-        out += [p(32, 64, 1, 4, 2)]
+        out += [p(128, 64, 2, 2), p(128, 128, 2, 4, sched=sk)]
+        if m > 512:
+            out.append(p(64, 128, 2, 4))
     return out
 
 
@@ -279,13 +270,13 @@ def _pingpong_candidates(m, n, k, dev):
     tile_n = _wave_tile_n(m, n, dev)
     groups = sorted({_group(k, dev, 0.5), _group(k, dev, 0.125)})
     out = [_pingpong_default(m, n, k, dev)]
-    for tile_k in (128, 64):
-        for g in groups:
-            out.append(pingpong(tile_n, tile_k, 32, 0, g))
-            if not direct:
-                # Wider epilogue sub-tile: half the barriers per tile, fewer stages.
-                out.append(pingpong(tile_n, tile_k, 64, 2, g))
+    for g in groups:
+        out.append(pingpong(tile_n, 128, 32, 0, g))
+        if not direct:
+            # Wider epilogue sub-tile: half the barriers per tile, fewer stages.
+            out.append(pingpong(tile_n, 128, 64, 2, g))
     if not direct:
+        out.append(pingpong(tile_n, 64, 64, 2, groups[-1]))
         # Cooperative 256x128 tile: both warp groups share one B tile (less
         # L2-to-SM traffic per MAC), epilogue not overlapped.
         for early in (False, True):
@@ -318,19 +309,26 @@ def _dedup(tactics, n, k):
 
 
 def valid_tactics(m, n, k, dev):
-    """Candidates for the autotuner bucket whose representative M is ``m``."""
+    """Candidates for the autotuner bucket whose representative M is ``m``.
+
+    Every candidate is compiled before the bucket is profiled, so the lists
+    only keep configurations that won or tied a bucket in sweeps of all
+    configurations on SM120 and SM121.
+    """
     check_shape(m, n, k)
     out = [default_tactic(m, n, k, dev)]
     if m <= SKINNY_MAX_M:
         out += _decode_candidates(m, n, k)
-    if m <= 64:
+    if 2 < m <= 64:
         out += _stream_tile_candidates(m, n)
-    if m <= 16:
-        out += [persistent(32, 64, 1, 4, 2), persistent(32, 64, 2, 2)]
-        out += [persistent(32, 128, 1, 4)]
-    if m > 16:
-        out += _persistent_candidates(m, n, k, dev)
+    if 4 < m <= 16 or 32 < m <= 64:
+        out.append(persistent(32, 64, 1, 4, 2))
+    if 16 < m <= 32:
+        out.append(persistent(32, 64, 2, 2))
+    if 32 < m <= 64:
+        out.append(persistent(32, 128, 1, 4))
     if m > 64:
+        out += _persistent_candidates(m, n, k, dev)
         out += _pingpong_candidates(m, n, k, dev)
     return _dedup(out, n, k)
 
