@@ -23,6 +23,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T
 from cutlass.experimental import primitives as prims
 
+from .math import mul_packed_f32x2, fma_packed_f32x2
 from .ops import pack_float4_to_fp8_e4m3
 
 
@@ -60,18 +61,17 @@ class MlaOutputQuant:
 
     @cute.jit
     def rotate(self, args, values, row, column):
-        """Apply conjugate RoPE to an FP32 fragment in its current lane layout."""
+        """Rotate a mutable final-output fragment in place."""
         _, positions, cos_sin, _ = args
         token = Int64(row) // self.num_heads
         count = cutlass.const_expr(values.shape[0])
-        fragment = cutlass.Array(Float32, count, space=cutlass.AddressSpace.rmem)
-        for i in cutlass.range_constexpr(count):
-            fragment[i] = values[i]
+        fragment = values
 
         # The cache contains forward sin; conjugation changes its sign here.
         if column + count - 1 >= 448:
             position = positions[token]
-            pairs = cutlass.const_expr(min(16, count // 2))
+            # Load independent coefficients together before consuming them.
+            pairs = cutlass.const_expr(min(32, count // 2))
             for i in cutlass.range_constexpr(0, count, pairs * 2):
                 d = column + i
                 if d >= 448:
@@ -86,9 +86,12 @@ class MlaOutputQuant:
                     sin = (base + 32).load(count=pairs, alignment=alignment)
                     for j in cutlass.range_constexpr(pairs):
                         x, y = fragment[i + 2 * j], fragment[i + 2 * j + 1]
-                        fragment[i + 2 * j] = x * cos[j] + y * sin[j]
-                        fragment[i + 2 * j + 1] = y * cos[j] - x * sin[j]
-        return fragment
+                        sine = mul_packed_f32x2((y, x), (sin[j], sin[j]), ftz=True)
+                        rotated = fma_packed_f32x2(
+                            (x, y), (cos[j], cos[j]), (sine[0], -sine[1]), ftz=True
+                        )
+                        fragment[i + 2 * j] = rotated[0]
+                        fragment[i + 2 * j + 1] = rotated[1]
 
     @cute.jit
     def store(
@@ -107,7 +110,13 @@ class MlaOutputQuant:
         remove the rotation at compile time, limiting epilogue code size.
         """
         if cutlass.const_expr(rotary):
-            fragment = self.rotate(args, values, row, column)
+            # Some epilogues pass an immutable register vector. Two-CTA
+            # epilogues rotate their mutable accumulator before this store.
+            count = cutlass.const_expr(values.shape[0])
+            fragment = cutlass.Array(Float32, count, space=cutlass.AddressSpace.rmem)
+            for i in cutlass.range_constexpr(count):
+                fragment[i] = values[i]
+            self.rotate(args, fragment, row, column)
         else:
             fragment = values
         out, _, _, scales = args
@@ -146,7 +155,14 @@ class MlaOutputQuant:
             if cutlass.const_expr(self.ue8m0):
                 exponent = (scale.bitcast(Uint32) + Uint32(0x007FFFFF)) >> 23
                 scale = (exponent << 23).bitcast(Float32)
-            inv_scale = cute.math.rcp(scale, approx=True)
+            if cutlass.const_expr(self.ue8m0):
+                inverse_bits = (Uint32(254) - exponent) << 23
+                # UE8M0 scales are powers of two; keep reciprocal(inf) == 0.
+                inv_scale = (
+                    Float32(0) if exponent == 255 else inverse_bits.bitcast(Float32)
+                )
+            else:
+                inv_scale = cute.math.rcp(scale, approx=True)
             block = (column + start) // self.block_size
             group = head // (self.num_heads // self.num_groups)
             block_in_group = (
@@ -167,18 +183,21 @@ class MlaOutputQuant:
                 else:
                     scales[token, group, block_in_group] = scale
 
-            words = cutlass.const_expr(min(4, per_block // 4))
+            words = cutlass.const_expr(min(8, per_block // 4))
             for i in cutlass.range_constexpr(0, per_block, 4 * words):
                 v = start + i
                 packed = cutlass.Array(Int32, words, space=cutlass.AddressSpace.rmem)
                 for w in cutlass.range_constexpr(words):
                     j = v + 4 * w
-                    packed[w] = pack_float4_to_fp8_e4m3(
-                        fragment[j] * inv_scale,
-                        fragment[j + 1] * inv_scale,
-                        fragment[j + 2] * inv_scale,
-                        fragment[j + 3] * inv_scale,
+                    lo = mul_packed_f32x2(
+                        (fragment[j], fragment[j + 1]), (inv_scale, inv_scale), ftz=True
                     )
+                    hi = mul_packed_f32x2(
+                        (fragment[j + 2], fragment[j + 3]),
+                        (inv_scale, inv_scale),
+                        ftz=True,
+                    )
+                    packed[w] = pack_float4_to_fp8_e4m3(lo[0], lo[1], hi[0], hi[1])
                 ptr = cutlass.inttoptr(
                     (out.iterator.raw_ptr() + Int64(row) * 512 + column + v).toint(
                         Int64
@@ -186,4 +205,13 @@ class MlaOutputQuant:
                     mem_space=1,
                     dtype=Int32,
                 )
-                ptr.store(packed.load(0, words), alignment=4 * words)
+                if cutlass.const_expr(words == 8):
+                    # Native allocations support a 256-bit store. Retain the
+                    # documented 16-byte alignment for caller-owned buffers.
+                    if (ptr.toint(Int64) & Int64(31)) == 0:
+                        ptr.store(packed.load(0, 8), alignment=32)
+                    else:
+                        ptr.store(packed.load(0, 4), alignment=16)
+                        (ptr + 4).store(packed.load(4, 4), alignment=16)
+                else:
+                    ptr.store(packed.load(0, words), alignment=4 * words)

@@ -340,6 +340,7 @@ def make_mla_decode_config(
     sparse_kv_stages: int = 0,
     cache_uniform_sparse_pages: bool = False,
     balance_sparse_registers: bool = False,
+    fuse_output_quant: bool = False,
 ) -> MlaDecodeConfig:
     """Create and populate a MlaDecodeConfig from problem parameters."""
     cfg = MlaDecodeConfig()
@@ -464,6 +465,14 @@ def make_mla_decode_config(
         cfg.softmax_reg_num = 144
         cfg.correction_reg_num = 144
         cfg.other_reg_num = 64
+
+    if fuse_output_quant and cfg.is_fp8_qkv() and cfg.threads_per_cta == 640:
+        # Quantization keeps an output block and rotary coefficients live.
+        # The gather tasks fit in 48 registers; use their surplus for the
+        # correction task while preserving the CTA's 61,440-register budget.
+        cfg.softmax_reg_num = 144
+        cfg.correction_reg_num = 192
+        cfg.other_reg_num = 48
 
     # SETMAXNREG redistributes the CTA's initial allocation, rounded down
     # to eight registers/thread; the remainder of the SM file is not credit.

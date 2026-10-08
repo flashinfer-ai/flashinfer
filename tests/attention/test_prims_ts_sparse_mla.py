@@ -457,6 +457,11 @@ def test_rope_quant_graph(
     columns = heads // groups * 512 // block // (4 if fmt == "ue8m0" else 1)
     assert scales.shape == (rows, groups, columns)
     assert scales.stride() == (1, columns * padded, padded)
+    # Graph replay also exercises caller-owned output aligned to 16, not 32.
+    output_storage = torch.empty(
+        output.numel() + 16, device=output.device, dtype=output.dtype
+    )
+    output = output_storage[16:].view_as(output)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         wrapper.run(

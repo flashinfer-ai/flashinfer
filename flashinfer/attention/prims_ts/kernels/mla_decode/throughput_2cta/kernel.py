@@ -1051,6 +1051,8 @@ class MlaDecodeTs:
             sparse_kv_stages=self.sparse_kv_stages,
             cache_uniform_sparse_pages=self.sparse_uniform_pages,
             balance_sparse_registers=self.sparse_balanced_registers,
+            fuse_output_quant=self.output_quant is not None
+            and self.fuse_sparse_epilogue,
         )
 
     @cute.jit

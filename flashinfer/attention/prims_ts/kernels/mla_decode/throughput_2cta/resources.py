@@ -3602,6 +3602,24 @@ class GmemOResource(HighThroughputMlaResource):
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
 
     @cute.jit
+    def _prefetch_output_rope(self, flat_row, batch_idx, local_tidx, head, valid):
+        """Fetch rotary coefficients while the nonrotary output is finalized."""
+        tile_h = self.cfg.mma_pv_tiler[0] // self.cfg.num_mma_ctas
+        # One lane per logical query in this CTA; the first row may start
+        # partway through a head group. The other column group duplicates it.
+        if local_tidx < tile_h and valid and (head == 0 or local_tidx == 0):
+            row = Int64(flat_row)
+            if cutlass.const_expr(self.cu_seqlens_q is None):
+                row += (
+                    Int64(batch_idx) * self.logical_num_heads_q * self.logical_seq_len_q
+                )
+            _, positions, cos_sin, _ = self.output_quant_args
+            position = positions[row // self.logical_num_heads_q]
+            cache_row = cos_sin.iterator.raw_ptr() + Int64(position) * 64
+            prims.prefetch_l1(cache_row)
+            prims.prefetch_l1(cache_row + 32)
+
+    @cute.jit
     def _normalization_scale(self, row_sum, row_max, local_tidx, blk_coord):
         safe_sum = row_sum if row_sum > Float32(0) else Float32(1)
         scale = self.output_scale * cute.math.rcp(safe_sum, approx=True)
@@ -3693,10 +3711,9 @@ class GmemOResource(HighThroughputMlaResource):
                 values[i], values[i + 1] = scaled[0], scaled[1]
             if cutlass.const_expr(half == 0):
                 if valid:
-                    rotated = self.output_quant.rotate(
+                    self.output_quant.rotate(
                         self.output_quant_args, values, row, column + offset
                     )
-                    values.store(rotated.load(0, 64), 0)
             result.store(values.load(0, 64), offset)
         return result
 
@@ -3781,6 +3798,17 @@ class GmemOResource(HighThroughputMlaResource):
             _,
             query_is_valid,
         ) = self._query_row_state(row_in_tile, seq_q_idx, batch_idx)
+
+        if cutlass.const_expr(
+            self.output_quant is not None and self.partial_output is None
+        ):
+            self._prefetch_output_rope(
+                storage_flat_query_row,
+                batch_idx,
+                local_tidx,
+                logical_head_idx,
+                row_in_tile < physical_tile_rows and query_is_valid,
+            )
 
         # Fully masked split rows can occur when physical tail rows or earlier
         # causal query rows have no visible K values in this split. Store zero
@@ -4069,6 +4097,19 @@ class GmemOResource(HighThroughputMlaResource):
             _,
             query_is_valid,
         ) = self._query_row_state(row_in_tile, seq_q_idx, batch_idx)
+
+        if cutlass.const_expr(
+            self.output_quant is not None
+            and self.partial_output is None
+            and iter_n == 0
+        ):
+            self._prefetch_output_rope(
+                storage_flat_query_row,
+                batch_idx,
+                local_tidx,
+                logical_head_idx,
+                row_in_tile < physical_tile_rows and query_is_valid,
+            )
 
         if cutlass.const_expr(
             self.output_quant is not None
