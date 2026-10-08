@@ -985,9 +985,7 @@ def main():
             )
             for generation, empty in ((0, False), (2, False), (1, True)):
                 data = fill(generation, empty)
-                oracle = reference(
-                    data, weights, fp32=True, swiglu_limit=swiglu_limit
-                )
+                oracle = reference(data, weights, fp32=True, swiglu_limit=swiglu_limit)
                 actual = iteration.run()
                 torch.cuda.synchronize()
                 baseline = upstream.run()
