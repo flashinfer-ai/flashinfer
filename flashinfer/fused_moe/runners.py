@@ -24,6 +24,7 @@ fragile backend-specific kernel-launch code lives in exactly one place.
 from __future__ import annotations
 
 import functools
+import importlib.util
 import warnings
 import weakref
 from collections import OrderedDict
@@ -31,7 +32,18 @@ from contextlib import suppress
 import dataclasses
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, ClassVar, List, Literal, Mapping, Optional, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    cast,
+)
 
 import torch
 
@@ -48,8 +60,13 @@ from ..quantization.nvfp4_quantization_utils import (
     nvfp4_4over6_cache_key,
     resolve_nvfp4_4over6,
 )
-from ..utils import next_positive_power_of_2, round_up
+from ..tllm_enums import DEFAULT_SWIGLU_LIMIT
+from ..utils import get_compute_capability, next_positive_power_of_2, round_up
 from .api import (
+    _CUDNN_GROUPED_GEMM_BF16_ARCHS,
+    _CUDNN_GROUPED_GEMM_FP4_ARCHS,
+    _CUDNN_GROUPED_GEMM_FP8_ARCHS,
+    _CUDNN_GROUPED_GEMM_MXFP8_ARCHS,
     _CUTLASS_BF16_ARCHS,
     _CUTLASS_FP8_ARCHS,
     _CUTLASS_FP8_BLOCK_ARCHS,
@@ -585,6 +602,10 @@ class MoERunner(TunableRunner):
     ] = {}
     # Set to True only after S is wired through validation and launch.
     supports_fused_shared_experts: ClassVar[bool] = False
+    # Whether the kernel consumes ``MoEActivationPack.per_token_scale``. Runners
+    # that leave this False reject ``QuantConfig(per_token_scale=True)`` and a
+    # non-None pack scale instead of silently dropping them.
+    supports_per_token_scale: ClassVar[bool] = False
     # Cleared by backends whose kernels cannot map global expert ids onto a
     # local shard (local_expert_offset / local_num_experts != num_experts).
     supports_expert_parallelism: ClassVar[bool] = True
@@ -683,6 +704,7 @@ class MoERunner(TunableRunner):
         self._assert_shared_experts_supported()
         self._assert_expert_parallelism_supported()
         self._assert_nvfp4_4over6_supported()
+        self._assert_per_token_scale_supported()
         self._check_activation_parameters()
 
     def _check_activation_parameters(self) -> None:
@@ -713,6 +735,37 @@ class MoERunner(TunableRunner):
             "directly. Leave the field unset to use them, or "
             "select a backend that implements it."
         )
+
+    def _assert_per_token_scale_supported(self) -> None:
+        """Reject a declared per-token scale the kernel would ignore."""
+        if self.config.quant.per_token_scale and not self.supports_per_token_scale:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support per_token_scale=True."
+            )
+
+    def _validate_pack_contract(self, act: MoEActivationPack) -> None:
+        """Reject a pack this runner cannot execute; call first in ``pack_inputs``.
+
+        ``MoELayer`` already filters runners by routing mode, so this guards
+        the direct-runner path. The per-token check is here rather than in
+        ``check_support`` because it is a per-call tensor: a pack scale is
+        accepted only when the runner was built with
+        ``QuantConfig(per_token_scale=True)``, since the TRT-LLM and Prims-TS
+        launchers switch kernels on the tensor's presence while tactics were
+        enumerated for the configured mode.
+        """
+        if act.routing_input_mode not in self.supported_routing_modes:
+            names = ", ".join(mode.name for mode in self.supported_routing_modes)
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support "
+                f"routing_input_mode={act.routing_input_mode!r}; supported: {names}."
+            )
+        if act.per_token_scale is not None and not self.config.quant.per_token_scale:
+            raise ValueError(
+                f"{type(self).__name__} was configured without "
+                "QuantConfig(per_token_scale=True) and does not consume "
+                "MoEActivationPack.per_token_scale."
+            )
 
     def _assert_expert_parallelism_supported(self) -> None:
         """Reject EP shards for backends that cannot compute a local expert subset."""
@@ -834,6 +887,10 @@ class CakeWarpDecodeRunner(MoERunner):
     ``alpha=1`` and ``beta=0``. Parameterized SwiGLU and SiTU use an extended
     launch entry point that consumes the prepared per-expert activation tensors.
     Activation is identified by the exact geometry.
+    The SM100 H4096/I2048/E256/top-k6 route keeps its dedicated clamped
+    entry and raw-accumulator parameter units. Its weights require matched
+    NVFP4 shuffled MajorK data and R128c4 E4M3 block scales, not merely an
+    FP4 dtype label; checkpoint conversion precedes weight-pack preparation.
     """
 
     backend_key = "cake"
@@ -850,6 +907,7 @@ class CakeWarpDecodeRunner(MoERunner):
         (SwiGLU(), 2048, 1536, 60, 4),
         (SwiGLU(), 2560, 768, 384, 4),
         (SiLU(), 6144, 1536, 192, 4),
+        (SwiGLU(limit=10.0), 4096, 2048, 256, 6),
         (SwiGLU(), 2048, 768, 128, 8),
         (SwiGLU(), 4096, 1536, 128, 8),
         (SwiGLU(), 2048, 512, 256, 8),
@@ -874,6 +932,7 @@ class CakeWarpDecodeRunner(MoERunner):
     )
     _GATED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = ("gemm1_alpha",)
     _ACTIVATION_PARAMETER_KEYS: ClassVar[dict[ActivationConfig, tuple[str, ...]]] = {
+        SwiGLU(limit=10.0): ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
         SwiGLU(alpha=1.702, beta=1.0, limit=7.0): (
             "gemm1_alpha",
             "gemm1_beta",
@@ -919,6 +978,9 @@ class CakeWarpDecodeRunner(MoERunner):
         # profiled as-is, so the autotuner never synthesizes invalid expert ids.
         self.tuning_config = TuningConfig(use_cuda_graph=True)
 
+    def _uses_clamped_swiglu(self) -> bool:
+        return self.config.activation == SwiGLU(limit=10.0)
+
     def _check_support(self) -> None:
         super()._check_support()
         if self._device_arch not in (100, 103):
@@ -926,15 +988,13 @@ class CakeWarpDecodeRunner(MoERunner):
                 "CakeWarpDecodeRunner requires exact SM100 or SM103, "
                 f"got SM{self._device_arch}."
             )
+        if self._uses_clamped_swiglu() and self._device_arch != 100:
+            raise NotImplementedError("Clamped E256 warp decode requires exact SM100.")
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("CakeWarpDecodeRunner requires do_finalize=True.")
         if self.config.execution.enable_pdl is not True:
             raise NotImplementedError(
                 "CakeWarpDecodeRunner requires ExecutionConfig(enable_pdl=True)."
-            )
-        if self.config.quant.per_token_scale:
-            raise NotImplementedError(
-                "CakeWarpDecodeRunner does not support per-token activation scaling."
             )
         if self.config.quant.swizzled_scale_factors is True:
             raise NotImplementedError(
@@ -974,7 +1034,8 @@ class CakeWarpDecodeRunner(MoERunner):
                 "(1536, 256, 8), and SiLU() with "
                 "(1536, 192, 4), SwiGLU(alpha=1.702, beta=1.0, limit=7.0) "
                 "with (3072, 128, 4), or SiTU(gate_scale=4.0, linear_scale=25.0) "
-                "with (3072, 896, 16); got "
+                "with (3072, 896, 16), or SwiGLU(limit=10.0) with "
+                "(2048, 256, 6) on SM100; got "
                 f"{configuration_without_hidden}."
             )
 
@@ -1203,8 +1264,8 @@ class CakeWarpDecodeRunner(MoERunner):
         # pack_inputs runs before forward on every MoELayer call. During graph
         # capture it cannot allocate, so transfer the most recently used,
         # already-prepared workspace for this exact geometry to the capture
-        # stream. forward records the stream claim and C++ inserts the external
-        # completion-event dependency on any prior warmup submission.
+        # stream. forward records the stream claim. The caller must order uses
+        # of shared scratch: captured calls do not wait on a prior submission.
         for cached_key, (_, workspace) in reversed(self._workspace_cache.items()):
             if cached_key[1] != geometry:
                 continue
@@ -1248,10 +1309,10 @@ class CakeWarpDecodeRunner(MoERunner):
             )
         ):
             # A framework may pack on its caller stream and perform the first
-            # real launch on an internal side stream. During capture, the C++
-            # completion event records the dependency on any prior warmup
-            # submission, so the prepared packed workspace can transfer without
-            # allocation. Eager cross-stream calls still allocate independently.
+            # real launch on an internal side stream. Capture can transfer the
+            # prepared workspace without allocation; the caller must order any
+            # graph replay or eager call sharing it. Captured launches do not
+            # insert a wait. Eager cross-stream calls allocate independently.
             self._cache_workspace_for_stream(stream, geometry, packed_workspace)
             return packed_workspace
 
@@ -1322,11 +1383,7 @@ class CakeWarpDecodeRunner(MoERunner):
     ) -> List[torch.Tensor]:
         """Validate and flatten the exact warp-decode TVM-FFI input ABI."""
         self._require_built()
-        if act.routing_input_mode is not RoutingInputMode.UnpackedPrecomputed:
-            raise NotImplementedError(
-                "CakeWarpDecodeRunner requires "
-                "routing_input_mode=RoutingInputMode.UnpackedPrecomputed."
-            )
+        self._validate_pack_contract(act)
 
         num_tokens = int(act.hidden_states_q.shape[0])
         if not 1 <= num_tokens <= 32:
@@ -1359,7 +1416,8 @@ class CakeWarpDecodeRunner(MoERunner):
                 "with (6144, 1536, 192, 4), "
                 "SwiGLU(alpha=1.702, beta=1.0, limit=7.0) with (6144, 3072, 128, 4), "
                 "or SiTU(gate_scale=4.0, linear_scale=25.0) "
-                "with (3584, 3072, 896, 16); got "
+                "with (3584, 3072, 896, 16), or SwiGLU(limit=10.0) with "
+                "(4096, 2048, 256, 6) on SM100; got "
                 f"{configuration}."
             )
 
@@ -1392,11 +1450,10 @@ class CakeWarpDecodeRunner(MoERunner):
             shape=(num_tokens, hidden_size // 16),
             device=device,
         )
-        if act.per_token_scale is not None:
-            raise ValueError("CakeWarpDecodeRunner does not consume per_token_scale.")
-
         view = weights.get_view(self.backend_key)
         activation = self.config.activation
+        if self._uses_clamped_swiglu() and self._device_arch != 100:
+            raise NotImplementedError("Clamped E256 warp decode requires exact SM100.")
         activation_parameter_keys = self._ACTIVATION_PARAMETER_KEYS.get(activation, ())
         gated_weight_keys = (
             activation_parameter_keys or self._GATED_WEIGHT_KEYS
@@ -1564,7 +1621,11 @@ class CakeWarpDecodeRunner(MoERunner):
             self._stream_token(stream),
         )
         try:
-            if parameterized:
+            if self._uses_clamped_swiglu():
+                self._module.cake_fused_moe_warp_decode_clamped_swiglu(
+                    *launch_inputs, prepared[1], True
+                )
+            elif parameterized:
                 self._module.cake_fused_moe_warp_decode_with_activation_params(
                     *launch_inputs, prepared[1], True
                 )
@@ -1686,12 +1747,6 @@ class _CutlassRunnerBase(MoERunner):
                 f"{type(self).__name__} does not support "
                 f"SM{self._device_arch}; supported architectures are "
                 f"{self._supported_archs}."
-            )
-        if self.config.quant.per_token_scale:
-            # The flat CUTLASS ABI has no per-token activation scale input;
-            # packing would silently drop ``act.per_token_scale``.
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support per_token_scale=True."
             )
         if self.config.quant.swizzled_scale_factors is True and self._linear_act_sf:
             # Only the MXFP8 runners have a swizzled input_sf path; silently
@@ -2010,10 +2065,7 @@ class _CutlassRunnerBase(MoERunner):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
-        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only PackedPrecomputed routing."
-            )
+        self._validate_pack_contract(act)
         hidden_states = act.hidden_states_q
         if hidden_states.ndim != 2 or hidden_states.dtype is not self._x_dtype:
             raise TypeError(
@@ -2107,8 +2159,6 @@ class _CutlassRunnerBase(MoERunner):
         ]
 
     def _validate_activation_scale(self, act: MoEActivationPack) -> None:
-        if act.per_token_scale is not None:
-            raise ValueError(f"{type(self).__name__} does not consume per_token_scale.")
         if self._linear_act_sf:
             scale = act.hidden_states_scale
             num_tokens = act.hidden_states_q.shape[0]
@@ -3383,10 +3433,7 @@ class CuTileBf16Runner(MoERunner):
 
     def _validate_inputs(self, act: MoEActivationPack) -> tuple[torch.Tensor, int, int]:
         self._require_built()
-        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only PackedPrecomputed routing."
-            )
+        self._validate_pack_contract(act)
         hidden_states = act.hidden_states_q
         if hidden_states.ndim != 2 or hidden_states.dtype is not torch.bfloat16:
             raise TypeError(
@@ -3874,8 +3921,6 @@ class _CuTileFp8Runner(CuTileBf16Runner):
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self.config.quant.per_token_scale:
-            raise NotImplementedError("cuTile FP8 does not support per-token scales.")
 
     def _build(self) -> None:
         from .cutile import fp8
@@ -4870,6 +4915,7 @@ class CuteDslRunner(MoERunner):
     """Translate activation and weight packs into a CuTe DSL runner input list."""
 
     backend_key = "cute_dsl"
+    supports_per_token_scale = True
     # CuteDSL has no in-kernel router; it only consumes pre-routed packs.
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (
@@ -5106,15 +5152,7 @@ class CuteDslRunner(MoERunner):
         it for each token bucket.
         """
         self._require_built()
-        # MoELayer already filters by supported_routing_modes; this guards the
-        # direct-runner path (tests/benchmarks) against silently forwarding a
-        # logits pack's None topk tensors into the kernel launch.
-        if act.routing_input_mode not in self.supported_routing_modes:
-            raise NotImplementedError(
-                f"CuteDslRunner does not support "
-                f"routing_input_mode={act.routing_input_mode!r} "
-                "(only PackedPrecomputed is wired; CuteDSL has no in-kernel router)."
-            )
+        self._validate_pack_contract(act)
         v = weights.get_view(self.backend_key)
         num_tokens = act.hidden_states_q.shape[0]
         _validate_prerouted_inputs(act, num_tokens, self._inner.top_k, "CuteDslRunner")
@@ -5496,6 +5534,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
     """
 
     backend_key = "trtllm_fp4_routed"
+    supports_per_token_scale = True
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
@@ -5681,6 +5720,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         ``[offset, offset + local_num_experts)``.
         """
         self._require_built()
+        self._validate_pack_contract(act)
         from ..tllm_enums import SfLayout
         from .core import MoeRunnerInputs, RoutingInputMode
 
@@ -6105,6 +6145,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
+        self._validate_pack_contract(act)
         from ..tllm_enums import WeightLayout
         from .core import MoeRunnerInputs, RoutingInputMode
 
@@ -6429,6 +6470,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
+        self._validate_pack_contract(act)
         from ..tllm_enums import RoutingMethodType
         from .core import MoeRunnerInputs
 
@@ -6685,6 +6727,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         ``act.hidden_states_scale`` is unused.
         """
         self._require_built()
+        self._validate_pack_contract(act)
         from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
@@ -6946,6 +6989,7 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
+        self._validate_pack_contract(act)
         view = weights.get_view(self.backend_key)
         if view.get("gemm1_clamp_limit") is None:
             raise ValueError(
@@ -7075,9 +7119,11 @@ class CakeStepFunNvfp4Runner(CakeStepFunRunner, TrtllmFp4RoutedRunner):
     ] = {
         (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLUStep,),
     }
-    # Shared-expert support follows the native family this runner wraps (the
-    # aggregate on CakeStepFunRunner is for MoELayer backend filtering only).
+    # Shared-expert and per-token-scale support follow the native family this
+    # runner wraps (the aggregates on CakeStepFunRunner serve MoELayer backend
+    # filtering and the registry's opt-in set; every instance is a family).
     supports_fused_shared_experts = TrtllmFp4RoutedRunner.supports_fused_shared_experts
+    supports_per_token_scale = TrtllmFp4RoutedRunner.supports_per_token_scale
 
     def forward(
         self,
@@ -7105,6 +7151,7 @@ class CakeStepFunBf16Runner(CakeStepFunRunner, TrtllmBf16RoutedRunner):
         SwiGLUStep,
     )
     supports_fused_shared_experts = TrtllmBf16RoutedRunner.supports_fused_shared_experts
+    supports_per_token_scale = TrtllmBf16RoutedRunner.supports_per_token_scale
 
     def forward(
         self,
@@ -7134,6 +7181,7 @@ class CakeStepFunFp8PerTensorRunner(CakeStepFunRunner, TrtllmFp8PerTensorRunner)
     supports_fused_shared_experts = (
         TrtllmFp8PerTensorRunner.supports_fused_shared_experts
     )
+    supports_per_token_scale = TrtllmFp8PerTensorRunner.supports_per_token_scale
 
     def forward(
         self,
@@ -7163,6 +7211,7 @@ class CakeStepFunMxfp8Runner(CakeStepFunRunner, TrtllmFp8BlockRunner):
         (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLUStep,),
     }
     supports_fused_shared_experts = TrtllmFp8BlockRunner.supports_fused_shared_experts
+    supports_per_token_scale = TrtllmFp8BlockRunner.supports_per_token_scale
 
     def forward(
         self,
@@ -7201,6 +7250,9 @@ CakeStepFunRunner.supported_routing_modes = tuple(
 CakeStepFunRunner.supports_fused_shared_experts = any(
     runner.supports_fused_shared_experts for runner in _CAKE_STEPFUN_RUNNERS
 )
+CakeStepFunRunner.supports_per_token_scale = any(
+    runner.supports_per_token_scale for runner in _CAKE_STEPFUN_RUNNERS
+)
 CakeStepFunRunner.supported_activation_classes_by_quant = {
     pair: (SwiGLUStep,)
     for runner in _CAKE_STEPFUN_RUNNERS
@@ -7224,6 +7276,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
     """
 
     backend_key = "prims_ts"
+    supports_per_token_scale = True
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
@@ -7545,6 +7598,8 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
+        self._validate_pack_contract(act)
+
         from flashinfer.tllm_enums import RoutingMethodType
         from flashinfer.prims_ts.moe.support import (
             is_prims_ts_bf16_supported,
@@ -7860,6 +7915,7 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
+        self._validate_pack_contract(act)
         from .core import MoeRunnerInputs
 
         view = weights.get_view(self.backend_key)
@@ -8117,10 +8173,6 @@ class SM12xFp8Runner(MoERunner):
             raise NotImplementedError("SM12x FP8 requires do_finalize=True.")
         if not self.config.finalize.use_fused_finalize:
             raise NotImplementedError("SM12x FP8 requires use_fused_finalize=True.")
-        if self.config.quant.per_token_scale:
-            raise NotImplementedError(
-                "SM12x FP8 quantizes BF16 activations internally."
-            )
 
     def _build(self) -> None:
         from .cute_dsl.blackwell_sm12x.moe_fp8_fc1_act_q1 import (
@@ -8151,10 +8203,11 @@ class SM12xFp8Runner(MoERunner):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
+        self._validate_pack_contract(act)
         if act.hidden_states_q.dtype is not torch.bfloat16:
             raise TypeError("SM12x FP8 requires BF16 hidden states.")
-        if act.hidden_states_scale is not None or act.per_token_scale is not None:
-            raise ValueError("SM12x FP8 requires activation scales to be None.")
+        if act.hidden_states_scale is not None:
+            raise ValueError("SM12x FP8 requires hidden_states_scale to be None.")
         _validate_prerouted_inputs(
             act,
             act.hidden_states_q.shape[0],
@@ -8362,10 +8415,6 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
             raise NotImplementedError(
                 "SM12x MXFP8 x MXFP4 requires use_fused_finalize=True."
             )
-        if self.config.quant.per_token_scale:
-            raise NotImplementedError(
-                "SM12x MXFP8 x MXFP4 quantizes BF16 activations internally."
-            )
 
     def _build(self) -> None:
         from .cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_fc1_act_q1 import (
@@ -8396,11 +8445,12 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
+        self._validate_pack_contract(act)
         if act.hidden_states_q.dtype is not torch.bfloat16:
             raise TypeError("SM12x MXFP8 x MXFP4 requires BF16 hidden states.")
-        if act.hidden_states_scale is not None or act.per_token_scale is not None:
+        if act.hidden_states_scale is not None:
             raise ValueError(
-                "SM12x MXFP8 x MXFP4 requires activation scales to be None."
+                "SM12x MXFP8 x MXFP4 requires hidden_states_scale to be None."
             )
         _validate_prerouted_inputs(
             act,
@@ -8674,17 +8724,16 @@ class SM12xNvfp4Bf16Runner(MoERunner):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
-        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only PackedPrecomputed routing."
-            )
+        self._validate_pack_contract(act)
         x = act.hidden_states_q
         if x.ndim != 2 or x.dtype is not torch.bfloat16 or not x.is_contiguous():
             raise TypeError(
                 f"{type(self).__name__} requires contiguous 2D BF16 hidden states."
             )
-        if act.hidden_states_scale is not None or act.per_token_scale is not None:
-            raise ValueError(f"{type(self).__name__} requires activation scales None.")
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} requires hidden_states_scale to be None."
+            )
         num_tokens, hidden_size = x.shape
         if num_tokens == 0:
             raise NotImplementedError(
@@ -8912,6 +8961,7 @@ class _B12xRunner(MoERunner):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
+        self._validate_pack_contract(act)
         v = weights.get_view(self.backend_key)
         self._validate_prepared_weights(v)
         # Only the packed weights are expert-major; SFs are swizzled, alphas may broadcast.
@@ -9039,6 +9089,1376 @@ class B12xW4A16Runner(_B12xRunner):
         "w2_weight_sf",
         "w2_alpha",
     )
+
+
+# ---------------------------------------------------------------------------
+# cuDNN grouped-GEMM runners
+# ---------------------------------------------------------------------------
+#
+# A grouped GEMM multiplies contiguous row segments of one activation matrix by
+# per-expert weights; segment ``e`` is ``rows[m_indptr[e]:m_indptr[e + 1]]``.
+# The runners compose the flat API into the layer, one kernel per stage:
+#
+#     hidden_states [T, H], topk_ids / topk_weights [T, k]
+#       (1) permute  sort the T*k assignments by expert (m_indptr, row maps),
+#                    then gather token rows into that order
+#       (2) gemm1    grouped_mm_*(permuted, W1, m_indptr) -> [rows, 2I | I]
+#       (3) act      typed ActivationConfig -> [rows, I]  (+ requant when quantized:
+#                    fused into the activation for FP8, a separate pass otherwise)
+#       (4) gemm2    grouped_mm_*(intermediate, W2, m_indptr) -> [rows, H]
+#       (5) finalize out[t] = sum_k topk_weights[t, k] * rows[token_to_row[t, k]]
+
+# Expert-segment tile of the block-scaled runners (cuDNN reads block scales in
+# 128-row tiles) and the multiple their hidden_size and intermediate_size need.
+_BLOCK_SCALE_TILE = 128
+# Expert-segment tile of the BF16 and FP8 runners: the smallest moe_sort tile.
+_PLAIN_SEGMENT_ROWS = 16
+# Architectures whose moe_utils kernels sort, permute and finalize.
+_MOE_UTILS_ARCHS: tuple[int, ...] = (90, 100, 103, 107)
+
+# (gemm1, gemm2) plan indices of the fallback tactic
+_FALLBACK_STAGE_TACTIC: tuple[int, int] = (-1, -1)
+
+
+@dataclass
+class _GroupedGemmLayout:
+    """Expert-sorted row layout of one call; rows beyond ``m_indptr[-1]`` are padding."""
+
+    m_indptr: torch.Tensor  # [E_local + 1] int32 segment offsets for grouped_mm_*
+    token_to_row: torch.Tensor  # [T, k] int32 row of every assignment, -1 if non-local
+    # [rows] int64 source token of every row (padding -> 0); torch permute path only.
+    row_to_token: Optional[torch.Tensor] = None
+    _row_expert: Optional[torch.Tensor] = None
+
+    def row_expert(self, rows: int) -> torch.Tensor:
+        """``[rows]`` local expert of every row (padding: the last expert), built on
+        first use: only the per-expert dequant of the FP8 and NVFP4 runners reads it."""
+        if self._row_expert is None:
+            row = torch.arange(
+                rows, dtype=self.m_indptr.dtype, device=self.m_indptr.device
+            )
+            self._row_expert = torch.searchsorted(
+                self.m_indptr[1:], row, right=True
+            ).clamp_(max=self.m_indptr.numel() - 2)
+        return self._row_expert
+
+
+def _layout_from_topk(
+    topk_ids: torch.Tensor,
+    *,
+    num_local_experts: int,
+    local_expert_offset: int,
+    num_rows: int,
+    segment_alignment: int,
+) -> _GroupedGemmLayout:
+    """Expert-sort the assignments with torch ops.
+
+    Non-local ids get no row, every expert segment is padded to
+    ``segment_alignment`` rows and unused rows read token 0.
+    """
+    num_tokens, top_k = topk_ids.shape
+    num_assignments = num_tokens * top_k
+    device = topk_ids.device
+
+    local = topk_ids.reshape(-1) - local_expert_offset
+    valid = (local >= 0) & (local < num_local_experts)
+    key = torch.where(valid, local, num_local_experts)
+    sorted_key, order = torch.sort(key, stable=True)
+    boundaries = torch.arange(num_local_experts + 1, dtype=torch.int32, device=device)
+    # Unaligned segment starts; ``starts[-1]`` counts the local assignments.
+    starts = torch.searchsorted(sorted_key, boundaries)
+    counts = starts[1:] - starts[:-1]
+    counts = (counts + segment_alignment - 1) // segment_alignment * segment_alignment
+    m_indptr = torch.cat((starts[:1], torch.cumsum(counts, 0)))
+    rank = torch.arange(num_assignments, device=device) - starts[sorted_key]
+    row_of_sorted = torch.where(
+        sorted_key < num_local_experts,
+        m_indptr[sorted_key] + rank,
+        torch.full_like(rank, num_rows),  # non-local: parked on the spare slot
+    )
+    row_of_assignment = torch.empty_like(row_of_sorted)
+    row_of_assignment[order] = row_of_sorted
+    token_to_row = torch.where(
+        row_of_assignment < num_rows,
+        row_of_assignment,
+        torch.full_like(row_of_assignment, -1),
+    )
+    # Tail entries (non-local assignments) land on the spare slot num_rows.
+    row_to_token = torch.zeros(num_rows + 1, dtype=torch.int64, device=device)
+    row_to_token[row_of_sorted] = order // top_k
+    return _GroupedGemmLayout(
+        m_indptr=m_indptr.to(torch.int32),
+        token_to_row=token_to_row.to(torch.int32).view(num_tokens, top_k),
+        row_to_token=row_to_token[:num_rows],
+    )
+
+
+def _scatter_rows(
+    source: torch.Tensor, token_to_row: torch.Tensor, *, out: torch.Tensor
+) -> torch.Tensor:
+    """``out[token_to_row[t, j]] = source[t]``; the spare last row of ``out`` absorbs the -1 slots."""
+    num_tokens, top_k = token_to_row.shape
+    spare = out.shape[0] - 1
+    rows = torch.where(
+        token_to_row >= 0, token_to_row, torch.full_like(token_to_row, spare)
+    )
+    is_fp8 = out.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    storage = out.view(torch.int8) if is_fp8 else out
+    source_storage = source.view(torch.int8) if is_fp8 else source
+    expanded = source_storage.unsqueeze(1).expand(-1, top_k, -1)
+    storage.index_copy_(
+        0, rows.reshape(-1).to(torch.int64), expanded.reshape(num_tokens * top_k, -1)
+    )
+    return out
+
+
+def _combine_rows(
+    rows: torch.Tensor,
+    token_to_row: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """``out[t] = sum_j topk_weights[t, j] * rows[token_to_row[t, j]]`` over local slots.
+
+    Float32 accumulation one slot at a time; -1 slots contribute nothing.
+    """
+    local = token_to_row >= 0
+    indices = token_to_row.clamp(min=0).to(torch.int64)
+    weights = topk_weights.float()
+    acc = torch.zeros(out.shape, dtype=torch.float32, device=out.device)
+    for slot in range(indices.shape[1]):
+        gathered = rows.index_select(0, indices[:, slot]).float()
+        gathered = torch.where(local[:, slot, None], gathered, 0.0)
+        acc.addcmul_(gathered, weights[:, slot, None])
+    return out.copy_(acc)
+
+
+def _dequant_rows_by_expert(
+    out: torch.Tensor, per_expert: torch.Tensor, layout: _GroupedGemmLayout
+) -> torch.Tensor:
+    """Multiply every GEMM output row by its expert's dequant factor, in place."""
+    return out.mul_(
+        per_expert.index_select(0, layout.row_expert(out.shape[0]))[:, None]
+    )
+
+
+@dataclass
+class _GroupedGemmWorkspace:
+    """Stage buffers of one ``(token bucket, hidden_size)``, allocated on the
+    bucket's first use, plus its ``moe_sort`` buffers. The activation and GEMM2
+    outputs are allocated per call."""
+
+    num_rows: int
+    permuted_hidden_states: torch.Tensor  # [rows, H / k_pack], activation dtype
+    gemm1_out: torch.Tensor  # [rows, 2I | I] bf16
+    sort: Optional[dict[str, torch.Tensor]] = (
+        None  # moe_sort out_* buffers (kernel path)
+    )
+    # Block-scaled runners: token-major permuted scale rows with a spare last row
+    # for the -1 slots, and their swizzled 128x4 copy that the GEMM1 graph reads.
+    permuted_hidden_states_scale_rows: Optional[torch.Tensor] = None
+    permuted_hidden_states_scale: Optional[torch.Tensor] = None
+
+
+class _CudnnGroupedGemmRunnerBase(MoERunner):
+    """Shared pipeline of the cuDNN grouped-GEMM MoE runners.
+
+    permute (``moe_sort`` + ``moe_permute``, or fallback to torch ops)
+    -> GEMM1
+    -> fused activation
+    -> GEMM2
+    -> finalize (``moe_unpermute`` or fallback to torch ops).
+
+    Every expert segment is padded to ``_segment_alignment`` rows; padding rows
+    are computed but never read back. Stage buffers hold the token bucket's
+    worst-case row count and every stage covers all of it: cuDNN's grouped GEMM
+    takes segment starts only, so the last expert's segment runs to the end of
+    the buffer.
+    """
+
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    )
+    supported_activation_classes = (SwiGLU,)
+    supports_expert_parallelism = True
+    _num_top_tactics_per_stage: ClassVar[int] = 2
+    _x_dtype: ClassVar[torch.dtype]
+    _weight_dtype: ClassVar[torch.dtype]
+    _supported_archs: ClassVar[tuple[int, ...]]
+    _required_weight_keys: ClassVar[tuple[str, ...]]
+    _expected_num_inputs: ClassVar[int]
+    _segment_alignment: ClassVar[int] = _PLAIN_SEGMENT_ROWS
+    # Packed-input index of the [E_local] float32 GEMM2 weight dequant, if any.
+    _fc2_dequant_input: ClassVar[Optional[int]] = None
+    # silu_and_mul output dtype and the packed-input index of its float32
+    # multiplier, if any (FP8: the static requantization scale).
+    _intermediate_dtype: ClassVar[torch.dtype] = torch.bfloat16
+    _fc2_act_quant_scale_input: ClassVar[Optional[int]] = None
+    _k_pack: ClassVar[int] = 1  # elements per stored byte along K (2 for packed FP4)
+
+    def __init__(self, config: MoEConfig, device: torch.device) -> None:
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError(f"{type(self).__name__} requires CUDA, got {device}.")
+        if self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        major, minor = get_compute_capability(self.device)
+        self._device_arch = major * 10 + minor
+        self._use_moe_utils = self._device_arch in _MOE_UTILS_ARCHS
+        self._workspace_cache: dict[tuple[int, int], _GroupedGemmWorkspace] = {}
+        self.tuning_config = TuningConfig()
+
+    # --- lifecycle --------------------------------------------------------
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        if self.config.execution.enable_pdl is True:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support PDL launches."
+            )
+        if self._device_arch not in self._supported_archs:
+            raise RuntimeError(
+                f"{type(self).__name__} does not support SM{self._device_arch}; "
+                f"supported architectures are {self._supported_archs}."
+            )
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support per_token_scale=True; the "
+                "cuDNN grouped GEMMs take no per-token activation scale."
+            )
+        if self.config.quant.swizzled_scale_factors is True:
+            raise NotImplementedError(
+                f"{type(self).__name__} reads token-major activation block scales "
+                "only; swizzled_scale_factors=True is not supported."
+            )
+        from ..grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION, _check_cudnn_version
+
+        _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, f"{self.backend_key} MoE")
+        if importlib.util.find_spec("triton") is None:
+            raise RuntimeError(
+                f"{type(self).__name__} requires Triton for its silu_and_mul kernel."
+            )
+
+    def _check_activation_parameters(self) -> None:
+        activation = self.config.activation
+        if isinstance(activation, SwiGLU) and (
+            activation.alpha != 1.0
+            or activation.beta != 0.0
+            or activation.limit != DEFAULT_SWIGLU_LIMIT
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} supports SwiGLU with default scalars only "
+                f"(the fused silu_and_mul kernel), got {activation!r}."
+            )
+
+    def _build(self) -> None:
+        """Import the activation kernel and load the ``moe_utils`` kernels; without
+        the latter the torch permute and finalize run."""
+        from ..triton.activation import silu_and_mul  # noqa: F401
+
+        if not self._use_moe_utils:
+            return
+        from .cute_dsl.moe_utils import _get_moe_utils_module
+
+        try:
+            _get_moe_utils_module()
+        except Exception as exc:  # any load failure leaves the torch path usable
+            warnings.warn(
+                f"{type(self).__name__}: the moe_utils kernels are unavailable "
+                f"({exc}); using the torch permute and finalize path.",
+                stacklevel=2,
+            )
+            self._use_moe_utils = False
+
+    # --- geometry and workspace -------------------------------------------
+
+    @property
+    def _num_local_experts(self) -> int:
+        experts = self.config.experts
+        return (
+            experts.local_num_experts
+            if experts.local_num_experts is not None
+            else self.config.routing.num_experts
+        )
+
+    @property
+    def _gemm1_rows(self) -> int:
+        return self.config.experts.intermediate_size * (
+            2 if self.config.activation.is_gated else 1
+        )
+
+    def _activation_geometry(self, hidden_states: torch.Tensor) -> tuple[int, int]:
+        return hidden_states.shape[0], hidden_states.shape[1] * self._k_pack
+
+    def _layout_rows(self, num_tokens: int) -> int:
+        """Rows of the expert-sorted layout: one per assignment, every expert
+        segment padded to ``_segment_alignment``."""
+        from .cute_dsl.moe_utils import get_max_num_permuted_tokens
+
+        return get_max_num_permuted_tokens(
+            num_tokens,
+            self.config.routing.top_k,
+            self._num_local_experts,
+            self._segment_alignment,
+        )
+
+    def _ensure_workspace(
+        self, num_tokens: int, hidden_size: int
+    ) -> _GroupedGemmWorkspace:
+        """Stage buffers for the token bucket of ``num_tokens``, allocated once per bucket."""
+        self._require_built()
+        ceiling = self.config.execution.tune_max_num_tokens
+        if num_tokens > ceiling:
+            raise ValueError(
+                f"num_tokens={num_tokens} exceeds tune_max_num_tokens={ceiling}."
+            )
+        bucket = map_to_hybrid_bucket(num_tokens, ceiling)
+        key = (bucket, hidden_size)
+        workspace = self._workspace_cache.get(key)
+        if workspace is None:
+            if self._is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{type(self).__name__} workspace for token bucket {bucket} "
+                    "must be allocated before CUDA Graph capture; warm this bucket first."
+                )
+            workspace = self._allocate_workspace(self._layout_rows(bucket), hidden_size)
+            if self._use_moe_utils:
+                from .cute_dsl.moe_utils import allocate_moe_sort_buffers
+
+                workspace.sort = allocate_moe_sort_buffers(
+                    bucket,
+                    self.config.routing.num_experts,
+                    self.config.routing.top_k,
+                    num_local_experts=self._num_local_experts,
+                    tile_tokens_dim=self._segment_alignment,
+                    device=self.device,
+                )
+            self._workspace_cache[key] = workspace
+        return workspace
+
+    def _is_current_stream_capturing(self) -> bool:
+        with torch.cuda.device(self.device):
+            return torch.cuda.is_current_stream_capturing()
+
+    def _allocate_workspace(self, rows: int, hidden_size: int) -> _GroupedGemmWorkspace:
+        """Stage buffers of one bucket; the permuted rows start zeroed so padding rows are finite."""
+
+        def empty(*shape: int, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+            return torch.empty(*shape, dtype=dtype, device=self.device)
+
+        return _GroupedGemmWorkspace(
+            num_rows=rows,
+            permuted_hidden_states=torch.zeros(
+                rows,
+                hidden_size // self._k_pack,
+                dtype=self._x_dtype,
+                device=self.device,
+            ),
+            gemm1_out=empty(rows, self._gemm1_rows),
+        )
+
+    # --- pack_inputs ------------------------------------------------------
+
+    def _validate_input_count(self, inputs: Sequence[Any]) -> None:
+        expected = self._expected_num_inputs + int(self.config.finalize.do_finalize)
+        if len(inputs) != expected:
+            raise ValueError(
+                f"{type(self).__name__} expects {expected} inputs, got {len(inputs)}."
+            )
+
+    def _validate_hidden_states(self, hidden_states: torch.Tensor) -> tuple[int, int]:
+        if hidden_states.dtype is not self._x_dtype:
+            raise TypeError(
+                f"{type(self).__name__} requires 2D {self._x_dtype} hidden_states_q, "
+                f"got dtype={hidden_states.dtype}."
+            )
+        if hidden_states.ndim != 2:
+            raise ValueError(
+                f"{type(self).__name__} requires 2D {self._x_dtype} hidden_states_q, "
+                f"got shape={tuple(hidden_states.shape)}."
+            )
+        if hidden_states.device != self.device or not hidden_states.is_contiguous():
+            raise ValueError(
+                f"{type(self).__name__} requires contiguous hidden states on {self.device}."
+            )
+        num_tokens, hidden_size = self._activation_geometry(hidden_states)
+        if num_tokens == 0:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support zero tokens."
+            )
+        # Rows are whole 16-byte chunks (moe_permute's copy width) on every path.
+        row_elements = 16 * self._k_pack // hidden_states.element_size()
+        if hidden_size % row_elements:
+            raise ValueError(
+                f"{type(self).__name__} requires hidden_size divisible by "
+                f"{row_elements} for {self._x_dtype} rows, got {hidden_size}."
+            )
+        return num_tokens, hidden_size
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        missing = [key for key in self._required_weight_keys if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        w1, w2 = view["fc1_expert_weights"], view["fc2_expert_weights"]
+        pack = self._k_pack
+        expected_w1 = (self._num_local_experts, self._gemm1_rows, hidden_size // pack)
+        expected_w2 = (
+            self._num_local_experts,
+            hidden_size,
+            self.config.experts.intermediate_size // pack,
+        )
+        if w1.dtype is not self._weight_dtype or w2.dtype is not self._weight_dtype:
+            raise TypeError(
+                f"{self.backend_key} prepared weights must be {self._weight_dtype}, "
+                f"got {w1.dtype}/{w2.dtype}."
+            )
+        if tuple(w1.shape) != expected_w1 or tuple(w2.shape) != expected_w2:
+            raise ValueError(
+                f"{self.backend_key} weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        for tensor in (w1, w2):
+            if tensor.device != self.device or not tensor.is_contiguous():
+                raise ValueError(
+                    f"{self.backend_key} prepared weights must be contiguous on {self.device}."
+                )
+        return [w1, w2]
+
+    def _require_view_tensor(
+        self,
+        view: dict[str, torch.Tensor],
+        name: str,
+        *,
+        dtype: torch.dtype,
+        shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        tensor = view[name]
+        if tensor.dtype is not dtype or tuple(tensor.shape) != shape:
+            raise ValueError(
+                f"{self.backend_key} {name} must be {dtype} {shape}, "
+                f"got {tensor.dtype} {tuple(tensor.shape)}."
+            )
+        if tensor.device != self.device or not tensor.is_contiguous():
+            raise ValueError(
+                f"{self.backend_key} {name} must be contiguous on {self.device}."
+            )
+        return tensor
+
+    def _pack_extra_inputs(
+        self, act: MoEActivationPack, view: dict[str, torch.Tensor]
+    ) -> List[torch.Tensor]:
+        """Validated inputs appended after the five base ones (scale tensors)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _pack_extra_inputs."
+        )
+
+    def _token_sized_extra_inputs(self) -> tuple[int, ...]:
+        """Packed-input indices beyond the first three whose dim 0 is the token count."""
+        return ()
+
+    def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Give synthesized profiles a valid, balanced routing over the local experts."""
+        num_tokens, hidden_size = self._activation_geometry(inputs[0])
+        self._ensure_workspace(num_tokens, hidden_size)
+        top_k = self.config.routing.top_k
+        offset = self.config.experts.local_expert_offset
+        assignments = torch.arange(
+            num_tokens * top_k, dtype=torch.int32, device=inputs[1].device
+        ).reshape(num_tokens, top_k)
+        inputs[1].copy_(assignments % self._num_local_experts + offset)
+        inputs[2].fill_(1.0 / top_k)
+        return inputs
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.routing_input_mode not in self.supported_routing_modes:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports pre-routed packs only "
+                f"(PackedPrecomputed / UnpackedPrecomputed), got {act.routing_input_mode!r}."
+            )
+        num_tokens, hidden_size = self._validate_hidden_states(act.hidden_states_q)
+        _validate_prerouted_inputs(
+            act,
+            num_tokens,
+            self.config.routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32, torch.bfloat16),
+            require_contiguous=True,
+        )
+        if act.per_token_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} takes no per_token_scale; the cuDNN grouped "
+                "GEMMs have no per-token activation scale input."
+            )
+        view = weights.get_view(self.backend_key)
+        weight_inputs = self._pack_weight_inputs(view, hidden_size)
+        extra_inputs = self._pack_extra_inputs(act, view)
+        self._ensure_workspace(num_tokens, hidden_size)
+        # Packed routing narrows the weights to BF16; unpacked routing hands the
+        # caller's tensor through unchanged.
+        topk_weights = (
+            act.topk_weights
+            if act.routing_input_mode is RoutingInputMode.UnpackedPrecomputed
+            else act.topk_weights.to(torch.bfloat16)
+        )
+        inputs = [
+            act.hidden_states_q,
+            act.topk_ids,
+            topk_weights,
+            *weight_inputs,
+            *extra_inputs,
+        ]
+        if self.config.finalize.do_finalize:
+            inputs.append(
+                torch.empty(
+                    num_tokens, hidden_size, dtype=torch.bfloat16, device=self.device
+                )
+            )
+        return inputs
+
+    def tuning_config_for(self, inputs: List[torch.Tensor]) -> TuningConfig:
+        token_sized = [0, 1, 2, *self._token_sized_extra_inputs()]
+        if self.config.finalize.do_finalize:
+            token_sized.append(len(inputs) - 1)
+        ceiling = self.config.execution.tune_max_num_tokens
+        return TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=tuple(token_sized),
+                    dim_idx=(0,) * len(token_sized),
+                    gen_tuning_buckets=(
+                        map_to_hybrid_bucket(inputs[0].shape[0], ceiling),
+                    ),
+                    map_to_tuning_buckets=make_hybrid_bucket_mapper(ceiling),
+                ),
+            ),
+            use_cuda_graph=True,
+            inputs_pre_hook=self._prepare_tuning_inputs,
+        )
+
+    # --- execution --------------------------------------------------------
+
+    def _layout_from_moe_sort(
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        workspace: _GroupedGemmWorkspace,
+    ) -> _GroupedGemmLayout:
+        """Segments from ``moe_sort``'s tile tables; tiles at or beyond ``num_non_exiting_tiles`` are unused."""
+        from .cute_dsl.moe_utils import moe_sort
+
+        assert workspace.sort is not None
+        tile = self._segment_alignment
+        num_local_experts = self._num_local_experts
+        tile_expert, _, token_to_row, _, _, num_tiles = moe_sort(
+            topk_ids,
+            topk_weights,
+            self.config.routing.num_experts,
+            self.config.routing.top_k,
+            local_expert_offset=self.config.experts.local_expert_offset,
+            num_local_experts=num_local_experts,
+            tile_tokens_dim=tile,
+            **workspace.sort,
+        )
+        device = topk_ids.device
+        tile_in_use = torch.arange(tile_expert.numel(), device=device) < num_tiles
+        # Unused tiles count for no expert.
+        tile_expert = torch.where(
+            tile_in_use, tile_expert, torch.full_like(tile_expert, num_local_experts)
+        )
+        tiles_per_expert = torch.zeros(
+            num_local_experts + 1, dtype=torch.int32, device=device
+        ).index_add_(0, tile_expert.long(), torch.ones_like(tile_expert))
+        m_indptr = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=device),
+                torch.cumsum(tiles_per_expert[:num_local_experts], 0, dtype=torch.int32)
+                * tile,
+            )
+        )
+        token_to_row = token_to_row[: topk_ids.shape[0]]
+        if not self.config.finalize.do_finalize:
+            # The sort buffer is rewritten by the next call while the returned
+            # unfinalized triple stays with the caller.
+            token_to_row = token_to_row.clone()
+        return _GroupedGemmLayout(m_indptr=m_indptr, token_to_row=token_to_row)
+
+    def _permute(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[_GroupedGemmLayout, _GroupedGemmWorkspace]:
+        hidden_states, topk_ids, topk_weights = inputs[:3]
+        workspace = self._ensure_workspace(*self._activation_geometry(hidden_states))
+        if not self._use_moe_utils:
+            layout = _layout_from_topk(
+                topk_ids,
+                num_local_experts=self._num_local_experts,
+                local_expert_offset=self.config.experts.local_expert_offset,
+                num_rows=workspace.num_rows,
+                segment_alignment=self._segment_alignment,
+            )
+            assert layout.row_to_token is not None
+            # permuted[r] = hidden_states[row_to_token[r]]; FP8 storage goes
+            # through an int8 view, which index_select accepts.
+            permuted = workspace.permuted_hidden_states
+            if permuted.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                torch.index_select(
+                    hidden_states.view(torch.int8),
+                    0,
+                    layout.row_to_token,
+                    out=permuted.view(torch.int8),
+                )
+            else:
+                torch.index_select(hidden_states, 0, layout.row_to_token, out=permuted)
+            return layout, workspace
+        from .cute_dsl.moe_utils import moe_permute
+
+        layout = self._layout_from_moe_sort(topk_ids, topk_weights, workspace)
+        sort = workspace.sort
+        assert sort is not None
+        moe_permute(
+            hidden_states,
+            workspace.permuted_hidden_states,
+            sort["out_tile_idx_to_mn_limit"],
+            sort["out_permuted_idx_to_expanded_idx"],
+            sort["out_num_non_exiting_tiles"],
+            workspace.num_rows,
+            self.config.routing.top_k,
+            self._segment_alignment,
+        )
+        return layout, workspace
+
+    def _run_plan(
+        self,
+        stage: int,
+        tactic: int,
+        run: Callable[[int], Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        """``run(tactic)``; a plan index beyond cuDNN's count for this shape runs the heuristic plan."""
+        result = run(tactic)
+        if result is not None:
+            return result
+        warnings.warn(
+            f"{self.backend_key} GEMM{stage} tactic {tactic} is not a cuDNN "
+            "execution-plan index for this shape on this device; running the "
+            "heuristic plan instead.",
+            stacklevel=2,
+        )
+        return run(-1)
+
+    def _gemm1(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        tactic: int,
+    ) -> torch.Tensor:
+        """GEMM1 into ``workspace.gemm1_out``; returns the dequantized ``[rows, 2I | I]`` BF16 rows."""
+        raise NotImplementedError(f"{type(self).__name__} must implement _gemm1.")
+
+    def _gemm2(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        intermediate: torch.Tensor,
+        tactic: int,
+    ) -> torch.Tensor:
+        """GEMM2 of ``intermediate``; returns new ``[rows, H]`` BF16 rows (per-expert dequant pending)."""
+        raise NotImplementedError(f"{type(self).__name__} must implement _gemm2.")
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        self._require_built()
+        self._validate_input_count(inputs)
+        if tactic == -1 or tactic is None:
+            gemm1_tactic, gemm2_tactic = _FALLBACK_STAGE_TACTIC
+        elif isinstance(tactic, (tuple, list)) and len(tactic) == 2:
+            gemm1_tactic, gemm2_tactic = int(tactic[0]), int(tactic[1])
+        else:
+            raise ValueError(
+                "cuDNN grouped-GEMM tactic must be -1 or a (gemm1, gemm2) pair, "
+                f"got {tactic!r}."
+            )
+        from ..triton.activation import silu_and_mul
+
+        _, topk_ids, topk_weights = inputs[:3]
+        layout, workspace = self._permute(inputs)
+        gemm1_out = self._gemm1(inputs, layout, workspace, gemm1_tactic)
+        intermediate = silu_and_mul(
+            gemm1_out,
+            o_scale=(
+                None
+                if self._fc2_act_quant_scale_input is None
+                else inputs[self._fc2_act_quant_scale_input]
+            ),
+            dtype=self._intermediate_dtype,
+        )
+        gemm2_out = self._gemm2(inputs, layout, workspace, intermediate, gemm2_tactic)
+        fc2_dequant = (
+            None if self._fc2_dequant_input is None else inputs[self._fc2_dequant_input]
+        )
+        if not self.config.finalize.do_finalize:
+            if fc2_dequant is not None:
+                _dequant_rows_by_expert(gemm2_out, fc2_dequant, layout)
+            return [gemm2_out, topk_weights, layout.token_to_row.reshape(-1)]
+        if fc2_dequant is not None:
+            # GEMM2's per-expert dequant rides on the routing weights of the
+            # finalize (a [T, k] product) instead of a pass over the [rows, H]
+            # output; slots of non-local experts are skipped by the finalize.
+            local = topk_ids.long() - self.config.experts.local_expert_offset
+            topk_weights = (
+                topk_weights.float()
+                * fc2_dequant[local.clamp(0, self._num_local_experts - 1)]
+            )
+        out = inputs[-1]
+        if self._use_moe_utils:
+            from .cute_dsl.moe_utils import moe_unpermute
+
+            num_tokens, top_k = topk_ids.shape
+            moe_unpermute(
+                gemm2_out, out, layout.token_to_row, topk_weights, num_tokens, top_k
+            )
+        else:
+            _combine_rows(gemm2_out, layout.token_to_row, topk_weights, out=out)
+        return out
+
+    # --- autotuning -------------------------------------------------------
+
+    def _plan_indices(self, a: torch.Tensor, weights: torch.Tensor) -> List[Any]:
+        """``range(plan_count)`` of the plain graph for these operand shapes, ``[-1]`` when none."""
+        from ..grouped_mm.cudnn import _cudnn_moe_grouped_gemm_plan_count
+
+        m_indptr = torch.zeros(
+            self._num_local_experts + 1, dtype=torch.int32, device=self.device
+        )
+        count = _cudnn_moe_grouped_gemm_plan_count(
+            a, weights, m_indptr, out_dtype=torch.bfloat16
+        )
+        return list(range(count)) if count > 0 else [-1]
+
+    def _block_scale_plan_indices(
+        self,
+        a: torch.Tensor,
+        weights: torch.Tensor,
+        a_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        *,
+        block_size: int,
+    ) -> List[Any]:
+        """``_plan_indices`` for the block-scaled graphs."""
+        from ..grouped_mm.cudnn import _cudnn_moe_block_scale_grouped_gemm_plan_count
+
+        m_indptr = torch.zeros(
+            self._num_local_experts + 1, dtype=torch.int32, device=self.device
+        )
+        count = _cudnn_moe_block_scale_grouped_gemm_plan_count(
+            a,
+            weights,
+            a_scale,
+            weight_scale,
+            m_indptr,
+            out_dtype=torch.bfloat16,
+            block_size=block_size,
+        )
+        return list(range(count)) if count > 0 else [-1]
+
+    def _stage_tactics(self, inputs: List[torch.Tensor], stage: int) -> List[Any]:
+        """Valid tactics of GEMM ``stage`` (1 or 2) for the bucket shape of ``inputs``."""
+        workspace = self._ensure_workspace(*self._activation_geometry(inputs[0]))
+        a = (
+            workspace.permuted_hidden_states
+            if stage == 1
+            else torch.empty(
+                workspace.num_rows,
+                self.config.experts.intermediate_size,
+                dtype=self._intermediate_dtype,
+                device=self.device,
+            )
+        )
+        return self._plan_indices(a, inputs[2 + stage])
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        """Rank each GEMM's plans on its own (the other GEMM at -1), then pair the top
+        ``_num_top_tactics_per_stage`` of each and add the all-heuristic fallback.
+        """
+        self._require_built()
+        self._validate_input_count(inputs)
+        # The tuning hook rewrites the routing and activation scales; rank on
+        # copies so the caller's tensors stay untouched.
+        inputs = list(inputs)
+        for index in (1, 2, *self._token_sized_extra_inputs()):
+            inputs[index] = inputs[index].clone()
+        tuner = AutoTuner.get()
+        tuning_config = TuningConfig(
+            use_cuda_graph=True, inputs_pre_hook=self._prepare_tuning_inputs
+        )
+        prefix = f"moe_{self.backend_key}_sm{self._device_arch}"
+        ranked = []
+        for stage in (1, 2):
+            tactics = tuner.rank_tactics(
+                f"{prefix}_gemm{stage}",
+                [_GroupedGemmStageRunner(self, stage)],
+                tuning_config,
+                inputs,
+                k=self._num_top_tactics_per_stage,
+            )
+            ranked.append([int(t) for t in tactics])
+        pairs = list(dict.fromkeys((g1, g2) for g1 in ranked[0] for g2 in ranked[1]))
+        if _FALLBACK_STAGE_TACTIC not in pairs:
+            pairs.append(_FALLBACK_STAGE_TACTIC)
+        return pairs
+
+    def _cache_key_extras(self) -> tuple:
+        # Plan indices are only meaningful for the cuDNN build that produced
+        # them and for the row layout of the permute path.
+        import cudnn
+
+        return super()._cache_key_extras() + (
+            self._device_arch,
+            int(cudnn.backend_version()),
+            self._use_moe_utils,
+        )
+
+
+class CudnnGroupedGemmBf16Runner(_CudnnGroupedGemmRunnerBase):
+    """BF16 MoE over ``grouped_mm_bf16``; no extra packed inputs."""
+
+    backend_key = "cudnn_grouped_gemm_bf16"
+    supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
+    _x_dtype = torch.bfloat16
+    _weight_dtype = torch.bfloat16
+    _supported_archs = _CUDNN_GROUPED_GEMM_BF16_ARCHS
+    _required_weight_keys = ("fc1_expert_weights", "fc2_expert_weights")
+    _expected_num_inputs = 5
+
+    def _pack_extra_inputs(
+        self, act: MoEActivationPack, view: dict[str, torch.Tensor]
+    ) -> List[torch.Tensor]:
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} BF16 activations do not use hidden_states_scale."
+            )
+        return []
+
+    def _gemm1(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_bf16
+
+        return self._run_plan(
+            1,
+            tactic,
+            lambda plan: grouped_mm_bf16(
+                workspace.permuted_hidden_states,
+                inputs[3],
+                layout.m_indptr,
+                out=workspace.gemm1_out,
+                tactic=plan,
+            ),
+        )
+
+    def _gemm2(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        intermediate: torch.Tensor,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_bf16
+
+        return self._run_plan(
+            2,
+            tactic,
+            lambda plan: grouped_mm_bf16(
+                intermediate, inputs[4], layout.m_indptr, tactic=plan
+            ),
+        )
+
+
+class CudnnGroupedGemmFp8PerTensorRunner(_CudnnGroupedGemmRunnerBase):
+    """FP8 per-tensor MoE over ``grouped_mm_fp8``.
+
+    The canonical per-tensor FP8 pack (no activation scale); the view carries
+    the folded static scales. GEMM1 rows are scaled by ``fc1_dequant_scale``,
+    the Triton ``silu_and_mul`` requantizes to E4M3 with ``fc2_act_quant_scale``
+    and the finalize applies ``fc2_dequant_scale``.
+    Extra packed inputs: ``[fc1_dequant_scale, fc2_act_quant_scale, fc2_dequant_scale]``.
+    """
+
+    backend_key = "cudnn_grouped_gemm_fp8_per_tensor"
+    supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
+    _x_dtype = torch.float8_e4m3fn
+    _weight_dtype = torch.float8_e4m3fn
+    _supported_archs = _CUDNN_GROUPED_GEMM_FP8_ARCHS
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_dequant_scale",
+        "fc2_act_quant_scale",
+        "fc2_dequant_scale",
+    )
+    _expected_num_inputs = 8
+    _fc2_dequant_input = 7
+    _intermediate_dtype = torch.float8_e4m3fn
+    _fc2_act_quant_scale_input = 6
+
+    def _pack_extra_inputs(
+        self, act: MoEActivationPack, view: dict[str, torch.Tensor]
+    ) -> List[torch.Tensor]:
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} activations do not use hidden_states_scale; "
+                "the static multipliers live in the weight view."
+            )
+        expected = (self._num_local_experts,)
+        return [
+            self._require_view_tensor(
+                view, "fc1_dequant_scale", dtype=torch.float32, shape=expected
+            ),
+            self._require_view_tensor(
+                view, "fc2_act_quant_scale", dtype=torch.float32, shape=()
+            ),
+            self._require_view_tensor(
+                view, "fc2_dequant_scale", dtype=torch.float32, shape=expected
+            ),
+        ]
+
+    def _gemm1(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_fp8
+
+        out = self._run_plan(
+            1,
+            tactic,
+            lambda plan: grouped_mm_fp8(
+                workspace.permuted_hidden_states,
+                inputs[3],
+                layout.m_indptr,
+                out=workspace.gemm1_out,
+                tactic=plan,
+            ),
+        )
+        return _dequant_rows_by_expert(out, inputs[5], layout)
+
+    def _gemm2(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        intermediate: torch.Tensor,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_fp8
+
+        return self._run_plan(
+            2,
+            tactic,
+            lambda plan: grouped_mm_fp8(
+                intermediate, inputs[4], layout.m_indptr, tactic=plan
+            ),
+        )
+
+
+class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
+    """Block-scaled runners: pre-quantized activations with token-major block
+    scales (``hidden_states_scale [M, H // _block_size]``, the last extra input),
+    128-row expert segments and sizes divisible by 128. The permuted scale rows
+    are swizzled into cuDNN's 128x4 layout for GEMM1; the intermediate is
+    quantized straight into that layout for GEMM2. Subclasses declare
+    ``_block_size`` and ``_block_scale_dtype``.
+    """
+
+    _segment_alignment = _BLOCK_SCALE_TILE
+    _block_size: ClassVar[int]
+    _block_scale_dtype: ClassVar[torch.dtype]
+
+    @property
+    def _hidden_states_scale_input(self) -> int:
+        """Packed-input index of the activation block scales: the last extra input."""
+        return self._expected_num_inputs - 1
+
+    def _token_sized_extra_inputs(self) -> tuple[int, ...]:
+        return (self._hidden_states_scale_input,)
+
+    def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        inputs = super()._prepare_tuning_inputs(inputs)
+        scale = inputs[self._hidden_states_scale_input]
+        scale.fill_(127 if scale.dtype == torch.uint8 else 1.0)
+        return inputs
+
+    def _allocate_workspace(self, rows: int, hidden_size: int) -> _GroupedGemmWorkspace:
+        """Add the permuted scale rows with one spare row for the -1 slots."""
+        workspace = super()._allocate_workspace(rows, hidden_size)
+        workspace.permuted_hidden_states_scale_rows = torch.zeros(
+            rows + 1,
+            hidden_size // self._block_size,
+            dtype=self._block_scale_dtype,
+            device=self.device,
+        )
+        return workspace
+
+    def _stage_tactics(self, inputs: List[torch.Tensor], stage: int) -> List[Any]:
+        workspace = self._ensure_workspace(*self._activation_geometry(inputs[0]))
+        rows = workspace.num_rows
+        k = (
+            self._activation_geometry(inputs[0])[1]
+            if stage == 1
+            else self.config.experts.intermediate_size
+        )
+        a = torch.empty(
+            rows, k // self._k_pack, dtype=self._x_dtype, device=self.device
+        )
+        a_scale = torch.empty(
+            rows,
+            k // self._block_size,
+            dtype=self._block_scale_dtype,
+            device=self.device,
+        )
+        return self._block_scale_plan_indices(
+            a,
+            inputs[2 + stage],
+            a_scale,
+            inputs[4 + stage],
+            block_size=self._block_size,
+        )
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from ..grouped_mm.cudnn import (
+            _check_cudnn_version,
+            _cudnn_moe_block_scale_min_version,
+        )
+
+        _check_cudnn_version(
+            _cudnn_moe_block_scale_min_version(self._device_arch),
+            f"{self.backend_key} MoE on SM{self._device_arch}",
+        )
+        intermediate_size = self.config.experts.intermediate_size
+        if intermediate_size % _BLOCK_SCALE_TILE:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires intermediate_size divisible by "
+                f"{_BLOCK_SCALE_TILE}, got {intermediate_size}."
+            )
+
+    def _validate_hidden_states(self, hidden_states: torch.Tensor) -> tuple[int, int]:
+        num_tokens, hidden_size = super()._validate_hidden_states(hidden_states)
+        if hidden_size % _BLOCK_SCALE_TILE:
+            raise ValueError(
+                f"{type(self).__name__} requires hidden_size divisible by "
+                f"{_BLOCK_SCALE_TILE}, got {hidden_size}."
+            )
+        return num_tokens, hidden_size
+
+    def _pack_hidden_states_scale(
+        self, act: MoEActivationPack, hidden_size: int
+    ) -> torch.Tensor:
+        """The pack's token-major ``[M, H // block]`` scales (``uint8`` or ``float8_e4m3fn`` storage)."""
+        scale = act.hidden_states_scale
+        expected = (act.hidden_states_q.shape[0], hidden_size // self._block_size)
+        if (
+            scale is None
+            or scale.dtype not in (torch.uint8, torch.float8_e4m3fn)
+            or tuple(scale.shape) != expected
+        ):
+            got = None if scale is None else (scale.dtype, tuple(scale.shape))
+            raise ValueError(
+                f"{type(self).__name__} requires hidden_states_scale as token-major "
+                f"uint8 or float8_e4m3fn block scales of shape {expected}, got {got}."
+            )
+        if scale.device != self.device or not scale.is_contiguous():
+            raise ValueError(
+                f"{type(self).__name__} requires contiguous hidden_states_scale on "
+                f"{self.device}."
+            )
+        return scale.view(self._block_scale_dtype)
+
+    def _permute(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[_GroupedGemmLayout, _GroupedGemmWorkspace]:
+        """Scatter the token-major scale rows into expert order, then swizzle them."""
+        layout, workspace = super()._permute(inputs)
+        assert workspace.permuted_hidden_states_scale_rows is not None
+        _scatter_rows(
+            inputs[self._hidden_states_scale_input],
+            layout.token_to_row,
+            out=workspace.permuted_hidden_states_scale_rows,
+        )
+        # cuDNN's swizzled 128x4 layout. The rows are a multiple of 128 and the
+        # columns of 4 (128-row segments, hidden_size % 128 == 0), so the
+        # swizzled buffer has exactly the row-major one's size.
+        from ..quantization.fp4_quantization import block_scale_interleave
+
+        scale_rows = workspace.permuted_hidden_states_scale_rows[: workspace.num_rows]
+        workspace.permuted_hidden_states_scale = (
+            block_scale_interleave(scale_rows.view(torch.uint8))
+            .view(scale_rows.shape)
+            .view(self._block_scale_dtype)
+        )
+        return layout, workspace
+
+
+class CudnnGroupedGemmMxfp8Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
+    """MXFP8 MoE over ``grouped_mm_mxfp8``.
+
+    E4M3 rows with UE8M0 ``uint8 [M, H // 32]`` token-major scales; E4M3 weights
+    with UE8M0 block scales per expert.
+    Extra packed inputs: ``[fc1_weight_scale, fc2_weight_scale, hidden_states_scale]``.
+    """
+
+    backend_key = "cudnn_grouped_gemm_mxfp8"
+    supported_quant_variants = ((QuantFormat.MXFP8, QuantFormat.MXFP8),)
+    _x_dtype = torch.float8_e4m3fn
+    _weight_dtype = torch.float8_e4m3fn
+    _supported_archs = _CUDNN_GROUPED_GEMM_MXFP8_ARCHS
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_weight_scale",
+        "fc2_weight_scale",
+    )
+    _expected_num_inputs = 8
+    _block_size = 32
+    _block_scale_dtype = torch.uint8
+
+    def _pack_extra_inputs(
+        self, act: MoEActivationPack, view: dict[str, torch.Tensor]
+    ) -> List[torch.Tensor]:
+        hidden_size = act.hidden_states_q.shape[1]
+        num_experts = self._num_local_experts
+        intermediate_size = self.config.experts.intermediate_size
+        return [
+            self._require_view_tensor(
+                view,
+                "fc1_weight_scale",
+                dtype=torch.uint8,
+                shape=(num_experts, self._gemm1_rows, hidden_size // self._block_size),
+            ),
+            self._require_view_tensor(
+                view,
+                "fc2_weight_scale",
+                dtype=torch.uint8,
+                shape=(num_experts, hidden_size, intermediate_size // self._block_size),
+            ),
+            self._pack_hidden_states_scale(act, hidden_size),
+        ]
+
+    def _gemm1(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_mxfp8
+
+        assert workspace.permuted_hidden_states_scale is not None
+        return self._run_plan(
+            1,
+            tactic,
+            lambda plan: grouped_mm_mxfp8(
+                workspace.permuted_hidden_states,
+                inputs[3],
+                workspace.permuted_hidden_states_scale,
+                inputs[5],
+                layout.m_indptr,
+                out=workspace.gemm1_out,
+                tactic=plan,
+            ),
+        )
+
+    def _gemm2(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        intermediate: torch.Tensor,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_mxfp8
+        from .prepare import _quantize_mxfp8_rows
+
+        quantized, scale = _quantize_mxfp8_rows(intermediate)
+        return self._run_plan(
+            2,
+            tactic,
+            lambda plan: grouped_mm_mxfp8(
+                quantized,
+                inputs[4],
+                scale,
+                inputs[6],
+                layout.m_indptr,
+                tactic=plan,
+            ),
+        )
+
+
+class CudnnGroupedGemmNvfp4Runner(_CudnnGroupedGemmBlockScaleRunnerBase):
+    """NVFP4 MoE over ``grouped_mm_fp4`` (16-wide blocks).
+
+    Packed E2M1 ``uint8 [M, H // 2]`` rows with ``float8_e4m3fn [M, H // 16]``
+    token-major scales and a global scale of one; packed E2M1 weights with E4M3
+    block scales and one global dequant per expert. The intermediate is
+    requantized with a global scale of one.
+    Extra packed inputs: ``[fc1_weight_scale, fc2_weight_scale, fc1_dequant,
+    fc2_dequant, hidden_states_scale]``.
+    """
+
+    backend_key = "cudnn_grouped_gemm_nvfp4"
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    _x_dtype = torch.uint8
+    _weight_dtype = torch.uint8
+    _k_pack = 2
+    _supported_archs = _CUDNN_GROUPED_GEMM_FP4_ARCHS
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_weight_scale",
+        "fc2_weight_scale",
+        "fc1_dequant",
+        "fc2_dequant",
+    )
+    _expected_num_inputs = 10
+    _fc2_dequant_input = 8
+    _block_size = 16
+    _block_scale_dtype = torch.float8_e4m3fn
+
+    def _pack_extra_inputs(
+        self, act: MoEActivationPack, view: dict[str, torch.Tensor]
+    ) -> List[torch.Tensor]:
+        hidden_size = act.hidden_states_q.shape[1] * self._k_pack
+        num_experts = self._num_local_experts
+        intermediate_size = self.config.experts.intermediate_size
+        return [
+            self._require_view_tensor(
+                view,
+                "fc1_weight_scale",
+                dtype=torch.float8_e4m3fn,
+                shape=(num_experts, self._gemm1_rows, hidden_size // self._block_size),
+            ),
+            self._require_view_tensor(
+                view,
+                "fc2_weight_scale",
+                dtype=torch.float8_e4m3fn,
+                shape=(num_experts, hidden_size, intermediate_size // self._block_size),
+            ),
+            self._require_view_tensor(
+                view, "fc1_dequant", dtype=torch.float32, shape=(num_experts,)
+            ),
+            self._require_view_tensor(
+                view, "fc2_dequant", dtype=torch.float32, shape=(num_experts,)
+            ),
+            self._pack_hidden_states_scale(act, hidden_size),
+        ]
+
+    def _gemm1(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_fp4
+
+        assert workspace.permuted_hidden_states_scale is not None
+        out = self._run_plan(
+            1,
+            tactic,
+            lambda plan: grouped_mm_fp4(
+                workspace.permuted_hidden_states,
+                inputs[3],
+                workspace.permuted_hidden_states_scale,
+                inputs[5],
+                layout.m_indptr,
+                out=workspace.gemm1_out,
+                block_size=self._block_size,
+                tactic=plan,
+            ),
+        )
+        return _dequant_rows_by_expert(out, inputs[7], layout)
+
+    def _gemm2(
+        self,
+        inputs: List[torch.Tensor],
+        layout: _GroupedGemmLayout,
+        workspace: _GroupedGemmWorkspace,
+        intermediate: torch.Tensor,
+        tactic: int,
+    ) -> torch.Tensor:
+        from ..grouped_mm import grouped_mm_fp4
+        from .prepare import _quantize_nvfp4_rows
+
+        quantized, scale, _ = _quantize_nvfp4_rows(intermediate)
+        return self._run_plan(
+            2,
+            tactic,
+            lambda plan: grouped_mm_fp4(
+                quantized,
+                inputs[4],
+                scale,
+                inputs[6],
+                layout.m_indptr,
+                block_size=self._block_size,
+                tactic=plan,
+            ),
+        )
+
+
+class _GroupedGemmStageRunner(TunableRunner):
+    """Autotuner view of one GEMM stage: varies its plan, keeps the other at -1."""
+
+    def __init__(self, parent: _CudnnGroupedGemmRunnerBase, stage: int) -> None:
+        if stage not in (1, 2):
+            raise ValueError(f"stage must be 1 or 2, got {stage}")
+        self.parent = parent
+        self.stage = stage
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        self.parent._validate_input_count(inputs)
+        return self.parent._stage_tactics(inputs, self.stage)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        compound = list(_FALLBACK_STAGE_TACTIC)
+        compound[self.stage - 1] = int(tactic)
+        return self.parent.forward(
+            inputs, tactic=tuple(compound), do_preparation=do_preparation, **kwargs
+        )
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return (*self.parent._cache_key_extras(), "stage", self.stage)
+
+    def __hash__(self) -> int:
+        return hash(self.get_cache_key_extras([]))
 
 
 def __getattr__(name: str):

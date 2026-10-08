@@ -42,6 +42,10 @@ from .api import (
     B12xW4A16Config,
     CakeStepFunConfig,
     CakeWarpDecodeConfig,
+    CudnnGroupedGemmBf16Config,
+    CudnnGroupedGemmFp8PerTensorConfig,
+    CudnnGroupedGemmMxfp8Config,
+    CudnnGroupedGemmNvfp4Config,
     CutlassBf16Config,
     CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
@@ -80,6 +84,10 @@ from .runners import (
     B12xW4A16Runner,
     CakeStepFunRunner,
     CakeWarpDecodeRunner,
+    CudnnGroupedGemmBf16Runner,
+    CudnnGroupedGemmFp8PerTensorRunner,
+    CudnnGroupedGemmMxfp8Runner,
+    CudnnGroupedGemmNvfp4Runner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
@@ -125,6 +133,10 @@ _RunnerT = Union[
     CudnnFrostNvfp4MoeRunner,
     CudnnFrostMxfp8Mxfp4MoeRunner,
     CakeWarpDecodeRunner,
+    CudnnGroupedGemmBf16Runner,
+    CudnnGroupedGemmFp8PerTensorRunner,
+    CudnnGroupedGemmMxfp8Runner,
+    CudnnGroupedGemmNvfp4Runner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
@@ -166,6 +178,10 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CudnnFrostNvfp4Config: CudnnFrostNvfp4MoeRunner,
     CudnnFrostMxfp8Mxfp4Config: CudnnFrostMxfp8Mxfp4MoeRunner,
     CakeWarpDecodeConfig: CakeWarpDecodeRunner,
+    CudnnGroupedGemmBf16Config: CudnnGroupedGemmBf16Runner,
+    CudnnGroupedGemmFp8PerTensorConfig: CudnnGroupedGemmFp8PerTensorRunner,
+    CudnnGroupedGemmMxfp8Config: CudnnGroupedGemmMxfp8Runner,
+    CudnnGroupedGemmNvfp4Config: CudnnGroupedGemmNvfp4Runner,
     CutlassBf16Config: CutlassBf16Runner,
     CutlassFp8BlockConfig: CutlassFp8BlockRunner,
     CutlassFp8PerTensorConfig: CutlassFp8PerTensorRunner,
@@ -381,9 +397,12 @@ class MoELayer:
         -------
         torch.Tensor or list of torch.Tensor
             The layer output. With ``config.finalize.do_finalize=False`` the
-            unreduced TRTLLM intermediates are returned instead, as
+            unreduced intermediates are returned instead, as
             ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``,
-            leaving the combine to the caller.
+            leaving the combine to the caller;
+            ``expanded_idx_to_permuted_idx[token * top_k + slot]`` is the row
+            of ``gemm2_output`` holding that assignment, or ``-1`` when its
+            expert is not local.
 
         Raises
         ------

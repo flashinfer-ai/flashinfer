@@ -30,8 +30,8 @@ Routes are selected from host-known scalars only — head count, page size and
 
 | heads | page_kv | next_n | model |
 |---|---|---|---|
-| 32 | 128, 64 | 1, 2, 4 | DeepSeek-V4.1-Flash decode |
-| 64 | 64 | 1, 2, 4 | DeepSeek-V3.2 decode |
+| 32 | 128, 64 | 1, 2, 3, 4, 5, 6 | DeepSeek-V4.1-Flash decode |
+| 64 | 64 | 1, 2, 3, 4, 5, 6 | DeepSeek-V3.2 decode |
 
 `route_available(num_heads, page_kv, next_n)` answers on the host; there is no
 fallback for an unsupported configuration. The scheduler program is shared by
@@ -128,8 +128,9 @@ pytest tests/experimental/test_sm120_paged_mqa_logits.py -q
 python benchmarks/bench_sm120_paged_mqa_logits.py
 ```
 
-The test covers every shipped `(H, page_kv, next_n)` program against a
-dequantized PyTorch reference and an independent Python mirror of the schedule,
+The test covers every shipped `next_n`, both head counts and both page sizes
+against a dequantized PyTorch reference and an independent Python mirror of the
+schedule,
 the `clean_logits=False` write extent, the padded block-stride cache view, CUDA
 Graph replay with changed contents, one-shot/plan equivalence and the
 architecture-target gate. It skips on devices without catalogued programs.
@@ -140,9 +141,10 @@ architecture-target gate. It skips on devices without catalogued programs.
 `routes`. Policy keys: `head_dim`, `fused_row_bytes` (132), `heads`, `page_kv`,
 `next_n`, `split_kv` (128 for every exported program, which is why the metadata
 entry keeps DeepGEMM's head-count-free signature), `next_n_atoms` (the Q-atom
-rule: one atom per request for every shipped `next_n` — 1 and 2 pair the
-tokens as DeepGEMM does, 4 scores the whole request from one atom where
-DeepGEMM runs two 2-token atoms), `max_batch` (the scheduler's shared-memory request
+rule, a function of `next_n` only: one atom per request for `next_n` 1–4 — 1
+and 2 pair the tokens as DeepGEMM does, 3 and 4 score the whole request from
+one atom where DeepGEMM runs two — and DeepGEMM's three 2-token atoms for 5
+and 6), `max_batch` (the scheduler's shared-memory request
 ceiling), `logits_stride_alignment` (`[128, 256]`), `clean_logits` (`"raw"`),
 `metadata_program`, `metadata_route`, `threads` and per-program `programs`
 records (tile size, group count, KV stages, atoms, shared-memory bytes). A

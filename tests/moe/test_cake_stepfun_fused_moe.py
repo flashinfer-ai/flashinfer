@@ -795,6 +795,32 @@ def test_fused_shared_experts_follow_the_native_family(precision):
 
 
 @pytest.mark.parametrize("precision", list(PRECISIONS))
+def test_per_token_scale_follows_the_native_family(precision):
+    """Only nvfp4 consumes the pack's per-token scale, like its trtllm-gen runner."""
+    spec = PRECISIONS[precision]
+    expected = spec.runner_cls is CakeStepFunNvfp4Runner
+    assert spec.native_runner.supports_per_token_scale is expected
+    assert spec.runner_cls.supports_per_token_scale is expected
+    # The dispatcher opts in for the runner registry (one family consumes the
+    # scale); every instance is a family and enforces its own flag.
+    assert CakeStepFunRunner.supports_per_token_scale is True
+    per_token = QuantConfig(
+        weight=spec.quant.weight,
+        activation=spec.quant.activation,
+        per_token_scale=True,
+    )
+    runner = CakeStepFunRunner(
+        _config(num_tokens=8, quant=per_token), torch.device("cpu")
+    )
+    assert type(runner) is spec.runner_cls
+    if expected:
+        runner._assert_per_token_scale_supported()
+    else:
+        with pytest.raises(NotImplementedError, match="per_token_scale=True"):
+            runner.check_support()
+
+
+@pytest.mark.parametrize("precision", list(PRECISIONS))
 def test_runner_rejects_non_stepfun_activations(precision):
     runner = CakeStepFunRunner(
         _config(num_tokens=8, quant=PRECISIONS[precision].quant, activation=SwiGLU()),
