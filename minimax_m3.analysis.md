@@ -41,14 +41,18 @@ four definitions, chain signatures, dispatch counts, and precompile errors.
 
 ## Evidence scope
 
-This is a feature-only forward port onto FlashInfer main (0.7.1). The CUDA and
-Triton kernel bodies are unchanged from the release-based integration in Draft
-!1941. That release head has H200 and model-level evidence, but those results
-do not establish performance or accuracy of this main-based package.
+The measured feature revision is 806c7a4d, based on FlashInfer main 188bdd76
+(version 0.7.1). Validation used the vLLM 0.31.0 container with a framework-side
+consumer integration, MiniMax-M3-NVFP4, and eight H200s with TP8+EP.
 
-Actual-main package installation, shipped tests, consumer dispatch/fallback,
-and the artifact harness are checked on Ballast H100 NVL before publication.
-The corresponding receipt identifies the exact source revision and dependency
-versions. H200 kernel benchmarks, model performance A/B, and paired model
-accuracy must be repeated on this main-based head before promotion.
-No main-head end-to-end speedup is claimed here.
+H200 kernel validation passed 36 correctness cases. Six production FULL-graph
+rows improved from 13.39 to 6.94 microseconds (1.93x). A same-node model comparison
+with synthetic 1024-input/256-output requests measured throughput gains of 2.25%
+at concurrency 8 and 1.78% at concurrency 16; p99 normalized interactivity
+improved 1.86% at both. Paired accuracy gates passed, including 19/20 GSM8K
+answers on both sides. See the PR description for the protocol, finite accuracy
+scope, and original first-trial tail regression that follow-ups did not reproduce.
+
+Subsequent commits update test registration, package-data metadata, and this
+documentation only. Runtime/kernel/build sources are unchanged from the measured
+revision; no additional model measurement is claimed for those descendants.
