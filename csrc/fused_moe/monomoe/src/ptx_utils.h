@@ -215,6 +215,23 @@ __device__ static __forceinline__ void fence_mbarrier_init_release_cluster() {
 }
 
 /**
+ * @brief Order this thread's prior generic-proxy writes to shared memory
+ *        before later async-proxy reads of it (WGMMA shared operands, TMA stores).
+ *
+ * Emits: `fence.proxy.async.shared::cta;`
+ *
+ * Every thread that wrote the data executes it, before the barrier that
+ * precedes the async-proxy read.
+ */
+__device__ static __forceinline__ void fence_proxy_async_shared_cta() {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+#else
+  asm volatile("trap;");
+#endif
+}
+
+/**
  * @brief Arrive on an mbarrier and set its transaction-bytes counter.
  *
  * The caller must issue the TMA(s) targeting this barrier AFTER this call;
