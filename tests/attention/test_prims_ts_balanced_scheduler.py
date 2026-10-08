@@ -29,6 +29,7 @@ from flashinfer.attention.prims_ts.balanced_scheduler.cost_model import (
 )
 from flashinfer.attention.prims_ts.balanced_scheduler.plan import (
     BalancedMLADecodePlan,
+    require_balanced_mla_calibration,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.constants import (
     balanced_partial_capacity,
@@ -911,13 +912,17 @@ def test_optimized_scheduler_corrects_wave_boundaries(seq_lens, cost, expected_t
 
 @_REQUIRES_CUDA_SCHEDULER
 def test_device_scheduler_selects_calibrated_bucket_from_live_lengths():
-    if "B200" not in torch.cuda.get_device_name().upper():
-        pytest.skip("B200 calibration is device-specific")
+    device = torch.device("cuda")
+    try:
+        calibration = require_balanced_mla_calibration(device)
+    except NotImplementedError as error:
+        pytest.skip(str(error))
     seq_lens = [512] * 7 + [131072]
     plan = BalancedMLADecodePlan(
         batch_size=len(seq_lens),
         num_partitions=74,
-        device=torch.device("cuda"),
+        device=device,
+        calibration=calibration,
         kernel_family="throughput_2cta",
         dtype_name="bf16",
         max_seq_len=131072,
@@ -928,3 +933,34 @@ def test_device_scheduler_selects_calibrated_bucket_from_live_lengths():
     assert plan.last_cost_bucket == "sparse_small"
     assert plan.cost_model_info["bucket"] == "sparse_small"
     _assert_device_plan_covers_requests(plan, seq_lens)
+
+
+@pytest.mark.parametrize(
+    "device_name,compute_capability,sm_count",
+    (
+        ("NVIDIA GB200", (10, 0), 152),
+        ("NVIDIA B200", (10, 0), 132),
+        ("NVIDIA GB300", (10, 3), 160),
+    ),
+)
+def test_calibrated_bucket_test_skips_unregistered_device(
+    monkeypatch, device_name, compute_capability, sm_count
+):
+    """The calibration test must skip by exact identity before GPU allocation."""
+
+    properties = SimpleNamespace(
+        name=device_name,
+        major=compute_capability[0],
+        minor=compute_capability[1],
+        multi_processor_count=sm_count,
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: device_name)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _device: properties)
+
+    def unexpected_allocation(*_args, **_kwargs):
+        raise AssertionError("uncalibrated-device test must skip before allocation")
+
+    monkeypatch.setattr(torch, "empty", unexpected_allocation)
+    with pytest.raises(pytest.skip.Exception, match="no calibrated cost model"):
+        test_device_scheduler_selects_calibrated_bucket_from_live_lengths()
