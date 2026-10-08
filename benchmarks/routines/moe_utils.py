@@ -776,3 +776,173 @@ def quantize_and_pack_nvfp4(
     assert block_scales_reshaped.numel() == expected_scale_elems, "Invalid scale shape"
 
     return quantized_packed, block_scales_reshaped, global_scale
+
+
+def create_nvfp4_moe_activations(
+    num_tokens: int,
+    hidden_size: int,
+    num_experts: int,
+    top_k: int,
+    device: str = "cuda",
+    seed: int = 42,
+) -> dict:
+    """Create NVFP4 activations and softmax top-k routing for CuTe DSL MoE.
+
+    Activations are quantized with a unit global scale and a linear E4M3
+    scale layout, matching the pack consumed by ``CuteDslConfig`` and
+    ``TrtllmFp4Config`` for NVFP4×NVFP4.
+
+    Returns:
+        Dict with ``x`` (packed uint8 [M, H // 2]), ``x_sf`` (E4M3 [M, H // 16]),
+        ``x_bf16``, ``token_selected_experts`` (int32 [M, top_k]),
+        ``token_final_scales`` (fp32 [M, top_k]) and ``fc2_input_scale``.
+    """
+    torch.manual_seed(seed)
+    sf_vec_size = SF_VEC_SIZE["nvfp4"]
+
+    x_bf16 = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
+    )
+    x_quantized, x_sf = fp4_quantize(
+        x_bf16,
+        global_scale=torch.tensor([1.0], device=device, dtype=torch.float32),
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=False,
+    )
+
+    router_logits = torch.randn(num_tokens, num_experts, device=device)
+    routing_weights = torch.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+
+    return {
+        "x": x_quantized,
+        "x_sf": x_sf,
+        "x_bf16": x_bf16,
+        "token_selected_experts": selected_experts.to(torch.int32),
+        "token_final_scales": routing_weights.float(),
+        "fc2_input_scale": torch.tensor([1.0], device=device, dtype=torch.float32),
+    }
+
+
+def quant_dequant_nvfp4(
+    tensor: torch.Tensor,
+    global_scale: torch.Tensor,
+    sf_vec_size: int = 16,
+) -> torch.Tensor:
+    """Round-trip a tensor through NVFP4 quantization (linear scale layout)."""
+    from flashinfer.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
+
+    fp4_packed, sf = fp4_quantize(
+        tensor.to(torch.bfloat16),
+        global_scale=global_scale,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=False,
+    )
+    dequantized = e2m1_and_ufp8sf_scale_to_float(
+        fp4_packed.cpu(),
+        sf.view(torch.uint8).reshape(-1).cpu(),
+        (1.0 / global_scale).cpu(),
+        sf_vec_size=sf_vec_size,
+        ufp8_type=1,
+        is_sf_swizzled_layout=False,
+    ).to(tensor.device)
+    return dequantized.float()
+
+
+def compute_reference_moe_nvfp4(
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    fc2_input_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP32 SwiGLU MoE reference with an NVFP4 round trip on the FC2 input.
+
+    Args:
+        hidden_states: Input [num_tokens, hidden_size].
+        gemm1_weights: [num_experts, 2 * intermediate_size, hidden_size] in
+            [linear, gate] order.
+        gemm2_weights: [num_experts, hidden_size, intermediate_size].
+        token_selected_experts: Expert ids [num_tokens, top_k]; ids outside
+            ``[0, num_experts)`` are skipped.
+        token_final_scales: Routing weights [num_tokens, top_k].
+        fc2_input_scale: Global scale of the FC2 input quantization; ``None``
+            keeps the FC2 input in FP32.
+
+    Returns:
+        FP32 output [num_tokens, hidden_size].
+    """
+    from flashinfer.tllm_enums import (
+        DEFAULT_SWIGLU_ALPHA,
+        DEFAULT_SWIGLU_BETA,
+        DEFAULT_SWIGLU_LIMIT,
+    )
+
+    device = hidden_states.device
+    hidden_states = hidden_states.float()
+    gemm1_weights = gemm1_weights.float()
+    gemm2_weights = gemm2_weights.float()
+    gemm1_alpha = torch.ones(num_experts, device=device, dtype=torch.float32)
+    gemm2_alpha = torch.ones(num_experts, device=device, dtype=torch.float32)
+
+    output = torch.zeros((num_tokens, hidden_size), dtype=torch.float32, device=device)
+    for token_idx in range(num_tokens):
+        token_input = hidden_states[token_idx : token_idx + 1]
+        for k in range(top_k):
+            expert_idx = token_selected_experts[token_idx, k].item()
+            scale = token_final_scales[token_idx, k].item()
+            if expert_idx < 0 or expert_idx >= num_experts:
+                continue
+
+            gemm1_out = gemm1_alpha[expert_idx] * (
+                token_input @ gemm1_weights[expert_idx].T
+            )
+            linear = gemm1_out[:, :intermediate_size]
+            gate = gemm1_out[:, intermediate_size:]
+            gate = gate.clamp(max=DEFAULT_SWIGLU_LIMIT)
+            linear = linear.clamp(min=-DEFAULT_SWIGLU_LIMIT, max=DEFAULT_SWIGLU_LIMIT)
+            act_out = (
+                gate
+                * torch.sigmoid(DEFAULT_SWIGLU_ALPHA * gate)
+                * (linear + DEFAULT_SWIGLU_BETA)
+            )
+            if fc2_input_scale is not None:
+                act_out = quant_dequant_nvfp4(act_out, fc2_input_scale, sf_vec_size=16)
+
+            gemm2_out = act_out @ gemm2_weights[expert_idx].T
+            output[token_idx] += scale * gemm2_alpha[expert_idx] * gemm2_out.squeeze(0)
+
+    return output
+
+
+def check_moe_accuracy(
+    actual: torch.Tensor, expected: torch.Tensor, percent_threshold: float = 0.97
+) -> Tuple[bool, float, float]:
+    """Percentage-based closeness check for quantized MoE outputs.
+
+    ``atol`` scales with the reference's standard deviation so FP4 noise that
+    grows with the hidden dimension does not fail large shapes.
+
+    Returns:
+        Tuple of (passed, fraction_within_tolerance, atol).
+    """
+    actual = actual.float()
+    expected = expected.float()
+
+    output_scale = max(expected.std().item(), 0.01)
+    atol = max(0.05, 1.5 * output_scale)
+    rtol = 0.5
+
+    abs_diff = torch.abs(actual - expected)
+    rel_diff = abs_diff / (torch.abs(expected) + 1e-8)
+    within_tolerance = (abs_diff < atol) | (rel_diff < rtol)
+    percent_within = within_tolerance.float().mean().item()
+
+    return percent_within >= percent_threshold, percent_within, atol

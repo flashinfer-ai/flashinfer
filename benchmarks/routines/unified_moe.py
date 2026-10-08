@@ -1,8 +1,9 @@
-"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, b12x and SM12x MoE runners."""
+"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, TRT-LLM, CuTe DSL, b12x and SM12x MoE runners."""
 
 from __future__ import annotations
 
 import argparse
+import functools
 from collections import defaultdict
 from typing import Any
 
@@ -33,6 +34,7 @@ from flashinfer.fused_moe import (
     CuTileMxfp8Config,
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
+    CuteDslConfig,
     ExecutionConfig,
     ExpertConfig,
     GELU,
@@ -54,6 +56,7 @@ from flashinfer.fused_moe import (
     SiTU,
     SwiGLU,
     SwiGLUStep,
+    TrtllmFp4Config,
 )
 from flashinfer.fused_moe.prepare import (
     _quantize_mxfp4_linear,
@@ -67,6 +70,7 @@ from .flashinfer_benchmark_utils import (
     enum_type,
     get_device,
     print_perf_metrics,
+    set_autotune_columns,
 )
 from .moe_utils import (
     add_common_moe_args,
@@ -94,7 +98,31 @@ _BACKEND_CONFIGS = {
     ("mxfp8_w8a16", "cutile"): CuTileMxfp8Bf16Config,
     ("mxfp4_w4a8", "cutile"): CuTileMxfp4Mxfp8Config,
     ("mxfp4_w4a8", "cutlass"): CutlassMxfp8Mxfp4Config,
+    ("mxfp4_w4a8", "trtllm"): TrtllmFp4Config,
+    ("mxfp4_w4a8", "cute_dsl"): CuteDslConfig,
 }
+
+_QUANT_FORMATS = {
+    "bf16": (QuantFormat.BF16, QuantFormat.BF16),
+    "nvfp4": (QuantFormat.NVFP4, QuantFormat.NVFP4),
+    "nvfp4_w4a16": (QuantFormat.NVFP4, QuantFormat.BF16),
+    "mxfp4": (QuantFormat.MXFP4, QuantFormat.MXFP4),
+    "mxfp4_w4a16": (QuantFormat.MXFP4, QuantFormat.BF16),
+    "fp8": (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+    "fp8_w8a16": (QuantFormat.FP8PerTensor, QuantFormat.BF16),
+    "mxfp8": (QuantFormat.MXFP8, QuantFormat.MXFP8),
+    "mxfp8_w8a16": (QuantFormat.MXFP8, QuantFormat.BF16),
+    "mxfp4_w4a8": (QuantFormat.MXFP4, QuantFormat.MXFP8),
+}
+
+# Backends whose weight preparation needs hidden_size and intermediate_size
+# divisible by 128 for a quant variant. cuTile's MXFP4 x MXFP8 path only needs
+# 32-element alignment and is not listed.
+_ALIGN_128_BACKENDS = {"mxfp4_w4a8": ("cutlass", "trtllm", "cute_dsl")}
+
+# Alternate spellings accepted by --quant-variant. ``mxfp4_mxfp8`` matches the
+# flat trtllm routines' ``--fp4_mode mxfp4_mxfp8``.
+_QUANT_VARIANT_ALIASES = {"mxfp4_mxfp8": "mxfp4_w4a8"}
 
 _ACTIVATIONS = {
     ActivationType.Swiglu: SwiGLU,
@@ -117,7 +145,7 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("cutlass", "cutile", "b12x", "sm12x"),
+        choices=("cutlass", "cutile", "trtllm", "cute_dsl", "b12x", "sm12x"),
         default=["cutlass", "cutile"],
         help="Unified MoE backends to benchmark with the same inputs.",
     )
@@ -125,9 +153,16 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
         "--quant-variant",
         "--quant_variant",
         dest="quant_variant",
-        choices=tuple(dict.fromkeys(mode for mode, _ in _BACKEND_CONFIGS)),
+        choices=(
+            *dict.fromkeys(mode for mode, _ in _BACKEND_CONFIGS),
+            *_QUANT_VARIANT_ALIASES,
+        ),
         default="bf16",
-        help="Precision mode: mxfp4 means MXFP4 weights and MXFP4 activations.",
+        help=(
+            "Precision mode: mxfp4 means MXFP4 weights and MXFP4 activations; "
+            "mxfp4_w4a8 (alias mxfp4_mxfp8) means MXFP4 weights and MXFP8 "
+            "activations."
+        ),
     )
     parser.add_argument(
         "--activation-type",
@@ -143,6 +178,9 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
     )
     args = parser.parse_args(line)
     args.backends = list(dict.fromkeys(args.backends))
+    args.quant_variant = _QUANT_VARIANT_ALIASES.get(
+        args.quant_variant, args.quant_variant
+    )
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -300,6 +338,10 @@ def _prepare_weight_view(
     }
     if quant_variant == "bf16" or backend == "cutlass":
         return config_type.prepare_weights(w1, w2, **common)
+    if backend in ("trtllm", "cute_dsl"):
+        return config_type.prepare_weights(
+            w1, w2, quant=_quant_config(quant_variant), **common
+        )
 
     if quant_variant.startswith(("fp8", "mxfp8")):
         block_scaled = quant_variant.startswith("mxfp8")
@@ -442,22 +484,39 @@ def _reference_activation(
     return result.to(torch.bfloat16)
 
 
+def _quant_config(quant_variant: str) -> QuantConfig:
+    weight_format, activation_format = _QUANT_FORMATS[quant_variant]
+    return QuantConfig(weight=weight_format, activation=activation_format)
+
+
+def _activation_slots(
+    inputs: list[torch.Tensor], activations: MoEActivationPack
+) -> tuple[int, int]:
+    """Locate the quantized activation and its scale in a packed input list."""
+
+    def find(tensor: torch.Tensor) -> int:
+        matches = [
+            index
+            for index, packed in enumerate(inputs)
+            if isinstance(packed, torch.Tensor)
+            and packed.data_ptr() == tensor.data_ptr()
+            and packed.shape == tensor.shape
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"expected exactly one packed input aliasing a {tuple(tensor.shape)} "
+                f"activation tensor, found {len(matches)}"
+            )
+        return matches[0]
+
+    assert activations.hidden_states_scale is not None
+    return find(activations.hidden_states_q), find(activations.hidden_states_scale)
+
+
 def _config_for_backend(args, activation, backend_config) -> MoEConfig:
-    weight_format, activation_format = {
-        "bf16": (QuantFormat.BF16, QuantFormat.BF16),
-        "nvfp4": (QuantFormat.NVFP4, QuantFormat.NVFP4),
-        "nvfp4_w4a16": (QuantFormat.NVFP4, QuantFormat.BF16),
-        "mxfp4": (QuantFormat.MXFP4, QuantFormat.MXFP4),
-        "mxfp4_w4a16": (QuantFormat.MXFP4, QuantFormat.BF16),
-        "fp8": (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
-        "fp8_w8a16": (QuantFormat.FP8PerTensor, QuantFormat.BF16),
-        "mxfp8": (QuantFormat.MXFP8, QuantFormat.MXFP8),
-        "mxfp8_w8a16": (QuantFormat.MXFP8, QuantFormat.BF16),
-        "mxfp4_w4a8": (QuantFormat.MXFP4, QuantFormat.MXFP8),
-    }[args.quant_variant]
     return MoEConfig(
         routing=RoutingConfig(num_experts=args.num_experts, top_k=args.top_k),
-        quant=QuantConfig(weight=weight_format, activation=activation_format),
+        quant=_quant_config(args.quant_variant),
         experts=ExpertConfig(intermediate_size=args.intermediate_size),
         activation=activation,
         backend=BackendOptions((backend_config,)),
@@ -476,8 +535,9 @@ def _choose_tactic(args, runner, inputs: list[torch.Tensor]):
         _, tactic = AutoTuner.get().choose_one(
             custom_op=f"moe_{runner.backend_key}",
             runners=[runner],
-            tuning_config=runner.tuning_config,
+            tuning_config=runner.tuning_config_for(inputs),
             inputs=inputs,
+            **runner.launch_kwargs_for(inputs),
         )
     return tactic
 
@@ -489,20 +549,26 @@ def _measure_runner(
     tactic: Any,
     *,
     input_quantizer=None,
+    activation_slots: tuple[int, int] | None = None,
     bf16_input=None,
 ):
-    runner.forward(inputs, tactic=tactic, do_preparation=True)
+    launch_kwargs = runner.launch_kwargs_for(inputs)
+    runner.forward(inputs, tactic=tactic, do_preparation=True, **launch_kwargs)
     torch.cuda.synchronize()
 
     def run(*profile_inputs):
         if input_quantizer is None:
             packed = list(profile_inputs)
         else:
-            # CUTLASS FP8 takes prequantized input. Include its public BF16
+            # Backends that take prequantized input include their public BF16
             # conversion in the timed graph to match cuTile's API boundary.
+            assert activation_slots is not None
             packed = list(profile_inputs[1:])
-            packed[1], packed[-1] = input_quantizer(profile_inputs[0])
-        return runner.forward(packed, tactic=tactic)
+            for slot, value in zip(
+                activation_slots, input_quantizer(profile_inputs[0]), strict=True
+            ):
+                packed[slot] = value.view(packed[slot].dtype)
+        return runner.forward(packed, tactic=tactic, **launch_kwargs)
 
     profile_inputs = tuple(inputs) if input_quantizer is None else (bf16_input, *inputs)
     output = run(*profile_inputs).detach().clone()
@@ -568,6 +634,16 @@ def run_unified_moe_test(args):
                 f"unified MoE on SM{arch}; skipping."
             )
             continue
+        if backend in _ALIGN_128_BACKENDS.get(args.quant_variant, ()) and (
+            args.hidden_size % 128 or args.intermediate_size % 128
+        ):
+            print(
+                f"[INFO] {backend} {args.quant_variant} unified MoE requires "
+                "hidden_size and intermediate_size divisible by 128, got "
+                f"hidden_size={args.hidden_size}, "
+                f"intermediate_size={args.intermediate_size}; skipping."
+            )
+            continue
 
         backend_config = config_type()
         config = _config_for_backend(args, activation, backend_config)
@@ -604,6 +680,15 @@ def run_unified_moe_test(args):
             input_quantizer = None
             if backend == "cutlass" and args.quant_variant in ("fp8", "mxfp4_w4a8"):
                 input_quantizer = config_type.prepare_activations
+            elif args.quant_variant == "mxfp4_w4a8" and backend in (
+                "trtllm",
+                "cute_dsl",
+            ):
+                # Same canonical linear-scale MXFP8 pack as CUTLASS consumes.
+                input_quantizer = functools.partial(
+                    TrtllmFp4Config.prepare_activations, quant=config.quant
+                )
+            if input_quantizer is not None:
                 quantized, scale = input_quantizer(activations.hidden_states_q)
                 backend_activations = MoEActivationPack(
                     hidden_states_q=quantized,
@@ -612,9 +697,19 @@ def run_unified_moe_test(args):
                     topk_weights=activations.topk_weights,
                 )
             inputs = runner.pack_inputs(backend_activations, weights)
+            activation_slots = None
+            if backend == "cutlass":
+                activation_slots = (1, -1)
+            elif input_quantizer is not None:
+                activation_slots = _activation_slots(inputs, backend_activations)
             # Like mm_fp4, execute the fallback once to reject configurations
             # that pass the coarse architecture check but fail at runtime.
-            runner.forward(inputs, tactic=-1, do_preparation=True)
+            runner.forward(
+                inputs,
+                tactic=-1,
+                do_preparation=True,
+                **runner.launch_kwargs_for(inputs),
+            )
             torch.cuda.synchronize()
         except (NotImplementedError, RuntimeError, TypeError, ValueError) as error:
             print(
@@ -636,6 +731,7 @@ def run_unified_moe_test(args):
             inputs,
             tactic,
             input_quantizer=input_quantizer,
+            activation_slots=activation_slots,
             bf16_input=activations.hidden_states_q,
         )
         backend_label = f"{backend}_autotune" if args.autotune else backend
@@ -717,6 +813,11 @@ def run_unified_moe_test(args):
             cold_l2_cache=True,
             prequantized_median_time=prequantized_median,
             prequantized_std_time=prequantized_std,
+        )
+        set_autotune_columns(
+            current,
+            args.autotune,
+            {f"moe_{runner.backend_key}": (type(runner).__name__, tactic)},
         )
         results.append(current)
 

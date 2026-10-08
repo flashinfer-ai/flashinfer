@@ -67,6 +67,13 @@ try:
 except ImportError:
     FLA_AVAILABLE = False
 
+#: chunk_gated_delta_rule ``backend=`` values exposed as harness backends.
+#: ``cake_gdn`` (source-only) and ``cudnn`` (cudnn-frontend linear-attention
+#: engine) are optional: a case they cannot serve is reported and skipped.
+_PREFILL_API_BACKENDS = ("flashinfer", "auto", "cake_gdn", "cudnn")
+_PREFILL_OPTIONAL_BACKENDS = ("cake_gdn", "cudnn")
+_PREFILL_ONLY_BACKENDS = ("fla", "auto", "cake_gdn", "cudnn")
+
 
 # ==============================================================================
 # Benchmark infrastructure
@@ -216,9 +223,12 @@ def parse_gdn_args(line, parser):
         required=False,
         nargs="+",
         default=["flashinfer"],
-        choices=["flashinfer", "triton", "fla"],
+        choices=["flashinfer", "triton", "fla", "auto", "cake_gdn", "cudnn"],
         help="Kernel backends to benchmark. 'triton' is available for "
-        "decode/MTP; 'fla' (flash-linear-attention) for prefill.",
+        "decode/MTP. Prefill: 'flashinfer', 'auto', 'cake_gdn' and 'cudnn' are "
+        "chunk_gated_delta_rule's backend= values ('cake_gdn' and 'cudnn' are "
+        "optional and skipped with a reason when unavailable); 'fla' is the "
+        "flash-linear-attention baseline.",
     )
 
     args = parser.parse_args(line)
@@ -287,16 +297,17 @@ def parse_gdn_args(line, parser):
                 "--update_state / --cache_intermediate_states are only "
                 "applicable to gated_delta_rule_mtp"
             )
-        if "fla" in args.backends:
+        prefill_only = [b for b in args.backends if b in _PREFILL_ONLY_BACKENDS]
+        if prefill_only:
             raise ValueError(
-                "The fla backend is only available for chunk_gated_delta_rule"
+                f"Backends {prefill_only} are only available for chunk_gated_delta_rule"
             )
 
     if is_prefill:
         if "triton" in args.backends:
             raise ValueError(
                 "The triton backend is only available for decode/MTP routines; "
-                "prefill supports flashinfer and fla"
+                f"prefill supports {list(_PREFILL_API_BACKENDS) + ['fla']}"
             )
 
     if args.verbose >= 1:
@@ -805,10 +816,13 @@ def testChunkGatedDeltaRule(args):
        is called with use_qk_l2norm_in_kernel=False so that the torch
        reference (which performs no normalization) sees identical inputs.
     2. Runs the requested backend(s):
-       - 'flashinfer': SM90 C++ / SM100 CuTe-DSL chunked GDN prefill
+       - 'flashinfer', 'auto', 'cake_gdn', 'cudnn': chunk_gated_delta_rule
+         with that ``backend=`` ('flashinfer' is the SM90 C++ / SM100 CuTe-DSL
+         kernel). 'cake_gdn' and 'cudnn' are probed with one call first and
+         skipped with the reason when they cannot serve the case.
        - 'fla': flash-linear-attention Triton baseline (perf-only, excluded
          from refcheck; requires pip install flash-linear-attention)
-    3. Optionally checks the flashinfer output against
+    3. Optionally checks the chunk_gated_delta_rule outputs against
        tests/gdn/reference_delta_rule.py::blockwise_delta_rule
     4. Measures performance metrics
 
@@ -929,7 +943,7 @@ def testChunkGatedDeltaRule(args):
         print(f"[VVERBOSE] {g.shape = }, {beta.shape = }")
 
     def run_backend(backend):
-        if backend == "flashinfer":
+        if backend in _PREFILL_API_BACKENDS:
             return chunk_gated_delta_rule(
                 q,
                 k,
@@ -943,6 +957,7 @@ def testChunkGatedDeltaRule(args):
                 False,  # use_qk_l2norm_in_kernel (k is pre-normalized)
                 output=output,
                 output_state=output_state,
+                backend=backend,
             )[0]
         elif backend == "fla":
             return fla_gdn(
@@ -959,7 +974,22 @@ def testChunkGatedDeltaRule(args):
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    # Reference check (flashinfer only; fla uses a different gate
+    for backend in [b for b in backends if b in _PREFILL_OPTIONAL_BACKENDS]:
+        try:
+            run_backend(backend)
+            torch.cuda.synchronize()
+        except Exception as exc:  # noqa: BLE001 -- reported and skipped
+            reason = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+            print(
+                f"[WARNING] {backend} backend for {args.routine} is unavailable "
+                f"for this case ({type(exc).__name__}: {reason}). Skipping."
+            )
+            backends.remove(backend)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    # Reference check (chunk_gated_delta_rule backends; fla uses a different gate
     # parameterization and is benchmarked perf-only)
     has_reference_output = False
     outputs = {}
