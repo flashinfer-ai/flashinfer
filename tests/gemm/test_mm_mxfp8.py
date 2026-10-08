@@ -153,6 +153,36 @@ def _prepare_mxfp8_tensors(
     return input_mxfp8, weight_mxfp8, input_scale, weight_scale
 
 
+def _mxfp8_cute_dsl_tactics(m, n, k=128):
+    """Tactics the cute-dsl runner offers for (m, n, k); compiles no kernel."""
+    device = torch.device("cuda")
+    a = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=device)
+    b = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=device).T
+    a_sf = torch.empty((max(m, 128) * k // 32,), dtype=torch.uint8, device=device)
+    b_sf = torch.empty((max(n, 128) * k // 32,), dtype=torch.uint8, device=device)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+    major, minor = get_compute_capability(device)
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(major, minor, True, torch.bfloat16)
+    return runner.get_valid_tactics([a, b, a_sf, b_sf, torch.bfloat16, out, None], None)
+
+
+def test_mm_mxfp8_cute_dsl_narrow_tiles_only_within_32_tokens():
+    """Narrow N tiles (< 64) address the 128-wide SFB tile through a shifted
+    TMEM column; an odd shift faults in tcgen05.mma, so the runner must only
+    offer them while the kernel-N extent (n, or m when A and B are swapped)
+    is at most 32."""
+    _skip_if_unsupported("cute-dsl")
+    for m, n in ((128, 128), (128, 64), (64, 128)):
+        narrow = [t for t in _mxfp8_cute_dsl_tactics(m, n) if t[0][1] < 64]
+        assert narrow == [], (m, n, narrow)
+    # kernel-N = n = 32: narrow tiles only without the A/B swap
+    narrow = [t for t in _mxfp8_cute_dsl_tactics(128, 32) if t[0][1] < 64]
+    assert narrow and all(not t[2] for t in narrow), narrow
+    # kernel-N = m = 32: narrow tiles only with the A/B swap
+    narrow = [t for t in _mxfp8_cute_dsl_tactics(32, 128) if t[0][1] < 64]
+    assert narrow and all(t[2] for t in narrow), narrow
+
+
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])
 @pytest.mark.parametrize("n", [128, 256, 512, 1024])
 @pytest.mark.parametrize("k", [128, 256, 512, 1024, 2048, 2560, 3200])
@@ -305,6 +335,131 @@ def test_mm_mxfp8_cute_dsl_low_m(m, k):
         auto_tuning=True,
         provide_out=True,
     )
+
+
+def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():
+    """A low-M cached tactic must not fail when reused for a larger M."""
+    _skip_if_unsupported("cute-dsl")
+
+    m, n, k = 64, 256, 2048
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input,
+        weight,
+        SfLayout.layout_128x4,
+        SfLayout.layout_128x4,
+        "cute-dsl",
+    )
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(  # pyright: ignore[reportPrivateUsage]
+        major, minor, True, torch.bfloat16
+    )
+    runner(
+        [
+            input_mxfp8,
+            weight_mxfp8.T,
+            input_scale,
+            weight_scale,
+            torch.bfloat16,
+            out,
+            workspace,
+        ],
+        # Valid for M=32, but not for the runtime M=64 above.
+        tactic=((128, 32), (1, 1), True, False, 2),
+    )
+
+    _assert_cosine_similarity(torch.mm(input, weight.T), out)
+
+
+@pytest.mark.parametrize("m", [40, 64])
+@pytest.mark.parametrize("tile_n", [8, 16, 32])
+def test_mm_mxfp8_cute_dsl_stale_narrow_tile_tactic_falls_back(m, tile_n):
+    """A narrow swap-AB tactic tuned for M<=32 must not be replayed at M>32.
+
+    Narrow (< 64) N tiles cover at most 32 kernel-N columns; replaying one at
+    a larger runtime M used to fault with cudaErrorMisalignedAddress.
+    """
+    _skip_if_unsupported("cute-dsl")
+
+    n, k = 256, 2048
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input,
+        weight,
+        SfLayout.layout_128x4,
+        SfLayout.layout_128x4,
+        "cute-dsl",
+    )
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(  # pyright: ignore[reportPrivateUsage]
+        major, minor, True, torch.bfloat16
+    )
+    runner(
+        [
+            input_mxfp8,
+            weight_mxfp8.T,
+            input_scale,
+            weight_scale,
+            torch.bfloat16,
+            out,
+            workspace,
+        ],
+        tactic=((128, tile_n), (1, 1), True, False, 1),
+    )
+    torch.cuda.synchronize()
+
+    _assert_cosine_similarity(torch.mm(input, weight.T), out)
+
+
+@pytest.mark.parametrize(
+    "ab_dtype_name,sf_dtype_name,sf_vec_size",
+    [
+        ("Float4E2M1FN", "Float8E4M3FN", 16),  # NVFP4
+        ("Float4E2M1FN", "Float8E8M0FNU", 32),  # MXFP4
+        ("Float8E4M3FN", "Float8E8M0FNU", 32),  # MXFP8
+    ],
+)
+@pytest.mark.parametrize("tile_n", [8, 16, 32])
+def test_narrow_tile_can_implement_boundary(
+    ab_dtype_name, sf_dtype_name, sf_vec_size, tile_n
+):
+    """CPU-only: a narrow N tile is accepted at kernel N = 32, rejected at 33."""
+    cutlass = pytest.importorskip("cutlass")
+    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100 import (
+        Sm100BlockScaledPersistentDenseGemmKernel,
+    )
+
+    def can_implement(tile_n, kernel_n):
+        # swap_ab orientation: kernel M = weight N, kernel N = tokens.
+        return Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
+            getattr(cutlass, ab_dtype_name),
+            getattr(cutlass, sf_dtype_name),
+            sf_vec_size,
+            cutlass.BFloat16,
+            (128, tile_n),
+            (1, 1),
+            256,
+            kernel_n,
+            2048,
+            1,
+            "k",
+            "k",
+            "m",
+        )
+
+    assert can_implement(tile_n, 32)
+    assert not can_implement(tile_n, 33)
+    # Control: a 64-wide tile at N = 33 is accepted, so the rejection above
+    # comes from the narrow-tile bound, not from a dtype or alignment check.
+    assert can_implement(64, 33)
 
 
 def test_mm_mxfp8_invalid_input_dtype():

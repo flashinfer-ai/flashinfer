@@ -1,3 +1,5 @@
+import random
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -80,46 +82,69 @@ def test_bmm_bf16(b, m, n, k, res_dtype, backend):
     assert cos_sim > 0.99
 
 
-@pytest.mark.parametrize(
-    "shape,res_dtype,expected_route",
-    [
-        ((1, 48, 80, 64), torch.float32, 0),
-        ((1, 48, 80, 256), torch.float16, 1),
-        ((1, 16, 64, 1024), torch.float16, 2),
-        ((16, 128, 80, 256), torch.bfloat16, 3),
-        ((16, 128, 80, 256), torch.float16, 4),
-        ((16, 128, 80, 256), torch.float32, 5),
-        ((16, 128, 64, 256), torch.bfloat16, 6),
-        ((16, 128, 64, 256), torch.float16, 7),
-        ((16, 128, 64, 256), torch.float32, 8),
-        ((4, 16, 1024, 1024), torch.bfloat16, 9),
-        ((4, 16, 1024, 1024), torch.float16, 10),
-        ((4, 16, 1024, 1024), torch.float32, 11),
-        ((2, 8, 1024, 1024), torch.bfloat16, 12),
-        ((2, 8, 1024, 1024), torch.float32, 2),
-    ],
-)
-def test_bmm_bf16_cake_routes_and_output_identity(shape, res_dtype, expected_route):
+def _cake_bmm_case(b, m, n, k, res_dtype, seed):
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    a = torch.randn((b, m, k), device="cuda", dtype=torch.bfloat16, generator=generator)
+    mat2 = torch.randn(
+        (b, n, k), device="cuda", dtype=torch.bfloat16, generator=generator
+    ).transpose(-2, -1)
+    expected = torch.bmm(a.float(), mat2.float()).to(res_dtype)
+    return a, mat2, expected
+
+
+@pytest.mark.parametrize("k", [64, 256, 1024])
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_bmm_bf16_cake_random_shapes(k, res_dtype, seed):
+    """Random batch/M/N (N a multiple of 8) per supported K, checked against FP32 torch.bmm.
+
+    The draws cover M below one tile, M and N that are not tile multiples
+    (partial tiles on both axes) and N below one tile width.
+    """
     _skip_unless_cake_bf16_bmm_supported()
 
-    b, m, n, k = shape
-    torch.manual_seed(7)
-    a = torch.randn((b, m, k), device="cuda", dtype=torch.bfloat16)
-    mat2 = torch.randn((b, n, k), device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    rng = random.Random(seed * 7919 + k)
+    b = rng.randint(1, 24)
+    m = rng.randint(1, 160)
+    n = 8 * rng.randint(1, 20)
+    a, mat2, expected = _cake_bmm_case(b, m, n, k, res_dtype, seed)
     out = torch.empty((b, m, n), device="cuda", dtype=res_dtype)
-    expected = torch.bmm(a.float(), mat2.float()).to(res_dtype)
 
-    result = bmm_bf16(
-        a,
-        mat2,
-        out=out,
-        out_dtype=res_dtype,
-        backend="cake",
-    )
+    result = bmm_bf16(a, mat2, out=out, out_dtype=res_dtype, backend="cake")
 
     assert result is out
     torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
-    assert get_blackwell_bf16_bmm_module().route_of(a, mat2, out) == expected_route
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 48, 80, 64),
+        (1, 48, 80, 256),
+        (1, 16, 64, 1024),
+        (16, 128, 80, 256),
+        (16, 128, 64, 256),
+        (4, 128, 256, 256),
+        (4, 16, 1024, 1024),
+        (2, 8, 1024, 1024),
+        (3, 8, 8, 64),
+        (5, 17, 24, 256),
+        (2, 33, 1032, 1024),
+    ],
+)
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_bmm_bf16_cake_fixed_shapes(shape, res_dtype):
+    """Historical deployment shapes and tile-boundary shapes with random inputs."""
+    _skip_unless_cake_bf16_bmm_supported()
+
+    b, m, n, k = shape
+    a, mat2, expected = _cake_bmm_case(b, m, n, k, res_dtype, seed=7)
+    out = torch.empty((b, m, n), device="cuda", dtype=res_dtype)
+
+    result = bmm_bf16(a, mat2, out=out, out_dtype=res_dtype, backend="cake")
+
+    assert result is out
+    torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
 
 def test_bmm_bf16_cake_repeat_reuses_module_and_output():
@@ -197,8 +222,6 @@ def test_bmm_bf16_cake_rejects_misaligned_data_pointer(misaligned):
 
     expected_error = f"{misaligned} data pointer must be 16-byte aligned"
     with pytest.raises(ValueError, match=expected_error):
-        get_blackwell_bf16_bmm_module().route_of(a, mat2, out)
-    with pytest.raises(ValueError, match=expected_error):
         bmm_bf16(a, mat2, out=out, backend="cake")
 
 
@@ -210,13 +233,9 @@ def test_bmm_bf16_cake_rejects_output_input_overlap():
         -2, -1
     )
     with pytest.raises(ValueError, match="out must not overlap A"):
-        get_blackwell_bf16_bmm_module().route_of(a, mat2, a)
-    with pytest.raises(ValueError, match="out must not overlap A"):
         bmm_bf16(a, mat2, out=a, backend="cake")
 
     out_overlapping_b = mat2.transpose(-2, -1).view(-1)[: 16 * 64].view(1, 16, 64)
-    with pytest.raises(ValueError, match="out must not overlap B"):
-        get_blackwell_bf16_bmm_module().route_of(a, mat2, out_overlapping_b)
     with pytest.raises(ValueError, match="out must not overlap B"):
         bmm_bf16(a, mat2, out=out_overlapping_b, backend="cake")
 

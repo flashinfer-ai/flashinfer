@@ -3,8 +3,8 @@
 
 Use ``benchmark`` for full MoELayer comparisons: the complete applicable original
 backend pool versus the same pool plus automatic Frost candidates, plus Frost's
-independently autotuned four-plan result. The original backend tactic pools are
-preserved. For example::
+independently autotuned result including fused FC1 and FMA candidates. The
+original backend tactic pools are preserved. For example::
 
     python benchmarks/bench_cudnn_frost_moe_mxfp8.py benchmark \
         --activation all --experts 8 --hidden 4096 --intermediate 14336 \
@@ -43,14 +43,14 @@ from pathlib import Path
 
 import torch
 
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+from flashinfer.fused_moe.backends.cudnn_frost import (
     runtime,
 )
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.activations import (
+from flashinfer.fused_moe.backends.cudnn_frost.activations import (
     ACTIVATIONS,
     is_gated,
 )
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8 import (
+from flashinfer.fused_moe.backends.cudnn_frost.mxfp8 import (
     runtime as mxfp8,
 )
 
@@ -145,7 +145,7 @@ def routing_offsets(tokens, experts, top_k, routing):
         logits[: tokens // 2, 0] += 2
     ids = logits.topk(top_k, dim=-1).indices
     counts = torch.bincount(ids.flatten(), minlength=experts)
-    offsets = (counts.cumsum(0) - counts).to(torch.int32)
+    offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(torch.int32)
     return offsets, counts.tolist()
 
 
@@ -517,6 +517,9 @@ def discover_original(arch, quant, activation):
 
     eligible, audit = {}, []
     for cfg_cls, runner_cls in _BACKEND_RUNNERS.items():
+        # Frost is measured separately against the competing backend pool.
+        if runner_cls.backend_key.startswith("cudnn_frost_"):
+            continue
         supported_acts = (
             runner_cls.supported_activation_classes_by_quant.get(quant.pair, ())
             if runner_cls.supported_activation_classes_by_quant
@@ -677,9 +680,9 @@ def benchmark_case(args, config, weights, activation, geometry, routing, tokens,
         packed_keepalive.append(packed)
         frost_tactics = runner.get_valid_tactics(packed, None)
         candidate_count = len(frost_tactics)
-        if candidate_count != 4:
+        if candidate_count < 4:
             raise RuntimeError(
-                f"Expected top-2 x top-2 = 4 plans, got {candidate_count}"
+                f"Expected at least 4 Frost plans, got {candidate_count}"
             )
         for tactic in frost_tactics:
             out = runner.forward(packed, tactic)
@@ -899,7 +902,7 @@ def benchmark(args):
         output = args.output.open("x")
     try:
         if args.artifacts is not None:
-            from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8 import (
+            from flashinfer.fused_moe.backends.cudnn_frost.mxfp8 import (
                 moe,
             )
 

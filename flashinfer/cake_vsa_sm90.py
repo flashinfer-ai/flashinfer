@@ -69,6 +69,11 @@ NUM_CONSUMER_WGS = 2
 MAX_SEQ = 136
 MAX_SELECTED = 64
 TILE_FIXED_COST = 0.3
+# A tile's load time also carries a fixed part (Q lift, epilogue, inter-tile gap: ~ one
+# position's load) and a split tile the merge of its two warpgroups' partials; in ring
+# positions.  Mirrors ``vsa_sm90_bf16``.
+TILE_FIXED_LOAD = 1.0
+SPLIT_MERGE_LOAD = 1.0
 LOAD_COST = 1.0
 # By-value first-tile header of the persistent kernel: per CTA ``[head, qb0,
 # qb1, mode, n_hdr, (blk_a, blk_b) x HDR_POS, pad]`` (int16) so the first Q
@@ -89,6 +94,15 @@ _FP32_MAX = 3.4028234663852886e38
 META_NSEQ = 4
 META_NOWN = 5
 META_NTILES = 7
+# Queue kernel (``attention_queue``): the last POOL_ROUNDS tiles of every CTA's
+# static list are handed out at run time; used only for uniform plans whose
+# every CTA has at least POOL_MIN_TILES tiles.  Both values match the kernel.
+POOL_ROUNDS = 2
+POOL_MIN_TILES = 12  # 8-tile rows measured 1 % slower on the CuTe route
+POOL_SMALL_MIN_TILES = (
+    8  # ... or this many tiles of at most POOL_SMALL_TILE_POS positions
+)
+POOL_SMALL_TILE_POS = 0  # 0 disables the tiny-tile exception
 META_SEQ_OFF = 8
 META_SEQ_WORDS = MAX_SEQ // 2
 MAX_OWN = MAX_SEQ // 2
@@ -98,6 +112,14 @@ META_WORDS = META_OWN_OFF + NUM_CONSUMER_WGS * OWN_WORDS  # 144
 
 # Small-selection route (port of the Cake kernel module ``vsa_sm90_small``).
 SMALL_KMAX_VARIANTS = (1, 3, 4, 6)
+# Split-KV variants that ship.  :func:`split_kmax` ranks variants by
+# ``chain_blocks(kmax) + SPLIT_MERGE_COST * (max_nsplit - 1)``: KMAX 3 has the
+# same two-block chain as KMAX 4 and never fewer slices, so KMAX 4 always wins
+# the tie-or-better; KMAX 1 (one-block chain, one slice per block) only wins
+# when KMAX 3/4/6 all exceed the one-wave item budget while KMAX 1 fits it,
+# a band of ragged masks with ``2 * tiles`` within two of the SM count and one
+# selection of 13..31 blocks.  Those masks run the persistent kernel instead.
+SPLIT_KMAX_VARIANTS = (4, 6)
 SMALL_OCCUPANCY = {
     1: 4,
     2: 1,
@@ -175,10 +197,11 @@ def split_kmax(counts: list[int], *, sms: Optional[int] = None) -> int:
     Variants whose item count fits one wave (when ``sms`` is given) and whose
     plan fits the parameter bank are ranked by ``chain_blocks(kmax) * SPLIT_BLOCK_COST
     + (max_nsplit - 1) * SPLIT_MERGE_COST``; the cheapest wins (largest kmax on
-    ties).  Raises when no variant fits.  Mirrors ``vsa_sm90_small.split_kmax``.
+    ties).  Raises when no variant fits.  Mirrors ``vsa_sm90_small.split_kmax``
+    over the shipped :data:`SPLIT_KMAX_VARIANTS`.
     """
     best = None
-    for kmax in SMALL_KMAX_VARIANTS:
+    for kmax in SPLIT_KMAX_VARIANTS:
         nsplits = [max(1, -(-c // kmax)) for c in counts]
         items = sum(nsplits)
         if (
@@ -460,6 +483,10 @@ def plan_small(
         raise ValueError(
             f"kmax={kmax} is not a compiled small-kernel variant {SMALL_KMAX_VARIANTS}"
         )
+    if split and kmax not in SPLIT_KMAX_VARIANTS:
+        raise ValueError(
+            f"kmax={kmax} is not a compiled split-KV variant {SPLIT_KMAX_VARIANTS}"
+        )
     if not split and not cluster and kmax < capacity:
         raise ValueError(f"kmax={kmax} cannot hold {capacity} blocks per tile")
     tiles = h * mb
@@ -643,14 +670,45 @@ def _tile_cost(owns_t) -> float:
     return max(len(o) for o in owns_t) + TILE_FIXED_COST
 
 
+def _tile_load(kind: int, len_t: int) -> float:
+    return len_t + TILE_FIXED_LOAD + (SPLIT_MERGE_LOAD if kind == 1 else 0.0)
+
+
 GRID_MIN_FRACTION = (
     0.9  # a smaller, uniform persistent grid only while >= 90 % of the SMs stay busy
 )
+# Grid model (H100 SXM, forced-grid measurements on h7-m32768-k64): the per-SM
+# stream rate is 3 % higher with at most 128 of the 132 SMs streaming and then
+# rises only slowly (~(g/128) ** -0.25), so a CTA's load time is scaled
+# accordingly and a uniform 128-CTA grid beats 132 CTAs carrying the same
+# maximum tile count.  Mirrors ``vsa_sm90_bf16``.
+GRID_MODEL = 1
+# The refined load model (per-tile fixed load, split-merge load, grid knee credit) is
+# calibrated on long tiles (>= 32 KV blocks per query block); on short tiles the pair plans
+# it prefers measured 8-14 % slower than the split plans of the previous model, so below this
+# mean number of KV blocks per query block the previous model (raw positions, flat grid) decides.
+REFINED_LOAD_MIN_K = 28.0
+GRID_RATE_FULL_PENALTY = 0.03
+GRID_RATE_EXP = 0.25
+GRID_RATE_KNEE = 128
+
+
+def _grid_load_scale(g: int, sms: int) -> float:
+    if GRID_MODEL == 0 or sms <= GRID_RATE_KNEE or g >= sms:
+        return 1.0
+    if g > GRID_RATE_KNEE:
+        # Grids between the knee and the full machine measured 0.2-1.3 % slower
+        # on the CuTe route when chosen for a sub-1 % model credit; only the
+        # measured knee (<= 128 CTAs) takes the credit.
+        return 1.0
+    knee = 1.0 - GRID_RATE_FULL_PENALTY
+    return knee * (g / GRID_RATE_KNEE) ** GRID_RATE_EXP
 
 
 def _list_schedule(
-    costs: list[float], lens: list[int], g: int
+    costs: list[float], lens: list[float], g: int, load_scale: float = 1.0
 ) -> tuple[list[list[int]], float]:
+    """``load_scale`` is the grid's per-position load time relative to the full machine."""
     cons = [0.0] * g
     load = [0.0] * g
     heap = [(0.0, c) for c in range(g)]
@@ -659,7 +717,7 @@ def _list_schedule(
         _, c = heapq.heappop(heap)
         lists[c].append(t)
         cons[c] += costs[t]
-        load[c] += lens[t] * LOAD_COST
+        load[c] += lens[t] * LOAD_COST * load_scale
         heapq.heappush(heap, (max(cons[c], load[c]), c))
     return lists, max(key for key, _ in heap)
 
@@ -683,7 +741,7 @@ def _grid_candidates(n_tiles: int, sms: int) -> list[int]:
 
 
 def _assign_tiles(
-    costs: list[float], lens: list[int], sms: int
+    costs: list[float], lens: list[float], sms: int, refined: bool = True
 ) -> tuple[list[list[int]], float]:
     """List-schedule the tiles onto ``g`` persistent CTAs.
 
@@ -696,9 +754,18 @@ def _assign_tiles(
     ``vsa_sm90_bf16._assign_tiles``.
     """
     best = None
-    for g in _grid_candidates(len(costs), sms):
-        lists, makespan = _list_schedule(costs, lens, g)
-        spread = max(len(lst) for lst in lists) - min(len(lst) for lst in lists)
+    max_full = None
+    for g in _grid_candidates(len(costs), sms):  # descending: the full grid first
+        lists, makespan = _list_schedule(
+            costs, lens, g, _grid_load_scale(g, sms) if refined else 1.0
+        )
+        max_tiles = max(len(lst) for lst in lists)
+        if max_full is None:
+            max_full = max_tiles
+        elif max_tiles > max_full:
+            # only grids with the full grid's maximum tile count take the knee's rate credit
+            continue
+        spread = max_tiles - min(len(lst) for lst in lists)
         key = (round(makespan, 9), spread, -g)
         if best is None or key < best[0]:
             best = (key, lists, makespan)
@@ -839,6 +906,10 @@ def plan_vsa_sm90(
         raise ValueError("sms must be positive")
     rows = [[m.nonzero().flatten().tolist() for m in mask[hh]] for hh in range(h)]
     ragged = int(counts.min()) != int(counts.max())
+    # The refined load model is calibrated on uniform plans; on ragged plans it
+    # only re-orders and re-balances the list schedule and measured slower on
+    # the 32k-token K=64 ragged rows, so ragged plans keep the previous model.
+    refined = (not ragged) and float(counts.sum()) / (h * mb) >= REFINED_LOAD_MIN_K
 
     def build(mode: str):
         infos: list[tuple[int, int, int, int]] = []
@@ -850,67 +921,114 @@ def plan_vsa_sm90(
             for qb, partner in pairs:
                 _emit_tile(hh, qb, partner, mode, rows, infos, seqs, owns, lens)
         costs = [_tile_cost(owns[t]) for t in range(len(infos))]
+        loads = [
+            _tile_load(infos[t][3], lens[t]) if refined else float(lens[t])
+            for t in range(len(infos))
+        ]
         if not ragged:
             order = list(range(len(infos)))
         elif h * nb * BLOCK * HEAD_DIM * 2 * 2 <= TILE_ORDER_L2_BUDGET:
             order = sorted(
                 range(len(infos)),
                 key=lambda i: (
-                    -max(costs[i], lens[i] * LOAD_COST),
+                    -max(costs[i], loads[i] * LOAD_COST),
                     infos[i][0],
                     infos[i][1],
                 ),
             )
         else:
             order = sorted(range(len(infos)), key=lambda i: (infos[i][0], -costs[i]))
-        return tuple([x[i] for i in order] for x in (infos, seqs, owns, lens, costs))
+        return tuple(
+            [x[i] for i in order] for x in (infos, seqs, owns, lens, costs, loads)
+        )
 
     if mode is None:
         best = None
         for cand in ("split", "pair"):  # ties go to split
             built = build(cand)
-            _, makespan = _assign_tiles(built[4], built[3], sms)
+            _, makespan = _assign_tiles(built[4], built[5], sms, refined)
             if best is None or makespan < best[0]:
                 best = (makespan, cand, built)
-        _, mode, (infos, seqs, owns, lens, costs) = best
+        _, mode, (infos, seqs, owns, lens, costs, loads) = best
     else:
-        infos, seqs, owns, lens, costs = build(mode)
-    lists, makespan = _assign_tiles(costs, lens, sms)
+        infos, seqs, owns, lens, costs, loads = build(mode)
+    lists, makespan = _assign_tiles(costs, loads, sms, refined)
     g = len(lists)
-    stride = max(len(lst) for lst in lists)
     if g > HDR_CTAS:
         raise ValueError(
             f"persistent grid {g} exceeds the {HDR_CTAS}-CTA by-value header"
         )
+    # Uniform plans with enough rounds run the queue kernel (``attention_queue``):
+    # every CTA keeps its static list (the list schedule, so concurrent CTAs
+    # stream one head in lock step) except its last POOL_ROUNDS tiles, which
+    # form a pool handed out at run time in the lists' round order (the tail
+    # then balances on measured, not modelled, tile times).  Ragged plans and
+    # short lists keep the static kernel: a big tile taken late costs up to one
+    # tile of tail, and a round boundary's simultaneous fetches need several
+    # rounds to amortise.
+    min_tiles = min(len(lst) for lst in lists)
+    queue = (not ragged) and (
+        min_tiles >= POOL_MIN_TILES
+        or (
+            POOL_SMALL_TILE_POS > 0
+            and min_tiles >= POOL_SMALL_MIN_TILES
+            and max(lens) <= POOL_SMALL_TILE_POS
+        )
+    )
+    pool_rounds = POOL_ROUNDS if queue else 0
+    static = [lst[: max(1, len(lst) - pool_rounds)] for lst in lists]
+    pool_order = sorted(
+        (i, c, t)
+        for c, lst in enumerate(lists)
+        for i, t in enumerate(lst)
+        if i >= len(static[c])
+    )
+    pool = [t for _, _, t in pool_order]
+    stride = max(len(st) for st in static)
+    # Queue layout: static rows, the pool rows, then one all-zero sentinel row
+    # per CTA (a fetch past the pool stages a slot whose word META_NTILES is 0).
+    n_rows = g * stride + len(pool) + (g if queue else 0)
     hdr = np.zeros((HDR_HALFWORDS,), dtype=np.int16)
-    for c, lst in enumerate(lists):
-        t = lst[0]
+    for c, st in enumerate(static):
+        t = st[0]
         n_hdr = min(HDR_ISSUE, lens[t])
         hdr[c * HDR_WORDS : c * HDR_WORDS + 5] = (*infos[t], n_hdr)
         hdr[c * HDR_WORDS + 5 : c * HDR_WORDS + 5 + 2 * n_hdr] = seqs[t][: 2 * n_hdr]
-    meta = np.zeros((g * stride, META_WORDS), dtype=np.uint32)
-    for c, lst in enumerate(lists):
-        for i, t in enumerate(lst):
-            r = c * stride + i
-            meta[r, 0:4] = infos[t]
-            meta[r, META_NSEQ] = lens[t]
-            sq = np.asarray(seqs[t], dtype=np.int64) & 0xFFFF
-            meta[r, META_SEQ_OFF : META_SEQ_OFF + len(sq) // 2] = sq[0::2] | (
-                sq[1::2] << 16
-            )
-            for w in range(NUM_CONSUMER_WGS):
-                ol = owns[t][w]
-                meta[r, META_NOWN + w] = len(ol)
-                if len(ol) > MAX_OWN:
-                    raise ValueError("own list exceeds MAX_OWN")
-                ow = np.asarray(ol + [0] * (len(ol) & 1), dtype=np.int64)
-                base = META_OWN_OFF + w * OWN_WORDS
-                meta[r, base : base + len(ow) // 2] = ow[0::2] | (ow[1::2] << 16)
-        meta[c * stride, META_NTILES] = len(lst)
+    # Plan rows laid out per CTA: row c * stride + i is CTA c's i-th (static)
+    # tile; the first row of each CTA also carries its (static) tile count
+    # (word META_NTILES).  Queue layout: the other static rows and the pool
+    # rows carry 1 in that word (valid), the sentinel rows 0.
+    meta = np.zeros((n_rows, META_WORDS), dtype=np.uint32)
+
+    def fill(r, t, nt):
+        meta[r, 0:4] = infos[t]
+        meta[r, META_NSEQ] = lens[t]
+        sq = np.asarray(seqs[t], dtype=np.int64) & 0xFFFF
+        meta[r, META_SEQ_OFF : META_SEQ_OFF + len(sq) // 2] = sq[0::2] | (
+            sq[1::2] << 16
+        )
+        for w in range(NUM_CONSUMER_WGS):
+            ol = owns[t][w]
+            meta[r, META_NOWN + w] = len(ol)
+            if len(ol) > MAX_OWN:
+                raise ValueError("own list exceeds MAX_OWN")
+            ow = np.asarray(ol + [0] * (len(ol) & 1), dtype=np.int64)
+            base = META_OWN_OFF + w * OWN_WORDS
+            meta[r, base : base + len(ow) // 2] = ow[0::2] | (ow[1::2] << 16)
+        meta[r, META_NTILES] = nt
+
+    for c, st in enumerate(static):
+        for i, t in enumerate(st):
+            fill(c * stride + i, t, len(st) if i == 0 else int(queue))
+    for j, tp in enumerate(pool):
+        fill(g * stride + j, tp, 1)
     return {
         "meta": torch.from_numpy(meta.view(np.int32).copy()),
         "hdr": torch.from_numpy(hdr),
         "tile_stride": stride,
+        "queue": queue,
+        "pool": pool,
+        "num_rows": n_rows,
         "mode": mode,
         "makespan": makespan,
         "num_ctas": g,
@@ -1110,6 +1228,8 @@ class CakeVsaSm90Plan:
         self.num_ctas = plan["num_ctas"]
         self.num_tiles = plan["num_tiles"]
         self.tile_stride = plan["tile_stride"]
+        self.queue = plan["queue"]
+        self.num_rows = plan["num_rows"]
         self.num_heads = plan["H"]
         self.qo_len = plan["MB"] * BLOCK
         self.kv_len = plan["NB"] * BLOCK
@@ -1120,8 +1240,11 @@ class CakeVsaSm90Plan:
             self.meta = host_meta.to(self.device, non_blocking=non_blocking)
             # By-value kernel parameter in both builds: stays on the host.
             self.hdr = plan["hdr"].contiguous()
-            # The kernel's debug/timeline buffers are inert in the exported
-            # build; they only have to exist on the device.
+            # The timeline buffer is inert in the exported build; ``dbg`` holds
+            # the queue kernel's two tile-queue words (zero between launches:
+            # the last CTA to drain the pool resets them, so a captured graph
+            # replays without a memset).  Like the split-KV counters, the words
+            # belong to this plan: two launches of one plan must not overlap.
             self.dbg = torch.zeros((64,), dtype=torch.int32, device=self.device)
             self.tl = torch.zeros((8,), dtype=torch.uint64, device=self.device)
             # Capture must retain an external wait node for the metadata
@@ -1195,7 +1318,7 @@ class CakeVsaSm90Plan:
                     raise ValueError("out must not overlap Q/K/V storage")
 
         if self.small_kmax is None:
-            stage = "attention"
+            stage = "attention_queue" if self.queue else "attention"
         elif self.small_cluster:
             stage = f"small_k{self.small_kmax}c{self.small_cluster}"
         else:

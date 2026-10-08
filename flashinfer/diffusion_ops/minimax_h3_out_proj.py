@@ -26,6 +26,8 @@ from ..jit.minimax_h3_out_proj import (
 )
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
 from .minimax_h3_fc1_swiglu import (
+    _check_index,
+    _check_table,
     _scalar_f32,
     _swizzle_sf_128x4,
     _unswizzle_sf_128x4,
@@ -40,6 +42,9 @@ MINIMAX_H3_HEAD_DIM = 128
 MINIMAX_H3_ATTN_DIM = (
     MINIMAX_H3_NUM_HEADS * MINIMAX_H3_HEAD_DIM
 )  # 7168, the GEMM reduction
+# Production default gate table row count (3 modulation rows x 3 timestep groups) used by the
+# tests and benchmarks.  It is NOT a validation bound: the operators accept ``[rows, 5376]`` gate
+# tables with any ``rows >= 1`` and read the row count and row stride from the tensor.
 MINIMAX_H3_GATE_ROWS = 9
 MINIMAX_H3_SEQUENCE_PARALLEL_DEGREES = (1, 2, 4, 8)
 MINIMAX_H3_MAX_ROWS = 1 << 24
@@ -153,10 +158,14 @@ def _check_epilogue_inputs(
     rows: int,
     device: torch.device,
 ) -> None:
-    _check_tensor(
-        gate, "gate", (MINIMAX_H3_GATE_ROWS, MINIMAX_H3_HIDDEN), torch.bfloat16, device
-    )
-    _check_tensor(gate_index, "gate_index", (rows,), torch.int32, device)
+    _check_table(gate, "gate", device)
+    # The out_proj epilogue forms the gate table offset as a 32x32->64-bit multiply of the row index and
+    # the row pitch: rows must not overlap and the pitch must fit 32 bits.
+    if not MINIMAX_H3_HIDDEN <= gate.stride(0) < 2**32:
+        raise ValueError(
+            f"gate row stride must be in [{MINIMAX_H3_HIDDEN}, 2^32) elements, got {gate.stride(0)}"
+        )
+    _check_index(gate_index, "gate_index", rows, device)
     _check_tensor(
         residual, "residual", (rows, MINIMAX_H3_HIDDEN), torch.bfloat16, device
     )
@@ -232,9 +241,10 @@ def _gate_residual_epilogue(
     gate_index: torch.Tensor,
     residual: torch.Tensor,
 ) -> torch.Tensor:
+    gate_rows = int(gate.shape[0])
     idx = gate_index.to(torch.int64)
-    valid = (idx >= 0) & (idx < MINIMAX_H3_GATE_ROWS)
-    g = gate.index_select(0, idx.clamp(0, MINIMAX_H3_GATE_ROWS - 1))
+    valid = (idx >= 0) & (idx < gate_rows)
+    g = gate.index_select(0, idx.clamp(0, gate_rows - 1))
     g = torch.where(valid[:, None], g, torch.zeros_like(g))
     p = (g * o).to(torch.bfloat16)  # BF16 x BF16: FP32 product, one rounding
     return (residual + p).to(torch.bfloat16)
@@ -537,10 +547,12 @@ def minimax_h3_out_proj(
     BF16 exactly where the PyTorch module graph does::
 
         o   = BF16(A @ o_weight^T)                 # FP32 accumulation
-        p   = BF16(gate[gate_index[m]] * o)        # gate = 0 for an index outside [0, 9)
+        p   = BF16(gate[gate_index[m]] * o)        # gate = 0 for an index outside [0, rows)
         out = BF16(residual + p)
 
-    One persistent 2-CTA tcgen05 GEMM with the fused epilogue runs on the current stream.
+    One persistent 2-CTA tcgen05 GEMM with the fused epilogue runs on the current stream.  The
+    gate operands are the engine's own tensors (a column-chunk table view, int64 indices);
+    nothing is copied on the host.
 
     Parameters
     ----------
@@ -550,9 +562,14 @@ def minimax_h3_out_proj(
     o_weight : torch.Tensor
         Contiguous ``bfloat16`` ``[5376, 7168]`` output-projection weight (``nn.Linear`` layout).
     gate : torch.Tensor
-        ``bfloat16`` ``[9, 5376]`` gate table.
+        ``bfloat16`` ``[rows, 5376]`` gate table with any ``rows >= 1``.  ``stride(1)`` must be
+        ``1``; ``stride(0)`` may exceed ``5376`` (for example ``6 * 5376`` for a column chunk of
+        the engine's ``[rows, 6 * 5376]`` modulation projection) and must be a multiple of 8
+        elements (16 bytes); the data pointer must be 16-byte aligned.  The tensor is passed to
+        the kernel as it is, with its row count and row stride.
     gate_index : torch.Tensor
-        ``int32`` ``[M]`` table row per activation row.
+        Contiguous ``int64`` ``[M]`` table row per activation row.  Values in ``[0, rows)``
+        select a gate row; any other int64 value yields ``gate = 0`` (``out = residual``).
     residual : torch.Tensor
         Contiguous ``bfloat16`` ``[M, 5376]`` residual stream.
     out : Optional[torch.Tensor]

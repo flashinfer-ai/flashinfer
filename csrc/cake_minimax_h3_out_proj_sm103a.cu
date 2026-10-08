@@ -26,7 +26,10 @@
 //   NVFP4: a_q, a_sf = nvfp4_quantize(A, a_global_scale)  (E2M1 + UE4M3 per 16, FlashInfer recipe)
 //          o = BF16(alpha * ((a_q * a_sf) @ (w_q * w_sf)^T)),
 //          alpha = 1 / (a_global_scale * w_global_scale)
-//   p   = BF16(gate[gate_index[m]] * o)                    gate = 0 for an index outside [0, 9)
+//   p   = BF16(gate[gate_index[m]] * o)                    gate: bf16 [rows, 5376] table read as
+//                                                          base + idx * gate_row_stride (contiguous or a
+//                                                          column chunk of a wider projection); gate = 0
+//                                                          for an int64 index outside [0, gate_rows)
 //   out = BF16(residual + p)
 //
 // The BF16 variant is a single persistent 2-CTA (cta_group::2) tcgen05 GEMM whose activation
@@ -76,57 +79,9 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count));
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
 // suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
 // explicit loop still makes this helper blocking until acquire succeeds.
-
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
     asm volatile(
         "{\n\t"
@@ -139,91 +94,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         "DONE:\n\t"
         "}\n"
         :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
 }
 
 __device__ __forceinline__ void mbarrier_wait_cluster_hint(
@@ -241,72 +111,14 @@ __device__ __forceinline__ void mbarrier_wait_cluster_hint(
         :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void tcgen05_mma_f16_cta2(
-    int taddr, uint64_t a_desc, uint64_t b_desc,
-    uint32_t i_desc, int enable_input_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        ".reg .b32 m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\t"
-        "mov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
-        "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, {m0, m1, m2, m3, m4, m5, m6, m7}, p;\n\t"
-        "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(enable_input_d)
-         : "memory");
-}
-
 __device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
     return (x & 0x3FFFFULL) >> 4ULL;
 }
-
 
 union MmaSmemDesc {
     uint64_t u64;
     uint32_t u32[2];
 };
-
-__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
-    MmaSmemDesc tmp;
-    tmp.u64 = smem_desc;
-    tmp.u32[0] += offset;
-    smem_desc = tmp.u64;
-}
 
 __device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
     asm volatile(
@@ -319,53 +131,6 @@ __device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16
         :: "r"(mbar_addr), "h"(cta_mask) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-__device__ __forceinline__ uint32_t smem_addr(const void* ptr) {
-    uint32_t addr;
-    asm("{\n\t"
-        ".reg .u64 u64addr;\n\t"
-        "cvta.to.shared.u64 u64addr, %1;\n\t"
-        "cvt.u32.u64 %0, u64addr;\n\t"
-        "}\n" : "=r"(addr) : "l"(ptr));
-    return addr;
-}
-
-__device__ __forceinline__ uint32_t mapa_to_rank(uint32_t local_addr, uint32_t rank) {
-    uint32_t remote;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
-        : "=r"(remote) : "r"(local_addr), "r"(rank));
-    return remote;
-}
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-    float c;
-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-    return c;
-}
-
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
-
 __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
     int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
     asm volatile(
@@ -374,17 +139,6 @@ __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
         " [%0], [%1, {%2, %3, %4}], [%5];"
         :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
            "r"(mbar_addr) : "memory");
-}
-
-__device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
-    asm volatile(
-        "{\n\t"
-        ".reg .b16 lo, hi;\n\t"
-        "mov.b32 {lo, hi}, %1;\n\t"
-        "tcgen05.commit.cta_group::2.mbarrier::arrive::one"
-        ".shared::cluster.multicast::cluster.b64 [%0], lo;\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"((uint32_t)cta_mask) : "memory");
 }
 
 __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
@@ -399,57 +153,10 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
         : "r"(tmem_addr));
 }
 
-__device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
-    tmem_ld_x16(dst, addr);
-    asm volatile("tcgen05.wait::ld.sync.aligned;");
-}
-
-__device__ __forceinline__ float warp_reduce_max(float val) {
-
-#pragma unroll
-
-for (int offset = 16; offset > 0; offset >>= 1)
-        val = max_noftz(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
-    return val;
-}
-
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-
-for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
-
-__device__ __forceinline__ float row_max_reduce(float2 acc) {
-    return max_noftz(acc.x, acc.y);
-}
-
-__device__ __forceinline__ void row_max_x32_accum(const float* sv, float2& acc) {
-
-for (int j = 0; j < 16; j++) {
-        if (j % 2 == 0)
-            acc.x = max_noftz(acc.x, max_noftz(sv[j*2], sv[j*2+1]));
-        else
-            acc.y = max_noftz(acc.y, max_noftz(sv[j*2], sv[j*2+1]));
-    }
-}
-
-__device__ __forceinline__ void fma_f32x2_inplace(float2* a, float2 b, float2 c) {
-    unsigned long long r;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(r)
-        : "l"(*(unsigned long long*)a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    *(unsigned long long*)a = r;
-}
-
-__device__ __forceinline__ void fma_f32x2_noftz_inplace(float2* a, float2 b, float2 c) {
-    unsigned long long r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(r)
-        : "l"(*(unsigned long long*)a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    *(unsigned long long*)a = r;
+__device__ __forceinline__ float max_noftz(float a, float b) {
+    float c;
+    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
+    return c;
 }
 
 __device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
@@ -457,493 +164,7 @@ __device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
         : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
 }
 
-__device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("mul.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void add_f32x2_inplace(float2* a, float2 b) {
-    asm("add.rn.ftz.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void add_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("add.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void sub_f32x2_inplace(float2* a, float2 b) {
-    asm("sub.rn.ftz.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void sub_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("sub.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ float2 add_f32x2(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 sub_f32x2(float2 a, float2 b) {
-    float2 r;
-    asm("sub.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 sub_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("sub.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ void fma_scale_x32(
-    float* sv, const float2* scale2, const float2* neg_max2)
-{
-    float2* sv_2 = reinterpret_cast<float2*>(sv);
-
-for (int j = 0; j < 16; j++)
-        fma_f32x2_inplace(&sv_2[j], *scale2, *neg_max2);
-}
-
-__device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rn.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
-
-__device__ __forceinline__ float2 add_f32x2_rn_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rn_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rz_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rz_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rz.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rm_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rm.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rm_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rm.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rp_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rp.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rp_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rp.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rn_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rn_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rz_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rz_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rz.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rm_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rm.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rm_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rm.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rp_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rp.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rp_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rp.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rn_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rn_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rn.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rn_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rn.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rz_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rz_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rz_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rz.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rz_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rz.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rm_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rm.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rm_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rm.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rm_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rm.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rm_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rm.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rp_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rp.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rp_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rp.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rp_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rp.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rp.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
 
 __device__ __forceinline__ void tcgen05_mma_mxf8_bs_cta2(
     int taddr, uint64_t a_desc, uint64_t b_desc, uint32_t i_desc,
@@ -958,13 +179,6 @@ __device__ __forceinline__ void tcgen05_mma_mxf8_bs_cta2(
         :: "r"(taddr), "l"(a_desc), "l"(b_desc),
            "r"(i_desc), "r"(sfa_taddr), "r"(sfb_taddr),
            "r"(enable_input_d));
-}
-
-__device__ __forceinline__ uint64_t make_sf_cp_desc_sbo128(int addr) {
-    const int SBO = 128;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL);
 }
 
 __device__ __forceinline__ uint64_t make_sf_cp_desc_lo_sbo128(int lo) {
@@ -1031,7 +245,6 @@ __device__ __forceinline__ void tcgen05_mma_mxf4nvf4_bs_cta2(
 #define NUM_K_ITERS 112
 #define N_TILES 21
 #define HIDDEN 5376
-#define GATE_ROWS 9
 #define num_cluster_tiles ((m_tiles / CTA_GROUP) * N_TILES)
 #define tiles_per_group (GROUP_M * N_TILES)
 
@@ -1054,7 +267,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_minimax_h3_out_proj_bf16(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ gate, int* __restrict__ gate_index, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ out, int M, int m_tiles, int k_blocks_per_seg)
+kernel_minimax_h3_out_proj_bf16(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ gate, long long* __restrict__ gate_index, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ out, int M, int m_tiles, int k_blocks_per_seg, int gate_rows, long long gate_row_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1062,7 +275,12 @@ kernel_minimax_h3_out_proj_bf16(const __grid_constant__ CUtensorMap A, const __g
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
@@ -1393,14 +611,11 @@ kernel_minimax_h3_out_proj_bf16(const __grid_constant__ CUtensorMap A, const __g
                 int lane_addr = taddr + (unsigned int)(epi_warp * 32 << 16) + epi_stage * (unsigned int)BLOCK_N + (unsigned int)col0;
                 int _min_0 = ((global_row) < (M - 1) ? (global_row) : (M - 1));
                 int load_row = _min_0;
-                int table_row = gate_index[load_row];
-                int valid_lo = ((table_row >= 0) ? 1 : 0);
-                int valid_hi = ((table_row < GATE_ROWS) ? 1 : 0);
-                float gate_mul = (float)(valid_lo * valid_hi);
-                int _max_0 = ((table_row) > (0) ? (table_row) : (0));
-                int _min_1 = ((_max_0) < (GATE_ROWS - 1) ? (_max_0) : (GATE_ROWS - 1));
-                int safe_row = _min_1;
-                unsigned long long gate_base = (unsigned long long)safe_row * (unsigned long long)HIDDEN + (unsigned long long)off_n_1 + (unsigned long long)col0;
+                long long table_row = gate_index[load_row];
+                int in_range = (((unsigned long long)table_row < (unsigned long long)(unsigned int)gate_rows) ? 1 : 0);
+                float gate_mul = (float)in_range;
+                unsigned int safe_row = (unsigned int)table_row * (unsigned int)in_range;
+                unsigned long long gate_base = (unsigned long long)safe_row * (unsigned long long)(unsigned int)gate_row_stride + (unsigned long long)off_n_1 + (unsigned long long)col0;
                 unsigned long long row_base = (unsigned long long)global_row * (unsigned long long)HIDDEN + (unsigned long long)off_n_1 + (unsigned long long)col0;
                 #pragma unroll 1
                 for (int n_chunk = 0; n_chunk < B_HALF_N / 16; n_chunk++) {
@@ -1598,7 +813,6 @@ kernel_minimax_h3_out_proj_bf16(const __grid_constant__ CUtensorMap A, const __g
 #undef BLOCK_N
 #undef B_HALF_N
 #undef CTA_GROUP
-#undef GATE_ROWS
 #undef GROUP_M
 #undef HIDDEN
 #undef MINIMAX_H3_OUT_PROJ_INF
@@ -1658,6 +872,8 @@ kernel_minimax_h3_quant_mxfp8(__nv_bfloat16* __restrict__ attn_out, uint8_t* __r
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -1763,10 +979,17 @@ kernel_minimax_h3_quant_mxfp8(__nv_bfloat16* __restrict__ attn_out, uint8_t* __r
                 unsigned int inverse_bits = ((scale_byte == 0) ? zero_bits : inverse_nonzero_bits);
                 float inverse = 0.0f;
                 inverse = reinterpret_cast<float*>(&inverse_bits)[0];
+                #if __CUDA_ARCH__ >= 1000
                 const float2 _scale2_1 = {inverse, inverse};
                 #pragma unroll
                 for (int _ls = 0; _ls < 4; _ls++)
                     mul_f32x2_inplace(&reinterpret_cast<float2*>(vals)[_ls], _scale2_1);
+                #else
+                #pragma unroll
+                for (int _ls = 0; _ls < 8; _ls++) {
+                    vals[_ls] = vals[_ls] * inverse;
+                }
+                #endif
                 {
                     unsigned int _fp8_pk[2];
                     asm("{\n\t"
@@ -1857,14 +1080,13 @@ kernel_minimax_h3_quant_mxfp8(__nv_bfloat16* __restrict__ attn_out, uint8_t* __r
 #define N_TILES 21
 #define SF_K_TILES 56
 #define HIDDEN 5376
-#define GATE_ROWS 9
 #define num_cluster_tiles ((m_tiles / CTA_GROUP) * N_TILES)
 #define tiles_per_group (GROUP_M * N_TILES)
 
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_minimax_h3_out_proj_e4m3(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ gate, int* __restrict__ gate_index, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ out, int M, int m_tiles)
+kernel_minimax_h3_out_proj_e4m3(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ gate, long long* __restrict__ gate_index, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ out, int M, int m_tiles, int gate_rows, long long gate_row_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1872,7 +1094,12 @@ kernel_minimax_h3_out_proj_e4m3(const __grid_constant__ CUtensorMap A, const __g
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
@@ -2209,14 +1436,11 @@ kernel_minimax_h3_out_proj_e4m3(const __grid_constant__ CUtensorMap A, const __g
                 int lane_addr = taddr + (unsigned int)(epi_warp * 32 << 16) + (unsigned int)col0;
                 int _min_0 = ((global_row) < (M - 1) ? (global_row) : (M - 1));
                 int load_row = _min_0;
-                int table_row = gate_index[load_row];
-                int valid_lo = ((table_row >= 0) ? 1 : 0);
-                int valid_hi = ((table_row < GATE_ROWS) ? 1 : 0);
-                float gate_mul = (float)(valid_lo * valid_hi);
-                int _max_0 = ((table_row) > (0) ? (table_row) : (0));
-                int _min_1 = ((_max_0) < (GATE_ROWS - 1) ? (_max_0) : (GATE_ROWS - 1));
-                int safe_row = _min_1;
-                unsigned long long gate_base = (unsigned long long)safe_row * (unsigned long long)HIDDEN + (unsigned long long)off_n_1 + (unsigned long long)col0;
+                long long table_row = gate_index[load_row];
+                int in_range = (((unsigned long long)table_row < (unsigned long long)(unsigned int)gate_rows) ? 1 : 0);
+                float gate_mul = (float)in_range;
+                unsigned int safe_row = (unsigned int)table_row * (unsigned int)in_range;
+                unsigned long long gate_base = (unsigned long long)safe_row * (unsigned long long)(unsigned int)gate_row_stride + (unsigned long long)off_n_1 + (unsigned long long)col0;
                 unsigned long long row_base = (unsigned long long)global_row * (unsigned long long)HIDDEN + (unsigned long long)off_n_1 + (unsigned long long)col0;
                 mbarrier_wait(mainloop_done_addr + (acc_stage_1) * 8, _phase_mainloop_done);
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -2425,7 +1649,6 @@ kernel_minimax_h3_out_proj_e4m3(const __grid_constant__ CUtensorMap A, const __g
 #undef BLOCK_N
 #undef B_HALF_N
 #undef CTA_GROUP
-#undef GATE_ROWS
 #undef GROUP_M
 #undef HIDDEN
 #undef MINIMAX_H3_OUT_PROJ_INF
@@ -2510,6 +1733,8 @@ kernel_minimax_h3_quant_nvfp4(__nv_bfloat16* __restrict__ attn_out, float* __res
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -2619,10 +1844,17 @@ kernel_minimax_h3_quant_nvfp4(__nv_bfloat16* __restrict__ attn_out, float* __res
                 float _rcp_2 = approx_rcp(sf_f * inv_g);
                 float out_scale_nonzero = _rcp_2;
                 float out_scale = ((absmax == 0.0f) ? 0.0f : out_scale_nonzero);
+                #if __CUDA_ARCH__ >= 1000
                 const float2 _scale2_1 = {out_scale, out_scale};
                 #pragma unroll
                 for (int _ls = 0; _ls < 4; _ls++)
                     mul_f32x2_inplace(&reinterpret_cast<float2*>(vals)[_ls], _scale2_1);
+                #else
+                #pragma unroll
+                for (int _ls = 0; _ls < 8; _ls++) {
+                    vals[_ls] = vals[_ls] * out_scale;
+                }
+                #endif
                 unsigned int packed[1];
                 asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed[0]) : "f"(vals[0]), "f"(vals[1]), "f"(vals[2]), "f"(vals[3]), "f"(vals[4]), "f"(vals[5]), "f"(vals[6]), "f"(vals[7]));
                 *(reinterpret_cast<unsigned int*>(a_q + (word_base + (unsigned long long)(k_1 >> 3))) + (0)) = packed[0];
@@ -2710,14 +1942,13 @@ kernel_minimax_h3_quant_nvfp4(__nv_bfloat16* __restrict__ attn_out, float* __res
 #define N_TILES 21
 #define SF_K_TILES 112
 #define HIDDEN 5376
-#define GATE_ROWS 9
 #define num_cluster_tiles ((m_tiles / CTA_GROUP) * N_TILES)
 #define tiles_per_group (GROUP_M * N_TILES)
 
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_minimax_h3_out_proj_e2m1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, float* __restrict__ alpha, __nv_bfloat16* __restrict__ gate, int* __restrict__ gate_index, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ out, int M, int m_tiles)
+kernel_minimax_h3_out_proj_e2m1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, float* __restrict__ alpha, __nv_bfloat16* __restrict__ gate, long long* __restrict__ gate_index, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ out, int M, int m_tiles, int gate_rows, long long gate_row_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -2725,7 +1956,12 @@ kernel_minimax_h3_out_proj_e2m1(const __grid_constant__ CUtensorMap A, const __g
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
@@ -3087,14 +2323,11 @@ kernel_minimax_h3_out_proj_e2m1(const __grid_constant__ CUtensorMap A, const __g
                 int lane_addr = taddr + (unsigned int)(epi_warp * 32 << 16) + (unsigned int)col0;
                 int _min_0 = ((global_row) < (M - 1) ? (global_row) : (M - 1));
                 int load_row = _min_0;
-                int table_row = gate_index[load_row];
-                int valid_lo = ((table_row >= 0) ? 1 : 0);
-                int valid_hi = ((table_row < GATE_ROWS) ? 1 : 0);
-                float gate_mul = (float)(valid_lo * valid_hi);
-                int _max_0 = ((table_row) > (0) ? (table_row) : (0));
-                int _min_1 = ((_max_0) < (GATE_ROWS - 1) ? (_max_0) : (GATE_ROWS - 1));
-                int safe_row = _min_1;
-                unsigned long long gate_base = (unsigned long long)safe_row * (unsigned long long)HIDDEN + (unsigned long long)off_n_1 + (unsigned long long)col0;
+                long long table_row = gate_index[load_row];
+                int in_range = (((unsigned long long)table_row < (unsigned long long)(unsigned int)gate_rows) ? 1 : 0);
+                float gate_mul = (float)in_range;
+                unsigned int safe_row = (unsigned int)table_row * (unsigned int)in_range;
+                unsigned long long gate_base = (unsigned long long)safe_row * (unsigned long long)(unsigned int)gate_row_stride + (unsigned long long)off_n_1 + (unsigned long long)col0;
                 unsigned long long row_base = (unsigned long long)global_row * (unsigned long long)HIDDEN + (unsigned long long)off_n_1 + (unsigned long long)col0;
                 mbarrier_wait(mainloop_done_addr + (acc_stage_1) * 8, _phase_mainloop_done);
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -3303,7 +2536,6 @@ kernel_minimax_h3_out_proj_e2m1(const __grid_constant__ CUtensorMap A, const __g
 #undef BLOCK_N
 #undef B_HALF_N
 #undef CTA_GROUP
-#undef GATE_ROWS
 #undef GROUP_M
 #undef HIDDEN
 #undef MINIMAX_H3_OUT_PROJ_INF
@@ -3394,8 +2626,9 @@ constexpr int64_t kHidden = 5376;        // N: o_weight rows, out columns
 constexpr int64_t kAttnDim = 7168;     // K: 56 heads x 128
 constexpr int64_t kNumHeads = 56;
 constexpr int64_t kHeadDim = 128;
-constexpr int64_t kGateRows = 9;
 constexpr int64_t kMaxRows = 16777216;
+constexpr int64_t kMaxGateRows = 2147483647;  // gate_rows is an int kernel argument
+constexpr int64_t kGateRowAlign = 8;          // elements: 16-byte rows for the 128-bit gate loads
 constexpr int64_t kBlockM = 128;
 constexpr int64_t kCtaGroup = 2;
 constexpr int64_t kNTiles = 21;       // 256 output columns per CTA pair, all variants
@@ -3542,13 +2775,35 @@ ReceiveLayout CheckAttnOut(const TensorView& attn_out) {
   return ReceiveLayout{degree, rows};
 }
 
-void CheckEpilogueTensors(const TensorView& gate, const TensorView& gate_index, const TensorView& residual,
-                          const TensorView& out, int64_t rows, DLDevice device) {
-  CheckMatrix(gate, "gate", kGateRows, kHidden, dl_bfloat16, "bfloat16", device, 16);
-  CheckVector(gate_index, "gate_index", rows, dl_int32, "int32", device, 4);
+// Gate table: bf16 [rows, kHidden] with unit column stride, 1 <= rows <= kMaxGateRows, a row stride that
+// is a multiple of kGateRowAlign elements in [kHidden, 2^32) and a 16-byte-aligned base.  A contiguous [rows, 5376] table and
+// the gate_msa column chunk of a [rows, 6 * 5376] projection both qualify; the epilogue reads table row
+// r at base + r * row_stride and multiplies by zero for an index outside [0, rows).
+struct GateTable {
+  int64_t rows;
+  int64_t row_stride;  // elements between consecutive rows
+};
+
+GateTable CheckEpilogueTensors(const TensorView& gate, const TensorView& gate_index, const TensorView& residual,
+                               const TensorView& out, int64_t rows, DLDevice device) {
+  CheckDeviceTensor(gate, "gate", device, 16);
+  CheckDtype(gate, "gate", dl_bfloat16, "bfloat16");
+  TVM_FFI_CHECK(gate.ndim() == 2 && gate.size(1) == kHidden, ValueError)
+      << "gate must have shape [rows, " << kHidden << "]";
+  TVM_FFI_CHECK(gate.size(0) >= 1 && gate.size(0) <= kMaxGateRows, ValueError)
+      << "gate must have 1 <= rows <= " << kMaxGateRows;
+  TVM_FFI_CHECK(gate.stride(1) == 1, ValueError) << "gate must have unit column stride";
+  TVM_FFI_CHECK(gate.stride(0) % kGateRowAlign == 0, ValueError)
+      << "gate row stride must be a multiple of " << kGateRowAlign << " elements (16-byte rows)";
+  // The epilogue forms the table offset as a 32x32->64-bit multiply of the row index and the stride:
+  // rows must not overlap and the stride must fit 32 bits.
+  TVM_FFI_CHECK(gate.stride(0) >= kHidden && gate.stride(0) < (int64_t(1) << 32), ValueError)
+      << "gate row stride must satisfy " << kHidden << " <= stride(0) < 2^32 elements, got " << gate.stride(0);
+  CheckVector(gate_index, "gate_index", rows, dl_int64, "int64", device, 8);
   // The epilogue reads residual and writes out as 256-bit vectors at 32-byte-aligned column offsets.
   CheckMatrix(residual, "residual", rows, kHidden, dl_bfloat16, "bfloat16", device, 32);
   CheckMatrix(out, "out", rows, kHidden, dl_bfloat16, "bfloat16", device, 32);
+  return GateTable{gate.size(0), gate.stride(0)};
 }
 
 // K-major [rows, cols] operand viewed as the rank-3 tensor (box_k, rows, cols / box_k): coordinate
@@ -3668,14 +2923,15 @@ void LaunchCluster(Kernel kernel, int64_t grid, int threads, int smem_bytes, cud
 }  // namespace
 
 // BF16 operator: one launch.  attn_out: bfloat16 [P, M, 56 / P, 128] receive layout (P in {1, 2, 4, 8});
-// o_weight: bfloat16 [5376, 7168]; gate: bfloat16 [9, 5376]; gate_index: int32 [M]; residual / out:
-// bfloat16 [M, 5376].  out = BF16(residual + BF16(gate[gate_index] * BF16(A @ o_weight^T))).
+// o_weight: bfloat16 [5376, 7168]; gate: bfloat16 [rows, 5376] table (see CheckEpilogueTensors);
+// gate_index: int64 [M], values outside [0, rows) give gate = 0; residual / out: bfloat16 [M, 5376].
+// out = BF16(residual + BF16(gate[gate_index] * BF16(A @ o_weight^T))).
 void minimax_h3_out_proj(TensorView attn_out, TensorView o_weight, TensorView gate, TensorView gate_index,
                          TensorView residual, TensorView out) {
   const ReceiveLayout layout = CheckAttnOut(attn_out);
   const DLDevice device = attn_out.device();
   CheckMatrix(o_weight, "o_weight", kHidden, kAttnDim, dl_bfloat16, "bfloat16", device, 16);
-  CheckEpilogueTensors(gate, gate_index, residual, out, layout.rows, device);
+  const GateTable table = CheckEpilogueTensors(gate, gate_index, residual, out, layout.rows, device);
 
   ffi::CUDADeviceGuard device_guard(device.device_id);
   const cudaStream_t stream = get_stream(device);
@@ -3690,9 +2946,10 @@ void minimax_h3_out_proj(TensorView attn_out, TensorView o_weight, TensorView ga
                                              kAttnDim, kBf16BoxK, kBf16BoxRowsB, kBf16BoxGroups, "o_weight");
   LaunchCluster(kernel_minimax_h3_out_proj_bf16, GemmGrid(m_tiles), kGemmBf16Threads, kGemmBf16Smem, stream, kGemmBf16Pdl,
                 "MiniMax-H3 out-proj (bf16)", a_map, b_map, static_cast<__nv_bfloat16*>(gate.data_ptr()),
-                static_cast<int*>(gate_index.data_ptr()), static_cast<__nv_bfloat16*>(residual.data_ptr()),
+                static_cast<long long*>(gate_index.data_ptr()), static_cast<__nv_bfloat16*>(residual.data_ptr()),
                 static_cast<__nv_bfloat16*>(out.data_ptr()), static_cast<int>(layout.rows), static_cast<int>(m_tiles),
-                static_cast<int>(kBf16KBlocks / layout.degree));
+                static_cast<int>(kBf16KBlocks / layout.degree), static_cast<int>(table.rows),
+                static_cast<long long>(table.row_stride));
 }
 
 // MXFP8 operator: two launches.  o_weight_q: float8_e4m3fn [5376, 7168]; o_scale_tiles: uint8
@@ -3713,7 +2970,7 @@ void minimax_h3_out_proj_mxfp8(TensorView attn_out, TensorView o_weight_q, Tenso
   CheckByteBuffer(o_scale_tiles, "o_scale_tiles", kMxfp8OScaleBytes, device);
   TVM_FFI_CHECK(o_scale_tiles.size(0) == kMxfp8OScaleBytes, ValueError)
       << "o_scale_tiles must hold exactly " << kMxfp8OScaleBytes << " bytes";
-  CheckEpilogueTensors(gate, gate_index, residual, out, rows, device);
+  const GateTable table = CheckEpilogueTensors(gate, gate_index, residual, out, rows, device);
   CheckMatrix(workspace_q, "workspace_q", rows, kAttnDim, dl_float8_e4m3fn, "float8_e4m3fn", device, 16);
   CheckByteBuffer(workspace_sf, "workspace_sf", sf_bytes, device);
 
@@ -3738,9 +2995,10 @@ void minimax_h3_out_proj_mxfp8(TensorView attn_out, TensorView o_weight_q, Tenso
                                                kMxfp8SfbBoxTiles, "o_scale_tiles");
   LaunchCluster(kernel_minimax_h3_out_proj_e4m3, GemmGrid(m_tiles), kGemmQuantThreads, kGemmMxfp8Smem, stream, kGemmMxfp8Pdl,
                 "MiniMax-H3 out-proj (mxfp8)", a_map, b_map, sfa_map, sfb_map,
-                static_cast<__nv_bfloat16*>(gate.data_ptr()), static_cast<int*>(gate_index.data_ptr()),
+                static_cast<__nv_bfloat16*>(gate.data_ptr()), static_cast<long long*>(gate_index.data_ptr()),
                 static_cast<__nv_bfloat16*>(residual.data_ptr()), static_cast<__nv_bfloat16*>(out.data_ptr()),
-                static_cast<int>(rows), static_cast<int>(m_tiles));
+                static_cast<int>(rows), static_cast<int>(m_tiles), static_cast<int>(table.rows),
+                static_cast<long long>(table.row_stride));
 }
 
 // NVFP4 operator: two launches.  a_global_scale: float32 [1] activation global scale (FlashInfer
@@ -3763,7 +3021,7 @@ void minimax_h3_out_proj_nvfp4(TensorView attn_out, TensorView a_global_scale, T
   CheckByteBuffer(o_scale_tiles, "o_scale_tiles", kNvfp4OScaleBytes, device);
   TVM_FFI_CHECK(o_scale_tiles.size(0) == kNvfp4OScaleBytes, ValueError)
       << "o_scale_tiles must hold exactly " << kNvfp4OScaleBytes << " bytes";
-  CheckEpilogueTensors(gate, gate_index, residual, out, rows, device);
+  const GateTable table = CheckEpilogueTensors(gate, gate_index, residual, out, rows, device);
   CheckMatrix(workspace_q, "workspace_q", rows, kNvfp4PackedCols, dl_uint8, "uint8", device, 16);
   CheckByteBuffer(workspace_sf, "workspace_sf", sf_bytes, device);
 
@@ -3791,8 +3049,9 @@ void minimax_h3_out_proj_nvfp4(TensorView attn_out, TensorView a_global_scale, T
   LaunchCluster(kernel_minimax_h3_out_proj_e2m1, GemmGrid(m_tiles), kGemmQuantThreads, kGemmNvfp4Smem, stream, kGemmNvfp4Pdl,
                 "MiniMax-H3 out-proj (nvfp4)", a_map, b_map, sfa_map, sfb_map,
                 static_cast<float*>(alpha.data_ptr()), static_cast<__nv_bfloat16*>(gate.data_ptr()),
-                static_cast<int*>(gate_index.data_ptr()), static_cast<__nv_bfloat16*>(residual.data_ptr()),
-                static_cast<__nv_bfloat16*>(out.data_ptr()), static_cast<int>(rows), static_cast<int>(m_tiles));
+                static_cast<long long*>(gate_index.data_ptr()), static_cast<__nv_bfloat16*>(residual.data_ptr()),
+                static_cast<__nv_bfloat16*>(out.data_ptr()), static_cast<int>(rows), static_cast<int>(m_tiles),
+                static_cast<int>(table.rows), static_cast<long long>(table.row_stride));
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(minimax_h3_out_proj, minimax_h3_out_proj);

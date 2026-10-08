@@ -23,6 +23,7 @@ class SplitKernelContext:
     fleet_params: "FleetParams"
     recv_topk_idx: Optional["torch.Tensor"] = None
     recv_topk_weights: Optional["torch.Tensor"] = None
+    recv_count: Optional["torch.Tensor"] = None
 
 
 class SplitKernelBackend(ABC):
