@@ -710,8 +710,17 @@ if CUDNN_AVAILABLE:
             cudnn_v_cache.set_uid(UIDs.V_UID.value)
 
             if block_tables is not None:
-                nd_block_tables = block_tables.reshape(
-                    block_tables.shape[0], 1, block_tables.shape[1], 1
+                # Storage can reserve more pages for later captured replans.
+                # The graph describes only its declared KV range, preserving
+                # the reserved row stride and the original bound pointers.
+                graph_pages = (graph_s_kv + k_cache.shape[2] - 1) // k_cache.shape[2]
+                if block_tables.shape[1] < graph_pages:
+                    raise ValueError(
+                        "block_tables does not cover the declared KV capacity"
+                    )
+                graph_tables = block_tables[:, :graph_pages]
+                nd_block_tables = graph_tables.reshape(
+                    graph_tables.shape[0], 1, graph_tables.shape[1], 1
                 )
                 cudnn_k_block_tables = g.tensor_like(nd_block_tables)
                 cudnn_k_block_tables.set_uid(UIDs.BLOCK_TABLES_K_UID.value)

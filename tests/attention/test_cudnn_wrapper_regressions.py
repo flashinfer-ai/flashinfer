@@ -1376,14 +1376,20 @@ def test_paged_auto_fallback_refreshes_retained_capture(
 @pytest.mark.parametrize(
     "page_capacity,larger_kv,fallback", [(300, 4500, False), (2304, 36000, True)]
 )
+@pytest.mark.parametrize("backend_only", [False, True])
 def test_paged_auto_capture_reserves_initialized_page_capacity(
-    monkeypatch, page_capacity, larger_kv, fallback
+    monkeypatch, page_capacity, larger_kv, fallback, backend_only
 ):
     if (
         not prefill._cudnn_supports_paged_auto()
         or torch.cuda.get_device_capability() != (10, 0)
     ):
         pytest.skip("requires the qualified SM100 paged-auto runtime")
+    # Check backend viability even when default heuristics prefer FROST.
+    if backend_only:
+        monkeypatch.setattr(
+            prefill.cudnn.pygraph, "_candidate_engines", lambda self: []
+        )
     # Select the provider independently of evolving performance heuristics.
     admitted = [True]
     monkeypatch.setattr(
