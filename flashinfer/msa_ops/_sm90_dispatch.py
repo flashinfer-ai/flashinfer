@@ -19,6 +19,10 @@ Cake-served classes:
   program;
 * sparse prefill: GQA groups 4, 8 and 16 with at most 4096 pages per sequence.
 
+Both sparse routes serve bf16 ``q`` only: the Cake programs reject other
+dtypes and the CuTe DSL prefill kernels type their q / out pointers bf16
+without checking, so fp16 raises at the dispatch instead of being misread.
+
 The remaining classes keep the CuTe DSL kernels (proxy-score decode of a bf16
 index cache for Hq outside {1, 2, 4} or with several index heads, top-k
 planner coordinates without a program, sparse prefill of GQA groups 1 / 2 /
@@ -310,8 +314,14 @@ def topk_select_sm90(
         isinstance(num_valid_pages, int) and num_valid_pages == max_score.shape[1]
     ):
         if not isinstance(num_valid_pages, torch.Tensor):
+            # Neither the Cake programs nor the CuTe DSL kernel read a
+            # batch-wide count: both take the per-token (total_q,) int32
+            # tensor at the score load. A scalar equal to the score width is
+            # the unclamped case and is accepted above.
             raise NotImplementedError(
-                "SM90 msa_topk_select takes num_valid_pages as a per-token tensor"
+                "SM90 msa_topk_select takes num_valid_pages as a per-token "
+                f"(total_q,) int32 tensor; got the scalar {num_valid_pages} for "
+                f"{max_score.shape[1]} score columns"
             )
         nvp = _i32(num_valid_pages)
 
@@ -408,10 +418,16 @@ def sparse_decode_sm90(
     (right-aligned causal, the surface's decode semantics) with the caller's
     ``seqlen_q``, which the program checks against ``q``, ``seqused_k`` and
     ``page_table``; the public entry rejects ``causal=False`` and ``q_offset``
-    and validates the paged metadata before reaching this function.
+    and validates the paged metadata before reaching this function.  The
+    program consumes bf16 ``q`` only and SM90 has no other decode schedule,
+    so any other ``q`` dtype raises here.
     """
     from .cake_hopper_sm90 import hopper_msa_sparse_decode_attention
 
+    if q.dtype != torch.bfloat16:
+        raise NotImplementedError(
+            f"SM90 msa_sparse_decode_attention serves bf16 q; got {q.dtype}"
+        )
     _check_packed_kv(k, v)
     hopper_msa_sparse_decode_attention(
         q,
@@ -450,10 +466,17 @@ def sparse_prefill_sm90(
     given, and read K and V through their own strides, so they allocate
     nothing per call (CUDA-graph capturable as is).  Query ``i`` of sequence
     ``b`` attends the keys of its selected blocks at positions
-    ``<= q_offset[b] + i``.
+    ``<= q_offset[b] + i``.  Every SM90 sparse-prefill schedule reads ``q``
+    and writes ``out`` as bf16 -- the Cake programs reject other dtypes and
+    the CuTe DSL kernels type the raw pointers bf16 without checking -- so
+    fp16 raises here, before a route is chosen.
     """
     from .cake_hopper_sm90 import hopper_msa_sparse_attention, prefill_route_available
 
+    if q.dtype != torch.bfloat16:
+        raise NotImplementedError(
+            f"SM90 msa_sparse_attention serves bf16 q; got {q.dtype}"
+        )
     if prefill_route_available(
         num_q_heads=q.shape[1],
         num_kv_heads=k.shape[1],

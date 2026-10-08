@@ -937,6 +937,20 @@ def test_separate_kv_allocations_are_rejected():
 
 
 @sm90_only
+def test_topk_select_scalar_num_valid_pages():
+    """A batch-wide scalar count is served at the full score width only (no
+    clamping, identical to the default); neither SM90 top-k schedule reads a
+    scalar, so a smaller one raises instead of being dropped."""
+    torch.manual_seed(2)
+    hq, tiles, total_q = 2, 48, 37
+    scores = torch.randn(hq, tiles, total_q, dtype=torch.float32, device="cuda")
+    full = msa_topk_select(scores, TOPK, num_valid_pages=tiles)
+    assert torch.equal(full, msa_topk_select(scores, TOPK))
+    with pytest.raises(NotImplementedError, match="per-token"):
+        msa_topk_select(scores, TOPK, num_valid_pages=tiles - 8)
+
+
+@sm90_only
 @pytest.mark.parametrize("topk", [8, 32, 64])
 def test_topk_width_other_than_16_is_rejected(topk):
     scores = torch.randn(4, 64, 32, dtype=torch.float32, device="cuda")
@@ -1005,6 +1019,44 @@ def test_bf16_kv_cache_is_rejected_by_sparse_attention():
             cu_q,
             page_table=page_table,
             seqused_k=seqused_k,
+        )
+
+
+@sm90_only
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 1), (2, 1)])
+def test_fp16_q_is_rejected_by_sm90_sparse_attention(num_qo_heads, num_kv_heads):
+    """Every SM90 sparse-prefill schedule is bf16-only: the programs reject
+    fp16 q and the CuTe DSL kernels (GQA 2 here) would read it as bf16 bytes,
+    so both classes must raise at the dispatch."""
+    q, k, v, idx, cu_q, page_table, seqused_k = _prefill_inputs(
+        num_qo_heads, num_kv_heads, 16, (32, 32), seed=10
+    )
+    with pytest.raises(NotImplementedError, match="bf16 q"):
+        msa_sparse_attention(
+            q.to(torch.float16),
+            k,
+            v,
+            idx,
+            cu_q,
+            causal=True,
+            page_table=page_table,
+            seqused_k=seqused_k,
+        )
+
+
+@sm90_only
+def test_fp16_q_is_rejected_by_sm90_sparse_decode():
+    """The SM90 decode program consumes bf16 q and has no fallback schedule."""
+    q, k, v, idx, page_table, seqused_k = _decode_inputs(seed=11)
+    with pytest.raises(NotImplementedError, match="bf16 q"):
+        msa_sparse_decode_attention(
+            q.to(torch.float16),
+            k,
+            v,
+            idx,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            seqlen_q=1,
         )
 
 
