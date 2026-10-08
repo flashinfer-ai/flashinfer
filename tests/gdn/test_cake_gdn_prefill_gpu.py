@@ -91,6 +91,15 @@ def _caller_qk_l2norm(value):
     return (value_f32 / denominator).to(value.dtype)
 
 
+def _expected_noncp_route_suffix(*, seq_lens, num_q_heads=4, num_v_heads=8, **_):
+    """Mirror select_cake_gdn_prefill_variant's physical-schedule rule for the live arch:
+    DV-split when 2 * num_seqs * num_o_heads fits the arch's active-cluster count."""
+    major, minor = torch.cuda.get_device_capability()
+    arch = cake_gdn.arch_for_compute_capability(major, minor)
+    tiles = 2 * len(seq_lens) * max(num_q_heads, num_v_heads)
+    return ".dvsplit" if tiles <= cake_gdn._ARCH_ACTIVE_CLUSTERS[arch] else ".full_dv"
+
+
 def _make_case(
     *,
     seq_lens,
@@ -590,8 +599,23 @@ def test_public_cake_gdn_prefill_is_cuda_graph_safe():
             ".dvsplit",
         ),
         (
+            # 2 * 3 seqs * 32 heads = 192 tiles: full-DV on SM100a/SM103a (148/160
+            # active clusters), DV-split on SM107 (212) -- the suffix follows the arch.
             {
                 "seq_lens": (128, 192, 64),
+                "indexed": True,
+                "state_dtype": torch.bfloat16,
+                "num_q_heads": 32,
+                "num_k_heads": 32,
+                "num_v_heads": 32,
+            },
+            "upper",
+            "auto",
+        ),
+        (
+            # 2 * 4 seqs * 32 heads = 256 tiles: full-DV on every supported arch.
+            {
+                "seq_lens": (128, 192, 64, 96),
                 "indexed": True,
                 "state_dtype": torch.bfloat16,
                 "num_q_heads": 32,
@@ -617,6 +641,8 @@ def test_public_cake_gdn_prefill_is_cuda_graph_safe():
 def test_public_cake_gdn_prefill_raw_abi_invalid_slot_is_noop(
     kwargs, invalid_value, expected_route_suffix
 ):
+    if expected_route_suffix == "auto":
+        expected_route_suffix = _expected_noncp_route_suffix(**kwargs)
     case = _make_case(**kwargs)
     case["output"].fill_(13.0)
     if case["state_checkpoints"].numel():
