@@ -7,10 +7,15 @@ command on the baseline and candidate checkouts in separate processes:
 
     python benchmarks/bench_cudnn_wrapper_host.py --kind decode --batch 64 --kv 1024 --output decode.json
     python benchmarks/bench_cudnn_wrapper_host.py --kind ragged --batch 16 --q 512 --kv 512 --output ragged.json
+    python benchmarks/bench_cudnn_wrapper_host.py --kind paged --batch 16 --q 128 --kv 8192 --replan --output paged.json
 
 For ragged planning, compare --replan --ragged-indptr gpu against
 --replan --ragged-indptr gpu_with_cpu_mirrors with otherwise identical arguments.
 Both bind the same kind of GPU prefixes; only the host readback differs.
+
+Paged prefill uses pinned CPU prefixes and KV lengths, without caller-supplied
+block tables or length maxima, matching the ordinary vLLM paged plan call.
+Input pinning is outside the measured plan cost.
 
 Each result includes sampled independent math checks and one-ULP CUDA
 graph replay after poisoning the output. Host enqueue excludes synchronization,
@@ -57,7 +62,7 @@ def _source_revision():
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--kind", choices=["decode", "ragged"], required=True)
+    p.add_argument("--kind", choices=["decode", "ragged", "paged"], required=True)
     p.add_argument("--batch", type=int, required=True)
     p.add_argument("--q", type=int, default=1)
     p.add_argument("--kv", type=int, required=True)
@@ -107,6 +112,9 @@ def main():
         if a.ragged_indptr == "gpu_with_cpu_mirrors"
         else {}
     )
+    if a.kind == "paged":
+        qo, indptr, last = qo.pin_memory(), indptr.pin_memory(), last.pin_memory()
+        seq_lens_cpu = torch.full((b,), sk, dtype=torch.int32, pin_memory=True)
     if a.kind == "ragged":
         k_ragged = (
             cache_nhd[tables.long(), 0]
@@ -173,6 +181,24 @@ def main():
                 if sq > 1:
                     kw["q_len_per_req"] = sq
                 plan = lambda: w.plan(indptr, indices, last, h, hk, d, page, **kw)
+            elif a.kind == "paged":
+                w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                    ws, a.layout, backend=backend
+                )
+                plan = lambda: w.plan(
+                    qo,
+                    indptr,
+                    indices,
+                    last,
+                    h,
+                    hk,
+                    d,
+                    page,
+                    causal=True,
+                    q_data_type=q.dtype,
+                    kv_data_type=q.dtype,
+                    seq_lens=seq_lens_cpu,
+                )
             else:
                 w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
                     ws, "NHD", backend=backend
@@ -259,8 +285,11 @@ def main():
                 for _ in range(20):
                     run()
             # Replay correctness is separate from eager, including poisoned output.
-            # Other backends need graph-mode buffers to keep plan addresses alive.
-            row["replan_before_replay"] = a.replan and backend == "cudnn"
+            # The ordinary paged wrapper has no graph-mode prefix buffers;
+            # benchmark its plan-once replay independently of eager replanning.
+            row["replan_before_replay"] = (
+                a.replan and backend == "cudnn" and a.kind != "paged"
+            )
             if row["replan_before_replay"]:
                 plan()
             out.fill_(float("nan"))
