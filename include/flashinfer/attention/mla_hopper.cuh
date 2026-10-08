@@ -540,7 +540,9 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
   for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
     wgmma::op</*init=*/false>(desc_p, desc_ckv, o_frag);
     desc_p += 2;
-    desc_ckv += 1024;
+    // WGMMA consumes 16 KV rows, and descriptor addresses use 16-byte units.
+    // The descriptor step therefore equals the byte size of one value row.
+    desc_ckv += KTraits::HEAD_DIM_CKV * sizeof(KVDescType);
   }
   warpgroup_commit_batch();
   warpgroup_fence_frag<KTraits::NUM_REGS_O_FRAG>(o_frag);

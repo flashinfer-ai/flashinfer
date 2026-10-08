@@ -28,7 +28,7 @@ def _gdn2_prefill_reference(q, k, v, g, beta, w, initial_state, cu_seqlens, scal
     All three gates are per channel: ``g`` and ``beta`` on the key dimension,
     ``w`` on the value dimension. Per token,
 
-        S = diag(g) S
+        S = diag(exp(g)) S
         v_new = w * v - S (beta * k)
         S += v_new (x) k
         o = scale * S q
@@ -46,7 +46,7 @@ def _gdn2_prefill_reference(q, k, v, g, beta, w, initial_state, cu_seqlens, scal
     q_exp = q.float().repeat_interleave(num_sab_heads // num_q_heads, dim=1)
     k_exp = k.float().repeat_interleave(num_sab_heads // num_k_heads, dim=1)
     v_exp = v.float().repeat_interleave(num_sab_heads // num_v_heads, dim=1)
-    g_f32 = g.float()
+    g_f32 = g.float().exp()
     beta_f32 = beta.float()
     w_f32 = w.float()
 

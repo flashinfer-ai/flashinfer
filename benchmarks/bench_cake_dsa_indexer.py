@@ -441,7 +441,12 @@ class CakeArm(Arm):
         super().__init__(inputs)
         dev = inputs.device
         self.workspace_bytes = cake_backend.dsa_indexer_workspace_size(
-            inputs.top_k, dev
+            inputs.num_queries,
+            inputs.num_keys,
+            inputs.num_segments,
+            top_k=inputs.top_k,
+            ratio=inputs.ratio,
+            device=dev,
         )
         self.workspace = torch.empty(
             self.workspace_bytes, dtype=torch.uint8, device=dev
