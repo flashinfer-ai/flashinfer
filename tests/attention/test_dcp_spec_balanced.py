@@ -920,8 +920,10 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
                 )
             continue
         if kind == "fp8_p64_d256":
-            # CAKE-685 unit 90: planner (1) / plan-free static one-wave (2) on the row-tile geometry; the rule needs q_len
-            assert variants["items_lower_bound"] == "batch_size * num_kv_heads * q_tiles"
+            # planner (1) / plan-free static one-wave (2) on the row-tile geometry; the rule needs q_len
+            assert (
+                variants["items_lower_bound"] == "batch_size * num_kv_heads * q_tiles"
+            )
             assert (below, above, static) == (1, 1, 2)
             assert regime == {
                 "page_size": 64,

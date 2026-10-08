@@ -554,7 +554,7 @@ def dcp_balanced_program(
         * int(regime["page_size"])
         // int(regime["chunk_tokens"])
     )
-    # ``max_chunks``: the head_dim-256 family's cost-model window (CAKE-685 unit 90); absent on the D128 family
+    # ``max_chunks``: the head_dim-256 family's cost-model window; absent on the D128 family
     max_chunks = regime.get("max_chunks")
     if (
         n_max >= int(regime["min_chunks"])
