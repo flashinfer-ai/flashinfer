@@ -101,6 +101,48 @@ def _cake_gdn_sentinel(device_index: int, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty(1, dtype=dtype, device=torch.device("cuda", device_index))
 
 
+# Int32 device copies of int64 metadata tensors, keyed exactly like the host-int
+# cache above and under the same immutability contract.  The kernels take int32
+# offsets / slots; converting on every call launched one extra kernel ahead of the
+# main kernel (and exposed the main launch gap in eager mode) for int64 callers.
+_CAKE_GDN_I32_COPIES: collections.OrderedDict[
+    tuple[int, int, Optional[int], int],
+    tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor],
+] = collections.OrderedDict()
+
+
+def _cake_gdn_i32(values: torch.Tensor) -> torch.Tensor:
+    """Return ``values`` as int32, converting an int64 metadata tensor once per tensor.
+
+    Int32 tensors are returned as is.  Int64 metadata is converted on first sight
+    and the copy is reused while the same tensor object (same storage, same version
+    for non-inference tensors) is passed again, mirroring ``_cake_gdn_host_ints``.
+    During CUDA Graph capture a miss converts per call so the cast is recorded in the
+    graph; an eager call before capture populates the cache like the host ints.
+    """
+
+    if values.dtype == torch.int32:
+        return values
+    version = None if values.is_inference() else int(values._version)
+    key = (
+        int(values.device.index or 0),
+        int(values.data_ptr()),
+        version,
+        int(values.numel()),
+    )
+    cached = _CAKE_GDN_I32_COPIES.get(key)
+    if cached is not None and cached[0]() is values:
+        _CAKE_GDN_I32_COPIES.move_to_end(key)
+        return cached[1]
+    converted = values.to(torch.int32)
+    if torch.cuda.is_current_stream_capturing():
+        return converted
+    _CAKE_GDN_I32_COPIES[key] = (weakref.ref(values), converted)
+    while len(_CAKE_GDN_I32_COPIES) > _CAKE_GDN_HOST_INTS_MAX:
+        _CAKE_GDN_I32_COPIES.popitem(last=False)
+    return converted
+
+
 def _cake_gdn_host_ints(values: torch.Tensor, *, purpose: str) -> tuple[int, ...]:
     """Resolve immutable CUDA integer metadata once, outside Graph capture."""
 
@@ -423,15 +465,9 @@ def _run_cake_gdn_prefill(
             grid_x = min(active_clusters, total_tiles)
 
     empty_i32 = _cake_gdn_sentinel(device_index, torch.int32)
-    cu_seqlens_i32 = (
-        cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
-    )
+    cu_seqlens_i32 = _cake_gdn_i32(cu_seqlens)
     state_indices_i32 = (
-        empty_i32
-        if state_indices is None
-        else state_indices
-        if state_indices.dtype == torch.int32
-        else state_indices.to(torch.int32)
+        empty_i32 if state_indices is None else _cake_gdn_i32(state_indices)
     )
     empty_state = _cake_gdn_sentinel(device_index, state_dtype)
     launch_initial_state = initial_state if initial_state is not None else empty_state
@@ -446,9 +482,7 @@ def _run_cake_gdn_prefill(
     cu_checkpoints_i32 = (
         empty_i32
         if checkpoint_every_n_tokens == 0 or checkpoint_cu_starts is None
-        else checkpoint_cu_starts
-        if checkpoint_cu_starts.dtype == torch.int32
-        else checkpoint_cu_starts.to(torch.int32)
+        else _cake_gdn_i32(checkpoint_cu_starts)
     )
     tensormap_workspace = torch.empty(grid_x * 512, dtype=torch.uint8, device=q.device)
     entry(

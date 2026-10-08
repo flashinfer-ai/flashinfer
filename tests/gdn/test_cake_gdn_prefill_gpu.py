@@ -548,6 +548,73 @@ def test_public_cake_gdn_prefill_checkpoint_is_cuda_graph_safe():
 
 
 @torch.inference_mode()
+def test_public_cake_gdn_prefill_int64_metadata_is_converted_once():
+    """Int64 cu_seqlens / state_indices reuse one cached int32 copy across calls.
+
+    The kernels take int32 offsets and slots.  Converting on every call launched an
+    extra kernel ahead of the main kernel for int64 callers; the adapter now keeps
+    one int32 copy per live metadata tensor (same key and immutability contract as
+    the host-int cache) and the int64 path must stay bitwise-identical to int32.
+    """
+    from flashinfer import gdn_prefill as prefill_mod
+
+    case = _make_case(
+        seq_lens=(128, 64),
+        indexed=True,
+        state_dtype=torch.bfloat16,
+        num_q_heads=16,
+        num_k_heads=16,
+        num_v_heads=16,
+        state_pool_padding=0,
+    )
+    initial_state = case["initial_state"].clone()
+    _launch(case)
+    torch.cuda.synchronize()
+    out_i32 = case["output"].clone()
+    state_i32 = case["output_state"].clone()
+
+    cu64 = case["cu_seqlens"].to(torch.int64)
+    slots64 = case["state_indices"].to(torch.int64)
+    case["cu_seqlens"], case["state_indices"] = cu64, slots64
+    case["initial_state"].copy_(initial_state)
+    case["output"].zero_()
+    prefill_mod._CAKE_GDN_I32_COPIES.clear()
+    _launch(case)
+    torch.cuda.synchronize()
+    assert torch.equal(case["output"], out_i32)
+    assert torch.equal(case["output_state"], state_i32)
+    cached = {
+        key: value
+        for key, (ref, value) in prefill_mod._CAKE_GDN_I32_COPIES.items()
+        if ref() is cu64 or ref() is slots64
+    }
+    assert len(cached) == 2, sorted(prefill_mod._CAKE_GDN_I32_COPIES)
+    first_copies = {id(value) for value in cached.values()}
+
+    case["initial_state"].copy_(initial_state)
+    case["output"].zero_()
+    _launch(case)
+    torch.cuda.synchronize()
+    assert torch.equal(case["output"], out_i32)
+    assert torch.equal(case["output_state"], state_i32)
+    again = {
+        id(value)
+        for ref, value in prefill_mod._CAKE_GDN_I32_COPIES.values()
+        if ref() is cu64 or ref() is slots64
+    }
+    assert again == first_copies, "the second int64 call must reuse the cached int32 copies"
+
+    # A fresh int64 tensor (new identity) converts again; the stale entry is not reused.
+    cu64_again = cu64.clone()
+    case["cu_seqlens"] = cu64_again
+    case["initial_state"].copy_(initial_state)
+    case["output"].zero_()
+    _launch(case)
+    torch.cuda.synchronize()
+    assert torch.equal(case["output"], out_i32)
+    assert any(ref() is cu64_again for ref, _ in prefill_mod._CAKE_GDN_I32_COPIES.values())
+
+
 def test_public_cake_gdn_prefill_is_cuda_graph_safe():
     case = _make_case(
         seq_lens=(128,),
