@@ -2103,6 +2103,65 @@ class SM12xNvfp4Bf16Config:
 
 
 @dataclass(frozen=True)
+class SM12xNvfp4Config:
+    """SM120/SM121 CuTe-DSL NVFP4-weight x NVFP4-activation backend.
+
+    The W4A4 peer of :class:`SM12xNvfp4Bf16Config`: it reads the same prepared
+    cuTile NVFP4 weight view in place and quantizes BF16 hidden states to NVFP4
+    inside the op, so one weight copy serves W4A4 and W4A16. Activation global
+    scales are taken from the optional view keys ``"w1_input_global_scale"``
+    and ``"w2_input_global_scale"`` (FP32 scalars, the quantization multiplier
+    ``1 / input_scale``) and default to 1. Requires ``hidden_size % 128 == 0``
+    and ``intermediate_size % 64 == 0``. Supports ``SwiGLU`` with default
+    scalars and ``ReLU2``. Expert parallelism and fused shared experts are not
+    supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w1_global_scale,
+        w2_fp4,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+        device=None,
+    ):
+        """Build the shared cuTile NVFP4 view from checkpoint NVFP4 weights.
+
+        Register it with ``MoEWeightPack.prepare_for("sm12x_nvfp4", ...)``, or
+        reuse a view already registered for ``"cutile_nvfp4"``.
+        """
+        return CuTileNvfp4Config.prepare_weights(
+            w1_fp4,
+            w1_block_scale,
+            w1_global_scale,
+            w2_fp4,
+            w2_block_scale,
+            w2_global_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            source_format=source_format,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "SM12xNvfp4Config()"
+
+
+@dataclass(frozen=True)
 class B12xNvfp4Config:
     """SM120/SM121 CuTe-DSL b12x NVFP4/W4A4 backend."""
 
@@ -2301,6 +2360,7 @@ BackendConfigType = Union[
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
+    SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 ]
@@ -2340,6 +2400,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
+    SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 )
