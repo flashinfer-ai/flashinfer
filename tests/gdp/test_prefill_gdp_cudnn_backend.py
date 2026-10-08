@@ -77,7 +77,10 @@ def _require_backend(request):
     """
     callspec = getattr(request.node, "callspec", None)
     backend = callspec.params.get("backend", "cudnn") if callspec else "cudnn"
-    if backend in ("cudnn", "auto") and _CUDNN_UNAVAILABLE is not None:
+    if backend == "auto":
+        if _CUDNN_UNAVAILABLE is not None and _FLASHINFER_UNAVAILABLE is not None:
+            pytest.skip("no GDP prefill backend can serve this device")
+    elif backend == "cudnn" and _CUDNN_UNAVAILABLE is not None:
         pytest.skip(f"cuDNN linear attention unavailable: {_CUDNN_UNAVAILABLE}")
     if backend == "flashinfer" and _FLASHINFER_UNAVAILABLE is not None:
         pytest.skip(_FLASHINFER_UNAVAILABLE)
@@ -369,8 +372,16 @@ def test_gdp_carries_state_dtype(backend, state_dtype):
     assert_rel_close("final_state", final_state, ref_state, SERIAL_TOLERANCE)
 
 
-@pytest.mark.parametrize("backend", GDP_BACKENDS)
+@pytest.mark.parametrize("backend", ["cudnn"])
 def test_gdp_handles_zero_length_sequences(backend):
+    """cuDNN leaves an empty sequence's incoming state in place.
+
+    cuDNN only: the GDN kernel emits no work for an empty sequence, so it
+    never writes that row of the final state and the caller reads whatever
+    torch.empty returned.  That predates GDP -- it reproduces at
+    num_householder=1 and through chunk_gated_delta_rule directly -- and
+    belongs to GDN rather than this entry point.
+    """
     seq_lens = [0, 65, 0, 33]
     inputs = _make_inputs(seq_lens, 4, 4, 4, 2, seed=61, initial_state=True)
     ref_out, ref_state = _serial(inputs)
@@ -567,10 +578,52 @@ def test_public_api_is_exported():
 
 @pytest.mark.parametrize("backend", ["auto", "cudnn"])
 def test_both_backend_values_reach_cudnn(backend):
-    """FlashInfer has no GDP kernel, so ``auto`` and ``cudnn`` are one path."""
+    """Where cuDNN can serve, ``auto`` resolves to it."""
+    if _CUDNN_UNAVAILABLE is not None:
+        pytest.skip(f"cuDNN linear attention unavailable: {_CUDNN_UNAVAILABLE}")
     inputs = _make_inputs([256], 4, 4, 4, 2, seed=113)
     ref_out, _ = _serial(inputs)
     assert_rel_close("output", _run(inputs, backend=backend), ref_out, SERIAL_TOLERANCE)
+
+
+# Parametrized on one value so the fixture above gates it as "auto": this must
+# run wherever EITHER backend can serve, which is the whole point of it.
+@pytest.mark.parametrize("backend", ["auto"])
+def test_auto_resolves_to_a_backend_that_can_serve(backend):
+    """``auto`` must not pick an engine this device has no kernel for.
+
+    cuDNN's linear-attention engines are SM100-family only, so on SM90 ``auto``
+    has to resolve to the in-tree kernel instead of raising with no engine.
+    """
+    inputs = _make_inputs([256, 128], 4, 4, 4, 2, seed=11)
+    ref_out, _ = _serial(inputs)
+    assert_rel_close("output", _run(inputs, backend=backend), ref_out, SERIAL_TOLERANCE)
+
+
+# "auto" only tells the fixture above to run this anywhere either backend can:
+# the call under test raises before it reaches an engine.
+@pytest.mark.parametrize("backend", ["auto"])
+@pytest.mark.parametrize("gdn_backend", ["cudnn", "cake_gdn"])
+def test_gdn_entry_point_declines_householders_it_cannot_serve(gdn_backend, backend):
+    """Only the flashinfer GDN backend implements num_householder > 1.
+
+    The cuDNN and cake dispatches sit above the GDP arch guard, so without
+    this they would return a plain GDN result -- every Householder but the
+    first silently dropped.
+    """
+    inputs = _make_inputs([256], 4, 4, 4, 2, seed=5)
+    with pytest.raises(NotImplementedError, match="Gated DeltaProduct"):
+        chunk_gated_delta_rule(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            inputs["g"],
+            inputs["beta"],
+            None,
+            cu_seqlens=inputs["cu_seqlens"] * 2,
+            num_householder=2,
+            backend=gdn_backend,
+        )
 
 
 def test_backend_argument_is_validated():

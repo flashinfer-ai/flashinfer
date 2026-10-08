@@ -19,6 +19,7 @@ from typing import Literal, Optional, Tuple, Union
 import torch
 
 from .api_logging import flashinfer_api
+from .utils import get_compute_capability
 from .trace.templates.gdp import gdp_prefill_trace
 
 _CU_SEQLENS_DTYPES = (torch.int32, torch.int64)
@@ -116,9 +117,13 @@ def chunk_gated_delta_product(
         ``"auto"`` (default) and ``"cudnn"`` run cuDNN's fused SM100
         linear-attention engine through
         :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_product`.
-        ``"flashinfer"`` runs the SM100 GDN prefill kernel over the expanded
-        sub-token timeline; it requires ``g`` and ``beta`` in float32, as
-        :func:`flashinfer.gdn_prefill.chunk_gated_delta_rule` does.
+        ``"flashinfer"`` runs the in-tree GDN prefill kernel over the
+        expanded sub-token timeline on SM90 and SM100; it requires ``g`` and
+        ``beta`` in float32, as
+        :func:`flashinfer.gdn_prefill.chunk_gated_delta_rule` does, and does
+        not write the final state of a zero-length sequence.  On SM90, where
+        cuDNN has no linear-attention engine, ``"auto"`` resolves to
+        ``"flashinfer"`` rather than failing.
 
     Returns
     -------
@@ -143,6 +148,11 @@ def chunk_gated_delta_product(
         raise ValueError(
             f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
         )
+
+    if backend == "auto" and get_compute_capability(q.device)[0] == 9:
+        # cuDNN's linear-attention engines are SM100-family only, so on SM90
+        # "auto" would raise with no engine. The in-tree GDN kernel serves it.
+        backend = "flashinfer"
 
     if backend == "flashinfer":
         from .gdn_prefill import chunk_gated_delta_rule
