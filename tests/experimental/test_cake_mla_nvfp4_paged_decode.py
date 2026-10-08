@@ -38,6 +38,9 @@ from flashinfer.experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
     SF_BYTES,
     SUPPORTED_COMPUTE_CAPABILITIES,
     V_DIM,
+    WIDE_BLOCK_M,
+    WIDE_CLUSTER,
+    WIDE_LSE_BIAS,
     CakeMlaNvfp4PagedDecode,
     CakeMlaNvfp4QueryQuantize,
     cake_mla_nvfp4_paged_decode,
@@ -46,6 +49,8 @@ from flashinfer.experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
     plan_mla_nvfp4_paged_decode,
     quantize_mla_nvfp4_query,
     rt_for_rows,
+    use_wide_route,
+    wide_tiles,
     workspace_bytes,
 )
 
@@ -440,7 +445,11 @@ def test_decode_q1(num_heads, kv_lens):
         [1] * len(kv_lens), kv_lens, num_heads, seed=625001, device=device
     )
     out, _, runner = _run(case, dense_q_len=1)
-    assert runner.rt == rt_for_rows(num_heads)[0]
+    assert runner.plan.main_kind == (
+        "main_wide"
+        if use_wide_route(num_heads)
+        else f"main_rt{rt_for_rows(num_heads)[0]}"
+    )
     ref, _ = _reference(case)
     _check(out, ref)
 
@@ -687,7 +696,7 @@ def test_every_kernel_key_resolves_on_the_running_architecture():
         assert set(record) >= {"role", "sources", "arches"}
         # Only the attention programs (hardware QMUL4 through PTX ISA 9.4) carry the toolkit floor.
         assert (record.get("min_cuda_version") == "13.4") == key.startswith("main_")
-    assert {f"main_rt{rt}" for rt in ROW_TILES} <= set(cake_jit.KERNELS)
+    assert {f"main_rt{rt}" for rt in ROW_TILES} | {"main_wide"} <= set(cake_jit.KERNELS)
     assert {"reduce_w1", "reduce_w2", "reduce_w4", "reduce_cta", "quantize"} <= set(
         cake_jit.KERNELS
     )
@@ -730,13 +739,22 @@ def test_plan_invariants(sm_count):
                     max_seq_len=max_seq_len,
                     sm_count=sm_count,
                 )
-                rt, m_tiles = rt_for_rows(max_q_len * num_heads)
+                if use_wide_route(max_q_len * num_heads):
+                    assert plan.wide and plan.main_kind == "main_wide"
+                    rt, m_tiles, ctas = (
+                        WIDE_BLOCK_M,
+                        wide_tiles(max_q_len * num_heads),
+                        WIDE_CLUSTER,
+                    )
+                else:
+                    assert not plan.wide and plan.main_kind == f"main_rt{plan.rt}"
+                    (rt, m_tiles), ctas = rt_for_rows(max_q_len * num_heads), 1
                 assert (plan.rt, plan.m_tiles) == (rt, m_tiles)
                 assert plan.rows_max == batch * max_q_len * num_heads
-                assert plan.grid_main == (plan.num_split, m_tiles, batch)
+                assert plan.grid_main == (ctas * plan.num_split, m_tiles, batch)
                 assert 1 <= plan.num_split <= MAX_SPLITS
-                assert plan.num_split * batch * m_tiles <= max(
-                    sm_count, batch * m_tiles
+                assert ctas * plan.num_split * batch * m_tiles <= max(
+                    sm_count, ctas * batch * m_tiles
                 )
                 if plan.num_split >= 33:
                     assert plan.reduce_kind == "reduce_cta" and plan.grid_reduce == (
@@ -763,7 +781,9 @@ def test_plan_invariants(sm_count):
     ragged = plan_mla_nvfp4_paged_decode(
         batch=3, max_q_len=8, num_heads=12, max_seq_len=4096, sm_count=152, rows=13 * 12
     )
-    assert ragged.rows_max == 156 and ragged.grid_main == (ragged.num_split, 2, 3)
+    # 8 x 12 = 96 rows per request: the wide route, one 128-row cluster per (split, request).
+    assert ragged.wide and ragged.rows_max == 156
+    assert ragged.grid_main == (WIDE_CLUSTER * ragged.num_split, 1, 3)
     with pytest.raises(ValueError, match="rows must be"):
         plan_mla_nvfp4_paged_decode(
             batch=1, max_q_len=1, num_heads=12, max_seq_len=64, sm_count=152, rows=13
@@ -772,3 +792,32 @@ def test_plan_invariants(sm_count):
 
 def test_lse_bias_is_the_e4m3_probability_budget():
     assert pytest.approx(math.log2(448.0) - 5.0) == LSE_BIAS
+    assert WIDE_LSE_BIAS == 6.0
+
+
+def test_wide_route_selection():
+    assert not use_wide_route(48) and use_wide_route(49) and use_wide_route(128)
+    assert (
+        wide_tiles(49) == 1
+        and wide_tiles(128) == 1
+        and wide_tiles(129) == 2
+        and wide_tiles(8 * 48) == 3
+    )
+    plan = plan_mla_nvfp4_paged_decode(
+        batch=8, max_q_len=1, num_heads=96, max_seq_len=342305, sm_count=152
+    )
+    assert (
+        plan.wide
+        and plan.main_kind == "main_wide"
+        and plan.rt == WIDE_BLOCK_M
+        and plan.m_tiles == 1
+    )
+    assert (
+        plan.grid_main == (WIDE_CLUSTER * plan.num_split, 1, 8)
+        and plan.lse_bias == WIDE_LSE_BIAS
+    )
+    assert plan.num_split * WIDE_CLUSTER * 8 <= 152
+    narrow = plan_mla_nvfp4_paged_decode(
+        batch=8, max_q_len=1, num_heads=48, max_seq_len=342305, sm_count=152
+    )
+    assert not narrow.wide and narrow.lse_bias == LSE_BIAS

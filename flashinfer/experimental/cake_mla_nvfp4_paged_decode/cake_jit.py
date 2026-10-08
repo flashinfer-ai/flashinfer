@@ -123,6 +123,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "min_cuda_version": "13.4",
     },
+    "cake_mla_nvfp4_paged_decode_461fdb80f34f6610cafd": {
+        "role": "main",
+        "sources": [
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_461fdb80f34f6610cafd_cu134_kernel.cu",
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_461fdb80f34f6610cafd_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "min_cuda_version": "13.4",
+    },
     "cake_mla_nvfp4_paged_decode_6f1a02023e9c749c14e7": {
         "role": "reduce",
         "sources": [
@@ -186,6 +195,7 @@ KERNELS: dict[str, str] = {
     "main_rt16": "cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161",
     "main_rt32": "cake_mla_nvfp4_paged_decode_19c7a30a6bd596fcdaf0",
     "main_rt48": "cake_mla_nvfp4_paged_decode_a97a6e8c4568efb5162e",
+    "main_wide": "cake_mla_nvfp4_paged_decode_461fdb80f34f6610cafd",
     "quantize": "cake_mla_nvfp4_paged_decode_a9bf6a63f937e7cacaba",
     "reduce_cta": "cake_mla_nvfp4_paged_decode_d0b9705bb5f3deafe9b7",
     "reduce_w1": "cake_mla_nvfp4_paged_decode_b2e4c5513e1d7e5618c0",

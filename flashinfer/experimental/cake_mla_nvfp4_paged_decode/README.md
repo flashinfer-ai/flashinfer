@@ -43,13 +43,19 @@ with the Blackwell `QMUL4` instruction spelled in PTX ISA 9.4
 loader refuses the attention programs below the registered `min_cuda_version`
 rather than falling back to a slower emulation.
 
-The attention program is a swapped-AB tcgen05 schedule: one CTA per (request,
-row tile of 16 / 32 / 48 packed (token, head) rows, KV split) computes
-S^T[128 tokens, rows] with two `kind::mxf4nvf4` block-scaled MMAs (cache block
-scales as the A scale factors, query block scales as the B scale factors) plus
-one `kind::f8f6f4` rope MMA, converts V on chip to E4M3 with a per-token
-power-of-two shift compensated in P, and accumulates O^T on `kind::f8f6f4`. The
-host plan (row tile, split count, grids, reducer) depends only on the batch
+Two attention programs share one contract. Requests with at most 48 packed
+(token, head) rows run the swapped-AB tcgen05 schedule: one CTA per (request,
+row tile of 16 / 32 / 48 rows, KV split) computes S^T[128 tokens, rows] with two
+`kind::mxf4nvf4` block-scaled MMAs (cache block scales as the A scale factors,
+query block scales as the B scale factors) plus one `kind::f8f6f4` rope MMA,
+converts V on chip to E4M3 with a per-token power-of-two shift compensated in
+P, and accumulates O^T on `kind::f8f6f4`. Requests with more rows (H96 / H128,
+MTP with q_len x H > 48) run the two-CTA wide schedule (`main_wide`, a cluster
+of two CTAs with `cta_group::2` MMAs): 128 rows per cluster, both CTAs' tokens
+in every QK (the query as a TMEM A operand), the V conversion shared by the
+pair under a uniform 2^-3 scale shift restored in the output normalisation, and
+an M128 N256 PV. The host plan (route, row tile, split count, grids, reducer)
+depends only on the batch
 shape, the longest KV and the device's SM count; a split-KV merge kernel runs
 behind the attention kernel (programmatic dependent launch) when the plan has
 more than one split. `prepare_cake_mla_nvfp4_paged_decode(...)` returns a

@@ -70,6 +70,11 @@ BOX_TOK = 32  # tokens per TMA box: page sizes are powers of two >= 32
 MAX_SPLITS = 256
 MIN_TILES_PER_SPLIT = 2
 ROW_TILES = (16, 32, 48)  # packed (token, head) rows per CTA
+# Two-CTA wide route (requests with more than WIDE_MIN_ROWS packed rows): 128 rows per cluster of two CTAs.
+WIDE_MIN_ROWS = 48
+WIDE_BLOCK_M = 128
+WIDE_CLUSTER = 2  # CTAs per cluster
+WIDE_LSE_BIAS = 6.0  # the wide kernel's P = 2^6 exp2(s - m) (uniform V shift; no lazy-ratchet slack in the bias)
 REDUCE_WARPS = 8  # warp reducer CTA: 256 threads
 REDUCE_CTA_MIN_SPLITS = 33  # above the warp reducer's lane-per-split range
 REDUCE_DIM_CHUNKS = 4  # CTA reducer: 128 latent dims per CTA
@@ -156,6 +161,15 @@ def rt_for_rows(rows_per_request: int) -> tuple[int, int]:
     return ROW_TILES[-1], m_tiles
 
 
+def use_wide_route(rows_per_request: int) -> bool:
+    """Requests with more packed rows than the largest row tile take the two-CTA wide route."""
+    return rows_per_request > WIDE_MIN_ROWS
+
+
+def wide_tiles(rows_per_request: int) -> int:
+    return (rows_per_request + WIDE_BLOCK_M - 1) // WIDE_BLOCK_M
+
+
 def plan_num_split(items: int, max_seq_len: int, sm_count: int) -> int:
     """One CTA per SM per wave: fill the machine with (work item, split) pairs."""
     target = max(1, sm_count // max(1, items))
@@ -175,18 +189,25 @@ def reduce_warps_per_row(rows: int) -> int:
 class DecodePlan:
     """Launch plan of one batch shape: row tile, split plan, grids and reducer."""
 
-    rt: int
+    rt: int  # rows per CTA (16 / 32 / 48) or per cluster (128, wide route)
     m_tiles: int
     num_split: int
     rows_max: int
-    grid_main: tuple[int, int, int]
+    grid_main: tuple[
+        int, int, int
+    ]  # wide route: 2 * num_split CTAs along x (one cluster per split)
     reduce_kind: str  # "reduce_w4" / "reduce_w2" / "reduce_w1" / "reduce_cta"; unused when num_split == 1
     reduce_warps: int  # 0 for the CTA reducer
     grid_reduce: tuple[int, int, int]
+    wide: bool = False
 
     @property
     def main_kind(self) -> str:
-        return f"main_rt{self.rt}"
+        return "main_wide" if self.wide else f"main_rt{self.rt}"
+
+    @property
+    def lse_bias(self) -> float:
+        return WIDE_LSE_BIAS if self.wide else LSE_BIAS
 
 
 @functools.lru_cache(maxsize=1024)
@@ -212,12 +233,18 @@ def plan_mla_nvfp4_paged_decode(
         raise ValueError(
             f"rows must be in [1, batch * max_q_len * num_heads = {batch * max_q_len * num_heads}], got {rows_max}"
         )
-    rt, m_tiles = rt_for_rows(max_q_len * num_heads)
+    wide = use_wide_route(max_q_len * num_heads)
+    if wide:
+        rt, m_tiles = WIDE_BLOCK_M, wide_tiles(max_q_len * num_heads)
+        ctas_per_item = WIDE_CLUSTER
+    else:
+        rt, m_tiles = rt_for_rows(max_q_len * num_heads)
+        ctas_per_item = 1
     items = batch * m_tiles
     splits = (
         int(num_split)
         if num_split
-        else plan_num_split(items, int(max_seq_len), sm_count)
+        else plan_num_split(items, int(max_seq_len), sm_count // ctas_per_item)
     )
     if not 1 <= splits <= MAX_SPLITS:
         raise ValueError(f"num_split must be in [1, {MAX_SPLITS}], got {splits}")
@@ -234,10 +261,11 @@ def plan_mla_nvfp4_paged_decode(
         m_tiles=m_tiles,
         num_split=splits,
         rows_max=rows_max,
-        grid_main=(splits, m_tiles, batch),
+        grid_main=(ctas_per_item * splits, m_tiles, batch),
         reduce_kind=reduce_kind,
         reduce_warps=reduce_warps,
         grid_reduce=grid_reduce,
+        wide=wide,
     )
 
 
@@ -765,7 +793,7 @@ class CakeMlaNvfp4PagedDecode:
                 num_heads=self.num_heads,
                 num_split=plan.num_split,
                 bmm2_scale=self.bmm2_scale,
-                lse_bias=LSE_BIAS,
+                lse_bias=plan.lse_bias,
                 has_lse=has_lse,
                 grid=plan.grid_reduce,
             )
@@ -881,6 +909,10 @@ __all__ = [
     "ROPE",
     "ROW_TILES",
     "SF_BYTES",
+    "WIDE_BLOCK_M",
+    "WIDE_CLUSTER",
+    "WIDE_LSE_BIAS",
+    "WIDE_MIN_ROWS",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "V_DIM",
     "cake_mla_nvfp4_paged_decode",
@@ -892,5 +924,7 @@ __all__ = [
     "query_scale_constants",
     "reduce_warps_per_row",
     "rt_for_rows",
+    "use_wide_route",
+    "wide_tiles",
     "workspace_bytes",
 ]
