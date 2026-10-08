@@ -68,4 +68,6 @@ def test_expert_weight_gradients_keep_the_row_tail(rows):
     for name, got, want in zip(("gate", "up", "down"), actual, expected, strict=True):
         error = float((got.double() - want).norm() / want.norm())
         assert want.norm() > 0
-        assert error <= 1e-2, f"{name} weight gradient lost the {tail}-row tail: rel {error:.3e}"
+        assert error <= 1e-2, (
+            f"{name} weight gradient lost the {tail}-row tail: rel {error:.3e}"
+        )
