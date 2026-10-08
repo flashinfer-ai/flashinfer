@@ -1024,9 +1024,12 @@ def sampling_from_logits(
         RNG streams depend only on those values, not on the output row index.
         Moving a request's distribution and RNG values together preserves its draw
         for the same sampling operation, including when sampled alone. Identical
-        seed/offset pairs use the same random stream; use distinct pairs for
-        independent requests. Scalar and length-one-only inputs retain the shared
-        RNG behavior, whose Philox subsequence includes the output row index.
+        seed/offset pairs use the same random stream. Use request-specific seeds
+        for separate request streams. Offset selects a position within a stream;
+        different offsets with the same seed do not guarantee non-overlapping
+        draws, especially when sampling consumes multiple draws. Scalar and
+        length-one-only inputs retain the shared RNG behavior, whose Philox
+        subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1118,9 +1121,12 @@ def sampling_from_probs(
         RNG streams depend only on those values, not on the output row index.
         Moving a request's distribution and RNG values together preserves its draw
         for the same sampling operation, including when sampled alone. Identical
-        seed/offset pairs use the same random stream; use distinct pairs for
-        independent requests. Scalar and length-one-only inputs retain the shared
-        RNG behavior, whose Philox subsequence includes the output row index.
+        seed/offset pairs use the same random stream. Use request-specific seeds
+        for separate request streams. Offset selects a position within a stream;
+        different offsets with the same seed do not guarantee non-overlapping
+        draws, especially when sampling consumes multiple draws. Scalar and
+        length-one-only inputs retain the shared RNG behavior, whose Philox
+        subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1243,9 +1249,12 @@ def top_p_sampling_from_probs(
         RNG streams depend only on those values, not on the output row index.
         Moving a request's distribution and RNG values together preserves its draw
         for the same sampling operation, including when sampled alone. Identical
-        seed/offset pairs use the same random stream; use distinct pairs for
-        independent requests. Scalar and length-one-only inputs retain the shared
-        RNG behavior, whose Philox subsequence includes the output row index.
+        seed/offset pairs use the same random stream. Use request-specific seeds
+        for separate request streams. Offset selects a position within a stream;
+        different offsets with the same seed do not guarantee non-overlapping
+        draws, especially when sampling consumes multiple draws. Scalar and
+        length-one-only inputs retain the shared RNG behavior, whose Philox
+        subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1377,9 +1386,12 @@ def top_k_sampling_from_probs(
         RNG streams depend only on those values, not on the output row index.
         Moving a request's distribution and RNG values together preserves its draw
         for the same sampling operation, including when sampled alone. Identical
-        seed/offset pairs use the same random stream; use distinct pairs for
-        independent requests. Scalar and length-one-only inputs retain the shared
-        RNG behavior, whose Philox subsequence includes the output row index.
+        seed/offset pairs use the same random stream. Use request-specific seeds
+        for separate request streams. Offset selects a position within a stream;
+        different offsets with the same seed do not guarantee non-overlapping
+        draws, especially when sampling consumes multiple draws. Scalar and
+        length-one-only inputs retain the shared RNG behavior, whose Philox
+        subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1512,9 +1524,12 @@ def min_p_sampling_from_probs(
         RNG streams depend only on those values, not on the output row index.
         Moving a request's distribution and RNG values together preserves its draw
         for the same sampling operation, including when sampled alone. Identical
-        seed/offset pairs use the same random stream; use distinct pairs for
-        independent requests. Scalar and length-one-only inputs retain the shared
-        RNG behavior, whose Philox subsequence includes the output row index.
+        seed/offset pairs use the same random stream. Use request-specific seeds
+        for separate request streams. Offset selects a position within a stream;
+        different offsets with the same seed do not guarantee non-overlapping
+        draws, especially when sampling consumes multiple draws. Scalar and
+        length-one-only inputs retain the shared RNG behavior, whose Philox
+        subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1740,9 +1755,12 @@ def top_k_top_p_sampling_from_logits(
         RNG streams depend only on those values, not on the output row index.
         Moving a request's distribution and RNG values together preserves its draw
         for the same sampling operation, including when sampled alone. Identical
-        seed/offset pairs use the same random stream; use distinct pairs for
-        independent requests. Scalar and length-one-only inputs retain the shared
-        RNG behavior, whose Philox subsequence includes the output row index.
+        seed/offset pairs use the same random stream. Use request-specific seeds
+        for separate request streams. Offset selects a position within a stream;
+        different offsets with the same seed do not guarantee non-overlapping
+        draws, especially when sampling consumes multiple draws. Scalar and
+        length-one-only inputs retain the shared RNG behavior, whose Philox
+        subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1913,9 +1931,12 @@ def top_k_top_p_sampling_from_probs(
         RNG streams depend only on those values, not on the output row index.
         Moving a request's distribution and RNG values together preserves its draw
         for the same sampling operation, including when sampled alone. Identical
-        seed/offset pairs use the same random stream; use distinct pairs for
-        independent requests. Scalar and length-one-only inputs retain the shared
-        RNG behavior, whose Philox subsequence includes the output row index.
+        seed/offset pairs use the same random stream. Use request-specific seeds
+        for separate request streams. Offset selects a position within a stream;
+        different offsets with the same seed do not guarantee non-overlapping
+        draws, especially when sampling consumes multiple draws. Scalar and
+        length-one-only inputs retain the shared RNG behavior, whose Philox
+        subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -2331,9 +2352,12 @@ def chain_speculative_sampling(
         RNG streams depend only on those values, not on the output row index.
         Moving a request's distribution and RNG values together preserves its draw
         for the same sampling operation, including when sampled alone. Identical
-        seed/offset pairs use the same random stream; use distinct pairs for
-        independent requests. Scalar and length-one-only inputs retain the shared
-        RNG behavior, whose Philox subsequence includes the output row index.
+        seed/offset pairs use the same random stream. Use request-specific seeds
+        for separate request streams. Offset selects a position within a stream;
+        different offsets with the same seed do not guarantee non-overlapping
+        draws, especially when sampling consumes multiple draws. Scalar and
+        length-one-only inputs retain the shared RNG behavior, whose Philox
+        subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
