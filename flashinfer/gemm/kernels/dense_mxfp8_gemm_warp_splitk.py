@@ -63,13 +63,11 @@ from .dense_bf16_gemm_warp_splitk import (
 
 # One K block per MMA step: m16n8k32 in E4M3, run as two FP16 m16n8k16.
 _MMA_SHAPE = (16, 8, 32)
-# Above 16 tokens every extra token tile re-reads the weight and the tcgen05
-# kernels win (B300: M=32 is 1.5-2.5x slower than the tcgen05 default).
+# Above 16 tokens every extra token tile re-reads the weight.
 _MAX_M = 16
 _SUPPORTED_TOKEN_TILES = (8, 16)
-# Longest K served. Splitting K only inside a CTA cannot add CTAs, so the gain over
-# the tcgen05 kernels (cluster split-K included) shrinks as K grows. Autotuned on
-# B300 at M <= 8: 1.36x for K <= 2048, 1.15x for K 3072-5120, level at K >= 6144.
+# Longest K served: splitting K only inside a CTA cannot add CTAs, so long K is
+# left to the cluster split-K kernel.
 _MAX_K = 5120
 _SF_VEC_SIZE = 32
 # One 4-byte scale word covers four K blocks (the inner dimension of the 128x4
@@ -80,8 +78,7 @@ _SF_WORD_K = 4 * _SF_VEC_SIZE
 _SUPPORTED_K_TILES = (256, 512)
 _OUT_DTYPES = (_torch.bfloat16, _torch.float16)
 # Bytes of A+B tiles a CTA keeps in flight (stages * (output_tile + token_tile) *
-# k_tile). Measured on B300 (N=4608, K=6144, M<=16): ~48 KB is fastest, 24 KB
-# under-covers the DRAM latency, and 96 KB or more is slower again.
+# k_tile): enough to cover DRAM latency without an over-deep ring.
 _TARGET_RING_BYTES = 48 * 1024
 _MIN_RING_BYTES = 32 * 1024
 _MAX_RING_BYTES = 128 * 1024
@@ -261,7 +258,7 @@ def _ring_bytes(output_tile: int, token_tile: int, k_tile: int, stages: int) -> 
 def _pruned_stages(
     legal: tuple[int, ...], output_tile: int, token_tile: int, k_tile: int
 ) -> tuple[int, ...]:
-    """Autotune ring depths: powers of two whose ring holds 32-128 KB in flight.
+    """Autotune ring depths: powers of two (> 2) holding 32-128 KB in flight.
 
     Every stage count is a separate compilation, and shallow or very deep rings
     are measurably slower, so they only add compile time and room for tuner
@@ -273,7 +270,8 @@ def _pruned_stages(
     keep = {
         stages
         for stages in legal
-        if stages & (stages - 1) == 0
+        if stages > 2
+        and stages & (stages - 1) == 0
         and _MIN_RING_BYTES
         <= _ring_bytes(output_tile, token_tile, k_tile, stages)
         <= _MAX_RING_BYTES
@@ -422,8 +420,7 @@ def default_tactic(m: int, n: int, k: int) -> MxFp8WarpSplitKTactic:
         )
         <= _SM_SMEM_BYTES
     )
-    # The ring closest to the measured sweet spot (deeper on ties); a deeper ring
-    # than ~96 KB costs more than it hides.
+    # The ring closest to _TARGET_RING_BYTES (deeper on ties).
     stages = min(
         resident_stages or legal_stages,
         key=lambda stages: (
@@ -446,7 +443,7 @@ def autotune_tactics(m: int, n: int, k: int) -> list[MxFp8WarpSplitKTactic]:
         return []
     tactics: list[MxFp8WarpSplitKTactic] = []
     for output_tile in _SUPPORTED_OUTPUT_TILES:
-        if n % output_tile:
+        if n % output_tile or (output_tile == 32 and k > 3072):
             continue
         for token_tile in _SUPPORTED_TOKEN_TILES:
             for k_tile in _SUPPORTED_K_TILES:
