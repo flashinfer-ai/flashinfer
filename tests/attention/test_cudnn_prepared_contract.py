@@ -80,6 +80,21 @@ def test_bounded_ragged_requires_matching_native_feature(
     try:
         assert prefill._cudnn_supports_bounded_ragged() is mla
         assert prefill._cudnn_supports_bounded_ragged(d128=True) is d128
+        monkeypatch.setattr(
+            prefill, "_cudnn_supports_direct_seqlens", lambda *a, **kw: True
+        )
+        indptr = torch.tensor([0, 16], dtype=torch.int32)
+        for head_dim, supported in ((192, mla), (128, d128)):
+            metadata = prefill._PrefillMetadata(
+                16,
+                2048,
+                True,
+                False,
+                batch_offsets_q=indptr,
+                batch_offsets_k=indptr,
+                max_total_num_rows=64,
+            ).resolve_from_plan(torch.bfloat16, 8, 8, head_dim, 128)
+            assert metadata.max_total_num_rows == (64 if supported else None)
     finally:
         prefill._cudnn_supports_bounded_ragged.cache_clear()
 

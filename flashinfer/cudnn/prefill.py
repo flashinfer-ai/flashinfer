@@ -1051,7 +1051,7 @@ class _PrefillMetadata:
             self.max_total_num_rows > 0
             and direct
             and q_dtype in (torch.float16, torch.bfloat16)
-            and _cudnn_supports_bounded_ragged()
+            and _cudnn_supports_bounded_ragged(d128=head_dim_qk == 128)
         ):
             self.max_total_num_rows = None
         if direct:
