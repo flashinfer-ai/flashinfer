@@ -20,7 +20,7 @@
 #pragma once
 
 __device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
+  if (token == 0) {
+    mbarrier_wait(mbar_addr, phase);
+  }
 }

@@ -20,8 +20,8 @@
 #pragma once
 
 __device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
-    MmaSmemDesc tmp;
-    tmp.u64 = smem_desc;
-    tmp.u32[0] += offset;
-    smem_desc = tmp.u64;
+  MmaSmemDesc tmp;
+  tmp.u64 = smem_desc;
+  tmp.u32[0] += offset;
+  smem_desc = tmp.u64;
 }

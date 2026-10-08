@@ -20,26 +20,32 @@
 // includes (cooperative groups) stay in the kernels that use them.
 #pragma once
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
+typedef signed char int8_t;
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
 #if defined(__CUDACC_RTC__)
 typedef unsigned long long uint64_t;
 #else
-typedef unsigned long      uint64_t;
+typedef unsigned long uint64_t;
 #endif
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
+typedef signed int int32_t;
+typedef short int int16_t;
 template <typename T, int Capacity = 8>
-struct __align__(16) CakePeerPointerTable { T* ptrs[Capacity]; };
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+struct __align__(16) CakePeerPointerTable {
+  T* ptrs[Capacity];
+};
+struct __align__(64) CakeTensorMap64 {
+  uint64_t opaque[16];
+};
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 
 #if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+typedef struct __align__(128) {
+  uint64_t opaque[16];
+} CUtensorMap;
 #else
 #include <cuda.h>
 #endif
@@ -47,8 +53,8 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-
 #include <math_constants.h>
+
 #include "cake_device_helpers/cake_elect_sync_1ee8cd91025d8932.cuh"
 #include "cake_device_helpers/cake_mbarrier_init_15e581aef85ee586.cuh"
 #include "cake_device_helpers/cake_mbarrier_try_wait_ff90a180b11cb94a.cuh"
@@ -56,13 +62,13 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include "cake_device_helpers/cake_mbarrier_wait_token_ab979b5719cba616.cuh"
 #include "cake_device_helpers/cake_tcgen05_mma_f16_03fde8c1cbf058c8.cuh"
 union MmaSmemDesc {
-    uint64_t u64;
-    uint32_t u32[2];
+  uint64_t u64;
+  uint32_t u32[2];
 };
-#include "cake_device_helpers/cake_incr_smem_desc_lo_4429b045244f74bc.cuh"
 #include "cake_device_helpers/cake_elect_commit_8131fdc67daf4d23.cuh"
+#include "cake_device_helpers/cake_incr_smem_desc_lo_4429b045244f74bc.cuh"
+#include "cake_device_helpers/cake_make_warp_uniform_26e432f3ff129648.cuh"
 #include "cake_device_helpers/cake_mbarrier_arrive_71ef360c3ac78eb7.cuh"
 #include "cake_device_helpers/cake_mbarrier_arrive_expect_tx_54ce59d489f69526.cuh"
 #include "cake_device_helpers/cake_tma_3d_gmem2smem_7df1e07811f83fc6.cuh"
 #include "cake_device_helpers/cake_tmem_ld_x8_38cb8e5e57da80f2.cuh"
-#include "cake_device_helpers/cake_make_warp_uniform_26e432f3ff129648.cuh"

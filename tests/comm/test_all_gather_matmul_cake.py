@@ -571,7 +571,10 @@ def _published_workspace(push_buffers):
     """A workspace one generation old, as ``_publish_scratch`` finds it at a growth (CPU stand-ins)."""
 
     workspace = backend._Workspace(
-        dtype=torch.bfloat16, rank=0, world_size=2, device_index=0
+        dtype=torch.bfloat16,
+        rank=0,
+        world_size=2,
+        device_index=0,
     )
     workspace.pitch = 512
     workspace.scratch = torch.empty(2, 512, 8, dtype=torch.bfloat16)

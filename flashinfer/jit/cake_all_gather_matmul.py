@@ -574,16 +574,19 @@ def chunk_plan(rows: int) -> tuple[int, int, int]:
 
 
 def main_grid(
-    rows: int, n: int, *, world_size: int, sm_count: int
+    rows: int,
+    n: int,
+    *,
+    world_size: int,
+    sm_count: int,
 ) -> tuple[int, int, int]:
     """Launch grid of the persistent main kernel: one CTA per SM, bounded by the
     total output tile count (``world_size * ceil128(rows) / 128 * N / 256``), each
     CTA striding over the arrival-ordered tile list."""
 
     if int(world_size) <= 0 or int(sm_count) <= 0:
-        raise ValueError(
-            "the persistent main grid needs a positive world_size and sm_count"
-        )
+        message = "the persistent main grid needs a positive world_size and sm_count"
+        raise ValueError(message)
     total_tiles = int(world_size) * (padded_rows(rows) // BLOCK_M) * (int(n) // BLOCK_N)
     return (max(1, min(total_tiles, int(sm_count))), 1, 1)
 
@@ -601,11 +604,9 @@ def uses_sm_push(*, rows: int, world_size: int, cols: int) -> bool:
     the SM push; the copy engine wins in both cases)."""
 
     padded = padded_rows(rows)
-    return (
-        int(world_size) >= 4
-        and padded <= SM_PUSH_MAX_ROWS
-        and int(cols) <= sm_push_max_cols(padded)
-    )
+    if int(world_size) < 4 or padded > SM_PUSH_MAX_ROWS:
+        return False
+    return int(cols) <= sm_push_max_cols(padded)
 
 
 def weight_layout(w: torch.Tensor) -> str:

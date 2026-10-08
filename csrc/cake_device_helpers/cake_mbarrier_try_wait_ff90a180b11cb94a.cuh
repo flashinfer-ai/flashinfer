@@ -20,15 +20,16 @@
 #pragma once
 
 __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
+  uint32_t token;
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+      " P1, [%1], %2;\n\t"
+      "selp.u32 %0, 1, 0, P1;\n\t"
+      "}\n"
+      : "=r"(token)
+      : "r"(mbar_addr), "r"(phase)
+      : "memory");
+  return token;
 }

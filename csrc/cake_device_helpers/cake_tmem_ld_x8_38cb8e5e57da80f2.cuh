@@ -20,10 +20,10 @@
 #pragma once
 
 __device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x8.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]),
-          "=f"(dst[4]), "=f"(dst[5]), "=f"(dst[6]), "=f"(dst[7])
-        : "r"(tmem_addr));
+  asm volatile(
+      "tcgen05.ld.sync.aligned.32x32b.x8.b32"
+      " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+      : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]), "=f"(dst[4]), "=f"(dst[5]),
+        "=f"(dst[6]), "=f"(dst[7])
+      : "r"(tmem_addr));
 }

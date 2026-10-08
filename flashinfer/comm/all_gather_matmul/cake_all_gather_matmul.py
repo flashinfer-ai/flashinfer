@@ -749,7 +749,9 @@ def _launch(
             )
         capturing = bool(torch.cuda.is_current_stream_capturing())
         sm_push = loader.uses_sm_push(
-            rows=rows, world_size=call.world_size, cols=call.n
+            rows=rows,
+            world_size=call.world_size,
+            cols=call.n,
         )
         if capturing and sm_push and workspace.push_buffers is None:
             # A caller error, not a failed collective: nothing was submitted.
