@@ -96,6 +96,19 @@ FlashInfer provides optional pre-compiled packages for users who want faster ini
 
 **For development, you typically DON'T need these.** JIT compilation is fast enough and gives you live code reload.
 
+## cuDNN linear attention
+
+Use `nvidia-cudnn-frontend>=1.31.0`; KDA and GDN normalization use additive
+`1e-6` without an epsilon argument. Auto selection also requires CuTe DSL 4.7+.
+The bounded SM100 policies live in `kda.py` and `gdn_prefill.py`. Validate both
+output and final state before changing a policy. Explicit state-pool calls
+require unique, in-range slots; auto keeps pools on their native route.
+
+Use `benchmarks/bench_cudnn_linear_attention.py` for public-call comparisons.
+Its raw-gate GDN baseline includes Torch gate transforms; it is not a vLLM
+fused-producer baseline. Keep host CPU, completed wall and reset-inclusive
+CUDA graph times separate.
+
 ## Testing
 
 Run the regular test suite:

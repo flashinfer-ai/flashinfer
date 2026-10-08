@@ -691,7 +691,7 @@ def cudnn_chunk_gated_delta_rule(
 
     Argument meanings match :func:`flashinfer.chunk_gated_delta_rule`.
 
-    Requires cudnn-frontend 1.29+ with the ``cutedsl`` extra. Everything else
+    Requires cudnn-frontend 1.31.0+ with the ``cutedsl`` extra. Everything else
     the engine decides for itself: it declines a graph it cannot serve (the
     per-engine reason lands in the frontend's log).
 
@@ -728,8 +728,7 @@ def cudnn_chunk_gated_delta_rule(
         ``[num_seqs + 1]`` int32 or int64. Required.
     use_qk_l2norm_in_kernel : bool
         Normalize Q/K with additive epsilon ``1e-6`` and round to the input
-        dtype, matching the public GDN API. This currently runs a separate
-        normalization kernel because FE GDN uses a different epsilon convention.
+        dtype inside the frontend, matching the public GDN API.
     output : torch.Tensor, optional
         Pre-allocated ``[total_seq_len, num_o_heads, 128]``, written in place
         by the kernel.
@@ -805,12 +804,6 @@ def cudnn_chunk_gated_delta_rule(
             v_dim,
             q.device,
         )
-    if use_qk_l2norm_in_kernel:
-        from ..gdn_kernels.qk_l2norm import normalize_qk
-
-        q, k = normalize_qk(q, k)
-        use_qk_l2norm_in_kernel = False
-
     g_in = (
         torch.zeros(total, num_sab_heads, dtype=torch.float32, device=q.device)
         if g is None and gate_domain == "log"
@@ -894,7 +887,7 @@ def cudnn_chunk_gated_delta_product(
     updates and the readout following the last one. ``num_householder == 1``
     is exactly :func:`cudnn_chunk_gated_delta_rule`.
 
-    Requires cudnn-frontend 1.29+ with the ``cutedsl`` extra. Everything else
+    Requires cudnn-frontend 1.31.0+ with the ``cutedsl`` extra. Everything else
     the engine decides for itself: it declines a graph it cannot serve (the
     per-engine reason lands in the frontend's log).
 
@@ -1065,7 +1058,7 @@ def cudnn_chunk_gated_delta_rule2(
         S_t &\mathrel{+}= k_t \otimes v^{new}_t \\
         o_t &= \mathrm{scale} \cdot q_t^\top S_t
 
-    Requires cudnn-frontend 1.29+ with the ``cutedsl`` extra. Everything else
+    Requires cudnn-frontend 1.31.0+ with the ``cutedsl`` extra. Everything else
     the engine decides for itself.
 
     Parameters
@@ -1230,7 +1223,7 @@ def cudnn_recurrent_kda(
     ordinary multi-token prefill subset: no speculative decode,
     no ``initial_state_source``, no state checkpoints.
 
-    Requires cudnn-frontend 1.29+ with the ``cutedsl`` extra. Everything else
+    Requires cudnn-frontend 1.31.0+ with the ``cutedsl`` extra. Everything else
     the engine decides for itself.
 
     Parameters

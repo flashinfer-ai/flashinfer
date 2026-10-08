@@ -710,7 +710,19 @@ def test_cudnn_backend_rejects_state_checkpoints():
 
 
 @pytest.mark.parametrize("direct", [False, True])
-def test_cudnn_gdn_normalizes_zero_and_tiny_vectors_with_additive_epsilon(direct):
+def test_cudnn_gdn_normalizes_zero_and_tiny_vectors_with_additive_epsilon(
+    direct, monkeypatch
+):
+    from flashinfer.cudnn import linear_attention
+
+    run = linear_attention._run_la_graph
+    seen = []
+
+    def observe(*args, **kwargs):
+        seen.append((args[1], args[2], kwargs["use_qk_l2norm"]))
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(linear_attention, "_run_la_graph", observe)
     inputs = _make_inputs([65], 8, 8, 8, seed=23, normalize=False, norm_scale=1e-4)
     inputs["q"][:16].zero_()
     inputs["k"][:16].zero_()
@@ -737,6 +749,10 @@ def test_cudnn_gdn_normalizes_zero_and_tiny_vectors_with_additive_epsilon(direct
             use_qk_l2norm_in_kernel=True,
             output_final_state=True,
         )
+    assert len(seen) == 1
+    assert seen[0][0] is inputs["q"]
+    assert seen[0][1] is inputs["k"]
+    assert seen[0][2] is True
     expected_out, expected_state = _serial(normalized)
     assert_rel_close(
         "additive normalization output", actual_out, expected_out, SERIAL_TOLERANCE

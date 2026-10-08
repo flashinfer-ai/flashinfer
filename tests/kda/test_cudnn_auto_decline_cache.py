@@ -81,7 +81,7 @@ def test_distinct_descriptor_or_runtime_retries(monkeypatch, change):
     q = torch.empty(2, 3)
     options = dict(
         scale=1.0,
-        additive_epsilon=1e-6,
+        use_qk_l2norm_in_kernel=True,
         gate_domain="log",
         output=None,
         initial_state=None,
@@ -102,7 +102,7 @@ def test_distinct_descriptor_or_runtime_retries(monkeypatch, change):
     elif change == "scale":
         options["scale"] = 0.5
     elif change == "normalization":
-        options["additive_epsilon"] = None
+        options["use_qk_l2norm_in_kernel"] = False
     elif change == "gate":
         options["gate_domain"] = "linear"
     elif change == "output":

@@ -303,7 +303,7 @@ def test_auto_fallback_signal_is_limited_to_plan_build(monkeypatch):
     q, g = torch.ones(2, 1, 4), torch.ones(2, 1)
     cu = torch.tensor([0, 2], dtype=torch.int32)
 
-    def run(epsilon=None):
+    def run():
         return adapter._run_la_graph(
             "gdn",
             q,
@@ -319,7 +319,6 @@ def test_auto_fallback_signal_is_limited_to_plan_build(monkeypatch):
             safe_gate=False,
             gate_lower_bound=None,
             batch_invariant=False,
-            qk_l2norm_additive_epsilon=epsilon,
         )
 
     for error_type in (NotImplementedError, adapter.cudnn.cudnnGraphNotSupportedError):
@@ -335,17 +334,13 @@ def test_auto_fallback_signal_is_limited_to_plan_build(monkeypatch):
         assert type(caught.value) is error_type
         assert caught.value._fi_la_build_unsupported
 
-    def old_builder(*args, **kwargs):
-        raise TypeError("got unexpected arguments ['qk_l2norm_additive_epsilon']")
+    def invalid_builder(*args, **kwargs):
+        raise TypeError("invalid tensor descriptor")
 
-    monkeypatch.setattr(adapter, "_build_la_graph", old_builder)
-    with pytest.raises(TypeError) as attribute:
-        run(epsilon=1e-6)
-    assert type(attribute.value) is TypeError
-    assert attribute.value._fi_la_build_unsupported
-    with pytest.raises(TypeError) as unrelated:
+    monkeypatch.setattr(adapter, "_build_la_graph", invalid_builder)
+    with pytest.raises(TypeError, match="invalid tensor descriptor") as caught:
         run()
-    assert not getattr(unrelated.value, "_fi_la_build_unsupported", False)
+    assert not getattr(caught.value, "_fi_la_build_unsupported", False)
 
     def failed_execute(*args, **kwargs):
         raise NotImplementedError("execution failed")

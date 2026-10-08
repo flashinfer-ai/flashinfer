@@ -14,12 +14,10 @@ reset/synchronization. Each captured invocation includes the same state reset;
 the replay span includes reset, copies, kernels and gaps, not just kernel time.
 Caller-owned outputs/state and retained capture workspaces are used throughout.
 
-KDA's existing auto routes use different normalization formulas. Zero/tiny rows
-disambiguate additive 1e-6 versus clamp 1e-24 against an independent FP32 serial
-reference. Explicit cuDNN uses the formula actually observed on stock auto;
-other explicit backends report their own formula and comparability. GDN uses
-pre-normalized Q/K by default; --gdn-normalize measures the public additive
-normalization path on every backend, including any provider-owned conversion.
+KDA uses additive 1e-6 normalization on every backend. Zero/tiny rows check
+this against an independent FP32 serial reference. GDN uses pre-normalized
+Q/K by default; --gdn-normalize measures additive normalization, including
+any provider-owned conversion.
 These are adapter measurements, not serving TTFT or full-model accuracy.
 The native-auto arm disables only the cuDNN preference outside each
 timed block, keeping the public callable and original native selection intact.
@@ -185,14 +183,7 @@ def serial_reference(args, data, norm):
 
         def normalize(tensor):
             square = tensor.square().sum(-1, keepdim=True)
-            return (
-                tensor
-                * (
-                    square + 1e-6
-                    if norm == "additive-1e-6"
-                    else square.clamp_min(1e-24)
-                ).rsqrt()
-            )
+            return tensor * (square + 1e-6).rsqrt()
 
         q, k = normalize(q), normalize(k)
     if args.family == "kda":
@@ -315,8 +306,6 @@ def make_runner(
             backend="auto" if backend == "native-auto" else backend,
             prefill_workspace=workspace,
         )
-        if backend == "cudnn" and norm == "additive-1e-6":
-            kwargs["qk_l2norm_additive_epsilon"] = 1e-6
         if "seq_order" in data and backend != "cudnn":
             kwargs["seq_order"] = data["seq_order"]
 
@@ -570,9 +559,9 @@ def main():
     torch.set_num_threads(1)
     data = make_data(args, 41)
     norms = (
-        ("additive-1e-6", "clamp-1e-24")
-        if args.family == "kda"
-        else (("additive-1e-6",) if args.gdn_normalize else ("pre-normalized",))
+        ("additive-1e-6",)
+        if args.family == "kda" or args.gdn_normalize
+        else ("pre-normalized",)
     )
     references = {norm: serial_reference(args, data, norm) for norm in norms}
     arms, records = {}, {}

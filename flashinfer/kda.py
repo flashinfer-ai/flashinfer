@@ -50,12 +50,8 @@ def _cudnn_kda_prefill_available() -> bool:
 
 def _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens) -> bool:
     """Measured performance policy, separate from native numerical eligibility."""
-    # B200 matched public-call benchmarks win both completed-call and replay
-    # time for this bounded region. H32 and ragged batches can lose despite
-    # faster host enqueue. Do not extrapolate this policy to SM103 or other
-    # shapes; refresh with benchmarks/bench_cudnn_linear_attention.py.
-    # High-head BF16 at 8K had only a 4% completed-call margin, sensitive to
-    # host cost. Keep that region native until 16K; this is admission policy.
+    # PR #6187 measured this B200 region. Keep H32, ragged batches and SM103
+    # native; high-head BF16 has little margin at 8K, so admit it only at 16K.
     return (
         q.is_cuda
         and q.dtype == torch.bfloat16
@@ -92,14 +88,12 @@ def _try_cudnn_kda_prefill(
     lower_bound,
     cu_seqlens,
     output,
-    additive_epsilon,
 ):
     """Substitute an eligible native prefill without changing its math or aliases."""
     from .cudnn import cudnn_recurrent_kda
     from .cudnn.linear_attention import _try_cudnn_auto
 
-    # Native launchers check these after eligibility. Keep that contract even
-    # when auto replaces the launcher; FE descriptor checks do not check aliasing.
+    # Keep native alias checks before either cuDNN execution or cached fallback.
     _kda_prefill._check_output_does_not_overlap_inputs(
         output, q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state
     )
@@ -810,7 +804,6 @@ def recurrent_kda(
                     lower_bound=lower_bound,
                     cu_seqlens=cu_seqlens,
                     output=output,
-                    additive_epsilon=1e-6,
                 )
                 if result is not None:
                     return result
@@ -957,7 +950,6 @@ def recurrent_kda(
                     lower_bound=lower_bound,
                     cu_seqlens=cu_seqlens,
                     output=output,
-                    additive_epsilon=None,
                 )
                 if result is not None:
                     return result

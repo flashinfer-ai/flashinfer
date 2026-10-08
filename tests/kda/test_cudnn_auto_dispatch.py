@@ -104,12 +104,12 @@ def _force_native_route(monkeypatch, native, seen):
 
 
 @pytest.mark.parametrize(
-    "native,state_dtype,epsilon",
-    [("small-bh", torch.bfloat16, 1e-6), ("cute-dsl", torch.float32, None)],
+    "native,state_dtype",
+    [("small-bh", torch.bfloat16), ("cute-dsl", torch.float32)],
 )
 @pytest.mark.parametrize("return_state", [False, True])
 def test_auto_preserves_math_dtype_and_fresh_bindings(
-    monkeypatch, native, state_dtype, epsilon, return_state
+    monkeypatch, native, state_dtype, return_state
 ):
     seen = []
     _force_native_route(monkeypatch, native, seen)
@@ -120,7 +120,8 @@ def test_auto_preserves_math_dtype_and_fresh_bindings(
         result = kda.recurrent_kda(**values, backend="auto")
         provider, bound = seen[-1]
         assert provider == "cudnn"
-        assert bound["qk_l2norm_additive_epsilon"] == epsilon
+        assert bound["use_qk_l2norm_in_kernel"] is True
+        assert "qk_l2norm_additive_epsilon" not in bound
         for name in ("q", "k", "v", "g", "beta", "initial_state", "output"):
             assert bound[name] is values[name]
         assert bound["initial_state"].dtype == state_dtype
@@ -333,10 +334,7 @@ def test_tensor_scalar_values_do_not_share_decline(monkeypatch, option):
     assert len(seen) == 3
 
 
-@pytest.mark.parametrize("unsupported_attribute", [False, True])
-def test_real_build_boundary_distinguishes_old_attribute_from_descriptor_error(
-    monkeypatch, unsupported_attribute
-):
+def test_build_typeerror_propagates_without_mutating_state(monkeypatch):
     seen = []
     _force_native_route(monkeypatch, "small-bh", seen)
     values = _inputs()
@@ -346,30 +344,16 @@ def test_real_build_boundary_distinguishes_old_attribute_from_descriptor_error(
     monkeypatch.setattr(linear_attention, "_check_cudnn_frontend", lambda *args: None)
 
     def build(*args, **kwargs):
-        assert kwargs["qk_l2norm_additive_epsilon"] == 1e-6
-        torch.testing.assert_close(
-            kwargs["initial_state"], torch.zeros_like(values["initial_state"])
-        )
-        if unsupported_attribute:
-            raise TypeError(
-                "kda() got unexpected arguments ['qk_l2norm_additive_epsilon']"
-            )
+        assert "qk_l2norm_additive_epsilon" not in kwargs
         raise TypeError("invalid tensor descriptor")
 
-    monkeypatch.setattr(linear_attention, "_build_la_graph", build, raising=False)
-    if unsupported_attribute:
+    monkeypatch.setattr(linear_attention, "_build_la_graph", build)
+    with pytest.raises(TypeError, match="invalid tensor descriptor"):
         kda.recurrent_kda(**values, backend="auto")
-        assert [provider for provider, _ in seen] == ["native"]
-        torch.testing.assert_close(
-            values["initial_state"], torch.ones_like(values["initial_state"])
-        )
-    else:
-        with pytest.raises(TypeError, match="invalid tensor descriptor"):
-            kda.recurrent_kda(**values, backend="auto")
-        assert not seen
-        torch.testing.assert_close(
-            values["initial_state"], torch.zeros_like(values["initial_state"])
-        )
+    assert not seen
+    torch.testing.assert_close(
+        values["initial_state"], torch.zeros_like(values["initial_state"])
+    )
 
 
 @pytest.mark.parametrize(
@@ -480,7 +464,8 @@ def test_auto_candidate_matches_native_with_fresh_pointers_and_replay(
 
     def observe(*args, **kwargs):
         result = native_cudnn(*args, **kwargs)
-        seen.append(kwargs["qk_l2norm_additive_epsilon"])
+        assert "qk_l2norm_additive_epsilon" not in kwargs
+        seen.append(kwargs["use_qk_l2norm_in_kernel"])
         return result
 
     monkeypatch.setattr(cudnn_adapter, "cudnn_recurrent_kda", observe)
