@@ -37,6 +37,53 @@ def test_ordered_execution_feature_detection():
     assert supports_ordered_cudnn_execution(Ordered)
 
 
+@pytest.mark.parametrize(
+    "version,features,mla,d128",
+    [
+        (
+            "1.30.0",
+            {
+                "supports_nonpaged_packed_split": True,
+                "supports_nonpaged_d128_packed_split": True,
+            },
+            False,
+            False,
+        ),
+        ("1.31.0", {}, False, False),
+        ("1.31.0", {"supports_nonpaged_packed_split": True}, True, False),
+        ("1.31.0", {"supports_nonpaged_d128_packed_split": True}, False, True),
+        (
+            "1.31.0",
+            {
+                "supports_nonpaged_packed_split": True,
+                "supports_nonpaged_d128_packed_split": True,
+            },
+            True,
+            True,
+        ),
+    ],
+)
+def test_bounded_ragged_requires_matching_native_feature(
+    monkeypatch, version, features, mla, d128
+):
+    """A native MLA executor does not establish D128 packed-split support."""
+    monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
+    monkeypatch.setattr(
+        prefill,
+        "cudnn",
+        SimpleNamespace(
+            __version__=version,
+            _pybind_module=SimpleNamespace(_SdpaThdBinder=SimpleNamespace(**features)),
+        ),
+    )
+    prefill._cudnn_supports_bounded_ragged.cache_clear()
+    try:
+        assert prefill._cudnn_supports_bounded_ragged() is mla
+        assert prefill._cudnn_supports_bounded_ragged(d128=True) is d128
+    finally:
+        prefill._cudnn_supports_bounded_ragged.cache_clear()
+
+
 def test_ordered_execution_errors_are_not_retried(monkeypatch):
     calls = []
 
@@ -551,7 +598,7 @@ def test_prefill_hn_same_plan_rebinds_current_output_stride(monkeypatch):
 @pytest.mark.parametrize("supported", [False, True])
 def test_prefill_capacity_is_a_plan_descriptor(monkeypatch, supported):
     """A larger lifetime capacity must not reuse a smaller compiled graph."""
-    monkeypatch.setattr(prefill, "_cudnn_supports_bounded_ragged", lambda: supported)
+    monkeypatch.setattr(prefill, "_cudnn_supports_bounded_ragged", lambda **kw: supported)
     monkeypatch.setattr(prefill, "_cudnn_supports_direct_seqlens", lambda *a, **k: True)
     monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
     monkeypatch.setattr(

@@ -73,9 +73,12 @@ head dimensions, dtypes, tensor strides, attention scale, mask and requested
 Stats layout remain part of the graph signature; they are not padded into a
 larger head-count class.
 
-On SM100, BF16 expanded MLA (D192/V128, equal Q/KV heads) with cuDNN Frontend
-1.31 or newer and its matching native extension uses bounded batch/Q/KV
-classes for short-Q, long-KV prefixes.
+On SM100/SM107, qualified BF16 expanded MLA (D192/V128, equal Q/KV heads)
+and D128/V128 ragged prefill with cuDNN Frontend 1.31 or newer and its matching
+native extension use bounded batch/Q/KV classes for short-Q, long-KV prefixes.
+The qualified range is B1–4, 4–64 query heads, Q2–1024, and KV2K–32K with
+KV at least four times Q; D128 supports integral GQA groups 1/2/4/8.
+Q2–128 share the Q128 class, while Q=1 keeps the separate decode class.
 Batch and lengths round up to powers of two within the qualified range;
 Q129 and Q241 can share the same Q256 graph. The graph also receives a packed
 Q capacity, allowing either cuDNN provider to reserve workspace and choose
