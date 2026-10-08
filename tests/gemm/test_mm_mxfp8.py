@@ -429,7 +429,7 @@ def test_mm_mxfp8_cute_dsl_sm107_tactics(m, n, k):
 @pytest.mark.parametrize("m", [1, 100, 256, 4096])
 @pytest.mark.parametrize("k", [1024, 544])
 def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m, k, monkeypatch):
-    """Without autotuning, SM107 runs the SM107 kernel and never an SM100 one."""
+    """Without autotuning, mm_mxfp8 on SM107 runs the SM107 runner's default tactic."""
     n = 1536
     _sm107_mxfp8_runner()
     from flashinfer.gemm.kernels.utils import _select_sm107_mm_mxfp8_cute_dsl_tactic
@@ -442,10 +442,23 @@ def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m, k, monkeypatch):
         is not None
     )
 
-    def no_sm100_runner(*args, **kwargs):
-        raise AssertionError("SM107 mm_mxfp8 fell back to the SM100 runner")
+    sm107_tactics_run = []
+    make_sm107_runner = gemm_base._cute_dsl_gemm_mxfp8_sm107_runner  # pyright: ignore[reportPrivateUsage]
 
-    monkeypatch.setattr(gemm_base, "_cute_dsl_gemm_mxfp8_runner", no_sm100_runner)
+    def recording_sm107_runner(*args, **kwargs):
+        runner = make_sm107_runner(*args, **kwargs)
+        forward = runner.forward
+
+        def recording_forward(inputs, tactic=None, **forward_kwargs):
+            sm107_tactics_run.append(tactic)
+            return forward(inputs, tactic=tactic, **forward_kwargs)
+
+        runner.forward = recording_forward
+        return runner
+
+    monkeypatch.setattr(
+        gemm_base, "_cute_dsl_gemm_mxfp8_sm107_runner", recording_sm107_runner
+    )
     _run_mm_mxfp8(
         m,
         n,
@@ -456,6 +469,9 @@ def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m, k, monkeypatch):
         auto_tuning=False,
         provide_out=True,
     )
+    # The SM107 runner launched its untuned default (tactic -1); it only ever builds
+    # the SM107 kernel.
+    assert sm107_tactics_run == [-1], sm107_tactics_run
 
 
 @pytest.mark.arch_rubin
