@@ -692,6 +692,9 @@ def test_public_cake_gdn_prefill_int64_metadata_graph_owns_its_copy():
     )
     case["cu_seqlens"] = case["cu_seqlens"].to(torch.int64)
     initial_state = case["initial_state"].clone()
+    # The inputs were produced on the default stream; order the side stream after
+    # them before the adapter reads cu_seqlens on it.
+    torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         _launch(case)
