@@ -14,78 +14,17 @@
  * limitations under the License.
  */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
+// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
+#include "cake_minimax_h3_varlen_attention_device_common.cuh"
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 128
 
-#include <math_constants.h>
-
-__device__ __forceinline__ float approx_exp2(float x) {
-    float y;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-
-__device__ __forceinline__ float approx_rcp(float x) {
-    float y;
-    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-    float c;
-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-    return c;
-}
-
-
-__device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
-    asm("mul.rn.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-
-// ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
-
 extern "C" {
 
-__global__ __launch_bounds__(128) void
-kernel_cake_minimax_h3_varlen_attention_ff9654b6e96277c07d5e(__half* __restrict__ partial_O, float* __restrict__ partial_ML, int* __restrict__ combine_table, int* __restrict__ seg_begin, int* __restrict__ seg_len, __nv_bfloat16* __restrict__ O, int num_heads)
+__global__ __launch_bounds__(THREADS) void
+kernel_cake_minimax_h3_varlen_attention_579b1fc2756eec97f194(__half* __restrict__ partial_O, float* __restrict__ partial_ML, int* __restrict__ combine_table, int* __restrict__ seg_begin, int* __restrict__ seg_len, __nv_bfloat16* __restrict__ O, int num_heads)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
