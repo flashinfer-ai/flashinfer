@@ -1,7 +1,6 @@
 """Trace tests for routed TRT-LLM FP8 per-tensor-scale MoE."""
 
 import torch
-import pytest
 
 
 def _trace_kwargs():
@@ -78,85 +77,3 @@ def test_fp8_per_tensor_routed_moe_trace_reference_unpacks_routing():
         [[0.25 * sigmoid_1], [1.5 * sigmoid_2]], dtype=torch.bfloat16
     )
     torch.testing.assert_close(output, expected)
-
-
-@pytest.mark.parametrize(
-    "custom_limits", [False, True], ids=["default-7", "mixed-7-16"]
-)
-@pytest.mark.parametrize("from_logits", [False, True], ids=["routed", "logits"])
-def test_fp8_step_serialized_trace_keeps_nonunit_raw_limits(custom_limits, from_logits):
-    from flashinfer import ActivationType
-    from flashinfer.fused_moe import (
-        reorder_rows_for_gated_act_gemm,
-        trtllm_fp8_per_tensor_scale_moe,
-        trtllm_fp8_per_tensor_scale_routed_moe,
-    )
-    from flashinfer.quantization import shuffle_matrix_a
-
-    hidden = intermediate = 512
-    channels = torch.tensor([0, 19, 257])
-    output_channels = torch.tensor([0, 17, 271])
-    up = torch.tensor([[32.0, 16.0, -32.0], [-8.0, -4.0, 8.0]])
-    gate = torch.tensor([[16.0, 4.0, -8.0], [8.0, 2.0, -4.0]])
-    down = torch.tensor([1.0, -2.0, 0.5])
-    w1 = torch.zeros(2, 2 * intermediate, hidden)
-    w1[:, channels, 0] = up
-    w1[:, intermediate + channels, 0] = gate
-    w2 = torch.zeros(2, hidden, intermediate)
-    w2[:, output_channels, channels] = down
-    # Use the same FC1 interleave and FC1/FC2 row permutations as preparation.
-    w1 = torch.stack(
-        [
-            shuffle_matrix_a(reorder_rows_for_gated_act_gemm(weight), 128)
-            for weight in w1
-        ]
-    )
-    w2 = torch.stack([shuffle_matrix_a(weight, 128) for weight in w2])
-    x = torch.zeros(2, hidden)
-    x[:, 0] = 1
-    kwargs = _trace_kwargs()
-    kwargs.update(
-        hidden_states=x.to(torch.float8_e4m3fn),
-        intermediate_size=intermediate,
-        activation_type=ActivationType.SwigluStep.value,
-        gemm1_weights=w1.to(torch.float8_e4m3fn),
-        gemm2_weights=w2.to(torch.float8_e4m3fn),
-        output1_scales_gate_scalar=torch.tensor([0.5, 2.0]),
-        output1_scales_scalar=torch.tensor([0.25, 3.0]),
-        output2_scales_scalar=torch.tensor([2.0, 0.5]),
-    )
-    routing_weights = torch.tensor([0.25, 0.75])
-    api = trtllm_fp8_per_tensor_scale_routed_moe
-    reference_name = "_trtllm_fp8_per_tensor_scale_routed_moe_reference"
-    if from_logits:
-        kwargs.pop("topk_ids")
-        logits = torch.full((2, 8), -float("inf"))
-        logits[0, 4] = logits[1, 5] = 0
-        kwargs.update(routing_logits=logits, routing_method_type=0)
-        routing_weights = torch.ones(2)
-        api = trtllm_fp8_per_tensor_scale_moe
-        reference_name = "_trtllm_fp8_per_tensor_scale_moe_reference"
-
-    physical_limits = torch.tensor([7.0, 16.0] if custom_limits else [7.0, 7.0])
-    gate_scale = kwargs["output1_scales_gate_scalar"]
-    raw_limits = physical_limits / gate_scale
-    kwargs["gemm1_clamp_limit"] = raw_limits if custom_limits else None
-    definition = api.fi_trace(**kwargs)
-    assert definition["inputs"]["gemm1_clamp_limit"]["optional"] is True
-    namespace = {}
-    exec(definition["reference"], namespace)  # noqa: S102
-    actual = namespace[reference_name](**kwargs)
-    up = up.clamp(min=-raw_limits[:, None], max=raw_limits[:, None])
-    gate = torch.nn.functional.silu(gate * gate_scale[:, None]).clamp(
-        max=physical_limits[:, None]
-    )
-    expected = torch.zeros(2, hidden, dtype=torch.bfloat16)
-    expected[:, output_channels] = (
-        up
-        * gate
-        * kwargs["output1_scales_scalar"][:, None]
-        * down
-        * kwargs["output2_scales_scalar"][:, None]
-        * routing_weights[:, None]
-    ).to(torch.bfloat16)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

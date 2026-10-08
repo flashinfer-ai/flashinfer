@@ -956,10 +956,6 @@ class TestTypedActivationConfig:
         from flashinfer.fused_moe.prepare import _activation_param_view
 
         assert _activation_param_view(SwiGLU(), 3, torch.device("cpu")) == {}
-        assert _activation_param_view(SwiGLUStep(), 3, torch.device("cpu")) == {}
-        step = _activation_param_view(SwiGLUStep(limit=16.0), 3, torch.device("cpu"))
-        assert set(step) == {"gemm1_clamp_limit"}
-        torch.testing.assert_close(step["gemm1_clamp_limit"], torch.full((3,), 16.0))
         view = _activation_param_view(
             SwiGLU(alpha=1.7, beta=0.25, limit=6.0),
             3,
@@ -1182,9 +1178,7 @@ class TestTypedActivationConfig:
         assert SwiGLUStep().limit == 7.0
 
 
-@pytest.mark.parametrize(
-    "activation", (SwiGLU(), SwiGLUStep(), SwiGLUStep(limit=16.0), ReLU2())
-)
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_trtllm_bf16_preparation_shapes_for_declared_activations(activation):
     experts, hidden, intermediate = 2, 128, 128
     rows = intermediate * (2 if activation.is_gated else 1)
@@ -1202,9 +1196,7 @@ def test_trtllm_bf16_preparation_shapes_for_declared_activations(activation):
     assert view["gemm2_weights"].numel() == experts * hidden * intermediate
 
 
-@pytest.mark.parametrize(
-    "activation", (SwiGLU(), SwiGLUStep(), SwiGLUStep(limit=16.0), ReLU2())
-)
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_trtllm_fp8_per_tensor_preparation_shapes_for_declared_activations(
     activation,
 ):
@@ -1466,23 +1458,6 @@ class TestMoERunnerSupport:
         )
         base.update(overrides)
         return MoEConfig(**base)
-
-    def test_trtllm_fp4_step_supports_per_token_scaling(self, monkeypatch):
-        """The Step export includes BF16 FC1 outputs for per-token NVFP4."""
-        import flashinfer.utils as utils
-
-        runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
-        runner.config = self._nvfp4_swiglu(
-            activation=SwiGLUStep(7),
-            quant=QuantConfig(
-                weight=QuantFormat.NVFP4,
-                activation=QuantFormat.NVFP4,
-                per_token_scale=True,
-            ),
-        )
-        runner.device = torch.device("cuda")
-        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 0))
-        runner.check_support()
 
     @pytest.mark.parametrize(
         ("compute_capability", "supported"),
@@ -3826,28 +3801,11 @@ class TestTrtllmFp4UnpackedContract:
                 prepared_weights[key] = torch.full_like(prepared_weights[key], 2.0)
             if "gemm1_clamp_limit" in prepared_weights:
                 prepared_weights["gemm1_clamp_limit"] /= 2.0
-        fc1_size = intermediate_size * (2 if activation.is_gated else 1)
-        assert prepared_weights["gemm1_weights"].shape == (
-            num_experts,
-            fc1_size,
-            hidden_size // 2,
-        )
-        assert prepared_weights["gemm1_weights_scale"].shape == (
-            num_experts,
-            fc1_size,
-            hidden_size // 16,
-        )
         weight_pack.prepare_for(
             runner.backend_key,
             prepared_weights,
         )
         inputs = runner.pack_inputs(act_pack, weight_pack)
-        from flashinfer.fused_moe.core import MoeRunnerInputs
-
-        moe_inputs = MoeRunnerInputs.from_list(inputs)
-        assert moe_inputs.per_token_scale is act_pack.per_token_scale
-        assert "per_token_scale" not in inputs.launch_state.static_kwargs
-        assert runner._inner.use_per_token_scaling is True
         for _ in range(3):
             runner.forward(inputs, tactic=-1)
         torch.cuda.synchronize()

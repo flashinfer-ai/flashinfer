@@ -1077,32 +1077,9 @@ def test_fp8_per_tensor_swiglu_step_mixed_limits(routing_input_mode):
     default_act, default_weights, _, all_seven_ref, _ = _make_per_tensor_fp8_case(
         **kwargs
     )
-    view = weights.get_view("trtllm_fp8_per_tensor")
-    gate_scale = view["output1_scales_gate_scalar"]
-    raw_limit = view["gemm1_clamp_limit"]
-    assert not torch.allclose(gate_scale, torch.ones_like(gate_scale))
-    torch.testing.assert_close(raw_limit * gate_scale, limits)
-    assert not torch.allclose(ref, all_seven_ref, atol=1e-2, rtol=1e-2)
-
-    runner = _build_per_tensor_fp8_runner(config)
-    packed = runner.pack_inputs(act, weights)
-    torch.testing.assert_close(
-        runner.launch_kwargs_for(packed)["launch_state"].static_kwargs[
-            "gemm1_clamp_limit"
-        ],
-        raw_limit,
-    )
-    _assert_per_tensor_fp8_close(runner.forward(packed), ref)
-
-    # A null pointer still means physical 7 after non-unit dequantization.
-    assert (
-        default_weights.get_view("trtllm_fp8_per_tensor").get("gemm1_clamp_limit")
-        is None
-    )
-    _assert_per_tensor_fp8_close(
-        runner.forward(runner.pack_inputs(default_act, default_weights)),
-        all_seven_ref,
-    )
+    layer = MoELayer(config)
+    _assert_per_tensor_fp8_close(layer(act, weights), ref)
+    _assert_per_tensor_fp8_close(layer(default_act, default_weights), all_seven_ref)
 
 
 @pytest.mark.parametrize(

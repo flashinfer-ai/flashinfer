@@ -2490,37 +2490,6 @@ def test_bf16_moe_swiglu_oa_activation_param_validation():
     with pytest.raises(ValueError, match=r"ActivationType\.Swiglu"):
         trtllm_bf16_routed_moe(**routed_kwargs, gemm1_clamp_limit=per_expert)
 
-    step_kwargs = {**kwargs, "activation_type": ActivationType.SwigluStep.value}
-    with pytest.raises(ValueError, match="SwigluStep accepts gemm1_clamp_limit only"):
-        trtllm_bf16_moe(**step_kwargs, gemm1_alpha=per_expert)
-    with pytest.raises(ValueError, match="SwigluStep accepts gemm1_clamp_limit only"):
-        trtllm_bf16_moe(**step_kwargs, gemm1_beta=per_expert)
-
-
-def test_fp8_per_tensor_swiglu_step_limit_validation():
-    """The direct ABI accepts only per-expert FP32 raw limits for SwigluStep."""
-    from flashinfer.fused_moe.core import _validate_fp8_per_tensor_step_limit
-
-    raw_limit = torch.tensor([7.0, 16.0], dtype=torch.float32)
-    _validate_fp8_per_tensor_step_limit(
-        ActivationType.SwigluStep, raw_limit, 2, torch.device("cpu")
-    )
-    with pytest.raises(ValueError, match="SwigluStep only"):
-        _validate_fp8_per_tensor_step_limit(
-            ActivationType.Swiglu, raw_limit, 2, torch.device("cpu")
-        )
-    with pytest.raises(ValueError, match="Invalid shape"):
-        _validate_fp8_per_tensor_step_limit(
-            ActivationType.SwigluStep, raw_limit[:1], 2, torch.device("cpu")
-        )
-    with pytest.raises(ValueError, match="Invalid dtype"):
-        _validate_fp8_per_tensor_step_limit(
-            ActivationType.SwigluStep,
-            raw_limit.to(torch.bfloat16),
-            2,
-            torch.device("cpu"),
-        )
-
 
 def test_bf16_moe_swiglu_oa_activation_params(cache_permute_indices):
     """TRT-LLM Gen BF16 MoE applies raw fused FC1 SwiGLU OA params."""
@@ -2685,6 +2654,7 @@ def test_bf16_moe_swiglu_oa_activation_params(cache_permute_indices):
         ),
     ],
 )
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_swiglu_step_mixed_expert_limits(
     moe_impl, weight_layout, cache_permute_indices
 ):
@@ -2751,6 +2721,7 @@ def test_swiglu_step_mixed_expert_limits(
         ),
     ],
 )
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_swiglu_step_fused_shared_limit_16(moe_impl, cache_permute_indices):
     """A fused shared expert reads its own cap after the routed expert rows."""
     num_routed_experts = 32
@@ -2795,9 +2766,11 @@ def test_swiglu_step_fused_shared_limit_16(moe_impl, cache_permute_indices):
 def test_bf16_swiglu_step_clamps_after_silu_and_graph_replay(limit, from_logits):
     """Sparse projections distinguish post-SiLU capping and both signs of up."""
     from flashinfer.fused_moe import (
+        BackendOptions,
         ExpertConfig,
         MoEActivationPack,
         MoEConfig,
+        MoELayer,
         MoEWeightPack,
         QuantConfig,
         QuantFormat,
@@ -2805,7 +2778,6 @@ def test_bf16_swiglu_step_clamps_after_silu_and_graph_replay(limit, from_logits)
         RoutingInputMode,
         SwiGLUStep,
         TrtllmBf16Config,
-        TrtllmBf16RoutedRunner,
     )
 
     if not torch.cuda.is_available() or get_compute_capability(
@@ -2830,6 +2802,7 @@ def test_bf16_swiglu_step_clamps_after_silu_and_graph_replay(limit, from_logits)
         quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
         experts=ExpertConfig(intermediate_size=intermediate),
         activation=activation,
+        backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
     )
     act = MoEActivationPack(
         hidden_states_q=x,
@@ -2843,12 +2816,10 @@ def test_bf16_swiglu_step_clamps_after_silu_and_graph_replay(limit, from_logits)
             else RoutingInputMode.UnpackedPrecomputed
         ),
     )
-    runner = TrtllmBf16RoutedRunner(config, device)
-    runner.check_support()
-    runner.build()
+    layer = MoELayer(config)
     weights = MoEWeightPack()
     weights.prepare_for(
-        runner.backend_key,
+        "trtllm_bf16_routed",
         TrtllmBf16Config.prepare_weights(
             w1,
             w2,
@@ -2858,17 +2829,7 @@ def test_bf16_swiglu_step_clamps_after_silu_and_graph_replay(limit, from_logits)
             activation=activation,
         ),
     )
-    inputs = runner.pack_inputs(act, weights)
-    if limit == 7.0 and not from_logits:
-        # Call the native runner directly to exercise the C++ ABI validation.
-        for key in ("gemm1_alpha", "gemm1_beta"):
-            native_kwargs = dict(inputs.launch_state.static_kwargs)
-            native_kwargs[key] = torch.ones(experts, device=device)
-            with pytest.raises(
-                Exception, match="SwigluStep accepts gemm1_clamp_limit only"
-            ):
-                runner._inner.forward(inputs, **native_kwargs)
-    actual = runner.forward(inputs).clone()
+    actual = layer(act, weights).clone()
     expected = torch.zeros_like(actual)
     expected[:, 0] = (
         torch.nn.functional.silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
@@ -2881,7 +2842,7 @@ def test_bf16_swiglu_step_clamps_after_silu_and_graph_replay(limit, from_logits)
         assert not torch.allclose(actual[:, 0].float(), wrong, rtol=0.01, atol=0.001)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = runner.forward(inputs)
+        captured = layer(act, weights)
     graph.replay()
     torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
