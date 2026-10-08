@@ -20,6 +20,7 @@ import torch
 class _Platform:
     @staticmethod
     def is_arch_support_pdl():
+        """Whether the current CUDA device supports programmatic dependent launch."""
         return torch.cuda.get_device_capability(torch.cuda.current_device())[0] >= 9
 
 
@@ -29,6 +30,7 @@ import triton.language as tl
 
 
 def round_up(x, n):
+    """Round x up to the next multiple of n."""
     return ((x + n - 1) // n) * n
 
 
@@ -37,6 +39,7 @@ SPARSE_BLOCK_SIZE = 128
 
 @triton.jit
 def _compare_and_swap(x, ids, flip, i: tl.constexpr, n_dims: tl.constexpr):
+    """Compare paired scores and exchange their associated block indices."""
     n_outer: tl.constexpr = x.numel >> n_dims
     shape: tl.constexpr = [n_outer * 2**i, 2, 2 ** (n_dims - i - 1)]
     y = tl.reshape(x, shape)
@@ -64,6 +67,7 @@ def _compare_and_swap(x, ids, flip, i: tl.constexpr, n_dims: tl.constexpr):
 def _bitonic_merge(
     x, ids, stage: tl.constexpr, order: tl.constexpr, n_dims: tl.constexpr
 ):
+    """Merge one bitonic score stage while carrying block indices."""
     n_outer: tl.constexpr = x.numel >> n_dims
     tl.static_assert(stage <= n_dims)
     if order == 2:
@@ -106,6 +110,7 @@ def _decode_index_score_kernel(
     USE_PDL: tl.constexpr,
     EARLY_SELECT: tl.constexpr = False,
 ):
+    """Score paged blocks, optionally bypassing rows that select every block."""
     BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
@@ -218,6 +223,7 @@ def _topk_index_partial_kernel(
     USE_PDL: tl.constexpr,
     EARLY_SELECT: tl.constexpr = False,
 ):
+    """Select chunk-local candidates, bypassing provably short rows."""
     tl.static_assert(topk < BLOCK_SIZE_K)
     pid_b = tl.program_id(0)  # flattened query-token id
     pid_h = tl.program_id(1)
@@ -364,6 +370,7 @@ def _topk_index_merge_kernel(
     USE_PDL: tl.constexpr,
     EARLY_SELECT: tl.constexpr = False,
 ):
+    """Merge chunk candidates into the selected prefix and trailing padding."""
     pid_b = tl.program_id(0)  # flattened query-token id
     pid_h = tl.program_id(1)
     req_id = pid_b // decode_query_len

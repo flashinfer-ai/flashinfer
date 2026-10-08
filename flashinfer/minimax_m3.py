@@ -28,12 +28,14 @@ _COUNTS = {
 
 @functools.cache
 def _allowlist():
+    """Load the packaged geometry limits once per process."""
     return json.loads(
         resources.files("flashinfer").joinpath("minimax_m3_workloads.json").read_text()
     )
 
 
 def _minimax_m3_index_decode_stats():
+    """Return dispatch counts and per-device preparation diagnostics."""
     return dict(
         _COUNTS,
         compiled_variants=len(_MODULES),
@@ -59,6 +61,7 @@ def _supports_geometry(
     out=None,
     score_out=None,
 ):
+    """Check specialization limits without reading device tensor contents."""
     b = idx_q.shape[0]
     return (
         os.environ.get("FLASHINFER_SPECIALIZED_KERNEL_DISABLE") != "1"
@@ -193,6 +196,54 @@ def minimax_m3_index_decode(
     max_seq_len must be a valid upper bound on those lengths. The output
     buffer can contain additional query rows and keeps its stable address.
     FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 selects the stock implementation.
+
+    Parameters
+    ----------
+    idx_q : torch.Tensor
+        BF16 index queries of shape [total_q, num_kv_heads, head_dim] on CUDA.
+    index_kv_cache : torch.Tensor
+        BF16 paged index keys of shape [num_pages, 128, head_dim].
+    block_table : torch.Tensor
+        Int32 physical page IDs of shape [num_requests, table_width].
+    seq_lens : torch.Tensor
+        Int32 live context lengths of shape [num_requests] on the same device.
+    max_seq_len : int
+        Positive host upper bound on every live context length. The block table
+        must cover this bound; lengths remain on the device during graph replay.
+    topk : int, optional
+        Maximum number of selected logical blocks per query. Default is 16.
+    init_blocks : int, optional
+        Number of initial blocks forced into the selection. Default is 0.
+    local_blocks : int, optional
+        Number of recent blocks forced into the selection. Default is 1.
+    num_kv_heads : int, optional
+        Number of index/KV heads, equal to the query head count. Default is 1.
+    decode_query_len : int, optional
+        Query tokens per request; total_q = num_requests * decode_query_len.
+        Default is 1.
+    max_decode_query_len : int, optional
+        Compile-time bound on query tokens per request. Default is 1.
+    out : torch.Tensor, optional
+        Caller-owned int32 output of shape [num_kv_heads, >=total_q, topk].
+        Only the first total_q rows are used; their address stays stable.
+    score_out : torch.Tensor, optional
+        Caller-owned float32 score buffer of shape
+        [num_kv_heads, total_q, >=ceil(max_seq_len / 128)]. Supplying it
+        selects the stock path, which writes scores using the buffer's strides.
+
+    Returns
+    -------
+    torch.Tensor
+        Int32 logical block IDs of shape [num_kv_heads, total_q, topk],
+        with a valid selected prefix followed by -1 padding. Selection
+        order within the prefix is unspecified. When out is supplied,
+        returns its used view.
+
+    Notes
+    -----
+    All tensors must be on the query's CUDA device. Call
+    minimax_m3_index_decode_warmup on the actual layouts before graph
+    capture to prepare the specialized kernels.
     """
     b = idx_q.shape[0]
     capturing = False
@@ -256,6 +307,7 @@ def minimax_m3_index_decode(
         )
 
         def chain(bound, early):
+            """Launch the stock or short-row chain on the query device."""
             with torch.cuda.device(device):
                 return stock(
                     idx_q,
@@ -299,18 +351,19 @@ def minimax_m3_index_decode(
             _LOG.info("MiniMax M3 FlashInfer index kernel dispatched")
         return output
     _COUNTS["fallback_count"] += 1
-    return stock(
-        idx_q,
-        index_kv_cache,
-        block_table,
-        seq_lens,
-        max_seq_len,
-        topk,
-        init_blocks,
-        local_blocks,
-        num_kv_heads,
-        decode_query_len,
-        max_decode_query_len,
-        out=out,
-        score_out=score_out,
-    )
+    with torch.cuda.device(idx_q.device):
+        return stock(
+            idx_q,
+            index_kv_cache,
+            block_table,
+            seq_lens,
+            max_seq_len,
+            topk,
+            init_blocks,
+            local_blocks,
+            num_kv_heads,
+            decode_query_len,
+            max_decode_query_len,
+            out=out,
+            score_out=score_out,
+        )

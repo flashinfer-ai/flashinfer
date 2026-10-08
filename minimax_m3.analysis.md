@@ -53,6 +53,8 @@ improved 1.86% at both. Paired accuracy gates passed, including 19/20 GSM8K
 answers on both sides. See the PR description for the protocol, finite accuracy
 scope, and original first-trial tail regression that follow-ups did not reproduce.
 
-Subsequent commits update test registration, package-data metadata, and this
-documentation only. Runtime/kernel/build sources are unchanged from the measured
-revision; no additional model measurement is claimed for those descendants.
+Subsequent commits update test registration, package-data metadata, and
+documentation. Review fixes add a query-device guard to the stock fallback and
+an order-insensitive trace checker with regression tests. Kernel algorithms and
+the optimized dispatch path are unchanged; no additional model measurement is
+claimed for these descendants.
