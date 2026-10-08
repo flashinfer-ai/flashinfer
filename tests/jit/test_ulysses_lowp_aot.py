@@ -44,21 +44,17 @@ def test_ulysses_lowp_aot_inventory(
     monkeypatch.setattr(aot, "get_cuda_version", lambda: Version(cuda_version))
     capabilities = aot.detect_sm_capabilities()
     monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
-    for name in (
-        "gen_spdlog_module",
-        "gen_cudnn_fmha_module",
-        "gen_nvfp4_attention_sm120_module",
-        "gen_sparse_mla_sm120_module",
-        "gen_sparse_mla_nvfp4_sm120_module",
-    ):
-        monkeypatch.setattr(aot, name, Mock(return_value=SimpleNamespace(name=name)))
-    for name in (
-        "gen_comm_alltoall_module",
-        "gen_trtllm_comm_module",
-        "gen_vllm_comm_module",
-        "gen_pcie_ipc_comm_module",
-    ):
-        monkeypatch.setattr(comm, name, Mock(return_value=SimpleNamespace(name=name)))
+    # Isolate inventory selection from unrelated generators as the AOT list evolves.
+    for module in (aot, comm):
+        for name in dir(module):
+            if (
+                name.startswith("gen_")
+                and "_module" in name
+                and name != "gen_all_modules"
+            ):
+                spec = SimpleNamespace(name=name)
+                result = [spec] if name.endswith("_modules") else spec
+                monkeypatch.setattr(module, name, Mock(return_value=result))
     generators = {}
     for name in ("ulysses_lowp", "ulysses_lowp_sm90"):
         generators[name] = Mock(return_value=SimpleNamespace(name=name))
