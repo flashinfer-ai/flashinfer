@@ -715,16 +715,16 @@ decode_tile(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int scale = sf_word_1 >> (unsigned int)(8 * ((c & 1) * 2)) & 255;
                         unsigned int v8[4];
                         {
-                            v8[0] = cake_dsv4_qmul4_portable<5>(raw[0], scale);
+                            v8[0] = cake_dsv4_qmul4<5>(raw[0], scale);
                         }
                         {
-                            v8[1] = cake_dsv4_qmul4_portable<6>(raw[0], scale);
+                            v8[1] = cake_dsv4_qmul4<6>(raw[0], scale);
                         }
                         {
-                            v8[2] = cake_dsv4_qmul4_portable<5>(raw[1], scale);
+                            v8[2] = cake_dsv4_qmul4<5>(raw[1], scale);
                         }
                         {
-                            v8[3] = cake_dsv4_qmul4_portable<6>(raw[1], scale);
+                            v8[3] = cake_dsv4_qmul4<6>(raw[1], scale);
                         }
                         if constexpr (O_CHUNKS == 1) {
                             if (c >> 4 == o_chunk) {
@@ -746,16 +746,16 @@ decode_tile(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int scale_1 = sf_word_1 >> (unsigned int)(8 * ((c & 1) * 2 + 1)) & 255;
                         unsigned int v8_2[4];
                         {
-                            v8_2[0] = cake_dsv4_qmul4_portable<5>(raw[2], scale_1);
+                            v8_2[0] = cake_dsv4_qmul4<5>(raw[2], scale_1);
                         }
                         {
-                            v8_2[1] = cake_dsv4_qmul4_portable<6>(raw[2], scale_1);
+                            v8_2[1] = cake_dsv4_qmul4<6>(raw[2], scale_1);
                         }
                         {
-                            v8_2[2] = cake_dsv4_qmul4_portable<5>(raw[3], scale_1);
+                            v8_2[2] = cake_dsv4_qmul4<5>(raw[3], scale_1);
                         }
                         {
-                            v8_2[3] = cake_dsv4_qmul4_portable<6>(raw[3], scale_1);
+                            v8_2[3] = cake_dsv4_qmul4<6>(raw[3], scale_1);
                         }
                         if constexpr (O_CHUNKS == 1) {
                             if (c >> 4 == o_chunk) {
@@ -3299,16 +3299,16 @@ decode_tile(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int scale_2 = sf_word_3 >> (unsigned int)(8 * ((c_2 & 1) * 2)) & 255;
                         unsigned int v8_1[4];
                         {
-                            v8_1[0] = cake_dsv4_qmul4_portable<5>(raw_1[0], scale_2);
+                            v8_1[0] = cake_dsv4_qmul4<5>(raw_1[0], scale_2);
                         }
                         {
-                            v8_1[1] = cake_dsv4_qmul4_portable<6>(raw_1[0], scale_2);
+                            v8_1[1] = cake_dsv4_qmul4<6>(raw_1[0], scale_2);
                         }
                         {
-                            v8_1[2] = cake_dsv4_qmul4_portable<5>(raw_1[1], scale_2);
+                            v8_1[2] = cake_dsv4_qmul4<5>(raw_1[1], scale_2);
                         }
                         {
-                            v8_1[3] = cake_dsv4_qmul4_portable<6>(raw_1[1], scale_2);
+                            v8_1[3] = cake_dsv4_qmul4<6>(raw_1[1], scale_2);
                         }
                         if constexpr (O_CHUNKS == 1) {
                             if (c_2 >> 4 == o_chunk_1) {
@@ -3330,16 +3330,16 @@ decode_tile(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ 
                         unsigned int scale_1_1 = sf_word_3 >> (unsigned int)(8 * ((c_2 & 1) * 2 + 1)) & 255;
                         unsigned int v8_2_1[4];
                         {
-                            v8_2_1[0] = cake_dsv4_qmul4_portable<5>(raw_1[2], scale_1_1);
+                            v8_2_1[0] = cake_dsv4_qmul4<5>(raw_1[2], scale_1_1);
                         }
                         {
-                            v8_2_1[1] = cake_dsv4_qmul4_portable<6>(raw_1[2], scale_1_1);
+                            v8_2_1[1] = cake_dsv4_qmul4<6>(raw_1[2], scale_1_1);
                         }
                         {
-                            v8_2_1[2] = cake_dsv4_qmul4_portable<5>(raw_1[3], scale_1_1);
+                            v8_2_1[2] = cake_dsv4_qmul4<5>(raw_1[3], scale_1_1);
                         }
                         {
-                            v8_2_1[3] = cake_dsv4_qmul4_portable<6>(raw_1[3], scale_1_1);
+                            v8_2_1[3] = cake_dsv4_qmul4<6>(raw_1[3], scale_1_1);
                         }
                         if constexpr (O_CHUNKS == 1) {
                             if (c_2 >> 4 == o_chunk_1) {

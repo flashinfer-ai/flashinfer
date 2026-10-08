@@ -372,56 +372,18 @@ __device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
         : "r"(tmem_addr));
 }
 
-// Portable (public-PTX) QMUL4 for the DSv4 NVFP4 cache: E2M1 x E4M3 -> E4M3 with one rounding.
-// Per 16-value block the eight possible magnitudes RN(scale * m), m in {0, 0.5, 1, 1.5, 2, 3, 4, 6}, are built once
-// as an 8-byte table (one scale conversion, four exact f16x2 products, four satfinite conversions); each call then
-// selects its four bytes with prmt by the E2M1 magnitude code and restores the E2M1 sign with a second prmt.
-// Bit-identical to the cvt/mul/cvt form for every finite scale; only a NaN scale differs (sign of the NaN payload).
-struct cake_dsv4_qmul4_table_t {
-  uint32_t lo;
-  uint32_t hi;
-};
-
-__device__ __forceinline__ cake_dsv4_qmul4_table_t cake_dsv4_qmul4_table(uint32_t scale) {
-  const uint16_t scale_byte = static_cast<uint16_t>(scale & 0xFFu);
-  const uint16_t s2 = static_cast<uint16_t>(scale_byte | (scale_byte << 8));
-  cake_dsv4_qmul4_table_t t;
-  asm("{\n"
-      ".reg .b32 sh, c0, c1, c2, c3, p0, p1, p2, p3;\n"
-      ".reg .b16 e0, e1, e2, e3;\n"
-      "cvt.rn.f16x2.e4m3x2 sh, %2;\n"
-      "mov.b32 c0, 0x38000000;\n"  // {0, 0.5}
-      "mov.b32 c1, 0x3E003C00;\n"  // {1, 1.5}
-      "mov.b32 c2, 0x42004000;\n"  // {2, 3}
-      "mov.b32 c3, 0x46004400;\n"  // {4, 6}
-      "mul.rn.f16x2 p0, sh, c0;\n"
-      "mul.rn.f16x2 p1, sh, c1;\n"
-      "mul.rn.f16x2 p2, sh, c2;\n"
-      "mul.rn.f16x2 p3, sh, c3;\n"
-      "cvt.rn.satfinite.e4m3x2.f16x2 e0, p0;\n"
-      "cvt.rn.satfinite.e4m3x2.f16x2 e1, p1;\n"
-      "cvt.rn.satfinite.e4m3x2.f16x2 e2, p2;\n"
-      "cvt.rn.satfinite.e4m3x2.f16x2 e3, p3;\n"
-      "mov.b32 %0, {e0, e1};\n"
-      "mov.b32 %1, {e2, e3};\n"
-      "}\n"
-      : "=r"(t.lo), "=r"(t.hi)
-      : "h"(s2));
-  return t;
-}
-
+// Hardware QMUL4 for the DSv4 NVFP4 cache: E2M1 x E4M3 -> E4M3 with one rounding (round to nearest even, satfinite):
+// the PTX ISA 9.4 packed multiply `mul.rn.e4m3x4.e2m1x4.e4m3x4.satfinite` (CUDA 13.4 or newer; sm_100a / sm_103a).
+// kVariant 5 multiplies the low four E2M1 nibbles of `src`, 6 the high four; the E4M3 scale is byte 0 of `scale`.
+#if !(__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+#error "the Cake DSv4 NVFP4 decode kernels require CUDA 13.4 or newer (PTX ISA 9.4 mul.e4m3x4.e2m1x4)"
+#endif
 template <int kVariant>
-__device__ __forceinline__ uint32_t cake_dsv4_qmul4_portable(uint32_t src, uint32_t scale) {
+__device__ __forceinline__ uint32_t cake_dsv4_qmul4(uint32_t src, uint32_t scale) {
   static_assert(kVariant == 5 || kVariant == 6, "invalid Cake DSv4 QMUL4 variant (LOWER4 / HIGHER4 only)");
-  const cake_dsv4_qmul4_table_t t = cake_dsv4_qmul4_table(scale);
-  const uint32_t h = (kVariant == 5) ? src : (src >> 16);
-  const uint32_t sel = h & 0x7777u;  // magnitude codes; prmt reads only the low four selector nibbles
-  const uint32_t h4 = h << 4;
-  uint32_t mag;
-  uint32_t sgn;
-  asm("prmt.b32 %0, %1, %2, %3;" : "=r"(mag) : "r"(t.lo), "r"(t.hi), "r"(sel));
-  // replicate mode: output byte k = 8 copies of bit 7 of the selected byte = the sign bit of E2M1 nibble k
-  // (nibbles 1 / 3 sit at bits 7 / 15 of h, nibbles 0 / 2 at bits 7 / 15 of h << 4)
-  asm("prmt.b32 %0, %1, %2, 0x9D8C;" : "=r"(sgn) : "r"(h), "r"(h4));
-  return mag ^ (sgn & 0x80808080u);
+  const uint32_t scale4 = __byte_perm(scale, 0u, 0x0000);  // the E4M3 scale byte in all four lanes
+  const uint16_t a = static_cast<uint16_t>(kVariant == 5 ? src : (src >> 16));
+  uint32_t d;
+  asm("mul.rn.e4m3x4.e2m1x4.e4m3x4.satfinite %0, %1, %2;" : "=r"(d) : "h"(a), "r"(scale4));
+  return d;
 }
