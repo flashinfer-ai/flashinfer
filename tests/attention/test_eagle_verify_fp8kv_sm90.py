@@ -31,7 +31,6 @@ from flashinfer.prefill import (
 from flashinfer.utils import MaskMode
 
 DISABLE_ENV = "FLASHINFER_DISABLE_EAGLE_VERIFY_FP8KV_SM90"
-PDL_ENV = "FLASHINFER_EAGLE_VERIFY_FP8KV_SM90_PDL"
 QO_LEN, H_QO, H_KV, HEAD_DIM, PAGE = 4, 4, 1, 256, 1
 MASK_TAIL_SLACK = 8  # bytes the kernel may read past the packed mask
 
@@ -39,7 +38,6 @@ MASK_TAIL_SLACK = 8  # bytes the kernel may read past the packed mask
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     monkeypatch.delenv(DISABLE_ENV, raising=False)
-    monkeypatch.delenv(PDL_ENV, raising=False)
     _reset_eagle_verify_fp8kv_sm90_stats()
     yield
     _reset_eagle_verify_fp8kv_sm90_stats()
@@ -159,7 +157,6 @@ def _fake_wrapper(
             workspace_floats=workspace_floats,
             mask_bytes_required=mask_bytes + MASK_TAIL_SLACK,
             device_index=0,
-            pdl=False,
         ),
     )
     for key, value in overrides.items():
@@ -442,7 +439,7 @@ def test_disable_switch_is_read_at_plan_time(monkeypatch):
     assert _eagle_verify_fp8kv_sm90_stats()["plans_disabled"] == 1 and loads == [1]
 
 
-def test_pdl_switch_is_read_at_plan_time_and_defaults_off(monkeypatch):
+def test_prepare_sizes_splits_to_one_wave_and_reuses_workspace(monkeypatch):
     monkeypatch.setattr(
         prefill_mod, "_eagle_verify_fp8kv_sm90_plan_eligibility", lambda *a, **k: None
     )
@@ -465,16 +462,11 @@ def test_pdl_switch_is_read_at_plan_time_and_defaults_off(monkeypatch):
     wrapper._eagle_verify_fp8kv_sm90_workspace = None
     _eagle_verify_fp8kv_sm90_prepare(**_prepare_kwargs(wrapper, 2, good, 64))
     state = wrapper._eagle_verify_fp8kv_sm90_state
-    assert state is not None and state.pdl is False  # default: plain merge launch
+    assert state is not None
     assert state.num_splits == 198  # ceil(3 * 132 / 2)
     assert _eagle_verify_fp8kv_sm90_stats()["workspace_allocs"] == 1
-    monkeypatch.setenv(PDL_ENV, "1")
     _eagle_verify_fp8kv_sm90_prepare(**_prepare_kwargs(wrapper, 2, good, 64))
-    assert wrapper._eagle_verify_fp8kv_sm90_state.pdl is True
     assert _eagle_verify_fp8kv_sm90_stats()["workspace_allocs"] == 1  # reused
-    monkeypatch.setenv(PDL_ENV, "0")
-    _eagle_verify_fp8kv_sm90_prepare(**_prepare_kwargs(wrapper, 2, good, 64))
-    assert wrapper._eagle_verify_fp8kv_sm90_state.pdl is False
 
 
 # --------------------------------------------------------------------------

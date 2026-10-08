@@ -1781,13 +1781,6 @@ def _resolve_uniform_q_len(
 # and publish l = 0; the merge discards it through a select).
 # ---------------------------------------------------------------------------
 _EAGLE_VERIFY_FP8KV_SM90_DISABLE_ENV = "FLASHINFER_DISABLE_EAGLE_VERIFY_FP8KV_SM90"
-# Experimental opt-in: launch the merge kernel with programmatic dependent
-# launch (read at plan time and baked into the plan state; default off = plain
-# stream-ordered launch). A merge grid made resident by PDL while the attention
-# grid still has unscheduled CTAs (batch x splits above one wave) competes with
-# it for SM slots and has deadlocked multi-rank CUDA-graph capture; the plain
-# launch cannot. The measured gain of PDL is 1-2 us on single-wave grids only.
-_EAGLE_VERIFY_FP8KV_SM90_PDL_ENV = "FLASHINFER_EAGLE_VERIFY_FP8KV_SM90_PDL"
 _EAGLE_VERIFY_FP8KV_SM90_MASK_TAIL_SLACK_BYTES = 8
 _EAGLE_VERIFY_FP8KV_SM90_QO_LEN = 4
 _EAGLE_VERIFY_FP8KV_SM90_NUM_QO_HEADS = 4
@@ -1824,10 +1817,6 @@ _eagle_verify_fp8kv_sm90_announced = False
 
 def _eagle_verify_fp8kv_sm90_disabled() -> bool:
     return os.environ.get(_EAGLE_VERIFY_FP8KV_SM90_DISABLE_ENV, "") not in ("", "0")
-
-
-def _eagle_verify_fp8kv_sm90_pdl_requested() -> bool:
-    return os.environ.get(_EAGLE_VERIFY_FP8KV_SM90_PDL_ENV, "") not in ("", "0")
 
 
 def _eagle_verify_fp8kv_sm90_stats() -> Dict[str, Any]:
@@ -2273,9 +2262,6 @@ def _eagle_verify_fp8kv_sm90_prepare(
         workspace_floats=workspace_floats,
         mask_bytes_required=mask_bytes_required,
         device_index=device_index,
-        # merge launch mode, decided at plan time so a captured graph and its
-        # eager warm-ups agree; default plain stream-ordered launch
-        pdl=_eagle_verify_fp8kv_sm90_pdl_requested(),
     )
     counters["plans_prepared"] += 1
 
@@ -2361,7 +2347,6 @@ def _eagle_verify_fp8kv_sm90_dispatch(
         out,
         state.batch_size,
         state.num_splits,
-        1 if state.pdl else 0,
     )
     counters["runs_dispatched"] += 1
     if capturing:
@@ -2372,10 +2357,9 @@ def _eagle_verify_fp8kv_sm90_dispatch(
         _eagle_verify_fp8kv_sm90_announced = True
         logger.info(
             "eagle_verify_fp8kv_sm90: serving the target-verify attention "
-            "(batch_size=%d, num_splits=%d, pdl=%d, cuda_graph=%s)",
+            "(batch_size=%d, num_splits=%d, cuda_graph=%s)",
             state.batch_size,
             state.num_splits,
-            1 if state.pdl else 0,
             wrapper.is_cuda_graph_enabled,
         )
     return True

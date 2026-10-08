@@ -26,14 +26,9 @@
 // with mma.sync m16n8k16 (bf16 x bf16, fp32 accumulate; e4m3 -> bf16
 // dequantisation is exact) with fp32 online-softmax statistics, and writes a
 // partial (m, l, O) state with an L2 evict_last hint. A second kernel merges
-// the partial states of a request in fp32 and rounds once to bf16. By default
-// the merge is a plain stream-ordered launch; the caller may opt into
-// programmatic dependent launch (use_pdl), in which case the merge is launched
-// with cudaLaunchAttributeProgrammaticStreamSerialization and its CTAs become
-// resident while the attention grid drains (the device code carries the
-// griddepcontrol instructions either way: without the attribute
-// launch_dependents has no dependents to signal and wait returns at once, so
-// the plain launch is exactly the stream-serialised two-kernel sequence).
+// the partial states of a request in fp32 and rounds once to bf16. The merge
+// is a plain stream-ordered launch: the attention grid has fully retired before
+// any merge CTA starts.
 //
 // Numerics match FlashInfer's FA2 custom-mask path: bf16 Q x exact K, fp32
 // logits / max / sum / rescale, P rounded once to bf16 before the P.V MMA, fp32
@@ -222,9 +217,6 @@ __global__ void __launch_bounds__(NTHR, CTAPSM)
       pml[pbase * NROW * 2 + tid * 2] = MNEG;
       pml[pbase * NROW * 2 + tid * 2 + 1] = 0.f;
     }
-    __threadfence();
-    __syncthreads();
-    asm volatile("griddepcontrol.launch_dependents;");
     return;
   }
   // All products are below 2^31 for the supported pool, avoiding two 64-bit divides.
@@ -567,15 +559,6 @@ __global__ void __launch_bounds__(NTHR, CTAPSM)
     pml[pbase * NROW * 2 + row1 * 2] = mrun1;
     pml[pbase * NROW * 2 + row1 * 2 + 1] = (lb.x + lb.y) + (lb.z + lb.w);
   }
-  // Programmatic dependent launch (SM90).  The two launches are stream-serialised, so the
-  // merge's grid setup and CTA dispatch -- 1-2 us, a tenth of the whole c8 launch -- sits in
-  // a bubble after the last verify CTA retires.  Signalling here lets the merge CTAs become
-  // resident and run their prologue while the verify grid drains; they block on
-  // griddepcontrol.wait only for the actual partial-state loads, whose data this fence has
-  // already made visible.
-  __threadfence();
-  __syncthreads();
-  asm volatile("griddepcontrol.launch_dependents;");
 }
 
 // ---------------- merge ----------------
@@ -623,8 +606,6 @@ __global__ void __launch_bounds__(MSG* MLANE)
   const long long base = (long long)r * SPLITS;
   const float* pmr = pml + row * 2;
   const float4* por = (const float4*)(po + row * HD + d);
-
-  asm volatile("griddepcontrol.wait;");
 
   const uint64_t opol = pol_evict_last();
   float m = MNEG, l = 0.f;
@@ -701,34 +682,16 @@ __global__ void __launch_bounds__(MSG* MLANE)
 }
 
 // ---------------- launcher ----------------
-// Default: a plain stream-ordered launch of the merge (the attention grid has
-// fully retired before any merge CTA starts; griddepcontrol.wait returns at
-// once because no programmatic dependency exists). With use_pdl the merge is
-// launched with cudaLaunchAttributeProgrammaticStreamSerialization so its CTAs
-// may become resident (and block in griddepcontrol.wait) while the attention
-// grid drains; inside a CUDA-graph capture that attribute becomes a programmatic
-// dependency edge between the two kernel nodes. PDL is opt-in because a
-// dependent grid that is resident while the primary grid still has unscheduled
-// CTAs (attention grids above one wave, i.e. batch x splits > 3 x SMs) competes
-// with the primary for SM slots; the plain launch cannot.
+// A plain stream-ordered launch of the merge: the attention grid has fully
+// retired before any merge CTA starts. Programmatic dependent launch is
+// deliberately not used: a merge grid made resident while the attention grid
+// still has unscheduled CTAs (batch x splits above 3 x SMs) competes with it
+// for SM slots and deadlocks CUDA-graph capture.
 template <int UF>
 cudaError_t launch_merge(int grid, int thr, cudaStream_t stream, const float* po, const float* pml,
-                         __nv_bfloat16* o, int R, int SPLITS, bool use_pdl) {
-  if (!use_pdl) {
-    merge_kernel<UF><<<grid, thr, 0, stream>>>(po, pml, o, R, SPLITS);
-    return cudaGetLastError();
-  }
-  cudaLaunchAttribute attr[1];
-  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attr[0].val.programmaticStreamSerializationAllowed = 1;
-  cudaLaunchConfig_t cfg;
-  cfg.gridDim = dim3(grid, 1, 1);
-  cfg.blockDim = dim3(thr, 1, 1);
-  cfg.dynamicSmemBytes = 0;
-  cfg.stream = stream;
-  cfg.attrs = attr;
-  cfg.numAttrs = 1;
-  return cudaLaunchKernelEx(&cfg, merge_kernel<UF>, po, pml, o, R, SPLITS);
+                         __nv_bfloat16* o, int R, int SPLITS) {
+  merge_kernel<UF><<<grid, thr, 0, stream>>>(po, pml, o, R, SPLITS);
+  return cudaGetLastError();
 }
 
 constexpr int64_t kNumRows = NROW;
@@ -771,16 +734,14 @@ void eagle_verify_fp8kv_sm90_init(int64_t device_id) {
 // copy); kv_indices int32; packed_custom_mask uint8 (little-endian bits, one
 // byte-aligned segment per request, followed by >= 8 readable bytes); workspace
 // fp32 (>= workspace_floats, all slots kept, never assumed zeroed); o
-// [batch_size*4, 4, 256] bf16 contiguous; use_pdl 0/1 selects the merge launch
-// mode (0 = plain stream-ordered launch, 1 = programmatic dependent launch).
+// [batch_size*4, 4, 256] bf16 contiguous.
 // Launches on the caller's current stream; no host synchronisation, no
-// allocation (CUDA-graph capturable: two kernel nodes, joined by a programmatic
-// dependency edge only when use_pdl is 1).
+// allocation (CUDA-graph capturable: two stream-ordered kernel nodes).
 void eagle_verify_fp8kv_sm90_run(TensorView q, TensorView k_cache, TensorView v_cache,
                                  TensorView qo_indptr, TensorView kv_indptr, TensorView kv_indices,
                                  TensorView packed_custom_mask, TensorView mask_indptr,
                                  TensorView workspace, TensorView o, int64_t batch_size,
-                                 int64_t num_splits, int64_t use_pdl) {
+                                 int64_t num_splits) {
   TVM_FFI_ICHECK_GT(batch_size, 0);
   TVM_FFI_ICHECK_GT(num_splits, 0);
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
@@ -860,16 +821,15 @@ void eagle_verify_fp8kv_sm90_run(TensorView q, TensorView k_cache, TensorView v_
   // DRAM round trip for 2-3 useful loads, and a too-large UF only burns registers.
   const int need = (SPLITS + MSG - 1) / MSG;
   const int grid = R * NROW * 4, thr = MSG * MLANE;
-  const bool pdl = use_pdl != 0;
   __nv_bfloat16* out = static_cast<__nv_bfloat16*>(o.data_ptr());
   if (need <= 2)
-    status = launch_merge<2>(grid, thr, stream, po, pml, out, R, SPLITS, pdl);
+    status = launch_merge<2>(grid, thr, stream, po, pml, out, R, SPLITS);
   else if (need <= 4)
-    status = launch_merge<4>(grid, thr, stream, po, pml, out, R, SPLITS, pdl);
+    status = launch_merge<4>(grid, thr, stream, po, pml, out, R, SPLITS);
   else if (need <= 8)
-    status = launch_merge<8>(grid, thr, stream, po, pml, out, R, SPLITS, pdl);
+    status = launch_merge<8>(grid, thr, stream, po, pml, out, R, SPLITS);
   else
-    status = launch_merge<16>(grid, thr, stream, po, pml, out, R, SPLITS, pdl);
+    status = launch_merge<16>(grid, thr, stream, po, pml, out, R, SPLITS);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "eagle_verify_fp8kv_sm90 merge launch failed: " << cudaGetErrorString(status);
 }
