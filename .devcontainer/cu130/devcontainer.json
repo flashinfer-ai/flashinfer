@@ -27,12 +27,6 @@
     },
     "mounts": [
         "type=bind,source=${localEnv:HOME}/.ssh,target=/home/devuser/.ssh,readonly",
-        // A named volume rather than a host bind: Docker manages it, so the
-        // cache does not inherit the host home's filesystem, quota, or
-        // ownership. The ${devcontainerId} suffix gives each devcontainer
-        // its own cache directory -- sccache's local storage supports a
-        // single server at a time, and concurrent servers sharing one
-        // directory race into spurious build failures.
         "type=volume,source=flashinfer-sccache-${devcontainerId},target=/home/devuser/.cache/sccache"
     ],
     "containerEnv": {
