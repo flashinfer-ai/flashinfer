@@ -153,7 +153,7 @@ def _prepare_mxfp8_tensors(
     return input_mxfp8, weight_mxfp8, input_scale, weight_scale
 
 
-def _mxfp8_cute_dsl_tactics(m, n, k=128, capability=None):
+def _mxfp8_cute_dsl_tactics(m, n, k=128):
     """Tactics the cute-dsl runner offers for (m, n, k); compiles no kernel."""
     device = torch.device("cuda")
     a = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=device)
@@ -161,7 +161,7 @@ def _mxfp8_cute_dsl_tactics(m, n, k=128, capability=None):
     a_sf = torch.empty((max(m, 128) * k // 32,), dtype=torch.uint8, device=device)
     b_sf = torch.empty((max(n, 128) * k // 32,), dtype=torch.uint8, device=device)
     out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
-    major, minor = capability or get_compute_capability(device)
+    major, minor = get_compute_capability(device)
     runner = gemm_base._cute_dsl_gemm_mxfp8_runner(major, minor, True, torch.bfloat16)
     return runner.get_valid_tactics([a, b, a_sf, b_sf, torch.bfloat16, out, None], None)
 
@@ -172,21 +172,14 @@ def test_mm_mxfp8_cute_dsl_narrow_tiles_only_within_32_tokens():
     offer them while the kernel-N extent (n, or m when A and B are swapped)
     is at most 32."""
     _skip_if_unsupported("cute-dsl")
-    sm100 = (10, 0)  # SM107 offers SM107-kernel tactics, which have no narrow tiles
     for m, n in ((128, 128), (128, 64), (64, 128)):
-        narrow = [
-            t for t in _mxfp8_cute_dsl_tactics(m, n, capability=sm100) if t[0][1] < 64
-        ]
+        narrow = [t for t in _mxfp8_cute_dsl_tactics(m, n) if t[0][1] < 64]
         assert narrow == [], (m, n, narrow)
     # kernel-N = n = 32: narrow tiles only without the A/B swap
-    narrow = [
-        t for t in _mxfp8_cute_dsl_tactics(128, 32, capability=sm100) if t[0][1] < 64
-    ]
+    narrow = [t for t in _mxfp8_cute_dsl_tactics(128, 32) if t[0][1] < 64]
     assert narrow and all(not t[2] for t in narrow), narrow
     # kernel-N = m = 32: narrow tiles only with the A/B swap
-    narrow = [
-        t for t in _mxfp8_cute_dsl_tactics(32, 128, capability=sm100) if t[0][1] < 64
-    ]
+    narrow = [t for t in _mxfp8_cute_dsl_tactics(32, 128) if t[0][1] < 64]
     assert narrow and all(t[2] for t in narrow), narrow
 
 
@@ -344,28 +337,61 @@ def test_mm_mxfp8_cute_dsl_low_m(m, k):
     )
 
 
-def _sm107_mxfp8_cute_dsl_tactics(m, n, k):
-    """SM107-kernel tactics the cute-dsl runner offers; skips off SM107."""
+def _sm107_mxfp8_runner():
+    """The SM107 cute-dsl runner; skips off SM107 or without the SM107 kernel."""
     _skip_if_unsupported("cute-dsl")
     if get_compute_capability(torch.device("cuda")) != (10, 7):
         pytest.skip("The SM107 CuTe-DSL MXFP8 kernel is SM107-only")
     pytest.importorskip("flashinfer.gemm.kernels.dense_blockscaled_gemm_sm107")
-    return [t for t in _mxfp8_cute_dsl_tactics(m, n, k) if isinstance(t[4], tuple)]
+    return gemm_base._cute_dsl_gemm_mxfp8_sm107_runner(  # pyright: ignore[reportPrivateUsage]
+        torch.bfloat16
+    )
+
+
+def _sm107_mxfp8_inputs(m, n, k):
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
+    )
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+    inputs = [
+        input_mxfp8,
+        weight_mxfp8.T,
+        input_scale,
+        weight_scale,
+        torch.bfloat16,
+        out,
+        workspace,
+    ]
+    return inputs, torch.mm(input, weight.T)
 
 
 def test_mm_mxfp8_cute_dsl_offers_sm107_tactics():
-    tactics = _sm107_mxfp8_cute_dsl_tactics(256, 1536, 6144)
-    assert tactics, "SM107 kernel is importable but contributes no mm_mxfp8 tactics"
+    runner = _sm107_mxfp8_runner()
+    inputs, _ = _sm107_mxfp8_inputs(256, 1536, 6144)
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert tactics, "SM107 kernel is importable but offers no mm_mxfp8 tactics"
     assert {t[2] for t in tactics} == {False, True}
     assert any(t[0][0] == 512 for t in tactics), "512-row (B-reuse) tiles missing"
-    # On SM107 the SM100 kernels are not autotuned when the SM107 kernel fits.
-    assert len(tactics) == len(_mxfp8_cute_dsl_tactics(256, 1536, 6144))
     # Swap-AB puts M on the kernel's N axis, but the output's contiguous dimension
     # is still N, so it does not need M % 8 == 0.
-    assert {t[2] for t in _sm107_mxfp8_cute_dsl_tactics(100, 1536, 6144)} == {
-        False,
-        True,
-    }
+    inputs, _ = _sm107_mxfp8_inputs(100, 1536, 6144)
+    assert {t[2] for t in runner.get_valid_tactics(inputs, None)} == {False, True}
+
+
+def test_mm_mxfp8_cute_dsl_sm107_runner_selection():
+    """mm_mxfp8(backend="cute-dsl") uses the SM107 kernel unless it cannot run."""
+    _sm107_mxfp8_runner()
+    a = torch.empty([64, 1024], device="cuda", dtype=torch.float8_e4m3fn)
+    b = torch.empty([1024, 1536], device="cuda", dtype=torch.float8_e4m3fn)
+    use = gemm_base._use_sm107_mxfp8_cute_dsl  # pyright: ignore[reportPrivateUsage]
+    out = torch.empty([64, 1536], device="cuda", dtype=torch.bfloat16)
+    assert use(10, 7, a, b, out)
+    assert not use(10, 7, a, b, torch.empty([64, 1600], device="cuda")[:, :1536])
+    assert not use(10, 7, a, b[:, :1532], out[:, :1532].contiguous())
+    assert not use(10, 0, a, b, out)
 
 
 @pytest.mark.parametrize(
@@ -380,32 +406,12 @@ def test_mm_mxfp8_cute_dsl_offers_sm107_tactics():
 )
 def test_mm_mxfp8_cute_dsl_sm107_tactics(m, n, k):
     """Every (tile, MMA M, swap-AB) group of SM107 tactics computes the GEMM."""
-    tactics = _sm107_mxfp8_cute_dsl_tactics(m, n, k)
+    runner = _sm107_mxfp8_runner()
+    inputs, reference = _sm107_mxfp8_inputs(m, n, k)
     one_per_group = {}
-    for t in tactics:
-        one_per_group.setdefault((t[0], t[4][0], t[2]), t)
-
-    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
-    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
-        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
-    )
-    reference = torch.mm(input, weight.T)
-    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
-    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
-    major, minor = get_compute_capability(torch.device("cuda"))
-    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(  # pyright: ignore[reportPrivateUsage]
-        major, minor, True, torch.bfloat16
-    )
-    inputs = [
-        input_mxfp8,
-        weight_mxfp8.T,
-        input_scale,
-        weight_scale,
-        torch.bfloat16,
-        out,
-        workspace,
-    ]
+    for t in runner.get_valid_tactics(inputs, None):
+        one_per_group.setdefault((t[0], t[3], t[2]), t)
+    out = inputs[5]
     for tactic in one_per_group.values():
         out.zero_()
         runner(inputs, tactic=tactic)
@@ -415,18 +421,20 @@ def test_mm_mxfp8_cute_dsl_sm107_tactics(m, n, k):
 @pytest.mark.parametrize("m", [1, 100, 256, 4096])
 @pytest.mark.parametrize("k", [1024, 544])
 def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m, k):
-    """Without autotuning, SM107 runs the SM107 kernel."""
+    """Without autotuning, SM107 runs the SM107 kernel and never an SM100 one."""
     n = 1536
-    _sm107_mxfp8_cute_dsl_tactics(m, n, k)
+    _sm107_mxfp8_runner()
     from flashinfer.gemm.kernels.utils import _select_sm107_mm_mxfp8_cute_dsl_tactic
     from flashinfer.utils import get_device_sm_count
 
-    tactic = _select_sm107_mm_mxfp8_cute_dsl_tactic(
-        m, n, k, get_device_sm_count(torch.device("cuda"))
+    assert (
+        _select_sm107_mm_mxfp8_cute_dsl_tactic(
+            m, n, k, get_device_sm_count(torch.device("cuda"))
+        )
+        is not None
     )
-    assert tactic is not None and isinstance(tactic[4], tuple), tactic
-
-    cached = set(gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE)  # pyright: ignore[reportPrivateUsage]
+    sm100_cache = gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE  # pyright: ignore[reportPrivateUsage]
+    cached = set(sm100_cache)
     _run_mm_mxfp8(
         m,
         n,
@@ -437,41 +445,16 @@ def test_mm_mxfp8_cute_dsl_sm107_untuned_default(m, k):
         auto_tuning=False,
         provide_out=True,
     )
-    launched = set(gemm_base._CUTE_DSL_MM_MXFP8_KERNEL_CACHE) - cached  # pyright: ignore[reportPrivateUsage]
-    assert all(isinstance(key[1][-1], tuple) for key in launched), launched
+    assert set(sm100_cache) == cached, "untuned SM107 call compiled an SM100 kernel"
 
 
 @pytest.mark.parametrize("m", [1, 3, 100, 129])
 def test_mm_mxfp8_cute_dsl_sm107_swap_ab_any_m(m):
     """Swap-AB SM107 tactics run at any M, including M % 8 != 0."""
-    n, k = 1536, 1024
-    _sm107_mxfp8_cute_dsl_tactics(m, n, k)
-
-    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
-    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
-        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
-    )
-    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
-    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
-    major, minor = get_compute_capability(torch.device("cuda"))
-    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(  # pyright: ignore[reportPrivateUsage]
-        major, minor, True, torch.bfloat16
-    )
-    runner(
-        [
-            input_mxfp8,
-            weight_mxfp8.T,
-            input_scale,
-            weight_scale,
-            torch.bfloat16,
-            out,
-            workspace,
-        ],
-        tactic=((128, 128), (1, 1), True, False, (128,)),
-    )
-
-    _assert_cosine_similarity(torch.mm(input, weight.T), out)
+    runner = _sm107_mxfp8_runner()
+    inputs, reference = _sm107_mxfp8_inputs(m, 1536, 1024)
+    runner(inputs, tactic=((128, 128), (1, 1), True, 128))
+    _assert_cosine_similarity(reference, inputs[5])
 
 
 def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():

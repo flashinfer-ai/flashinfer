@@ -446,9 +446,9 @@ def _select_sm107_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
 
 def _get_sm107_mxfp8_tactics(m, n, real_k, c_cutlass_dtype):
     """SM107-kernel tactics that can run an mm_mxfp8 (M, N, K); used by both the
-    cute-dsl runner's autotune enumeration and the untuned selector.
+    SM107 cute-dsl runner's autotune enumeration and the untuned selector.
 
-    Each tactic is (mma_tiler_mn, cluster_shape_mn, swap_ab, False, (mma_inst_shape_m,)).
+    Each tactic is (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m).
     """
     import cutlass
 
@@ -480,9 +480,7 @@ def _get_sm107_mxfp8_tactics(m, n, real_k, c_cutlass_dtype):
                         "m" if swap_ab else "n",
                         mma_tiler_k=_SM107_MXFP8_MMA_TILER_K,
                     ):
-                        tactics.append(
-                            (tile, cluster, swap_ab, False, (mma_inst_shape_m,))
-                        )
+                        tactics.append((tile, cluster, swap_ab, mma_inst_shape_m))
     return tactics
 
 
@@ -499,7 +497,7 @@ def _compute_sm107_mxfp8_tactic_for_m(rep_m, n, real_k, sm_count):
     best_tactic = None
     best_score = -1.0
     for tactic in _get_sm107_mxfp8_tactics(rep_m, n, real_k, cutlass.BFloat16):
-        tile, cluster, swap_ab, _, (mma_inst_shape_m,) = tactic
+        tile, cluster, swap_ab, mma_inst_shape_m = tactic
         if mma_inst_shape_m != tile[0]:
             continue
         score = _score_block_scaled_tactic(

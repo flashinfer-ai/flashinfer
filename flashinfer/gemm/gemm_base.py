@@ -6400,17 +6400,6 @@ def _cute_dsl_gemm_mxfp8_runner(
 
     split_k_kernel_cls = Sm100BlockScaledSplitKGemmKernel
 
-    Sm107Kernel = None
-    if sm_major * 10 + sm_minor == 107:
-        try:
-            from .kernels.dense_blockscaled_gemm_sm107 import (
-                Sm107BlockScaledPersistentDenseGemmKernel,
-            )
-
-            Sm107Kernel = Sm107BlockScaledPersistentDenseGemmKernel
-        except ImportError:
-            pass
-
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
             f"cute_dsl mm_mxfp8 does not support output dtype {out_dtype}. "
@@ -6425,14 +6414,9 @@ def _cute_dsl_gemm_mxfp8_runner(
             "Supported: torch.bfloat16, torch.float16."
         )
     c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
+    _ = sm_major, sm_minor
 
     class CuteDSLMxfp8GemmRunner(TunableRunner):
-        """Tactics are (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, kernel_params).
-
-        kernel_params is the split-K slice count (int) for the SM100 kernels, or
-        (mma_inst_shape_m,) for the SM107 kernel.
-        """
-
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, _, _, out, _ = inputs
             return (str(out.dtype), enable_pdl)
@@ -6447,13 +6431,6 @@ def _cute_dsl_gemm_mxfp8_runner(
             n = b.shape[1]
             real_k = a.shape[1]
             ab_dtype = cutlass.Float8E4M3FN
-            if Sm107Kernel is not None and out.is_contiguous():
-                sm107_tactics = _get_sm107_mxfp8_tactics(m, n, real_k, c_cutlass_dtype)
-                # On SM107 the SM100 kernels only serve what the SM107 kernel
-                # cannot run: a non-contiguous out, or N % 8 != 0.
-                if sm107_tactics:
-                    return sm107_tactics
-
             base_tactics = _get_sm100_block_scaled_tactics(
                 m=m,
                 n=n,
@@ -6484,7 +6461,6 @@ def _cute_dsl_gemm_mxfp8_runner(
                             split_k_slices,
                         )
                     )
-
             return valid_tactics
 
         def forward(
@@ -6521,17 +6497,8 @@ def _cute_dsl_gemm_mxfp8_runner(
                     1,
                 )
 
-            def default_tactic():
-                if Sm107Kernel is not None and out.is_contiguous():
-                    sm107_tactic = _select_sm107_mm_mxfp8_cute_dsl_tactic(
-                        m, n, real_k, get_device_sm_count(a.device)
-                    )
-                    if sm107_tactic is not None:
-                        return sm107_tactic
-                return fallback_tactic
-
             if tactic is None or tactic == -1:
-                tactic = default_tactic()
+                tactic = fallback_tactic
 
             (
                 mma_tiler_mn,
@@ -6540,14 +6507,6 @@ def _cute_dsl_gemm_mxfp8_runner(
                 use_prefetch,
                 split_k_slices,
             ) = tactic
-            sm107_params = None
-            if isinstance(split_k_slices, tuple):
-                if Sm107Kernel is None:
-                    raise ValueError(
-                        f"SM107 MXFP8 tactic needs the SM107 kernel: {tactic}"
-                    )
-                sm107_params = split_k_slices
-                split_k_slices = 1
             if split_k_slices < 1:
                 raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
             is_split_k = split_k_slices > 1
@@ -6628,7 +6587,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                 use_prefetch,
                 enable_pdl,
                 out_dtype,
-                sm107_params or split_k_slices,
+                split_k_slices,
             )
 
             make_kernel: Callable[[], object]
@@ -6639,14 +6598,6 @@ def _cute_dsl_gemm_mxfp8_runner(
                     mma_tiler_mn,
                     split_k_slices,
                     enable_pdl,
-                )
-            elif sm107_params is not None and Sm107Kernel is not None:
-                (mma_inst_shape_m,) = sm107_params
-                make_kernel = lambda: Sm107Kernel(
-                    sf_vec_size,
-                    (mma_inst_shape_m, mma_tiler_mn[1], _SM107_MXFP8_MMA_INST_SHAPE_K),
-                    (mma_tiler_mn[0], mma_tiler_mn[1], _SM107_MXFP8_MMA_TILER_K),
-                    cluster_shape_mn,
                 )
             else:
                 make_kernel = lambda: Sm100BlockScaledPersistentDenseGemmKernel(
@@ -6694,6 +6645,149 @@ def _cute_dsl_gemm_mxfp8_runner(
             return out
 
     return CuteDSLMxfp8GemmRunner()
+
+
+@functools.cache
+def _sm107_mxfp8_cute_dsl_kernel():
+    """The SM107 CuTe-DSL block-scaled GEMM kernel class, or None if this
+    nvidia-cutlass-dsl wheel lacks the Rubin helpers it needs."""
+    try:
+        from .kernels.dense_blockscaled_gemm_sm107 import (
+            Sm107BlockScaledPersistentDenseGemmKernel,
+        )
+    except ImportError:
+        return None
+    return Sm107BlockScaledPersistentDenseGemmKernel
+
+
+def _use_sm107_mxfp8_cute_dsl(
+    major: int, minor: int, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
+) -> bool:
+    """Whether mm_mxfp8(backend="cute-dsl") runs the SM107 kernel.
+
+    On SM107 the SM100 kernels only serve what the SM107 kernel cannot run: a
+    non-contiguous out, or an N or K that breaks its 16-byte alignment.
+    """
+    return (
+        (major, minor) == (10, 7)
+        and out.is_contiguous()
+        and b.shape[1] % 8 == 0
+        and a.shape[1] % 16 == 0
+        and _sm107_mxfp8_cute_dsl_kernel() is not None
+    )
+
+
+_CUTE_DSL_MM_MXFP8_SM107_KERNEL_CACHE: dict[tuple, tuple] = {}
+
+
+def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
+    """CuTe-DSL mm_mxfp8 runner for Sm107BlockScaledPersistentDenseGemmKernel.
+
+    Tactics are (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m). The
+    kernel has no PDL support, so unlike the SM100 runner it takes no enable_pdl.
+    """
+    import cutlass
+
+    from ..cute_dsl.utils import torch_to_cutlass_dtype
+
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"cute_dsl mm_mxfp8 does not support output dtype {out_dtype}. "
+            "Supported: torch.bfloat16, torch.float16."
+        )
+    c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
+    Sm107Kernel = _sm107_mxfp8_cute_dsl_kernel()
+
+    class CuteDSLMxfp8Sm107GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            _, _, _, _, _, out, _ = inputs
+            return (str(out.dtype),)
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list:
+            a, b, _, _, _, _, _ = inputs
+            return _get_sm107_mxfp8_tactics(
+                a.shape[0], b.shape[1], a.shape[1], c_cutlass_dtype
+            )
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=None,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            (a, b, a_descale, b_descale, _, out, _) = inputs
+            m = a.shape[0]
+            real_k = a.shape[1]
+            n = b.shape[1]
+
+            if tactic is None or tactic == -1:
+                tactic = _select_sm107_mm_mxfp8_cute_dsl_tactic(
+                    m, n, real_k, get_device_sm_count(a.device)
+                )
+                if tactic is None:
+                    raise ValueError(
+                        f"The SM107 CuTe-DSL kernel cannot run mm_mxfp8 with "
+                        f"m={m}, n={n}, k={real_k}."
+                    )
+            mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m = tactic
+
+            sf_vec_size = 32
+            if swap_ab:
+                kernel_m, kernel_n = n, m
+                kernel_a, kernel_b = b.T, a
+                kernel_a_sf, kernel_b_sf = b_descale, a_descale
+            else:
+                kernel_m, kernel_n = m, n
+                kernel_a, kernel_b = a, b.T
+                kernel_a_sf, kernel_b_sf = a_descale, b_descale
+
+            sf_m = (kernel_m + 127) // 128
+            sf_n = (kernel_n + 127) // 128
+            sf_k = (real_k // sf_vec_size + 3) // 4
+
+            compiled_gemm, _ = _compile_block_scaled_gemm(
+                _CUTE_DSL_MM_MXFP8_SM107_KERNEL_CACHE,
+                (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m, out_dtype),
+                lambda: Sm107Kernel(
+                    sf_vec_size,
+                    (mma_inst_shape_m, mma_tiler_mn[1], _SM107_MXFP8_MMA_INST_SHAPE_K),
+                    (mma_tiler_mn[0], mma_tiler_mn[1], _SM107_MXFP8_MMA_TILER_K),
+                    cluster_shape_mn,
+                ),
+                ab_cutlass_dtype=cutlass.Float8E4M3FN,
+                sf_dtype=cutlass.Float8E8M0FNU,
+                c_cutlass_dtype=c_cutlass_dtype,
+                ab_assumed_align=16,
+                cluster_shape_mn=cluster_shape_mn,
+                swap_ab=swap_ab,
+                sf_m=sf_m,
+                sf_n=sf_n,
+                sf_k=sf_k,
+                batch_size=1,
+            )
+
+            launch_out = (
+                out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
+            )
+            compiled_gemm(
+                kernel_a,
+                kernel_b,
+                launch_out,
+                sf_m,
+                sf_n,
+                sf_k,
+                kernel_a_sf.data_ptr(),
+                kernel_b_sf.data_ptr(),
+                _prepare_alpha_for_launch(None, a.device),
+            )
+            return out
+
+    return CuteDSLMxfp8Sm107GemmRunner()
 
 
 def _cudnn_mm_mxfp8_runner():
@@ -7005,7 +7099,11 @@ def mm_mxfp8(
         "trtllm": lambda: get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
             use_8x4_sf_layout
         ),
-        "cute-dsl": lambda: _cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype),
+        "cute-dsl": lambda: (
+            _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype)
+            if _use_sm107_mxfp8_cute_dsl(major, minor, a, b, out)
+            else _cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype)
+        ),
         "cutedsl_low_latency": lambda: _cutedsl_low_latency_blockscaled_gemm_runner(
             major * 10 + minor, True
         ),
