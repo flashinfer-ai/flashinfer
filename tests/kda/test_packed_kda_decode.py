@@ -627,6 +627,7 @@ def test_kernel_facade_preserves_legacy_fallback_and_caller_stream_cpu(
     )
     monkeypatch.setattr(packed_module, "torch", fake_torch)
     monkeypatch.setattr(packed_module, "_target_for_device", lambda device: target)
+    monkeypatch.setattr(packed_module, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(
         packed_module,
         "_optimized_alignment_flags",
@@ -669,6 +670,7 @@ def test_kernel_facade_selects_optimized_variant_and_caller_stream_cpu(monkeypat
     )
     monkeypatch.setattr(packed_module, "torch", fake_torch)
     monkeypatch.setattr(packed_module, "_target_for_device", lambda device: target)
+    monkeypatch.setattr(packed_module, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(
         packed_module,
         "_optimized_alignment_flags",

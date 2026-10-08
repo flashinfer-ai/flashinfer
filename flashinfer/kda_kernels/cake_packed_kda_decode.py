@@ -150,6 +150,7 @@ def run_packed_kda_decode(
     )
     optimized_variant = select_cake_kda_packed_t1_variant(
         batch,
+        compute_capability=get_compute_capability(mixed_qkv.device),
         state_aligned=state_aligned,
         aux_vec4_aligned=aux_vec4_aligned,
     )

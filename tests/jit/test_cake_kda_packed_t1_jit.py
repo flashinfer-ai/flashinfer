@@ -12,6 +12,11 @@ from flashinfer.jit import cake_kda_packed_t1
 from flashinfer.jit import core as jit_core
 
 
+_SM100_CAPABILITIES = ((10, 0), (10, 3))
+_ALL_CAPABILITIES = tuple(cake_kda_packed_t1.CAKE_KDA_PACKED_T1_ALIGNED_BANDS)
+
+
+@pytest.mark.parametrize("compute_capability", _SM100_CAPABILITIES)
 @pytest.mark.parametrize(
     ("batch", "expected"),
     [
@@ -33,10 +38,13 @@ from flashinfer.jit import core as jit_core
         (65535, "cpasync_tile128_register_pipeline"),
     ],
 )
-def test_aligned_selector_matches_qualified_batch_bands(batch, expected):
+def test_aligned_selector_matches_qualified_batch_bands(
+    compute_capability, batch, expected
+):
     assert (
         cake_kda_packed_t1.select_cake_kda_packed_t1_variant(
             batch,
+            compute_capability=compute_capability,
             state_aligned=True,
             aux_vec4_aligned=True,
         )
@@ -44,6 +52,55 @@ def test_aligned_selector_matches_qualified_batch_bands(batch, expected):
     )
 
 
+@pytest.mark.parametrize(
+    ("batch", "expected"),
+    [
+        (1, "register_tile16"),
+        (18, "register_tile16"),
+        (19, "cpasync_tile64_register_pipeline"),
+        (63, "cpasync_tile64_register_pipeline"),
+        (64, "cpasync_tile128_register_pipeline"),
+        (65535, "cpasync_tile128_register_pipeline"),
+    ],
+)
+def test_aligned_selector_rebands_on_compute_capability_10_7(batch, expected):
+    assert (
+        cake_kda_packed_t1.select_cake_kda_packed_t1_variant(
+            batch,
+            compute_capability=(10, 7),
+            state_aligned=True,
+            aux_vec4_aligned=True,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("compute_capability", _ALL_CAPABILITIES)
+def test_aligned_selector_bands_are_well_formed(compute_capability):
+    bands = cake_kda_packed_t1.CAKE_KDA_PACKED_T1_ALIGNED_BANDS[compute_capability]
+    limits = [max_batch for max_batch, _ in bands[:-1]]
+    assert bands[-1][0] is None
+    assert all(isinstance(limit, int) and limit > 0 for limit in limits)
+    assert limits == sorted(set(limits))
+    for _, variant in bands:
+        assert variant in cake_kda_packed_t1.CAKE_KDA_PACKED_T1_VARIANTS
+        assert cake_kda_packed_t1.CAKE_KDA_PACKED_T1_VARIANT_METADATA[
+            variant
+        ].requires_aux_vec4
+
+
+@pytest.mark.parametrize("compute_capability", ((9, 0), (12, 0), (10, 8)))
+def test_selector_rejects_capabilities_without_qualified_bands(compute_capability):
+    with pytest.raises(ValueError, match="no qualified selector bands"):
+        cake_kda_packed_t1.select_cake_kda_packed_t1_variant(
+            8,
+            compute_capability=compute_capability,
+            state_aligned=True,
+            aux_vec4_aligned=True,
+        )
+
+
+@pytest.mark.parametrize("compute_capability", _ALL_CAPABILITIES)
 @pytest.mark.parametrize(
     ("batch", "expected"),
     [
@@ -56,10 +113,13 @@ def test_aligned_selector_matches_qualified_batch_bands(batch, expected):
         (65535, None),
     ],
 )
-def test_scalar_aux_selector_fails_closed_outside_qualified_bands(batch, expected):
+def test_scalar_aux_selector_fails_closed_outside_qualified_bands(
+    compute_capability, batch, expected
+):
     assert (
         cake_kda_packed_t1.select_cake_kda_packed_t1_variant(
             batch,
+            compute_capability=compute_capability,
             state_aligned=True,
             aux_vec4_aligned=False,
         )
@@ -67,11 +127,13 @@ def test_scalar_aux_selector_fails_closed_outside_qualified_bands(batch, expecte
     )
 
 
-def test_unaligned_state_uses_legacy_route():
+@pytest.mark.parametrize("compute_capability", _ALL_CAPABILITIES)
+def test_unaligned_state_uses_legacy_route(compute_capability):
     for batch in (1, 38, 512):
         assert (
             cake_kda_packed_t1.select_cake_kda_packed_t1_variant(
                 batch,
+                compute_capability=compute_capability,
                 state_aligned=False,
                 aux_vec4_aligned=True,
             )
@@ -80,6 +142,7 @@ def test_unaligned_state_uses_legacy_route():
     with pytest.raises(ValueError, match="batch must be positive"):
         cake_kda_packed_t1.select_cake_kda_packed_t1_variant(
             0,
+            compute_capability=compute_capability,
             state_aligned=True,
             aux_vec4_aligned=True,
         )
