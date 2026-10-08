@@ -2317,9 +2317,13 @@ def create_mma_task_split_kv(
                 FmhaStage.Loop,
             )
 
+        # The last BMM1 has been issued once the loop ends, and BMM2 never reads
+        # Q. Releasing it here lets a persistent CTA load the next work tile's
+        # Q while the final softmax and BMM2 waves run, as the KV256 MMA does.
+        smem_q.release()
+
         pv_mma(smem_v0, smem_p0, "vp_mma_tail", KV_INST0, FmhaStage.Tail)
         pv_mma(smem_v1, smem_p1, "vp_mma_tail", KV_INST1, FmhaStage.Tail)
-        smem_q.release()
 
     def mma_schedule_prelude(
         smem_q: MemoryResource,
@@ -2616,8 +2620,10 @@ def create_mma_task_one_inst_qkv(
             qk_mma(q_desc, "qk_mma_loop", FmhaStage.Loop)
             pv_mma("vp_mma_loop", FmhaStage.Loop)
 
-        pv_mma("vp_mma_tail", FmhaStage.Tail)
+        # BMM2 never reads Q; release it before the final wave
+        # (see create_mma_task_split_kv).
         smem_q.release()
+        pv_mma("vp_mma_tail", FmhaStage.Tail)
 
     def mma_schedule_prelude(
         smem_q: MemoryResource,
