@@ -8,7 +8,7 @@ from cutlass.cute import core as cute_core
 from cutlass.cute.atom import Trait, make_atom
 from cutlass.cute.nvgpu import warp, warpgroup
 from cutlass.cute.typing import Shape
-from cutlass.cutlass_dsl import T
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 
@@ -260,6 +260,106 @@ def load_tensor_as_b(
     return tBrB
 
 
+@cute.jit
+def gemm_f16acc_carry(
+    tiled_mma,
+    acc32: cute.Tensor,
+    tA: cute.Tensor,
+    tB: cute.Tensor,
+    group: cutlass.Constexpr,
+):
+    """acc32 += A @ B^T with FP16-accumulate m16n8k16 MMAs and an FP32 carry.
+
+    ``tiled_mma`` is built from an FP16-accumulator atom
+    (``warp.MmaF16BF16Op(Float16, Float16, (16, 8, 16))``), ``tA`` / ``tB`` are FP16
+    operand fragments and ``acc32`` is the FP32 accumulator fragment holding the
+    running sum (same C layout as the plain FP32 path). Every ``group`` consecutive
+    K steps accumulate into a zeroed FP16 fragment, which is then added to ``acc32``,
+    so the sum carried across the whole K extent stays FP32.
+    """
+    k_blocks = cute.size(tA, mode=[2])
+    part = cute.make_rmem_tensor_like(acc32, cutlass.Float16)
+    for k0 in cutlass.range_constexpr(0, k_blocks, group):
+        part.fill(cutlass.Float16(0.0))
+        for k in cutlass.range_constexpr(k0, min(k0 + group, k_blocks)):
+            cute.gemm(tiled_mma, part, tA[None, None, k], tB[None, None, k], part)
+        for i in cutlass.range_constexpr(cute.size(part)):
+            acc32[i] = acc32[i] + cutlass.Float32(part[i])
+
+
+@dsl_user_op
+def _cvt_bf16x2_to_f16x2_sat(x: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """Packed bf16x2 -> f16x2 (round to nearest, saturating at +-65504)."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Uint32(x).ir_value(loc=loc, ip=ip)],
+            "{\n"
+            ".reg .b32 lo, hi;\n"
+            ".reg .f32 flo, fhi;\n"
+            "shl.b32 lo, $1, 16;\n"
+            "and.b32 hi, $1, 0xffff0000;\n"
+            "mov.b32 flo, lo;\n"
+            "mov.b32 fhi, hi;\n"
+            "cvt.rn.satfinite.f16x2.f32 $0, fhi, flo;\n"
+            "}",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def convert_smem_inplace(
+    sTile_flat: cute.Tensor,
+    src_dtype,
+    dst_dtype,
+    thread_idx: cutlass.Int32,
+    num_threads: cutlass.Constexpr,
+):
+    """Convert a flat shared-memory tile from BF16 to FP16 in place.
+
+    Only ``src_dtype=BFloat16`` / ``dst_dtype=Float16`` is implemented (both 16 bits
+    wide). ``sTile_flat`` is a flat 16-byte-aligned tensor of the tile (its size a
+    multiple of ``8 * num_threads``). The tile is treated as a 1-D array of 128-bit
+    vectors (8 elements); thread ``t`` converts vectors ``t, t + num_threads, ...`` so
+    that consecutive lanes touch consecutive 16-byte chunks (no bank conflicts). Values
+    outside the FP16 range saturate to +-65504. The caller orders the writes against
+    the readers (``fence_view_async_shared`` + a barrier of the converting threads).
+    """
+    if cutlass.const_expr(
+        not (src_dtype is cutlass.BFloat16 and dst_dtype is cutlass.Float16)
+    ):
+        raise NotImplementedError("convert_smem_inplace: only BFloat16 -> Float16")
+    vec = 8
+    num_vec = cute.size(sTile_flat) // vec
+    src_ptr = sTile_flat.iterator
+    dst_ptr = cute.recast_ptr(src_ptr, dtype=dst_dtype)
+    vec_layout = cute.make_layout(vec)
+    copy_atom_src = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), src_dtype, num_bits_per_copy=128
+    )
+    copy_atom_dst = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), dst_dtype, num_bits_per_copy=128
+    )
+    for j in cutlass.range_constexpr(num_vec // num_threads):
+        off = cute.assume((thread_idx + j * num_threads) * vec, divby=vec)
+        s_src = cute.make_tensor(src_ptr + off, vec_layout)
+        s_dst = cute.make_tensor(dst_ptr + off, vec_layout)
+        r_src = cute.make_rmem_tensor(vec, src_dtype)
+        cute.copy(copy_atom_src, s_src, r_src)
+        r_dst = cute.make_rmem_tensor(vec, dst_dtype)
+        r_src_u32 = cute.recast_tensor(r_src, cutlass.Uint32)
+        r_dst_u32 = cute.recast_tensor(r_dst, cutlass.Uint32)
+        for i in cutlass.range_constexpr(vec // 2):
+            r_dst_u32[i] = _cvt_bf16x2_to_f16x2_sat(r_src_u32[i])
+        cute.copy(copy_atom_dst, r_dst, s_dst)
+
+
 class SM80:
     @staticmethod
     @cute.jit
@@ -408,3 +508,63 @@ class SM90:
         operand_as_acc = cute.make_tensor(operand.iterator, acc.layout)
         operand_as_acc.store(acc.load().to(dtype))
         return operand
+
+
+@cute.jit
+def _mn_gemm_f16acc_to_f16(
+    tiled_mma,
+    c_shape,
+    tA: cute.Tensor,
+    tB: cute.Tensor,
+    group: cutlass.Constexpr,
+) -> cute.Tensor:
+    """A @ B^T with FP16-accumulate MMAs, returned as an FP16 fragment.
+
+    For a result that is rounded to FP16 right away (an MMA operand or an smem
+    tile): one K group is the FP16 partial sum itself, two groups are added in FP16
+    (one rounding of the exact sum, the same value as an FP32 carry rounded to FP16),
+    more groups are carried in FP32 (``gemm_f16acc_carry``) and rounded at the end.
+    ``c_shape`` is ``thr_mma.partition_shape_C(...)`` of the result tile.
+    """
+    k_blocks = cute.size(tA, mode=[2])
+    num_groups = (k_blocks + group - 1) // group
+    if cutlass.const_expr(num_groups <= 2):
+        part0 = cute.make_rmem_tensor(c_shape, cutlass.Float16)
+        part0.fill(cutlass.Float16(0.0))
+        for k in cutlass.range_constexpr(0, min(group, k_blocks)):
+            cute.gemm(tiled_mma, part0, tA[None, None, k], tB[None, None, k], part0)
+        out = part0
+        if cutlass.const_expr(num_groups == 2):
+            part1 = cute.make_rmem_tensor(c_shape, cutlass.Float16)
+            part1.fill(cutlass.Float16(0.0))
+            for k in cutlass.range_constexpr(group, k_blocks):
+                cute.gemm(tiled_mma, part1, tA[None, None, k], tB[None, None, k], part1)
+            out = cute.make_rmem_tensor_like(part0, cutlass.Float16)
+            out.store(part0.load() + part1.load())
+    else:
+        acc32 = cute.make_rmem_tensor(c_shape, cutlass.Float32)
+        acc32.fill(cutlass.Float32(0.0))
+        gemm_f16acc_carry(tiled_mma, acc32, tA, tB, group)
+        out = cute.make_rmem_tensor_like(acc32, cutlass.Float16)
+        out.store(acc32.load().to(cutlass.Float16))
+    return out
+
+
+@cute.jit
+def _mn_gemm_f16acc_carry_scaled(
+    tiled_mma,
+    acc32: cute.Tensor,
+    tA: cute.Tensor,
+    tB: cute.Tensor,
+    group: cutlass.Constexpr,
+    scale: cutlass.Float32,
+):
+    """``gemm_f16acc_carry`` that adds ``scale * partial`` into ``acc32``."""
+    k_blocks = cute.size(tA, mode=[2])
+    part = cute.make_rmem_tensor_like(acc32, cutlass.Float16)
+    for k0 in cutlass.range_constexpr(0, k_blocks, group):
+        part.fill(cutlass.Float16(0.0))
+        for k in cutlass.range_constexpr(k0, min(k0 + group, k_blocks)):
+            cute.gemm(tiled_mma, part, tA[None, None, k], tB[None, None, k], part)
+        for i in cutlass.range_constexpr(cute.size(part)):
+            acc32[i] = acc32[i] + scale * cutlass.Float32(part[i])

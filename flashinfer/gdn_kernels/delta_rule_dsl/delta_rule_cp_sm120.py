@@ -29,6 +29,10 @@ from .helpers import (
     SM80,
     TF32,
     WarpMmaTF32Op,
+    _mn_gemm_f16acc_carry_scaled,
+    _mn_gemm_f16acc_to_f16,
+    convert_smem_inplace,
+    gemm_f16acc_carry,
     load_tensor_as_c,
     load_tensor_as_a,
     load_tensor_as_b,
@@ -86,15 +90,32 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
+        fp16_accum_mma: bool = False,
+        f16_group: int = 4,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.inverse_dtype = cutlass.Float16
+        # FP16-accumulate mode (SM12x: FP32-accumulate HMMA is rate-limited). The MMA
+        # atom and its operands are FP16 (BF16 K is converted in registers), K steps
+        # accumulate in FP16 groups of f16_group that are carried into the FP32
+        # accumulator, and T is stored in FP16.
+        self.fp16_accum_mma = fp16_accum_mma
+        self.f16_group = f16_group
+        self.op_dtype = cutlass.Float16 if fp16_accum_mma else dtype
+        self.mma_acc_dtype = cutlass.Float16 if fp16_accum_mma else acc_dtype
         self.BLK = 64
         self.D = 128
         self.manual_cache_key(
-            "dtype", "acc_dtype", "cu_seqlens_dtype", "inverse_dtype", "BLK", "D"
+            "dtype",
+            "acc_dtype",
+            "cu_seqlens_dtype",
+            "inverse_dtype",
+            "BLK",
+            "D",
+            "fp16_accum_mma",
+            "f16_group",
         )
 
     @cute.jit
@@ -217,7 +238,7 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
         tTrInv_cv = thr_load.retile(tTrInv)
         cute.copy(tiled_load, tTsT, tTrInv_cv)
 
-        store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.dtype)
+        store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.op_dtype)
         tiled_store = cute.make_tiled_copy_C(store_atom, kk_tiled_mma)
         thr_store = tiled_store.get_slice(tidx)
         tTgT = thr_store.partition_D(gT_CR)
@@ -225,7 +246,7 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
         tTcT = thr_store.partition_D(cT_CR)
         tTrInv_store = thr_store.retile(tTrInv)
         tTrT = cute.make_rmem_tensor(
-            kk_tiled_mma.partition_shape_C((self.BLK, self.BLK)), self.dtype
+            kk_tiled_mma.partition_shape_C((self.BLK, self.BLK)), self.op_dtype
         )
         tTrT_store = thr_store.retile(tTrT)
 
@@ -235,7 +256,7 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
             if row < valid_len and col < valid_len:
                 beta = cutlass.Float32(sBeta[row])
                 value = -beta * cutlass.Float32(tTrInv_store[i])
-            tTrT_store[i] = self.dtype(value)
+            tTrT_store[i] = self.op_dtype(value)
         cute.autovec_copy(tTrT_store, tTgT)
 
     @cute.jit
@@ -433,34 +454,64 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
             cute.arch.sync_threads()
 
             kk_tiled_mma = cute.make_tiled_mma(
-                warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16)),
+                warp.MmaF16BF16Op(self.op_dtype, self.mma_acc_dtype, (16, 8, 16)),
                 cute.make_layout((4, 1, 1)),
                 permutation_mnk=(self.BLK, self.BLK, self.D),
             )
             kk_thr_mma = kk_tiled_mma.get_slice(tidx)
-            ldsm_atom = cute.make_copy_atom(
-                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
-            )
-            kk_tiled_copy_A = cute.make_tiled_copy_A(ldsm_atom, kk_tiled_mma)
-            kk_tiled_copy_B = cute.make_tiled_copy_B(ldsm_atom, kk_tiled_mma)
-            kk_thr_copy_A = kk_tiled_copy_A.get_slice(tidx)
-            kk_thr_copy_B = kk_tiled_copy_B.get_slice(tidx)
-            tKKrA = kk_thr_mma.make_fragment_A(kk_thr_mma.partition_A(sK_SD))
-            tKKrB = kk_thr_mma.make_fragment_B(kk_thr_mma.partition_B(sK_SD))
-            tKKrA_cv = kk_thr_copy_A.retile(tKKrA)
-            tKKrB_cv = kk_thr_copy_B.retile(tKKrB)
-            tKKsA = kk_thr_copy_A.partition_S(sK_SD)
-            tKKsB = kk_thr_copy_B.partition_S(sK_SD)
-            tKKrKK = kk_thr_mma.make_fragment_C(
-                kk_thr_mma.partition_shape_C((self.BLK, self.BLK))
-            )
-            cMkk = cute.make_identity_tensor((self.BLK, self.BLK))
-            tKKcMkk = kk_thr_mma.partition_C(cMkk)
+            if cutlass.const_expr(self.fp16_accum_mma):
+                # FP16 A/B fragments (BF16 K is converted in registers) and an FP32
+                # accumulator that carries the FP16 partial sums.
+                tKKrA = load_tensor_as_a(
+                    sK_SD,
+                    kk_tiled_mma,
+                    tidx,
+                    (self.BLK, self.D),
+                    self.dtype,
+                    True,
+                    dst_dtype=self.op_dtype,
+                )
+                tKKrB = load_tensor_as_b(
+                    sK_SD,
+                    kk_tiled_mma,
+                    tidx,
+                    (self.BLK, self.D),
+                    self.dtype,
+                    True,
+                    dst_dtype=self.op_dtype,
+                )
+                tKKrKK = cute.make_rmem_tensor(
+                    kk_thr_mma.partition_shape_C((self.BLK, self.BLK)), self.acc_dtype
+                )
+                cMkk = cute.make_identity_tensor((self.BLK, self.BLK))
+                tKKcMkk = kk_thr_mma.partition_C(cMkk)
 
-            cute.copy(kk_tiled_copy_A, tKKsA, tKKrA_cv)
-            cute.copy(kk_tiled_copy_B, tKKsB, tKKrB_cv)
-            tKKrKK.fill(self.acc_dtype(0.0))
-            cute.gemm(kk_tiled_mma, tKKrKK, tKKrA, tKKrB, tKKrKK)
+                tKKrKK.fill(self.acc_dtype(0.0))
+                gemm_f16acc_carry(kk_tiled_mma, tKKrKK, tKKrA, tKKrB, self.f16_group)
+            else:
+                ldsm_atom = cute.make_copy_atom(
+                    warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
+                )
+                kk_tiled_copy_A = cute.make_tiled_copy_A(ldsm_atom, kk_tiled_mma)
+                kk_tiled_copy_B = cute.make_tiled_copy_B(ldsm_atom, kk_tiled_mma)
+                kk_thr_copy_A = kk_tiled_copy_A.get_slice(tidx)
+                kk_thr_copy_B = kk_tiled_copy_B.get_slice(tidx)
+                tKKrA = kk_thr_mma.make_fragment_A(kk_thr_mma.partition_A(sK_SD))
+                tKKrB = kk_thr_mma.make_fragment_B(kk_thr_mma.partition_B(sK_SD))
+                tKKrA_cv = kk_thr_copy_A.retile(tKKrA)
+                tKKrB_cv = kk_thr_copy_B.retile(tKKrB)
+                tKKsA = kk_thr_copy_A.partition_S(sK_SD)
+                tKKsB = kk_thr_copy_B.partition_S(sK_SD)
+                tKKrKK = kk_thr_mma.make_fragment_C(
+                    kk_thr_mma.partition_shape_C((self.BLK, self.BLK))
+                )
+                cMkk = cute.make_identity_tensor((self.BLK, self.BLK))
+                tKKcMkk = kk_thr_mma.partition_C(cMkk)
+
+                cute.copy(kk_tiled_copy_A, tKKsA, tKKrA_cv)
+                cute.copy(kk_tiled_copy_B, tKKsB, tKKrB_cv)
+                tKKrKK.fill(self.acc_dtype(0.0))
+                cute.gemm(kk_tiled_mma, tKKrKK, tKKrA, tKKrB, tKKrKK)
             k_pipeline.consumer_release(k_consumer_state)
 
             self.kk_epi(tKKrKK, tKKcMkk, sBeta)
@@ -480,10 +531,14 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
 
 
 @functools.cache
-def _get_t_precompute_kernel(kernel_dtype, cu_seqlens_dtype):
+def _get_t_precompute_kernel(
+    kernel_dtype, cu_seqlens_dtype, fp16_accum_mma=False, f16_group=4
+):
     return CPDeltaRuleTPrecomputeSm120(
         kernel_dtype,
         cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens_dtype),
+        fp16_accum_mma=fp16_accum_mma,
+        f16_group=f16_group,
     )
 
 
@@ -494,6 +549,8 @@ def cp_delta_rule_t_precompute_dsl_sm120(
     total_seqlen: int,
     max_seqlen: int | None = None,
     *,
+    fp16_accum_mma: bool = False,
+    f16_group: int = 4,
     _skip_check: bool = False,
     _device=None,
     _stream=None,
@@ -503,6 +560,10 @@ def cp_delta_rule_t_precompute_dsl_sm120(
     Flat varlen input returns `T := -(inv(IKK) beta)^T` with shape
     `(total_t_blocks, num_heads, 64, 64)`, where
     `total_t_blocks = chunk_bound(num_seqs, total_seqlen, 64)`.
+
+    With `fp16_accum_mma` the KK product uses FP16-accumulate MMAs (partial sums
+    of `f16_group` K steps carried into FP32) and T is returned in FP16 for
+    either input dtype; otherwise T has the dtype of `k`.
 
     Inputs must already be contiguous. This wrapper validates that contract but
     does not materialize contiguous copies.
@@ -560,7 +621,7 @@ def cp_delta_rule_t_precompute_dsl_sm120(
     t = _get_cp_workspace(
         "gdn_cp_sm120_t",
         (total_t_blocks, num_sab_heads, 64, 64),
-        k.dtype,
+        torch.float16 if fp16_accum_mma else k.dtype,
         device,
     )
     if total_t_blocks == 0:
@@ -582,7 +643,9 @@ def cp_delta_rule_t_precompute_dsl_sm120(
     )
 
     compile_options = _sm120_compile_options(device)
-    kernel = _get_t_precompute_kernel(kernel_dtype, cu_seqlens.dtype)
+    kernel = _get_t_precompute_kernel(
+        kernel_dtype, cu_seqlens.dtype, fp16_accum_mma, f16_group
+    )
     compiled = get_cached_compile(kernel, compile_options)
     if compiled is None:
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
@@ -628,6 +691,10 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         LOAD_T = 2
         LOAD_ALPHA = 3
 
+    # 256 math threads: the in-place BF16 -> FP16 K smem conversion is done
+    # (FP16-accumulate mode with BF16 inputs only).
+    CVT_SYNC = 7
+
     @staticmethod
     def get_register_requirements(
         max_threads_per_block: int,
@@ -655,10 +722,22 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
+        fp16_accum_mma: bool = False,
+        f16_group: int = 4,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
         self.cu_seqlens_dtype = cu_seqlens_dtype
+        # FP16-accumulate mode (SM12x: FP32-accumulate HMMA is rate-limited). The MMA
+        # atoms and every MMA operand (K, T, X, and M / S / Z / Y converted from their
+        # FP32 accumulators) are FP16; each GEMM accumulates groups of f16_group K
+        # steps in FP16 and carries them into FP32 (the M / N accumulators stay FP32).
+        self.fp16_accum_mma = fp16_accum_mma
+        self.f16_group = f16_group
+        self.op_dtype = cutlass.Float16 if fp16_accum_mma else dtype
+        self.mma_acc_dtype = cutlass.Float16 if fp16_accum_mma else acc_dtype
+        # BF16 inputs: the K tile is converted to FP16 in smem once per block.
+        self.cvt_k_smem = fp16_accum_mma and dtype is not cutlass.Float16
         self.BLK = 64
         self.D = 128
         self.k_stage = 2
@@ -675,6 +754,10 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
             "v_stage",
             "t_stage",
             "alpha_stage",
+            "fp16_accum_mma",
+            "f16_group",
+            "op_dtype",
+            "mma_acc_dtype",
         )
 
     @cute.jit
@@ -712,15 +795,15 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         transpose: cutlass.Constexpr = True,
     ):
         stsm_atom = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=4), self.dtype
+            warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=4), self.op_dtype
         )
         tiled_copy = cute.make_tiled_copy_C(stsm_atom, tiled_mma)
         thr_copy = tiled_copy.get_slice(thread_idx)
         tCsC = thr_copy.partition_D(sC)
         tCsC_align = cute.make_tensor(tCsC.iterator.align(16), tCsC.layout)
-        tCrC_cvt = cute.make_fragment_like(tCrC, self.dtype)
+        tCrC_cvt = cute.make_fragment_like(tCrC, self.op_dtype)
         for i in cutlass.range_constexpr(cute.size(tCrC)):
-            tCrC_cvt[i] = self.dtype(tCrC[i])
+            tCrC_cvt[i] = self.op_dtype(tCrC[i])
         tCrC_cvt_cv = thr_copy.retile(tCrC_cvt)
         cute.copy(tiled_copy, tCrC_cvt_cv, tCsC_align)
 
@@ -866,21 +949,26 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         thread_idx: cutlass.Int32,
         wg_idx: cutlass.Int32,
         is_first_block: bool,
+        # BF16 inputs in FP16-accumulate mode only: flat (stage-major) smem view of the
+        # K storage (converted to FP16 in place, one block ahead) and whether another
+        # block follows.
+        sK_flat=None,
+        has_next=None,
     ):
         # ── Tiled MMAs ───────────────────────────────────────────────────────
         x_tiled_mma = cute.make_tiled_mma(
-            warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16)),
+            warp.MmaF16BF16Op(self.op_dtype, self.mma_acc_dtype, (16, 8, 16)),
             cute.make_layout((8, 1, 1)),
             permutation_mnk=(self.D, self.BLK, self.BLK),
         )
         z_tiled_mma = cute.make_tiled_mma(
-            warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16)),
+            warp.MmaF16BF16Op(self.op_dtype, self.mma_acc_dtype, (16, 8, 16)),
             cute.make_layout((8, 1, 1)),
             permutation_mnk=(self.D, self.BLK, self.D),
         )
         y_tiled_mma = z_tiled_mma
         trans_tiled_mma = cute.make_tiled_mma(
-            warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16)),
+            warp.MmaF16BF16Op(self.op_dtype, self.mma_acc_dtype, (16, 8, 16)),
             cute.make_layout((8, 1, 1)),
             permutation_mnk=(self.D, self.D, self.BLK),
         )
@@ -909,16 +997,26 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
 
         # ── X = T_fused K, stored as Xt = X^T for state and transfer ────────
         tXrK = load_tensor_as_a(
-            sK, x_tiled_mma, thread_idx, (self.D, self.BLK), self.dtype, False
+            sK, x_tiled_mma, thread_idx, (self.D, self.BLK), self.op_dtype, False
         )
         tXrT = load_tensor_as_b(
-            sT_blk, x_tiled_mma, thread_idx, (self.BLK, self.BLK), self.dtype, True
+            sT_blk, x_tiled_mma, thread_idx, (self.BLK, self.BLK), self.op_dtype, True
         )
-        tXrX = x_thr_mma.make_fragment_C(
-            x_thr_mma.partition_shape_C((self.D, self.BLK))
-        )
-        tXrX.fill(self.acc_dtype(0.0))
-        cute.gemm(x_tiled_mma, tXrX, tXrK, tXrT, tXrX)
+        if cutlass.const_expr(self.fp16_accum_mma):
+            # X is stored as an FP16 operand, so it stays an FP16 fragment.
+            tXrX = _mn_gemm_f16acc_to_f16(
+                x_tiled_mma,
+                x_thr_mma.partition_shape_C((self.D, self.BLK)),
+                tXrK,
+                tXrT,
+                self.f16_group,
+            )
+        else:
+            tXrX = x_thr_mma.make_fragment_C(
+                x_thr_mma.partition_shape_C((self.D, self.BLK))
+            )
+            tXrX.fill(self.acc_dtype(0.0))
+            cute.gemm(x_tiled_mma, tXrX, tXrK, tXrT, tXrX)
         t_pipeline.consumer_release(t_consumer_state)
         t_consumer_state.advance()
         self.store_acc_to_smem(tXrX, sX_DS, x_tiled_mma, thread_idx, False)
@@ -926,14 +1024,14 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
 
         # ── Transfer: Z = M K^T, M <- gamma_end (M + Z X) ───────────────────
         ldsm_n4 = cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.op_dtype
         )
         z_tiled_copy_B = cute.make_tiled_copy_B(ldsm_n4, z_tiled_mma)
         z_thr_copy_B = z_tiled_copy_B.get_slice(thread_idx)
         z_tile_shape = (self.D, self.BLK, self.D)
         tZrK = cute.make_rmem_tensor(
             z_thr_mma.partition_shape_B(cute.slice_(z_tile_shape, (0, None, None))),
-            self.dtype,
+            self.op_dtype,
         )
         tZrK_cv = z_thr_copy_B.retile(tZrK)
         tZsK = z_thr_copy_B.partition_S(sK_SD)
@@ -942,25 +1040,44 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         ):  # first iter transfer matrix is identity, skip MMA
             tTRANSrZ = tXrK
         else:
-            tZrTrans = SM80.make_acc_into_op(tTransferT, z_tiled_mma, self.dtype)
-            tZrZ = z_thr_mma.make_fragment_C(
-                z_thr_mma.partition_shape_C((self.D, self.BLK))
-            )
+            tZrTrans = SM80.make_acc_into_op(tTransferT, z_tiled_mma, self.op_dtype)
             cute.copy(z_tiled_copy_B, tZsK, tZrK_cv)
-            tZrZ.fill(self.acc_dtype(0.0))
-            cute.gemm(z_tiled_mma, tZrZ, tZrTrans, tZrK, tZrZ)
-            tTRANSrZ = SM80.make_acc_into_op(tZrZ, trans_tiled_mma, self.dtype)
+            if cutlass.const_expr(self.fp16_accum_mma):
+                tZrZ = _mn_gemm_f16acc_to_f16(
+                    z_tiled_mma,
+                    z_thr_mma.partition_shape_C((self.D, self.BLK)),
+                    tZrTrans,
+                    tZrK,
+                    self.f16_group,
+                )
+            else:
+                tZrZ = z_thr_mma.make_fragment_C(
+                    z_thr_mma.partition_shape_C((self.D, self.BLK))
+                )
+                tZrZ.fill(self.acc_dtype(0.0))
+                cute.gemm(z_tiled_mma, tZrZ, tZrTrans, tZrK, tZrZ)
+            tTRANSrZ = SM80.make_acc_into_op(tZrZ, trans_tiled_mma, self.op_dtype)
 
         tTRANSrX = load_tensor_as_b(
-            sX_DS, trans_tiled_mma, thread_idx, (self.D, self.BLK), self.dtype, True
+            sX_DS, trans_tiled_mma, thread_idx, (self.D, self.BLK), self.op_dtype, True
         )
-        cute.gemm(trans_tiled_mma, tTransferT, tTRANSrZ, tTRANSrX, tTransferT)
+        if cutlass.const_expr(self.fp16_accum_mma):
+            gemm_f16acc_carry(
+                trans_tiled_mma, tTransferT, tTRANSrZ, tTRANSrX, self.f16_group
+            )
+        else:
+            cute.gemm(trans_tiled_mma, tTransferT, tTRANSrZ, tTRANSrX, tTransferT)
         self.scale_acc_by_scalar(tTransferT, block_coeff)
 
         # ── State: Y = gamma_end S K^T - gamma_end V^T Gamma^-1, S <- gamma_end S + Y X
-        tYrY = y_thr_mma.make_fragment_C(
-            y_thr_mma.partition_shape_C((self.D, self.BLK))
-        )
+        if cutlass.const_expr(self.fp16_accum_mma):
+            tYrY = cute.make_rmem_tensor(
+                y_thr_mma.partition_shape_C((self.D, self.BLK)), self.acc_dtype
+            )
+        else:
+            tYrY = y_thr_mma.make_fragment_C(
+                y_thr_mma.partition_shape_C((self.D, self.BLK))
+            )
         tYcK = y_thr_mma.partition_C(cK)
         tYrV = load_tensor_as_c(
             sV,
@@ -978,28 +1095,52 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         alpha_consumer_state.advance()
 
         tYrK = tZrK
+        if cutlass.const_expr(self.fp16_accum_mma):
+            # The Y accumulator starts at V' and takes gamma_end * (S K^T) partial
+            # sums, so no separate V' fragment is live across the GEMM.
+            tYrY = tYrV
         if cutlass.const_expr(not is_first_block):
-            tYrS = SM80.make_acc_into_op(tStateT, y_tiled_mma, self.dtype)
+            tYrS = SM80.make_acc_into_op(tStateT, y_tiled_mma, self.op_dtype)
             self._math_order_wait(wg_idx)
             cute.copy(z_tiled_copy_B, tZsK, tZrK_cv)
-            tYrY.fill(self.acc_dtype(0.0))
-            cute.gemm(y_tiled_mma, tYrY, tYrS, tYrK, tYrY)
+            if cutlass.const_expr(self.fp16_accum_mma):
+                _mn_gemm_f16acc_carry_scaled(
+                    y_tiled_mma, tYrY, tYrS, tYrK, self.f16_group, block_coeff
+                )
+            else:
+                tYrY.fill(self.acc_dtype(0.0))
+                cute.gemm(y_tiled_mma, tYrY, tYrS, tYrK, tYrY)
             self._math_order_notify(wg_idx)
 
-            for i in cutlass.range(cute.size(tYrY), unroll_full=True):
-                tYrY[i] = block_coeff * tYrY[i] + tYrV[i]
-        else:
+            if cutlass.const_expr(not self.fp16_accum_mma):
+                for i in cutlass.range(cute.size(tYrY), unroll_full=True):
+                    tYrY[i] = block_coeff * tYrY[i] + tYrV[i]
+        elif cutlass.const_expr(not self.fp16_accum_mma):
             cute.basic_copy(tYrV, tYrY)
 
-        tSTATErY = SM80.make_acc_into_op(tYrY, state_tiled_mma, self.dtype)
+        tSTATErY = SM80.make_acc_into_op(tYrY, state_tiled_mma, self.op_dtype)
         tSTATErX = load_tensor_as_b(
-            sX_DS, state_tiled_mma, thread_idx, (self.D, self.BLK), self.dtype, True
+            sX_DS, state_tiled_mma, thread_idx, (self.D, self.BLK), self.op_dtype, True
         )
         self.scale_acc_by_scalar(tStateT, block_coeff)
         self._math_order_wait(wg_idx)
-        cute.gemm(state_tiled_mma, tStateT, tSTATErY, tSTATErX, tStateT)
+        if cutlass.const_expr(self.fp16_accum_mma):
+            gemm_f16acc_carry(
+                state_tiled_mma, tStateT, tSTATErY, tSTATErX, self.f16_group
+            )
+        else:
+            cute.gemm(state_tiled_mma, tStateT, tSTATErY, tSTATErX, tStateT)
         self._math_order_notify(wg_idx)
 
+        if cutlass.const_expr(self.cvt_k_smem):
+            # BF16 inputs: the 256 math threads convert the next block's K tile (loaded
+            # by TMA long ago) to FP16 in place; the MATH_SYNC below orders these writes
+            # against the next block's reads, so no extra barrier is needed.
+            if has_next:
+                k_next = k_consumer_state.clone()
+                k_next.advance()
+                k_pipeline.consumer_wait(k_next)
+                self._convert_k_tile(sK_flat, k_next.index, thread_idx)
         cute.arch.barrier(barrier_id=NamedBarrier.MATH_SYNC, number_of_threads=256)
         k_pipeline.consumer_release(k_consumer_state)
         k_consumer_state.advance()
@@ -1011,6 +1152,22 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
             t_consumer_state,
             alpha_consumer_state,
         )
+
+    @cute.jit
+    def _convert_k_tile(
+        self, sK_flat: cute.Tensor, stage: cutlass.Int32, thread_idx: cutlass.Int32
+    ):
+        k_off = cute.assume(stage * (self.BLK * self.D), divby=8)
+        convert_smem_inplace(
+            cute.make_tensor(
+                sK_flat.iterator + k_off, cute.make_layout(self.BLK * self.D)
+            ),
+            self.dtype,
+            self.op_dtype,
+            thread_idx,
+            256,
+        )
+        cute.arch.fence_view_async_shared()
 
     @cute.jit
     def run_load_tensor_role(
@@ -1108,7 +1265,9 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         num_chunks: cutlass.Int32,
         wg_idx: cutlass.Int32,
         tidx: cutlass.Int32,
+        sK_flat=None,
     ):
+        # Accumulator register layout only (the M / N accumulators stay FP32).
         acc_hmma = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16)),
             cute.make_layout((8, 1, 1)),
@@ -1133,6 +1292,13 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         if valid_len > self.BLK:
             valid_len = self.BLK
 
+        has_next = None
+        if cutlass.const_expr(self.cvt_k_smem):
+            # BF16 inputs: convert the first K tile here, later ones one block ahead.
+            k_pipeline.consumer_wait(k_consumer_state)
+            self._convert_k_tile(sK_flat, k_consumer_state.index, tidx)
+            cute.arch.barrier(barrier_id=self.CVT_SYNC, number_of_threads=256)
+            has_next = num_blocks > 1
         (
             k_consumer_state,
             v_consumer_state,
@@ -1158,6 +1324,8 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
             tidx,
             wg_idx,
             True,
+            sK_flat,
+            has_next,
         )
 
         for blk in cutlass.range(1, num_blocks, 1, unroll=1):
@@ -1165,6 +1333,9 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
             valid_len = chunk_len - block_start
             if valid_len > self.BLK:
                 valid_len = self.BLK
+            has_next_blk = None
+            if cutlass.const_expr(self.cvt_k_smem):
+                has_next_blk = blk + 1 < num_blocks
 
             (
                 k_consumer_state,
@@ -1191,6 +1362,8 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
                 tidx,
                 wg_idx,
                 False,
+                sK_flat,
+                has_next_blk,
             )
 
         out_layout = cute.make_layout(
@@ -1280,7 +1453,8 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         dtype_bytes = self.dtype.width // 8
         self.tma_load_k_bytes = cute.size(k_tma_layout_ds) * dtype_bytes
         self.tma_load_v_bytes = cute.size(v_tma_layout_ds) * dtype_bytes
-        self.tma_load_t_bytes = cute.size(t_tma_layout) * dtype_bytes
+        # T (FP16 workspace in FP16-accumulate mode) and X are MMA operands.
+        self.tma_load_t_bytes = cute.size(t_tma_layout) * (self.op_dtype.width // 8)
 
         @cute.struct
         class SharedStorage:
@@ -1295,10 +1469,11 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
                 cute.struct.MemRange[self.dtype, cute.cosize(k_storage_layout_sd)], 128
             ]
             smem_x: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(x_storage_layout_ds)], 128
+                cute.struct.MemRange[self.op_dtype, cute.cosize(x_storage_layout_ds)],
+                128,
             ]
             smem_t: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(t_storage_layout)], 16
+                cute.struct.MemRange[self.op_dtype, cute.cosize(t_storage_layout)], 16
             ]
             smem_alpha: cute.struct.Align[
                 cute.struct.MemRange[
@@ -1437,6 +1612,20 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         )
         sAlpha = storage.smem_alpha.get_tensor(alpha_layout)
 
+        # The view the math warp groups read the K MMA operand through: the TMA
+        # (input dtype) view unless BF16 K tiles are converted to FP16 in place.
+        sK_DS_op = sK_DS
+        sK_flat = None
+        if cutlass.const_expr(self.cvt_k_smem):
+            sK_DS_op = storage.smem_k.get_tensor(
+                k_storage_layout_ds.outer,
+                swizzle=k_storage_layout_ds.inner,
+                dtype=self.op_dtype,
+            )
+            sK_flat = storage.smem_k.get_tensor(
+                cute.make_layout(self.k_stage * self.BLK * self.D)
+            )
+
         ldst_warp_role = cute.arch.make_warp_uniform(warp_idx % 4)
         if ldst_warp_role == self.LoadWarpRole.LOAD_K:
             cpasync.prefetch_descriptor(tma_atom_k)
@@ -1573,7 +1762,7 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
                     alpha_consumer_state,
                 ) = self.run_math_role(
                     sV_DS,
-                    sK_DS,
+                    sK_DS_op,
                     sT,
                     sX_DS,
                     sAlpha,
@@ -1595,6 +1784,7 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
                     total_cp_chunks,
                     self.WarpGroupRole.MATH0,
                     math_tidx,
+                    sK_flat,
                 )
             else:
                 cute.arch.setmaxregister_increase(mma_registers)
@@ -1606,7 +1796,7 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
                     alpha_consumer_state,
                 ) = self.run_math_role(
                     sV_DS,
-                    sK_DS,
+                    sK_DS_op,
                     sT,
                     sX_DS,
                     sAlpha,
@@ -1628,14 +1818,19 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
                     total_cp_chunks,
                     self.WarpGroupRole.MATH1,
                     math_tidx,
+                    sK_flat,
                 )
 
 
 @functools.cache
-def _get_mn_precompute_kernel(kernel_dtype, cu_seqlens_dtype):
+def _get_mn_precompute_kernel(
+    kernel_dtype, cu_seqlens_dtype, fp16_accum_mma=False, f16_group=4
+):
     return CPDeltaRuleMNPrecomputeSm120(
         kernel_dtype,
         cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens_dtype),
+        fp16_accum_mma=fp16_accum_mma,
+        f16_group=f16_group,
     )
 
 
@@ -1649,6 +1844,8 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
     cp_chunk_len: int = 4096,
     max_seqlen: int | None = None,
     *,
+    fp16_accum_mma: bool = False,
+    f16_group: int = 4,
     _skip_check: bool = False,
     _device=None,
     _stream=None,
@@ -1658,6 +1855,12 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
     Flat varlen input returns transfer/state workspaces with shape
     `(total_cp_chunks, num_heads, DimV, DimK)`, where
     `total_cp_chunks = chunk_bound(num_seqs, total_seqlen, cp_chunk_len)`.
+
+    With `fp16_accum_mma` every GEMM uses FP16-accumulate MMAs (partial sums of
+    `f16_group` K steps carried into the FP32 accumulators; the transfer/state
+    workspaces stay FP32) and `t` must be the FP16 workspace of the T stage run
+    with `fp16_accum_mma`, for either input dtype; otherwise `t` has the dtype
+    of `k`.
 
     Inputs must already be contiguous. This wrapper validates that contract but
     does not materialize contiguous copies.
@@ -1727,7 +1930,12 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
             raise RuntimeError(
                 f"CPDeltaRuleMNPrecomputeSm120 only supports fp16/bf16 inputs, got {k.dtype}"
             )
-        if t.dtype != k.dtype:
+        if fp16_accum_mma:
+            if t.dtype != torch.float16:
+                raise RuntimeError(
+                    f"t dtype must be float16 with fp16_accum_mma, got {t.dtype}"
+                )
+        elif t.dtype != k.dtype:
             raise RuntimeError(
                 f"t dtype must match k dtype, got {t.dtype} and {k.dtype}"
             )
@@ -1774,7 +1982,9 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
     )
 
     compile_options = _sm120_compile_options(device)
-    kernel = _get_mn_precompute_kernel(kernel_dtype, cu_seqlens.dtype)
+    kernel = _get_mn_precompute_kernel(
+        kernel_dtype, cu_seqlens.dtype, fp16_accum_mma, f16_group
+    )
     compiled = get_cached_compile(kernel, compile_options)
     if compiled is None:
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
@@ -3133,10 +3343,22 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         checkpoint_cu_starts_dtype: torch.dtype | None = None,
         state_inner_strides: tuple[int, ...] | None = None,
         initial_state_inner_strides: tuple[int, ...] | None = None,
+        fp16_accum_mma: bool = False,
+        f16_group: int = 4,
     ):
         self.needs_alpha = True
         self.dtype = dtype
         self.acc_dtype = acc_dtype
+        # FP16-accumulate mode (SM12x: FP32-accumulate HMMA is rate-limited). The MMA
+        # atoms and every derived operand (state, V - SK, NewV, QK, T) use FP16 and
+        # accumulate K steps in FP16 groups that are carried into the FP32
+        # accumulators. T is read from an FP16 workspace for both input dtypes.
+        self.fp16_accum_mma = fp16_accum_mma
+        self.f16_group = f16_group
+        self.op_dtype = cutlass.Float16 if fp16_accum_mma else dtype
+        self.mma_acc_dtype = cutlass.Float16 if fp16_accum_mma else acc_dtype
+        # BF16 inputs: Q / K tiles are converted to FP16 in smem once per block.
+        self.cvt_qk_smem = fp16_accum_mma and dtype is not cutlass.Float16
         self.BLK_Q = 64
         self.BLK_KV = 64
         self.D = 128
@@ -3187,7 +3409,15 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
             "kk_stage",
             "alpha_beta_stage",
             "t_stage",
+            "fp16_accum_mma",
+            "f16_group",
+            "op_dtype",
+            "mma_acc_dtype",
         )
+
+    # Named barrier of the 256 math threads for the in-place BF16 -> FP16 Q / K tile
+    # conversion (mode on, BF16 inputs only); not part of the shared NamedBarrier enum.
+    CVT_SYNC_BARRIER = 14
 
     @cute.jit
     def _math_order_init(self, wg_idx: cutlass.Int32):
@@ -3213,6 +3443,42 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
             cute.arch.barrier_arrive(
                 barrier_id=NamedBarrier.MATH_WG0, number_of_threads=256
             )
+
+    @cute.jit
+    def cvt_qk_tiles(
+        self,
+        sQ_flat: cute.Tensor,
+        sK_flat: cute.Tensor,
+        q_stage: cutlass.Int32,
+        k_stage: cutlass.Int32,
+        math_tidx: cutlass.Int32,
+    ):
+        # BF16 inputs, mode on: the 256 math threads convert this block's Q and K
+        # tiles to FP16 in place (the swizzled FP16 views then read the converted
+        # data). Called by both math warp groups once per block, after the TMA of
+        # the block landed and before anyone reads the tile.
+        k_off = cute.assume(k_stage * (self.BLK_KV * self.D), divby=8)
+        q_off = cute.assume(q_stage * (self.BLK_Q * self.D), divby=8)
+        convert_smem_inplace(
+            cute.make_tensor(
+                sK_flat.iterator + k_off, cute.make_layout(self.BLK_KV * self.D)
+            ),
+            self.dtype,
+            self.op_dtype,
+            math_tidx,
+            256,
+        )
+        convert_smem_inplace(
+            cute.make_tensor(
+                sQ_flat.iterator + q_off, cute.make_layout(self.BLK_Q * self.D)
+            ),
+            self.dtype,
+            self.op_dtype,
+            math_tidx,
+            256,
+        )
+        cute.arch.fence_view_async_shared()
+        cute.arch.barrier(barrier_id=self.CVT_SYNC_BARRIER, number_of_threads=256)
 
     @cute.jit
     def o1_epi(
@@ -3267,13 +3533,13 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 if cutlass.const_expr(is_final_block):
                     if tok >= B:
                         coeff = cutlass.Float32(0.0)
-                tKVrV[i] = self.dtype(cutlass.Float32(tKVrV[i]) * coeff)
+                tKVrV[i] = self.op_dtype(cutlass.Float32(tKVrV[i]) * coeff)
         else:
             for i in cutlass.range_constexpr(cute.size(tKVrV)):
                 _, tok = tKVcV[i]
                 if cutlass.const_expr(is_final_block):
                     if tok >= B:
-                        tKVrV[i] = self.dtype(0.0)
+                        tKVrV[i] = self.op_dtype(0.0)
 
     @cute.jit
     def o_store(
@@ -3651,7 +3917,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
     ):
         alpha_log = sAlpha[None, AlphaProcessor.CUMSUM_LOG, alpha_stage]
         stsm_atom = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
+            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.op_dtype
         )
         qk_tiled_store = cute.make_tiled_copy_C(stsm_atom, qk_tiled_mma)
         kk_tiled_store = cute.make_tiled_copy_C(stsm_atom, kk_tiled_mma)
@@ -3661,9 +3927,9 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         tKKsKK = kk_thr_store.partition_D(sKK_opd)
         tQKcMqk_cv = kk_thr_store.retile(tQKcMqk)
         tQKrQK_cv = kk_thr_store.retile(tQKrQK)
-        tQKrQK_cvt = cute.make_fragment_like(tQKrQK, self.dtype)
+        tQKrQK_cvt = cute.make_fragment_like(tQKrQK, self.op_dtype)
         tQKrQK_cvt_cv = kk_thr_store.retile(tQKrQK_cvt)
-        tKKrT = cute.make_fragment_like(tKKsKK, self.dtype)
+        tKKrT = cute.make_fragment_like(tKKsKK, self.op_dtype)
 
         for i in cutlass.range_constexpr(cute.size(tKKrT)):
             s, t = tQKcMqk_cv[i]
@@ -3684,8 +3950,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 qk_value = qk_value if pred else cutlass.Float32(0.0)
                 t_value = t_value if pred else cutlass.Float32(0.0)
 
-            tQKrQK_cvt_cv[i] = self.dtype(qk_value)
-            tKKrT[i] = self.dtype(t_value)
+            tQKrQK_cvt_cv[i] = self.op_dtype(qk_value)
+            tKKrT[i] = self.op_dtype(t_value)
         cute.copy(qk_tiled_store, qk_thr_store.retile(tQKrQK_cvt), tQKsQK)
         cute.copy(kk_tiled_store, tKKrT, tKKsKK)
 
@@ -3719,6 +3985,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         tQKcMqk: cute.Tensor,
         tKKcMkk: cute.Tensor,
         aux_tidx: cutlass.Int32,
+        sQ_flat=None,
+        sK_flat=None,
     ):
         B = self.BLK_KV
         if cutlass.const_expr(is_final_block):
@@ -3726,20 +3994,36 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
 
         k_pipeline.consumer_wait(k_consumer_state)
         q_pipeline.consumer_wait(q_consumer_state)
+        if cutlass.const_expr(self.cvt_qk_smem):
+            self.cvt_qk_tiles(
+                sQ_flat,
+                sK_flat,
+                q_consumer_state.index,
+                k_consumer_state.index,
+                aux_tidx,
+            )
         qk_thr_mma = qk_tiled_mma.get_slice(aux_tidx)
         sQ = sQ_SD[None, None, q_consumer_state.index]
         sK = sK_SD[None, None, k_consumer_state.index]
         tQKrQ = load_tensor_as_a(
-            sQ, qk_tiled_mma, aux_tidx, (self.BLK_Q, self.D), self.dtype, True
+            sQ, qk_tiled_mma, aux_tidx, (self.BLK_Q, self.D), self.op_dtype, True
         )
         tQKrK = load_tensor_as_b(
-            sK, qk_tiled_mma, aux_tidx, (self.BLK_KV, self.D), self.dtype, True
+            sK, qk_tiled_mma, aux_tidx, (self.BLK_KV, self.D), self.op_dtype, True
         )
-        tQKrQK = qk_thr_mma.make_fragment_C(
-            qk_thr_mma.partition_shape_C((self.BLK_Q, self.BLK_KV))
-        )
+        if cutlass.const_expr(self.fp16_accum_mma):
+            tQKrQK = cute.make_rmem_tensor(
+                qk_thr_mma.partition_shape_C((self.BLK_Q, self.BLK_KV)), self.acc_dtype
+            )
+        else:
+            tQKrQK = qk_thr_mma.make_fragment_C(
+                qk_thr_mma.partition_shape_C((self.BLK_Q, self.BLK_KV))
+            )
         tQKrQK.fill(self.acc_dtype(0.0))
-        cute.gemm(qk_tiled_mma, tQKrQK, tQKrQ, tQKrK, tQKrQK)
+        if cutlass.const_expr(self.fp16_accum_mma):
+            gemm_f16acc_carry(qk_tiled_mma, tQKrQK, tQKrQ, tQKrK, self.f16_group)
+        else:
+            cute.gemm(qk_tiled_mma, tQKrQK, tQKrQ, tQKrK, tQKrQK)
         k_pipeline.consumer_release(k_consumer_state)
         k_consumer_state.advance()
         q_pipeline.consumer_release(q_consumer_state)
@@ -3817,6 +4101,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         tKVrKV: cute.Tensor,
         scale: cutlass.Float32,
         wg_idx: cutlass.Int32,
+        sQ_flat=None,
+        sK_flat=None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx - cutlass.Int32(128)
@@ -3834,7 +4120,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         o_stage = o_producer_state.index
         alpha_stage = alpha_consumer_state.index
 
-        mma_atom = warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16))
+        mma_atom = warp.MmaF16BF16Op(self.op_dtype, self.mma_acc_dtype, (16, 8, 16))
         o1_tiled_mma = cute.make_tiled_mma(
             mma_atom, cute.make_layout((8, 1, 1)), permutation_mnk=tile_shape_o1
         )
@@ -3855,18 +4141,31 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         kv_thr_mma = kv_tiled_mma.get_slice(thread_idx)
 
         ldsm_n4 = cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.op_dtype
         )
         ldsm_t4 = cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.op_dtype
         )
+        # V is read in the input dtype (converted in registers).
+        ldsm_t4_v = ldsm_t4
+        if cutlass.const_expr(self.op_dtype is not self.dtype):
+            ldsm_t4_v = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype
+            )
 
         sK_DS_k = sK_DS[None, None, k_stage]
 
-        sk_tiled_copy_C = cute.make_tiled_copy_C(ldsm_t4, sk_tiled_mma)
+        sk_tiled_copy_C = cute.make_tiled_copy_C(ldsm_t4_v, sk_tiled_mma)
         sk_thr_copy_C = sk_tiled_copy_C.get_slice(thread_idx)
 
         q_pipeline.consumer_wait(q_consumer_state)
+        if cutlass.const_expr(self.cvt_qk_smem):
+            # BF16 inputs: warp group 0 converted this block's Q / K tiles in its aux
+            # phase; warp group 1 converts them here (the 256 math threads share the
+            # tiles and meet at one barrier before either reads them as FP16).
+            if wg_idx != 0:
+                k_pipeline.consumer_wait(k_consumer_state)
+                self.cvt_qk_tiles(sQ_flat, sK_flat, q_stage, k_stage, thread_idx)
         if cutlass.const_expr(self.needs_alpha):
             alpha_pipeline.consumer_wait(alpha_consumer_state)
             cute.arch.fence_view_async_shared()
@@ -3881,14 +4180,17 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 o1_thr_mma.partition_shape_B(
                     cute.slice_(tile_shape_o1, (0, None, None))
                 ),
-                self.dtype,
+                self.op_dtype,
             )
             tOrQ_cv = o1_thr_copy_B.retile(tOrQ)
             tOsQ = o1_thr_copy_B.partition_S(sQ_SD)
             cute.copy(o1_tiled_copy_B, tOsQ[None, None, None, q_stage], tOrQ_cv)
-            tOrKV = SM80.make_acc_into_op(tKVrKV, o1_tiled_mma, self.dtype)
+            tOrKV = SM80.make_acc_into_op(tKVrKV, o1_tiled_mma, self.op_dtype)
             self._math_order_wait(wg_idx)
-            cute.gemm(o1_tiled_mma, tOrO, tOrKV, tOrQ, tOrO)
+            if cutlass.const_expr(self.fp16_accum_mma):
+                gemm_f16acc_carry(o1_tiled_mma, tOrO, tOrKV, tOrQ, self.f16_group)
+            else:
+                cute.gemm(o1_tiled_mma, tOrO, tOrKV, tOrQ, tOrO)
             self._math_order_notify(wg_idx)
             cO = cute.make_identity_tensor((d, blk_q))
             tOcO = o1_thr_mma.partition_C(cO)
@@ -3908,30 +4210,55 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 sk_thr_mma.partition_shape_B(
                     cute.slice_(tile_shape_sk, (0, None, None))
                 ),
-                self.dtype,
+                self.op_dtype,
             )
             tSKrK_cv = sk_thr_copy_B.retile(tSKrK)
             tSKsK = sk_thr_copy_B.partition_S(sK_SD)
-            tSKrS = SM80.make_acc_into_op(tKVrKV, sk_tiled_mma, self.dtype)
+            tSKrS = SM80.make_acc_into_op(tKVrKV, sk_tiled_mma, self.op_dtype)
             self._math_order_wait(wg_idx)
             cute.copy(sk_tiled_copy_B, tSKsK[None, None, None, k_stage], tSKrK_cv)
-            cute.gemm(sk_tiled_mma, tSKrSK, tSKrS, tSKrK, tSKrSK)
+            if cutlass.const_expr(self.fp16_accum_mma):
+                gemm_f16acc_carry(sk_tiled_mma, tSKrSK, tSKrS, tSKrK, self.f16_group)
+            else:
+                cute.gemm(sk_tiled_mma, tSKrSK, tSKrS, tSKrK, tSKrSK)
             self._math_order_notify(wg_idx)
 
         v_pipeline.consumer_wait(v_consumer_state)
-        tNewVrA = cute.make_fragment_like(
-            SM80.convert_c_layout_to_a_layout(tSKrSK.layout, newv_tiled_mma), self.dtype
-        )
-        tNewVrA_as_SK = cute.make_tensor(tNewVrA.iterator, tSKrSK.layout)
-        tNewVrA_as_SK_cv = sk_thr_copy_C.retile(tNewVrA_as_SK)
-        tSKsV = sk_thr_copy_C.partition_S(sV_DS)
-        cute.copy(sk_tiled_copy_C, tSKsV[None, None, None, v_stage], tNewVrA_as_SK_cv)
-        if cutlass.const_expr(not is_first_block):
-            cSK = cute.make_identity_tensor((d, blk_kv))
-            tSKcSK = sk_thr_mma.partition_C(cSK)
-            self.sk_epi(tSKrSK, tSKcSK, sAlpha, alpha_stage)
-            for i in cutlass.range_constexpr(cute.size(tNewVrA_as_SK)):
-                tNewVrA_as_SK[i] = tNewVrA_as_SK[i] - self.dtype(tSKrSK[i])
+        if cutlass.const_expr(self.fp16_accum_mma):
+            # V is loaded in the input dtype; (V - SK) is rounded once from FP32 into
+            # the FP16 operand of the NewV GEMM.
+            tSKrV = cute.make_fragment_like(tSKrSK, self.dtype)
+            tSKrV_cv = sk_thr_copy_C.retile(tSKrV)
+            tSKsV = sk_thr_copy_C.partition_S(sV_DS)
+            cute.copy(sk_tiled_copy_C, tSKsV[None, None, None, v_stage], tSKrV_cv)
+            tSKrVop = cute.make_fragment_like(tSKrV, self.op_dtype)
+            if cutlass.const_expr(not is_first_block):
+                cSK = cute.make_identity_tensor((d, blk_kv))
+                tSKcSK = sk_thr_mma.partition_C(cSK)
+                self.sk_epi(tSKrSK, tSKcSK, sAlpha, alpha_stage)
+                for i in cutlass.range_constexpr(cute.size(tSKrV)):
+                    tSKrVop[i] = self.op_dtype(cutlass.Float32(tSKrV[i]) - tSKrSK[i])
+            else:
+                for i in cutlass.range_constexpr(cute.size(tSKrV)):
+                    tSKrVop[i] = self.op_dtype(cutlass.Float32(tSKrV[i]))
+            tNewVrA = SM80.make_acc_into_op(tSKrVop, newv_tiled_mma, self.op_dtype)
+        else:
+            tNewVrA = cute.make_fragment_like(
+                SM80.convert_c_layout_to_a_layout(tSKrSK.layout, newv_tiled_mma),
+                self.dtype,
+            )
+            tNewVrA_as_SK = cute.make_tensor(tNewVrA.iterator, tSKrSK.layout)
+            tNewVrA_as_SK_cv = sk_thr_copy_C.retile(tNewVrA_as_SK)
+            tSKsV = sk_thr_copy_C.partition_S(sV_DS)
+            cute.copy(
+                sk_tiled_copy_C, tSKsV[None, None, None, v_stage], tNewVrA_as_SK_cv
+            )
+            if cutlass.const_expr(not is_first_block):
+                cSK = cute.make_identity_tensor((d, blk_kv))
+                tSKcSK = sk_thr_mma.partition_C(cSK)
+                self.sk_epi(tSKrSK, tSKcSK, sAlpha, alpha_stage)
+                for i in cutlass.range_constexpr(cute.size(tNewVrA_as_SK)):
+                    tNewVrA_as_SK[i] = tNewVrA_as_SK[i] - self.dtype(tSKrSK[i])
 
         tNewVrC = cute.make_rmem_tensor(
             newv_thr_mma.partition_shape_C((d, blk_kv)), self.acc_dtype
@@ -3951,14 +4278,17 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
             tNewVrB_cv,
         )
         tNewVrC.fill(self.acc_dtype(0.0))
-        cute.gemm(newv_tiled_mma, tNewVrC, tNewVrA, tNewVrB, tNewVrC)
+        if cutlass.const_expr(self.fp16_accum_mma):
+            gemm_f16acc_carry(newv_tiled_mma, tNewVrC, tNewVrA, tNewVrB, self.f16_group)
+        else:
+            cute.gemm(newv_tiled_mma, tNewVrC, tNewVrA, tNewVrB, tNewVrC)
         self._math_order_notify(wg_idx)
         v_pipeline.consumer_release(v_consumer_state)
         v_consumer_state.advance()
         kk_pipeline.consumer_release(kk_consumer_state)
         kk_consumer_state.advance()
 
-        tOrNewV = SM80.make_acc_into_op(tNewVrC, o2_tiled_mma, self.dtype)
+        tOrNewV = SM80.make_acc_into_op(tNewVrC, o2_tiled_mma, self.op_dtype)
         qk_pipeline.consumer_wait(qk_consumer_state)
         o2_tiled_copy_B = cute.make_tiled_copy_B(ldsm_n4, o2_tiled_mma)
         o2_thr_copy_B = o2_tiled_copy_B.get_slice(thread_idx)
@@ -3971,7 +4301,10 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         cute.copy(
             o2_tiled_copy_B, tOsQK[None, None, None, qk_consumer_state.index], tOrQK_cv
         )
-        cute.gemm(o2_tiled_mma, tOrO, tOrNewV, tOrQK, tOrO)
+        if cutlass.const_expr(self.fp16_accum_mma):
+            gemm_f16acc_carry(o2_tiled_mma, tOrO, tOrNewV, tOrQK, self.f16_group)
+        else:
+            cute.gemm(o2_tiled_mma, tOrO, tOrNewV, tOrQK, tOrO)
         self._math_order_notify(wg_idx)
         qk_pipeline.consumer_release(qk_consumer_state)
         qk_consumer_state.advance()
@@ -4009,7 +4342,10 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
             alpha_pipeline.consumer_release(alpha_consumer_state)
             alpha_consumer_state.advance()
         cute.copy(kv_tiled_copy_B, tKVsK[None, None, None, k_stage], tKVrK_cv)
-        cute.gemm(kv_tiled_mma, tKVrKV, tOrNewV, tKVrK, tKVrKV)
+        if cutlass.const_expr(self.fp16_accum_mma):
+            gemm_f16acc_carry(kv_tiled_mma, tKVrKV, tOrNewV, tKVrK, self.f16_group)
+        else:
+            cute.gemm(kv_tiled_mma, tKVrKV, tOrNewV, tKVrK, tKVrKV)
         k_pipeline.consumer_release(k_consumer_state)
         k_consumer_state.advance()
         return (
@@ -4068,6 +4404,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         total_checkpoints: cutlass.Int32,
         checkpoint_every_n_tokens: cutlass.Int32,
         produce_aux: cutlass.Constexpr,
+        sQ_flat=None,
+        sK_flat=None,
     ):
         self._math_order_init(wg_idx)
         q_consumer_state = pipeline.make_pipeline_state(
@@ -4093,14 +4431,21 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         )
 
         kv_tiled_mma = cute.make_tiled_mma(
-            warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16)),
+            warp.MmaF16BF16Op(self.op_dtype, self.mma_acc_dtype, (16, 8, 16)),
             cute.make_layout((8, 1, 1)),
             permutation_mnk=(self.D, self.D, self.BLK_KV),
         )
         kv_thr_mma = kv_tiled_mma.get_slice(math_tidx)
-        tKVrKV = kv_thr_mma.make_fragment_C(
-            kv_thr_mma.partition_shape_C((self.D, self.D))
-        )
+        if cutlass.const_expr(self.fp16_accum_mma):
+            # The state stays FP32 (the MMA accumulates FP16 partial sums that are
+            # carried into it).
+            tKVrKV = cute.make_rmem_tensor(
+                kv_thr_mma.partition_shape_C((self.D, self.D)), self.acc_dtype
+            )
+        else:
+            tKVrKV = kv_thr_mma.make_fragment_C(
+                kv_thr_mma.partition_shape_C((self.D, self.D))
+            )
         tKVrKV.fill(self.acc_dtype(0.0))
 
         if cutlass.const_expr(produce_aux):
@@ -4123,7 +4468,9 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 pipeline.PipelineUserType.Consumer, self.alpha_beta_stage
             )
             aux_tidx = math_tidx % 128
-            aux_mma_atom = warp.MmaF16BF16Op(self.dtype, self.acc_dtype, (16, 8, 16))
+            aux_mma_atom = warp.MmaF16BF16Op(
+                self.op_dtype, self.mma_acc_dtype, (16, 8, 16)
+            )
             qk_tiled_mma = cute.make_tiled_mma(
                 aux_mma_atom,
                 cute.make_layout((4, 1, 1)),
@@ -4216,6 +4563,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 tQKcMqk,
                 tKKcMkk,
                 aux_tidx,
+                sQ_flat,
+                sK_flat,
             )
 
         first_B = work_desc.seq_len
@@ -4260,6 +4609,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 tKVrKV,
                 scale,
                 wg_idx,
+                sQ_flat,
+                sK_flat,
             )
         else:
             if load_fixed_state:
@@ -4301,6 +4652,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                     tKVrKV,
                     scale,
                     wg_idx,
+                    sQ_flat,
+                    sK_flat,
                 )
             else:
                 (
@@ -4341,6 +4694,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                     tKVrKV,
                     scale,
                     wg_idx,
+                    sQ_flat,
+                    sK_flat,
                 )
         self.maybe_store_checkpoint(
             tKVrKV,
@@ -4393,6 +4748,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                     tQKcMqk,
                     tKKcMkk,
                     aux_tidx,
+                    sQ_flat,
+                    sK_flat,
                 )
             (
                 q_consumer_state,
@@ -4432,6 +4789,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 tKVrKV,
                 scale,
                 wg_idx,
+                sQ_flat,
+                sK_flat,
             )
             self.maybe_store_checkpoint(
                 tKVrKV,
@@ -4486,6 +4845,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                     tQKcMqk,
                     tKKcMkk,
                     aux_tidx,
+                    sQ_flat,
+                    sK_flat,
                 )
             (
                 q_consumer_state,
@@ -4525,6 +4886,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 tKVrKV,
                 scale,
                 wg_idx,
+                sQ_flat,
+                sK_flat,
             )
             self.maybe_store_checkpoint(
                 tKVrKV,
@@ -4682,13 +5045,13 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 cute.struct.MemRange[self.dtype, cute.cosize(v_storage_layout_sd)], 128
             ]
             smem_t: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(t_storage_layout)], 16
+                cute.struct.MemRange[self.op_dtype, cute.cosize(t_storage_layout)], 16
             ]
             smem_qk: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(qk_storage_layout)], 16
+                cute.struct.MemRange[self.op_dtype, cute.cosize(qk_storage_layout)], 16
             ]
             smem_kk: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(kk_storage_layout)], 16
+                cute.struct.MemRange[self.op_dtype, cute.cosize(kk_storage_layout)], 16
             ]
             smem_o: cute.struct.Align[
                 cute.struct.MemRange[self.dtype, cute.cosize(o_storage_layout)], 128
@@ -4878,6 +5241,28 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         v_layout_ds = cute.select(v_layout_sd, [1, 0, 2])
         sV_DS = storage.smem_v.get_tensor(v_layout_ds.outer, swizzle=v_layout_ds.inner)
 
+        # Views the math warp groups read the MMA operands through. They are the TMA
+        # (input dtype) views unless BF16 Q / K tiles are converted to FP16 in place.
+        sQ_SD_op, sK_SD_op, sK_DS_op = sQ_SD, sK_SD, sK_DS
+        sQ_flat = None
+        sK_flat = None
+        if cutlass.const_expr(self.cvt_qk_smem):
+            sQ_SD_op = storage.smem_q.get_tensor(
+                q_layout_sd.outer, swizzle=q_layout_sd.inner, dtype=self.op_dtype
+            )
+            sK_SD_op = storage.smem_k.get_tensor(
+                k_layout_sd.outer, swizzle=k_layout_sd.inner, dtype=self.op_dtype
+            )
+            sK_DS_op = storage.smem_k.get_tensor(
+                k_layout_ds.outer, swizzle=k_layout_ds.inner, dtype=self.op_dtype
+            )
+            sQ_flat = storage.smem_q.get_tensor(
+                cute.make_layout(self.q_stage * self.BLK_Q * self.D)
+            )
+            sK_flat = storage.smem_k.get_tensor(
+                cute.make_layout(self.k_stage * self.BLK_KV * self.D)
+            )
+
         qk_layout_atom = cute.make_layout((8, 8), stride=(8, 1))
         qk_layout = cute.tile_to_shape(
             qk_layout_atom, (self.BLK_Q, self.BLK_KV, self.qk_stage), order=(0, 1, 2)
@@ -5065,9 +5450,9 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 cute.arch.setmaxregister_increase(state_mma_registers)
                 if warp_group_idx == CPPrefillWarpGroupRole.MATH_STATE0:
                     self.run_cp_state_math_role(
-                        sQ_SD,
-                        sK_SD,
-                        sK_DS,
+                        sQ_SD_op,
+                        sK_SD_op,
+                        sK_DS_op,
                         sV_DS,
                         sT,
                         sQK,
@@ -5108,12 +5493,14 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                         total_checkpoints,
                         checkpoint_every_n_tokens,
                         True,
+                        sQ_flat,
+                        sK_flat,
                     )
                 else:
                     self.run_cp_state_math_role(
-                        sQ_SD,
-                        sK_SD,
-                        sK_DS,
+                        sQ_SD_op,
+                        sK_SD_op,
+                        sK_DS_op,
                         sV_DS,
                         sT,
                         sQK,
@@ -5154,6 +5541,8 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                         total_checkpoints,
                         checkpoint_every_n_tokens,
                         False,
+                        sQ_flat,
+                        sK_flat,
                     )
 
 
@@ -5172,6 +5561,8 @@ def _get_prefill_kernel(
     checkpoint_cu_starts_dtype,
     state_inner_strides,
     initial_state_inner_strides,
+    fp16_accum_mma=False,
+    f16_group=4,
 ):
     return CPDeltaRulePrefillSm120(
         kernel_dtype,
@@ -5187,6 +5578,8 @@ def _get_prefill_kernel(
         checkpoint_cu_starts_dtype=checkpoint_cu_starts_dtype,
         state_inner_strides=state_inner_strides,
         initial_state_inner_strides=initial_state_inner_strides,
+        fp16_accum_mma=fp16_accum_mma,
+        f16_group=f16_group,
     )
 
 
@@ -5210,6 +5603,8 @@ def cp_delta_rule_prefill_dsl_sm120(
     checkpoint_cu_starts: torch.Tensor | None = None,
     checkpoint_every_n_tokens: int = 0,
     *,
+    fp16_accum_mma: bool = False,
+    f16_group: int = 4,
     _skip_check: bool = False,
     _device=None,
     _stream=None,
@@ -5219,6 +5614,11 @@ def cp_delta_rule_prefill_dsl_sm120(
     Flat varlen input consumes flat Q/K/V/O/alpha tensors and varlen T/fixed-state
     workspaces. `state` is the public per-sequence final state in native
     `(DimV, DimK)` layout.
+
+    With `fp16_accum_mma` every GEMM uses FP16-accumulate MMAs (partial sums of
+    `f16_group` K steps carried into FP32 accumulators, the state stays FP32) and `t`
+    must be the FP16 workspace of the T stage run with the same flag; otherwise `t`
+    has the dtype of `q`.
     """
     import cuda.bindings.driver as cuda_driver
 
@@ -5353,15 +5753,17 @@ def cp_delta_rule_prefill_dsl_sm120(
             raise RuntimeError(
                 f"CPDeltaRulePrefillSm120 only supports fp16/bf16 inputs, got {q.dtype}"
             )
+        t_dtype = torch.float16 if fp16_accum_mma else q.dtype
         if (
             k.dtype != q.dtype
             or v.dtype != q.dtype
             or o.dtype != q.dtype
-            or t.dtype != q.dtype
+            or t.dtype != t_dtype
         ):
             raise RuntimeError(
-                "q/k/v/o/t dtypes must match, "
-                f"got q={q.dtype}, k={k.dtype}, v={v.dtype}, o={o.dtype}, t={t.dtype}"
+                "q/k/v/o dtypes must match and t must be "
+                f"{t_dtype}, got q={q.dtype}, k={k.dtype}, v={v.dtype}, "
+                f"o={o.dtype}, t={t.dtype}"
             )
         if alpha.dtype != torch.float32:
             raise RuntimeError(
@@ -5480,6 +5882,8 @@ def cp_delta_rule_prefill_dsl_sm120(
             if use_state_indices and needs_initial_state
             else None
         ),
+        fp16_accum_mma=fp16_accum_mma,
+        f16_group=f16_group,
     )
     state_arg = state if store_final_state else fixed_state
     compile_options = _sm120_compile_options(device)
@@ -5591,12 +5995,18 @@ def cp_delta_rule_dsl_sm120(
     max_seqlen: int | None = None,
     cp_chunk_len: int | None = None,
     cp_chunk_len_granularity: int = CP_CHUNK_LEN_GRANULARITY,
+    fp16_accum_mma: bool = False,
 ):
     """Run the CP SM120 delta-rule prefill pipeline on flat varlen tensors.
 
     Q/K/V/alpha/beta/O/state follow the same public layout as the non-CP
     prefill path. Internal T, M, N, and fixed-state tensors use the varlen
     workspace layout.
+
+    With ``fp16_accum_mma`` the T precompute, MN precompute and prefill stages run
+    their GEMMs on FP16-accumulate MMAs with an FP32 carry (the T workspace becomes
+    float16); the state fixup stage and the dtypes and layouts of the outputs are
+    unchanged.
     """
     import cuda.bindings.driver as cuda_driver
 
@@ -5772,6 +6182,7 @@ def cp_delta_rule_dsl_sm120(
         if not use_state_indices and not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
 
+    mode_kwargs = {"fp16_accum_mma": True} if fp16_accum_mma else {}
     t = cp_delta_rule_t_precompute_dsl_sm120(
         k,
         beta,
@@ -5781,6 +6192,7 @@ def cp_delta_rule_dsl_sm120(
         _skip_check=True,
         _device=device,
         _stream=stream,
+        **mode_kwargs,
     )
     local_transfer, local_state = cp_delta_rule_mn_precompute_dsl_sm120(
         k,
@@ -5794,6 +6206,7 @@ def cp_delta_rule_dsl_sm120(
         _skip_check=True,
         _device=device,
         _stream=stream,
+        **mode_kwargs,
     )
     fixed_state = cp_delta_rule_fixup_dsl_sm120(
         local_transfer,
@@ -5830,4 +6243,5 @@ def cp_delta_rule_dsl_sm120(
         _skip_check=True,
         _device=device,
         _stream=stream,
+        **mode_kwargs,
     )
