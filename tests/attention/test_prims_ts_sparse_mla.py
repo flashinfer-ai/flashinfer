@@ -548,6 +548,46 @@ def test_rope_quant_scales_and_contract(block, fmt):
     actual, actual_scales = _dequant_output(output, scales, block)
     torch.testing.assert_close(actual_scales, expected_scales, atol=0, rtol=2e-6)
     torch.testing.assert_close(actual, expected, atol=2e-7, rtol=2e-6)
+    if block == 32 and fmt == "ue8m0":
+        eager_out, eager_scales = batch_sparse_mla_decode_with_paged_kv_cache(
+            q,
+            kv,
+            metadata,
+            output_quant_block_size=block,
+            out_scale_format=fmt,
+            num_output_groups=2,
+            token_positions=positions,
+            cos_sin_cache=cos_sin,
+        )
+        torch.testing.assert_close(eager_out.float(), output.float(), atol=0, rtol=0)
+        torch.testing.assert_close(eager_scales, scales, atol=0, rtol=0)
+        misaligned = torch.empty(output.numel() + 1, dtype=output.dtype, device="cuda")[
+            1:
+        ].view_as(output)
+        with pytest.raises(ValueError, match="aligned"):
+            wrapper.run(
+                q,
+                kv,
+                metadata,
+                token_positions=positions,
+                cos_sin_cache=cos_sin,
+                out=misaligned,
+            )
+        scale_storage = torch.empty(
+            scales.untyped_storage().nbytes() // 4 + 1,
+            dtype=scales.dtype,
+            device="cuda",
+        )
+        misaligned_scales = scale_storage.as_strided(scales.shape, scales.stride(), 1)
+        with pytest.raises(ValueError, match="out_scale"):
+            wrapper.run(
+                q,
+                kv,
+                metadata,
+                token_positions=positions,
+                cos_sin_cache=cos_sin,
+                out_scale=misaligned_scales,
+            )
     with pytest.raises(ValueError, match="token_positions"):
         wrapper.run(
             q, kv, metadata, token_positions=positions + 2, cos_sin_cache=cos_sin
@@ -585,6 +625,25 @@ def test_rope_quant_scales_and_contract(block, fmt):
     )
     assert empty_out.shape == (0, 2, 2048)
     assert empty_scales.shape == (0, 2, 2048 // block // (4 if fmt == "ue8m0" else 1))
+
+
+def test_rope_quant_plan_options():
+    plan = dict(
+        device="cuda", batch_size=1, num_heads=8, max_topk=1, num_output_groups=2
+    )
+    for block, error in ((True, TypeError), (32.0, TypeError), (64, ValueError)):
+        with pytest.raises(error, match="output_quant_block_size"):
+            get_prims_ts_sparse_mla_decode_workspace_size(
+                **plan, output_quant_block_size=block
+            )
+    with pytest.raises(ValueError, match="out_scale_format"):
+        get_prims_ts_sparse_mla_decode_workspace_size(
+            **plan, output_quant_block_size=32, out_scale_format="e4m3"
+        )
+    with pytest.raises(ValueError, match="num_output_groups"):
+        get_prims_ts_sparse_mla_decode_workspace_size(
+            **dict(plan, num_output_groups=3), output_quant_block_size=32
+        )
 
 
 # Accuracy and important public validation contracts.

@@ -2210,7 +2210,8 @@ def _make_sparse_output_quant(heads, block_size, scale_format, groups):
                 "output quantization options require output_quant_block_size"
             )
         return None
-    if isinstance(block_size, bool) or block_size not in (32, 128):
+    block_size = _validate_positive_int(block_size, "output_quant_block_size")
+    if block_size not in (32, 128):
         raise ValueError("output_quant_block_size must be 32, 128, or None")
     if scale_format not in ("fp32", "ue8m0"):
         raise ValueError("out_scale_format must be 'fp32' or 'ue8m0'")
@@ -2234,14 +2235,21 @@ def _fake_output_quant_args(quant):
     if quant.ue8m0:
         columns //= 4
     return (
-        _fake_sparse_tensor(cutlass.Float8E4M3FN, (cute.sym_int64(),)),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float8E4M3FN,
+            (cute.sym_int64(),),
+            stride_order=(0,),
+            assumed_align=16,
+        ),
         _fake_sparse_tensor(cutlass.Int32, (rows,)),
-        _fake_sparse_tensor(cutlass.Float32, (cute.sym_int(), 64)),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (cute.sym_int(), 64), stride_order=(1, 0), assumed_align=16
+        ),
         cute.runtime.make_fake_tensor(
             cutlass.Int32 if quant.ue8m0 else cutlass.Float32,
             (rows, quant.num_groups, columns),
             stride=(1, columns * padded_rows, padded_rows),
-            assumed_align=4,
+            assumed_align=16,
         ),
     )
 
@@ -2292,10 +2300,10 @@ def _prepare_sparse_output_quant(
         or out.dtype != torch.float8_e4m3fn
         or out.device != device
         or not out.is_contiguous()
-        or out.data_ptr() % 4
+        or out.data_ptr() % 16
     ):
         raise ValueError(
-            f"out must be contiguous CUDA E4M3{shape}, aligned to four bytes"
+            f"out must be contiguous CUDA E4M3{shape}, aligned to 16 bytes"
         )
     scale_dtype = torch.int32 if quant.ue8m0 else torch.float32
     scale_shape = (rows, quant.num_groups, columns)
@@ -2311,10 +2319,11 @@ def _prepare_sparse_output_quant(
         or scales.stride() != scale_stride
         or scales.dtype != scale_dtype
         or scales.device != device
-        or scales.data_ptr() % 4
+        or scales.data_ptr() % 16
     ):
         raise ValueError(
-            f"out_scale must be CUDA {scale_dtype}{scale_shape} with strides {scale_stride}"
+            f"out_scale must be 16-byte aligned CUDA {scale_dtype}{scale_shape} "
+            f"with strides {scale_stride}"
         )
     return out, scales, (out.view(-1), positions.view(-1), cos_sin, scales)
 
@@ -2355,9 +2364,6 @@ def _resolve_sparse_mla_plan(
 
     if not isinstance(assume_valid_prefix, bool):
         raise TypeError("assume_valid_prefix must be bool")
-    _make_sparse_output_quant(
-        num_heads, output_quant_block_size, out_scale_format, num_output_groups
-    )
     device, _ = _resolve_cuda_device(device)
     if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
         raise NotImplementedError("sparse TS MLA requires SM100 or SM103")
@@ -2370,6 +2376,9 @@ def _resolve_sparse_mla_plan(
             raise ValueError(f"{name} must be a positive integer")
     if num_heads > 128:
         raise ValueError("num_heads must be at most 128")
+    output_quant = _make_sparse_output_quant(
+        num_heads, output_quant_block_size, out_scale_format, num_output_groups
+    )
     for value in (max_topk, max_extra_topk):
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError("source capacities must be nonnegative integers")
@@ -2490,7 +2499,7 @@ def _resolve_sparse_mla_plan(
         ("public_lse", (max_rows, num_heads), torch.float32),
     ):
         sections[name], byte_end = _append_workspace_section(byte_end, shape, dtype)
-    return device, profile, spec, sections, byte_end, capacity
+    return device, profile, spec, sections, byte_end, capacity, output_quant
 
 
 class BatchSparseMLADecodePagedTSWrapper:
@@ -2558,25 +2567,24 @@ class BatchSparseMLADecodePagedTSWrapper:
         MXFP8; FP32 scales use unrounded amax/448. Both use an amax floor of
         1e-4. A block never crosses a head boundary.
         """
-        device, profile, spec, sections, byte_end, capacity = _resolve_sparse_mla_plan(
-            device,
-            batch_size,
-            num_heads,
-            max_topk=max_topk,
-            max_extra_topk=max_extra_topk,
-            max_seq_len_q=max_seq_len_q,
-            packed_query=packed_query,
-            q_data_type=q_data_type,
-            kv_layout=kv_layout,
-            has_sinks=has_sinks,
-            return_lse=return_lse,
-            assume_valid_prefix=assume_valid_prefix,
-            output_quant_block_size=output_quant_block_size,
-            out_scale_format=out_scale_format,
-            num_output_groups=num_output_groups,
-        )
-        output_quant = _make_sparse_output_quant(
-            num_heads, output_quant_block_size, out_scale_format, num_output_groups
+        (device, profile, spec, sections, byte_end, capacity, output_quant) = (
+            _resolve_sparse_mla_plan(
+                device,
+                batch_size,
+                num_heads,
+                max_topk=max_topk,
+                max_extra_topk=max_extra_topk,
+                max_seq_len_q=max_seq_len_q,
+                packed_query=packed_query,
+                q_data_type=q_data_type,
+                kv_layout=kv_layout,
+                has_sinks=has_sinks,
+                return_lse=return_lse,
+                assume_valid_prefix=assume_valid_prefix,
+                output_quant_block_size=output_quant_block_size,
+                out_scale_format=out_scale_format,
+                num_output_groups=num_output_groups,
+            )
         )
         kernel = spec.kernel
         family = profile.family
@@ -2871,13 +2879,13 @@ class BatchSparseMLADecodePagedTSWrapper:
         Positions must be in [0,P); validate=False leaves this to the caller.
 
         Return (out, out_scale), or (out, out_scale, lse) with return_lse=True.
-        Out is contiguous E4M3[T,G,C], where T is total query tokens and
-        C=(H/G)*512, in natural head/channel order. For K=output_quant_block_size
+        Out is 16-byte aligned contiguous E4M3[T,G,C], where T is total query
+        tokens and C=(H/G)*512, in natural head/channel order. For K=output_quant_block_size
         and N=C/K, FP32 scales have logical shape [T,G,N]; UE8M0 scales have
         shape [T,G,N/4], INT32 packing four block exponent bytes, first in the
         least significant byte (scale=2**(byte-127)). Allocate scale backing as
-        [G,columns,pad4(T)] and use backing.permute(2,0,1)[:T], with strides
-        (1,columns*pad4(T),pad4(T)). Padding is not written. The scalar
+        16-byte aligned [G,columns,pad4(T)] and use backing.permute(2,0,1)[:T],
+        with strides (1,columns*pad4(T),pad4(T)). Padding is not written. The scalar
         ``output_scale`` multiplier remains applied before quantization.
 
         Preallocate out/out_scale/lse and warm up before graph capture. With
@@ -3068,6 +3076,8 @@ class BatchSparseMLADecodePagedTSWrapper:
                 primary_lengths=sl,
             )
             query_view = query.view(rows, 1, state["heads"], 512)
+            # Final FP8 stores use output_quant_args. Keep the core O argument
+            # in its existing BF16 partial-state layout for every schedule.
             for slot in range(2 if independent else 1):
                 _launch_mla_decode(
                     _MLARuntime(
@@ -3146,7 +3156,7 @@ def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
     compiling a kernel. Bind the resulting byte buffer to the wrapper constructor
     and call plan() before graph capture; run() is the prepared standalone launch.
     """
-    _, _, _, _, size_bytes, _ = _resolve_sparse_mla_plan(*plan_args, **plan_kwargs)
+    _, _, _, _, size_bytes, _, _ = _resolve_sparse_mla_plan(*plan_args, **plan_kwargs)
     return size_bytes
 
 
@@ -3181,6 +3191,8 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     """Eager plan-and-run helper using caller-prepared metadata.
 
     Use a planned wrapper for CUDA Graph replay. Preparation remains external.
+    Output quantization arguments and return layouts follow
+    :class:`BatchSparseMLADecodePagedTSWrapper`.
     """
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(

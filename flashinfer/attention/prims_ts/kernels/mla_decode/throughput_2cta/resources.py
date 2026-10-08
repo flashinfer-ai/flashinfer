@@ -3656,6 +3656,17 @@ class GmemOResource(HighThroughputMlaResource):
             batch_idx,
         )
 
+    @cute.jit
+    def _store_quantized_slice(
+        self, values, flat_row, batch_idx, column, rotary: cutlass.Constexpr[bool]
+    ):
+        row = Int64(flat_row)
+        if cutlass.const_expr(self.cu_seqlens_q is None):
+            row += Int64(batch_idx) * self.logical_num_heads_q * self.logical_seq_len_q
+        self.output_quant.store(
+            self.output_quant_args, values, row, column, rotary=rotary
+        )
+
     @producer_work
     @cute.jit
     def epilogue_store(self, stage_info: StageInfo) -> None:
@@ -3811,18 +3822,12 @@ class GmemOResource(HighThroughputMlaResource):
                                 evict="noallocate",
                             )
                 elif cutlass.const_expr(self.output_quant is not None):
-                    output_row = Int64(storage_flat_query_row)
-                    if cutlass.const_expr(self.cu_seqlens_q is None):
-                        output_row += (
-                            Int64(batch_idx)
-                            * self.logical_num_heads_q
-                            * self.logical_seq_len_q
-                        )
-                    self.output_quant.store(
-                        self.output_quant_args,
+                    self._store_quantized_slice(
                         qk_acc_regs,
-                        output_row,
+                        storage_flat_query_row,
+                        batch_idx,
                         iter_n * tile_d + g_j,
+                        iter_n + 1 == cfg.iterations_pv_n,
                     )
                 else:
                     # 16-bit output (split_kv == 1, direct output)
@@ -4072,18 +4077,12 @@ class GmemOResource(HighThroughputMlaResource):
                             evict="noallocate",
                         )
             elif cutlass.const_expr(self.output_quant is not None):
-                output_row = Int64(storage_flat_query_row)
-                if cutlass.const_expr(self.cu_seqlens_q is None):
-                    output_row += (
-                        Int64(batch_idx)
-                        * self.logical_num_heads_q
-                        * self.logical_seq_len_q
-                    )
-                self.output_quant.store(
-                    self.output_quant_args,
+                self._store_quantized_slice(
                     qk_acc_regs,
-                    output_row,
+                    storage_flat_query_row,
+                    batch_idx,
                     iter_n * tile_d + g_j,
+                    iter_n + 1 == cfg.iterations_pv_n,
                 )
             else:
                 if cutlass.const_expr(self.cu_seqlens_q is not None):
