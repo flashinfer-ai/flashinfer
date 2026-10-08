@@ -50,7 +50,7 @@ def gated_delta_product_mtp(
     householder micro-steps.  With speculative decoding on top, ``T`` is
     already ``num_spec + 1``, so the micro-step axis is ``n_h * (num_spec + 1)``.
 
-    ``k``, ``v`` and ``beta`` carry the householder axis next to the token axis,
+    ``k``, ``v`` and ``b`` carry the householder axis next to the token axis,
     so reshaping them to the micro-step timeline is free.  ``q`` and ``a`` stay
     one row per REAL token; the kernel indexes them directly.
 
