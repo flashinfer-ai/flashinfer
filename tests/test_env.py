@@ -1,4 +1,4 @@
-"""Regression tests for _get_cubin_dir() priority — issue #2976.
+"""Regression tests for environment configuration and compiler selection.
 
 env.py imports CompilationContext (CUDA deps), so we load it in isolation
 with lightweight stubs to keep tests runnable without a GPU.
@@ -7,9 +7,13 @@ with lightweight stubs to keep tests runnable without a GPU.
 """
 
 import importlib.util
+import os
 import pathlib
+import subprocess
 import sys
 import types
+
+import pytest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -167,3 +171,58 @@ def test_cuda_architectures_for_call_collects_nested_tensor_devices(monkeypatch)
     assert _env._cuda_architectures_for_call(
         (tensor0,), {"nested": [tensor1]}
     ) == frozenset({"sm103a", "sm120f"})
+
+
+@pytest.mark.parametrize("explicit_assembler", [False, True])
+def test_triton_import_preserves_compiler_identity(tmp_path, explicit_assembler):
+    pytest.importorskip("triton.backends.nvidia.compiler")
+    assembler = tmp_path / "ptxas"
+    assembler.write_text("#!/bin/sh\nprintf '%s\\n' 'ptxas, release 13.3, V13.3.73'\n")
+    assembler.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = os.pathsep.join((str(tmp_path), environment["PATH"]))
+    environment["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(_REPO_ROOT), environment.get("PYTHONPATH")))
+    )
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    environment["FLASHINFER_WORKSPACE_BASE"] = str(tmp_path)
+    environment.pop("TRITON_PTXAS_BLACKWELL_PATH", None)
+    if explicit_assembler:
+        environment["TRITON_PTXAS_BLACKWELL_PATH"] = str(assembler)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import os
+import subprocess
+import sys
+
+from triton.backends.compiler import GPUTarget
+from triton.backends.nvidia.compiler import CUDABackend, get_ptxas
+
+backend = CUDABackend(GPUTarget("cuda", 120, 32))
+planned_key = backend.hash()
+assembler = get_ptxas(120).path
+override = os.environ.get("TRITON_PTXAS_BLACKWELL_PATH")
+
+import flashinfer.triton
+
+child_key = subprocess.check_output(
+    [sys.executable, "-c", '''
+from triton.backends.compiler import GPUTarget
+from triton.backends.nvidia.compiler import CUDABackend
+print(CUDABackend(GPUTarget("cuda", 120, 32)).hash())
+'''], text=True,
+).rstrip("\\n")
+assert planned_key == child_key, (planned_key, child_key)
+assert get_ptxas(120).path == assembler
+assert os.environ.get("TRITON_PTXAS_BLACKWELL_PATH") == override
+""",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
