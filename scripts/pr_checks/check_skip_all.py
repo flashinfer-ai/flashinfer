@@ -232,29 +232,93 @@ def _changed_test_files_from_list(path: str) -> list[str]:
 # Summary parsing
 # ---------------------------------------------------------------------------
 
-def _load_summary(path: str) -> tuple[str, list[dict]]:
+def _load_summary(path: str, lane_name: str | None = None) -> tuple[str, list[dict]]:
     """Load a run-summary.json and return (lane_name, sources).
 
     The lane name is inferred from the path or defaults to "unknown".
     """
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
-    # Infer lane name from parent directory structure or filename.
-    # Typical: junit/run-summary.json (H100), junit-a10g/run-summary.json, etc.
-    parts = PurePosixPath(path).parts
-    lane = "unknown"
-    for part in parts:
-        lower = part.lower()
-        if any(gpu in lower for gpu in ("h100", "a10g", "t4", "sm90", "sm86", "sm75")):
-            lane = part
-            break
+    if lane_name is None:
+        # Infer lane name from parent directory structure or filename.
+        # Typical: junit-h100/run-summary.json, junit-a10g/run-summary.json, etc.
+        parts = PurePosixPath(path).parts
+        lane_name = "unknown"
+        for part in parts:
+            lower = part.lower()
+            if any(gpu in lower for gpu in ("h100", "a10g", "t4", "sm90", "sm86", "sm75")):
+                lane_name = part
+                break
     sources = data.get("sources", [])
-    return lane, sources
+    return lane_name, sources
+
+
+def _aggregate_from_junit_xml(
+    changed_files: list[str],
+    junit_xml_dirs: list[tuple[str, Path]],
+    results: dict[str, FileResult],
+) -> None:
+    """Aggregate per-file results from raw JUnit XML directories (no run-summary).
+
+    Each entry in *junit_xml_dirs* is ``(lane_name, directory)`` where directory
+    contains ``*.xml`` files written by ``pytest --junitxml``.  The XML file
+    names encode the source file path (e.g. ``tests/utils/test_sampling.py.xml``).
+
+    For each testcase element we read the outcome (passed/failed/skipped) and
+    accumulate into the existing *results* dict under the given lane.
+    """
+    for lane_name, xml_dir in junit_xml_dirs:
+        if not xml_dir.is_dir():
+            continue
+        for xml_path in xml_dir.rglob("*.xml"):
+            try:
+                root = ET.parse(xml_path).getroot()
+            except (OSError, ET.ParseError):
+                continue
+            for testcase in root.iter("testcase"):
+                # Determine source file from pytest_nodeid property or classname.
+                nodeid = ""
+                props_el = testcase.find("./properties")
+                if props_el is not None:
+                    for prop in props_el.findall("property"):
+                        if prop.attrib.get("name") == "pytest_nodeid":
+                            nodeid = prop.attrib.get("value", "")
+                            break
+                if nodeid:
+                    source_file = nodeid.split("::")[0]
+                else:
+                    classname = testcase.attrib.get("classname", "")
+                    source_file = classname.replace(".", "/") + ".py"
+
+                if source_file not in results:
+                    continue
+
+                # Determine outcome.
+                if testcase.find("./failure") is not None or testcase.find("./error") is not None:
+                    outcome = "failed"
+                elif testcase.find("./skipped") is not None:
+                    outcome = "skipped"
+                else:
+                    outcome = "passed"
+
+                fr = results[source_file]
+                lr = fr.lanes.get(lane_name, LaneResult(lane=lane_name))
+                lr.planned += 1
+                if outcome == "passed":
+                    lr.passed += 1
+                elif outcome == "failed":
+                    lr.failed += 1
+                elif outcome == "skipped":
+                    lr.skipped += 1
+                else:
+                    lr.unknown += 1
+                fr.lanes[lane_name] = lr
 
 
 def _aggregate_results(
     changed_files: list[str],
     summary_paths: list[str],
+    junit_xml_dirs: list[tuple[str, Path]] | None = None,
 ) -> dict[str, FileResult]:
     """Build per-file, per-lane result aggregation for changed test files."""
     results: dict[str, FileResult] = {f: FileResult(path=f) for f in changed_files}
@@ -274,6 +338,9 @@ def _aggregate_results(
             lr.unknown += source.get("unknown", 0)
             fr.lanes[lane] = lr
 
+    if junit_xml_dirs:
+        _aggregate_from_junit_xml(changed_files, junit_xml_dirs, results)
+
     return results
 
 
@@ -285,13 +352,16 @@ def find_skip_all_files(
     changed_files: list[str],
     summary_paths: list[str],
     junit_dirs: list[Path] | None = None,
+    junit_xml_dirs: list[tuple[str, Path]] | None = None,
 ) -> tuple[list[SkipAllFinding], dict[str, FileResult]]:
     """Return findings for changed test files that were skip-all on every lane.
 
     Also returns the full results dict for reporting purposes.
     When *junit_dirs* are provided, skip reasons are extracted from JUnit XML.
+    When *junit_xml_dirs* are provided, per-file outcomes are aggregated from
+    raw JUnit XML (used for A10G/T4 shard lanes that don't produce run-summary.json).
     """
-    results = _aggregate_results(changed_files, summary_paths)
+    results = _aggregate_results(changed_files, summary_paths, junit_xml_dirs)
     findings: list[SkipAllFinding] = []
 
     for path in changed_files:
@@ -580,6 +650,12 @@ def main() -> int:
              "(repeatable, one per lane)",
     )
     ap.add_argument(
+        "--junit-xml-lane", action="append", default=[], nargs=2,
+        metavar=("LANE_NAME", "DIR"),
+        help="Lane name and JUnit XML directory for lanes without run-summary.json "
+             "(repeatable, e.g. --junit-xml-lane A10G junit-shards/a10g)",
+    )
+    ap.add_argument(
         "--github-actions", action="store_true",
         help="Emit GitHub Actions annotations",
     )
@@ -602,13 +678,18 @@ def main() -> int:
         ap.error("provide --base-sha + --head-sha, or --changed-files")
         return 1  # unreachable
 
-    if not args.summary:
-        ap.error("at least one --summary is required")
+    if not args.summary and not args.junit_xml_lane:
+        ap.error("at least one --summary or --junit-xml-lane is required")
         return 1
 
     junit_dirs = [Path(d) for d in args.junit_dir] if args.junit_dir else None
+    junit_xml_dirs = (
+        [(name, Path(d)) for name, d in args.junit_xml_lane]
+        if args.junit_xml_lane else None
+    )
     findings, results = find_skip_all_files(
         changed, args.summary, junit_dirs=junit_dirs,
+        junit_xml_dirs=junit_xml_dirs,
     )
 
     # Report.

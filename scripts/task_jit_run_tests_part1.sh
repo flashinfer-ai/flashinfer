@@ -13,13 +13,18 @@ if [ "$SKIP_INSTALL" = "0" ]; then
   install_flashinfer_editable
 fi
 
+# Create JUnit XML output directories for cross-lane coverage analysis
+mkdir -p junit-shard/tests/attention junit-shard/tests/utils junit-shard/tests/gemm \
+  junit-shard/tests/cli junit-shard/tests/moe junit-shard/tests/experimental \
+  junit-shard/tests
+
 # Run each test file separately to isolate CUDA memory issues
 # moe_ep unit subset: host-only + single-GPU (multirank/mega auto-skip via
 # markers; see tests/moe_ep/run_tests.sh and docs/design_docs/moe_ep_runbook.md)
 bash tests/moe_ep/run_tests.sh unit
-pytest -s tests/attention/test_logits_cap.py
-pytest -s tests/attention/test_sliding_window.py
-pytest -s tests/attention/test_tensor_cores_decode.py
-pytest -s tests/attention/test_batch_decode_kernels.py
+pytest -s --junitxml=junit-shard/tests/attention/test_logits_cap.py.xml tests/attention/test_logits_cap.py
+pytest -s --junitxml=junit-shard/tests/attention/test_sliding_window.py.xml tests/attention/test_sliding_window.py
+pytest -s --junitxml=junit-shard/tests/attention/test_tensor_cores_decode.py.xml tests/attention/test_tensor_cores_decode.py
+pytest -s --junitxml=junit-shard/tests/attention/test_batch_decode_kernels.py.xml tests/attention/test_batch_decode_kernels.py
 # pytest -s tests/gemm/test_group_gemm.py
 # pytest -s tests/attention/test_alibi.py

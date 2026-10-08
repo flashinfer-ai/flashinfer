@@ -506,6 +506,23 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Make shard JUnit XML readable
+        if: ${{ always() && matrix.kind == 'gpu' }}
+        run: |
+          if [ -d junit-shard ]; then
+            sudo chmod -R a+rX junit-shard
+          fi
+
+      - name: Upload shard JUnit XML
+        if: ${{ always() && matrix.kind == 'gpu' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-shard-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            junit-shard/**/*.xml
+          if-no-files-found: warn
+          retention-days: 14
+
 
   # ---------------------------------------------------------------------------
   # Test Results Summary
@@ -667,6 +684,15 @@ jobs:
           merge-multiple: true
         continue-on-error: true
 
+      - name: Download shard JUnit artifacts (A10G/T4)
+        if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-shard-*
+          path: junit-shards
+          merge-multiple: true
+        continue-on-error: true
+
       - name: Check skip-all test files
         id: skip-all
         if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
@@ -678,8 +704,23 @@ jobs:
           if [ -f junit-h100/run-summary.json ]; then
             SUMMARY_ARGS="--summary junit-h100/run-summary.json"
           fi
-          if [ -z "$SUMMARY_ARGS" ]; then
-            echo "No run-summary.json artifacts found; skipping skip-all check"
+
+          # A10G/T4 shard lanes produce raw JUnit XML (no run-summary.json).
+          # Discover them from the merged download directory.
+          SHARD_ARGS=""
+          if [ -d junit-shards ]; then
+            # The merged artifact flattens all shard uploads into one tree.
+            # Infer lane names from the XML paths: the shard scripts write
+            # junit-shard/tests/..., so after merge we get
+            # junit-shards/tests/... from each lane.  Since the download
+            # merges all lanes into one directory, we label the combined
+            # tree as "A10G+T4" — individual lane attribution would require
+            # per-lane artifact naming, which the shard scripts don't do.
+            SHARD_ARGS="--junit-xml-lane A10G+T4 junit-shards"
+          fi
+
+          if [ -z "$SUMMARY_ARGS" ] && [ -z "$SHARD_ARGS" ]; then
+            echo "No JUnit artifacts found; skipping skip-all check"
             echo "skip_all_found=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -689,6 +730,7 @@ jobs:
           REPORT=$(python3 scripts/pr_checks/check_skip_all.py \
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
             $SUMMARY_ARGS \
+            $SHARD_ARGS \
             --junit-dir junit-h100 \
             --github-actions 2>&1) || true
           echo "$REPORT"
