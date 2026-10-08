@@ -71,7 +71,7 @@ class MlaOutputQuant:
         # The cache contains forward sin; conjugation changes its sign here.
         if column + count - 1 >= 448:
             position = positions[token]
-            pairs = cutlass.const_expr(min(4, count // 2))
+            pairs = cutlass.const_expr(min(16, count // 2))
             for i in cutlass.range_constexpr(0, count, pairs * 2):
                 d = column + i
                 if d >= 448:
@@ -81,8 +81,9 @@ class MlaOutputQuant:
                         + Int64(position) * 64
                         + (d - 448) // 2
                     )
-                    cos = base.load(count=pairs, alignment=pairs * 4)
-                    sin = (base + 32).load(count=pairs, alignment=pairs * 4)
+                    alignment = cutlass.const_expr(min(16, pairs * 4))
+                    cos = base.load(count=pairs, alignment=alignment)
+                    sin = (base + 32).load(count=pairs, alignment=alignment)
                     for j in cutlass.range_constexpr(pairs):
                         x, y = fragment[i + 2 * j], fragment[i + 2 * j + 1]
                         fragment[i + 2 * j] = x * cos[j] + y * sin[j]

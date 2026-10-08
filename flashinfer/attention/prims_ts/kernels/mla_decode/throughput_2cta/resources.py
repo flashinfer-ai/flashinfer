@@ -3667,6 +3667,39 @@ class GmemOResource(HighThroughputMlaResource):
             self.output_quant_args, values, row, column, rotary=rotary
         )
 
+    @cute.jit
+    def _load_rotary_slice(
+        self, tmem_addr, norm_scale, flat_row, batch_idx, column, valid
+    ):
+        """Rotate the upper half before the other 64 accumulators become live."""
+        row = Int64(flat_row)
+        if cutlass.const_expr(self.cu_seqlens_q is None):
+            row += Int64(batch_idx) * self.logical_num_heads_q * self.logical_seq_len_q
+        result = cutlass.Array(Float32, 128, space=cutlass.AddressSpace.rmem)
+        # The correction warp's register budget cannot keep 128 accumulators
+        # and a batch of RoPE coefficients live together without serial loads.
+        for half in cutlass.range_constexpr(2):
+            offset = cutlass.const_expr(64 if half == 0 else 0)
+            values = cutlass.Array(Float32, 64, space=cutlass.AddressSpace.rmem)
+            for chunk in cutlass.range_constexpr(2):
+                ptr = prims.make_tmem_ptr(tmem_addr + offset + chunk * 32, Float32)
+                values.store(
+                    prims.tcgen05_ld(TCGEN05_32B_SHAPE, ptr, num=32), chunk * 32
+                )
+            for i in cutlass.range_constexpr(0, 64, 2):
+                scaled = mul_packed_f32x2(
+                    (values[i], values[i + 1]), (norm_scale, norm_scale)
+                )
+                values[i], values[i + 1] = scaled[0], scaled[1]
+            if cutlass.const_expr(half == 0):
+                if valid:
+                    rotated = self.output_quant.rotate(
+                        self.output_quant_args, values, row, column + offset
+                    )
+                    values.store(rotated.load(0, 64), 0)
+            result.store(values.load(0, 64), offset)
+        return result
+
     @producer_work
     @cute.jit
     def epilogue_store(self, stage_info: StageInfo) -> None:
@@ -3761,22 +3794,36 @@ class GmemOResource(HighThroughputMlaResource):
             tmem_raw_addr_n = tmem_raw_addr + (
                 iter_n * (cfg.mma_pv_tiler[1] // cfg.warps_in_n)
             )
-            for load_idx in cutlass.range_constexpr(num_tmem_loads):
-                curr_addr = tmem_raw_addr_n + load_idx * TCGEN05_32B_REGS_PER_LOAD
-                tmem_ptr = prims.make_tmem_ptr(curr_addr, Float32)
-                loaded = prims.tcgen05_ld(
-                    t2r_shape, tmem_ptr, num=TCGEN05_32B_REGS_PER_LOAD
+            if cutlass.const_expr(
+                self.output_quant is not None
+                and self.partial_output is None
+                and iter_n + 1 == cfg.iterations_pv_n
+            ):
+                qk_acc_regs = self._load_rotary_slice(
+                    tmem_raw_addr_n,
+                    norm_scale,
+                    storage_flat_query_row,
+                    batch_idx,
+                    iter_n * tile_d + g_j,
+                    row_in_tile < physical_tile_rows and query_is_valid,
                 )
-                qk_acc_regs.store(loaded, load_idx * TCGEN05_32B_REGS_PER_LOAD)
+            else:
+                for load_idx in cutlass.range_constexpr(num_tmem_loads):
+                    curr_addr = tmem_raw_addr_n + load_idx * TCGEN05_32B_REGS_PER_LOAD
+                    tmem_ptr = prims.make_tmem_ptr(curr_addr, Float32)
+                    loaded = prims.tcgen05_ld(
+                        t2r_shape, tmem_ptr, num=TCGEN05_32B_REGS_PER_LOAD
+                    )
+                    qk_acc_regs.store(loaded, load_idx * TCGEN05_32B_REGS_PER_LOAD)
 
-            # Normalize: O = O * output_scale / row_sum
-            for i in cutlass.range_constexpr(0, 128, 2):
-                scaled = mul_packed_f32x2(
-                    (qk_acc_regs[i], qk_acc_regs[i + 1]),
-                    (norm_scale, norm_scale),
-                )
-                qk_acc_regs[i] = scaled[0]
-                qk_acc_regs[i + 1] = scaled[1]
+                # Normalize: O = O * output_scale / row_sum
+                for i in cutlass.range_constexpr(0, 128, 2):
+                    scaled = mul_packed_f32x2(
+                        (qk_acc_regs[i], qk_acc_regs[i + 1]),
+                        (norm_scale, norm_scale),
+                    )
+                    qk_acc_regs[i] = scaled[0]
+                    qk_acc_regs[i + 1] = scaled[1]
 
             # Store O to GMEM
             if row_in_tile < physical_tile_rows and query_is_valid:
@@ -3827,7 +3874,7 @@ class GmemOResource(HighThroughputMlaResource):
                         storage_flat_query_row,
                         batch_idx,
                         iter_n * tile_d + g_j,
-                        iter_n + 1 == cfg.iterations_pv_n,
+                        False,
                     )
                 else:
                     # 16-bit output (split_kv == 1, direct output)
@@ -3998,23 +4045,8 @@ class GmemOResource(HighThroughputMlaResource):
         t2r_shape = TCGEN05_32B_SHAPE
         num_tmem_loads = 4
         qk_acc_regs = cutlass.Array(Float32, 128, space=cutlass.AddressSpace.rmem)
-        for load_idx in cutlass.range_constexpr(num_tmem_loads):
-            curr_addr = tmem_raw_addr + load_idx * TCGEN05_32B_REGS_PER_LOAD
-            tmem_ptr = prims.make_tmem_ptr(curr_addr, Float32)
-            loaded = prims.tcgen05_ld(
-                t2r_shape, tmem_ptr, num=TCGEN05_32B_REGS_PER_LOAD
-            )
-            qk_acc_regs.store(loaded, load_idx * TCGEN05_32B_REGS_PER_LOAD)
-
         row_has_values = row_sum > Float32(0)
         norm_scale = self._normalization_scale(row_sum, row_max, local_tidx, blk_coord)
-        for i in cutlass.range_constexpr(0, 128, 2):
-            scaled = mul_packed_f32x2(
-                (qk_acc_regs[i], qk_acc_regs[i + 1]),
-                (norm_scale, norm_scale),
-            )
-            qk_acc_regs[i] = scaled[0]
-            qk_acc_regs[i + 1] = scaled[1]
 
         tile_h = cfg.mma_pv_tiler[0] // cfg.num_mma_ctas
         tile_d = cfg.mma_pv_tiler[1]
@@ -4037,6 +4069,35 @@ class GmemOResource(HighThroughputMlaResource):
             _,
             query_is_valid,
         ) = self._query_row_state(row_in_tile, seq_q_idx, batch_idx)
+
+        if cutlass.const_expr(
+            self.output_quant is not None
+            and self.partial_output is None
+            and iter_n + 1 == cfg.iterations_pv_n
+        ):
+            qk_acc_regs = self._load_rotary_slice(
+                tmem_raw_addr,
+                norm_scale,
+                storage_flat_query_row,
+                batch_idx,
+                iter_n * tile_d + g_j,
+                row_in_tile < physical_tile_rows and query_is_valid,
+            )
+        else:
+            for load_idx in cutlass.range_constexpr(num_tmem_loads):
+                curr_addr = tmem_raw_addr + load_idx * TCGEN05_32B_REGS_PER_LOAD
+                tmem_ptr = prims.make_tmem_ptr(curr_addr, Float32)
+                loaded = prims.tcgen05_ld(
+                    t2r_shape, tmem_ptr, num=TCGEN05_32B_REGS_PER_LOAD
+                )
+                qk_acc_regs.store(loaded, load_idx * TCGEN05_32B_REGS_PER_LOAD)
+            for i in cutlass.range_constexpr(0, 128, 2):
+                scaled = mul_packed_f32x2(
+                    (qk_acc_regs[i], qk_acc_regs[i + 1]),
+                    (norm_scale, norm_scale),
+                )
+                qk_acc_regs[i] = scaled[0]
+                qk_acc_regs[i + 1] = scaled[1]
 
         if row_in_tile < physical_tile_rows and query_is_valid:
             if cutlass.const_expr(self.partial_output is not None):
@@ -4082,7 +4143,7 @@ class GmemOResource(HighThroughputMlaResource):
                     storage_flat_query_row,
                     batch_idx,
                     iter_n * tile_d + g_j,
-                    iter_n + 1 == cfg.iterations_pv_n,
+                    False,
                 )
             else:
                 if cutlass.const_expr(self.cu_seqlens_q is not None):

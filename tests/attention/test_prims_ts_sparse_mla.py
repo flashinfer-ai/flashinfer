@@ -405,7 +405,10 @@ def test_rope_quant_graph(
         shape[:-2]
     )
     theta = torch.randn(rows * 3 + 64, 32, device="cuda")
-    cos_sin = torch.cat((theta.cos(), theta.sin()), -1)
+    # Vectorized RoPE loads must honor the public 16-byte alignment contract.
+    storage = torch.empty(theta.numel() * 2 + 4, device="cuda")
+    cos_sin = storage[4:].view(-1, 64)
+    cos_sin.copy_(torch.cat((theta.cos(), theta.sin()), -1))
     groups = max(1, heads // 8)
     wrapper = BatchSparseMLADecodePagedTSWrapper()
     wrapper.plan(
