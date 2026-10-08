@@ -4394,7 +4394,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             int half_15 = tid / 128;
                             int k_pair = tile_row_2 >> 1 & 1 ^ half_15;
                             int scale_index = tile_row_2 % 32 * 4 + tile_row_2 / 32;
-                            #pragma unroll
+                            #pragma unroll 1
                             for (int stage_11 = 0; stage_11 < 2; stage_11++) {
                                 if (tile_end_2 > first_tile_3 + stage_11) {
                                     int row_27 = first_row_6;
@@ -4412,11 +4412,11 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                     int peer_5 = _relaxed_ld_38;
                                     float weight = weights[local_row_4];
                                     float router_gradient = 0.0f;
-                                    unsigned int gate_scales = q_words[(131072 + stage_11 * 512) / 4 + scale_index];
-                                    unsigned int up_scales = q_words[(132096 + stage_11 * 512) / 4 + scale_index];
-                                    int gate_base = (65536 + stage_11 * 16384) / 4 + tile_row_2 * 32;
-                                    int up_base = (98304 + stage_11 * 16384) / 4 + tile_row_2 * 32;
-                                    int dh_base = stage_11 * 32768 / 4 + tile_row_2 * 64;
+                                    unsigned int gate_scales = q_words[32768 + stage_11 * 128 + scale_index];
+                                    unsigned int up_scales = q_words[33024 + stage_11 * 128 + scale_index];
+                                    int gate_base = 16384 + stage_11 * 4096 + tile_row_2 * 32;
+                                    int up_base = 24576 + stage_11 * 4096 + tile_row_2 * 32;
+                                    int dh_base = stage_11 * 8192 + tile_row_2 * 64;
                                     int dup_stage_base = 33280 + tile_row_2 * 64;
                                     unsigned int dgate_scale_pair = 0;
                                     unsigned int dup_scale_pair = 0;
@@ -4678,8 +4678,8 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"(q_words_addr + (unsigned int)((dup_stage_base + col_idx_2 / 2) * 4)), "r"(dup_words[k_22 * 2]), "r"(dup_words[k_22 * 2 + 1]) : "memory");
                                         }
                                     }
-                                    q_halves[(131072 + stage_11 * 512) / 2 + scale_index * 2 + k_pair] = (uint16_t)dgate_scale_pair;
-                                    q_halves[(132096 + stage_11 * 512) / 2 + scale_index * 2 + k_pair] = (uint16_t)dup_scale_pair;
+                                    q_halves[65536 + stage_11 * 256 + scale_index * 2 + k_pair] = (uint16_t)dgate_scale_pair;
+                                    q_halves[66048 + stage_11 * 256 + scale_index * 2 + k_pair] = (uint16_t)dup_scale_pair;
                                     if (stage_11 == 1) {
                                         if (tid == 0) {
                                             asm volatile("cp.async.bulk.wait_group.read 0;");
@@ -4695,7 +4695,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                         tma_store_3d((&du_sc_r), 0, scale_tile_1, 0, q_flat_addr + 132096 + (unsigned int)(stage_11 * 512));
                                         asm volatile("cp.async.bulk.commit_group;");
                                     }
-                                    int src_offset = ((half_15 == 0) ? stage_11 * 32768 / 2 : 66560);
+                                    int src_offset = ((half_15 == 0) ? stage_11 * 16384 : 66560);
                                     int t_row_4 = tile_row_2 % 64 * 2 + tile_row_2 / 64;
                                     int rotation_7 = tile_row_2 / 8;
                                     unsigned int t_scale_word_4 = 0;
