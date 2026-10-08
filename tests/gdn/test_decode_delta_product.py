@@ -684,3 +684,138 @@ def test_decode_rejects_mismatched_householder_counts():
             scale=K**-0.5,
             disable_state_update=False,
         )
+
+
+# --------------------------------------------------------------------------
+# 9. SMEM chunking must not change results, and must bound the footprint.
+# --------------------------------------------------------------------------
+def _smem_bytes(chunk: int, k_dim: int, tile_v: int) -> int:
+    """Mirror of run_gdn_verify_kernel_mtp's smem_bytes formula."""
+    return (
+        4 * chunk * (k_dim + 8)  # sQ
+        + 4 * chunk * (k_dim + 8)  # sK
+        + 4 * chunk  # sG
+        + 4 * chunk  # sBeta
+        + 4 * chunk * tile_v  # sVdata
+        + 2 * chunk * tile_v  # sOutput
+        + 128
+    )
+
+
+def test_choose_stage_rows_leaves_gdn_unchunked():
+    """n_h=1 GDN must get CHUNK == T, i.e. the pre-chunking kernel verbatim.
+
+    The chunked path is only reachable when the staged range is long enough to
+    cost occupancy, which under expansion means n_h > 1. Any GDN shape returning
+    CHUNK < T would be a behaviour change on a path this work is not meant to
+    touch.
+    """
+    from flashinfer.gdn_kernels.gdn_decode_mtp import choose_stage_rows, get_mtp_config
+
+    for batch in (1, 2, 8, 32, 128, 512):
+        for seq_len in (1, 2, 4, 8):  # n_h=1: seq_len is the draft length
+            tile_v, _, ilp_rows, _ = get_mtp_config(
+                batch, seq_len, num_v_heads=32, v_dim=128, k_dim=128
+            )
+            assert choose_stage_rows(seq_len, 128, tile_v, ilp_rows) == seq_len, (
+                f"B={batch} T={seq_len} would be chunked (tile_v={tile_v}, "
+                f"ilp={ilp_rows}); GDN must keep CHUNK == T"
+            )
+
+
+@pytest.mark.parametrize("seq_len", [24, 30, 48], ids=lambda t: f"seq_len={t}")
+def test_choose_stage_rows_bounds_smem(seq_len):
+    """Above the budget, CHUNK must cap SMEM and divide T evenly.
+
+    A non-divisor would leave a short final chunk, which the kernel's
+    range_constexpr(CHUNK) loop cannot express -- it would read past the end of
+    the staged range.
+    """
+    from flashinfer.gdn_kernels.gdn_decode_mtp import choose_stage_rows
+
+    k_dim, tile_v, ilp_rows = 128, 16, 4  # tile_v // 4 == ilp_rows -> single sweep
+    chunk = choose_stage_rows(seq_len, k_dim, tile_v, ilp_rows)
+    assert chunk < seq_len, f"seq_len={seq_len} should be chunked"
+    assert seq_len % chunk == 0, f"CHUNK={chunk} does not divide T={seq_len}"
+    assert _smem_bytes(chunk, k_dim, tile_v) <= 16384
+
+
+def test_choose_stage_rows_requires_single_sweep():
+    """Chunking is unsafe when the consumer re-sweeps [0, T) per row tile.
+
+    Each warp sweeps the token range rows_per_group // ilp_rows times. With more
+    than one sweep the producer would refill a chunk before the second sweep read
+    it, so the helper must decline rather than corrupt.
+    """
+    from flashinfer.gdn_kernels.gdn_decode_mtp import choose_stage_rows
+
+    # tile_v // 4 == 8 != ilp_rows == 4  -> two sweeps
+    assert choose_stage_rows(48, 128, 32, 4) == 48
+
+
+@pytest.mark.parametrize(
+    "num_householder,T,chunk",
+    [(3, 8, 12), (2, 8, 8)],
+    ids=["nh3_T8_chunk12", "nh2_T8_chunk8"],
+)
+def test_chunked_smem_is_bit_identical(num_householder, T, chunk):
+    """Chunking must be exactly invisible in the results.
+
+    It splits the token loop but reorders no arithmetic: every token still sees
+    the same state in the same sequence. So this is exact equality, not a
+    tolerance -- any difference means state or staging leaked across a chunk
+    boundary. The regression it guards against is real: seeding the recurrent
+    state r_h inside the chunk loop instead of once silently resets it every
+    chunk, which no shape or tolerance check would catch.
+
+    Note this does NOT use _skip_if_unsupported() -- that guard states the
+    *prefill* arch requirement. gated_delta_rule_mtp runs more widely, and this
+    test is worth running wherever it does.
+
+    One alternative chunk per config: each distinct CHUNK is a separate JIT
+    compilation, so the matrix is kept deliberately small.
+    """
+    import flashinfer.gdn_kernels.gdn_decode_mtp as mtp
+
+    n_h, B, HQ, HV, K, V = num_householder, 3, 16, 32, 128, 128
+    TN = T * n_h
+    assert chunk < TN and TN % chunk == 0, "chunk must be a proper divisor of T*n_h"
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm = _gen_decode_inputs(
+        B, T, n_h, HQ, HV, K, V, dtype, device, seed=17
+    )
+
+    def run(staged_rows):
+        original = mtp.choose_stage_rows
+        mtp.choose_stage_rows = lambda *args, **kwargs: staged_rows
+        try:
+            pool_copy = pool.clone()
+            out, _ = gated_delta_product_mtp(
+                q,
+                k,
+                v,
+                pool_copy,
+                idx,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                scale=K**-0.5,
+                ssm_state_indices=ssm,
+                disable_state_update=False,
+            )
+            torch.cuda.synchronize()
+            return out.clone(), pool_copy.clone()
+        finally:
+            mtp.choose_stage_rows = original
+
+    ref_out, ref_pool = run(TN)  # CHUNK == T: the pre-chunking code path
+    out, pool_after = run(chunk)
+    assert torch.equal(out, ref_out), (
+        f"CHUNK={chunk} changed the output vs CHUNK={TN}; "
+        "chunking must not reorder arithmetic"
+    )
+    assert torch.equal(pool_after, ref_pool), (
+        f"CHUNK={chunk} changed the final state vs CHUNK={TN}; "
+        "r_h must be seeded once and written back on the last chunk only"
+    )
