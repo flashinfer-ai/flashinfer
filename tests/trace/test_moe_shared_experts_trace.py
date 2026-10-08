@@ -20,7 +20,7 @@ from flashinfer.trace.templates.moe import (
 FI_TRACE_OUT = Path(__file__).parent / "fi_trace_out"
 SHARED_JSON = (
     FI_TRACE_OUT
-    / "moe_fp8_block_scale_ds_shared_experts_s1_e33_topk8_ng8_kg4_h7168_i2048.json"
+    / "moe_fp8_block_scale_ds_shared_experts_s1_e33_topk8_ng8_kg4_h7168_i2048_act3.json"
 )
 FP4_SHARED_JSON = (
     FI_TRACE_OUT
@@ -28,6 +28,11 @@ FP4_SHARED_JSON = (
 )
 
 _DEEPSEEK_V3 = 2
+
+
+@pytest.mark.parametrize("fixture", [SHARED_JSON, FP4_SHARED_JSON])
+def test_committed_shared_expert_fixture_exists(fixture):
+    assert fixture.is_file(), f"missing committed trace fixture: {fixture.name}"
 
 
 def _axes(**overrides):
