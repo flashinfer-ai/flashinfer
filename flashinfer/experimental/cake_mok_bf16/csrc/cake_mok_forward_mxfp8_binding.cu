@@ -21,7 +21,7 @@
 extern "C" __global__ void kernel_cake_mok_forward_mxfp8(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap x_routed, const __grid_constant__ CUtensorMap x_routed_sc, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap wg_routed, const __grid_constant__ CUtensorMap wu_routed, const __grid_constant__ CUtensorMap wd_routed, const __grid_constant__ CUtensorMap wg_routed_sc, const __grid_constant__ CUtensorMap wu_routed_sc, const __grid_constant__ CUtensorMap wd_routed_sc, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap gate_routed_fp8, const __grid_constant__ CUtensorMap up_routed_fp8, const __grid_constant__ CUtensorMap gate_routed_sc, const __grid_constant__ CUtensorMap up_routed_sc, const __grid_constant__ CUtensorMap gate_shared_in, const __grid_constant__ CUtensorMap up_shared_in, const __grid_constant__ CUtensorMap gate_routed_in, const __grid_constant__ CUtensorMap up_routed_in, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_routed_fp8, const __grid_constant__ CUtensorMap hidden_routed_sc, const __grid_constant__ CUtensorMap hidden_routed_fp8_t, const __grid_constant__ CUtensorMap hidden_routed_sc_t, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap hidden_routed_in, const __grid_constant__ CUtensorMap hidden_routed_in_sc, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap y_routed, const __grid_constant__ CUtensorMap x_dispatch_fp8, const __grid_constant__ CUtensorMap x_dispatch_sc, const __grid_constant__ CUtensorMap x_dispatch_fp8_t, const __grid_constant__ CUtensorMap x_dispatch_sc_t, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ gate_ready, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit, int swiglu_clamped, int recompute_only);
 
 
-namespace cake_host_shim_24ae1970221d8746 {
+namespace cake_host_shim_51142708ac4d3bce {
 
 using tvm::ffi::TensorView;
 
@@ -2600,6 +2600,6 @@ void Run(TensorView arg_x_shared, TensorView arg_x_routed, TensorView arg_x_rout
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_24ae1970221d8746
+}  // namespace cake_host_shim_51142708ac4d3bce
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_24ae1970221d8746::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_51142708ac4d3bce::Run);

@@ -45,6 +45,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_X_TILE_OFF 1024
 #define SMEM_X_TILE_STAGE_BYTES 32768
 #define SMEM_X_TILE_STRIDE 32768
+#define SMEM_X_HALVES_OFF 1024
+#define SMEM_X_HALVES_STAGE_BYTES 32768
+#define SMEM_X_HALVES_STRIDE 32768
 #define SMEM_X_WORDS_OFF 1024
 #define SMEM_X_WORDS_STAGE_BYTES 32768
 #define SMEM_X_WORDS_STRIDE 32768
@@ -142,22 +145,6 @@ __device__ __forceinline__ void tma_store_4d(
         :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(w), "r"(smem_addr) : "memory");
 }
 
-
-__device__ __forceinline__ unsigned int __as_u32(float v) {
-    unsigned int u;
-    asm("mov.b32 %0, %1;" : "=r"(u) : "f"(v));
-    return u;
-}
-__device__ __forceinline__ unsigned int __as_u32(__nv_bfloat162 v) {
-    return *reinterpret_cast<const unsigned int*>(&v);
-}
-__device__ __forceinline__ unsigned int __as_u32(unsigned int v) { return v; }
-__device__ __forceinline__ unsigned int __as_u32(int v) {
-    unsigned int u;
-    asm("mov.b32 %0, %1;" : "=r"(u) : "r"(v));
-    return u;
-}
-
 extern "C" {
 
 __global__ __launch_bounds__(128) void
@@ -187,6 +174,8 @@ kernel_cake_mok_quantize_transposed(const __grid_constant__ CUtensorMap x_bf16, 
     // Kernel setup ops
     __nv_bfloat16* x_tile = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int x_tile_addr = smem + 1024;
+    uint16_t* x_halves = reinterpret_cast<uint16_t*>(smem_raw + 1024);
+    const int x_halves_addr = smem + 1024;
     unsigned int* x_words = reinterpret_cast<unsigned int*>(smem_raw + 1024);
     const int x_words_addr = smem + 1024;
     unsigned int* t_words = reinterpret_cast<unsigned int*>(smem_raw + 33792);
@@ -227,10 +216,11 @@ kernel_cake_mok_quantize_transposed(const __grid_constant__ CUtensorMap x_bf16, 
         #pragma unroll
         for (int k = 0; k < 16; k++) {
             int src_row = k_block * 32 + (tid * 4 + k * 2) % 32;
-            float v0 = (float)x_tile[src_row * 128 + t_row];
-            float v1 = (float)x_tile[(src_row + 1) * 128 + t_row];
-            __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(v0, v1));
-            t_words_0[k] = __as_u32(_bf16x2_0);
+            unsigned int lo = (unsigned int)x_halves[src_row * 128 + t_row];
+            unsigned int hi = (unsigned int)x_halves[(src_row + 1) * 128 + t_row];
+            uint32_t _prmt_b32_0;
+            asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(_prmt_b32_0) : "r"(lo), "r"(hi));
+            t_words_0[k] = _prmt_b32_0;
         }
         unsigned int t_packed[8];
         uint32_t _bf16x2_abs_0;
@@ -264,10 +254,10 @@ kernel_cake_mok_quantize_transposed(const __grid_constant__ CUtensorMap x_bf16, 
             unsigned int w1 = t_words_0[2 * i + 1];
             float _cvt_f32_bf16_1;
             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_1) : "h"((uint16_t)(w0 & 65535)));
-            float v0_1 = _cvt_f32_bf16_1;
+            float v0 = _cvt_f32_bf16_1;
             float _cvt_f32_bf16_2;
             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_2) : "h"((uint16_t)(w0 >> 16)));
-            float v1_1 = _cvt_f32_bf16_2;
+            float v1 = _cvt_f32_bf16_2;
             float _cvt_f32_bf16_3;
             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_3) : "h"((uint16_t)(w1 & 65535)));
             float v2 = _cvt_f32_bf16_3;
@@ -275,12 +265,12 @@ kernel_cake_mok_quantize_transposed(const __grid_constant__ CUtensorMap x_bf16, 
             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_4) : "h"((uint16_t)(w1 >> 16)));
             float v3 = _cvt_f32_bf16_4;
             uint16_t _e4m3x2_f32_0;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_0) : "f"(v1_1 * inv), "f"(v0_1 * inv));
-            uint16_t lo = _e4m3x2_f32_0;
+            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_0) : "f"(v1 * inv), "f"(v0 * inv));
+            uint16_t lo_1 = _e4m3x2_f32_0;
             uint16_t _e4m3x2_f32_1;
             asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_1) : "f"(v3 * inv), "f"(v2 * inv));
-            uint16_t hi = _e4m3x2_f32_1;
-            t_packed[i] = (unsigned int)lo | (unsigned int)hi << 16;
+            uint16_t hi_1 = _e4m3x2_f32_1;
+            t_packed[i] = (unsigned int)lo_1 | (unsigned int)hi_1 << 16;
         }
         unsigned int t_scale_byte = scale_byte;
         #pragma unroll

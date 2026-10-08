@@ -45,6 +45,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_X_TILE_OFF 1024
 #define SMEM_X_TILE_STAGE_BYTES 32768
 #define SMEM_X_TILE_STRIDE 32768
+#define SMEM_X_HALVES_OFF 1024
+#define SMEM_X_HALVES_STAGE_BYTES 32768
+#define SMEM_X_HALVES_STRIDE 32768
 #define SMEM_X_WORDS_OFF 1024
 #define SMEM_X_WORDS_STAGE_BYTES 32768
 #define SMEM_X_WORDS_STRIDE 32768
@@ -171,6 +174,8 @@ kernel_cake_mok_quantize_normal(const __grid_constant__ CUtensorMap x_bf16, cons
     // Kernel setup ops
     __nv_bfloat16* x_tile = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int x_tile_addr = smem + 1024;
+    uint16_t* x_halves = reinterpret_cast<uint16_t*>(smem_raw + 1024);
+    const int x_halves_addr = smem + 1024;
     unsigned int* x_words = reinterpret_cast<unsigned int*>(smem_raw + 1024);
     const int x_words_addr = smem + 1024;
     unsigned int* t_words = reinterpret_cast<unsigned int*>(smem_raw + 33792);

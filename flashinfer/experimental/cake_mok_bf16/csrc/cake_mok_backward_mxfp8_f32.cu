@@ -139,6 +139,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_HIDDEN_WORDS_OFF 197632
 #define SMEM_HIDDEN_WORDS_STAGE_BYTES 32768
 #define SMEM_HIDDEN_WORDS_STRIDE 32768
+#define SMEM_HIDDEN_HALVES_OFF 197632
+#define SMEM_HIDDEN_HALVES_STAGE_BYTES 32768
+#define SMEM_HIDDEN_HALVES_STRIDE 32768
 #define SMEM_DISPATCH_SMEM_OFF 1024
 #define SMEM_DISPATCH_SMEM_STAGE_BYTES 131072
 #define SMEM_DISPATCH_SMEM_STRIDE 131072
@@ -473,6 +476,8 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
     const int up_words_addr = smem + 99328;
     unsigned int* hidden_words = reinterpret_cast<unsigned int*>(smem_raw + 197632);
     const int hidden_words_addr = smem + 197632;
+    uint16_t* hidden_halves = reinterpret_cast<uint16_t*>(smem_raw + 197632);
+    const int hidden_halves_addr = smem + 197632;
     __nv_bfloat16* dispatch_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int dispatch_smem_addr = smem + 1024;
     unsigned int* dispatch_words = reinterpret_cast<unsigned int*>(smem_raw + 1024);
@@ -3818,16 +3823,16 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                     row_22 = row_22 + 1;
                                     col_16 = col_16 - col_blocks_11;
                                 }
-                                #pragma unroll
-                                for (int step = 0; step < 32; step++) {
-                                    int pair_15 = step * 256 + tid;
-                                    float2 _cvt_f32_6 = __bfloat1622float2(__as_bf16x2(gate_words[stage_8 * 8192 + pair_15]));
-                                    float2 _cvt_f32_7 = __bfloat1622float2(__as_bf16x2(up_words[stage_8 * 8192 + pair_15]));
-                                    float gx = _cvt_f32_6.x;
-                                    float gy = _cvt_f32_6.y;
-                                    float ux = _cvt_f32_7.x;
-                                    float uy = _cvt_f32_7.y;
-                                    if (swiglu_clamped != 0) {
+                                if (swiglu_clamped != 0) {
+                                    #pragma unroll
+                                    for (int step = 0; step < 32; step++) {
+                                        int pair_15 = step * 256 + tid;
+                                        float2 _cvt_f32_6 = __bfloat1622float2(__as_bf16x2(gate_words[stage_8 * 8192 + pair_15]));
+                                        float2 _cvt_f32_7 = __bfloat1622float2(__as_bf16x2(up_words[stage_8 * 8192 + pair_15]));
+                                        float gx = _cvt_f32_6.x;
+                                        float gy = _cvt_f32_6.y;
+                                        float ux = _cvt_f32_7.x;
+                                        float uy = _cvt_f32_7.y;
                                         float _min_48 = fminf(gx, swiglu_limit);
                                         gx = _min_48;
                                         float _min_49 = fminf(gy, swiglu_limit);
@@ -3838,13 +3843,30 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                         float _max_23 = max_noftz(uy, -swiglu_limit);
                                         float _min_51 = fminf(_max_23, swiglu_limit);
                                         uy = _min_51;
+                                        float _exp_2 = expf(gx * -1.0f);
+                                        float hx = gx / (_exp_2 + 1.0f) * ux;
+                                        float _exp_3 = expf(gy * -1.0f);
+                                        float hy = gy / (_exp_3 + 1.0f) * uy;
+                                        __nv_bfloat162 _bf16x2_14 = __float22bfloat162_rn(make_float2(hx, hy));
+                                        hidden_words[pair_15] = __as_u32(_bf16x2_14);
                                     }
-                                    float _exp_2 = expf(gx * -1.0f);
-                                    float hx = gx / (_exp_2 + 1.0f) * ux;
-                                    float _exp_3 = expf(gy * -1.0f);
-                                    float hy = gy / (_exp_3 + 1.0f) * uy;
-                                    __nv_bfloat162 _bf16x2_14 = __float22bfloat162_rn(make_float2(hx, hy));
-                                    hidden_words[pair_15] = __as_u32(_bf16x2_14);
+                                } else {
+                                    #pragma unroll
+                                    for (int step_1 = 0; step_1 < 32; step_1++) {
+                                        int pair_16 = step_1 * 256 + tid;
+                                        float2 _cvt_f32_8 = __bfloat1622float2(__as_bf16x2(gate_words[stage_8 * 8192 + pair_16]));
+                                        float2 _cvt_f32_9 = __bfloat1622float2(__as_bf16x2(up_words[stage_8 * 8192 + pair_16]));
+                                        float gx_1 = _cvt_f32_8.x;
+                                        float gy_1 = _cvt_f32_8.y;
+                                        float ux_1 = _cvt_f32_9.x;
+                                        float uy_1 = _cvt_f32_9.y;
+                                        float _exp_4 = expf(gx_1 * -1.0f);
+                                        float hx_1 = gx_1 / (_exp_4 + 1.0f) * ux_1;
+                                        float _exp_5 = expf(gy_1 * -1.0f);
+                                        float hy_1 = gy_1 / (_exp_5 + 1.0f) * uy_1;
+                                        __nv_bfloat162 _bf16x2_15 = __float22bfloat162_rn(make_float2(hx_1, hy_1));
+                                        hidden_words[pair_16] = __as_u32(_bf16x2_15);
+                                    }
                                 }
                                 __syncthreads();
                                 if (tid < 128) {
@@ -3858,10 +3880,11 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                         #pragma unroll
                                         for (int k_14 = 0; k_14 < 16; k_14++) {
                                             int src_row_3 = k_block_3 * 32 + (tid * 4 + k_14 * 2) % 32;
-                                            float v0_11 = (float)hidden_flat[src_row_3 * 128 + t_row_3];
-                                            float v1_11 = (float)hidden_flat[(src_row_3 + 1) * 128 + t_row_3];
-                                            __nv_bfloat162 _bf16x2_15 = __float22bfloat162_rn(make_float2(v0_11, v1_11));
-                                            t_words_3[k_14] = __as_u32(_bf16x2_15);
+                                            unsigned int lo_8 = (unsigned int)hidden_halves[src_row_3 * 128 + t_row_3];
+                                            unsigned int hi_8 = (unsigned int)hidden_halves[(src_row_3 + 1) * 128 + t_row_3];
+                                            uint32_t _prmt_b32_0;
+                                            asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(_prmt_b32_0) : "r"(lo_8), "r"(hi_8));
+                                            t_words_3[k_14] = _prmt_b32_0;
                                         }
                                         unsigned int t_packed_3[8];
                                         uint32_t _bf16x2_abs_16;
@@ -3895,10 +3918,10 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             unsigned int w1_8 = t_words_3[2 * i_16 + 1];
                                             float _cvt_f32_bf16_41;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_41) : "h"((uint16_t)(w0_8 & 65535)));
-                                            float v0_12 = _cvt_f32_bf16_41;
+                                            float v0_11 = _cvt_f32_bf16_41;
                                             float _cvt_f32_bf16_42;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_42) : "h"((uint16_t)(w0_8 >> 16)));
-                                            float v1_12 = _cvt_f32_bf16_42;
+                                            float v1_11 = _cvt_f32_bf16_42;
                                             float _cvt_f32_bf16_43;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_43) : "h"((uint16_t)(w1_8 & 65535)));
                                             float v2_8 = _cvt_f32_bf16_43;
@@ -3906,12 +3929,12 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_44) : "h"((uint16_t)(w1_8 >> 16)));
                                             float v3_8 = _cvt_f32_bf16_44;
                                             uint16_t _e4m3x2_f32_16;
-                                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_16) : "f"(v1_12 * inv_8), "f"(v0_12 * inv_8));
-                                            uint16_t lo_8 = _e4m3x2_f32_16;
+                                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_16) : "f"(v1_11 * inv_8), "f"(v0_11 * inv_8));
+                                            uint16_t lo_9 = _e4m3x2_f32_16;
                                             uint16_t _e4m3x2_f32_17;
                                             asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_17) : "f"(v3_8 * inv_8), "f"(v2_8 * inv_8));
-                                            uint16_t hi_8 = _e4m3x2_f32_17;
-                                            t_packed_3[i_16] = (unsigned int)lo_8 | (unsigned int)hi_8 << 16;
+                                            uint16_t hi_9 = _e4m3x2_f32_17;
+                                            t_packed_3[i_16] = (unsigned int)lo_9 | (unsigned int)hi_9 << 16;
                                         }
                                         unsigned int t_scale_byte_3 = scale_byte_8;
                                         #pragma unroll
@@ -3971,10 +3994,10 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             unsigned int w1_9 = words_5[j_15 * 16 + 2 * i_18 + 1];
                                             float _cvt_f32_bf16_46;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_46) : "h"((uint16_t)(w0_9 & 65535)));
-                                            float v0_13 = _cvt_f32_bf16_46;
+                                            float v0_12 = _cvt_f32_bf16_46;
                                             float _cvt_f32_bf16_47;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_47) : "h"((uint16_t)(w0_9 >> 16)));
-                                            float v1_13 = _cvt_f32_bf16_47;
+                                            float v1_12 = _cvt_f32_bf16_47;
                                             float _cvt_f32_bf16_48;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_48) : "h"((uint16_t)(w1_9 & 65535)));
                                             float v2_9 = _cvt_f32_bf16_48;
@@ -3982,12 +4005,12 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_49) : "h"((uint16_t)(w1_9 >> 16)));
                                             float v3_9 = _cvt_f32_bf16_49;
                                             uint16_t _e4m3x2_f32_18;
-                                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_18) : "f"(v1_13 * inv_9), "f"(v0_13 * inv_9));
-                                            uint16_t lo_9 = _e4m3x2_f32_18;
+                                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_18) : "f"(v1_12 * inv_9), "f"(v0_12 * inv_9));
+                                            uint16_t lo_10 = _e4m3x2_f32_18;
                                             uint16_t _e4m3x2_f32_19;
                                             asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_19) : "f"(v3_9 * inv_9), "f"(v2_9 * inv_9));
-                                            uint16_t hi_9 = _e4m3x2_f32_19;
-                                            n_packed_3[i_18] = (unsigned int)lo_9 | (unsigned int)hi_9 << 16;
+                                            uint16_t hi_10 = _e4m3x2_f32_19;
+                                            n_packed_3[i_18] = (unsigned int)lo_10 | (unsigned int)hi_10 << 16;
                                         }
                                         unsigned int n_scale_byte_3 = scale_byte_9;
                                         #pragma unroll
@@ -4225,9 +4248,9 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                 : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_7[15]))
                                                 : "r"(address_22));
                                             #pragma unroll
-                                            for (int pair_16 = 0; pair_16 < 8; pair_16++) {
-                                                __nv_bfloat162 _bf16x2_16 = __float22bfloat162_rn(make_float2(_tmem_load_7[pair_16 * 2], _tmem_load_7[pair_16 * 2 + 1]));
-                                                packed_17[chunk_10 * 16 + half_13 * 8 + pair_16] = __as_u32(_bf16x2_16);
+                                            for (int pair_17 = 0; pair_17 < 8; pair_17++) {
+                                                __nv_bfloat162 _bf16x2_16 = __float22bfloat162_rn(make_float2(_tmem_load_7[pair_17 * 2], _tmem_load_7[pair_17 * 2 + 1]));
+                                                packed_17[chunk_10 * 16 + half_13 * 8 + pair_17] = __as_u32(_bf16x2_16);
                                             }
                                         }
                                     }
@@ -4379,15 +4402,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                             }
                             float inv_e4m3_max_6 = 0.002232142857f;
                             float scale_floor_6 = 1e-12f;
-                            int tile_row_2 = tid % 128;
+                            int lane_13 = tid % 32;
+                            int tile_row_2 = tid % 128 / 32 * 32 + lane_13 % 16 / 2 * 4 + lane_13 / 16 * 2 + lane_13 % 2;
                             int half_15 = tid / 128;
                             int k_pair = tile_row_2 >> 1 & 1 ^ half_15;
                             int scale_index = tile_row_2 % 32 * 4 + tile_row_2 / 32;
                             #pragma unroll
                             for (int stage_11 = 0; stage_11 < 2; stage_11++) {
                                 if (tile_end_2 > first_tile_3 + stage_11) {
-                                    mbarrier_wait(swiglu_arrived_addr + (stage_11) * 8, phase_bits_13 >> (unsigned int)stage_11 & 1);
-                                    phase_bits_13 = phase_bits_13 ^ (unsigned int)(1 << stage_11);
                                     int row_27 = first_row_6;
                                     int col_20 = first_col_3 + stage_11;
                                     if (col_20 >= col_blocks_13) {
@@ -4396,7 +4418,11 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                     }
                                     int local_block_1 = row_27 - macro_row_offset_2;
                                     int local_row_4 = local_block_1 * 128 + tile_row_2;
-                                    int peer_5 = schedule_rank[row_27 * 128 + tile_row_2];
+                                    mbarrier_wait(swiglu_arrived_addr + (stage_11) * 8, phase_bits_13 >> (unsigned int)stage_11 & 1);
+                                    phase_bits_13 = phase_bits_13 ^ (unsigned int)(1 << stage_11);
+                                    int32_t _relaxed_ld_38;
+                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_38) : "l"(schedule_rank + (row_27 * 128 + tile_row_2)) : "memory");
+                                    int peer_5 = _relaxed_ld_38;
                                     float weight = weights[local_row_4];
                                     float router_gradient = 0.0f;
                                     unsigned int gate_scales = q_words[(131072 + stage_11 * 512) / 4 + scale_index];
@@ -4444,13 +4470,13 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                         "mov.b32 {lo, hi}, pair;\n"
                                                         "cvt.f32.f16 %0, lo; cvt.f32.f16 %1, hi; }"
                                                         : "=f"(_fp8x2_decode_1.x), "=f"(_fp8x2_decode_1.y) : "h"((uint16_t)(up_word >> (unsigned int)(16 * h) & 65535)));
-                                                    float2 _cvt_f32_8 = __bfloat1622float2(__as_bf16x2(_q_words_reg_0[h]));
+                                                    float2 _cvt_f32_10 = __bfloat1622float2(__as_bf16x2(_q_words_reg_0[h]));
                                                     float g_x = _fp8x2_decode_0.x * gate_scale;
                                                     float g_y = _fp8x2_decode_0.y * gate_scale;
                                                     float u_x = _fp8x2_decode_1.x * up_scale;
                                                     float u_y = _fp8x2_decode_1.y * up_scale;
-                                                    float dh_x = _cvt_f32_8.x * weight;
-                                                    float dh_y = _cvt_f32_8.y * weight;
+                                                    float dh_x = _cvt_f32_10.x * weight;
+                                                    float dh_y = _cvt_f32_10.y * weight;
                                                     float g_cx = g_x;
                                                     float g_cy = g_y;
                                                     float u_cx = u_x;
@@ -4469,10 +4495,10 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                     float _max_31 = max_noftz(u_y, -swiglu_limit);
                                                     float _min_60 = fminf(_max_31, swiglu_limit);
                                                     u_cy = _min_60;
-                                                    float _exp_4 = expf(-g_cx);
-                                                    float sigmoid_x = 1.0f / (1.0f + _exp_4);
-                                                    float _exp_5 = expf(-g_cy);
-                                                    float sigmoid_y = 1.0f / (1.0f + _exp_5);
+                                                    float _exp_6 = expf(-g_cx);
+                                                    float sigmoid_x = 1.0f / (1.0f + _exp_6);
+                                                    float _exp_7 = expf(-g_cy);
+                                                    float sigmoid_y = 1.0f / (1.0f + _exp_7);
                                                     float silu_x = g_cx * sigmoid_x;
                                                     float silu_y = g_cy * sigmoid_y;
                                                     float dsilu_x = (1.0f - silu_x) * sigmoid_x + silu_x;
@@ -4487,7 +4513,7 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                     dgate_y = ((gate_mask_y) ? dgate_y : 0.0f);
                                                     dup_x = ((up_mask_x) ? dup_x : 0.0f);
                                                     dup_y = ((up_mask_y) ? dup_y : 0.0f);
-                                                    router_gradient = router_gradient + (_cvt_f32_8.x * hidden_x + _cvt_f32_8.y * hidden_y);
+                                                    router_gradient = router_gradient + (_cvt_f32_10.x * hidden_x + _cvt_f32_10.y * hidden_y);
                                                     __nv_bfloat162 _bf16x2_17 = __float22bfloat162_rn(make_float2(dgate_x, dgate_y));
                                                     dgate_words[k_18 * 2 + h] = __as_u32(_bf16x2_17);
                                                     __nv_bfloat162 _bf16x2_18 = __float22bfloat162_rn(make_float2(dup_x, dup_y));
@@ -4519,21 +4545,21 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                         "mov.b32 {lo, hi}, pair;\n"
                                                         "cvt.f32.f16 %0, lo; cvt.f32.f16 %1, hi; }"
                                                         : "=f"(_fp8x2_decode_3.x), "=f"(_fp8x2_decode_3.y) : "h"((uint16_t)(up_word_1 >> (unsigned int)(16 * h_1) & 65535)));
-                                                    float2 _cvt_f32_9 = __bfloat1622float2(__as_bf16x2(_q_words_reg_1[h_1]));
+                                                    float2 _cvt_f32_11 = __bfloat1622float2(__as_bf16x2(_q_words_reg_1[h_1]));
                                                     float g_x_1 = _fp8x2_decode_2.x * gate_scale;
                                                     float g_y_1 = _fp8x2_decode_2.y * gate_scale;
                                                     float u_x_1 = _fp8x2_decode_3.x * up_scale;
                                                     float u_y_1 = _fp8x2_decode_3.y * up_scale;
-                                                    float dh_x_1 = _cvt_f32_9.x * weight;
-                                                    float dh_y_1 = _cvt_f32_9.y * weight;
+                                                    float dh_x_1 = _cvt_f32_11.x * weight;
+                                                    float dh_y_1 = _cvt_f32_11.y * weight;
                                                     float g_cx_1 = g_x_1;
                                                     float g_cy_1 = g_y_1;
                                                     float u_cx_1 = u_x_1;
                                                     float u_cy_1 = u_y_1;
-                                                    float _exp_6 = expf(-g_cx_1);
-                                                    float sigmoid_x_1 = 1.0f / (1.0f + _exp_6);
-                                                    float _exp_7 = expf(-g_cy_1);
-                                                    float sigmoid_y_1 = 1.0f / (1.0f + _exp_7);
+                                                    float _exp_8 = expf(-g_cx_1);
+                                                    float sigmoid_x_1 = 1.0f / (1.0f + _exp_8);
+                                                    float _exp_9 = expf(-g_cy_1);
+                                                    float sigmoid_y_1 = 1.0f / (1.0f + _exp_9);
                                                     float silu_x_1 = g_cx_1 * sigmoid_x_1;
                                                     float silu_y_1 = g_cy_1 * sigmoid_y_1;
                                                     float dsilu_x_1 = (1.0f - silu_x_1) * sigmoid_x_1 + silu_x_1;
@@ -4544,7 +4570,7 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                     float dgate_y_1 = dsilu_y_1 * u_cy_1 * dh_y_1;
                                                     float dup_x_1 = silu_x_1 * dh_x_1;
                                                     float dup_y_1 = silu_y_1 * dh_y_1;
-                                                    router_gradient = router_gradient + (_cvt_f32_9.x * hidden_x_1 + _cvt_f32_9.y * hidden_y_1);
+                                                    router_gradient = router_gradient + (_cvt_f32_11.x * hidden_x_1 + _cvt_f32_11.y * hidden_y_1);
                                                     __nv_bfloat162 _bf16x2_19 = __float22bfloat162_rn(make_float2(dgate_x_1, dgate_y_1));
                                                     dgate_words[k_19 * 2 + h_1] = __as_u32(_bf16x2_19);
                                                     __nv_bfloat162 _bf16x2_20 = __float22bfloat162_rn(make_float2(dup_x_1, dup_y_1));
@@ -4585,10 +4611,10 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             unsigned int w1_10 = dgate_words[2 * i_20 + 1];
                                             float _cvt_f32_bf16_51;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_51) : "h"((uint16_t)(w0_10 & 65535)));
-                                            float v0_14 = _cvt_f32_bf16_51;
+                                            float v0_13 = _cvt_f32_bf16_51;
                                             float _cvt_f32_bf16_52;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_52) : "h"((uint16_t)(w0_10 >> 16)));
-                                            float v1_14 = _cvt_f32_bf16_52;
+                                            float v1_13 = _cvt_f32_bf16_52;
                                             float _cvt_f32_bf16_53;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_53) : "h"((uint16_t)(w1_10 & 65535)));
                                             float v2_10 = _cvt_f32_bf16_53;
@@ -4596,12 +4622,12 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_54) : "h"((uint16_t)(w1_10 >> 16)));
                                             float v3_10 = _cvt_f32_bf16_54;
                                             uint16_t _e4m3x2_f32_20;
-                                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_20) : "f"(v1_14 * inv_10), "f"(v0_14 * inv_10));
-                                            uint16_t lo_10 = _e4m3x2_f32_20;
+                                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_20) : "f"(v1_13 * inv_10), "f"(v0_13 * inv_10));
+                                            uint16_t lo_11 = _e4m3x2_f32_20;
                                             uint16_t _e4m3x2_f32_21;
                                             asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_21) : "f"(v3_10 * inv_10), "f"(v2_10 * inv_10));
-                                            uint16_t hi_10 = _e4m3x2_f32_21;
-                                            dgate_packed[i_20] = (unsigned int)lo_10 | (unsigned int)hi_10 << 16;
+                                            uint16_t hi_11 = _e4m3x2_f32_21;
+                                            dgate_packed[i_20] = (unsigned int)lo_11 | (unsigned int)hi_11 << 16;
                                         }
                                         unsigned int dgate_byte = scale_byte_10;
                                         uint32_t _bf16x2_abs_22;
@@ -4635,10 +4661,10 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             unsigned int w1_11 = dup_words[2 * i_21 + 1];
                                             float _cvt_f32_bf16_56;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_56) : "h"((uint16_t)(w0_11 & 65535)));
-                                            float v0_15 = _cvt_f32_bf16_56;
+                                            float v0_14 = _cvt_f32_bf16_56;
                                             float _cvt_f32_bf16_57;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_57) : "h"((uint16_t)(w0_11 >> 16)));
-                                            float v1_15 = _cvt_f32_bf16_57;
+                                            float v1_14 = _cvt_f32_bf16_57;
                                             float _cvt_f32_bf16_58;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_58) : "h"((uint16_t)(w1_11 & 65535)));
                                             float v2_11 = _cvt_f32_bf16_58;
@@ -4646,12 +4672,12 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_59) : "h"((uint16_t)(w1_11 >> 16)));
                                             float v3_11 = _cvt_f32_bf16_59;
                                             uint16_t _e4m3x2_f32_22;
-                                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_22) : "f"(v1_15 * inv_6_1), "f"(v0_15 * inv_6_1));
-                                            uint16_t lo_11 = _e4m3x2_f32_22;
+                                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_22) : "f"(v1_14 * inv_6_1), "f"(v0_14 * inv_6_1));
+                                            uint16_t lo_12 = _e4m3x2_f32_22;
                                             uint16_t _e4m3x2_f32_23;
                                             asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_23) : "f"(v3_11 * inv_6_1), "f"(v2_11 * inv_6_1));
-                                            uint16_t hi_11 = _e4m3x2_f32_23;
-                                            dup_packed[i_21] = (unsigned int)lo_11 | (unsigned int)hi_11 << 16;
+                                            uint16_t hi_12 = _e4m3x2_f32_23;
+                                            dup_packed[i_21] = (unsigned int)lo_12 | (unsigned int)hi_12 << 16;
                                         }
                                         unsigned int dup_byte = scale_byte_4_1;
                                         dgate_scale_pair = dgate_scale_pair | dgate_byte << (unsigned int)(k_sub * 8);
@@ -4667,6 +4693,11 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                     }
                                     q_halves[(131072 + stage_11 * 512) / 2 + scale_index * 2 + k_pair] = (uint16_t)dgate_scale_pair;
                                     q_halves[(132096 + stage_11 * 512) / 2 + scale_index * 2 + k_pair] = (uint16_t)dup_scale_pair;
+                                    if (stage_11 == 1) {
+                                        if (tid == 0) {
+                                            asm volatile("cp.async.bulk.wait_group.read 0;");
+                                        }
+                                    }
                                     __syncthreads();
                                     if (tid == 0) {
                                         int scale_tile_1 = (local_block_1 * col_blocks_13 + col_20) * 32;
@@ -4688,10 +4719,11 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                         #pragma unroll
                                         for (int k_23 = 0; k_23 < 16; k_23++) {
                                             int src_row_4 = k_block_5 * 32 + (tile_row_2 * 4 + k_23 * 2) % 32;
-                                            float v0_16 = (float)q_flat[src_row_4 * 128 + src_offset + t_row_4];
-                                            float v1_16 = (float)q_flat[(src_row_4 + 1) * 128 + src_offset + t_row_4];
-                                            __nv_bfloat162 _bf16x2_21 = __float22bfloat162_rn(make_float2(v0_16, v1_16));
-                                            t_words_4[k_23] = __as_u32(_bf16x2_21);
+                                            unsigned int lo_13 = (unsigned int)q_halves[src_row_4 * 128 + src_offset + t_row_4];
+                                            unsigned int hi_13 = (unsigned int)q_halves[(src_row_4 + 1) * 128 + src_offset + t_row_4];
+                                            uint32_t _prmt_b32_1;
+                                            asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(_prmt_b32_1) : "r"(lo_13), "r"(hi_13));
+                                            t_words_4[k_23] = _prmt_b32_1;
                                         }
                                         unsigned int t_packed_4[8];
                                         uint32_t _bf16x2_abs_24;
@@ -4725,10 +4757,10 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             unsigned int w1_12 = t_words_4[2 * i_22 + 1];
                                             float _cvt_f32_bf16_61;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_61) : "h"((uint16_t)(w0_12 & 65535)));
-                                            float v0_17 = _cvt_f32_bf16_61;
+                                            float v0_15 = _cvt_f32_bf16_61;
                                             float _cvt_f32_bf16_62;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_62) : "h"((uint16_t)(w0_12 >> 16)));
-                                            float v1_17 = _cvt_f32_bf16_62;
+                                            float v1_15 = _cvt_f32_bf16_62;
                                             float _cvt_f32_bf16_63;
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_63) : "h"((uint16_t)(w1_12 & 65535)));
                                             float v2_12 = _cvt_f32_bf16_63;
@@ -4736,12 +4768,12 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_64) : "h"((uint16_t)(w1_12 >> 16)));
                                             float v3_12 = _cvt_f32_bf16_64;
                                             uint16_t _e4m3x2_f32_24;
-                                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_24) : "f"(v1_17 * inv_11), "f"(v0_17 * inv_11));
-                                            uint16_t lo_12 = _e4m3x2_f32_24;
+                                            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_24) : "f"(v1_15 * inv_11), "f"(v0_15 * inv_11));
+                                            uint16_t lo_14 = _e4m3x2_f32_24;
                                             uint16_t _e4m3x2_f32_25;
                                             asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_25) : "f"(v3_12 * inv_11), "f"(v2_12 * inv_11));
-                                            uint16_t hi_12 = _e4m3x2_f32_25;
-                                            t_packed_4[i_22] = (unsigned int)lo_12 | (unsigned int)hi_12 << 16;
+                                            uint16_t hi_14 = _e4m3x2_f32_25;
+                                            t_packed_4[i_22] = (unsigned int)lo_14 | (unsigned int)hi_14 << 16;
                                         }
                                         unsigned int t_scale_byte_4 = scale_byte_11;
                                         #pragma unroll
@@ -4764,11 +4796,19 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                         tma_store_2d((&du_fp8_t_r), local_block_1 * 128, col_20 * 128, q_flat_addr + 165888 + 16384);
                                         tma_store_3d((&du_sc_t_r), 0, t_scale_tile, 0, q_flat_addr + 198656 + 512);
                                         asm volatile("cp.async.bulk.commit_group;");
-                                        asm volatile("cp.async.bulk.wait_group.read 0;");
                                     }
                                     if (half_15 == 0 && peer_5 >= 0) {
                                         router_gradient = router_gradient + q_router[stage_11 * 128 + tile_row_2];
                                         partials[local_row_4 * col_blocks_13 + col_20] = router_gradient;
+                                    }
+                                    if (stage_11 == 1) {
+                                        if (tid == 0) {
+                                            asm volatile("cp.async.bulk.wait_group.read 0;");
+                                        }
+                                    } else if (tile_end_2 <= first_tile_3 + 1) {
+                                        if (tid == 0) {
+                                            asm volatile("cp.async.bulk.wait_group.read 0;");
+                                        }
                                     }
                                     __syncthreads();
                                 }
@@ -4857,14 +4897,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                         {
                                             bool enabled_value_19 = 1;
                                             if (enabled_value_19 != 0) {
-                                                int32_t _relaxed_ld_38;
-                                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_38) : "l"(dg_ready + (shared_rows + macro_rows_8 + x_8)) : "memory");
-                                                int value_18 = _relaxed_ld_38;
+                                                int32_t _relaxed_ld_39;
+                                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_39) : "l"(dg_ready + (shared_rows + macro_rows_8 + x_8)) : "memory");
+                                                int value_18 = _relaxed_ld_39;
                                                 while (value_18 < row_count) {
                                                     asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                    int32_t _relaxed_ld_39;
-                                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_39) : "l"(dg_ready + (shared_rows + macro_rows_8 + x_8)) : "memory");
-                                                    value_18 = _relaxed_ld_39;
+                                                    int32_t _relaxed_ld_40;
+                                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_40) : "l"(dg_ready + (shared_rows + macro_rows_8 + x_8)) : "memory");
+                                                    value_18 = _relaxed_ld_40;
                                                 }
                                                 asm volatile("fence.acquire.gpu;" ::: "memory");
                                             }
@@ -4912,14 +4952,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             {
                                                 bool enabled_value_20 = 1;
                                                 if (enabled_value_20 != 0) {
-                                                    int32_t _relaxed_ld_40;
-                                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_40) : "l"(dg_ready + (shared_rows + macro_rows_8 + x_8)) : "memory");
-                                                    int value_19 = _relaxed_ld_40;
+                                                    int32_t _relaxed_ld_41;
+                                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_41) : "l"(dg_ready + (shared_rows + macro_rows_8 + x_8)) : "memory");
+                                                    int value_19 = _relaxed_ld_41;
                                                     while (value_19 < row_count) {
                                                         asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                        int32_t _relaxed_ld_41;
-                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_41) : "l"(dg_ready + (shared_rows + macro_rows_8 + x_8)) : "memory");
-                                                        value_19 = _relaxed_ld_41;
+                                                        int32_t _relaxed_ld_42;
+                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_42) : "l"(dg_ready + (shared_rows + macro_rows_8 + x_8)) : "memory");
+                                                        value_19 = _relaxed_ld_42;
                                                     }
                                                     asm volatile("fence.acquire.gpu;" ::: "memory");
                                                 }
@@ -5021,9 +5061,9 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                     : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_8[15]))
                                                     : "r"(address_24));
                                                 #pragma unroll
-                                                for (int pair_17 = 0; pair_17 < 8; pair_17++) {
-                                                    __nv_bfloat162 _bf16x2_22 = __float22bfloat162_rn(make_float2(_tmem_load_8[pair_17 * 2], _tmem_load_8[pair_17 * 2 + 1]));
-                                                    packed_18[chunk_12 * 16 + half_16 * 8 + pair_17] = __as_u32(_bf16x2_22);
+                                                for (int pair_18 = 0; pair_18 < 8; pair_18++) {
+                                                    __nv_bfloat162 _bf16x2_21 = __float22bfloat162_rn(make_float2(_tmem_load_8[pair_18 * 2], _tmem_load_8[pair_18 * 2 + 1]));
+                                                    packed_18[chunk_12 * 16 + half_16 * 8 + pair_18] = __as_u32(_bf16x2_21);
                                                 }
                                             }
                                         }
@@ -5046,13 +5086,13 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             }
                                             asm volatile("barrier.sync 1, 128;" ::: "memory");
                                             int warp_0_8 = tid / 32;
-                                            int lane_13 = tid % 32;
+                                            int lane_14 = tid % 32;
                                             #pragma unroll
                                             for (int half_17 = 0; half_17 < 2; half_17++) {
                                                 #pragma unroll
                                                 for (int col_tile_6 = 0; col_tile_6 < 2; col_tile_6++) {
-                                                    int row_30 = warp_0_8 * 32 + half_17 * 16 + lane_13 % 16;
-                                                    int col_22 = col_tile_6 * 16 + lane_13 / 16 * 8;
+                                                    int row_30 = warp_0_8 * 32 + half_17 * 16 + lane_14 % 16;
+                                                    int col_22 = col_tile_6 * 16 + lane_14 / 16 * 8;
                                                     unsigned int address_25 = d_smem_addr + (unsigned int)(chunk_13 % 3 * 8192) + (unsigned int)((row_30 * 32 + col_22) * 2);
                                                     address_25 = address_25 ^ (address_25 & 511) >> 7 << 4;
                                                     int offset_0_1 = chunk_13 * 16 + half_17 * 8 + col_tile_6 * 4;
@@ -5170,14 +5210,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             if (idx_22 == 0 || token_row_3 % 256 == 0) {
                                                 bool enabled_value_23 = macro_1 > 0;
                                                 if (enabled_value_23 != 0) {
-                                                    int32_t _relaxed_ld_46;
-                                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_46) : "l"(replay_h + (token_row_3 / 256)) : "memory");
-                                                    int value_20 = _relaxed_ld_46;
+                                                    int32_t _relaxed_ld_47;
+                                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_47) : "l"(replay_h + (token_row_3 / 256)) : "memory");
+                                                    int value_20 = _relaxed_ld_47;
                                                     while (value_20 < row_count) {
                                                         asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                        int32_t _relaxed_ld_47;
-                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_47) : "l"(replay_h + (token_row_3 / 256)) : "memory");
-                                                        value_20 = _relaxed_ld_47;
+                                                        int32_t _relaxed_ld_48;
+                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_48) : "l"(replay_h + (token_row_3 / 256)) : "memory");
+                                                        value_20 = _relaxed_ld_48;
                                                     }
                                                     asm volatile("fence.acquire.gpu;" ::: "memory");
                                                 }
@@ -5189,14 +5229,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                 int input_count_3 = (input_rows_3 + 127) / 128 * ((hidden + 511) / 512);
                                                 bool enabled_value_24 = 1;
                                                 if (enabled_value_24 != 0) {
-                                                    int32_t _relaxed_ld_48;
-                                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_48) : "l"(dy_ready + input_mini_3) : "memory");
-                                                    int value_21 = _relaxed_ld_48;
+                                                    int32_t _relaxed_ld_49;
+                                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_49) : "l"(dy_ready + input_mini_3) : "memory");
+                                                    int value_21 = _relaxed_ld_49;
                                                     while (value_21 < input_count_3) {
                                                         asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                        int32_t _relaxed_ld_49;
-                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_49) : "l"(dy_ready + input_mini_3) : "memory");
-                                                        value_21 = _relaxed_ld_49;
+                                                        int32_t _relaxed_ld_50;
+                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_50) : "l"(dy_ready + input_mini_3) : "memory");
+                                                        value_21 = _relaxed_ld_50;
                                                     }
                                                     asm volatile("fence.acquire.gpu;" ::: "memory");
                                                 }
@@ -5229,14 +5269,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                 if (idx_23 == 0 || token_row_4 % 256 == 0) {
                                                     bool enabled_value_25 = macro_1 > 0;
                                                     if (enabled_value_25 != 0) {
-                                                        int32_t _relaxed_ld_54;
-                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_54) : "l"(replay_h + (token_row_4 / 256)) : "memory");
-                                                        int value_22 = _relaxed_ld_54;
+                                                        int32_t _relaxed_ld_55;
+                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_55) : "l"(replay_h + (token_row_4 / 256)) : "memory");
+                                                        int value_22 = _relaxed_ld_55;
                                                         while (value_22 < row_count) {
                                                             asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                            int32_t _relaxed_ld_55;
-                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_55) : "l"(replay_h + (token_row_4 / 256)) : "memory");
-                                                            value_22 = _relaxed_ld_55;
+                                                            int32_t _relaxed_ld_56;
+                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_56) : "l"(replay_h + (token_row_4 / 256)) : "memory");
+                                                            value_22 = _relaxed_ld_56;
                                                         }
                                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                                     }
@@ -5248,14 +5288,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                     int input_count_4 = (input_rows_4 + 127) / 128 * ((hidden + 511) / 512);
                                                     bool enabled_value_26 = 1;
                                                     if (enabled_value_26 != 0) {
-                                                        int32_t _relaxed_ld_56;
-                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_56) : "l"(dy_ready + input_mini_4) : "memory");
-                                                        int value_23 = _relaxed_ld_56;
+                                                        int32_t _relaxed_ld_57;
+                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_57) : "l"(dy_ready + input_mini_4) : "memory");
+                                                        int value_23 = _relaxed_ld_57;
                                                         while (value_23 < input_count_4) {
                                                             asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                            int32_t _relaxed_ld_57;
-                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_57) : "l"(dy_ready + input_mini_4) : "memory");
-                                                            value_23 = _relaxed_ld_57;
+                                                            int32_t _relaxed_ld_58;
+                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_58) : "l"(dy_ready + input_mini_4) : "memory");
+                                                            value_23 = _relaxed_ld_58;
                                                         }
                                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                                     }
@@ -5465,14 +5505,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                 if (idx_25 == 0 || token_row_5 % 256 == 0) {
                                                     bool enabled_value_29 = 1;
                                                     if (enabled_value_29 != 0) {
-                                                        int32_t _relaxed_ld_62;
-                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_62) : "l"(dg_ready + (shared_rows + token_row_5 / 256)) : "memory");
-                                                        int value_25 = _relaxed_ld_62;
+                                                        int32_t _relaxed_ld_63;
+                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_63) : "l"(dg_ready + (shared_rows + token_row_5 / 256)) : "memory");
+                                                        int value_25 = _relaxed_ld_63;
                                                         while (value_25 < row_count) {
                                                             asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                            int32_t _relaxed_ld_63;
-                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_63) : "l"(dg_ready + (shared_rows + token_row_5 / 256)) : "memory");
-                                                            value_25 = _relaxed_ld_63;
+                                                            int32_t _relaxed_ld_64;
+                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_64) : "l"(dg_ready + (shared_rows + token_row_5 / 256)) : "memory");
+                                                            value_25 = _relaxed_ld_64;
                                                         }
                                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                                     }
@@ -5484,14 +5524,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                     int input_count_5 = (input_rows_5 + 127) / 128 * ((hidden + 511) / 512);
                                                     bool enabled_value_30 = macro_1 > 0;
                                                     if (enabled_value_30 != 0) {
-                                                        int32_t _relaxed_ld_64;
-                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_64) : "l"(replay_x + input_mini_5) : "memory");
-                                                        int value_26 = _relaxed_ld_64;
+                                                        int32_t _relaxed_ld_65;
+                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_65) : "l"(replay_x + input_mini_5) : "memory");
+                                                        int value_26 = _relaxed_ld_65;
                                                         while (value_26 < input_count_5) {
                                                             asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                            int32_t _relaxed_ld_65;
-                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_65) : "l"(replay_x + input_mini_5) : "memory");
-                                                            value_26 = _relaxed_ld_65;
+                                                            int32_t _relaxed_ld_66;
+                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_66) : "l"(replay_x + input_mini_5) : "memory");
+                                                            value_26 = _relaxed_ld_66;
                                                         }
                                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                                     }
@@ -5524,14 +5564,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                     if (idx_26 == 0 || token_row_6 % 256 == 0) {
                                                         bool enabled_value_31 = 1;
                                                         if (enabled_value_31 != 0) {
-                                                            int32_t _relaxed_ld_70;
-                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_70) : "l"(dg_ready + (shared_rows + token_row_6 / 256)) : "memory");
-                                                            int value_27 = _relaxed_ld_70;
+                                                            int32_t _relaxed_ld_71;
+                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_71) : "l"(dg_ready + (shared_rows + token_row_6 / 256)) : "memory");
+                                                            int value_27 = _relaxed_ld_71;
                                                             while (value_27 < row_count) {
                                                                 asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                                int32_t _relaxed_ld_71;
-                                                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_71) : "l"(dg_ready + (shared_rows + token_row_6 / 256)) : "memory");
-                                                                value_27 = _relaxed_ld_71;
+                                                                int32_t _relaxed_ld_72;
+                                                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_72) : "l"(dg_ready + (shared_rows + token_row_6 / 256)) : "memory");
+                                                                value_27 = _relaxed_ld_72;
                                                             }
                                                             asm volatile("fence.acquire.gpu;" ::: "memory");
                                                         }
@@ -5543,14 +5583,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                         int input_count_6 = (input_rows_6 + 127) / 128 * ((hidden + 511) / 512);
                                                         bool enabled_value_32 = macro_1 > 0;
                                                         if (enabled_value_32 != 0) {
-                                                            int32_t _relaxed_ld_72;
-                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_72) : "l"(replay_x + input_mini_6) : "memory");
-                                                            int value_28 = _relaxed_ld_72;
+                                                            int32_t _relaxed_ld_73;
+                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_73) : "l"(replay_x + input_mini_6) : "memory");
+                                                            int value_28 = _relaxed_ld_73;
                                                             while (value_28 < input_count_6) {
                                                                 asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                                int32_t _relaxed_ld_73;
-                                                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_73) : "l"(replay_x + input_mini_6) : "memory");
-                                                                value_28 = _relaxed_ld_73;
+                                                                int32_t _relaxed_ld_74;
+                                                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_74) : "l"(replay_x + input_mini_6) : "memory");
+                                                                value_28 = _relaxed_ld_74;
                                                             }
                                                             asm volatile("fence.acquire.gpu;" ::: "memory");
                                                         }
@@ -5759,14 +5799,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                 if (idx_28 == 0 || token_row_7 % 256 == 0) {
                                                     bool enabled_value_35 = 1;
                                                     if (enabled_value_35 != 0) {
-                                                        int32_t _relaxed_ld_78;
-                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_78) : "l"(dg_ready + (shared_rows + token_row_7 / 256)) : "memory");
-                                                        int value_30 = _relaxed_ld_78;
+                                                        int32_t _relaxed_ld_79;
+                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_79) : "l"(dg_ready + (shared_rows + token_row_7 / 256)) : "memory");
+                                                        int value_30 = _relaxed_ld_79;
                                                         while (value_30 < row_count) {
                                                             asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                            int32_t _relaxed_ld_79;
-                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_79) : "l"(dg_ready + (shared_rows + token_row_7 / 256)) : "memory");
-                                                            value_30 = _relaxed_ld_79;
+                                                            int32_t _relaxed_ld_80;
+                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_80) : "l"(dg_ready + (shared_rows + token_row_7 / 256)) : "memory");
+                                                            value_30 = _relaxed_ld_80;
                                                         }
                                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                                     }
@@ -5778,14 +5818,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                     int input_count_7 = (input_rows_7 + 127) / 128 * ((hidden + 511) / 512);
                                                     bool enabled_value_36 = macro_1 > 0;
                                                     if (enabled_value_36 != 0) {
-                                                        int32_t _relaxed_ld_80;
-                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_80) : "l"(replay_x + input_mini_7) : "memory");
-                                                        int value_31 = _relaxed_ld_80;
+                                                        int32_t _relaxed_ld_81;
+                                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_81) : "l"(replay_x + input_mini_7) : "memory");
+                                                        int value_31 = _relaxed_ld_81;
                                                         while (value_31 < input_count_7) {
                                                             asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                            int32_t _relaxed_ld_81;
-                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_81) : "l"(replay_x + input_mini_7) : "memory");
-                                                            value_31 = _relaxed_ld_81;
+                                                            int32_t _relaxed_ld_82;
+                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_82) : "l"(replay_x + input_mini_7) : "memory");
+                                                            value_31 = _relaxed_ld_82;
                                                         }
                                                         asm volatile("fence.acquire.gpu;" ::: "memory");
                                                     }
@@ -5818,14 +5858,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                     if (idx_29 == 0 || token_row_8 % 256 == 0) {
                                                         bool enabled_value_37 = 1;
                                                         if (enabled_value_37 != 0) {
-                                                            int32_t _relaxed_ld_86;
-                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_86) : "l"(dg_ready + (shared_rows + token_row_8 / 256)) : "memory");
-                                                            int value_32 = _relaxed_ld_86;
+                                                            int32_t _relaxed_ld_87;
+                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_87) : "l"(dg_ready + (shared_rows + token_row_8 / 256)) : "memory");
+                                                            int value_32 = _relaxed_ld_87;
                                                             while (value_32 < row_count) {
                                                                 asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                                int32_t _relaxed_ld_87;
-                                                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_87) : "l"(dg_ready + (shared_rows + token_row_8 / 256)) : "memory");
-                                                                value_32 = _relaxed_ld_87;
+                                                                int32_t _relaxed_ld_88;
+                                                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_88) : "l"(dg_ready + (shared_rows + token_row_8 / 256)) : "memory");
+                                                                value_32 = _relaxed_ld_88;
                                                             }
                                                             asm volatile("fence.acquire.gpu;" ::: "memory");
                                                         }
@@ -5837,14 +5877,14 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                                         int input_count_8 = (input_rows_8 + 127) / 128 * ((hidden + 511) / 512);
                                                         bool enabled_value_38 = macro_1 > 0;
                                                         if (enabled_value_38 != 0) {
-                                                            int32_t _relaxed_ld_88;
-                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_88) : "l"(replay_x + input_mini_8) : "memory");
-                                                            int value_33 = _relaxed_ld_88;
+                                                            int32_t _relaxed_ld_89;
+                                                            asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_89) : "l"(replay_x + input_mini_8) : "memory");
+                                                            int value_33 = _relaxed_ld_89;
                                                             while (value_33 < input_count_8) {
                                                                 asm volatile("nanosleep.u32 %0;" :: "r"(16));
-                                                                int32_t _relaxed_ld_89;
-                                                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_89) : "l"(replay_x + input_mini_8) : "memory");
-                                                                value_33 = _relaxed_ld_89;
+                                                                int32_t _relaxed_ld_90;
+                                                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_90) : "l"(replay_x + input_mini_8) : "memory");
+                                                                value_33 = _relaxed_ld_90;
                                                             }
                                                             asm volatile("fence.acquire.gpu;" ::: "memory");
                                                         }
