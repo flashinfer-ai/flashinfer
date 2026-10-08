@@ -4317,6 +4317,98 @@ def test_public_proxy_bsr_and_bitmask_match_reference_for_tail(
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
+@torch.no_grad()
+def test_public_bitmask_rows_spanning_word_batches_match_reference() -> None:
+    """Bitmask rows wider than one prepare batch keep their semantic blocks.
+
+    Route preparation compacts 32 exact words (1024 blocks) per batch. Row 0
+    selects 1000 blocks of the first batch and more after it, so one prepared
+    pass straddles the batch boundary; row 1 leaves a whole all-zero batch
+    between its selected blocks; row 2 selects every block.
+    """
+
+    case = _Case(
+        "q8_kv8_bf16_bitmask_multi_batch",
+        1,
+        1,
+        24,
+        8 * 2100 - 5,
+        8,
+        8,
+        torch.bfloat16,
+        "dense",
+        "holey",
+        "auto",
+    )
+    num_kv_blocks = math.ceil(case.seq_len_kv / case.kv_block_size)
+    generator = torch.Generator().manual_seed(2026093001)
+    straddling_row = sorted(
+        torch.randperm(1024, generator=generator)[:1000].tolist()
+        + list(range(1024, 1324))
+    )
+    gapped_row = [*range(5, 900, 3), *range(2 * 1024 + 7, num_kv_blocks, 5)]
+    patterns: _Patterns = (
+        (
+            (
+                tuple(straddling_row),
+                tuple(gapped_row),
+                tuple(range(num_kv_blocks)),
+            ),
+        ),
+    )
+    exact_block_bits = _make_exact_block_bits(patterns, num_kv_blocks)
+    valid_bits, valid_by_batch = _make_token_mask(case)
+    torch.manual_seed(2026093002)
+    q = torch.randn(
+        (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
+        device="cuda",
+        dtype=case.dtype,
+    )
+    k = torch.randn(
+        (case.batch_size, case.seq_len_kv, case.num_heads, _HEAD_DIM),
+        device="cuda",
+        dtype=case.dtype,
+    )
+    v = torch.randn_like(k)
+    sm_scale = 1.0 / math.sqrt(_HEAD_DIM)
+    expected = _reference(case, q, k, v, patterns, valid_by_batch, sm_scale)
+
+    block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
+    try:
+        wrapper = block_sparse_module.BlockSparseTSWrapper()
+        wrapper.plan(
+            case.batch_size,
+            case.seq_len_q,
+            case.seq_len_kv,
+            case.num_heads,
+            case.num_heads,
+            _HEAD_DIM,
+            case.q_block_size,
+            case.kv_block_size,
+            device=q.device,
+            max_blocks_per_row=num_kv_blocks,
+            use_kv_valid_bits=True,
+            sparse_format="bitmask",
+            mask_type=case.mask_type,
+            q_data_type=case.dtype,
+        )
+        actual = wrapper.run(
+            q,
+            k,
+            v,
+            exact_block_bits=exact_block_bits,
+            kv_valid_bits=valid_bits,
+            sm_scale=sm_scale,
+        )
+        torch.cuda.synchronize()
+    finally:
+        block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("case", _GQA_CASES, ids=lambda case: case.name)
 @torch.no_grad()
 def test_public_block_sparse_gqa_correctness(
