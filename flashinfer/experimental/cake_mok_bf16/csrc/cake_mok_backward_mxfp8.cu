@@ -4390,8 +4390,7 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                             }
                             float inv_e4m3_max_6 = 0.002232142857f;
                             float scale_floor_6 = 1e-12f;
-                            int lane_13 = tid % 32;
-                            int tile_row_2 = tid % 128 / 32 * 32 + lane_13 % 16 / 2 * 4 + lane_13 / 16 * 2 + lane_13 % 2;
+                            int tile_row_2 = tid % 128;
                             int half_15 = tid / 128;
                             int k_pair = tile_row_2 >> 1 & 1 ^ half_15;
                             int scale_index = tile_row_2 % 32 * 4 + tile_row_2 / 32;
@@ -5074,13 +5073,13 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             }
                                             asm volatile("barrier.sync 1, 128;" ::: "memory");
                                             int warp_0_8 = tid / 32;
-                                            int lane_14 = tid % 32;
+                                            int lane_13 = tid % 32;
                                             #pragma unroll
                                             for (int half_17 = 0; half_17 < 2; half_17++) {
                                                 #pragma unroll
                                                 for (int col_tile_6 = 0; col_tile_6 < 2; col_tile_6++) {
-                                                    int row_30 = warp_0_8 * 32 + half_17 * 16 + lane_14 % 16;
-                                                    int col_22 = col_tile_6 * 16 + lane_14 / 16 * 8;
+                                                    int row_30 = warp_0_8 * 32 + half_17 * 16 + lane_13 % 16;
+                                                    int col_22 = col_tile_6 * 16 + lane_13 / 16 * 8;
                                                     unsigned int address_25 = d_smem_addr + (unsigned int)(chunk_13 % 3 * 8192) + (unsigned int)((row_30 * 32 + col_22) * 2);
                                                     address_25 = address_25 ^ (address_25 & 511) >> 7 << 4;
                                                     int offset_0_1 = chunk_13 * 16 + half_17 * 8 + col_tile_6 * 4;
@@ -5389,13 +5388,13 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                             }
                                             asm volatile("barrier.sync 1, 128;" ::: "memory");
                                             int warp_0_9 = tid / 32;
-                                            int lane_15 = tid % 32;
+                                            int lane_14 = tid % 32;
                                             #pragma unroll
                                             for (int half_19 = 0; half_19 < 2; half_19++) {
                                                 #pragma unroll
                                                 for (int col_tile_7 = 0; col_tile_7 < 2; col_tile_7++) {
-                                                    int row_32 = warp_0_9 * 32 + half_19 * 16 + lane_15 % 16;
-                                                    int col_24 = col_tile_7 * 16 + lane_15 / 16 * 8;
+                                                    int row_32 = warp_0_9 * 32 + half_19 * 16 + lane_14 % 16;
+                                                    int col_24 = col_tile_7 * 16 + lane_14 / 16 * 8;
                                                     unsigned int address_27 = d_smem_addr + (unsigned int)(chunk_15 % 3 * 8192) + (unsigned int)((row_32 * 32 + col_24) * 2);
                                                     address_27 = address_27 ^ (address_27 & 511) >> 7 << 4;
                                                     int offset_0_2 = chunk_15 * 16 + half_19 * 8 + col_tile_7 * 4;
@@ -5710,13 +5709,13 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 }
                                                 asm volatile("barrier.sync 1, 128;" ::: "memory");
                                                 int warp_0_10 = tid / 32;
-                                                int lane_16 = tid % 32;
+                                                int lane_15 = tid % 32;
                                                 #pragma unroll
                                                 for (int half_21 = 0; half_21 < 2; half_21++) {
                                                     #pragma unroll
                                                     for (int col_tile_8 = 0; col_tile_8 < 2; col_tile_8++) {
-                                                        int row_34 = warp_0_10 * 32 + half_21 * 16 + lane_16 % 16;
-                                                        int col_26 = col_tile_8 * 16 + lane_16 / 16 * 8;
+                                                        int row_34 = warp_0_10 * 32 + half_21 * 16 + lane_15 % 16;
+                                                        int col_26 = col_tile_8 * 16 + lane_15 / 16 * 8;
                                                         unsigned int address_29 = d_smem_addr + (unsigned int)(chunk_17 % 3 * 8192) + (unsigned int)((row_34 * 32 + col_26) * 2);
                                                         address_29 = address_29 ^ (address_29 & 511) >> 7 << 4;
                                                         int offset_0_3 = chunk_17 * 16 + half_21 * 8 + col_tile_8 * 4;
@@ -6030,13 +6029,13 @@ kernel_cake_mok_backward_mxfp8(const __grid_constant__ CUtensorMap dy_s, const _
                                                 }
                                                 asm volatile("barrier.sync 1, 128;" ::: "memory");
                                                 int warp_0_11 = tid / 32;
-                                                int lane_17 = tid % 32;
+                                                int lane_16 = tid % 32;
                                                 #pragma unroll
                                                 for (int half_23 = 0; half_23 < 2; half_23++) {
                                                     #pragma unroll
                                                     for (int col_tile_9 = 0; col_tile_9 < 2; col_tile_9++) {
-                                                        int row_36 = warp_0_11 * 32 + half_23 * 16 + lane_17 % 16;
-                                                        int col_28 = col_tile_9 * 16 + lane_17 / 16 * 8;
+                                                        int row_36 = warp_0_11 * 32 + half_23 * 16 + lane_16 % 16;
+                                                        int col_28 = col_tile_9 * 16 + lane_16 / 16 * 8;
                                                         unsigned int address_31 = d_smem_addr + (unsigned int)(chunk_19 % 3 * 8192) + (unsigned int)((row_36 * 32 + col_28) * 2);
                                                         address_31 = address_31 ^ (address_31 & 511) >> 7 << 4;
                                                         int offset_0_4 = chunk_19 * 16 + half_23 * 8 + col_tile_9 * 4;

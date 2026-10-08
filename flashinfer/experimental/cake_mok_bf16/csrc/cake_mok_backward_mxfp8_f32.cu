@@ -4402,8 +4402,7 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                             }
                             float inv_e4m3_max_6 = 0.002232142857f;
                             float scale_floor_6 = 1e-12f;
-                            int lane_13 = tid % 32;
-                            int tile_row_2 = tid % 128 / 32 * 32 + lane_13 % 16 / 2 * 4 + lane_13 / 16 * 2 + lane_13 % 2;
+                            int tile_row_2 = tid % 128;
                             int half_15 = tid / 128;
                             int k_pair = tile_row_2 >> 1 & 1 ^ half_15;
                             int scale_index = tile_row_2 % 32 * 4 + tile_row_2 / 32;
@@ -5086,13 +5085,13 @@ kernel_cake_mok_backward_mxfp8_f32(const __grid_constant__ CUtensorMap dy_s, con
                                             }
                                             asm volatile("barrier.sync 1, 128;" ::: "memory");
                                             int warp_0_8 = tid / 32;
-                                            int lane_14 = tid % 32;
+                                            int lane_13 = tid % 32;
                                             #pragma unroll
                                             for (int half_17 = 0; half_17 < 2; half_17++) {
                                                 #pragma unroll
                                                 for (int col_tile_6 = 0; col_tile_6 < 2; col_tile_6++) {
-                                                    int row_30 = warp_0_8 * 32 + half_17 * 16 + lane_14 % 16;
-                                                    int col_22 = col_tile_6 * 16 + lane_14 / 16 * 8;
+                                                    int row_30 = warp_0_8 * 32 + half_17 * 16 + lane_13 % 16;
+                                                    int col_22 = col_tile_6 * 16 + lane_13 / 16 * 8;
                                                     unsigned int address_25 = d_smem_addr + (unsigned int)(chunk_13 % 3 * 8192) + (unsigned int)((row_30 * 32 + col_22) * 2);
                                                     address_25 = address_25 ^ (address_25 & 511) >> 7 << 4;
                                                     int offset_0_1 = chunk_13 * 16 + half_17 * 8 + col_tile_6 * 4;
