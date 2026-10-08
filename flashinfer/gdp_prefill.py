@@ -168,16 +168,6 @@ def chunk_gated_delta_product(
         # scaled.  q, the forget gate and the output stay at real-token rows and
         # the kernel indexes them directly, so nothing is materialised.  CP
         # schedules on the expanded timeline and is not validated for it.
-        if beta is None:
-            # chunk_gated_delta_rule defaults beta to one row per q token, but
-            # beta is per (token, Householder): the kernel walks k's timeline
-            # and would index past a real-token-length tensor.
-            beta = torch.ones(
-                (k.size(0), max(q.size(1), v.size(1))),
-                dtype=torch.float32,
-                device=q.device,
-            )
-
         return chunk_gated_delta_rule(
             q,
             k,

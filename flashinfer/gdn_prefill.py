@@ -890,13 +890,21 @@ def chunk_gated_delta_rule(
     head_size = q.size(2)
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
-    # g is per real token, beta per (token, Householder).  Getting beta's
-    # length wrong reads past it rather than failing, so check it here.
+    # k, v and beta ride the expanded timeline while q and g stay at
+    # real-token rows.  A short tensor reads past itself rather than failing,
+    # so check every one of them here, before any arch dispatch.
+    expanded = q.size(0) * num_householder
+    for _name, _t in (("k", k), ("v", v)):
+        if _t.size(0) != expanded:
+            raise ValueError(
+                f"{_name} must have num_householder ({num_householder}) rows per "
+                f"token, got {_t.size(0)} for {q.size(0)} tokens"
+            )
     if g is not None and g.size(0) != q.size(0):
         raise ValueError(
             f"g must have one row per token, got {g.size(0)} for {q.size(0)} tokens"
         )
-    if beta is not None and beta.size(0) != q.size(0) * num_householder:
+    if beta is not None and beta.size(0) != expanded:
         raise ValueError(
             f"beta must have num_householder ({num_householder}) rows per token, "
             f"got {beta.size(0)} for {q.size(0)} tokens"
@@ -1148,7 +1156,10 @@ def chunk_gated_delta_rule(
                 beta
                 if beta is not None
                 else torch.ones(
-                    total_seq_len, num_sab_heads, dtype=torch.float32, device=device
+                    total_seq_len * num_householder,
+                    num_sab_heads,
+                    dtype=torch.float32,
+                    device=device,
                 )
             )
             cp_delta_rule_dsl = cast(
@@ -1246,8 +1257,12 @@ def chunk_gated_delta_rule(
         _beta = (
             beta
             if beta is not None
+            # beta is per (token, Householder): the kernel walks k's timeline
             else torch.ones(
-                total_seq_len, num_sab_heads, dtype=torch.float32, device=device
+                total_seq_len * num_householder,
+                num_sab_heads,
+                dtype=torch.float32,
+                device=device,
             )
         )
 

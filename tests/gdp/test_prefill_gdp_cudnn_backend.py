@@ -639,7 +639,7 @@ def test_gdn_entry_point_declines_householders_it_cannot_serve(gdn_backend, back
         )
 
 
-@pytest.mark.parametrize("backend", ["auto"])
+@pytest.mark.parametrize("backend", ["flashinfer"])
 def test_gate_lengths_are_validated(backend):
     """A beta on the real-token timeline reads past itself, so reject it.
 
