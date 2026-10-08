@@ -2934,7 +2934,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # Rounding whole powers of two can hide an underfilled grid.
             q_tile = 128 // (num_qo_heads // num_kv_heads)
             bounds = (
-                max(128, ((int(self._max_q_len) + q_tile - 1) // q_tile) * q_tile),
+                # Preserve the short-query occupancy class instead of declaring
+                # Q64 as Q128. Larger classes retain the existing tile buckets.
+                64
+                if self._max_q_len <= 64
+                else max(128, ((int(self._max_q_len) + q_tile - 1) // q_tile) * q_tile),
                 1 << (int(self._max_kv_len) - 1).bit_length(),
             )
             if block_tables is None or block_tables.shape[1] * page_size >= bounds[1]:

@@ -1460,3 +1460,98 @@ def test_paged_auto_capture_reserves_initialized_page_capacity(
         check(metadata)
     finally:
         graph.reset()
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("layout", ["NH", "HN"])
+@pytest.mark.parametrize("explicit_q", [None, 128])
+def test_paged_auto_query_capacity_switch_preserves_capture(
+    monkeypatch, layout, explicit_q
+):
+    if (
+        not prefill._cudnn_supports_paged_auto()
+        or torch.cuda.get_device_capability() != (10, 0)
+    ):
+        pytest.skip("requires the qualified SM100 paged-auto runtime")
+    # Exercise capacity changes independently of evolving performance heuristics.
+    monkeypatch.setattr(
+        flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: True
+    )
+    torch.manual_seed(43)
+    q = torch.randn(128, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(256, 16, 2, 128, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    lse_storage = torch.empty((128, 8) if layout == "NH" else (8, 128), device="cuda")
+    ix = torch.randperm(256, device="cuda", dtype=torch.int32)
+    ip = torch.tensor([0, 256], dtype=torch.int32)
+    last = torch.tensor([16], dtype=torch.int32)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, device="cuda", dtype=torch.uint8),
+        "HND",
+        backend="auto",
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.empty(2, device="cuda", dtype=torch.int32),
+        paged_kv_indptr_buf=torch.empty(2, device="cuda", dtype=torch.int32),
+        paged_kv_indices_buf=torch.empty_like(ix),
+        paged_kv_last_page_len_buf=torch.empty_like(last, device="cuda"),
+        max_total_num_rows=128,
+    )
+
+    def plan(n):
+        qo = torch.tensor([0, n], dtype=torch.int32)
+        kw = {} if explicit_q is None else {"max_token_per_sequence": explicit_q}
+        w.plan(qo, ip, ix, last, 8, 2, 128, 16, causal=True, q_data_type=q.dtype, **kw)
+        assert w._backend == "cudnn"
+        return qo
+
+    def lse(n):
+        return (
+            lse_storage[:n]
+            if layout == "NH"
+            else lse_storage.flatten()[: n * 8].view(8, n)
+        )
+
+    def run(n):
+        w.run(
+            q[:n],
+            (k.transpose(1, 2), v.transpose(1, 2)),
+            out=out[:n],
+            lse=lse(n),
+            return_lse=True,
+            lse_layout=layout,
+            lse_base="ln",
+        )
+
+    def check(n, qo):
+        ref, stats = _reference(
+            q[:n], k, v, qo, ip, ix, last, causal=True, scale=128**-0.5
+        )
+        torch.testing.assert_close(out[:n].float(), ref, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(
+            lse(n) if layout == "NH" else lse(n).T, stats, atol=0.001, rtol=0.001
+        )
+
+    qo = plan(64)
+    run(64)
+    check(64, qo)
+    g = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(g):
+            run(64)
+        # Replan outside the old capture, then return within its original bounds.
+        for n in (65, 128, 64):
+            ix = ix.roll(17)
+            v.mul_(0.75)
+            qo = plan(n)
+            run(n)
+            check(n, qo)
+        q.mul_(0.5)
+        v.mul_(0.75)
+        out.fill_(torch.nan)
+        lse_storage.fill_(torch.nan)
+        g.replay()
+        check(64, qo)
+        assert torch.isnan(out[64:]).all()
+    finally:
+        g.reset()
