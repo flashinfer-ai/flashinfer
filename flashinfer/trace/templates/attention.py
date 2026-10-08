@@ -3334,8 +3334,10 @@ def _trtllm_paged_attention_reference(
     bmm1_scale = float(kwargs.get("bmm1_scale", 1.0 / math.sqrt(head_dim)) or 1.0)
     bmm2_scale = float(kwargs.get("bmm2_scale", 1.0) or 1.0)
     cum_seq_lens_q = kwargs.get("cum_seq_lens_q")
-    window_left = int(kwargs.get("window_left", -1))
-    window_right = int(kwargs.get("window_right", -1))
+    window_left_arg = kwargs.get("window_left")
+    window_right_arg = kwargs.get("window_right")
+    window_left = -1 if window_left_arg is None else int(window_left_arg)
+    window_right = -1 if window_right_arg is None else int(window_right_arg)
     variable_window_token_starts = kwargs.get("variable_window_token_starts")
     variable_window_token_ends = kwargs.get("variable_window_token_ends")
     batch_size = block_tables.shape[0]
@@ -4023,6 +4025,9 @@ trtllm_batch_context_trace = TraceTemplate(
         ),
         "window_left": Scalar(
             "int32", optional=True, description="Left sliding-window reach."
+        ),
+        "causal": Scalar(
+            "bool", optional=True, description="Whether to apply causal masking."
         ),
         "window_right": Scalar(
             "int32", optional=True, description="Right sliding-window reach."

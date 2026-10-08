@@ -2687,6 +2687,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
+            For the ``trtllm-gen`` backend, an unsupported non-causal sliding window is rejected
+            during :meth:`plan` (rather than being deferred until :meth:`run`).
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -7187,14 +7189,14 @@ def trtllm_batch_context_with_kv_cache(
             )
         effective_window_right = window_right
 
-    if backend == "cake" and (has_variable_window or window_right >= 0):
+    if backend == "cake" and (
+        has_variable_window
+        or effective_window_right > 0
+        or (not causal and window_left >= 0)
+    ):
         raise NotImplementedError(
-            "The cake backend does not support two-sided or variable attention windows."
-        )
-    if backend == "cake" and not causal and window_left >= 0:
-        raise NotImplementedError(
-            "Sliding-window non-causal attention is not supported for cake paged KV cache. "
-            "Use window_left=-1 for dense bidirectional attention."
+            "The cake backend supports only dense attention or a causal left window; "
+            "two-sided, non-causal sliding, and variable attention windows are unsupported."
         )
 
     if isinstance(kv_cache, tuple):
@@ -7406,24 +7408,38 @@ def trtllm_batch_context_with_kv_cache(
         o_sf_start_index,
         batch_size,
         window_left,
-        effective_window_right,
-        cum_seq_lens_q,
-        cum_seq_lens_kv,
-        variable_window_token_starts,
-        variable_window_token_ends,
-        sm_count,
-        enable_pdl,
-        workspace_size,
-        sinks,
-        key_block_scales,
-        value_block_scales,
-        skip_softmax_threshold_scale_factor,
-        uses_shared_paged_kv_idx,
-        use_fp16_softmax,
-        uses_spcompress,
-        causal,
-        lse,
     ]
+    if backend == "cake":
+        # Preserve Cake's established 34-argument FFI ABI. Its context entry
+        # point predates two-sided and per-token windows, but still consumes
+        # window_left for the causal compatibility route.
+        run_args.extend((cum_seq_lens_q, cum_seq_lens_kv))
+    else:
+        run_args.extend(
+            (
+                effective_window_right,
+                cum_seq_lens_q,
+                cum_seq_lens_kv,
+                variable_window_token_starts,
+                variable_window_token_ends,
+            )
+        )
+    run_args.extend(
+        [
+            sm_count,
+            enable_pdl,
+            workspace_size,
+            sinks,
+            key_block_scales,
+            value_block_scales,
+            skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
+            use_fp16_softmax,
+            uses_spcompress,
+            causal,
+            lse,
+        ]
+    )
     if backend != "cake":
         run_args.append(1.0)  # lse_scale
     run_args.extend((lse_stride_tokens, lse_stride_heads))

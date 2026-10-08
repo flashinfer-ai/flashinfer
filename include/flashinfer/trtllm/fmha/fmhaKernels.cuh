@@ -346,13 +346,20 @@ class TllmGenFmhaKernel {
     return meta.mFp16Softmax;
   }
 
-  // Existing metadata headers use semantic mFp16Softmax/mUsesSpcompress names, while the current
-  // public-release exporter intentionally calls the same stable ABI slots mReserved1/mReserved2.
-  // No header version macro distinguishes the layouts, so prefer semantic names when present and
-  // retain this field-presence fallback until all supported public artifacts use one spelling.
+  // The pinned public artifact uses semantic mFp16Softmax/mUsesSpcompress names. Some older
+  // supported generated headers call the same stable ABI slots mReserved1/mReserved2. No header
+  // version macro distinguishes the layouts, so prefer semantic names when present and retain
+  // this field-presence fallback until every supported artifact uses one spelling.
   template <typename Meta>
   static auto getFp16Softmax(Meta const& meta, long) -> decltype(meta.mReserved1) {
     return meta.mReserved1;
+  }
+
+  template <typename Meta>
+  static bool getFp16Softmax(Meta const&, ...) {
+    static_assert(sizeof(Meta) == 0,
+                  "Kernel metadata must define mFp16Softmax or its legacy ABI alias mReserved1");
+    return false;
   }
 
   template <typename Meta>
@@ -363,6 +370,14 @@ class TllmGenFmhaKernel {
   template <typename Meta>
   static auto getUsesSpcompress(Meta const& meta, long) -> decltype(meta.mReserved2) {
     return meta.mReserved2;
+  }
+
+  template <typename Meta>
+  static bool getUsesSpcompress(Meta const&, ...) {
+    static_assert(sizeof(Meta) == 0,
+                  "Kernel metadata must define mUsesSpcompress or its legacy ABI alias "
+                  "mReserved2");
+    return false;
   }
 
   uint64_t hashID(KernelMeta const& kernelMeta) const {
@@ -660,7 +675,10 @@ class TllmGenFmhaKernel {
       if (isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType)) {
         if (params.mChunkedAttentionSize > 0) {
           maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mChunkedAttentionSize);
-        } else if (params.mLeftSlidingWindow >= 0 && params.mRightSlidingWindow >= 0) {
+        } else {
+          FLASHINFER_CHECK(params.mLeftSlidingWindow >= 0 && params.mRightSlidingWindow >= 0,
+                           "Sliding-window attention requires both window bounds to be >= 0 when "
+                           "chunked attention is disabled.");
           // Consider that the first tileKv might contain tokensKv that is out of the attention
           // window.
           maxAttentionWindow =
@@ -1229,10 +1247,53 @@ class TllmGenFmhaKernel {
 
   // Select a kernel based on the heuristic.
   void selectKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const {
+    bool const isMlaGeneration = isGenerationKernel(params.mKernelType) && isMlaGenKernel(params);
+    bool const hasVariableWindowStart = params.variableWindowTokenStartsPtr != nullptr;
+    bool const hasVariableWindowEnd = params.variableWindowTokenEndsPtr != nullptr;
+    bool const hasFixedWindow = params.mLeftSlidingWindow >= 0 || params.mRightSlidingWindow >= 0;
+    bool const hasChunkedAttention = params.mChunkedAttentionSize > 0;
+    FLASHINFER_CHECK(params.mLeftSlidingWindow >= -1 && params.mRightSlidingWindow >= -1,
+                     "Sliding-window bounds must be at least -1.");
+    FLASHINFER_CHECK(hasVariableWindowStart == hasVariableWindowEnd,
+                     "VariableWindow start and end pointers must be provided together.");
+
+    if (isVariableWindowMask(selectKernelParams.mMaskType)) {
+      FLASHINFER_CHECK(hasVariableWindowStart && !hasFixedWindow && !hasChunkedAttention,
+                       "VariableWindow requires both bound pointers and cannot be combined with "
+                       "fixed-window or chunked attention.");
+    } else {
+      FLASHINFER_CHECK(!hasVariableWindowStart,
+                       "Variable-window pointers require the VariableWindow mask type.");
+    }
+
+    if (isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType)) {
+      bool const hasCompleteFixedWindow =
+          params.mLeftSlidingWindow >= 0 && params.mRightSlidingWindow >= 0;
+      FLASHINFER_CHECK(hasCompleteFixedWindow != hasChunkedAttention,
+                       "Sliding-window and chunked attention are mutually exclusive, and one "
+                       "complete configuration must be provided.");
+    } else if (isCausalMask(selectKernelParams.mMaskType)) {
+      bool const fixedWindowDoesNotBind =
+          params.mLeftSlidingWindow == -1 || params.mMaxSeqLenKv <= params.mLeftSlidingWindow + 1;
+      FLASHINFER_CHECK(
+          !hasChunkedAttention && params.mRightSlidingWindow <= 0 && fixedWindowDoesNotBind,
+          "Causal mask selection requires chunked attention to be disabled and any "
+          "fixed window to cover the whole KV sequence.");
+    } else if (isDenseMask(selectKernelParams.mMaskType) && !isMlaGeneration) {
+      bool const noFixedWindow =
+          params.mLeftSlidingWindow == -1 && params.mRightSlidingWindow == -1;
+      bool const fixedWindowDoesNotBind = params.mLeftSlidingWindow >= 0 &&
+                                          params.mRightSlidingWindow >= 0 &&
+                                          params.mMaxSeqLenKv <= params.mLeftSlidingWindow + 1 &&
+                                          params.mMaxSeqLenKv <= params.mRightSlidingWindow + 1;
+      FLASHINFER_CHECK(!hasChunkedAttention && (noFixedWindow || fixedWindowDoesNotBind),
+                       "Dense mask selection requires chunked attention to be disabled and any "
+                       "fixed window to cover the whole KV sequence in both directions.");
+    }
+
     // Normalize this before heuristic probing; some GQA-generation heuristics load candidate
     // kernels while selecting tileSizeQ.
     selectNumTokensPerPage(params, selectKernelParams);
-    bool const isMlaGeneration = isGenerationKernel(params.mKernelType) && isMlaGenKernel(params);
 
     // Select the kernel based on the kernel type.
     if (isMlaGeneration) {

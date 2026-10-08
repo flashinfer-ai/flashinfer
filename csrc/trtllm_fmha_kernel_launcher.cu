@@ -137,8 +137,16 @@ inline void validateTrtllmGenWindowConfig(bool is_causal, int64_t window_left, i
                   "causal attention requires window_right to be -1 or 0");
   } else {
     TVM_FFI_CHECK((window_left == -1) == (window_right == -1),
-                  "non-causal fixed-window attention requires both window bounds to be >= 0");
+                  "non-causal attention requires window_left and window_right to both be -1 or "
+                  "both be >= 0");
   }
+}
+
+inline bool fixedWindowBinds(bool is_causal, int64_t max_kv_len, int64_t window_left,
+                             int64_t window_right) {
+  bool const left_binds = window_left >= 0 && max_kv_len > window_left + 1;
+  bool const right_binds = !is_causal && window_right >= 0 && max_kv_len > window_right + 1;
+  return left_binds || right_binds;
 }
 
 class TllmGenFmhaRunnerCache {
@@ -333,7 +341,7 @@ void trtllm_paged_attention_launcher(
   if (mode == TllmPagedAttentionMode::Context) {
     if (variable_window_token_starts != nullptr) {
       runner_params.mMaskType = TrtllmGenAttentionMaskType::VariableWindow;
-    } else if (window_left >= 0 || window_right >= 0) {
+    } else if (fixedWindowBinds(is_causal, max_kv_len, window_left, window_right)) {
       runner_params.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
     } else {
       runner_params.mMaskType =
@@ -351,9 +359,11 @@ void trtllm_paged_attention_launcher(
     // specified as causal, this is expected for better performance as each CTA will only process
     // one tokenQ in those cases, so dense mask works the same as causal mask.
     runner_params.mMaskType =
-        is_mla_decode ? TrtllmGenAttentionMaskType::Dense
-                      : (window_left >= 0 ? TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
-                                          : TrtllmGenAttentionMaskType::Causal);
+        is_mla_decode
+            ? TrtllmGenAttentionMaskType::Dense
+            : (fixedWindowBinds(/*is_causal=*/true, max_kv_len, window_left, /*window_right=*/0)
+                   ? TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
+                   : TrtllmGenAttentionMaskType::Causal);
     runner_params.mKernelType = FmhaKernelType::Generation;
     bool use_multi_block = true;
     runner_params.mTileScheduler =
@@ -933,9 +943,10 @@ void trtllm_ragged_attention_launcher(
   runner_params.mKernelType = FmhaKernelType::Context;
   runner_params.mTileScheduler = TileScheduler::Persistent;
   runner_params.mMultiCtasKvMode = false;
-  runner_params.mMaskType = window_left >= 0 ? TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
-                                             : (is_causal ? TrtllmGenAttentionMaskType::Causal
-                                                          : TrtllmGenAttentionMaskType::Dense);
+  runner_params.mMaskType =
+      fixedWindowBinds(is_causal, max_kv_len, window_left, window_right)
+          ? TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
+          : (is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense);
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
   // Only allocate the softmax stats slab when LSE is requested; size with the same
