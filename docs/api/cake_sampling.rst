@@ -48,8 +48,20 @@ the launch share it).
   sample), bit 7 the slab-tail form of either sample build (``_cs_lb`` / ``_sp_lb``: a fused
   launch's selected pairs are pushed into the first CTA's shared memory for the tail), bit 8 the
   pushed-coarse-sums form of the default build (``_lg``: coarse histogram sums are stored into
-  every CTA's shared memory for the two-level select, two-launch chains only) and bit 5 the
-  row-span filter arm of a cluster-8 stream above the two-warp tail.  Each build is taken only on
+  every CTA's shared memory for the two-level select, two-launch chains only), bit 9 the
+  leader-push exchange form of the default or sample build of a multi-CTA stream (``_lp`` /
+  ``_cs_lp`` / ``_sp_lp``: every CTA stores its compacted candidate list straight into the first
+  CTA's receive buffer and its length into every CTA before the single exchange barrier, so the
+  pull form's DSM read rounds and exit rendezvous disappear; it displaces bits 7 and 8), bit 10
+  the CTA-local select form of a leader-push sample build (``_cs_lp_l1`` / ``_sp_lp_l1``: each CTA
+  picks its filter bucket from its own sample, so the cluster-wide coarse-histogram round
+  disappears and the push is the only cluster round; fused launches with the smallest top-k, up to
+  32 on compute capability 10.3, 20 on 10.0 and 10 on 9.0; on 10.0 and 10.3 it also carries the
+  leader push onto the two-chunk ept-32 rows the bit-9 chunk rule excludes -- at any batch on 10.0,
+  on 10.3 when the second chunk is full or the batch has at least four rows), bit 11 the integer-tested form of the whole-CTA
+  tail build (``_bt_tia``: the tail's f64 target and sample tests run as the stage-2/3 integer
+  emulation; compute capability 10.3, whose FP64 pipe is slow) and bit 5
+  the row-span filter arm of a cluster-8 stream above the two-warp tail.  Each build is taken only on
   the capabilities, cluster sizes and row lengths where it measured faster; the policy constants
   live in :mod:`flashinfer.cake_sampling`.
 * **Stage-2/3 static forms**: the stage-2/3 kernel exists in three forms that differ only in
@@ -80,7 +92,10 @@ and ``top_k_max`` is not given, the host reads ``top_k.max()`` (one device synch
 
 The stage-1 variant is chosen per call by a cost model whose single-wave CTA capacity table and
 constants are keyed by the device's SM count (148 for B200 / B300, 132 for H100, 212 for Rubin
-R200; other devices use the nearest measured table); ``renorm_out`` and ``workspace`` expose the
+R200; other devices use the nearest measured table).  On the 212-SM table a small-k (``top_k_max``
+at most 64 or unknown) ept-32 streaming pick whose grid and the cluster-8 grid both fit one wave is
+re-picked to the cluster-8 ept-16 stream (measured 8-15 % faster on R200 at batch <= 16; multi-wave
+grids, large k and the other tables keep the ranked pick).  ``renorm_out`` and ``workspace`` expose the
 sorted slab of a call.
 
 Source product
@@ -112,10 +127,14 @@ the precision level and the selection exactness may not):
 * **Sample**: always inside the exact support (the kept prefix); run-to-run deterministic for identical inputs,
   ``philox_seed`` and ``philox_offset`` (CUDA-graph replay, concurrent streams and repeated invocation included);
   multi-seed next-token histograms within the 99 % binomial band of the exact distribution per row class.
+  A call captured into a CUDA graph without explicit Philox parameters never reads the generator inside the
+  capture (PyTorch would register it with the graph and replay two ``FillFunctor`` kernels per launch, +46 us per
+  replay on GB300); it uses the generator's initial seed with a host-side offset that differs between captures.
 * **Renormalized slab** (``renorm_out``): fp32 with ``rtol 1e-6``, ``atol 1e-7`` against the float64 reference.
   Keys stay exact fp32 bit patterns; every accumulation is at least fp32 (no bf16 / fp16 anywhere); no tolerance is
   loosened to admit a kernel change.
-* Every stage-1 build of a variant (``_bt``, ``_cs``, ``_sp``, ``_cs_lb``, ``_sp_lb``, ``_lg``) and every stage-2/3
+* Every stage-1 build of a variant (``_bt``, ``_cs``, ``_sp``, ``_cs_lb``, ``_sp_lb``, ``_lg``, ``_lp``, ``_cs_lp``,
+  ``_sp_lp``) and every stage-2/3
   form is additionally gated on bit-identity with the default build on every tested row.  A change that moves bits
   must document exactly which rows can differ (ties, the eps boundary) and why.
 * The exact fallbacks stay kernel-side: a candidate list that overflows the gather capacity takes the three-pass

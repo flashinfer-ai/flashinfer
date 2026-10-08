@@ -50,6 +50,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_B_STRIDE 49152
 #define SMEM_TOTAL 196704
 #define THREADS 384
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -148,7 +149,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
+__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
 kernel_cake_sm90_bf16_megamoe_fc1_gated(unsigned int num_experts, unsigned int shape_n, unsigned int shape_k, float clamp_limit, const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap W, long long* __restrict__ offsets, __nv_bfloat16* __restrict__ D)
 {
     const int tid = threadIdx.x;
@@ -362,12 +363,17 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated(unsigned int num_experts, unsigned int s
         uint32_t warp_group_idx = static_cast<uint32_t>(tid) / 128u;
         unsigned int math_wg_idx = make_warp_uniform(warp_group_idx);
         float accum[128] = {0};
-        float outv[4] = {0};
+        unsigned int pk[4] = {0};
         unsigned int it_c = 0;
         unsigned int tile_base_c = 0;
         unsigned int warp_in_wg = (unsigned int)warp % 4;
         unsigned int lane_row = lane / 4;
         unsigned int lane_col = lane % 4 * 2;
+        unsigned int q_lane = lane % 4;
+        unsigned int m_odd = -(q_lane & 1);
+        unsigned int m_even = m_odd ^ 4294967295u;
+        unsigned int m_hi = -(q_lane >> 1 & 1);
+        unsigned int m_lo = m_hi ^ 4294967295u;
         for (unsigned int e_c = 0; e_c < num_experts; e_c++) {
             unsigned int row0_c = (unsigned int)offsets[e_c];
             unsigned int row1_c = (unsigned int)offsets[e_c + 1];
@@ -826,405 +832,385 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated(unsigned int num_experts, unsigned int s
                 }
                 unsigned int row_lo = m0_c + math_wg_idx * 64 + warp_in_wg * 16 + lane_row;
                 unsigned int row_hi = row_lo + 8;
-                unsigned int col_o = n0_c / 2 + lane_col;
+                unsigned int col_v = n0_c / 2 + q_lane * 8;
                 float _exp2_0 = approx_exp2(accum[0] * -1.4426950408889634f);
                 float _rcp_0 = approx_rcp(_exp2_0 + 1.0f);
                 float _exp2_1 = approx_exp2(accum[1] * -1.4426950408889634f);
                 float _rcp_1 = approx_rcp(_exp2_1 + 1.0f);
-                outv[0] = accum[0] * _rcp_0 * accum[16];
-                outv[1] = accum[1] * _rcp_1 * accum[17];
-                float _exp2_2 = approx_exp2(accum[2] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(accum[0] * _rcp_0 * accum[16], accum[1] * _rcp_1 * accum[17]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_0)[0];
+                float _exp2_2 = approx_exp2(accum[4] * -1.4426950408889634f);
                 float _rcp_2 = approx_rcp(_exp2_2 + 1.0f);
-                float _exp2_3 = approx_exp2(accum[3] * -1.4426950408889634f);
+                float _exp2_3 = approx_exp2(accum[5] * -1.4426950408889634f);
                 float _rcp_3 = approx_rcp(_exp2_3 + 1.0f);
-                outv[2] = accum[2] * _rcp_2 * accum[18];
-                outv[3] = accum[3] * _rcp_3 * accum[19];
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_0 = n0_c / 2 + 8 + lane_col;
-                float _exp2_4 = approx_exp2(accum[4] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_1 = __float22bfloat162_rn(make_float2(accum[4] * _rcp_2 * accum[20], accum[5] * _rcp_3 * accum[21]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_1)[0];
+                float _exp2_4 = approx_exp2(accum[8] * -1.4426950408889634f);
                 float _rcp_4 = approx_rcp(_exp2_4 + 1.0f);
-                float _exp2_5 = approx_exp2(accum[5] * -1.4426950408889634f);
+                float _exp2_5 = approx_exp2(accum[9] * -1.4426950408889634f);
                 float _rcp_5 = approx_rcp(_exp2_5 + 1.0f);
-                outv[0] = accum[4] * _rcp_4 * accum[20];
-                outv[1] = accum[5] * _rcp_5 * accum[21];
-                float _exp2_6 = approx_exp2(accum[6] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_2 = __float22bfloat162_rn(make_float2(accum[8] * _rcp_4 * accum[24], accum[9] * _rcp_5 * accum[25]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_2)[0];
+                float _exp2_6 = approx_exp2(accum[12] * -1.4426950408889634f);
                 float _rcp_6 = approx_rcp(_exp2_6 + 1.0f);
-                float _exp2_7 = approx_exp2(accum[7] * -1.4426950408889634f);
+                float _exp2_7 = approx_exp2(accum[13] * -1.4426950408889634f);
                 float _rcp_7 = approx_rcp(_exp2_7 + 1.0f);
-                outv[2] = accum[6] * _rcp_6 * accum[22];
-                outv[3] = accum[7] * _rcp_7 * accum[23];
+                __nv_bfloat162 _bf16x2_3 = __float22bfloat162_rn(make_float2(accum[12] * _rcp_6 * accum[28], accum[13] * _rcp_7 * accum[29]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_3)[0];
+                unsigned int x0 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, x0, 1);
+                unsigned int y0 = _shfl_xor_0;
+                unsigned int _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, x1, 1);
+                unsigned int y1 = _shfl_xor_1;
+                pk[0] = y0 & m_odd | pk[0] & m_even;
+                pk[1] = y0 & m_even | pk[1] & m_odd;
+                pk[2] = y1 & m_odd | pk[2] & m_even;
+                pk[3] = y1 & m_even | pk[3] & m_odd;
+                unsigned int x2 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, x2, 2);
+                unsigned int y2 = _shfl_xor_2;
+                unsigned int _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, x3, 2);
+                unsigned int y3 = _shfl_xor_3;
+                pk[0] = y2 & m_hi | pk[0] & m_lo;
+                pk[2] = y2 & m_lo | pk[2] & m_hi;
+                pk[1] = y3 & m_hi | pk[1] & m_lo;
+                pk[3] = y3 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_0)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_v))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_0)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_1 = n0_c / 2 + 16 + lane_col;
-                float _exp2_8 = approx_exp2(accum[8] * -1.4426950408889634f);
+                float _exp2_8 = approx_exp2(accum[2] * -1.4426950408889634f);
                 float _rcp_8 = approx_rcp(_exp2_8 + 1.0f);
-                float _exp2_9 = approx_exp2(accum[9] * -1.4426950408889634f);
+                float _exp2_9 = approx_exp2(accum[3] * -1.4426950408889634f);
                 float _rcp_9 = approx_rcp(_exp2_9 + 1.0f);
-                outv[0] = accum[8] * _rcp_8 * accum[24];
-                outv[1] = accum[9] * _rcp_9 * accum[25];
-                float _exp2_10 = approx_exp2(accum[10] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_4 = __float22bfloat162_rn(make_float2(accum[2] * _rcp_8 * accum[18], accum[3] * _rcp_9 * accum[19]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_4)[0];
+                float _exp2_10 = approx_exp2(accum[6] * -1.4426950408889634f);
                 float _rcp_10 = approx_rcp(_exp2_10 + 1.0f);
-                float _exp2_11 = approx_exp2(accum[11] * -1.4426950408889634f);
+                float _exp2_11 = approx_exp2(accum[7] * -1.4426950408889634f);
                 float _rcp_11 = approx_rcp(_exp2_11 + 1.0f);
-                outv[2] = accum[10] * _rcp_10 * accum[26];
-                outv[3] = accum[11] * _rcp_11 * accum[27];
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_1)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_1)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_2 = n0_c / 2 + 24 + lane_col;
-                float _exp2_12 = approx_exp2(accum[12] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_5 = __float22bfloat162_rn(make_float2(accum[6] * _rcp_10 * accum[22], accum[7] * _rcp_11 * accum[23]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_5)[0];
+                float _exp2_12 = approx_exp2(accum[10] * -1.4426950408889634f);
                 float _rcp_12 = approx_rcp(_exp2_12 + 1.0f);
-                float _exp2_13 = approx_exp2(accum[13] * -1.4426950408889634f);
+                float _exp2_13 = approx_exp2(accum[11] * -1.4426950408889634f);
                 float _rcp_13 = approx_rcp(_exp2_13 + 1.0f);
-                outv[0] = accum[12] * _rcp_12 * accum[28];
-                outv[1] = accum[13] * _rcp_13 * accum[29];
+                __nv_bfloat162 _bf16x2_6 = __float22bfloat162_rn(make_float2(accum[10] * _rcp_12 * accum[26], accum[11] * _rcp_13 * accum[27]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_6)[0];
                 float _exp2_14 = approx_exp2(accum[14] * -1.4426950408889634f);
                 float _rcp_14 = approx_rcp(_exp2_14 + 1.0f);
                 float _exp2_15 = approx_exp2(accum[15] * -1.4426950408889634f);
                 float _rcp_15 = approx_rcp(_exp2_15 + 1.0f);
-                outv[2] = accum[14] * _rcp_14 * accum[30];
-                outv[3] = accum[15] * _rcp_15 * accum[31];
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_2)))[0]) = _pk;
-                    }
-                }
+                __nv_bfloat162 _bf16x2_7 = __float22bfloat162_rn(make_float2(accum[14] * _rcp_14 * accum[30], accum[15] * _rcp_15 * accum[31]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_7)[0];
+                unsigned int x0_0 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_1 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, x0_0, 1);
+                unsigned int y0_2 = _shfl_xor_4;
+                unsigned int _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, x1_1, 1);
+                unsigned int y1_3 = _shfl_xor_5;
+                pk[0] = y0_2 & m_odd | pk[0] & m_even;
+                pk[1] = y0_2 & m_even | pk[1] & m_odd;
+                pk[2] = y1_3 & m_odd | pk[2] & m_even;
+                pk[3] = y1_3 & m_even | pk[3] & m_odd;
+                unsigned int x2_4 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_5 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, x2_4, 2);
+                unsigned int y2_6 = _shfl_xor_6;
+                unsigned int _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, x3_5, 2);
+                unsigned int y3_7 = _shfl_xor_7;
+                pk[0] = y2_6 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_6 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_7 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_7 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_2)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_v))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_o_3 = n0_c / 2 + 32 + lane_col;
+                unsigned int col_v_8 = n0_c / 2 + (4 + q_lane) * 8;
                 float _exp2_16 = approx_exp2(accum[32] * -1.4426950408889634f);
                 float _rcp_16 = approx_rcp(_exp2_16 + 1.0f);
                 float _exp2_17 = approx_exp2(accum[33] * -1.4426950408889634f);
                 float _rcp_17 = approx_rcp(_exp2_17 + 1.0f);
-                outv[0] = accum[32] * _rcp_16 * accum[48];
-                outv[1] = accum[33] * _rcp_17 * accum[49];
-                float _exp2_18 = approx_exp2(accum[34] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_8 = __float22bfloat162_rn(make_float2(accum[32] * _rcp_16 * accum[48], accum[33] * _rcp_17 * accum[49]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_8)[0];
+                float _exp2_18 = approx_exp2(accum[36] * -1.4426950408889634f);
                 float _rcp_18 = approx_rcp(_exp2_18 + 1.0f);
-                float _exp2_19 = approx_exp2(accum[35] * -1.4426950408889634f);
+                float _exp2_19 = approx_exp2(accum[37] * -1.4426950408889634f);
                 float _rcp_19 = approx_rcp(_exp2_19 + 1.0f);
-                outv[2] = accum[34] * _rcp_18 * accum[50];
-                outv[3] = accum[35] * _rcp_19 * accum[51];
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_3)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_3)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_4 = n0_c / 2 + 40 + lane_col;
-                float _exp2_20 = approx_exp2(accum[36] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_9 = __float22bfloat162_rn(make_float2(accum[36] * _rcp_18 * accum[52], accum[37] * _rcp_19 * accum[53]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_9)[0];
+                float _exp2_20 = approx_exp2(accum[40] * -1.4426950408889634f);
                 float _rcp_20 = approx_rcp(_exp2_20 + 1.0f);
-                float _exp2_21 = approx_exp2(accum[37] * -1.4426950408889634f);
+                float _exp2_21 = approx_exp2(accum[41] * -1.4426950408889634f);
                 float _rcp_21 = approx_rcp(_exp2_21 + 1.0f);
-                outv[0] = accum[36] * _rcp_20 * accum[52];
-                outv[1] = accum[37] * _rcp_21 * accum[53];
-                float _exp2_22 = approx_exp2(accum[38] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_10 = __float22bfloat162_rn(make_float2(accum[40] * _rcp_20 * accum[56], accum[41] * _rcp_21 * accum[57]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_10)[0];
+                float _exp2_22 = approx_exp2(accum[44] * -1.4426950408889634f);
                 float _rcp_22 = approx_rcp(_exp2_22 + 1.0f);
-                float _exp2_23 = approx_exp2(accum[39] * -1.4426950408889634f);
+                float _exp2_23 = approx_exp2(accum[45] * -1.4426950408889634f);
                 float _rcp_23 = approx_rcp(_exp2_23 + 1.0f);
-                outv[2] = accum[38] * _rcp_22 * accum[54];
-                outv[3] = accum[39] * _rcp_23 * accum[55];
+                __nv_bfloat162 _bf16x2_11 = __float22bfloat162_rn(make_float2(accum[44] * _rcp_22 * accum[60], accum[45] * _rcp_23 * accum[61]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_11)[0];
+                unsigned int x0_9 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_10 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, x0_9, 1);
+                unsigned int y0_11 = _shfl_xor_8;
+                unsigned int _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, x1_10, 1);
+                unsigned int y1_12 = _shfl_xor_9;
+                pk[0] = y0_11 & m_odd | pk[0] & m_even;
+                pk[1] = y0_11 & m_even | pk[1] & m_odd;
+                pk[2] = y1_12 & m_odd | pk[2] & m_even;
+                pk[3] = y1_12 & m_even | pk[3] & m_odd;
+                unsigned int x2_13 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_14 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, x2_13, 2);
+                unsigned int y2_15 = _shfl_xor_10;
+                unsigned int _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, x3_14, 2);
+                unsigned int y3_16 = _shfl_xor_11;
+                pk[0] = y2_15 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_15 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_16 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_16 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_4)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_v_8))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_4)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_5 = n0_c / 2 + 48 + lane_col;
-                float _exp2_24 = approx_exp2(accum[40] * -1.4426950408889634f);
+                float _exp2_24 = approx_exp2(accum[34] * -1.4426950408889634f);
                 float _rcp_24 = approx_rcp(_exp2_24 + 1.0f);
-                float _exp2_25 = approx_exp2(accum[41] * -1.4426950408889634f);
+                float _exp2_25 = approx_exp2(accum[35] * -1.4426950408889634f);
                 float _rcp_25 = approx_rcp(_exp2_25 + 1.0f);
-                outv[0] = accum[40] * _rcp_24 * accum[56];
-                outv[1] = accum[41] * _rcp_25 * accum[57];
-                float _exp2_26 = approx_exp2(accum[42] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_12 = __float22bfloat162_rn(make_float2(accum[34] * _rcp_24 * accum[50], accum[35] * _rcp_25 * accum[51]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_12)[0];
+                float _exp2_26 = approx_exp2(accum[38] * -1.4426950408889634f);
                 float _rcp_26 = approx_rcp(_exp2_26 + 1.0f);
-                float _exp2_27 = approx_exp2(accum[43] * -1.4426950408889634f);
+                float _exp2_27 = approx_exp2(accum[39] * -1.4426950408889634f);
                 float _rcp_27 = approx_rcp(_exp2_27 + 1.0f);
-                outv[2] = accum[42] * _rcp_26 * accum[58];
-                outv[3] = accum[43] * _rcp_27 * accum[59];
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_5)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_5)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_6 = n0_c / 2 + 56 + lane_col;
-                float _exp2_28 = approx_exp2(accum[44] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_13 = __float22bfloat162_rn(make_float2(accum[38] * _rcp_26 * accum[54], accum[39] * _rcp_27 * accum[55]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_13)[0];
+                float _exp2_28 = approx_exp2(accum[42] * -1.4426950408889634f);
                 float _rcp_28 = approx_rcp(_exp2_28 + 1.0f);
-                float _exp2_29 = approx_exp2(accum[45] * -1.4426950408889634f);
+                float _exp2_29 = approx_exp2(accum[43] * -1.4426950408889634f);
                 float _rcp_29 = approx_rcp(_exp2_29 + 1.0f);
-                outv[0] = accum[44] * _rcp_28 * accum[60];
-                outv[1] = accum[45] * _rcp_29 * accum[61];
+                __nv_bfloat162 _bf16x2_14 = __float22bfloat162_rn(make_float2(accum[42] * _rcp_28 * accum[58], accum[43] * _rcp_29 * accum[59]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_14)[0];
                 float _exp2_30 = approx_exp2(accum[46] * -1.4426950408889634f);
                 float _rcp_30 = approx_rcp(_exp2_30 + 1.0f);
                 float _exp2_31 = approx_exp2(accum[47] * -1.4426950408889634f);
                 float _rcp_31 = approx_rcp(_exp2_31 + 1.0f);
-                outv[2] = accum[46] * _rcp_30 * accum[62];
-                outv[3] = accum[47] * _rcp_31 * accum[63];
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_6)))[0]) = _pk;
-                    }
-                }
+                __nv_bfloat162 _bf16x2_15 = __float22bfloat162_rn(make_float2(accum[46] * _rcp_30 * accum[62], accum[47] * _rcp_31 * accum[63]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_15)[0];
+                unsigned int x0_17 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_18 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, x0_17, 1);
+                unsigned int y0_19 = _shfl_xor_12;
+                unsigned int _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, x1_18, 1);
+                unsigned int y1_20 = _shfl_xor_13;
+                pk[0] = y0_19 & m_odd | pk[0] & m_even;
+                pk[1] = y0_19 & m_even | pk[1] & m_odd;
+                pk[2] = y1_20 & m_odd | pk[2] & m_even;
+                pk[3] = y1_20 & m_even | pk[3] & m_odd;
+                unsigned int x2_21 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_22 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, x2_21, 2);
+                unsigned int y2_23 = _shfl_xor_14;
+                unsigned int _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, x3_22, 2);
+                unsigned int y3_24 = _shfl_xor_15;
+                pk[0] = y2_23 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_23 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_24 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_24 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_6)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_v_8))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_o_7 = n0_c / 2 + 64 + lane_col;
+                unsigned int col_v_25 = n0_c / 2 + (8 + q_lane) * 8;
                 float _exp2_32 = approx_exp2(accum[64] * -1.4426950408889634f);
                 float _rcp_32 = approx_rcp(_exp2_32 + 1.0f);
                 float _exp2_33 = approx_exp2(accum[65] * -1.4426950408889634f);
                 float _rcp_33 = approx_rcp(_exp2_33 + 1.0f);
-                outv[0] = accum[64] * _rcp_32 * accum[80];
-                outv[1] = accum[65] * _rcp_33 * accum[81];
-                float _exp2_34 = approx_exp2(accum[66] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_16 = __float22bfloat162_rn(make_float2(accum[64] * _rcp_32 * accum[80], accum[65] * _rcp_33 * accum[81]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_16)[0];
+                float _exp2_34 = approx_exp2(accum[68] * -1.4426950408889634f);
                 float _rcp_34 = approx_rcp(_exp2_34 + 1.0f);
-                float _exp2_35 = approx_exp2(accum[67] * -1.4426950408889634f);
+                float _exp2_35 = approx_exp2(accum[69] * -1.4426950408889634f);
                 float _rcp_35 = approx_rcp(_exp2_35 + 1.0f);
-                outv[2] = accum[66] * _rcp_34 * accum[82];
-                outv[3] = accum[67] * _rcp_35 * accum[83];
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_7)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_7)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_8 = n0_c / 2 + 72 + lane_col;
-                float _exp2_36 = approx_exp2(accum[68] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_17 = __float22bfloat162_rn(make_float2(accum[68] * _rcp_34 * accum[84], accum[69] * _rcp_35 * accum[85]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_17)[0];
+                float _exp2_36 = approx_exp2(accum[72] * -1.4426950408889634f);
                 float _rcp_36 = approx_rcp(_exp2_36 + 1.0f);
-                float _exp2_37 = approx_exp2(accum[69] * -1.4426950408889634f);
+                float _exp2_37 = approx_exp2(accum[73] * -1.4426950408889634f);
                 float _rcp_37 = approx_rcp(_exp2_37 + 1.0f);
-                outv[0] = accum[68] * _rcp_36 * accum[84];
-                outv[1] = accum[69] * _rcp_37 * accum[85];
-                float _exp2_38 = approx_exp2(accum[70] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_18 = __float22bfloat162_rn(make_float2(accum[72] * _rcp_36 * accum[88], accum[73] * _rcp_37 * accum[89]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_18)[0];
+                float _exp2_38 = approx_exp2(accum[76] * -1.4426950408889634f);
                 float _rcp_38 = approx_rcp(_exp2_38 + 1.0f);
-                float _exp2_39 = approx_exp2(accum[71] * -1.4426950408889634f);
+                float _exp2_39 = approx_exp2(accum[77] * -1.4426950408889634f);
                 float _rcp_39 = approx_rcp(_exp2_39 + 1.0f);
-                outv[2] = accum[70] * _rcp_38 * accum[86];
-                outv[3] = accum[71] * _rcp_39 * accum[87];
+                __nv_bfloat162 _bf16x2_19 = __float22bfloat162_rn(make_float2(accum[76] * _rcp_38 * accum[92], accum[77] * _rcp_39 * accum[93]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_19)[0];
+                unsigned int x0_26 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_27 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_16 = __shfl_xor_sync(0xFFFFFFFF, x0_26, 1);
+                unsigned int y0_28 = _shfl_xor_16;
+                unsigned int _shfl_xor_17 = __shfl_xor_sync(0xFFFFFFFF, x1_27, 1);
+                unsigned int y1_29 = _shfl_xor_17;
+                pk[0] = y0_28 & m_odd | pk[0] & m_even;
+                pk[1] = y0_28 & m_even | pk[1] & m_odd;
+                pk[2] = y1_29 & m_odd | pk[2] & m_even;
+                pk[3] = y1_29 & m_even | pk[3] & m_odd;
+                unsigned int x2_30 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_31 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_18 = __shfl_xor_sync(0xFFFFFFFF, x2_30, 2);
+                unsigned int y2_32 = _shfl_xor_18;
+                unsigned int _shfl_xor_19 = __shfl_xor_sync(0xFFFFFFFF, x3_31, 2);
+                unsigned int y3_33 = _shfl_xor_19;
+                pk[0] = y2_32 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_32 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_33 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_33 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_8)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_v_25))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_8)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_9 = n0_c / 2 + 80 + lane_col;
-                float _exp2_40 = approx_exp2(accum[72] * -1.4426950408889634f);
+                float _exp2_40 = approx_exp2(accum[66] * -1.4426950408889634f);
                 float _rcp_40 = approx_rcp(_exp2_40 + 1.0f);
-                float _exp2_41 = approx_exp2(accum[73] * -1.4426950408889634f);
+                float _exp2_41 = approx_exp2(accum[67] * -1.4426950408889634f);
                 float _rcp_41 = approx_rcp(_exp2_41 + 1.0f);
-                outv[0] = accum[72] * _rcp_40 * accum[88];
-                outv[1] = accum[73] * _rcp_41 * accum[89];
-                float _exp2_42 = approx_exp2(accum[74] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_20 = __float22bfloat162_rn(make_float2(accum[66] * _rcp_40 * accum[82], accum[67] * _rcp_41 * accum[83]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_20)[0];
+                float _exp2_42 = approx_exp2(accum[70] * -1.4426950408889634f);
                 float _rcp_42 = approx_rcp(_exp2_42 + 1.0f);
-                float _exp2_43 = approx_exp2(accum[75] * -1.4426950408889634f);
+                float _exp2_43 = approx_exp2(accum[71] * -1.4426950408889634f);
                 float _rcp_43 = approx_rcp(_exp2_43 + 1.0f);
-                outv[2] = accum[74] * _rcp_42 * accum[90];
-                outv[3] = accum[75] * _rcp_43 * accum[91];
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_9)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_9)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_10 = n0_c / 2 + 88 + lane_col;
-                float _exp2_44 = approx_exp2(accum[76] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_21 = __float22bfloat162_rn(make_float2(accum[70] * _rcp_42 * accum[86], accum[71] * _rcp_43 * accum[87]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_21)[0];
+                float _exp2_44 = approx_exp2(accum[74] * -1.4426950408889634f);
                 float _rcp_44 = approx_rcp(_exp2_44 + 1.0f);
-                float _exp2_45 = approx_exp2(accum[77] * -1.4426950408889634f);
+                float _exp2_45 = approx_exp2(accum[75] * -1.4426950408889634f);
                 float _rcp_45 = approx_rcp(_exp2_45 + 1.0f);
-                outv[0] = accum[76] * _rcp_44 * accum[92];
-                outv[1] = accum[77] * _rcp_45 * accum[93];
+                __nv_bfloat162 _bf16x2_22 = __float22bfloat162_rn(make_float2(accum[74] * _rcp_44 * accum[90], accum[75] * _rcp_45 * accum[91]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_22)[0];
                 float _exp2_46 = approx_exp2(accum[78] * -1.4426950408889634f);
                 float _rcp_46 = approx_rcp(_exp2_46 + 1.0f);
                 float _exp2_47 = approx_exp2(accum[79] * -1.4426950408889634f);
                 float _rcp_47 = approx_rcp(_exp2_47 + 1.0f);
-                outv[2] = accum[78] * _rcp_46 * accum[94];
-                outv[3] = accum[79] * _rcp_47 * accum[95];
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_10)))[0]) = _pk;
-                    }
-                }
+                __nv_bfloat162 _bf16x2_23 = __float22bfloat162_rn(make_float2(accum[78] * _rcp_46 * accum[94], accum[79] * _rcp_47 * accum[95]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_23)[0];
+                unsigned int x0_34 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_35 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_20 = __shfl_xor_sync(0xFFFFFFFF, x0_34, 1);
+                unsigned int y0_36 = _shfl_xor_20;
+                unsigned int _shfl_xor_21 = __shfl_xor_sync(0xFFFFFFFF, x1_35, 1);
+                unsigned int y1_37 = _shfl_xor_21;
+                pk[0] = y0_36 & m_odd | pk[0] & m_even;
+                pk[1] = y0_36 & m_even | pk[1] & m_odd;
+                pk[2] = y1_37 & m_odd | pk[2] & m_even;
+                pk[3] = y1_37 & m_even | pk[3] & m_odd;
+                unsigned int x2_38 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_39 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_22 = __shfl_xor_sync(0xFFFFFFFF, x2_38, 2);
+                unsigned int y2_40 = _shfl_xor_22;
+                unsigned int _shfl_xor_23 = __shfl_xor_sync(0xFFFFFFFF, x3_39, 2);
+                unsigned int y3_41 = _shfl_xor_23;
+                pk[0] = y2_40 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_40 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_41 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_41 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_10)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_v_25))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_o_11 = n0_c / 2 + 96 + lane_col;
+                unsigned int col_v_42 = n0_c / 2 + (12 + q_lane) * 8;
                 float _exp2_48 = approx_exp2(accum[96] * -1.4426950408889634f);
                 float _rcp_48 = approx_rcp(_exp2_48 + 1.0f);
                 float _exp2_49 = approx_exp2(accum[97] * -1.4426950408889634f);
                 float _rcp_49 = approx_rcp(_exp2_49 + 1.0f);
-                outv[0] = accum[96] * _rcp_48 * accum[112];
-                outv[1] = accum[97] * _rcp_49 * accum[113];
-                float _exp2_50 = approx_exp2(accum[98] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_24 = __float22bfloat162_rn(make_float2(accum[96] * _rcp_48 * accum[112], accum[97] * _rcp_49 * accum[113]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_24)[0];
+                float _exp2_50 = approx_exp2(accum[100] * -1.4426950408889634f);
                 float _rcp_50 = approx_rcp(_exp2_50 + 1.0f);
-                float _exp2_51 = approx_exp2(accum[99] * -1.4426950408889634f);
+                float _exp2_51 = approx_exp2(accum[101] * -1.4426950408889634f);
                 float _rcp_51 = approx_rcp(_exp2_51 + 1.0f);
-                outv[2] = accum[98] * _rcp_50 * accum[114];
-                outv[3] = accum[99] * _rcp_51 * accum[115];
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_11)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_11)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_12 = n0_c / 2 + 104 + lane_col;
-                float _exp2_52 = approx_exp2(accum[100] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_25 = __float22bfloat162_rn(make_float2(accum[100] * _rcp_50 * accum[116], accum[101] * _rcp_51 * accum[117]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_25)[0];
+                float _exp2_52 = approx_exp2(accum[104] * -1.4426950408889634f);
                 float _rcp_52 = approx_rcp(_exp2_52 + 1.0f);
-                float _exp2_53 = approx_exp2(accum[101] * -1.4426950408889634f);
+                float _exp2_53 = approx_exp2(accum[105] * -1.4426950408889634f);
                 float _rcp_53 = approx_rcp(_exp2_53 + 1.0f);
-                outv[0] = accum[100] * _rcp_52 * accum[116];
-                outv[1] = accum[101] * _rcp_53 * accum[117];
-                float _exp2_54 = approx_exp2(accum[102] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_26 = __float22bfloat162_rn(make_float2(accum[104] * _rcp_52 * accum[120], accum[105] * _rcp_53 * accum[121]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_26)[0];
+                float _exp2_54 = approx_exp2(accum[108] * -1.4426950408889634f);
                 float _rcp_54 = approx_rcp(_exp2_54 + 1.0f);
-                float _exp2_55 = approx_exp2(accum[103] * -1.4426950408889634f);
+                float _exp2_55 = approx_exp2(accum[109] * -1.4426950408889634f);
                 float _rcp_55 = approx_rcp(_exp2_55 + 1.0f);
-                outv[2] = accum[102] * _rcp_54 * accum[118];
-                outv[3] = accum[103] * _rcp_55 * accum[119];
+                __nv_bfloat162 _bf16x2_27 = __float22bfloat162_rn(make_float2(accum[108] * _rcp_54 * accum[124], accum[109] * _rcp_55 * accum[125]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_27)[0];
+                unsigned int x0_43 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_44 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_24 = __shfl_xor_sync(0xFFFFFFFF, x0_43, 1);
+                unsigned int y0_45 = _shfl_xor_24;
+                unsigned int _shfl_xor_25 = __shfl_xor_sync(0xFFFFFFFF, x1_44, 1);
+                unsigned int y1_46 = _shfl_xor_25;
+                pk[0] = y0_45 & m_odd | pk[0] & m_even;
+                pk[1] = y0_45 & m_even | pk[1] & m_odd;
+                pk[2] = y1_46 & m_odd | pk[2] & m_even;
+                pk[3] = y1_46 & m_even | pk[3] & m_odd;
+                unsigned int x2_47 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_48 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_26 = __shfl_xor_sync(0xFFFFFFFF, x2_47, 2);
+                unsigned int y2_49 = _shfl_xor_26;
+                unsigned int _shfl_xor_27 = __shfl_xor_sync(0xFFFFFFFF, x3_48, 2);
+                unsigned int y3_50 = _shfl_xor_27;
+                pk[0] = y2_49 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_49 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_50 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_50 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_12)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_v_42))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_12)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_13 = n0_c / 2 + 112 + lane_col;
-                float _exp2_56 = approx_exp2(accum[104] * -1.4426950408889634f);
+                float _exp2_56 = approx_exp2(accum[98] * -1.4426950408889634f);
                 float _rcp_56 = approx_rcp(_exp2_56 + 1.0f);
-                float _exp2_57 = approx_exp2(accum[105] * -1.4426950408889634f);
+                float _exp2_57 = approx_exp2(accum[99] * -1.4426950408889634f);
                 float _rcp_57 = approx_rcp(_exp2_57 + 1.0f);
-                outv[0] = accum[104] * _rcp_56 * accum[120];
-                outv[1] = accum[105] * _rcp_57 * accum[121];
-                float _exp2_58 = approx_exp2(accum[106] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_28 = __float22bfloat162_rn(make_float2(accum[98] * _rcp_56 * accum[114], accum[99] * _rcp_57 * accum[115]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_28)[0];
+                float _exp2_58 = approx_exp2(accum[102] * -1.4426950408889634f);
                 float _rcp_58 = approx_rcp(_exp2_58 + 1.0f);
-                float _exp2_59 = approx_exp2(accum[107] * -1.4426950408889634f);
+                float _exp2_59 = approx_exp2(accum[103] * -1.4426950408889634f);
                 float _rcp_59 = approx_rcp(_exp2_59 + 1.0f);
-                outv[2] = accum[106] * _rcp_58 * accum[122];
-                outv[3] = accum[107] * _rcp_59 * accum[123];
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_13)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_13)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_14 = n0_c / 2 + 120 + lane_col;
-                float _exp2_60 = approx_exp2(accum[108] * -1.4426950408889634f);
+                __nv_bfloat162 _bf16x2_29 = __float22bfloat162_rn(make_float2(accum[102] * _rcp_58 * accum[118], accum[103] * _rcp_59 * accum[119]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_29)[0];
+                float _exp2_60 = approx_exp2(accum[106] * -1.4426950408889634f);
                 float _rcp_60 = approx_rcp(_exp2_60 + 1.0f);
-                float _exp2_61 = approx_exp2(accum[109] * -1.4426950408889634f);
+                float _exp2_61 = approx_exp2(accum[107] * -1.4426950408889634f);
                 float _rcp_61 = approx_rcp(_exp2_61 + 1.0f);
-                outv[0] = accum[108] * _rcp_60 * accum[124];
-                outv[1] = accum[109] * _rcp_61 * accum[125];
+                __nv_bfloat162 _bf16x2_30 = __float22bfloat162_rn(make_float2(accum[106] * _rcp_60 * accum[122], accum[107] * _rcp_61 * accum[123]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_30)[0];
                 float _exp2_62 = approx_exp2(accum[110] * -1.4426950408889634f);
                 float _rcp_62 = approx_rcp(_exp2_62 + 1.0f);
                 float _exp2_63 = approx_exp2(accum[111] * -1.4426950408889634f);
                 float _rcp_63 = approx_rcp(_exp2_63 + 1.0f);
-                outv[2] = accum[110] * _rcp_62 * accum[126];
-                outv[3] = accum[111] * _rcp_63 * accum[127];
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_14)))[0]) = _pk;
-                    }
-                }
+                __nv_bfloat162 _bf16x2_31 = __float22bfloat162_rn(make_float2(accum[110] * _rcp_62 * accum[126], accum[111] * _rcp_63 * accum[127]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_31)[0];
+                unsigned int x0_51 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_52 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, x0_51, 1);
+                unsigned int y0_53 = _shfl_xor_28;
+                unsigned int _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, x1_52, 1);
+                unsigned int y1_54 = _shfl_xor_29;
+                pk[0] = y0_53 & m_odd | pk[0] & m_even;
+                pk[1] = y0_53 & m_even | pk[1] & m_odd;
+                pk[2] = y1_54 & m_odd | pk[2] & m_even;
+                pk[3] = y1_54 & m_even | pk[3] & m_odd;
+                unsigned int x2_55 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_56 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_30 = __shfl_xor_sync(0xFFFFFFFF, x2_55, 2);
+                unsigned int y2_57 = _shfl_xor_30;
+                unsigned int _shfl_xor_31 = __shfl_xor_sync(0xFFFFFFFF, x3_56, 2);
+                unsigned int y3_58 = _shfl_xor_31;
+                pk[0] = y2_57 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_57 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_58 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_58 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_14)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_v_42))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
             }
             tile_base_c = tile_base_c + n_tiles_e_c;

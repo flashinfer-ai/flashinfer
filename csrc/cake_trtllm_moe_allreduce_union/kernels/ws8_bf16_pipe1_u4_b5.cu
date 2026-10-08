@@ -32,7 +32,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(224, 5) __cluster_dims__(4,1,1) void
-kernel_cake_trtllm_moe_allreduce_union_ws8_bf16_pipe1_u4_b5(__nv_bfloat16* __restrict__ active_expert_tokens, float* __restrict__ expert_scales, __nv_bfloat16* __restrict__ token_input, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ gamma, __nv_bfloat16* __restrict__ moe_allreduce_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ quant_out, __nv_bfloat16* __restrict__ scale_out, long long* __restrict__ workspace_tensor, int* __restrict__ workspace_control, __nv_bfloat16* __restrict__ workspace_payload_0, __nv_bfloat16* __restrict__ workspace_payload_1, __nv_bfloat16* __restrict__ workspace_payload_2, __nv_bfloat16* __restrict__ workspace_payload_3, __nv_bfloat16* __restrict__ workspace_payload_4, __nv_bfloat16* __restrict__ workspace_payload_5, __nv_bfloat16* __restrict__ workspace_payload_6, __nv_bfloat16* __restrict__ workspace_payload_7, int world_rank, int tokens, int active_experts, float epsilon, float weight_bias, float scale_factor, int layout_code)
+kernel_cake_trtllm_moe_allreduce_union_ws8_bf16_pipe1_u4_b5(__nv_bfloat16* __restrict__ active_expert_tokens, float* __restrict__ expert_scales, __nv_bfloat16* __restrict__ token_input, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ gamma, __nv_bfloat16* __restrict__ moe_allreduce_out, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ norm_out, long long* __restrict__ workspace_tensor, int world_rank, int tokens, int active_experts, float epsilon, float weight_bias)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -40,11 +40,11 @@ kernel_cake_trtllm_moe_allreduce_union_ws8_bf16_pipe1_u4_b5(__nv_bfloat16* __res
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1030
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#else
+#if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
+#else
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 #endif
 
     const int bid = blockIdx.x;

@@ -15,7 +15,8 @@ limitations under the License.
 """
 
 import functools
-from pathlib import Path
+import json
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from . import env as jit_env
@@ -47,59 +48,59 @@ _CONTRACT_HEADER = "cake_warp_decode_contract.cuh"
 # directories hold the kernels that differ. The generated manifest header
 # declares every symbol listed here for the matching target.
 _COMMON_SOURCES: tuple[str, ...] = (
-    "cake_warp_decode_024bed5eb8061821a022_kernel.cu",
-    "cake_warp_decode_2943d5a4f443be1b5408_kernel.cu",
-    "cake_warp_decode_670effeafbee07071ec6_kernel.cu",
-    "cake_warp_decode_6b2146aa6e4e8f2e2161_kernel.cu",
-    "cake_warp_decode_857d1ba629d5d1813f19_kernel.cu",
-    "cake_warp_decode_87d1b6a9bbc9ece09ad6_kernel.cu",
-    "cake_warp_decode_8851303d75b4e1cec033_kernel.cu",
-    "cake_warp_decode_8d34c1c2891be9b66f15_kernel.cu",
-    "cake_warp_decode_9021eadecd3078bf13c5_kernel.cu",
-    "cake_warp_decode_ac22f4a6ae1ebaae1276_kernel.cu",
-    "cake_warp_decode_b5ee48ba618c8145d075_kernel.cu",
-    "cake_warp_decode_b8935d27ab092becf9a0_kernel.cu",
-    "cake_warp_decode_b9ce2c4ba5690e69450c_kernel.cu",
-    "cake_warp_decode_bbea84bc0aa6f631c01e_kernel.cu",
-    "cake_warp_decode_de1fffa0c9722d6f3dc2_kernel.cu",
-    "cake_warp_decode_e7c996a7418120fdc59d_kernel.cu",
-    "cake_warp_decode_fc102671dcafa54593ec_kernel.cu",
+    "cake_warp_decode_0686b950e5dc33f7f54f_kernel.cu",
+    "cake_warp_decode_2d89b2ccfa19074dd9fb_kernel.cu",
+    "cake_warp_decode_345efbf7077827bc328e_kernel.cu",
+    "cake_warp_decode_3aa297e8ff45f1333ec9_kernel.cu",
+    "cake_warp_decode_510ad9e9035da24674b6_kernel.cu",
+    "cake_warp_decode_514c77f65f72ffd8d0a5_kernel.cu",
+    "cake_warp_decode_5312a73885ff3541a6b6_kernel.cu",
+    "cake_warp_decode_5c23234a34054124f4ce_kernel.cu",
+    "cake_warp_decode_61f9c98fb7c8656ae154_kernel.cu",
+    "cake_warp_decode_7d6f94378c1107da3804_kernel.cu",
+    "cake_warp_decode_8388b2049117830020f2_kernel.cu",
+    "cake_warp_decode_8acc0c77f5b6d2888496_kernel.cu",
+    "cake_warp_decode_958ca99134107b938d76_kernel.cu",
+    "cake_warp_decode_9ace9f7e5e0c273ae879_kernel.cu",
+    "cake_warp_decode_a11aa740b9780f90e7ee_kernel.cu",
+    "cake_warp_decode_a3292d8194689829d62c_kernel.cu",
+    "cake_warp_decode_a57e715fd2682ae22fe1_kernel.cu",
+    "cake_warp_decode_b0e329ce4c715a895df4_kernel.cu",
+    "cake_warp_decode_de0e5a68a49864417599_kernel.cu",
 )
 _SM100A_SOURCES: tuple[str, ...] = (
-    "cake_warp_decode_1919fdc835c6d5747044_kernel.cu",
-    "cake_warp_decode_36c3fc6de7aff6664eb4_kernel.cu",
-    "cake_warp_decode_571467f2fe1a078edd15_kernel.cu",
-    "cake_warp_decode_8aa1d75a331e184994b1_kernel.cu",
-    "cake_warp_decode_8aec1074daa9fa51c03c_kernel.cu",
-    "cake_warp_decode_913a821ce8dee11dafcf_kernel.cu",
-    "cake_warp_decode_9bba0f8393c3f5c41338_kernel.cu",
-    "cake_warp_decode_aacea66676dc5e3ed74d_kernel.cu",
-    "cake_warp_decode_ab11eefabf140deeaf0c_kernel.cu",
-    "cake_warp_decode_b1f32bc0ea0d0dbbf453_kernel.cu",
-    "cake_warp_decode_c2c3b32fdd0cd7ae0c4c_kernel.cu",
-    "cake_warp_decode_d17899c336800a8599a6_kernel.cu",
-    "cake_warp_decode_df32a9c78cd8ea22ac78_kernel.cu",
-    "cake_warp_decode_e465613750770e29988f_kernel.cu",
-    "cake_warp_decode_fc0aed4e58408740ce2a_kernel.cu",
+    "cake_warp_decode_045dba6ecaaa5f878a96_kernel.cu",
+    "cake_warp_decode_0aeb22c5851fb0a20bfb_kernel.cu",
+    "cake_warp_decode_2355e31771baf48971ec_kernel.cu",
+    "cake_warp_decode_2dd7cc6dccb82323247b_kernel.cu",
+    "cake_warp_decode_56ddbbdf57cdb02ccd29_kernel.cu",
+    "cake_warp_decode_6aee17fe7c1c9a9fbc4f_kernel.cu",
+    "cake_warp_decode_6b5216f21144ca9c3cec_kernel.cu",
+    "cake_warp_decode_7f06ba61ca2fcfe503d1_kernel.cu",
+    "cake_warp_decode_a4ab70bb923f293f6c03_kernel.cu",
+    "cake_warp_decode_b451f69ab3b063de0072_kernel.cu",
+    "cake_warp_decode_c6e324e2d43c0e98cca8_kernel.cu",
+    "cake_warp_decode_ebcaf3ae004497a9132f_kernel.cu",
+    "cake_warp_decode_f4eb1d54caa22ccfeb83_kernel.cu",
+    "cake_warp_decode_f5eac8f9332dd5595fce_kernel.cu",
+    "cake_warp_decode_fc64115f77142914c771_kernel.cu",
 )
 _SM103A_SOURCES: tuple[str, ...] = (
-    "cake_warp_decode_0d07af7cfe5697b5ecdc_kernel.cu",
-    "cake_warp_decode_269d5aebbb5aa995796a_kernel.cu",
-    "cake_warp_decode_36ef13a3551d497679cd_kernel.cu",
-    "cake_warp_decode_3b1c1adc59f3837a48a4_kernel.cu",
-    "cake_warp_decode_3f5bc27d007af5687d63_kernel.cu",
-    "cake_warp_decode_49b2dacb8c21fd7ca1c6_kernel.cu",
-    "cake_warp_decode_64b75a49bc729f82a995_kernel.cu",
-    "cake_warp_decode_65d8dc9a2b51bca5f578_kernel.cu",
-    "cake_warp_decode_7173b39130de7a59f9c6_kernel.cu",
-    "cake_warp_decode_7e715939a26489a27fcb_kernel.cu",
-    "cake_warp_decode_7fc08d4a160ade893bda_kernel.cu",
-    "cake_warp_decode_8bce1085cbf8aaa7c7f6_kernel.cu",
-    "cake_warp_decode_9805c54bf6db2ee12595_kernel.cu",
-    "cake_warp_decode_b0f548cc0bc03def0160_kernel.cu",
-    "cake_warp_decode_b47db4977f3026b27967_kernel.cu",
-    "cake_warp_decode_b84333fbc5c6282202d1_kernel.cu",
-    "cake_warp_decode_e2796e299356440aa3e4_kernel.cu",
+    "cake_warp_decode_16387cc0de2abce13ade_kernel.cu",
+    "cake_warp_decode_31a3880ae8e28c314b6e_kernel.cu",
+    "cake_warp_decode_372605d6f63db4b97d71_kernel.cu",
+    "cake_warp_decode_3754ea7477cc2b195d70_kernel.cu",
+    "cake_warp_decode_5304d683b9d7578df0b1_kernel.cu",
+    "cake_warp_decode_55b2995635e0b6aa2b52_kernel.cu",
+    "cake_warp_decode_57d9c60cbe65cd74f52d_kernel.cu",
+    "cake_warp_decode_6a78714a458f2b53e363_kernel.cu",
+    "cake_warp_decode_707580ee046c8424e63f_kernel.cu",
+    "cake_warp_decode_ae864980eb4b1aa0e8c1_kernel.cu",
+    "cake_warp_decode_af89090fc3cdb3814f96_kernel.cu",
+    "cake_warp_decode_b3500b8b821383793dfd_kernel.cu",
+    "cake_warp_decode_c5afe5ba09998bcee409_kernel.cu",
+    "cake_warp_decode_ca90fcc9f37486b6d2af_kernel.cu",
+    "cake_warp_decode_e2e6dc8e54d3325b2362_kernel.cu",
 )
 _TARGET_SOURCES: dict[CakeWarpDecodeTarget, tuple[tuple[str, tuple[str, ...]], ...]] = {
     "sm100a": (("common", _COMMON_SOURCES), ("sm_100a", _SM100A_SOURCES)),
@@ -107,7 +108,7 @@ _TARGET_SOURCES: dict[CakeWarpDecodeTarget, tuple[tuple[str, tuple[str, ...]], .
 }
 # Every device TU compiles with fast math except the SiTU static FC1 kernel.
 _NO_FAST_MATH_SOURCES: frozenset[str] = frozenset(
-    ["cake_warp_decode_bbea84bc0aa6f631c01e_kernel.cu"]
+    ["cake_warp_decode_958ca99134107b938d76_kernel.cu"]
 )
 
 
@@ -166,6 +167,130 @@ def _device_sources(csrc_dir: Path, target: CakeWarpDecodeTarget) -> list[Path]:
     return sources
 
 
+def _require_dict(value: Any, context: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Cake warp-decode export manifest {context} must be an object"
+        )
+    return value
+
+
+def _resolve_export_path(csrc_dir: Path, raw_path: Any, context: str) -> Path:
+    if not isinstance(raw_path, str) or not raw_path or "\\" in raw_path:
+        raise ValueError(
+            f"Cake warp-decode export manifest {context} must be a non-empty POSIX path"
+        )
+    parts = raw_path.split("/")
+    posix_path = PurePosixPath(raw_path)
+    if posix_path.is_absolute() or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(
+            f"Cake warp-decode export manifest {context} is not a safe relative path: "
+            f"{raw_path!r}"
+        )
+
+    repo_root = csrc_dir.parents[2].resolve()
+    resolved = (repo_root / Path(*posix_path.parts)).resolve()
+    try:
+        resolved.relative_to(repo_root)
+    except ValueError as error:
+        raise ValueError(
+            f"Cake warp-decode export manifest {context} escapes the package root: "
+            f"{raw_path!r}"
+        ) from error
+    if not resolved.is_file():
+        raise FileNotFoundError(
+            f"Cake warp-decode export manifest {context} source not found: {resolved}"
+        )
+    return resolved
+
+
+def _load_clamped_e256_sources(
+    csrc_dir: Path, target: CakeWarpDecodeTarget
+) -> list[Path]:
+    """Enable the SM100 extension only with its complete generated inventory."""
+    if target != "sm100a":
+        return []
+    directory = csrc_dir / "generated" / "dsv4_clamped_e256"
+    manifest_path = directory / "module_manifest.json"
+    if not manifest_path.is_file():
+        return []
+    manifest = _require_dict(
+        json.loads(manifest_path.read_text()), "clamped E256 modules"
+    )
+    if manifest.get("schema_version") != 1 or manifest.get("target") != "sm_100a":
+        raise ValueError("Clamped E256 inventory requires schema 1 and exact sm_100a")
+    modules = manifest.get("modules")
+    if not isinstance(modules, list) or len(modules) != 15:
+        raise ValueError("Clamped E256 inventory must contain its 15 selected modules")
+    paths: list[Path] = []
+    identifiers: set[str] = set()
+    for module in modules:
+        module = _require_dict(module, "clamped E256 module")
+        identity = module.get("id")
+        filename = module.get("file")
+        if (
+            not isinstance(identity, str)
+            or identity in identifiers
+            or not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not filename.endswith(".cu")
+        ):
+            raise ValueError("Clamped E256 module identity/source path is invalid")
+        if module.get("compile_options") != ["--use_fast_math"]:
+            raise ValueError(
+                "Clamped E256 module compile options differ from the selected source"
+            )
+        if module.get("pdl") is not True or module.get("cooperative") is not False:
+            raise ValueError(
+                "Clamped E256 requires non-cooperative programmatic dependent launch"
+            )
+        identifiers.add(identity)
+        paths.append(
+            _resolve_export_path(
+                csrc_dir,
+                "csrc/fused_moe/warp_decode/generated/dsv4_clamped_e256/" + filename,
+                "clamped E256 device source",
+            )
+        )
+    if len(set(paths)) != len(paths):
+        raise ValueError("Clamped E256 inventory repeats a device source")
+    for filename in (
+        "declarations.cuh",
+        "dsv4_clamped_e256_manifest.cuh",
+        "route_metadata.json",
+    ):
+        if not (directory / filename).is_file():
+            raise FileNotFoundError(
+                f"Clamped E256 generated source missing: {directory / filename}"
+            )
+    routes = _require_dict(
+        json.loads((directory / "route_metadata.json").read_text()),
+        "clamped E256 routes",
+    )
+    rows = routes.get("routes")
+    if (
+        routes.get("schema_version") != 1
+        or not isinstance(rows, list)
+        or [row.get("T") for row in rows] != list(range(1, 33))
+    ):
+        raise ValueError("Clamped E256 inventory must cover every token count 1..32")
+    used: set[str] = set()
+    for row in rows:
+        calls = row.get("launches")
+        expected = 3 if row["T"] <= 6 else 4
+        if not isinstance(calls, list) or len(calls) != expected:
+            raise ValueError("Clamped E256 route has an incomplete launch sequence")
+        for order, call in enumerate(calls):
+            if call.get("order") != order or call.get("module_id") not in identifiers:
+                raise ValueError(
+                    "Clamped E256 route references a missing or unordered module"
+                )
+            used.add(call["module_id"])
+    if used != identifiers:
+        raise ValueError("Clamped E256 inventory contains an unselected module")
+    return paths
+
+
 def get_cake_fused_moe_warp_decode_uri(
     target: CakeWarpDecodeTarget = "sm103a",
 ) -> str:
@@ -185,7 +310,8 @@ def gen_cake_fused_moe_warp_decode_module(
     uri = get_cake_fused_moe_warp_decode_uri(target)
     csrc_dir = _get_cake_fused_moe_warp_decode_csrc_dir()
     generated_dir = csrc_dir / "generated"
-    device_sources = _device_sources(csrc_dir, target)
+    clamped_sources = _load_clamped_e256_sources(csrc_dir, target)
+    device_sources = [*_device_sources(csrc_dir, target), *clamped_sources]
     for source in (
         csrc_dir / _BINDING_SOURCE,
         generated_dir / _GENERATED_MANIFEST,
@@ -197,6 +323,7 @@ def gen_cake_fused_moe_warp_decode_module(
     target_flags = [
         *_TARGET_FLAGS[target],
         f"-DFLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR={_TARGET_MINOR[target]}",
+        f"-DFLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256={int(bool(clamped_sources))}",
     ]
     spec = gen_jit_spec(
         name=uri,

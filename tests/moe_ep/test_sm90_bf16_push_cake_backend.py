@@ -13,6 +13,7 @@ Single-GPU tests run under plain pytest; the EP2+ tests need
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -53,6 +54,11 @@ TOP_K = 2
 TOKEN_CAPACITY = 64
 ATOL = 1e-2
 RTOL = 1e-2
+# combine wire formats of the backend (see cake_config.py): the pre-reduced wire is
+# the default, the per-route wire is the round-1 format kept for A/B comparison.
+WIRES = ("prereduced", "prereduced_hilo", "per_route")
+# optional JSON-lines sink of every _check() statistic (precision table input)
+PRECISION_LOG_ENV = "SM90_BF16_PUSH_CAKE_PRECISION_LOG"
 
 _KEEP_ALIVE: list[object] = []
 
@@ -82,7 +88,7 @@ def _make_inputs(
     rank: int = 0,
     world_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Routing patterns: random | hot | all_remote | dup_rank | masked | empty_rank."""
+    """Routing patterns: random | hot | all_remote | dup_rank | dup_remote | all_local | masked | empty_rank."""
     generator = torch.Generator(device="cpu").manual_seed(seed)
     x = torch.randn(num_tokens, HIDDEN, generator=generator).to(
         device=device, dtype=torch.bfloat16
@@ -94,9 +100,17 @@ def _make_inputs(
     elif mode == "all_remote" and num_experts > LOCAL_EXPERTS:
         logits[:, local_start : local_start + LOCAL_EXPERTS] = float("-inf")
         ids = logits.topk(TOP_K, dim=1).indices.to(torch.int32)
-    elif mode == "dup_rank":
-        # every route of a token lands on one rank (exercises dedup dispatch)
-        owner = torch.randint(0, world_size, (num_tokens,), generator=generator)
+    elif mode in ("dup_rank", "dup_remote", "all_local"):
+        # every route of a token lands on ONE rank (dedup dispatch; the pre-reduced
+        # combine wire folds all of them into a single row): any rank | a remote
+        # rank only | this rank only
+        if mode == "all_local" or world_size == 1:
+            owner = torch.full((num_tokens,), rank, dtype=torch.int64)
+        elif mode == "dup_remote":
+            owner = torch.randint(0, world_size - 1, (num_tokens,), generator=generator)
+            owner = owner + (owner >= rank).to(torch.int64)  # skip this rank
+        else:
+            owner = torch.randint(0, world_size, (num_tokens,), generator=generator)
         base = owner * LOCAL_EXPERTS
         offs = torch.stack(
             [
@@ -126,6 +140,8 @@ def _build_layer(
     dedup_dispatch: bool = True,
     capacity_factor: float = 1.0,
     clamp_limit: float | None = None,
+    combine_wire: str | None = None,
+    token_capacity: int = TOKEN_CAPACITY,
     seed: int = 7,
 ):
     from flashinfer.moe_ep import (
@@ -152,7 +168,7 @@ def _build_layer(
         ),
         fleet_params=FleetParams(
             num_experts=total_experts,
-            max_tokens_per_rank=TOKEN_CAPACITY,
+            max_tokens_per_rank=token_capacity,
             token_hidden_size=HIDDEN,
         ),
         weights=MoEWeightPack(
@@ -166,6 +182,7 @@ def _build_layer(
                 capacity_factor=capacity_factor,
                 dedup_dispatch=dedup_dispatch,
                 clamp_limit=clamp_limit,
+                combine_wire=combine_wire,
             ),
             quantize_input=True,
             preprocess_weights=True,
@@ -207,32 +224,60 @@ def _check(
         f"[sm90_bf16_push_cake]{label} vs bf16-contract ref: {stats}; vs fp32 ref: {stats_fp32}",
         flush=True,
     )
+    log_path = os.environ.get(PRECISION_LOG_ENV, "").strip()
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "label": label.strip(),
+                        "num_tokens": int(x.shape[0]),
+                        "vs_bf16_ref": stats,
+                        "vs_fp32_ref": stats_fp32,
+                    }
+                )
+                + "\n"
+            )
     assert stats["mismatches"] == 0, f"{label}: {stats} (atol={ATOL}, rtol={RTOL})"
     return stats
 
 
 # --------------------------------------------------------------------------- EP1
 @requires_sm90
+@pytest.mark.parametrize("wire", WIRES)
 @pytest.mark.parametrize("dedup_dispatch", [True, False])
-def test_ep1_forward_repeated_and_deterministic(dedup_dispatch: bool) -> None:
+def test_ep1_forward_repeated_and_deterministic(
+    dedup_dispatch: bool, wire: str
+) -> None:
     device = torch.device("cuda", 0)
-    layer, w13, w2 = _build_layer(1, 0, device, dedup_dispatch=dedup_dispatch)
+    layer, w13, w2 = _build_layer(
+        1, 0, device, dedup_dispatch=dedup_dispatch, combine_wire=wire
+    )
     x, ids, weights = _make_inputs(TOKEN_CAPACITY, LOCAL_EXPERTS, 11, device)
     outputs = []
     for _ in range(3):
         outputs.append(_forward(layer, x, ids, weights).clone())
         torch.cuda.synchronize()
-    _check(outputs[0], x, ids, weights, w13, w2, label=f" ep1 dedup={dedup_dispatch}")
+    _check(
+        outputs[0],
+        x,
+        ids,
+        weights,
+        w13,
+        w2,
+        label=f" ep1 {wire} dedup={dedup_dispatch}",
+    )
     # bitwise run-to-run determinism (recorded; the kernels have a fixed reduction order)
     for repeat in outputs[1:]:
         assert torch.equal(repeat, outputs[0])
 
 
 @requires_sm90
+@pytest.mark.parametrize("wire", WIRES)
 @pytest.mark.parametrize("case", ["short", "masked", "hot", "empty", "dup_rank"])
-def test_ep1_edge_routes(case: str) -> None:
+def test_ep1_edge_routes(case: str, wire: str) -> None:
     device = torch.device("cuda", 0)
-    layer, w13, w2 = _build_layer(1, 0, device)
+    layer, w13, w2 = _build_layer(1, 0, device, combine_wire=wire)
     if case == "empty":
         num_tokens = 0
     elif case == "short":
@@ -245,12 +290,83 @@ def test_ep1_edge_routes(case: str) -> None:
     torch.cuda.synchronize()
     assert output.shape == (num_tokens, HIDDEN)
     if num_tokens:
-        _check(output, x, ids, weights, w13, w2, label=f" ep1 {case}")
+        _check(output, x, ids, weights, w13, w2, label=f" ep1 {wire} {case}")
     # the layer keeps working after an edge round
     x2, ids2, weights2 = _make_inputs(TOKEN_CAPACITY, LOCAL_EXPERTS, 22, device)
     output2 = _forward(layer, x2, ids2, weights2)
     torch.cuda.synchronize()
-    _check(output2, x2, ids2, weights2, w13, w2, label=f" ep1 {case} recovery")
+    _check(output2, x2, ids2, weights2, w13, w2, label=f" ep1 {wire} {case} recovery")
+
+
+@requires_sm90
+def _find_runner(root, class_name="Sm90CakeBf16MoERunner", max_depth=8):
+    """Locate the runner inside the layer's object graph (bounded BFS)."""
+    seen: set[int] = set()
+    frontier = [(root, 0)]
+    while frontier:
+        obj, depth = frontier.pop(0)
+        if id(obj) in seen or depth > max_depth:
+            continue
+        seen.add(id(obj))
+        if type(obj).__name__ == class_name:
+            return obj
+        if isinstance(obj, dict):
+            children = list(obj.values())
+        elif isinstance(obj, (list, tuple, set)):
+            children = list(obj)
+        else:
+            try:
+                children = list(vars(obj).values())
+            except TypeError:
+                children = []
+        frontier.extend((child, depth + 1) for child in children)
+    return None
+
+
+@requires_sm90
+@pytest.mark.parametrize(
+    "token_capacity, env, expected",
+    [
+        # distinct token capacities per case: the mega workspace pool is keyed
+        # per process on (max_tokens_per_rank, config) and the wire is resolved
+        # when the pooled runner is built, so a reused workspace would report
+        # the wire of the case that created it
+        (8, None, "per_route"),
+        (9, None, "prereduced"),
+        (TOKEN_CAPACITY, None, "prereduced"),
+        (7, "prereduced", "prereduced"),
+        (65, "per_route", "per_route"),
+    ],
+)
+def test_ep1_combine_wire_per_shape_default(
+    token_capacity: int, env: str | None, expected: str, monkeypatch
+) -> None:
+    """combine_wire=None: the environment override wins when set; otherwise the
+    per-shape default picks per_route for max_tokens_per_rank <= 8 and
+    prereduced above.  The output stays correct either way."""
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe import (
+        COMBINE_WIRE_ENV,
+        COMBINE_WIRE_PER_SHAPE_MAX_TOKENS,
+    )
+
+    assert COMBINE_WIRE_PER_SHAPE_MAX_TOKENS == 8
+    if env is None:
+        monkeypatch.delenv(COMBINE_WIRE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(COMBINE_WIRE_ENV, env)
+    device = torch.device("cuda", 0)
+    layer, w13, w2 = _build_layer(
+        1, 0, device, combine_wire=None, token_capacity=token_capacity, seed=31
+    )
+    x, ids, weights = _make_inputs(
+        token_capacity, LOCAL_EXPERTS, 31, device, mode="random"
+    )
+    output = _forward(layer, x, ids, weights)
+    torch.cuda.synchronize()
+    _check(output, x, ids, weights, w13, w2, label=f" per-shape t_cap={token_capacity}")
+    runner = _find_runner(layer)
+    assert runner is not None
+    assert runner.combine_wire == expected
 
 
 @requires_sm90
@@ -374,9 +490,10 @@ def test_grouped_gemm_guards_reject_misaligned_and_oversized_geometry() -> None:
 
 
 @requires_sm90
-def test_ep1_graph_replay() -> None:
+@pytest.mark.parametrize("wire", WIRES)
+def test_ep1_graph_replay(wire: str) -> None:
     device = torch.device("cuda", 0)
-    layer, w13, w2 = _build_layer(1, 0, device)
+    layer, w13, w2 = _build_layer(1, 0, device, combine_wire=wire)
     inputs = [
         _make_inputs(TOKEN_CAPACITY, LOCAL_EXPERTS, 51 + index, device)
         for index in range(2)
@@ -410,7 +527,15 @@ def test_ep1_graph_replay() -> None:
     assert not torch.equal(replayed[0], replayed[1])
     for index, (x, ids, weights) in enumerate(inputs):
         assert torch.equal(replayed[index], eager[index])
-        _check(replayed[index], x, ids, weights, w13, w2, label=f" ep1 graph[{index}]")
+        _check(
+            replayed[index],
+            x,
+            ids,
+            weights,
+            w13,
+            w2,
+            label=f" ep1 {wire} graph[{index}]",
+        )
 
 
 @requires_sm90
@@ -487,18 +612,29 @@ def _dist_setup() -> tuple[int, int]:
 
 
 @requires_dist
+@pytest.mark.parametrize("wire", WIRES)
 @pytest.mark.parametrize(
-    "mode", ["random", "all_remote", "hot", "masked", "dup_rank", "empty_rank"]
+    "mode",
+    [
+        "random",
+        "all_remote",
+        "hot",
+        "masked",
+        "dup_rank",
+        "dup_remote",
+        "all_local",
+        "empty_rank",
+    ],
 )
 @pytest.mark.parametrize("dedup_dispatch", [True, False])
-def test_ep_forward_modes(mode: str, dedup_dispatch: bool) -> None:
+def test_ep_forward_modes(mode: str, dedup_dispatch: bool, wire: str) -> None:
     import torch.distributed as dist
 
     rank, world_size = _dist_setup()
     device = torch.device("cuda", rank)
     total_experts = LOCAL_EXPERTS * world_size
     layer, w13, w2 = _build_layer(
-        world_size, rank, device, dedup_dispatch=dedup_dispatch
+        world_size, rank, device, dedup_dispatch=dedup_dispatch, combine_wire=wire
     )
     x, ids, weights = _make_inputs(
         TOKEN_CAPACITY,
@@ -520,10 +656,55 @@ def test_ep_forward_modes(mode: str, dedup_dispatch: bool) -> None:
         weights,
         w13,
         w2,
-        label=f" ep{world_size} rank{rank} {mode} dedup={dedup_dispatch}",
+        label=f" ep{world_size} rank{rank} {wire} {mode} dedup={dedup_dispatch}",
     )
     for repeat in outputs[1:]:
         assert torch.equal(repeat, outputs[0])
+    dist.barrier()
+
+
+@requires_dist
+def test_ep_combine_wire_mismatch_raises() -> None:
+    """The combine wire is a cross-rank contract: a mixed pipe must fail on every rank."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    wire = WIRES[-1] if rank == 0 else WIRES[0]
+    x, ids, weights = _make_inputs(
+        TOKEN_CAPACITY, LOCAL_EXPERTS * world_size, 23 + rank, device, mode="random"
+    )
+    with pytest.raises(Exception, match="combine_wire"):
+        # A distinct max_tokens_per_rank gives this layer a fresh process-level
+        # workspace-pool key on every rank: the pipe + runner (and with them the
+        # cross-rank combine_wire handshake) are created lazily by the first
+        # forward, and a pooled workspace of an earlier test would be reused
+        # without any handshake.  Every rank raises together (guarded phase).
+        mixed, _w13, _w2 = _build_layer(
+            world_size,
+            rank,
+            device,
+            combine_wire=wire,
+            token_capacity=TOKEN_CAPACITY // 2,
+            seed=23,
+        )
+        half = TOKEN_CAPACITY // 2
+        _forward(mixed, x[:half], ids[:half], weights[:half])
+        torch.cuda.synchronize()
+    dist.barrier()
+    # the process keeps working: a consistent pipe after the rejected one
+    layer, w13, w2 = _build_layer(world_size, rank, device, seed=23)
+    output = _forward(layer, x, ids, weights)
+    torch.cuda.synchronize()
+    _check(
+        output,
+        x,
+        ids,
+        weights,
+        w13,
+        w2,
+        label=f" ep{world_size} rank{rank} after-mismatch",
+    )
     dist.barrier()
 
 
@@ -564,13 +745,14 @@ def test_ep_init_timeout_is_restored_after_workspace_setup() -> None:
 
 
 @requires_dist
-def test_ep_uneven_tokens_and_recovery() -> None:
+@pytest.mark.parametrize("wire", WIRES)
+def test_ep_uneven_tokens_and_recovery(wire: str) -> None:
     import torch.distributed as dist
 
     rank, world_size = _dist_setup()
     device = torch.device("cuda", rank)
     total_experts = LOCAL_EXPERTS * world_size
-    layer, w13, w2 = _build_layer(world_size, rank, device)
+    layer, w13, w2 = _build_layer(world_size, rank, device, combine_wire=wire)
     # rank 0 sends nothing; the others use a token count that is not a tile multiple
     num_tokens = 0 if rank == 0 else max(TOKEN_CAPACITY - 13 * rank, 1)
     x, ids, weights = _make_inputs(
@@ -581,7 +763,13 @@ def test_ep_uneven_tokens_and_recovery() -> None:
     assert output.shape == (num_tokens, HIDDEN)
     if num_tokens:
         _check(
-            output, x, ids, weights, w13, w2, label=f" ep{world_size} rank{rank} uneven"
+            output,
+            x,
+            ids,
+            weights,
+            w13,
+            w2,
+            label=f" ep{world_size} rank{rank} {wire} uneven",
         )
     x2, ids2, weights2 = _make_inputs(
         TOKEN_CAPACITY,
@@ -600,19 +788,20 @@ def test_ep_uneven_tokens_and_recovery() -> None:
         weights2,
         w13,
         w2,
-        label=f" ep{world_size} rank{rank} recovery",
+        label=f" ep{world_size} rank{rank} {wire} recovery",
     )
     dist.barrier()
 
 
 @requires_dist
-def test_ep_graph_replay() -> None:
+@pytest.mark.parametrize("wire", WIRES)
+def test_ep_graph_replay(wire: str) -> None:
     import torch.distributed as dist
 
     rank, world_size = _dist_setup()
     device = torch.device("cuda", rank)
     total_experts = LOCAL_EXPERTS * world_size
-    layer, w13, w2 = _build_layer(world_size, rank, device)
+    layer, w13, w2 = _build_layer(world_size, rank, device, combine_wire=wire)
     inputs = [
         _make_inputs(
             TOKEN_CAPACITY,
@@ -662,6 +851,6 @@ def test_ep_graph_replay() -> None:
             weights,
             w13,
             w2,
-            label=f" ep{world_size} rank{rank} graph[{index}]",
+            label=f" ep{world_size} rank{rank} {wire} graph[{index}]",
         )
     dist.barrier()

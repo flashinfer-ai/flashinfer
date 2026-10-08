@@ -31,7 +31,7 @@ def _get_module():
 
 @register_custom_op(
     "flashinfer::minimax_h3_bf16_pre_attention",
-    mutates_args=("out",),
+    mutates_args=("workspace", "out"),
 )
 def _minimax_h3_bf16_pre_attention_impl(
     x: torch.Tensor,
@@ -44,6 +44,7 @@ def _minimax_h3_bf16_pre_attention_impl(
     k_norm_weight: torch.Tensor,
     rope_cos_sin: torch.Tensor,
     rope_positions: torch.Tensor,
+    workspace: torch.Tensor,
     out: torch.Tensor,
     m: int,
     ulysses_degree: int,
@@ -52,7 +53,9 @@ def _minimax_h3_bf16_pre_attention_impl(
 ) -> None:
     # TVM-FFI argument order of the generated host tail: the AdaLN row count
     # and row stride are read from the ``adaln_scale`` / ``adaln_shift``
-    # TensorViews, the RoPE cache row count from ``rope_cos_sin``.
+    # TensorViews, the RoPE cache row count from ``rope_cos_sin``; the host
+    # tail launches the norm/AdaLN kernel into ``workspace`` and the QKV GEMM
+    # (with the fused Q/K RMSNorm, RoPE and pack epilogue) into ``out``.
     _get_module().minimax_h3_bf16_pre_attention(
         x,
         x_norm_weight,
@@ -64,6 +67,7 @@ def _minimax_h3_bf16_pre_attention_impl(
         k_norm_weight,
         rope_cos_sin,
         rope_positions,
+        workspace,
         out,
         m,
         ulysses_degree,
@@ -84,6 +88,7 @@ def _minimax_h3_bf16_pre_attention_fake(
     k_norm_weight: torch.Tensor,
     rope_cos_sin: torch.Tensor,
     rope_positions: torch.Tensor,
+    workspace: torch.Tensor,
     out: torch.Tensor,
     m: int,
     ulysses_degree: int,

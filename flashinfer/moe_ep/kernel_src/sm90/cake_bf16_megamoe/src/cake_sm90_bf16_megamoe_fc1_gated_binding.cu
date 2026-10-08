@@ -28,7 +28,7 @@
 extern "C" __global__ void kernel_cake_sm90_bf16_megamoe_fc1_gated(unsigned int num_experts, unsigned int shape_n, unsigned int shape_k, float clamp_limit, const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap W, long long* __restrict__ offsets, __nv_bfloat16* __restrict__ D);
 
 
-namespace cake_host_shim_ea0f2b6888e54d87 {
+namespace cake_host_shim_eb8949ca791e3b41 {
 
 using tvm::ffi::TensorView;
 
@@ -144,7 +144,14 @@ inline CUtensorMap EncodeTma_W(const TensorView& t) {
 void Run(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, double arg_clamp_limit, TensorView arg_A, TensorView arg_W, TensorView arg_offsets, TensorView arg_D, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_A.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
-  TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));  // binds the context for the encoders
+  {
+    // Bind the primary context for the tensor-map encoders once per thread and device.
+    static thread_local int encoder_context_device = -1;
+    if (encoder_context_device != dev.device_id) {
+      TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));
+      encoder_context_device = dev.device_id;
+    }
+  }
   TVM_FFI_CHECK(arg_num_experts >= 0LL && arg_num_experts <= 4294967295LL, ValueError)
       << "scalar 'num_experts' value " << arg_num_experts
       << " is outside u32 range [0, 4294967295]";
@@ -216,6 +223,6 @@ void Run(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, doub
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_ea0f2b6888e54d87
+}  // namespace cake_host_shim_eb8949ca791e3b41
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_ea0f2b6888e54d87::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_eb8949ca791e3b41::Run);
