@@ -190,7 +190,7 @@ class _Program:
         self.entry = entry
         self.plan = plan
         # The argument order bound once: (True, grid axis) for the grid scalars, (False, argument name) otherwise.
-        self.slots = tuple(
+        self.slots: tuple[tuple[bool, Any], ...] = tuple(
             (kind == "grid", _GRID_AXES[argument] if kind == "grid" else argument)
             for kind, argument in plan
         )
@@ -1425,7 +1425,7 @@ def plan_proxy_score_prefill(
         stages=_PXP_STAGES,
         n_mtiles=n_mtiles,
         nsplit=nsplit,
-        lpt=form["lpt"],
+        lpt=bool(form["lpt"]),
     )
 
 
