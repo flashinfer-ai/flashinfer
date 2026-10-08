@@ -572,6 +572,29 @@ CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES: dict[str, dict[int, str]] = {
     "sm_103a": {192: "vec8r56"}
 }
 
+# Architectures whose calibration does not follow the shared bands carry a
+# complete band table of their own (mirrors Cake's ``BF16_T1_ROUTE_ARCH_BANDS``).
+# sm_107a (Rubin R200, 212 SMs): calibrated on R200 against the per-row fastest
+# of the ten admitted (body, TILE_V) instances over the 94 Qwen3.5 serving rows
+# plus 17 synthetic batches (CAKE-1096); the shared table costs 1.064x of the
+# per-row fastest there (1.268x at 1536 state heads), this table 1.001x.  The
+# ``vec8occ`` instance at TILE_V=16 leads below 192 heads (one wave of 128-row
+# CTAs; ``vec8``/``vec8r56`` 0.4-3.3 % behind), TILE_V=32 takes over at 193-256
+# (``vec8``) and 257-368 / 417-3072 heads (``vec8occ``), 369-416 heads return to
+# ``vec8occ`` at TILE_V=16, and the wide 128-row body only wins above 3072 heads
+# (the shared table hands over at 768).
+CAKE_GDN_BF16_T1_ROUTE_ARCH_BANDS: dict[str, tuple[tuple[int | None, str, int], ...]] = {
+    "sm_107a": (
+        (192, "vec8occ", 16),
+        (256, "vec8", 32),
+        (368, "vec8occ", 32),
+        (416, "vec8occ", 16),
+        (768, "vec8", 32),
+        (3072, "vec8occ", 32),
+        (None, "wide", 128),
+    ),
+}
+
 
 def cake_gdn_bf16_t1_route(
     batch_size: int, num_v_heads: int, arch: CakeGDNArch
@@ -579,12 +602,14 @@ def cake_gdn_bf16_t1_route(
     """``(body, TILE_V)`` of the BF16-state T=1 decode route for ``batch_size * num_v_heads`` state heads on ``arch``."""
 
     state_heads = int(batch_size) * int(num_v_heads)
-    for max_state_heads, body, tile_v in CAKE_GDN_BF16_T1_ROUTE_BANDS:
+    bands = CAKE_GDN_BF16_T1_ROUTE_ARCH_BANDS.get(arch)
+    overrides = CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES.get(arch, {}) if bands is None else {}
+    if bands is None:
+        bands = CAKE_GDN_BF16_T1_ROUTE_BANDS
+    for max_state_heads, body, tile_v in bands:
         if max_state_heads is None or state_heads <= max_state_heads:
-            return CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES.get(arch, {}).get(
-                max_state_heads, body
-            ), tile_v
-    raise AssertionError("CAKE_GDN_BF16_T1_ROUTE_BANDS must end with an open band")
+            return overrides.get(max_state_heads, body), tile_v
+    raise AssertionError("BF16 T=1 route band tables must end with an open band")
 
 
 def cake_gdn_bf16_route_tile_v(route_id: str) -> int:

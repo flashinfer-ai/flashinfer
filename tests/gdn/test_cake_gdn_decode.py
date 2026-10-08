@@ -489,19 +489,40 @@ def test_bf16_t1_route_rule_follows_the_state_head_count() -> None:
         assert body in cake_gdn.CAKE_GDN_BF16_T1_BODIES and tile_v in (16, 32, 64, 128)
     rule = cake_gdn.cake_gdn_bf16_t1_route
     assert set(cake_gdn.CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES) == {"sm_103a"}
-    for arch, overrides in (
-        ("sm_100a", {}),
-        ("sm_103a", cake_gdn.CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES["sm_103a"]),
+    assert set(cake_gdn.CAKE_GDN_BF16_T1_ROUTE_ARCH_BANDS) == {"sm_107a"}
+    for arch, arch_bands, overrides in (
+        ("sm_100a", bands, {}),
+        ("sm_103a", bands, cake_gdn.CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES["sm_103a"]),
+        ("sm_107a", cake_gdn.CAKE_GDN_BF16_T1_ROUTE_ARCH_BANDS["sm_107a"], {}),
     ):
+        arch_bounds = [band[0] for band in arch_bands]
+        assert arch_bounds[-1] is None and None not in arch_bounds[:-1]
+        assert arch_bounds[:-1] == sorted(arch_bounds[:-1])
         previous = 0
-        for max_state_heads, body, tile_v in bands[:-1]:
+        for max_state_heads, body, tile_v in arch_bands[:-1]:
             expected = (overrides.get(max_state_heads, body), tile_v)
             assert expected[0] in cake_gdn.CAKE_GDN_BF16_T1_BODIES
+            assert tile_v in (16, 32, 64, 128)
             assert rule(1, previous + 1, arch) == expected
             assert rule(1, max_state_heads, arch) == expected
             previous = max_state_heads
-        assert rule(1, previous + 1, arch) == bands[-1][1:]
+        assert rule(1, previous + 1, arch) == arch_bands[-1][1:]
         assert rule(512, 32, arch) == ("wide", 128)
+    # sm_107a (Rubin R200) carries a complete table of its own: TILE_V=16 of the
+    # occupancy-first body below 192 heads and again at 369-416, TILE_V=32 in
+    # between and up to 3072 heads, the wide body only above that.
+    assert rule(1, 32, "sm_107a") == ("vec8occ", 16)
+    assert rule(6, 32, "sm_107a") == ("vec8occ", 16)
+    assert rule(8, 32, "sm_107a") == ("vec8", 32)
+    assert rule(9, 32, "sm_107a") == ("vec8occ", 32)
+    assert rule(23, 16, "sm_107a") == ("vec8occ", 32)
+    assert rule(24, 16, "sm_107a") == ("vec8occ", 16)
+    assert rule(13, 32, "sm_107a") == ("vec8occ", 16)
+    assert rule(14, 32, "sm_107a") == ("vec8", 32)
+    assert rule(24, 32, "sm_107a") == ("vec8", 32)
+    assert rule(32, 32, "sm_107a") == ("vec8occ", 32)
+    assert rule(96, 32, "sm_107a") == ("vec8occ", 32)
+    assert rule(128, 32, "sm_107a") == ("wide", 128)
     assert rule(1, 8, "sm_103a") == ("vec8", 32)
     assert rule(1, 32, "sm_100a") == ("vec8", 16)
     assert rule(1, 32, "sm_103a") == ("vec8r56", 16)
@@ -559,7 +580,7 @@ def test_bf16_t1_route_rule_follows_the_state_head_count() -> None:
 
 
 @pytest.mark.parametrize("heads", _QWEN35_BF16_T1_GEOMETRIES)
-@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
 def test_decode_resolver_admits_every_qwen35_bf16_t1_geometry_at_any_batch(
     arch, heads
 ) -> None:
@@ -594,6 +615,9 @@ def test_decode_resolver_admits_every_qwen35_bf16_t1_geometry_at_any_batch(
                 assert f"t1_bf16state_{body}_" in route.variant_name
             assert cake_gdn.cake_gdn_bf16_route_tile_v(route.route_id) == tile_v
             record = cake_gdn._kernel_record(route.variant_name)
+            # The loader fails closed on a record that does not list the
+            # architecture, so every routed instance must carry it.
+            assert arch in record["architectures"]
             assert record["specializations"]["H"] == num_q_heads
             assert record["specializations"]["HV"] == num_v_heads
             assert record["specializations"]["STRIDED_INPUTS"] == 1
