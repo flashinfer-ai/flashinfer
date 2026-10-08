@@ -154,15 +154,31 @@ def test_bf16_moe_trace_reference_applies_swiglu_oa_params():
 @pytest.mark.parametrize("limit", [0.25, 7.0, 16.0])
 def test_bf16_step_trace_serialized_reference(limit):
     from flashinfer import ActivationType
-    from flashinfer.fused_moe import trtllm_bf16_moe, trtllm_bf16_routed_moe
+    from flashinfer.fused_moe import (
+        SwiGLUStep,
+        TrtllmBf16Config,
+        trtllm_bf16_moe,
+        trtllm_bf16_routed_moe,
+    )
 
     up = torch.tensor([-32.0, -8.0, 8.0, 32.0])
     gate = torch.tensor([32.0, 7.0, 1.0, -1.0])
-    x = torch.stack((up, gate), dim=1).to(torch.bfloat16)
-    w1 = torch.eye(2, dtype=torch.bfloat16).unsqueeze(0)
-    w2 = torch.tensor([[[1.0], [0.0]]], dtype=torch.bfloat16)
+    hidden = intermediate = 256
+    x = torch.zeros(4, hidden, dtype=torch.bfloat16)
+    x[:, 129], x[:, 193] = up, gate
+    w1 = torch.zeros(1, 2 * intermediate, hidden, dtype=torch.bfloat16)
+    w2 = torch.zeros(1, hidden, intermediate, dtype=torch.bfloat16)
+    w1[0, 19, 129] = w1[0, intermediate + 19, 193] = w2[0, 17, 19] = 1
+    prepared = TrtllmBf16Config.prepare_weights(
+        w1,
+        w2,
+        num_local_experts=1,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        activation=SwiGLUStep(limit=limit),
+    )
     expected = torch.zeros_like(x)
-    expected[:, 0] = (
+    expected[:, 17] = (
         torch.nn.functional.silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
     ).to(x.dtype)
     for api, kwargs, name in (
@@ -175,11 +191,11 @@ def test_bf16_step_trace_serialized_reference(limit):
     ):
         kwargs.update(
             hidden_states=x,
-            gemm1_weights=w1,
-            gemm2_weights=w2,
+            gemm1_weights=prepared["gemm1_weights"],
+            gemm2_weights=prepared["gemm2_weights"],
             num_experts=1,
             local_num_experts=1,
-            intermediate_size=1,
+            intermediate_size=intermediate,
             activation_type=ActivationType.SwigluStep.value,
             gemm1_alpha=None,
             gemm1_beta=None,
@@ -191,6 +207,9 @@ def test_bf16_step_trace_serialized_reference(limit):
             # Native routed IDs pack the BF16 routing weight in the low bits.
             kwargs["topk_ids"] = torch.full((4, 1), 0x3F80, dtype=torch.int32)
         definition = api.fi_trace(**kwargs)
+        assert definition["axes"]["hidden_size"]["value"] == hidden
+        assert definition["axes"]["gemm1_out_size"]["value"] == 2 * intermediate
+        assert len(definition["inputs"]["gemm1_weights"]["shape"]) == 4
         namespace = {}
         exec(definition["reference"], namespace)  # noqa: S102
         actual = namespace[name](**kwargs)

@@ -827,6 +827,12 @@ StepFun cubins followed by per-token requantization for FC2.
 The TRT-LLM backend requires batched-GEMM export `7.0.5.0.4.0` or later
 containing StepFun epilogues; older artifacts report missing StepFun kernels.
 
+StepFun trace references consume the same native weight layouts as the APIs:
+BF16 uses BlockMajorK, and shuffled weights use the prepared FC1/FC2 row
+order. MXFP8 and NVFP4 additionally use 128x4 weight-scale layouts. BF16 and
+MXFP8 traces retain `use_shuffled_weight` to select the row order. Serialized
+references restore these layouts using PyTorch.
+
 `SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
 `linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the
 unclamped linear branch, which only the CuTe-DSL scalar ABI can express: the

@@ -28,6 +28,7 @@ from ...tllm_enums import (
 )
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 from ._init_helpers import fp8_block_quant_1d, fp8_block_quant_2d
+from .gemm import _unswizzle_batched_sf_128x4
 from .quantize import _fp4_quantize_reference
 
 # ---------------------------------------------------------------------------
@@ -167,6 +168,21 @@ sm90_mixed_gemm_weight_interleave_trace = TraceTemplate(
 # ---------------------------------------------------------------------------
 
 
+def _trtllm_unshuffle_weight(weight, gated):
+    """Restore MajorK rows shuffled for the TRTLLM 128-row epilogue."""
+    rows = torch.arange(weight.shape[1], device=weight.device)
+    shuffled_rows = rows // 32 * 32 + rows % 4 * 8 + rows % 32 // 4
+    weight = weight.float().index_select(1, shuffled_rows)
+    if gated:
+        experts, num_rows, hidden = weight.shape
+        weight = (
+            weight.reshape(experts, num_rows // 2, 2, hidden)
+            .transpose(1, 2)
+            .reshape(experts, num_rows, hidden)
+        )
+    return weight
+
+
 @torch.no_grad()
 def _fp8_moe_run_experts(
     hidden_states,
@@ -184,6 +200,7 @@ def _fp8_moe_run_experts(
     gemm1_clamp_limit=None,
     activation_type=3,
     fp8_quantization_type=1,
+    use_shuffled_weight=False,
 ):
     """FP8 block-scale dequantization + SwiGLU + GEMM for all routing types.
 
@@ -211,10 +228,18 @@ def _fp8_moe_run_experts(
         a_exp = hidden_states_scale.view(torch.uint8).reshape(T, H // 32)
         a_scale = torch.exp2(a_exp.to(torch.float32) - 127.0)
         A = hidden_states.float() * a_scale.repeat_interleave(32, dim=-1)
-        s1 = torch.exp2(gemm1_weights_scale.view(torch.uint8).float() - 127.0)
-        s2 = torch.exp2(gemm2_weights_scale.view(torch.uint8).float() - 127.0)
+        s1 = gemm1_weights_scale.view(torch.uint8)
+        s2 = gemm2_weights_scale.view(torch.uint8)
+        if use_shuffled_weight:
+            s1 = _unswizzle_batched_sf_128x4(s1, E_local, 2 * I, H // 32)
+            s2 = _unswizzle_batched_sf_128x4(s2, E_local, H, I // 32)
+        s1 = torch.exp2(s1.float() - 127.0)
+        s2 = torch.exp2(s2.float() - 127.0)
         W13 = gemm1_weights.float() * s1.repeat_interleave(32, dim=-1)
         W2 = gemm2_weights.float() * s2.repeat_interleave(32, dim=-1)
+        if use_shuffled_weight:
+            W13 = _trtllm_unshuffle_weight(W13, gated=True)
+            W2 = _trtllm_unshuffle_weight(W2, gated=False)
     else:
         A_fp32 = hidden_states.to(torch.float32)
         A_scale = hidden_states_scale.to(torch.float32)  # [H/128, T]
@@ -395,15 +420,8 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
         gemm1_clamp_limit=gemm1_clamp_limit,
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
-
-
-# The rendered reference must run standalone (tests/trace exec it from the
-# committed JSON), so the module-level helper it calls has to be inlined ahead
-# of it. Without this the emitted source raises NameError on first call.
-_trtllm_fp8_block_scale_moe_ds_routing_reference._trace_reference_dependencies = (
-    _fp8_moe_run_experts,
-)
 
 
 @torch.no_grad()
@@ -458,6 +476,7 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
         gemm1_clamp_limit=gemm1_clamp_limit,
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
 
 
@@ -514,6 +533,7 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
         gemm1_clamp_limit=gemm1_clamp_limit,
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
 
 
@@ -570,6 +590,7 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
         gemm1_clamp_limit=gemm1_clamp_limit,
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
 
 
@@ -627,6 +648,7 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
         gemm1_clamp_limit=gemm1_clamp_limit,
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
 
 
@@ -687,6 +709,7 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
         gemm1_clamp_limit=gemm1_clamp_limit,
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
 
 
@@ -1512,6 +1535,16 @@ def _fp4_moe_run_experts(
     is_mxfp4 = gemm1_weights_scale.dtype == torch.uint8
     device = gemm1_weights.device
 
+    if int(activation_type) == 7:
+        experts, rows, packed_hidden = gemm1_weights.shape
+        gemm1_weights_scale = _unswizzle_batched_sf_128x4(
+            gemm1_weights_scale, experts, rows, packed_hidden * 2 // 16
+        )
+        experts, rows, packed_intermediate = gemm2_weights.shape
+        gemm2_weights_scale = _unswizzle_batched_sf_128x4(
+            gemm2_weights_scale, experts, rows, packed_intermediate * 2 // 16
+        )
+
     # Dequantize both expert-weight tensors in one shot.
     W1 = _dequantize_fp4_tensor(
         gemm1_weights, gemm1_weights_scale, is_ue8m0_scales=is_mxfp4
@@ -1519,6 +1552,18 @@ def _fp4_moe_run_experts(
     W2 = _dequantize_fp4_tensor(
         gemm2_weights, gemm2_weights_scale, is_ue8m0_scales=is_mxfp4
     )  # [E_local, H, I]
+
+    if int(activation_type) == 7:
+        W1 = _trtllm_unshuffle_weight(W1, gated=True)
+        W2 = _trtllm_unshuffle_weight(W2, gated=False)
+        if gemm1_bias is not None:
+            gemm1_bias = _trtllm_unshuffle_weight(
+                gemm1_bias.unsqueeze(-1), True
+            ).squeeze(-1)
+        if gemm2_bias is not None:
+            gemm2_bias = _trtllm_unshuffle_weight(
+                gemm2_bias.unsqueeze(-1), False
+            ).squeeze(-1)
 
     E_local, gemm1_out_size, H = W1.shape
     I = gemm1_out_size // 2
@@ -1809,18 +1854,6 @@ def _trtllm_fp4_block_scale_moe_ds_routing_reference(
         E_global + nsfe,
         **activation_kwargs,
     )
-
-
-cast(
-    Any, _trtllm_fp4_block_scale_moe_ds_routing_reference
-)._trace_reference_dependencies = (
-    _unpack_fp4_e2m1,
-    _ue8m0_to_float32,
-    _decode_block_scales,
-    _dequantize_fp4_tensor,
-    _dequantize_fp4_hidden_states,
-    _fp4_moe_run_experts,
-)
 
 
 @torch.no_grad()
@@ -2598,6 +2631,7 @@ def _moe_bf16_run_experts(
     activation_type=3,
     situ_beta=None,
     situ_linear_beta=None,
+    use_shuffled_weight=True,
 ):
     """Un-quantized (bf16) MoE expert computation."""
     # Keep enum values local so the serialized reference needs only PyTorch.
@@ -2614,6 +2648,12 @@ def _moe_bf16_run_experts(
             f"Unsupported activation_type {activation_type!r}; "
             "expected 3 (SwiGLU), 7 (SwiGLUStep), 8 (GeGLUTanh), or 6 (ReLU2)"
         )
+    if activation_type == swiglu_step:
+        gemm1_weights = gemm1_weights.transpose(1, 2).flatten(2)
+        gemm2_weights = gemm2_weights.transpose(1, 2).flatten(2)
+        if use_shuffled_weight:
+            gemm1_weights = _trtllm_unshuffle_weight(gemm1_weights, gated=True)
+            gemm2_weights = _trtllm_unshuffle_weight(gemm2_weights, gated=False)
     T, H = hidden_states.shape
     E_local, gemm1_out, _ = gemm1_weights.shape
     I = gemm1_out // 2
@@ -2734,6 +2774,7 @@ def _trtllm_bf16_moe_reference(
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
         activation_type=activation_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", True),
     )
 
 
@@ -2768,6 +2809,7 @@ def _trtllm_bf16_routed_moe_reference(
             gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=gemm1_clamp_limit,
             activation_type=activation_type,
+            use_shuffled_weight=_unused.get("use_shuffled_weight", True),
         )
     T = topk_ids.shape[0]
     scale = float(routed_scaling_factor or 1.0)
@@ -2790,6 +2832,7 @@ def _trtllm_bf16_routed_moe_reference(
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
         activation_type=activation_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", True),
     )
 
 
@@ -2809,24 +2852,9 @@ def _trtllm_fp8_per_tensor_step_run_experts(
 ):
     """StepFun epilogue with raw accumulator limits and calibrated FP8 scales."""
 
-    def canonical_weight(weight, gated):
-        # Per-tensor FP8 uses MajorK weights shuffled for epilogue_tile_m=128.
-        # Keep the inverse here so the serialized reference needs only PyTorch.
-        rows = torch.arange(weight.shape[1], device=weight.device)
-        shuffled_rows = rows // 32 * 32 + rows % 4 * 8 + rows % 32 // 4
-        weight = weight.to(torch.float32).index_select(1, shuffled_rows)
-        if gated:
-            experts, num_rows, hidden = weight.shape
-            weight = (
-                weight.reshape(experts, num_rows // 2, 2, hidden)
-                .transpose(1, 2)
-                .reshape(experts, num_rows, hidden)
-            )
-        return weight
-
     activations = hidden_states.to(torch.float32)
-    w1 = canonical_weight(gemm1_weights, gated=True)
-    w2 = canonical_weight(gemm2_weights, gated=False)
+    w1 = _trtllm_unshuffle_weight(gemm1_weights, gated=True)
+    w2 = _trtllm_unshuffle_weight(gemm2_weights, gated=False)
     intermediate = w1.shape[1] // 2
     output = torch.zeros_like(activations)
     for local_idx in range(w1.shape[0]):
@@ -2983,16 +3011,19 @@ def _trtllm_fp8_per_tensor_scale_routed_moe_reference(
 
 
 cast(Any, _trtllm_bf16_moe_reference)._trace_reference_dependencies = (
+    _trtllm_unshuffle_weight,
     _moe_expert_param,
     _moe_bf16_run_experts,
     _default_routing_weights,
 )
 cast(Any, _trtllm_bf16_routed_moe_reference)._trace_reference_dependencies = (
+    _trtllm_unshuffle_weight,
     _moe_expert_param,
     _moe_bf16_run_experts,
     _step_decode_precomputed_routing,
 )
 cast(Any, _trtllm_fp8_per_tensor_scale_moe_reference)._trace_reference_dependencies = (
+    _trtllm_unshuffle_weight,
     _moe_expert_param,
     _moe_bf16_run_experts,
     _default_routing_weights,
@@ -3000,7 +3031,10 @@ cast(Any, _trtllm_fp8_per_tensor_scale_moe_reference)._trace_reference_dependenc
 )
 cast(
     Any, _trtllm_fp8_per_tensor_scale_routed_moe_reference
-)._trace_reference_dependencies = (_trtllm_fp8_per_tensor_step_run_experts,)
+)._trace_reference_dependencies = (
+    _trtllm_unshuffle_weight,
+    _trtllm_fp8_per_tensor_step_run_experts,
+)
 
 
 @torch.no_grad()
@@ -3058,6 +3092,7 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
         gemm1_clamp_limit=gemm1_clamp_limit,
         activation_type=activation_type,
         fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
 
 
@@ -3822,11 +3857,34 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
 
 
 # StepFun siblings preserve the existing activation's definition filenames.
-def _make_step_moe_trace(base: TraceTemplate, *, mxfp8: bool = False) -> TraceTemplate:
+def _make_step_moe_trace(
+    base: TraceTemplate, *, mxfp8: bool = False, bf16: bool = False
+) -> TraceTemplate:
     axes = dict(base.axes)
     axes["activation_type"] = Const(abbrev="act", value=7)
     inputs = dict(base.inputs)
     inputs["activation_type"] = Scalar("int32", description="7=SwiGLUStep.")
+    if bf16:
+        axes["num_hidden_blocks"] = Const(
+            abbrev="", description="hidden_size / block_k."
+        )
+        axes["num_intermediate_blocks"] = Const(
+            abbrev="", description="intermediate_size / block_k."
+        )
+        axes["block_k"] = Const(
+            abbrev="", description="BF16 values per BlockMajorK block."
+        )
+        inputs["intermediate_size"] = Scalar("int32")
+        inputs["gemm1_weights"] = Tensor(
+            ["num_local_experts", "num_hidden_blocks", "gemm1_out_size", "block_k"],
+            description="FC1 shuffled BlockMajorK weights.",
+        )
+        inputs["gemm2_weights"] = Tensor(
+            ["num_local_experts", "num_intermediate_blocks", "hidden_size", "block_k"],
+            description="FC2 shuffled BlockMajorK weights.",
+        )
+    if bf16 or mxfp8:
+        inputs["use_shuffled_weight"] = Scalar("bool", optional=True)
     if mxfp8:
         rows = "num_weight_rows" if "num_weight_rows" in axes else "num_local_experts"
         axes.pop("num_gemm1_out_blocks", None)
@@ -3875,8 +3933,10 @@ def _make_step_moe_trace_dispatch(base: TraceTemplate, step: TraceTemplate):
     return dispatch
 
 
-trtllm_bf16_moe_step_trace = _make_step_moe_trace(trtllm_bf16_moe_trace)
-trtllm_bf16_routed_moe_step_trace = _make_step_moe_trace(trtllm_bf16_routed_moe_trace)
+trtllm_bf16_moe_step_trace = _make_step_moe_trace(trtllm_bf16_moe_trace, bf16=True)
+trtllm_bf16_routed_moe_step_trace = _make_step_moe_trace(
+    trtllm_bf16_routed_moe_trace, bf16=True
+)
 trtllm_fp8_per_tensor_scale_moe_step_trace = _make_step_moe_trace(
     trtllm_fp8_per_tensor_scale_moe_trace
 )
@@ -3924,14 +3984,22 @@ for _fp8_reference in (
     _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference,
     _trtllm_fp8_block_scale_moe_topk_routing_reference,
 ):
-    cast(Any, _fp8_reference)._trace_reference_dependencies = (_fp8_moe_run_experts,)
+    cast(Any, _fp8_reference)._trace_reference_dependencies = (
+        _unswizzle_batched_sf_128x4,
+        _trtllm_unshuffle_weight,
+        _fp8_moe_run_experts,
+    )
 cast(
     Any, _trtllm_fp8_block_scale_routed_moe_reference
 )._trace_reference_dependencies = (
     _step_decode_precomputed_routing,
+    _unswizzle_batched_sf_128x4,
+    _trtllm_unshuffle_weight,
     _fp8_moe_run_experts,
 )
 _FP4_REFERENCE_DEPENDENCIES = (
+    _unswizzle_batched_sf_128x4,
+    _trtllm_unshuffle_weight,
     _unpack_fp4_e2m1,
     _ue8m0_to_float32,
     _decode_block_scales,

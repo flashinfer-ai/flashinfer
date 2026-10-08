@@ -11,9 +11,12 @@ import torch
 def test_nvfp4_step_serialized_reference(limit, per_token, output_scale):
     from flashinfer import ActivationType
     from flashinfer.fused_moe import (
+        reorder_rows_for_gated_act_gemm,
         trtllm_fp4_block_scale_moe,
         trtllm_fp4_block_scale_routed_moe,
     )
+
+    from flashinfer.quantization import shuffle_matrix_a
 
     tokens, hidden, intermediate = 4, 128, 128
     x = torch.zeros(tokens, hidden // 2, dtype=torch.uint8)
@@ -23,9 +26,9 @@ def test_nvfp4_step_serialized_reference(limit, per_token, output_scale):
     w1[0, 0, 0] = 0x02  # FC1 up selects input channel 0 with weight 1.
     w1[0, intermediate, 0] = 0x20  # FC1 gate selects channel 1.
     w2 = torch.zeros(1, hidden, intermediate // 2, dtype=torch.uint8)
-    w2[0, 0, 0] = 0x02
+    w2[0, 17, 0] = 0x02
     bias2 = torch.zeros(1, hidden, dtype=torch.bfloat16)
-    bias2[0, 0] = 2.0
+    bias2[0, 17] = 2.0
     token_scales = torch.tensor([0.5, 2.0, 1.0, 4.0]) if per_token else None
     physical_limit = 7.0 if limit is None else limit
     kwargs = dict(
@@ -61,16 +64,40 @@ def test_nvfp4_step_serialized_reference(limit, per_token, output_scale):
         routing_method_type=0,
         activation_type=ActivationType.SwigluStep.value,
     )
-    up = torch.tensor([-6.0, -2.0, 2.0, 6.0]) * 2.0
-    gate = torch.tensor([6.0, 4.0, 2.0, -1.0]) * 2.0
+    kwargs["gemm1_weights_scale"][0, 0] = 2.0
+    kwargs["gemm1_weights_scale"][0, intermediate] = 0.5
+    kwargs["gemm2_weights_scale"][0, 17] = 2.0
+    for weight_key, scale_key, gated in (
+        ("gemm1_weights", "gemm1_weights_scale", True),
+        ("gemm2_weights", "gemm2_weights_scale", False),
+    ):
+        weight = kwargs[weight_key][0]
+        scale = kwargs[scale_key][0].view(torch.uint8)
+        if gated:
+            weight = reorder_rows_for_gated_act_gemm(weight)
+            scale = reorder_rows_for_gated_act_gemm(scale)
+        kwargs[weight_key] = shuffle_matrix_a(weight, 128).unsqueeze(0)
+        scale = shuffle_matrix_a(scale, 128)
+        rows, cols = scale.shape
+        kwargs[scale_key] = (
+            scale.reshape(rows // 128, 4, 32, cols // 4, 4)
+            .permute(0, 3, 2, 1, 4)
+            .reshape(1, rows, cols)
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+        )
+    kwargs["gemm2_bias"] = shuffle_matrix_a(bias2[0, :, None], 128).reshape_as(bias2)
+    up = torch.tensor([-6.0, -2.0, 2.0, 6.0]) * 4.0
+    gate = torch.tensor([6.0, 4.0, 2.0, -1.0])
     if token_scales is not None:
         up *= token_scales
         gate *= token_scales
     expected = torch.zeros(tokens, hidden, dtype=torch.bfloat16)
-    expected[:, 0] = (
+    expected[:, 17] = (
         (
             up.clamp(-physical_limit, physical_limit)
             * torch.nn.functional.silu(gate).clamp(max=physical_limit)
+            * 2.0
             + 2.0
         )
         * output_scale

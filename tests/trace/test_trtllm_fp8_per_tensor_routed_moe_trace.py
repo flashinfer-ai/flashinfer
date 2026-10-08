@@ -87,13 +87,11 @@ def test_fp8_per_tensor_routed_moe_trace_reference_unpacks_routing():
 def test_fp8_step_serialized_trace_keeps_nonunit_raw_limits(custom_limits, from_logits):
     from flashinfer import ActivationType
     from flashinfer.fused_moe import (
+        reorder_rows_for_gated_act_gemm,
         trtllm_fp8_per_tensor_scale_moe,
         trtllm_fp8_per_tensor_scale_routed_moe,
     )
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
+    from flashinfer.quantization import shuffle_matrix_a
 
     hidden = intermediate = 512
     channels = torch.tensor([0, 19, 257])
@@ -107,9 +105,13 @@ def test_fp8_step_serialized_trace_keeps_nonunit_raw_limits(custom_limits, from_
     w2 = torch.zeros(2, hidden, intermediate)
     w2[:, output_channels, channels] = down
     # Use the same FC1 interleave and FC1/FC2 row permutations as preparation.
-    cache = {}
-    perm1 = _maybe_get_cached_w3_w1_permute_indices(cache, w1[0], 128)
-    perm2 = get_w2_permute_indices_with_cache(cache, w2[0], 128)
+    w1 = torch.stack(
+        [
+            shuffle_matrix_a(reorder_rows_for_gated_act_gemm(weight), 128)
+            for weight in w1
+        ]
+    )
+    w2 = torch.stack([shuffle_matrix_a(weight, 128) for weight in w2])
     x = torch.zeros(2, hidden)
     x[:, 0] = 1
     kwargs = _trace_kwargs()
@@ -117,8 +119,8 @@ def test_fp8_step_serialized_trace_keeps_nonunit_raw_limits(custom_limits, from_
         hidden_states=x.to(torch.float8_e4m3fn),
         intermediate_size=intermediate,
         activation_type=ActivationType.SwigluStep.value,
-        gemm1_weights=w1[:, perm1].to(torch.float8_e4m3fn),
-        gemm2_weights=w2[:, perm2].to(torch.float8_e4m3fn),
+        gemm1_weights=w1.to(torch.float8_e4m3fn),
+        gemm2_weights=w2.to(torch.float8_e4m3fn),
         output1_scales_gate_scalar=torch.tensor([0.5, 2.0]),
         output1_scales_scalar=torch.tensor([0.25, 3.0]),
         output2_scales_scalar=torch.tensor([2.0, 0.5]),

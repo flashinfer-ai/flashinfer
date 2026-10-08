@@ -199,13 +199,17 @@ def test_mxfp8_moe_trace_reference_applies_swiglu_oa_params():
 
 
 @pytest.mark.parametrize("limit", [0.25, 7.0, 16.0])
-def test_mxfp8_step_trace_serialized_reference(limit):
+@pytest.mark.parametrize("shuffled", [False, True])
+def test_mxfp8_step_trace_serialized_reference(limit, shuffled):
     from flashinfer import ActivationType
     from flashinfer.fused_moe.core import Fp8QuantizationType
     from flashinfer.fused_moe import (
+        reorder_rows_for_gated_act_gemm,
         trtllm_fp8_block_scale_moe,
         trtllm_fp8_block_scale_routed_moe,
     )
+
+    from flashinfer.quantization import shuffle_matrix_a
 
     kwargs = _make_identity_mxfp8_inputs()
     hidden = kwargs.pop("hidden_states_bf16")
@@ -226,10 +230,38 @@ def test_mxfp8_step_trace_serialized_reference(limit):
         gemm1_beta=None,
         gemm1_clamp_limit=torch.tensor([limit]),
     )
+    # Distinct row scales expose both row permutations and the 128x4 swizzle.
+    kwargs["gemm1_weights_scale"][0, 0] = 128
+    kwargs["gemm1_weights_scale"][0, 128] = 126
+    kwargs["gemm2_weights"][:, 17] = kwargs["gemm2_weights"][:, 0]
+    kwargs["gemm2_weights"][:, 0] = 0
+    kwargs["gemm2_weights_scale"][0, 17] = 128
+    kwargs["use_shuffled_weight"] = shuffled
+    if shuffled:
+        for weight_key, scale_key, gated in (
+            ("gemm1_weights", "gemm1_weights_scale", True),
+            ("gemm2_weights", "gemm2_weights_scale", False),
+        ):
+            weight = kwargs[weight_key][0].view(torch.uint8)
+            scale = kwargs[scale_key][0]
+            if gated:
+                weight = reorder_rows_for_gated_act_gemm(weight)
+                scale = reorder_rows_for_gated_act_gemm(scale)
+            kwargs[weight_key] = (
+                shuffle_matrix_a(weight, 128).unsqueeze(0).view(torch.float8_e4m3fn)
+            )
+            scale = shuffle_matrix_a(scale, 128)
+            rows, cols = scale.shape
+            kwargs[scale_key] = (
+                scale.reshape(rows // 128, 4, 32, cols // 4, 4)
+                .permute(0, 3, 2, 1, 4)
+                .reshape(1, rows, cols)
+            )
     expected = torch.zeros_like(hidden)
-    expected[:, 0] = (
-        torch.nn.functional.silu(hidden[:, 1].float()).clamp(max=limit)
-        * hidden[:, 0].float().clamp(-limit, limit)
+    expected[:, 17] = (
+        torch.nn.functional.silu(hidden[:, 1].float() * 0.5).clamp(max=limit)
+        * (hidden[:, 0].float() * 2).clamp(-limit, limit)
+        * 2
     ).to(hidden.dtype)
     for api, name in (
         (
