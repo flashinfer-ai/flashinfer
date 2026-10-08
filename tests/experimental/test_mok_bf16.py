@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Synthetic BF16 training checks, including later-ring recomputation."""
 
+import math
+
 import pytest
 import torch
 
@@ -22,7 +24,7 @@ def _require_gpu():
         pytest.skip("Requires an SM100a-compatible CUDA device")
 
 
-@pytest.mark.parametrize("variant", ["base", "ragged", "clamped"])
+@pytest.mark.parametrize("variant", ["base", "ragged", "clamped", "clamped_boundary"])
 def test_fused_training(monkeypatch, variant):
     _require_gpu()
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
@@ -31,7 +33,10 @@ def test_fused_training(monkeypatch, variant):
 
 # (hidden, intermediate, macrobatch, source tokens, swiglu_limit). ``ragged``
 # uses odd, non-tile-aligned source counts (including one row); ``clamped``
-# uses limits that mask a large share of the gate/up elements.
+# uses limits that mask a large share of the gate/up elements;
+# ``clamped_boundary`` pins gate/up elements exactly at the GLM-5.3-Flash limit
+# L = 10, one BF16 ulp inside and outside it, and at 0 (unit-vector gate/up
+# weights make the pre-activations equal to selected input entries exactly).
 GEOMETRIES = {
     "base": (
         (256, 256, 768, 512, None),
@@ -48,7 +53,36 @@ GEOMETRIES = {
         (512, 512, 768, 501, 0.1),
         (256, 256, 1536, 512, 10.0),
     ),
+    "clamped_boundary": ((256, 256, 768, 512, 10.0),),
 }
+
+
+def boundary_levels(limit, device):
+    """``[-L-ulp, -L, -L+ulp, 0, L-ulp, L, L+ulp]`` as BF16 (ulp = BF16 spacing at L);
+    every level must be exactly representable."""
+    ulp = torch.finfo(torch.bfloat16).eps * 2.0 ** math.floor(math.log2(limit))
+    values = [-limit - ulp, -limit, -limit + ulp, 0.0, limit - ulp, limit, limit + ulp]
+    levels = torch.tensor(values, dtype=torch.bfloat16, device=device)
+    assert torch.equal(levels.float(), torch.tensor(values, device=device)), values
+    return levels
+
+
+def pin_clamp_boundary(x, shared, routed, limit):
+    """Unit-vector gate/up rows: ``gate[:, j] = x[:, (j - e) % hidden]`` exactly (one
+    BF16 product, FP32 accumulation), so input entries at the boundary levels put
+    gate/up exactly at +-L, one ulp inside/outside and 0 on the routed and shared
+    experts; half of the input entries are pinned, the down projections stay random."""
+    hidden = x.shape[1]
+    assert shared[0].shape == (hidden, hidden), "needs intermediate == hidden"
+    eye = torch.eye(hidden, dtype=x.dtype, device=x.device)
+    shared[0], shared[1] = eye, eye.roll(1, 0)
+    experts = routed[0].shape[0]
+    routed[0] = torch.stack([eye.roll(e, 0) for e in range(experts)])
+    routed[1] = torch.stack([eye.roll(e + 1, 0) for e in range(experts)])
+    levels = boundary_levels(limit, x.device)
+    pinned = torch.rand(x.shape, device=x.device) < 0.5
+    draws = torch.randint(levels.numel(), (int(pinned.sum()),), device=x.device)
+    x[pinned] = levels[draws]
 
 
 def _check_fused_training(variant="base"):
@@ -75,6 +109,8 @@ def _check_fused_training(variant="base"):
                 torch.randn(experts, hidden, intermediate, **options)
                 / intermediate**0.5,
             ]
+            if variant == "clamped_boundary":
+                pin_clamp_boundary(x, shared, routed, swiglu_limit)
             scores = torch.rand(tokens, topk, device="cuda") + 0.1
             scores.div_(scores.sum(-1, keepdim=True)).mul_(2.5)
             row = torch.arange(tokens, device="cuda")

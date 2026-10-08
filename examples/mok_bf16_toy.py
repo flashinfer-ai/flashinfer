@@ -13,10 +13,29 @@ quantization of the dispatched rows, the saved gate/up and the hidden and
 gradient tiles, per row), the routed weight gradients against the plain FP32
 reference with a relative-L1 bound (their token-axis block scales follow the
 kernel's dispatch order, which the independent reference does not reproduce).
+
+Further environment knobs (all optional):
+
+* ``MOK_TOY_ROUTING=skew:<s>``: hot-rank routing instead of the round-robin
+  default; rank 0's experts receive ``s`` times the base routing probability
+  (top-k of shifted random logits, as in the training-step benchmark). The
+  realized per-rank routed loads are recorded.
+* ``MOK_TOY_SWIGLU_LIMIT=<L>``: clamped SwiGLU ``silu(min(gate, L)) *
+  clamp(up, -L, L)`` on the routed and shared experts (GLM-5.3-Flash uses
+  ``L = 10``); the clamped share of the shared gate/up elements is recorded.
+* ``MOK_TOY_LOCAL_EXPERTS=<n>`` / ``MOK_TOY_TOPK=<k>``: another exported
+  scheduler layout, e.g. the 288-expert ``8 x 36`` / ``32 x 9`` top-8 layouts
+  or the 256-expert ``4 x 64`` layout (defaults: ``4 x 4`` top-2 for 1 or 4
+  ranks, ``256 / ranks`` top-8 otherwise).
+* ``MOK_FAIRNESS=1``: additionally run the upstream ``mok`` package
+  (cursor/mixture-of-kittens, importable) on the identical inputs and compare
+  both implementations' errors against one FP32 reference (TF32 off), per
+  output: mean absolute error ratio <= 1.02 and maximum ratio <= 1.5.
 """
 
 import datetime
 import json
+import math
 import os
 
 import torch
@@ -358,6 +377,83 @@ def error_report(actual, expected, gate):
     return reports
 
 
+# FP32-reference fairness bounds against the upstream kernels (``MOK_FAIRNESS=1``):
+# per output, mean absolute error ratio and maximum absolute error ratio.
+FAIRNESS_MEAN_RATIO = 1.02
+FAIRNESS_MAX_RATIO = 1.5
+
+
+def _ratio(candidate, upstream):
+    if upstream > 0:
+        return candidate / upstream
+    return 1.0 if candidate == 0 else float("inf")
+
+
+def fairness_report(actual, upstream, oracle):
+    """Per output: both implementations' absolute errors against the same FP32
+    reference (mean and maximum over all ranks), their ratios and the verdict
+    under the fixed ``FAIRNESS_MEAN_RATIO`` / ``FAIRNESS_MAX_RATIO`` bounds."""
+    reports = {}
+    for name, a, b, o in zip(RESULT_NAMES, actual, upstream, oracle, strict=True):
+        if a.shape != o.shape or b.shape != o.shape:
+            raise ValueError(
+                f"{name}: shapes differ {tuple(a.shape)} {tuple(b.shape)} {tuple(o.shape)}"
+            )
+        # [0] candidate error sum, [1] upstream error sum, [2] reference L1,
+        # [3] elements, [4] nonfinite values (both implementations); peaks: max errors.
+        sums = torch.zeros(5, dtype=torch.float64, device=o.device)
+        peaks = torch.zeros(2, dtype=torch.float64, device=o.device)
+        for aa, bb, oo in zip(
+            a.flatten().split(1048576),
+            b.flatten().split(1048576),
+            o.flatten().split(1048576),
+            strict=True,
+        ):
+            if oo.numel() == 0:
+                continue
+            of = oo.float()
+            da = torch.nan_to_num((aa.float() - of).abs(), nan=float("inf"))
+            db = torch.nan_to_num((bb.float() - of).abs(), nan=float("inf"))
+            sums[0] += da.double().sum()
+            sums[1] += db.double().sum()
+            sums[2] += of.abs().double().sum()
+            sums[3] += oo.numel()
+            sums[4] += (~torch.isfinite(aa)).sum() + (~torch.isfinite(bb)).sum()
+            peaks[0] = torch.maximum(peaks[0], da.max().double())
+            peaks[1] = torch.maximum(peaks[1], db.max().double())
+        dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(peaks, op=dist.ReduceOp.MAX)
+        candidate_sum, upstream_sum, norm, elements, nonfinite = sums.tolist()
+        candidate_max, upstream_max = peaks.tolist()
+        candidate_mean = candidate_sum / elements if elements else 0.0
+        upstream_mean = upstream_sum / elements if elements else 0.0
+        mean_ratio, max_ratio = (
+            _ratio(candidate_mean, upstream_mean),
+            _ratio(candidate_max, upstream_max),
+        )
+        reports[name] = {
+            "shape": list(o.shape),
+            "elements": int(elements),
+            "candidate_mean_abs": candidate_mean,
+            "upstream_mean_abs": upstream_mean,
+            "mean_ratio": mean_ratio,
+            "candidate_max_abs": candidate_max,
+            "upstream_max_abs": upstream_max,
+            "max_ratio": max_ratio,
+            "candidate_relative_l1": candidate_sum / norm if norm else None,
+            "upstream_relative_l1": upstream_sum / norm if norm else None,
+            "nonfinite": int(nonfinite),
+            "mean_ratio_bound": FAIRNESS_MEAN_RATIO,
+            "max_ratio_bound": FAIRNESS_MAX_RATIO,
+            "pass": bool(
+                nonfinite == 0
+                and mean_ratio <= FAIRNESS_MEAN_RATIO
+                and max_ratio <= FAIRNESS_MAX_RATIO
+            ),
+        }
+    return reports
+
+
 class TrainingIteration:
     def __init__(
         self,
@@ -519,6 +615,105 @@ class TrainingIteration:
         return self.outputs
 
 
+class UpstreamIteration:
+    """The upstream ``mok`` package's kernels (cursor/mixture-of-kittens, ragged
+    dispatch) on the same inputs, weights and workspace geometry: the baseline of
+    the FP32-reference fairness comparison (``MOK_FAIRNESS=1``). MXFP8 routed
+    weights are quantized with the upstream quantizer, so each implementation
+    runs its own complete recipe."""
+
+    def __init__(
+        self,
+        config,
+        x,
+        ids,
+        scores,
+        dy,
+        weights,
+        *,
+        local_experts,
+        mxfp8,
+        swiglu_limit,
+        device,
+    ):
+        from mok import functional as upstream
+
+        self.upstream = upstream
+        self.x, self.ids, self.scores, self.dy = x, ids, scores, dy
+        self.weights, self.local_experts = weights, local_experts
+        self.swiglu_limit = swiglu_limit
+        self.config = upstream.MoKConfig(
+            fwd_num_comm_sms=config.fwd_num_comm_sms,
+            bwd_num_comm_sms=config.bwd_num_comm_sms,
+            minibatch_size=config.minibatch_size,
+            macrobatch_size=config.macrobatch_size,
+            schedule_capacity_multiplier=config.schedule_capacity_multiplier,
+        )
+        self.workspace = upstream.create_workspace(
+            self.config,
+            dist.group.WORLD,
+            device=device,
+            num_local_tokens=x.shape[0],
+            hidden_size=x.shape[1],
+            topk=ids.shape[1],
+        )
+        if mxfp8:
+            from mok import ops
+
+            quantized = [ops.mxfp8_quantize(w, True, True) for w in weights[3:]]
+            self.forward_routed = tuple((q[0], q[1]) for q in quantized)
+            self.backward_routed = (
+                quantized[0],
+                quantized[1],
+                (quantized[2][2], quantized[2][3]),
+            )
+        else:
+            self.forward_routed = self.backward_routed = tuple(weights[3:])
+
+    def run(self):
+        schedule = self.upstream.build_schedule(
+            self.workspace,
+            self.config,
+            self.ids,
+            num_local_experts=self.local_experts,
+        )
+        y, context = self.upstream.forward(
+            self.config,
+            self.workspace,
+            schedule,
+            self.x,
+            self.scores,
+            *self.weights[:3],
+            *self.forward_routed,
+            swiglu_limit=self.swiglu_limit,
+        )
+        gradients = self.upstream.backward(
+            self.config,
+            self.workspace,
+            schedule,
+            context,
+            self.dy,
+            self.x,
+            self.scores,
+            *self.weights[:3],
+            *self.backward_routed,
+            swiglu_limit=self.swiglu_limit,
+        )
+        return (y, *gradients)
+
+
+def _hot_factor(routing):
+    """``uniform`` -> 1.0 (round-robin routing); ``skew:<s>`` -> s >= 1."""
+    if routing == "uniform":
+        return 1.0
+    if routing.startswith("skew:"):
+        factor = float(routing.split(":", 1)[1])
+        if not math.isfinite(factor) or factor < 1.0:
+            raise ValueError("MOK_TOY_ROUTING=skew:<s> needs a finite s >= 1")
+        return factor
+    raise ValueError(f"unknown MOK_TOY_ROUTING {routing!r} (uniform | skew:<s>)")
+
+
 def main():
     local = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local)
@@ -532,18 +727,31 @@ def main():
             "nccl", device_id=device, timeout=datetime.timedelta(seconds=timeout_s)
         )
     rank, ep = dist.get_rank(), dist.get_world_size()
-    assert ep in (1, 4, 16, 64), "Launch with 1, 4, 16 or 64 ranks"
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     tokens = 512
-    topk, local_experts = (2, 4) if ep in (1, 4) else (8, 256 // ep)
+    # Scheduler layout (EP, local experts, top-k): the toy layout for 1 or 4 ranks,
+    # the 256-expert top-8 layouts otherwise; the environment selects any other
+    # exported layout (the adapter rejects layouts without exported kernels).
+    default_local_experts = 4 if ep in (1, 4) else 256 // ep
+    local_experts = int(os.environ.get("MOK_TOY_LOCAL_EXPERTS", default_local_experts))
+    default_topk = 2 if (ep, local_experts) in ((1, 4), (4, 4)) else 8
+    topk = int(os.environ.get("MOK_TOY_TOPK", default_topk))
     total_experts = ep * local_experts
     mxfp8 = os.environ.get("MOK_TOY_PRECISION", "bf16") == "mxfp8"
+    routing = os.environ.get("MOK_TOY_ROUTING", "uniform")
+    hot_factor = _hot_factor(routing)
+    limit = os.environ.get("MOK_TOY_SWIGLU_LIMIT", "")
+    swiglu_limit = float(limit) if limit else None
+    if swiglu_limit is not None and not 0 < swiglu_limit < float("inf"):
+        raise ValueError("MOK_TOY_SWIGLU_LIMIT must be a positive finite number")
+    fairness = os.environ.get("MOK_FAIRNESS", "0") == "1"
     functional = prepare_mok_bf16(
         ep_size=ep, local_experts=local_experts, topk=topk, mxfp8=mxfp8
     )
     gate = MXFP8_GATES if mxfp8 else BF16_GATE
     cases = []
+    fairness_failures = []
     for hidden, intermediate in ((256, 256), (512, 512)):
         config, workspace = create_mok_bf16_workspace(
             group=dist.group.WORLD,
@@ -598,13 +806,15 @@ def main():
             )
 
             def expected_outputs(data):
-                return reference_mxfp8(data, weights, quantized)
+                return reference_mxfp8(
+                    data, weights, quantized, swiglu_limit=swiglu_limit
+                )
 
         else:
             kernel_weights = {}
 
             def expected_outputs(data):
-                return reference(data, weights)
+                return reference(data, weights, swiglu_limit=swiglu_limit)
 
         iteration = TrainingIteration(
             config,
@@ -615,8 +825,11 @@ def main():
             dy,
             weights,
             functional=functional,
+            swiglu_limit=swiglu_limit,
             **kernel_weights,
         )
+        schedule_capacity = workspace.storage.schedule_capacity
+        routing_facts = {}
 
         def fill(generation, empty):
             torch.manual_seed(8291 + generation)
@@ -625,18 +838,54 @@ def main():
             all_scores = torch.rand(tokens * ep, topk, device=device) + 0.1
             all_scores.div_(all_scores.sum(-1, keepdim=True)).mul_(2.5)
             rows = torch.arange(tokens * ep, device=device) + generation
-            all_ids = torch.stack(
-                [
-                    (rows + slot) % (topk if empty else total_experts)
-                    for slot in range(topk)
-                ],
-                -1,
-            )
+            if empty or hot_factor == 1.0:
+                all_ids = torch.stack(
+                    [
+                        (rows + slot) % (topk if empty else total_experts)
+                        for slot in range(topk)
+                    ],
+                    -1,
+                )
+            else:
+                # Hot rank: rank 0's experts get ``hot_factor`` times the base
+                # routing probability (top-k of shifted random logits).
+                logits = torch.randn(tokens * ep, total_experts, device=device)
+                logits[:, :local_experts] += math.log(hot_factor)
+                all_ids = logits.topk(topk, dim=1).indices.to(torch.int64).contiguous()
+            # Every rank derives the same global routing; the hottest rank's padded
+            # routed rows must fit the schedule (overflow traps inside the kernels).
+            counts = torch.bincount(all_ids.flatten(), minlength=total_experts)
+            padded = (counts + 255) // 256 * 256
+            needed = int(padded.view(ep, local_experts).sum(1).max().item())
+            if needed > schedule_capacity:
+                raise ValueError(
+                    f"generation {generation}: the hottest rank needs {needed} routed rows, "
+                    f"schedule capacity {schedule_capacity}; raise schedule_capacity_multiplier"
+                )
             section = slice(rank * tokens, (rank + 1) * tokens)
             for destination, value in zip(
                 (x, dy, ids, scores), (all_x, all_dy, all_ids, all_scores), strict=True
             ):
                 destination.copy_(value[section])
+            facts = dict(needed_routed_rows_max_rank=needed)
+            if swiglu_limit is not None:
+                # Clamped share of the shared gate/up elements (mean over ranks):
+                # evidence that the clamp branches were exercised at this limit.
+                gate_values = x.float() @ weights[0].float().T
+                up_values = x.float() @ weights[1].float().T
+                fractions = torch.stack(
+                    (
+                        (gate_values > swiglu_limit).float().mean(),
+                        (up_values.abs() > swiglu_limit).float().mean(),
+                    )
+                )
+                dist.all_reduce(fractions)
+                fractions /= ep
+                facts.update(
+                    gate_clamped_fraction=fractions[0].item(),
+                    up_clamped_fraction=fractions[1].item(),
+                )
+            routing_facts[generation] = facts
             torch.cuda.synchronize()
             dist.barrier()
             return dict(x=all_x, d_output=all_dy, expert_ids=all_ids, scores=all_scores)
@@ -652,8 +901,17 @@ def main():
                 generation,
                 errors,
             )
-            loads.append(iteration.schedule.num_tokens.item())
-            report = dict(generation=generation, empty=empty, errors=errors)
+            # Realized routed rows of every rank (hot-rank evidence under skew).
+            per_rank = [None] * ep
+            dist.all_gather_object(per_rank, int(iteration.schedule.num_tokens.item()))
+            loads.append(per_rank)
+            report = dict(
+                generation=generation,
+                empty=empty,
+                errors=errors,
+                routed_rows_per_rank=per_rank,
+                **routing_facts[generation],
+            )
             reports.append(report)
             print(
                 f"rank {rank}: H{hidden} generation={generation} empty={empty} all nine PASS",
@@ -695,6 +953,7 @@ def main():
             dy,
             weights,
             functional=functional,
+            swiglu_limit=swiglu_limit,
             recompute=True,
             **kernel_weights,
         )
@@ -707,6 +966,52 @@ def main():
             ), (rank, hidden, "checkpoint step differs from the saved-context step")
             if checkpoint.graph is None:
                 checkpoint.capture()
+        # Fairness against the upstream kernels: both implementations on the same
+        # inputs, errors against the same FP32 reference (after the contract above,
+        # so its evidence is complete even if the upstream arm fails).
+        fairness_reports = []
+        if fairness:
+            upstream = UpstreamIteration(
+                config,
+                x,
+                ids,
+                scores,
+                dy,
+                weights,
+                local_experts=local_experts,
+                mxfp8=mxfp8,
+                swiglu_limit=swiglu_limit,
+                device=device,
+            )
+            for generation, empty in ((0, False), (2, False), (1, True)):
+                data = fill(generation, empty)
+                oracle = reference(
+                    data, weights, fp32=True, swiglu_limit=swiglu_limit
+                )
+                actual = iteration.run()
+                torch.cuda.synchronize()
+                baseline = upstream.run()
+                torch.cuda.synchronize()
+                outputs = fairness_report(actual, baseline, oracle)
+                passed = all(value["pass"] for value in outputs.values())
+                entry = dict(
+                    hidden=hidden,
+                    precision="mxfp8" if mxfp8 else "bf16",
+                    generation=generation,
+                    empty=empty,
+                    passed=passed,
+                    outputs=outputs,
+                )
+                fairness_reports.append(entry)
+                if not passed:
+                    fairness_failures.append(entry)
+                print(
+                    f"rank {rank}: H{hidden} generation={generation} empty={empty} "
+                    f"fairness vs upstream {'PASS' if passed else 'FAIL'}",
+                    flush=True,
+                )
+                if rank == 0:
+                    print(json.dumps(dict(fairness=entry)), flush=True)
         cases.append(
             dict(
                 hidden=hidden,
@@ -715,20 +1020,32 @@ def main():
                 source_tokens_per_rank=tokens,
                 global_source_tokens=tokens * ep,
                 topk=topk,
+                local_experts=local_experts,
                 global_experts=total_experts,
+                routing=routing,
+                hot_factor=hot_factor,
+                swiglu_limit=swiglu_limit,
                 macro=config.macrobatch_size,
                 mini=config.minibatch_size,
-                schedule_capacity=workspace.storage.schedule_capacity,
-                routed_loads=loads,
+                schedule_capacity=schedule_capacity,
+                routed_rows_per_rank=loads,
                 reports=reports,
                 three_graph_replays_bitwise_equal=True,
                 checkpoint_recompute_bitwise_equal=True,
+                fairness=fairness_reports,
             )
         )
+    status = "PASS" if not fairness_failures else "FAIL"
     if rank == 0:
-        print(json.dumps(dict(status="PASS", ep=ep, cases=cases), indent=2))
+        print(json.dumps(dict(status=status, ep=ep, cases=cases), indent=2))
     if owns_group:
         dist.destroy_process_group()
+    assert not fairness_failures, [
+        (f["hidden"], f["generation"], name)
+        for f in fairness_failures
+        for name, value in f["outputs"].items()
+        if not value["pass"]
+    ]
 
 
 if __name__ == "__main__":
