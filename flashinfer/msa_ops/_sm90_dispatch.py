@@ -27,6 +27,7 @@ kernel: ``use_fp32_acc=True`` (the default) raises for the classes without a
 Cake program instead of silently returning f16-accumulated scores.
 """
 
+import functools
 from typing import Optional
 
 import torch
@@ -41,6 +42,60 @@ _BLK_KV = 128
 # The campaign dispatcher keyed on TOTAL pages, which is why it routed these
 # shapes into the bad path. 800 keeps margin below the measured cliff.
 _MPG_UNION_MAX = 800
+
+
+@functools.lru_cache(maxsize=64)
+def is_sm90a_device(device: torch.device) -> bool:
+    """``flashinfer.utils.is_sm90a_supported`` resolved once per device.
+
+    The helper re-parses the CUDA version string (two ``packaging.version.Version``
+    constructions) on every call; the public MSA entries call it per op, i.e.
+    three times per MiniMax-M3 layer on the decode path.
+    """
+    from ..utils import is_sm90a_supported
+
+    return bool(is_sm90a_supported(device))
+
+
+@functools.lru_cache(maxsize=64)
+def _sm_count(device: torch.device) -> int:
+    from ..utils import get_device_sm_count
+
+    return int(get_device_sm_count(device))
+
+
+def _i32(t: torch.Tensor) -> torch.Tensor:
+    """``t.to(torch.int32).contiguous()`` without the two no-op dispatches when ``t`` already is (same object)."""
+    if t.dtype == torch.int32 and t.is_contiguous():
+        return t
+    return t.to(torch.int32).contiguous()
+
+
+# Interleaved-K/V admission memoized per geometry.  Keys are plain tuples (never tensors): shape, strides, the byte
+# distance of v from k, element size and dtypes.  Equal geometry means the same contract outcome: with equal strides
+# and v starting ``head_dim`` elements after k inside k's first row, the two views interleave element-wise, so they
+# can only be halves of one allocation -- the storage identity ``_as_packed_kv`` probes is implied.
+_PACKED_KV_ADMITTED: set = set()
+
+
+def _check_packed_kv(k: torch.Tensor, v: torch.Tensor) -> None:
+    """The layout contract of ``_as_packed_kv`` (raises identically), resolved once per K/V geometry."""
+    key = (
+        tuple(k.shape),
+        tuple(v.shape),
+        k.stride(),
+        v.stride(),
+        v.data_ptr() - k.data_ptr(),
+        k.element_size(),
+        k.dtype,
+        v.dtype,
+    )
+    if key in _PACKED_KV_ADMITTED:
+        return
+    _as_packed_kv(k, v)
+    if len(_PACKED_KV_ADMITTED) >= 64:
+        _PACKED_KV_ADMITTED.clear()
+    _PACKED_KV_ADMITTED.add(key)
 
 
 def _prefix_lens(cu_seqlens_q: torch.Tensor, seqused_k: torch.Tensor) -> torch.Tensor:
@@ -101,9 +156,9 @@ def proxy_score_sm90(
         and sq == max_seqlen_q
     )
 
-    cu = cu_seqlens_q.to(torch.int32).contiguous()
-    pt = page_table.to(torch.int32).contiguous()
-    sk = seqused_k.to(torch.int32).contiguous()
+    cu = _i32(cu_seqlens_q)
+    pt = _i32(page_table)
+    sk = _i32(seqused_k)
 
     if decode:
         if kv_fp8:
@@ -135,11 +190,7 @@ def proxy_score_sm90(
                 per_head=per_head,
                 max_seqlen_q=max_seqlen_q,
                 batch_size=batch_size,
-                q_offset=(
-                    q_offset.to(torch.int32).contiguous()
-                    if q_offset is not None
-                    else None
-                ),
+                q_offset=(_i32(q_offset) if q_offset is not None else None),
             )
         if kv_fp8:
             from .cute_dsl.proxy_score_decode_sm90 import run as _decode
@@ -173,9 +224,7 @@ def proxy_score_sm90(
             per_head=per_head,
             max_seqlen_q=max_seqlen_q,
             batch_size=batch_size,
-            q_offset=(
-                q_offset.to(torch.int32).contiguous() if q_offset is not None else None
-            ),
+            q_offset=(_i32(q_offset) if q_offset is not None else None),
             use_fp32_acc=use_fp32_acc,
         )
     if use_fp32_acc:
@@ -225,10 +274,9 @@ def topk_select_sm90(
             raise NotImplementedError(
                 "SM90 msa_topk_select takes num_valid_pages as a per-token tensor"
             )
-        nvp = num_valid_pages.to(torch.int32).contiguous()
+        nvp = _i32(num_valid_pages)
 
     hq, tiles, total_q = (int(x) for x in max_score.shape)
-    from ..utils import get_device_sm_count
     from .cake_hopper_sm90 import hopper_msa_topk_select, topk_route_available
 
     # The Cake program writes the op's (total_q, Hq, topk) layout directly, so
@@ -237,7 +285,7 @@ def topk_select_sm90(
         num_heads=hq,
         tiles=tiles,
         total_q=total_q,
-        num_sms=int(get_device_sm_count(max_score.device)),
+        num_sms=_sm_count(max_score.device),
         masked=force_begin_blocks > 0 or force_end_blocks > 0,
         nvp=nvp is not None,
     ):
@@ -322,14 +370,14 @@ def sparse_decode_sm90(
     """
     from .cake_hopper_sm90 import hopper_msa_sparse_decode_attention
 
-    _as_packed_kv(k, v)
-    seqused_k = seqused_k.to(torch.int32).contiguous()
+    _check_packed_kv(k, v)
+    seqused_k = _i32(seqused_k)
     hopper_msa_sparse_decode_attention(
         q,
         k,
         v,
-        q2k_indices.to(torch.int32).contiguous(),
-        page_table=page_table.to(torch.int32).contiguous(),
+        _i32(q2k_indices),
+        page_table=_i32(page_table),
         seqused_k=seqused_k,
         seqlen_q=q.shape[0] // seqused_k.numel(),
         softmax_scale=softmax_scale,
@@ -370,19 +418,17 @@ def sparse_prefill_sm90(
         num_kv_heads=k.shape[1],
         max_pages=int(page_table.shape[1]),
     ):
-        _as_packed_kv(k, v)
+        _check_packed_kv(k, v)
         hopper_msa_sparse_attention(
             q,
             k,
             v,
-            q2k_indices.to(torch.int32).contiguous(),
-            cu_seqlens_q.to(torch.int32).contiguous(),
-            page_table=page_table.to(torch.int32).contiguous(),
-            seqused_k=seqused_k.to(torch.int32).contiguous(),
+            _i32(q2k_indices),
+            _i32(cu_seqlens_q),
+            page_table=_i32(page_table),
+            seqused_k=_i32(seqused_k),
             out=out,
-            q_offset=(
-                q_offset.to(torch.int32).contiguous() if q_offset is not None else None
-            ),
+            q_offset=(_i32(q_offset) if q_offset is not None else None),
             softmax_scale=softmax_scale,
         )
         if v_global_scale is not None and v_global_scale != 1.0:
