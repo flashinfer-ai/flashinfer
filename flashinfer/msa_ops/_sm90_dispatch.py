@@ -28,7 +28,7 @@ Cake program instead of silently returning f16-accumulated scores.
 """
 
 import functools
-from typing import Optional
+from typing import Iterable, Optional
 
 import torch
 
@@ -126,6 +126,26 @@ def _fold_scales(q, out_scale, softmax_scale, head_dim):
     if abs(softmax_scale - default) <= 1e-9 * max(1.0, abs(default)):
         return q
     return q * (softmax_scale / default)
+
+
+def preload_sm90_programs(kinds: Optional[Iterable[str]] = None) -> dict[str, int]:
+    """Build and load the Cake Hopper MSA programs of the op kinds ``kinds``
+    (default: all) now, outside CUDA graph capture.
+
+    Explicit opt-in.  By default each program is JIT-built at the first eager
+    use of its route, and a program first needed while a CUDA graph is being
+    captured raises instead of building inside the capture; a per-geometry
+    eager warm-up before capture (vLLM's capture loop) therefore needs no
+    preloading.  Frameworks that capture geometries they never ran eagerly,
+    or that want the build cost at model load, call this once per process.
+    Kinds: ``sparse_decode``, ``proxy_decode``, ``proxy_prefill``,
+    ``topk_select``, ``sparse_prefill``; about 4 s per program not yet in the
+    JIT cache (79 programs in all), ~10 ms per prebuilt one.  Returns the
+    programs loaded per kind.
+    """
+    from .cake_hopper_sm90 import preload_programs
+
+    return preload_programs(kinds)
 
 
 def proxy_score_sm90(

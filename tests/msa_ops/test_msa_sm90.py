@@ -631,6 +631,82 @@ def test_prefill_pipeline_replays_bitwise_from_cuda_graph():
     assert torch.equal(aout, eager[2])
 
 
+@sm90_only
+def test_program_first_needed_under_capture_raises_instead_of_building(monkeypatch):
+    """A program no eager call has loaded is not JIT-built inside a CUDA graph
+    capture: the launch raises, naming the program and the remedies, and the
+    loader is not called.  An eager call of the geometry then loads it and the
+    same capture replays bitwise."""
+    from flashinfer.jit import cake_hopper_msa as jm
+    from flashinfer.msa_ops import cake_hopper_sm90 as ch
+
+    nsm = flashinfer.utils.get_device_sm_count(torch.device("cuda"))
+    plan = ch.plan_topk_select(
+        num_heads=1, tiles=8, total_q=256, num_sms=nsm, masked=True, nvp=True
+    )
+    name = jm.ROUTES.get(plan.route)
+    if name is None:
+        pytest.skip(f"no Cake top-k program for {plan.route} on this tree")
+    scores = torch.randn(1, 8, 256, dtype=torch.float32, device="cuda")
+    nvp = torch.randint(1, 9, (256,), dtype=torch.int32, device="cuda")
+    sel = torch.empty((256, 1, TOPK), dtype=torch.int32, device="cuda")
+
+    def topk():
+        msa_topk_select(
+            scores, TOPK, num_valid_pages=nvp, output=sel, force_begin_blocks=1
+        )
+
+    # the geometry's program leaves the process registry; the templates that cached it are reset
+    monkeypatch.delitem(ch._loaded_modules, name, raising=False)
+    ch._program.cache_clear()
+    ch._topk_template.cache_clear()
+    misses = jm.load_hopper_msa_module.cache_info().misses
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="is not loaded") as info,
+        torch.cuda.graph(graph),
+    ):
+        topk()
+    assert name in str(info.value)
+    assert "preload_programs" in str(info.value)
+    assert jm.load_hopper_msa_module.cache_info().misses == misses
+    topk()  # the eager call loads it (outside capture)
+    torch.cuda.synchronize()
+    eager = sel.clone()
+    sel.fill_(-7)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        topk()
+    sel.fill_(-7)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(sel, eager)
+
+
+@sm90_only
+def test_preload_loads_every_program_of_a_kind_outside_capture():
+    """The explicit opt-in loads every delivered program of the named kinds,
+    reports what it loaded, and refuses unknown kinds and capture."""
+    from flashinfer.msa_ops import cake_hopper_sm90 as ch
+    from flashinfer.msa_ops._sm90_dispatch import preload_sm90_programs
+
+    names = ch._programs_of_kind("proxy_prefill")
+    assert names
+    loaded = preload_sm90_programs(("proxy_prefill",))
+    assert set(loaded) == {"proxy_prefill"}
+    assert 0 <= loaded["proxy_prefill"] <= len(names)
+    assert all(name in ch._loaded_modules for name in names)
+    assert preload_sm90_programs(("proxy_prefill",)) == {"proxy_prefill": 0}
+    with pytest.raises(ValueError, match="unknown"):
+        preload_sm90_programs(("no_such_kind",))
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="must not run under CUDA graph capture"),
+        torch.cuda.graph(graph),
+    ):
+        preload_sm90_programs(("proxy_prefill",))
+
+
 # ---------------------------------------------------------------------------
 # restrictions -- each raises instead of returning plausible, wrong numbers
 # ---------------------------------------------------------------------------

@@ -25,7 +25,12 @@ and L2 policy of the decode regime, key-split count of the prefill regime;
 top-k select: columns per CTA and tile groups per column; sparse prefill: the
 v1 / v2 kernel by pages per sequence), the scratch contract of the split
 decode, and the CUDA-graph rules.  Dispatch reads host-known scalars and
-tensor metadata only; nothing here synchronizes the stream.
+tensor metadata only; nothing here synchronizes the stream.  Plans, route
+checks and the per-geometry launch templates (program, grid, kernel scalars,
+retained buffers) are resolved once per host-known key (``functools.lru_cache``;
+every key is a tuple of ints / bools / dtypes / the device index, never a
+tensor) and never invalidated: they are pure functions of the key and of the
+import-time program registry (host round 1).
 
 Routing on SM90 stays in ``flashinfer.msa_ops._sm90_dispatch``: it keeps the
 surface's raise rules (paged KV only, K and V interleaved in one allocation,
@@ -42,6 +47,17 @@ captured decode keeps valid device pointers after later, larger captures;
 capturing a decode whose scratch has not been warmed by an eager call raises.
 The persistent decode grid, the proxy-score, top-k and sparse-prefill
 programs take no scratch at all.
+
+Program loading: a program's module is JIT-built (FlashInfer, one file lock
+per module) and loaded through TVM-FFI at the first eager use of its route;
+a program first needed while the current stream is capturing a CUDA graph
+raises a RuntimeError naming the program and the remedies instead of
+building inside the capture.  A per-geometry eager warm-up before capture
+(what the split-decode scratch requires anyway, and what vLLM's capture
+loop does) therefore loads every program a capture needs; frameworks that
+capture geometries never run eagerly, or that want the build cost at model
+load, call ``preload_programs`` (every delivered program of the given op
+kinds, read from the route table) once per process (host round 1, phase 3).
 """
 
 from __future__ import annotations
@@ -51,12 +67,12 @@ import heapq
 import math
 import threading
 from dataclasses import dataclass, replace
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import torch
 import tvm_ffi
 
-from ..jit.cake_hopper_msa import MODULES, load_hopper_msa_module, route_program
+from ..jit.cake_hopper_msa import MODULES, ROUTES, load_hopper_msa_module, route_program
 from ..utils import get_compute_capability, get_device_sm_count
 
 _BLOCK_SIZE = 128
@@ -137,10 +153,35 @@ def _num_sms(device_index: int) -> int:
     return int(get_device_sm_count(device))
 
 
+# Stream of a launch: ``tvm_ffi.use_torch_stream()`` builds a ``torch.cuda.Stream`` object, formats its device and
+# resolves a tvm_ffi device on every call; the raw handle of the current stream on the current device is the same
+# value read directly (one tvm_ffi device object per CUDA device, the context object per launch).  Falls back to
+# ``use_torch_stream`` when either entry point is absent.  Host round 1 of the Hopper MSA port.
+_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+try:
+    from tvm_ffi.stream import StreamContext as _FFIStreamContext
+except Exception:  # noqa: BLE001  (older tvm_ffi layouts)
+    _FFIStreamContext = None
+_ffi_devices: dict[int, Any] = {}
+
+
+def _ffi_stream_context():
+    """Context running the FFI call on the current torch stream of the current device."""
+
+    if _raw_stream is None or _FFIStreamContext is None:
+        return tvm_ffi.use_torch_stream()
+    index = torch.cuda.current_device()
+    device = _ffi_devices.get(index)
+    if device is None:
+        device = tvm_ffi.device(f"cuda:{index}")
+        _ffi_devices[index] = device
+    return _FFIStreamContext(device, _raw_stream(index))
+
+
 class _Program:
     """One loaded program: its FFI entry and physical argument order."""
 
-    __slots__ = ("entry", "plan", "name")
+    __slots__ = ("entry", "plan", "name", "slots")
 
     def __init__(
         self, name: str, entry: Any, plan: tuple[tuple[str, str], ...]
@@ -148,35 +189,169 @@ class _Program:
         self.name = name
         self.entry = entry
         self.plan = plan
+        # The argument order bound once: (True, grid axis) for the grid scalars, (False, argument name) otherwise.
+        self.slots = tuple(
+            (kind == "grid", _GRID_AXES[argument] if kind == "grid" else argument)
+            for kind, argument in plan
+        )
 
-    def launch(self, grid: tuple[int, int, int], **arguments: Any) -> None:
-        """Launch on the current torch stream with the generated argument order."""
+    def launch(
+        self,
+        grid: tuple[int, int, int],
+        constants: Optional[dict[str, Any]] = None,
+        **arguments: Any,
+    ) -> None:
+        """Launch on the current torch stream with the generated argument order.
 
-        values = []
-        for kind, name in self.plan:
-            if kind == "grid":
-                values.append(int(grid[_GRID_AXES[name]]))
-            else:
-                values.append(arguments[name])
-        with tvm_ffi.use_torch_stream():
+        ``constants`` holds the arguments of a launch template resolved once per geometry (kernel scalars, retained
+        buffers); ``arguments`` the per-call tensors.  A name present in both is taken from ``arguments``.
+        """
+
+        if constants:
+            values = [
+                int(grid[key])
+                if is_grid
+                else (arguments[key] if key in arguments else constants[key])
+                for is_grid, key in self.slots
+            ]
+        else:
+            values = [
+                int(grid[key]) if is_grid else arguments[key]
+                for is_grid, key in self.slots
+            ]
+        with _ffi_stream_context():
             self.entry(*values)
+
+
+# ---------------------------------------------------------------------------
+# Program loading
+# ---------------------------------------------------------------------------
+
+# Op kind -> the route-key families (``<family>:<coordinates>:<stage>``) of its delivered programs.
+_KIND_FAMILIES: dict[str, tuple[str, ...]] = {
+    "sparse_decode": ("decode_v5",),
+    "proxy_decode": ("proxy_decode",),
+    "proxy_prefill": ("proxy_prefill",),
+    "topk_select": ("topk_select",),
+    "sparse_prefill": ("prefill_v1", "prefill_v2"),
+}
+# Op kind -> the launcher below whose eager call loads a program of the kind (named in the capture error).
+_KIND_LAUNCHERS: dict[str, str] = {
+    "sparse_decode": "hopper_msa_sparse_decode_attention",
+    "proxy_decode": "hopper_msa_proxy_score_decode",
+    "proxy_prefill": "hopper_msa_proxy_score_prefill",
+    "topk_select": "hopper_msa_topk_select",
+    "sparse_prefill": "hopper_msa_sparse_attention",
+}
+PROGRAM_KINDS: tuple[str, ...] = tuple(_KIND_FAMILIES)
+
+
+def _route_family(route: str) -> str:
+    return route.split(":", 1)[0]
+
+
+def _check_route_families() -> None:
+    """Every delivered route belongs to an op kind, or ``preload_programs`` could not reach its program."""
+
+    known = {family for families in _KIND_FAMILIES.values() for family in families}
+    unassigned = sorted({_route_family(route) for route in ROUTES} - known)
+    if unassigned:
+        raise RuntimeError(
+            f"Hopper MSA route families without an op kind: {unassigned} (extend _KIND_FAMILIES)"
+        )
+
+
+_check_route_families()
+
+
+@functools.cache
+def _programs_of_kind(kind: str) -> tuple[str, ...]:
+    """The delivered programs of one op kind (distinct, sorted), read from the route table."""
+
+    families = _KIND_FAMILIES[kind]
+    return tuple(
+        sorted(
+            {name for route, name in ROUTES.items() if _route_family(route) in families}
+        )
+    )
+
+
+def _kind_of_route(route: str) -> str:
+    family = _route_family(route)
+    return next(kind for kind, families in _KIND_FAMILIES.items() if family in families)
+
+
+# program name -> its loaded module (this process)
+_loaded_modules: dict[str, Any] = {}
+
+
+def _capture_error(route: str) -> RuntimeError:
+    kind = _kind_of_route(route)
+    return RuntimeError(
+        f"Hopper MSA program {route_program(route)} (route {route!r}) is not loaded and the current stream is "
+        f"capturing a CUDA graph: run {_KIND_LAUNCHERS[kind]} eagerly with this geometry once per process before "
+        f"capture, or call preload_programs(({kind!r},)) at model load"
+    )
+
+
+def _loaded_module(route: str) -> Any:
+    """The module of one route, built (FlashInfer JIT, one file lock per module) and loaded at its first use --
+    never under CUDA graph capture: a program first needed there raises instead."""
+
+    name = route_program(route)
+    module = _loaded_modules.get(name)
+    if module is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise _capture_error(route)
+        module = load_hopper_msa_module(name)
+        _loaded_modules[name] = module
+    return module
+
+
+def preload_programs(kinds: Optional[Iterable[str]] = None) -> dict[str, int]:
+    """Build and load every delivered program of the op kinds ``kinds`` (default: all of ``PROGRAM_KINDS``) now,
+    outside CUDA graph capture, so that a geometry first met under capture finds its program loaded.
+
+    Explicit opt-in.  By default a program is built and loaded at the first eager use of its route -- nothing up
+    front, and what a per-geometry eager warm-up before capture (vLLM's capture loop) relies on.  Preloading a kind
+    costs one nvcc build per program not yet in the JIT cache (about 4 s each: 22 / 24 / 23 / 4 / 6 programs for
+    sparse decode / proxy decode / top-k select / proxy prefill / sparse prefill) and about 10 ms per prebuilt
+    program.  Returns the number of programs this call loaded, per kind.  Raises under capture and for an unknown
+    kind.
+    """
+
+    selected = PROGRAM_KINDS if kinds is None else tuple(kinds)
+    unknown = [kind for kind in selected if kind not in _KIND_FAMILIES]
+    if unknown:
+        raise ValueError(
+            f"unknown Hopper MSA program kinds {unknown}; known kinds: {PROGRAM_KINDS}"
+        )
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "preload_programs builds and loads programs and must not run under CUDA graph capture"
+        )
+    loaded: dict[str, int] = {}
+    for kind in selected:
+        count = 0
+        for name in _programs_of_kind(kind):
+            if name not in _loaded_modules:
+                _loaded_modules[name] = load_hopper_msa_module(name)
+                count += 1
+        loaded[kind] = count
+    return loaded
 
 
 @functools.cache
 def _program(route: str) -> _Program:
     name = route_program(route)
     record = MODULES[name]
-    module = load_hopper_msa_module(name)
+    module = _loaded_module(route)
     plan = tuple((str(kind), str(argument)) for kind, argument in record["arg_plan"])
     return _Program(name, getattr(module, record["ffi_entry"]), plan)
 
 
 def _route_available(route: str) -> bool:
-    try:
-        route_program(route)
-    except KeyError:
-        return False
-    return True
+    return route in ROUTES
 
 
 _trace_carriers: dict[int, torch.Tensor] = {}
@@ -302,6 +477,7 @@ def _max_splits(nc: int, stages: int, half: bool = False) -> int:
     )
 
 
+@functools.lru_cache(maxsize=4096)
 def plan_sparse_decode(
     *,
     total_q: int,
@@ -459,6 +635,55 @@ def _scratch(
     return buffers
 
 
+@functools.lru_cache(maxsize=4096)
+def _decode_template(
+    *,
+    total_q: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    seqlen_q: int,
+    max_pages: int,
+    device_index: int,
+) -> tuple[_Program, tuple[int, int, int], dict[str, Any]]:
+    """The launch of one decode geometry resolved once: program, grid and the per-plan arguments (kernel scalars,
+    the trace carrier, the retained split scratch).  Pure in its key; the per-call tensors join at launch time.
+    A first use under CUDA-graph capture raises exactly as the eager-first rules of the buffers did (nothing cached)."""
+
+    plan = plan_sparse_decode(
+        total_q=total_q,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        num_sms=_num_sms(device_index),
+        seqlen_q=seqlen_q,
+        max_pages=max_pages,
+    )
+    device = torch.device("cuda", device_index)
+    items = total_q * num_kv_heads * plan.chunks
+    constants: dict[str, Any] = dict(
+        total_q=total_q,
+        seqlen_q=seqlen_q,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        max_pages=max_pages,
+        num_chunks=plan.chunks,
+        zero_u32=0,
+        trace=_trace_carrier(device),
+    )
+    if plan.persist:
+        # One CTA per residency slot loops over the items: the item count is a kernel scalar, no split scratch.
+        constants["num_items"] = items
+    else:
+        part_o, part_ml, counters, done = _scratch(
+            device, items=items, splits=plan.splits, nc=plan.nc
+        )
+        constants.update(part_o=part_o, part_ml=part_ml, counters=counters, done=done)
+    return (
+        _program(plan.route),
+        plan.grid(total_q=total_q, num_kv_heads=num_kv_heads),
+        constants,
+    )
+
+
 def hopper_msa_sparse_decode_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -530,21 +755,21 @@ def hopper_msa_sparse_decode_attention(
         raise ValueError(f"seqused_k must be contiguous int32 with {batch} entries")
     if out.shape != q.shape or out.dtype != torch.bfloat16 or not out.is_contiguous():
         raise ValueError("out must be a contiguous bf16 tensor shaped like q")
-    device = q.device
     max_pages = int(page_table.shape[1])
-    plan = plan_sparse_decode(
+    program, grid, constants = _decode_template(
         total_q=total_q,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
-        num_sms=_num_sms(_device_index(device)),
-        seqlen_q=seqlen_q,
+        seqlen_q=int(seqlen_q),
         max_pages=max_pages,
+        device_index=_device_index(q.device),
     )
-    items = total_q * num_kv_heads * plan.chunks
     scale = (
         1.0 / math.sqrt(_HEAD_DIM) if softmax_scale is None else float(softmax_scale)
     )
-    arguments: dict[str, Any] = dict(
+    program.launch(
+        grid,
+        constants,
         Q32=q.view(torch.uint32),
         K=k.view(torch.uint8),
         V=v.view(torch.uint8),
@@ -552,26 +777,7 @@ def hopper_msa_sparse_decode_attention(
         q2k_indices=q2k_indices,
         page_table=page_table,
         seqused_k=seqused_k,
-        total_q=total_q,
-        seqlen_q=int(seqlen_q),
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        max_pages=max_pages,
-        num_chunks=plan.chunks,
         softmax_scale_log2=scale * _LOG2E,
-        zero_u32=0,
-        trace=_trace_carrier(device),
-    )
-    if plan.persist:
-        # One CTA per residency slot loops over the items: the item count is a kernel scalar, no split scratch.
-        arguments["num_items"] = items
-    else:
-        part_o, part_ml, counters, done = _scratch(
-            device, items=items, splits=plan.splits, nc=plan.nc
-        )
-        arguments.update(part_o=part_o, part_ml=part_ml, counters=counters, done=done)
-    _program(plan.route).launch(
-        plan.grid(total_q=total_q, num_kv_heads=num_kv_heads), **arguments
     )
     return out
 
@@ -627,6 +833,47 @@ def proxy_evict_first(
     page_bytes = _BLOCK_SIZE * _HEAD_DIM * (1 if fp8 else 2)
     footprint = min(int(batch) * int(max_k_tiles), int(num_pages)) * page_bytes
     return footprint < 5 * _L2_BYTES
+
+
+@functools.lru_cache(maxsize=4096)
+def _proxy_decode_template(
+    *,
+    q_dtype: torch.dtype,
+    num_q_heads: int,
+    max_seqlen_q: int,
+    batch: int,
+    max_k_tiles: int,
+    total_q: int,
+    num_pages: int,
+    pt_stride: int,
+    has_qoff: bool,
+    device_index: int,
+) -> tuple[_Program, tuple[int, int, int], dict[str, Any]]:
+    """The launch of one decode-regime proxy geometry resolved once: program, grid (CTA order) and kernel scalars."""
+
+    batch_fast = plan_proxy_score(
+        batch=batch, max_k_tiles=max_k_tiles, num_pages=num_pages
+    )
+    evict_first = proxy_evict_first(
+        batch=batch,
+        max_k_tiles=max_k_tiles,
+        num_pages=num_pages,
+        fp8=q_dtype == torch.float8_e4m3fn,
+    )
+    constants: dict[str, Any] = dict(
+        has_qoff=1 if has_qoff else 0,
+        pt_stride=pt_stride,
+        max_k_tiles=max_k_tiles,
+        total_q=total_q,
+        batch_fast=1 if batch_fast else 0,
+        evict_first=1 if evict_first else 0,
+        trace=_trace_carrier(torch.device("cuda", device_index)),
+    )
+    program = _program(
+        proxy_route(q_dtype=q_dtype, num_q_heads=num_q_heads, max_seqlen_q=max_seqlen_q)
+    )
+    grid = (batch, max_k_tiles, 1) if batch_fast else (max_k_tiles, batch, 1)
+    return program, grid, constants
 
 
 def hopper_msa_proxy_score_decode(
@@ -715,32 +962,27 @@ def hopper_msa_proxy_score_decode(
     else:
         q2 = q.view(total_q * num_q_heads, _HEAD_DIM)
         k2 = k.view(num_pages * _BLOCK_SIZE, _HEAD_DIM)
-    batch_fast = plan_proxy_score(
-        batch=batch, max_k_tiles=max_k_tiles, num_pages=num_pages
-    )
-    evict_first = proxy_evict_first(
+    program, grid, constants = _proxy_decode_template(
+        q_dtype=q.dtype,
+        num_q_heads=num_q_heads,
+        max_seqlen_q=sq,
         batch=batch,
         max_k_tiles=max_k_tiles,
+        total_q=total_q,
         num_pages=num_pages,
-        fp8=q.dtype == torch.float8_e4m3fn,
+        pt_stride=int(page_table.stride(0)),
+        has_qoff=q_offset is not None,
+        device_index=_device_index(q.device),
     )
-    _program(
-        proxy_route(q_dtype=q.dtype, num_q_heads=num_q_heads, max_seqlen_q=sq)
-    ).launch(
-        (batch, max_k_tiles, 1) if batch_fast else (max_k_tiles, batch, 1),
+    program.launch(
+        grid,
+        constants,
         Q=q2,
         K=k2,
         out=per_head,
         page_table=page_table,
         seqused_k=seqused_k,
         q_offset=q_offset if q_offset is not None else seqused_k,
-        has_qoff=1 if q_offset is not None else 0,
-        pt_stride=int(page_table.stride(0)),
-        max_k_tiles=max_k_tiles,
-        total_q=total_q,
-        batch_fast=1 if batch_fast else 0,
-        evict_first=1 if evict_first else 0,
-        trace=_trace_carrier(q.device),
     )
     return per_head
 
@@ -994,6 +1236,7 @@ class HopperProxyPrefillPlan:
         return (hq * self.n_mtiles, self.nsplit, batch)
 
 
+@functools.lru_cache(maxsize=256)
 def proxy_prefill_route_available(
     *, q_dtype: torch.dtype, num_kv_heads: int, use_fp32_acc: bool
 ) -> bool:
@@ -1115,6 +1358,7 @@ def f16_short_form(
     return _PXP_VARIANT_F16_SHORT, "fi"
 
 
+@functools.lru_cache(maxsize=4096)
 def plan_proxy_score_prefill(
     *,
     hq: int,
@@ -1183,6 +1427,41 @@ def plan_proxy_score_prefill(
         nsplit=nsplit,
         lpt=form["lpt"],
     )
+
+
+@functools.lru_cache(maxsize=4096)
+def _proxy_prefill_template(
+    *,
+    hq: int,
+    batch: int,
+    max_k_tiles: int,
+    max_seqlen_q: int,
+    use_fp32_acc: bool,
+    total_q: int,
+    pt_stride: int,
+    has_qoff: bool,
+    device_index: int,
+) -> tuple[_Program, tuple[int, int, int], dict[str, Any]]:
+    """The launch of one prefill-regime proxy geometry resolved once: program, grid and kernel scalars."""
+
+    plan = plan_proxy_score_prefill(
+        hq=hq,
+        batch=batch,
+        max_k_tiles=max_k_tiles,
+        max_seqlen_q=max_seqlen_q,
+        use_fp32_acc=use_fp32_acc,
+        num_sms=_num_sms(device_index),
+    )
+    constants: dict[str, Any] = dict(
+        has_qoff=1 if has_qoff else 0,
+        pt_stride=pt_stride,
+        max_k_tiles=max_k_tiles,
+        total_q=total_q,
+        num_heads=hq,
+        nsplit=plan.nsplit,
+        trace=_trace_carrier(torch.device("cuda", device_index)),
+    )
+    return _program(plan.route), plan.grid(hq=hq, batch=batch), constants
 
 
 def hopper_msa_proxy_score_prefill(
@@ -1271,17 +1550,21 @@ def hopper_msa_proxy_score_prefill(
         raise ValueError(f"q_offset must be contiguous int32 with {batch} entries")
     if int(max_seqlen_q) <= 0:
         raise ValueError(f"max_seqlen_q must be positive, got {max_seqlen_q}")
-    plan = plan_proxy_score_prefill(
+    num_pages = int(k.shape[0])
+    program, grid, constants = _proxy_prefill_template(
         hq=num_q_heads,
         batch=batch,
         max_k_tiles=max_k_tiles,
         max_seqlen_q=int(max_seqlen_q),
         use_fp32_acc=bool(use_fp32_acc),
-        num_sms=_num_sms(_device_index(q.device)),
+        total_q=total_q,
+        pt_stride=int(page_table.stride(0)),
+        has_qoff=q_offset is not None,
+        device_index=_device_index(q.device),
     )
-    num_pages = int(k.shape[0])
-    _program(plan.route).launch(
-        plan.grid(hq=num_q_heads, batch=batch),
+    program.launch(
+        grid,
+        constants,
         Q=q.view(torch.uint8),
         K=k.view(torch.uint8).view(
             num_pages * int(k.shape[1]) * _BLOCK_SIZE, _HEAD_DIM
@@ -1291,13 +1574,6 @@ def hopper_msa_proxy_score_prefill(
         page_table=page_table,
         seqused_k=seqused_k,
         q_offset=q_offset if q_offset is not None else seqused_k,
-        has_qoff=1 if q_offset is not None else 0,
-        pt_stride=int(page_table.stride(0)),
-        max_k_tiles=max_k_tiles,
-        total_q=total_q,
-        num_heads=num_q_heads,
-        nsplit=plan.nsplit,
-        trace=_trace_carrier(q.device),
     )
     return per_head
 
@@ -1507,6 +1783,61 @@ def plan_topk_select(
     )
 
 
+@functools.lru_cache(maxsize=4096)
+def _topk_resolution(
+    *, num_heads: int, tiles: int, total_q: int, num_sms: int, masked: bool, nvp: bool
+) -> tuple[HopperTopkPlan, Optional[str]]:
+    """``(plan, program name or None)`` of one top-k geometry: the planner's coordinate and whether a Cake program
+    was delivered for its route -- resolved once per geometry for the route check and the launcher alike."""
+
+    plan = plan_topk_select(
+        num_heads=num_heads,
+        tiles=tiles,
+        total_q=total_q,
+        num_sms=num_sms,
+        masked=masked,
+        nvp=nvp,
+    )
+    return plan, ROUTES.get(plan.route)
+
+
+@functools.lru_cache(maxsize=4096)
+def _topk_template(
+    *,
+    num_heads: int,
+    tiles: int,
+    total_q: int,
+    num_sms: int,
+    masked: bool,
+    nvp: bool,
+    device_index: int,
+) -> tuple[_Program, tuple[int, int, int], dict[str, Any]]:
+    """The launch of one top-k geometry resolved once: program, grid and kernel scalars (the never-read int32 filler
+    of the form without per-token valid pages included)."""
+
+    plan, name = _topk_resolution(
+        num_heads=num_heads,
+        tiles=tiles,
+        total_q=total_q,
+        num_sms=num_sms,
+        masked=masked,
+        nvp=nvp,
+    )
+    if name is None:
+        raise NotImplementedError(
+            f"no Cake SM90 top-k program for the planner coordinate {plan.route!r} (Hq {num_heads}, tiles {tiles}, total_q {total_q})"
+        )
+    constants: dict[str, Any] = dict(
+        tiles=tiles,
+        total_q=total_q,
+        num_heads=num_heads,
+        num_chunks=plan.chunks(tiles),
+    )
+    if not nvp:
+        constants["nvp"] = _int32_dummy(torch.device("cuda", device_index))
+    return _program(plan.route), (-(-total_q // plan.c), num_heads, 1), constants
+
+
 def topk_route_available(
     *, num_heads: int, tiles: int, total_q: int, num_sms: int, masked: bool, nvp: bool
 ) -> bool:
@@ -1515,15 +1846,17 @@ def topk_route_available(
 
     if tiles < 1 or tiles > _TK_MAX_TILES or total_q < 1 or num_heads < 1:
         return False
-    plan = plan_topk_select(
-        num_heads=int(num_heads),
-        tiles=int(tiles),
-        total_q=int(total_q),
-        num_sms=int(num_sms),
-        masked=bool(masked),
-        nvp=bool(nvp),
+    return (
+        _topk_resolution(
+            num_heads=int(num_heads),
+            tiles=int(tiles),
+            total_q=int(total_q),
+            num_sms=int(num_sms),
+            masked=bool(masked),
+            nvp=bool(nvp),
+        )[1]
+        is not None
     )
-    return _route_available(plan.route)
 
 
 def hopper_msa_topk_select(
@@ -1580,30 +1913,30 @@ def hopper_msa_topk_select(
                 "num_valid_pages must be a contiguous int32 (total_q,) tensor"
             )
         nvp = num_valid_pages
-    plan = plan_topk_select(
+    device_index = _device_index(max_score.device)
+    program, grid, constants = _topk_template(
         num_heads=hq,
         tiles=tiles,
         total_q=total_q,
-        num_sms=_num_sms(_device_index(max_score.device)),
+        num_sms=_num_sms(device_index),
         masked=fb > 0 or fe > 0,
         nvp=nvp is not None,
+        device_index=device_index,
     )
-    if not _route_available(plan.route):
-        raise NotImplementedError(
-            f"no Cake SM90 top-k program for the planner coordinate {plan.route!r} (Hq {hq}, tiles {tiles}, total_q {total_q})"
+    if nvp is not None:
+        program.launch(
+            grid,
+            constants,
+            S=max_score.view(torch.uint32),
+            nvp=nvp,
+            out=output,
+            fb=fb,
+            fe=fe,
         )
-    _program(plan.route).launch(
-        (-(-total_q // plan.c), hq, 1),
-        S=max_score.view(torch.uint32),
-        nvp=nvp if nvp is not None else _int32_dummy(max_score.device),
-        out=output,
-        tiles=tiles,
-        total_q=total_q,
-        num_heads=hq,
-        num_chunks=plan.chunks(tiles),
-        fb=fb,
-        fe=fe,
-    )
+    else:
+        program.launch(
+            grid, constants, S=max_score.view(torch.uint32), out=output, fb=fb, fe=fe
+        )
     return output
 
 
@@ -1644,6 +1977,7 @@ class HopperPrefillPlan:
         return f"prefill_v2:g{self.group}:nc{_PF_V2_NCONS}:st4:fb2:none:qrs:pp:pvwait:role:amma:main"
 
 
+@functools.lru_cache(maxsize=4096)
 def plan_sparse_prefill(
     *, num_q_heads: int, num_kv_heads: int, max_pages: int
 ) -> HopperPrefillPlan:
@@ -1659,6 +1993,7 @@ def plan_sparse_prefill(
     return HopperPrefillPlan(impl=impl, group=group)
 
 
+@functools.lru_cache(maxsize=4096)
 def prefill_route_available(
     *, num_q_heads: int, num_kv_heads: int, max_pages: int
 ) -> bool:
@@ -1676,6 +2011,41 @@ def prefill_route_available(
             num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, max_pages=max_pages
         ).route
     )
+
+
+@functools.lru_cache(maxsize=4096)
+def _prefill_template(
+    *,
+    num_q_heads: int,
+    num_kv_heads: int,
+    max_pages: int,
+    total_q: int,
+    batch: int,
+    use_q_offset: bool,
+    device_index: int,
+) -> tuple[_Program, tuple[int, int, int], dict[str, Any]]:
+    """The launch of one sparse-prefill geometry resolved once: program, grid and kernel scalars."""
+
+    plan = plan_sparse_prefill(
+        num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, max_pages=max_pages
+    )
+    if not _route_available(plan.route):
+        raise NotImplementedError(
+            f"no Cake SM90 sparse-prefill program for GQA group {plan.group} ({plan.route!r})"
+        )
+    # >= sum_b ceil(qlen_b / tokens per group); the extra CTAs find no group and idle.
+    groups = max(1, -(-total_q // plan.tokens_per_group) + batch - 1)
+    constants: dict[str, Any] = dict(
+        total_q=total_q,
+        batch=batch,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        max_pages=max_pages,
+        use_q_offset=1 if use_q_offset else 0,
+        zero_u32=0,
+        trace=_trace_carrier(torch.device("cuda", device_index)),
+    )
+    return _program(plan.route), (groups, num_kv_heads, 1), constants
 
 
 def hopper_msa_sparse_attention(
@@ -1772,20 +2142,21 @@ def hopper_msa_sparse_attention(
         raise NotImplementedError(
             f"SM90 sparse prefill unions at most {_PF_MAX_BLOCKS} blocks per sequence, got {max_pages}"
         )
-    plan = plan_sparse_prefill(
-        num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, max_pages=max_pages
+    program, grid, constants = _prefill_template(
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        max_pages=max_pages,
+        total_q=total_q,
+        batch=batch,
+        use_q_offset=q_offset is not None,
+        device_index=_device_index(q.device),
     )
-    if not _route_available(plan.route):
-        raise NotImplementedError(
-            f"no Cake SM90 sparse-prefill program for GQA group {plan.group} ({plan.route!r})"
-        )
     scale = (
         1.0 / math.sqrt(_HEAD_DIM) if softmax_scale is None else float(softmax_scale)
     )
-    # >= sum_b ceil(qlen_b / tokens per group); the extra CTAs find no group and idle.
-    groups = max(1, -(-total_q // plan.tokens_per_group) + batch - 1)
-    _program(plan.route).launch(
-        (groups, num_kv_heads, 1),
+    program.launch(
+        grid,
+        constants,
         Q32=q.view(torch.uint32),
         K=k.view(torch.uint8),
         V=v.view(torch.uint8),
@@ -1795,20 +2166,13 @@ def hopper_msa_sparse_attention(
         page_table=page_table,
         seqused_k=seqused_k,
         q_offset=q_offset if q_offset is not None else seqused_k,
-        total_q=total_q,
-        batch=batch,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        max_pages=max_pages,
-        use_q_offset=1 if q_offset is not None else 0,
         softmax_scale_log2=scale * _LOG2E,
-        zero_u32=0,
-        trace=_trace_carrier(q.device),
     )
     return out
 
 
 __all__ = [
+    "PROGRAM_KINDS",
     "HopperDecodePlan",
     "HopperPrefillPlan",
     "HopperProxyPrefillPlan",
@@ -1824,6 +2188,7 @@ __all__ = [
     "plan_sparse_decode",
     "plan_sparse_prefill",
     "plan_topk_select",
+    "preload_programs",
     "prefill_route_available",
     "proxy_decode_route_available",
     "proxy_evict_first",
