@@ -44,6 +44,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
+from flashinfer.gdp_prefill import chunk_gated_delta_product
 from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import get_compute_capability
 
@@ -56,18 +57,33 @@ except ImportError:
     _has_fla = False
 
 
-def _cudnn_rejection_reason(device):
-    """Why the cuDNN backend cannot run this benchmark, or None if it can."""
+def _cudnn_rejection_reason(device, num_householder=1):
+    """Why the cuDNN backend cannot run this benchmark, or None if it can.
+
+    Probes the entry point that will actually be measured: GDN and GDP are
+    separate cuDNN engines, so one answering says nothing about the other.
+    """
     tokens, heads, dim = 64, 1, 128
     qkv = dict(dtype=torch.float16, device=device)
+    cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device=device)
     try:
-        chunk_gated_delta_rule(
-            torch.randn(tokens, heads, dim, **qkv),
-            torch.randn(tokens, heads, dim, **qkv),
-            torch.randn(tokens, heads, dim, **qkv),
-            cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32, device=device),
-            backend="cudnn",
-        )
+        if num_householder > 1:
+            chunk_gated_delta_product(
+                torch.randn(tokens, heads, dim, **qkv),
+                torch.randn(tokens * num_householder, heads, dim, **qkv),
+                torch.randn(tokens * num_householder, heads, dim, **qkv),
+                num_householder=num_householder,
+                cu_seqlens=cu_seqlens,
+                backend="cudnn",
+            )
+        else:
+            chunk_gated_delta_rule(
+                torch.randn(tokens, heads, dim, **qkv),
+                torch.randn(tokens, heads, dim, **qkv),
+                torch.randn(tokens, heads, dim, **qkv),
+                cu_seqlens=cu_seqlens,
+                backend="cudnn",
+            )
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
     return None
@@ -113,9 +129,13 @@ SEQ_CONFIGS = [
 DRIFT_THRESHOLD = 0.02
 
 
-def _gdn_tflops(total_tokens, h_v, d, time_ms):
-    """Calculate TFLOPS: 2 GEMMs (kv outer product + q@state) per token per head."""
-    flops = 2 * 2 * total_tokens * h_v * d * d
+def _gdn_tflops(total_tokens, h_v, d, time_ms, num_householder=1):
+    """Calculate TFLOPS: 2 GEMMs (kv outer product + q@state) per token per head.
+
+    Under GDP the kv outer product runs once per (token, Householder) while the
+    q@state readout stays once per real token, so only the first scales by n_h.
+    """
+    flops = 2 * total_tokens * h_v * d * d * (num_householder + 1)
     return flops / time_ms / 1e9
 
 
@@ -137,18 +157,22 @@ def bench_fi(args, endpoints, h_qk, h_v, d, backend="auto"):
     starts = (0,) + tuple(endpoints[:-1])
     max_seqlen = max(end - start for start, end in zip(starts, endpoints, strict=True))
 
+    n_h = args.num_householder
+    # GDP: k, v and beta carry n_h rows per real token; q, g and the output
+    # stay at real-token rows and the kernel indexes them there.
+    TE = T * n_h
     q = torch.randn((T, h_qk, d), dtype=dtype, device=device)
     k = F.normalize(
-        torch.randn(T, h_qk, d, dtype=torch.float32, device=device), p=2, dim=-1
+        torch.randn(TE, h_qk, d, dtype=torch.float32, device=device), p=2, dim=-1
     ).to(dtype)
-    v = torch.randn((T, h_v, d), dtype=dtype, device=device)
+    v = torch.randn((TE, h_v, d), dtype=dtype, device=device)
     # FlashInfer's g is the linear-space forget gate alpha in (0, 1)
     # ("defaults to all ones" = no decay). Log-space gates (e.g. logsigmoid)
     # are out of domain and produce NaN outputs/state.
     g = torch.rand(T, h_v, dtype=torch.float32, device=device).clamp_min(
         torch.finfo(torch.float32).tiny
     )
-    beta = torch.rand(T, h_v, dtype=torch.float32, device=device).sigmoid()
+    beta = torch.rand(TE, h_v, dtype=torch.float32, device=device).sigmoid()
     h0 = torch.randn((N, h_v, d, d), dtype=torch.float32, device=device)
 
     num_buffer = get_num_rotating_buffers(args.iters, q, k, v)
@@ -159,20 +183,36 @@ def bench_fi(args, endpoints, h_qk, h_v, d, backend="auto"):
 
     def fn():
         nonlocal rotation_buffer_idx
-        chunk_gated_delta_rule(
-            q[rotation_buffer_idx % num_buffer],
-            k[rotation_buffer_idx % num_buffer],
-            v[rotation_buffer_idx % num_buffer],
-            g,
-            beta,
-            None,
-            h0,
-            True,
-            cu_seqlens,
-            False,
-            backend=backend,
-            max_seqlen=max_seqlen,
-        )
+        if n_h > 1:
+            chunk_gated_delta_product(
+                q[rotation_buffer_idx % num_buffer],
+                k[rotation_buffer_idx % num_buffer],
+                v[rotation_buffer_idx % num_buffer],
+                g,
+                beta,
+                n_h,
+                None,
+                h0,
+                True,
+                cu_seqlens,
+                False,
+                backend=backend,
+            )
+        else:
+            chunk_gated_delta_rule(
+                q[rotation_buffer_idx % num_buffer],
+                k[rotation_buffer_idx % num_buffer],
+                v[rotation_buffer_idx % num_buffer],
+                g,
+                beta,
+                None,
+                h0,
+                True,
+                cu_seqlens,
+                False,
+                backend=backend,
+                max_seqlen=max_seqlen,
+            )
         rotation_buffer_idx += 1
 
     times = bench_gpu_time(
@@ -242,6 +282,13 @@ def bench_fla(args, endpoints, h_qk, h_v, d):
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark GDN Prefill Kernel")
+    parser.add_argument(
+        "--num-householder",
+        type=int,
+        default=1,
+        help="Householder updates per token. >1 benchmarks GDP "
+        "(chunk_gated_delta_product) instead of GDN.",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--cooling-time", type=float, default=0.1)
@@ -264,13 +311,21 @@ def main():
         major, f"SM{major}{minor}"
     )
 
+    # FLA's baseline is the gated delta rule, so it is not a GDP comparison.
+    has_fla = _has_fla and args.num_householder == 1
+    if _has_fla and args.num_householder > 1:
+        print("Note: FLA has no GDP baseline; skipping that column.")
     if not _has_fla:
         print(
             "Warning: FLA not installed (pip install flash-linear-attention). "
             "Benchmarking FlashInfer only."
         )
 
-    cudnn_reason = None if args.skip_cudnn else _cudnn_rejection_reason(device)
+    cudnn_reason = (
+        None
+        if args.skip_cudnn
+        else _cudnn_rejection_reason(device, args.num_householder)
+    )
     has_cudnn = not args.skip_cudnn and cudnn_reason is None
     if cudnn_reason is not None:
         print(f"Warning: cuDNN backend unavailable: {cudnn_reason}")
@@ -285,7 +340,7 @@ def main():
     )
     if has_cudnn:
         header += f"  {'cuDNN':>10s}  {'FI/cuDNN':>9s}"
-    if _has_fla:
+    if has_fla:
         header += f"  {'FLA/Triton':>10s}  {'Speedup':>8s}"
     print(header)
     print("-" * len(header))
@@ -293,7 +348,7 @@ def main():
     order = ["FI"]
     if has_cudnn:
         order.append("cuDNN")
-    if _has_fla:
+    if has_fla:
         order.append("FLA")
 
     for h_qk, h_v, d, h_label in HEAD_CONFIGS:
@@ -312,12 +367,20 @@ def main():
                             h_qk,
                             h_v,
                             d,
-                            backend="cudnn" if name == "cuDNN" else "auto",
+                            backend=(
+                                "cudnn"
+                                if name == "cuDNN"
+                                # GDP's "auto" IS cuDNN, so both columns would
+                                # measure the same kernel; name it instead.
+                                else "flashinfer"
+                                if args.num_householder > 1
+                                else "auto"
+                            ),
                         )
                     )
                 time.sleep(args.cooling_time)
             fi_ms = float(np.median(block_medians["FI"]))
-            tflops = _gdn_tflops(T, h_v, d, fi_ms)
+            tflops = _gdn_tflops(T, h_v, d, fi_ms, args.num_householder)
             row = (
                 f"{h_label:<15s}  {s_label:<16s}  {h_qk:>4d} {h_v:>4d}"
                 f"  {fi_ms:>21.3f}ms  {tflops:>6.1f}"
@@ -327,7 +390,7 @@ def main():
                 speedup = fi_ms / cudnn_ms
                 marker = "+" if speedup > 1.0 else "-"
                 row += f"  {cudnn_ms:>9.3f}ms  {speedup:>8.2f}x {marker}"
-            if _has_fla:
+            if has_fla:
                 fla_ms = float(np.median(block_medians["FLA"]))
                 speedup = fla_ms / fi_ms
                 marker = "+" if speedup > 1.0 else "-"
