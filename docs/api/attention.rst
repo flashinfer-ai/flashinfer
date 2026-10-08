@@ -18,45 +18,10 @@ for the public entry points, supported contracts, and examples. Current accuracy
 and performance signoff is on SM100a/B200; SM103a/B300 is architecture-gated
 but not yet signoff-qualified.
 
-.. currentmodule:: flashinfer.attention.prims_ts
-
-FMHA Context/Prefill
---------------------
-
-.. autosummary::
-    :toctree: ../generated
-
-    batch_prefill
-    batch_prefill_with_paged_kv_cache
-
-.. autoclass:: BatchPrefillTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-.. autoclass:: BatchPrefillPagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-FMHA Decode
------------
-
-.. autosummary::
-    :toctree: ../generated
-
-    batch_decode_with_paged_kv_cache
-    get_prims_ts_batch_decode_workspace_size
-    prepare_prims_ts_batch_decode_with_kv_cache
-    prims_ts_batch_decode_with_kv_cache
-
-.. autoclass:: PrimsTSBatchDecodePlan
-    :members:
-
-.. autoclass:: BatchDecodePagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
+Calling these APIs is an explicit opt-in and emits an
+``ExperimentalWarning`` once per decorated function. They provide no API
+compatibility guarantee; generated stable API reference entries are deferred
+until graduation. Logging and existing ``fi_trace`` bindings remain available.
 
 QToken-KvBlock-Sparse-Attention
 --------------------------------
@@ -68,53 +33,6 @@ QToken-KvBlock-Sparse-Attention consumes per-query
 ``kv_block_size`` is the semantic sparse K/V atom and currently supports
 only four tokens. The wrapper plans capacity outside CUDA Graph capture and
 runs live route metadata on the hot path.
-
-.. autosummary::
-    :toctree: ../generated
-
-    QTokenKvBlockSparsePagedTSWrapper
-    get_q_token_kv_block_sparse_workspace_size
-    q_token_kv_block_sparse_attention_with_paged_kv_cache
-    validate_q_token_kv_block_sparse_group_size
-    suggest_q_token_kv_block_sparse_group_size
-    make_q_token_kv_block_sparse_qo_indptr
-
-.. autoclass:: QTokenKvBlockSparsePagedTSWrapper
-    :members:
-
-Block-Sparse FMHA
------------------
-
-.. autosummary::
-    :toctree: ../generated
-
-    block_sparse_attention
-    block_sparse_attention_with_paged_kv_cache
-
-.. autoclass:: BlockSparseTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-.. autoclass:: BlockSparsePagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-MLA Decode
-----------
-
-.. autosummary::
-    :toctree: ../generated
-
-    batch_mla_decode_with_paged_kv_cache
-    get_prims_ts_batch_mla_decode_workspace_size
-    prims_ts_batch_mla_decode_with_kv_cache
-
-.. autoclass:: BatchMLADecodePagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
 
 
 flashinfer.decode
@@ -174,13 +92,7 @@ recapture.
 
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
-
-    .. automethod:: __init__
-
-.. autoclass:: BatchDecodeMlaWithPagedKVCacheWrapper
-    :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 
@@ -233,13 +145,32 @@ Batch Prefill/Append Attention
 
 .. autoclass:: BatchPrefillWithPagedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 
 .. autoclass:: BatchPrefillWithRaggedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
+
+    .. automethod:: __init__
+
+
+Causal + Bidirectional Ranges Prefill
+-------------------------------------
+
+.. currentmodule:: flashinfer.attention
+
+A batch-prefill wrapper whose fa2 attention variant owns the whole mask:
+causal, plus an inclusive per-query key span attended in both directions. The
+spans are handed to :meth:`BatchPrefillWithCausalBidirectionalRangesWrapper.run`
+as a compact ``int32 [total_q, 2]`` tensor and no mask is materialized, so
+nothing scales with ``qo_len * kv_len``. The JIT module is specialized in the
+constructor, and the inherited options the variant makes meaningless are
+rejected rather than ignored.
+
+.. autoclass:: BatchPrefillWithCausalBidirectionalRangesWrapper
+    :members:
 
     .. automethod:: __init__
 
@@ -297,12 +228,45 @@ PageAttention for MLA
     trtllm_batch_decode_sparse_mla_dsv4
     nvfp4_quantize_pack_sparse_mla_cache
     nvfp4_quantize_append_sparse_mla_cache
+    dsv41_fp4_quantize_pack_sparse_mla_cache
+    dsv41_fp4_quantize_append_sparse_mla_cache
+    dsv41_fp8_quantize_pack_sparse_mla_cache
+    dsv41_fp8_quantize_append_sparse_mla_cache
     convert_compressed_page_aligned_sparse_indices_to_hca_metadata
     DSV4HCAMetadata
     xqa_batch_decode_with_kv_cache_mla
     supported_sparse_mla_sm120_configs
     SparseMLASm120DecodeConfig
     SparseMLASm120Wrapper
+    cake_sparse_mla_sm120_dsv4_nvfp4_decode
+    cake_sparse_mla_sm120_dsv4_nvfp4_prefill
+    cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel
+    cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill
+    cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles
+    cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits
+    cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes
+    cake_dsv4_nvfp4_rope_quantize_insert
+    cake_dsv4_nvfp4_kv_rope_quantize_insert
+
+.. note::
+
+    With ``backend="cake"`` on SM120/SM121 (``kv_cache_format="nvfp4"``), one
+    query token runs the Cake split decode kernel and several tokens run the
+    decode or the single-launch prefill kernel as chosen by
+    ``cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`` (DeepSeek-V4 sparse MLA
+    SM120 tracker: flashinfer#4254).
+
+.. note::
+
+    The NVFP4 cache that route reads is written per layer by the fused
+    SM120/SM121 writers ``cake_dsv4_nvfp4_rope_quantize_insert`` (sliding-window
+    pool: GPT-J RoPE of the query and latent KV, head-padded ``q_out`` or, with
+    ``q_inplace=True`` and no head padding, the query rotated in place, NVFP4
+    quantization and paged insert in one launch) and
+    ``cake_dsv4_nvfp4_kv_rope_quantize_insert`` (compressed pool with
+    ``compress_ratio`` 1 or 2, speculative context with ratio 1); both produce
+    the bytes of ``nvfp4_quantize_append_sparse_mla_cache`` applied to the
+    BF16-rounded roped rows.
 
 .. note::
 
@@ -314,6 +278,24 @@ PageAttention for MLA
     with ``hca_sparse_indices_format="compressed-page-aligned"``. SWA entries
     remain arbitrary absolute rows. Precompute that conversion before a CUDA
     Graph or a latency-sensitive loop.
+
+.. note::
+
+    ``kv_cache_format="nvfp4"`` (the 384-byte-per-token DeepSeek-V4 NVFP4 sparse
+    cache: 448 NoPE values as E2M1 with one E4M3 scale per 16 values, 64 BF16
+    RoPE values, ``page_size * 352`` data bytes followed by ``page_size * 32``
+    scale bytes per page) is consumed by ``backend="sparse"`` on SM120 / SM121 and
+    by ``backend="cake"`` on SM100 / SM103 (B200 / GB300). The CAKE route takes a
+    BF16 query, two independent tables (``sparse_indices`` over ``swa_kv_cache``
+    and ``extra_sparse_indices`` over ``compressed_kv_cache`` with their own
+    ``*_topk_lens``; ``-1`` entries are masked), ``sinks``, a caller-owned
+    ``workspace_buffer`` sized by
+    :func:`flashinfer.mla.cake_dsv4.get_cake_dsv4_workspace_bytes` and is
+    CUDA-Graph safe. Build the cache with
+    :func:`nvfp4_quantize_pack_sparse_mla_cache` /
+    :func:`nvfp4_quantize_append_sparse_mla_cache` (one implementation for all
+    four architectures). ``backend="auto"`` keeps selecting TRTLLM-GEN on
+    SM100 / SM103; pass ``backend="cake"`` explicitly.
 
 .. autoclass:: BatchMLAPagedAttentionWrapper
     :members:

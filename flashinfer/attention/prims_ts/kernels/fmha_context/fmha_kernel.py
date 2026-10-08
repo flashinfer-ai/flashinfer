@@ -154,6 +154,7 @@ from cutlass.experimental.task_scheduling.memory import (
 from cutlass.experimental.task_scheduling.resources import (
     MemoryResource,
     PipelineConfig,
+    SignalingThreads,
     TileSchedulerConfig,
     WorkQueue,
 )
@@ -175,6 +176,7 @@ from .fmha_resources import (
     TmemSPResource,
     TmemStatsResource,
     TmemStatsDoneResource,
+    TmemPPrefixReadyResource,
 )
 from .fmha_tasks import (
     PackedContextWorkQueue,
@@ -690,6 +692,7 @@ def build_context_task_manager(
     list[MemoryResource],
     SmemAllocation,
     SmemAllocation,
+    SmemAllocation,
     WorkQueue | None,
     SmemAllocation | None,
 ]:
@@ -747,7 +750,7 @@ def build_context_task_manager(
     -------
     tuple
         ``(TaskManager, tmem_resources, tmem_ptr_alloc, dealloc_mbar_alloc,
-        work_queue, clc_response_alloc)``.
+        peer_dealloc_mbar_alloc, work_queue, clc_response_alloc)``.
     """
     if cfg.use_paged_kv:
         if cfg.num_tokens_per_page not in _SUPPORTED_CONTEXT_PAGE_SIZES:
@@ -762,9 +765,15 @@ def build_context_task_manager(
     # Cluster / CTA layout
     # ---------------------------------------------------------------------------
     # CTA layout in CuTe VMNK order. V is the CTA-group dimension used for
-    # 2-CTA cooperative MMA; MNK are the logical cluster axes. FMHA uses a
-    # single-CTA cluster here, so (V, M, N, K) = (1, 1, 1, 1).
-    cluster_shape_vmnk = (1, 1, 1, 1)
+    # 2-CTA cooperative MMA; MNK are the logical cluster axes. V is 2 in the
+    # two-CTA UMMA form and 1 otherwise.
+    cluster_shape_vmnk = (cfg.cta_group_size, 1, 1, 1)
+    two_cta = cfg.two_cta_umma
+    # With two CTAs, only the leader's UMMA consumes K/V, so both CTAs' TMA
+    # loads signal the leader's barrier.
+    tma_umma_leader_kwargs = (
+        {"consumer_signaling_threads": SignalingThreads.CtaLeader} if two_cta else {}
+    )
 
     # ---------------------------------------------------------------------------
     # Warp counts
@@ -794,25 +803,42 @@ def build_context_task_manager(
     # advance_on_wait=True advances consumer_state on ConsumerWait.
     smem_q_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=cfg.q_stage,
-        num_bytes=cfg.tma_copy_q_bytes,
+        num_bytes=cfg.tma_copy_q_bytes * cfg.cta_group_size,
         producer_group=tma_producer_group,
         consumer_group=pipeline.CooperativeGroup(Agent.Thread),
         cta_layout_vmnk=cluster_shape_vmnk,
         advance_on_wait=True,
+        num_bytes_per_warp_per_cta=cfg.tma_copy_q_bytes if two_cta else None,
+        **tma_umma_leader_kwargs,
     )
     # SmemKV: capacity-derived stages, Load -> MMA.
     # advance_on_wait=True advances consumer_state at ConsumerWait rather than
     # ConsumerRelease. This keeps the previous V tile live while MMA starts the
     # next QK tile, giving QK0 -> PV1(previous V) -> QK1 ordering without
     # releasing the previous V tile first.
+    # K and V share this pipeline unless their dtypes differ in width.
     smem_kv_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
-        num_stages=cfg.kv_stage,
-        num_bytes=cfg.tma_copy_kv_bytes,
+        num_stages=cfg.kv_stage_k,
+        num_bytes=cfg.tma_copy_kv_bytes * cfg.cta_group_size,
         producer_group=tma_producer_group,
         consumer_group=pipeline.CooperativeGroup(Agent.Thread),
         cta_layout_vmnk=cluster_shape_vmnk,
         advance_on_wait=True,
+        num_bytes_per_warp_per_cta=cfg.tma_copy_kv_bytes if two_cta else None,
+        **tma_umma_leader_kwargs,
     )
+    smem_v_pipeline_cfg = None
+    if cfg.split_kv_pipelines:
+        smem_v_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
+            num_stages=cfg.kv_stage_v,
+            num_bytes=cfg.tma_copy_v_bytes * cfg.cta_group_size,
+            producer_group=tma_producer_group,
+            consumer_group=pipeline.CooperativeGroup(Agent.Thread),
+            cta_layout_vmnk=cluster_shape_vmnk,
+            advance_on_wait=True,
+            num_bytes_per_warp_per_cta=cfg.tma_copy_v_bytes if two_cta else None,
+            **tma_umma_leader_kwargs,
+        )
     # Page-offsets prefetch (paged-KV only): the auxiliary warp produces and
     # the load warp consumes.
     # Async-async because both are CUDA-thread groups (no TMA arrival barrier).
@@ -873,18 +899,32 @@ def build_context_task_manager(
     )
     umma_hw_group = pipeline.CooperativeGroup(Agent.Thread)
     mma_group = pipeline.CooperativeGroup(Agent.Thread, num_mma_warps * warp_size)
+    # S/P and O barriers live on the leader CTA. Their arrival counts must cover
+    # the consumer threads of both CTAs, and only the leader's UMMA commits them.
+    softmax_group_umma = pipeline.CooperativeGroup(
+        Agent.Thread,
+        num_softmax_warps * warp_size * cfg.cta_group_size,
+    )
+    correction_group_umma = pipeline.CooperativeGroup(
+        Agent.Thread, num_correction_warps * warp_size * cfg.cta_group_size
+    )
+    umma_leader_kwargs = (
+        {"producer_signaling_threads": SignalingThreads.CtaLeader} if two_cta else {}
+    )
 
     tmem_sp0_pipeline_cfg = PipelineConfig.create_umma_async_pipeline_cfg(
         num_stages=cfg.mma_softmax_stage,
         producer_group=umma_hw_group,
-        consumer_group=softmax_group,
+        consumer_group=softmax_group_umma,
         cta_layout_vmnk=cluster_shape_vmnk,
+        **umma_leader_kwargs,
     )
     tmem_sp1_pipeline_cfg = PipelineConfig.create_umma_async_pipeline_cfg(
         num_stages=cfg.mma_softmax_stage,
         producer_group=umma_hw_group,
-        consumer_group=softmax_group,
+        consumer_group=softmax_group_umma,
         cta_layout_vmnk=cluster_shape_vmnk,
+        **umma_leader_kwargs,
     )
     tmem_p0_pipeline_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
         num_stages=cfg.mma_softmax_stage,
@@ -895,8 +935,9 @@ def build_context_task_manager(
     tmem_o_pipeline_cfg = PipelineConfig.create_umma_async_pipeline_cfg(
         num_stages=cfg.mma_corr_stage,
         producer_group=umma_hw_group,
-        consumer_group=correction_group,
+        consumer_group=correction_group_umma,
         cta_layout_vmnk=cluster_shape_vmnk,
+        **umma_leader_kwargs,
     )
 
     tmem_vec0_pipeline_cfg = PipelineConfig.create_async_async_pipeline_cfg(
@@ -999,16 +1040,33 @@ def build_context_task_manager(
                 page_table_is_v=True,
                 name="smem_page_offsets_v",
             )
-    smem_kv = SmemKVResource(
-        tma_k_desc=tma_k_desc,
-        tma_v_desc=tma_v_desc,
-        pipeline_config=smem_kv_pipeline_cfg,
+    # smem_kv only stages K when we have mixed QK/PV dtypes,
+    # and K and V in alternating stages when QK/PV are the same dtype.
+    split_kv = cfg.split_kv_pipelines
+    kv_resource_kwargs = dict(
         cfg=cfg,
         page_offsets_kv=smem_page_offsets_kv,
         page_offsets_v=smem_page_offsets_v,
         block_tables=g_block_tables,
-        name="smem_kv",
     )
+    smem_kv = SmemKVResource(
+        tma_k_desc=tma_k_desc,
+        tma_v_desc=None if split_kv else tma_v_desc,
+        pipeline_config=smem_kv_pipeline_cfg,
+        role="k" if split_kv else "kv",
+        name="smem_k" if split_kv else "smem_kv",
+        **kv_resource_kwargs,
+    )
+    smem_v = None
+    if split_kv:
+        smem_v = SmemKVResource(
+            tma_k_desc=None,
+            tma_v_desc=tma_v_desc,
+            pipeline_config=smem_v_pipeline_cfg,
+            role="v",
+            name="smem_v",
+            **kv_resource_kwargs,
+        )
 
     # WorkQueue: persistent tile scheduler state (static or CLC dynamic), not
     # Q/K/V/O dataflow. Non-persistent launches omit it so each CTA executes
@@ -1136,6 +1194,35 @@ def build_context_task_manager(
         pipeline_config=tmem_stats_done_0_pipeline_cfg,
         name="tmem_stats_done_0",
     )
+    # P-prefix barriers: Softmax (producer) arrives after storing the first 64
+    # keys of P, MMA (consumer) starts PV on them. One per query group.
+    tmem_p_prefix_ready: list[TmemPPrefixReadyResource | None] = [None, None]
+    if cfg.pv_half_overlap:
+        tmem_p_prefix_ready = [
+            TmemPPrefixReadyResource(
+                # With two CTAs the P-half barrier is consumed by the leader's UMMA,
+                # so it needs the AsyncUmma form.
+                pipeline_config=(
+                    PipelineConfig.create_async_umma_pipeline_cfg(
+                        num_stages=1,
+                        producer_group=softmax_group_umma,
+                        consumer_group=umma_hw_group,
+                        cta_layout_vmnk=cluster_shape_vmnk,
+                        **tma_umma_leader_kwargs,
+                    )
+                    if two_cta
+                    else PipelineConfig.create_async_async_pipeline_cfg(
+                        num_stages=1,
+                        producer_group=softmax_group,
+                        consumer_group=mma_group,
+                        cta_layout_vmnk=cluster_shape_vmnk,
+                    )
+                ),
+                name=f"tmem_p_prefix_ready_{index}",
+            )
+            for index in range(2)
+        ]
+    tmem_p_prefix_ready_0, tmem_p_prefix_ready_1 = tmem_p_prefix_ready
 
     single_qkv_instance = cfg.single_qkv_instance
     tmem_sp1: TmemSPResource | None = None
@@ -1237,6 +1324,7 @@ def build_context_task_manager(
         gmem_qkv,
         smem_q,
         smem_kv,
+        smem_v,
         work_queue,
         smem_page_offsets_kv=smem_page_offsets_kv,
         smem_page_offsets_v=smem_page_offsets_v,
@@ -1246,6 +1334,7 @@ def build_context_task_manager(
         gmem_qkv,
         smem_q,
         smem_kv,
+        smem_v,
         tmem_sp0,
         tmem_sp1,
         tmem_p0,
@@ -1253,6 +1342,8 @@ def build_context_task_manager(
         tmem_stats_done_0,
         tmem_stats_done_1,
         work_queue,
+        tmem_p_prefix_ready_0=tmem_p_prefix_ready_0,
+        tmem_p_prefix_ready_1=tmem_p_prefix_ready_1,
         **mma_domain_kwargs,
     )
 
@@ -1265,6 +1356,7 @@ def build_context_task_manager(
         tmem_p0,
         s0s1_seq,
         work_queue,
+        tmem_p_prefix_ready=tmem_p_prefix_ready_0,
         **softmax0_domain_kwargs,
     )
     softmax1_task: Task | None = None
@@ -1278,6 +1370,7 @@ def build_context_task_manager(
             None,
             s0s1_seq,
             work_queue,
+            tmem_p_prefix_ready=tmem_p_prefix_ready_1,
             **softmax1_domain_kwargs,
         )
     correction_task = create_correction_task(
@@ -1383,18 +1476,32 @@ def build_context_task_manager(
     smem_kv_deps: list[MemoryResource] = [gmem_qkv]
     if smem_page_offsets_kv is not None:
         smem_kv_deps.append(smem_page_offsets_kv)
-    if smem_page_offsets_v is not None:
+    if smem_page_offsets_v is not None and not cfg.split_kv_pipelines:
         smem_kv_deps.append(smem_page_offsets_v)
     stats_done_0_deps = [] if cfg.stats_via_smem else [tmem_stats_done_0]
+    # One entry when K and V share the buffer, and
+    # two otherwise (e.g. when K/V are different dtypes)
+    smem_kv_resources = (smem_kv, smem_v) if cfg.split_kv_pipelines else (smem_kv,)
     resource_dependency_graph: dict[MemoryResource, list[MemoryResource]] = {
         smem_q: scheduler_deps(gmem_qkv),
         smem_kv: scheduler_deps(*smem_kv_deps),
-        tmem_sp0: scheduler_deps(tmem_sp0, smem_q, smem_kv, *stats_done_0_deps),
-        tmem_vec0: scheduler_deps(tmem_sp0),
-        tmem_o: tmem_o_dependencies,
-        smem_o_0: scheduler_deps(tmem_vec0, tmem_o),
-        gmem_o_0: scheduler_deps(smem_o_0),
     }
+    if cfg.split_kv_pipelines:
+        smem_v_deps: list[MemoryResource] = [gmem_qkv]
+        if smem_page_offsets_v is not None:
+            smem_v_deps.append(smem_page_offsets_v)
+        resource_dependency_graph[smem_v] = scheduler_deps(*smem_v_deps)
+    resource_dependency_graph.update(
+        {
+            tmem_sp0: scheduler_deps(
+                tmem_sp0, smem_q, *smem_kv_resources, *stats_done_0_deps
+            ),
+            tmem_vec0: scheduler_deps(tmem_sp0),
+            tmem_o: tmem_o_dependencies,
+            smem_o_0: scheduler_deps(tmem_vec0, tmem_o),
+            gmem_o_0: scheduler_deps(smem_o_0),
+        }
+    )
     if not cfg.stats_via_smem:
         resource_dependency_graph[tmem_stats_done_0] = [tmem_vec0]
     if tmem_p0 is not None:
@@ -1405,7 +1512,7 @@ def build_context_task_manager(
                 tmem_sp1: scheduler_deps(
                     tmem_sp1,
                     smem_q,
-                    smem_kv,
+                    *smem_kv_resources,
                     s0s1_seq,
                     *([] if cfg.stats_via_smem else [tmem_stats_done_1]),
                 ),
@@ -1417,6 +1524,9 @@ def build_context_task_manager(
         )
         if not cfg.stats_via_smem:
             resource_dependency_graph[tmem_stats_done_1] = [tmem_vec1]
+        if cfg.pv_half_overlap:
+            resource_dependency_graph[tmem_p_prefix_ready_0] = scheduler_deps(tmem_sp0)
+            resource_dependency_graph[tmem_p_prefix_ready_1] = scheduler_deps(tmem_sp1)
     if work_queue is not None:
         resource_dependency_graph[work_queue] = [work_queue] if is_clc_dynamic else []
     if smem_page_offsets_kv is not None:
@@ -1436,6 +1546,8 @@ def build_context_task_manager(
 
     add_smem_resource(smem_q)
     add_smem_resource(smem_kv)
+    if cfg.split_kv_pipelines:
+        add_smem_resource(smem_v)
     if smem_page_offsets_kv is not None:
         add_smem_resource(smem_page_offsets_kv)
     if smem_page_offsets_v is not None:
@@ -1457,6 +1569,8 @@ def build_context_task_manager(
         add_smem_resource(tmem_vec1)
     if s0s1_seq is not None:
         add_smem_resource(s0s1_seq)
+    add_smem_resource(tmem_p_prefix_ready_0)
+    add_smem_resource(tmem_p_prefix_ready_1)
     if tmem_stats_done_1 is not None and not cfg.stats_via_smem:
         add_smem_resource(tmem_stats_done_1)
     if work_queue is not None and work_queue.pipeline_config is not None:
@@ -1493,6 +1607,9 @@ def build_context_task_manager(
     dealloc_mbar_alloc = smem_allocator.add(
         SmemAllocation("tmem_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
     )
+    peer_dealloc_mbar_alloc = smem_allocator.add(
+        SmemAllocation("tmem_peer_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
+    )
     clc_response_alloc: SmemAllocation | None = None
     if is_clc_dynamic and clc_response_ptr is None:
         # Keep the CLC response inside the unified TS allocation. The kernel
@@ -1509,11 +1626,12 @@ def build_context_task_manager(
             )
         )
     smem_allocator.compute_layout()
+    kv_stages = cfg.kv_stage_k + (cfg.kv_stage_v if cfg.split_kv_pipelines else 0)
     expected_barrier_bytes = (
         sum(
             _context_pipeline_stage_counts(
                 cfg,
-                kv_stages=cfg.kv_stage,
+                kv_stages=kv_stages,
                 is_clc_dynamic=is_clc_dynamic,
             ).values()
         )
@@ -1586,6 +1704,7 @@ def build_context_task_manager(
         tmem_resources,
         tmem_ptr_alloc,
         dealloc_mbar_alloc,
+        peer_dealloc_mbar_alloc,
         work_queue,
         clc_response_alloc,
     )
@@ -1612,7 +1731,10 @@ def _context_pipeline_stage_counts(
     kv_stages: int,
     is_clc_dynamic: bool,
 ) -> dict[str, int]:
-    """Return every physical pipeline's mbarrier stage count."""
+    """Return every physical pipeline's mbarrier stage count.
+
+    ``kv_stages`` totals the K/V pipelines: one ring, or both when split.
+    """
     counts = {
         "smem_q": cfg.q_stage,
         "smem_kv": kv_stages,
@@ -1627,25 +1749,23 @@ def _context_pipeline_stage_counts(
         "tmem_o": cfg.mma_corr_stage,
         "smem_o": cfg.num_qkv_instances,
         "s0s1_seq": 0 if cfg.single_qkv_instance else 1,
+        "tmem_p_prefix_ready": 2 if cfg.pv_half_overlap else 0,
         "tmem_stats_done": 0 if cfg.stats_via_smem else cfg.num_qkv_instances,
         "work_queue": 1 if is_clc_dynamic else 0,
     }
     return {name: stages for name, stages in counts.items() if stages}
 
 
-def _infer_context_kv_stages(
+def _kv_ring_smem_budget_bytes(
     cfg: FmhaConfig,
     *,
     is_clc_dynamic: bool,
     page_table_window_entries: int | None = None,
-    require_cadence: bool = True,
 ) -> int:
-    """Return the deepest K/V ring that fits the exact TS SMEM footprint.
+    """Return the SMEM left for the K/V ring(s) after every fixed allocation.
 
-    All terms come from resource topology or public CUTLASS hardware metadata:
-    Q, O, correction statistics, page-ID rings, fixed control records, and one
-    16-byte pipeline barrier per physical stage. The task manager remains the
-    authoritative check and uses the same stage-count policy below.
+    Fixed terms are Q, O, correction statistics, page-ID rings, control
+    records, and one 16-byte barrier per stage. The task manager still checks.
     """
     q_row_bytes = (cfg.q_dtype.width * cfg.smem_q_head_dim + 7) // 8
     q_row_bytes = (
@@ -1684,9 +1804,13 @@ def _infer_context_kv_stages(
         page_offset_stages * page_table_window_entries * cutlass.Int32.width // 8
     )
 
+    # The TS allocator bump-allocates each data block at its own alignment
+    # (largest first), so a buffer-aligned block costs its size rounded up to
+    # cfg.buffer_align_bytes; the 4-32 byte records follow, then barriers.
+    align = cfg.buffer_align_bytes
     control_bytes = (2 * cutlass.Int32.width + cutlass.Int64.width) // 8
     if is_clc_dynamic:
-        control_bytes += cutlass.Int128.width // 8
+        control_bytes = (control_bytes + 15) // 16 * 16 + cutlass.Int128.width // 8
     fixed_barrier_stages = sum(
         _context_pipeline_stage_counts(
             cfg,
@@ -1695,19 +1819,43 @@ def _infer_context_kv_stages(
         ).values()
     )
     fixed_smem_bytes = (
-        q_tile_bytes * cfg.q_stage
-        + o_stage_bytes * cfg.num_qkv_instances
-        + stats_bytes
-        + page_offsets_bytes
-        + control_bytes
+        (q_tile_bytes * cfg.q_stage + align - 1) // align * align
+        + (o_stage_bytes + align - 1) // align * align * cfg.num_qkv_instances
+        + (stats_bytes + 15) // 16 * 16
+        + (page_offsets_bytes + 15) // 16 * 16
+        + (control_bytes + 7) // 8 * 8
         + fixed_barrier_stages * _PIPELINE_BARRIER_BYTES_PER_STAGE
     )
+    return utils.get_smem_capacity_in_bytes("sm_100") - fixed_smem_bytes
+
+
+def _infer_single_instance_kv_stages(
+    cfg: FmhaConfig,
+    *,
+    is_clc_dynamic: bool,
+    page_table_window_entries: int | None = None,
+    require_cadence: bool = True,
+) -> int:
+    """Return the deepest K/V ring that fits the exact TS SMEM footprint.
+
+    All terms come from resource topology or public CUTLASS hardware metadata:
+    Q, O, correction statistics, page-ID rings, fixed control records, and one
+    16-byte pipeline barrier per physical stage. The task manager remains the
+    authoritative check and uses the same stage-count policy below.
+    """
+    kv_budget_bytes = _kv_ring_smem_budget_bytes(
+        cfg,
+        is_clc_dynamic=is_clc_dynamic,
+        page_table_window_entries=page_table_window_entries,
+    )
     kv_dtype_width = max(cfg.k_dtype.width, cfg.v_dtype.width)
+    kv_head_dim = (
+        cfg.head_dim_per_stage_kv if cfg.stage_kv_by_head_dim else cfg.qk_mma_tiler[2]
+    )
     kv_stage_bytes = (
-        cfg.qk_mma_tiler[1] * cfg.head_dim_per_stage_kv * kv_dtype_width // 8
+        cfg.qk_mma_tiler[1] // cfg.cta_group_size * kv_head_dim * kv_dtype_width // 8
     )
     kv_stage_footprint_bytes = kv_stage_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
-    kv_budget_bytes = utils.get_smem_capacity_in_bytes("sm_100") - fixed_smem_bytes
     memory_fit_stages = kv_budget_bytes // kv_stage_footprint_bytes
     cadence_stages = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
     if require_cadence and memory_fit_stages < cadence_stages:
@@ -1719,14 +1867,68 @@ def _infer_context_kv_stages(
     return memory_fit_stages
 
 
-def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
+def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
+    """Select one shared K/V ring or, for mixed dtypes, size K and V independently."""
+    cfg.split_kv_pipelines = cfg.k_dtype.width != cfg.v_dtype.width
+    cfg.kv_stage_k = cfg.kv_stage
+    cfg.kv_stage_v = cfg.kv_stage
+    if not cfg.split_kv_pipelines:
+        # Same-width K and V share one ring: deepen it to what the SMEM budget
+        # allows after every other buffer, as FA4 does.
+        n_stages = max(
+            cfg.kv_stage,
+            _infer_single_instance_kv_stages(
+                cfg, is_clc_dynamic=is_clc_dynamic, require_cadence=False
+            ),
+        )
+        cfg.kv_stage = n_stages
+        cfg.kv_stage_k = n_stages
+        cfg.kv_stage_v = n_stages
+        return
+    # Mixed dtypes require separate K and V rings. Size each ring from one
+    # cadence up to cfg.kv_stage against the shared SMEM budget.
+    budget_bytes = _kv_ring_smem_budget_bytes(cfg, is_clc_dynamic=is_clc_dynamic)
+    kv_head_dim = (
+        cfg.head_dim_per_stage_kv if cfg.stage_kv_by_head_dim else cfg.qk_mma_tiler[2]
+    )
+    kv_rows_per_cta = cfg.qk_mma_tiler[1] // cfg.cta_group_size
+    k_stage_footprint = (
+        kv_rows_per_cta * kv_head_dim * cfg.k_dtype.width // 8
+        + _PIPELINE_BARRIER_BYTES_PER_STAGE
+    )
+    v_stage_footprint = (
+        kv_rows_per_cta * kv_head_dim * cfg.v_dtype.width // 8
+        + _PIPELINE_BARRIER_BYTES_PER_STAGE
+    )
+    # K and V share the same head_dim and head_dim_per_stage_kv, so their
+    # minimum ring depths (num_head_dim_stages) are equal and both rings are sized identically.
+    cadence = cfg.num_head_dim_stages_k
+    n_stages = budget_bytes // (k_stage_footprint + v_stage_footprint)
+    if n_stages < cadence:
+        raise ValueError(
+            f"split K/V staging requires at least {cadence} stages per ring "
+            f"({cadence * (k_stage_footprint + v_stage_footprint)} bytes), but the "
+            f"shared-memory budget fits only {budget_bytes} bytes"
+        )
+    cfg.kv_stage_k = n_stages
+    cfg.kv_stage_v = n_stages
+
+
+def _configure_pipeline_stages(
+    cfg: FmhaConfig, *, is_clc_dynamic: bool, is_persistent: bool
+) -> None:
     """Set topology- and capacity-derived context pipeline stage counts."""
     cfg.q_stage = cfg.num_qkv_instances
-    cfg.kv_stage = 3
+    # Stages using Two-CTA method are half-tiles, where the peer CTA holds the
+    # other half. Double them to keep the same SMEM and tiles in flight.
+    cfg.kv_stage = 6 if cfg.two_cta_umma else 3
     cfg.has_tmem_p_pipeline = _should_use_tmem_p_pipeline(cfg)
     cfg.stage_scoped_tmem_stats = cfg.has_tmem_p_pipeline
     cfg.mma_softmax_stage = 2 if cfg.has_tmem_p_pipeline else 1
     cfg.softmax_corr_stage = 2 if cfg.stage_scoped_tmem_stats else 1
+    # The early-sum policy decides the P-prefix barriers, so settle it before
+    # the K/V ring is sized against the remaining SMEM.
+    _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
     # A single Q instance always reuses one physical O accumulator. Allow only
     # one outstanding PV result so correction finishes before the next PV.
     # StatsDone protects statistics, and is released before O correction;
@@ -1737,7 +1939,7 @@ def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None
         cfg.page_table_window_entries = natural_page_window_entries
         candidate_page_window_entries = cfg.page_table_window_candidate_entries
         if candidate_page_window_entries > natural_page_window_entries:
-            candidate_kv_stages = _infer_context_kv_stages(
+            candidate_kv_stages = _infer_single_instance_kv_stages(
                 cfg,
                 is_clc_dynamic=is_clc_dynamic,
                 page_table_window_entries=candidate_page_window_entries,
@@ -1746,10 +1948,11 @@ def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None
             cadence_stages = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
             if candidate_kv_stages >= cadence_stages:
                 cfg.page_table_window_entries = candidate_page_window_entries
-        cfg.kv_stage = _infer_context_kv_stages(
+        cfg.kv_stage = _infer_single_instance_kv_stages(
             cfg,
             is_clc_dynamic=is_clc_dynamic,
         )
+    _configure_kv_ring_depths(cfg, is_clc_dynamic=is_clc_dynamic)
 
 
 # Dense work traverses the full K domain for every Q tile, so its persistent
@@ -1760,6 +1963,9 @@ def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None
 # batch size, sequence length, head count, layout, or a measured crossover.
 _EARLY_TILE_SUM_DENSE_REGISTER_BUDGET = (176, 80, 80)
 _EARLY_TILE_SUM_CAUSAL_REGISTER_BUDGET = (184, 88, 56)
+
+# Lazy-correction margin for BF16 V. cuDNN and FA4 use 8.
+_CORR_SKIP_THRESHOLD_LOG2 = 8.0
 
 
 def _configure_early_tile_sum_policy(
@@ -1817,9 +2023,10 @@ def _configure_smem_shapes(cfg: FmhaConfig) -> None:
         cfg.q_stage,
         cfg.qk_mma_tiler[0] * cfg.smem_q_head_dim,
     )
+    # In two-CTA, each CTA stages half the K rows and half the V columns of a tile.
     cfg.sK_shape = (
         cfg.kv_stage,
-        cfg.qk_mma_tiler[1] * kv_head_dim,
+        cfg.qk_mma_tiler[1] * kv_head_dim // cfg.cta_group_size,
     )
     cfg.sO_stage_elements = cfg.epi_tile[0] * o_head_dim
 
@@ -1923,6 +2130,7 @@ def _configure_head_paired_tma_copy_metadata(
     *,
     q_dtype: type,
     k_dtype: type,
+    v_dtype: type,
     o_dtype: type,
 ) -> None:
     """Derive TMA copy granularities for head-paired Q/K/V/O tensors."""
@@ -1952,6 +2160,17 @@ def _configure_head_paired_tma_copy_metadata(
         cfg.tma_copy_kv_elements // cfg.tma_copy_kv_stage_iters
     )
     cfg.tma_copy_kv_bytes = cfg.tma_copy_kv_elements * k_dtype.width // 8
+
+    v_inner_dim_size = cfg.pv_mma_tiler[1] * v_dtype.width // 8
+    cfg.tma_copy_v_iters = 1
+    if v_inner_dim_size % 128 == 0:
+        cfg.tma_copy_v_iters = v_inner_dim_size // 128
+    elif v_inner_dim_size != 64 and v_inner_dim_size != 32:
+        raise RuntimeError(f"Unsupported inner dimension size: {v_inner_dim_size}")
+    cfg.tma_copy_v_granu_inner = cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters
+    cfg.tma_copy_v_stage_iters = kv_head_dim // cfg.tma_copy_v_granu_inner
+    cfg.tma_copy_v_granu_elems = cfg.tma_copy_kv_elements // cfg.tma_copy_v_stage_iters
+    cfg.tma_copy_v_bytes = cfg.tma_copy_kv_elements * v_dtype.width // 8
 
     output_inner_dim_size = cfg.epi_tile[1] * o_dtype.width // 8
     cfg.tma_copy_o_iters = 1
@@ -2230,11 +2449,23 @@ def _select_fmha_domain_policy(
     # peers traverse the full static K/V domain.
     domain_n_kwargs = {"domain": num_kv_tiles}
     domain_n_minus_1_kwargs = {"domain": num_kv_tiles - 1}
+    # Query-paired softmax handles the partial last K/V tile after its loop:
+    # N-1 unmasked iterations, then a masked tail. The single-QKV schedules
+    # mask the last tile inside the loop instead, so they keep the full N domain.
+    softmax_uses_dense_k_tail = (
+        not cfg.single_qkv_instance
+        and not cfg.is_causal
+        and not cfg.has_varlen
+        and cfg.fixed_dense_k_tail > 0
+    )
+    softmax_domain_kwargs = (
+        domain_n_minus_1_kwargs if softmax_uses_dense_k_tail else domain_n_kwargs
+    )
     return FmhaDomainPolicy(
         domain_n_kwargs=domain_n_kwargs,
         domain_n_minus_1_kwargs=domain_n_minus_1_kwargs,
-        softmax0_domain_kwargs=domain_n_kwargs,
-        softmax1_domain_kwargs=domain_n_kwargs,
+        softmax0_domain_kwargs=softmax_domain_kwargs,
+        softmax1_domain_kwargs=softmax_domain_kwargs,
     )
 
 
@@ -2270,6 +2501,7 @@ def build_fmha_task_manager(
 ) -> Tuple[
     TaskManager,
     list[MemoryResource],
+    SmemAllocation,
     SmemAllocation,
     SmemAllocation,
     WorkQueue | None,
@@ -2387,8 +2619,10 @@ class FmhaTs:
         Accumulator dtype for QK GEMM (default: Float32).
     pv_acc_dtype : type, optional
         Accumulator dtype for PV GEMM (default: Float32).
-    in_dtype : type, optional
-        Input tensor dtype for Q, K, V (default: Float16).
+    in_qk_dtype : type, optional
+        Input tensor dtype for Q and K (default: Float16).
+    in_pv_dtype : type, optional
+        Input tensor dtype for V (default: Float16).
     out_dtype : type, optional
         Output tensor dtype for O (default: Float16).
     mma_tiler_mn : Tuple[int, int], optional
@@ -2420,6 +2654,10 @@ class FmhaTs:
         into the TMEM S load on the non-masked path (default: False). The
         context runner enables this by default on SM103 (B300) and SM107
         (Rubin).
+    two_cta_umma : bool, optional
+        Issue the QK and PV UMMAs in ``cta_group::2`` across a 2-CTA cluster, each
+        CTA staging half of every K/V tile. Dense contiguous query-paired D128 with
+        bf16 QK only, launched non-persistently.
     use_paged_kv : bool, optional
         Read K/V from a physical page pool through a fixed block table.
     num_tokens_per_page : int, optional
@@ -2437,7 +2675,8 @@ class FmhaTs:
         self,
         qk_acc_dtype: type | None = None,
         pv_acc_dtype: type | None = None,
-        in_dtype: type | None = None,
+        in_qk_dtype: type | None = None,
+        in_pv_dtype: type | None = None,
         out_dtype: type | None = None,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         d: int = 128,
@@ -2451,6 +2690,7 @@ class FmhaTs:
         h_r: int = 1,
         enable_skip_correction: bool = True,
         uses_ldtm_stat: bool = False,
+        two_cta_umma: bool = False,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
         max_kv_len: int = 1,
@@ -2501,9 +2741,10 @@ class FmhaTs:
         self.is_clc_dynamic = is_clc_dynamic
         self.exhaustive_deadlock_race_check = exhaustive_deadlock_race_check
 
-        q_dtype = in_dtype or cutlass.Float16
-        k_dtype = in_dtype or cutlass.Float16
-        v_dtype = in_dtype or cutlass.Float16
+        q_dtype = in_qk_dtype or cutlass.Float16
+        k_dtype = in_qk_dtype or cutlass.Float16
+        v_dtype = in_pv_dtype or cutlass.Float16
+
         o_dtype = out_dtype or cutlass.Float16
 
         # Validate the logical Q/K and V head dimensions before choosing tiles.
@@ -2519,6 +2760,23 @@ class FmhaTs:
         padded_d = 1 << (max(d, 64) - 1).bit_length()
         cfg = FmhaConfig()
         cfg.logical_head_dim_qk = d
+        if two_cta_umma and (
+            is_persistent
+            or is_causal
+            or has_variable_window
+            or head_paired
+            or use_paged_kv
+            or d != 128
+            or d_v != 128
+            or q_dtype.width != 16
+        ):
+            raise ValueError(
+                "two-CTA UMMA requires the non-persistent dense contiguous "
+                "query-paired D128 context kernel with 16-bit QK"
+            )
+        cfg.two_cta_umma = two_cta_umma
+        if two_cta_umma:
+            cfg.cluster_shape_mn = (2, 1)
         self.cfg = cfg
         # Compact Q and staged O fit two resident query tiles plus the K/V
         # ring. Pairing overlaps the two softmax groups with MMA work.
@@ -2549,6 +2807,8 @@ class FmhaTs:
             cfg.num_regs_correction = 88
             cfg.num_regs_other = 56
         cfg.enable_skip_correction = enable_skip_correction
+        if enable_skip_correction and v_dtype.width == 16:
+            cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
         cfg.uses_ldtm_stat = uses_ldtm_stat
         cfg.qk_acc_dtype = qk_acc_dtype or cutlass.Float32
         cfg.pv_acc_dtype = pv_acc_dtype or cutlass.Float32
@@ -2567,7 +2827,9 @@ class FmhaTs:
         if head_paired:
             _configure_head_paired_tilers(cfg, mma_tiler_mn=mma_tiler_mn, d=d)
             _configure_head_dim_staging(cfg)
-            _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
+            _configure_pipeline_stages(
+                cfg, is_clc_dynamic=is_clc_dynamic, is_persistent=is_persistent
+            )
             if cfg.single_qkv_instance:
                 _configure_single_instance_tmem_layout(cfg)
                 _configure_single_instance_warp_layout(cfg)
@@ -2577,6 +2839,7 @@ class FmhaTs:
                 cfg,
                 q_dtype=q_dtype,
                 k_dtype=k_dtype,
+                v_dtype=v_dtype,
                 o_dtype=o_dtype,
             )
             _configure_common_launch_flags(
@@ -2588,7 +2851,6 @@ class FmhaTs:
                 window_size_left=window_size_left,
                 has_variable_window=has_variable_window,
             )
-            _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
             return
 
         # MMA tiler: (M, N, K) = (128, 128, 128)
@@ -2597,7 +2859,9 @@ class FmhaTs:
         cfg.pv_mma_tiler = (mma_tiler[0], d_v, mma_tiler[1])
         cfg.epi_tile = cfg.pv_mma_tiler[:2]
         _configure_head_dim_staging(cfg)
-        _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
+        _configure_pipeline_stages(
+            cfg, is_clc_dynamic=is_clc_dynamic, is_persistent=is_persistent
+        )
         if cfg.single_qkv_instance:
             _configure_single_instance_tmem_layout(cfg)
             _configure_single_instance_warp_layout(cfg)
@@ -2635,6 +2899,24 @@ class FmhaTs:
         )
         cfg.tma_copy_kv_bytes = cfg.tma_copy_kv_elements * k_dtype.width // 8
 
+        # TMA copy granularity for V
+        v_inner_dim_size = cfg.pv_mma_tiler[1] * v_dtype.width // 8
+        cfg.tma_copy_v_iters = 1
+        if v_inner_dim_size % 128 == 0:
+            cfg.tma_copy_v_iters = v_inner_dim_size // 128
+        elif v_inner_dim_size != 64 and v_inner_dim_size != 32:
+            raise RuntimeError(f"Unsupported inner dimension size: {v_inner_dim_size}")
+        cfg.tma_copy_v_granu_inner = cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters
+        cfg.tma_copy_v_stage_iters = kv_head_dim // cfg.tma_copy_v_granu_inner
+        if cfg.two_cta_umma:
+            cfg.tma_copy_v_iters = 1
+            cfg.tma_copy_v_granu_inner = cfg.pv_n_per_cta
+            cfg.tma_copy_v_stage_iters = 1
+        cfg.tma_copy_v_granu_elems = (
+            cfg.tma_copy_kv_elements // cfg.tma_copy_v_stage_iters
+        )
+        cfg.tma_copy_v_bytes = cfg.tma_copy_kv_elements * v_dtype.width // 8
+
         # TMA copy granularity for O
         cfg.tma_copy_o_iters = (cfg.epi_tile[1] * o_dtype.width) // 1024
         cfg.tma_copy_o_granu_inner = cfg.epi_tile[1] // cfg.tma_copy_o_iters
@@ -2656,7 +2938,6 @@ class FmhaTs:
             window_size_left=window_size_left,
             has_variable_window=has_variable_window,
         )
-        _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
 
     # ---------------------------------------------------------------------------
     # Host entry point
@@ -2749,13 +3030,22 @@ class FmhaTs:
         elif cutlass.const_expr(output_inner_dim_size == 32):
             tma_o_swizzle = cuda.TensorMapSwizzle.s32b
 
+        v_inner_dim_size = cfg.tma_copy_v_granu_inner * cfg.v_dtype.width // 8
+        tma_v_swizzle = cuda.TensorMapSwizzle.none
+        if cutlass.const_expr(v_inner_dim_size % 128 == 0):
+            tma_v_swizzle = cuda.TensorMapSwizzle.s128b
+        elif cutlass.const_expr(v_inner_dim_size == 64):
+            tma_v_swizzle = cuda.TensorMapSwizzle.s64b
+        elif cutlass.const_expr(v_inner_dim_size == 32):
+            tma_v_swizzle = cuda.TensorMapSwizzle.s32b
+
         q_box_dims = (1, cfg.qk_mma_tiler[0], 1, cfg.tma_copy_q_granu_inner)
-        kv_box_dims = (1, cfg.qk_mma_tiler[1], 1, cfg.tma_copy_kv_granu_inner)
+        kv_box_dims = (1, cfg.kv_tile_rows_per_cta, 1, cfg.tma_copy_kv_granu_inner)
         v_box_dims = (
             1,
             cfg.pv_mma_tiler[2],
             1,
-            cfg.tma_copy_kv_granu_inner,
+            cfg.tma_copy_v_granu_inner,
         )
         o_box_dims = (1, cfg.epi_tile[0], 1, cfg.tma_copy_o_granu_inner)
         stride_order = (3, 2, 1, 0)
@@ -2775,7 +3065,7 @@ class FmhaTs:
                 v_box_dims = (
                     cfg.pv_mma_tiler[2],
                     1,
-                    cfg.tma_copy_kv_granu_inner,
+                    cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters,
                 )
                 kv_stride_order = stride_order
         if cutlass.const_expr(cum_seqlen_q is not None):
@@ -2808,29 +3098,39 @@ class FmhaTs:
             # Paged-KV path: K/V are compact pool tensors with shape
             # (total_pages, h_kv, num_tokens_per_page, d). The TMA box covers
             # one page × one d-fragment; the loader stitches pages and d-halves
-            # together via per-fragment coordinates. Keep both descriptors on
-            # the native rank-4 view. Synthetic ragged V maps with numeric-zero
+            # together via per-fragment coords. Keep both descriptors on the
+            # native rank-4 view. Synthetic ragged V maps with numeric-zero
             # OOB fill have triggered mixed-specialization SM100 aborts; their
             # special-NaN alternative is also invalid because tcgen05.mma
             # propagates the NaN instead of treating it as a zero operand.
-            paged_kv_box_dims = (
+            # When K and V share a dtype, one box shape and swizzle covers
+            # both. Mixed dtypes (e.g. QK-BF16/PV-FP8) require separate
+            # descriptors with V's inner granularity and swizzle derived from
+            # v_dtype.
+            paged_k_box_dims = (
                 1,
                 1,
                 cfg.num_tokens_per_page,
                 cfg.tma_copy_kv_granu_inner,
             )
+            paged_v_box_dims = (
+                1,
+                1,
+                cfg.num_tokens_per_page,
+                cfg.tma_copy_v_granu_inner,
+            )
             tma_k_desc = cuda.create_tensor_map_tiled_from_view(
                 k_cute,
-                box_dims=paged_kv_box_dims,
+                box_dims=paged_k_box_dims,
                 stride_order=kv_stride_order,
                 swizzle=tma_qkv_swizzle,
                 l2_promotion=tma_kv_l2_promotion,
             )
             tma_v_desc = cuda.create_tensor_map_tiled_from_view(
                 v_cute,
-                box_dims=paged_kv_box_dims,
+                box_dims=paged_v_box_dims,
                 stride_order=kv_stride_order,
-                swizzle=tma_qkv_swizzle,
+                swizzle=tma_v_swizzle,
                 l2_promotion=tma_kv_l2_promotion,
             )
         else:
@@ -2845,7 +3145,7 @@ class FmhaTs:
                 v_cute,
                 box_dims=v_box_dims,
                 stride_order=kv_stride_order,
-                swizzle=tma_qkv_swizzle,
+                swizzle=tma_v_swizzle,
                 l2_promotion=tma_kv_l2_promotion,
             )
 
@@ -2905,7 +3205,11 @@ class FmhaTs:
         if cutlass.const_expr(cfg.uses_head_batch_seq_tile_order):
             problem_shape = (num_head_tiles, b, num_seq_tiles)
         else:
-            problem_shape = (num_seq_tiles, num_head_tiles, b)
+            grid_seq_tiles = num_seq_tiles
+            if cutlass.const_expr(cfg.two_cta_umma):
+                # Clusters pair Q tiles; an odd count gets one padding tile.
+                grid_seq_tiles = cute.ceil_div(num_seq_tiles, 2) * 2
+            problem_shape = (grid_seq_tiles, num_head_tiles, b)
 
         if cutlass.const_expr(self.is_clc_dynamic):
             tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
@@ -3052,6 +3356,7 @@ class FmhaTs:
             tmem_resources,
             tmem_ptr_alloc,
             dealloc_mbar_alloc,
+            peer_dealloc_mbar_alloc,
             work_queue,
             clc_response_alloc,
         ) = build_fmha_task_manager(
@@ -3112,8 +3417,10 @@ class FmhaTs:
         smem_allocator = task_manager.smem_allocator
         tmem_ptr_i32 = smem_allocator.get(tmem_ptr_alloc)
         tmem_dealloc_mbar = smem_allocator.get(dealloc_mbar_alloc)
+        tmem_peer_dealloc_mbar = smem_allocator.get(peer_dealloc_mbar_alloc)
 
-        # 5. Initialize tmem dealloc barrier
+        # 5. Initialize tmem dealloc barriers. The local barrier counts this
+        # CTA's consumers. The peer MMA warp arrives on the second barrier.
         num_tmem_consumer_threads = cute.arch.WARP_SIZE * (
             len(cfg.softmax0_warp_ids)
             + len(cfg.softmax1_warp_ids)
@@ -3122,6 +3429,8 @@ class FmhaTs:
         if warp_idx == cfg.empty_warp_id:
             if prims.elect_sync():
                 prims.mbarrier_init(tmem_dealloc_mbar, num_tmem_consumer_threads)
+                if cutlass.const_expr(cfg.two_cta_umma):
+                    prims.mbarrier_init(tmem_peer_dealloc_mbar, 1)
 
         # Fence barrier inits from setup_resources_and_tasks() — pipeline
         # barriers need fencing before first use.
@@ -3132,10 +3441,15 @@ class FmhaTs:
         prims.barrier_cluster_wait()
 
         # 6. TMEM allocation (MMA warp)
+        tmem_cta_group = (
+            prims.CTAGroup.CTA_2
+            if cutlass.const_expr(cfg.two_cta_umma)
+            else prims.CTAGroup.CTA_1
+        )
         if warp_idx == cfg.mma_warp_id:
             tmem_alloc_cols = Int32(cfg.tmem_alloc_cols)
-            prims.tcgen05_alloc(tmem_ptr_i32, tmem_alloc_cols)
-            prims.tcgen05_relinquish_alloc_permit()
+            prims.tcgen05_alloc(tmem_ptr_i32, tmem_alloc_cols, group=tmem_cta_group)
+            prims.tcgen05_relinquish_alloc_permit(group=tmem_cta_group)
 
         # All-warp barrier to ensure TMEM allocation is visible.
         # Previously only correction+MMA warps synced; expanded to all
@@ -3177,6 +3491,17 @@ class FmhaTs:
         if warp_idx == cfg.mma_warp_id:
             while not prims.mbarrier_try_wait_parity(tmem_dealloc_mbar, 0):
                 pass
+            if cutlass.const_expr(cfg.two_cta_umma):
+                # Wait for the peer after the local consumers are done so the
+                # paired TMEM and the leader-side barriers stay live until both
+                # CTAs have finished reading O and arriving on them.
+                cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+                if prims.elect_sync():
+                    prims.mbarrier_arrive(
+                        prims.mapa(tmem_peer_dealloc_mbar, cta_rank ^ 1)
+                    )
+                while not prims.mbarrier_try_wait_parity(tmem_peer_dealloc_mbar, 0):
+                    pass
             tmem_alloc_cols = Int32(cfg.tmem_alloc_cols)
             tmem_ptr = prims.make_tmem_ptr(tmem_ptr_i32.load(), cutlass.Int8)
-            prims.tcgen05_dealloc(tmem_ptr, tmem_alloc_cols)
+            prims.tcgen05_dealloc(tmem_ptr, tmem_alloc_cols, group=tmem_cta_group)

@@ -1297,6 +1297,7 @@ def cutlass_fused_moe(
     *,
     situ_beta: Optional[torch.Tensor] = None,
     situ_linear_beta: Optional[torch.Tensor] = None,
+    backend: str = "cutlass",
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -1471,6 +1472,11 @@ def cutlass_fused_moe(
         their own buffer. A buffer sized for the maximum token count is valid for all
         smaller counts on the same call.
 
+    backend : str
+        ``"cutlass"`` preserves the existing backend. ``"cake"`` selects the
+        prepared TP8-local SiTU complete call; output and workspace are required.
+        See the Cake SiTU guide for its TRTLLM shuffled NVFP4 weight layout.
+
     Returns
     -------
     out: torch.Tensor
@@ -1489,7 +1495,14 @@ def cutlass_fused_moe(
     - It implements both tensor parallelism and expert parallelism.
     - Currently, some advanced features like FP8 block scaling and minimum latency mode
         are not implemented for Blackwell architecture.
+
     """
+    if backend == "cake":
+        from .cake_kimi_k3_situ import _cake_situ_fused_moe
+
+        return _cake_situ_fused_moe(locals())
+    if backend != "cutlass":
+        raise ValueError(f"unsupported fused MoE backend: {backend!r}")
     major, minor = get_compute_capability(input.device)
     device_arch = f"{major * 10 + minor}"
 
@@ -1589,6 +1602,7 @@ def cutlass_fused_moe_workspace_size(
     use_packed_weights: bool = False,
     use_wfp4afp8_humming: bool = False,
     device: Optional[torch.device] = None,
+    backend: str = "cutlass",
 ) -> int:
     """Return the workspace buffer size in bytes required by :func:`cutlass_fused_moe`.
 
@@ -1626,7 +1640,17 @@ def cutlass_fused_moe_workspace_size(
     ----
     Allocate one workspace buffer per CUDA stream context.  Overlapping
     micro-batches on separate streams each need their own buffer.
+
+    backend : str
+        ``"cake"`` returns the prepared SiTU scratch size using host metadata
+        only. It requires BF16/uint8, TP8, SiTU and the documented fixed geometry.
     """
+    if backend == "cake":
+        from .cake_kimi_k3_situ import _cake_situ_workspace_size
+
+        return _cake_situ_workspace_size(locals())
+    if backend != "cutlass":
+        raise ValueError(f"unsupported fused MoE backend: {backend!r}")
     if max_num_tokens <= 0:
         raise ValueError(f"max_num_tokens must be positive, got {max_num_tokens}")
     if hidden_size <= 0:
@@ -3403,7 +3427,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             num_local_experts,
             num_experts,
             routing_method_type,
-            routing_replay_out,
         )
         total_experts_per_token = top_k + n_fused_shared
         # GEMM2's N (what the FC2 weights are sized for) and the narrower
@@ -4592,10 +4615,13 @@ def _validate_routing_replay_out(
 ) -> None:
     """Validate routing_replay_out tensor properties before passing to C++ kernels.
 
-    ``num_tokens`` bounds dim0 from below: the routing kernels write one replay row per
-    token unconditionally, so a shorter buffer is written past its end. Oversized buffers
-    stay legal for CUDA-graph capture at a fixed maximum batch size. It is required rather
-    than defaulted so that a new entry point cannot silently opt out of the bound.
+    The buffer is routed-only: ``dim1 == top_k``. Fused shared-expert slots are
+    not written, so ``top_k + num_fused_shared_experts`` is not a valid width.
+    ``num_tokens`` bounds dim0 from below: the routing kernels write one replay
+    row per token unconditionally, so a shorter buffer is written past its end.
+    Oversized buffers stay legal for CUDA-graph capture at a fixed maximum batch
+    size. It is required rather than defaulted so that a new entry point cannot
+    silently opt out of the bound.
     """
     if routing_replay_out is None:
         return
@@ -4627,7 +4653,6 @@ def _validate_fused_shared_experts(
     local_num_experts: int,
     num_experts: int,
     routing_method_type: int,
-    routing_replay_out: Optional[torch.Tensor],
 ) -> int:
     n_fused_shared = num_fused_shared_experts or 0
     if n_fused_shared <= 0:
@@ -4639,10 +4664,6 @@ def _validate_fused_shared_experts(
             "local_num_experts == num_experts. Got "
             f"num_fused_shared_experts={n_fused_shared}, local_expert_offset={local_expert_offset}, "
             f"local_num_experts={local_num_experts}, num_experts={num_experts}."
-        )
-    if routing_replay_out is not None:
-        raise ValueError(
-            "routing_replay_out is not supported with num_fused_shared_experts > 0"
         )
     if routing_method_type != RoutingMethodType.DeepSeekV3.value:
         raise ValueError(
@@ -5441,7 +5462,7 @@ def trtllm_fp8_per_channel_scale_moe(
     Args:
         routing_logits: [seq_len, num_experts] tensor of routing logits
         routing_bias: [num_experts] tensor of routing bias
-        hidden_states: [seq_len, hidden_size] tensor of input hidden states
+        hidden_states: [seq_len, hidden_size] FP8 E4M3 tensor of input hidden states
         hidden_states_scale: [seq_len, 1] FP32 per-token dequantization multipliers
         gemm1_weights: [num_experts, M, hidden_size] FP8 first layer weights,
             where M is 2*intermediate_size for gated activations and
@@ -5476,6 +5497,12 @@ def trtllm_fp8_per_channel_scale_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx).
     """
+    if hidden_states.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "FP8 per-channel MoE hidden_states must have dtype "
+            f"torch.float8_e4m3fn, got {hidden_states.dtype}."
+        )
+
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_channel_scale_moe(
         routing_logits,
         None,
@@ -5554,7 +5581,7 @@ def trtllm_fp8_per_channel_scale_routed_moe(
     routing_bias : Optional[torch.Tensor]
         ``[num_experts]`` tensor of routing bias. May be ``None``.
     hidden_states : torch.Tensor
-        ``[seq_len, hidden_size]`` tensor of input hidden states.
+        ``[seq_len, hidden_size]`` FP8 E4M3 tensor of input hidden states.
     hidden_states_scale : torch.Tensor
         ``[seq_len, 1]`` FP32 per-token dequantization multipliers.
     gemm1_weights : torch.Tensor
@@ -5612,6 +5639,12 @@ def trtllm_fp8_per_channel_scale_routed_moe(
         Final MoE output when ``do_finalize`` is ``True``; otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
+    if hidden_states.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "FP8 per-channel MoE hidden_states must have dtype "
+            f"torch.float8_e4m3fn, got {hidden_states.dtype}."
+        )
+
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_channel_scale_moe(
         None,  # routing_logits
         topk_ids,
@@ -5786,6 +5819,9 @@ def trtllm_fp8_block_scale_moe(
         matches ``topk_indices``.  When ``None`` (default) the kernel skips
         the write entirely.  The buffer may be larger than ``num_tokens`` for
         CUDA-graph pre-allocation; only rows ``[0, num_tokens)`` are written.
+        With fused shared experts the layout stays routed-only: ``dim1`` is
+        ``top_k``, not ``top_k + num_fused_shared_experts``, and shared slots
+        are not recorded.
     gemm1_alpha : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
         parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
@@ -5849,7 +5885,6 @@ def trtllm_fp8_block_scale_moe(
         local_num_experts,
         num_experts,
         routing_method_type,
-        routing_replay_out,
     )
     _validate_routing_replay_out(
         routing_replay_out,
@@ -6319,8 +6354,10 @@ def trtllm_fp4_block_scale_moe(
         order matches ``topk_indices``.  When ``None`` (default) the
         kernel skips the write entirely.  The buffer may be larger than
         ``num_tokens`` for CUDA-graph pre-allocation; only rows
-        ``[0, num_tokens)`` are written.
-
+        ``[0, num_tokens)`` are written.  With fused shared experts the
+        layout stays routed-only: ``dim1`` is ``top_k``, not
+        ``top_k + num_fused_shared_experts``, and shared slots are not
+        recorded.
     num_fused_shared_experts : Optional[int]
         Number of shared experts to fuse into the MoE kernel (default
         ``None`` / ``0``).  When ``> 0``, every per-expert tensor
@@ -6379,7 +6416,6 @@ def trtllm_fp4_block_scale_moe(
         local_num_experts,
         num_experts,
         routing_method_type,
-        routing_replay_out,
     )
     _validate_routing_replay_out(
         routing_replay_out,
@@ -6645,7 +6681,6 @@ def trtllm_fp4_block_scale_routed_moe(
         local_num_experts,
         num_experts,
         routing_method_type,
-        None,
     )
 
     # The kernel folds dequantScaleAb into scaleC and applies it to the bias
@@ -7057,3 +7092,6 @@ def trtllm_mxint4_block_scale_routed_moe(
         valid_hidden_size,
         valid_intermediate_size,
     )
+
+
+from .cake_kimi_k3_situ import cake_fused_moe_prepare_workspace  # noqa: E402,F401

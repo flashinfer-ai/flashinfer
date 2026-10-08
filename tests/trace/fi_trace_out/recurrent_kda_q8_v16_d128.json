@@ -1,9 +1,10 @@
 {
   "name": "recurrent_kda_q8_v16_d128",
-  "description": "Recurrent Key-Driven Attention decode with per-key-dimension gating and an optional read-only committed-state source.",
+  "description": "Recurrent Key-Driven Attention with per-key-dimension gating and an optional read-only committed-state source. Classifies the call's phase and serves prefill or decode accordingly.",
   "op_type": "kda",
   "tags": [
-    "fi_api:flashinfer.kda_decode.recurrent_kda",
+    "fi_api:flashinfer.kda.recurrent_kda",
+    "stage:prefill",
     "stage:decode",
     "status:verified"
   ],
@@ -42,11 +43,24 @@
     "num_sequences": {
       "type": "var",
       "description": "Number of state-source indices."
+    },
+    "num_checkpoints": {
+      "type": "var",
+      "description": "Number of packed prefill checkpoints."
+    },
+    "num_checkpoint_offsets": {
+      "type": "var",
+      "description": "Number of packed checkpoint cumulative offsets."
+    },
+    "kg_dim": {
+      "type": "var",
+      "description": "Key/gate cache row width (2 * head_dim)."
     }
   },
   "constraints": [
     "num_v_heads % num_q_heads == 0",
-    "head_dim in (64, 128)"
+    "head_dim in (64, 128)",
+    "num_checkpoint_offsets == num_sequences + 1"
   ],
   "inputs": {
     "q": {
@@ -122,6 +136,33 @@
       "optional": true,
       "description": "Committed-state slot selected for each sequence."
     },
+    "ssm_state_indices": {
+      "shape": [
+        "num_sequences"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Writable state-pool slot selected for each prefill sequence."
+    },
+    "state_checkpoints": {
+      "shape": [
+        "num_checkpoints",
+        "num_v_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Caller-owned packed KDA pre-block state output."
+    },
+    "checkpoint_cu_starts": {
+      "shape": [
+        "num_checkpoint_offsets"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Per-sequence cumulative packed checkpoint counts."
+    },
     "scale": {
       "shape": null,
       "dtype": "float32",
@@ -156,6 +197,38 @@
       "shape": null,
       "dtype": "int32",
       "optional": true
+    },
+    "disable_state_update": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "correction_cache": {
+      "shape": [
+        "source_pool_size",
+        "num_v_heads",
+        "seq_len",
+        "head_dim"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Frozen-verify only: slot-indexed float32 per-token delta-rule corrections for a commit/recovery kernel."
+    },
+    "kg_cache": {
+      "shape": [
+        "source_pool_size",
+        "num_v_heads",
+        "seq_len",
+        "kg_dim"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Frozen-verify only: slot-indexed (normalized key | raw gate) cache; kg_dim == 2 * head_dim."
+    },
+    "checkpoint_every_n_tokens": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
     }
   },
   "outputs": {
@@ -177,6 +250,17 @@
       ],
       "dtype": "bfloat16",
       "optional": true
+    },
+    "state_checkpoints": {
+      "shape": [
+        "num_checkpoints",
+        "num_v_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "param": "state_checkpoints"
     }
   },
   "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"

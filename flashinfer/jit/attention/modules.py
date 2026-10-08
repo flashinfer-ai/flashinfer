@@ -25,7 +25,6 @@ from ..core import (
     JitSpec,
     common_nvcc_flags,
     gen_jit_spec,
-    logger,
     sm90a_nvcc_flags,
     current_compilation_context,
 )
@@ -106,6 +105,32 @@ class _BatchMLAModuleProxy:
 
 BatchPrefillPagedKVStrideMode = Literal["runtime", "equal", "independent"]
 BatchPrefillModuleSurface = Literal["full", "paged"]
+BatchAttentionKVStrideMode = Literal["runtime", "equal", "independent"]
+
+
+def _validate_batch_attention_stride_mode(
+    paged_kv_stride_mode: BatchAttentionKVStrideMode,
+) -> None:
+    if paged_kv_stride_mode not in ("runtime", "equal", "independent"):
+        raise ValueError(
+            "paged_kv_stride_mode must be one of 'runtime', 'equal', or "
+            f"'independent', got {paged_kv_stride_mode!r}"
+        )
+
+
+def _get_batch_attention_module_uri(
+    base_uri: str, paged_kv_stride_mode: BatchAttentionKVStrideMode
+) -> str:
+    _validate_batch_attention_stride_mode(paged_kv_stride_mode)
+    return (
+        base_uri
+        + {
+            "runtime": "",
+            "equal": "_kv_stride_equal",
+            "independent": "_kv_stride_independent",
+        }[paged_kv_stride_mode]
+    )
+
 
 _BATCH_PREFILL_MODULE_URI_SUFFIX = {
     ("runtime", "full"): "",
@@ -322,116 +347,6 @@ def gen_batch_mla_module(
         extra_cuda_cflags=extra_cuda_cflags,
         post_load_adapter=_BatchMLAModuleProxy,
     )
-
-
-def get_batch_decode_mla_uri(
-    dtype_q: torch.dtype,
-    dtype_kv: torch.dtype,
-    dtype_o: torch.dtype,
-    dtype_idx: torch.dtype,
-    head_dim_ckv: int,
-    use_sliding_window: bool,
-    use_logits_soft_cap: bool,
-    arc: str,
-) -> str:
-    return (
-        f"batch_decode_mla_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
-        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
-        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
-        f"head_dim_ckv{head_dim_ckv}_"
-        f"use_swa_{use_sliding_window}_"
-        f"use_logits_cap_{use_logits_soft_cap}_"
-        f"arc_{arc}"
-    )
-
-
-def gen_batch_decode_mla_module(
-    dtype_q: torch.dtype,
-    dtype_kv: torch.dtype,
-    dtype_o: torch.dtype,
-    dtype_idx: torch.dtype,
-    head_dim: int,
-    num_qo_heads: int,
-    use_sliding_window: bool,
-    use_logits_soft_cap: bool,
-    use_tensor_cores: bool,
-) -> JitSpec:
-    cuda_arch_major = torch.cuda.get_device_properties(0).major
-
-    if cuda_arch_major >= 9:  # smem size of SM90 can accommodate all 128 qo-heads data
-        qo_tile_len = 128
-    else:
-        qo_tile_len = 64
-
-    if (
-        use_tensor_cores
-        and cuda_arch_major >= 8
-        and num_qo_heads % qo_tile_len == 0
-        and dtype_q == torch.float16
-        and dtype_kv == torch.float16
-        and dtype_o == torch.float16
-    ):
-        logger.info("Use tensor-core SM80 version of MLA decode kernel.")
-        arc = "sm80"
-    else:
-        logger.info("Fall back to cuda-core version of MLA decode kernel.")
-        arc = "cuda_core"
-
-    uri = get_batch_decode_mla_uri(
-        dtype_q,
-        dtype_kv,
-        dtype_o,
-        dtype_idx,
-        head_dim,
-        use_sliding_window,
-        use_logits_soft_cap,
-        arc,
-    )
-    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
-    os.makedirs(gen_directory, exist_ok=True)
-
-    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_decode_mla_config.jinja") as f:
-        config_templ = jinja2.Template(f.read())
-    generated_config_path = gen_directory / "mla_config.inc"
-    write_if_different(
-        generated_config_path,
-        config_templ.render(
-            dtype_q=dtype_map[dtype_q],
-            dtype_kv=dtype_map_kv[dtype_kv],
-            dtype_o=dtype_map[dtype_o],
-            dtype_idx=dtype_map[dtype_idx],
-            head_dim_ckv=head_dim,
-            head_dim_kpe=head_dim // 8,
-            qo_tile_len=qo_tile_len,
-            use_sliding_window=str(use_sliding_window).lower(),
-            use_logits_soft_cap=str(use_logits_soft_cap).lower(),
-        ),
-    )
-
-    filenames = []
-    if arc == "sm80":
-        filenames = [
-            "batch_decode_mla_cute_sm80.cu",
-            "batch_decode_mla_binding.cu",
-        ]
-    else:
-        filenames = [
-            "batch_decode_mla_plan.cu",
-            "batch_decode_mla_run.cu",
-            "batch_decode_mla_binding.cu",
-        ]
-
-    source_paths = []
-    for filename in filenames:
-        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
-        dest_path = gen_directory / filename
-        source_paths.append(dest_path)
-        with open(src_path, "r") as f:
-            source = f.read()
-        write_if_different(dest_path, source)
-
-    return gen_jit_spec(uri, source_paths)
 
 
 def get_single_prefill_uri(
@@ -1339,6 +1254,160 @@ def _gen_batch_prefill_independent_paged_module(
     )
 
 
+def get_batch_prefill_bidirectional_ranges_spec(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+) -> dict:
+    """The single source of truth for this variant's JIT contract.
+
+    Both the public generator and the wrapper build their module from this, so
+    the URI, the additional tensor/scalar names and their dtypes cannot drift
+    apart between the two entry points.
+
+    There is no positional-encoding parameter: ``POS_ENCODING_MODE`` is a
+    compile-time constant of the customize config, and any rotary mode makes
+    the kernel read rope parameters that this variant does not declare as
+    additional scalars. The mode is fixed to ``NONE`` here rather than accepted
+    and then failing at nvcc time.
+    """
+    from flashinfer.jit.attention.variants import bidirectional_ranges_decl
+
+    # fa2 has no fp8 tensor-core path and no fp8 output path. The public
+    # generators assert on both before rendering; this variant reaches
+    # gen_customize_batch_prefill_module directly, so the same refusals belong
+    # here, where the wrapper and the public generator both pass through.
+    # Reaching nvcc instead would fail on static_assert(sizeof(DTypeQ) == 2)
+    # with nothing naming the argument that caused it.
+    _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if dtype_q in _FP8_DTYPES:
+        raise ValueError(
+            "fp8 tensor core is not supported in fa2 backend: "
+            f"dtype_q={dtype_q} cannot be used with this variant."
+        )
+    if dtype_o in _FP8_DTYPES:
+        raise ValueError(
+            "FP8 output is not supported in fa2/fa3 backends yet: "
+            f"dtype_o={dtype_o} cannot be used with this variant."
+        )
+    # dtype_kv is deliberately not restricted here: a KV-only quantization,
+    # packed NVFP4 included, does not turn on the fp8 tensor-core template.
+
+    uri = (
+        f"batch_prefill_with_bidirectional_ranges_"
+        f"dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}"
+    )
+
+    packed_fp4_kv = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+
+    tensor_names: List[str] = ["bidirectional_ranges"]
+    tensor_dtypes: List[str] = ["int32_t"]
+    if packed_fp4_kv:
+        # The generator emits the scale-factor stride setters that the packed
+        # fp4 KV load path reads only for these exact names.
+        tensor_names += ["maybe_k_cache_sf", "maybe_v_cache_sf"]
+        tensor_dtypes += ["uint8_t", "uint8_t"]
+
+    return {
+        "uri": uri,
+        "backend": "fa2",
+        "dtype_q": dtype_q,
+        "dtype_kv": dtype_kv,
+        "dtype_o": dtype_o,
+        "dtype_idx": dtype_idx,
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
+        # Two values per byte, so a packed cache's last axis is half as wide as
+        # the head dimension the module was compiled for.
+        "packed_fp4_kv": packed_fp4_kv,
+        "tensor_names": tensor_names,
+        "tensor_dtypes": tensor_dtypes,
+        "scalar_names": ["causal_window_left", "range_window_left", "sm_scale"],
+        "scalar_dtypes": ["double", "double", "double"],
+        "variant_name": "CausalBidirectionalRangesAttention",
+        "variant_decl": bidirectional_ranges_decl["fa2"],
+        "jit_kwargs": {
+            # The variant owns the window, so the kernel-side sliding-window
+            # and soft-cap paths stay off.
+            "pos_encoding_mode": 0,  # PosEncodingMode.NONE
+            "use_sliding_window": False,
+            "use_logits_soft_cap": False,
+            "use_fp16_qk_reduction": False,
+        },
+    }
+
+
+def batch_prefill_bidirectional_ranges_jit_args(spec: dict) -> List[Any]:
+    """Positional ``jit_args`` for ``BatchPrefillWithPagedKVCacheWrapper``."""
+    return [
+        spec["uri"],
+        spec["dtype_q"],
+        spec["dtype_kv"],
+        spec["dtype_o"],
+        spec["dtype_idx"],
+        spec["head_dim_qk"],
+        spec["head_dim_vo"],
+        spec["tensor_names"],
+        spec["tensor_dtypes"],
+        spec["scalar_names"],
+        spec["scalar_dtypes"],
+        spec["variant_name"],
+        spec["variant_decl"],
+    ]
+
+
+def gen_batch_prefill_bidirectional_ranges_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+) -> JitSpec:
+    """Build the causal + bidirectional-ranges batch-prefill module.
+
+    fa2 only: it is the only backend whose kernels evaluate a custom
+    ``LogitsMask`` on every KV tile, which is what lets the variant own the
+    whole mask instead of reading a materialized one. The positional-encoding
+    mode is fixed to ``NONE``; see
+    :func:`get_batch_prefill_bidirectional_ranges_spec`.
+    """
+    spec = get_batch_prefill_bidirectional_ranges_spec(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+    )
+    return gen_customize_batch_prefill_module(
+        spec["backend"],
+        spec["uri"],
+        spec["dtype_q"],
+        spec["dtype_kv"],
+        spec["dtype_o"],
+        spec["dtype_idx"],
+        spec["head_dim_qk"],
+        spec["head_dim_vo"],
+        spec["tensor_names"],
+        spec["tensor_dtypes"],
+        spec["scalar_names"],
+        spec["scalar_dtypes"],
+        spec["variant_name"],
+        spec["variant_decl"],
+        fp8_enabled=False,
+        **spec["jit_kwargs"],
+    )
+
+
 def gen_batch_prefill_attention_sink_module(
     backend: str,
     dtype_q: torch.dtype,
@@ -1389,7 +1458,7 @@ def gen_batch_prefill_attention_sink_module(
     )
 
 
-def gen_batch_attention_module(
+def _gen_batch_attention_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -1399,6 +1468,8 @@ def gen_batch_attention_module(
     pos_encoding_mode: int,
     use_logits_soft_cap: bool,
     use_profiler: bool,
+    *,
+    paged_kv_stride_mode: BatchAttentionKVStrideMode,
 ):
     uri = get_batch_attention_uri(
         dtype_q,
@@ -1411,6 +1482,7 @@ def gen_batch_attention_module(
         use_logits_soft_cap,
         use_profiler,
     )
+    uri = _get_batch_attention_module_uri(uri, paged_kv_stride_mode)
 
     additional_tensor_names: List[str] = ["maybe_k_cache_sf", "maybe_v_cache_sf"]
     additional_tensor_dtypes: List[str] = ["uint8_t", "uint8_t"]
@@ -1419,7 +1491,7 @@ def gen_batch_attention_module(
     variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
     variant_decl = "#include<flashinfer/attention/variants.cuh>"
 
-    return gen_customize_batch_attention_module(
+    return _gen_customize_batch_attention_module(
         uri,
         dtype_q,
         dtype_kv,
@@ -1436,6 +1508,85 @@ def gen_batch_attention_module(
         pos_encoding_mode=pos_encoding_mode,
         use_logits_soft_cap=use_logits_soft_cap,
         use_profiler=use_profiler,
+        paged_kv_stride_mode=paged_kv_stride_mode,
+    )
+
+
+def gen_batch_attention_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
+    use_profiler: bool,
+):
+    """Generate the public compatibility module with runtime stride dispatch."""
+    return _gen_batch_attention_module(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_logits_soft_cap,
+        use_profiler,
+        paged_kv_stride_mode="runtime",
+    )
+
+
+def _gen_batch_attention_primary_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
+    use_profiler: bool,
+):
+    """Generate the default equal-stride persistent attention primary."""
+    return _gen_batch_attention_module(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_logits_soft_cap,
+        use_profiler,
+        paged_kv_stride_mode="equal",
+    )
+
+
+def _gen_batch_attention_independent_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
+    use_profiler: bool,
+):
+    """Generate the persistent attention module loaded lazily for unequal strides."""
+    return _gen_batch_attention_module(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_logits_soft_cap,
+        use_profiler,
+        paged_kv_stride_mode="independent",
     )
 
 
@@ -2211,6 +2362,49 @@ def gen_customize_batch_attention_module(
     use_logits_soft_cap: bool = False,
     use_profiler: bool = False,
 ):
+    """Generate a custom runtime-dispatched module under the caller's unchanged URI."""
+    return _gen_customize_batch_attention_module(
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode=pos_encoding_mode,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_profiler=use_profiler,
+        paged_kv_stride_mode="runtime",
+    )
+
+
+def _gen_customize_batch_attention_module(
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_logits_soft_cap: bool = False,
+    use_profiler: bool = False,
+    *,
+    paged_kv_stride_mode: BatchAttentionKVStrideMode,
+):
+    _validate_batch_attention_stride_mode(paged_kv_stride_mode)
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
@@ -2222,6 +2416,12 @@ def gen_customize_batch_attention_module(
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+        "paged_kv_stride_mode": paged_kv_stride_mode,
+        "equal_kv_strides_values": {
+            "runtime": ["false", "true"],
+            "equal": ["true"],
+            "independent": ["false"],
+        }[paged_kv_stride_mode],
     }
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, _) = generate_additional_params(

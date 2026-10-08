@@ -1092,3 +1092,251 @@ mxfp8_grouped_quantize_trace = TraceTemplate(
     tags=["status:verified", "quantization:mxfp8"],
     init=_mxfp8_grouped_quantize_init,
 )
+
+
+class _Dsv41CacheFormat:
+    """Static facts of one DeepSeek-V4.1 paged cache ABI (shared by pack / append traces)."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        bytes_per_token: int,
+        tag: str,
+        cache_description: str,
+        pack_description: str,
+        append_description: str,
+    ) -> None:
+        self.name = name
+        self.bytes_per_token = bytes_per_token
+        self.tag = tag
+        self.cache_description = cache_description
+        self.pack_description = pack_description
+        self.append_description = append_description
+
+
+_DSV41_FP4_FORMAT = _Dsv41CacheFormat(
+    name="fp4",
+    bytes_per_token=288,
+    tag="quantization:fp4",
+    cache_description=(
+        "Opaque V41_FP4 uint8 cache: each physical page stores page_size * 256 "
+        "packed E2M1 data bytes followed by page_size * 32 E4M3 scale bytes. "
+        "The last dimension is not a contiguous per-token record. "
+        "Page-strided views are supported; bytes inside each page remain packed."
+    ),
+    pack_description=(
+        "Quantize complete DeepSeek-V4.1 latent-KV pages, including RoPE, "
+        "in groups of 16 to E2M1 with E4M3 scales. "
+        "Scale = clamp(amax / 6, 2**-9, 448) rounded to E4M3; "
+        "non-finite values poison their group (NaN scale, zero codes)."
+    ),
+    append_description=(
+        "Quantize DeepSeek-V4.1 latent KV by physical slot with the same "
+        "group-16 E2M1 / clamped E4M3 conversion as full-page pack. "
+        "Mutates cache in place and returns None; the trace output is "
+        "the updated cache. Unaddressed data and scale slots are preserved."
+    ),
+)
+
+_DSV41_FP8_FORMAT = _Dsv41CacheFormat(
+    name="fp8",
+    bytes_per_token=528,
+    tag="quantization:fp8",
+    cache_description=(
+        "Opaque DSV4_1 FP8 uint8 cache: each physical page stores page_size * 512 "
+        "E4M3 data bytes followed by page_size * 16 UE8M0 scale bytes. "
+        "The last dimension is not a contiguous per-token record. "
+        "Page-strided views are supported; bytes inside each page remain packed."
+    ),
+    pack_description=(
+        "Quantize complete DeepSeek-V4.1 latent-KV pages, including RoPE, "
+        "in groups of 32 to E4M3 with UE8M0 scales. "
+        "Scale = 2**ceil(log2(max(amax / 448, 1e-4))) with amax clamped at 1e-4; "
+        "values are divided by the scale and rounded to nearest-even E4M3 "
+        "saturating at 448. A NaN in a group gives a 0xFF scale and 0x7F codes; "
+        "an infinite group gives a 0xFF scale, 0x7F for the infinite values and "
+        "signed zero codes elsewhere (the torch reference trajectory)."
+    ),
+    append_description=(
+        "Quantize DeepSeek-V4.1 latent KV by physical slot with the same "
+        "group-32 E4M3 / UE8M0 conversion as full-page pack. "
+        "Mutates cache in place and returns None; the trace output is "
+        "the updated cache. Unaddressed data and scale slots are preserved."
+    ),
+)
+
+
+def _dsv41_paged_dims(layout, width):
+    if layout == "flat":
+        return ["num_pages", "page_bytes"]
+    if layout == "hnd":
+        return ["num_pages", "latent_heads", "page_size", width]
+    if layout == "nhd":
+        return ["num_pages", "page_size", "latent_heads", width]
+    return ["num_pages", "page_size", width]
+
+
+def _make_dsv41_pack_trace(fmt, input_layout, kv_layout):
+    return TraceTemplate(
+        op_type="quantization",
+        name_prefix=f"dsv41_{fmt.name}_quantize_pack_sparse_mla_cache_{input_layout}_{kv_layout.lower()}",
+        description=fmt.pack_description,
+        axes={
+            "num_pages": Var(),
+            "page_size": Const(abbrev="ps"),
+            "latent_dim": Const(value=512, abbrev=""),
+            "latent_heads": Const(value=1, abbrev=""),
+            "bytes_per_token": Const(value=fmt.bytes_per_token, abbrev=""),
+        },
+        inputs={
+            "latent_kv": Tensor(
+                _dsv41_paged_dims(input_layout, "latent_dim"),
+                description="Contiguous BF16/FP16 latent KV, including all 512 dimensions.",
+            ),
+            "kv_layout": Scalar(
+                "string",
+                optional=True,
+                description=f"Output layout; this definition uses {kv_layout}. API default: HND.",
+            ),
+        },
+        outputs={
+            "cache": Tensor(
+                _dsv41_paged_dims(kv_layout.lower(), "bytes_per_token"),
+                dtype="uint8",
+                description=fmt.cache_description,
+            ),
+        },
+        tags=[fmt.tag, "mla", f"kv_layout:{kv_layout}"],
+    )
+
+
+def _dsv41_pack_traces(fmt):
+    return {
+        (input_layout, kv_layout): _make_dsv41_pack_trace(fmt, input_layout, kv_layout)
+        for input_layout in ("3d", "hnd", "nhd")
+        for kv_layout in ("HND", "NHD")
+    }
+
+
+_DSV41_FP4_PACK_TRACES = _dsv41_pack_traces(_DSV41_FP4_FORMAT)
+_DSV41_FP8_PACK_TRACES = _dsv41_pack_traces(_DSV41_FP8_FORMAT)
+
+
+def _dsv41_paged_layout(tensor):
+    if tensor.ndim == 2:
+        return "flat"
+    if tensor.ndim == 4:
+        return "hnd" if tensor.shape[1] == 1 else "nhd"
+    return "3d"
+
+
+def dsv41_fp4_quantize_pack_sparse_mla_cache_trace(**kwargs):
+    return _DSV41_FP4_PACK_TRACES[
+        _dsv41_paged_layout(kwargs["latent_kv"]), kwargs.get("kv_layout", "HND")
+    ]
+
+
+dsv41_fp4_quantize_pack_sparse_mla_cache_trace.templates = list(  # type: ignore[attr-defined]
+    _DSV41_FP4_PACK_TRACES.values()
+)
+
+
+def dsv41_fp8_quantize_pack_sparse_mla_cache_trace(**kwargs):
+    return _DSV41_FP8_PACK_TRACES[
+        _dsv41_paged_layout(kwargs["latent_kv"]), kwargs.get("kv_layout", "HND")
+    ]
+
+
+dsv41_fp8_quantize_pack_sparse_mla_cache_trace.templates = list(  # type: ignore[attr-defined]
+    _DSV41_FP8_PACK_TRACES.values()
+)
+
+
+def _make_dsv41_append_trace(fmt, latent_rank, cache_layout):
+    latent_dims = [f"latent_dim_{i}" for i in range(latent_rank - 1)]
+    cache_dims = _dsv41_paged_dims(cache_layout, "bytes_per_token")
+    axes = {
+        "num_tokens": Var(description="Number of slot-mapping entries."),
+        **{dim: Var() for dim in latent_dims},
+        "latent_dim": Const(value=512, abbrev=""),
+        "num_pages": Var(),
+        "bytes_per_token": Const(value=fmt.bytes_per_token, abbrev=""),
+    }
+    if cache_layout == "flat":
+        axes["page_bytes"] = Const(
+            abbrev="pb", description=f"page_size * {fmt.bytes_per_token} bytes."
+        )
+    else:
+        axes["page_size"] = Const(abbrev="ps")
+    if cache_layout in ("hnd", "nhd"):
+        axes["latent_heads"] = Const(value=1, abbrev="")
+    return TraceTemplate(
+        op_type="quantization",
+        name_prefix=f"dsv41_{fmt.name}_quantize_append_sparse_mla_cache_{latent_rank}d_{cache_layout}",
+        description=fmt.append_description,
+        axes=axes,
+        inputs={
+            "latent_kv": Tensor(
+                [*latent_dims, "latent_dim"],
+                description="Contiguous BF16/FP16; flatten leading dimensions to one 512-value row per slot.",
+            ),
+            "slot_mapping": Tensor(
+                ["num_tokens"],
+                description=(
+                    "Contiguous int32/int64 physical slots: page_id * page_size + entry_id. "
+                    "Negative or out-of-range slots are ignored; the lowest-index "
+                    "input row wins duplicate valid slots."
+                ),
+            ),
+            "cache": Tensor(cache_dims, description=fmt.cache_description),
+        },
+        outputs={
+            "cache": Tensor(
+                cache_dims,
+                dtype_from="cache",
+                description="The input cache, updated in place.",
+            ),
+        },
+        constraints=[
+            f"{' * '.join(latent_dims)} == num_tokens",
+            *(["page_bytes % bytes_per_token == 0"] if cache_layout == "flat" else []),
+        ],
+        tags=[fmt.tag, "mla", "inplace"],
+    )
+
+
+def _dsv41_append_traces(fmt):
+    return {
+        (latent_rank, cache_layout): _make_dsv41_append_trace(
+            fmt, latent_rank, cache_layout
+        )
+        for latent_rank in (2, 3, 4)
+        for cache_layout in ("flat", "3d", "hnd", "nhd")
+    }
+
+
+_DSV41_FP4_APPEND_TRACES = _dsv41_append_traces(_DSV41_FP4_FORMAT)
+_DSV41_FP8_APPEND_TRACES = _dsv41_append_traces(_DSV41_FP8_FORMAT)
+
+
+def dsv41_fp4_quantize_append_sparse_mla_cache_trace(**kwargs):
+    return _DSV41_FP4_APPEND_TRACES[
+        kwargs["latent_kv"].ndim, _dsv41_paged_layout(kwargs["cache"])
+    ]
+
+
+dsv41_fp4_quantize_append_sparse_mla_cache_trace.templates = list(  # type: ignore[attr-defined]
+    _DSV41_FP4_APPEND_TRACES.values()
+)
+
+
+def dsv41_fp8_quantize_append_sparse_mla_cache_trace(**kwargs):
+    return _DSV41_FP8_APPEND_TRACES[
+        kwargs["latent_kv"].ndim, _dsv41_paged_layout(kwargs["cache"])
+    ]
+
+
+dsv41_fp8_quantize_append_sparse_mla_cache_trace.templates = list(  # type: ignore[attr-defined]
+    _DSV41_FP8_APPEND_TRACES.values()
+)

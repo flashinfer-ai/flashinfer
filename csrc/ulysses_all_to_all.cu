@@ -26,6 +26,9 @@
 #include <cstdint>
 
 #include "flashinfer/comm/ulysses_all_to_all.cuh"
+#ifdef FLASHINFER_ULYSSES_GENERATED
+#include "cake_ulysses_dispatch.cuh"
+#endif
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Array;
@@ -161,11 +164,19 @@ void ulysses_a2a(fptr_t _fa, TensorView inp, TensorView out, int64_t B, int64_t 
       TVM_FFI_ICHECK(false) << "ulysses_a2a only supports float32, float16 and bfloat16"; \
   }
 
+#ifdef FLASHINFER_ULYSSES_GENERATED
+  auto launch_status = fi::LaunchGeneratedUlysses(
+      fa, inp.data_ptr(), encode_dlpack_dtype(out.dtype()), static_cast<int>(B),
+      static_cast<int>(S_local), H_local, static_cast<int>(D), static_cast<int>(mode), stream);
+  TVM_FFI_ICHECK(launch_status == cudaSuccess);
+#else
   if (mode == 0) {
     DISPATCH_DTYPE(0);
   } else {
     DISPATCH_DTYPE(1);
   }
+
+#endif
 
 #undef DISPATCH_DTYPE
 #undef DISPATCH_NGPUS

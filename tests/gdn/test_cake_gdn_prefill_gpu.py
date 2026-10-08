@@ -339,6 +339,50 @@ def _launch_raw_indexed_prefill(case):
             "num_k_heads": 2,
             "num_v_heads": 4,
         },
+        # Qwen3.5 per-rank head splits with gathered BF16 state (the SGLang
+        # extend route): DV-split and full-DV physical schedules.
+        {
+            "seq_lens": (512, 300),
+            "state_dtype": torch.bfloat16,
+            "num_q_heads": 8,
+            "num_k_heads": 8,
+            "num_v_heads": 16,
+        },
+        {
+            "seq_lens": (1024,),
+            "state_dtype": torch.bfloat16,
+            "num_q_heads": 8,
+            "num_k_heads": 8,
+            "num_v_heads": 32,
+        },
+        {
+            "seq_lens": (257, 64, 1000),
+            "state_dtype": torch.bfloat16,
+            "num_q_heads": 4,
+            "num_k_heads": 4,
+            "num_v_heads": 16,
+        },
+        {
+            "seq_lens": (512,) * 8,
+            "state_dtype": torch.bfloat16,
+            "num_q_heads": 4,
+            "num_k_heads": 4,
+            "num_v_heads": 16,
+        },
+        {
+            "seq_lens": (96,) * 16,
+            "state_dtype": torch.bfloat16,
+            "num_q_heads": 2,
+            "num_k_heads": 2,
+            "num_v_heads": 8,
+        },
+        {
+            "seq_lens": (2048,) * 4,
+            "state_dtype": torch.bfloat16,
+            "num_q_heads": 8,
+            "num_k_heads": 8,
+            "num_v_heads": 32,
+        },
     ),
 )
 def test_public_cake_gdn_prefill_matches_independent_recurrence(kwargs):

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 by FlashInfer team.
+# Copyright (c) 2025-2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,15 +36,15 @@ TraceRegistryEntry = tuple[Callable[..., Any], Any, str]
 _TRACE_REGISTRATION_MODULES = (
     "flashinfer.activation",
     "flashinfer.attention._core",
-    "flashinfer.attention.prims_ts.block_sparse",
-    "flashinfer.attention.prims_ts.decode",
-    "flashinfer.attention.prims_ts.mla_decode",
     "flashinfer.attn_scores.attn_scores",
     "flashinfer.cake_vsa",
     "flashinfer.cascade",
     "flashinfer.comm.allreduce",
     "flashinfer.comm.dcp_alltoall",
+    "flashinfer.comm.dcp_lse_reduce",
     "flashinfer.comm.pcie_ipc_ar",
+    "flashinfer.comm.pcie_ipc_collectives.all_gather",
+    "flashinfer.comm.pcie_ipc_collectives.reduce_scatter",
     "flashinfer.concat_ops",
     "flashinfer.cudnn.decode",
     "flashinfer.cudnn.prefill",
@@ -58,12 +58,15 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.fused_moe.backends.prims_ts.bf16_op",
     "flashinfer.fused_moe.backends.prims_ts.fp4_op",
     "flashinfer.fused_moe.backends.prims_ts.fp8_op",
+    "flashinfer.fused_moe.alphamoe_fused_router",
     "flashinfer.fused_moe.core",
+    "flashinfer.fused_moe.alphamoe_nvfp4_sm100",
     "flashinfer.fused_moe.cute_dsl.b12x_moe",
     "flashinfer.fused_moe.cute_dsl.fused_moe",
     "flashinfer.fused_moe.cute_dsl.sm90_fused_moe",
     "flashinfer.fused_moe.fused_routing_dsv3",
     "flashinfer.fused_moe.hash_topk",
+    "flashinfer.fused_moe.layer",
     "flashinfer.fused_moe.monomoe",
     "flashinfer.fused_moe.prepare",
     "flashinfer.fused_moe.trtllm_gen_routing",
@@ -85,6 +88,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.mhc",
     "flashinfer.mla._batch_mla._wrapper",
     "flashinfer.mla._core",
+    "flashinfer.mla._sparse_mla_sm120._api",
     "flashinfer.cake_minimax_h3",
     "flashinfer.msa_ops.proxy_score",
     "flashinfer.msa_ops.sparse_decode",

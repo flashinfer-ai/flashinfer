@@ -96,8 +96,9 @@ def compute_reference_activation(
     values: torch.Tensor,
     activation: ActivationConfig,
     intermediate_size: int,
+    out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Apply the typed unified-MoE activation with its BF16 precision boundary."""
+    """Apply the typed unified-MoE activation and round to the intermediate dtype."""
     if activation.is_gated:
         up, gate = values.split(intermediate_size, dim=-1)
         gate = gate.float()
@@ -144,7 +145,7 @@ def compute_reference_activation(
             result = F.silu(values)
         else:
             raise ValueError(f"unsupported non-gated activation {activation!r}")
-    return result.to(torch.bfloat16)
+    return result.to(out_dtype)
 
 
 def compute_reference_moe(
@@ -1279,3 +1280,26 @@ def compute_reference_moe_relu2(
             output[token_idx] += scale * fc2_out.squeeze(0)
 
     return output
+
+
+# ---------------------------------------------------------------------------
+# Per-tensor FP8 -- static calibration helpers shared by the unified MoE suites
+# ---------------------------------------------------------------------------
+
+
+def fp8_per_tensor_global_scale(x: torch.Tensor) -> torch.Tensor:
+    """The static E4M3 multiplier a calibration pass would derive: ``fp8_max / amax``."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = x.float().abs().amax()
+    return torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
+
+
+def fp8_per_tensor_requant_hook(intermediate_scale_global: torch.Tensor):
+    """Model the kernel's static E4M3 requantization of GEMM1 output before GEMM2."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+    def hook(intermediate: torch.Tensor) -> torch.Tensor:
+        q = (intermediate * intermediate_scale_global).clamp(-fp8_max, fp8_max)
+        return q.to(torch.float8_e4m3fn).float() / intermediate_scale_global
+
+    return hook

@@ -1,42 +1,24 @@
-"""Offline knob tuner for the cutedsl mega-MoE path (CLI shim).
+"""Offline tuning for CuTe DSL MegaMoE backends.
 
-This module is only the command-line frontend: it parses arguments and
-dispatches to the tuner that lives NEXT TO the backend being tuned
-(``backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/tuner.py`` for
-``--dtype nvfp4``, ``.../mxfp8_mxfp8_bf16_cutedsl/tuner.py`` for the mxfp8
-kinds).  Shared sweep machinery lives in ``backends/mega/kernel/tuning.py``.
+``--arch auto`` selects SM107 on Rubin and SM100 otherwise. The
+``sm90_fp8_*`` dtypes select the Hopper tuner. BF16 and mixed BF16/MXFP8
+are supported by the SM100 tuner only. MXFP4/MXFP8 is wired for SM107.
 
-The sweep runs the collective autotune OUTSIDE any serving engine and
-persists the winners in the knob cache (see
-``kernel_src/cutedsl_megamoe/shim/knob_cache.py``). After tuning, an engine
-that constructs the mega layer with ``knobs=None`` (the default) resolves the
-recorded winner with a pure dict lookup — no compiles, no collectives, no
-timing on the hot path.
+Match the deployment's GPU, EP world size, geometry, and token capacity::
 
-Run with the SAME EP world size, GPU model, and geometry as production.
-Multi-rank (matches a 4-GPU EP deployment)::
-
-    torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \\
-        --dtype nvfp4 --hidden 7168 --intermediate 2048 \\
+    torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
+        --dtype nvfp4 --hidden 7168 --intermediate 2048 \
         --num-experts 256 --topk 8 --max-tokens 8 512 2048
 
-Single-rank (no torchrun)::
-
-    MEGA_NO_DIST=1 python -m flashinfer.moe_ep.tune --dtype nvfp4 ...
-
-``--intermediate`` is the model's post-SwiGLU width (the
-``*MegaMoeConfig.intermediate_size`` convention); the shim-level conversion
-(NVFP4 sessions size fc1 as ``2 * intermediate``) is applied internally, so
-recorded cache keys match engine-time lookups exactly.
-
-Nondeterministic candidates (``in_kernel_fc2_reduce``) are EXCLUDED by
-default; pass ``--allow-nondeterministic`` to sweep them (a recorded ikr
-winner makes the engine's output accumulation order nondeterministic).
+``--intermediate`` is the width after activation. Use ``MEGA_NO_DIST=1`` for
+single-rank tuning. Atomic reduction candidates require
+``--allow-nondeterministic`` and an engine configuration that enables IKR.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
 from typing import List, Optional
 
@@ -47,14 +29,39 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="Offline cutedsl mega-MoE knob tuner (writes the knob cache).",
     )
     parser.add_argument(
-        "--dtype", choices=("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"), default="nvfp4"
+        "--dtype",
+        choices=(
+            "nvfp4",
+            "mxfp8_e4m3",
+            "mxfp8_e5m2",
+            "mxfp4_mxfp8",
+            "sm90_fp8_e4m3",
+            "sm90_fp8_e5m2",
+            "bf16",
+            "bf16_mxfp8_e4m3",
+            "bf16_mxfp8_e5m2",
+        ),
+        default="nvfp4",
+    )
+    parser.add_argument(
+        "--fp8-scale-mode",
+        choices=("per_tensor", "blockwise"),
+        default="per_tensor",
+        help="FP8 scale ABI (sm90_fp8_* dtypes only)",
+    )
+    parser.add_argument(
+        "--arch",
+        choices=("auto", "sm90", "sm100", "sm107"),
+        default="auto",
+        help="backend family; auto selects sm107 on Rubin, sm100 otherwise; "
+        "sm90_fp8_* dtypes select sm90",
     )
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument(
         "--intermediate",
         type=int,
         required=True,
-        help="model post-SwiGLU intermediate size "
+        help="model width after activation "
         "(*MegaMoeConfig.intermediate_size convention)",
     )
     parser.add_argument("--num-experts", type=int, required=True)
@@ -71,9 +78,47 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--combine-dtype",
         choices=("bf16", "mxfp8", "nvfp4"),
         default="bf16",
-        help="cross-rank combine wire (nvfp4 dtype only)",
+        help="cross-rank FC2 return format (SM100 NVFP4 or SM107)",
+    )
+    parser.add_argument(
+        "--kernel-variant",
+        choices=("inference", "genphase"),
+        default="inference",
+        help="SM107 kernel composition; GenPhase requires at most 1024 tokens/rank",
     )
     parser.add_argument("--gate-up-clamp", type=float, default=None)
+    parser.add_argument(
+        "--activation",
+        choices=("swiglu", "situ"),
+        default="swiglu",
+        help="SM107 activation; SiTU requires both beta arguments",
+    )
+    parser.add_argument("--situ-beta", type=float)
+    parser.add_argument("--situ-linear-beta", type=float)
+    parser.add_argument(
+        "--input-norm-const",
+        type=float,
+        default=1.0,
+        help="SM107 NVFP4 input quantization normalization",
+    )
+    parser.add_argument(
+        "--fc1-alpha",
+        type=float,
+        default=1.0,
+        help="SM107 NVFP4 FC1 accumulator multiplier for every expert",
+    )
+    parser.add_argument(
+        "--fc2-alpha",
+        type=float,
+        default=1.0,
+        help="SM107 NVFP4 FC2 accumulator multiplier for every expert",
+    )
+    parser.add_argument(
+        "--fc1-norm-const",
+        type=float,
+        default=1.0,
+        help="SM107 NVFP4 intermediate quantization normalization",
+    )
     parser.add_argument(
         "--allow-nondeterministic",
         action="store_true",
@@ -126,21 +171,76 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_arch(arch: str) -> str:
+    if arch != "auto":
+        return arch
+    import torch
+
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7):
+        return "sm107"
+    return "sm100"
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
-    if args.combine_dtype != "bf16" and args.dtype != "nvfp4":
-        print("--combine-dtype is only wired for --dtype nvfp4", file=sys.stderr)
+    if args.dtype.startswith("sm90_fp8"):
+        if args.arch not in ("auto", "sm90"):
+            print("sm90_fp8_* dtypes require --arch auto or sm90", file=sys.stderr)
+            return 2
+        family = "sm90"
+        backend = "fp8_fp8_bf16_pull_cutedsl"
+    else:
+        family = _resolve_arch(args.arch)
+        if family == "sm90" or (family == "sm107" and args.dtype.startswith("bf16")):
+            print(f"--dtype {args.dtype} is unsupported on {family}", file=sys.stderr)
+            return 2
+        if args.dtype == "mxfp4_mxfp8":
+            if family != "sm107":
+                print("--dtype mxfp4_mxfp8 requires --arch sm107", file=sys.stderr)
+                return 2
+            backend = "mxfp8_mxfp4_bf16_cutedsl"
+        elif args.dtype == "nvfp4":
+            backend = "nvfp4_nvfp4_bf16_cutedsl"
+        elif args.dtype == "bf16":
+            backend = "bf16_bf16_bf16_cutedsl"
+        elif args.dtype.startswith("bf16_mxfp8"):
+            backend = "bf16_mxfp8_bf16_cutedsl"
+        else:
+            backend = "mxfp8_mxfp8_bf16_cutedsl"
+
+    if family != "sm107" and args.combine_dtype != "bf16" and args.dtype != "nvfp4":
+        print("--combine-dtype requires SM100 NVFP4 or SM107", file=sys.stderr)
+        return 2
+    if args.kernel_variant == "genphase" and args.combine_dtype != "bf16":
+        print("GenPhase requires --combine-dtype bf16", file=sys.stderr)
         return 2
 
-    if args.dtype == "nvfp4":
-        from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner import (
-            run_tuning,
+    if args.kernel_variant != "inference" and family != "sm107":
+        print("--kernel-variant genphase requires --arch sm107", file=sys.stderr)
+        return 2
+
+    activation_requested = (
+        args.activation != "swiglu"
+        or args.situ_beta is not None
+        or args.situ_linear_beta is not None
+    )
+    scaling_requested = any(
+        getattr(args, name) != 1.0
+        for name in ("input_norm_const", "fc1_alpha", "fc2_alpha", "fc1_norm_const")
+    )
+    if family != "sm107" and (activation_requested or scaling_requested):
+        print(
+            "activation and normalization options require --arch sm107", file=sys.stderr
         )
-    else:
-        from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.tuner import (
-            run_tuning,
-        )
-    return run_tuning(args)
+        return 2
+    if scaling_requested and args.dtype != "nvfp4":
+        print("normalization options require --dtype nvfp4", file=sys.stderr)
+        return 2
+
+    tuner = importlib.import_module(
+        f".backends.mega.kernel.{family}.{backend}.tuner", __package__
+    )
+    return tuner.run_tuning(args)
 
 
 if __name__ == "__main__":

@@ -825,11 +825,6 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         merge_state_in_place(V_shared, S_shared, V_unique, S_unique)
         return V_shared
 
-    @flashinfer_api
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect"""
-        pass
-
 
 class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with shared-prefix paged kv-cache for
@@ -910,7 +905,6 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     ...     outputs.append(o)
     ...
     s[0].shape>>> # clear auxiliary data structures
-    >>> prefill_wrapper.end_forward()
     >>> outputs[0].shape
     torch.Size([100, 64, 128])
 
@@ -1122,8 +1116,3 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         )
         merge_state_in_place(V_shared, S_shared, V_unique, S_unique)
         return V_shared
-
-    @flashinfer_api
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect"""
-        pass
