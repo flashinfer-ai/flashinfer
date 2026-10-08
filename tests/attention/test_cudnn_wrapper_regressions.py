@@ -1278,3 +1278,88 @@ def test_paged_capture_replan_changes_indices_and_lengths(dtype, lse_layout):
         torch.testing.assert_close(actual_lse, expected_lse, atol=0.001, rtol=0.001)
     finally:
         graph.reset()
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("lse_layout", ["NH", "HN"])
+@pytest.mark.parametrize("device_lengths", [False, True])
+def test_paged_auto_fallback_refreshes_retained_capture(
+    monkeypatch, lse_layout, device_lengths
+):
+    # Control admission to exercise the transition independently of performance
+    # heuristics. A captured cuDNN call still reads its original owned table.
+    admitted = [True]
+    monkeypatch.setattr(
+        flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: admitted[0]
+    )
+    q, k, v, qo, ip, ix, last = _paged_inputs()
+    ix = ix.cuda()
+    out = torch.empty_like(q)
+    lse = torch.empty((5, 8) if lse_layout == "NH" else (8, 5), device=q.device)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, device=q.device, dtype=torch.uint8),
+        kv_layout="HND",
+        backend="auto",
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.empty_like(qo, device=q.device),
+        paged_kv_indptr_buf=torch.empty_like(ip, device=q.device),
+        paged_kv_indices_buf=torch.empty_like(ix),
+        paged_kv_last_page_len_buf=torch.empty_like(last, device=q.device),
+    )
+
+    def plan():
+        kwargs = {}
+        if device_lengths:
+            kwargs = dict(
+                max_sequence_kv=128,
+                seq_lens=((ip[1:] - ip[:-1] - 1) * 16 + last).cuda(),
+            )
+        wrapper.plan(
+            qo, ip, ix, last, 8, 2, 128, 16, causal=True, q_data_type=q.dtype, **kwargs
+        )
+
+    def run():
+        wrapper.run(
+            q,
+            (k.transpose(1, 2), v.transpose(1, 2)),
+            out=out,
+            lse=lse,
+            return_lse=True,
+            lse_layout=lse_layout,
+            lse_base="ln",
+        )
+
+    def check():
+        expected, stats = _reference(
+            q, k, v, qo, ip, ix, last, causal=True, scale=128**-0.5
+        )
+        torch.testing.assert_close(out.float(), expected, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(
+            lse if lse_layout == "NH" else lse.T, stats, atol=0.001, rtol=0.001
+        )
+
+    plan()
+    assert wrapper._backend == "cudnn"
+    run()
+    check()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run()
+        for selected in (False, True):
+            admitted[0] = selected
+            qo = torch.tensor([0, 2, 5], dtype=torch.int32)
+            ip = torch.tensor([0, 2, 5], dtype=torch.int32)
+            ix = torch.tensor([5, 2, 4, 3, 1], device=q.device, dtype=torch.int32)
+            plan()
+            assert wrapper._backend == ("cudnn" if selected else "fa2")
+            run()
+            check()
+            v.mul_(0.75)
+            out.fill_(torch.nan)
+            lse.fill_(torch.nan)
+            graph.replay()
+            check()
+    finally:
+        graph.reset()

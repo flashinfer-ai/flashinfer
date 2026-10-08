@@ -24,6 +24,41 @@ from flashinfer.cudnn import decode, prefill
 from flashinfer.cudnn.utils import supports_ordered_cudnn_execution
 
 
+@pytest.mark.parametrize(
+    "version,backend,native,runtime,expected",
+    [
+        ("1.30.0", 92700, True, True, False),
+        ("1.31.0", 92600, True, True, False),
+        ("1.31.0", 92700, False, True, False),
+        ("1.31.0", 92700, True, False, False),
+        ("1.31.0", 92700, True, True, True),
+    ],
+)
+def test_paged_auto_requires_qualified_runtime(
+    monkeypatch, version, backend, native, runtime, expected
+):
+    monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
+    monkeypatch.setattr(
+        prefill,
+        "cudnn",
+        SimpleNamespace(
+            __version__=version,
+            backend_version=lambda: backend,
+            _pybind_module=SimpleNamespace(
+                _SdpaThdBinder=SimpleNamespace(supports_paged_packed_split=native)
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        prefill, "cudnn_frontend_frost_runtime_available", lambda: runtime
+    )
+    prefill._cudnn_supports_paged_auto.cache_clear()
+    try:
+        assert prefill._cudnn_supports_paged_auto() is expected
+    finally:
+        prefill._cudnn_supports_paged_auto.cache_clear()
+
+
 def test_ordered_execution_feature_detection():
     class Legacy:
         def execute(self, tensor_dict, workspace=None, handle=None):
@@ -80,6 +115,21 @@ def test_bounded_ragged_requires_matching_native_feature(
     try:
         assert prefill._cudnn_supports_bounded_ragged() is mla
         assert prefill._cudnn_supports_bounded_ragged(d128=True) is d128
+        monkeypatch.setattr(
+            prefill, "_cudnn_supports_direct_seqlens", lambda *a, **kw: True
+        )
+        indptr = torch.tensor([0, 16], dtype=torch.int32)
+        for head_dim, supported in ((192, mla), (128, d128)):
+            metadata = prefill._PrefillMetadata(
+                16,
+                2048,
+                True,
+                False,
+                batch_offsets_q=indptr,
+                batch_offsets_k=indptr,
+                max_total_num_rows=64,
+            ).resolve_from_plan(torch.bfloat16, 8, 8, head_dim, 128)
+            assert metadata.max_total_num_rows == (64 if supported else None)
     finally:
         prefill._cudnn_supports_bounded_ragged.cache_clear()
 
@@ -537,7 +587,10 @@ def test_prefill_hn_override_key_ignores_runtime_token_count(monkeypatch, suppor
         assert (keys[1] == keys[2]) == (supported and override is not None)
 
 
-def test_prefill_hn_same_plan_rebinds_current_output_stride(monkeypatch):
+@pytest.mark.parametrize("backend_lowering", [None, False, True])
+def test_prefill_hn_same_plan_rebinds_current_output_stride(
+    monkeypatch, backend_lowering
+):
     monkeypatch.setattr(prefill, "_CUDNN_NATIVE_HN_SUPPORTED", True)
     monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: True)
     monkeypatch.setattr(prefill, "_create_cudnn_handle", lambda stream: 23)
@@ -561,8 +614,38 @@ def test_prefill_hn_same_plan_rebinds_current_output_stride(monkeypatch):
     )
     calls = []
 
+    operand_uids = {
+        getattr(prefill.UIDs, name).value
+        for name in (
+            "Q_UID",
+            "K_UID",
+            "V_UID",
+            "O_UID",
+            "STATS_UID",
+            "ACTUAL_SEQ_LENS_Q_UID",
+            "ACTUAL_SEQ_LENS_KV_UID",
+        )
+    }
+    if backend_lowering is not False:
+        operand_uids.update(
+            getattr(prefill.UIDs, name).value
+            for name in (
+                "RAGGED_Q_UID",
+                "RAGGED_O_UID",
+                "RAGGED_STATS_UID",
+                "RAGGED_K_UID",
+                "RAGGED_V_UID",
+            )
+        )
+    observations = []
+
     class Graph:
+        def _variant_pack_uids(self):
+            observations.append(True)
+            return None if backend_lowering is None else sorted(operand_uids)
+
         def execute(self, buffers, *, tensor_uids=None, **kwargs):
+            assert set(kwargs["override_uids"]) == operand_uids
             calls.append(kwargs)
 
     plan = prefill._CudnnPrefillPlan.prepare(metadata, q.dtype, q.device)
@@ -593,6 +676,7 @@ def test_prefill_hn_same_plan_rebinds_current_output_stride(monkeypatch):
         at = call["override_uids"].index(prefill.UIDs.STATS_UID.value)
         assert call["override_strides"][at] == [4 * tokens, tokens, 1, 1]
     assert calls[0]["override_strides"] is not calls[1]["override_strides"]
+    assert observations == [True]  # The graph layout is observed once, before reuse.
 
 
 @pytest.mark.parametrize("supported", [False, True])

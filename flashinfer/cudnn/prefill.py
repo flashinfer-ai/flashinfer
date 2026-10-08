@@ -17,6 +17,7 @@ from .utils import (
     supports_native_cudnn_log2,
     build_cudnn_graph_with_log2,
     require_native_cudnn_log2,
+    cudnn_frontend_frost_runtime_available,
 )
 
 try:
@@ -75,6 +76,24 @@ def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -
         major, minor = map(int, cudnn.__version__.split(".")[:2])
         return (major, minor) >= min_frontend
     except Exception:
+        return False
+
+
+@functools.cache
+def _cudnn_supports_paged_auto() -> bool:
+    """The qualified paged prefill selection requires FE 1.31 / cuDNN 9.27."""
+    if not CUDNN_AVAILABLE:
+        return False
+    try:
+        version = tuple(map(int, cudnn.__version__.split(".")[:2]))
+        binder = getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None)
+        return (
+            version >= (1, 31)
+            and cudnn_frontend_frost_runtime_available()
+            and cudnn.backend_version() >= 92700
+            and bool(getattr(binder, "supports_paged_packed_split", False))
+        )
+    except (AttributeError, TypeError, ValueError):
         return False
 
 
@@ -903,10 +922,41 @@ def _override_execute_kwargs(
     s_kv: int,
     with_stats: bool,
     stats_head_stride: int = 0,
+    operand_uids=None,
 ) -> dict:
     """Real shapes for an override-graph execute: the dims/strides
     _build_prefill_graph would have declared for this call, in the same form."""
     h_qo, d_qk = q.shape[1], q.shape[2]
+    if k_cache.dim() == 4:
+        # Paged K/V and table layouts stay fixed in the descriptor key. Only
+        # packed Q/O, their prefixes and optional Stats vary inside this bound.
+        d_vo = v_cache.shape[-1]
+        q_s, q_h, q_d = q.stride()
+        rows, unit = [batch_size + 1, 1, 1, 1], [1, 1, 1, 1]
+        uids = [
+            UIDs.Q_UID.value,
+            UIDs.O_UID.value,
+            UIDs.RAGGED_Q_UID.value,
+            UIDs.RAGGED_O_UID.value,
+            UIDs.ACTUAL_SEQ_LENS_Q_UID.value,
+        ]
+        shapes = [[batch_size, h_qo, s_qo, d_qk], [batch_size, h_qo, s_qo, d_vo]] + [
+            rows
+        ] * 3
+        strides = [
+            [h_qo * d_qk, q_h, q_s, q_d],
+            [s_qo * d_vo * h_qo, d_vo, d_vo * h_qo, 1],
+        ] + [unit] * 3
+        if with_stats:
+            uids += [UIDs.STATS_UID.value, UIDs.RAGGED_STATS_UID.value]
+            shapes += [[batch_size, h_qo, s_qo, 1], rows]
+            strides += [
+                [h_qo * stats_head_stride, stats_head_stride, 1, 1]
+                if stats_head_stride
+                else [s_qo * h_qo, 1, h_qo, 1],
+                unit,
+            ]
+        return _prefill_override_kwargs(uids, shapes, strides, operand_uids)
     h_kv, d_vo = v_cache.shape[1], v_cache.shape[2]
     q_s, q_h, q_d = q.stride()
     k_s, k_h, k_d = k_cache.stride()
@@ -945,6 +995,28 @@ def _override_execute_kwargs(
             else [s_qo * h_qo, 1, h_qo, 1],
             unit,
         ]
+    return _prefill_override_kwargs(uids, shapes, strides, operand_uids)
+
+
+def _prefill_override_kwargs(uids, shapes, strides, operand_uids):
+    # Ragged offsets are backend-only operands. A lowering decline can leave
+    # them out of the Python graph; other required operands must remain.
+    if operand_uids is not None:
+        auxiliary = {
+            UIDs.RAGGED_Q_UID.value,
+            UIDs.RAGGED_K_UID.value,
+            UIDs.RAGGED_V_UID.value,
+            UIDs.RAGGED_O_UID.value,
+            UIDs.RAGGED_STATS_UID.value,
+        }
+        keep = [
+            i
+            for i, uid in enumerate(uids)
+            if uid not in auxiliary or uid in operand_uids
+        ]
+        uids = [uids[i] for i in keep]
+        shapes = [shapes[i] for i in keep]
+        strides = [strides[i] for i in keep]
     return dict(override_uids=uids, override_shapes=shapes, override_strides=strides)
 
 
@@ -981,6 +1053,7 @@ class _PrefillMetadata:
     # insufficient: captured graphs can outlive later plan() calls.
     max_total_num_rows: Optional[int] = None
     _bounded_ragged: bool = False
+    _bounded_paged: bool = False
 
     def resolve(self, q, k_cache, v_cache, *, batch_offsets_units="elements"):
         return self.resolve_from_plan(
@@ -1051,7 +1124,7 @@ class _PrefillMetadata:
             self.max_total_num_rows > 0
             and direct
             and q_dtype in (torch.float16, torch.bfloat16)
-            and _cudnn_supports_bounded_ragged()
+            and _cudnn_supports_bounded_ragged(d128=head_dim_qk == 128)
         ):
             self.max_total_num_rows = None
         if direct:
@@ -1084,6 +1157,35 @@ class _PrefillMetadata:
         )
 
     def override_shape_from_plan(self, q_dtype, ragged):
+        if (
+            self._bounded_paged
+            and self.block_tables is not None
+            and self._bounded_ragged
+            and q_dtype == torch.bfloat16
+            and self.cu_seq_lens_q is not None
+            and self.actual_seq_lens_kv is not None
+            and self.batch_offsets_q is not None
+            and self.batch_offsets_o is not None
+            and self.q_scale is None
+            and self.k_scale is None
+            and self.v_scale is None
+            and all(
+                t is None or t.is_contiguous()
+                for t in (
+                    self.cu_seq_lens_q,
+                    self.actual_seq_lens_kv,
+                    self.batch_offsets_q,
+                    self.batch_offsets_o,
+                    self.batch_offsets_stats,
+                )
+            )
+            and _cudnn_supports_paged_auto()
+            and _cudnn_supports_shape_override()
+        ):
+            batch = self.cu_seq_lens_q.shape[0] - 1
+            # The qualified wrapper already chose stable Q/KV bounds.
+            # Paged tables retain their exact batch and physical strides.
+            return batch, self.max_token_per_sequence, self.max_sequence_kv
         # Override descriptors declare contiguous indptrs at the cache batch.
         if (
             self.cu_seq_lens_q is not None
@@ -1239,6 +1341,7 @@ class _CudnnPrefillPlan:
             and previous.metadata.o_data_type == metadata.o_data_type
             and previous.override_enabled == enabled
             and previous.metadata._bounded_ragged == metadata._bounded_ragged
+            and previous.metadata._bounded_paged == metadata._bounded_paged
             and previous.exact_keys[True] == exact
             and all(
                 a is b
@@ -1294,6 +1397,7 @@ class _CudnnPrefillPlan:
             and dtype == previous.dtype
             and self.override_enabled == previous.override_enabled
             and metadata._bounded_ragged == previous.metadata._bounded_ragged
+            and metadata._bounded_paged == previous.metadata._bounded_paged
         ):
             self.override = previous.override
             self.exact_keys = previous.exact_keys
@@ -1370,6 +1474,7 @@ class CudnnPrefillGraph:
         "key",
         "graph",
         "override_cache",
+        "override_operand_uids",
         "return_lse",
         "ordered_execution",
         "stats_head_stride",
@@ -1392,6 +1497,14 @@ class CudnnPrefillGraph:
         self.key = key
         self.graph = graph
         self.override_cache = override_cache
+        operand_uids = (
+            graph._variant_pack_uids()
+            if override_cache is not None and hasattr(graph, "_variant_pack_uids")
+            else None
+        )
+        self.override_operand_uids = (
+            None if operand_uids is None else frozenset(operand_uids)
+        )
         self.return_lse = return_lse
         self.ordered_execution = supports_ordered_cudnn_execution(type(graph))
         self.stats_head_stride = stats_head_stride
@@ -1460,6 +1573,7 @@ class CudnnPrefillGraph:
                     s_kv=metadata.max_sequence_kv,
                     with_stats=self.return_lse,
                     stats_head_stride=stats_head_stride,
+                    operand_uids=self.override_operand_uids,
                 )
                 if self.override_cache is not None
                 else {}
@@ -1550,6 +1664,7 @@ class CudnnPrefillGraph:
                 s_kv=metadata.max_sequence_kv,
                 with_stats=self.return_lse,
                 stats_head_stride=q.size(0) if self.stats_head_stride else 0,
+                operand_uids=self.override_operand_uids,
             )
 
         return self._execute(
