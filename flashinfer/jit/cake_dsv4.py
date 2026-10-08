@@ -21,6 +21,7 @@ from .core import (
     sm100a_nvcc_flags,
     sm103a_nvcc_flags,
 )
+from .cpp_ext import get_cuda_version, is_cuda_version_at_least
 
 
 _ARCH_NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
@@ -770,6 +771,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "identity": "49494e300c28e2607b8fbf53461f8feb7b54a6e5b7fa41eddacffa15a35f0d77",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_cluster_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_cluster_binding.cu",
@@ -779,6 +781,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "identity": "976823fded0bf6ba6d147b8aa0f04e52a8c5e19650c8cc742f2512af729d42e6",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_persistent_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_persistent_binding.cu",
@@ -792,6 +795,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_PV_N16_OC1=1",
                 ],
                 "identity": "998454a7a8cc7c3574d3f78b6c199e0717046de533fbe91222d66878f35a9796",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_pv_n16_oc1_binding.cu",
@@ -805,6 +809,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_PV_N32_OC1=1",
                 ],
                 "identity": "9bcd65ba31af6217ee6c53d5152c0d25756b99ba87890abb3f617fd3bfd5ce3e",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_pv_n32_oc1_binding.cu",
@@ -818,6 +823,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC1=1",
                 ],
                 "identity": "63f4919b648c4a79f3edeebef8454497e24e6cf350af705bd9099f3d76fca589",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_swap_n16_oc1_binding.cu",
@@ -831,6 +837,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC2=1",
                 ],
                 "identity": "a268b049641f10e38d4792fa0fdcb6b83a83a8fdc0f0bef0df88885eba4ac01b",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_swap_n16_oc2_binding.cu",
@@ -844,6 +851,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC4=1",
                 ],
                 "identity": "c851cbecd250a26c803d03ad6c95e5fc5161953f7346730fb8d245dd2115d54c",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_swap_n16_oc4_binding.cu",
@@ -857,6 +865,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC1=1",
                 ],
                 "identity": "cf60c1787eaf95a6b39a7c382dc53e5096c446affecfe0fd736f5a278efac694",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_swap_n32_oc1_binding.cu",
@@ -870,6 +879,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC2=1",
                 ],
                 "identity": "3e88f3a7d8928a142d3ee2f7419901df92f9a618985cb45f4b8ace0c36afaf1c",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_swap_n32_oc2_binding.cu",
@@ -883,6 +893,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC4=1",
                 ],
                 "identity": "18e871bd9b109d25df450ca8556fd9262425f7ba069ccbab6bfff782d4c27b73",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_swap_n32_oc4_binding.cu",
@@ -892,6 +903,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_NVFP4_G4 + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "identity": "e5328bbd7472ba2fd35bcc392aa07ed3396b1171bce689965363eaa12d1b09bd",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_binding.cu",
@@ -905,6 +917,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC1=1",
                 ],
                 "identity": "f5f68e08df3ea6a6cb64a1ea5907d9762349616a8a78b9844bff442af74872a4",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_tile_oc1_binding.cu",
@@ -918,6 +931,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC2=1",
                 ],
                 "identity": "f5f1ba5290c058be097831314165175852a32e2c05d4ce30016e167f6bf0e453",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_tile_oc2_binding.cu",
@@ -931,6 +945,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC4=1",
                 ],
                 "identity": "eaddf8e85236f19dcee73e42ba2e16452ffa3f65ac6887b286053ae551c41b71",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_tile_oc4_binding.cu",
@@ -940,6 +955,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_NVFP4_MERGE + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "identity": "a6f2ce7178afe7e71affc479deb6e431428cf029d321f975cea1b1e9335ee9f2",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_merge_kernel.cu",
                     "common/cake_dsv4_nvfp4_merge_binding.cu",
@@ -1207,6 +1223,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "identity": "1f16170b32d14cd79cc6be81144da4230ff8db9dec09b8056d0430039eb3533b",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_cluster_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_cluster_binding.cu",
@@ -1216,6 +1233,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_NVFP4_DECODE + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "identity": "c86a59db3d49d7c6015774312f6c92ef13365680e8f3c1ba88086119999a6925",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_persistent_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_persistent_binding.cu",
@@ -1229,6 +1247,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_PV_N16_OC1=1",
                 ],
                 "identity": "6fc9e70fc87034b7d25333477efa1473bdeaaca02392933ba9bd6b8e1b4d307b",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_pv_n16_oc1_binding.cu",
@@ -1242,6 +1261,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_PV_N32_OC1=1",
                 ],
                 "identity": "a84acafeeaa907d9595171f2dfbb8cf1dae73994409b01ebe9871532625524e3",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_pv_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_pv_n32_oc1_binding.cu",
@@ -1255,6 +1275,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC1=1",
                 ],
                 "identity": "715a6268ad990b0e3ba92fd0960545b0e10c44e3d00aebd0e546d164380e57e4",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_swap_n16_oc1_binding.cu",
@@ -1268,6 +1289,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC2=1",
                 ],
                 "identity": "f7434754e7163c1933276bd9736d9cf7e82ec33c769495935cd672753ae417ae",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_swap_n16_oc2_binding.cu",
@@ -1281,6 +1303,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N16_OC4=1",
                 ],
                 "identity": "08e8c96a1771d46c803a2b2465a491942cb1edeba93f09be1a5a772f1f55e807",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_swap_n16_oc4_binding.cu",
@@ -1294,6 +1317,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC1=1",
                 ],
                 "identity": "00b399753f787447f0fa09a0e58f80ed5dabec0a321bbadef826a785193a78b4",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_swap_n32_oc1_binding.cu",
@@ -1307,6 +1331,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC2=1",
                 ],
                 "identity": "82cbea3ac9fe023b9fe31848a28d9b569c5747975ca96261118dc87eba227a78",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_swap_n32_oc2_binding.cu",
@@ -1320,6 +1345,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_SWAP_N32_OC4=1",
                 ],
                 "identity": "448d0695357cdf656a806d52134f73bf31b3adcc389cae2aabd8393515443571",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_swap_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_swap_n32_oc4_binding.cu",
@@ -1329,6 +1355,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_NVFP4_G4 + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "identity": "873302f41f18258c8e6c25601c35f56ad71c408964d4ecd49d765c8dcf9d69e5",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_t64_n64_oc1_binding.cu",
@@ -1342,6 +1369,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC1=1",
                 ],
                 "identity": "8a1f3023937588b3196960cfbbdc383889506c53d33a66c18e7d38921fdc62aa",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_tile_oc1_binding.cu",
@@ -1355,6 +1383,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC2=1",
                 ],
                 "identity": "f5fa4b28ca6e0930f7af8e21e83fdf95f0068e3261bfe691e056608e3df5b4a8",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_tile_oc2_binding.cu",
@@ -1368,6 +1397,7 @@ _ARCH_REGISTRATIONS = {
                     "-DCAKE_DSV4_NVFP4_DECODE_TILE_OC4=1",
                 ],
                 "identity": "37fdb46c1fd7b6f665bc35807baf525028823f6d84d8aea2c9c6669d0de3a68e",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_decode_tile_kernel.cu",
                     "common/cake_dsv4_nvfp4_decode_tile_oc4_binding.cu",
@@ -1377,6 +1407,7 @@ _ARCH_REGISTRATIONS = {
                 "arg_plan": _PLAN_NVFP4_MERGE + _GRID,
                 "compile_flags": ["--use_fast_math"],
                 "identity": "779c102eca2dbc30af8314b00055c1fd6cc84510da626b8f66b71e40a69956d5",
+                "min_cuda_version": "13.4",
                 "sources": [
                     "common/cake_dsv4_nvfp4_merge_kernel.cu",
                     "common/cake_dsv4_nvfp4_merge_binding.cu",
@@ -1439,6 +1470,14 @@ def get_cake_dsv4_spec(variant: str, *, arch: str) -> dict:
 @functools.cache
 def gen_cake_dsv4_module(variant: str, *, arch: str) -> JitSpec:
     contract = get_cake_dsv4_spec(variant, arch=arch)
+    required = contract.get("min_cuda_version")
+    if required is not None and not is_cuda_version_at_least(required):
+        raise RuntimeError(
+            f"CAKE DSv4 variant {variant} ({arch}) requires CUDA {required} or newer; "
+            f"the CUDA toolkit found is {get_cuda_version()}. Its generated kernels spell "
+            "the Blackwell QMUL4 as the PTX ISA 9.4 packed multiply "
+            "(mul.e4m3x4.e2m1x4), which older nvcc/ptxas cannot assemble."
+        )
     csrc_dir = _get_csrc_dir()
     sources = [csrc_dir / name for name in contract["sources"]]
     missing = [path for path in sources if not path.is_file()]
