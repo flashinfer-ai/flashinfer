@@ -869,6 +869,14 @@ def chunk_gated_delta_rule(
         raise ValueError("max_seqlen cannot exceed total_seq_len")
     if num_householder < 1:
         raise ValueError(f"num_householder must be >= 1, got {num_householder}")
+    # "auto" resolves to the flashinfer kernels below, which implement GDP.
+    # The others would reach their own kernel and silently compute GDN,
+    # ignoring every Householder but the first.
+    if num_householder > 1 and backend not in ("auto", "flashinfer"):
+        raise NotImplementedError(
+            f"num_householder={num_householder} (Gated DeltaProduct) is only "
+            f"implemented for the flashinfer GDN backend, got backend={backend!r}"
+        )
     num_q_heads = q.size(1)
     num_v_heads = v.size(1)
     head_size = q.size(2)
