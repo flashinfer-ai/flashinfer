@@ -2808,9 +2808,25 @@ def _trtllm_fp8_per_tensor_step_run_experts(
     gemm1_clamp_limit=None,
 ):
     """StepFun epilogue with raw accumulator limits and calibrated FP8 scales."""
+
+    def canonical_weight(weight, gated):
+        # Per-tensor FP8 uses MajorK weights shuffled for epilogue_tile_m=128.
+        # Keep the inverse here so the serialized reference needs only PyTorch.
+        rows = torch.arange(weight.shape[1], device=weight.device)
+        shuffled_rows = rows // 32 * 32 + rows % 4 * 8 + rows % 32 // 4
+        weight = weight.to(torch.float32).index_select(1, shuffled_rows)
+        if gated:
+            experts, num_rows, hidden = weight.shape
+            weight = (
+                weight.reshape(experts, num_rows // 2, 2, hidden)
+                .transpose(1, 2)
+                .reshape(experts, num_rows, hidden)
+            )
+        return weight
+
     activations = hidden_states.to(torch.float32)
-    w1 = gemm1_weights.to(torch.float32)
-    w2 = gemm2_weights.to(torch.float32)
+    w1 = canonical_weight(gemm1_weights, gated=True)
+    w2 = canonical_weight(gemm2_weights, gated=False)
     intermediate = w1.shape[1] // 2
     output = torch.zeros_like(activations)
     for local_idx in range(w1.shape[0]):
