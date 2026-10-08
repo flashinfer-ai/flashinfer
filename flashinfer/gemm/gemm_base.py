@@ -6384,6 +6384,7 @@ def _cute_dsl_gemm_mxfp8_runner(
     sm_minor: int,
     enable_pdl: bool,
     out_dtype: torch.dtype,
+    warp_splitk_supports: Optional[Callable[[List[torch.Tensor]], bool]] = None,
 ):
     import cutlass
 
@@ -6426,6 +6427,12 @@ def _cute_dsl_gemm_mxfp8_runner(
             m = a.shape[0]
             n = b.shape[1]
             real_k = a.shape[1]
+            if (
+                warp_splitk_supports is not None
+                and m <= 8
+                and warp_splitk_supports(inputs)
+            ):
+                return []
             ab_dtype = cutlass.Float8E4M3FN
             base_tactics = _get_sm100_block_scaled_tactics(
                 m=m,
@@ -6442,6 +6449,10 @@ def _cute_dsl_gemm_mxfp8_runner(
                 return valid_tactics
 
             for split_k_slices in split_k_kernel_cls.SUPPORTED_SPLIT_K_SLICES:
+                if split_k_slices == 4 and m > 16:
+                    continue
+                if warp_splitk_supports is not None and real_k < 4096:
+                    continue
                 if split_k_kernel_cls.is_valid_tactic(
                     m,
                     real_k,
@@ -6737,14 +6748,17 @@ def _cute_dsl_mxfp8_runners(
     """Runners of ``mm_mxfp8(backend="cute-dsl")``; ``[0]`` is the untuned default."""
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
 
-    tcgen05 = _cute_dsl_gemm_mxfp8_runner(sm_major, sm_minor, enable_pdl, out_dtype)
-    # Older DSLs lack cutlass.experimental but still serve the tcgen05 kernels.
+    # Older DSLs lack cutlass.experimental; only the block-scaled runner remains.
     if not is_cute_dsl_experimental_available():
-        return [tcgen05]
+        return [_cute_dsl_gemm_mxfp8_runner(sm_major, sm_minor, enable_pdl, out_dtype)]
     warp = _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl)
-    # Untuned default (B300, cold L2): the warp default tactic beats the tcgen05
-    # default for M <= 8 (1.25x at K <= 2048, 1.20x at K 3072-5120) and for M = 16
-    # at K <= 2048 (1.11x), but not for M = 16 at K > 2048 (as low as 0.87x).
+    tcgen05 = _cute_dsl_gemm_mxfp8_runner(
+        sm_major,
+        sm_minor,
+        enable_pdl,
+        out_dtype,
+        warp_splitk_supports=warp.supports_inputs,
+    )
     m, k = inputs[0].shape
     if warp.supports_inputs(inputs) and (m <= 8 or k <= 2048):
         return [warp, tcgen05]
@@ -9087,7 +9101,7 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
 _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     _MM_MXFP8_TUNING_CONFIG,
     use_cuda_graph=True,
-    # Rank the tcgen05 and warp split-K kernels from a cold L2, as the BF16 config.
+    # Rank the runners from a cold L2, as the BF16 cute-dsl config does.
     use_cold_l2_graph_replay=True,
     use_cold_l2_cache=True,
 )
