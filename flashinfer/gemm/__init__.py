@@ -54,6 +54,9 @@ from .kimi_k3_fp8_projection import (
 )
 from .kimi_k3_fp8_projection import kimi_k3_fp8_projection as kimi_k3_fp8_projection
 from .kimi_k3_fp8_projection import (
+    kimi_k3_fp8_projection_launcher as kimi_k3_fp8_projection_launcher,
+)
+from .kimi_k3_fp8_projection import (
     prepare_kimi_k3_fp8_projection as prepare_kimi_k3_fp8_projection,
 )
 from .kimi_k3_fp8_projection import (
@@ -70,6 +73,16 @@ from .gemm_svdquant import (
     nvfp4_quantize_smooth as nvfp4_quantize_smooth,
     svdquant_linear as svdquant_linear,
 )
+
+# Dense PrimsTS FP8/NVFP4 GEMMs are imported lazily enough that installations
+# without the experimental CuTe DSL can still import flashinfer.gemm.  The DSL
+# is required only when one of these APIs is launched.
+from ..prims_ts.gemm import fp4_linear as fp4_linear
+from ..prims_ts.gemm import fp4_linear_swiglu as fp4_linear_swiglu
+from ..prims_ts.gemm import fp4_qkv_qknorm_rope as fp4_qkv_qknorm_rope
+from ..prims_ts.gemm import fp8_linear as fp8_linear
+from ..prims_ts.gemm import fp8_linear_swiglu as fp8_linear_swiglu
+from ..prims_ts.gemm import fp8_qkv_qknorm_rope as fp8_qkv_qknorm_rope
 
 from .routergemm import (
     mm_M1_16_K6144_N256 as mm_M1_16_K6144_N256,
@@ -182,11 +195,18 @@ __all__ = (
         "PreparedBatchDeepGemmFp8NtGroupwise",
         "allocate_kimi_k3_fp8_projection_workspace",
         "kimi_k3_fp8_projection",
+        "kimi_k3_fp8_projection_launcher",
         "prepare_kimi_k3_fp8_projection",
         "prepare_kimi_k3_fp8_projection_weights",
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
+        "fp8_linear",
+        "fp8_linear_swiglu",
+        "fp8_qkv_qknorm_rope",
+        "fp4_linear",
+        "fp4_linear_swiglu",
+        "fp4_qkv_qknorm_rope",
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",

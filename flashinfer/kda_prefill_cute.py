@@ -31,7 +31,7 @@ from .kda_prefill import (
 )
 from .utils import get_compute_capability
 
-_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
+_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3), (10, 7)}
 _HEAD_DIM = 128
 _CHUNK_SIZE = 16
 
@@ -382,7 +382,7 @@ def _run_cute_dsl_kda_prefill(
     else:
         out = output
     _check_output_does_not_overlap_inputs(
-        out,
+        output,
         q=q,
         k=k,
         v=v,

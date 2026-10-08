@@ -181,7 +181,7 @@ def _launch_persistent_kda(
     workspace = prefill_workspace if explicit else _get_stream_workspace(q.device)
     out = torch.empty_like(v) if output is None else output
     _check_output_does_not_overlap_inputs(
-        out, q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state
+        output, q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state
     )
     for name, tensor in (
         ("A_log", A_log),
