@@ -476,8 +476,9 @@ int64_t mla_plan_head_divisor(TensorView workspace, bool is_fp8, int64_t batch_s
   params.mNumTokensPerPage = page_size;
   params.mQkvLayout = QkvLayout::PagedKv;
   params.mMultiProcessorCount = sm_count;
-  params.mAttentionWindowSize = INT_MAX;
-  params.mChunkedAttentionSize = INT_MAX;
+  params.mLeftSlidingWindow = -1;
+  params.mRightSlidingWindow = -1;
+  params.mChunkedAttentionSize = 0;
   params.mUsesSharedPagedKvIdx = true;
   params.mMaskType = TrtllmGenAttentionMaskType::Dense;
   params.mKernelType = FmhaKernelType::Generation;

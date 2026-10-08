@@ -1079,8 +1079,8 @@ def test_trtllm_gen_prefill_run_forwards_noncausal_window_as_invalid_pair(monkey
         def build_and_load(self):
             return FakeOp()
 
-        def get_library_path(self):
-            return "unused"
+        def get_library_paths(self):
+            return ("unused",)
 
     flashinfer.prefill.get_trtllm_gen_prefill_module.cache_clear()
     monkeypatch.setattr(flashinfer.prefill, "gen_trtllm_gen_fmha_module", FakeJitModule)
