@@ -426,6 +426,18 @@ def msa_sparse_decode_attention(
                 "SM90 msa_sparse_decode_attention derives query positions as "
                 "seqused_k - seqlen_q + i; q_offset is not supported"
             )
+        # The paged-metadata checks of the SM120/SM121 path below: the program
+        # derives every query position from seqused_k and seqlen_q, so a
+        # seqused_k or page_table sized for another batch must fail here
+        # instead of shifting every position silently.
+        if seqused_k.dtype != torch.int32 or seqused_k.ndim != 1:
+            raise ValueError("seqused_k must be 1D int32")
+        if seqused_k.numel() != batch_size:
+            raise ValueError(f"seqused_k must have batch_size ({batch_size}) entries")
+        if page_table.ndim != 2:
+            raise ValueError("page_table must be int32 of shape (batch, max_pages)")
+        if page_table.shape[0] != batch_size:
+            raise ValueError("page_table batch dimension must match q batch_size")
         from ._sm90_dispatch import sparse_decode_sm90
 
         if out is None:
@@ -449,6 +461,7 @@ def msa_sparse_decode_attention(
             page_table,
             seqused_k,
             out,
+            seqlen_q=seqlen_q,
             softmax_scale=softmax_scale,
             v_global_scale=v_global_scale,
         )

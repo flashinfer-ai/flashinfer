@@ -19,10 +19,13 @@ Cake-served classes:
   program;
 * sparse prefill: GQA groups 4, 8 and 16 with at most 4096 pages per sequence.
 
-The remaining classes keep the CuTe DSL kernels (proxy-score decode for bf16
-Hq outside {1, 2, 4} or multi-head index caches, top-k planner coordinates
-without a program, sparse prefill of GQA groups 1 / 2 / 32 / 64 or above
-4096 pages).  The proxy-score prefill regime has no f32-accumulating CuTe
+The remaining classes keep the CuTe DSL kernels (proxy-score decode of a bf16
+index cache for Hq outside {1, 2, 4} or with several index heads, top-k
+planner coordinates without a program, sparse prefill of GQA groups 1 / 2 /
+32 / 64 or above 4096 pages).  The fp8 proxy-score CuTe kernels re-view the
+index cache with a one-head page stride and select no KV head, so an fp8
+index cache with several heads raises in both regimes instead of scoring the
+wrong pages.  The proxy-score prefill regime has no f32-accumulating CuTe
 kernel: ``use_fp32_acc=True`` (the default) raises for the classes without a
 Cake program instead of silently returning f16-accumulated scores.
 """
@@ -194,8 +197,8 @@ def proxy_score_sm90(
 
         # Cake programs serve fp8 and bf16 decode scoring of a one-head index
         # cache for Hq in (1, 2, 4) and max_seqlen_q in (1, 2, 3, 4); bf16 Hq
-        # outside that set and multi-head index caches keep the CuTe DSL decode
-        # schedules.
+        # outside that set and bf16 multi-head index caches keep the CuTe DSL
+        # decode schedules.
         if proxy_decode_route_available(
             q_dtype=q.dtype,
             num_q_heads=q.shape[1],
@@ -213,6 +216,15 @@ def proxy_score_sm90(
                 q_offset=(_i32(q_offset) if q_offset is not None else None),
             )
         if kv_fp8:
+            if k.shape[1] != 1:
+                # The fp8 CuTe decode schedule re-views the cache as consecutive
+                # one-head pages ((64, 128, 2 * num_pages) with a fixed half-page
+                # stride) and its grid has no KV-head axis: with several index
+                # heads every head would score the wrong pages.
+                raise NotImplementedError(
+                    "SM90 fp8 proxy-score decode serves a one-head index cache; "
+                    f"got {k.shape[1]} index heads"
+                )
             from .cute_dsl.proxy_score_decode_sm90 import run as _decode
         else:
             from .cute_dsl.proxy_score_decode_bf16_sm90 import run as _decode
@@ -230,8 +242,8 @@ def proxy_score_sm90(
     )
 
     # Cake programs serve fp8 prefill scoring of a one-head index cache in
-    # both accumulation precisions; a multi-head index cache keeps the CuTe
-    # DSL kernel, which accumulates in f16 only.
+    # both accumulation precisions; the CuTe DSL kernel (f16 accumulation)
+    # serves the same one-head class, so several index heads raise in both.
     if proxy_prefill_route_available(
         q_dtype=q.dtype, num_kv_heads=k.shape[1], use_fp32_acc=use_fp32_acc
     ):
@@ -253,6 +265,13 @@ def proxy_score_sm90(
             f"serves fp8 q with a one-head index cache; got q {q.dtype} with "
             f"{k.shape[1]} index heads. Pass use_fp32_acc=False for the "
             "f16-accumulating kernel."
+        )
+    if k.shape[1] != 1:
+        # The CuTe prefill kernel rebuilds K as (page, d, num_pages) with a
+        # one-head page stride and its grid has no KV-head axis.
+        raise NotImplementedError(
+            "SM90 proxy-score prefill with f16 accumulation (use_fp32_acc=False) "
+            f"serves a one-head index cache; got {k.shape[1]} index heads"
         )
     from .cute_dsl.proxy_score_prefill_sm90 import run as _prefill
 
@@ -375,6 +394,7 @@ def sparse_decode_sm90(
     seqused_k: torch.Tensor,
     out: torch.Tensor,
     *,
+    seqlen_q: int,
     softmax_scale: Optional[float] = None,
     v_global_scale: Optional[float] = None,
 ) -> torch.Tensor:
@@ -385,21 +405,22 @@ def sparse_decode_sm90(
     own strides, so the interleaved halves are passed as given once the
     surface's layout contract (``_as_packed_kv``) has admitted them.  Query
     ``i`` of a sequence attends at position ``seqused_k - seqlen_q + i``
-    (right-aligned causal, the surface's decode semantics); the public entry
-    rejects ``causal=False`` and ``q_offset`` before reaching this function.
+    (right-aligned causal, the surface's decode semantics) with the caller's
+    ``seqlen_q``, which the program checks against ``q``, ``seqused_k`` and
+    ``page_table``; the public entry rejects ``causal=False`` and ``q_offset``
+    and validates the paged metadata before reaching this function.
     """
     from .cake_hopper_sm90 import hopper_msa_sparse_decode_attention
 
     _check_packed_kv(k, v)
-    seqused_k = _i32(seqused_k)
     hopper_msa_sparse_decode_attention(
         q,
         k,
         v,
         _i32(q2k_indices),
         page_table=_i32(page_table),
-        seqused_k=seqused_k,
-        seqlen_q=q.shape[0] // seqused_k.numel(),
+        seqused_k=_i32(seqused_k),
+        seqlen_q=seqlen_q,
         softmax_scale=softmax_scale,
         out=out,
     )

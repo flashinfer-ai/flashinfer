@@ -32,6 +32,7 @@ from ._common import (
     _compile_cache,
     _cutlass_dtype,
     _fake,
+    _q_offset_explicit,
     _q_offset_tensor,
     _resolve_packed_kv,
 )
@@ -277,11 +278,20 @@ def msa_sparse_attention(
             out = torch.zeros(
                 (total_q, num_qo_heads, head_dim), dtype=q.dtype, device=q.device
             )
-        elif out.shape != q.shape or out.dtype != q.dtype or not out.is_contiguous():
+        elif (
+            out.shape != q.shape
+            or out.dtype != q.dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            # The kernels take out as a raw pointer on q's device.
             raise ValueError(
-                "out must be a contiguous tensor shaped and typed like q, got "
-                f"{tuple(out.shape)} {out.dtype}"
+                "out must be a contiguous tensor shaped and typed like q on q's "
+                f"device, got {tuple(out.shape)} {out.dtype} {out.device}"
             )
+        if q_offset is not None and not isinstance(q_offset, torch.Tensor):
+            # The documented integer form: one offset for every sequence.
+            q_offset = _q_offset_explicit(q_offset, cu_seqlens_q.numel() - 1, q.device)
         return sparse_prefill_sm90(
             q,
             k,
@@ -291,7 +301,7 @@ def msa_sparse_attention(
             page_table,
             seqused_k,
             out,
-            q_offset=q_offset if isinstance(q_offset, torch.Tensor) else None,
+            q_offset=q_offset,
             softmax_scale=softmax_scale,
             v_global_scale=v_global_scale,
         )

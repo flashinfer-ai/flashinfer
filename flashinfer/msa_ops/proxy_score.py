@@ -404,6 +404,7 @@ def msa_proxy_score(
         _compile_cache,
         _cutlass_dtype,
         _fake,
+        _q_offset_explicit,
         _q_offset_tensor,
     )
 
@@ -484,6 +485,9 @@ def msa_proxy_score(
             raise NotImplementedError("SM90 proxy-score is causal only")
         from ._sm90_dispatch import proxy_score_sm90
 
+        if q_offset is not None and not isinstance(q_offset, torch.Tensor):
+            # The documented integer form: one offset for every sequence.
+            q_offset = _q_offset_explicit(q_offset, batch_size, dev)
         proxy_score_sm90(
             q,
             k,
@@ -494,7 +498,7 @@ def msa_proxy_score(
             max_seqlen_q=max_seqlen_q,
             batch_size=batch_size,
             kv_fp8=kv_fp8,
-            q_offset=q_offset if isinstance(q_offset, torch.Tensor) else None,
+            q_offset=q_offset,
             use_fp32_acc=use_fp32_acc,
         )
         if not reduce_heads:

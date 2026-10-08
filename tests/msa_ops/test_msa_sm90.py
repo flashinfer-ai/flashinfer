@@ -57,7 +57,8 @@ def _decode_inputs(
 
     Mirrors the shapes the SM90 decode schedule is built for: q is bf16, the KV
     cache is fp8 e4m3 with K and V interleaved in one buffer, and q2k_indices are
-    block indices within the sequence that resolve through ``page_table``.
+    distinct ascending block indices within the sequence (the format
+    ``msa_topk_select`` produces) that resolve through ``page_table``.
     """
     torch.manual_seed(seed)
     npages = max_k_tiles * batch
@@ -73,8 +74,12 @@ def _decode_inputs(
     q = (torch.randn(total_q, num_qo_heads, HEAD_DIM, device=device) / 4).to(
         torch.bfloat16
     )
-    idx = torch.randint(
-        0, max_k_tiles, (num_kv_heads, total_q, TOPK), dtype=torch.int32, device=device
+    idx = (
+        torch.rand(num_kv_heads, total_q, max_k_tiles, device=device)
+        .argsort(dim=-1)[..., :TOPK]
+        .sort(dim=-1)
+        .values.to(torch.int32)
+        .contiguous()
     )
     page_table = (
         torch.randperm(npages, device=device)[: batch * max_k_tiles]
@@ -222,7 +227,7 @@ def _prefill_reference(q, k, v, idx, cu_q, page_table, seqused_k):
 @sm90_only
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 2), (16, 4), (64, 4)])
 def test_sparse_decode_paged_matches_reference(num_qo_heads, num_kv_heads):
-    """Paged sparse decode against a dense torch reference over the selected blocks."""
+    """Paged sparse decode against the FP32 oracle over the selected blocks."""
     q, k, v, idx, page_table, seqused_k = _decode_inputs(
         num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads
     )
@@ -239,7 +244,10 @@ def test_sparse_decode_paged_matches_reference(num_qo_heads, num_kv_heads):
     )
     assert out.shape == q.shape
     assert out.dtype == q.dtype
-    assert torch.isfinite(out.float()).all()
+    # one query per sequence: the prefill oracle with unit query lengths
+    cu_q = torch.arange(q.shape[0] + 1, dtype=torch.int32, device="cuda")
+    ref = _prefill_reference(q, k, v, idx, cu_q, page_table, seqused_k)
+    torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
 
 
 @sm90_only
@@ -387,6 +395,21 @@ def test_proxy_score_prefill_honours_q_offset():
 
 
 @sm90_only
+def test_proxy_score_prefill_int_q_offset_matches_tensor():
+    """The documented integer ``q_offset`` is one offset for every sequence: it
+    must score exactly like the equivalent int32 tensor, not be dropped."""
+    q, k, cu_q, page_table, seqused_k, pages = _proxy_prefill_inputs(seed=7)
+    common = dict(
+        page_table=page_table, seqused_k=seqused_k, max_seqlen_q=512, max_k_tiles=pages
+    )
+    offset = torch.full((seqused_k.numel(),), 300, dtype=torch.int32, device="cuda")
+    as_tensor = msa_proxy_score(q, k, cu_q, q_offset=offset, **common)
+    as_int = msa_proxy_score(q, k, cu_q, q_offset=300, **common)
+    assert torch.equal(as_int, as_tensor)
+    assert not torch.equal(as_int, msa_proxy_score(q, k, cu_q, **common))
+
+
+@sm90_only
 def test_topk_select_matches_reference_from_inf_validity():
     """Validity read from the -inf tiles the proxy pass writes, including a token
     with fewer than 16 valid blocks (-1 padded)."""
@@ -476,6 +499,31 @@ def test_sparse_prefill_writes_out_and_scales_v():
     torch.testing.assert_close(
         scaled.float(), plain.float() * 0.5, atol=1e-2, rtol=1e-2
     )
+
+
+@sm90_only
+def test_sparse_prefill_int_q_offset_matches_tensor():
+    """An integer ``q_offset`` places query ``i`` of every sequence at
+    ``q_offset + i``: identical to the equivalent int32 tensor and to the FP32
+    oracle aligned on that position, not silently right-aligned."""
+    q, k, v, idx, cu_q, page_table, seqused_k = _prefill_inputs(
+        8, 1, 16, (40, 72), seed=8
+    )
+    common = dict(causal=True, page_table=page_table, seqused_k=seqused_k)
+    # 1950 keeps every selected block partially visible for every query of
+    # both sequences and moves the first sequence away from its end-of-
+    # sequence alignment (seqused_k - 40 = 1995)
+    offset = torch.full((seqused_k.numel(),), 1950, dtype=torch.int32, device="cuda")
+    as_tensor = msa_sparse_attention(q, k, v, idx, cu_q, q_offset=offset, **common)
+    as_int = msa_sparse_attention(q, k, v, idx, cu_q, q_offset=1950, **common)
+    assert torch.equal(as_int, as_tensor)
+    assert not torch.equal(as_int, msa_sparse_attention(q, k, v, idx, cu_q, **common))
+    # the oracle aligns on seqused_k - qlen: shorten the sequences so that
+    # position 1950 + i is where query i sits (the keys it drops are above the
+    # causal limit for the kernel too)
+    shortened = offset + (cu_q[1:] - cu_q[:-1])
+    ref = _prefill_reference(q, k, v, idx, cu_q, page_table, shortened)
+    torch.testing.assert_close(as_int.float(), ref, atol=1e-2, rtol=1e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -742,6 +790,116 @@ def test_per_tensor_kv_scales_are_rejected_not_ignored():
             seqlen_q=1,
             k_scale=scale,
             v_scale=scale,
+        )
+
+
+@sm90_only
+def test_fp8_proxy_decode_rejects_multi_head_index_cache():
+    """The fp8 decode schedule re-views the index cache with a one-head page
+    stride and selects no KV head; several index heads must raise, not score
+    the wrong pages."""
+    torch.manual_seed(0)
+    batch, hq, hkv, pages = 2, 4, 2, 8
+    npages = pages * batch
+    q = (torch.randn(batch, hq, HEAD_DIM, device="cuda") / 3).to(torch.bfloat16)
+    k = (torch.randn(npages, hkv, BLK_KV, HEAD_DIM, device="cuda") / 3).to(
+        torch.float8_e4m3fn
+    )
+    page_table = torch.arange(npages, dtype=torch.int32, device="cuda").view(
+        batch, pages
+    )
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    seqused_k = torch.full(
+        (batch,), pages * BLK_KV - 13, dtype=torch.int32, device="cuda"
+    )
+    with pytest.raises(NotImplementedError, match="one-head index cache"):
+        msa_proxy_score(
+            q,
+            k,
+            cu_q,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_q=1,
+            max_k_tiles=pages,
+        )
+
+
+@sm90_only
+@pytest.mark.parametrize("use_fp32_acc", [True, False])
+def test_fp8_proxy_prefill_rejects_multi_head_index_cache(use_fp32_acc):
+    """Both accumulation precisions of the prefill regime serve a one-head fp8
+    index cache; the f16 kernel also assumes a one-head page stride."""
+    torch.manual_seed(0)
+    batch, chunk, pages, hq, hkv = 2, 128, 8, 4, 2
+    npages = pages * batch
+    total_q = chunk * batch
+    q = (torch.randn(total_q, hq, HEAD_DIM, device="cuda") / 3).to(torch.float8_e4m3fn)
+    k = (torch.randn(npages, hkv, BLK_KV, HEAD_DIM, device="cuda") / 3).to(
+        torch.float8_e4m3fn
+    )
+    page_table = torch.arange(npages, dtype=torch.int32, device="cuda").view(
+        batch, pages
+    )
+    cu_q = torch.arange(0, total_q + 1, chunk, dtype=torch.int32, device="cuda")
+    seqused_k = torch.full(
+        (batch,), pages * BLK_KV - 13, dtype=torch.int32, device="cuda"
+    )
+    with pytest.raises(NotImplementedError, match="one-head index cache"):
+        msa_proxy_score(
+            q,
+            k,
+            cu_q,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_q=chunk,
+            max_k_tiles=pages,
+            use_fp32_acc=use_fp32_acc,
+        )
+
+
+@sm90_only
+def test_sparse_decode_rejects_mismatched_paged_metadata():
+    """``seqused_k`` / ``page_table`` sized for another batch must raise: the
+    decode program derives every query position from them."""
+    q, k, v, idx, page_table, seqused_k = _decode_inputs(batch=2)
+    with pytest.raises(ValueError, match="seqused_k must have batch_size"):
+        msa_sparse_decode_attention(
+            q, k, v, idx, page_table=page_table, seqused_k=seqused_k[:1], seqlen_q=1
+        )
+    with pytest.raises(ValueError, match="page_table batch dimension"):
+        msa_sparse_decode_attention(
+            q, k, v, idx, page_table=page_table[:1], seqused_k=seqused_k, seqlen_q=1
+        )
+    with pytest.raises(ValueError, match="1D int32"):
+        msa_sparse_decode_attention(
+            q,
+            k,
+            v,
+            idx,
+            page_table=page_table,
+            seqused_k=seqused_k.to(torch.int64),
+            seqlen_q=1,
+        )
+
+
+@sm90_only
+def test_sparse_prefill_rejects_out_on_another_device():
+    """``out`` reaches the kernel as a raw pointer on q's device."""
+    q, k, v, idx, cu_q, page_table, seqused_k = _prefill_inputs(
+        8, 1, 16, (32, 32), seed=9
+    )
+    out = torch.empty(q.shape, dtype=q.dtype)  # host memory
+    with pytest.raises(ValueError, match="on q's device"):
+        msa_sparse_attention(
+            q,
+            k,
+            v,
+            idx,
+            cu_q,
+            causal=True,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            out=out,
         )
 
 
