@@ -1315,13 +1315,16 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(const __grid_constant__ CUtenso
                         }
                         int lse_idx_r = (batch_s * q_len + j_r) * num_q_heads + q_head_r;
                         int narrow_r = 0;
+                        if (block_end_s >= 3) {
+                            narrow_r = 1;
+                        }
                         if (narrow_r != 0) {
                             int d0_n = block_begin_s * (4 * f_r) + (128 + sm_tid) % 4 * f_r;
                             int o_row_n = slot_tile_base_s * 16384 + r_row * 4 + d0_n * 64;
                             int o_idx_n = ((batch_s * q_len + j_r) * num_q_heads + q_head_r) * HEAD_DIM + d0_n;
                             float acc_f[4];
                             float out4[4];
-                            int n_pad_r = (n_chunks_s + 15) / 16 * 16;
+                            int n_pad_r = (n_chunks_s + 7) / 8 * 8;
                             #pragma unroll 1
                             for (int g_r = 0; g_r < 16 >> block_end_s; g_r++) {
                                 acc_f[0] = 0.0f;
@@ -1331,7 +1334,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(const __grid_constant__ CUtenso
                                 float m_f = -1e+30f;
                                 float l_f = 0.0f;
                                 int o_col_r = o_row_n + g_r * 4 * 64;
-                                #pragma unroll 16
+                                #pragma unroll 8
                                 for (int c_m = 0; c_m < n_pad_r; c_m++) {
                                     int c_c = c_m;
                                     if (n_chunks_s <= c_m) {
@@ -2810,13 +2813,16 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(const __grid_constant__ CUtenso
                         }
                         int lse_idx_r_1 = (batch_c * q_len + j_r_1) * num_q_heads + q_head_r_1;
                         int narrow_r_1 = 0;
+                        if (block_end_c >= 3) {
+                            narrow_r_1 = 1;
+                        }
                         if (narrow_r_1 != 0) {
                             int d0_n_1 = block_begin_c * (4 * f_r_1) + wg_tid_c % 4 * f_r_1;
                             int o_row_n_1 = slot_tile_base_c * 16384 + r_row_1 * 4 + d0_n_1 * 64;
                             int o_idx_n_1 = ((batch_c * q_len + j_r_1) * num_q_heads + q_head_r_1) * HEAD_DIM + d0_n_1;
                             float acc_f_1[4];
                             float out4_1[4];
-                            int n_pad_r_1 = (n_chunks_c + 15) / 16 * 16;
+                            int n_pad_r_1 = (n_chunks_c + 7) / 8 * 8;
                             #pragma unroll 1
                             for (int g_r_1 = 0; g_r_1 < 16 >> block_end_c; g_r_1++) {
                                 acc_f_1[0] = 0.0f;
@@ -2826,7 +2832,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(const __grid_constant__ CUtenso
                                 float m_f_1 = -1e+30f;
                                 float l_f_1 = 0.0f;
                                 int o_col_r_1 = o_row_n_1 + g_r_1 * 4 * 64;
-                                #pragma unroll 16
+                                #pragma unroll 8
                                 for (int c_m_1 = 0; c_m_1 < n_pad_r_1; c_m_1++) {
                                     int c_c_2 = c_m_1;
                                     if (n_chunks_c <= c_m_1) {
