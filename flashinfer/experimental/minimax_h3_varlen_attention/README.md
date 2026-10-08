@@ -53,12 +53,20 @@ out4 = minimax_h3_varlen_nvfp4_attention(
 )  # NVFP4 QK, NVFP4 PV
 ```
 
-Both one-shot APIs plan on every call. Without `cu_seqlens_host` they read
-`cu_seqlens` back to the host (one stream synchronization) to build the
-segment plan; passing `cu_seqlens_host=[...]` (the same offsets as a Python
-sequence) is the fast path: no device synchronization, only the small plan
-table uploads. For repeated launches or CUDA Graph capture use the prepared
-form from this package:
+The BF16 one-shot API resolves its segment plan through a most-recently-used
+plan cache (`cached_bf16_segment_plan`, `BF16_PLAN_CACHE_CAPACITY = 256`
+entries keyed by `(cu_seqlens, device, num_heads, kv_splits, stream)`): the
+first call for a segment layout builds and uploads the plan tables, every
+later call with the same `cu_seqlens` / `num_heads` on that device and stream
+re-launches with them -- no Python planning, no host-to-device copies, no
+allocation when `out` is given (the diffusion engine issues hundreds of
+identical-layout calls per sample). The NVFP4 one-shot API plans and
+allocates its packed operand workspace on every call. Without
+`cu_seqlens_host` both read `cu_seqlens` back to the host (one stream
+synchronization); passing `cu_seqlens_host=[...]` (the same offsets as a
+Python sequence) avoids any device synchronization. For CUDA Graph capture
+use the prepared form from this package (or warm the BF16 one-shot entry up
+with the exact `cu_seqlens` on the capture stream before capturing):
 
 ```python
 from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
@@ -95,10 +103,12 @@ unit with one table lookup. The host builds, from `cu_seqlens` (empty segments
 dropped) and `num_heads`:
 
 * `seg_begin[s]`, `seg_len[s]` (int32, `num_segments` entries),
-* `unit_table` (int32, `4 * total_tiles` entries): per slot the segment index,
-  `head << 16 | cluster_in_segment`, `kv_block_begin << 16 | kv_blocks` (the
-  unit's K/V block range inside the segment) and its partial slot (`-1` for an
-  unsplit unit, which writes the BF16 output directly),
+* `unit_table` (int32, `8 * (total_tiles + num_clusters)` entries): per slot the
+  segment's token begin and length, `head << 16 | cluster_in_segment`,
+  `kv_block_begin << 16 | kv_blocks` (the unit's K/V block range inside the
+  segment), its partial slot (`-1` for an unsplit unit, which writes the BF16
+  output directly) and three reserved words, followed by `num_clusters` zero
+  records (every kernel role prefetches the record of its next unit),
 * `combine_table` (int32, `4 * num_combine_units` entries): per K/V-split
   unit the segment index, `head << 16 | cluster_in_segment`, its first partial
   slot and the number of splits, plus the plan's partial workspace
@@ -108,7 +118,9 @@ dropped) and `num_heads`:
 Units are enumerated segment-major (heads slow, clusters fast, so a cluster's
 Q tiles reuse the segment's K/V from L2) and placed into slots
 longest-processing-time first over the per-unit cost `ceil(seg_len / 128) + 2`
-K/V blocks (`assign_unit_slots`): the partial tail round receives the cheapest
+K/V blocks (`assign_unit_slots`; a unit with at most 256 valid Q rows runs a
+single Q stage and costs `ceil(3 / 5 * blocks) + 2`): the partial tail round
+receives the cheapest
 units and, within every full round, the clusters that also own a tail unit
 receive that round's cheapest units; equal costs keep the enumeration order.
 
@@ -132,10 +144,11 @@ kernel).
 The plan is a host-side function of `(cu_seqlens, num_heads, num_SMs)` and
 reproduces the Cake production plan table for table (`num_heads < 2^15`,
 fewer than `2^16` clusters per segment). K/V TMA loads that run past a segment
-are masked to `-inf` before the softmax; ragged Q tail tiles are staged with
-predicated zero-filling copies;
-output rows are stored straight to global memory predicated on the row lying
-inside its segment.
+are masked to `-inf` before the softmax; every Q tile is one TMA load (rows past
+the segment are finite and never stored). Output tiles that lie wholly inside
+their segment are written by one TMA store from a swizzled shared-memory slab;
+ragged tail tiles are stored row by row predicated on the row lying inside its
+segment.
 
 ### NVFP4 (`nvfp4_fp4pv`, `nvfp4_fp8pv`)
 
@@ -236,9 +249,13 @@ is CUDA-Graph capturable.
   `fp8` PV mode is the default because its error is lower at similar speed;
   `fp4` PV is the fastest mode for long segments.
 * One-shot APIs synchronize once to read `cu_seqlens` unless
-  `cu_seqlens_host` is passed (the fast path). The prepared runners never
-  allocate or synchronize; device facts (SM count, compute capability) are
-  read once per device.
+  `cu_seqlens_host` is passed (the fast path). BF16 plans are cached per
+  `(cu_seqlens, device, num_heads, kv_splits, stream)` (most recent 256;
+  the oldest is evicted); launches of one plan are stream-ordered on their
+  stream (a K/V-split plan's partial workspace is rewritten by every
+  launch) and concurrent streams never share a plan. The prepared runners
+  never allocate or synchronize; device facts (SM count, compute
+  capability) are read once per device.
 * Generated sources live under `csrc/cake_minimax_h3_varlen_attention/` (one
   kernel source and one host binding per program, shared by both
   architectures) and are registered in `cake_jit.py` (`MODULES`, `ROUTES`) by

@@ -24,7 +24,7 @@ Every launch of the call is a generated Cake program:
 
 | Route (host dispatch) | Programs | When |
 | --- | --- | --- |
-| quantization launch + persistent 2-CTA GEMM | `quant:u<units>`, `gemm_tstore` (16-byte aligned output base and a row stride that is a multiple of 8 elements: TMA-store epilogue) or `gemm` (other strides: register epilogue) | `M > 256` unless the family is tabulated for the decode kernel at that row count, and the tabulated `(N, K)` families whose measured best route is the GEMM |
+| quantization launch + persistent 2-CTA GEMM | `quant:u<units>`, `gemm_tstore` (16-byte aligned output base and a row stride that is a multiple of 8 elements: TMA-store epilogue) or `gemm` (other strides: register epilogue); the `_n192` instances of the same epilogues on the tabulated `gemm_bn` rows (the N = 576 `kv_a` family at M > 256: three 192-column tiles instead of 768 padded columns) ; decode programs carry `_px<D>` when the row's table key `pfx` prefetches the BF16 token tile into L2 D stages ahead of its TMA load (round-6 next loop, lever PX on the small fused rows: the tile's DRAM access precedes the weight burst instead of queueing behind it) | `M > 256` unless the family is tabulated for the decode kernel at that row count, and the tabulated `(N, K)` families whose measured best route is the GEMM |
 | quantization launch + decode | `quant:u1`, `decode:t<tok>_p<stages>` | measured table entry with `fused = false` |
 | fused decode | `decode:t<tok>_p<stages>_fused[_res]` | measured table entry with `fused = true` (the token tile is quantized in-CTA; `_res` keeps the quantized token tiles resident for `K <= 256`); above 256 rows only the single-N-tile families (`f_a`, `b_proj`) are tabulated |
 
@@ -84,8 +84,8 @@ activation bit-exact vs the DeepGEMM recipe; see
 `tests/experimental/test_cake_kimi_k3_fp8_projection.py`.
 
 Benchmark: `python benchmarks/bench_cake_kimi_k3_fp8_projection.py [--cupti]`
-times the 132 representative rows (22 families x `M in {1, 8, 64, 256, 4096,
-16384}`) as CUDA-graph replays with a cold L2 against FlashInfer's existing
+times the 198 representative rows (22 families x `M in {1, 8, 64, 256, 512,
+1024, 2048, 4096, 16384}`) as CUDA-graph replays with a cold L2 against FlashInfer's existing
 `per_token_group_quant_8bit` + `gemm_fp8_nt_groupwise` chains (`cutlass` sm1 /
 sm2, `trtllm`, `cutile`) on the same weight.
 

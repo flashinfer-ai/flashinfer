@@ -833,3 +833,165 @@ def test_routing_replay_out(
 
     torch.testing.assert_close(topk_values, topk_values_no_replay)
     torch.testing.assert_close(topk_indices, topk_indices_no_replay)
+
+
+# ---------------------------------------------------------------------------
+# backend="cake" vs backend="default" on correlated, tie-heavy and large-T inputs
+# ---------------------------------------------------------------------------
+#
+# Both backends evaluate the same sigmoid, add the same bias and select groups
+# and experts on identical FP32 values, so expert ids, their order and
+# ``routing_replay_out`` must be identical.  Only the normalisation
+# ``sigmoid * routed_scaling_factor / sum`` differs (FP32 reciprocal in the
+# Cake kernels, FP64 division in the default kernel), so the weights are
+# compared within one ulp of the output dtype (|dw| <= 1e-6 for float32).
+# The e2e DeepSeek-V3 run that motivated this (sglang, TP4) found the existing
+# cross-backend check clean only on i.i.d. normal rows at T <= 64; the profiles
+# below add correlated ("real-logit-like") logits, coarse value grids with many
+# exact ties, very negative logits where the +1e-20 term matters, and token
+# counts up to 65536.
+
+
+def _routing_inputs(profile, num_tokens, num_experts, score_dtype, bias_dtype, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    dev = "cuda"
+    if profile == "randn":
+        scores = torch.randn(num_tokens, num_experts, device=dev, generator=gen)
+        bias = torch.randn(num_experts, device=dev, generator=gen)
+    elif profile == "reallike":
+        # Token-correlated router logits: RMS-normalised hidden states times a gate
+        # weight plus a per-expert popularity offset; fp32 correction bias of O(1).
+        hidden_dim = 1024
+        hidden = torch.randn(num_tokens, hidden_dim, device=dev, generator=gen)
+        hidden = hidden * torch.rsqrt(hidden.pow(2).mean(-1, keepdim=True) + 1e-6)
+        gate = torch.randn(num_experts, hidden_dim, device=dev, generator=gen) * (
+            1.7 / hidden_dim**0.5
+        )
+        offsets = torch.randn(num_experts, device=dev, generator=gen) * 0.5
+        scores = hidden @ gate.t() + offsets
+        bias = torch.randn(num_experts, device=dev, generator=gen) * 0.6 + 0.3
+    elif profile == "tie":
+        # Coarse value grids: many exactly equal sigmoid and biased scores.
+        scores = (
+            torch.randn(num_tokens, num_experts, device=dev, generator=gen) * 2
+        ).round() * 0.5
+        bias = (
+            torch.randint(0, 5, (num_experts,), device=dev, generator=gen).float()
+            * 0.25
+        )
+    elif profile == "extreme":
+        # Every logit very negative: the selected sigmoid sum is ~1e-11..1e-15, so
+        # the +1e-20 term is observable; some rows are exactly zero.
+        scores = -25.0 - 10.0 * torch.rand(
+            num_tokens, num_experts, device=dev, generator=gen
+        )
+        scores[: max(1, num_tokens // 8)] = -100.0
+        bias = torch.randn(num_experts, device=dev, generator=gen) * 1e-3
+    else:
+        raise ValueError(profile)
+    return scores.to(score_dtype).contiguous(), bias.to(bias_dtype).contiguous()
+
+
+_ROUTING_CONFIGS = [
+    pytest.param(256, 8, 4, 8, id="grouped-k8g4"),
+    pytest.param(128, 4, 2, 4, id="grouped-general"),
+    pytest.param(96, 3, 2, 5, id="grouped-odd"),
+    pytest.param(128, 1, 1, 1, id="single128"),
+    # No single-group config with num_experts > 128: the default backend's 384/256-expert
+    # instances reduce NumExpertWarps * 8 intermediate shared slots of which only `topk`
+    # per warp are written, so with the only admissible topk (1) their output depends on
+    # stale shared memory and is not a usable reference.
+]
+_ROUTING_DTYPE_PAIRS = [
+    pytest.param(torch.float32, torch.float32, id="f32-f32"),
+    pytest.param(torch.float32, torch.bfloat16, id="f32-bf16"),
+    pytest.param(torch.bfloat16, torch.bfloat16, id="bf16-bf16"),
+    pytest.param(torch.bfloat16, torch.float32, id="bf16-f32"),
+    pytest.param(torch.float16, torch.float16, id="f16-f16"),
+    pytest.param(torch.float16, torch.bfloat16, id="f16-bf16"),
+    pytest.param(torch.bfloat16, torch.float16, id="bf16-f16"),
+    pytest.param(torch.float32, torch.float16, id="f32-f16"),
+    pytest.param(torch.float16, torch.float32, id="f16-f32"),
+]
+
+
+@pytest.mark.parametrize("profile", ["randn", "reallike", "tie", "extreme"])
+@pytest.mark.parametrize("num_tokens", [1, 64, 4096, 65536])
+@pytest.mark.parametrize("score_dtype,bias_dtype", _ROUTING_DTYPE_PAIRS)
+@pytest.mark.parametrize("num_experts,n_group,topk_group,topk", _ROUTING_CONFIGS)
+def test_cake_backend_matches_default(
+    num_experts, n_group, topk_group, topk, score_dtype, bias_dtype, num_tokens, profile
+):
+    """backend="cake" selects the same experts as backend="default"; weights within 1 ulp."""
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake fused routing requires SM100 or SM103")
+    if num_tokens >= 4096 and (score_dtype, bias_dtype) not in (
+        (torch.float32, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float16, torch.float32),
+    ):
+        pytest.skip("large-T rows cover one pair per score dtype")
+
+    seed = (
+        hash(
+            (
+                num_experts,
+                n_group,
+                topk,
+                str(score_dtype),
+                str(bias_dtype),
+                num_tokens,
+                profile,
+            )
+        )
+        & 0x7FFFFFFF
+    )
+    scores, bias = _routing_inputs(
+        profile, num_tokens, num_experts, score_dtype, bias_dtype, seed
+    )
+    routed_scaling_factor = 2.5 if topk > 1 else 1.0
+    launch_with_pdl = num_tokens % 2 == 0
+    replay_rows = num_tokens + (5 if num_tokens % 3 == 0 else 0)
+
+    outputs = {}
+    for backend in ("default", "cake"):
+        values = torch.empty(num_tokens, topk, device="cuda", dtype=score_dtype)
+        indices = torch.full((num_tokens, topk), -7, device="cuda", dtype=torch.int32)
+        replay = torch.full((replay_rows, topk), -1, device="cuda", dtype=torch.int16)
+        fused_topk_deepseek(
+            scores,
+            bias,
+            n_group,
+            topk_group,
+            topk,
+            routed_scaling_factor,
+            values,
+            indices,
+            launch_with_pdl,
+            replay,
+            backend=backend,
+        )
+        torch.cuda.synchronize()
+        outputs[backend] = (values, indices, replay)
+
+    default_values, default_indices, default_replay = outputs["default"]
+    cake_values, cake_indices, cake_replay = outputs["cake"]
+    assert torch.equal(cake_indices, default_indices), (
+        "expert ids (and their order) differ"
+    )
+    assert torch.equal(cake_replay, default_replay), "routing_replay_out differs"
+    ulp_rtol = {torch.float32: 0.0, torch.float16: 2.0**-10, torch.bfloat16: 2.0**-7}[
+        score_dtype
+    ]
+    default_f = default_values.float()
+    cake_f = cake_values.float()
+    delta = (cake_f - default_f).abs()
+    bad = delta > 1e-6 + ulp_rtol * default_f.abs()
+    if bool(bad.any()):
+        rows = bad.any(dim=1).nonzero().flatten()[:4].tolist()
+        detail = [(row, default_f[row].tolist(), cake_f[row].tolist()) for row in rows]
+        raise AssertionError(
+            f"{int(bad.sum())} of {bad.numel()} weights differ by more than one ulp "
+            f"(max |dw| {float(delta.max()):.3e}); first rows {detail}"
+        )
