@@ -91,6 +91,22 @@ def _cake_gdn_sm_count(device_index: int) -> int:
 
 
 @functools.cache
+def _cake_gdn_tensormap_workspace(
+    device_index: int, stream: int, grid_x: int
+) -> torch.Tensor:
+    """Per-launch tensor-map scratch (512 bytes per CTA), resolved once per device, stream and grid.
+
+    The kernel rewrites the workspace at every launch, so one buffer per stream
+    serves every call on that stream in order and keeps the launch path
+    allocation-free (no per-call ``torch.empty`` under CUDA Graph capture either).
+    """
+
+    return torch.empty(
+        grid_x * 512, dtype=torch.uint8, device=torch.device("cuda", device_index)
+    )
+
+
+@functools.cache
 def _cake_gdn_sentinel(device_index: int, dtype: torch.dtype) -> torch.Tensor:
     """One-element placeholder passed for absent optional tensors.
 
@@ -525,7 +541,9 @@ def _run_cake_gdn_prefill(
         if checkpoint_every_n_tokens == 0 or checkpoint_cu_starts is None
         else _cake_gdn_i32(checkpoint_cu_starts)
     )
-    tensormap_workspace = torch.empty(grid_x * 512, dtype=torch.uint8, device=q.device)
+    tensormap_workspace = _cake_gdn_tensormap_workspace(
+        device_index, torch.cuda.current_stream(device_index).cuda_stream, grid_x
+    )
     entry(
         q,
         k,

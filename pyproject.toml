@@ -83,6 +83,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
 "flashinfer.experimental.msa_nvfp4_decode" = ["csrc/**"]
 "flashinfer.experimental.nvfp4_mla_decode" = ["csrc/**"]
+"flashinfer.experimental.cake_dsa_indexer" = ["csrc/**"]
+# Route catalog of the experimental SM120 paged MQA-logits export, read at runtime next to its module.
+"flashinfer.experimental.deepgemm_sm120_paged_mqa_logits" = ["*.json"]
 "flashinfer" = ["_build_meta.py"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
@@ -114,6 +117,11 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
   "src/a2a/*.cuh",
   "src/fp8_gemm/*.cu",
   "src/fp8_gemm/*.cuh",
+]
+# Generated SM90 BF16 Cake MegaMoE sources and manifest, compiled on demand.
+"flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe" = [
+  "src/*.cu",
+  "src/*.json",
 ]
 # Generated SM100 BF16 rank-major mega-MoE CUDA bundle. The runtime validates
 # the manifest checksum before compiling the source on demand.

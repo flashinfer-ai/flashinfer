@@ -30,71 +30,30 @@ from flashinfer.autotuner import (
 )
 
 from ..api_logging import flashinfer_api, flashinfer_experimental_api
-from ..jit import gen_trtllm_gen_fmha_module, setup_cubin_loader
 from ..trace.templates.attention import (
     trtllm_batch_decode_mla_trace_dispatch,
     xqa_batch_decode_mla_trace,
 )
 from ..utils import (
-    _check_block_tables_shape,
-    _get_trtllm_gen_multi_ctas_kv_counter_buffer,
-    _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     check_shape_dtype_device,
     check_trtllm_gen_sm107_only_feature,
     device_support_pdl,
     get_compute_capability,
     get_device_sm_count,
-    get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     is_sm12x_supported,
     log2e,
 )
-from ..xqa import xqa_mla
-
-
-@dataclass(frozen=True)
-class MLAHeadDimensions:
-    """
-    The dimensions of a single MLA head.
-
-    Args:
-        qk_nope_head_dim (int): The number of input channels without positional information in non-absorb mode.
-        qk_rope_head_dim (int): The number of channels carrying positional information for both absorb and non-absorb modes.
-        v_head_dim (int): The number of value channels, which is also the output head dimension in non-absorb mode.
-        kv_lora_rank (int): The dimension of the compressed key-value representation across heads.
-    """
-
-    qk_nope_head_dim: int
-    qk_rope_head_dim: int
-    v_head_dim: int
-    kv_lora_rank: int
-
-
-deepseek_mla_dimensions = MLAHeadDimensions(
-    qk_nope_head_dim=128,
-    qk_rope_head_dim=64,
-    v_head_dim=128,
-    kv_lora_rank=512,
+from ._utils import (
+    MLAHeadDimensions as MLAHeadDimensions,
+    deepseek_mla_dimensions as deepseek_mla_dimensions,
+    smaller_mla_dimensions as smaller_mla_dimensions,
+    nope_mla_dimensions as nope_mla_dimensions,
+    supported_mla_head_dimensions as supported_mla_head_dimensions,
+    _check_mla_query_kv_shape,
+    _check_mla_dense_page_table_shape,
+    _check_mla_sparse_index_shape,
 )
-
-smaller_mla_dimensions = MLAHeadDimensions(
-    qk_nope_head_dim=64,
-    qk_rope_head_dim=64,
-    v_head_dim=128,
-    kv_lora_rank=256,
-)
-
-nope_mla_dimensions = MLAHeadDimensions(
-    qk_nope_head_dim=256,
-    qk_rope_head_dim=0,
-    v_head_dim=256,
-    kv_lora_rank=512,
-)
-
-supported_mla_head_dimensions = [
-    deepseek_mla_dimensions,
-    smaller_mla_dimensions,
-    nope_mla_dimensions,
-]
 
 
 @dataclass(frozen=True)
@@ -138,13 +97,6 @@ class _NormalizedSparseMLASegment:
     kv_cache: Optional[torch.Tensor]
     indices: torch.Tensor
     lengths: Optional[torch.Tensor]
-
-
-def _cute_dsl_monolithic_log_scale(
-    return_lse_base: Optional[Literal["basee", "base2"]],
-) -> float:
-    """Preserve monolithic base-e output unless base-2 is explicitly requested."""
-    return 1.0 if return_lse_base == "base2" else 1.0 / log2e
 
 
 def _normalize_optional_mla_sink(
@@ -746,7 +698,7 @@ def _trtllm_batch_decode_sparse_mla_v32_sm120(
     )
 
 
-def _check_trtllm_gen_mla_shape(
+def _check_mla_functional_shape(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     kv_lora_rank: int,
@@ -759,80 +711,25 @@ def _check_trtllm_gen_mla_shape(
     max_q_len: Optional[int] = None,
     require_aligned_block_table: bool = True,
 ) -> torch.Tensor:
-    is_flattened_query = False
-    if query.ndim == 4:
-        num_seqs, num_tokens, _, qk_head_dim = query.shape
-    elif query.ndim == 3:
-        is_flattened_query = True
-        if batch_size is None or max_q_len is None:
-            raise ValueError(
-                "batch_size and max_q_len are required when query.ndim == 3"
-            )
-        num_seqs = batch_size
-        num_tokens = max_q_len
-        _, _, qk_head_dim = query.shape
-    else:
-        raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
+    """Validate shared functional shapes and return normalized 4D KV storage.
 
-    # Support both 3D and 4D kv_cache for backward compatibility
-    if kv_cache.ndim == 3:
-        # [num_pages, page_size, head_dim_ckv + head_dim_kpe] -> [num_pages, 1, page_size, head_dim_ckv + head_dim_kpe]
-        kv_cache = kv_cache.unsqueeze(1)
-    elif kv_cache.ndim != 4:
-        raise ValueError(f"Expected kv_cache.ndim == 3 or 4, got {kv_cache.ndim}")
-
-    is_deepseek_dimensions = (
-        kv_lora_rank == deepseek_mla_dimensions.kv_lora_rank
-        and qk_rope_head_dim == deepseek_mla_dimensions.qk_rope_head_dim
+    TRTLLM-GEN, CuTe DSL and XQA use these query, KV and page-table checks.
+    Backend-specific capability restrictions are validated separately.
+    """
+    kv_cache = _check_mla_query_kv_shape(
+        query, kv_cache, kv_lora_rank, qk_rope_head_dim, batch_size, max_q_len
     )
-    is_smaller_mla_dimensions = (
-        kv_lora_rank == smaller_mla_dimensions.kv_lora_rank
-        and qk_rope_head_dim == smaller_mla_dimensions.qk_rope_head_dim
-    )
-    is_nope_mla_dimensions = (
-        kv_lora_rank == nope_mla_dimensions.kv_lora_rank
-        and qk_rope_head_dim == nope_mla_dimensions.qk_rope_head_dim
-    )
-    if not (
-        is_deepseek_dimensions or is_smaller_mla_dimensions or is_nope_mla_dimensions
-    ):
-        raise ValueError(
-            f"Unsupported MLA dimensions, got kv_lora_rank={kv_lora_rank} and qk_rope_head_dim={qk_rope_head_dim}, supported dimensions are: {supported_mla_head_dimensions}"
-        )
-
-    ckv_dim = kv_cache.shape[3]
-    expected_qk_head_dim = kv_lora_rank + qk_rope_head_dim
-    if qk_head_dim != expected_qk_head_dim or ckv_dim != expected_qk_head_dim:
-        raise ValueError(
-            f"Expected head dim {expected_qk_head_dim} for query and kv_cache, got {qk_head_dim} and {ckv_dim}"
-        )
-
     if sparse_mla_top_k > 0:
-        page_table_shape = page_table.shape
-        expected_page_table_shape = (
-            (query.size(0), sparse_mla_top_k)
-            if is_flattened_query
-            else (num_seqs, num_tokens, sparse_mla_top_k)
-        )
-        if page_table_shape != expected_page_table_shape:
-            raise ValueError(
-                "Expected page_table.shape == "
-                f"{expected_page_table_shape}" + f", got {page_table_shape}"
-            )
+        _check_mla_sparse_index_shape(query, page_table, sparse_mla_top_k)
     else:
-        _check_block_tables_shape(page_table, uses_shared_paged_kv_idx)
-        B_block_table = page_table.shape[0]
-        block_num = page_table.shape[-1]
-        block_size = page_size
-        if num_seqs != B_block_table:
-            raise ValueError(
-                f"Expected batch size {num_seqs} for query and block_table, got {num_seqs} and {B_block_table}"
-            )
-        if require_aligned_block_table and block_num % (128 / block_size) != 0:
-            raise ValueError(
-                f"Expected block_num % (128 / block_size) == 0, got {block_num=} and {block_size=}"
-            )
-
+        num_seqs = query.shape[0] if query.ndim == 4 else batch_size
+        _check_mla_dense_page_table_shape(
+            page_table,
+            num_seqs,
+            page_size,
+            uses_shared_paged_kv_idx,
+            require_aligned_block_table,
+        )
     return kv_cache
 
 
@@ -2816,21 +2713,27 @@ def trtllm_batch_decode_sparse_mla_dsv4(
 # Keep the backend-neutral spelling as a compatibility alias, while the
 # existing TRTLLM-prefixed API remains the canonical public callable.
 batch_decode_sparse_mla_dsv4 = trtllm_batch_decode_sparse_mla_dsv4
-_trtllm_batch_decode_sparse_mla_dsv4 = trtllm_batch_decode_sparse_mla_dsv4
 
 
-@functools.cache
-def get_trtllm_gen_fmha_module():
-    mod = gen_trtllm_gen_fmha_module()
-    op = mod.build_and_load()
-    for library_path in mod.get_library_paths():
-        setup_cubin_loader(library_path)
-    return op
-
-
+# Backend dependencies for functional dispatch and public API exports.
+from ._batch_mla._backends.trtllm_gen_backend import (
+    _BatchMLAPagedAttentionTrtllmGenBackend,
+    get_trtllm_gen_fmha_module,
+    _prepare_trtllm_gen_mla_output,
+    _trtllm_gen_mla_incompatibility_reason,
+)
 from ._batch_mla._backends._fa_common import (
     get_batch_mla_module as get_batch_mla_module,
 )
+from ._batch_mla._backends.cute_dsl_modular_backend import (
+    _BatchMLAPagedAttentionCuteDslModularBackend,
+)
+from ._batch_mla._backends.cute_dsl_monolithic_backend import (
+    _BatchMLAPagedAttentionCuteDslMonolithicBackend,
+)
+from ._batch_mla._backends.xqa_backend import _BatchMLAPagedAttentionXqaBackend
+
+_XQA_MLA_TUNING_CONFIG = TuningConfig(use_cuda_graph=True)
 from ._batch_mla._backends.cutlass_backend import get_mla_module as get_mla_module
 from ._batch_mla._contracts import MLAPlanMetadata as MLAPlanMetadata
 from ._batch_mla._wrapper import (
@@ -2844,17 +2747,6 @@ from ._batch_mla._wrapper import (
 # Keep the trtllm-gen autotune sweep bounded; actual counter storage is sized
 # dynamically per profiled batch.
 _TRTLLM_GEN_MLA_MAX_BATCH = 8192
-
-
-def _round_to_seq_len_bucket(x: int) -> int:
-    """Power-of-2 bucket for max_seq_len in autotune cache keys.
-
-    Collapses small variations across deployments so they can share cache
-    entries (e.g., max_seq_len=16384 and 16385 hash to the same bucket).
-    """
-    if x <= 1:
-        return 1
-    return 1 << (x - 1).bit_length()
 
 
 def _resolve_cute_dsl_workspace_sizer(
@@ -3372,7 +3264,7 @@ def _build_mla_decode_tuning_config(
     per-call configs this replaces).
     """
     # kv_cache may be 3D [num_pages, page_size, D] or 4D
-    # [num_pages, 1, page_size, D] after `_check_trtllm_gen_mla_shape` —
+    # [num_pages, 1, page_size, D] after `_check_mla_functional_shape` —
     # page_size is the second-to-last dim in both layouts.
     page_size = kv_cache.shape[-2]
     provisioned_max_seq_len = block_tables.shape[-1] * page_size
@@ -3404,411 +3296,164 @@ def _build_mla_decode_tuning_config(
     )
 
 
-class TrtllmGenMlaDecodeRunner(TunableRunner):
-    """Wraps ``trtllm_paged_attention_decode`` for the autotuner.
-
-    Non-tensor parameters of ``trtllm_batch_decode_with_kv_cache_mla`` are
-    stashed at construction time. The autotuner passes
-    ``[query, block_tables, seq_lens, out]`` via ``inputs`` and reads the
-    pre-normalized ``kv_cache`` and ``workspace_buffer`` from ``self``.
-
-    The dispatcher is responsible for: (a) normalizing kv_cache via
-    ``_check_trtllm_gen_mla_shape``, (b) computing ``sm_count``, and (c)
-    applying the ``bmm*_scale * log2e`` conversion for the tensor case
-    BEFORE constructing this runner.
-    """
-
-    def __init__(
-        self,
-        *,
-        kv_cache: torch.Tensor,
-        workspace_buffer: torch.Tensor,
-        sm_count: int,
-        qk_nope_head_dim: int,
-        kv_lora_rank: int,
-        qk_rope_head_dim: int,
-        max_seq_len: int,
-        sparse_mla_top_k: int,
-        bmm1_scale,
-        bmm2_scale,
-        sinks: Optional[List[torch.Tensor]],
-        skip_softmax_threshold_scale_factor: Optional[float],
-        enable_pdl: bool,
-        is_var_seq: bool,
-        uses_shared_paged_kv_idx: bool,
-        return_lse: bool,
-        lse: Optional[torch.Tensor],
-        return_lse_base: Optional[Literal["basee", "base2"]],
-        use_fp16_softmax: Optional[bool] = None,
-    ):
-        self._run = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
-        self.kv_cache = kv_cache
-        self.workspace_buffer = workspace_buffer
-        self.sm_count = sm_count
-        # Allocated lazily for autotune profiling and reused (grown if a later
-        # profile needs more). The final request may instead pass a caller-owned
-        # buffer directly to forward(). The kernel self-resets the counters after
-        # each ordered launch, so neither path re-zeros between launches.
-        self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.kv_lora_rank = kv_lora_rank
-        self.qk_rope_head_dim = qk_rope_head_dim
-        # kv_cache has been normalized to 4D by _check_trtllm_gen_mla_shape;
-        # the page_size dim is -2 in both 3D (legacy) and 4D shapes.
-        self.page_size = kv_cache.shape[-2]
-        self.max_seq_len = max_seq_len
-        self.sparse_mla_top_k = sparse_mla_top_k
-        self.bmm1_scale = bmm1_scale
-        self.bmm2_scale = bmm2_scale
-        self.sinks = sinks
-        self.skip_softmax_threshold_scale_factor = skip_softmax_threshold_scale_factor
-        self.enable_pdl = enable_pdl
-        self.is_var_seq = is_var_seq
-        self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
-        self.return_lse = return_lse
-        self.lse = lse
-        self.return_lse_base = return_lse_base
-        self.use_fp16_softmax = use_fp16_softmax
-
-    def __hash__(self):
-        # The default `TunableRunner.__hash__` walks `self.__dict__` and falls
-        # back to `id(...)` for unhashable values; our kv_cache / workspace /
-        # sinks attributes are tensors or lists whose `id()` differs per
-        # dispatcher call, which would poison the autotune cache key. All
-        # tactic-determining state is already captured by
-        # `get_cache_key_extras`, so return a class-stable hash here.
-        return hash(type(self))
-
-    def get_valid_tactics(self, inputs, profile) -> List[int]:
-        return [-1]
-
-    def get_cache_key_extras(self, inputs):
-        q, _, _, out = inputs[:4]
-        sinks_key = (
-            None
-            if self.sinks is None
-            else tuple((tuple(t.shape), t.dtype) for t in self.sinks)
+def _validate_mla_ragged_query(
+    query: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cum_seq_lens_q: torch.Tensor,
+    max_q_len: Optional[int],
+) -> Tuple[int, int]:
+    """Validate compact-Q metadata, reading it on the host only to infer its maximum."""
+    if query.ndim != 3:
+        raise ValueError(
+            "query must have shape [total_q, num_heads, head_dim_qk] "
+            "when cum_seq_lens_q is provided"
         )
-        return (
-            q.dtype,
-            self.kv_cache.dtype,
-            out.dtype,
-            self.qk_nope_head_dim,
-            self.kv_lora_rank,
-            self.qk_rope_head_dim,
-            self.page_size,
-            _round_to_seq_len_bucket(self.max_seq_len),
-            self.sparse_mla_top_k,
-            self.is_var_seq,
-            self.uses_shared_paged_kv_idx,
-            self.enable_pdl,
-            "bmm1_tensor"
-            if isinstance(self.bmm1_scale, torch.Tensor)
-            else "bmm1_float",
-            "bmm2_tensor"
-            if isinstance(self.bmm2_scale, torch.Tensor)
-            else "bmm2_float",
-            sinks_key,
-            self.skip_softmax_threshold_scale_factor,
-            self.return_lse,
-            len(inputs) == 5,
+    check_shape_dtype_device(
+        cum_seq_lens_q,
+        None,
+        torch.int32,
+        query.device,
+        "cum_seq_lens_q",
+    )
+    if cum_seq_lens_q.ndim != 1:
+        raise ValueError(
+            f"Expected cum_seq_lens_q.ndim == 1, got {cum_seq_lens_q.ndim}"
+        )
+    if cum_seq_lens_q.size(0) < 2:
+        raise ValueError("cum_seq_lens_q must contain at least two entries")
+    batch_size = cum_seq_lens_q.size(0) - 1
+    if batch_size != seq_lens.size(0):
+        raise ValueError(
+            "Batch size mismatch: cum_seq_lens_q describes "
+            f"{batch_size} sequences, but seq_lens has {seq_lens.size(0)} entries"
+        )
+    if max_q_len is None:
+        cum_seq_lens_q_host = cum_seq_lens_q.cpu()
+        if cum_seq_lens_q_host[0].item() != 0:
+            raise ValueError("cum_seq_lens_q must start with 0")
+        if cum_seq_lens_q_host[-1].item() != query.size(0):
+            raise ValueError("cum_seq_lens_q[-1] must match the flattened query length")
+        q_lens = cum_seq_lens_q_host[1:] - cum_seq_lens_q_host[:-1]
+        if torch.any(q_lens < 0).item():
+            raise ValueError("cum_seq_lens_q must be monotonically non-decreasing")
+        max_q_len = q_lens.max().item()
+        if max_q_len <= 0:
+            raise ValueError("cum_seq_lens_q must describe at least one query token")
+    elif max_q_len <= 0:
+        raise ValueError("max_q_len must be greater than 0")
+
+    return batch_size, max_q_len
+
+
+def _select_mla_ragged_backend(
+    backend: str,
+    trtllm_gen_not_supported_reason: Optional[str],
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    sinks: Optional[List[torch.Tensor]],
+    sparse_mla_top_k: int,
+    skip_softmax_threshold_scale_factor: Optional[float],
+    uses_shared_paged_kv_idx: bool,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    is_var_seq: bool,
+    cute_dsl_impl: str,
+    cum_seq_lens_q: torch.Tensor,
+    max_q_len: int,
+    enable_dcp: bool,
+    cp_world: int,
+    lse_requested: bool,
+) -> str:
+    """Resolve direct ragged execution, probing CuTe only when it can be selected."""
+    trt_var_q_reason = trtllm_gen_not_supported_reason
+
+    # Explicit TRT and auto calls that TRT supports do not need to import
+    # or validate CuTeDSL. Evaluate the fallback only when it can run.
+    cute_dsl_reason: Optional[str] = None
+    if backend == "cute-dsl" or (backend == "auto" and trt_var_q_reason is not None):
+        cute_dsl_reason = _cute_dsl_incompatibility_reason(
+            query,
+            torch.bfloat16,
+            bmm1_scale,
+            bmm2_scale,
+            sinks,
+            sparse_mla_top_k,
+            skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            kv_cache.shape[-2],
+            is_var_seq,
+            cute_dsl_impl=cute_dsl_impl,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+            enable_dcp=enable_dcp,
+            cp_world=cp_world,
         )
 
-    def forward(
-        self,
-        inputs,
-        tactic: int = -1,
-        do_preparation: bool = False,
-        multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
-        **kwargs,
-    ):
-        query, block_tables, seq_lens, out = inputs[:4]
-        sparse_mla_top_k_lens = inputs[4] if len(inputs) == 5 else None
-        batch_size = query.size(0)
-        max_q_len = query.size(1)
-        num_qo_heads = query.size(2)
-        query_flat = query.flatten(0, 1)
-
-        lse_scale = 1.0
-        if self.return_lse:
-            if self.return_lse_base == "basee":
-                lse_scale = 1.0 / log2e
-            lse_shape = (batch_size * max_q_len, num_qo_heads)
-            # Reuse caller's lse when its shape matches the current input
-            # (final dispatcher call); otherwise allocate fresh for the
-            # autotune profile loop (synthetic inputs at bucket batch dims).
-            if self.lse is not None and tuple(self.lse.shape) == lse_shape:
-                lse = self.lse
-            else:
-                lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
-            lse_stride_tokens = lse.stride(0)
-            lse_stride_heads = lse.stride(1)
+    selected_var_q_backend: str
+    if backend == "cute-dsl":
+        if cute_dsl_reason is not None:
+            raise ValueError(cute_dsl_reason)
+        selected_var_q_backend = "cute-dsl"
+    elif backend == "trtllm-gen":
+        if trt_var_q_reason is not None:
+            if lse_requested:
+                raise NotImplementedError(trt_var_q_reason)
+            raise ValueError(trt_var_q_reason)
+        selected_var_q_backend = "trtllm-gen"
+    else:
+        # CuTeDSL fills TRT capability gaps and is the ragged-Q LSE path.
+        if trt_var_q_reason is None:
+            selected_var_q_backend = "trtllm-gen"
+        elif cute_dsl_reason is None:
+            selected_var_q_backend = "cute-dsl"
         else:
-            lse = None
-            lse_stride_tokens = 0
-            lse_stride_heads = 0
-
-        counter_buffer = multi_ctas_kv_counter_buffer
-        if counter_buffer is None:
-            counter_buffer = self._multi_ctas_kv_counter_buffer
-            required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
-                batch_size, num_qo_heads, self.sm_count
+            raise ValueError(
+                "auto: no backend supports this variable-Q configuration "
+                f"(trtllm-gen: {trt_var_q_reason}; "
+                f"cute-dsl: {cute_dsl_reason})"
             )
-            counter_buffer_bytes = (
-                0
-                if counter_buffer is None
-                else counter_buffer.numel() * counter_buffer.element_size()
-            )
-            if counter_buffer is None or counter_buffer_bytes < required_counter_bytes:
-                counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
-                    batch_size,
-                    num_qo_heads,
-                    self.sm_count,
-                    query.device,
-                )
-                self._multi_ctas_kv_counter_buffer = counter_buffer
-        multi_ctas_kv_counter_buffer = counter_buffer
-        self._run(
-            out,
-            None,  # fp4 output (unsupported by wrapper)
-            query_flat,
-            self.kv_cache,
-            self.kv_cache,  # kv passed twice (K/V views over the same buffer)
-            self.workspace_buffer,
-            multi_ctas_kv_counter_buffer,
-            block_tables,
-            seq_lens,
-            max_q_len,
-            self.max_seq_len,
-            self.bmm1_scale,
-            self.bmm2_scale,
-            -1,  # o_sf_scale
-            -1,  # o_sf_vec_size
-            0,  # o_sf_start_index
-            batch_size,
-            -1,  # window_left
-            self.sparse_mla_top_k,
-            self.sm_count,
-            self.enable_pdl,
-            self.workspace_buffer.numel() * self.workspace_buffer.element_size(),
-            self.sinks,
-            None,  # cum_seq_lens_q
-            None,  # key_block_scales
-            None,  # value_block_scales
-            self.skip_softmax_threshold_scale_factor,
-            self.uses_shared_paged_kv_idx,
-            lse,
-            lse_scale,
-            lse_stride_tokens,
-            lse_stride_heads,
-            False,  # enable_block_sparse_attention
-            sparse_mla_top_k_lens,
-            0,  # bf16q_fp8kv_transform_mode
-            self.use_fp16_softmax,
+
+    return selected_var_q_backend
+
+
+def _prepare_mla_uniform_lse(
+    query: torch.Tensor, lse: Optional[torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return a flat backend view and preserve the caller's LSE object for return."""
+    user_lse = lse
+    flat_lse_shape = (query.size(0) * query.size(1), query.size(2))
+    nested_lse_shape = (query.size(0), query.size(1), query.size(2))
+    if lse is None:
+        lse = torch.empty(flat_lse_shape, dtype=torch.float32, device=query.device)
+        user_lse = lse
+    elif tuple(lse.shape) == flat_lse_shape:
+        check_shape_dtype_device(
+            lse, flat_lse_shape, torch.float32, query.device, "lse"
         )
-        return out
-
-
-class CuteDslMlaDecodeRunner(TunableRunner):
-    """Wraps ``cute_dsl_mla_decode`` for the autotuner.
-
-    Only accepts the cute-dsl-compatible parameter subset; the dispatcher's
-    auto path filters out incompatible configurations via
-    ``_cute_dsl_incompatibility_reason`` before constructing this runner.
-
-    Note: cute-dsl uses ``softmax_scale``/``output_scale`` as its parameter
-    names for the bmm1/bmm2 scales. Both are floats only (tensor form is
-    unsupported and filtered out upstream).
-    """
-
-    def __init__(
-        self,
-        *,
-        kv_cache: torch.Tensor,
-        workspace_buffer: torch.Tensor,
-        kv_lora_rank: int,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        max_seq_len: int,
-        softmax_scale: float,
-        output_scale: float,
-        out_dtype: torch.dtype,
-        enable_pdl: bool,
-        is_var_seq: bool,
-        uses_shared_paged_kv_idx: bool,
-        lse: Optional[torch.Tensor],
-        return_lse: bool,
-        return_lse_base: Optional[Literal["basee", "base2"]],
-        sinks: Optional[torch.Tensor],
-        cute_dsl_impl: str,
-        enable_dcp: bool = False,
-        cp_world: int = 1,
-        cp_rank: int = 0,
-    ):
-        from ..cute_dsl.attention import cute_dsl_mla_decode
-
-        self._run = cute_dsl_mla_decode
-        self.kv_cache = kv_cache
-        self.workspace_buffer = workspace_buffer
-        self.kv_lora_rank = kv_lora_rank
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        # kv_cache may be 3D [num_pages, page_size, D] or 4D
-        # [num_pages, 1, page_size, D] after `_check_trtllm_gen_mla_shape` at
-        # dispatcher level — page_size is the second-to-last dim in both.
-        self.page_size = kv_cache.shape[-2]
-        self.max_seq_len = max_seq_len
-        self.softmax_scale = softmax_scale
-        self.output_scale = output_scale
-        self.out_dtype = out_dtype
-        self.enable_pdl = enable_pdl
-        self.is_var_seq = is_var_seq
-        self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
-        self.lse = lse
-        self.return_lse = return_lse
-        self.return_lse_base = return_lse_base
-        self.sinks = sinks
-        self.cute_dsl_impl = cute_dsl_impl
-        self.enable_dcp = enable_dcp
-        self.cp_world = cp_world
-        self.cp_rank = cp_rank
-        self._profile_lse: Optional[torch.Tensor] = None
-        self._workspace_sizer, self._resolved_cute_dsl_impl = (
-            _resolve_cute_dsl_workspace_sizer(cute_dsl_impl, sinks, enable_dcp)
+    elif tuple(lse.shape) == nested_lse_shape:
+        check_shape_dtype_device(
+            lse, nested_lse_shape, torch.float32, query.device, "lse"
         )
-
-    def __hash__(self):
-        # See TrtllmGenMlaDecodeRunner.__hash__ — tactic-determining state is
-        # captured by get_cache_key_extras; the default per-instance hash
-        # would key on `id(kv_cache)` / `id(workspace_buffer)` and break the
-        # autotune cache across dispatcher calls.
-        return hash(type(self))
-
-    def get_valid_tactics(self, inputs, profile) -> List[int]:
-        # Workspace-bound: cute-dsl's per-CTA split-K state grows with B.
-        # If the caller's workspace can't fit batch=B for this profile, opt
-        # out so the autotuner skips us (no JIT cost) and trtllm-gen wins by
-        # default for that bucket.
-        from ..cute_dsl.utils import get_num_sm
-
-        q = inputs[0]
-        B, q_len, num_heads, _ = q.shape
-        _, ws = _call_cute_dsl_workspace_sizer(
-            self._workspace_sizer,
-            self._resolved_cute_dsl_impl,
-            B,
-            q_len,
-            num_heads,
-            self.kv_lora_rank,
-            get_num_sm(q.device),
-            self.max_seq_len,
+        # Normalize to 2D for the backend; .view shares storage so the
+        # kernel writes propagate back to user_lse automatically.
+        lse = lse.view(flat_lse_shape)
+    else:
+        raise ValueError(
+            f"lse must have shape {flat_lse_shape} or {nested_lse_shape}; "
+            f"got {tuple(lse.shape)}"
         )
-        workspace_bytes = (
-            self.workspace_buffer.numel() * self.workspace_buffer.element_size()
-        )
-        if ws > workspace_bytes:
-            return []
-        return [-1]
-
-    def get_cache_key_extras(self, inputs):
-        q, _, _, out = inputs[:4]
-        # Cute-dsl rejects sparse/skip-softmax/tensor-scales upstream, so
-        # those are omitted from extras as constants for this runner.
-        # ``sinks`` and ``cute_dsl_impl`` are included because they flip the
-        # impl (modular vs monolithic) inside ``cute_dsl_mla_decode``.  The
-        # monolithic K-tile count and workspace capacity keep cache hits from
-        # bypassing a different split-workspace validity decision.
-        sinks_key = (
-            None if self.sinks is None else (tuple(self.sinks.shape), self.sinks.dtype)
-        )
-        workspace_bytes = (
-            self.workspace_buffer.numel() * self.workspace_buffer.element_size()
-        )
-        seq_len_workspace_key = (
-            (self.max_seq_len + 127) // 128
-            if self._resolved_cute_dsl_impl == "monolithic"
-            else _round_to_seq_len_bucket(self.max_seq_len)
-        )
-        return (
-            q.dtype,
-            self.kv_cache.dtype,
-            out.dtype,
-            self.qk_nope_head_dim,
-            self.kv_lora_rank,
-            self.qk_rope_head_dim,
-            self.page_size,
-            seq_len_workspace_key,
-            workspace_bytes,
-            self.is_var_seq,
-            self.uses_shared_paged_kv_idx,
-            self.enable_pdl,
-            sinks_key,
-            self.cute_dsl_impl,
-            getattr(self, "enable_dcp", False),
-            getattr(self, "cp_world", 1),
-        )
-
-    def forward(
-        self,
-        inputs,
-        tactic: int = -1,
-        do_preparation: bool = False,
-        **kwargs,
-    ):
-        query, block_tables, seq_lens, out = inputs[:4]
-        causal_seqlens_kv_global = inputs[4] if self.enable_dcp else None
-
-        # LSE is not a tuning input because it does not influence tactic
-        # selection. When a synthetic batch differs from the caller batch,
-        # provide matching temporary storage while retaining the caller's LSE
-        # for the final invocation.
-        lse = self.lse
-        lse_scale = _cute_dsl_monolithic_log_scale(self.return_lse_base)
-        if self.return_lse:
-            expected_numel = query.shape[0] * query.shape[1] * query.shape[2]
-            if lse is None or lse.numel() != expected_numel:
-                expected_shape = (
-                    query.shape[0] * query.shape[1],
-                    query.shape[2],
-                )
-                if (
-                    self._profile_lse is None
-                    or tuple(self._profile_lse.shape) != expected_shape
-                ):
-                    self._profile_lse = torch.empty(
-                        expected_shape,
-                        dtype=torch.float32,
-                        device=query.device,
-                    )
-                lse = self._profile_lse
-        return self._run(
-            query=query,
-            kv_cache=self.kv_cache,
-            workspace_buffer=self.workspace_buffer,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=self.max_seq_len,
-            softmax_scale=self.softmax_scale,
-            output_scale=self.output_scale,
-            out=out,
-            out_dtype=self.out_dtype,
-            is_var_seq=self.is_var_seq,
-            enable_pdl=self.enable_pdl,
-            lse=lse,
-            return_lse=self.return_lse,
-            lse_scale=lse_scale,
-            sinks=self.sinks,
-            cute_dsl_impl=self.cute_dsl_impl,
-            enable_dcp=self.enable_dcp,
-            cp_world=self.cp_world,
-            cp_rank=self.cp_rank,
-            causal_seqlens_kv_global=causal_seqlens_kv_global,
-        )
+    return lse, user_lse
 
 
-def _trtllm_batch_decode_with_kv_cache_mla_impl(
+# Shared public-request validation, cross-backend selection/autotuning and
+# output/LSE return adaptation live here. Backend modules own their capability
+# checks and extracted execution mechanics; remaining backend preparation can
+# migrate separately without changing this dispatch boundary.
+def _mla_with_kv_cache_impl(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
@@ -3843,7 +3488,8 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Decode MLA with Blackwell, TRTLLM-GEN, CuteDSL, XQA, or sparse kernels.
+    r"""Execute MLA decode or prefill through the selected backend:
+    TRTLLM-GEN, CuteDSL, XQA, Cake, or SM120/SM121 sparse kernels.
 
     With ``backend="auto"``, SM100/SM103 devices use TRTLLM-GEN for sparse MLA
     when ``sparse_mla_top_k > 0``. SM120/SM121 devices use the packed sparse
@@ -4085,13 +3731,18 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
 
     Autotune
     --------
-    On SM100/SM103 dense MLA, calling under ``flashinfer.autotune(True)`` with
+    On SM100/SM103/SM107 dense MLA, calling under ``flashinfer.autotune(True)`` with
     ``backend="auto"`` profiles both ``trtllm-gen`` and ``cute-dsl`` when DCP
     is disabled. DCP profiles only its required monolithic CuTeDSL runner.
     Both modes use a bucketed batch sweep up to each runner's kernel/workspace
     cap and cache the winning tactic per shape signature. Subsequent calls under
     ``autotune(False)`` use the cached choice; any batch outside the tuned range
     falls back to the runner's default tactic with a one-time warning.
+    Uniform explicit CuTeDSL requests use the same tuner with one candidate.
+    Explicit TRTLLM-GEN requests enter the tuner only during tuning; inference
+    directly executes its sole tactic. Compact variable-Q requests select an eligible backend directly
+    and do not enter the autotuner. The internal ``autotune`` execution route
+    does not introduce a public functional ``backend="autotune"`` option.
 
     The autotune bucket range and cache key do **not** depend on
     ``kv_cache.shape[0]`` (the number of pages in the pool), so reallocating the
@@ -4104,6 +3755,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     the production page-sharing pattern of your workload (e.g., heavily shared
     prefix → smaller pool; independent contexts → larger pool).
     """
+    # Shared argument validation. Packed sparse inputs keep their own contract.
     if return_lse_base is not None and (
         not isinstance(return_lse_base, str)
         or return_lse_base not in ("basee", "base2")
@@ -4150,7 +3802,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
             "path is available via nvfp4_quantize_append_paged_mla_kv_cache."
         )
 
-    backend = _validate_mla_dcp_args(
+    resolved_backend = _validate_mla_dcp_args(
         query=query,
         backend=backend,
         sinks=sinks,
@@ -4163,53 +3815,520 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         causal_seqlens_kv_global=causal_seqlens_kv_global,
     )
 
+    if resolved_backend not in (
+        "auto",
+        "trtllm-gen",
+        "cute-dsl",
+        "xqa",
+        "sparse",
+        "cake",
+    ):
+        raise ValueError(f"Backend {resolved_backend} not supported")
+
     check_trtllm_gen_sm107_only_feature(
         use_fp16_softmax, "use_fp16_softmax", query.device
     )
 
-    if backend == "cake" and _cake_trtllm_mla_blackwell_supports(
-        query, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, sparse_mla_top_k
-    ):
-        # Two Cake MLA families answer to backend="cake": the TRT-LLM-style Blackwell decode
-        # programs for their generated dimension tuples, and the Kimi-K3 FP8 paged-cache route
-        # (below) for everything else in its contract.
-        from .cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
+    # Resolve architecture policy before applying backend-specific contracts.
+    if resolved_backend == "auto":
+        cc = get_compute_capability(query.device)
+        if cc[0] == 12 and sparse_mla_top_k > 0:
+            resolved_backend = "sparse"
+        elif cc[0] != 10:
+            resolved_backend = "xqa"
 
-        return trtllm_mla_blackwell_decode(
-            query=query,
+    # The native no-rope trtllm-gen/cute-dsl kernels require the per-token
+    # active top-k length; the SM120 sparse backend bounds each row by its
+    # -1 entries instead and does not consume sparse_mla_top_k_lens.
+    if is_nope_mla and resolved_backend not in ("sparse", "cake"):
+        if sparse_mla_top_k <= 0:
+            raise ValueError(
+                "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k > 0"
+            )
+        if sparse_mla_top_k_lens is None:
+            raise ValueError(
+                "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
+            )
+    if sparse_mla_top_k_lens is not None and resolved_backend == "sparse":
+        raise ValueError(
+            "sparse_mla_top_k_lens is not supported by the SM120 sparse MLA "
+            "backend; pass per-token active top-k lengths via seq_lens instead"
+        )
+
+    # Resolve eligibility and fallback without constructing or launching runners.
+    # TRT/CuTe share input normalization. Ragged eligibility precedes shape checks,
+    # whereas uniform eligibility follows them, preserving existing diagnostics.
+    if resolved_backend in ("auto", "trtllm-gen", "cute-dsl"):
+        if seq_lens is None:
+            raise ValueError(
+                "seq_lens is required for trtllm-gen and cute-dsl MLA backends"
+            )
+
+        # Shared setup for the trtllm-gen / cute-dsl autotune dispatch.
+        enable_pdl = (
+            device_support_pdl(query.device) if enable_pdl is None else enable_pdl
+        )
+        sm_count = get_device_sm_count(query.device)
+
+        block_size = kv_cache.size(-2)
+        num_heads_q = query.size(-2)
+        trtllm_gen_not_supported_reason = _trtllm_gen_mla_incompatibility_reason(
+            num_heads_q=num_heads_q,
+            block_size=block_size,
+            has_var_q=cum_seq_lens_q is not None,
+            lse_requested=return_lse or lse is not None,
+        )
+
+        if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
+            raise ValueError("skip_softmax is not supported for sparse MLA")
+
+        has_var_q = cum_seq_lens_q is not None
+        if has_var_q:
+            batch_size, max_q_len = _validate_mla_ragged_query(
+                query, seq_lens, cum_seq_lens_q, max_q_len
+            )
+            resolved_backend = _select_mla_ragged_backend(
+                resolved_backend,
+                trtllm_gen_not_supported_reason,
+                query,
+                kv_cache,
+                bmm1_scale,
+                bmm2_scale,
+                sinks,
+                sparse_mla_top_k,
+                skip_softmax_threshold_scale_factor,
+                uses_shared_paged_kv_idx,
+                qk_rope_head_dim,
+                kv_lora_rank,
+                is_var_seq,
+                cute_dsl_impl,
+                cum_seq_lens_q,
+                max_q_len,
+                enable_dcp,
+                cp_world,
+                return_lse or lse is not None,
+            )
+            kv_cache = _check_mla_functional_shape(
+                query,
+                kv_cache,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                sparse_mla_top_k,
+                block_tables,
+                block_size,
+                uses_shared_paged_kv_idx,
+                batch_size=batch_size,
+                max_q_len=max_q_len,
+                require_aligned_block_table=resolved_backend == "cute-dsl",
+            )
+
+            out = _prepare_trtllm_gen_mla_output(
+                out, query.shape[:-1] + (kv_lora_rank,), query.device
+            )
+
+            if return_lse:
+                expected_lse_shape = (query.size(0), query.size(1))
+                if lse is None:
+                    lse = torch.empty(
+                        expected_lse_shape,
+                        dtype=torch.float32,
+                        device=query.device,
+                    )
+                else:
+                    check_shape_dtype_device(
+                        lse,
+                        expected_lse_shape,
+                        torch.float32,
+                        query.device,
+                        "lse",
+                    )
+
+        else:
+            # Explicit TRT accepts native page-table width; auto and CuTe require alignment.
+            kv_cache = _check_mla_functional_shape(
+                query,
+                kv_cache,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                sparse_mla_top_k,
+                block_tables,
+                block_size,
+                uses_shared_paged_kv_idx,
+                require_aligned_block_table=resolved_backend != "trtllm-gen",
+            )
+
+            # Pre-allocate `out` so non-swept dims have a template for autotune
+            # profiling (the autotuner inherits non-swept dims from caller tensors).
+            out = _prepare_trtllm_gen_mla_output(
+                out, query.shape[:-1] + (kv_lora_rank,), query.device
+            )
+
+            user_lse = lse
+            if return_lse:
+                lse, user_lse = _prepare_mla_uniform_lse(query, lse)
+
+            page_size = kv_cache.shape[-2]
+            cute_dsl_reason = None
+            if resolved_backend != "trtllm-gen":
+                cute_dsl_reason = _cute_dsl_incompatibility_reason(
+                    query,
+                    out.dtype,
+                    bmm1_scale,
+                    bmm2_scale,
+                    sinks,
+                    sparse_mla_top_k,
+                    skip_softmax_threshold_scale_factor,
+                    uses_shared_paged_kv_idx,
+                    qk_rope_head_dim,
+                    kv_lora_rank,
+                    page_size,
+                    is_var_seq,
+                    use_fp16_softmax=use_fp16_softmax,
+                    cute_dsl_impl=cute_dsl_impl,
+                    enable_dcp=enable_dcp,
+                    cp_world=cp_world,
+                )
+            if resolved_backend == "cute-dsl":
+                if cute_dsl_reason is not None:
+                    raise ValueError(cute_dsl_reason)
+                runner_names = ["cute-dsl"]
+            elif resolved_backend == "trtllm-gen":
+                if trtllm_gen_not_supported_reason is not None:
+                    raise ValueError(trtllm_gen_not_supported_reason)
+                runner_names = ["trtllm-gen"]
+            else:  # resolved_backend == "auto"
+                runner_names = []
+                if trtllm_gen_not_supported_reason is None:
+                    runner_names.append("trtllm-gen")
+                if cute_dsl_reason is None:
+                    runner_names.append("cute-dsl")
+                if not runner_names:
+                    raise ValueError(
+                        f"auto: no backend supports this configuration "
+                        f"(trtllm-gen: {trtllm_gen_not_supported_reason}; "
+                        f"cute-dsl: {cute_dsl_reason})"
+                    )
+
+            resolved_backend = "autotune"
+
+    # Execute the resolved route. Selection policy and candidate execution remain separate.
+    if resolved_backend == "autotune":
+        if (
+            multi_ctas_kv_counter_buffer is not None
+            and "trtllm-gen" not in runner_names
+        ):
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer is only supported when a trtllm-gen runner is selected"
+            )
+        if multi_ctas_kv_counter_buffer is not None:
+            multi_ctas_kv_counter_buffer = (
+                _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
+                    multi_ctas_kv_counter_buffer,
+                    query.size(0),
+                    query.size(2),
+                    sm_count,
+                    query.device,
+                )
+            )
+
+        runners: List[TunableRunner] = []
+        if "trtllm-gen" in runner_names:
+            # The TRT adapter lowers tensor scales once before profiling/launch.
+            runners.append(
+                _BatchMLAPagedAttentionTrtllmGenBackend.from_functional(
+                    kv_cache=kv_cache,
+                    workspace_buffer=workspace_buffer,
+                    sm_count=sm_count,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    max_seq_len=max_seq_len,
+                    sparse_mla_top_k=sparse_mla_top_k,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    sinks=sinks,
+                    skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                    enable_pdl=enable_pdl,
+                    is_var_seq=is_var_seq,
+                    uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                    return_lse=return_lse,
+                    lse=lse,
+                    return_lse_base=return_lse_base,
+                    use_fp16_softmax=use_fp16_softmax,
+                )
+            )
+        if "cute-dsl" in runner_names:
+            # Normalize sinks: public contract accepts Optional[List[Tensor]] for
+            # legacy reasons, but cute-dsl's modular variant expects a single
+            # per-head tensor or None. The list-of-1 case has been guarded by
+            # `_cute_dsl_incompatibility_reason` so we can unpack here safely.
+            cute_dsl_sinks: Optional[torch.Tensor] = None
+            if sinks is not None:
+                cute_dsl_sinks = sinks[0] if isinstance(sinks, (list, tuple)) else sinks
+            from ..cute_dsl.attention.mla_dispatch import _resolve_impl
+
+            resolved_impl = _resolve_impl(
+                requested=cute_dsl_impl,
+                kwargs={"sinks": cute_dsl_sinks, "enable_dcp": enable_dcp},
+            )
+            # Each resolved CuTe implementation owns its functional adapter.
+            cute_runner_factory = (
+                _BatchMLAPagedAttentionCuteDslMonolithicBackend.from_functional
+                if resolved_impl == "monolithic"
+                else _BatchMLAPagedAttentionCuteDslModularBackend.from_functional
+            )
+            runners.append(
+                cute_runner_factory(
+                    kv_cache=kv_cache,
+                    workspace_buffer=workspace_buffer,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    max_seq_len=max_seq_len,
+                    softmax_scale=bmm1_scale,
+                    output_scale=bmm2_scale,
+                    out_dtype=out.dtype,
+                    enable_pdl=enable_pdl,
+                    is_var_seq=is_var_seq,
+                    uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                    lse=lse,
+                    return_lse=return_lse,
+                    return_lse_base=return_lse_base,
+                    sinks=cute_dsl_sinks,
+                    cute_dsl_impl=cute_dsl_impl,
+                    enable_dcp=enable_dcp,
+                    cp_world=cp_world,
+                    cp_rank=cp_rank,
+                )
+            )
+
+        inputs = [query, block_tables, seq_lens, out]
+        if sparse_mla_top_k_lens is not None:
+            inputs.append(sparse_mla_top_k_lens)
+        elif enable_dcp:
+            # The global causal bound varies with batch and must be synthesized
+            # alongside the other batch-shaped tensors during autotuning.
+            inputs.append(causal_seqlens_kv_global)
+        tuner = AutoTuner.get()
+        if backend == "trtllm-gen" and not tuner.is_tuning_mode:
+            # Explicit TRT has one implementation and only tactic -1. Keep
+            # profiling inside autotune(), but inference needs no selection.
+            runner, tactic = runners[0], -1
+        else:
+            _, q_len, num_heads, _ = query.shape
+            tuning_config = _build_mla_decode_tuning_config(
+                kv_cache=kv_cache,
+                block_tables=block_tables,
+                workspace_buffer=workspace_buffer,
+                runner_names=runner_names,
+                q_len=q_len,
+                num_heads=num_heads,
+                kv_lora_rank=kv_lora_rank,
+                max_seq_len=max_seq_len,
+                device=query.device,
+                has_sparse_mla_top_k_lens=sparse_mla_top_k_lens is not None,
+                cute_dsl_impl=cute_dsl_impl,
+                sinks=sinks,
+                enable_dcp=enable_dcp,
+                cp_world=cp_world,
+                cp_rank=cp_rank,
+            )
+            runner, tactic = tuner.choose_one(
+                "trtllm_batch_decode_mla",
+                runners,
+                tuning_config,
+                inputs,
+            )
+        if isinstance(runner, _BatchMLAPagedAttentionTrtllmGenBackend):
+            runner(
+                inputs=inputs,
+                tactic=tactic,
+                multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+            )
+        else:
+            runner(inputs=inputs, tactic=tactic)
+        # Return the original 2D/3D caller object, or the allocated flat default.
+        return (out, user_lse) if return_lse else out
+    elif resolved_backend == "trtllm-gen":
+        # Validate caller storage before acquiring the executable, preserving
+        # public error ordering. The runner owns allocation when none is supplied.
+        if multi_ctas_kv_counter_buffer is not None:
+            multi_ctas_kv_counter_buffer = (
+                _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
+                    multi_ctas_kv_counter_buffer,
+                    batch_size,
+                    query.size(1),
+                    sm_count,
+                    query.device,
+                )
+            )
+        runner = _BatchMLAPagedAttentionTrtllmGenBackend.from_functional(
             kv_cache=kv_cache,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
+            workspace_buffer=workspace_buffer,
+            sm_count=sm_count,
             qk_nope_head_dim=qk_nope_head_dim,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
+            max_seq_len=max_seq_len,
             sparse_mla_top_k=sparse_mla_top_k,
-            out=out,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             sinks=sinks,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
             enable_pdl=enable_pdl,
+            is_var_seq=is_var_seq,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            return_lse=False,
+            lse=None,
+            return_lse_base=return_lse_base,
+            use_fp16_softmax=use_fp16_softmax,
+        )
+        inputs = [query, block_tables, seq_lens, out]
+        if sparse_mla_top_k_lens is not None:
+            inputs.append(sparse_mla_top_k_lens)
+        return runner(
+            inputs=inputs,
+            tactic=-1,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_q_len=max_q_len,
+        )
+
+    elif resolved_backend == "cute-dsl":
+        if multi_ctas_kv_counter_buffer is not None:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer is only supported by the "
+                "trtllm-gen backend"
+            )
+        # Compact variable-Q has already resolved to monolithic CuTe. Execute
+        # the same backend directly, without functional batch-bucket tuning.
+        runner = _BatchMLAPagedAttentionCuteDslMonolithicBackend.from_functional(
+            kv_cache=kv_cache,
+            workspace_buffer=workspace_buffer,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            max_seq_len=max_seq_len,
+            softmax_scale=bmm1_scale,
+            output_scale=bmm2_scale,
+            out_dtype=out.dtype,
+            is_var_seq=is_var_seq,
+            enable_pdl=enable_pdl,
             uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
             lse=lse,
             return_lse=return_lse,
+            return_lse_base=return_lse_base,
+            sinks=None,
+            cute_dsl_impl=cute_dsl_impl,
+            enable_dcp=enable_dcp,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
+        )
+        inputs = [query, block_tables, seq_lens, out]
+        if enable_dcp:
+            inputs.append(causal_seqlens_kv_global)
+        return runner(
+            inputs=inputs,
+            tactic=-1,
             cum_seq_lens_q=cum_seq_lens_q,
             max_q_len=max_q_len,
-            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
-            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
-            enable_dcp=enable_dcp,
-            backend="cake",
         )
 
-    if backend == "auto":
-        cc = get_compute_capability(query.device)
-        if cc[0] == 12 and sparse_mla_top_k > 0:
-            backend = "sparse"
-        elif cc[0] != 10:
-            backend = "xqa"
+    elif resolved_backend == "xqa":
+        if multi_ctas_kv_counter_buffer is not None:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer is only supported by the trtllm-gen backend"
+            )
+        if seq_lens is None:
+            raise ValueError("seq_lens is required for XQA MLA")
+        if sparse_mla_top_k > 0:
+            raise ValueError("XQA MLA does not support sparse_mla_top_k")
+        if cum_seq_lens_q is not None or max_q_len is not None:
+            raise ValueError("XQA MLA does not support cum_seq_lens_q / max_q_len")
+        if not is_sm12x_supported(query.device):
+            raise ValueError(
+                "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 12.9)"
+            )
+        fp8_ok = (
+            query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
+        )
+        bf16_ok = query.dtype == torch.bfloat16 and kv_cache.dtype == torch.bfloat16
+        if not (fp8_ok or bf16_ok):
+            raise ValueError(
+                f"XQA MLA on SM120/SM121 supports (fp8, fp8) or (bfloat16, bfloat16) only, got {query.dtype} and {kv_cache.dtype}"
+            )
+        if sinks is not None:
+            raise ValueError("XQA MLA does not support sinks")
+        if query.size(1) != 1:
+            raise ValueError(
+                f"XQA MLA only supports q_len_per_request == 1, got {query.size(1)}"
+            )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError("skip_softmax is not supported for XQA backend")
+        if not uses_shared_paged_kv_idx:
+            raise ValueError(
+                "XQA MLA does not support separate KV page indices (uses_shared_paged_kv_idx=False)"
+            )
+        if use_fp16_softmax:
+            raise ValueError(
+                "use_fp16_softmax is only supported by backend='trtllm-gen'"
+            )
+        if return_lse or lse is not None:
+            raise NotImplementedError(
+                "XQA MLA backend does not support return_lse/lse output"
+            )
+        return xqa_batch_decode_with_kv_cache_mla(
+            query,
+            kv_cache,
+            workspace_buffer,
+            -1,  # Unused, marked for removal.
+            kv_lora_rank,
+            qk_rope_head_dim,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            out,
+            bmm1_scale,
+            bmm2_scale,
+            sinks,
+            enable_pdl,
+        )
+    elif resolved_backend == "cake":
+        if _cake_trtllm_mla_blackwell_supports(
+            query, qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, sparse_mla_top_k
+        ):
+            # Two Cake MLA families answer to backend="cake": the TRT-LLM-style Blackwell decode
+            # programs for their generated dimension tuples, and the Kimi-K3 FP8 paged-cache route
+            # (below) for everything else in its contract.
+            from .cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
 
-    if backend == "cake":
+            return trtllm_mla_blackwell_decode(
+                query=query,
+                kv_cache=kv_cache,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=max_seq_len,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                sparse_mla_top_k=sparse_mla_top_k,
+                out=out,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                sinks=sinks,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                enable_pdl=enable_pdl,
+                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                lse=lse,
+                return_lse=return_lse,
+                cum_seq_lens_q=cum_seq_lens_q,
+                max_q_len=max_q_len,
+                multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+                sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+                enable_dcp=enable_dcp,
+                backend="cake",
+            )
+
         # Cake-generated Kimi-K3 MLA over the FP8 paged latent cache (SM100 / SM103): dense
         # decode, packed variable-Q / MTP and incremental prefill; BF16 output, caller-owned
         # ``out``, current stream, CUDA-Graph replayable.  Unsupported here: sparse top-k,
@@ -4270,87 +4389,10 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
             max_seq_len=int(max_seq_len),
         )
 
-    # The native no-rope trtllm-gen/cute-dsl kernels require the per-token
-    # active top-k length; the SM120 sparse backend bounds each row by its
-    # -1 entries instead and does not consume sparse_mla_top_k_lens.
-    if is_nope_mla and backend != "sparse":
-        if sparse_mla_top_k <= 0:
-            raise ValueError(
-                "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k > 0"
-            )
-        if sparse_mla_top_k_lens is None:
-            raise ValueError(
-                "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
-            )
-    if sparse_mla_top_k_lens is not None and backend == "sparse":
-        raise ValueError(
-            "sparse_mla_top_k_lens is not supported by the SM120 sparse MLA "
-            "backend; pass per-token active top-k lengths via seq_lens instead"
-        )
-
-    if backend == "xqa":
-        if multi_ctas_kv_counter_buffer is not None:
-            raise ValueError(
-                "multi_ctas_kv_counter_buffer is only supported by the trtllm-gen backend"
-            )
-        if seq_lens is None:
-            raise ValueError("seq_lens is required for XQA MLA")
-        if sparse_mla_top_k > 0:
-            raise ValueError("XQA MLA does not support sparse_mla_top_k")
-        if cum_seq_lens_q is not None or max_q_len is not None:
-            raise ValueError("XQA MLA does not support cum_seq_lens_q / max_q_len")
-        if not is_sm12x_supported(query.device):
-            raise ValueError(
-                "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 12.9)"
-            )
-        fp8_ok = (
-            query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
-        )
-        bf16_ok = query.dtype == torch.bfloat16 and kv_cache.dtype == torch.bfloat16
-        if not (fp8_ok or bf16_ok):
-            raise ValueError(
-                f"XQA MLA on SM120/SM121 supports (fp8, fp8) or (bfloat16, bfloat16) only, got {query.dtype} and {kv_cache.dtype}"
-            )
-        if sinks is not None:
-            raise ValueError("XQA MLA does not support sinks")
-        if query.size(1) != 1:
-            raise ValueError(
-                f"XQA MLA only supports q_len_per_request == 1, got {query.size(1)}"
-            )
-        if skip_softmax_threshold_scale_factor is not None:
-            raise ValueError("skip_softmax is not supported for XQA backend")
-        if not uses_shared_paged_kv_idx:
-            raise ValueError(
-                "XQA MLA does not support separate KV page indices (uses_shared_paged_kv_idx=False)"
-            )
-        if use_fp16_softmax:
-            raise ValueError(
-                "use_fp16_softmax is only supported by backend='trtllm-gen'"
-            )
-        if return_lse or lse is not None:
-            raise NotImplementedError(
-                "XQA MLA backend does not support return_lse/lse output"
-            )
-        return xqa_batch_decode_with_kv_cache_mla(
-            query,
-            kv_cache,
-            workspace_buffer,
-            -1,  # Unused, marked for removal.
-            kv_lora_rank,
-            qk_rope_head_dim,
-            block_tables,
-            seq_lens,
-            max_seq_len,
-            out,
-            bmm1_scale,
-            bmm2_scale,
-            sinks,
-            enable_pdl,
-        )
-    if backend not in ("auto", "trtllm-gen", "cute-dsl", "sparse"):
-        raise ValueError(f"Backend {backend} not supported")
-
-    if backend == "sparse":
+    elif resolved_backend == "sparse":
+        # Packed SM120/SM121 sparse MLA only, despite the helper's legacy
+        # "_trtllm_" name. TRTLLM-GEN dense and native sparse MLA use the
+        # TRT runner paths above.
         if multi_ctas_kv_counter_buffer is not None:
             raise ValueError(
                 "multi_ctas_kv_counter_buffer is only supported by the trtllm-gen backend"
@@ -4380,479 +4422,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
             kv_scale_format=kv_scale_format,
         )
 
-    if seq_lens is None:
-        raise ValueError(
-            "seq_lens is required for trtllm-gen and cute-dsl MLA backends"
-        )
-
-    # log2e fusion is a trtllm-gen-only transform (the kernel expects
-    # log2-form scales for the tensor case). Apply after the xqa branch so
-    # that calling this function with backend="xqa" and calling
-    # xqa_batch_decode_with_kv_cache_mla directly yield the same kernel input.
-    if isinstance(bmm1_scale, torch.Tensor):
-        bmm1_scale = bmm1_scale * log2e
-
-    # Shared setup for the trtllm-gen / cute-dsl autotune dispatch.
-    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
-    sm_count = get_device_sm_count(query.device)
-
-    block_size = kv_cache.size(-2)
-    num_heads_q = query.size(-2)
-    trtllm_gen_not_supported_reason: Optional[str] = None
-    if 64 < num_heads_q < 128:
-        trtllm_gen_not_supported_reason = (
-            "trtllm-gen MLA decode does not support "
-            f"64 < num_heads_q < 128; got num_heads_q={num_heads_q}. "
-            "Use backend='cute-dsl' instead when the remaining configuration "
-            "is CuTeDSL-compatible."
-        )
-    elif block_size != 32 and block_size != 64:
-        trtllm_gen_not_supported_reason = (
-            f"trtllm-gen requires block_size in (32, 64), got {block_size}"
-        )
-
-    if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
-        raise ValueError("skip_softmax is not supported for sparse MLA")
-
-    has_var_q = cum_seq_lens_q is not None
-    if has_var_q:
-        if query.ndim != 3:
-            raise ValueError(
-                "query must have shape [total_q, num_heads, head_dim_qk] "
-                "when cum_seq_lens_q is provided"
-            )
-        check_shape_dtype_device(
-            cum_seq_lens_q,
-            None,
-            torch.int32,
-            query.device,
-            "cum_seq_lens_q",
-        )
-        if cum_seq_lens_q.ndim != 1:
-            raise ValueError(
-                f"Expected cum_seq_lens_q.ndim == 1, got {cum_seq_lens_q.ndim}"
-            )
-        if cum_seq_lens_q.size(0) < 2:
-            raise ValueError("cum_seq_lens_q must contain at least two entries")
-        batch_size = cum_seq_lens_q.size(0) - 1
-        if batch_size != seq_lens.size(0):
-            raise ValueError(
-                "Batch size mismatch: cum_seq_lens_q describes "
-                f"{batch_size} sequences, but seq_lens has {seq_lens.size(0)} entries"
-            )
-        if max_q_len is None:
-            cum_seq_lens_q_host = cum_seq_lens_q.cpu()
-            if cum_seq_lens_q_host[0].item() != 0:
-                raise ValueError("cum_seq_lens_q must start with 0")
-            if cum_seq_lens_q_host[-1].item() != query.size(0):
-                raise ValueError(
-                    "cum_seq_lens_q[-1] must match the flattened query length"
-                )
-            q_lens = cum_seq_lens_q_host[1:] - cum_seq_lens_q_host[:-1]
-            if torch.any(q_lens < 0).item():
-                raise ValueError("cum_seq_lens_q must be monotonically non-decreasing")
-            max_q_len = q_lens.max().item()
-            if max_q_len <= 0:
-                raise ValueError(
-                    "cum_seq_lens_q must describe at least one query token"
-                )
-        elif max_q_len <= 0:
-            raise ValueError("max_q_len must be greater than 0")
-
-        trt_var_q_reason = trtllm_gen_not_supported_reason
-        if return_lse or lse is not None:
-            trt_var_q_reason = (
-                "trtllm-gen MLA does not support return_lse/lse with cum_seq_lens_q"
-            )
-
-        # Explicit TRT and auto calls that TRT supports do not need to import
-        # or validate CuTeDSL. Evaluate the fallback only when it can run.
-        cute_dsl_reason: Optional[str] = None
-        if backend == "cute-dsl" or (
-            backend == "auto" and trt_var_q_reason is not None
-        ):
-            cute_dsl_reason = _cute_dsl_incompatibility_reason(
-                query,
-                torch.bfloat16,
-                bmm1_scale,
-                bmm2_scale,
-                sinks,
-                sparse_mla_top_k,
-                skip_softmax_threshold_scale_factor,
-                uses_shared_paged_kv_idx,
-                qk_rope_head_dim,
-                kv_lora_rank,
-                kv_cache.shape[-2],
-                is_var_seq,
-                cute_dsl_impl=cute_dsl_impl,
-                cum_seq_lens_q=cum_seq_lens_q,
-                max_q_len=max_q_len,
-                enable_dcp=enable_dcp,
-                cp_world=cp_world,
-            )
-
-        selected_var_q_backend: str
-        if backend == "cute-dsl":
-            if cute_dsl_reason is not None:
-                raise ValueError(cute_dsl_reason)
-            selected_var_q_backend = "cute-dsl"
-        elif backend == "trtllm-gen":
-            if trt_var_q_reason is not None:
-                if return_lse or lse is not None:
-                    raise NotImplementedError(trt_var_q_reason)
-                raise ValueError(trt_var_q_reason)
-            selected_var_q_backend = "trtllm-gen"
-        else:
-            # CuTeDSL fills TRT capability gaps and is the ragged-Q LSE path.
-            if trt_var_q_reason is None:
-                selected_var_q_backend = "trtllm-gen"
-            elif cute_dsl_reason is None:
-                selected_var_q_backend = "cute-dsl"
-            else:
-                raise ValueError(
-                    "auto: no backend supports this variable-Q configuration "
-                    f"(trtllm-gen: {trt_var_q_reason}; "
-                    f"cute-dsl: {cute_dsl_reason})"
-                )
-
-        kv_cache = _check_trtllm_gen_mla_shape(
-            query,
-            kv_cache,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            sparse_mla_top_k,
-            block_tables,
-            block_size,
-            uses_shared_paged_kv_idx,
-            batch_size=batch_size,
-            max_q_len=max_q_len,
-            require_aligned_block_table=selected_var_q_backend == "cute-dsl",
-        )
-
-        expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
-        if out is None:
-            out = torch.empty(
-                expected_out_shape, dtype=torch.bfloat16, device=query.device
-            )
-        else:
-            check_shape_dtype_device(
-                out,
-                expected_out_shape,
-                torch.bfloat16,
-                query.device,
-                "out",
-            )
-
-        if return_lse:
-            expected_lse_shape = (query.size(0), query.size(1))
-            if lse is None:
-                lse = torch.empty(
-                    expected_lse_shape,
-                    dtype=torch.float32,
-                    device=query.device,
-                )
-            else:
-                check_shape_dtype_device(
-                    lse,
-                    expected_lse_shape,
-                    torch.float32,
-                    query.device,
-                    "lse",
-                )
-
-        if selected_var_q_backend == "cute-dsl":
-            lse_scale = _cute_dsl_monolithic_log_scale(return_lse_base)
-            if multi_ctas_kv_counter_buffer is not None:
-                raise ValueError(
-                    "multi_ctas_kv_counter_buffer is only supported by the "
-                    "trtllm-gen backend"
-                )
-            from ..cute_dsl.attention import cute_dsl_mla_decode
-
-            return cute_dsl_mla_decode(
-                query=query,
-                kv_cache=kv_cache,
-                workspace_buffer=workspace_buffer,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                block_tables=block_tables,
-                seq_lens=seq_lens,
-                max_seq_len=max_seq_len,
-                softmax_scale=bmm1_scale,
-                output_scale=bmm2_scale,
-                out=out,
-                is_var_seq=is_var_seq,
-                enable_pdl=enable_pdl,
-                lse=lse,
-                return_lse=return_lse,
-                lse_scale=lse_scale,
-                cute_dsl_impl=cute_dsl_impl,
-                cum_seq_lens_q=cum_seq_lens_q,
-                max_q_len=max_q_len,
-                enable_dcp=enable_dcp,
-                cp_world=cp_world,
-                cp_rank=cp_rank,
-                causal_seqlens_kv_global=causal_seqlens_kv_global,
-            )
-
-        multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
-            multi_ctas_kv_counter_buffer,
-            batch_size,
-            query.size(1),
-            sm_count,
-            query.device,
-        )
-        get_trtllm_gen_fmha_module().trtllm_paged_attention_decode(
-            out,
-            None,  # fp4 output (unsupported by wrapper)
-            query,
-            kv_cache,
-            kv_cache,
-            workspace_buffer,
-            multi_ctas_kv_counter_buffer,
-            block_tables,
-            seq_lens,
-            max_q_len,
-            max_seq_len,
-            bmm1_scale,
-            bmm2_scale,
-            -1,  # o_sf_scale
-            -1,  # o_sf_vec_size
-            0,  # o_sf_start_index
-            batch_size,
-            -1,  # window_left
-            sparse_mla_top_k,
-            sm_count,
-            enable_pdl,
-            workspace_buffer.numel() * workspace_buffer.element_size(),
-            sinks,
-            cum_seq_lens_q,
-            None,  # key_block_scales
-            None,  # value_block_scales
-            skip_softmax_threshold_scale_factor,
-            uses_shared_paged_kv_idx,
-            None,  # lse
-            1.0,  # lse_scale
-            0,  # lse_stride_tokens
-            0,  # lse_stride_heads
-            False,  # enable_block_sparse_attention
-            sparse_mla_top_k_lens,
-            0,  # bf16q_fp8kv_transform_mode
-            use_fp16_softmax,
-        )
-        return out
-
-    # Normalize kv_cache to 4D and validate MLA dimensions. Despite the name,
-    # the shape/dim checks here apply to both backends.
-    kv_cache = _check_trtllm_gen_mla_shape(
-        query,
-        kv_cache,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        sparse_mla_top_k,
-        block_tables,
-        block_size,
-        uses_shared_paged_kv_idx,
-        require_aligned_block_table=backend != "trtllm-gen",
-    )
-
-    # Pre-allocate `out` so non-swept dims have a template for autotune
-    # profiling (the autotuner inherits non-swept dims from caller tensors).
-    expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
-    if out is None:
-        out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=query.device)
-    else:
-        check_shape_dtype_device(
-            out,
-            expected_out_shape,
-            torch.bfloat16,
-            query.device,
-            "out",
-        )
-
-    # Remember the caller-supplied lse so we can return it in its original
-    # shape: 2D ``(B*q_len, H)`` stays 2D, 3D ``(B, q_len, H)`` stays 3D, and
-    # an allocated default stays 2D.  Internally we normalize to 2D for the
-    # backend dispatch (matches trtllm-gen's native layout).
-    user_lse = lse
-    if return_lse:
-        flat_lse_shape = (query.size(0) * query.size(1), query.size(2))
-        nested_lse_shape = (query.size(0), query.size(1), query.size(2))
-        if lse is None:
-            lse = torch.empty(flat_lse_shape, dtype=torch.float32, device=query.device)
-            user_lse = lse
-        elif tuple(lse.shape) == flat_lse_shape:
-            check_shape_dtype_device(
-                lse, flat_lse_shape, torch.float32, query.device, "lse"
-            )
-        elif tuple(lse.shape) == nested_lse_shape:
-            check_shape_dtype_device(
-                lse, nested_lse_shape, torch.float32, query.device, "lse"
-            )
-            # Normalize to 2D for the backend; .view shares storage so the
-            # kernel writes propagate back to user_lse automatically.
-            lse = lse.view(flat_lse_shape)
-        else:
-            raise ValueError(
-                f"lse must have shape {flat_lse_shape} or {nested_lse_shape}; "
-                f"got {tuple(lse.shape)}"
-            )
-
-    page_size = kv_cache.shape[-2]
-    cute_dsl_reason = _cute_dsl_incompatibility_reason(
-        query,
-        out.dtype,
-        bmm1_scale,
-        bmm2_scale,
-        sinks,
-        sparse_mla_top_k,
-        skip_softmax_threshold_scale_factor,
-        uses_shared_paged_kv_idx,
-        qk_rope_head_dim,
-        kv_lora_rank,
-        page_size,
-        is_var_seq,
-        use_fp16_softmax=use_fp16_softmax,
-        cute_dsl_impl=cute_dsl_impl,
-        enable_dcp=enable_dcp,
-        cp_world=cp_world,
-    )
-    if backend == "cute-dsl":
-        if cute_dsl_reason is not None:
-            raise ValueError(cute_dsl_reason)
-        runner_names = ["cute-dsl"]
-    elif backend == "trtllm-gen":
-        if trtllm_gen_not_supported_reason is not None:
-            raise ValueError(trtllm_gen_not_supported_reason)
-        runner_names = ["trtllm-gen"]
-    else:  # backend == "auto"
-        runner_names = []
-        if trtllm_gen_not_supported_reason is None:
-            runner_names.append("trtllm-gen")
-        if cute_dsl_reason is None:
-            runner_names.append("cute-dsl")
-        if not runner_names:
-            raise ValueError(
-                f"auto: no backend supports this configuration "
-                f"(trtllm-gen: {trtllm_gen_not_supported_reason}; "
-                f"cute-dsl: {cute_dsl_reason})"
-            )
-
-    if multi_ctas_kv_counter_buffer is not None and "trtllm-gen" not in runner_names:
-        raise ValueError(
-            "multi_ctas_kv_counter_buffer is only supported when a trtllm-gen runner is selected"
-        )
-    if multi_ctas_kv_counter_buffer is not None:
-        multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
-            multi_ctas_kv_counter_buffer,
-            query.size(0),
-            query.size(2),
-            sm_count,
-            query.device,
-        )
-
-    runners: List[TunableRunner] = []
-    if "trtllm-gen" in runner_names:
-        runners.append(
-            TrtllmGenMlaDecodeRunner(
-                kv_cache=kv_cache,
-                workspace_buffer=workspace_buffer,
-                sm_count=sm_count,
-                qk_nope_head_dim=qk_nope_head_dim,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                max_seq_len=max_seq_len,
-                sparse_mla_top_k=sparse_mla_top_k,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-                sinks=sinks,
-                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-                enable_pdl=enable_pdl,
-                is_var_seq=is_var_seq,
-                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
-                return_lse=return_lse,
-                lse=lse,
-                return_lse_base=return_lse_base,
-                use_fp16_softmax=use_fp16_softmax,
-            )
-        )
-    if "cute-dsl" in runner_names:
-        # Normalize sinks: public contract accepts Optional[List[Tensor]] for
-        # legacy reasons, but cute-dsl's modular variant expects a single
-        # per-head tensor or None. The list-of-1 case has been guarded by
-        # `_cute_dsl_incompatibility_reason` so we can unpack here safely.
-        cute_dsl_sinks: Optional[torch.Tensor] = None
-        if sinks is not None:
-            cute_dsl_sinks = sinks[0] if isinstance(sinks, (list, tuple)) else sinks
-        runners.append(
-            CuteDslMlaDecodeRunner(
-                kv_cache=kv_cache,
-                workspace_buffer=workspace_buffer,
-                kv_lora_rank=kv_lora_rank,
-                qk_nope_head_dim=qk_nope_head_dim,
-                qk_rope_head_dim=qk_rope_head_dim,
-                max_seq_len=max_seq_len,
-                softmax_scale=bmm1_scale,
-                output_scale=bmm2_scale,
-                out_dtype=out.dtype,
-                enable_pdl=enable_pdl,
-                is_var_seq=is_var_seq,
-                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
-                lse=lse,
-                return_lse=return_lse,
-                return_lse_base=return_lse_base,
-                sinks=cute_dsl_sinks,
-                cute_dsl_impl=cute_dsl_impl,
-                enable_dcp=enable_dcp,
-                cp_world=cp_world,
-                cp_rank=cp_rank,
-            )
-        )
-
-    _, q_len, num_heads, _ = query.shape
-    tuning_config = _build_mla_decode_tuning_config(
-        kv_cache=kv_cache,
-        block_tables=block_tables,
-        workspace_buffer=workspace_buffer,
-        runner_names=runner_names,
-        q_len=q_len,
-        num_heads=num_heads,
-        kv_lora_rank=kv_lora_rank,
-        max_seq_len=max_seq_len,
-        device=query.device,
-        has_sparse_mla_top_k_lens=sparse_mla_top_k_lens is not None,
-        cute_dsl_impl=cute_dsl_impl,
-        sinks=sinks,
-        enable_dcp=enable_dcp,
-        cp_world=cp_world,
-        cp_rank=cp_rank,
-    )
-    inputs = [query, block_tables, seq_lens, out]
-    if sparse_mla_top_k_lens is not None:
-        inputs.append(sparse_mla_top_k_lens)
-    elif enable_dcp:
-        # The global causal bound varies with batch and must be synthesized
-        # alongside the other batch-shaped tensors during autotuning.
-        inputs.append(causal_seqlens_kv_global)
-    runner, tactic = AutoTuner.get().choose_one(
-        "trtllm_batch_decode_mla",
-        runners,
-        tuning_config,
-        inputs,
-    )
-    if isinstance(runner, TrtllmGenMlaDecodeRunner):
-        runner(
-            inputs=inputs,
-            tactic=tactic,
-            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
-        )
-    else:
-        runner(inputs=inputs, tactic=tactic)
-    if return_lse:
-        # Return the lse in the same shape the caller supplied (2D or 3D),
-        # or 2D ``(B*q_len, H)`` when we allocated the default.
-        return out, user_lse
-    return out
+    raise AssertionError(f"Unresolved MLA route: {resolved_backend}")
 
 
 @flashinfer_api(trace=trtllm_batch_decode_mla_trace_dispatch)
@@ -4891,8 +4461,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """See :func:`_trtllm_batch_decode_with_kv_cache_mla_impl` for parameter documentation."""
-    return _trtllm_batch_decode_with_kv_cache_mla_impl(
+    """See :func:`_mla_with_kv_cache_impl` for parameter documentation."""
+    return _mla_with_kv_cache_impl(
         query=query,
         kv_cache=kv_cache,
         workspace_buffer=workspace_buffer,
@@ -4929,9 +4499,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     )
 
 
-trtllm_batch_decode_with_kv_cache_mla.__doc__ = (
-    _trtllm_batch_decode_with_kv_cache_mla_impl.__doc__
-)
+trtllm_batch_decode_with_kv_cache_mla.__doc__ = _mla_with_kv_cache_impl.__doc__
 
 
 @flashinfer_experimental_api
@@ -5269,7 +4837,7 @@ def trtllm_prefill_with_kv_cache_mla(
     :func:`trtllm_batch_decode_with_kv_cache_mla` for complete parameter and
     return-value documentation.
     """
-    return _trtllm_batch_decode_with_kv_cache_mla_impl(
+    return _mla_with_kv_cache_impl(
         query=query,
         kv_cache=kv_cache,
         workspace_buffer=workspace_buffer,
@@ -5393,41 +4961,17 @@ def xqa_batch_decode_with_kv_cache_mla(
     ``(bmm1_scale_log2_tensor, bmm2_scale_tensor)`` tensor pair may be passed.
     When tensor inputs are supplied, the on-device path is taken (FP8 only).
     """
-    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
-    sm_count = get_device_sm_count(query.device)
-
-    # Extract block_size (works for both 3D and 4D)
-    block_size = kv_cache.size(-2)
-    q_len_per_request = query.size(1)
-    if q_len_per_request != 1:
-        raise ValueError(
-            f"XQA MLA only supports q_len_per_request == 1, got {q_len_per_request}"
-        )
-    if not is_sm12x_supported(query.device):
-        raise ValueError(
-            "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 12.9)"
-        )
-    fp8_ok = (
-        query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
-    )
-    bf16_ok = query.dtype == torch.bfloat16 and kv_cache.dtype == torch.bfloat16
-    if not (fp8_ok or bf16_ok):
-        raise ValueError(
-            f"XQA MLA supports (fp8, fp8) or (bfloat16, bfloat16) only, got {query.dtype} and {kv_cache.dtype}"
-        )
-    if sinks is not None:
-        raise ValueError("XQA MLA does not support sinks")
-
-    # Validate and normalize to 4D
-    kv_cache = _check_trtllm_gen_mla_shape(
-        query,
-        kv_cache,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        0,  # sparse_mla_top_k
-        block_tables,
-        block_size,
-        True,  # XQA always uses shared paged KV index layout
+    backend = _BatchMLAPagedAttentionXqaBackend.from_functional(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=block_tables,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        sinks=sinks,
+        enable_pdl=enable_pdl,
     )
 
     if out is None:
@@ -5443,27 +4987,23 @@ def xqa_batch_decode_with_kv_cache_mla(
             "out",
         )
 
-    workspace_u8 = workspace_buffer.view(torch.uint8)
-    semaphore = workspace_u8[: 8 * 1024 * 1024]  # reserve 8MB for semaphore
-    scratch = workspace_u8[8 * 1024 * 1024 :]
-    # This can not be replaced by kv_cache.transpose(1, 2) because the stride is not the same
-    kv_cache_new = kv_cache.squeeze(1).unsqueeze(2)
-    seq_lens_new = seq_lens.unsqueeze(1)
-
-    xqa_mla(
-        query,
-        kv_cache_new,
-        kv_cache_new,
-        block_tables,
-        seq_lens_new,
-        out,
-        scratch,
-        semaphore,
-        block_size,
-        q_scale=bmm1_scale,
-        kv_scale=bmm2_scale,
-        sm_count=sm_count,
-        enable_pdl=enable_pdl,
+    tuner = AutoTuner.get()
+    # XQA currently has one implementation and one tactic. Record measurements
+    # when requested, but the inference choice is always the same native launch.
+    if not tuner.is_tuning_mode:
+        return backend._execute(
+            query,
+            backend._kv_cache,
+            block_tables,
+            seq_lens.unsqueeze(1),
+            out,
+            bmm1_scale,
+            bmm2_scale,
+        )
+    inputs = [query, block_tables, seq_lens, out]
+    if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
+        inputs.extend((bmm1_scale, bmm2_scale))
+    runner, tactic = tuner.choose_one(
+        "xqa_batch_decode_mla", [backend], _XQA_MLA_TUNING_CONFIG, inputs
     )
-
-    return out
+    return runner(inputs, tactic=tactic)

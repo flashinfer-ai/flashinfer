@@ -931,17 +931,11 @@ def _launch_bf16_serving(
     batch_size: int,
     num_q_heads: int,
     num_v_heads: int,
+    route_id: str,
 ) -> None:
-    state_heads = batch_size * num_v_heads
-    tile_v = (
-        16
-        if num_q_heads == 4 and num_v_heads == 8
-        else 128
-        if state_heads >= 1024
-        else 64
-        if state_heads >= 512
-        else 32
-    )
+    # The grid is ``V / TILE_V`` CTAs per state head; the tile is the selected
+    # route's (the T=1 band rule and the MTP rule differ), never re-derived here.
+    tile_v = cake_gdn.cake_gdn_bf16_route_tile_v(route_id)
     cache = tensors["intermediate_state"]
     entry(
         tensors["q"],
@@ -1033,6 +1027,20 @@ def test_exported_decode_is_cuda_graph_safe() -> None:
         (8, 4, 4, 8, True, True, 4, False),
         (8, 2, 16, 64, True, False, 0, True),
         (8, 4, 16, 64, True, False, 5, True),
+        # Qwen3.5 per-rank T=1 serving geometries at SGLang graph batch sizes
+        # (one row per grid tile of the state-head rule: 16 / 32 / 64 / 128).
+        (1, 1, 16, 32, True, False, 0, False),
+        (16, 1, 16, 32, True, False, 0, False),
+        (64, 1, 16, 32, True, False, 0, True),
+        (2, 1, 8, 16, True, False, 0, False),
+        (48, 1, 8, 16, True, False, 0, False),
+        (3, 1, 4, 8, True, False, 0, False),
+        (8, 1, 8, 32, True, False, 0, False),
+        (24, 1, 8, 32, True, False, 0, True),
+        (4, 1, 4, 16, True, False, 0, False),
+        (128, 1, 4, 16, True, False, 0, False),
+        (1, 1, 2, 8, True, False, 0, False),
+        (96, 1, 2, 8, True, False, 0, False),
     ],
 )
 def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
@@ -1081,6 +1089,7 @@ def test_exported_bf16_serving_rows_match_torch_on_caller_stream(
             batch_size=batch_size,
             num_q_heads=num_q_heads,
             num_v_heads=num_v_heads,
+            route_id=route.route_id,
         )
     stream.synchronize()
 
@@ -1144,7 +1153,7 @@ def test_exported_bf16_verify_is_cuda_graph_safe(
     assert isinstance(out, torch.Tensor)
     assert isinstance(cache, torch.Tensor)
     backing_before = backing.clone()
-    _, entry = _load_bf16_serving(
+    route, entry = _load_bf16_serving(
         batch_size=batch_size,
         seq_len=seq_len,
         num_q_heads=num_q_heads,
@@ -1161,6 +1170,7 @@ def test_exported_bf16_verify_is_cuda_graph_safe(
             batch_size=batch_size,
             num_q_heads=num_q_heads,
             num_v_heads=num_v_heads,
+            route_id=route.route_id,
         )
     stream.synchronize()
     eager_out = out.clone()
@@ -1176,6 +1186,7 @@ def test_exported_bf16_verify_is_cuda_graph_safe(
             batch_size=batch_size,
             num_q_heads=num_q_heads,
             num_v_heads=num_v_heads,
+            route_id=route.route_id,
         )
     graph.replay()
     stream.synchronize()
