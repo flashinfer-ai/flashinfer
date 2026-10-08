@@ -21,6 +21,7 @@ import inspect
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal, get_type_hints
 
 import pytest
 import torch
@@ -901,6 +902,12 @@ def test_source_public_api_signatures_are_stable():
         == expected_run
     )
     assert _signature_contract(module.ssd_combined_fwd) == expected_run
+    for api in (
+        module.SSDCombined.run,
+        cake_module.CakeSSDCombined.run,
+        module.ssd_combined_fwd,
+    ):
+        assert get_type_hints(api)["scan_algorithm"] == Literal["auto", "exact_scan"]
 
     helper_names = (
         "seq_idx",

@@ -23,7 +23,7 @@ This module provides the combined forward pass for Mamba2 SSD, combining:
 
 import functools
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -513,7 +513,7 @@ class SSDCombined:
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
         *,
-        scan_algorithm: str = "auto",
+        scan_algorithm: Literal["auto", "exact_scan"] = "auto",
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run SSD combined forward pass.
 
@@ -926,7 +926,7 @@ def ssd_combined_fwd(
     out: Optional[torch.Tensor] = None,
     return_final_states: bool = True,
     *,
-    scan_algorithm: str = "auto",
+    scan_algorithm: Literal["auto", "exact_scan"] = "auto",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the source-built Cake SSDCombined backend.
 

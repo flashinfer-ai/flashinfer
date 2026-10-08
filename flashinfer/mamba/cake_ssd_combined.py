@@ -24,7 +24,7 @@ import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 from filelock import FileLock
@@ -53,7 +53,7 @@ def _select_scan_route(
     ngroups: int,
     dt_min: float,
     prefix_route_selected: bool,
-    scan_algorithm: str = "auto",
+    scan_algorithm: Literal["auto", "exact_scan"] = "auto",
 ) -> str:
     """Resolve semantic routing without binding generated program identities.
 
@@ -698,7 +698,7 @@ class CakeSSDCombined:
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
         *,
-        scan_algorithm: str = "auto",
+        scan_algorithm: Literal["auto", "exact_scan"] = "auto",
     ):
         batch, seqlen, nheads, headdim = x.shape
         if seqlen % _CHUNK_SIZE:
