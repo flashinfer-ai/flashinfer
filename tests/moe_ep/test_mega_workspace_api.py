@@ -275,8 +275,9 @@ def test_unfinalized_output_requires_explicit_backend_opt_in():
 
 
 @pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
+@pytest.mark.parametrize("backend", ["nvfp4", "bf16", "w4a16"])
 def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
-    monkeypatch, apply_topk_in_fc1
+    monkeypatch, backend, apply_topk_in_fc1
 ):
     """Remaining weights and identity indices reuse storage across live sizes."""
     import torch
@@ -284,31 +285,60 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
+        Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.backend import (
-        Nvfp4CutedslMegaKernelBackend,
-    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.cute_dsl.megamoe import bf16_nvfp4
     from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe
 
     capacity, top_k, hidden = 7, 2, 128
     partials = torch.randn(capacity, top_k, hidden, dtype=torch.bfloat16)
     raw = SimpleNamespace(
+        x=torch.empty(capacity, hidden, dtype=torch.bfloat16),
+        hidden=hidden,
+        combine_output=partials,
         topk_idx=torch.empty(capacity, top_k, dtype=torch.int32),
         topk_weights=torch.randn(capacity, top_k, dtype=torch.float32),
-        _frontend=SimpleNamespace(
-            deferred_topk_reduce_workspace=lambda: (partials, partials, None)
-        ),
+        _frontend=mock.Mock(),
+        _staging_inputs=None,
     )
-    monkeypatch.setattr(
-        cutedsl_megamoe, "get_symm_buffer_for_mega_moe", lambda *a, **k: raw
-    )
-    kernel = Nvfp4CutedslMegaKernelBackend(
-        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+    raw._frontend.config.apply_topk_in_fc1 = apply_topk_in_fc1
+    options = {"apply_topk_in_fc1": apply_topk_in_fc1}
+    allocate = mock.Mock(return_value=raw)
+    if backend == "nvfp4":
+        config_cls = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        monkeypatch.setattr(cutedsl_megamoe, "get_symm_buffer_for_mega_moe", allocate)
+        raw._frontend.deferred_topk_reduce_workspace.return_value = (
+            partials,
+            partials,
+            None,
+        )
+        launch = mock.Mock()
+    elif backend == "bf16":
+        config_cls = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
+        options = {"knobs": {"apply_topk_in_fc1": apply_topk_in_fc1}}
+        monkeypatch.setattr(
+            cutedsl_megamoe, "get_symm_buffer_for_bf16_mega_moe", allocate
+        )
+        launch = raw._frontend.run
+        launch.side_effect = lambda inputs, *, num_tokens: partials[:num_tokens]
+    else:
+        config_cls = Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        monkeypatch.setattr(
+            bf16_nvfp4, "get_symm_buffer_for_bf16_nvfp4_mega_moe", allocate
+        )
+        launch = mock.Mock(
+            side_effect=lambda *a, num_tokens, **k: partials[:num_tokens]
+        )
+        monkeypatch.setattr(bf16_nvfp4, "bf16_nvfp4_mega_moe", launch)
+    kernel = create_mega_kernel(
+        config_cls(
             intermediate_size=128,
             top_k=top_k,
-            apply_topk_in_fc1=apply_topk_in_fc1,
             do_finalize=False,
+            **options,
         )
     )
     kernel.bind_ep_bootstrap(
@@ -316,20 +346,35 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
     )
     workspace = kernel._allocate_workspace(FleetParams(2, capacity, hidden))
     assert workspace is raw
+    if backend != "bf16":
+        assert allocate.call_args.kwargs["defer_topk_reduce"]
+    assert kernel.supports_unfinalized_output
+    with pytest.raises(ValueError, match="requires compute_unfinalized"):
+        kernel.compute(workspace, (), output=None)
+    monkeypatch.setattr(cutedsl_megamoe, "staged_tokens", lambda _: None)
+    with pytest.raises(ValueError, match="requires stage_inputs"):
+        kernel.compute_unfinalized(workspace, ())
     weights_storage = raw._unfinalized_weights.untyped_storage().data_ptr()
     map_storage = raw._unfinalized_route_map.untyped_storage().data_ptr()
-    thunk = mock.Mock()
-    monkeypatch.setattr(
-        kernel, "_prepared_thunk_state", lambda *args: ((), thunk, None)
-    )
+    if backend == "nvfp4":
+        monkeypatch.setattr(
+            kernel, "_prepared_thunk_state", lambda *args: ((), launch, None)
+        )
     monkeypatch.setattr(torch, "arange", mock.Mock(side_effect=AssertionError))
     monkeypatch.setattr(torch, "ones_like", mock.Mock(side_effect=AssertionError))
 
     for live_tokens in (3, 0, 5):
         monkeypatch.setattr(cutedsl_megamoe, "staged_tokens", lambda _: live_tokens)
-        rows, weights, indices = kernel.compute_unfinalized(workspace, ())
+        raw._staging_inputs = (
+            raw.x[:live_tokens],
+            raw.topk_idx[:live_tokens],
+            raw.topk_weights[:live_tokens],
+        )
+        rows, weights, indices = kernel.compute_unfinalized(
+            workspace, ((None,), (None,))
+        )
         assert rows.shape == (live_tokens * top_k, hidden)
-        assert rows.dtype == torch.bfloat16
+        assert rows.dtype == torch.bfloat16 and rows.is_contiguous()
         assert weights.shape == indices.shape == (live_tokens, top_k)
         assert weights.dtype == torch.float32 and indices.dtype == torch.int32
         assert (
@@ -345,7 +390,64 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
         )
         torch.testing.assert_close(weights, expected_weights)
         torch.testing.assert_close(rows[indices.long()], partials[:live_tokens])
-    assert thunk.call_count == 3
+        if backend == "w4a16":
+            assert raw._staging_inputs is None
+    assert launch.call_count == 3
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
+        "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
+    ],
+)
+def test_finalized_and_unfinalized_workspaces_have_distinct_pool_keys(
+    monkeypatch, config_name
+):
+    import torch
+
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    config = getattr(moe_ep, config_name)(intermediate_size=128, top_k=2)
+    finalized = create_mega_kernel(config)
+    unfinalized = create_mega_kernel(dataclasses.replace(config, do_finalize=False))
+    bootstrap = moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    finalized.bind_ep_bootstrap(bootstrap)
+    unfinalized.bind_ep_bootstrap(bootstrap)
+    finalized._ep_comm_group = unfinalized._ep_comm_group = object()
+    fleet = moe_ep.FleetParams(2, 7, 128)
+    assert finalized._workspace_pool_key(fleet) != unfinalized._workspace_pool_key(
+        fleet
+    )
+    with pytest.raises(ValueError, match="requires do_finalize=False"):
+        finalized.compute_unfinalized(None, ())
+
+
+def test_w4a16_unfinalized_launch_failure_releases_staging_sources(monkeypatch):
+    import torch
+
+    from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.cute_dsl.megamoe import bf16_nvfp4
+
+    kernel = create_mega_kernel(
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128, top_k=2, do_finalize=False
+        )
+    )
+    workspace = SimpleNamespace(_staging_inputs=(torch.empty(3, 128),))
+    monkeypatch.setattr(
+        bf16_nvfp4,
+        "bf16_nvfp4_mega_moe",
+        mock.Mock(side_effect=RuntimeError("launch failed")),
+    )
+    with pytest.raises(RuntimeError, match="launch failed"):
+        kernel.compute_unfinalized(workspace, ((), ()))
+    assert workspace._staging_inputs is None
 
 
 def test_workspace_over_capacity_rejected_before_allocation_stage_or_compute():

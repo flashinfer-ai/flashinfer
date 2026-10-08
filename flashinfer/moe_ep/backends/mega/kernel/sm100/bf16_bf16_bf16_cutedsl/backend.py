@@ -48,6 +48,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
+        self.supports_unfinalized_output = not config.do_finalize
         self._autotune_pending = config.knobs == "auto"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
@@ -102,7 +103,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
         config = self._kernel_config
-        return get_symm_buffer_for_bf16_mega_moe(
+        workspace = get_symm_buffer_for_bf16_mega_moe(
             fleet_params.num_experts,
             fleet_params.max_tokens_per_rank,
             config.top_k,
@@ -114,6 +115,19 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
             knobs=config.knobs if isinstance(config.knobs, dict) else None,
         )
+        if not config.do_finalize:
+            workspace._unfinalized_route_map = torch.arange(
+                fleet_params.max_tokens_per_rank * config.top_k,
+                dtype=torch.int32,
+                device=workspace.topk_idx.device,
+            ).view(fleet_params.max_tokens_per_rank, config.top_k)
+            # Default BF16 folds routing into FC1; respect pinned frontend knobs.
+            workspace._unfinalized_weights = (
+                torch.ones_like(workspace.topk_weights)
+                if workspace._frontend.config.apply_topk_in_fc1
+                else workspace.topk_weights
+            )
+        return workspace
 
     def validate_forward(
         self,
@@ -157,6 +171,8 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
     ) -> torch.Tensor:
         from ......kernel_src.sm100.cutedsl_megamoe import bf16_mega_moe, staged_tokens
 
+        if self.supports_unfinalized_output:
+            raise ValueError("do_finalize=False requires compute_unfinalized()")
         if output is not None:
             num_tokens = output.shape[0]
         else:
@@ -197,6 +213,42 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         )
         return output if output is not None else view
 
+    def compute_unfinalized(
+        self,
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from ......kernel_src.sm100.cutedsl_megamoe import (
+            MegaMoEBf16Inputs,
+            staged_tokens,
+        )
+
+        if not self.supports_unfinalized_output:
+            raise ValueError("compute_unfinalized() requires do_finalize=False")
+        num_tokens = staged_tokens(workspace.topk_idx)
+        if num_tokens is None:
+            raise ValueError("compute_unfinalized() requires stage_inputs() first")
+        clamp = _clamp(self._kernel_config)
+        if clamp is not None:
+            workspace._frontend.set_gate_up_clamp(clamp)
+        # Launch at full capacity even when this rank has no live tokens.
+        partials = workspace._frontend.run(
+            MegaMoEBf16Inputs(
+                workspace.x,
+                workspace.topk_idx,
+                workspace.topk_weights,
+                transformed_weights[0][0],
+                transformed_weights[1][0],
+                workspace.combine_output,
+            ),
+            num_tokens=num_tokens,
+        )
+        return (
+            partials.view(num_tokens * self._kernel_config.top_k, workspace.hidden),
+            workspace._unfinalized_weights[:num_tokens],
+            workspace._unfinalized_route_map[:num_tokens],
+        )
+
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
         config = self._kernel_config
         if config.knobs == "auto":
@@ -217,6 +269,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             _clamp(config),
             config.enable_in_kernel_fc2_reduce,
+            config.do_finalize,
             knobs_pool_key(config.knobs),
         )
 

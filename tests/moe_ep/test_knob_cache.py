@@ -114,14 +114,19 @@ def test_record_upserts_same_key(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
+@pytest.mark.parametrize("dtype", ["nvfp4", "bf16_nvfp4"])
 def test_deferred_output_winners_do_not_replace_reduced_winners(
-    monkeypatch, tmp_path, apply_topk_in_fc1
+    monkeypatch, tmp_path, dtype, apply_topk_in_fc1
 ):
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
 
     _cache_env(monkeypatch, tmp_path)
     monkeypatch.setattr(knob_cache, "_current_device_name", lambda: "testgpu")
-    key = dict(max_tokens=128, apply_topk_in_fc1=apply_topk_in_fc1, **_KEY)
+    key = dict(
+        max_tokens=128,
+        apply_topk_in_fc1=apply_topk_in_fc1,
+        **{**_KEY, "dtype": dtype},
+    )
     deferred = {**_KNOBS, "flag_batch": 8}
     knob_cache.record_knobs(_KNOBS, **key)
     knob_cache.record_knobs(deferred, defer_topk_reduce=True, **key)
@@ -141,8 +146,9 @@ def test_deferred_output_winners_do_not_replace_reduced_winners(
     )
 
 
+@pytest.mark.parametrize("dtype", ["nvfp4", "bf16_nvfp4"])
 def test_legacy_reduced_entries_load_but_startup_profiles_are_ignored(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, dtype
 ):
     import json
 
@@ -152,7 +158,7 @@ def test_legacy_reduced_entries_load_but_startup_profiles_are_ignored(
     )
 
     path = _cache_env(monkeypatch, tmp_path)
-    key = dict(max_tokens=128, device="testgpu", **_KEY)
+    key = dict(max_tokens=128, device="testgpu", **{**_KEY, "dtype": dtype})
     record_knobs(_KNOBS, **key)
     data = json.loads(path.read_text())
     entry = data["entries"][0]
@@ -406,12 +412,13 @@ def test_backend_warns_on_auto_knobs():
 
 
 @pytest.mark.arch_blackwell
+@pytest.mark.parametrize("defer_topk_reduce", [False, True])
 @pytest.mark.parametrize(
     "mode,mma_m,explicit",
     [("nvfp4", 256, False), ("bf16_nvfp4", 128, False), ("bf16_nvfp4", 128, True)],
 )
 def test_symm_buffer_resolves_cached_knobs(
-    monkeypatch, tmp_path, mode, mma_m, explicit
+    monkeypatch, tmp_path, mode, mma_m, explicit, defer_topk_reduce
 ):
     """Cached and explicit partial tiles derive the same CTA instruction mode."""
     import torch
@@ -460,13 +467,23 @@ def test_symm_buffer_resolves_cached_knobs(
         topk=topk,
         max_tokens=max_tokens,
         apply_topk_in_fc1=mode == "nvfp4",
+        defer_topk_reduce=defer_topk_reduce,
     )
     knobs = cached if explicit else None
     buf = get_symm_buffer_for_mega_moe(
-        num_experts, max_tokens, topk, hidden, intermediate2x, 0, 1, knobs=knobs
+        num_experts,
+        max_tokens,
+        topk,
+        hidden,
+        intermediate2x,
+        0,
+        1,
+        knobs=knobs,
+        defer_topk_reduce=defer_topk_reduce,
     )
     try:
         cfg = buf._frontend.config
+        assert cfg.defer_topk_reduce == defer_topk_reduce
         assert cfg.mma_tiler_mnk == cached["mma_tiler_mnk"]
         assert cfg.use_2cta_instrs == (mma_m == 256)
         assert cfg.flag_batch == 16

@@ -15,6 +15,8 @@ traffic and the complete MegaMoE data path.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from .test_moe_ep_nvfp4_cutedsl_mega_multirank import (
@@ -203,11 +205,20 @@ def _assert_close(actual, expected) -> None:
     torch.testing.assert_close(actual, expected, atol=_ATOL, rtol=_RTOL)
 
 
-@pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
+@pytest.mark.parametrize(
+    "backend,apply_topk_in_fc1",
+    [
+        ("nvfp4", False),
+        ("nvfp4", True),
+        ("bf16", True),
+        ("w4a16", False),
+        ("w4a16", True),
+    ],
+)
 def test_external_weighted_reduction_live_rows_and_cuda_graph(
-    tmp_path, monkeypatch, apply_topk_in_fc1
+    tmp_path, monkeypatch, backend, apply_topk_in_fc1
 ):
-    """Both weight placements finalize correctly across empty rounds and graphs."""
+    """Caller finalization works across backends, empty rounds, and graphs."""
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size != 4:
@@ -223,124 +234,214 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
         MoEEpMegaLayer,
         MoEEpTensors,
         MoEWeightPack,
+        Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         ensure_moe_ep_cuda_device,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner import (
-        tune_one,
-    )
-    from flashinfer.moe_ep.tune import _parse_args
 
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
-    hidden, intermediate, topk, capacity = 5120, 2560, 8, 64
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires sm_100a or sm_103a")
+    hidden, intermediate, topk, capacity = (
+        (5120, 2560, 8, 64) if backend == "nvfp4" else (1024, 512, 2, 32)
+    )
     w13, w2 = _make_bf16_weights(
         rank,
         num_local_experts=2,
         hidden=hidden,
         intermediate=intermediate,
     )
-    alpha1, alpha2, norm = _identity_epilogue_params(2)
-    problem = dict(
-        hidden=hidden,
-        intermediate=intermediate,
-        num_experts=8,
-        topk=topk,
-        gate_up_clamp=None,
-        fast_math=True,
-        fc1_alpha=alpha1,
-        fc2_alpha=alpha2,
-        fc1_norm_const=norm,
-    )
+    if backend == "nvfp4":
+        alpha1, alpha2, norm = _identity_epilogue_params(2)
+        problem = dict(
+            hidden=hidden,
+            intermediate=intermediate,
+            num_experts=8,
+            topk=topk,
+            gate_up_clamp=None,
+            fast_math=True,
+            fc1_alpha=alpha1,
+            fc2_alpha=alpha2,
+            fc1_norm_const=norm,
+        )
+        config = _megakernel_config(
+            problem,
+            epilogue_via_config=True,
+            apply_topk_in_fc1=apply_topk_in_fc1,
+            do_finalize=False,
+            knobs=None,
+        )
+    else:
+        config_cls = (
+            Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
+            if backend == "bf16"
+            else Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        )
+        config = config_cls(
+            intermediate_size=intermediate,
+            top_k=topk,
+            gate_up_clamp=1.5,
+            do_finalize=False,
+            **({"apply_topk_in_fc1": apply_topk_in_fc1} if backend == "w4a16" else {}),
+        )
     layer = MoEEpMegaLayer(
         bootstrap=bootstrap,
         fleet_params=FleetParams(8, capacity, hidden),
         weights=MoEWeightPack(w13=w13, w2=w2),
         backend=MegaConfig(
-            megakernel=_megakernel_config(
-                problem,
-                epilogue_via_config=True,
-                apply_topk_in_fc1=apply_topk_in_fc1,
-                do_finalize=False,
-                knobs=None,
-            ),
+            megakernel=config,
+            quantize_input=backend == "nvfp4",
         ),
     )
     reference_workspace = None
+    reference_layer = None
     graph = None
     try:
-        cache_path = [str(tmp_path / "knobs.json") if rank == 0 else None]
-        dist.broadcast_object_list(cache_path, src=0)
-        monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", cache_path[0])
-        args = _parse_args(
-            [
-                "--hidden",
-                str(hidden),
-                "--intermediate",
-                str(intermediate),
-                "--num-experts",
-                "8",
-                "--topk",
-                str(topk),
-                "--max-tokens",
-                str(capacity),
-                "--live-tokens",
-                "9",
-                "--no-do-finalize",
-                "--apply-topk-in-fc1"
-                if apply_topk_in_fc1
-                else "--no-apply-topk-in-fc1",
-                "--sweep",
-                "schedule",
-                "--base-knobs",
-                '{"flag_batch": 8}',
-                "--max-candidates",
-                "2",
-                "--warmup-iters",
-                "1",
-                "--timed-iters",
-                "1",
-            ]
-        )
-        winner = tune_one(args, rank, world_size, capacity)
-        dist.barrier()
-        reference_workspace = _allocate_reference_workspace(
-            problem,
-            capacity,
-            rank,
-            world_size,
-            apply_topk_in_fc1=apply_topk_in_fc1,
-        )
+        if backend == "nvfp4":
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner import (
+                tune_one,
+            )
+            from flashinfer.moe_ep.tune import _parse_args
+
+            cache_path = [str(tmp_path / "knobs.json") if rank == 0 else None]
+            dist.broadcast_object_list(cache_path, src=0)
+            monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", cache_path[0])
+            args = _parse_args(
+                [
+                    "--hidden",
+                    str(hidden),
+                    "--intermediate",
+                    str(intermediate),
+                    "--num-experts",
+                    "8",
+                    "--topk",
+                    str(topk),
+                    "--max-tokens",
+                    str(capacity),
+                    "--live-tokens",
+                    "9",
+                    "--no-do-finalize",
+                    "--apply-topk-in-fc1"
+                    if apply_topk_in_fc1
+                    else "--no-apply-topk-in-fc1",
+                    "--sweep",
+                    "schedule",
+                    "--base-knobs",
+                    '{"flag_batch": 8}',
+                    "--max-candidates",
+                    "2",
+                    "--warmup-iters",
+                    "1",
+                    "--timed-iters",
+                    "1",
+                ]
+            )
+            winner = tune_one(args, rank, world_size, capacity)
+            dist.barrier()
+            reference_workspace = _allocate_reference_workspace(
+                problem,
+                capacity,
+                rank,
+                world_size,
+                apply_topk_in_fc1=apply_topk_in_fc1,
+            )
+            workspace = None
+        else:
+            reference_layer = MoEEpMegaLayer(
+                bootstrap=bootstrap,
+                fleet_params=FleetParams(8, capacity, hidden),
+                weights=MoEWeightPack(w13=w13, w2=w2),
+                backend=MegaConfig(
+                    megakernel=dataclasses.replace(config, do_finalize=True),
+                    quantize_input=False,
+                    transformed_weights=layer._transformed,
+                ),
+            )
+            workspace = layer.create_workspace(capacity)
+        pointers = None
 
         def batch(n):
             x, weights, ids = _make_inputs(
                 rank, num_tokens=n, hidden=hidden, num_experts=8, topk=topk
             )
+            if backend != "nvfp4":
+                # Exercise int32 and strided fused staging for W4A16.
+                ids = ids.to(torch.int32)
+                x = x.repeat_interleave(2, dim=1)[:, ::2]
             return MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=weights)
 
         def forward(t):
-            rows, weights, indices = layer.forward_unfinalized(t)
+            nonlocal pointers
+            rows, weights, indices = layer.forward_unfinalized(t, workspace=workspace)
             assert rows.shape == (t.num_tokens * topk, hidden)
+            assert rows.dtype == torch.bfloat16 and rows.is_contiguous()
             assert weights.shape == indices.shape == (t.num_tokens, topk)
-            assert indices.dtype == torch.int32
+            assert weights.dtype == torch.float32 and indices.dtype == torch.int32
+            current = tuple(
+                value.untyped_storage().data_ptr() for value in (rows, weights, indices)
+            )
+            if pointers is None:
+                pointers = current
+            assert current == pointers
             partials = rows[indices.long()]
             return (partials.float() * weights.unsqueeze(-1)).sum(1).bfloat16()
 
-        for n in (9, 0 if rank == 0 else 5, 0, 17):
-            t = batch(n)
-            actual = forward(t)
-            expected = _reference_forward(
+        def reference_forward(t):
+            if reference_layer is not None:
+                return reference_layer.forward(t)
+            return _reference_forward(
                 t, reference_workspace, layer._transformed, problem
             )
+
+        def assert_close(actual, expected, t):
+            # Share failures before teardown so every rank leaves the collective.
+            error = None
+            try:
+                if backend == "nvfp4":
+                    _assert_close(actual, expected)
+                else:
+                    torch.testing.assert_close(
+                        workspace._backend_workspace.combine_output[: t.num_tokens],
+                        reference_layer._workspace.combine_output[: t.num_tokens],
+                        atol=0,
+                        rtol=0,
+                    )
+                    # The built-in weighted reducer uses FMA; separate multiply/sum
+                    # can cross a BF16 rounding boundary even with identical rows.
+                    weighted = backend == "w4a16" and not apply_topk_in_fc1
+                    torch.testing.assert_close(
+                        actual,
+                        expected,
+                        atol=2e-3 if weighted else 0,
+                        rtol=8e-3 if weighted else 0,
+                    )
+            except AssertionError as exc:
+                error = str(exc)
+            errors = [None] * world_size
+            dist.all_gather_object(errors, error)
+            assert not any(errors), errors
+
+        for n in (9 if backend == "nvfp4" else 7, 0 if rank == 0 else 5, 0, 17):
+            t = batch(n)
+            actual = forward(t)
             torch.cuda.synchronize()
             dist.barrier()
-            _assert_close(actual, expected)
-        config = layer._workspace._frontend.config
-        assert {name: getattr(config, name) for name in winner} == winner
+            expected = reference_forward(t)
+            torch.cuda.synchronize()
+            dist.barrier()
+            assert_close(actual, expected, t)
+        if backend == "nvfp4":
+            config = layer._workspace._frontend.config
+            assert {name: getattr(config, name) for name in winner} == winner
+        else:
+            assert layer._workspace is None  # All calls used the explicit profile.
+            assert workspace._backend_workspace is not reference_layer._workspace
 
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            layer.warmup(t)
+            layer.warmup(t, workspace=workspace)
             forward(t)
         torch.cuda.synchronize()
         dist.barrier()
@@ -350,19 +451,19 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
         for _ in range(3):
             t.hidden_states.mul_(-0.5)
             t.topk_weights.add_(0.1)
-            expected = _reference_forward(
-                t, reference_workspace, layer._transformed, problem
-            )
+            expected = reference_forward(t)
             graph.replay()
             torch.cuda.synchronize()
             dist.barrier()
-            _assert_close(captured_output, expected)
+            assert_close(captured_output, expected, t)
     finally:
         torch.cuda.synchronize()
         if graph is not None:
             graph.reset()
         if reference_workspace is not None:
             reference_workspace.destroy()
+        if reference_layer is not None:
+            reference_layer.destroy()
         layer.destroy()
 
 
