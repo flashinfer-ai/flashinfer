@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import math
+import os
 import warnings
 import collections
 import functools
@@ -105,7 +106,7 @@ def _cake_gdn_sentinel(device_index: int, dtype: torch.dtype) -> torch.Tensor:
 # like the host-int cache above.  Those two tensors are already immutable by this
 # adapter's contract (their values are host-resolved once per live tensor), so one
 # int32 copy per live tensor is as safe as the cached host ints.  ``state_indices`` is
-# dynamic device data validated on-device every call and is converted per call.  The
+# dynamic device data (slot ids the caller may rewrite in place) and is converted per call.  The
 # kernels take int32 offsets / slots; converting on every call launched one extra
 # kernel ahead of the main kernel (and exposed the main launch gap in eager mode)
 # for int64 callers.
@@ -209,11 +210,30 @@ def _cake_gdn_prefill_seq_lens(
     return seq_lens
 
 
+# Per-call device-side slot validation, same default as ``gdn_decode.py``: the
+# ``torch._assert_async`` chain expands to four elementwise kernels plus the
+# ``_assert_async_cuda_kernel`` and exposes ~40 us of launch gaps around a
+# 25-70 us kernel on the indexed state-pool rows (R200 CUPTI per-kernel
+# decomposition: 5-6 kernels per call, 41-45 us of inter-kernel gap, while the
+# Cake kernel itself ran faster than the CuTe one).  The CuTe path trusts
+# caller-provided slots, so the Cake adapter does the same by default; set
+# ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`` to restore the asynchronous
+# fail-closed check (used by the invalid-slot tests).
+_CAKE_GDN_VALIDATE_SLOTS = (
+    os.environ.get("FLASHINFER_CAKE_GDN_VALIDATE_SLOTS", "0") == "1"
+)
+
+
 def _cake_gdn_assert_state_slots(
     indices: torch.Tensor, pool_size: int, *, name: str, allow_minus_one: bool
 ) -> None:
-    """Validate CUDA-resident state slots without a host synchronization."""
+    """Validate CUDA-resident state slots without a host synchronization.
 
+    Only active when ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1``; see the note above.
+    """
+
+    if not _CAKE_GDN_VALIDATE_SLOTS:
+        return
     in_pool = (indices >= 0) & (indices < pool_size)
     valid = ((indices == -1) | in_pool) if allow_minus_one else in_pool
     torch._assert_async(
@@ -488,7 +508,7 @@ def _run_cake_gdn_prefill(
     elif state_indices.dtype == torch.int32:
         state_indices_i32 = state_indices
     else:
-        # Slots are dynamic device data (validated on-device above): convert per call.
+        # Slots are dynamic device data the caller may rewrite in place: convert per call.
         state_indices_i32 = state_indices.to(torch.int32)
     empty_state = _cake_gdn_sentinel(device_index, state_dtype)
     launch_initial_state = initial_state if initial_state is not None else empty_state
