@@ -36,6 +36,7 @@ from ..._block_sparse.common import (
     _validate_sparse_kv_block_size,
 )
 from ...split_kv_mode_policy import select_split_kv_modes
+from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (
     AUTO_LAUNCH_TILE_SIZE_KV,
     BITS_PER_BYTE,
@@ -1390,6 +1391,13 @@ class FmhaDecodeConfig:
     softmax_order_barrier_id: int = 8
     # Both softmax task groups participate: 8 warps * 32 lanes.
     softmax_order_barrier_threads: int = 256
+    # Score pairs per streamed K32 fragment whose exponentials run as FMA
+    # polynomials instead of MUFU. The best value depends on the GPU's MUFU
+    # rate; ``arch_config_args`` supplies it for the launch device.
+    ex2_emulated_pairs: int = 4
+    # Reduce streamed score-fragment maxima inside the TMEM load
+    # (tcgen05.ld.red); ``arch_config_args`` supplies it.
+    uses_ldtm_stat: bool = False
     use_cluster_smem_reduction: bool = False
     use_separate_reduction_kernel: bool = False
     # Compile-time attention-mask selection. Public APIs normalize the string
@@ -5041,6 +5049,25 @@ def validate_storage_page_size(
         raise ValueError(
             "storage_tokens_per_page must be divisible by num_tokens_per_page"
         )
+
+
+def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
+    """Return the config fields whose value depends on the GPU architecture.
+
+    SM100 runs a quarter of the streamed exponentials as FMA polynomials
+    because the MUFU issue rate bounds its P pass while the FMA pipe is nearly
+    idle; larger shares grow the fragment body until the softmax warps become
+    instruction-fetch bound. SM103 doubles the MUFU ex2 rate (32 results per
+    SM clock), so the polynomials only add instructions there and every
+    exponential stays on MUFU. GPUs whose TMEM loads return score maxima
+    (LDTM.STAT) take them from the load, which replaces the max pass's
+    register reduction; the context kernel shares that gate.
+    """
+    is_sm103 = tuple(compute_capability) == (10, 3)
+    return {
+        "ex2_emulated_pairs": 0 if is_sm103 else 4,
+        "uses_ldtm_stat": ldtm_stat_supported(compute_capability),
+    }
 
 
 def make_decode_config(

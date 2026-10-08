@@ -523,7 +523,10 @@ def _validate_block_sparse_static_profile(
 def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig":
     """Build one decode configuration from its exact compile cache key."""
 
-    from ..kernels.fmha_decode.fmha_decode_config import make_decode_config
+    from ..kernels.fmha_decode.fmha_decode_config import (
+        arch_config_args,
+        make_decode_config,
+    )
 
     dtype = _cutlass_dtype(key.dtype_key)
     out_dtype = _cutlass_dtype(key.out_dtype_key)
@@ -535,6 +538,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
     )
     use_keeps_mma_ab = q_tile_size >= 64
     config_args: dict[str, object] = {
+        **arch_config_args(torch.cuda.get_device_capability(key.device_index)),
         "use_keeps_mma_ab": use_keeps_mma_ab,
         "tile_size_q": q_tile_size,
         "tile_size_kv": key.kv_route_size,

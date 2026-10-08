@@ -86,17 +86,11 @@ from .helpers_softmax import (
 from .sage_scales import SageKScalesResource
 from .tmem_s import TmemSResource
 
-# Tunable: number of score pairs per streamed fragment whose exponentials run
-# as FMA polynomials instead of MUFU. The MUFU issue rate bounds the fragment
-# otherwise, while the FMA pipe is nearly idle in the softmax warps. Larger
-# shares grow the fragment body and the softmax warps become instruction-fetch
-# bound again, so one quarter of the 16 pairs is the measured optimum.
-KV_TILE_256_EX2_EMULATED_PAIRS = 4
 
-
-def _pair_uses_ex2_emulation(pair_idx: int, pairs_per_fragment: int) -> bool:
-    """Spread the emulated pairs evenly across a fragment's score pairs."""
-    count = KV_TILE_256_EX2_EMULATED_PAIRS
+def _pair_uses_ex2_emulation(
+    pair_idx: int, pairs_per_fragment: int, count: int
+) -> bool:
+    """Spread ``count`` emulated pairs evenly across a fragment's score pairs."""
     pairs = pairs_per_fragment
     return ((pair_idx + 1) * count) // pairs != (pair_idx * count) // pairs
 
@@ -779,7 +773,9 @@ class SmemPResource(DecodeGenResourceBase):
             p0 = Float32(s_arr[value_idx])
             p1 = Float32(s_arr[value_idx + 1])
             if cutlass.const_expr(
-                _pair_uses_ex2_emulation(pair_idx, pairs_per_fragment)
+                _pair_uses_ex2_emulation(
+                    pair_idx, pairs_per_fragment, self.cfg.ex2_emulated_pairs
+                )
             ):
                 p0, p1 = _ex2_emulation_packed_f32x2(p0, p1)
             else:
