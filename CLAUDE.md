@@ -22,7 +22,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Dump environment report (bug reports) | `python -m flashinfer.collect_env` (or `flashinfer collect-env [--json]`) |
 | Install pre-commit hooks | `pre-commit install` |
 | Clear JIT cache | `rm -rf ~/.cache/flashinfer/` |
-| Force the stock MiniMax M3 index-selection path | `FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1` |
+| Force the stock MiniMax M3 index-selection path | `export FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1` |
 | Enable API logging (basic) | `export FLASHINFER_LOGLEVEL=1` |
 | Enable API logging (detailed) | `export FLASHINFER_LOGLEVEL=3` |
 | Enable API logging (with stats) | `export FLASHINFER_LOGLEVEL=5` |
