@@ -480,8 +480,12 @@ def _validate_mla_run_metadata(
     seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
     minimum_seq_len = 0 if state.balanced_plan is not None else 1
     if any(seq_len < minimum_seq_len for seq_len in seq_lens_host):
-        requirement = "non-negative" if minimum_seq_len == 0 else "positive"
-        raise ValueError(f"every runtime K/V length must be {requirement}")
+        message = (
+            "every runtime K/V length must be non-negative"
+            if minimum_seq_len == 0
+            else "every runtime request must contain at least one KV token"
+        )
+        raise ValueError(message)
     if state.balanced_plan is not None:
         if state.planned_seq_lens is None:
             raise RuntimeError(
