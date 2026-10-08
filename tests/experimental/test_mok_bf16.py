@@ -548,3 +548,22 @@ def test_epilogues(topk):
     torch.testing.assert_close(
         epilogues.backward(shared, routed), expected_dx, atol=0.01, rtol=0.01
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_comm_sms_defaults_follow_the_device_generation():
+    """The default communication-SM split comes from the row of the current device's
+    compute capability, or from the B200 row when that generation has no row."""
+    from flashinfer import mok
+
+    cc = tuple(torch.cuda.get_device_capability(0))
+    expected = mok.COMM_SMS_DEFAULTS.get(cc, mok.COMM_SMS_DEFAULTS[(10, 0)])
+    for precision in ("bf16", "mxfp8"):
+        fwd, bwd = mok.comm_sms_defaults(precision, torch.device("cuda", 0))
+        assert (fwd, bwd) == expected[precision]
+        assert fwd > 0 and bwd > 0
+    assert mok.comm_sms_defaults("bf16") == expected["bf16"]
+    with pytest.raises(ValueError, match="precision must be one of"):
+        mok.comm_sms_defaults("fp8")
+    for row in mok.COMM_SMS_DEFAULTS.values():
+        assert set(row) == {"bf16", "mxfp8"}

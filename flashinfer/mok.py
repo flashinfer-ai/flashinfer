@@ -61,9 +61,30 @@ def mxfp8_quantize(x_bf16, return_normal=True, return_transposed=True):
     return quantize(x_bf16, return_normal, return_transposed)
 
 
-# Communication SMs (forward, backward) per precision: the splits at which the complete
-# training step is fastest on B200 (EP4 GLM-5.2 shape sweeps of each kernel pair; backend README).
-COMM_SMS_DEFAULTS = {"bf16": (20, 24), "mxfp8": (40, 32)}
+# Communication SMs (forward, backward) per precision and GPU generation: the splits at which
+# the complete training step is fastest (EP4 GLM-5.2 shape sweeps of each kernel pair, uniform
+# routing; backend README). Keyed by compute capability (major, minor); a generation without
+# its own row uses the B200 table. B300 (10, 3) is measured with the B200 splits for now.
+COMM_SMS_DEFAULTS = {
+    (10, 0): {"bf16": (20, 24), "mxfp8": (40, 32)},
+    (10, 7): {"bf16": (40, 32), "mxfp8": (72, 64)},
+}
+_COMM_SMS_FALLBACK_ARCH = (10, 0)
+
+
+def comm_sms_defaults(precision, device=None):
+    """(forward, backward) communication-SM default of ``precision`` on ``device``.
+
+    ``device`` defaults to the current CUDA device; the table row of its compute
+    capability is used, the B200 row when that generation has no row of its own.
+    """
+    import torch
+
+    table = COMM_SMS_DEFAULTS[_COMM_SMS_FALLBACK_ARCH]
+    if precision not in table:
+        raise ValueError(f"precision must be one of {sorted(table)}, got {precision!r}")
+    cc = tuple(torch.cuda.get_device_capability(device))
+    return COMM_SMS_DEFAULTS.get(cc, table)[precision]
 
 
 @flashinfer_experimental_api
@@ -93,20 +114,18 @@ def create_mok_bf16_workspace(
     Call outside CUDA Graph capture; retain the workspace for every replay.
 
     ``fwd_num_comm_sms`` / ``bwd_num_comm_sms`` left ``None`` take the measured
-    default of ``precision`` (``"bf16"`` or ``"mxfp8"``): the BF16 kernels run
-    their communication clusters on 20 (forward) / 24 (backward) SMs, the
-    MXFP8 kernels on 40 / 32, which is where their complete training steps
-    are fastest on B200 (see the backend README). The precision only selects these defaults; the
-    kernels a call runs are chosen by the weights passed to it.
+    default of ``precision`` (``"bf16"`` or ``"mxfp8"``) for the generation of
+    ``device`` (:func:`comm_sms_defaults`): on B200 the BF16 kernels run their
+    communication clusters on 20 (forward) / 24 (backward) SMs and the MXFP8
+    kernels on 40 / 32; on the 212-SM compute-capability-10.7 part the fastest
+    complete steps use 40 / 32 (BF16) and 72 / 64 (MXFP8). The precision only
+    selects these defaults; the kernels a call runs are chosen by the weights
+    passed to it.
     """
     from .experimental.cake_mok_bf16.workspace import MoKConfig
     from .experimental.cake_mok_bf16.backend import create_source_workspace
 
-    if precision not in COMM_SMS_DEFAULTS:
-        raise ValueError(
-            f"precision must be one of {sorted(COMM_SMS_DEFAULTS)}, got {precision!r}"
-        )
-    default_fwd, default_bwd = COMM_SMS_DEFAULTS[precision]
+    default_fwd, default_bwd = comm_sms_defaults(precision, device)
     if fwd_num_comm_sms is None:
         fwd_num_comm_sms = default_fwd
     if bwd_num_comm_sms is None:

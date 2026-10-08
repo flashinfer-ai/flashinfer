@@ -117,8 +117,14 @@ for unequal lengths, empty ranks, count changes and graph reuse.
   20/24 34.18, 20/28 34.35, 24/24 34.45-34.53, 24/28 34.57, 28/24 34.71, 24/32 34.88,
   24/36 35.14; MXFP8 sweep 32/32 26.56, 36/32 25.93, 40/24 26.71, 40/28 26.04, 40/32 25.98,
   40/40 26.17, 40/48 26.44, 40/56 26.76. The MXFP8 kernels move half the activation
-  bytes per compute tile and shift the optimum towards communication). Pass
-  `precision="mxfp8"` to the factory for an MXFP8 workload, or set the counts explicitly.
+  bytes per compute tile and shift the optimum towards communication). The defaults are
+  keyed by the compute capability of the workspace device (`comm_sms_defaults`): the
+  212-SM compute-capability-10.7 part ships 40 / 32 for BF16 and 72 / 64 for MXFP8 (same
+  protocol; BF16 full step 20/24 19.54 ms, 32/28 16.95, 40/32 16.81, 48/40 16.82, 56/40
+  16.96, 64/48 17.18; MXFP8 full 72/64 13.05, 80/64 13.31, 80/56 13.52, 96/64 13.81,
+  112/64 14.54, checkpoint 72/64 16.50, 80/64 16.62, 80/56 16.92). Generations without
+  their own row use the B200 values. Pass `precision="mxfp8"` to the factory for an
+  MXFP8 workload, or set the counts explicitly.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
 - An EP16 workload can use 16,384 source tokens per rank (262,144 global), hidden width
