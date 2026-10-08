@@ -415,15 +415,10 @@ class CudnnFrostNvfp4MoeRunner(MoERunner):
 
     def _validate_pack(self, act, weights):
         require_moe_assembler()
-        if act.routing_input_mode not in self.supported_routing_modes:
-            raise NotImplementedError(
-                "cuDNN Frost NVFP4 MoE requires precomputed routing"
-            )
+        self._validate_pack_contract(act)
         x, xsf = act.hidden_states_q, act.hidden_states_scale
         if x.ndim != 2 or x.dtype != torch.uint8:
             raise ValueError("cuDNN Frost NVFP4 MoE requires packed uint8 x[T,H/2]")
-        if act.per_token_scale is not None:
-            raise ValueError("cuDNN Frost NVFP4 does not consume per-token scales")
         t, packed_h = x.shape
         h = packed_h * 2
         k, e, i = (
