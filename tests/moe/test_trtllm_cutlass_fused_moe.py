@@ -60,7 +60,9 @@ _CUTLASS_MOE_ARCH_SKIP = pytest.mark.skipif(
     reason="CUTLASS fused MoE is not supported on this architecture",
 )
 
-pytestmark = pytest.mark.solo
+# Peak host RSS 139-210 GiB on B200/GB200/GB300, 286 GiB on VR200 and up to
+# 119 GiB on H100 (flashinfer-ci nightlies, 2026-10).
+pytestmark = pytest.mark.exclusive_extreme_host_ram
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max

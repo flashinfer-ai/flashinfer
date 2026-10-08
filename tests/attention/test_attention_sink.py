@@ -30,7 +30,9 @@ from flashinfer.jit.attention import gen_batch_prefill_attention_sink_module
 from flashinfer.jit.attention.variants import attention_sink_decl
 from flashinfer.utils import has_flashinfer_jit_cache, is_sm90a_supported
 
-pytestmark = pytest.mark.solo
+# Peak host RSS 100-121 GiB on B200/GB200/GB300/VR200 and 35-83 GiB on H100
+# (flashinfer-ci nightlies, 2026-10).
+pytestmark = pytest.mark.exclusive_extreme_host_ram
 
 
 @pytest.fixture(

@@ -58,7 +58,10 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         "markers",
-        "solo: run every node from this source without overlapping another local unit",
+        "exclusive_extreme_host_ram: ONLY for test files whose peak host (CPU) RAM "
+        "would risk an OOM next to other test workers. The whole file runs alone, "
+        "after all parallel work, holding every GPU on the node. Any other use "
+        "serializes the file and makes the whole suite much slower.",
     )
     config.addinivalue_line(
         "markers",
@@ -89,10 +92,10 @@ def _marker_name(item: pytest.Item) -> str | None:
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
-    solo_sources = {
+    exclusive_sources = {
         Path(str(item.path)).resolve()
         for item in items
-        if item.get_closest_marker("solo") is not None
+        if item.get_closest_marker("exclusive_extreme_host_ram") is not None
     }
     long_running_sources = {
         Path(str(item.path)).resolve()
@@ -114,7 +117,7 @@ def pytest_collection_modifyitems(
                 base_function=node.base_function,
                 order=node.order,
                 shard_group=node.shard_group,
-                solo=item_path in solo_sources,
+                exclusive_extreme_host_ram=item_path in exclusive_sources,
                 long_running=item_path in long_running_sources,
             )
         )

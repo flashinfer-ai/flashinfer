@@ -190,7 +190,11 @@ def pytest_configure(config):
         "long_running: front-load this test file at the start of the parallel CI queue",
     )
     config.addinivalue_line(
-        "markers", "solo: run this whole test file alone (memory-heavy)"
+        "markers",
+        "exclusive_extreme_host_ram: ONLY for test files whose peak host (CPU) RAM "
+        "would risk an OOM next to other test workers. The whole file runs alone, "
+        "after all parallel work, holding every GPU on the node. Any other use "
+        "serializes the file and makes the whole suite much slower.",
     )
     config.addinivalue_line(
         "markers",

@@ -1318,14 +1318,14 @@ def test_completed_node_progress_observes_finalized_batches_from_every_shard(
     assert runner._completed_node_count(tmp_path / "junit", plan) == 2
 
 
-def test_solo_source_runs_exclusively_with_full_gpu_visibility(
+def test_exclusive_host_ram_source_runs_alone_with_full_gpu_visibility(
     tmp_path: Path,
 ) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
-    state = tmp_path / "solo-state"
+    state = tmp_path / "exclusive-state"
     state.mkdir()
-    (suite / "test_solo.py").write_text(
+    (suite / "test_heavy.py").write_text(
         """\
 import os
 import time
@@ -1333,28 +1333,28 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.solo
+pytestmark = pytest.mark.exclusive_extreme_host_ram
 
 @pytest.fixture(scope="module", autouse=True)
 def exclusive_source():
-    state = Path(os.environ["SOLO_STATE"])
-    solo = state / "solo-active"
+    state = Path(os.environ["EXCLUSIVE_STATE"])
+    exclusive = state / "exclusive-active"
     regular = state / "regular-active"
-    assert not regular.exists(), "regular batch overlapped solo setup"
-    solo.write_text("active", encoding="utf-8")
-    (state / "solo-devices").write_text(
+    assert not regular.exists(), "regular batch overlapped exclusive setup"
+    exclusive.write_text("active", encoding="utf-8")
+    (state / "exclusive-devices").write_text(
         os.environ.get("CUDA_VISIBLE_DEVICES", ""), encoding="utf-8"
     )
     time.sleep(1)
     yield
     time.sleep(1)
-    assert not regular.exists(), "regular batch overlapped solo teardown"
-    solo.unlink()
+    assert not regular.exists(), "regular batch overlapped exclusive teardown"
+    exclusive.unlink()
 
-def test_solo_one():
+def test_heavy_one():
     pass
 
-def test_solo_two():
+def test_heavy_two():
     pass
 """,
         encoding="utf-8",
@@ -1366,17 +1366,17 @@ import time
 from pathlib import Path
 
 def test_regular():
-    state = Path(os.environ["SOLO_STATE"])
-    solo = state / "solo-active"
+    state = Path(os.environ["EXCLUSIVE_STATE"])
+    exclusive = state / "exclusive-active"
     regular = state / "regular-active"
-    assert not solo.exists(), "solo batch overlapped regular setup"
+    assert not exclusive.exists(), "exclusive batch overlapped regular setup"
     regular.write_text("active", encoding="utf-8")
     (state / "regular-devices").write_text(
         os.environ.get("CUDA_VISIBLE_DEVICES", ""), encoding="utf-8"
     )
     try:
         time.sleep(2)
-        assert not solo.exists(), "solo batch overlapped regular execution"
+        assert not exclusive.exists(), "exclusive batch overlapped regular execution"
     finally:
         regular.unlink()
 """,
@@ -1391,12 +1391,12 @@ def test_regular():
         "2",
         env_override={
             "CUDA_VISIBLE_DEVICES": "0,1",
-            "SOLO_STATE": str(state),
+            "EXCLUSIVE_STATE": str(state),
         },
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (state / "solo-devices").read_text(encoding="utf-8") == "0,1"
+    assert (state / "exclusive-devices").read_text(encoding="utf-8") == "0,1"
     assert (state / "regular-devices").read_text(encoding="utf-8") in {"0", "1"}
 
 
@@ -1493,7 +1493,7 @@ def test_comm_conftest_validates_sibling_master_port(
         assert "MASTER_PORT must be between" in result.stdout + result.stderr
 
 
-def test_long_running_dispatches_first_and_solo_runs_after_non_solo_finalized(
+def test_long_running_dispatches_first_and_exclusive_runs_after_parallel_finalized(
     tmp_path: Path,
 ) -> None:
     suite = tmp_path / "suite"
@@ -1531,15 +1531,15 @@ def test_normal():
 """,
         encoding="utf-8",
     )
-    (suite / "test_solo.py").write_text(
+    (suite / "test_heavy.py").write_text(
         """\
 import os
 from pathlib import Path
 import pytest
 
-pytestmark = pytest.mark.solo
+pytestmark = pytest.mark.exclusive_extreme_host_ram
 
-def test_solo():
+def test_heavy():
     state = Path(os.environ["PHASE_STATE"])
     assert (state / "long-a-done").exists()
     assert (state / "long-b-done").exists()
@@ -1568,23 +1568,23 @@ def test_solo():
     assert "PYTEST RUNNING" not in result.stdout
 
 
-def test_pending_non_solo_work_blocks_the_solo_phase(tmp_path: Path) -> None:
+def test_pending_parallel_work_blocks_the_exclusive_phase(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
-    solo_started = tmp_path / "solo-started"
+    exclusive_started = tmp_path / "exclusive-started"
     (suite / "test_regular.py").write_text(
         "import time\ndef test_regular(): time.sleep(5)\n",
         encoding="utf-8",
     )
-    (suite / "test_solo.py").write_text(
+    (suite / "test_heavy.py").write_text(
         f"""\
 from pathlib import Path
 import pytest
 
-pytestmark = pytest.mark.solo
+pytestmark = pytest.mark.exclusive_extreme_host_ram
 
-def test_solo():
-    Path({str(solo_started)!r}).write_text("started", encoding="utf-8")
+def test_heavy():
+    Path({str(exclusive_started)!r}).write_text("started", encoding="utf-8")
 """,
         encoding="utf-8",
     )
@@ -1602,8 +1602,8 @@ def test_solo():
     )
 
     assert result.returncode == 2, result.stdout
-    assert not solo_started.exists()
-    assert "WORKER TASK worker=solo-0" not in result.stdout
+    assert not exclusive_started.exists()
+    assert "WORKER TASK worker=exclusive-0" not in result.stdout
     assert "Pending: 2" in result.stdout
 
 
