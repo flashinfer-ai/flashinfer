@@ -741,10 +741,19 @@ def _build_decode_gen_schedule(
     sparse_softmax_metadata0_cfg = None
     sparse_softmax_metadata1_cfg = None
     if cfg.use_block_sparse:
-        # Two stages are sufficient for the split-ring cadence: one route can
-        # await Softmax while Load publishes the next route for the same inst.
+        # Load publishes a route right after its K tile and Softmax releases
+        # the route when it starts that tile. When the ring frees a slot for
+        # an instance's next K tile, the instance's Softmax has started every
+        # route older than the K tiles the ring buffers per instance, so one
+        # stage more than those K tiles never stalls the load warp.
+        if use_per_inst_kv_resources:
+            inst_k_tiles = max(split_k0_stages, split_k1_stages)
+        else:
+            # One ring cycles K and V tiles of every instance.
+            inst_k_tiles = math.ceil(cfg.kv_stages / (2 * cfg.num_insts_kv))
+        route_metadata_stages = inst_k_tiles + 1
         sparse_softmax_metadata0_cfg = PipelineConfig(
-            num_stages=2,
+            num_stages=route_metadata_stages,
             num_bytes=0,
             producer_group=load_grp,
             consumer_group=softmax0_grp,
@@ -753,7 +762,7 @@ def _build_decode_gen_schedule(
             advance_on_wait=True,
         )
         sparse_softmax_metadata1_cfg = PipelineConfig(
-            num_stages=2,
+            num_stages=route_metadata_stages,
             num_bytes=0,
             producer_group=load_grp,
             consumer_group=softmax1_grp,
