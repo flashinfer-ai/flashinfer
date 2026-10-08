@@ -59,7 +59,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `trtllm_fp4_block_scale_routed_moe`, `trtllm_fp8_block_scale_routed_moe`, `trtllm_fp8_per_tensor_scale_routed_moe` - Pre-routed variants of the three routines above. Routing for `--routing_method` is computed once outside the timed region and passed as packed `(expert_id << 16) | bf16_weight` top-k entries (the layout SGLang's `flashinfer_trtllm_routed` backend passes), so only the routed kernel path is timed. `--refcheck` compares the output against the routing-logits path on the same weights.
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
     - `cute_dsl_bf16_moe` - CuTe-DSL BF16/FP16 fused MoE for Hopper.
-    - `unified_moe` - Unified MoE API comparison between the CUTLASS and cuTile backends (plus TRT-LLM and CuTe DSL for MXFP4 W4A8, `--quant-variant mxfp4_w4a8` or its alias `mxfp4_mxfp8`). It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 and MXFP8 W8A8/W8A16, and MXFP4 W4A8 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
+    - `unified_moe` - Unified MoE API comparison between the CUTLASS and cuTile backends (plus TRT-LLM and CuTe DSL for MXFP4 W4A8, `--quant-variant mxfp4_w4a8` or its alias `mxfp4_mxfp8`; cuDNN Frost on SM107 for BF16, NVFP4, MXFP8 and MXFP4 W4A8, and on SM120 for BF16; Prims-TS on SM100/SM103 for BF16 and NVFP4). It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 and MXFP8 W8A8/W8A16, and MXFP4 W4A8 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
 - MOE Communication:
     - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
 - AllReduce Communication:
@@ -599,7 +599,7 @@ Legend:
 | **trtllm_fp8_per_tensor_scale_routed_moe** |  |  |  |  |  | trtllm | trtllm | trtllm |  |
 | **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass | cutlass |  |
 | **cute_dsl_bf16_moe** |  |  |  |  | cute-dsl |  |  |  |  |
-| **unified_moe** |  |  |  | cutlass (BF16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass (BF16, MXFP4 W4A16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass, trtllm (MXFP4 W4A8), cute_dsl (MXFP4 W4A8) | cutlass, trtllm (MXFP4 W4A8), cute_dsl (MXFP4 W4A8) | cutlass, trtllm (MXFP4 W4A8), cute_dsl (MXFP4 W4A8) | cutlass (BF16, NVFP4 W4A4), cutile (BF16, NVFP4/MXFP4 W4A4/W4A16) |
+| **unified_moe** |  |  |  | cutlass (BF16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass (BF16, MXFP4 W4A16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass, trtllm (MXFP4 W4A8), cute_dsl (MXFP4 W4A8), prims_ts (BF16, NVFP4 W4A4) | cutlass, trtllm (MXFP4 W4A8), cute_dsl (MXFP4 W4A8), prims_ts (BF16, NVFP4 W4A4) | cutlass, trtllm (MXFP4 W4A8), cute_dsl (MXFP4 W4A8), cudnn_frost (BF16, NVFP4 W4A4, MXFP8, MXFP4 W4A8) | cutlass (BF16, NVFP4 W4A4), cutile (BF16, NVFP4/MXFP4 W4A4/W4A16), cudnn_frost (BF16) |
 | **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a | moe_a2a |  |
 | **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce | allreduce |  |
 | **rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |

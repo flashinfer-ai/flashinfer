@@ -1,4 +1,5 @@
-"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, TRT-LLM, CuTe DSL, b12x and SM12x MoE runners."""
+"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, TRT-LLM, CuTe DSL, cuDNN Frost,
+Prims-TS, b12x and SM12x MoE runners."""
 
 from __future__ import annotations
 
@@ -34,6 +35,10 @@ from flashinfer.fused_moe import (
     CuTileMxfp8Config,
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
+    CudnnFrostBf16Config,
+    CudnnFrostMxfp8Config,
+    CudnnFrostMxfp8Mxfp4Config,
+    CudnnFrostNvfp4Config,
     CuteDslConfig,
     ExecutionConfig,
     ExpertConfig,
@@ -46,6 +51,7 @@ from flashinfer.fused_moe import (
     MoEFinalizeConfig,
     MoELayer,
     MoEWeightPack,
+    PrimsTsConfig,
     QuantConfig,
     QuantFormat,
     ReLU,
@@ -82,9 +88,13 @@ from .moe_utils import (
 _BACKEND_CONFIGS = {
     ("bf16", "cutlass"): CutlassBf16Config,
     ("bf16", "cutile"): CuTileBf16Config,
+    ("bf16", "cudnn_frost"): CudnnFrostBf16Config,
+    ("bf16", "prims_ts"): PrimsTsConfig,
     ("nvfp4", "cutlass"): CutlassNvfp4Config,
     ("nvfp4", "cutile"): CuTileNvfp4Config,
     ("nvfp4", "b12x"): B12xNvfp4Config,
+    ("nvfp4", "cudnn_frost"): CudnnFrostNvfp4Config,
+    ("nvfp4", "prims_ts"): PrimsTsConfig,
     ("nvfp4_w4a16", "cutile"): CuTileNvfp4Bf16Config,
     ("nvfp4_w4a16", "b12x"): B12xW4A16Config,
     ("nvfp4_w4a16", "sm12x"): SM12xNvfp4Bf16Config,
@@ -95,11 +105,13 @@ _BACKEND_CONFIGS = {
     ("fp8", "cutlass"): CutlassFp8PerTensorConfig,
     ("fp8_w8a16", "cutile"): CuTileFp8PerTensorBf16Config,
     ("mxfp8", "cutile"): CuTileMxfp8Config,
+    ("mxfp8", "cudnn_frost"): CudnnFrostMxfp8Config,
     ("mxfp8_w8a16", "cutile"): CuTileMxfp8Bf16Config,
     ("mxfp4_w4a8", "cutile"): CuTileMxfp4Mxfp8Config,
     ("mxfp4_w4a8", "cutlass"): CutlassMxfp8Mxfp4Config,
     ("mxfp4_w4a8", "trtllm"): TrtllmFp4Config,
     ("mxfp4_w4a8", "cute_dsl"): CuteDslConfig,
+    ("mxfp4_w4a8", "cudnn_frost"): CudnnFrostMxfp8Mxfp4Config,
 }
 
 _QUANT_FORMATS = {
@@ -118,7 +130,14 @@ _QUANT_FORMATS = {
 # Backends whose weight preparation needs hidden_size and intermediate_size
 # divisible by 128 for a quant variant. cuTile's MXFP4 x MXFP8 path only needs
 # 32-element alignment and is not listed.
-_ALIGN_128_BACKENDS = {"mxfp4_w4a8": ("cutlass", "trtllm", "cute_dsl")}
+_ALIGN_128_BACKENDS = {
+    "nvfp4": ("cudnn_frost",),
+    "mxfp8": ("cudnn_frost",),
+    "mxfp4_w4a8": ("cutlass", "trtllm", "cute_dsl", "cudnn_frost"),
+}
+
+# Backends whose weight and activation preparation take the layer's QuantConfig.
+_QUANT_AWARE_BACKENDS = ("trtllm", "cute_dsl", "prims_ts")
 
 # Alternate spellings accepted by --quant-variant. ``mxfp4_mxfp8`` matches the
 # flat trtllm routines' ``--fp4_mode mxfp4_mxfp8``.
@@ -145,7 +164,16 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("cutlass", "cutile", "trtllm", "cute_dsl", "b12x", "sm12x"),
+        choices=(
+            "cutlass",
+            "cutile",
+            "trtllm",
+            "cute_dsl",
+            "cudnn_frost",
+            "prims_ts",
+            "b12x",
+            "sm12x",
+        ),
         default=["cutlass", "cutile"],
         help="Unified MoE backends to benchmark with the same inputs.",
     )
@@ -336,12 +364,13 @@ def _prepare_weight_view(
         "activation": activation,
         "device": device,
     }
-    if quant_variant == "bf16" or backend == "cutlass":
-        return config_type.prepare_weights(w1, w2, **common)
-    if backend in ("trtllm", "cute_dsl"):
+    if backend in _QUANT_AWARE_BACKENDS:
         return config_type.prepare_weights(
             w1, w2, quant=_quant_config(quant_variant), **common
         )
+    if quant_variant == "bf16" or backend in ("cutlass", "cudnn_frost"):
+        # cuDNN Frost consumes the canonical CUTLASS weight views.
+        return config_type.prepare_weights(w1, w2, **common)
 
     if quant_variant.startswith(("fp8", "mxfp8")):
         block_scaled = quant_variant.startswith("mxfp8")
@@ -649,13 +678,13 @@ def run_unified_moe_test(args):
         config = _config_for_backend(args, activation, backend_config)
         try:
             backend_activations = activations
-            if config_type is CutlassNvfp4Config:
-                # CUTLASS NVFP4 consumes the TRT-LLM canonical pre-quantized
-                # pack; b12x / cuTile NVFP4 quantize BF16 in-kernel. Inside the
-                # guard so an unaligned hidden_size skips this backend like any
-                # other unsupported configuration.
-                x_q, x_sf = CutlassNvfp4Config.prepare_activations(
-                    activations.hidden_states_q
+            if config_type in (CutlassNvfp4Config, CudnnFrostNvfp4Config):
+                # CUTLASS and cuDNN Frost NVFP4 consume the TRT-LLM canonical
+                # pre-quantized pack; b12x / cuTile NVFP4 quantize BF16
+                # in-kernel. Inside the guard so an unaligned hidden_size skips
+                # this backend like any other unsupported configuration.
+                x_q, x_sf = config_type.prepare_activations(
+                    activations.hidden_states_q, quant=config.quant
                 )
                 backend_activations = MoEActivationPack(
                     hidden_states_q=x_q,
@@ -687,6 +716,17 @@ def run_unified_moe_test(args):
                 # Same canonical linear-scale MXFP8 pack as CUTLASS consumes.
                 input_quantizer = functools.partial(
                     TrtllmFp4Config.prepare_activations, quant=config.quant
+                )
+            elif backend == "cudnn_frost" and args.quant_variant in (
+                "mxfp8",
+                "mxfp4_w4a8",
+            ):
+                input_quantizer = functools.partial(
+                    config_type.prepare_activations, quant=config.quant
+                )
+            elif backend == "prims_ts" and args.quant_variant == "nvfp4":
+                input_quantizer = functools.partial(
+                    PrimsTsConfig.prepare_activations, quant=config.quant
                 )
             if input_quantizer is not None:
                 quantized, scale = input_quantizer(activations.hidden_states_q)
@@ -776,9 +816,11 @@ def run_unified_moe_test(args):
             median_time,
             torch.bfloat16,
             weight_dtype,
-            # CUTLASS NVFP4 reads a pre-quantized FP4 + E4M3-scale pack; the
-            # other NVFP4 backends read BF16 and quantize in-kernel.
-            input_format="nvfp4" if config_type is CutlassNvfp4Config else None,
+            # CUTLASS and cuDNN Frost NVFP4 read a pre-quantized FP4 + E4M3-scale
+            # pack; the other NVFP4 backends read BF16 and quantize in-kernel.
+            input_format="nvfp4"
+            if config_type in (CutlassNvfp4Config, CudnnFrostNvfp4Config)
+            else None,
             weight_format=weight_format,
             routing_logits_dtype=None,
             active_experts=active_experts,
