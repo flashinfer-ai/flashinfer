@@ -198,7 +198,7 @@ _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM107: tuple[
     (None, "cpasync_tile128_register_pipeline"),
 )
 CAKE_KDA_PACKED_T1_ALIGNED_BANDS: dict[
-    tuple[int, int], tuple[tuple[Optional[int], CakeKDAPackedT1Variant], ...]
+    tuple[int, ...], tuple[tuple[Optional[int], CakeKDAPackedT1Variant], ...]
 ] = {
     (10, 0): _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM100,
     (10, 3): _CAKE_KDA_PACKED_T1_ALIGNED_BANDS_SM100,

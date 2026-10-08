@@ -583,7 +583,9 @@ CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES: dict[str, dict[int, str]] = {
 # (``vec8``) and 257-368 / 417-3072 heads (``vec8occ``), 369-416 heads return to
 # ``vec8occ`` at TILE_V=16, and the wide 128-row body only wins above 3072 heads
 # (the shared table hands over at 768).
-CAKE_GDN_BF16_T1_ROUTE_ARCH_BANDS: dict[str, tuple[tuple[int | None, str, int], ...]] = {
+CAKE_GDN_BF16_T1_ROUTE_ARCH_BANDS: dict[
+    str, tuple[tuple[int | None, str, int], ...]
+] = {
     "sm_107a": (
         (192, "vec8occ", 16),
         (256, "vec8", 32),
@@ -603,7 +605,9 @@ def cake_gdn_bf16_t1_route(
 
     state_heads = int(batch_size) * int(num_v_heads)
     bands = CAKE_GDN_BF16_T1_ROUTE_ARCH_BANDS.get(arch)
-    overrides = CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES.get(arch, {}) if bands is None else {}
+    overrides = (
+        CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES.get(arch, {}) if bands is None else {}
+    )
     if bands is None:
         bands = CAKE_GDN_BF16_T1_ROUTE_BANDS
     for max_state_heads, body, tile_v in bands:
