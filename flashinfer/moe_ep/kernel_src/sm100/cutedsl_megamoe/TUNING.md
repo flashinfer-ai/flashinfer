@@ -393,6 +393,32 @@ a shape comes in:
   one compiled slot, so callers can select a decode or prefill workspace
   whose capacity has an offline winner in the same knob cache.
 
+### Caller finalization for BF16 and W4A16
+
+SM100 BF16 and W4A16 MegaMoE also accept `do_finalize=False` in their kernel
+configs. Call `layer.forward_unfinalized(t)` to receive borrowed, contiguous
+BF16 `[T * top_k, hidden]` rows, FP32 `[T, top_k]` remaining routing weights,
+and an int32 `[T, top_k]` identity route map. Consume the results on the current
+stream before the pooled workspace is reused. EP communication completes even
+on zero-token ranks; warm up on all ranks before CUDA graph capture.
+
+BF16 applies routing weights in FC1 by default and returns remaining weights of one.
+W4A16 returns the staged routing weights by default, or ones with
+`apply_topk_in_fc1=True`. Caller finalization can use:
+
+```python
+rows, weights, route_map = layer.forward_unfinalized(t)
+partials = rows[route_map.long()].float()
+output = (partials * weights.unsqueeze(-1)).sum(dim=1).bfloat16()
+```
+
+W4A16's built-in weighted reducer uses fused multiply-add. A caller's separate
+multiply and sum can therefore round differently despite identical per-route rows.
+
+Both backends require `enable_in_kernel_fc2_reduce=False` and reject
+`knobs="auto"` in this mode. Use `knobs=None` or an explicit knob dictionary.
+The `--no-do-finalize` offline tuning CLI remains specific to SM100 NVFP4.
+
 ### Offline tuning for unfinalized NVFP4 output
 
 Use `--no-do-finalize` to tune SM100 NVFP4 for a serving configuration with
