@@ -45,9 +45,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_X_TILE_OFF 1024
 #define SMEM_X_TILE_STAGE_BYTES 32768
 #define SMEM_X_TILE_STRIDE 32768
-#define SMEM_X_HALVES_OFF 1024
-#define SMEM_X_HALVES_STAGE_BYTES 32768
-#define SMEM_X_HALVES_STRIDE 32768
 #define SMEM_X_WORDS_OFF 1024
 #define SMEM_X_WORDS_STAGE_BYTES 32768
 #define SMEM_X_WORDS_STRIDE 32768
@@ -174,8 +171,6 @@ kernel_cake_mok_quantize_transposed(const __grid_constant__ CUtensorMap x_bf16, 
     // Kernel setup ops
     __nv_bfloat16* x_tile = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int x_tile_addr = smem + 1024;
-    uint16_t* x_halves = reinterpret_cast<uint16_t*>(smem_raw + 1024);
-    const int x_halves_addr = smem + 1024;
     unsigned int* x_words = reinterpret_cast<unsigned int*>(smem_raw + 1024);
     const int x_words_addr = smem + 1024;
     unsigned int* t_words = reinterpret_cast<unsigned int*>(smem_raw + 33792);
@@ -208,19 +203,24 @@ kernel_cake_mok_quantize_transposed(const __grid_constant__ CUtensorMap x_bf16, 
     float scale_floor = 1e-12f;
     int t_row = tid % 64 * 2 + tid / 64;
     int rotation = tid / 8;
+    int pair_base = x_tile_addr + (unsigned int)((t_row - t_row % 2) * 2);
+    unsigned int merge_sel = (unsigned int)(21520 + t_row % 2 * 8738);
+    int row_bytes = 256;
     unsigned int t_scale_word = 0;
     #pragma unroll 1
     for (int j = 0; j < 4; j++) {
         int k_block = (j + rotation) % 4;
         unsigned int t_words_0[16];
+        unsigned int pair[2];
         #pragma unroll
         for (int k = 0; k < 16; k++) {
             int src_row = k_block * 32 + (tid * 4 + k * 2) % 32;
-            unsigned int lo = (unsigned int)x_halves[src_row * 128 + t_row];
-            unsigned int hi = (unsigned int)x_halves[(src_row + 1) * 128 + t_row];
+            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&pair[0])) : "r"(pair_base + src_row * row_bytes));
+            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&pair[1])) : "r"(pair_base + (src_row + 1) * row_bytes));
             uint32_t _prmt_b32_0;
-            asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(_prmt_b32_0) : "r"(lo), "r"(hi));
-            t_words_0[k] = _prmt_b32_0;
+            asm("prmt.b32 %0, %1, %2, %3;" : "=r"(_prmt_b32_0) : "r"(pair[0]), "r"(pair[1]), "r"(merge_sel));
+            unsigned int merged = _prmt_b32_0;
+            t_words_0[k] = merged;
         }
         unsigned int t_packed[8];
         uint32_t _bf16x2_abs_0;
@@ -266,21 +266,21 @@ kernel_cake_mok_quantize_transposed(const __grid_constant__ CUtensorMap x_bf16, 
             float v3 = _cvt_f32_bf16_4;
             uint16_t _e4m3x2_f32_0;
             asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_0) : "f"(v1 * inv), "f"(v0 * inv));
-            uint16_t lo_1 = _e4m3x2_f32_0;
+            uint16_t lo = _e4m3x2_f32_0;
             uint16_t _e4m3x2_f32_1;
             asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_1) : "f"(v3 * inv), "f"(v2 * inv));
-            uint16_t hi_1 = _e4m3x2_f32_1;
-            t_packed[i] = (unsigned int)lo_1 | (unsigned int)hi_1 << 16;
+            uint16_t hi = _e4m3x2_f32_1;
+            t_packed[i] = (unsigned int)lo | (unsigned int)hi << 16;
         }
         unsigned int t_scale_byte = scale_byte;
         #pragma unroll
         for (int i_1 = 0; i_1 < 8; i_1++) {
             int t_col = k_block * 32 + (tid * 4 + i_1 * 4) % 32;
-            t_words[t_row * 32 + t_col / 4] = t_packed[i_1];
+            asm volatile("st.shared.b32 [%0], %1;" :: "r"(t_words_addr + (unsigned int)((t_row * 32 + t_col / 4) * 4)), "r"((t_packed[i_1])));
         }
         t_scale_word = t_scale_word | t_scale_byte << (unsigned int)(k_block * 8);
     }
-    sc_t_words[t_row % 32 * 4 + t_row / 32] = t_scale_word;
+    asm volatile("st.shared.b32 [%0], %1;" :: "r"(sc_t_words_addr + (unsigned int)((t_row % 32 * 4 + t_row / 32) * 4)), "r"(t_scale_word));
     __syncthreads();
     if (tid == 0) {
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");

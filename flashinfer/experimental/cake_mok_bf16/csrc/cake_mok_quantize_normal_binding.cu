@@ -21,7 +21,7 @@
 extern "C" __global__ void kernel_cake_mok_quantize_normal(const __grid_constant__ CUtensorMap x_bf16, const __grid_constant__ CUtensorMap x_fp8, const __grid_constant__ CUtensorMap x_fp8_t, const __grid_constant__ CUtensorMap x_sc, const __grid_constant__ CUtensorMap x_sc_t, int col_blocks, int row_blocks);
 
 
-namespace cake_host_shim_5ad85bc28ca60f9a {
+namespace cake_host_shim_9c1f8e83a85ea44b {
 
 using tvm::ffi::TensorView;
 
@@ -393,6 +393,6 @@ void Run(TensorView arg_x_bf16, TensorView arg_x_fp8, TensorView arg_x_fp8_t, Te
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_5ad85bc28ca60f9a
+}  // namespace cake_host_shim_9c1f8e83a85ea44b
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_5ad85bc28ca60f9a::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_9c1f8e83a85ea44b::Run);

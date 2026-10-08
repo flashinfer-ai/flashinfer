@@ -45,9 +45,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_X_TILE_OFF 1024
 #define SMEM_X_TILE_STAGE_BYTES 32768
 #define SMEM_X_TILE_STRIDE 32768
-#define SMEM_X_HALVES_OFF 1024
-#define SMEM_X_HALVES_STAGE_BYTES 32768
-#define SMEM_X_HALVES_STRIDE 32768
 #define SMEM_X_WORDS_OFF 1024
 #define SMEM_X_WORDS_STAGE_BYTES 32768
 #define SMEM_X_WORDS_STRIDE 32768
@@ -174,8 +171,6 @@ kernel_cake_mok_quantize_normal(const __grid_constant__ CUtensorMap x_bf16, cons
     // Kernel setup ops
     __nv_bfloat16* x_tile = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int x_tile_addr = smem + 1024;
-    uint16_t* x_halves = reinterpret_cast<uint16_t*>(smem_raw + 1024);
-    const int x_halves_addr = smem + 1024;
     unsigned int* x_words = reinterpret_cast<unsigned int*>(smem_raw + 1024);
     const int x_words_addr = smem + 1024;
     unsigned int* t_words = reinterpret_cast<unsigned int*>(smem_raw + 33792);
@@ -208,6 +203,7 @@ kernel_cake_mok_quantize_normal(const __grid_constant__ CUtensorMap x_bf16, cons
     float scale_floor = 1e-12f;
     int n_row = tid;
     int rotation = tid / 8;
+    int row_base = x_words_addr + (unsigned int)(n_row * 128 * 2);
     unsigned int words[64];
     #pragma unroll
     for (int j = 0; j < 4; j++) {
@@ -215,7 +211,7 @@ kernel_cake_mok_quantize_normal(const __grid_constant__ CUtensorMap x_bf16, cons
         #pragma unroll
         for (int k = 0; k < 16; k++) {
             int src_col = k_block_j * 32 + (tid * 4 + k * 2) % 32;
-            words[j * 16 + k] = x_words[n_row * 64 + src_col / 2];
+            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&words[j * 16 + k])) : "r"(row_base + src_col * 2));
         }
     }
     __syncthreads();
@@ -277,11 +273,11 @@ kernel_cake_mok_quantize_normal(const __grid_constant__ CUtensorMap x_bf16, cons
         #pragma unroll
         for (int i_1 = 0; i_1 < 8; i_1++) {
             int n_col = k_block_n * 32 + (tid * 4 + i_1 * 4) % 32;
-            x_words[n_row * 32 + n_col / 4] = n_packed[i_1];
+            asm volatile("st.shared.b32 [%0], %1;" :: "r"(x_words_addr + (unsigned int)((n_row * 32 + n_col / 4) * 4)), "r"((n_packed[i_1])));
         }
         n_scale_word = n_scale_word | n_scale_byte << (unsigned int)(k_block_n * 8);
     }
-    sc_words[n_row % 32 * 4 + n_row / 32] = n_scale_word;
+    asm volatile("st.shared.b32 [%0], %1;" :: "r"(sc_words_addr + (unsigned int)((n_row % 32 * 4 + n_row / 32) * 4)), "r"(n_scale_word));
     __syncthreads();
     if (tid == 0) {
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
