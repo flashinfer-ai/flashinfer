@@ -29,18 +29,76 @@ Host contract (flashinfer#4671 hardening)
   producer and the reducer first and issue both through one FFI call
   (``run_sequence`` in ``cake_dsv4_launch_sequence.cc``), so no host work
   sits between the two kernels.
+* **Query layout.** Every variant receives the five query-layout parameters
+  (:data:`QUERY_LAYOUT_PARAMS`): ``seq_lens`` (int32, the cache length of
+  every request), ``cum_seq_lens_q``, ``ragged_query``, ``max_q_len`` and
+  ``batch_size``. The kernels derive the trtllm-gen SWA validity window from
+  them: with ``b`` the request owning metadata row ``t``, ``q_len_b`` its
+  query length and ``q_off`` the row's position in the request, combined
+  column ``c < 128`` is attended only when
+  ``c < clamp(seq_lens[b] - (q_len_b - 1 - q_off), 0, 128)`` (CAKE-957). A
+  dense call (``cum_seq_lens_q=None``) binds ``ragged_query = 0``,
+  ``max_q_len`` = the caller's per-request query length, ``batch_size =
+  seq_lens.numel()`` and ``seq_lens`` in place of the never-read
+  ``cum_seq_lens_q`` pointer; a ragged call binds the caller's offsets with
+  ``ragged_query = 1``. The producers in :data:`_RAGGED_ONLY_ROUTES` read the
+  request boundaries from ``cum_seq_lens_q`` unconditionally and receive the
+  cached dense offsets instead. No host value is ever ``None``.
+* **Preconditions on the metadata.** Every metadata row must keep at least
+  one column inside the three validity predicates' domain: the active length
+  ``sparse_topk_lens[t] + sparse_topk_lens_offset`` must be ``>= 1`` and the
+  owning request must satisfy ``seq_lens[b] >= q_len_b`` (so the SWA window
+  holds at least the row's own token). sglang satisfies both by construction
+  (constant 128 on SWA-only layers, the window always contains the current
+  token). A row whose columns are all ``-1`` or all beyond the window is a
+  defined input and returns the all-invalid zero result. An active length of
+  0 is outside the trtllm-gen contract (the stock FP8 kernels read past the
+  active length or return NaN there); the Cake programs regenerated for
+  CAKE-957 all return the zero result for it (tile-count guards in the FP8
+  persistent, BF16 H64 guard/prefill and FP8 H64 source-exact bodies). The
+  host does not synchronise to check these values.
 * **Workspace.** One caller-owned ``workspace_buffer`` is carved
   deterministically (:func:`cake_dsv4_workspace_layout`)::
 
       [0,      1024)          reserved (formerly the TMA descriptor slab; see below)
-      [1024,   1024 + 256 KiB) split-merge counters, uint32[65536]; zero at first use,
-                               the kernel leaves them zero after every launch
-      [P,      P + O_bytes)    partial_O  bf16 [T * H * S * 512]  (P = 1024 + 256 KiB)
-      [P + O_bytes, ...)       partial_lse f32 [T * H * S]
+      [1024,   1024 + 256 KiB) split-merge counters, uint32[65536]
+      [P,      P + O_bytes)    partial_O  bf16 [T * H * S * 512]  (P = 1024 + 256 KiB;
+                               O_bytes = 0 when the route runs one split)
+      [P + O_bytes, + L_bytes) partial_lse f32 [T * H * S]
+      [..., + Q_bytes)         shifted request offsets int32 [B + 1]
+                               (row-tiled launches after the first chunk only)
 
-  with every region 128-byte aligned. Callers zero the counter region once
-  (:func:`cake_dsv4_workspace_reset`, or the first eager call does it for that
-  tensor) and the kernels self-reset.
+  with every region 128-byte aligned. The requirement is exact per route
+  (:func:`cake_dsv4_workspace_requirement`, from the same
+  :func:`_route_plan` table the dispatcher launches with): routes without
+  partial buffers need no workspace bytes, one-split routes need the LSE
+  region only, split routes the partial O and LSE regions. When
+  ``workspace_buffer`` cannot hold one launch over all ``T`` metadata rows,
+  the host tiles the rows into consecutive launches that fit
+  (:func:`_dispatch_row_tiles`): ``Q``, ``O`` and the metadata tables are
+  sliced by row (views, no copies) and every chunk after the first receives
+  its request boundaries as ``cum_seq_lens_q - first_row`` (``B + 1`` int32
+  written into the workspace's offsets region by one ``torch.sub`` in stream
+  order, capturable) with ``ragged_query = 1``, so the window resolves for
+  any chunk start. The smallest accepted workspace is the one-row
+  requirement; :func:`get_cake_dsv4_workspace_bytes` is the single-launch
+  upper bound. sglang's fixed 128 MiB buffer therefore admits every row
+  count on every route; the only route whose single launch can outgrow it is
+  ``bf16_h32_topk128x_early_v47`` (``ceil(sparse_topk / 128)`` splits of
+  ``32 * 1028`` bytes per row, no token bound), which tiles.
+* **Split-merge counters.** ``bf16_h32_topk128x_early_v47`` (the only route
+  with an in-kernel last-arriver merge) needs its ``T * ceil(H / 8)``
+  counters zero at launch and leaves them zero afterwards. Zeroing is part
+  of the launch contract and never raises: the first eager launch through a
+  workspace zeroes the whole counter region once and registers the
+  workspace in :data:`_primed_workspaces` (keyed by device and base address,
+  guarded by a weak reference to the tensor owning the storage, so views of
+  one buffer share the state and a freed and reused address is re-primed);
+  a launch under CUDA Graph capture through an unregistered workspace
+  records a zero fill of exactly the counters it uses into the graph
+  (replays stay self-contained, nothing is registered). The kernels do not
+  depend on any other host state. :func:`cake_dsv4_workspace_reset` zeroes
+  and registers explicitly.
 * **Descriptor storage.** The SM103 bindings that read their TMA descriptors
   from device memory (``tma_workspace_bytes`` in their registration; the SM100
   twins pass descriptors by value and use none of this) take a private,
@@ -110,7 +168,8 @@ from __future__ import annotations
 import collections
 import functools
 import threading
-from dataclasses import dataclass
+import weakref
+from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Optional, Sequence, Union
 
 import torch
@@ -154,7 +213,13 @@ _BF16_TOPK128X_MAX_WIDTH = 388
 _FP8_ONE_PARTITION_MAX_WIDTH = 384
 _BF16_H64_COMPRESSED_PREFILL_TOKENS = 24
 _BF16_H64_PREFILL_MAX_SPARSE_WIDTH = 640
-_PRIMED_ATTR = "_cake_dsv4_counters_primed"
+# Workspaces whose split-merge counter region is known to be zero:
+# (device index, address of the workspace view) -> weak reference to the
+# tensor owning the storage (the view's ``_base`` or the tensor itself). A dead
+# reference or another owner at the same address means the memory was freed
+# and possibly reused: the workspace is primed again.
+_primed_workspaces: dict[tuple[Optional[int], int], "weakref.ref[torch.Tensor]"] = {}
+_primed_lock = threading.Lock()
 
 # NVFP4 cache route. Mirrors the Cake kernel module constants
 # (flashinfer_blackwell_sparse_mla_dsv4_nvfp4_decode: TOKEN_DATA_BYTES +
@@ -238,6 +303,16 @@ KERNEL_METADATA_PARAMS = (
     "sparse_topk_lens_offset",
     "sparse_topk",
     "num_query_tokens",
+)
+
+# Query-layout parameters of every generated variant (the SWA validity window;
+# see the module docstring). Mirrors the Cake seeds' SWA_WINDOW_PARAMS.
+QUERY_LAYOUT_PARAMS = (
+    "seq_lens",
+    "cum_seq_lens_q",
+    "ragged_query",
+    "max_q_len",
+    "batch_size",
 )
 
 _scale_cache: dict[tuple[str, Optional[int], float], torch.Tensor] = {}
@@ -504,6 +579,8 @@ class WorkspaceLayout:
     counters: tuple[int, int]
     partial_o: tuple[int, int]
     partial_lse: tuple[int, int]
+    # Shifted request offsets of a row-tiled chunk (size 0 for whole launches).
+    query_offsets: tuple[int, int]
     total_bytes: int
     # Final base-2 LSE f32 [T * H]; only carved for the NVFP4 route
     # (``with_lse=True``), otherwise an empty region at the layout end.
@@ -515,22 +592,42 @@ def cake_dsv4_workspace_layout(
     num_heads: int,
     num_splits: int,
     *,
+    num_query_offsets: int = 0,
     with_lse: bool = False,
 ) -> WorkspaceLayout:
     """Deterministic carve of ``workspace_buffer`` for one launch shape.
 
-    ``with_lse`` appends the NVFP4 route's final-LSE region after
-    ``partial_lse``; the default layout is unchanged.
+    One-split launches (``num_splits == 1``) write the final output directly
+    and carry no ``partial_O`` region (size 0); the LSE region follows the
+    counters immediately. ``num_query_offsets`` (``batch_size + 1`` for a
+    row-tiled chunk after the first, else 0) sizes the int32 region after
+    ``partial_lse`` that holds the chunk's shifted ``cum_seq_lens_q``.
+    ``with_lse`` appends the NVFP4 route's final-LSE region after that; the
+    default layout is unchanged.
     """
     tokens = _positive_int(num_query_tokens, "num_query_tokens")
     heads = _positive_int(num_heads, "num_heads")
     splits = _positive_int(num_splits, "num_splits")
+    if (
+        isinstance(num_query_offsets, bool)
+        or not isinstance(num_query_offsets, int)
+        or num_query_offsets < 0
+    ):
+        raise ValueError(
+            f"num_query_offsets must be a non-negative int, got {num_query_offsets!r}"
+        )
     partial_elems = tokens * heads * splits
-    o_bytes = _align_up(partial_elems * _HEAD_DIM * torch.bfloat16.itemsize)
+    o_bytes = (
+        _align_up(partial_elems * _HEAD_DIM * torch.bfloat16.itemsize)
+        if splits > 1
+        else 0
+    )
     lse_bytes = _align_up(partial_elems * torch.float32.itemsize)
+    offsets_bytes = _align_up(num_query_offsets * torch.int32.itemsize)
     o_offset = _PARTIAL_OFFSET
     lse_offset = o_offset + o_bytes
-    final_lse_offset = lse_offset + lse_bytes
+    offsets_offset = lse_offset + lse_bytes
+    final_lse_offset = offsets_offset + offsets_bytes
     final_lse_bytes = (
         _align_up(tokens * heads * torch.float32.itemsize) if with_lse else 0
     )
@@ -539,6 +636,7 @@ def cake_dsv4_workspace_layout(
         counters=(_COUNTER_OFFSET, _COUNTER_REGION_BYTES),
         partial_o=(o_offset, o_bytes),
         partial_lse=(lse_offset, lse_bytes),
+        query_offsets=(offsets_offset, offsets_bytes),
         total_bytes=final_lse_offset + final_lse_bytes,
         lse=(final_lse_offset, final_lse_bytes),
     )
@@ -554,20 +652,23 @@ def get_cake_dsv4_workspace_bytes(
     kv_cache_format: Literal["fp8", "nvfp4"] = "fp8",
     extra_topk: int = 0,
 ) -> int:
-    """Bytes ``workspace_buffer`` needs for ``backend="cake"`` at this shape.
+    """Single-launch upper bound of ``workspace_buffer`` for ``backend="cake"``.
 
     ``num_query_tokens`` is the metadata row count (padded query rows do not
-    count). The result is an upper bound over every route::
+    count). The result bounds every route's one-launch carve::
 
         S      = num_splits if given else max(ceil(sparse_topk / 128), 5)
-        bytes  = 1024                                   # TMA descriptor slab
+        bytes  = 1024                                   # reserved slab
                + 262144                                 # split-merge counters (uint32[65536])
-               + align128(num_query_tokens * num_heads * S * 512 * 2)   # partial_O (BF16)
+               + align128(num_query_tokens * num_heads * S * 512 * 2)   # partial_O (BF16), S > 1 only
                + align128(num_query_tokens * num_heads * S * 4)         # partial_lse (FP32)
 
     Partial buffers are BF16/FP32 for both BF16 and FP8 inputs; ``dtype`` is
     validated only. Pass ``num_splits`` to size for a known route (routes use
-    ``ceil(sparse_topk / 128)`` or a fixed 1..5 splits).
+    ``ceil(sparse_topk / 128)`` or a fixed 1..5 splits). A smaller buffer is
+    not an error: the host tiles the metadata rows into launches that fit,
+    down to the one-row requirement; :func:`cake_dsv4_workspace_requirement`
+    reports the exact per-route numbers for a call.
 
     ``kv_cache_format="nvfp4"`` sizes the NVFP4 cache route instead: ``S`` is
     ``num_splits`` if given, else ``min(ceil(sparse_topk / 128) +
@@ -774,32 +875,63 @@ def _descriptor_storage(
     return storage.tensor
 
 
-def cake_dsv4_workspace_reset(workspace_buffer: torch.Tensor) -> None:
-    """Zero the split-merge counter region of ``workspace_buffer``.
+def _workspace_owner(workspace: torch.Tensor) -> torch.Tensor:
+    """The tensor whose lifetime owns ``workspace``'s storage (its ``_base`` or itself)."""
+    base = workspace._base
+    return workspace if base is None else base
 
-    Call once after allocating a workspace (or allocate it with ``torch.zeros``
-    and warm up eagerly). The generated kernels leave the counters zero after
-    every launch, so no per-call reset is needed and CUDA graph replays stay
-    self-contained. Zeroing is an in-place fill; nothing is allocated.
+
+def _primed_key(raw: torch.Tensor) -> tuple[Optional[int], int]:
+    return (raw.device.index, raw.data_ptr())
+
+
+def _counters_primed(workspace: torch.Tensor, raw: torch.Tensor) -> bool:
+    """Whether the counter region behind ``raw`` is registered as zero."""
+    with _primed_lock:
+        ref = _primed_workspaces.get(_primed_key(raw))
+    return ref is not None and ref() is _workspace_owner(workspace)
+
+
+def _register_primed(workspace: torch.Tensor, raw: torch.Tensor) -> None:
+    with _primed_lock:
+        for key in [k for k, ref in _primed_workspaces.items() if ref() is None]:
+            del _primed_workspaces[key]
+        _primed_workspaces[_primed_key(raw)] = weakref.ref(_workspace_owner(workspace))
+
+
+def cake_dsv4_workspace_reset(workspace_buffer: torch.Tensor) -> None:
+    """Zero the split-merge counter region of ``workspace_buffer`` and register it.
+
+    Optional: the launch contract zeroes the counters itself (first eager use
+    zeroes and registers the workspace; a capture through an unregistered
+    workspace records the zero fill into the graph). Calling this after
+    allocating a workspace only moves that first fill out of the hot path.
+    Zeroing is an in-place fill; nothing is allocated.
     """
     raw = _workspace_bytes(workspace_buffer)
     _require_workspace_bytes(raw, _PARTIAL_OFFSET)
     raw[_COUNTER_OFFSET:_PARTIAL_OFFSET].zero_()
-    setattr(workspace_buffer, _PRIMED_ATTR, True)
+    _register_primed(workspace_buffer, raw)
 
 
-def _ensure_counters_zeroed(workspace: torch.Tensor, raw: torch.Tensor) -> None:
-    if getattr(workspace, _PRIMED_ATTR, False):
+def _ensure_counters_zeroed(
+    workspace: torch.Tensor, raw: torch.Tensor, merge_groups: int
+) -> None:
+    """Make the ``merge_groups`` counters of this launch zero; never raises for capture.
+
+    Registered workspace: nothing (the kernels leave the counters zero).
+    Unregistered, eager: zero the whole region once and register it.
+    Unregistered, under CUDA Graph capture: record a zero fill of exactly the
+    counters this launch uses into the graph; the registry is left alone
+    because the fill has not executed and only replays carry it.
+    """
+    if _counters_primed(workspace, raw):
         return
     if _is_capturing(workspace.device):
-        raise RuntimeError(
-            "CAKE DSv4 split-merge counters in this workspace_buffer have not been "
-            "initialised and the current stream is capturing a CUDA graph; call "
-            "flashinfer.mla.cake_dsv4_workspace_reset(workspace_buffer) or run one "
-            "eager call with this workspace before capture"
-        )
+        raw[_COUNTER_OFFSET : _COUNTER_OFFSET + merge_groups * 4].zero_()
+        return
     raw[_COUNTER_OFFSET:_PARTIAL_OFFSET].zero_()
-    setattr(workspace, _PRIMED_ATTR, True)
+    _register_primed(workspace, raw)
 
 
 # --------------------------------------------------------------------------- #
@@ -971,7 +1103,6 @@ _UNAVAILABLE_HINTS: Mapping[str, str] = {
         "combined sparse_indices table with sparse_topk_lens_offset == 0; "
         "regenerate the bindings for separate tables or length offsets"
     ),
-    "cum_seq_lens_q": "this variant needs ragged queries (cum_seq_lens_q)",
 }
 
 
@@ -1307,6 +1438,242 @@ def _route(
 
 
 # --------------------------------------------------------------------------- #
+# Route workspace plan                                                        #
+# --------------------------------------------------------------------------- #
+
+# Routes whose producers write the final output directly and keep no LSE:
+# they never touch the workspace.
+_NO_WORKSPACE_ROUTES = frozenset(
+    {
+        "bf16_swa128_single_cta",
+        "bf16_h128_swa128",
+        "bf16_h8_swa128_v43",
+        "bf16_h16_h32_swa128_v44",
+        "bf16_h8_h16_source_exact",
+        "fp8_h8_h16_source_exact",
+        "bf16_h64_guard_q_tma_batch_r25",
+        "bf16_h64_prefill",
+        "fp8_h64_source_exact",
+    }
+)
+# Routes that launch one producer with ``partials(1)``: final O written
+# directly, the LSE region of the workspace only.
+_ONE_SPLIT_ROUTES = frozenset(
+    {
+        "bf16_h128_prefill_v42",
+        "fp8_h128_prefill_source_persistent",
+        "fp8_h128_prefill_source_persistent_uniform",
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "fp8_lowhead_one_partition",
+        "fp8_lowhead_h64",
+        "fp8_lowhead_prefill",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _RoutePlan:
+    """Workspace use of one route at one shape: the single source for the
+    dispatcher's ``partials`` / ``counters`` calls and for the sizing API."""
+
+    # Partial buffers per (token, head); 1 = LSE region only, no partial_O.
+    num_splits: int
+    # False: the route binds no partial buffers and needs no workspace bytes.
+    uses_partials: bool
+    # Split-merge counters per metadata row (0: no in-kernel merge).
+    merge_groups_per_row: int
+
+
+def _route_plan(
+    route: str, *, num_query_tokens: int, num_heads: int, sparse_topk: int
+) -> _RoutePlan:
+    if route == "bf16_h64_compressed_q8_v38":
+        # One KV tile per split plus the H64 reducer (single split: direct O).
+        return _RoutePlan(_ceil_div(sparse_topk, _TILE_KV), True, 0)
+    if route == "bf16_h32_topk128x_early_v47":
+        # One KV tile per split; the last-arriving split of each (token, head
+        # tile) merges in-kernel through one counter per group.
+        return _RoutePlan(
+            _ceil_div(sparse_topk, _TILE_KV), True, _ceil_div(num_heads, 8)
+        )
+    if route == "bf16_h128_topk4x_v52":
+        # Five fixed full-V KV owners per token plus the split-5 reducer.
+        return _RoutePlan(5, True, 0)
+    if route == "bf16_h128_topk128x":
+        # Four disjoint full-V owners plus the LSE reducer up to the token
+        # bound; one row-first owner per token above it.
+        return _RoutePlan(
+            4 if num_query_tokens <= _BF16_TOPK128X_SPLIT_MAX_TOKENS else 1, True, 0
+        )
+    if route in _ONE_SPLIT_ROUTES:
+        return _RoutePlan(1, True, 0)
+    if route in _NO_WORKSPACE_ROUTES:
+        return _RoutePlan(1, False, 0)
+    raise RuntimeError(f"unhandled CAKE DSv4 route: {route}")
+
+
+def _launch_workspace_bytes(
+    plan: _RoutePlan, rows: int, num_heads: int, num_query_offsets: int = 0
+) -> int:
+    """Workspace bytes one launch of ``plan`` over ``rows`` metadata rows carves."""
+    if not plan.uses_partials:
+        return 0
+    return cake_dsv4_workspace_layout(
+        rows, num_heads, plan.num_splits, num_query_offsets=num_query_offsets
+    ).total_bytes
+
+
+def _launch_fits(
+    plan: _RoutePlan,
+    rows: int,
+    num_heads: int,
+    num_query_offsets: int,
+    workspace_bytes: int,
+) -> bool:
+    if (
+        plan.merge_groups_per_row
+        and rows * plan.merge_groups_per_row > _MAX_MERGE_GROUPS
+    ):
+        return False
+    return (
+        _launch_workspace_bytes(plan, rows, num_heads, num_query_offsets)
+        <= workspace_bytes
+    )
+
+
+def _rows_per_launch(
+    plan: _RoutePlan,
+    *,
+    num_query_tokens: int,
+    num_heads: int,
+    batch_size: int,
+    workspace_bytes: int,
+) -> int:
+    """Metadata rows per launch for a workspace of ``workspace_bytes``.
+
+    All rows when one launch fits (no row tiling, no offsets region);
+    otherwise the largest chunk whose carve, including the shifted request
+    offsets (``batch_size + 1`` int32) of the chunks after the first, fits;
+    0 when not even one row fits.
+    """
+    total = num_query_tokens
+    if _launch_fits(plan, total, num_heads, 0, workspace_bytes):
+        return total
+    offsets = batch_size + 1
+    per_row = (
+        num_heads
+        * plan.num_splits
+        * (
+            (_HEAD_DIM * torch.bfloat16.itemsize if plan.num_splits > 1 else 0)
+            + torch.float32.itemsize
+        )
+    )
+    rows = (
+        workspace_bytes
+        - _PARTIAL_OFFSET
+        - _align_up(offsets * torch.int32.itemsize)
+        - 2 * _ALIGN
+    ) // per_row
+    if plan.merge_groups_per_row:
+        rows = min(rows, _MAX_MERGE_GROUPS // plan.merge_groups_per_row)
+    rows = max(0, min(rows, total - 1))
+    while rows > 0 and not _launch_fits(
+        plan, rows, num_heads, offsets, workspace_bytes
+    ):
+        rows -= 1
+    while rows + 1 < total and _launch_fits(
+        plan, rows + 1, num_heads, offsets, workspace_bytes
+    ):
+        rows += 1
+    return rows
+
+
+@dataclass(frozen=True)
+class WorkspaceRequirement:
+    """Exact workspace numbers of one ``backend="cake"`` call.
+
+    ``single_launch_bytes`` is what one launch over all metadata rows carves
+    (0 for routes without partial buffers); ``minimum_bytes`` is the smallest
+    workspace the call accepts (one row per launch, row tiling); any size in
+    between works with :meth:`rows_per_launch` rows per launch.
+    """
+
+    route: str
+    num_splits: int
+    uses_workspace: bool
+    single_launch_bytes: int
+    minimum_bytes: int
+    num_query_tokens: int
+    num_heads: int
+    batch_size: int
+    plan: _RoutePlan = field(repr=False)
+
+    def rows_per_launch(self, workspace_bytes: int) -> int:
+        """Metadata rows per launch with ``workspace_bytes`` (0: too small)."""
+        return _rows_per_launch(
+            self.plan,
+            num_query_tokens=self.num_query_tokens,
+            num_heads=self.num_heads,
+            batch_size=self.batch_size,
+            workspace_bytes=int(workspace_bytes),
+        )
+
+
+def cake_dsv4_workspace_requirement(
+    *,
+    dtype: torch.dtype,
+    num_heads: int,
+    num_query_tokens: int,
+    sparse_topk: int,
+    compressed_page_size: int,
+    max_q_len: int,
+    batch_size: int,
+    ragged: bool,
+) -> WorkspaceRequirement:
+    """Route and exact workspace requirement of one call, without device access.
+
+    The arguments are the route inputs of :func:`run_cake_dsv4`:
+    ``num_query_tokens`` = metadata rows, ``sparse_topk`` = combined table
+    width, ``compressed_page_size`` = ``compressed_kv_cache.shape[-2]``
+    (irrelevant for SWA-only calls), ``max_q_len`` = dense per-request query
+    length or the ragged maximum, ``batch_size`` = ``seq_lens.numel()``,
+    ``ragged`` = ``cum_seq_lens_q is not None``. Raises ``ValueError`` for a
+    shape ``backend="cake"`` has no kernel for.
+    """
+    tokens = _positive_int(num_query_tokens, "num_query_tokens")
+    heads = _positive_int(num_heads, "num_heads")
+    batch = _positive_int(batch_size, "batch_size")
+    topk = _positive_int(sparse_topk, "sparse_topk")
+    route = _route(
+        dtype=dtype,
+        num_heads=heads,
+        max_q_len=_positive_int(max_q_len, "max_q_len"),
+        ragged=bool(ragged),
+        sparse_topk=topk,
+        batch_size=batch,
+        compressed_page_size=int(compressed_page_size),
+        num_query_tokens=tokens,
+    )
+    plan = _route_plan(
+        route, num_query_tokens=tokens, num_heads=heads, sparse_topk=topk
+    )
+    single = _launch_workspace_bytes(plan, tokens, heads, 0)
+    minimum = min(single, _launch_workspace_bytes(plan, 1, heads, batch + 1))
+    return WorkspaceRequirement(
+        route=route,
+        num_splits=plan.num_splits,
+        uses_workspace=plan.uses_partials,
+        single_launch_bytes=single,
+        minimum_bytes=minimum,
+        num_query_tokens=tokens,
+        num_heads=heads,
+        batch_size=batch,
+        plan=plan,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Output placement                                                            #
 # --------------------------------------------------------------------------- #
 _OUT_PHASE_PERIOD = 4096
@@ -1460,7 +1827,10 @@ def _int32_vector(
         raise ValueError(f"{name} must be int32, got {tensor.dtype}")
     if tensor.device != device:
         raise ValueError(f"{name} must be on {device}, got {tensor.device}")
-    flat = tensor.reshape(-1)
+    # A 1-D vector is bound as the caller's own object (reshape would wrap it
+    # in a new view object even when nothing changes); higher-rank inputs
+    # flatten without a copy or are rejected.
+    flat = tensor if tensor.dim() == 1 else tensor.reshape(-1)
     if flat.data_ptr() != tensor.data_ptr() or not flat.is_contiguous():
         raise ValueError(
             f"{name} must be contiguous; backend='cake' makes no host copy"
@@ -1524,8 +1894,9 @@ class _Launcher:
         }
 
     def counters(self, merge_groups: int) -> torch.Tensor:
-        _ensure_counters_zeroed(self.workspace, self.raw)
-        return _counters(self.raw, merge_groups)
+        counters = _counters(self.raw, merge_groups)
+        _ensure_counters_zeroed(self.workspace, self.raw, merge_groups)
+        return counters
 
     def reduce(self, reducer: str, **overrides: Any) -> _PreparedLaunch:
         tokens = self.values["num_query_tokens"]
@@ -1565,9 +1936,15 @@ def run_cake_dsv4(
     ``out_shape`` (default ``[rows, num_heads, 512]``) is the shape to allocate.
 
     ``query`` / ``out`` may have more rows than the metadata; only the first
-    ``num_query_tokens`` (metadata rows) are read and written. Apart from the
-    ``out=None`` output no device memory is allocated here; see the module
-    docstring for the workspace contract.
+    ``num_query_tokens`` (metadata rows) are read and written. ``max_q_len`` is
+    the dense per-request query length (``query.shape[1]`` of the caller's
+    ``[B, Q, H, 512]``) or the ragged maximum; ``seq_lens`` has one entry per
+    request and ``cum_seq_lens_q`` (ragged only) ``batch_size + 1`` offsets.
+    Apart from the ``out=None`` output no device memory is allocated here
+    (the dense request offsets of the ragged-only producers and of row-tiled
+    dense launches are process-lifetime constants, created on first use:
+    warm such shapes up eagerly before a capture); see the module docstring
+    for the workspace, counter and row-tiling contract.
     """
     if backend != "cake":
         raise ValueError(f"expected backend='cake', got {backend!r}")
@@ -1671,9 +2048,26 @@ def run_cake_dsv4(
             )
     out_rows = out.view(-1, num_heads, _HEAD_DIM)[:num_query_tokens]
 
-    if cum_seq_lens_q is None and route in _RAGGED_ONLY_ROUTES:
-        # Dense query on a ragged-only producer: every request is max_q_len long.
-        cum_seq_lens_q = _dense_query_offsets(batch_size, max_q_len, device=device)
+    if not ragged and batch_size * max_q_len < num_query_tokens:
+        raise ValueError(
+            f"dense query layout [batch_size={batch_size}, max_q_len={max_q_len}] "
+            f"holds {batch_size * max_q_len} rows but the metadata describes "
+            f"{num_query_tokens}"
+        )
+    if ragged:
+        request_offsets: Optional[torch.Tensor] = cum_seq_lens_q
+        cum_seq_lens_q_value = cum_seq_lens_q
+    else:
+        # Dense rows: the kernels map t -> (t // max_q_len, t % max_q_len) and
+        # never read cum_seq_lens_q, which is bound to the seq_lens pointer.
+        # The ragged-only producers read request boundaries unconditionally
+        # and receive the cached dense offsets (every request max_q_len long).
+        request_offsets = None
+        cum_seq_lens_q_value = (
+            _dense_query_offsets(batch_size, max_q_len, device=device)
+            if route in _RAGGED_ONLY_ROUTES
+            else seq_lens
+        )
 
     is_fp8 = query.dtype == torch.float8_e4m3fn
     values: dict[str, Any] = {
@@ -1682,7 +2076,7 @@ def run_cake_dsv4(
         "compressed_KV_cache": compressed.view(torch.uint8) if is_fp8 else compressed,
         "O": out_rows,
         "seq_lens": seq_lens,
-        "cum_seq_lens_q": cum_seq_lens_q,
+        "cum_seq_lens_q": cum_seq_lens_q_value,
         "sinks": sink_tensor,
         "bmm1_scale": scale1,
         "bmm2_scale": scale2,
@@ -1697,18 +2091,111 @@ def run_cake_dsv4(
         "num_splits": 1,
         "total_work_items": num_query_tokens,
     }
-    launcher = _Launcher(
-        arch=arch,
-        workspace=workspace_buffer,
-        raw=raw,
-        values=values,
+    plan = _route_plan(
+        route,
+        num_query_tokens=num_query_tokens,
+        num_heads=num_heads,
+        sparse_topk=sparse_topk,
     )
+    rows_per_launch = _rows_per_launch(
+        plan,
+        num_query_tokens=num_query_tokens,
+        num_heads=num_heads,
+        batch_size=batch_size,
+        workspace_bytes=raw.numel(),
+    )
+    if rows_per_launch < 1:
+        minimum = _launch_workspace_bytes(plan, 1, num_heads, batch_size + 1)
+        raise ValueError(
+            f"workspace_buffer holds {raw.numel()} bytes; the CAKE DSv4 route "
+            f"{route} needs at least {minimum} bytes for one metadata row "
+            f"({num_heads} heads, {plan.num_splits} splits); size it with "
+            "get_cake_dsv4_workspace_bytes() or cake_dsv4_workspace_requirement()"
+        )
     # One host-side critical section per call: descriptor-pool bookkeeping,
     # the bindings' descriptor checks and the launch enqueues (see
     # _descriptor_storage).
     with _descriptor_lock:
-        _dispatch_route(route, launcher)
+        if rows_per_launch >= num_query_tokens:
+            _dispatch_route(
+                route,
+                _Launcher(
+                    arch=arch, workspace=workspace_buffer, raw=raw, values=values
+                ),
+            )
+        else:
+            if request_offsets is None:
+                request_offsets = _dense_query_offsets(
+                    batch_size, max_q_len, device=device
+                )
+            _dispatch_row_tiles(
+                route,
+                arch=arch,
+                workspace=workspace_buffer,
+                raw=raw,
+                values=values,
+                meta=meta,
+                plan=plan,
+                rows_per_launch=rows_per_launch,
+                request_offsets=request_offsets,
+            )
     return out
+
+
+def _dispatch_row_tiles(
+    route: str,
+    *,
+    arch: str,
+    workspace: torch.Tensor,
+    raw: torch.Tensor,
+    values: Mapping[str, Any],
+    meta: SparseMetadata,
+    plan: _RoutePlan,
+    rows_per_launch: int,
+    request_offsets: torch.Tensor,
+) -> None:
+    """Launch ``route`` over consecutive metadata-row chunks that fit the workspace.
+
+    Every chunk sees row-sliced views of ``Q``, ``O`` and the metadata tables
+    (no copies; the index tables keep their row strides) and its own row
+    count. Chunks after the first cannot use the caller's layout (the kernels
+    index rows from 0), so they run as ragged rows whose request boundaries
+    are ``request_offsets - first_row`` (all ``batch_size + 1`` entries; the
+    kernels' scan tolerates negative entries of the requests before the
+    chunk), written into the workspace's offsets region in stream order --
+    one captured ``torch.sub`` per chunk, nothing allocated.
+    """
+    total = values["num_query_tokens"]
+    num_heads = values["num_heads"]
+    num_offsets = int(request_offsets.numel())
+    legacy = values["sparse_indices"]
+    for first in range(0, total, rows_per_launch):
+        rows = min(rows_per_launch, total - first)
+        stop = first + rows
+        chunk: dict[str, Any] = dict(values)
+        chunk.update(
+            Q=values["Q"][first:stop],
+            O=values["O"][first:stop],
+            swa_indices=_flat_index_span(meta.swa_indices[first:stop]),
+            compressed_indices=_flat_index_span(meta.compressed_indices[first:stop]),
+            sparse_topk_lens=meta.sparse_topk_lens[first:stop],
+            sparse_indices=None if legacy is None else legacy[first:stop],
+            num_query_tokens=rows,
+            total_work_items=rows,
+        )
+        if first:
+            layout = cake_dsv4_workspace_layout(
+                rows, num_heads, plan.num_splits, num_query_offsets=num_offsets
+            )
+            begin = layout.query_offsets[0]
+            shifted = raw[begin : begin + num_offsets * torch.int32.itemsize].view(
+                torch.int32
+            )
+            torch.sub(request_offsets, first, out=shifted)
+            chunk.update(cum_seq_lens_q=shifted, ragged_query=1)
+        _dispatch_route(
+            route, _Launcher(arch=arch, workspace=workspace, raw=raw, values=chunk)
+        )
 
 
 def _dispatch_route(route: str, L: _Launcher) -> None:
@@ -1716,6 +2203,7 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
     T = v["num_query_tokens"]
     H = v["num_heads"]
     topk = v["sparse_topk"]
+    plan = _route_plan(route, num_query_tokens=T, num_heads=H, sparse_topk=topk)
 
     if route in (
         "bf16_swa128_single_cta",
@@ -1744,7 +2232,7 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         return
 
     if route == "bf16_h64_compressed_q8_v38":
-        num_splits = _ceil_div(topk, _TILE_KV)
+        num_splits = plan.num_splits
         parts = L.partials(num_splits)
         compressed = L.variant(route, grid=(T * num_splits * 2, 1, 1), **parts)
         if num_splits > 1:
@@ -1754,8 +2242,8 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         return
 
     if route == "bf16_h32_topk128x_early_v47":
-        num_splits = _ceil_div(topk, _TILE_KV)
-        head_tiles = _ceil_div(H, 8)
+        num_splits = plan.num_splits
+        head_tiles = plan.merge_groups_per_row
         parts = L.partials(num_splits)
         arrivals = L.counters(T * head_tiles)
         L.run(
@@ -1777,7 +2265,7 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # The BF16/H128 producers launch directly with the grids their former
         # single-route family libraries computed: two CTAs per work item.
         producer = route
-        num_splits = 1
+        num_splits = plan.num_splits
         grid_x = 2 * T
         if route == "bf16_h128_prefill_v42":
             # Persistent KV-reuse body: one two-CTA cluster per item, at most
@@ -1790,8 +2278,9 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
                 producer = "bf16_h128_prefill_v42_snake"
             grid_x = min(2 * T, 2 * clusters)
         elif route == "bf16_h128_topk4x_v52":
-            # Five fixed full-V KV owners per token plus the split-5 reducer.
-            num_splits = 5
+            # Five fixed full-V KV owners per token plus the split-5 reducer
+            # (plan.num_splits == 5).
+            pass
         elif T > _BF16_TOPK128X_SPLIT_MAX_TOKENS:
             # Above the token bound one full-V owner per token whose invalid
             # (-1) sparse rows gather the tile's first index
@@ -1812,8 +2301,8 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
             # full-V KV owners (a three-tile row runs with the fourth tile
             # masked: 12.3-13.0 us vs 14.8 us for a three-owner pair) plus one
             # LSE reducer; GB300 width 260/388 rows measured 1.18-1.26x vs
-            # trtllm-gen against 0.83-1.05x for the single-owner kernel.
-            num_splits = 4
+            # trtllm-gen against 0.83-1.05x for the single-owner kernel
+            # (plan.num_splits == 4).
             producer = "bf16_h128_topk128x_split4_sm100"
         parts = L.partials(num_splits)
         if num_splits == 1:
@@ -2669,9 +3158,12 @@ def _nvfp4_gather4_views(flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
 __all__ = [
     "KERNEL_METADATA_PARAMS",
     "NVFP4Plan",
+    "QUERY_LAYOUT_PARAMS",
     "SparseMetadata",
     "WorkspaceLayout",
+    "WorkspaceRequirement",
     "cake_dsv4_workspace_layout",
+    "cake_dsv4_workspace_requirement",
     "cake_dsv4_workspace_reset",
     "canonical_arg_name",
     "get_cake_dsv4_workspace_bytes",

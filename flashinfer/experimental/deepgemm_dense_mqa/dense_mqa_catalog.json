@@ -83,7 +83,7 @@
         ]
       },
       "reason": {
-        "sm_100a": "not converged: partial:any blocked by q16231_pfx131077_chunk2048 1.0019 < floor 1.005",
+        "sm_100a": "not converged: partial:any blocked by q16231_pfx131077_chunk2048 0.9965 < floor 1.005 (0/9 sessions)",
         "sm_103a": "not converged"
       },
       "withheld_routes": {
@@ -153,30 +153,44 @@
             [
               16,
               null
+            ],
+            [
+              null,
+              32768
             ]
           ],
           "paged:fp8:h64:p32:n1": [
             [
               16,
               null
+            ],
+            [
+              null,
+              32768
             ]
           ],
           "paged:fp8:h64:p64:n1": [
             [
               16,
               null
+            ],
+            [
+              null,
+              32768
             ]
           ],
           "paged:fp8:h64:p64:n2": [
             [
               16,
               null
-            ]
-          ],
-          "paged:fp8:h64:p64:n4": [
+            ],
             [
-              16,
-              null
+              64,
+              32768
+            ],
+            [
+              null,
+              8192
             ]
           ]
         },
@@ -240,7 +254,7 @@
         }
       },
       "admission_reason": {
-        "sm_100a": "batch > 16 unmeasured on sm_100a (acceptance run budget); follow-up measurement pending",
+        "sm_100a": "large-batch long-context n1/n2 rows below the protocol floor at the deliverable sha (acc3 B200): n1 withheld above 32768 context at batch > 16, n2 above 32768 at batch 17-64 and above 8192 beyond",
         "sm_103a": "large-batch long-context n1/n2 rows below the protocol floor at the deliverable sha (acc2 GB300); h32:p64:n1 and h64:p32:n1 measured at batch <= 16 only, large-batch rules mirrored from h64:p64:n1"
       },
       "block_kv": [
@@ -359,8 +373,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "f8fbbcc290d3fd9dd0536e2673e1b1329da7d6e14de11b04661b054fcb97d0ac",
-        "sm_103a": "dca8a52698a4c88dbfe0fe2aaf7dca317434680a6c63c1aa949eff6573bdd971"
+        "sm_100a": "3840a2cfeb9a515c71cff5722348606117f3af2bb1d0feb6e68d771f094856ac",
+        "sm_103a": "220e161929f8069173c128cdb887cbc5b07a7aa0ca9f6615c89b508757c4ddfc"
       },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
@@ -374,6 +388,120 @@
       "sources": [
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_17203c2468ce2473c273_kernel.cu",
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_17203c2468ce2473c273_binding.cu"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_dense_mqa_29bf752eb8debb6a0ba5": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": {
+        "sm_100a": "76b445663dda9e4b98ca56bac8709781cb054bf590688167880e96e9b736d6b9",
+        "sm_103a": "b3841a20523a10fe7004d4bbcea89d30a06f4c5ce22e4ca500bdb246caac2cb6"
+      },
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "definitions": [
+        "SM_COUNT"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_29bf752eb8debb6a0ba5_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_29bf752eb8debb6a0ba5_binding.cu"
       ],
       "standalone": true
     },
@@ -441,8 +569,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "96385044bbc98856462a3c6ed3096ab48940b688f9e70be4b4e66b4e4773a4d2",
-        "sm_103a": "d8bac956b75a1401e964a3c98322cd5be77f228f1ffe79c952d8d503a13c5d51"
+        "sm_100a": "273eac9f3ddcceb358e3e4ac685692962fbeffd89163396dcca6ebd2858838fa",
+        "sm_103a": "4bc36a44f4c522d168114651200c3fd25b6a41cdb6c463b2d5d06e4e73b95b1d"
       },
       "compile_flags": [
         "--use_fast_math"
@@ -523,8 +651,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "eac0e6a2ab30b808248a0b7272dd9b5956c18d64ab20153494fcfa8d2bcaf048",
-        "sm_103a": "1218c55480e8c0373e5b7cc00eccda222da62de754175fc99bcf5ce31c322f4f"
+        "sm_100a": "e53cb0b0384b4a46e6a4b576f1142d7f688f5ac9284d5196a3472569d567ea4c",
+        "sm_103a": "58f2224889b824ee533645df47610590ba27460817d9e4b708fe3480f869b7bd"
       },
       "compile_flags": [
         "--use_fast_math"
@@ -637,8 +765,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "d726e21fe1d19f4b04fa3786351a17067f8381443a37eeb394f7ecbfd9ad1dd0",
-        "sm_103a": "25d24991611eaa6f185a1e01601fc11659efa9aeed64c4acf40644f32b8c9210"
+        "sm_100a": "18428374059ef9df220424b101a2e2d665fd56533d279407cdfd8c7c941eb81d",
+        "sm_103a": "6455d751c7a27834e8f44cb602fba9461178c5f416a1c94cd2646d9f34095fb8"
       },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
@@ -775,8 +903,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "44a45047730f833fe143c6ee03de764bba257a052a885d562c65627103600ee6",
-        "sm_103a": "56484b6cbfc46777c6ecce963aa6d8c777b26e6a00c4fd4094476b96970d809a"
+        "sm_100a": "1b304b8eaebcb91a5a8a7cc285f9e308946a1e54ed7946d57bc43e2dba4f4c95",
+        "sm_103a": "c95cdf7f005d2943443586b72b5e2a9a2f05625c431530e4e3f7b6e0f4d75702"
       },
       "compile_flags": [
         "--use_fast_math"
@@ -889,8 +1017,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "6668751119e36151a59840f0beb066d89ff946bf34af2057d0fbc5bf4eae90d2",
-        "sm_103a": "911efbcd70c7074ad7854ddf68993d2853a02d1c72899e28cbd40448a68c0300"
+        "sm_100a": "4cb1564715424446db227163a7f1f113969ed80a697f13fc2eec46841d1d11de",
+        "sm_103a": "d988886f3bdea30bb4d058ab0858349fc12fc3b324765ca6076362cd45ec8d10"
       },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
@@ -904,120 +1032,6 @@
       "sources": [
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_5f6dcb8825a57ab9661c_kernel.cu",
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_5f6dcb8825a57ab9661c_binding.cu"
-      ],
-      "standalone": true
-    },
-    "cake_deepgemm_dense_mqa_6d4afd572518d0fe52b7": {
-      "arches": [
-        "sm_100a",
-        "sm_103a"
-      ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Q"
-        ],
-        [
-          "tma_buffer",
-          "Q_scales_alias"
-        ],
-        [
-          "tma_buffer",
-          "KV"
-        ],
-        [
-          "tma_buffer",
-          "KV_scales"
-        ],
-        [
-          "tma_buffer",
-          "Weights"
-        ],
-        [
-          "buffer",
-          "Logits"
-        ],
-        [
-          "buffer",
-          "ScheduleMeta"
-        ],
-        [
-          "buffer",
-          "CandidateValues"
-        ],
-        [
-          "buffer",
-          "CandidateIndices"
-        ],
-        [
-          "buffer",
-          "CandidateCounts"
-        ],
-        [
-          "buffer",
-          "ScoreThresholds"
-        ],
-        [
-          "buffer",
-          "cu_seq_len_k_start"
-        ],
-        [
-          "buffer",
-          "cu_seq_len_k_end"
-        ],
-        [
-          "parameter",
-          "seq_len"
-        ],
-        [
-          "parameter",
-          "seq_len_kv"
-        ],
-        [
-          "parameter",
-          "stride_logits"
-        ],
-        [
-          "parameter",
-          "num_q_blocks"
-        ],
-        [
-          "parameter",
-          "num_kv_splits"
-        ],
-        [
-          "parameter",
-          "candidate_capacity"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": {
-        "sm_100a": "a5d6cb92e07ef393243708ecfa1115acf8cab8021c8371bdb85a262a20e62a57",
-        "sm_103a": "471705a37ad2686117ffd4367a8860ec739b03169c8399fb2bace8a9f4ca64f3"
-      },
-      "compile_flags": [
-        "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
-      ],
-      "ffi_entry": "run",
-      "kind": "module",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_6d4afd572518d0fe52b7_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_6d4afd572518d0fe52b7_binding.cu"
       ],
       "standalone": true
     },
@@ -1313,8 +1327,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "4558119660d98fa2f54513db7fe6c245388d5c3e3252cc57e83c786e25c3337c",
-        "sm_103a": "549dcc50aafc5ac72f6df4d06349067f45963525c9a02eab1e8e37d13af7786e"
+        "sm_100a": "2531d5f82c012e1f45730318daab6565dd7759371ef74404909e3a1f55103f94",
+        "sm_103a": "3553c9b4e17dcb5548ec4df3119f61cc3838eebee20345a4f05fba7a7de25cfa"
       },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
@@ -1395,8 +1409,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "514dc447498408a5b0a6cec3c99af6657f5043d32be79b3ecca2260a2e1668b4",
-        "sm_103a": "461c06d37269173f00a2d04a7aa50b76846fd52bbc11275e686bd0cdff77206b"
+        "sm_100a": "8a73bebfd08dbe5248b594d27e05c9b93c0796aa96bc884e65c8ea1e0dd7dbcf",
+        "sm_103a": "6fa3597dbd8806c75bc4e8038a45b3b895aa76811a00cbe78f10fc021c31c021"
       },
       "compile_flags": [
         "--use_fast_math"
@@ -1533,8 +1547,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "67d8e0dd81a4356f0caca41406bdb99624bcf061a473e810bacdf9ae97a8ff20",
-        "sm_103a": "99e49d189fcf2b8eeaabdd6d4ea918795a7d028645abbd9716b93ec434a30b56"
+        "sm_100a": "ac95c2d28e9dc8c9c2beb84c4583c73f1c4de6edb967a7439222118086ff1c07",
+        "sm_103a": "964fa903f5696bab0c58e30b63cb771d32b22baa215f90744c61dff23235520e"
       },
       "compile_flags": [
         "--use_fast_math"
@@ -1711,8 +1725,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "7135fc9ed17f4c9aafc5a1967cfe5965ecbcd97cee8ddc7e94471260dfb2398f",
-        "sm_103a": "73935069003e7f895201fbf8725ea73f4a134885fb550ebc438eadf685532678"
+        "sm_100a": "6835d506caa1c017b6e17d8899a7a83fe89ad00e78b5a8f0c0b15ae1133621da",
+        "sm_103a": "d806e70a0d8a698620f6d1408cd389c848ce0637458d5282023b4f12e8f0baf8"
       },
       "compile_flags": [],
       "definitions": [
@@ -1836,8 +1850,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "83b31792587febd61f634c791a185d67450cf29478569cc3f71982b170b61384",
-        "sm_103a": "0aca56315011bdeef5d96a21df27648c5730c29d19def2e09d1905d713690ab0"
+        "sm_100a": "7eea2cbe890170a8789d82ec807b08d8b3d9ca7a5c4ec710fee89a02d0ba0c4d",
+        "sm_103a": "0d29fd1c73df2b48edbb870f26522a001b868c05be41b00678c9a3dd05cc5dbf"
       },
       "compile_flags": [],
       "definitions": [
@@ -1961,8 +1975,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "48c3755bd4d70e4428b27af9af6c439a125566ad31be814541531f7066a17c0b",
-        "sm_103a": "79daea35225b4fcc32d71b938a0bbf4860edc4a3d71f8b7db783864c2c5d6778"
+        "sm_100a": "184267f30b59617408ae13a5039e7e10c54abe16be1ba5f8d3a980ff6219355b",
+        "sm_103a": "08bd3a8bc998ea3f431dfd9b137b1bb368b5b4438bbad2b5f661db545cfb17d8"
       },
       "compile_flags": [],
       "definitions": [
@@ -2086,8 +2100,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "b2d728ca2f3f84c18d8add45e4d55aaca10cce7cb1538a434814d4cea21cae64",
-        "sm_103a": "f9de26ba84bc6e53f30a1947252f5f37470a7d7bfab4d1a260ebe8097bf8c08f"
+        "sm_100a": "c0eb486d3ef115a0ddac7d1641c4fbae8e9219574d462cacff826628c86b7be6",
+        "sm_103a": "cf98aa97196de0cf0f7341babbf9255bd035993a29c9a63ea212be29c517e82e"
       },
       "compile_flags": [],
       "definitions": [
@@ -2211,8 +2225,8 @@
         ]
       ],
       "closure_sha256": {
-        "sm_100a": "4dc59c605a23e59bd0ee1c8daeb6d19f1c3e105e6dbe95b74a0be9834b143aa9",
-        "sm_103a": "69827c653fd287799676c963b6c3928b8855b0da0c9ab9de0d6a94ef31bfc9e2"
+        "sm_100a": "a86ca331e6ada9bb303ba7c4f27ec1a510ecff34add3ed3edf382814863a4bb9",
+        "sm_103a": "b88552fac8244b2ad2a0fc5b86bab7abf4fe24d41c8ed8849b80770a9a57a687"
       },
       "compile_flags": [],
       "definitions": [
@@ -2396,7 +2410,7 @@
       "stages": [
         [
           "logits",
-          "cake_deepgemm_dense_mqa_6d4afd572518d0fe52b7"
+          "cake_deepgemm_dense_mqa_29bf752eb8debb6a0ba5"
         ]
       ]
     },

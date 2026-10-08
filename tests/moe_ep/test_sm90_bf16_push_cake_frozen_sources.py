@@ -39,6 +39,8 @@ from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
     cake_weights as _weights,
 )
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 EXPECTED_LAUNCH = {
     "block": [384, 1, 1],
     "dynamic_smem_bytes": 196704,
@@ -75,6 +77,18 @@ def test_manifest_identity() -> None:
     assert manifest["name"] == "cake_sm90_bf16_megamoe"
     assert manifest["contract"]["ffi_entry"] == "run"
     assert sorted(manifest["contract"]["stages"]) == sorted(_jit.GROUPED_GEMM_STAGES)
+
+
+def test_package_data_declares_frozen_sources() -> None:
+    pyproject_path = _PROJECT_ROOT / "pyproject.toml"
+    if not pyproject_path.is_file():
+        pytest.skip("pyproject.toml is only available in source-tree test runs")
+    pyproject = pyproject_path.read_text(encoding="utf-8")
+    key = '"flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe" = ['
+    assert key in pyproject
+    package_block = pyproject.split(key, maxsplit=1)[1].split("]", maxsplit=1)[0]
+    assert '"src/*.cu"' in package_block
+    assert '"src/*.json"' in package_block
 
 
 def test_every_sealed_file_is_present_and_matches() -> None:

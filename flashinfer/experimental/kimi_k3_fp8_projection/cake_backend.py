@@ -154,6 +154,7 @@ DEC_SF_BYTES = 2048  # 2 K-sets x 512 B per operand
 DEC_SMEM_CAP = 230400  # decode SMEM pool budget
 DEC_MAX_STAGES = 4
 DEC_XB_MAX_STAGES = 8  # BF16 ring depth cap of the decoupled fused decode variant
+DEC_XQ_MAX_STAGES = 8  # FP8 token-ring depth cap (round 4 lever F; table key ``xq_stages``, adopted in round 7 on the 1,28,256 cells)
 DEC_QUANT_WARPS = (
     8  # quantizing warps of the fused decode instance (narrow-unit divisibility rule)
 )
@@ -385,6 +386,32 @@ def quant_units(M: int, k_blocks: int, sm_count: int) -> int:
     return 1
 
 
+def _decode_stage_geometry(
+    tok: int, fused: bool, resident: bool, xb_stages: int, xq_stages: int
+) -> tuple[int, int, int, int]:
+    """``(stage_bytes, xb_ring_bytes, xq_ring_bytes, res_bytes)`` of a decode instance (the Cake ``decode_ir`` SMEM rule).
+
+    ``xb_stages`` > 0 is the decoupled fused variant: the BF16 token tiles stream through their own ``xb_stages``-deep
+    ring instead of sharing the W / X stage; ``xq_stages`` > 0 (round 4 lever F, table key ``xq_stages``; needs the
+    BF16 ring) moves the FP8 token tile and its scales out of the W stage into an ``xq_stages``-deep ring, so a W stage
+    holds the weight tile plus one 1 KB scale set."""
+    tok_rows = max(tok, 32)
+    xb_bytes = tok * 512 if (fused and not resident) else 0
+    xb_ring = bool(fused and not resident and xb_stages > 0)
+    xq_ring = bool(fused and not resident and xq_stages > 0)
+    stage_x_bytes = 0 if (resident or xq_ring) else tok_rows * BLOCK_K
+    stage_bytes = (
+        DEC_W_BYTES
+        + stage_x_bytes
+        + (1024 if xq_ring else DEC_SF_BYTES)
+        + (0 if xb_ring else xb_bytes)
+    )
+    xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
+    xq_ring_bytes = xq_stages * (tok_rows * BLOCK_K + 1024) if xq_ring else 0
+    res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
+    return stage_bytes, xb_ring_bytes, xq_ring_bytes, res_bytes
+
+
 def decode_module_stages(
     tok: int,
     stages: int,
@@ -392,26 +419,20 @@ def decode_module_stages(
     resident: bool,
     xb_stages: int = 0,
     epi_chunk: int = 32,
+    xq_stages: int = 0,
 ) -> int:
-    """Pipeline depth of the physical decode instance after its SMEM clamp (the Cake ``decode_ir`` rule).
-
-    ``xb_stages`` > 0 is the decoupled fused variant: the BF16 token tiles stream through their own
-    ``xb_stages``-deep ring instead of sharing the W / X stage."""
-    tok_rows = max(tok, 32)
-    xb_bytes = tok * 512 if (fused and not resident) else 0
-    xb_ring = bool(fused and not resident and xb_stages > 0)
-    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
-    stage_bytes = (
-        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+    """Pipeline depth of the physical decode instance after its SMEM clamp (the Cake ``decode_ir`` rule); see
+    ``_decode_stage_geometry`` for the ring forms."""
+    stage_bytes, xb_ring_bytes, xq_ring_bytes, res_bytes = _decode_stage_geometry(
+        tok, fused, resident, xb_stages, xq_stages
     )
-    xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
-    res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
     epi_bytes = min(int(epi_chunk), 32, tok) * 128 * 4
     return max(
         1,
         min(
             stages,
-            (DEC_SMEM_CAP - epi_bytes - res_bytes - xb_ring_bytes) // stage_bytes,
+            (DEC_SMEM_CAP - epi_bytes - res_bytes - xb_ring_bytes - xq_ring_bytes)
+            // stage_bytes,
         ),
     )
 
@@ -454,7 +475,13 @@ DECODE_MAX_ACTIVE_CLUSTERS: dict[str, dict[int, int]] = {
 
 
 def decode_cs_alias_fits(
-    tok: int, stages: int, fused: bool, resident: bool, csplit: int, xb_stages: int = 0
+    tok: int,
+    stages: int,
+    fused: bool,
+    resident: bool,
+    csplit: int,
+    xb_stages: int = 0,
+    xq_stages: int = 0,
 ) -> bool:
     """Round 5: True when the one-round cluster exchange inbox + staging blocks
     ``(2C - 1) x 128 x (chunk | 1) x 4`` fit inside the physical instance's pipeline
@@ -462,14 +489,12 @@ def decode_cs_alias_fits(
     wide tile (1 stage at t128) does not fit and keeps the small-inbox exchange."""
     if csplit < 2:
         return False
-    tok_rows = max(tok, 32)
-    xb_bytes = tok * 512 if (fused and not resident) else 0
-    xb_ring = bool(fused and not resident and xb_stages > 0)
-    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
-    stage_bytes = (
-        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+    stage_bytes, _xb_ring_bytes, _xq_ring_bytes, _res_bytes = _decode_stage_geometry(
+        tok, fused, resident, xb_stages, xq_stages
     )
-    module_stages = decode_module_stages(tok, stages, fused, resident, xb_stages)
+    module_stages = decode_module_stages(
+        tok, stages, fused, resident, xb_stages, xq_stages=xq_stages
+    )
     tok_per_cta = -(-tok // csplit)  # ceil(tok / csplit)
     chunk = (
         -(-tok_per_cta // 4) * 4
@@ -485,29 +510,30 @@ def decode_cs_inbox_stages(
     csplit: int,
     xb_stages: int = 0,
     epi_chunk: int = 32,
+    xq_stages: int = 0,
 ) -> int:
     """Physical pipeline depth of the small-inbox (non-aliased) cluster split-K instance: the clamped depth of
     ``decode_module_stages`` reduced until a 4-row inbox round, ``(2C - 1) x 128 x 5 x 4`` bytes, fits next to the
     stages (host mirror of the Cake ``decode_cs_inbox_stages`` rule; the 7..16-wide clusters of round 6 give up one
     t16 stage)."""
     if csplit < 2:
-        return decode_module_stages(tok, stages, fused, resident, xb_stages, epi_chunk)
-    tok_rows = max(tok, 32)
-    xb_bytes = tok * 512 if (fused and not resident) else 0
-    xb_ring = bool(fused and not resident and xb_stages > 0)
-    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
-    stage_bytes = (
-        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+        return decode_module_stages(
+            tok, stages, fused, resident, xb_stages, epi_chunk, xq_stages
+        )
+    stage_bytes, xb_ring_bytes, xq_ring_bytes, res_bytes = _decode_stage_geometry(
+        tok, fused, resident, xb_stages, xq_stages
     )
-    xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
-    res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
     module_stages = decode_module_stages(
-        tok, stages, fused, resident, xb_stages, epi_chunk
+        tok, stages, fused, resident, xb_stages, epi_chunk, xq_stages
     )
     need = 5 * (2 * csplit - 1) * 128 * 4
     while (
         module_stages > 1
-        and DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes
+        and DEC_SMEM_CAP
+        - module_stages * stage_bytes
+        - res_bytes
+        - xb_ring_bytes
+        - xq_ring_bytes
         < need
     ):
         module_stages -= 1
@@ -515,7 +541,13 @@ def decode_cs_inbox_stages(
 
 
 def decode_cs_small_inbox_rounds(
-    tok: int, stages: int, fused: bool, resident: bool, csplit: int, xb_stages: int = 0
+    tok: int,
+    stages: int,
+    fused: bool,
+    resident: bool,
+    csplit: int,
+    xb_stages: int = 0,
+    xq_stages: int = 0,
 ) -> int:
     """Round 5: exchange rounds of the small (non-aliased) cluster inbox next to the
     physical pipeline stages (host mirror of the Cake ``decode_cs_small_inbox_rounds``
@@ -524,24 +556,30 @@ def decode_cs_small_inbox_rounds(
     all-rank ordering the aliased exchange needs costs ~1.6 us at C8."""
     if csplit < 2:
         return 1
-    tok_rows = max(tok, 32)
-    xb_bytes = tok * 512 if (fused and not resident) else 0
-    xb_ring = bool(fused and not resident and xb_stages > 0)
-    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
-    stage_bytes = (
-        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+    stage_bytes, xb_ring_bytes, xq_ring_bytes, res_bytes = _decode_stage_geometry(
+        tok, fused, resident, xb_stages, xq_stages
     )
-    xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
-    res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
-    module_stages = decode_module_stages(tok, stages, fused, resident, xb_stages)
+    module_stages = decode_module_stages(
+        tok, stages, fused, resident, xb_stages, xq_stages=xq_stages
+    )
     need = 5 * (2 * csplit - 1) * 128 * 4
     while (
         module_stages > 1
-        and DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes
+        and DEC_SMEM_CAP
+        - module_stages * stage_bytes
+        - res_bytes
+        - xb_ring_bytes
+        - xq_ring_bytes
         < need
     ):
         module_stages -= 1
-    budget = DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes
+    budget = (
+        DEC_SMEM_CAP
+        - module_stages * stage_bytes
+        - res_bytes
+        - xb_ring_bytes
+        - xq_ring_bytes
+    )
     tpc = -(-tok // csplit)
     chunk = min(-(-tpc // 4) * 4, (budget // ((2 * csplit - 1) * 128 * 4) - 1) // 4 * 4)
     return -(-tpc // max(chunk, 4))
@@ -576,6 +614,7 @@ class DecodeConfig:
     xb_stages: int = (
         0  # decoupled BF16 ring depth (fused, non-resident); 0 = coupled staging
     )
+    xq_stages: int = 0  # round 4 (lever F) FP8 token-ring depth (table key ``xq_stages``; needs the BF16 ring); 0 = FP8 tile inside the W stage
     qlanes: int = (
         16  # lanes per quantization unit (16 = half-warp units, 8 / 4 = narrow units)
     )
@@ -590,6 +629,7 @@ class DecodeConfig:
     qwarps: int = DEC_QUANT_WARPS  # round 6 continuation 8 (lever QW16): quantizing warps of the fused instance (table key ``qwarps``; 8 = the round-3 default, 16 on the fused 16384 rows)
     xbh: bool = False  # round 6 continuation 9 (lever XBH): half-slot BF16 ring -- the two 128-K blocks of a stage are loaded and released separately (table key ``xbh``; fused ring rows with narrow units)
     qer: bool = False  # round 6 continuation 10 (lever QER): early half-slot release -- each quantizing warp frees its BF16 half slot right after its register loads, before the conversion (table key ``qer``; xbh rows only)
+    xp: bool = False  # round 7 (lever XP): the cluster split-K exchange issues its DSM copies from one lane per peer in parallel (table key ``xp``; ``csplit`` > 1 rows only; bit-exact)
 
     @property
     def tok_rows(self) -> int:
@@ -611,6 +651,7 @@ class DecodeConfig:
             self.qlanes,
             self.csplit,
             cs_alias=self.cs_alias,
+            xq_stages=self.xq_stages,
             epi_chunk=self.epi_chunk,
             pf=self.pf,
             mc=self.mc,
@@ -623,6 +664,7 @@ class DecodeConfig:
             qwarps=self.qwarps,
             xbh=self.xbh,
             qer=self.qer,
+            xp=self.xp,
         )
 
 
@@ -708,6 +750,69 @@ def decode_config(
     if xb_stages == 0:
         stage_bytes = stage_bytes_ring + (xb_bytes if fused else 0)
         stages = max(2, min(DEC_MAX_STAGES, (DEC_SMEM_CAP - epi_bytes) // stage_bytes))
+    # Table key ``xq_stages`` (round 4 lever F, adopted in round 7 on the t16 cluster split-K M = 256 cells): the FP8 token
+    # tiles leave the W stage for their own ring ("auto" | N; needs the BF16 ring).  "auto" splits the budget over the three
+    # rings for the largest smallest depth, then the deepest W ring, then the most slots (host mirror of the Cake
+    # ``decode_config`` rule; a table ``stages`` pin is the Cake ``force_stages``).
+    xq_mode = entry.get("xq_stages", 0) if (fused and xb_stages > 0) else 0
+    xq_stages = 0
+    if xq_mode not in (0, "0", "", "none", None):
+        xq_bytes = tok_rows * BLOCK_K + 1024
+        w_only_bytes = DEC_W_BYTES + 1024
+        budget = DEC_SMEM_CAP - epi_bytes
+        force_stages = int(entry["stages"]) if entry.get("stages") else 0
+        if xq_mode == "auto":
+            best3 = None
+            for cw in range(2, DEC_MAX_STAGES + 1):
+                if force_stages and cw != force_stages:
+                    continue
+                for cq in range(1, DEC_XQ_MAX_STAGES + 1):
+                    cb = min(
+                        DEC_XB_MAX_STAGES,
+                        (budget - cw * w_only_bytes - cq * xq_bytes) // xb_bytes,
+                    )
+                    if xb_mode != "auto":
+                        if cb < int(xb_mode):
+                            continue  # an explicit BF16 depth must fit next to this (W, FP8) pair
+                        cb = int(xb_mode)
+                    if cb < 1:
+                        continue
+                    score3 = (min(cw, cq, cb), cw, cq + cb)
+                    if best3 is None or score3 > best3[0]:
+                        best3 = (score3, cw, cq, cb)
+            if best3 is not None:
+                _, stages, xq_stages, xb_stages = best3
+        else:
+            xq_stages = int(xq_mode)
+            if force_stages:
+                stages = force_stages
+            else:
+                stages = max(
+                    2,
+                    min(
+                        DEC_MAX_STAGES,
+                        (
+                            budget
+                            - xq_stages * xq_bytes
+                            - (xb_stages if xb_mode != "auto" else 1) * xb_bytes
+                        )
+                        // w_only_bytes,
+                    ),
+                )
+            if xb_mode == "auto":
+                xb_stages = min(
+                    DEC_XB_MAX_STAGES,
+                    (budget - stages * w_only_bytes - xq_stages * xq_bytes) // xb_bytes,
+                )
+            if (
+                xb_stages < 1
+                or stages * w_only_bytes + xq_stages * xq_bytes + xb_stages * xb_bytes
+                > budget
+            ):
+                raise ValueError(
+                    f"decode table entry: W {stages} x {w_only_bytes} + FP8 ring {xq_stages} x {xq_bytes} + BF16 ring "
+                    f"{xb_stages} x {xb_bytes} B exceed the {budget} B budget ({entry})"
+                )
     # Table key ``stages`` (round 6, lever D): the row pins the ring depth past ``DEC_MAX_STAGES`` (5 x 43008 B + an 8 KB
     # epilogue chunk fit the pool at t32); the physical instance still applies the SMEM clamp (``decode_module_stages``).
     if entry.get("stages"):
@@ -758,6 +863,7 @@ def decode_config(
     )
     if resident:
         xb_stages = 0  # resident tiles are fetched once; no ring
+        xq_stages = 0
     # Narrow quantization units (table key ``qlanes`` 4 / 8): every lane group must own a unit each stage, so the
     # width is doubled until the units divide evenly over the quantizing warps.
     qlanes = int(entry.get("qlanes", 16)) if fused and not resident else 16
@@ -778,6 +884,10 @@ def decode_config(
     # Table key ``qer`` (round 6 continuation 10, lever QER): early half-slot release (host mirror of the Cake ``decode_config`` rule:
     # xbh rows only; the kernel instance validates the one-unit-per-lane-group split).
     qer = bool(entry.get("qer", False)) and xbh
+    # Table key ``xp`` (round 7, lever XP): the cluster split-K exchange issues its DSM copies from one lane per peer in
+    # parallel instead of one lane walking the peers (host mirror of the Cake ``decode_config`` rule: csplit > 1 rows only;
+    # the same partials land in the same inbox slots, so the reduction is bit-exact with the serial issue).
+    xp = bool(entry.get("xp", False)) and csplit > 1
     # Table key ``tstore`` (round 6, lever E1): the split-1 epilogue stores BF16 through TMA; the instance has no TMA path
     # for the split-K / cluster reductions.
     tstore = bool(entry.get("tstore", False))
@@ -795,9 +905,11 @@ def decode_config(
     cs_alias = (
         csplit > 1
         and grid == total_work
-        and decode_cs_alias_fits(tok, stages, fused, resident, csplit, xb_stages)
+        and decode_cs_alias_fits(
+            tok, stages, fused, resident, csplit, xb_stages, xq_stages
+        )
         and decode_cs_small_inbox_rounds(
-            tok, stages, fused, resident, csplit, xb_stages
+            tok, stages, fused, resident, csplit, xb_stages, xq_stages
         )
         > 1
     )
@@ -811,16 +923,19 @@ def decode_config(
         stages=stages,
         # The small-inbox cluster exchange gives up pipeline depth until the inbox fits (round 6: one t16 stage at C7..C16).
         module_stages=decode_cs_inbox_stages(
-            tok, stages, fused, resident, csplit, xb_stages, epi_chunk
+            tok, stages, fused, resident, csplit, xb_stages, epi_chunk, xq_stages
         )
         if csplit > 1 and not cs_alias
-        else decode_module_stages(tok, stages, fused, resident, xb_stages, epi_chunk),
+        else decode_module_stages(
+            tok, stages, fused, resident, xb_stages, epi_chunk, xq_stages
+        ),
         m_tiles=m_tiles,
         tiles=tiles,
         total_work=total_work,
         grid=grid,
         tok_per_cta=-(-tok // split),
         xb_stages=xb_stages,
+        xq_stages=xq_stages,
         qlanes=qlanes,
         csplit=csplit,
         epi_chunk=epi_chunk,
@@ -832,6 +947,7 @@ def decode_config(
         xbh=xbh,
         qer=qer,
         cs_alias=cs_alias,
+        xp=xp,
     )
 
 
