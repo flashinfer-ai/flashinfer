@@ -1223,6 +1223,8 @@ def test_tuning_overrides_preserve_tensor_initializers():
         ),
         tensor_initializers=((0, initializer),),
         profiling_repeat=100,
+        timer="cupti",
+        first_tactic_margin=0.03,
     )
 
     with autotune(tune_mode=False, tuning_buckets=(100, 200)):
@@ -1230,6 +1232,8 @@ def test_tuning_overrides_preserve_tensor_initializers():
 
     assert overridden.tensor_initializers == config.tensor_initializers
     assert overridden.profiling_repeat == 100
+    assert overridden.timer == "cupti"
+    assert overridden.first_tactic_margin == 0.03
 
 
 def test_tuning_config_profiling_repeat_override(monkeypatch):

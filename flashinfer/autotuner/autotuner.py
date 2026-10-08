@@ -2168,6 +2168,8 @@ class AutoTuner:
             value_aware_input_indices=tuning_config.value_aware_input_indices,
             profile_arena_input_indices=tuning_config.profile_arena_input_indices,
             inputs_pre_hook=tuning_config.inputs_pre_hook,
+            timer=tuning_config.timer,
+            first_tactic_margin=tuning_config.first_tactic_margin,
         )
         self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
             new_config
