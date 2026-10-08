@@ -647,6 +647,11 @@ def test_rank_tactics_preparation_oom_error_and_input_lifetime(
         "flashinfer.autotuner.autotuner._tune_process_group",
         object() if distributed else None,
     )
+    # The sentinel group models OOM handling; real collectives are covered
+    # by test_autotuner_distributed.py.
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._all_ranks_hit_cache", lambda hit: hit
+    )
     sync = MagicMock(side_effect=sync_oom)
     monkeypatch.setattr(
         "flashinfer.autotuner.autotuner._sync_oom_across_tune_group", sync
