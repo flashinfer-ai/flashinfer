@@ -715,7 +715,7 @@ def test_choose_stage_rows_leaves_gdn_unchunked():
     for batch in (1, 2, 8, 32, 128, 512):
         for seq_len in (1, 2, 4, 8):  # n_h=1: seq_len is the draft length
             tile_v, _, ilp_rows, _ = get_mtp_config(
-                batch, seq_len, num_v_heads=32, v_dim=128, k_dim=128
+                batch, seq_len, num_v_heads=32, v_dim=128
             )
             assert choose_stage_rows(seq_len, 128, tile_v, ilp_rows) == seq_len, (
                 f"B={batch} T={seq_len} would be chunked (tile_v={tile_v}, "
@@ -785,9 +785,16 @@ def test_chunked_smem_is_bit_identical(num_householder, T, chunk):
         B, T, n_h, HQ, HV, K, V, dtype, device, seed=17
     )
 
+    consulted = []
+
     def run(staged_rows):
         original = mtp.choose_stage_rows
-        mtp.choose_stage_rows = lambda *args, **kwargs: staged_rows
+
+        def spy(*args, **kwargs):
+            consulted.append(staged_rows)
+            return staged_rows
+
+        mtp.choose_stage_rows = spy
         try:
             pool_copy = pool.clone()
             out, _ = gated_delta_product_mtp(
@@ -811,6 +818,12 @@ def test_chunked_smem_is_bit_identical(num_householder, T, chunk):
 
     ref_out, ref_pool = run(TN)  # CHUNK == T: the pre-chunking code path
     out, pool_after = run(chunk)
+    # Without this the test compares the unchunked kernel against itself and
+    # passes on an identity, whatever the patched value was.
+    assert consulted, (
+        "choose_stage_rows was never consulted, so both runs used the same "
+        "kernel; chunking is not wired into the launch path"
+    )
     assert torch.equal(out, ref_out), (
         f"CHUNK={chunk} changed the output vs CHUNK={TN}; "
         "chunking must not reorder arithmetic"

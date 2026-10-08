@@ -75,6 +75,36 @@ TILE_K_MTP = 128  # Full K dimension (shared across all configs)
 NUM_THREADS_MTP = 128  # 4 warps
 
 
+def choose_stage_rows(
+    T: int, k_dim: int, tile_v: int, ilp_rows: int, budget_bytes: int = 16384
+) -> int:
+    """Tokens staged in SMEM at once (CHUNK) for the warp-specialized MTP kernel.
+
+    All six SMEM buffers are sized by this, so the footprint is CHUNK * per_row
+    and does not grow with T.  Returning T disables chunking.
+
+    Chunking requires the consumer to sweep [0, T) exactly once per row tile --
+    otherwise a chunk would be read after the producer had already refilled it.
+    That holds iff rows_per_group (= tile_v // 4) equals ilp_rows.
+
+    ``budget_bytes`` was chosen from measurements on GB200: 16384 bytes keeps
+    the occupancy register-bound to 9 CTAs.
+    """
+    if tile_v // 4 != ilp_rows:
+        return T
+
+    # sK + sQ (both fp32) = 2 * (k_dim + 8) * 4
+    # sG + sBeta (both fp32) = 8
+    # sVdata + sOutput (fp32 and bf16) = 6 * tile_v
+    per_row = 2 * (k_dim + 8) * 4 + 8 + 6 * tile_v
+    max_rows = (budget_bytes - 128) // per_row
+    if max_rows >= T:
+        return T
+
+    # a divisor of T, so every chunk is full
+    return max((c for c in range(min(max_rows, T), 0, -1) if T % c == 0), default=1)
+
+
 def get_mtp_config(
     batch_size: int,
     seq_len: int,
@@ -380,6 +410,10 @@ def gdn_verify_kernel_mtp(
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     cache_replayssm: cutlass.Constexpr[bool],
+    # Tokens staged in SMEM at once.  Bounding this to CHUNK instead of T
+    # keeps the shared-memory footprint independent of sequence length,
+    # preserving occupancy at long T.  CHUNK == T disables chunking.
+    CHUNK: cutlass.Constexpr[int],
     # Householders per real token.  q and a carry one row per REAL token and
     # are synthesised for the other micro-steps; k/v/b carry all n_h.  n_h == 1
     # is plain GDN and every predicate below folds away.
@@ -1836,6 +1870,10 @@ def run_gdn_verify_kernel_mtp(
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     cache_replayssm: cutlass.Constexpr[bool],
+    # Tokens staged in SMEM at once.  Bounding this to CHUNK instead of T
+    # keeps the shared-memory footprint independent of sequence length,
+    # preserving occupancy at long T.  CHUNK == T disables chunking.
+    CHUNK: cutlass.Constexpr[int],
     n_h: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
@@ -1906,6 +1944,7 @@ def run_gdn_verify_kernel_mtp(
         use_packed_fma,
         per_token_pool_scatter,
         cache_replayssm,
+        CHUNK,
         n_h,
     ).launch(
         grid=(grid_size, 1, 1),
@@ -2899,6 +2938,7 @@ def _mtp_kernel_name(
     per_token_pool_scatter: bool = False,
     cache_replayssm: bool = False,
     n_h: int = 1,
+    chunk_rows: int = 0,
 ) -> str:
     """Specialization name within the gdn_decode_mtp module, encoding the
     kernel variant ("inline" or "warp") and every parameter that affects
@@ -2926,6 +2966,7 @@ def _mtp_kernel_name(
         per_token_pool_scatter,
         cache_replayssm,
         n_h,
+        chunk_rows,
     )
 
 
@@ -2952,6 +2993,7 @@ def _get_compiled_mtp_kernel(
     per_token_pool_scatter: bool = False,
     cache_replayssm: bool = False,
     n_h: int = 1,
+    chunk_rows: int = 0,
 ):
     """Cache compiled optimized MTP kernel for given configuration."""
     return {}
@@ -3193,6 +3235,9 @@ def run_mtp_decode(
         )
         cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
     else:
+        # TODO(next commit): chunk_rows = choose_stage_rows(...).
+        # The kernel does not stage per chunk yet, so CHUNK == T.
+        chunk_rows = T
         warp_cache_key = (
             target.compile_key,
             T,
@@ -3215,6 +3260,7 @@ def run_mtp_decode(
             per_token_pool_scatter,
             cache_replayssm,
             n_h,
+            chunk_rows,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
 
@@ -3433,6 +3479,7 @@ def run_mtp_decode(
                     use_packed_fma=use_packed_fma,
                     per_token_pool_scatter=per_token_pool_scatter,
                     cache_replayssm=cache_replayssm,
+                    CHUNK=chunk_rows,
                     n_h=n_h,
                     stream=stream,
                 ),
