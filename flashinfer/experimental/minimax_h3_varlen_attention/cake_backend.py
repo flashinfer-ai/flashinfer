@@ -709,10 +709,19 @@ def build_bf16_segment_plan(
     total_tiles = len(units)
     num_clusters = min(int(num_clusters), max(total_tiles, 1))
     table: list[int] = []
-    for unit in assign_unit_slots(costs, num_clusters):
-        seg, head, c, begin, count, slot, q_half = units[unit]
+    for unit_index in assign_unit_slots(costs, num_clusters):
+        seg, head, c, begin, count, slot, q_half = units[unit_index]
         table.extend(
-            (begins[seg], lens[seg], (head << 16) | c, (begin << 16) | count, slot, q_half, 0, 0)
+            (
+                begins[seg],
+                lens[seg],
+                (head << 16) | c,
+                (begin << 16) | count,
+                slot,
+                q_half,
+                0,
+                0,
+            )
         )
     partial_O, partial_ML = _partial_workspace(partial_slots, device)
     return BF16SegmentPlan(
