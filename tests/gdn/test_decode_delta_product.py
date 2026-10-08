@@ -598,6 +598,43 @@ def test_negative_ssm_state_index_skips_write(batch_size, dispatch, num_househol
     )
 
 
+@pytest.mark.parametrize(
+    "num_householder", [2, 3], ids=lambda nh: f"num_householder={nh}"
+)
+def test_decode_serves_a_single_token_of_a_single_sequence(num_householder):
+    """B == T == 1 is what a server at max_num_seqs=1 asks for every step.
+
+    ``ssm_state_indices`` is [B, T_real], so this is the one shape where both
+    its strides are 1 and no dimension has size > 1.  The kernel sees the
+    expanded T = T_real * n_h, so the T >= 2 guard upstream does not fire and
+    the tensor reaches the layout machinery, which cannot deduce a leading
+    dimension unless it is named.
+    """
+    _skip_if_unsupported()
+    n_h, B, T, HQ, HV, K, V = num_householder, 1, 1, 16, 32, 128, 128
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    q, k, v, A_log, a, dt_bias, b, pool, idx, ssm = _gen_decode_inputs(
+        B, T, n_h, HQ, HV, K, V, dtype, device, seed=29
+    )
+    assert ssm.shape == (1, 1) and ssm.stride() == (1, 1)
+    out, _ = gated_delta_product_mtp(
+        q,
+        k,
+        v,
+        pool,
+        idx,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        scale=1.0,
+        ssm_state_indices=ssm,
+        disable_state_update=False,
+    )
+    ref_o, _ = _reference(q, k, v, A_log, a, dt_bias, b, pool, idx)
+    torch.testing.assert_close(out, ref_o.to(dtype), atol=1e-2, rtol=5e-3)
+
+
 def test_decode_rejects_mismatched_householder_counts():
     """k, v and beta must agree on how many householders a token carries."""
     B, T, n_h, HQ, HV, K, V = 2, 2, 3, 16, 32, 128, 128

@@ -3314,9 +3314,12 @@ def run_mtp_decode(
         cu_seqlens_tensor = from_dlpack(
             cu_seqlens, assumed_align=16
         ).mark_layout_dynamic()
+        # [B, T] is T-contiguous.  Name it: GDP reaches here with one index per
+        # REAL token, so at B == T == 1 both strides are 1, no dimension has
+        # size > 1, and mark_layout_dynamic cannot deduce the leading one.
         ssm_idx_tensor = from_dlpack(
             ssm_state_indices_arg, assumed_align=16
-        ).mark_layout_dynamic()
+        ).mark_layout_dynamic(leading_dim=1)
         if cache_replayssm:
             replayssm_rawv_tensor = _mark_slot_dynamic(replayssm_rawv)
             replayssm_rawk_tensor = _mark_slot_dynamic(replayssm_rawk)
