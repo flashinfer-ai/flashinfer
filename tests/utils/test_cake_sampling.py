@@ -2930,9 +2930,12 @@ def test_slab_tail_build_matches_spec_build():
 
 
 def test_cuda_graph_capture_never_registers_the_generator():
-    """A captured default-generator call must not read the generator inside the capture: PyTorch would register it
-    with the graph and every replay would run two ``FillFunctor`` kernels (host-side round-9 lever C4).  The replays
-    stay bitwise reproducible, the generator is untouched by the capture, and distinct captures get distinct offsets."""
+    """A captured default-generator call must not touch the generator inside the capture: a capture that consumed or
+    advanced it records a whole-graph Philox increment, and every replay then runs two ``FillFunctor`` refresh kernels
+    (host-side round-9 lever C4).  The replays stay bitwise reproducible, the generator is untouched by the captures
+    and by the replays, and distinct captures get distinct offsets.  The replay-time fills are checked at the
+    dispatcher level (``aten::fill_``), which needs no CUPTI; the kernel-name check is evidence only where CUPTI
+    reports the replay (torch 2.13+cu129 on GB300 reported no CUDA events)."""
     _require_supported_device()
     probs = _probs(4, 32768)
     gen = torch.cuda.default_generators[torch.cuda.current_device()]
@@ -2969,12 +2972,24 @@ def test_cuda_graph_capture_never_registers_the_generator():
     first = out.clone()
     from torch.profiler import ProfilerActivity, profile
 
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         g.replay()
         torch.cuda.synchronize()
-    names = [e.name for e in prof.events() if e.device_type.name == "CUDA"]
-    assert names and not any("FillFunctor" in n for n in names), names
+        sentinel = out.clone()  # proves the profiler recorded this window
+    events = list(prof.events())
+    cpu_names = [e.name for e in events if e.device_type.name == "CPU"]
+    cuda_names = [e.name for e in events if e.device_type.name == "CUDA"]
+    # A capture that consumed or advanced the default generator (the pre-round-9 ``get_state`` + ``set_state`` path)
+    # records a whole-graph increment, and every replay then runs ``replay_prologue``: two eager ``fill_`` ops
+    # (``FillFunctor`` kernels) refresh the seed / offset words the graph reads and the host offset advances by that
+    # increment.  The dispatcher-level ``aten::fill_`` events and the host state are checked without CUPTI; the kernel
+    # names are evidence only where CUPTI reports the replay (torch 2.13+cu129 on GB300 reported no CUDA events).
+    assert "aten::clone" in cpu_names, cpu_names
+    assert not any(n.startswith("aten::fill") for n in cpu_names), cpu_names
+    assert not any("FillFunctor" in n for n in cuda_names), cuda_names
+    assert torch.equal(gen.get_state(), after_warmup)  # unchanged after two replays
     assert torch.equal(out, first)
+    assert torch.equal(sentinel, first)
     assert bool(torch.all((out >= 0) & (out < probs.shape[1])))
 
 
