@@ -567,11 +567,19 @@ class SSDCombined:
                 dispatch; ``"exact_scan"`` selects the stable scan that evaluates
                 decay from differences of cumulative exponents, independently
                 of ``dt_limit``. Non-default selection requires ``backend="cake"``.
+                This is a keyword-only, per-call choice, not a constructor
+                option. It does not change state storage dtype or guarantee
+                bitwise agreement with other scan implementations.
 
         Returns:
             A pair containing token-major output with shape
             ``[batch, seqlen, nheads, headdim]`` and either the final states or
             ``None`` when ``return_final_states`` is false.
+
+        Raises:
+            ValueError: If ``scan_algorithm`` is neither ``"auto"`` nor
+                ``"exact_scan"``, or explicit exact scan is requested with
+                a non-Cake backend.
         """
         # Keep backend-independent public validation ahead of dispatch so Cake
         # and CuTe expose the same exception type and message for shared API
@@ -975,11 +983,17 @@ def ssd_combined_fwd(
             ``dt_softplus=True, dt_limit=(0.0, float("inf")),
             scan_algorithm="exact_scan"`` to retain nonnegative step sizes while
             avoiding separately exponentiated prefix factors.
+            This keyword-only, per-call choice does not change state storage
+            dtype or guarantee bitwise agreement with other implementations.
 
     Returns:
         A pair containing token-major output with shape
         ``[batch, seqlen, nheads, headdim]`` and either final states or ``None``
         when ``return_final_states`` is false.
+
+    Raises:
+        ValueError: If ``scan_algorithm`` is neither ``"auto"`` nor
+            ``"exact_scan"``.
     """
 
     if scan_algorithm not in ("auto", "exact_scan"):
