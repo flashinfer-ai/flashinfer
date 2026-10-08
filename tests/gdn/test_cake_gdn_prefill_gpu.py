@@ -770,6 +770,11 @@ def test_public_cake_gdn_prefill_int64_metadata_graph_owns_its_copy():
         ref() is case["cu_seqlens"]
         for ref, _value, _stream, _ready in prefill_mod._CAKE_GDN_I32_COPIES.values()
     ), "the eager call must populate the int32 copy cache"
+    # The baseline clones above run asynchronously on the current stream; the side
+    # stream is non-blocking, so order it after them before it rewrites the pool and
+    # the output buffer they read (a write-after-read race otherwise seen under GPU
+    # contention: state_eager would capture the restored initial state).
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         case["initial_state"].copy_(initial_state)
         case["output"].zero_()
