@@ -106,6 +106,17 @@ struct KVCacheTraits<ModelType::GLM_NSA> : KVCacheTraits<ModelType::DSV3_2> {
   static constexpr ScaleFormat SCALE_FORMAT = Scales::FORMAT;
 };
 
+// Packed GLM DSA storage, expanded in place to the existing FP8 compute tile.
+// QK still has four block-128 scales; the converter writes one row scale four times.
+template <>
+struct KVCacheTraits<ModelType::GLM_NSA_NVFP4> : KVCacheTraits<ModelType::GLM_NSA> {
+  static constexpr int NVFP4_SCALE_OFFSET = D_NOPE / 2;
+  static constexpr int NVFP4_NUM_SCALES = D_NOPE / 16;
+  static constexpr int KV_SMEM_COPY_BYTES = NVFP4_SCALE_OFFSET + NVFP4_NUM_SCALES;
+  static constexpr int KV_ROPE_GMEM_OFFSET = KV_SMEM_COPY_BYTES;
+  static constexpr int BYTES_PER_TOKEN = KV_SMEM_COPY_BYTES + D_ROPE * sizeof(bf16);
+};
+
 template <>
 struct KVCacheTraits<ModelType::GLM53_NOPE> {
   // GLM-5.3-Flash is a native NoPE model. The absorbed query and latent KV
@@ -265,6 +276,19 @@ struct CacheFormatInfo {
 template <ModelType MT>
 constexpr CacheFormatInfo cache_format_info() {
   using KV = KVCacheTraits<MT>;
+  if constexpr (MT == ModelType::GLM_NSA_NVFP4) {
+    // Describe packed global storage, not the four FP32 compute scales in smem.
+    return {KV::D_QK,
+            KV::D_V,
+            KV::BYTES_PER_TOKEN,
+            true,
+            KV::D_NOPE,
+            KV::D_ROPE,
+            KV::NVFP4_NUM_SCALES,
+            KV::NVFP4_NUM_SCALES,
+            KV::NVFP4_SCALE_OFFSET,
+            KV::KV_ROPE_GMEM_OFFSET};
+  }
   return {KV::D_QK,
           KV::D_V,
           KV::BYTES_PER_TOKEN,
@@ -288,6 +312,7 @@ constexpr CacheFormatInfo cache_format_info(ModelType mt) {
     FORMAT(GLM53_NOPE);
     FORMAT(DOTS3_SWA);
     FORMAT(DSV4_1);
+    FORMAT(GLM_NSA_NVFP4);
   }
 #undef FORMAT
   return {};

@@ -28,6 +28,7 @@ struct PrefillColdParams {
   flashinfer::uint_fastdiv main_div;
   flashinfer::uint_fastdiv extra_div;
   float lse_scale = 1.f;
+  const float* kv_global_scale = nullptr;
 };
 
 struct Dsv4PageDivisors {
