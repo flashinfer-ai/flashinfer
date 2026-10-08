@@ -19,7 +19,7 @@ def cudnn_frost_grouped_gemm1_swiglu_workspace_size(
 ) -> int:
     """Return workspace bytes required by all matching generated tactics."""
 
-    from ..experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+    from .backends.cudnn_frost import (
         workspace_size,
     )
 
@@ -46,13 +46,14 @@ def cudnn_frost_grouped_gemm1_swiglu(
     """Run cuDNN Frost's fused dual grouped GEMM1 and SwiGLU epilogue.
 
     ``grouped_tokens`` is already sorted/materialized by group. Group ``g`` is
-    the row range beginning at ``first_token_offset[g]`` (the last range ends
-    at ``S``) and uses expert ``g % E``. Gate/up weights have shape ``[E,N,K]``.
+    the row range ``[first_token_offset[g], first_token_offset[g+1])`` and uses
+    expert ``g % E``. Offsets contain ``G+1`` nondecreasing int32 boundaries,
+    starting at zero and ending at or before the token buffer capacity ``S``. Gate/up weights have shape ``[E,N,K]``.
     The operation is ``silu(tokens @ gate.T) * (tokens @ up.T) * scale``.
     Routing, token permutation, and GEMM2 are intentionally outside this API.
     """
 
-    from ..experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+    from .backends.cudnn_frost import (
         CudnnFrostGroupedGemm1SwiGLURunner,
         workspace_size,
     )

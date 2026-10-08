@@ -27,9 +27,14 @@ def test_hangs():
         encoding="utf-8",
     )
 
+    # The isolated child does not load the FlashInfer plugins registering
+    # ``--full``, so it must not inherit the nightly PYTEST_ADDOPTS.
+    env = os.environ.copy()
+    env.pop("PYTEST_ADDOPTS", None)
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", str(test_file)],
         cwd=tmp_path,
+        env=env,
         text=True,
         capture_output=True,
         check=False,

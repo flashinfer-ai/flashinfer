@@ -20,7 +20,11 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
-from ..validation import validate_routing_values, validate_unit_scalars
+from ..validation import (
+    validate_input_norm_const,
+    validate_nvfp4_scalars,
+    validate_routing_values,
+)
 from .config import Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 from .staging import stage_mega_moe_inputs, validate_sm107_nvfp4_forward_inputs
 from .weights import (
@@ -59,6 +63,13 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
 
         self._ensure_ep_bootstrap(bootstrap)
         self._resolved_config(fleet_params)
+        validate_nvfp4_scalars(
+            self._scalar_values(),
+            num_local_experts=fleet_params.num_experts // self.ep_world_size,
+            device=torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cuda"),
+        )
         if torch.cuda.is_available():
             require_sm107_dsl()
         validate_mega_fleet_params(
@@ -95,6 +106,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
     def _resolved_config(self, fleet_params: FleetParams):
         from ..validation import make_workspace_config
 
+        validate_input_norm_const(self._kernel_config.input_norm_const)
         return make_workspace_config(
             self._kernel_config,
             fleet_params,
@@ -145,6 +157,12 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
                 max_tokens=fleet_params.max_tokens_per_rank,
                 allow_nondeterministic=k.in_kernel_fc2_reduce,
                 apply_topk_at_fc1=k.apply_topk_in_fc1,
+                activation=k.activation,
+                kernel_variant=k.kernel_variant,
+                combine_dtype=k.combine_dtype,
+                situ_beta=k.situ_beta,
+                situ_linear_beta=k.situ_linear_beta,
+                gate_up_clamp=k.gate_up_clamp,
             )
             if self.ep_rank == 0:
                 print(
@@ -166,7 +184,11 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
-        validate_unit_scalars(t)
+        validate_nvfp4_scalars(
+            self._scalar_values(t),
+            num_local_experts=fleet_params.num_experts // self.ep_world_size,
+            device=t.hidden_states.device,
+        )
         validate_sm107_nvfp4_forward_inputs(
             t.hidden_states,
             t.topk_ids,
@@ -177,12 +199,28 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             scales=t.scales,
         )
 
+    def _scalar_values(self, t=None):
+        """Resolve per-call tensors, then config defaults; staging fills None with one."""
+        values = {}
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            override = getattr(t, name, None)
+            values[name] = (
+                override if override is not None else getattr(self._kernel_config, name)
+            )
+        return values
+
     def stage_inputs(
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         validate_routing_values(
             t.topk_ids, t.topk_weights, workspace.config.num_total_experts
         )
+        for name, value in self._scalar_values(t).items():
+            target = getattr(workspace, name)
+            if value is None:
+                target.fill_(1.0)
+            else:
+                target.copy_(value)
         if quantize_input:
             staged = stage_mega_moe_inputs(
                 t.hidden_states,
@@ -192,6 +230,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
                 workspace.x_sf,
                 workspace.topk_idx,
                 workspace.topk_weights,
+                input_norm_const=self._kernel_config.input_norm_const,
             )
             workspace.note_staged_tokens(staged)
             return
@@ -259,6 +298,11 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.top_k,
             fp.token_hidden_size,
             k.intermediate_size,
+            k.activation,
+            k.kernel_variant,
+            k.combine_dtype,
+            k.situ_beta,
+            k.situ_linear_beta,
             k.gate_up_clamp,
             k.in_kernel_fc2_reduce,
             k.token_back_mode,

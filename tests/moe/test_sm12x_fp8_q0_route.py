@@ -7,6 +7,7 @@ from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_fp8_q0_route_triton import (
     fp8_q0_route_triton,
     fp8_q0_route_workspace_shapes,
+    make_fp8_q0_route_workspace,
 )
 from flashinfer.utils import is_sm120a_supported
 
@@ -50,7 +51,8 @@ def _quantize_reference(x):
 
 def _assert_output(x, topk_ids, topk_weights, num_experts, output):
     offsets, token_map, token_weights, q_out, scale_out = output
-    counts = torch.bincount(topk_ids.flatten().long(), minlength=num_experts)
+    routed = topk_ids >= 0
+    counts = torch.bincount(topk_ids[routed].long(), minlength=num_experts)
     offsets_ref = torch.zeros(num_experts + 1, dtype=torch.int32, device=x.device)
     offsets_ref[1:] = counts.cumsum(0, dtype=torch.int32)
     assert torch.equal(offsets, offsets_ref)
@@ -73,7 +75,7 @@ def _assert_output(x, topk_ids, topk_weights, num_experts, output):
             )
             scale_row = scale_begin + row - begin
             assert torch.equal(scale_out[:, scale_row], scale_ref[token])
-    assert bool(seen.all().item())
+    assert torch.equal(seen, routed)
 
 
 @pytest.mark.parametrize(
@@ -147,3 +149,55 @@ def test_fp8_q0_route_rejects_non_1d_workspace(workspace_name):
     }
     with pytest.raises(ValueError, match="1D buffer"):
         fp8_q0_route_triton(x, topk_ids, topk_weights, num_experts, **kwargs)
+
+
+def _mask_unrouted(topk_ids, pattern):
+    """Mark CUDA-graph padding the way vLLM does: expert id -1, weight kept."""
+    num_tokens, top_k = topk_ids.shape
+    if pattern == "tail":
+        masked = torch.zeros_like(topk_ids, dtype=torch.bool)
+        masked[num_tokens - max(1, num_tokens // 4) :] = True
+    elif pattern == "all":
+        masked = torch.ones_like(topk_ids, dtype=torch.bool)
+    elif pattern == "mixed":
+        token = torch.arange(num_tokens, device=topk_ids.device)[:, None]
+        slot = torch.arange(top_k, device=topk_ids.device)[None, :]
+        masked = (token + slot) % 2 == 0
+    else:
+        raise ValueError(pattern)
+    return topk_ids.masked_fill(masked, -1)
+
+
+@pytest.mark.parametrize("pattern", ("tail", "all", "mixed"))
+@pytest.mark.parametrize(
+    "path,num_tokens,top_k,num_experts",
+    (
+        ("decode", 5, 4, 7),
+        ("prefill", 65, 4, 7),
+        ("large_expert_fallback", 65, 4, 1025),
+    ),
+)
+def test_fp8_q0_route_skips_unrouted(path, num_tokens, top_k, num_experts, pattern):
+    """A negative expert id gets no routed row; the routed pairs are unchanged."""
+    _skip_if_not_sm120()
+    hidden_size = 256
+    x, topk_ids, topk_weights = _make_inputs(
+        num_tokens, hidden_size, top_k, num_experts
+    )
+    topk_ids = _mask_unrouted(topk_ids, pattern)
+    shape13, shape2 = fp8_q0_route_workspace_shapes(
+        num_tokens, hidden_size, top_k, num_experts
+    )
+    # Dirty external workspaces: stale rows must not leak into the result.
+    workspace13 = torch.full(shape13, 3.0, dtype=torch.bfloat16, device="cuda")
+    workspace2 = torch.full(shape2, 3.0, dtype=torch.bfloat16, device="cuda")
+    workspace = make_fp8_q0_route_workspace(
+        x, topk_ids, num_experts, workspace13=workspace13, workspace2=workspace2
+    )
+    output = fp8_q0_route_triton(
+        x, topk_ids, topk_weights, num_experts, workspace=workspace
+    )
+    _assert_output(x, topk_ids, topk_weights, num_experts, output)
+    unrouted = topk_ids < 0
+    assert bool((workspace.dst_rows[unrouted] == -1).all().item())
+    assert bool((workspace.scale_dst_rows[unrouted] == -1).all().item())

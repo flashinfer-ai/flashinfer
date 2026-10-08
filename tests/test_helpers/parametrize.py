@@ -171,12 +171,16 @@ def parametrize_product(
 
 
 def pytest_addoption(parser):
-    parser.getgroup("flashinfer").addoption(
-        "--full",
-        action="store_true",
-        default=False,
-        help="run full parameter matrices instead of regular subsets",
-    )
+    import argparse
+    import contextlib
+
+    with contextlib.suppress(argparse.ArgumentError):
+        parser.getgroup("flashinfer").addoption(
+            "--full",
+            action="store_true",
+            default=False,
+            help="run full parameter matrices instead of regular subsets",
+        )
 
 
 def pytest_generate_tests(metafunc):

@@ -811,6 +811,10 @@ python scripts/generate_moe_activation_matrix.py --write
 | `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
 | `b12x_w4a16` | `B12xW4A16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
 | `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU`, `SiTU` |
+| `cudnn_frost_bf16` | `CudnnFrostBf16Config` | `BF16×BF16` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+| `cudnn_frost_mxfp8` | `CudnnFrostMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+| `cudnn_frost_mxfp8_mxfp4` | `CudnnFrostMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+| `cudnn_frost_nvfp4` | `CudnnFrostNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×BF16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
@@ -834,9 +838,15 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
+| `prims_ts` | `PrimsTsConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
+| `prims_ts` | `PrimsTsConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
+| `prims_ts` | `PrimsTsConfig` | `MXFP4×BF16` | `SwiGLU` |
+| `prims_ts` | `PrimsTsConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `prims_ts` | `PrimsTsConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2` |
 | `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
 | `sm12x_fp8` | `SM12xFp8Config` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `sm12x_mxfp8_mxfp4` | `SM12xMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU` |
+| `sm12x_nvfp4_bf16` | `SM12xNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
 | `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×BF16` | `SwiGLU` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |

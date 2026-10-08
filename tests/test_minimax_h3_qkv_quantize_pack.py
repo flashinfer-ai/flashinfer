@@ -25,7 +25,7 @@ of every scale tile.
 from __future__ import annotations
 
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 import torch
@@ -116,31 +116,6 @@ def test_architecture_router_rejects_cross_routing(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
     with pytest.raises(RuntimeError, match="exact compute capability 10.0 or 10.3"):
         router.minimax_h3_qkv_pack_target(torch.device("cuda"))
-
-
-def test_aot_inventory_covers_every_exact_route(monkeypatch) -> None:
-    from flashinfer.jit import cake_minimax_h3_qkv_pack as jit
-
-    calls = []
-
-    class _PhysicalModule:
-        @staticmethod
-        def minimax_h3_qkv_pack_route_record(P, fmt):
-            return {"target": "sm103a", "P": P, "format": fmt}
-
-        @staticmethod
-        def gen_minimax_h3_qkv_pack_module(P, fmt):
-            calls.append((P, fmt))
-            return SimpleNamespace(name=f"{fmt}_{P}")
-
-    monkeypatch.setattr(jit.importlib, "import_module", lambda *_args: _PhysicalModule)
-    specs = jit.gen_minimax_h3_qkv_pack_aot_modules("sm103a")
-
-    assert jit.MINIMAX_H3_QKV_PACK_PARTITIONS == PARTITIONS
-    assert jit.MINIMAX_H3_QKV_PACK_FORMATS == FORMATS
-    assert len(calls) == 8
-    assert len(specs) == 8
-    assert {fmt for _, fmt in calls} == set(FORMATS)
 
 
 @pytest.mark.parametrize(

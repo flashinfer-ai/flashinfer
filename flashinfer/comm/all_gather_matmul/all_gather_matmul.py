@@ -50,7 +50,7 @@ Example (run with torchrun or mp.spawn across all GPU ranks)::
     out = all_gather_matmul(inp, w, group)
 """
 
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
@@ -98,23 +98,27 @@ def prepare_all_gather_matmul(
     group: dist.ProcessGroup,
     *,
     backend: str = "auto",
+    max_rows: Optional[int] = None,
     verbose: bool = False,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Prepare the packed-QKV all-gather matmul launcher.
+    """Prepare a capacity-bound Cake all-gather matmul launcher.
 
-    The returned callable binds ``w`` and ``group`` and accepts a new input
-    tensor with the same shape, dtype, and device as ``inp``. Both
-    ``backend="auto"`` and ``backend="cake"`` select the source-built
-    prepared BF16 launcher for TP8/N=1280 on SM100 or SM103, or TP4/N=2560
-    on SM103. SM100 TP8 uses asynchronous peer copies; the fused peer-copy
-    specialization remains specific to SM103. Unsupported inputs raise during
-    preparation instead of falling back to another implementation.
+    The returned callable binds ``w`` and ``group`` and accepts any contiguous
+    input with the dtype, device and ``K`` of ``inp`` and at most ``max_rows``
+    rows (default: ``inp.shape[0]``); the symmetric scratch is sized for that
+    capacity in this one collective, so later calls with fewer rows perform no
+    collective. ``w`` is the logical ``[8192, N]`` weight, contiguous or the
+    transposed view of a contiguous ``[N, 8192]`` parameter, with ``N`` a
+    positive multiple of 256. Both ``backend="auto"`` and ``backend="cake"``
+    select the Cake route (SM100 or SM103, bfloat16 or float16, two-, four- or
+    eight-rank NCCL groups). Unsupported inputs raise during preparation
+    instead of falling back to another implementation.
     """
     if backend not in {"auto", "cake"}:
         raise ValueError("backend must be exactly 'auto' or 'cake'")
 
-    from .cake_all_gather_matmul import (
-        _prepare_all_gather_matmul_cake_packed_qkv,
-    )
+    from .cake_all_gather_matmul import _prepare_all_gather_matmul_cake
 
-    return _prepare_all_gather_matmul_cake_packed_qkv(inp, w, group, verbose=verbose)
+    return _prepare_all_gather_matmul_cake(
+        inp, w, group, max_rows=max_rows, verbose=verbose
+    )

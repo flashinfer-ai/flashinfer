@@ -56,13 +56,37 @@ from tests.trace.template_registry import collect_registered_trace_templates
 # ---------------------------------------------------------------------------
 
 
+_DSV41_WRITER_BYTES = {"fp4": 288, "fp8": 528}
+
+
+def _dsv41_writers(fmt):
+    from flashinfer.mla import (
+        dsv41_fp4_quantize_append_sparse_mla_cache,
+        dsv41_fp4_quantize_pack_sparse_mla_cache,
+        dsv41_fp8_quantize_append_sparse_mla_cache,
+        dsv41_fp8_quantize_pack_sparse_mla_cache,
+    )
+
+    return {
+        "fp4": (
+            dsv41_fp4_quantize_pack_sparse_mla_cache,
+            dsv41_fp4_quantize_append_sparse_mla_cache,
+        ),
+        "fp8": (
+            dsv41_fp8_quantize_pack_sparse_mla_cache,
+            dsv41_fp8_quantize_append_sparse_mla_cache,
+        ),
+    }[fmt]
+
+
+@pytest.mark.parametrize("fmt", ["fp4", "fp8"])
 @pytest.mark.parametrize("input_layout", ["3d", "hnd", "nhd"])
 @pytest.mark.parametrize("kv_layout", [None, "HND", "NHD"])
-def test_dsv41_fp4_pack_trace(input_layout, kv_layout, tmp_path):
+def test_dsv41_pack_trace(fmt, input_layout, kv_layout, tmp_path):
     import json
 
-    from flashinfer.mla import dsv41_fp4_quantize_pack_sparse_mla_cache as pack
-
+    pack, _ = _dsv41_writers(fmt)
+    bpt = _DSV41_WRITER_BYTES[fmt]
     shapes = {"3d": (2, 8, 512), "hnd": (2, 1, 8, 512), "nhd": (2, 8, 1, 512)}
     latent = torch.empty(shapes[input_layout], dtype=torch.float16)
     kwargs = {} if kv_layout is None else {"kv_layout": kv_layout}
@@ -78,8 +102,9 @@ def test_dsv41_fp4_pack_trace(input_layout, kv_layout, tmp_path):
         == latent.shape
     )
     output = definition["outputs"]["cache"]
-    expected = (2, 8, 1, 288) if kv_layout == "NHD" else (2, 1, 8, 288)
+    expected = (2, 8, 1, bpt) if kv_layout == "NHD" else (2, 1, 8, bpt)
     assert tuple(axes[d] for d in output["shape"]) == expected
+    assert definition["tags"][1] == f"quantization:{fmt}"
     assert output["dtype"] == "uint8"
     assert definition["inputs"]["latent_kv"]["dtype"] == "float16"
     assert definition["inputs"]["kv_layout"]["dtype"] == "string"
@@ -89,13 +114,18 @@ def test_dsv41_fp4_pack_trace(input_layout, kv_layout, tmp_path):
     )
 
 
+@pytest.mark.parametrize("fmt", ["fp4", "fp8"])
 @pytest.mark.parametrize("latent_shape", [(6, 512), (2, 3, 512), (2, 1, 3, 512)])
-@pytest.mark.parametrize(
-    "cache_shape", [(2, 2304), (2, 8, 288), (2, 1, 8, 288), (2, 8, 1, 288)]
-)
-def test_dsv41_fp4_append_trace(latent_shape, cache_shape):
-    from flashinfer.mla import dsv41_fp4_quantize_append_sparse_mla_cache as append
-
+@pytest.mark.parametrize("cache_form", ["flat", "3d", "hnd", "nhd"])
+def test_dsv41_append_trace(fmt, latent_shape, cache_form):
+    _, append = _dsv41_writers(fmt)
+    bpt = _DSV41_WRITER_BYTES[fmt]
+    cache_shape = {
+        "flat": (2, 8 * bpt),
+        "3d": (2, 8, bpt),
+        "hnd": (2, 1, 8, bpt),
+        "nhd": (2, 8, 1, bpt),
+    }[cache_form]
     latent = torch.empty(latent_shape, dtype=torch.bfloat16)
     cache = torch.empty((4, *cache_shape[1:]), dtype=torch.uint8)[::2]
     definition = append.fi_trace(
@@ -127,13 +157,11 @@ def test_dsv41_fp4_append_trace(latent_shape, cache_shape):
     assert "Page-strided" in inputs["cache"]["description"]
 
 
-def test_dsv41_fp4_cache_autodump(tmp_path, monkeypatch):
+@pytest.mark.parametrize("fmt", ["fp4", "fp8"])
+def test_dsv41_cache_autodump(fmt, tmp_path, monkeypatch):
     import json
 
-    from flashinfer.mla import (
-        dsv41_fp4_quantize_append_sparse_mla_cache as append,
-        dsv41_fp4_quantize_pack_sparse_mla_cache as pack,
-    )
+    pack, append = _dsv41_writers(fmt)
     from flashinfer.trace import template
     from flashinfer.utils import get_compute_capability
 
@@ -558,11 +586,11 @@ def test_attention_ts_trace_constraints_match_cache_axes():
         attention_ts_decode_trace_dispatch,
         prims_ts_block_sparse_trace_dispatch,
         prims_ts_block_sparse_wrapper_trace_dispatch,
-        prims_ts_paged_block_sparse_trace_dispatch,
-        prims_ts_paged_block_sparse_wrapper_trace_dispatch,
         prims_ts_decode_mla_one_shot_trace_dispatch,
         prims_ts_decode_mla_wrapper_trace_dispatch,
         prims_ts_decode_wrapper_trace_dispatch,
+        prims_ts_paged_block_sparse_trace_dispatch,
+        prims_ts_paged_block_sparse_wrapper_trace_dispatch,
     )
 
     fmha_dispatches = (
@@ -669,6 +697,7 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         "prims_ts_block_sparse_bitmask_shared",
         "prims_ts_block_sparse_bsr_proxy_shared",
         "prims_ts_block_sparse_bitmask_proxy_shared",
+        "prims_ts_block_sparse_dense",
     }
     contiguous_wrapper_traces = {
         template.name_prefix: template
@@ -683,6 +712,7 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         "prims_ts_block_sparse_wrapper_bitmask_shared",
         "prims_ts_block_sparse_wrapper_bsr_proxy_shared",
         "prims_ts_block_sparse_wrapper_bitmask_proxy_shared",
+        "prims_ts_block_sparse_wrapper_dense",
     }
     route_modes = {
         ("bsr", False): ("", {"block_indptr", "block_indices"}),
@@ -707,6 +737,23 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         prims_ts_block_sparse_trace_dispatch()
         is one_shot_traces["prims_ts_block_sparse"]
     )
+    dense_trace = prims_ts_block_sparse_trace_dispatch(use_block_sparse=False)
+    assert dense_trace is one_shot_traces["prims_ts_block_sparse_dense"]
+    dense_wrapper = SimpleNamespace(
+        _plan_state=SimpleNamespace(
+            use_block_sparse=False, sparse_format="bsr", use_proxy_routes=False
+        )
+    )
+    dense_wrapper_trace = contiguous_wrapper_traces[
+        "prims_ts_block_sparse_wrapper_dense"
+    ]
+    assert (
+        prims_ts_block_sparse_wrapper_trace_dispatch(self=dense_wrapper)
+        is dense_wrapper_trace
+    )
+    for template in (dense_trace, dense_wrapper_trace):
+        assert not (set(template.inputs) & all_route_inputs)
+        assert "kv_valid_bits" not in template.inputs
     for (sparse_format, use_proxy_routes), (
         suffix,
         expected_inputs,
@@ -1619,7 +1666,9 @@ def test_fi_trace_complete(func, template, label):
 def test_fi_trace_complete_gqa_paged_decode():
     """GQA paged decode: tuple paged_kv_cache input handled correctly."""
     from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
-    from flashinfer.trace.templates.attention import gqa_paged_decode_trace  # noqa: F401
+    from flashinfer.trace.templates.attention import (
+        gqa_paged_decode_trace,  # noqa: F401
+    )
 
     B, H, KV, D, P, NP = 4, 8, 4, 64, 16, 8
     q = torch.zeros(B, H, D, dtype=torch.bfloat16)
