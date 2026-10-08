@@ -20,7 +20,8 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_attention_trace
-from ..utils import is_sm12x_supported, is_sm90a_supported
+from ..utils import is_sm12x_supported
+from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
 from ._blackwell_sm100 import (
     MSASparseAttentionWorkspace,
     blackwell_msa_sparse_attention,

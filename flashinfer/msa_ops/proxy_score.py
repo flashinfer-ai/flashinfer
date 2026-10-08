@@ -26,7 +26,8 @@ from ..trace.templates.msa import (
     msa_proxy_score_fp4_trace,
     msa_proxy_score_trace,
 )
-from ..utils import get_device_sm_count, is_sm12x_supported, is_sm90a_supported
+from ..utils import get_device_sm_count, is_sm12x_supported
+from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
 from ._common import _BLK_KV
 
 # NVFP4 scale granularity: one e4m3 block scale per 16 e2m1 elements.

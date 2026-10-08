@@ -344,7 +344,8 @@ def msa_sparse_decode_attention(
     import cutlass
     import cutlass.cute as cute
 
-    from ..utils import is_sm12x_supported, is_sm90a_supported
+    from ..utils import is_sm12x_supported
+    from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
     from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
     from ._common import _q_offset_explicit
 

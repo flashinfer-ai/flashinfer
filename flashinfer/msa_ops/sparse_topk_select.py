@@ -21,7 +21,8 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_topk_select_trace
-from ..utils import is_sm12x_supported, is_sm90a_supported
+from ..utils import is_sm12x_supported
+from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
 from ._blackwell_sm100 import blackwell_msa_topk_select, is_blackwell_msa_device
 
 
