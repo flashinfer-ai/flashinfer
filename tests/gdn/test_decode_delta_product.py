@@ -635,6 +635,34 @@ def test_decode_serves_a_single_token_of_a_single_sequence(num_householder):
     torch.testing.assert_close(out, ref_o.to(dtype), atol=1e-2, rtol=5e-3)
 
 
+def test_decode_rejects_non_t_contiguous_state_indices():
+    """Naming the leading dim asserts T-contiguity, so a strided view must not
+    reach the kernel: it would be read wrongly rather than rejected."""
+    B, T, n_h, HQ, HV, K, V = 2, 2, 2, 16, 32, 128, 128
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    q, k, v, A_log, a, dt_bias, b, pool, idx, _ = _gen_decode_inputs(
+        B, T, n_h, HQ, HV, K, V, dtype, device, seed=41
+    )
+    # [T, B] laid out contiguously, then transposed: shape is right, T is not
+    strided = torch.zeros(T, B, dtype=torch.int32, device=device).t()
+    assert strided.shape == (B, T) and strided.stride(1) != 1
+    with pytest.raises(AssertionError, match="contiguous along T"):
+        gated_delta_product_mtp(
+            q,
+            k,
+            v,
+            pool,
+            idx,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            scale=1.0,
+            ssm_state_indices=strided,
+            disable_state_update=False,
+        )
+
+
 def test_decode_rejects_mismatched_householder_counts():
     """k, v and beta must agree on how many householders a token carries."""
     B, T, n_h, HQ, HV, K, V = 2, 2, 3, 16, 32, 128, 128

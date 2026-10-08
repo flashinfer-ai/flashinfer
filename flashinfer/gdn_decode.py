@@ -1399,6 +1399,13 @@ def gated_delta_rule_mtp(
             f"ssm_state_indices must have shape [B={B}, T={T_real}], "
             f"got {tuple(ssm_state_indices.shape)}"
         )
+        # The kernel names dim 1 as the leading one rather than deducing it,
+        # which a [1, 1] tensor cannot support.  That asserts T-contiguity, so
+        # a strided view would be read wrongly and silently.
+        assert ssm_state_indices.stride(1) == 1, (
+            "ssm_state_indices must be contiguous along T, got strides "
+            f"{tuple(ssm_state_indices.stride())}"
+        )
         assert ssm_state_indices.dtype == torch.int32, (
             f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
         )
