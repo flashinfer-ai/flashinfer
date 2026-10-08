@@ -9119,6 +9119,15 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
                 f"{type(self).__name__} supports pre-routed packs only "
                 f"(PackedPrecomputed / UnpackedPrecomputed), got {act.routing_input_mode!r}."
             )
+        if act.per_token_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} takes no per_token_scale; the cuDNN grouped "
+                "GEMMs have no per-token activation scale input."
+            )
+        # The cuDNN-specific reasons above come first; the shared pack contract is
+        # the common gate every unified runner passes through (see
+        # tests/moe/test_unified_moe_pack_contract.py).
+        self._validate_pack_contract(act)
         num_tokens, hidden_size = self._validate_hidden_states(act.hidden_states_q)
         _validate_prerouted_inputs(
             act,
@@ -9128,11 +9137,6 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
             allowed_weights_dtypes=(torch.float32, torch.bfloat16),
             require_contiguous=True,
         )
-        if act.per_token_scale is not None:
-            raise ValueError(
-                f"{type(self).__name__} takes no per_token_scale; the cuDNN grouped "
-                "GEMMs have no per-token activation scale input."
-            )
         view = weights.get_view(self.backend_key)
         weight_inputs = self._pack_weight_inputs(view, hidden_size)
         extra_inputs = self._pack_extra_inputs(act, view)
