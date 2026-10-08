@@ -1332,6 +1332,9 @@ _TK_T32_GEOMETRIES = frozenset({(16, 16)})
 _TK_T32_THREADS = 256
 _TK_T32_MIN_ROWS = 17
 _TK_T32_MAX_ROWS = 32
+# Single-register-tile stream window of the module (``ONE_GEOMETRIES`` / ``one_default``, top-k round 4): the geometries
+# whose thread holds exactly one register tile stream it without the prefetch buffer / loop.  Measured, not derived.
+_TK_ONE_GEOMETRIES = frozenset({(8, 4), (2, 32), (8, 32), (16, 16), (2, 128)})
 _TK_INSTR_TILE32 = 620
 _TK_T_TILE32_US = 0.56
 _TK_W_CHOICES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
@@ -1367,6 +1370,19 @@ class HopperTopkPlan:
             rows = -(-int(tiles) // self.w)
             return -(-rows // 32)
         return -(-int(tiles) // (_TK_CHUNK * self.w))
+
+    def one(self, tiles: int) -> bool:
+        """Module ``one_default``: the single-register-tile stream (no prefetch buffer / loop, the sorted tile is the
+        running list) for the geometries in ``_TK_ONE_GEOMETRIES`` when the thread holds exactly one register tile and
+        the host FILTER knob is off (always, in production).  Not part of the route key and not a launch argument:
+        the exported program is built with the same rule (the public ``topk_module`` resolves it), so this mirror
+        states the structure the binary behind the route carries."""
+        return (self.c, self.w) in _TK_ONE_GEOMETRIES and self.chunks(tiles) == 1
+
+    @property
+    def ilv(self) -> bool:
+        """Interleaved tile walk: a measured-off A/B knob of the module (round 4); False for every planner shape."""
+        return False
 
     @property
     def route(self) -> str:
