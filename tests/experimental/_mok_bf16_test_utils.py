@@ -30,8 +30,13 @@ def mok_distributed_group():
     torch.cuda.set_device(device)
     owns_group = not dist.is_initialized()
     if owns_group:
+        # A rank that JIT-compiles the kernels on a cold cache can hold the other
+        # ranks in the workspace all-gather for minutes (longer on slow shared
+        # filesystems); a too-short collective timeout then aborts the process
+        # group from the NCCL watchdog.  MOK_PG_TIMEOUT_S widens it for such runs.
+        timeout_s = int(os.environ.get("MOK_PG_TIMEOUT_S", "600"))
         dist.init_process_group(
-            "nccl", device_id=device, timeout=datetime.timedelta(seconds=180)
+            "nccl", device_id=device, timeout=datetime.timedelta(seconds=timeout_s)
         )
     try:
         yield dist.group.WORLD

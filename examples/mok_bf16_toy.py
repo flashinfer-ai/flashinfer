@@ -525,8 +525,11 @@ def main():
     device = torch.device("cuda", local)
     owns_group = not dist.is_initialized()
     if owns_group:
+        # Cold JIT compilation on one rank can hold the others in the first
+        # collective for minutes; MOK_PG_TIMEOUT_S widens the watchdog timeout.
+        timeout_s = int(os.environ.get("MOK_PG_TIMEOUT_S", "600"))
         dist.init_process_group(
-            "nccl", device_id=device, timeout=datetime.timedelta(seconds=180)
+            "nccl", device_id=device, timeout=datetime.timedelta(seconds=timeout_s)
         )
     rank, ep = dist.get_rank(), dist.get_world_size()
     assert ep in (1, 4, 16, 64), "Launch with 1, 4, 16 or 64 ranks"
