@@ -6016,7 +6016,7 @@ def _check_mm_mxfp8_problem_size(
     min_k = 128
     if b.shape[1] < min_n or a.shape[1] < min_k:
         raise ValueError(
-            f"MXFP8 requires n >= {min_n} and k >= {min_k} for CUTLASS MXFP8. "
+            f"mm_mxfp8 requires n >= {min_n} and k >= {min_k}. "
             f"got m={a.shape[0]}, n={b.shape[1]}, k={a.shape[1]}."
         )
 
@@ -6876,11 +6876,16 @@ def mm_mxfp8(
           4.6.0, 1D swizzled 128x4 scales, and K divisible by 128.
         - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
           (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``). On
-          SM120/SM121 it requires CUDA 13+, ``K % 32 == 0``, a row-major ``a``,
-          a column-major ``b`` (a contiguous [N, K] weight transposed),
-          16-byte aligned tensors and BF16 or FP16 output; any N >= 1 is
-          accepted. It selects among GEMV, stream-K, persistent and ping-pong
-          kernels by M, N and K, or by the autotuner when tuning is enabled.
+          SM120/SM121 it requires CUDA 13+, ``K >= 128``, ``K % 32 == 0``, a
+          row-major ``a``, a column-major ``b`` (a contiguous [N, K] weight
+          transposed), 16-byte aligned tensors and BF16 or FP16 output; any
+          N >= 1 is accepted. It selects among GEMV, stream-K, persistent and
+          ping-pong kernels by M, N and K, or by the autotuner when tuning is
+          enabled. Calls on one device share a stream-K scratch buffer and
+          must be ordered on one stream. The kernels use programmatic
+          dependent launch and may read ``b`` and ``b_descale`` before waiting
+          on the previous kernel, so these must not be written by the kernel
+          launched immediately before on the same stream.
         - The ``"cutedsl_low_latency"`` backend requires SM100/SM103, ``M <= 8``,
           ``K % 128 == 0``, and swizzled 1D scales in the 128x4 layout.
         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.

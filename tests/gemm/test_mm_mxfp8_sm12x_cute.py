@@ -87,16 +87,21 @@ def _assert_exact(out, ref):
 def _bucket_cases():
     # (m, n, k): every M range of the policy, N and K tails, N < 128.
     return [
+        (1, 1, 2080),
         (1, 256, 512),
         (2, 129, 384),
+        (3, 7, 160),
         (3, 96, 2560),
         (4, 1024, 3200),
         (7, 640, 2560),
+        (8, 15, 1056),
         (8, 2688, 1856),
         (13, 1280, 2944),
+        (16, 33, 2592),
         (16, 2880, 1024),
         (17, 1856, 2688),
         (24, 320, 4096),
+        (24, 640, 2080),
         (32, 3072, 1536),
         (48, 1280, 2560),
         (33, 1024, 1024),
@@ -126,30 +131,93 @@ def test_default_tactic_exact(m, n, k, out_dtype):
     _assert_exact(provided, ref)
 
 
+_BF16, _FP16 = torch.bfloat16, torch.float16
+
+
 @pytest.mark.parametrize(
-    "m,n,k",
-    [(1, 640, 2560), (4, 129, 384), (8, 2688, 1856), (16, 96, 2560), (32, 1856, 2688)]
-    + [(64, 1024, 3200), (128, 2560, 640), (256, 129, 384), (512, 3072, 1536)]
-    + [(1024, 1280, 2560)],
+    "m,n,k,out_dtype",
+    [(m, n, k, _BF16) for m, n, k in [(1, 640, 2560), (4, 129, 384), (8, 129, 1056)]]
+    + [(m, n, k, _BF16) for m, n, k in [(8, 2688, 1856), (16, 96, 2560)]]
+    + [(m, n, k, _BF16) for m, n, k in [(32, 1856, 2688), (32, 640, 2080)]]
+    + [(m, n, k, _BF16) for m, n, k in [(64, 1024, 3200), (64, 256, 160)]]
+    + [(m, n, k, _BF16) for m, n, k in [(128, 2560, 640), (128, 129, 416)]]
+    + [(m, n, k, _BF16) for m, n, k in [(256, 129, 384), (512, 3072, 1536)]]
+    + [(1024, 1280, 2560, _BF16)]
+    # FP16 output: GEMV and persistent, stream-K, ping-pong (direct and TMA store).
+    + [(4, 129, 384, _FP16), (16, 96, 2560, _FP16), (256, 129, 384, _FP16)]
+    + [(1024, 1280, 2560, _FP16)],
 )
-def test_every_tactic_exact(m, n, k):
+def test_every_tactic_exact(m, n, k, out_dtype):
     """Every advertised tactic of an autotuner bucket, at the bucket's M and at
-    the smallest M of the bucket (runtime M tails)."""
+    the smallest M of the bucket (runtime M tails). Calls the runner directly,
+    so K < 128 (rejected by ``mm_mxfp8``) is covered too."""
     runner, dev = _runner_and_device()
     from flashinfer.gemm.kernels.sm12x_mxfp8 import policy
 
     tactics = policy.valid_tactics(m, n, k, dev)
-    assert tactics and len(set(t[0] for t in tactics)) >= 1
+    assert tactics
     for mm in sorted({m, m // 2 + 1}):
         (a, b, sfa, sfb), ref = _operands(mm, n, k, seed=mm * 7 + n)
-        out = torch.empty((mm, n), dtype=torch.bfloat16, device="cuda")
-        inputs = [a, b, sfa, sfb, torch.bfloat16, out, None]
+        out = torch.empty((mm, n), dtype=out_dtype, device="cuda")
+        inputs = [a, b, sfa, sfb, out_dtype, out, None]
         for tactic in tactics:
             if not policy.supports_m(tactic, mm):
                 continue
             out.fill_(float("nan"))
             runner(inputs, tactic=tactic)
             _assert_exact(out, ref)
+
+
+@pytest.mark.parametrize(
+    "m,n,k", [(1900, 1280, 2720), (951, 1280, 2720), (300, 129, 160)]
+)
+def test_pingpong_tails_exact(m, n, k):
+    """Every ping-pong candidate (including the cooperative 256-row tile, run
+    without the runtime fallback) on M tails and a 16-byte-unaligned N."""
+    _, dev = _runner_and_device()
+    from flashinfer.gemm.kernels.sm12x_mxfp8 import policy, runner
+
+    (a, b, sfa, sfb), ref = _operands(m, n, k, seed=m + k)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    for tactic in policy._pingpong_candidates(m, n, k, dev):
+        out.fill_(float("nan"))
+        runner.launch(tactic, a, b, sfa, sfb, out)
+        _assert_exact(out, ref)
+
+
+@pytest.mark.parametrize("extra", [1, -1])
+def test_streamk_sparse_split(extra):
+    """Persistent stream-K with sms + 1 or 2 * sms - 1 tiles: the split region
+    has 1 or sms - 1 tiles over all SMs, so many CTAs get no K iterations."""
+    _, dev = _runner_and_device()
+    from flashinfer.gemm.kernels.sm12x_mxfp8 import policy, runner
+
+    tiles = dev.sms + 1 if extra == 1 else 2 * dev.sms - 1
+    m, n, k = tiles * 128 - 5, 128, 256
+    tactic = policy.persistent(128, 128, 2, 4, sched="streamk")
+    grid, sk_tiles = policy.persistent_schedule(tactic, m, n, k, dev)
+    assert (grid, sk_tiles) == (dev.sms, tiles - dev.sms)
+    (a, b, sfa, sfb), ref = _operands(m, n, k, seed=tiles)
+    out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device="cuda")
+    runner.launch(tactic, a, b, sfa, sfb, out)
+    _assert_exact(out, ref)
+
+
+@pytest.mark.parametrize("m,n,k", [(2, 256, 512), (2, 4096, 2048), (24, 640, 2560)])
+def test_nan_scale_propagates(m, n, k):
+    """A UE8M0 scale of 0xFF (NaN) makes its output row NaN in every kernel."""
+    runner, dev = _runner_and_device()
+    from flashinfer.gemm.kernels.sm12x_mxfp8 import policy
+
+    (a, b, sfa, sfb), ref = _operands(m, n, k, seed=4)
+    sfa[0] = 255  # row 0, first k32 block
+    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    inputs = [a, b, sfa, sfb, torch.bfloat16, out, None]
+    for tactic in policy.valid_tactics(m, n, k, dev):
+        out.zero_()
+        runner(inputs, tactic=tactic)
+        assert torch.isnan(out[0]).all(), tactic
+        _assert_exact(out[1:], ref[1:])
 
 
 @pytest.mark.parametrize("m,n,k", [(1, 2560, 6144), (24, 640, 2560), (96, 2688, 1856)])

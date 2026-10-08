@@ -47,8 +47,8 @@ ping-pong warp-group ordering. Changes:
 - an optional cooperative 256x128 tile (both warp groups share a B tile);
 - a coalesced predicated epilogue for output rows that are not 16-byte
   aligned (TMA store otherwise);
-- programmatic dependent launch: weight loads are issued before
-  ``griddepcontrol.wait``, activations and outputs after it.
+- programmatic dependent launch: the first weight stage is loaded before
+  ``griddepcontrol.wait``; activations, later stages and outputs after it.
 """
 
 import cutlass
@@ -61,8 +61,9 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32
 from cutlass.cute.nvgpu import cpasync
 
+from .common import SF_CHUNK, SMEM_BYTES
+
 SF_VEC = 32
-SMEM_CAPACITY = 101376
 
 
 class Sm12xMxfp8PingpongGemm:
@@ -153,7 +154,7 @@ class Sm12xMxfp8PingpongGemm:
         epi_bytes = self.epi_tile[0] * self.epi_tile[1] * 2 * epi_stage
         if self.coop:
             epi_bytes *= 2  # one set of epilogue buffers per warp group
-        ab_stage = (SMEM_CAPACITY - 1024 - 1024 - epi_bytes) // (ab_bytes + sf_bytes)
+        ab_stage = (SMEM_BYTES - 1024 - 1024 - epi_bytes) // (ab_bytes + sf_bytes)
         assert ab_stage >= 2
         self.ab_stage = ab_stage
         self.epi_stage = epi_stage
@@ -174,7 +175,7 @@ class Sm12xMxfp8PingpongGemm:
             self.tiled_mma, sfa_tile, SF_VEC, ab_stage
         )
         # Per-warp-group view of a 256-row SFA block: one 128-row sub-block
-        # (byte offset 512 * warp group), same strides.
+        # (byte offset SF_CHUNK * warp group), same strides.
         self.sfa_mma_layout_staged = self.sfa_smem_layout_staged
         if self.coop:
 
@@ -245,6 +246,15 @@ class Sm12xMxfp8PingpongGemm:
         c3 = cute.make_tensor(
             c.iterator, cute.make_layout((m, n, 1), stride=(n, 1, m * n))
         )
+        c3_tma = c3
+        if cutlass.const_expr(self.direct_epilogue):
+            # The TMA store is unused here, but its descriptor is still encoded
+            # and needs a 16-byte row pitch.
+            n_pad = (n + 7) // 8 * 8
+            c3_tma = cute.make_tensor(
+                c.iterator,
+                cute.make_layout((m, n_pad, 1), stride=(n_pad, 1, m * n_pad)),
+            )
         sfa_ptr = cute.recast_ptr(sfa.iterator, dtype=self.sf_dtype)
         sfb_ptr = cute.recast_ptr(sfb.iterator, dtype=self.sf_dtype)
         sfa3 = cute.make_tensor(
@@ -254,7 +264,7 @@ class Sm12xMxfp8PingpongGemm:
             sfb_ptr, blockscaled_utils.tile_atom_to_shape_SF(b3.shape, SF_VEC)
         )
 
-        tm, tn, tk = self.tile_shape_mnk
+        _, tn, tk = self.tile_shape_mnk
         a_smem = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
         b_smem = cute.slice_(self.b_smem_layout_staged, (None, None, 0))
         tma_atom_a, tma_a = cpasync.make_tiled_tma_atom(
@@ -281,7 +291,7 @@ class Sm12xMxfp8PingpongGemm:
         )
         epi_smem = cute.slice_(self.epi_smem_layout_staged, (None, None, 0))
         tma_atom_c, tma_c = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(), c3, epi_smem, self.epi_tile
+            cpasync.CopyBulkTensorTileS2GOp(), c3_tma, epi_smem, self.epi_tile
         )
 
         num_m_tiles = (m + self.cta_m - 1) // self.cta_m
@@ -291,7 +301,8 @@ class Sm12xMxfp8PingpongGemm:
             mainloop_pipeline_array_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.ab_stage * 2
             ]
-            order_barrier_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+            # PipelineOrder(depth=2, length=2): depth * length mbarriers.
+            order_barrier_ptr: cute.struct.MemRange[cutlass.Int64, 4]
             sA: cute.struct.Align[
                 cute.struct.MemRange[
                     self.ab_dtype, cute.cosize(self.a_smem_layout_staged)
@@ -526,7 +537,7 @@ class Sm12xMxfp8PingpongGemm:
                 sA, (128, tk, self.ab_stage), (warp_group_idx, 0, 0)
             )
             sSFA_mma = cute.make_tensor(
-                sSFA.iterator + warp_group_idx * 512, sfa_mma_layout_staged
+                sSFA.iterator + warp_group_idx * SF_CHUNK, sfa_mma_layout_staged
             )
         tCsA = thr_mma.partition_A(sA_mma)
         tCsB = thr_mma.partition_B(sB)

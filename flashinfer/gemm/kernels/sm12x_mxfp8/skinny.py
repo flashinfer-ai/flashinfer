@@ -37,22 +37,22 @@ U32 = cutlass.Uint32
 F32 = cutlass.Float32
 
 
-def _quad_transpose4(R, i, r, h, o, b1, b0):
-    """In-quad transpose of 4 x 64-bit slots o..o+3: slot s of lane l <- slot l of lane s."""
+def _quad_transpose4(R, i, r, h, b1, b0):
+    """In-quad transpose of 4 x 64-bit slots: slot s of lane l <- slot l of lane s."""
     for k in range(2):
         for w in range(2):
-            a = R[i, r, h, o + k, w]
-            c = R[i, r, h, o + 2 + k, w]
+            a = R[i, r, h, k, w]
+            c = R[i, r, h, 2 + k, w]
             rc = ptx.shfl_bfly(ptx.sel(b1, a, c), 2)
-            R[i, r, h, o + k, w] = ptx.sel(b1, rc, a)
-            R[i, r, h, o + 2 + k, w] = ptx.sel(b1, c, rc)
+            R[i, r, h, k, w] = ptx.sel(b1, rc, a)
+            R[i, r, h, 2 + k, w] = ptx.sel(b1, c, rc)
     for k in range(2):
         for w in range(2):
-            a = R[i, r, h, o + 2 * k, w]
-            c = R[i, r, h, o + 2 * k + 1, w]
+            a = R[i, r, h, 2 * k, w]
+            c = R[i, r, h, 2 * k + 1, w]
             rc = ptx.shfl_bfly(ptx.sel(b0, a, c), 1)
-            R[i, r, h, o + 2 * k, w] = ptx.sel(b0, rc, a)
-            R[i, r, h, o + 2 * k + 1, w] = ptx.sel(b0, c, rc)
+            R[i, r, h, 2 * k, w] = ptx.sel(b0, rc, a)
+            R[i, r, h, 2 * k + 1, w] = ptx.sel(b0, c, rc)
 
 
 def _quad_transpose2(R, i, r, h, lane, t):
@@ -374,7 +374,7 @@ def _rowtile_kernel(
                 for r in cutlass.range_constexpr(RT):
                     for h in cutlass.range_constexpr(2):
                         if cutlass.const_expr(KU == 4):
-                            _quad_transpose4(abuf, i, r, h, 0, tb1, tb0)
+                            _quad_transpose4(abuf, i, r, h, tb1, tb0)
                         else:
                             _quad_transpose2(abuf, i, r, h, lane, t)
                 for bb in cutlass.range_constexpr(KU):
@@ -679,7 +679,7 @@ def _ctawide_kernel(
                 for r in cutlass.range_constexpr(RT):
                     for h in cutlass.range_constexpr(2):
                         if cutlass.const_expr(KU == 4):
-                            _quad_transpose4(abuf, i, r, h, 0, tb1, tb0)
+                            _quad_transpose4(abuf, i, r, h, tb1, tb0)
                         else:
                             _quad_transpose2(abuf, i, r, h, lane, t)
                 for bb in cutlass.range_constexpr(KU):
@@ -766,7 +766,8 @@ def _ctawide_kernel(
                         cute.arch.barrier()
                         cidx = by * STNB + blk
                         if tidx == 0:
-                            ptx.fence_acq_rel_gpu()
+                            # The barrier orders the CTA's partial stores before
+                            # this release; the acquire pairs with the last CTA.
                             sF[0] = ptx.atom_add_acq_rel_gpu(
                                 mCnt.iterator + cidx, I32(1)
                             )

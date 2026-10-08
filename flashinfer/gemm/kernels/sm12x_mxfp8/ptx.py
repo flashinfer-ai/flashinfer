@@ -469,13 +469,15 @@ def e4m3x4_to_f32(u, *, loc=None, ip=None):
 
 @dsl_user_op
 def pow2_e8m0(s, *, loc=None, ip=None):
-    """2^(s - 127) as FP32 for a UE8M0 byte ``s`` (``s == 0`` gives 2^-127)."""
+    """2^(s - 127) as FP32 for a UE8M0 byte ``s`` (``s == 0`` gives 2^-127,
+    ``s == 255`` is NaN as in the block-scaled MMA)."""
     return Float32(
         _asm(
             Float32.mlir_type,
             [s],
-            "{ .reg .pred p; .reg .b32 e; shl.b32 e, $1, 23; setp.eq.u32 p, $1, 0;\n"
-            "selp.b32 $0, 4194304, e, p; }",
+            "{ .reg .pred p, q; .reg .b32 e; shl.b32 e, $1, 23;\n"
+            "setp.eq.u32 p, $1, 0; setp.eq.u32 q, $1, 255;\n"
+            "selp.b32 e, 4194304, e, p; selp.b32 $0, 0x7fffffff, e, q; }",
             "=f,r",
             loc=loc,
             ip=ip,

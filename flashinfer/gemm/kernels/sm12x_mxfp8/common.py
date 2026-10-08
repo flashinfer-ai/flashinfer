@@ -5,6 +5,9 @@
 # Bytes of one 128-row x 4-k32-block chunk of the F8_128x4 scale layout.
 SF_CHUNK = 512
 
+# Shared memory available to one CTA on SM120 / SM121.
+SMEM_BYTES = 99 * 1024
+
 
 def ceil_div(a, b):
     return (a + b - 1) // b

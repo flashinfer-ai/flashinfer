@@ -11,8 +11,8 @@ F8_128x4 layout, read as given.
   into L2 with bulk prefetches split over the grid. Launched with
   programmatic dependent launch: launch and barrier setup overlap the previous
   kernel (typically the activation quantization), and all global memory
-  traffic follows ``griddepcontrol.wait``. Operands use TMA
-  (128B or 64B swizzle); each stage's 512-byte scale chunks use a 1D bulk copy.
+  traffic follows ``griddepcontrol.wait``. Operands use TMA with 128B
+  swizzle; each stage's 512-byte scale chunks use a 1D bulk copy.
 - WM x WN consumer warps: ldmatrix + ``mma.sync.m16n8k32`` block-scaled. A
   32-bit scale word holds the four k32 scales of one row of a 128-wide chunk.
   The next stage's scales and first fragments are loaded before the current
@@ -35,16 +35,19 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.utils import SmemAllocator
 
 from . import ptx
-from .common import SF_CHUNK, ceil_div
+from .common import SF_CHUNK, SMEM_BYTES, ceil_div
 
-SMEM_LIMIT = 101376
+# Per stage: full and empty mbarriers (counted at 16 bytes each). Fixed: the
+# stream-K flag and alignment slack.
+_STAGE_BARRIER_BYTES = 32
+_FIXED_BYTES = 16 + 2048
 
 
 def scale_chunks(bn):
-    """128-row weight scale chunks a BN-row tile can straddle."""
-    if 128 % bn == 0 or bn % 128 == 0:
-        return max(1, bn // 128)
-    return (bn + 254) // 128
+    """128-row weight scale chunks of a BN-row tile (BN divides or is a
+    multiple of 128, so a tile never straddles two chunks)."""
+    assert 128 % bn == 0 or bn % 128 == 0
+    return max(1, bn // 128)
 
 
 def stage_bytes(bm, bn, ks, kw):
@@ -52,17 +55,23 @@ def stage_bytes(bm, bn, ks, kw):
     return ks * (bm * kw + SF_CHUNK), ks * (bn * kw + SF_CHUNK * scale_chunks(bn))
 
 
-def max_b_stages(bm, bn, ks, kw, sa):
+def smem_bytes(bm, bn, ks, kw, sa, sb):
     a, b = stage_bytes(bm, bn, ks, kw)
-    return (SMEM_LIMIT - 2400 - sa * a) // b
+    return sa * a + sb * b + _STAGE_BARRIER_BYTES * (sa + sb) + _FIXED_BYTES
+
+
+def max_b_stages(bm, bn, ks, kw, sa):
+    """Most weight stages that fit next to ``sa`` activation stages."""
+    a, b = stage_bytes(bm, bn, ks, kw)
+    free = SMEM_BYTES - _FIXED_BYTES - sa * (a + _STAGE_BARRIER_BYTES)
+    return free // (b + _STAGE_BARRIER_BYTES)
 
 
 class Sm12xMxfp8Persistent:
     """Host wrapper; ``__call__(a, b, sfa, sfb, c, partials, counters, grid, sk_tiles)``.
 
     BM x BN CTA tile, WM x WN consumer warps, KW the K box width in bytes
-    (64 or 128), KS boxes per stage (KW = 64 requires KS = 1), SB weight
-    stages and SA activation stages.
+    (128), KS boxes per stage, SB weight stages and SA activation stages.
     """
 
     def __init__(self, n, k, bm, bn, wm, wn, ks, sb, kw, sa, streamk, out_f16=False):
@@ -72,9 +81,8 @@ class Sm12xMxfp8Persistent:
         self.streamk = streamk
         self.BM, self.BN, self.WM, self.WN, self.KS = bm, bn, wm, wn, ks
         self.SB, self.SA, self.KW = sb, sa, kw
-        assert kw in (64, 128) and (kw == 128 or ks == 1)
+        assert kw == 128
         assert 1 <= sa <= sb
-        self.half = kw == 64
         self.CW = wm * wn
         self.CT = self.CW * 32
         self.TM = bm // wm
@@ -94,18 +102,8 @@ class Sm12xMxfp8Persistent:
         self.A_BYTES = bm * kw
         self.ACC = self.MI * self.NI * 4
         self.threads = (self.CW + 1) * 32
-        sa_bytes = sa * ks * (self.A_BYTES + SF_CHUNK)
-        sb_bytes = sb * ks * (self.B_BYTES + self.NBC * SF_CHUNK)
-        self.smem_bytes = sa_bytes + sb_bytes + 4 * (sa + sb) * 8 + 16 + 2048
-        assert self.smem_bytes <= SMEM_LIMIT
-
-    def partial_floats(self, sk_tiles, grid):
-        """FP32 scratch for ``sk_tiles`` stream-K tiles on ``grid`` CTAs."""
-        if not sk_tiles:
-            return 0
-        si = sk_tiles * self.KI
-        maxc = (self.KI * grid + si - 1) // si + 1
-        return sk_tiles * maxc * self.BM * self.BN
+        self.smem_bytes = smem_bytes(bm, bn, ks, kw, sa, sb)
+        assert self.smem_bytes <= SMEM_BYTES
 
     # ------------------------------------------------------------------ host
     @cute.jit
@@ -147,15 +145,11 @@ class Sm12xMxfp8Persistent:
         )
 
     def swizzle(self):
-        if self.KW == 128:
-            return cute.make_swizzle(3, 4, 3)
-        return cute.make_swizzle(2, 4, 3)
+        return cute.make_swizzle(3, 4, 3)
 
     def swz_row(self, row):
-        """16-byte chunk XOR term of the 128B / 64B TMA swizzle for a K-major row."""
-        if self.KW == 128:
-            return row % 8
-        return (row // 2) % 4
+        """16-byte chunk XOR term of the 128B TMA swizzle for a K-major row."""
+        return row % 8
 
     # ---------------------------------------------------------------- device
     @cute.kernel
@@ -339,15 +333,10 @@ class Sm12xMxfp8Persistent:
 
     @cute.jit
     def stage_k(self, kk):
-        """(first box, valid boxes, first scale chunk, scale chunks) of iteration kk."""
+        """(first box, valid boxes) of iteration kk; box i uses scale chunk i."""
         kc0 = kk * self.KS
         nkc = cutlass.min(Int32(self.KS), Int32(self.Kb) - kc0)
-        sfc0 = kc0
-        nsf = nkc
-        if cutlass.const_expr(self.half):
-            sfc0 = kk // 2
-            nsf = Int32(1)
-        return kc0, nkc, sfc0, nsf
+        return kc0, nkc
 
     # ----------------------------------------------------------- producer
     @cute.jit
@@ -376,18 +365,16 @@ class Sm12xMxfp8Persistent:
         nt = tile // tiles_m
         sfb_row = (nt * self.BN) // 128
         nbc = cutlass.min(Int32(self.NBC), Int32(self.n_sf_rows_b) - sfb_row)
-        kc0, nkc, sfc0, nsf = self.stage_k(kk)
+        kc0, nkc = self.stage_k(kk)
         cute.arch.mbarrier_arrive_and_expect_tx(
-            fullB + s, nkc * self.B_BYTES + nsf * SF_CHUNK * nbc
+            fullB + s, nkc * (self.B_BYTES + SF_CHUNK * nbc)
         )
         for c in cutlass.range_constexpr(self.NBC):
             if c < nbc:
                 ptx.bulk_g2s(
                     (sSB.iterator + (s * self.NBC + c) * KS * SF_CHUNK).toint(),
-                    (
-                        sfb.iterator + ((sfb_row + c) * self.Kc + sfc0) * SF_CHUNK
-                    ).toint(),
-                    nsf * SF_CHUNK,
+                    (sfb.iterator + ((sfb_row + c) * self.Kc + kc0) * SF_CHUNK).toint(),
+                    nkc * SF_CHUNK,
                     (fullB + s).toint(),
                 )
         for ks in cutlass.range_constexpr(KS):
@@ -423,15 +410,15 @@ class Sm12xMxfp8Persistent:
             cute.arch.mbarrier_wait(emptyA + s, (q // SA - 1) % 2)
         tile, kk = self.locate(q, bid, G, dp_tiles, n_dp, sk_a)
         mt = tile % tiles_m
-        kc0, nkc, sfc0, nsf = self.stage_k(kk)
+        kc0, nkc = self.stage_k(kk)
         sfa_row = (mt * self.BM) // 128
         cute.arch.mbarrier_arrive_and_expect_tx(
-            fullA + s, nkc * self.A_BYTES + nsf * SF_CHUNK
+            fullA + s, nkc * (self.A_BYTES + SF_CHUNK)
         )
         ptx.bulk_g2s(
             (sSA.iterator + s * KS * SF_CHUNK).toint(),
-            (sfa.iterator + (sfa_row * self.Kc + sfc0) * SF_CHUNK).toint(),
-            nsf * SF_CHUNK,
+            (sfa.iterator + (sfa_row * self.Kc + kc0) * SF_CHUNK).toint(),
+            nkc * SF_CHUNK,
             (fullA + s).toint(),
         )
         for ks in cutlass.range_constexpr(KS):
@@ -566,7 +553,7 @@ class Sm12xMxfp8Persistent:
             cute.arch.mbarrier_arrive(emptyB + q % self.SB)
 
     @cute.jit
-    def load_sf(self, sfa_w, sfb_w, sSA, sSB, q, ks, kk, moff, noff, wm, wn, g, lane):
+    def load_sf(self, sfa_w, sfb_w, sSA, sSB, q, ks, moff, noff, wm, wn, g, lane):
         KS = self.KS
         MI, NI, TM, TN = self.MI, self.NI, self.TM, self.TN
         sa = q % self.SA
@@ -585,13 +572,6 @@ class Sm12xMxfp8Persistent:
                 + ((sb * self.NBC + r // 128) * KS + ks) * SF_CHUNK
                 + (((r % 32) * 4 + (r % 128) // 32) * 4)
             )
-        if cutlass.const_expr(self.half):
-            # Odd 64-wide boxes use bytes 2 and 3 of the shared 128-wide scale word.
-            sh = (kk % 2) * 16
-            for mi in cutlass.range_constexpr(MI):
-                sfa_w[mi] = sfa_w[mi] >> sh
-            for ni in cutlass.range_constexpr(NI):
-                sfb_w[ni] = sfb_w[ni] >> sh
 
     def load_frags(self, a_st, b_st, kb, a_row0, a_ch, b_row0, b_ch):
         KW = self.KW
@@ -688,7 +668,7 @@ class Sm12xMxfp8Persistent:
         """Iterations [k0, k1) of one tile."""
         KS, NK = self.KS, self.NK
         self.wait_stage(fullA, fullB, q)
-        self.load_sf(sfa_w, sfb_w, sSA, sSB, q, 0, k0, moff, noff, wm, wn, g, lane)
+        self.load_sf(sfa_w, sfb_w, sSA, sSB, q, 0, moff, noff, wm, wn, g, lane)
         a0, b0 = self.unit_addr(sA, sB, q, 0)
         af0, bf0 = self.load_frags(a0, b0, 0, a_row0, a_ch, b_row0, b_ch)
         self.frags_to_reg(fr, af0, bf0)
@@ -697,7 +677,7 @@ class Sm12xMxfp8Persistent:
                 a_st, b_st = self.unit_addr(sA, sB, q, ks)
                 if cutlass.const_expr(ks > 0):
                     self.load_sf(
-                        sfa_w, sfb_w, sSA, sSB, q, ks, kk, moff, noff, wm, wn, g, lane
+                        sfa_w, sfb_w, sSA, sSB, q, ks, moff, noff, wm, wn, g, lane
                     )
                     af, bf = self.load_frags(a_st, b_st, 0, a_row0, a_ch, b_row0, b_ch)
                 else:
@@ -719,7 +699,6 @@ class Sm12xMxfp8Persistent:
                                 sSB,
                                 q + 1,
                                 0,
-                                kk + 1,
                                 moff,
                                 noff,
                                 wm,
@@ -846,7 +825,6 @@ class Sm12xMxfp8Persistent:
                     self.write_slot(acc, ws, tl * maxc + (bid - c_lo), tx)
                     ptx.bar_sync(1, self.CT)
                     if tx == 0:
-                        ptx.fence_acq_rel_gpu()
                         # The counter accumulates K iterations; the CTA completing KI stores.
                         old = ptx.atom_add_acq_rel_gpu(
                             (cnt.iterator + tl).toint(), k1 - k0

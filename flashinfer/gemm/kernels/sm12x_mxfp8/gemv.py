@@ -259,7 +259,8 @@ def _gemv_kernel(
     # With a K split the trip count must be uniform across the CTA (the
     # reduction has barriers); otherwise each warp walks only its own rows.
     if cutlass.const_expr(KSPL > 1):
-        # Opaque runtime value: a constant trip count is fully unrolled and spills.
+        # imin hides the constant from the compiler: with a compile-time trip
+        # count the loop below is fully unrolled despite unroll=1, and spills.
         nloc = ptx.imin(I32((NRG + TW - 1) // TW), I32((NRG + TW - 1) // TW))
     else:
         nloc = (NRG - gw + TW - 1) // TW

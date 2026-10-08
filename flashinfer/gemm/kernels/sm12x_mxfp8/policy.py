@@ -23,14 +23,13 @@ tactic are derived from (M, N, K) and the device (SM count, L2 size).
 
 from typing import NamedTuple
 
-from .common import ceil_div
+from .common import SMEM_BYTES, ceil_div
 from .persistent import max_b_stages
 
 VERSION = "sm12x_mxfp8_v1"
 
 # Largest M served by the skinny family (the GEMV serves M <= its mb).
 SKINNY_MAX_M = 32
-SMEM_BYTES = 99 * 1024
 
 
 class Device(NamedTuple):
