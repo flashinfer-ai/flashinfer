@@ -246,7 +246,15 @@ def _allocation_requests() -> int:
     collection pass can free an earlier case's inputs during the call), which
     is not an allocation by the call under test and made the equality fail with
     *fewer* bytes live after the call (flashinfer-ai/flashinfer#6236).
+
+    Only the native caching allocator maintains the counter; under
+    ``PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync`` it stays at zero and the
+    checks would pass vacuously, so they skip there.
     """
+    if torch.cuda.get_allocator_backend() != "native":
+        pytest.skip(
+            "the no-allocation checks read a native caching-allocator statistic"
+        )
     return int(torch.cuda.memory_stats()["allocation.all.allocated"])
 
 
