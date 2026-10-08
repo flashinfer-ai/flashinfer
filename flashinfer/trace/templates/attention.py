@@ -4889,6 +4889,114 @@ concat_mla_k_trace.axes["num_heads_broadcast"] = Const(
 )
 
 
+# ── Concat + fp8 quantize MLA K/V (DeepSeek / Kimi context chunks) ───────────
+
+
+@torch.no_grad()
+def _concat_mla_kv_quant_fp8_reference(
+    kv_nope, k_pe, key=None, value=None, nope_dim=128, **_unused
+):
+    """Reference for concat_mla_kv_quant_fp8: saturating fp8 e4m3 cast of
+    ``kv_nope = [k_nope | v]`` and of the head-shared ``k_pe``, laid out as
+    ``key = [k_nope ‖ broadcast(k_pe)]`` and ``value = v``.
+
+    Layouts:
+      - kv_nope: [num_tokens, num_heads, nope_dim + v_dim]  bf16
+      - k_pe:    [num_tokens, rope_dim]                     bf16 (shared across heads)
+      - key:     [num_tokens, num_heads, nope_dim + rope_dim]  float8_e4m3fn
+      - value:   [num_tokens, num_heads, v_dim]                float8_e4m3fn
+    ``Tensor.to(float8_e4m3fn)`` saturates on torch >= 2.13 (finite overflow
+    and +-inf -> +-448, NaN -> NaN); the kernel is byte-exact with that cast.
+    """
+    fp8 = torch.float8_e4m3fn
+    num_tokens, num_heads, _ = kv_nope.shape
+    k_pe = k_pe.reshape(num_tokens, 1, k_pe.shape[-1])
+    kv_fp8 = kv_nope.to(fp8)
+    key_out = torch.cat(
+        [kv_fp8[..., :nope_dim], k_pe.to(fp8).expand(num_tokens, num_heads, -1)],
+        dim=-1,
+    )
+    value_out = kv_fp8[..., nope_dim:].contiguous()
+    if key is not None:
+        key.copy_(key_out)
+        key_out = key
+    if value is not None:
+        value.copy_(value_out)
+        value_out = value
+    return key_out, value_out
+
+
+def _concat_mla_kv_quant_fp8_init(
+    *,
+    num_tokens: int,
+    num_heads: int = 12,
+    kv_dim: int = 256,
+    rope_dim: int = 64,
+    qk_dim: int = 0,  # derived: nope_dim + rope_dim
+    v_dim: int = 0,  # derived: kv_dim - nope_dim
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.concat_mla_kv_quant_fp8``."""
+    del qk_dim, v_dim
+    torch.manual_seed(seed)
+    kv_nope = torch.randn(
+        num_tokens, num_heads, kv_dim, dtype=torch.bfloat16, device=device
+    )
+    k_pe = torch.randn(num_tokens, rope_dim, dtype=torch.bfloat16, device=device)
+    return {"kv_nope": kv_nope, "k_pe": k_pe}
+
+
+concat_mla_kv_quant_fp8_trace = TraceTemplate(
+    op_type="mla_paged",
+    name_prefix="concat_mla_kv_quant_fp8",
+    description=(
+        "MLA context K/V pack with fp8 e4m3 quantization: casts the per-head "
+        "``kv_nope = [k_nope | v]`` projection and the head-shared RoPE key "
+        "``k_pe`` to float8_e4m3fn (saturating) and writes ``key = [k_nope ‖ "
+        "k_pe]`` and ``value = v`` as contiguous buffers for a ragged MLA "
+        "prefill kernel, in one memory pass."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "num_heads": Const(abbrev="h"),
+        "kv_dim": Const(
+            description="nope_dim + v_dim (kv_nope last dim).", abbrev="kv"
+        ),
+        "rope_dim": Const(abbrev="rope"),
+        # Output-only dims (derived: qk_dim = nope_dim + rope_dim, v_dim =
+        # kv_dim - nope_dim; nope_dim defaults to 128).
+        "qk_dim": Var(description="nope_dim + rope_dim (key last dim)."),
+        "v_dim": Var(description="kv_dim - nope_dim (value last dim)."),
+    },
+    inputs={
+        "kv_nope": Tensor(
+            ["num_tokens", "num_heads", "kv_dim"],
+            description="[k_nope | v] per head, bf16.",
+        ),
+        "k_pe": Tensor(
+            ["num_tokens", "rope_dim"],
+            description="RoPE'd key shared across heads, bf16.",
+        ),
+    },
+    outputs={
+        "key": Tensor(
+            ["num_tokens", "num_heads", "qk_dim"],
+            dtype="float8_e4m3fn",
+            description="[k_nope ‖ k_pe] per head, saturating e4m3.",
+        ),
+        "value": Tensor(
+            ["num_tokens", "num_heads", "v_dim"],
+            dtype="float8_e4m3fn",
+            description="v per head, saturating e4m3.",
+        ),
+    },
+    tags=["status:verified", "mla"],
+    reference=_concat_mla_kv_quant_fp8_reference,
+    init=_concat_mla_kv_quant_fp8_init,
+)
+
+
 # ── cuDNN paged attention ─────────────────────────────────────────────────────
 
 _CUDNN_PAGED_AXES: dict[str, Var | Const] = {

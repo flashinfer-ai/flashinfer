@@ -321,6 +321,51 @@ def test_aot_provider_discovery_skips_incompatible_provider(
     assert "Ignoring incompatible flashinfer jit-cache provider" in caplog.text
 
 
+def test_aot_provider_discovery_ignores_mismatched_shim(monkeypatch, caplog):
+    """A stale shim must not break the import that replaces it (#5886)."""
+    monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
+    monkeypatch.setattr(jit_env, "flashinfer_version", "0.7.0.post1")
+    monkeypatch.setattr(jit_env, "has_flashinfer_jit_cache", lambda: True)
+
+    def get_jit_cache_providers():
+        raise AssertionError("a mismatched shim must not be queried")
+
+    shim = SimpleNamespace(
+        __version__="0.7.0+cu130",
+        get_jit_cache_providers=get_jit_cache_providers,
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer_jit_cache", shim)
+
+    assert jit_env._get_aot_providers() == ()
+    assert "Ignoring incompatible flashinfer-jit-cache package" in caplog.text
+    assert "flashinfer download-kernels" in caplog.text
+
+
+def test_aot_provider_discovery_uses_mismatched_shim_when_check_disabled(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    monkeypatch.setattr(jit_env, "flashinfer_version", "0.7.0.post1")
+    monkeypatch.setattr(jit_env, "has_flashinfer_jit_cache", lambda: True)
+    stale_provider = SimpleNamespace(
+        provider_id="sm90a",
+        distribution="flashinfer-jit-cache-sm90a",
+        version="0.7.0+cu130",
+        jit_cache_dir=tmp_path,
+        cuda_architectures=frozenset({"sm90a"}),
+        modules=frozenset({"attention_module"}),
+    )
+    shim = SimpleNamespace(
+        __version__="0.7.0+cu130",
+        get_jit_cache_providers=lambda: (stale_provider,),
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer_jit_cache", shim)
+
+    providers = jit_env._get_aot_providers()
+
+    assert [provider.provider_id for provider in providers] == ["sm90a"]
+
+
 def test_aot_provider_discovery_skips_different_cuda_release(
     monkeypatch, caplog, tmp_path
 ):
