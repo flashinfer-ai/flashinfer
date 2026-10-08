@@ -66,6 +66,15 @@ _LAZY = {
         "moe_hopper_fp8.mega_reference_fp8",
         "compute_megamoe_reference_fp8",
     ),
+    # BF16 helpers (moe_hopper_bf16/hopper_moe_utils.py) + torch reference
+    # (moe_hopper_bf16/mega_reference_bf16.py)
+    "Bf16NonzeroValue": ("moe_hopper_bf16.hopper_moe_utils", "Bf16NonzeroValue"),
+    "create_bf16_tensor": ("moe_hopper_bf16.hopper_moe_utils", "create_bf16_tensor"),
+    "bf16_reference_mm": ("moe_hopper_bf16.hopper_moe_utils", "bf16_reference_mm"),
+    "compute_megamoe_reference_bf16": (
+        "moe_hopper_bf16.mega_reference_bf16",
+        "compute_megamoe_reference_bf16",
+    ),
 }
 
 
