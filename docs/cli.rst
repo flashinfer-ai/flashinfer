@@ -176,6 +176,13 @@ still installed unchanged.
 If one wheel install fails, the command still attempts the other install and
 reports any failures at the end.
 
+The kernel wheels must match the installed ``flashinfer-python`` version, so
+run ``flashinfer download-kernels`` again after upgrading FlashInfer. Until
+then, FlashInfer logs a warning at import and ignores the mismatched wheels:
+cubins are downloaded on demand and kernels are JIT-compiled, as if the
+wheels were not installed. Set ``FLASHINFER_DISABLE_VERSION_CHECK=1`` to use
+mismatched wheels anyway.
+
 Cache Management
 ----------------
 
