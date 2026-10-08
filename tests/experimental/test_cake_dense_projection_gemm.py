@@ -1515,7 +1515,9 @@ def test_sk_sync_rule_yields_to_caller_forced_forms():
     v = _views("proj", "q_a", "wgrad", "bf16", 16231)
     kw = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
     rule, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
-    assert rule.sk_sync and rule.cta_rows == 128 and rule.template.endswith("_sks")
+    assert (
+        rule.sk_sync and rule.cta_rows == 128 and "_sks" in rule.template
+    )  # round 25: the row's rule adds the slab path (`_sks_sb2`)
     assert (rule.num_full, rule.tail_tiles, rule.sk_units, rule.iters_per_unit) == (
         106,
         86,
@@ -1876,7 +1878,7 @@ def test_round21_rules_plan_like_the_cake_launcher(T):
         "group_m": 8,
         "promo": "l2_256b",
     }
-    # the table size is asserted by the newest round's test (round 24: 100 = 49 + 51); round 21 shipped 98 = 49 + 49
+    # the table size is asserted by the newest round's test (round 25: 100 = 49 + 51); round 24 shipped 100 = 49 + 51; round 21 shipped 98 = 49 + 49
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
     v = _views("proj", "kv_a", "dgrad", "bf16", T)
     plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
@@ -1942,16 +1944,7 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
     # column-grouped raster (group_m 8, cgrp), the dense_down forward bf16 adds the row-half release and the column-grouped raster
     # (ovr, cgrp, group_m 12) to its cta_rows 256 / sk_parts 3 rule, and the o_proj forward bf16 replaces ovl by ovr and adds the
     # column-grouped raster (cgrp, group_m 8) to its cta_rows 256 / htail rule; no sm_100a rule changes
-    # the table size belongs to the newest round's test (round 21 shipped 98 = 49 + 49; round 24 touches sm_107a keys only)
-    assert (
-        len(ROW_RULES) == 100
-    )  # 49 + 51 at Cake 02c04ba1831 - the templates step's RULES print
-    assert (
-        sum(k[0] == "sm_100a" for k in ROW_RULES) == 49
-    )  # no sm_100a change - the RULES_100 print
-    assert (
-        sum(k[0] == "sm_107a" for k in ROW_RULES) == 51
-    )  # two new sm_107a keys, four re-ruled - the RULES_107 print
+    # the table size is asserted by the newest round's test (round 25: 100 = 49 + 51); round 24 shipped 100 = 49 + 51
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
     kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
     # ---- (a) indexer_hw input gradient bf16 (G @ W, 6144 x 32 x T): the single-CTA form with the pd 3 drain replaces the
@@ -2027,9 +2020,8 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
         and not old_w.sk_sync
         and old_w.sk_slab == 0
     )
-    # the sm_100a shared_down weight gradient keeps its exact-split rule ({"group_m": 4, "sk_exact": 3}): no synchronised tail there
-    pw100, *_ = plan_dense_projection_gemm(w["A"], w["B"], w["out"], **kw)
-    assert not pw100.sk_sync
+    # round 25 re-rules the sm_100a shared_down weight gradient onto the synchronised tail as well ({"group_m": 4, "sk_sync": True,
+    # "sk_sync_m": 26, "sk_slab": 2}) - asserted by test_round25_rules_plan_like_the_cake_launcher; in round 24 it kept {"group_m": 4, "sk_exact": 3}
     # ---- (d) NEW key: q_a / shared_gate_up forward bf16 (X @ W^T, 2048 x 6144 x T, shared key; the sm_107a twin of the round-21
     #      sm_100a lever B rule): the column-grouped raster with 8 column tiles per group; both sibling rows ----
     gkey = ("sm_107a", False, False, False, False, False, 2048, 6144, None)
@@ -2123,6 +2115,244 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
         and not po100.cgrp
         and po100.group_m == 8
     )
+
+
+@pytest.mark.parametrize("T", [16172, 16231])
+def test_round25_rules_plan_like_the_cake_launcher(T):
+    # the round-25 rule changes (Cake f397cd4da99): seven weight-gradient rules move to the synchronised stream-K tail with the two-slab
+    # fixup - on sm_107a the fp32 shared_down (margin 38) and q_a / shared_gate_up (margin 26) weight gradients leave the round-2 tall tile
+    # for the 128-row tail with the register epilogue (f32_v8 + store_ef), the bf16 q_a / shared_gate_up weight gradient adds the slab path
+    # to its round-18 synchronised tail; on sm_100a the bf16 and fp32 weight gradients of shared_down / q_a / shared_gate_up replace the
+    # round-16 exact 3-way tail split (sk_exact 3) by the synchronised tail with margin 26 and the slab path, keeping their raster groups and
+    # fp32 register epilogue.  No key is added or removed and no instance-key field changes.
+    # the table size belongs to the newest round's test (round 24 shipped 100 = 49 + 51; round 25 re-rules seven existing keys)
+    assert (
+        len(ROW_RULES) == 100
+    )  # 100 expected (no key added / removed) - the templates step's RULES print
+    assert (
+        sum(k[0] == "sm_100a" for k in ROW_RULES) == 49
+    )  # 49 expected - the RULES_100 print
+    assert (
+        sum(k[0] == "sm_107a" for k in ROW_RULES) == 51
+    )  # 51 expected - the RULES_107 print
+    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
+    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
+    # ---- (a) sm_107a shared_down weight gradient fp32 (nn, 2048 x 6144 over T): the 128-row synchronised stream-K tail (main-unit margin
+    #      38 K steps, two-slab fixup) with the fp32 v8 evict-first register epilogue replaces the round-2 tall tile (lock e9d8042b:
+    #      dense_proj_gemm_nn_n256_m256_f32_tma1 through the rule {"cta_rows": 256}) ----
+    sdf_key = ("sm_107a", True, True, True, False, False, 2048, None, 6144)
+    assert ROW_RULES[sdf_key] == {
+        "sk_sync": True,
+        "sk_sync_m": 38,
+        "sk_slab": 2,
+        "epi": "reg",
+        "f32_v8": True,
+        "store_ef": True,
+    }
+    sdf = _views("proj", "shared_down", "wgrad", "f32", T)
+    p_sdf, *_ = plan_dense_projection_gemm(sdf["A"], sdf["B"], sdf["out"], **kw107)
+    assert (
+        p_sdf.template == "dense_proj_gemm_nn_n256_f32_v8_ef_sks_sb2"
+    )  # ROUTE_TEMPLATE_NEW of the round-25 templates step = TEMPLATES_REACHED_NEW (nn_n256_f32_v8_ef_sks_sb2, the round-25 sweep symbol)
+    assert (
+        p_sdf.sk_sync
+        and p_sdf.sk_slab == 2
+        and p_sdf.sk_exact == 0
+        and p_sdf.epi == "reg"
+        and p_sdf.store_ef
+    )
+    assert (p_sdf.cta_rows, p_sdf.block_n) == (128, 256) and not p_sdf.htail
+    # a caller forcing the former tall form plans the lock-e9d8042b program of the row (the forced cta_rows leaves the rule's 128-row family,
+    # so the planner drops the rule's epilogue / tail knobs; sk_sync and the TMA-store epilogue are passed explicitly all the same)
+    old_sdf, *_ = plan_dense_projection_gemm(
+        sdf["A"], sdf["B"], sdf["out"], cta_rows=256, sk_sync=False, epi="tma", **kw107
+    )
+    assert (
+        old_sdf.template == "dense_proj_gemm_nn_n256_m256_f32_tma1"
+        and not old_sdf.sk_sync
+        and old_sdf.cta_rows == 256
+    )
+    # ---- (b) sm_107a q_a / shared_gate_up weight gradient fp32 (nn, 6144 x 2048 over T; one shared key): the same lever with the bf16
+    #      sibling's margin 26 (lock e9d8042b: dense_proj_gemm_nn_n256_m256_f32_tma1 through {"cta_rows": 256}); both sibling rows ----
+    qaf_key = ("sm_107a", True, True, True, False, False, 6144, None, 2048)
+    assert ROW_RULES[qaf_key] == {
+        "sk_sync": True,
+        "sk_sync_m": 26,
+        "sk_slab": 2,
+        "epi": "reg",
+        "f32_v8": True,
+        "store_ef": True,
+    }
+    for row in ("q_a", "shared_gate_up"):
+        v = _views("proj", row, "wgrad", "f32", T)
+        p, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw107)
+        assert p.template == "dense_proj_gemm_nn_n256_f32_v8_ef_sks_sb2", (
+            row
+        )  # ROUTE_TEMPLATE_NEW of the round-25 templates step = TEMPLATES_REACHED_NEW (nn_n256_f32_v8_ef_sks_sb2)
+        assert (
+            p.sk_sync
+            and p.sk_slab == 2
+            and p.sk_exact == 0
+            and p.epi == "reg"
+            and p.store_ef
+            and p.cta_rows == 128
+        ), row
+        old, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], cta_rows=256, sk_sync=False, epi="tma", **kw107
+        )
+        assert (
+            old.template == "dense_proj_gemm_nn_n256_m256_f32_tma1" and not old.sk_sync
+        ), row
+    # ---- (c) sm_107a q_a / shared_gate_up weight gradient bf16 (nn, 6144 x 2048 over T; one shared key): the two-slab fixup joins the
+    #      round-18 synchronised tail (lock e9d8042b: dense_proj_gemm_nn_n256_sks through {"sk_sync": True, "sk_sync_m": 26}); the plan
+    #      arithmetic of the synchronised tail is unchanged by the slab path (192 pair tiles on 106 pairs: 86 tails, 20 collectors, s = 216,
+    #      asserted by test_sk_sync_rule_yields_to_caller_forced_forms) ----
+    qab_key = ("sm_107a", True, True, False, False, False, 6144, None, 2048)
+    assert ROW_RULES[qab_key] == {"sk_sync": True, "sk_sync_m": 26, "sk_slab": 2}
+    for row in ("q_a", "shared_gate_up"):
+        v = _views("proj", row, "wgrad", "bf16", T)
+        p, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw107)
+        assert p.template == "dense_proj_gemm_nn_n256_sks_sb2", (
+            row
+        )  # ROUTE_TEMPLATE_NEW of the round-25 templates step (nn_n256_sks_sb2 = the round-24 sm_107a shared_down wgrad bf16 program, no new template)
+        assert p.sk_sync and p.sk_slab == 2 and p.cta_rows == 128, row
+        old, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], sk_slab=0, **kw107
+        )
+        assert (
+            old.template == "dense_proj_gemm_nn_n256_sks"
+            and old.sk_sync
+            and old.sk_slab == 0
+        ), row  # lock e9d8042b
+    # the sm_107a shared_down weight gradient bf16 keeps its round-20 rule ({"sk_sync": True, "sk_sync_m": 38, "sk_slab": 2}) and program
+    assert ROW_RULES[
+        ("sm_107a", True, True, False, False, False, 2048, None, 6144)
+    ] == {"sk_sync": True, "sk_sync_m": 38, "sk_slab": 2}
+    sdb107 = _views("proj", "shared_down", "wgrad", "bf16", T)
+    p_ctl, *_ = plan_dense_projection_gemm(
+        sdb107["A"], sdb107["B"], sdb107["out"], **kw107
+    )
+    assert (
+        p_ctl.template == "dense_proj_gemm_nn_n256_sks_sb2"
+        and p_ctl.sk_sync
+        and p_ctl.sk_slab == 2
+    )
+    # ---- (d) sm_100a shared_down weight gradient bf16 (nn, 2048 x 6144 over T): the synchronised tail (margin 26) with the two-slab fixup
+    #      replaces the round-16 exact 3-way split of the 44-tile tail wave; the raster group 4 is kept (lock e9d8042b: dense_proj_gemm_nn_n256_skx
+    #      through {"group_m": 4, "sk_exact": 3}) ----
+    sdb_key = ("sm_100a", True, True, False, False, False, 2048, None, 6144)
+    assert ROW_RULES[sdb_key] == {
+        "group_m": 4,
+        "sk_sync": True,
+        "sk_sync_m": 26,
+        "sk_slab": 2,
+    }
+    p_sdb, *_ = plan_dense_projection_gemm(
+        sdb107["A"], sdb107["B"], sdb107["out"], **kw
+    )
+    assert (
+        p_sdb.template == "dense_proj_gemm_nn_n256_sks_sb2"
+    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n256_sks_sb2 - the same program as the sm_107a shared_down row; confirm per route)
+    assert (
+        p_sdb.sk_sync
+        and p_sdb.sk_slab == 2
+        and p_sdb.sk_exact == 0
+        and p_sdb.group_m == 4
+        and p_sdb.cta_rows == 128
+    )
+    old_sdb, *_ = plan_dense_projection_gemm(
+        sdb107["A"], sdb107["B"], sdb107["out"], sk_sync=False, sk_exact=3, **kw
+    )
+    assert (
+        old_sdb.template == "dense_proj_gemm_nn_n256_skx"
+        and not old_sdb.sk_sync
+        and old_sdb.sk_exact == 3
+    )  # lock e9d8042b
+    # ---- (e) sm_100a q_a / shared_gate_up weight gradient bf16 (nn, 6144 x 2048 over T; one shared key): the same lever (lock e9d8042b:
+    #      dense_proj_gemm_nn_n256_skx through {"sk_exact": 3}); both sibling rows ----
+    qab100_key = ("sm_100a", True, True, False, False, False, 6144, None, 2048)
+    assert ROW_RULES[qab100_key] == {"sk_sync": True, "sk_sync_m": 26, "sk_slab": 2}
+    for row in ("q_a", "shared_gate_up"):
+        v = _views("proj", row, "wgrad", "bf16", T)
+        p, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+        assert p.template == "dense_proj_gemm_nn_n256_sks_sb2", row
+        assert p.sk_sync and p.sk_slab == 2 and p.sk_exact == 0 and p.cta_rows == 128, (
+            row
+        )
+        old, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], sk_sync=False, sk_exact=3, **kw
+        )
+        assert old.template == "dense_proj_gemm_nn_n256_skx" and old.sk_exact == 3, (
+            row
+        )  # lock e9d8042b
+    # ---- (f) sm_100a shared_down weight gradient fp32 (nn, 2048 x 6144 over T): the synchronised tail (margin 26, two-slab fixup) replaces
+    #      the exact 3-way split under the unchanged fp32 v8 evict-first register epilogue and raster group 8 (lock e9d8042b:
+    #      dense_proj_gemm_nn_n256_f32_v8_ef_skx through {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True, "sk_exact": 3}) ----
+    sdf100_key = ("sm_100a", True, True, True, False, False, 2048, None, 6144)
+    assert ROW_RULES[sdf100_key] == {
+        "group_m": 8,
+        "epi": "reg",
+        "f32_v8": True,
+        "store_ef": True,
+        "sk_sync": True,
+        "sk_sync_m": 26,
+        "sk_slab": 2,
+    }
+    p_sdf100, *_ = plan_dense_projection_gemm(sdf["A"], sdf["B"], sdf["out"], **kw)
+    assert (
+        p_sdf100.template == "dense_proj_gemm_nn_n256_f32_v8_ef_sks_sb2"
+    )  # ROUTE_TEMPLATE_NEW of the templates step = TEMPLATES_REACHED_NEW (predicted nn_n256_f32_v8_ef_sks_sb2 - the same new program as the sm_107a fp32 rows; confirm per route)
+    assert (
+        p_sdf100.sk_sync
+        and p_sdf100.sk_slab == 2
+        and p_sdf100.sk_exact == 0
+        and p_sdf100.epi == "reg"
+        and p_sdf100.store_ef
+        and p_sdf100.group_m == 8
+    )
+    old_sdf100, *_ = plan_dense_projection_gemm(
+        sdf["A"], sdf["B"], sdf["out"], sk_sync=False, sk_exact=3, **kw
+    )
+    assert (
+        old_sdf100.template == "dense_proj_gemm_nn_n256_f32_v8_ef_skx"
+        and old_sdf100.sk_exact == 3
+        and old_sdf100.epi == "reg"
+    )  # lock e9d8042b
+    # ---- (g) sm_100a q_a / shared_gate_up weight gradient fp32 (nn, 6144 x 2048 over T; one shared key): the same lever under raster group 32
+    #      (lock e9d8042b: dense_proj_gemm_nn_n256_f32_v8_ef_skx through {"group_m": 32, "epi": 'reg', "f32_v8": True, "store_ef": True,
+    #      "sk_exact": 3}); both sibling rows ----
+    qaf100_key = ("sm_100a", True, True, True, False, False, 6144, None, 2048)
+    assert ROW_RULES[qaf100_key] == {
+        "group_m": 32,
+        "epi": "reg",
+        "f32_v8": True,
+        "store_ef": True,
+        "sk_sync": True,
+        "sk_sync_m": 26,
+        "sk_slab": 2,
+    }
+    for row in ("q_a", "shared_gate_up"):
+        v = _views("proj", row, "wgrad", "f32", T)
+        p, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
+        assert p.template == "dense_proj_gemm_nn_n256_f32_v8_ef_sks_sb2", row
+        assert (
+            p.sk_sync
+            and p.sk_slab == 2
+            and p.sk_exact == 0
+            and p.epi == "reg"
+            and p.store_ef
+            and p.group_m == 32
+        ), row
+        old, *_ = plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], sk_sync=False, sk_exact=3, **kw
+        )
+        assert (
+            old.template == "dense_proj_gemm_nn_n256_f32_v8_ef_skx"
+            and old.sk_exact == 3
+        ), row  # lock e9d8042b
+    # the exact-split programs of the seven keys have no other route in lock e9d8042b, so the templates step is expected to RETIRE them
+    # (predicted: nn_n256_skx, nn_n256_f32_v8_ef_skx, nn_n256_sks; nn_n256_m256_f32_tma1 stays - dense_down / dense_gate_up wgrad f32 on
+    # sm_100a and o_proj wgrad f32 on sm_107a keep it); the EXPORTED_TEMPLATES table of this file is regenerated by the figen step - not asserted here
 
 
 @pytest.mark.parametrize("T", [16172, 16231])
