@@ -784,9 +784,10 @@ def test_balanced_uri_names_the_family_instance_and_pins() -> None:
     assert get_dcp_spec_balanced_uri("dcp_spec_bf16_balanced", "sm100a", 32, 2) == (
         f"cake_fmha_dcp_spec_bf16_balanced_n32_program2_sm100a_{CAKE_FMHA_JIT_TAG}"
     )
+    # the E4M3 head_dim-256 family ships two programs (1 planner, 2 static one-wave): its URI names the program
     assert get_dcp_spec_balanced_uri(
-        "dcp_spec_bf16_fp8_d256_balanced", "sm103a", 64
-    ).startswith("cake_fmha_dcp_spec_bf16_fp8_d256_balanced_n64_sm103a_")
+        "dcp_spec_bf16_fp8_d256_balanced", "sm103a", 64, 2
+    ).startswith("cake_fmha_dcp_spec_bf16_fp8_d256_balanced_n64_program2_sm103a_")
     assert (
         tuple(_KIND_FAMILY[kind] for kind in DCP_BALANCED_KINDS)
         == DCP_BALANCED_FAMILIES
@@ -834,7 +835,10 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
                     is None
                 )
             continue
-        assert variants["items_lower_bound"] == "batch_size * num_kv_heads"
+        assert variants["items_lower_bound"] in (
+            "batch_size * num_kv_heads",
+            "batch_size * num_kv_heads * q_tiles",
+        )
         below, above, static = (
             int(variants["below_grid"]),
             int(variants["at_or_above_grid"]),
@@ -914,6 +918,41 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
                     == early["programs"][str(static)]
                     == 4
                 )
+            continue
+        if kind == "fp8_p64_d256":
+            # CAKE-685 unit 90: planner (1) / plan-free static one-wave (2) on the row-tile geometry; the rule needs q_len
+            assert variants["items_lower_bound"] == "batch_size * num_kv_heads * q_tiles"
+            assert (below, above, static) == (1, 1, 2)
+            assert regime == {
+                "page_size": 64,
+                "chunk_tokens": 256,
+                "min_chunks": 5,
+                "max_chunks": 48,
+                "reduce_tickets_per_tile": 16,
+            }
+            with pytest.raises(ValueError, match="q_len"):
+                program(1, 1, 128, 148)
+            for sm in (148, 152):
+                # the b1 ctx32768 q4 cp4 goal row: 128 pages -> 32 chunks, one row tile, 1 x (32 + 16) = 48 tickets
+                assert program(1, 1, 128, sm, q_len=4) == static
+                # q_len 5..8 = two row tiles (96 tickets); b2 (96) and b3 (144) q4 fit the grid, b4 (192) does not
+                assert program(1, 1, 128, sm, q_len=5) == static
+                assert program(1, 1, 128, sm, q_len=8) == static
+                assert program(2, 1, 128, sm, q_len=4) == static
+                assert program(3, 1, 128, sm, q_len=4) == static
+                assert program(4, 1, 128, sm, q_len=4) == below
+                # the chunk-count window: 16 pages -> 4 chunks (below 5), 20 -> 5; 192 -> 48, 196 -> 49 (above 48)
+                assert program(1, 1, 16, sm, q_len=1) == below
+                assert program(1, 1, 20, sm, q_len=1) == static
+                assert program(1, 1, 192, sm, q_len=1) == static
+                assert program(1, 1, 196, sm, q_len=1) == below
+                # at 48 chunks a tile costs 64 tickets: two tiles fit, three do not
+                assert program(2, 1, 192, sm, q_len=1) == static
+                assert program(3, 1, 192, sm, q_len=1) == below
+                # the b128 q1 goal row: 128 tiles never fit one wave with their reduce tickets (planner program)
+                assert program(128, 1, 128, sm, q_len=1) == below == above
+                # at or above the grid (one tile per CTA): the planner program
+                assert program(sm, 1, 20, sm, q_len=1) == above
             continue
         assert regime == {
             "page_size": 64,
@@ -1664,6 +1703,7 @@ def test_d256_band_row_launches_the_gqa16_program(monkeypatch) -> None:
                 num_kv_heads=1,
                 max_pages_per_seq=int(inputs["block_tables"].shape[1]),
                 sm_count=148,
+                q_len=5,
             ),
         )
     ]
@@ -1686,6 +1726,7 @@ def test_d256_band_row_launches_the_gqa16_program(monkeypatch) -> None:
             num_kv_heads=1,
             max_pages_per_seq=int(inputs["block_tables"].shape[1]),
             sm_count=148,
+            q_len=4,
         ),
     )
     assert not calls["static"]

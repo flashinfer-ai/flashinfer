@@ -441,6 +441,7 @@ def dcp_balanced_program(
     sm_count: int,
     arch: Optional[str] = None,
     n_rows: Optional[int] = None,
+    q_len: Optional[int] = None,
 ) -> Optional[int]:
     """The traced program a balanced family's launch runs, or ``None`` for a one-program family.
 
@@ -473,8 +474,17 @@ def dcp_balanced_program(
     launch on one of its architectures runs the early-issue form of its
     program (``programs[program]``: the loader decodes its own ticket in the
     kernel prologue and issues the first Q / K / V boxes before the
-    scheduler's token; bitwise the program's output).  Mirrors the manifest's
-    ``program_variants`` rule from host metadata only.
+    scheduler's token; bitwise the program's output).  The E4M3 head_dim-256
+    family ships two programs on its row-tile geometry (one work item per
+    (request, KV head, tile of four speculative rows): ``items_lower_bound =
+    batch_size * num_kv_heads * q_tiles``, so the rule needs ``q_len``): a
+    launch whose page-table width bounds every tile to ``min_chunks <= n_max <=
+    max_chunks`` chunks (the window where the planner's own cost model picks
+    that chunk length) and whose ``tiles * (n_max + reduce_tickets_per_tile)``
+    tickets fit the grid runs the plan-free static one-wave program
+    (``static_one_wave``; bitwise the planner program's output), every other
+    launch the planner program (``below_grid`` = ``at_or_above_grid``).
+    Mirrors the manifest's ``program_variants`` rule from host metadata only.
     """
 
     _check_dcp_balanced_kind(kind)
@@ -483,10 +493,19 @@ def dcp_balanced_program(
     variants = dcp_balanced_program_variants(_DCP_BALANCED_FAMILY[kind])
     if variants is None:
         return None
-    if variants.get("items_lower_bound") != "batch_size * num_kv_heads":
+    bound = variants.get("items_lower_bound")
+    if bound == "batch_size * num_kv_heads":
+        q_tiles = 1
+    elif bound == "batch_size * num_kv_heads * q_tiles":
+        # the E4M3 head_dim-256 family: one work item per (request, KV head, row tile)
+        if q_len is None:
+            raise ValueError(
+                f"the balanced DCP program rule of {kind} needs q_len (row tiles)"
+            )
+        q_tiles = dcp_balanced_q_tiles(kind, int(q_len))
+    else:
         raise RuntimeError(
-            f"unsupported balanced DCP program rule for {kind}: "
-            f"{variants.get('items_lower_bound')!r}"
+            f"unsupported balanced DCP program rule for {kind}: {bound!r}"
         )
     if int(sm_count) <= 0:
         raise ValueError(f"sm_count must be positive, got {sm_count}")
@@ -494,7 +513,7 @@ def dcp_balanced_program(
         raise ValueError("batch_size and num_kv_heads must be positive")
     if int(max_pages_per_seq) <= 0:
         raise ValueError(f"max_pages_per_seq must be positive, got {max_pages_per_seq}")
-    tiles = int(batch_size) * int(num_kv_heads)
+    tiles = int(batch_size) * int(num_kv_heads) * q_tiles
     if tiles >= int(sm_count):
         return int(variants["at_or_above_grid"])
     regime = variants["static_one_wave_regime"]
@@ -535,9 +554,13 @@ def dcp_balanced_program(
         * int(regime["page_size"])
         // int(regime["chunk_tokens"])
     )
-    if n_max >= int(regime["min_chunks"]) and tiles * (
-        n_max + int(regime["reduce_tickets_per_tile"])
-    ) <= int(sm_count):
+    # ``max_chunks``: the head_dim-256 family's cost-model window (CAKE-685 unit 90); absent on the D128 family
+    max_chunks = regime.get("max_chunks")
+    if (
+        n_max >= int(regime["min_chunks"])
+        and (max_chunks is None or n_max <= int(max_chunks))
+        and tiles * (n_max + int(regime["reduce_tickets_per_tile"])) <= int(sm_count)
+    ):
         return int(variants["static_one_wave"])
     return int(variants["below_grid"])
 
@@ -864,6 +887,7 @@ def _run_dcp_spec_balanced(
             sm_count=sm_count,
             arch=_DCP_BALANCED_ARCH.get(target, target),
             n_rows=n_rows,
+            q_len=q_len_per_req,
         ),
     )
     if kind == "bf16_p16":
