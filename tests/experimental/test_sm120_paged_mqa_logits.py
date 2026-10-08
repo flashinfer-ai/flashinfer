@@ -40,6 +40,15 @@ CASES = [
     (64, 64, 3, 3, 1024),
     (64, 64, 5, 2, 512),
     (64, 64, 6, 2, 1024),
+    # The remaining exported routes, so every (heads, page, next_n) the catalog
+    # ships has a GPU correctness case (test_sm120_cases_cover_every_route).
+    (32, 128, 2, 6, 2048),
+    (32, 128, 5, 2, 1024),
+    (32, 64, 1, 5, 1536),
+    (32, 64, 3, 3, 1024),
+    (32, 64, 4, 3, 512),
+    (32, 64, 6, 2, 1024),
+    (64, 64, 2, 4, 1024),
 ]
 
 
@@ -372,6 +381,19 @@ def test_sm120_paged_strided_per_layer_view():
             ),
             *args,
         )
+
+
+def test_sm120_cases_cover_every_route():
+    """Every exported (heads, page, next_n) route has a GPU correctness case."""
+    catalog = _runtime._catalog()
+    exported = {
+        (record["num_heads"], record["page_kv"], record["next_n"])
+        for record in catalog["routes"].values()
+        if record["sequence"] is not None
+    }
+    covered = {(heads, page_kv, next_n) for heads, page_kv, next_n, _b, _c in CASES}
+    assert exported, "the installed catalog exports no logits route"
+    assert exported <= covered, sorted(exported - covered)
 
 
 def test_sm120_paged_host_helpers_and_rejections():
