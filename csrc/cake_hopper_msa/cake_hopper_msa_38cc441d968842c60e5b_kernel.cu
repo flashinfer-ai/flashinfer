@@ -144,16 +144,6 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 
 
 
-__device__ __forceinline__ void tma_3d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4}], [%5];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
-           "r"(mbar_addr) : "memory");
-}
-
 
 __device__ __forceinline__ void cp_async_bulk_gmem2smem(
     unsigned smem_addr, const void* gmem_ptr, unsigned bytes, int mbar_addr) {
@@ -175,7 +165,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_hopper_msa_1e69b47145a598e6a6e6(unsigned int* __restrict__ Q32, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, int* __restrict__ q2k_indices, int* __restrict__ page_table, int* __restrict__ seqused_k, unsigned int* __restrict__ part_o, float* __restrict__ part_ml, unsigned int* __restrict__ counters, unsigned int* __restrict__ done, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, int max_pages, int num_chunks, float softmax_scale_log2, unsigned int zero_u32, unsigned long long* __restrict__ trace)
+kernel_cake_hopper_msa_38cc441d968842c60e5b(unsigned int* __restrict__ Q32, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, int* __restrict__ q2k_indices, int* __restrict__ page_table, int* __restrict__ seqused_k, unsigned int* __restrict__ part_o, float* __restrict__ part_ml, unsigned int* __restrict__ counters, unsigned int* __restrict__ done, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, int max_pages, int num_chunks, float softmax_scale_log2, unsigned int zero_u32, unsigned long long* __restrict__ trace)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -321,10 +311,26 @@ kernel_cake_hopper_msa_1e69b47145a598e6a6e6(unsigned int* __restrict__ Q32, cons
         if (warp == 1) {
             if (elect_sync()) {
                 mbarrier_arrive_expect_tx(kv_full_addr, 32768);
-                tma_3d_gmem2smem(kv8_addr, (&K), 0, 0, page_head, kv_full_addr);
-                tma_3d_gmem2smem(kv8_addr + 8192, (&K), 0, 64, page_head, kv_full_addr);
-                tma_3d_gmem2smem(kv8_addr + 16384, (&V), 0, 0, page_head, kv_full_addr);
-                tma_3d_gmem2smem(kv8_addr + 24576, (&V), 0, 64, page_head, kv_full_addr);
+                asm volatile(
+                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                    :: "r"(kv8_addr), "l"((&K)), "r"(0), "r"(0), "r"(page_head),
+                       "r"(kv_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+                asm volatile(
+                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                    :: "r"(kv8_addr + 8192), "l"((&K)), "r"(0), "r"(64), "r"(page_head),
+                       "r"(kv_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+                asm volatile(
+                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                    :: "r"(kv8_addr + 16384), "l"((&V)), "r"(0), "r"(0), "r"(page_head),
+                       "r"(kv_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+                asm volatile(
+                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                    :: "r"(kv8_addr + 24576), "l"((&V)), "r"(0), "r"(64), "r"(page_head),
+                       "r"(kv_full_addr), "l"(0x12F0000000000000ULL) : "memory");
             }
         }
     }
@@ -688,10 +694,26 @@ kernel_cake_hopper_msa_1e69b47145a598e6a6e6(unsigned int* __restrict__ Q32, cons
             if (warp == 1) {
                 if (elect_sync()) {
                     mbarrier_arrive_expect_tx(kv_full_addr + 8, 32768);
-                    tma_3d_gmem2smem(kv8_addr + 32768, (&K), 0, 0, page_head_1, kv_full_addr + 8);
-                    tma_3d_gmem2smem(kv8_addr + 32768 + 8192, (&K), 0, 64, page_head_1, kv_full_addr + 8);
-                    tma_3d_gmem2smem(kv8_addr + 32768 + 16384, (&V), 0, 0, page_head_1, kv_full_addr + 8);
-                    tma_3d_gmem2smem(kv8_addr + 32768 + 24576, (&V), 0, 64, page_head_1, kv_full_addr + 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                        :: "r"(kv8_addr + 32768), "l"((&K)), "r"(0), "r"(0), "r"(page_head_1),
+                           "r"(kv_full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                        :: "r"(kv8_addr + 32768 + 8192), "l"((&K)), "r"(0), "r"(64), "r"(page_head_1),
+                           "r"(kv_full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                        :: "r"(kv8_addr + 32768 + 16384), "l"((&V)), "r"(0), "r"(0), "r"(page_head_1),
+                           "r"(kv_full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                        :: "r"(kv8_addr + 32768 + 24576), "l"((&V)), "r"(0), "r"(64), "r"(page_head_1),
+                           "r"(kv_full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
                 }
             }
         }
@@ -1491,10 +1513,26 @@ kernel_cake_hopper_msa_1e69b47145a598e6a6e6(unsigned int* __restrict__ Q32, cons
             if (warp == 1) {
                 if (elect_sync()) {
                     mbarrier_arrive_expect_tx(kv_full_addr + (stage) * 8, 32768);
-                    tma_3d_gmem2smem(kv8_addr + (unsigned int)(stage * 32768), (&K), 0, 0, page_head_2_1, kv_full_addr + (stage) * 8);
-                    tma_3d_gmem2smem(kv8_addr + (unsigned int)(stage * 32768) + 8192, (&K), 0, 64, page_head_2_1, kv_full_addr + (stage) * 8);
-                    tma_3d_gmem2smem(kv8_addr + (unsigned int)(stage * 32768) + 16384, (&V), 0, 0, page_head_2_1, kv_full_addr + (stage) * 8);
-                    tma_3d_gmem2smem(kv8_addr + (unsigned int)(stage * 32768) + 24576, (&V), 0, 64, page_head_2_1, kv_full_addr + (stage) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                        :: "r"(kv8_addr + (unsigned int)(stage * 32768)), "l"((&K)), "r"(0), "r"(0), "r"(page_head_2_1),
+                           "r"(kv_full_addr + (stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                        :: "r"(kv8_addr + (unsigned int)(stage * 32768) + 8192), "l"((&K)), "r"(0), "r"(64), "r"(page_head_2_1),
+                           "r"(kv_full_addr + (stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                        :: "r"(kv8_addr + (unsigned int)(stage * 32768) + 16384), "l"((&V)), "r"(0), "r"(0), "r"(page_head_2_1),
+                           "r"(kv_full_addr + (stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                        :: "r"(kv8_addr + (unsigned int)(stage * 32768) + 24576), "l"((&V)), "r"(0), "r"(64), "r"(page_head_2_1),
+                           "r"(kv_full_addr + (stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
                 }
             }
         }
@@ -1671,6 +1709,7 @@ kernel_cake_hopper_msa_1e69b47145a598e6a6e6(unsigned int* __restrict__ Q32, cons
         merge = 1;
         if (warp == 0) {
             if (elect_sync()) {
+                asm volatile("fence.proxy.async.global;" ::: "memory");
                 mbarrier_arrive_expect_tx(mfull_addr, 8448);
                 cp_async_bulk_gmem2smem(kv8_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(part_o) + ((unsigned long long)(item * 2048) * (unsigned long long)4)), 8192, mfull_addr);
                 cp_async_bulk_gmem2smem(p16_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(part_ml) + ((unsigned long long)(item * 64) * (unsigned long long)4)), 256, mfull_addr);

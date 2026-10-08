@@ -165,7 +165,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_hopper_msa_62b7c62bf60cbc5bfe87(unsigned int* __restrict__ Q32, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, int* __restrict__ q2k_indices, int* __restrict__ page_table, int* __restrict__ seqused_k, unsigned int* __restrict__ part_o, float* __restrict__ part_ml, unsigned int* __restrict__ counters, unsigned int* __restrict__ done, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, int max_pages, int num_chunks, float softmax_scale_log2, unsigned int zero_u32, unsigned long long* __restrict__ trace)
+kernel_cake_hopper_msa_b913a8ab00c89d5f0c28(unsigned int* __restrict__ Q32, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, int* __restrict__ q2k_indices, int* __restrict__ page_table, int* __restrict__ seqused_k, unsigned int* __restrict__ part_o, float* __restrict__ part_ml, unsigned int* __restrict__ counters, unsigned int* __restrict__ done, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, int max_pages, int num_chunks, float softmax_scale_log2, unsigned int zero_u32, unsigned long long* __restrict__ trace)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -2087,6 +2087,7 @@ kernel_cake_hopper_msa_62b7c62bf60cbc5bfe87(unsigned int* __restrict__ Q32, cons
         merge = 1;
         if (warp == 0) {
             if (elect_sync()) {
+                asm volatile("fence.proxy.async.global;" ::: "memory");
                 mbarrier_arrive_expect_tx(mfull_addr, 33792);
                 cp_async_bulk_gmem2smem(kv8_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(part_o) + ((unsigned long long)(item * 8192) * (unsigned long long)4)), 32768, mfull_addr);
                 cp_async_bulk_gmem2smem(p16_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(part_ml) + ((unsigned long long)(item * 256) * (unsigned long long)4)), 1024, mfull_addr);

@@ -175,7 +175,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, int* __restrict__ q2k_indices, int* __restrict__ page_table, int* __restrict__ seqused_k, unsigned int* __restrict__ part_o, float* __restrict__ part_ml, unsigned int* __restrict__ counters, unsigned int* __restrict__ done, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, int max_pages, int num_chunks, float softmax_scale_log2, unsigned int zero_u32, unsigned long long* __restrict__ trace)
+kernel_cake_hopper_msa_81024a78b1952b01d7bc(unsigned int* __restrict__ Q32, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, int* __restrict__ q2k_indices, int* __restrict__ page_table, int* __restrict__ seqused_k, unsigned int* __restrict__ part_o, float* __restrict__ part_ml, unsigned int* __restrict__ counters, unsigned int* __restrict__ done, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, int max_pages, int num_chunks, float softmax_scale_log2, unsigned int zero_u32, unsigned long long* __restrict__ trace)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -251,8 +251,8 @@ kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, cons
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&V))) : "memory"); }
     int tok = blockIdx.y;
     int gx = blockIdx.x;
-    int gc = gx / 2;
-    int split = gx - gc * 2;
+    int gc = gx / 4;
+    int split = gx - gc * 4;
     int kv_head = gc / num_chunks;
     int chunk = gc - kv_head * num_chunks;
     int batch = tok / seqlen_q;
@@ -305,7 +305,7 @@ kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, cons
             meta[16 + lane_0] = page * num_kv_heads + kv_head;
         }
         __syncwarp();
-        int slot = split * 8;
+        int slot = split * 4;
         int blk_1 = meta[slot];
         int page_head = meta[16 + slot];
         int valid = 0;
@@ -666,13 +666,13 @@ kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, cons
     uint64_t _wgmma_desc_2 = (((uint64_t)(((q16_addr + 1024)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
     uint64_t _wgmma_b_0_4 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_2 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_2);
     #pragma unroll 1
-    for (int j = 0; j < 8; j++) {
+    for (int j = 0; j < 4; j++) {
         int stage = j % 2;
         int phase = j / 2 % 2;
         int par = j - j / 2 * 2;
         mbarrier_wait(kv_full_addr + (stage) * 8, phase);
         if (j == 0) {
-            int slot_1 = split * 8 + 1;
+            int slot_1 = split * 4 + 1;
             int blk_2 = meta[slot_1];
             int page_head_1 = meta[16 + slot_1];
             int valid_1 = 0;
@@ -695,7 +695,7 @@ kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, cons
                 }
             }
         }
-        int slot_2 = split * 8 + j;
+        int slot_2 = split * 4 + j;
         int blk_3 = meta[slot_2];
         int page_head_2 = meta[16 + slot_2];
         int valid_2 = 0;
@@ -1474,8 +1474,8 @@ kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, cons
         av0[31] = dv0[31] + zero_u32;
         av1[31] = dv1[31] + zero_u32;
         int nxt = j + 2;
-        if (nxt < 8) {
-            int slot_0 = split * 8 + nxt;
+        if (nxt < 4) {
+            int slot_0 = split * 4 + nxt;
             int blk_1_1 = meta[slot_0];
             int page_head_2_1 = meta[16 + slot_0];
             int valid_3 = 0;
@@ -1614,7 +1614,7 @@ kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, cons
         : "r"(lred_addr + (unsigned int)(hh5_3 * 4 * 4)));
     lsum[1] = rv[0] + rv[1] + (rv[2] + rv[3]);
     int merge = 1;
-    int pbase = item * 2 + split;
+    int pbase = item * 4 + split;
     int orow = (pbase * 128 + tid_1) * 4;
     float invl[2];
     invl[0] = 0.0f;
@@ -1667,13 +1667,14 @@ kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, cons
     asm volatile("barrier.sync 8, 128;" ::: "memory");
     unsigned int oldv = flag[0];
     merge = 0;
-    if ((oldv & 1) == 1) {
+    if ((oldv & 3) == 3) {
         merge = 1;
         if (warp == 0) {
             if (elect_sync()) {
-                mbarrier_arrive_expect_tx(mfull_addr, 4224);
-                cp_async_bulk_gmem2smem(kv8_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(part_o) + ((unsigned long long)(item * 1024) * (unsigned long long)4)), 4096, mfull_addr);
-                cp_async_bulk_gmem2smem(p16_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(part_ml) + ((unsigned long long)(item * 32) * (unsigned long long)4)), 128, mfull_addr);
+                asm volatile("fence.proxy.async.global;" ::: "memory");
+                mbarrier_arrive_expect_tx(mfull_addr, 8448);
+                cp_async_bulk_gmem2smem(kv8_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(part_o) + ((unsigned long long)(item * 2048) * (unsigned long long)4)), 8192, mfull_addr);
+                cp_async_bulk_gmem2smem(p16_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(part_ml) + ((unsigned long long)(item * 64) * (unsigned long long)4)), 256, mfull_addr);
             }
         }
         mbarrier_wait(mfull_addr, 0);
@@ -1687,9 +1688,9 @@ kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, cons
         d_o1[3] = 0.0f;
         lsum[0] = 0.0f;
         lsum[1] = 0.0f;
-        float mlall[8];
-        unsigned int pall[8];
-        float cw[4];
+        float mlall[16];
+        unsigned int pall[16];
+        float cw[8];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&mlall[0])), "=r"(*reinterpret_cast<uint32_t*>(&mlall[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mlall[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mlall[(0) + 3]))
             : "r"(p16_addr + (unsigned int)(cq * 4 * 4)));
@@ -1697,11 +1698,23 @@ kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, cons
             : "=r"(*reinterpret_cast<uint32_t*>(&mlall[4])), "=r"(*reinterpret_cast<uint32_t*>(&mlall[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mlall[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mlall[(4) + 3]))
             : "r"(p16_addr + (unsigned int)((4 + cq) * 4 * 4)));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&mlall[8])), "=r"(*reinterpret_cast<uint32_t*>(&mlall[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mlall[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mlall[(8) + 3]))
+            : "r"(p16_addr + (unsigned int)((8 + cq) * 4 * 4)));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&mlall[12])), "=r"(*reinterpret_cast<uint32_t*>(&mlall[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&mlall[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&mlall[(12) + 3]))
+            : "r"(p16_addr + (unsigned int)((12 + cq) * 4 * 4)));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&pall[0])), "=r"(*reinterpret_cast<uint32_t*>(&pall[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pall[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pall[(0) + 3]))
             : "r"(kv8_addr + (unsigned int)(tid_1 * 4 * 4)));
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&pall[4])), "=r"(*reinterpret_cast<uint32_t*>(&pall[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pall[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pall[(4) + 3]))
             : "r"(kv8_addr + (unsigned int)((128 + tid_1) * 4 * 4)));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&pall[8])), "=r"(*reinterpret_cast<uint32_t*>(&pall[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pall[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pall[(8) + 3]))
+            : "r"(kv8_addr + (unsigned int)((256 + tid_1) * 4 * 4)));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&pall[12])), "=r"(*reinterpret_cast<uint32_t*>(&pall[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pall[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pall[(12) + 3]))
+            : "r"(kv8_addr + (unsigned int)((384 + tid_1) * 4 * 4)));
         float m0 = -CAKE_INF;
         float m1 = -CAKE_INF;
         float _max_22 = max_noftz(m0, mlall[0]);
@@ -1712,6 +1725,14 @@ kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, cons
         m0 = _max_24;
         float _max_25 = max_noftz(m1, mlall[6]);
         m1 = _max_25;
+        float _max_26 = max_noftz(m0, mlall[8]);
+        m0 = _max_26;
+        float _max_27 = max_noftz(m1, mlall[10]);
+        m1 = _max_27;
+        float _max_28 = max_noftz(m0, mlall[12]);
+        m0 = _max_28;
+        float _max_29 = max_noftz(m1, mlall[14]);
+        m1 = _max_29;
         cw[0] = 0.0f;
         if (mlall[0] != -CAKE_INF) {
             float _exp2_10 = approx_exp2(mlall[0] - m0);
@@ -1736,6 +1757,30 @@ kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, cons
         }
         lsum[0] = lsum[0] + cw[2];
         lsum[1] = lsum[1] + cw[3];
+        cw[4] = 0.0f;
+        if (mlall[8] != -CAKE_INF) {
+            float _exp2_14 = approx_exp2(mlall[8] - m0);
+            cw[4] = _exp2_14 * mlall[9];
+        }
+        cw[5] = 0.0f;
+        if (mlall[10] != -CAKE_INF) {
+            float _exp2_15 = approx_exp2(mlall[10] - m1);
+            cw[5] = _exp2_15 * mlall[11];
+        }
+        lsum[0] = lsum[0] + cw[4];
+        lsum[1] = lsum[1] + cw[5];
+        cw[6] = 0.0f;
+        if (mlall[12] != -CAKE_INF) {
+            float _exp2_16 = approx_exp2(mlall[12] - m0);
+            cw[6] = _exp2_16 * mlall[13];
+        }
+        cw[7] = 0.0f;
+        if (mlall[14] != -CAKE_INF) {
+            float _exp2_17 = approx_exp2(mlall[14] - m1);
+            cw[7] = _exp2_17 * mlall[15];
+        }
+        lsum[0] = lsum[0] + cw[6];
+        lsum[1] = lsum[1] + cw[7];
         float _cvt_f32_f16_0;
         asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_0) : "h"((uint16_t)(pall[0])));
         d_o0[0] = d_o0[0] + cw[0] * _cvt_f32_f16_0;
@@ -1784,6 +1829,54 @@ kernel_cake_hopper_msa_1c4b519bae7a1c4f0b6c(unsigned int* __restrict__ Q32, cons
         float _cvt_f32_f16_15;
         asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_15) : "h"((uint16_t)(pall[7] >> 16)));
         d_o1[3] = d_o1[3] + cw[3] * _cvt_f32_f16_15;
+        float _cvt_f32_f16_16;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_16) : "h"((uint16_t)(pall[8])));
+        d_o0[0] = d_o0[0] + cw[4] * _cvt_f32_f16_16;
+        float _cvt_f32_f16_17;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_17) : "h"((uint16_t)(pall[8] >> 16)));
+        d_o0[1] = d_o0[1] + cw[5] * _cvt_f32_f16_17;
+        float _cvt_f32_f16_18;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_18) : "h"((uint16_t)(pall[9])));
+        d_o0[2] = d_o0[2] + cw[4] * _cvt_f32_f16_18;
+        float _cvt_f32_f16_19;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_19) : "h"((uint16_t)(pall[9] >> 16)));
+        d_o0[3] = d_o0[3] + cw[5] * _cvt_f32_f16_19;
+        float _cvt_f32_f16_20;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_20) : "h"((uint16_t)(pall[10])));
+        d_o1[0] = d_o1[0] + cw[4] * _cvt_f32_f16_20;
+        float _cvt_f32_f16_21;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_21) : "h"((uint16_t)(pall[10] >> 16)));
+        d_o1[1] = d_o1[1] + cw[5] * _cvt_f32_f16_21;
+        float _cvt_f32_f16_22;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_22) : "h"((uint16_t)(pall[11])));
+        d_o1[2] = d_o1[2] + cw[4] * _cvt_f32_f16_22;
+        float _cvt_f32_f16_23;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_23) : "h"((uint16_t)(pall[11] >> 16)));
+        d_o1[3] = d_o1[3] + cw[5] * _cvt_f32_f16_23;
+        float _cvt_f32_f16_24;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_24) : "h"((uint16_t)(pall[12])));
+        d_o0[0] = d_o0[0] + cw[6] * _cvt_f32_f16_24;
+        float _cvt_f32_f16_25;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_25) : "h"((uint16_t)(pall[12] >> 16)));
+        d_o0[1] = d_o0[1] + cw[7] * _cvt_f32_f16_25;
+        float _cvt_f32_f16_26;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_26) : "h"((uint16_t)(pall[13])));
+        d_o0[2] = d_o0[2] + cw[6] * _cvt_f32_f16_26;
+        float _cvt_f32_f16_27;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_27) : "h"((uint16_t)(pall[13] >> 16)));
+        d_o0[3] = d_o0[3] + cw[7] * _cvt_f32_f16_27;
+        float _cvt_f32_f16_28;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_28) : "h"((uint16_t)(pall[14])));
+        d_o1[0] = d_o1[0] + cw[6] * _cvt_f32_f16_28;
+        float _cvt_f32_f16_29;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_29) : "h"((uint16_t)(pall[14] >> 16)));
+        d_o1[1] = d_o1[1] + cw[7] * _cvt_f32_f16_29;
+        float _cvt_f32_f16_30;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_30) : "h"((uint16_t)(pall[15])));
+        d_o1[2] = d_o1[2] + cw[6] * _cvt_f32_f16_30;
+        float _cvt_f32_f16_31;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_31) : "h"((uint16_t)(pall[15] >> 16)));
+        d_o1[3] = d_o1[3] + cw[7] * _cvt_f32_f16_31;
     }
     if (merge != 0) {
         float inv = 0.0f;

@@ -45,31 +45,31 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_KV8_OFF 1024
 #define SMEM_KV8_STAGE_BYTES 32768
 #define SMEM_KV8_STRIDE 32768
-#define SMEM_IDENT8_OFF 66560
+#define SMEM_IDENT8_OFF 99328
 #define SMEM_IDENT8_STAGE_BYTES 8192
 #define SMEM_IDENT8_STRIDE 8192
-#define SMEM_Q16_OFF 74752
+#define SMEM_Q16_OFF 107520
 #define SMEM_Q16_STAGE_BYTES 4096
 #define SMEM_Q16_STRIDE 4096
-#define SMEM_P16_OFF 78848
+#define SMEM_P16_OFF 111616
 #define SMEM_P16_STAGE_BYTES 2048
 #define SMEM_P16_STRIDE 2048
-#define SMEM_RED_OFF 87040
+#define SMEM_RED_OFF 119808
 #define SMEM_RED_STAGE_BYTES 256
 #define SMEM_RED_STRIDE 256
-#define SMEM_LRED_OFF 87296
+#define SMEM_LRED_OFF 120064
 #define SMEM_LRED_STAGE_BYTES 256
 #define SMEM_LRED_STRIDE 256
-#define SMEM_FLAG_OFF 87552
+#define SMEM_FLAG_OFF 120320
 #define SMEM_FLAG_STAGE_BYTES 16
 #define SMEM_FLAG_STRIDE 16
-#define SMEM_META_OFF 87568
+#define SMEM_META_OFF 120336
 #define SMEM_META_STAGE_BYTES 128
 #define SMEM_META_STRIDE 128
-#define SMEM_TOTAL 87808
+#define SMEM_TOTAL 120576
 #define THREADS 128
 #define TRACE 0
-#define LAUNCH_MIN_BLOCKS 2
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -175,7 +175,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_hopper_msa_d64de771601dd69d68e8(unsigned int* __restrict__ Q32, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, int* __restrict__ q2k_indices, int* __restrict__ page_table, int* __restrict__ seqused_k, unsigned int* __restrict__ part_o, float* __restrict__ part_ml, unsigned int* __restrict__ counters, unsigned int* __restrict__ done, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, int max_pages, int num_chunks, float softmax_scale_log2, unsigned int zero_u32, unsigned long long* __restrict__ trace)
+kernel_cake_hopper_msa_22e2c702719324fe5eb1(unsigned int* __restrict__ Q32, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, int* __restrict__ q2k_indices, int* __restrict__ page_table, int* __restrict__ seqused_k, unsigned int* __restrict__ part_o, float* __restrict__ part_ml, unsigned int* __restrict__ counters, unsigned int* __restrict__ done, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, int max_pages, int num_chunks, float softmax_scale_log2, unsigned int zero_u32, unsigned long long* __restrict__ trace)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -187,8 +187,8 @@ kernel_cake_hopper_msa_d64de771601dd69d68e8(unsigned int* __restrict__ Q32, cons
 
     const int mbar_base = smem;
     #define kv_full_addr (mbar_base + 0)
-    #define v_full_addr (mbar_base + 16)
-    #define mfull_addr (mbar_base + 32)
+    #define v_full_addr (mbar_base + 24)
+    #define mfull_addr (mbar_base + 48)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -198,35 +198,37 @@ kernel_cake_hopper_msa_d64de771601dd69d68e8(unsigned int* __restrict__ Q32, cons
     // Kernel setup ops
     uint8_t* kv8 = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int kv8_addr = smem + 1024;
-    uint8_t* ident8 = reinterpret_cast<uint8_t*>(smem_raw + 66560);
-    const int ident8_addr = smem + 66560;
-    __half* q16 = reinterpret_cast<__half*>(smem_raw + 74752);
-    const int q16_addr = smem + 74752;
-    __half* p16 = reinterpret_cast<__half*>(smem_raw + 78848);
-    const int p16_addr = smem + 78848;
-    float* red = reinterpret_cast<float*>(smem_raw + 87040);
-    const int red_addr = smem + 87040;
-    float* lred = reinterpret_cast<float*>(smem_raw + 87296);
-    const int lred_addr = smem + 87296;
-    unsigned int* flag = reinterpret_cast<unsigned int*>(smem_raw + 87552);
-    const int flag_addr = smem + 87552;
-    int* meta = reinterpret_cast<int*>(smem_raw + 87568);
-    const int meta_addr = smem + 87568;
+    uint8_t* ident8 = reinterpret_cast<uint8_t*>(smem_raw + 99328);
+    const int ident8_addr = smem + 99328;
+    __half* q16 = reinterpret_cast<__half*>(smem_raw + 107520);
+    const int q16_addr = smem + 107520;
+    __half* p16 = reinterpret_cast<__half*>(smem_raw + 111616);
+    const int p16_addr = smem + 111616;
+    float* red = reinterpret_cast<float*>(smem_raw + 119808);
+    const int red_addr = smem + 119808;
+    float* lred = reinterpret_cast<float*>(smem_raw + 120064);
+    const int lred_addr = smem + 120064;
+    unsigned int* flag = reinterpret_cast<unsigned int*>(smem_raw + 120320);
+    const int flag_addr = smem + 120320;
+    int* meta = reinterpret_cast<int*>(smem_raw + 120336);
+    const int meta_addr = smem + 120336;
 
-    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 5 barriers)
-    // Mbarriers at smem_raw[0..40)
+    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 7 barriers)
+    // Mbarriers at smem_raw[0..56)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
-            // kv_full: 2 barriers, init_count=1
+            // kv_full: 3 barriers, init_count=1
             mbarrier_init(smem + 0, 1);
             mbarrier_init(smem + 8, 1);
-            // v_full: 2 barriers, init_count=1
             mbarrier_init(smem + 16, 1);
+            // v_full: 3 barriers, init_count=1
             mbarrier_init(smem + 24, 1);
-            // mfull: 1 barriers, init_count=1
             mbarrier_init(smem + 32, 1);
+            mbarrier_init(smem + 40, 1);
+            // mfull: 1 barriers, init_count=1
+            mbarrier_init(smem + 48, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -750,8 +752,8 @@ kernel_cake_hopper_msa_d64de771601dd69d68e8(unsigned int* __restrict__ Q32, cons
     uint64_t _wgmma_b_0_4 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_2 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_2);
     #pragma unroll 1
     for (int j = 0; j < 8; j++) {
-        int stage = j % 2;
-        int phase = j / 2 % 2;
+        int stage = j % 3;
+        int phase = j / 3 % 2;
         int par = j - j / 2 * 2;
         mbarrier_wait(kv_full_addr + (stage) * 8, phase);
         if (j == 0) {
@@ -777,10 +779,32 @@ kernel_cake_hopper_msa_d64de771601dd69d68e8(unsigned int* __restrict__ Q32, cons
                     tma_3d_gmem2smem(kv8_addr + 32768 + 24576, (&V), 0, 64, page_head_1, kv_full_addr + 8);
                 }
             }
+            int slot_0 = split * 8 + 2;
+            int blk_1_1 = meta[slot_0];
+            int page_head_2 = meta[16 + slot_0];
+            int valid_3 = 0;
+            if (blk_1_1 >= 0) {
+                valid_3 = q_pos + 1 - blk_1_1 * 128;
+                if (valid_3 > 128) {
+                    valid_3 = 128;
+                }
+                if (valid_3 < 0) {
+                    valid_3 = 0;
+                }
+            }
+            if (warp == 1) {
+                if (elect_sync()) {
+                    mbarrier_arrive_expect_tx(kv_full_addr + 16, 32768);
+                    tma_3d_gmem2smem(kv8_addr + 65536, (&K), 0, 0, page_head_2, kv_full_addr + 16);
+                    tma_3d_gmem2smem(kv8_addr + 65536 + 8192, (&K), 0, 64, page_head_2, kv_full_addr + 16);
+                    tma_3d_gmem2smem(kv8_addr + 65536 + 16384, (&V), 0, 0, page_head_2, kv_full_addr + 16);
+                    tma_3d_gmem2smem(kv8_addr + 65536 + 24576, (&V), 0, 64, page_head_2, kv_full_addr + 16);
+                }
+            }
         }
         int slot_2 = split * 8 + j;
         int blk_3 = meta[slot_2];
-        int page_head_2 = meta[16 + slot_2];
+        int page_head_3 = meta[16 + slot_2];
         int valid_2 = 0;
         if (blk_3 >= 0) {
             valid_2 = q_pos + 1 - blk_3 * 128;
@@ -1782,19 +1806,19 @@ kernel_cake_hopper_msa_d64de771601dd69d68e8(unsigned int* __restrict__ Q32, cons
         av1[30] = dv1[30] + zero_u32;
         av0[31] = dv0[31] + zero_u32;
         av1[31] = dv1[31] + zero_u32;
-        int nxt = j + 2;
+        int nxt = j + 3;
         if (nxt < 8) {
-            int slot_0 = split * 8 + nxt;
-            int blk_1_1 = meta[slot_0];
-            int page_head_2_1 = meta[16 + slot_0];
-            int valid_3 = 0;
-            if (blk_1_1 >= 0) {
-                valid_3 = q_pos + 1 - blk_1_1 * 128;
-                if (valid_3 > 128) {
-                    valid_3 = 128;
+            int slot_0_1 = split * 8 + nxt;
+            int blk_1_2 = meta[slot_0_1];
+            int page_head_2_1 = meta[16 + slot_0_1];
+            int valid_3_1 = 0;
+            if (blk_1_2 >= 0) {
+                valid_3_1 = q_pos + 1 - blk_1_2 * 128;
+                if (valid_3_1 > 128) {
+                    valid_3_1 = 128;
                 }
-                if (valid_3 < 0) {
-                    valid_3 = 0;
+                if (valid_3_1 < 0) {
+                    valid_3_1 = 0;
                 }
             }
             if (warp == 1) {
@@ -2049,6 +2073,7 @@ kernel_cake_hopper_msa_d64de771601dd69d68e8(unsigned int* __restrict__ Q32, cons
         merge = 1;
         if (warp == 0) {
             if (elect_sync()) {
+                asm volatile("fence.proxy.async.global;" ::: "memory");
                 mbarrier_arrive_expect_tx(mfull_addr, 8448);
                 cp_async_bulk_gmem2smem(kv8_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(part_o) + ((unsigned long long)(item * 2048) * (unsigned long long)4)), 8192, mfull_addr);
                 cp_async_bulk_gmem2smem(p16_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(part_ml) + ((unsigned long long)(item * 64) * (unsigned long long)4)), 256, mfull_addr);
