@@ -486,6 +486,31 @@ def test_paged_prefill_default_scale_layout_lse(
         rtol=2e-3,
     )
 
+    # Replanning a captured wrapper requires persistent auxiliary buffers.
+    # The ordinary-wrapper eager checks above exercise its separate contract.
+    ix = ix.to(q.device)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws,
+        layout,
+        backend="cudnn",
+        use_cuda_graph=True,
+        qo_indptr_buf=qo.cuda(),
+        paged_kv_indptr_buf=ip.cuda(),
+        paged_kv_indices_buf=ix.cuda(),
+        paged_kv_last_page_len_buf=last.cuda(),
+    )
+    w.plan(
+        qo, ip, ix, last, 8, 2, 128, 16, causal=True, q_data_type=q.dtype, **metadata
+    )
+    w.run(
+        q,
+        cache,
+        out=out,
+        lse=lse,
+        return_lse=True,
+        lse_base=lse_base,
+        lse_layout=lse_layout,
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         w.run(
