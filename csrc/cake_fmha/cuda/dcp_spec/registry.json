@@ -553,6 +553,30 @@
         ],
         "v_scale": "per_tensor_folded_into_output"
       },
+      "program_variants": {
+        "at_or_above_grid": 1,
+        "below_grid": 1,
+        "bodies": {
+          "1": "cake_fmha_dcp_spec_bf16_fp8_d256_balanced_program1.cu",
+          "2": "cake_fmha_dcp_spec_bf16_fp8_d256_balanced_program2.cu"
+        },
+        "default": 1,
+        "items_lower_bound": "batch_size * num_kv_heads * q_tiles",
+        "key": "program",
+        "rule": "program = static_one_wave when min_chunks <= n_max = ceil(max_pages_per_seq * page_size / chunk_tokens) <= max_chunks and batch_size * num_kv_heads * q_tiles * (n_max + reduce_tickets_per_tile) <= grid (sm_count: one persistent CTA per multiprocessor; q_tiles = ceil(q_len / 4): one work item per (KV head, row tile); the plan-free static ticket assignment, ticket = CTA index, same chunk and fold order as the planner's one-wave plan); else below_grid (= at_or_above_grid: one planner body)",
+        "static_one_wave": 2,
+        "static_one_wave_regime": {
+          "chunk_tokens": 256,
+          "max_chunks": 48,
+          "min_chunks": 5,
+          "page_size": 64,
+          "reduce_tickets_per_tile": 16
+        },
+        "values": [
+          1,
+          2
+        ]
+      },
       "public_name": "cake_fmha_dcp_spec_bf16_fp8_d256_balanced",
       "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced",
       "selector": {
@@ -1196,11 +1220,12 @@
             "Q_BOX_TOKENS": 2
           },
           "selector": {
-            "n_rows": 32
+            "n_rows": 32,
+            "program": 1
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel_program1.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel_program1.cu"
           }
         },
         {
@@ -1209,11 +1234,40 @@
             "Q_BOX_TOKENS": 2
           },
           "selector": {
-            "n_rows": 64
+            "n_rows": 64,
+            "program": 1
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel_program1.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel_program1.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 32,
+            "Q_BOX_TOKENS": 2
+          },
+          "selector": {
+            "n_rows": 32,
+            "program": 2
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel_program2.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel_program2.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 64,
+            "Q_BOX_TOKENS": 2
+          },
+          "selector": {
+            "n_rows": 64,
+            "program": 2
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel_program2.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel_program2.cu"
           }
         }
       ],
