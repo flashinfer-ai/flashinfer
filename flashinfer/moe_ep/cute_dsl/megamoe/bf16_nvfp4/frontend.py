@@ -706,6 +706,8 @@ class MegaMoEBf16Nvfp4SymmBuffer:
     fc2_alpha: torch.Tensor
     _frontend: MegaMoEBf16Nvfp4Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
+    _unfinalized_route_map: Optional[torch.Tensor] = None
+    _unfinalized_weights: Optional[torch.Tensor] = None
     _destroyed: bool = False
     _staging_inputs: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = field(
         default=None, repr=False
@@ -728,6 +730,8 @@ class MegaMoEBf16Nvfp4SymmBuffer:
             for root in self._sym_roots:
                 free_sym_tensor(root)
             self._sym_roots.clear()
+            self._unfinalized_route_map = None
+            self._unfinalized_weights = None
             self._destroyed = True
 
 
