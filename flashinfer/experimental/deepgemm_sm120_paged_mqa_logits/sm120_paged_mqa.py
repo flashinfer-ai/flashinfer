@@ -8,14 +8,22 @@ int32 ``context_lens [B, next_n]`` (the schedule is sized from each request's
 last token, every token masks with its own length) and an int32 ``block_table
 [B, S]`` with unit column stride.
 
-A call is a real TWO-kernel sequence: the single-warp scheduler writes
+Two kernels implement the family: the single-warp scheduler writes
 ``schedule_meta [num_sms + 1, 2]`` and the persistent logits program walks the
-half-open ``(q_atom, kv_split)`` range it finds there.  Both kernels arrive as
-ONE generated prepared-sequence binding, so ``plan.run()`` is a single FFI
-submission with the per-stage programmatic-dependent-launch attributes intact.
-``get_paged_mqa_logits_metadata`` launches the scheduler alone through its own
-standalone program, so it returns a real schedule (unlike the SM100 dense
-family's placeholder).
+half-open ``(q_atom, kv_split)`` range it finds there.  Three submissions are
+delivered, each a single FFI call:
+
+* ``prepare_sm120_paged_mqa_logits`` / :class:`Sm120PagedIndexerPlan` -- the
+  ``(metadata, logits)`` pair as ONE generated prepared-sequence binding (two
+  kernel launches with the per-stage programmatic-dependent-launch attributes
+  intact); the schedule is rebuilt on every ``run()``.
+* ``get_paged_mqa_logits_metadata`` / :class:`Sm120MetadataPlan` -- the
+  scheduler alone through its standalone program: a real schedule (unlike the
+  SM100 dense family's placeholder).
+* ``fp8_paged_mqa_logits`` with a caller schedule /
+  :class:`Sm120PagedLogitsPlan` -- the logits program alone through its
+  standalone program (ONE kernel launch), consuming the schedule the caller
+  built with ``get_paged_mqa_logits_metadata``: DeepGEMM's per-layer contract.
 
 Routes are selected from host-known scalars only: head count, page size and
 ``next_n``.  Output: FP32 ``[B * next_n, paged_logits_stride(max_context_len)]``
@@ -29,6 +37,7 @@ from __future__ import annotations
 import functools
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 CATALOG_SCHEMA = "sm120_paged_mqa.v1"
 CATALOG_FILE = "sm120_paged_mqa_catalog.json"
@@ -106,21 +115,32 @@ def route_name(num_heads, page_kv, next_n, logits_dtype="float32"):
     return f"sm120:fp8:h{int(num_heads)}:p{int(page_kv)}:n{int(next_n)}"
 
 
+def logits_route_name(num_heads, page_kv, next_n, logits_dtype="float32"):
+    """Route of the standalone logits launch that consumes a caller's schedule."""
+    return route_name(num_heads, page_kv, next_n, logits_dtype) + ":logits"
+
+
 def metadata_route_name():
     """Route of the standalone scheduler launch."""
     return str(policy()["metadata_route"])
 
 
 def route_available(num_heads, page_kv, next_n, logits_dtype="float32"):
-    """True when the shipped catalog carries this paged route (host-only)."""
+    """True when the shipped catalog carries this paged route (host-only).
+
+    A route is complete only with both of its deliveries: the ``(metadata,
+    logits)`` prepared sequence and the standalone logits program.
+    """
     try:
         if num_heads not in exported_heads() or page_kv not in exported_page_sizes():
             return False
         next_n_atoms(next_n)
-        route = route_name(num_heads, page_kv, next_n, logits_dtype)
+        sequence = route_name(num_heads, page_kv, next_n, logits_dtype)
+        standalone = logits_route_name(num_heads, page_kv, next_n, logits_dtype)
     except ValueError:
         return False
-    return route in _catalog()["routes"]
+    routes = _catalog()["routes"]
+    return sequence in routes and standalone in routes
 
 
 def paged_logits_stride(max_context_len):
@@ -341,6 +361,24 @@ def _check_schedule_meta(schedule_meta, num_sms, device):
     return schedule_meta
 
 
+def schedule_budget(schedule_meta):
+    """CTA budget a caller-built schedule was sized for: ``shape[0] - 1``.
+
+    Only the shape is a host fact.  Whether the schedule was built for the same
+    ``context_lens`` and ``next_n`` cannot be checked without a synchronisation,
+    so -- as in DeepGEMM -- that stays the caller's contract.
+    """
+    if (
+        schedule_meta.ndim != 2
+        or int(schedule_meta.shape[1]) != 2
+        or int(schedule_meta.shape[0]) < 2
+    ):
+        raise ValueError(
+            "schedule_meta must be int32 [num_sms + 1, 2] from get_paged_mqa_logits_metadata"
+        )
+    return int(schedule_meta.shape[0]) - 1
+
+
 def fused_cache_rows(kv_cache, page_kv=None):
     """``(fused_2d, pages, page_kv, block_stride_bytes)`` of the fused uint8 KV cache.
 
@@ -526,6 +564,127 @@ class Sm120MetadataPlan:
         return self.schedule_meta
 
 
+def _paged_operands(
+    q,
+    kv_cache,
+    weights,
+    context_lens,
+    block_table,
+    max_context_len,
+    *,
+    page_kv,
+    logits_dtype,
+    sm_count,
+):
+    """Validate the paged operands shared by both logits plans and resolve the route facts.
+
+    Returns a namespace with the device facts (``arch``, ``num_sms``), the
+    geometry (``batch``, ``next_n``, ``num_heads``, ``page_kv``, ``pages``,
+    ``block_stride_bytes``, ``max_context_len``, ``rows``, ``stride``), the fused
+    2-D cache view and the operand tensors to retain.
+    """
+    import torch
+
+    arch, num_sms = _resolve_device(q, sm_count)
+    batch, next_n = _check_context_lens(context_lens)
+    if (
+        q.ndim != 4
+        or tuple(q.shape[:2]) != (batch, next_n)
+        or int(q.shape[3]) != HEAD_DIM
+    ):
+        raise ValueError(
+            "q must be [B, next_n, H, 128] matching context_lens [B, next_n]"
+        )
+    num_heads = int(q.shape[2])
+    if num_heads not in exported_heads():
+        raise ValueError(
+            f"q has {num_heads} heads; exported head counts: {exported_heads()}"
+        )
+    if q.dtype != torch.float8_e4m3fn or not q.is_contiguous():
+        raise ValueError("q must be contiguous E4M3")
+    fused, pages, page_kv, block_stride_bytes = fused_cache_rows(kv_cache, page_kv)
+    if page_kv not in exported_page_sizes():
+        raise ValueError(
+            f"page_kv {page_kv} is not exported; exported page sizes: {exported_page_sizes()}"
+        )
+    rows = batch * next_n
+    if (
+        weights.dtype != torch.float32
+        or tuple(weights.shape) != (rows, num_heads)
+        or not weights.is_contiguous()
+    ):
+        raise ValueError("weights must be contiguous FP32 [B * next_n, H]")
+    if (
+        block_table.ndim != 2
+        or block_table.dtype != torch.int32
+        or int(block_table.shape[0]) != batch
+        or int(block_table.stride(1)) != 1
+    ):
+        raise ValueError("block_table must be int32 [B, S] with unit column stride")
+    max_context_len = int(max_context_len)
+    if max_context_len < 1 or max_context_len > int(block_table.shape[1]) * page_kv:
+        raise ValueError("max_context_len must be in 1..S * page_kv")
+    if not route_available(num_heads, page_kv, next_n, logits_dtype):
+        raise ValueError(
+            f"no exported SM120 paged MQA route for {num_heads} heads, page "
+            f"{page_kv}, next_n {next_n}, {logits_dtype}"
+        )
+    tensors = (q, kv_cache, weights, context_lens, block_table)
+    if any(tensor.device != q.device for tensor in tensors):
+        raise ValueError("all inputs must be on one CUDA device")
+    stride = paged_logits_stride(max_context_len)
+    if rows * stride >= 2**31:
+        raise ValueError("the logits element index must fit in int32")
+    return SimpleNamespace(
+        arch=arch,
+        num_sms=num_sms,
+        batch=batch,
+        next_n=next_n,
+        num_heads=num_heads,
+        page_kv=page_kv,
+        pages=pages,
+        block_stride_bytes=block_stride_bytes,
+        max_context_len=max_context_len,
+        rows=rows,
+        stride=stride,
+        fused=fused,
+        tensors=tensors,
+    )
+
+
+def _check_output(output, rows, stride, device):
+    """The FP32 ``[rows, stride]`` logits buffer: allocated when ``None``."""
+    import torch
+
+    if output is None:
+        return torch.empty((rows, stride), dtype=torch.float32, device=device)
+    if (
+        output.dtype != torch.float32
+        or tuple(output.shape) != (rows, stride)
+        or output.device != device
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            "output must be contiguous FP32 [B * next_n, paged_logits_stride(max_context_len)]"
+        )
+    return output
+
+
+def _adopt_operands(plan, operands):
+    plan.arch, plan.num_sms, plan.num_heads = (
+        operands.arch,
+        operands.num_sms,
+        operands.num_heads,
+    )
+    plan.page_kv, plan.next_n, plan.batch = (
+        operands.page_kv,
+        operands.next_n,
+        operands.batch,
+    )
+    plan.pages, plan.block_stride_bytes = operands.pages, operands.block_stride_bytes
+    plan.max_context_len = operands.max_context_len
+
+
 class Sm120PagedIndexerPlan:
     """Bind the paged operands for repeated two-kernel logits submissions.
 
@@ -565,77 +724,28 @@ class Sm120PagedIndexerPlan:
     ):
         import torch
 
-        arch, num_sms = _resolve_device(q, sm_count)
-        batch, next_n = _check_context_lens(context_lens)
-        if (
-            q.ndim != 4
-            or tuple(q.shape[:2]) != (batch, next_n)
-            or int(q.shape[3]) != HEAD_DIM
-        ):
-            raise ValueError(
-                "q must be [B, next_n, H, 128] matching context_lens [B, next_n]"
-            )
-        num_heads = int(q.shape[2])
-        if num_heads not in exported_heads():
-            raise ValueError(
-                f"q has {num_heads} heads; exported head counts: {exported_heads()}"
-            )
-        if q.dtype != torch.float8_e4m3fn or not q.is_contiguous():
-            raise ValueError("q must be contiguous E4M3")
-        fused, pages, page_kv, block_stride_bytes = fused_cache_rows(kv_cache, page_kv)
-        if page_kv not in exported_page_sizes():
-            raise ValueError(
-                f"page_kv {page_kv} is not exported; exported page sizes: {exported_page_sizes()}"
-            )
-        rows = batch * next_n
-        if (
-            weights.dtype != torch.float32
-            or tuple(weights.shape) != (rows, num_heads)
-            or not weights.is_contiguous()
-        ):
-            raise ValueError("weights must be contiguous FP32 [B * next_n, H]")
-        if (
-            block_table.ndim != 2
-            or block_table.dtype != torch.int32
-            or int(block_table.shape[0]) != batch
-            or int(block_table.stride(1)) != 1
-        ):
-            raise ValueError("block_table must be int32 [B, S] with unit column stride")
-        max_context_len = int(max_context_len)
-        if max_context_len < 1 or max_context_len > int(block_table.shape[1]) * page_kv:
-            raise ValueError("max_context_len must be in 1..S * page_kv")
-        if not route_available(num_heads, page_kv, next_n, logits_dtype):
-            raise ValueError(
-                f"no exported SM120 paged MQA route for {num_heads} heads, page "
-                f"{page_kv}, next_n {next_n}, {logits_dtype}"
-            )
-        tensors = [q, kv_cache, weights, context_lens, block_table]
-        if any(tensor.device != q.device for tensor in tensors):
-            raise ValueError("all inputs must be on one CUDA device")
-        stride = paged_logits_stride(max_context_len)
-        if rows * stride >= 2**31:
-            raise ValueError("the logits element index must fit in int32")
-        if output is None:
-            output = torch.empty((rows, stride), dtype=torch.float32, device=q.device)
-        if (
-            output.dtype != torch.float32
-            or tuple(output.shape) != (rows, stride)
-            or output.device != q.device
-            or not output.is_contiguous()
-        ):
-            raise ValueError(
-                "output must be contiguous FP32 [B * next_n, paged_logits_stride(max_context_len)]"
-            )
+        operands = _paged_operands(
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_table,
+            max_context_len,
+            page_kv=page_kv,
+            logits_dtype=logits_dtype,
+            sm_count=sm_count,
+        )
+        num_sms = operands.num_sms
+        output = _check_output(output, operands.rows, operands.stride, q.device)
         if schedule_meta is None:
             schedule_meta = torch.empty(
                 metadata_shape(num_sms), dtype=torch.int32, device=q.device
             )
         _check_schedule_meta(schedule_meta, num_sms, q.device)
-        self.arch, self.num_sms, self.num_heads = arch, num_sms, num_heads
-        self.page_kv, self.next_n, self.batch = page_kv, next_n, batch
-        self.pages, self.block_stride_bytes = pages, block_stride_bytes
-        self.max_context_len = max_context_len
-        self.route_name = route_name(num_heads, page_kv, next_n, logits_dtype)
+        _adopt_operands(self, operands)
+        self.route_name = route_name(
+            operands.num_heads, operands.page_kv, operands.next_n, logits_dtype
+        )
         self.route = _catalog()["routes"][self.route_name]
         stages = list(self.route["stages"])
         if [stage for stage, _program in stages] != ["metadata", "logits"]:
@@ -646,7 +756,7 @@ class Sm120PagedIndexerPlan:
             "metadata": metadata_bindings(context_lens, schedule_meta, num_sms=num_sms),
             "logits": logits_bindings(
                 q,
-                fused,
+                operands.fused,
                 weights,
                 context_lens,
                 block_table,
@@ -662,12 +772,12 @@ class Sm120PagedIndexerPlan:
             )
         self._submissions, self._programs = [], []
         self.program_names = [sequence]
-        submit, loaded = _submission(arch, sequence, bindings, stage=None)
+        submit, loaded = _submission(operands.arch, sequence, bindings, stage=None)
         self._submissions.append(submit)
         self._programs.append(loaded)
         self.output, self.schedule_meta = output, schedule_meta
-        self.logical_output = output[:, :max_context_len]
-        self._retained = (*tensors, fused, output, schedule_meta)
+        self.logical_output = output[:, : operands.max_context_len]
+        self._retained = (*operands.tensors, operands.fused, output, schedule_meta)
 
     @property
     def launch_count(self):
@@ -681,6 +791,109 @@ class Sm120PagedIndexerPlan:
 
     def run(self):
         """Submit the (metadata, logits) sequence on the current PyTorch stream."""
+        import tvm_ffi
+
+        with tvm_ffi.use_torch_stream():
+            for entry, args in self._submissions:
+                entry(*args)
+        return self.logical_output
+
+
+class Sm120PagedLogitsPlan:
+    """Bind the paged operands and a caller-built schedule for one-kernel submissions.
+
+    The operands are those of :class:`Sm120PagedIndexerPlan`; ``schedule_meta``
+    is the int32 ``[num_sms + 1, 2]`` buffer :func:`get_paged_mqa_logits_metadata`
+    built, and its first dimension IS the CTA budget: the logits grid launches
+    exactly ``num_sms`` CTAs and each walks the half-open range the schedule
+    assigns it.  ``run()`` submits the logits program alone (one FFI call, one
+    kernel launch) on the current stream and returns ``logical_output``.
+
+    Contract (DeepGEMM's): the schedule must have been built for the same
+    ``context_lens`` (each request's last token), the same ``next_n`` and this
+    budget.  No device-side check is possible without a synchronisation, so a
+    stale or foreign schedule yields unspecified logits rather than an error;
+    rebuild it with ``get_paged_mqa_logits_metadata`` whenever the context
+    lengths change.  Buffer contents may change between runs, including CUDA
+    Graph replay (the schedule is read on every run).
+    """
+
+    def __init__(
+        self,
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_context_len,
+        *,
+        page_kv=None,
+        output=None,
+        logits_dtype="float32",
+    ):
+        num_sms = schedule_budget(schedule_meta)
+        operands = _paged_operands(
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_table,
+            max_context_len,
+            page_kv=page_kv,
+            logits_dtype=logits_dtype,
+            sm_count=num_sms,
+        )
+        _check_schedule_meta(schedule_meta, num_sms, q.device)
+        output = _check_output(output, operands.rows, operands.stride, q.device)
+        _adopt_operands(self, operands)
+        self.route_name = logits_route_name(
+            operands.num_heads, operands.page_kv, operands.next_n, logits_dtype
+        )
+        self.route = _catalog()["routes"][self.route_name]
+        stages = list(self.route["stages"])
+        if [stage for stage, _program in stages] != ["logits"]:
+            raise ValueError(
+                f"route {self.route_name} must be the single logits stage, catalog has {stages}"
+            )
+        if self.route.get("sequence"):
+            raise ValueError(f"route {self.route_name} must not be a prepared sequence")
+        bindings = {
+            "logits": logits_bindings(
+                q,
+                operands.fused,
+                weights,
+                context_lens,
+                block_table,
+                schedule_meta,
+                output,
+                num_sms=num_sms,
+            ),
+        }
+        self._submissions, self._programs = [], []
+        self.program_names = [program for _stage, program in stages]
+        for stage_name, program in stages:
+            submit, loaded = _submission(
+                operands.arch, program, bindings, stage=stage_name
+            )
+            self._submissions.append(submit)
+            self._programs.append(loaded)
+        self.output, self.schedule_meta = output, schedule_meta
+        self.logical_output = output[:, : operands.max_context_len]
+        self._retained = (*operands.tensors, operands.fused, output, schedule_meta)
+
+    @property
+    def launch_count(self):
+        """FFI submissions ``run()`` issues (one)."""
+        return len(self._submissions)
+
+    @property
+    def kernel_launches(self):
+        """Kernel launches per submission: the logits program alone."""
+        return int(self.route["kernel_launches"])
+
+    def run(self):
+        """Submit the logits program on the current PyTorch stream."""
         import tvm_ffi
 
         with tvm_ffi.use_torch_stream():
@@ -712,6 +925,56 @@ def get_paged_mqa_logits_metadata(
     return Sm120MetadataPlan(context_lens, page_kv, num_sms, out=out).run()
 
 
+def one_shot_plan(
+    q,
+    kv_cache,
+    weights,
+    context_lens,
+    block_table,
+    schedule_meta,
+    max_context_len,
+    clean_logits=False,
+    indices=None,
+    *,
+    page_kv=None,
+):
+    """The plan :func:`fp8_paged_mqa_logits` submits for these arguments.
+
+    With a ``schedule_meta`` it is an :class:`Sm120PagedLogitsPlan`: the logits
+    program alone consumes the caller's schedule (one kernel launch).  With
+    ``None`` it is an :class:`Sm120PagedIndexerPlan` for the device's SM count:
+    the ``(metadata, logits)`` sequence builds the schedule (two launches).
+    Either way the output is a fresh row-padded buffer.  Exposed so a caller or
+    test can see what the one-shot entry launches without a profiler.
+    """
+    if clean_logits:
+        raise ValueError(
+            "clean_logits=True is not supported with [B, next_n] context_lens (DeepGEMM semantics)"
+        )
+    if indices is not None:
+        raise ValueError("indices (variable-length request selection) is unsupported")
+    if schedule_meta is None:
+        return Sm120PagedIndexerPlan(
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_table,
+            max_context_len,
+            page_kv=page_kv,
+        )
+    return Sm120PagedLogitsPlan(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_context_len,
+        page_kv=page_kv,
+    )
+
+
 def fp8_paged_mqa_logits(
     q,
     kv_cache,
@@ -729,45 +992,28 @@ def fp8_paged_mqa_logits(
 
     ``schedule_meta`` is the int32 ``[num_sms + 1, 2]`` buffer from
     :func:`get_paged_mqa_logits_metadata`: its first dimension fixes the CTA
-    budget, and the call REBUILDS it in the same sequence before the logits
-    program reads it (the schedule is a pure function of ``context_lens``,
-    ``split_kv``, ``next_n`` and the budget, so a buffer produced by the
-    metadata entry on the same inputs is rewritten with identical bytes).
-    ``None`` selects the device's SM count and an internal buffer.
-    ``clean_logits=True`` is rejected for two-dimensional context lengths
-    exactly as DeepGEMM does; ``indices`` must be ``None``.  Returns the FP32
-    ``[B * next_n, max_context_len]`` view of a freshly allocated row-padded
-    buffer.
+    budget and the call submits the logits program ALONE -- one kernel launch
+    consuming that schedule, as DeepGEMM does.  The schedule must have been
+    built for the same ``context_lens``, ``next_n`` and budget (the caller's
+    contract; it cannot be checked on the device without a synchronisation).
+    ``None`` selects the device's SM count and builds the schedule in the
+    ``(metadata, logits)`` sequence (two launches).  ``clean_logits=True`` is
+    rejected for two-dimensional context lengths exactly as DeepGEMM does;
+    ``indices`` must be ``None``.  Returns the FP32 ``[B * next_n,
+    max_context_len]`` view of a freshly allocated row-padded buffer.
     """
-    if clean_logits:
-        raise ValueError(
-            "clean_logits=True is not supported with [B, next_n] context_lens (DeepGEMM semantics)"
-        )
-    if indices is not None:
-        raise ValueError("indices (variable-length request selection) is unsupported")
-    num_sms = None
-    if schedule_meta is not None:
-        if (
-            schedule_meta.ndim != 2
-            or int(schedule_meta.shape[1]) != 2
-            or int(schedule_meta.shape[0]) < 2
-        ):
-            raise ValueError(
-                "schedule_meta must be int32 [num_sms + 1, 2] (get_paged_mqa_logits_metadata) or None"
-            )
-        num_sms = int(schedule_meta.shape[0]) - 1
-    plan = Sm120PagedIndexerPlan(
+    return one_shot_plan(
         q,
         kv_cache,
         weights,
         context_lens,
         block_table,
+        schedule_meta,
         max_context_len,
+        clean_logits=clean_logits,
+        indices=indices,
         page_kv=page_kv,
-        schedule_meta=schedule_meta,
-        sm_count=num_sms,
-    )
-    return plan.run()
+    ).run()
 
 
 def prepare_sm120_paged_mqa_logits(
