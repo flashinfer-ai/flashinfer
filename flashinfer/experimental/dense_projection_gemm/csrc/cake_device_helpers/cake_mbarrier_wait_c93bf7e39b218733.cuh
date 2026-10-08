@@ -23,15 +23,16 @@
 // suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
 // explicit loop still makes this helper blocking until acquire succeeds.
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE;\n\t"
-        "bra.uni LAB_WAIT;\n\t"
-        "DONE:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      "LAB_WAIT:\n\t"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+      " P1, [%0], %1;\n\t"
+      "@P1 bra.uni DONE;\n\t"
+      "bra.uni LAB_WAIT;\n\t"
+      "DONE:\n\t"
+      "}\n" ::"r"(mbar_addr),
+      "r"(phase)
+      : "memory");
 }

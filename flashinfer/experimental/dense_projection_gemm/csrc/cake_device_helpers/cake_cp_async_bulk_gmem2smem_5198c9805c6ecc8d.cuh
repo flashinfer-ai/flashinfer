@@ -19,11 +19,11 @@
 // after its typedefs and the helpers it calls.
 #pragma once
 
-__device__ __forceinline__ void cp_async_bulk_gmem2smem(
-    unsigned smem_addr, const void* gmem_ptr, unsigned bytes, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
-        " [%0], [%1], %2, [%3];"
-        :: "r"(smem_addr), "l"(gmem_ptr), "r"(bytes), "r"(mbar_addr)
-        : "memory");
+__device__ __forceinline__ void cp_async_bulk_gmem2smem(unsigned smem_addr, const void* gmem_ptr,
+                                                        unsigned bytes, int mbar_addr) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+      " [%0], [%1], %2, [%3];" ::"r"(smem_addr),
+      "l"(gmem_ptr), "r"(bytes), "r"(mbar_addr)
+      : "memory");
 }

@@ -20,12 +20,13 @@
 #pragma once
 
 __device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred leader;\n\t"
-        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-        "@leader tcgen05.commit.cta_group::2.mbarrier::arrive::one"
-        ".shared::cluster.multicast::cluster.b64 [%0], %1;\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "h"(cta_mask) : "memory");
+  asm volatile(
+      "{\n\t"
+      ".reg .pred leader;\n\t"
+      "elect.sync _|leader, 0xFFFFFFFF;\n\t"
+      "@leader tcgen05.commit.cta_group::2.mbarrier::arrive::one"
+      ".shared::cluster.multicast::cluster.b64 [%0], %1;\n\t"
+      "}\n" ::"r"(mbar_addr),
+      "h"(cta_mask)
+      : "memory");
 }

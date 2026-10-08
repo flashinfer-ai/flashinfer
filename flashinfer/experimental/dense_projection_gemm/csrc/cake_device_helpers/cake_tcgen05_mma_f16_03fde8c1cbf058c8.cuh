@@ -19,16 +19,14 @@
 // after its typedefs and the helpers it calls.
 #pragma once
 
-__device__ __forceinline__ void tcgen05_mma_f16(
-    int taddr, uint64_t a_desc, uint64_t b_desc,
-    uint32_t i_desc, int enable_input_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t"
-        "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(enable_input_d)
-         : "memory");
+__device__ __forceinline__ void tcgen05_mma_f16(int taddr, uint64_t a_desc, uint64_t b_desc,
+                                                uint32_t i_desc, int enable_input_d) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t"
+      "}\n" ::"r"(taddr),
+      "l"(a_desc), "l"(b_desc), "r"(i_desc), "r"(enable_input_d)
+      : "memory");
 }

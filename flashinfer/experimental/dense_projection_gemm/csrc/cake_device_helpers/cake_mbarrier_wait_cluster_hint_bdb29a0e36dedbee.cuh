@@ -19,17 +19,18 @@
 // after its typedefs and the helpers it calls.
 #pragma once
 
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
+__device__ __forceinline__ void mbarrier_wait_cluster_hint(int mbar_addr, int phase,
+                                                           uint32_t suspend_time_hint) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      "LAB_WAIT_CLUSTER_HINT:\n\t"
+      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+      " P1, [%0], %1, %2;\n\t"
+      "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
+      "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
+      "DONE_CLUSTER_HINT:\n\t"
+      "}\n" ::"r"(mbar_addr),
+      "r"(phase), "r"(suspend_time_hint)
+      : "memory");
 }

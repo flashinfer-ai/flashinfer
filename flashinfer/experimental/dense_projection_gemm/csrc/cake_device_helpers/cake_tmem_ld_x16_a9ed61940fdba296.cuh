@@ -20,13 +20,12 @@
 #pragma once
 
 __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x16.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7,"
-        "  %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
-        : "=f"(dst[0]),  "=f"(dst[1]),  "=f"(dst[2]),  "=f"(dst[3]),
-          "=f"(dst[4]),  "=f"(dst[5]),  "=f"(dst[6]),  "=f"(dst[7]),
-          "=f"(dst[8]),  "=f"(dst[9]),  "=f"(dst[10]), "=f"(dst[11]),
-          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15])
-        : "r"(tmem_addr));
+  asm volatile(
+      "tcgen05.ld.sync.aligned.32x32b.x16.b32"
+      " {%0, %1, %2, %3, %4, %5, %6, %7,"
+      "  %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+      : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]), "=f"(dst[4]), "=f"(dst[5]),
+        "=f"(dst[6]), "=f"(dst[7]), "=f"(dst[8]), "=f"(dst[9]), "=f"(dst[10]), "=f"(dst[11]),
+        "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15])
+      : "r"(tmem_addr));
 }

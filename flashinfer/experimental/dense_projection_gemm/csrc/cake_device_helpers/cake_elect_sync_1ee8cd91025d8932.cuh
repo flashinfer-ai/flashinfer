@@ -20,14 +20,14 @@
 #pragma once
 
 __device__ __forceinline__ uint32_t elect_sync() {
-    uint32_t pred = 0;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred %%px;\n\t"
-        "elect.sync _|%%px, %1;\n\t"
-        "@%%px mov.s32 %0, 1;\n\t"
-        "}\n"
-        : "+r"(pred)
-        : "r"(0xFFFFFFFF));
-    return pred;
+  uint32_t pred = 0;
+  asm volatile(
+      "{\n\t"
+      ".reg .pred %%px;\n\t"
+      "elect.sync _|%%px, %1;\n\t"
+      "@%%px mov.s32 %0, 1;\n\t"
+      "}\n"
+      : "+r"(pred)
+      : "r"(0xFFFFFFFF));
+  return pred;
 }

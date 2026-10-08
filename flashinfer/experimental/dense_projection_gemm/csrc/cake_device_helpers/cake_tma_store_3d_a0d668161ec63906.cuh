@@ -19,10 +19,11 @@
 // after its typedefs and the helpers it calls.
 #pragma once
 
-__device__ __forceinline__ void tma_store_3d(
-    const void *tmap, int x, int y, int z, unsigned smem_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
-        " [%0, {%1, %2, %3}], [%4];"
-        :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(smem_addr) : "memory");
+__device__ __forceinline__ void tma_store_3d(const void* tmap, int x, int y, int z,
+                                             unsigned smem_addr) {
+  asm volatile(
+      "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
+      " [%0, {%1, %2, %3}], [%4];" ::"l"(tmap),
+      "r"(x), "r"(y), "r"(z), "r"(smem_addr)
+      : "memory");
 }

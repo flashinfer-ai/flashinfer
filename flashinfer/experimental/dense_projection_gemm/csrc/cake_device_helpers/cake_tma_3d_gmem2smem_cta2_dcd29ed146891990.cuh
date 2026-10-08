@@ -19,12 +19,12 @@
 // after its typedefs and the helpers it calls.
 #pragma once
 
-__device__ __forceinline__ void tma_3d_gmem2smem_cta2(
-    int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cluster.global"
-        ".mbarrier::complete_tx::bytes.cta_group::2"
-        " [%0], [%1, {%2, %3, %4}], [%5];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
-           "r"(mbar_addr) : "memory");
+__device__ __forceinline__ void tma_3d_gmem2smem_cta2(int dst, const void* tmap_ptr, int x, int y,
+                                                      int z, int mbar_addr) {
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cluster.global"
+      ".mbarrier::complete_tx::bytes.cta_group::2"
+      " [%0], [%1, {%2, %3, %4}], [%5];" ::"r"(dst),
+      "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr)
+      : "memory");
 }
