@@ -402,11 +402,11 @@ class Sm100PersistentDenseGemmKernel:
             num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_id)),
         )
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],
             is_two_cta=use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
         # Cluster arrive after barrier init
@@ -642,7 +642,7 @@ class Sm100PersistentDenseGemmKernel:
                 tCgC[((None, None), 0, 0, None, None, None)], epi_tile
             )
             tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
-            tTR_rAcc = cute.make_fragment(
+            tTR_rAcc = cute.make_rmem_tensor(
                 tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
             )
 
@@ -653,7 +653,7 @@ class Sm100PersistentDenseGemmKernel:
             tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
             thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
             tRS_sC = thr_copy_r2s.partition_D(sC)
-            tTR_rC = cute.make_fragment(tTR_rAcc.shape, self.c_dtype)
+            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tRS_rC = tiled_copy_r2s.retile(tTR_rC)
 
             # SMEM -> GMEM TMA store setup
@@ -873,6 +873,9 @@ class Sm100PersistentDenseGemmKernel:
         c_major: str,
     ) -> bool:
         """Check if the gemm can be implemented."""
+        # wrapper() assumes K-major A/B
+        if a_major != "k" or b_major != "k" or min(m, n, k, batch_size) <= 0:
+            return False
         if not Sm100PersistentDenseGemmKernel.check_supported_dtypes(
             ab_dtype, ab_dtype, acc_dtype, c_dtype
         ):
