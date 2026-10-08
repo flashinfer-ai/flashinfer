@@ -1020,9 +1020,13 @@ def sampling_from_logits(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        The output row index also feeds the Philox subsequence: moving the same seed
-        and offset to a different batch slot changes the RNG stream, so per-row seeds
-        do not make sampling invariant to batch position.
+        When either seed or offset has one element per output row (length > 1),
+        RNG streams depend only on those values, not on the output row index.
+        Moving a request's distribution and RNG values together preserves its draw
+        for the same sampling operation, including when sampled alone. Identical
+        seed/offset pairs use the same random stream; use distinct pairs for
+        independent requests. Scalar and length-one-only inputs retain the shared
+        RNG behavior, whose Philox subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1110,9 +1114,13 @@ def sampling_from_probs(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        The output row index also feeds the Philox subsequence: moving the same seed
-        and offset to a different batch slot changes the RNG stream, so per-row seeds
-        do not make sampling invariant to batch position.
+        When either seed or offset has one element per output row (length > 1),
+        RNG streams depend only on those values, not on the output row index.
+        Moving a request's distribution and RNG values together preserves its draw
+        for the same sampling operation, including when sampled alone. Identical
+        seed/offset pairs use the same random stream; use distinct pairs for
+        independent requests. Scalar and length-one-only inputs retain the shared
+        RNG behavior, whose Philox subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1231,9 +1239,13 @@ def top_p_sampling_from_probs(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        The output row index also feeds the Philox subsequence: moving the same seed
-        and offset to a different batch slot changes the RNG stream, so per-row seeds
-        do not make sampling invariant to batch position.
+        When either seed or offset has one element per output row (length > 1),
+        RNG streams depend only on those values, not on the output row index.
+        Moving a request's distribution and RNG values together preserves its draw
+        for the same sampling operation, including when sampled alone. Identical
+        seed/offset pairs use the same random stream; use distinct pairs for
+        independent requests. Scalar and length-one-only inputs retain the shared
+        RNG behavior, whose Philox subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1361,9 +1373,13 @@ def top_k_sampling_from_probs(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        The output row index also feeds the Philox subsequence: moving the same seed
-        and offset to a different batch slot changes the RNG stream, so per-row seeds
-        do not make sampling invariant to batch position.
+        When either seed or offset has one element per output row (length > 1),
+        RNG streams depend only on those values, not on the output row index.
+        Moving a request's distribution and RNG values together preserves its draw
+        for the same sampling operation, including when sampled alone. Identical
+        seed/offset pairs use the same random stream; use distinct pairs for
+        independent requests. Scalar and length-one-only inputs retain the shared
+        RNG behavior, whose Philox subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1492,9 +1508,13 @@ def min_p_sampling_from_probs(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        The output row index also feeds the Philox subsequence: moving the same seed
-        and offset to a different batch slot changes the RNG stream, so per-row seeds
-        do not make sampling invariant to batch position.
+        When either seed or offset has one element per output row (length > 1),
+        RNG streams depend only on those values, not on the output row index.
+        Moving a request's distribution and RNG values together preserves its draw
+        for the same sampling operation, including when sampled alone. Identical
+        seed/offset pairs use the same random stream; use distinct pairs for
+        independent requests. Scalar and length-one-only inputs retain the shared
+        RNG behavior, whose Philox subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1716,9 +1736,13 @@ def top_k_top_p_sampling_from_logits(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        The output row index also feeds the Philox subsequence: moving the same seed
-        and offset to a different batch slot changes the RNG stream, so per-row seeds
-        do not make sampling invariant to batch position.
+        When either seed or offset has one element per output row (length > 1),
+        RNG streams depend only on those values, not on the output row index.
+        Moving a request's distribution and RNG values together preserves its draw
+        for the same sampling operation, including when sampled alone. Identical
+        seed/offset pairs use the same random stream; use distinct pairs for
+        independent requests. Scalar and length-one-only inputs retain the shared
+        RNG behavior, whose Philox subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1885,9 +1909,13 @@ def top_k_top_p_sampling_from_probs(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        The output row index also feeds the Philox subsequence: moving the same seed
-        and offset to a different batch slot changes the RNG stream, so per-row seeds
-        do not make sampling invariant to batch position.
+        When either seed or offset has one element per output row (length > 1),
+        RNG streams depend only on those values, not on the output row index.
+        Moving a request's distribution and RNG values together preserves its draw
+        for the same sampling operation, including when sampled alone. Identical
+        seed/offset pairs use the same random stream; use distinct pairs for
+        independent requests. Scalar and length-one-only inputs retain the shared
+        RNG behavior, whose Philox subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -2299,9 +2327,13 @@ def chain_speculative_sampling(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        The output row index also feeds the Philox subsequence: moving the same seed
-        and offset to a different batch slot changes the RNG stream, so per-row seeds
-        do not make sampling invariant to batch position.
+        When either seed or offset has one element per output row (length > 1),
+        RNG streams depend only on those values, not on the output row index.
+        Moving a request's distribution and RNG values together preserves its draw
+        for the same sampling operation, including when sampled alone. Identical
+        seed/offset pairs use the same random stream; use distinct pairs for
+        independent requests. Scalar and length-one-only inputs retain the shared
+        RNG behavior, whose Philox subsequence includes the output row index.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:

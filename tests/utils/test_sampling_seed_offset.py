@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Per-output RNG tensors must match scalar RNG values at the same output row."""
+"""Per-output RNG tensors must follow requests across batch layouts."""
 
 from functools import partial
 
@@ -32,13 +32,17 @@ SAMPLERS = [
     "min_p",
     "top_k_top_p",
     "top_k_top_p_logits",
+    "top_k_top_p_sequential",
+    "top_k_top_p_logits_sequential",
 ]
 RNG_SHAPES = [(4, 4), (1, 4), (4, 1), (1, 1)]
 
 
-def _sampler(name, indexed):
+def _sampler(name, indexed, vocab_size=257):
     generator = torch.Generator(device="cuda").manual_seed(42)
-    logits = torch.randn(3 if indexed else 4, 257, device="cuda", generator=generator)
+    logits = torch.randn(
+        3 if indexed else 4, vocab_size, device="cuda", generator=generator
+    )
     probs = torch.softmax(logits, dim=-1)
     # RNG arrays describe output rows, including repeated/gathered input rows.
     indices = (
@@ -57,21 +61,17 @@ def _sampler(name, indexed):
         return partial(sampling.top_p_sampling_from_probs, probs, 0.8, **common)
     if name == "min_p":
         return partial(sampling.min_p_sampling_from_probs, probs, 0.1, **common)
-    if name == "top_k_top_p":
-        return partial(
-            sampling.top_k_top_p_sampling_from_probs,
-            probs,
-            100,
-            0.8,
-            filter_apply_order="joint",
-            **common,
-        )
+    function = (
+        sampling.top_k_top_p_sampling_from_logits
+        if "logits" in name
+        else sampling.top_k_top_p_sampling_from_probs
+    )
     return partial(
-        sampling.top_k_top_p_sampling_from_logits,
-        logits,
+        function,
+        logits if "logits" in name else probs,
         100,
         0.8,
-        filter_apply_order="joint",
+        filter_apply_order="top_k_first" if name.endswith("sequential") else "joint",
         **common,
     )
 
@@ -85,20 +85,56 @@ def _rng_tensors(seed_size, offset_size, dtype):
     )
 
 
-def _assert_scalar_reference(sample, actual, seed, offset):
-    # Keep the full output batch in each reference call: the existing Philox
-    # subsequence includes the output row, even when explicit seeds are supplied.
+def _select_rows(sample, rows):
+    """Select output rows without changing their input distributions."""
+    kwargs = dict(sample.keywords)
+    if kwargs.get("indices") is not None:
+        kwargs["indices"] = kwargs["indices"][rows].contiguous()
+        args = sample.args
+    else:
+        args = tuple(
+            arg[rows].contiguous() if isinstance(arg, torch.Tensor) else arg
+            for arg in sample.args
+        )
+    return partial(sample.func, *args, **kwargs)
+
+
+def _assert_rng_reference(sample, actual, seed, offset):
+    # Per-row RNG must match sampling that request alone. Broadcast-only RNG
+    # retains the legacy output-row subsequence and its scalar reference.
     seeds = seed.cpu().tolist()
     offsets = offset.cpu().tolist()
     outputs = actual if isinstance(actual, tuple) else (actual,)
     for row in range(4):
-        expected = sample(
-            seed=seeds[0 if len(seeds) == 1 else row],
-            offset=offsets[0 if len(offsets) == 1 else row],
+        per_row = len(seeds) > 1 or len(offsets) > 1
+        reference_sample = _select_rows(sample, [row]) if per_row else sample
+        seed_row = 0 if len(seeds) == 1 else row
+        offset_row = 0 if len(offsets) == 1 else row
+        expected = reference_sample(
+            seed=seed[seed_row : seed_row + 1] if per_row else seeds[seed_row],
+            offset=offset[offset_row : offset_row + 1]
+            if per_row
+            else offsets[offset_row],
         )
         references = expected if isinstance(expected, tuple) else (expected,)
         for output, reference in zip(outputs, references, strict=True):
-            torch.testing.assert_close(output[row], reference[row], rtol=0, atol=0)
+            torch.testing.assert_close(
+                output[row], reference[0 if per_row else row], rtol=0, atol=0
+            )
+    if len(seeds) > 1 or len(offsets) > 1:
+        for rows in ([3, 1, 0, 2], [3, 1], [2]):
+            selected = _select_rows(sample, rows)(
+                # PyTorch does not implement CUDA advanced indexing for uint64.
+                seed=seed.view(torch.int64)[rows].view(seed.dtype)
+                if len(seeds) > 1
+                else seed,
+                offset=offset.view(torch.int64)[rows].view(offset.dtype)
+                if len(offsets) > 1
+                else offset,
+            )
+            selected = selected if isinstance(selected, tuple) else (selected,)
+            for output, reordered in zip(outputs, selected, strict=True):
+                torch.testing.assert_close(output[rows], reordered, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("name", SAMPLERS)
@@ -109,7 +145,7 @@ def test_sampling_row_seed_offset(name, indexed, dtype, seed_size, offset_size):
     sample = _sampler(name, indexed)
     seed, offset = _rng_tensors(seed_size, offset_size, dtype)
     actual = sample(seed=seed, offset=offset)
-    _assert_scalar_reference(sample, actual, seed, offset)
+    _assert_rng_reference(sample, actual, seed, offset)
 
 
 def _chain_sampler(reject_at):
@@ -137,7 +173,7 @@ def test_chain_sampling_row_seed_offset(reject_at, dtype, seed_size, offset_size
     sample = _chain_sampler(reject_at)
     seed, offset = _rng_tensors(seed_size, offset_size, dtype)
     actual = sample(seed=seed, offset=offset)
-    _assert_scalar_reference(sample, actual, seed, offset)
+    _assert_rng_reference(sample, actual, seed, offset)
 
 
 @pytest.mark.parametrize("name", [*SAMPLERS, "chain"])
@@ -150,11 +186,11 @@ def test_sampling_rng_tensor_cuda_graph(name, seed_size, offset_size):
     with torch.cuda.graph(graph):
         actual = sample(seed=seed, offset=offset)
     graph.replay()
-    _assert_scalar_reference(sample, actual, seed, offset)
+    _assert_rng_reference(sample, actual, seed, offset)
     seed.add_(1234567)
     offset.add_(256)
     graph.replay()
-    _assert_scalar_reference(sample, actual, seed, offset)
+    _assert_rng_reference(sample, actual, seed, offset)
 
 
 @pytest.mark.parametrize("name", ["seed", "offset"])
@@ -173,3 +209,32 @@ def test_sampling_rng_tensor_ffi_rejects_invalid_length(name, size):
         offset = invalid
     with pytest.raises(RuntimeError, match=f"{name} tensor length must be 1 or 4"):
         module.sampling_from_logits(logits, output, indices, True, seed, 0, offset, 0)
+
+
+@pytest.mark.parametrize("name", SAMPLERS)
+@pytest.mark.parametrize("vocab_size", [256, 1026])
+def test_sampling_row_rng_vectorization(name, vocab_size):
+    # Cover vector widths 4 and 2 in addition to the width-1 (257) matrix.
+    sample = _sampler(name, False, vocab_size)
+    seed, offset = _rng_tensors(4, 4, torch.int64)
+    _assert_rng_reference(sample, sample(seed=seed, offset=offset), seed, offset)
+
+
+@pytest.mark.parametrize(
+    "name", ["top_k_top_p_sequential", "top_k_top_p_logits_sequential"]
+)
+def test_sampling_row_rng_top_k_fast_path(name):
+    sample = _sampler(name, False, 65536)
+    seed, offset = _rng_tensors(4, 4, torch.int64)
+    _assert_rng_reference(sample, sample(seed=seed, offset=offset), seed, offset)
+
+
+@pytest.mark.parametrize("name", [*SAMPLERS, "chain"])
+def test_repeated_request_rng_replays_same_draw(name):
+    sample = _chain_sampler(1) if name == "chain" else _sampler(name, True)
+    # Duplicate a single logical request, including its RNG values. Distinct
+    # output slots must not introduce hidden randomness for this request.
+    sample = _select_rows(sample, [2, 2, 2, 2])
+    seed = torch.full((4,), 2**63 + 17, device="cuda", dtype=torch.uint64)
+    offset = torch.full((4,), 2**32, device="cuda", dtype=torch.uint64)
+    _assert_rng_reference(sample, sample(seed=seed, offset=offset), seed, offset)

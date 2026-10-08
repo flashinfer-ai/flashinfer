@@ -684,6 +684,14 @@ struct DataAndIndex {
   }
 };
 
+// Per-output RNG tensors identify logical requests, so moving them between batch
+// slots must not change their streams. Scalar/broadcast RNG keeps the legacy row
+// subsequence to give each output an independent draw from the shared stream.
+__device__ __forceinline__ uint32_t SamplingRNGRow(uint32_t row, uint32_t seed_stride,
+                                                   uint32_t offset_stride) {
+  return (seed_stride || offset_stride) ? 0 : row;
+}
+
 template <typename DType, uint32_t VEC_SIZE>
 __device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t philox_seed,
                                                                       uint64_t philox_offset,
@@ -767,7 +775,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromLog
 
     vec_t<DType, VEC_SIZE> gumbel_noise = GenerateGumbelNoise<DType, VEC_SIZE>(
         philox_seed, philox_offset,
-        static_cast<uint64_t>(bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE));
+        static_cast<uint64_t>(SamplingRNGRow(bx, seed_stride, offset_stride) * d +
+                              (i * BLOCK_THREADS + tx) * VEC_SIZE));
     DataAndIndex<DType, IdType> cur_data[VEC_SIZE];
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
@@ -802,7 +811,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromPro
   uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
   uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
-  curand_init(philox_seed, bx, philox_offset, &state);
+  curand_init(philox_seed, SamplingRNGRow(bx, seed_stride, offset_stride), philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
 
   extern __shared__ __align__(
@@ -868,7 +877,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFro
   uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t state;
-  curand_init(philox_seed, bx, philox_offset, &state);
+  curand_init(philox_seed, SamplingRNGRow(bx, seed_stride, offset_stride), philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
 
@@ -1001,7 +1010,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPSamplingFro
   uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t state;
-  curand_init(philox_seed, bx, philox_offset, &state);
+  curand_init(philox_seed, SamplingRNGRow(bx, seed_stride, offset_stride), philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   float top_p = (top_p_arr == nullptr) ? top_p_val : top_p_arr[row_idx];
 
@@ -1127,7 +1136,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void MinPSamplingFro
   uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t state;
-  curand_init(philox_seed, bx, philox_offset, &state);
+  curand_init(philox_seed, SamplingRNGRow(bx, seed_stride, offset_stride), philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   float p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[row_idx];
 
@@ -1223,7 +1232,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplin
   uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t state;
-  curand_init(philox_seed, bx, philox_offset, &state);
+  curand_init(philox_seed, SamplingRNGRow(bx, seed_stride, offset_stride), philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
   const float p = top_p_arr == nullptr ? top_p_val : top_p_arr[row_idx];
@@ -1898,7 +1907,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
   uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t curand_state;
-  curand_init(philox_seed, bx, philox_offset, &curand_state);
+  curand_init(philox_seed, SamplingRNGRow(bx, seed_stride, offset_stride), philox_offset,
+              &curand_state);
 
   extern __shared__ __align__(
       alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
