@@ -1286,6 +1286,13 @@ def test_paged_capture_replan_changes_indices_and_lengths(dtype, lse_layout):
 def test_paged_auto_fallback_refreshes_retained_capture(
     monkeypatch, lse_layout, device_lengths
 ):
+    if (
+        not prefill._cudnn_supports_paged_auto()
+        or torch.cuda.get_device_capability() != (10, 0)
+    ):
+        pytest.skip("requires the qualified SM100 paged-auto runtime")
+    # Override shape admission only after checking the real runtime capability:
+    # older backends can reject the reserved page table before capture begins.
     # Control admission to exercise the transition independently of performance
     # heuristics. A captured cuDNN call still reads its original owned table.
     admitted = [True]
