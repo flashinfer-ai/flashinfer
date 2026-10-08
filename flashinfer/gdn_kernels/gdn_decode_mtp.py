@@ -155,6 +155,26 @@ def get_mtp_config(
             ilp_rows = 8
             use_smem_v = False
 
+    # Cap tile_v by sequence length.  A longer token loop makes the resident
+    # [tile_v, K] state cost more relative to the one-off q/k reads each V-slice
+    # CTA repeats, so the largest workable tile shrinks as seq_len grows.  The
+    # work_units table above only consults seq_len for the <=448 branch, so
+    # without this every branch keeps its short-sequence tile indefinitely.
+    #
+    # Measured on GB200, HV=32, bf16, per-kernel time:
+    #
+    #   seq_len | best tile_v | uncapped heuristic | gain
+    #   --------|-------------|--------------------|------
+    #        12 |          32 | 64                 | up to 1.42x
+    #        24 |          16 | 64 / 32            | up to 1.34x
+    #
+    # The thresholds sit in the gaps between sampled points (seq_len was
+    # 3/6/12/24); 8 and 16 are the powers of two inside them.
+    if seq_len > 16:
+        tile_v = min(tile_v, 16)
+    elif seq_len > 8:
+        tile_v = min(tile_v, 32)
+
     # Clamp tile_v to v_dim (e.g. v_dim=64 models shouldn't use tile_v=128)
     tile_v = min(tile_v, v_dim)
 
@@ -464,20 +484,20 @@ def gdn_verify_kernel_mtp(
     # Allocate shared memory for pre-computed values (broadcast to all warps)
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
+        cutlass.Float32, cute.make_layout((CHUNK, K), stride=(K + 8, 1)), 16
     )
     sK = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
+        cutlass.Float32, cute.make_layout((CHUNK, K), stride=(K + 8, 1)), 16
     )
-    sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T,)), 16)
-    sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T,)), 16)
-    # Shared memory for preloaded v values [T, tile_v] — avoids repeated GMEM loads
+    sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((CHUNK,)), 16)
+    sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((CHUNK,)), 16)
+    # Shared memory for preloaded v values [CHUNK, tile_v] — avoids repeated GMEM loads
     sVdata = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
+        cutlass.Float32, cute.make_layout((CHUNK, tile_v), stride=(tile_v, 1)), 16
     )
-    # Shared memory for output accumulation [T, tile_v] — enables coalesced GMEM writeback
+    # Shared memory for output accumulation [CHUNK, tile_v] — enables coalesced GMEM writeback
     sOutput = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
+        cutlass.BFloat16, cute.make_layout((CHUNK, tile_v), stride=(tile_v, 1)), 16
     )
 
     # Register arrays for computation
@@ -544,1288 +564,1370 @@ def gdn_verify_kernel_mtp(
         # ReplaySSM assigns timesteps across all four warps and folds the raw
         # window writes into the q/k/g/beta precompute. The normal path keeps
         # the established warp-0 precompute + warps-1..3 state prefetch.
-        if cutlass.const_expr(cache_replayssm):
-            num_precompute_passes: cutlass.Constexpr[int] = (T + 3) // 4
-            for pass_idx in cutlass.range_constexpr(num_precompute_passes):
-                i_t_pre = pass_idx * 4 + warp_idx
-                if i_t_pre < T:
-                    _mtp_precompute_replayssm_step(
-                        q,
-                        k,
-                        v,
-                        a,
-                        b,
-                        sQ,
-                        sK,
-                        sG,
-                        sBeta,
-                        sVdata,
-                        replayssm_rawv,
-                        replayssm_rawk,
-                        replayssm_g,
-                        replayssm_beta,
-                        r_A_log,
-                        r_dt_bias,
-                        cache_idx,
-                        i_n,
-                        i_t_pre,
-                        i_h,
-                        i_hv,
-                        i_v,
-                        lane_in_group,
-                        lane_id,
-                        softplus_beta,
-                        softplus_threshold,
-                        scale,
-                        HV,
-                        H,
-                        K,
-                        V,
-                        tile_v,
-                        vec_size,
-                        use_qk_l2norm,
-                        use_smem_v,
+        # Stage only CHUNK tokens of SMEM at a time.  This keeps the
+        # shared-memory footprint independent of T, which preserves
+        # occupancy at long sequences.
+        for c0 in cutlass.range_constexpr(0, T, CHUNK):
+            if cutlass.const_expr(cache_replayssm):
+                num_precompute_passes: cutlass.Constexpr[int] = (T + 3) // 4
+                for pass_idx in cutlass.range_constexpr(num_precompute_passes):
+                    i_t_pre = pass_idx * 4 + warp_idx
+                    if i_t_pre < T:
+                        _mtp_precompute_replayssm_step(
+                            q,
+                            k,
+                            v,
+                            a,
+                            b,
+                            sQ,
+                            sK,
+                            sG,
+                            sBeta,
+                            sVdata,
+                            replayssm_rawv,
+                            replayssm_rawk,
+                            replayssm_g,
+                            replayssm_beta,
+                            r_A_log,
+                            r_dt_bias,
+                            cache_idx,
+                            i_n,
+                            i_t_pre,
+                            i_h,
+                            i_hv,
+                            i_v,
+                            lane_in_group,
+                            lane_id,
+                            softplus_beta,
+                            softplus_threshold,
+                            scale,
+                            HV,
+                            H,
+                            K,
+                            V,
+                            tile_v,
+                            vec_size,
+                            use_qk_l2norm,
+                            use_smem_v,
+                        )
+            elif warp_idx == 0:
+                # Warp 0: Phase 1 — compute and broadcast q, k, g, beta via SMEM
+                for j_c in cutlass.range_constexpr(CHUNK):
+                    i_t = c0 + j_c
+                    q_tile = cute.local_tile(
+                        q, (1, 1, 1, vec_size), (i_n, i_t // n_h, i_h, lane_in_group)
                     )
-        elif warp_idx == 0:
-            # Warp 0: Phase 1 — compute and broadcast q, k, g, beta via SMEM
-            for i_t in cutlass.range_constexpr(T):
-                q_tile = cute.local_tile(
-                    q, (1, 1, 1, vec_size), (i_n, i_t // n_h, i_h, lane_in_group)
-                )
-                k_tile = cute.local_tile(
-                    k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
-                )
-                cute.autovec_copy(q_tile[(0, 0, 0, None)], r_q_bf16)
-                cute.autovec_copy(k_tile[(0, 0, 0, None)], r_k_bf16)
+                    k_tile = cute.local_tile(
+                        k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
+                    )
+                    cute.autovec_copy(q_tile[(0, 0, 0, None)], r_q_bf16)
+                    cute.autovec_copy(k_tile[(0, 0, 0, None)], r_k_bf16)
 
-                for i in cutlass.range_constexpr(vec_size):
-                    r_q[i] = cutlass.Float32(r_q_bf16[i]) * (
+                    for i in cutlass.range_constexpr(vec_size):
+                        r_q[i] = cutlass.Float32(r_q_bf16[i]) * (
+                            cutlass.Float32(1.0)
+                            if cutlass.const_expr(i_t % n_h == n_h - 1)
+                            else cutlass.Float32(0.0)
+                        )
+                        r_k[i] = cutlass.Float32(r_k_bf16[i])
+
+                    if cutlass.const_expr(use_qk_l2norm):
+                        sum_q = 0.0
+                        sum_k = 0.0
+                        for i in cutlass.range_constexpr(vec_size):
+                            sum_q += r_q[i] * r_q[i]
+                            sum_k += r_k[i] * r_k[i]
+
+                        # Full warp reduction (threads_per_group=32, vec_size=4)
+                        for offset in [16, 8, 4, 2, 1]:
+                            sum_q += cute.arch.shuffle_sync_bfly(
+                                sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_k += cute.arch.shuffle_sync_bfly(
+                                sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+
+                        inv_norm_q_scaled = (
+                            cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
+                        )
+                        inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
+
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_q[i] = r_q[i] * inv_norm_q_scaled
+                            r_k[i] = r_k[i] * inv_norm_k
+                    else:
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_q[i] = r_q[i] * scale
+
+                    # Warp 0 writes to SMEM — with vec_size=8, only first 16 threads
+                    # cover full K (16*8=128). Threads 16-31 write redundantly (same values).
+                    for i in cutlass.range_constexpr(vec_size):
+                        sQ[(j_c, k_start + i)] = r_q[i]
+                        sK[(j_c, k_start + i)] = r_k[i]
+
+                    r_a = cutlass.Float32(a[i_n, i_t // n_h, i_hv])
+                    r_b = cutlass.Float32(b[i_n, i_t, i_hv])
+
+                    x = r_a + r_dt_bias
+                    beta_x = softplus_beta * x
+
+                    exp_beta_x = cute.exp(beta_x, fastmath=True)
+                    softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                        cutlass.Float32(1.0) + exp_beta_x, fastmath=True
+                    )
+                    use_softplus = (
                         cutlass.Float32(1.0)
-                        if cutlass.const_expr(i_t % n_h == n_h - 1)
+                        if beta_x <= softplus_threshold
                         else cutlass.Float32(0.0)
                     )
-                    r_k[i] = cutlass.Float32(r_k_bf16[i])
-
-                if cutlass.const_expr(use_qk_l2norm):
-                    sum_q = 0.0
-                    sum_k = 0.0
-                    for i in cutlass.range_constexpr(vec_size):
-                        sum_q += r_q[i] * r_q[i]
-                        sum_k += r_k[i] * r_k[i]
-
-                    # Full warp reduction (threads_per_group=32, vec_size=4)
-                    for offset in [16, 8, 4, 2, 1]:
-                        sum_q += cute.arch.shuffle_sync_bfly(
-                            sum_q, offset=offset, mask=-1, mask_and_clamp=31
-                        )
-                        sum_k += cute.arch.shuffle_sync_bfly(
-                            sum_k, offset=offset, mask=-1, mask_and_clamp=31
-                        )
-
-                    inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
-                    inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
-
-                    for i in cutlass.range_constexpr(vec_size):
-                        r_q[i] = r_q[i] * inv_norm_q_scaled
-                        r_k[i] = r_k[i] * inv_norm_k
-                else:
-                    for i in cutlass.range_constexpr(vec_size):
-                        r_q[i] = r_q[i] * scale
-
-                # Warp 0 writes to SMEM — with vec_size=8, only first 16 threads
-                # cover full K (16*8=128). Threads 16-31 write redundantly (same values).
-                for i in cutlass.range_constexpr(vec_size):
-                    sQ[(i_t, k_start + i)] = r_q[i]
-                    sK[(i_t, k_start + i)] = r_k[i]
-
-                r_a = cutlass.Float32(a[i_n, i_t // n_h, i_hv])
-                r_b = cutlass.Float32(b[i_n, i_t, i_hv])
-
-                x = r_a + r_dt_bias
-                beta_x = softplus_beta * x
-
-                exp_beta_x = cute.exp(beta_x, fastmath=True)
-                softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x, fastmath=True
-                )
-                use_softplus = (
-                    cutlass.Float32(1.0)
-                    if beta_x <= softplus_threshold
-                    else cutlass.Float32(0.0)
-                )
-                softplus_x = (
-                    use_softplus * softplus_val
-                    + (cutlass.Float32(1.0) - use_softplus) * x
-                )
-
-                r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
-                r_beta = cutlass.Float32(1.0) / (
-                    cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=True)
-                )
-                r_g = (
-                    cute.exp(r_g_value, fastmath=True)
-                    if cutlass.const_expr(i_t % n_h == 0)
-                    else cutlass.Float32(1.0)
-                )
-
-                # All threads in warp 0 write same warp-uniform values
-                sG[i_t] = r_g
-                sBeta[i_t] = r_beta
-
-                if cutlass.const_expr(use_smem_v and not cache_replayssm):
-                    v_tile_start = i_v * tile_v
-                    if tidx < tile_v:
-                        v_global_idx = v_tile_start + tidx
-                        if v_global_idx < V:
-                            sVdata[(i_t, tidx)] = cutlass.Float32(
-                                v[i_n, i_t, i_hv, v_global_idx]
-                            )
-        else:
-            # Warps 1-3: Prefetch h-state for first ILP set during Phase 1 window
-            # This overlaps h-state DRAM latency with warp 0's Phase 1 compute
-            v_base_prefetch = i_v * tile_v + group_idx * rows_per_group
-            if cutlass.const_expr(ilp_rows >= 4):
-                # Prefetch 4 h-state rows
-                v_pf_d = v_base_prefetch + 3
-                if v_pf_d < V:
-                    pf_a = cute.local_tile(
-                        h_read_view,
-                        (1, vec_size),
-                        (v_base_prefetch, lane_in_group),
+                    softplus_x = (
+                        use_softplus * softplus_val
+                        + (cutlass.Float32(1.0) - use_softplus) * x
                     )
-                    pf_b = cute.local_tile(
-                        h_read_view,
-                        (1, vec_size),
-                        (v_base_prefetch + 1, lane_in_group),
+
+                    r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+                    r_beta = cutlass.Float32(1.0) / (
+                        cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=True)
                     )
-                    pf_c = cute.local_tile(
-                        h_read_view,
-                        (1, vec_size),
-                        (v_base_prefetch + 2, lane_in_group),
+                    r_g = (
+                        cute.exp(r_g_value, fastmath=True)
+                        if cutlass.const_expr(i_t % n_h == 0)
+                        else cutlass.Float32(1.0)
                     )
-                    pf_d = cute.local_tile(
-                        h_read_view,
-                        (1, vec_size),
-                        (v_base_prefetch + 3, lane_in_group),
-                    )
-                    cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
-                    cute.autovec_copy(pf_b, cute.slice_(r_h, (1, None)))
-                    cute.autovec_copy(pf_c, cute.slice_(r_h, (2, None)))
-                    cute.autovec_copy(pf_d, cute.slice_(r_h, (3, None)))
-            elif cutlass.const_expr(ilp_rows == 2):
-                # Prefetch 2 h-state rows
-                v_pf_b = v_base_prefetch + 1
-                if v_pf_b < V:
-                    pf_a = cute.local_tile(
-                        h_read_view,
-                        (1, vec_size),
-                        (v_base_prefetch, lane_in_group),
-                    )
-                    pf_b = cute.local_tile(
-                        h_read_view,
-                        (1, vec_size),
-                        (v_base_prefetch + 1, lane_in_group),
-                    )
-                    cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
-                    cute.autovec_copy(pf_b, cute.slice_(r_h, (1, None)))
+
+                    # All threads in warp 0 write same warp-uniform values
+                    sG[j_c] = r_g
+                    sBeta[j_c] = r_beta
+
+                    if cutlass.const_expr(use_smem_v and not cache_replayssm):
+                        v_tile_start = i_v * tile_v
+                        if tidx < tile_v:
+                            v_global_idx = v_tile_start + tidx
+                            if v_global_idx < V:
+                                sVdata[(j_c, tidx)] = cutlass.Float32(
+                                    v[i_n, i_t, i_hv, v_global_idx]
+                                )
             else:
-                # Prefetch 1 h-state row
-                if v_base_prefetch < V:
-                    pf_a = cute.local_tile(
-                        h_read_view,
-                        (1, vec_size),
-                        (v_base_prefetch, lane_in_group),
-                    )
-                    cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
-
-            # Cooperatively preload v values if use_smem_v (warps 1-3 help too)
-            if cutlass.const_expr(use_smem_v and not cache_replayssm):
-                for i_t in cutlass.range_constexpr(T):
-                    v_tile_start = i_v * tile_v
-                    if tidx < tile_v:
-                        v_global_idx = v_tile_start + tidx
-                        if v_global_idx < V:
-                            sVdata[(i_t, tidx)] = cutlass.Float32(
-                                v[i_n, i_t, i_hv, v_global_idx]
+                # Warps 1-3: Prefetch h-state for first ILP set during Phase 1 window
+                # This overlaps h-state DRAM latency with warp 0's Phase 1 compute
+                # r_h is the recurrent state: seed it on the first chunk only.
+                if cutlass.const_expr(c0 == 0):
+                    v_base_prefetch = i_v * tile_v + group_idx * rows_per_group
+                    if cutlass.const_expr(ilp_rows >= 4):
+                        # Prefetch 4 h-state rows
+                        v_pf_d = v_base_prefetch + 3
+                        if v_pf_d < V:
+                            pf_a = cute.local_tile(
+                                h_read_view,
+                                (1, vec_size),
+                                (v_base_prefetch, lane_in_group),
                             )
+                            pf_b = cute.local_tile(
+                                h_read_view,
+                                (1, vec_size),
+                                (v_base_prefetch + 1, lane_in_group),
+                            )
+                            pf_c = cute.local_tile(
+                                h_read_view,
+                                (1, vec_size),
+                                (v_base_prefetch + 2, lane_in_group),
+                            )
+                            pf_d = cute.local_tile(
+                                h_read_view,
+                                (1, vec_size),
+                                (v_base_prefetch + 3, lane_in_group),
+                            )
+                            cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
+                            cute.autovec_copy(pf_b, cute.slice_(r_h, (1, None)))
+                            cute.autovec_copy(pf_c, cute.slice_(r_h, (2, None)))
+                            cute.autovec_copy(pf_d, cute.slice_(r_h, (3, None)))
+                    elif cutlass.const_expr(ilp_rows == 2):
+                        # Prefetch 2 h-state rows
+                        v_pf_b = v_base_prefetch + 1
+                        if v_pf_b < V:
+                            pf_a = cute.local_tile(
+                                h_read_view,
+                                (1, vec_size),
+                                (v_base_prefetch, lane_in_group),
+                            )
+                            pf_b = cute.local_tile(
+                                h_read_view,
+                                (1, vec_size),
+                                (v_base_prefetch + 1, lane_in_group),
+                            )
+                            cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
+                            cute.autovec_copy(pf_b, cute.slice_(r_h, (1, None)))
+                    else:
+                        # Prefetch 1 h-state row
+                        if v_base_prefetch < V:
+                            pf_a = cute.local_tile(
+                                h_read_view,
+                                (1, vec_size),
+                                (v_base_prefetch, lane_in_group),
+                            )
+                            cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
 
-        cute.arch.barrier()
+                    # Cooperatively preload v values if use_smem_v (warps 1-3 help too)
+                    if cutlass.const_expr(use_smem_v and not cache_replayssm):
+                        for j_c in cutlass.range_constexpr(CHUNK):
+                            i_t = c0 + j_c
+                            v_tile_start = i_v * tile_v
+                            if tidx < tile_v:
+                                v_global_idx = v_tile_start + tidx
+                                if v_global_idx < V:
+                                    sVdata[(j_c, tidx)] = cutlass.Float32(
+                                        v[i_n, i_t, i_hv, v_global_idx]
+                                    )
 
-        if cutlass.const_expr(ilp_rows == 8):
-            # === 8-ROW ILP PATH: Process 8 V-rows simultaneously ===
-            eighth_rows: cutlass.Constexpr[int] = rows_per_group // 8
+            cute.arch.barrier()
 
-            for row_oct in cutlass.range_constexpr(eighth_rows):
-                v_base = i_v * tile_v + group_idx * rows_per_group + row_oct * 8
-                v0 = v_base
-                v1 = v_base + 1
-                v2 = v_base + 2
-                v3 = v_base + 3
-                v4 = v_base + 4
-                v5 = v_base + 5
-                v6 = v_base + 6
-                v7 = v_base + 7
+            if cutlass.const_expr(ilp_rows == 8):
+                # === 8-ROW ILP PATH: Process 8 V-rows simultaneously ===
+                eighth_rows: cutlass.Constexpr[int] = rows_per_group // 8
 
-                if v7 < V:
-                    # Load h for ALL 8 V-rows (8 independent load streams)
-                    ht0 = cute.local_tile(
-                        h_read_view, (1, vec_size), (v0, lane_in_group)
-                    )
-                    ht1 = cute.local_tile(
-                        h_read_view, (1, vec_size), (v1, lane_in_group)
-                    )
-                    ht2 = cute.local_tile(
-                        h_read_view, (1, vec_size), (v2, lane_in_group)
-                    )
-                    ht3 = cute.local_tile(
-                        h_read_view, (1, vec_size), (v3, lane_in_group)
-                    )
-                    ht4 = cute.local_tile(
-                        h_read_view, (1, vec_size), (v4, lane_in_group)
-                    )
-                    ht5 = cute.local_tile(
-                        h_read_view, (1, vec_size), (v5, lane_in_group)
-                    )
-                    ht6 = cute.local_tile(
-                        h_read_view, (1, vec_size), (v6, lane_in_group)
-                    )
-                    ht7 = cute.local_tile(
-                        h_read_view, (1, vec_size), (v7, lane_in_group)
-                    )
-                    cute.autovec_copy(ht0, cute.slice_(r_h, (0, None)))
-                    cute.autovec_copy(ht1, cute.slice_(r_h, (1, None)))
-                    cute.autovec_copy(ht2, cute.slice_(r_h, (2, None)))
-                    cute.autovec_copy(ht3, cute.slice_(r_h, (3, None)))
-                    cute.autovec_copy(ht4, cute.slice_(r_h, (4, None)))
-                    cute.autovec_copy(ht5, cute.slice_(r_h, (5, None)))
-                    cute.autovec_copy(ht6, cute.slice_(r_h, (6, None)))
-                    cute.autovec_copy(ht7, cute.slice_(r_h, (7, None)))
+                for row_oct in cutlass.range_constexpr(eighth_rows):
+                    v_base = i_v * tile_v + group_idx * rows_per_group + row_oct * 8
+                    v0 = v_base
+                    v1 = v_base + 1
+                    v2 = v_base + 2
+                    v3 = v_base + 3
+                    v4 = v_base + 4
+                    v5 = v_base + 5
+                    v6 = v_base + 6
+                    v7 = v_base + 7
 
-                    for i_t in cutlass.range_constexpr(T):
-                        sQ_tile = cute.local_tile(
-                            sQ, (1, vec_size), (i_t, lane_in_group)
+                    if v7 < V:
+                        # Load h for ALL 8 V-rows (8 independent load streams)
+                        ht0 = cute.local_tile(
+                            h_read_view, (1, vec_size), (v0, lane_in_group)
                         )
-                        sK_tile = cute.local_tile(
-                            sK, (1, vec_size), (i_t, lane_in_group)
+                        ht1 = cute.local_tile(
+                            h_read_view, (1, vec_size), (v1, lane_in_group)
                         )
-                        cute.autovec_copy(sQ_tile, r_q)
-                        cute.autovec_copy(sK_tile, r_k)
+                        ht2 = cute.local_tile(
+                            h_read_view, (1, vec_size), (v2, lane_in_group)
+                        )
+                        ht3 = cute.local_tile(
+                            h_read_view, (1, vec_size), (v3, lane_in_group)
+                        )
+                        ht4 = cute.local_tile(
+                            h_read_view, (1, vec_size), (v4, lane_in_group)
+                        )
+                        ht5 = cute.local_tile(
+                            h_read_view, (1, vec_size), (v5, lane_in_group)
+                        )
+                        ht6 = cute.local_tile(
+                            h_read_view, (1, vec_size), (v6, lane_in_group)
+                        )
+                        ht7 = cute.local_tile(
+                            h_read_view, (1, vec_size), (v7, lane_in_group)
+                        )
+                        if cutlass.const_expr(c0 == 0):
+                            cute.autovec_copy(ht0, cute.slice_(r_h, (0, None)))
+                            cute.autovec_copy(ht1, cute.slice_(r_h, (1, None)))
+                            cute.autovec_copy(ht2, cute.slice_(r_h, (2, None)))
+                            cute.autovec_copy(ht3, cute.slice_(r_h, (3, None)))
+                            cute.autovec_copy(ht4, cute.slice_(r_h, (4, None)))
+                            cute.autovec_copy(ht5, cute.slice_(r_h, (5, None)))
+                            cute.autovec_copy(ht6, cute.slice_(r_h, (6, None)))
+                            cute.autovec_copy(ht7, cute.slice_(r_h, (7, None)))
 
-                        r_g = sG[i_t]
-                        r_beta = sBeta[i_t]
+                        for j_c in cutlass.range_constexpr(CHUNK):
+                            i_t = c0 + j_c
+                            sQ_tile = cute.local_tile(
+                                sQ, (1, vec_size), (j_c, lane_in_group)
+                            )
+                            sK_tile = cute.local_tile(
+                                sK, (1, vec_size), (j_c, lane_in_group)
+                            )
+                            cute.autovec_copy(sQ_tile, r_q)
+                            cute.autovec_copy(sK_tile, r_k)
 
-                        # Step 1: Decay all 8 h vectors
-                        for i in cutlass.range_constexpr(vec_size):
-                            r_h[0, i] = r_h[0, i] * r_g
-                            r_h[1, i] = r_h[1, i] * r_g
-                            r_h[2, i] = r_h[2, i] * r_g
-                            r_h[3, i] = r_h[3, i] * r_g
-                            r_h[4, i] = r_h[4, i] * r_g
-                            r_h[5, i] = r_h[5, i] * r_g
-                            r_h[6, i] = r_h[6, i] * r_g
-                            r_h[7, i] = r_h[7, i] * r_g
+                            r_g = sG[j_c]
+                            r_beta = sBeta[j_c]
 
-                        # Step 2: Dot products h@k for all 8 rows
-                        s0 = 0.0
-                        s1 = 0.0
-                        s2 = 0.0
-                        s3 = 0.0
-                        s4 = 0.0
-                        s5 = 0.0
-                        s6 = 0.0
-                        s7 = 0.0
-                        for i in cutlass.range_constexpr(vec_size):
-                            s0 += r_h[0, i] * r_k[i]
-                            s1 += r_h[1, i] * r_k[i]
-                            s2 += r_h[2, i] * r_k[i]
-                            s3 += r_h[3, i] * r_k[i]
-                            s4 += r_h[4, i] * r_k[i]
-                            s5 += r_h[5, i] * r_k[i]
-                            s6 += r_h[6, i] * r_k[i]
-                            s7 += r_h[7, i] * r_k[i]
+                            # Step 1: Decay all 8 h vectors
+                            for i in cutlass.range_constexpr(vec_size):
+                                r_h[0, i] = r_h[0, i] * r_g
+                                r_h[1, i] = r_h[1, i] * r_g
+                                r_h[2, i] = r_h[2, i] * r_g
+                                r_h[3, i] = r_h[3, i] * r_g
+                                r_h[4, i] = r_h[4, i] * r_g
+                                r_h[5, i] = r_h[5, i] * r_g
+                                r_h[6, i] = r_h[6, i] * r_g
+                                r_h[7, i] = r_h[7, i] * r_g
 
-                        for offset in [16, 8, 4, 2, 1]:
-                            s0 += cute.arch.shuffle_sync_bfly(
-                                s0, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            s1 += cute.arch.shuffle_sync_bfly(
-                                s1, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            s2 += cute.arch.shuffle_sync_bfly(
-                                s2, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            s3 += cute.arch.shuffle_sync_bfly(
-                                s3, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            s4 += cute.arch.shuffle_sync_bfly(
-                                s4, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            s5 += cute.arch.shuffle_sync_bfly(
-                                s5, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            s6 += cute.arch.shuffle_sync_bfly(
-                                s6, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            s7 += cute.arch.shuffle_sync_bfly(
-                                s7, offset=offset, mask=-1, mask_and_clamp=31
-                            )
+                            # Step 2: Dot products h@k for all 8 rows
+                            s0 = 0.0
+                            s1 = 0.0
+                            s2 = 0.0
+                            s3 = 0.0
+                            s4 = 0.0
+                            s5 = 0.0
+                            s6 = 0.0
+                            s7 = 0.0
+                            for i in cutlass.range_constexpr(vec_size):
+                                s0 += r_h[0, i] * r_k[i]
+                                s1 += r_h[1, i] * r_k[i]
+                                s2 += r_h[2, i] * r_k[i]
+                                s3 += r_h[3, i] * r_k[i]
+                                s4 += r_h[4, i] * r_k[i]
+                                s5 += r_h[5, i] * r_k[i]
+                                s6 += r_h[6, i] * r_k[i]
+                                s7 += r_h[7, i] * r_k[i]
 
-                        # Step 3: Load v, delta rule
-                        if cutlass.const_expr(use_smem_v):
-                            vl = v0 - i_v * tile_v
-                            rv0 = sVdata[(i_t, vl)]
-                            rv1 = sVdata[(i_t, vl + 1)]
-                            rv2 = sVdata[(i_t, vl + 2)]
-                            rv3 = sVdata[(i_t, vl + 3)]
-                            rv4 = sVdata[(i_t, vl + 4)]
-                            rv5 = sVdata[(i_t, vl + 5)]
-                            rv6 = sVdata[(i_t, vl + 6)]
-                            rv7 = sVdata[(i_t, vl + 7)]
-                        else:
-                            rv0 = cutlass.Float32(v[i_n, i_t, i_hv, v0])
-                            rv1 = cutlass.Float32(v[i_n, i_t, i_hv, v1])
-                            rv2 = cutlass.Float32(v[i_n, i_t, i_hv, v2])
-                            rv3 = cutlass.Float32(v[i_n, i_t, i_hv, v3])
-                            rv4 = cutlass.Float32(v[i_n, i_t, i_hv, v4])
-                            rv5 = cutlass.Float32(v[i_n, i_t, i_hv, v5])
-                            rv6 = cutlass.Float32(v[i_n, i_t, i_hv, v6])
-                            rv7 = cutlass.Float32(v[i_n, i_t, i_hv, v7])
-                        vn0 = (rv0 - s0) * r_beta
-                        vn1 = (rv1 - s1) * r_beta
-                        vn2 = (rv2 - s2) * r_beta
-                        vn3 = (rv3 - s3) * r_beta
-                        vn4 = (rv4 - s4) * r_beta
-                        vn5 = (rv5 - s5) * r_beta
-                        vn6 = (rv6 - s6) * r_beta
-                        vn7 = (rv7 - s7) * r_beta
+                            for offset in [16, 8, 4, 2, 1]:
+                                s0 += cute.arch.shuffle_sync_bfly(
+                                    s0, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                s1 += cute.arch.shuffle_sync_bfly(
+                                    s1, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                s2 += cute.arch.shuffle_sync_bfly(
+                                    s2, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                s3 += cute.arch.shuffle_sync_bfly(
+                                    s3, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                s4 += cute.arch.shuffle_sync_bfly(
+                                    s4, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                s5 += cute.arch.shuffle_sync_bfly(
+                                    s5, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                s6 += cute.arch.shuffle_sync_bfly(
+                                    s6, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                s7 += cute.arch.shuffle_sync_bfly(
+                                    s7, offset=offset, mask=-1, mask_and_clamp=31
+                                )
 
-                        # Step 4: Rank-1 update all 8 h vectors
-                        for i in cutlass.range_constexpr(vec_size):
-                            r_h[0, i] += r_k[i] * vn0
-                            r_h[1, i] += r_k[i] * vn1
-                            r_h[2, i] += r_k[i] * vn2
-                            r_h[3, i] += r_k[i] * vn3
-                            r_h[4, i] += r_k[i] * vn4
-                            r_h[5, i] += r_k[i] * vn5
-                            r_h[6, i] += r_k[i] * vn6
-                            r_h[7, i] += r_k[i] * vn7
-
-                        # Cache intermediate state if needed
-                        if not cutlass.const_expr(cache_replayssm):
-                            if cache_intermediate_states:
-                                flat_idx = i_n * T * HV + i_t * HV + i_hv
-                                it0 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v0, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (0, None)), it0)
-                                it1 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v1, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (1, None)), it1)
-                                it2 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v2, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (2, None)), it2)
-                                it3 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v3, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (3, None)), it3)
-                                it4 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v4, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (4, None)), it4)
-                                it5 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v5, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (5, None)), it5)
-                                it6 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v6, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (6, None)), it6)
-                                it7 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v7, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (7, None)), it7)
-
-                        # FLA-style per-token scatter: write h_{i_t+1} directly
-                        # to pool[ssm_state_indices[i_n, i_t // n_h]] (a different slot
-                        # per iteration). h0_source is [pool_size * HV, V, K] so
-                        # the slot-flat index is pool_slot * HV + i_hv.
-                        # The snapshot belongs to the real token, so only its
-                        # last micro-step scatters.
-                        if cutlass.const_expr(
-                            per_token_pool_scatter and i_t % n_h == n_h - 1
-                        ):
-                            pool_slot_t = cutlass.Int32(
-                                ssm_state_indices[i_n, i_t // n_h]
-                            )
-                            if pool_slot_t >= 0:
-                                # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                                # (65,536 bytes). Element multiply overflows Int32 at
-                                # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                                # T=8 the max is 73,727 — well over. Matches the
-                                # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                                # used by reads (PR #3230). Zero reg cost: compiler
-                                # emits mad.wide.u32.
-                                fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                                fla_t0 = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v0, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t0)
-                                fla_t1 = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v1, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t1)
-                                fla_t2 = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v2, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t2)
-                                fla_t3 = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v3, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t3)
-                                fla_t4 = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v4, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (4, None)), fla_t4)
-                                fla_t5 = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v5, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (5, None)), fla_t5)
-                                fla_t6 = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v6, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (6, None)), fla_t6)
-                                fla_t7 = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v7, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (7, None)), fla_t7)
-
-                        # Step 5: Output dot products h@q for all 8 rows
-                        o0 = 0.0
-                        o1 = 0.0
-                        o2 = 0.0
-                        o3 = 0.0
-                        o4 = 0.0
-                        o5 = 0.0
-                        o6 = 0.0
-                        o7 = 0.0
-                        for i in cutlass.range_constexpr(vec_size):
-                            o0 += r_h[0, i] * r_q[i]
-                            o1 += r_h[1, i] * r_q[i]
-                            o2 += r_h[2, i] * r_q[i]
-                            o3 += r_h[3, i] * r_q[i]
-                            o4 += r_h[4, i] * r_q[i]
-                            o5 += r_h[5, i] * r_q[i]
-                            o6 += r_h[6, i] * r_q[i]
-                            o7 += r_h[7, i] * r_q[i]
-
-                        for offset in [16, 8, 4, 2, 1]:
-                            o0 += cute.arch.shuffle_sync_bfly(
-                                o0, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            o1 += cute.arch.shuffle_sync_bfly(
-                                o1, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            o2 += cute.arch.shuffle_sync_bfly(
-                                o2, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            o3 += cute.arch.shuffle_sync_bfly(
-                                o3, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            o4 += cute.arch.shuffle_sync_bfly(
-                                o4, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            o5 += cute.arch.shuffle_sync_bfly(
-                                o5, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            o6 += cute.arch.shuffle_sync_bfly(
-                                o6, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            o7 += cute.arch.shuffle_sync_bfly(
-                                o7, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-
-                        if lane_in_group == 0:
+                            # Step 3: Load v, delta rule
                             if cutlass.const_expr(use_smem_v):
-                                vl0 = v0 - i_v * tile_v
-                                sOutput[(i_t, vl0)] = cutlass.BFloat16(o0)
-                                sOutput[(i_t, vl0 + 1)] = cutlass.BFloat16(o1)
-                                sOutput[(i_t, vl0 + 2)] = cutlass.BFloat16(o2)
-                                sOutput[(i_t, vl0 + 3)] = cutlass.BFloat16(o3)
-                                sOutput[(i_t, vl0 + 4)] = cutlass.BFloat16(o4)
-                                sOutput[(i_t, vl0 + 5)] = cutlass.BFloat16(o5)
-                                sOutput[(i_t, vl0 + 6)] = cutlass.BFloat16(o6)
-                                sOutput[(i_t, vl0 + 7)] = cutlass.BFloat16(o7)
+                                vl = v0 - i_v * tile_v
+                                rv0 = sVdata[(j_c, vl)]
+                                rv1 = sVdata[(j_c, vl + 1)]
+                                rv2 = sVdata[(j_c, vl + 2)]
+                                rv3 = sVdata[(j_c, vl + 3)]
+                                rv4 = sVdata[(j_c, vl + 4)]
+                                rv5 = sVdata[(j_c, vl + 5)]
+                                rv6 = sVdata[(j_c, vl + 6)]
+                                rv7 = sVdata[(j_c, vl + 7)]
                             else:
-                                # Only the last micro-step of a real token produces an output row.
-                                if cutlass.const_expr(i_t % n_h == n_h - 1):
-                                    o[(i_n, i_t // n_h, i_hv, v0)] = cutlass.BFloat16(
-                                        o0
-                                    )
-                                    o[(i_n, i_t // n_h, i_hv, v1)] = cutlass.BFloat16(
-                                        o1
-                                    )
-                                    o[(i_n, i_t // n_h, i_hv, v2)] = cutlass.BFloat16(
-                                        o2
-                                    )
-                                    o[(i_n, i_t // n_h, i_hv, v3)] = cutlass.BFloat16(
-                                        o3
-                                    )
-                                    o[(i_n, i_t // n_h, i_hv, v4)] = cutlass.BFloat16(
-                                        o4
-                                    )
-                                    o[(i_n, i_t // n_h, i_hv, v5)] = cutlass.BFloat16(
-                                        o5
-                                    )
-                                    o[(i_n, i_t // n_h, i_hv, v6)] = cutlass.BFloat16(
-                                        o6
-                                    )
-                                    o[(i_n, i_t // n_h, i_hv, v7)] = cutlass.BFloat16(
-                                        o7
-                                    )
+                                rv0 = cutlass.Float32(v[i_n, i_t, i_hv, v0])
+                                rv1 = cutlass.Float32(v[i_n, i_t, i_hv, v1])
+                                rv2 = cutlass.Float32(v[i_n, i_t, i_hv, v2])
+                                rv3 = cutlass.Float32(v[i_n, i_t, i_hv, v3])
+                                rv4 = cutlass.Float32(v[i_n, i_t, i_hv, v4])
+                                rv5 = cutlass.Float32(v[i_n, i_t, i_hv, v5])
+                                rv6 = cutlass.Float32(v[i_n, i_t, i_hv, v6])
+                                rv7 = cutlass.Float32(v[i_n, i_t, i_hv, v7])
+                            vn0 = (rv0 - s0) * r_beta
+                            vn1 = (rv1 - s1) * r_beta
+                            vn2 = (rv2 - s2) * r_beta
+                            vn3 = (rv3 - s3) * r_beta
+                            vn4 = (rv4 - s4) * r_beta
+                            vn5 = (rv5 - s5) * r_beta
+                            vn6 = (rv6 - s6) * r_beta
+                            vn7 = (rv7 - s7) * r_beta
 
-                    # Write final state back for all 8 rows. Negative write
-                    # indices (output_state_indices == -1) skip the writeback.
-                    if cutlass.const_expr(
-                        not disable_state_update and not per_token_pool_scatter
-                    ):
-                        if write_cache_idx_raw >= 0:
-                            ht_o0 = cute.local_tile(
-                                h_write_view,
-                                (1, vec_size),
-                                (v0, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), ht_o0)
-                            ht_o1 = cute.local_tile(
-                                h_write_view,
-                                (1, vec_size),
-                                (v1, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), ht_o1)
-                            ht_o2 = cute.local_tile(
-                                h_write_view,
-                                (1, vec_size),
-                                (v2, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (2, None)), ht_o2)
-                            ht_o3 = cute.local_tile(
-                                h_write_view,
-                                (1, vec_size),
-                                (v3, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (3, None)), ht_o3)
-                            ht_o4 = cute.local_tile(
-                                h_write_view,
-                                (1, vec_size),
-                                (v4, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (4, None)), ht_o4)
-                            ht_o5 = cute.local_tile(
-                                h_write_view,
-                                (1, vec_size),
-                                (v5, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (5, None)), ht_o5)
-                            ht_o6 = cute.local_tile(
-                                h_write_view,
-                                (1, vec_size),
-                                (v6, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (6, None)), ht_o6)
-                            ht_o7 = cute.local_tile(
-                                h_write_view,
-                                (1, vec_size),
-                                (v7, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (7, None)), ht_o7)
-        elif cutlass.const_expr(ilp_rows == 4):
-            # === 4-ROW ILP PATH: Process 4 V-rows simultaneously ===
-            quarter_rows: cutlass.Constexpr[int] = rows_per_group // 4
+                            # Step 4: Rank-1 update all 8 h vectors
+                            for i in cutlass.range_constexpr(vec_size):
+                                r_h[0, i] += r_k[i] * vn0
+                                r_h[1, i] += r_k[i] * vn1
+                                r_h[2, i] += r_k[i] * vn2
+                                r_h[3, i] += r_k[i] * vn3
+                                r_h[4, i] += r_k[i] * vn4
+                                r_h[5, i] += r_k[i] * vn5
+                                r_h[6, i] += r_k[i] * vn6
+                                r_h[7, i] += r_k[i] * vn7
 
-            for row_quad in cutlass.range_constexpr(quarter_rows):
-                v_idx_a = i_v * tile_v + group_idx * rows_per_group + row_quad * 4
-                v_idx_b = v_idx_a + 1
-                v_idx_c = v_idx_a + 2
-                v_idx_d = v_idx_a + 3
-
-                if v_idx_d < V:
-                    # Load h for 4 V-rows. Warps 1-3 skip first quad (prefetched in Phase 1).
-                    if (
-                        cutlass.const_expr(cache_replayssm)
-                        or warp_idx == 0
-                        or row_quad > 0
-                    ):
-                        h_tile_a = cute.local_tile(
-                            h_read_view,
-                            (1, vec_size),
-                            (v_idx_a, lane_in_group),
-                        )
-                        h_tile_b = cute.local_tile(
-                            h_read_view,
-                            (1, vec_size),
-                            (v_idx_b, lane_in_group),
-                        )
-                        h_tile_c = cute.local_tile(
-                            h_read_view,
-                            (1, vec_size),
-                            (v_idx_c, lane_in_group),
-                        )
-                        h_tile_d = cute.local_tile(
-                            h_read_view,
-                            (1, vec_size),
-                            (v_idx_d, lane_in_group),
-                        )
-                        cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
-                        cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
-                        cute.autovec_copy(h_tile_c, cute.slice_(r_h, (2, None)))
-                        cute.autovec_copy(h_tile_d, cute.slice_(r_h, (3, None)))
-                    # else: warps 1-3 on first quad — r_h already loaded during Phase 1
-
-                    # Process all T time steps with all 4 h vectors in registers
-                    for i_t in cutlass.range_constexpr(T):
-                        # Load pre-computed q, k from shared memory (shared between all rows)
-                        sQ_tile = cute.local_tile(
-                            sQ, (1, vec_size), (i_t, lane_in_group)
-                        )
-                        sK_tile = cute.local_tile(
-                            sK, (1, vec_size), (i_t, lane_in_group)
-                        )
-                        cute.autovec_copy(sQ_tile, r_q)
-                        cute.autovec_copy(sK_tile, r_k)
-
-                        r_g = sG[i_t]
-                        r_beta = sBeta[i_t]
-
-                        # Steps 1+2 FUSED: Decay + h@k using fma_packed_f32x2
-                        # Process 2 elements at a time; Blackwell packs 2 FMA in 1 instruction
-                        sum_hk_a = cutlass.Float32(0.0)
-                        sum_hk_a2 = cutlass.Float32(0.0)
-                        sum_hk_b = cutlass.Float32(0.0)
-                        sum_hk_b2 = cutlass.Float32(0.0)
-                        sum_hk_c = cutlass.Float32(0.0)
-                        sum_hk_c2 = cutlass.Float32(0.0)
-                        sum_hk_d = cutlass.Float32(0.0)
-                        sum_hk_d2 = cutlass.Float32(0.0)
-                        for i in cutlass.range_constexpr(0, vec_size, 2):
-                            r_h[0, i] = r_h[0, i] * r_g
-                            r_h[0, i + 1] = r_h[0, i + 1] * r_g
-                            r_h[1, i] = r_h[1, i] * r_g
-                            r_h[1, i + 1] = r_h[1, i + 1] * r_g
-                            r_h[2, i] = r_h[2, i] * r_g
-                            r_h[2, i + 1] = r_h[2, i + 1] * r_g
-                            r_h[3, i] = r_h[3, i] * r_g
-                            r_h[3, i + 1] = r_h[3, i + 1] * r_g
-                            if cutlass.const_expr(use_packed_fma):
-                                sum_hk_a, sum_hk_a2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[0, i], r_h[0, i + 1]),
-                                    src_b=(r_k[i], r_k[i + 1]),
-                                    src_c=(sum_hk_a, sum_hk_a2),
-                                )
-                                sum_hk_b, sum_hk_b2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[1, i], r_h[1, i + 1]),
-                                    src_b=(r_k[i], r_k[i + 1]),
-                                    src_c=(sum_hk_b, sum_hk_b2),
-                                )
-                                sum_hk_c, sum_hk_c2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[2, i], r_h[2, i + 1]),
-                                    src_b=(r_k[i], r_k[i + 1]),
-                                    src_c=(sum_hk_c, sum_hk_c2),
-                                )
-                                sum_hk_d, sum_hk_d2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[3, i], r_h[3, i + 1]),
-                                    src_b=(r_k[i], r_k[i + 1]),
-                                    src_c=(sum_hk_d, sum_hk_d2),
-                                )
-                            else:
-                                sum_hk_a, sum_hk_a2 = fma_pair(
-                                    r_h[0, i],
-                                    r_h[0, i + 1],
-                                    r_k[i],
-                                    r_k[i + 1],
-                                    sum_hk_a,
-                                    sum_hk_a2,
-                                )
-                                sum_hk_b, sum_hk_b2 = fma_pair(
-                                    r_h[1, i],
-                                    r_h[1, i + 1],
-                                    r_k[i],
-                                    r_k[i + 1],
-                                    sum_hk_b,
-                                    sum_hk_b2,
-                                )
-                                sum_hk_c, sum_hk_c2 = fma_pair(
-                                    r_h[2, i],
-                                    r_h[2, i + 1],
-                                    r_k[i],
-                                    r_k[i + 1],
-                                    sum_hk_c,
-                                    sum_hk_c2,
-                                )
-                                sum_hk_d, sum_hk_d2 = fma_pair(
-                                    r_h[3, i],
-                                    r_h[3, i + 1],
-                                    r_k[i],
-                                    r_k[i + 1],
-                                    sum_hk_d,
-                                    sum_hk_d2,
-                                )
-                        sum_hk_a = sum_hk_a + sum_hk_a2
-                        sum_hk_b = sum_hk_b + sum_hk_b2
-                        sum_hk_c = sum_hk_c + sum_hk_c2
-                        sum_hk_d = sum_hk_d + sum_hk_d2
-
-                        # Full warp reduction for ALL 4 h@k dot products
-                        for offset in [16, 8, 4, 2, 1]:
-                            if cutlass.const_expr(offset < threads_per_group):
-                                shuffle_control: cutlass.Constexpr[int] = (
-                                    (32 - threads_per_group) << 8
-                                ) | (threads_per_group - 1)
-                                sum_hk_a += cute.arch.shuffle_sync_bfly(
-                                    sum_hk_a,
-                                    offset=offset,
-                                    mask=-1,
-                                    mask_and_clamp=shuffle_control,
-                                )
-                                sum_hk_b += cute.arch.shuffle_sync_bfly(
-                                    sum_hk_b,
-                                    offset=offset,
-                                    mask=-1,
-                                    mask_and_clamp=shuffle_control,
-                                )
-                                sum_hk_c += cute.arch.shuffle_sync_bfly(
-                                    sum_hk_c,
-                                    offset=offset,
-                                    mask=-1,
-                                    mask_and_clamp=shuffle_control,
-                                )
-                                sum_hk_d += cute.arch.shuffle_sync_bfly(
-                                    sum_hk_d,
-                                    offset=offset,
-                                    mask=-1,
-                                    mask_and_clamp=shuffle_control,
-                                )
-
-                        # Step 3: Load v for ALL 4 rows, apply delta rule
-                        if cutlass.const_expr(use_smem_v):
-                            v_local_a = v_idx_a - i_v * tile_v
-                            r_v_a = sVdata[(i_t, v_local_a)]
-                            r_v_b = sVdata[(i_t, v_local_a + 1)]
-                            r_v_c = sVdata[(i_t, v_local_a + 2)]
-                            r_v_d = sVdata[(i_t, v_local_a + 3)]
-                        else:
-                            r_v_a = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_a])
-                            r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
-                            r_v_c = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_c])
-                            r_v_d = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_d])
-                        v_new_a = (r_v_a - sum_hk_a) * r_beta
-                        v_new_b = (r_v_b - sum_hk_b) * r_beta
-                        v_new_c = (r_v_c - sum_hk_c) * r_beta
-                        v_new_d = (r_v_d - sum_hk_d) * r_beta
-
-                        # Steps 4+5 FUSED: h-update + h@q using fma_packed_f32x2
-                        sum_hq_a = cutlass.Float32(0.0)
-                        sum_hq_a2 = cutlass.Float32(0.0)
-                        sum_hq_b = cutlass.Float32(0.0)
-                        sum_hq_b2 = cutlass.Float32(0.0)
-                        sum_hq_c = cutlass.Float32(0.0)
-                        sum_hq_c2 = cutlass.Float32(0.0)
-                        sum_hq_d = cutlass.Float32(0.0)
-                        sum_hq_d2 = cutlass.Float32(0.0)
-                        for i in cutlass.range_constexpr(0, vec_size, 2):
-                            if cutlass.const_expr(use_packed_fma):
-                                r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_k[i], r_k[i + 1]),
-                                    src_b=(v_new_a, v_new_a),
-                                    src_c=(r_h[0, i], r_h[0, i + 1]),
-                                )
-                                r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_k[i], r_k[i + 1]),
-                                    src_b=(v_new_b, v_new_b),
-                                    src_c=(r_h[1, i], r_h[1, i + 1]),
-                                )
-                                r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_k[i], r_k[i + 1]),
-                                    src_b=(v_new_c, v_new_c),
-                                    src_c=(r_h[2, i], r_h[2, i + 1]),
-                                )
-                                r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_k[i], r_k[i + 1]),
-                                    src_b=(v_new_d, v_new_d),
-                                    src_c=(r_h[3, i], r_h[3, i + 1]),
-                                )
-                                sum_hq_a, sum_hq_a2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[0, i], r_h[0, i + 1]),
-                                    src_b=(r_q[i], r_q[i + 1]),
-                                    src_c=(sum_hq_a, sum_hq_a2),
-                                )
-                                sum_hq_b, sum_hq_b2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[1, i], r_h[1, i + 1]),
-                                    src_b=(r_q[i], r_q[i + 1]),
-                                    src_c=(sum_hq_b, sum_hq_b2),
-                                )
-                                sum_hq_c, sum_hq_c2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[2, i], r_h[2, i + 1]),
-                                    src_b=(r_q[i], r_q[i + 1]),
-                                    src_c=(sum_hq_c, sum_hq_c2),
-                                )
-                                sum_hq_d, sum_hq_d2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[3, i], r_h[3, i + 1]),
-                                    src_b=(r_q[i], r_q[i + 1]),
-                                    src_c=(sum_hq_d, sum_hq_d2),
-                                )
-                            else:
-                                r_h[0, i], r_h[0, i + 1] = fma_pair(
-                                    r_k[i],
-                                    r_k[i + 1],
-                                    v_new_a,
-                                    v_new_a,
-                                    r_h[0, i],
-                                    r_h[0, i + 1],
-                                )
-                                r_h[1, i], r_h[1, i + 1] = fma_pair(
-                                    r_k[i],
-                                    r_k[i + 1],
-                                    v_new_b,
-                                    v_new_b,
-                                    r_h[1, i],
-                                    r_h[1, i + 1],
-                                )
-                                r_h[2, i], r_h[2, i + 1] = fma_pair(
-                                    r_k[i],
-                                    r_k[i + 1],
-                                    v_new_c,
-                                    v_new_c,
-                                    r_h[2, i],
-                                    r_h[2, i + 1],
-                                )
-                                r_h[3, i], r_h[3, i + 1] = fma_pair(
-                                    r_k[i],
-                                    r_k[i + 1],
-                                    v_new_d,
-                                    v_new_d,
-                                    r_h[3, i],
-                                    r_h[3, i + 1],
-                                )
-                                sum_hq_a, sum_hq_a2 = fma_pair(
-                                    r_h[0, i],
-                                    r_h[0, i + 1],
-                                    r_q[i],
-                                    r_q[i + 1],
-                                    sum_hq_a,
-                                    sum_hq_a2,
-                                )
-                                sum_hq_b, sum_hq_b2 = fma_pair(
-                                    r_h[1, i],
-                                    r_h[1, i + 1],
-                                    r_q[i],
-                                    r_q[i + 1],
-                                    sum_hq_b,
-                                    sum_hq_b2,
-                                )
-                                sum_hq_c, sum_hq_c2 = fma_pair(
-                                    r_h[2, i],
-                                    r_h[2, i + 1],
-                                    r_q[i],
-                                    r_q[i + 1],
-                                    sum_hq_c,
-                                    sum_hq_c2,
-                                )
-                                sum_hq_d, sum_hq_d2 = fma_pair(
-                                    r_h[3, i],
-                                    r_h[3, i + 1],
-                                    r_q[i],
-                                    r_q[i + 1],
-                                    sum_hq_d,
-                                    sum_hq_d2,
-                                )
-                        sum_hq_a = sum_hq_a + sum_hq_a2
-                        sum_hq_b = sum_hq_b + sum_hq_b2
-                        sum_hq_c = sum_hq_c + sum_hq_c2
-                        sum_hq_d = sum_hq_d + sum_hq_d2
-
-                        # Full warp reduction for ALL 4 h@q dot products
-                        for offset in [16, 8, 4, 2, 1]:
-                            if cutlass.const_expr(offset < threads_per_group):
-                                shuffle_control_q: cutlass.Constexpr[int] = (
-                                    (32 - threads_per_group) << 8
-                                ) | (threads_per_group - 1)
-                                sum_hq_a += cute.arch.shuffle_sync_bfly(
-                                    sum_hq_a,
-                                    offset=offset,
-                                    mask=-1,
-                                    mask_and_clamp=shuffle_control_q,
-                                )
-                                sum_hq_b += cute.arch.shuffle_sync_bfly(
-                                    sum_hq_b,
-                                    offset=offset,
-                                    mask=-1,
-                                    mask_and_clamp=shuffle_control_q,
-                                )
-                                sum_hq_c += cute.arch.shuffle_sync_bfly(
-                                    sum_hq_c,
-                                    offset=offset,
-                                    mask=-1,
-                                    mask_and_clamp=shuffle_control_q,
-                                )
-                                sum_hq_d += cute.arch.shuffle_sync_bfly(
-                                    sum_hq_d,
-                                    offset=offset,
-                                    mask=-1,
-                                    mask_and_clamp=shuffle_control_q,
-                                )
-
-                        # Write output for ALL 4 rows
-                        if lane_in_group == 0:
-                            if cutlass.const_expr(use_smem_v):
-                                vla = v_idx_a - i_v * tile_v
-                                sOutput[(i_t, vla)] = cutlass.BFloat16(sum_hq_a)
-                                sOutput[(i_t, vla + 1)] = cutlass.BFloat16(sum_hq_b)
-                                sOutput[(i_t, vla + 2)] = cutlass.BFloat16(sum_hq_c)
-                                sOutput[(i_t, vla + 3)] = cutlass.BFloat16(sum_hq_d)
-                            else:
-                                # Only the last micro-step of a real token produces an output row.
-                                if cutlass.const_expr(i_t % n_h == n_h - 1):
-                                    o[(i_n, i_t // n_h, i_hv, v_idx_a)] = (
-                                        cutlass.BFloat16(sum_hq_a)
+                            # Cache intermediate state if needed
+                            if not cutlass.const_expr(cache_replayssm):
+                                if cache_intermediate_states:
+                                    flat_idx = i_n * T * HV + i_t * HV + i_hv
+                                    it0 = cute.local_tile(
+                                        intermediate_states,
+                                        (1, 1, vec_size),
+                                        (flat_idx, v0, lane_in_group),
                                     )
-                                    o[(i_n, i_t // n_h, i_hv, v_idx_b)] = (
-                                        cutlass.BFloat16(sum_hq_b)
+                                    cute.autovec_copy(cute.slice_(r_h, (0, None)), it0)
+                                    it1 = cute.local_tile(
+                                        intermediate_states,
+                                        (1, 1, vec_size),
+                                        (flat_idx, v1, lane_in_group),
                                     )
-                                    o[(i_n, i_t // n_h, i_hv, v_idx_c)] = (
-                                        cutlass.BFloat16(sum_hq_c)
+                                    cute.autovec_copy(cute.slice_(r_h, (1, None)), it1)
+                                    it2 = cute.local_tile(
+                                        intermediate_states,
+                                        (1, 1, vec_size),
+                                        (flat_idx, v2, lane_in_group),
                                     )
-                                    o[(i_n, i_t // n_h, i_hv, v_idx_d)] = (
-                                        cutlass.BFloat16(sum_hq_d)
+                                    cute.autovec_copy(cute.slice_(r_h, (2, None)), it2)
+                                    it3 = cute.local_tile(
+                                        intermediate_states,
+                                        (1, 1, vec_size),
+                                        (flat_idx, v3, lane_in_group),
+                                    )
+                                    cute.autovec_copy(cute.slice_(r_h, (3, None)), it3)
+                                    it4 = cute.local_tile(
+                                        intermediate_states,
+                                        (1, 1, vec_size),
+                                        (flat_idx, v4, lane_in_group),
+                                    )
+                                    cute.autovec_copy(cute.slice_(r_h, (4, None)), it4)
+                                    it5 = cute.local_tile(
+                                        intermediate_states,
+                                        (1, 1, vec_size),
+                                        (flat_idx, v5, lane_in_group),
+                                    )
+                                    cute.autovec_copy(cute.slice_(r_h, (5, None)), it5)
+                                    it6 = cute.local_tile(
+                                        intermediate_states,
+                                        (1, 1, vec_size),
+                                        (flat_idx, v6, lane_in_group),
+                                    )
+                                    cute.autovec_copy(cute.slice_(r_h, (6, None)), it6)
+                                    it7 = cute.local_tile(
+                                        intermediate_states,
+                                        (1, 1, vec_size),
+                                        (flat_idx, v7, lane_in_group),
+                                    )
+                                    cute.autovec_copy(cute.slice_(r_h, (7, None)), it7)
+
+                            # FLA-style per-token scatter: write h_{i_t+1} directly
+                            # to pool[ssm_state_indices[i_n, i_t // n_h]] (a different slot
+                            # per iteration). h0_source is [pool_size * HV, V, K] so
+                            # the slot-flat index is pool_slot * HV + i_hv.
+                            # The snapshot belongs to the real token, so only its
+                            # last micro-step scatters.
+                            if cutlass.const_expr(
+                                per_token_pool_scatter and i_t % n_h == n_h - 1
+                            ):
+                                pool_slot_t = cutlass.Int32(
+                                    ssm_state_indices[i_n, i_t // n_h]
+                                )
+                                if pool_slot_t >= 0:
+                                    # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                                    # (65,536 bytes). Element multiply overflows Int32 at
+                                    # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                                    # T=8 the max is 73,727 — well over. Matches the
+                                    # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                                    # used by reads (PR #3230). Zero reg cost: compiler
+                                    # emits mad.wide.u32.
+                                    fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                                    fla_t0 = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v0, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (0, None)), fla_t0
+                                    )
+                                    fla_t1 = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v1, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (1, None)), fla_t1
+                                    )
+                                    fla_t2 = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v2, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (2, None)), fla_t2
+                                    )
+                                    fla_t3 = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v3, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (3, None)), fla_t3
+                                    )
+                                    fla_t4 = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v4, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (4, None)), fla_t4
+                                    )
+                                    fla_t5 = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v5, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (5, None)), fla_t5
+                                    )
+                                    fla_t6 = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v6, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (6, None)), fla_t6
+                                    )
+                                    fla_t7 = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v7, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (7, None)), fla_t7
                                     )
 
-                        # Cache intermediate state LAST in timestep (fire-and-forget stores
-                        # overlap with next timestep's compute)
-                        if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
-                            inter_tile_a = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_a, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile_a)
-                            inter_tile_b = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_b, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
-                            inter_tile_c = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_c, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (2, None)), inter_tile_c)
-                            inter_tile_d = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_d, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_tile_d)
+                            # Step 5: Output dot products h@q for all 8 rows
+                            o0 = 0.0
+                            o1 = 0.0
+                            o2 = 0.0
+                            o3 = 0.0
+                            o4 = 0.0
+                            o5 = 0.0
+                            o6 = 0.0
+                            o7 = 0.0
+                            for i in cutlass.range_constexpr(vec_size):
+                                o0 += r_h[0, i] * r_q[i]
+                                o1 += r_h[1, i] * r_q[i]
+                                o2 += r_h[2, i] * r_q[i]
+                                o3 += r_h[3, i] * r_q[i]
+                                o4 += r_h[4, i] * r_q[i]
+                                o5 += r_h[5, i] * r_q[i]
+                                o6 += r_h[6, i] * r_q[i]
+                                o7 += r_h[7, i] * r_q[i]
 
-                        # FLA-style per-token pool scatter (parallel to cache).
-                        # The snapshot belongs to the real token, so only its
-                        # last micro-step scatters.
+                            for offset in [16, 8, 4, 2, 1]:
+                                o0 += cute.arch.shuffle_sync_bfly(
+                                    o0, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                o1 += cute.arch.shuffle_sync_bfly(
+                                    o1, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                o2 += cute.arch.shuffle_sync_bfly(
+                                    o2, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                o3 += cute.arch.shuffle_sync_bfly(
+                                    o3, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                o4 += cute.arch.shuffle_sync_bfly(
+                                    o4, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                o5 += cute.arch.shuffle_sync_bfly(
+                                    o5, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                o6 += cute.arch.shuffle_sync_bfly(
+                                    o6, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                o7 += cute.arch.shuffle_sync_bfly(
+                                    o7, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+
+                            if lane_in_group == 0:
+                                if cutlass.const_expr(use_smem_v):
+                                    vl0 = v0 - i_v * tile_v
+                                    sOutput[(j_c, vl0)] = cutlass.BFloat16(o0)
+                                    sOutput[(j_c, vl0 + 1)] = cutlass.BFloat16(o1)
+                                    sOutput[(j_c, vl0 + 2)] = cutlass.BFloat16(o2)
+                                    sOutput[(j_c, vl0 + 3)] = cutlass.BFloat16(o3)
+                                    sOutput[(j_c, vl0 + 4)] = cutlass.BFloat16(o4)
+                                    sOutput[(j_c, vl0 + 5)] = cutlass.BFloat16(o5)
+                                    sOutput[(j_c, vl0 + 6)] = cutlass.BFloat16(o6)
+                                    sOutput[(j_c, vl0 + 7)] = cutlass.BFloat16(o7)
+                                else:
+                                    # Only the last micro-step of a real token produces an output row.
+                                    if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                        o[(i_n, i_t // n_h, i_hv, v0)] = (
+                                            cutlass.BFloat16(o0)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v1)] = (
+                                            cutlass.BFloat16(o1)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v2)] = (
+                                            cutlass.BFloat16(o2)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v3)] = (
+                                            cutlass.BFloat16(o3)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v4)] = (
+                                            cutlass.BFloat16(o4)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v5)] = (
+                                            cutlass.BFloat16(o5)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v6)] = (
+                                            cutlass.BFloat16(o6)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v7)] = (
+                                            cutlass.BFloat16(o7)
+                                        )
+
+                        # Write final state back for all 8 rows. Negative write
+                        # indices (output_state_indices == -1) skip the writeback.
                         if cutlass.const_expr(
-                            per_token_pool_scatter and i_t % n_h == n_h - 1
+                            not disable_state_update
+                            and not per_token_pool_scatter
+                            and c0 + CHUNK >= T  # final state: last chunk only
                         ):
-                            pool_slot_t = cutlass.Int32(
-                                ssm_state_indices[i_n, i_t // n_h]
-                            )
-                            if pool_slot_t >= 0:
-                                # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                                # (65,536 bytes). Element multiply overflows Int32 at
-                                # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                                # T=8 the max is 73,727 — well over. Matches the
-                                # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                                # used by reads (PR #3230). Zero reg cost: compiler
-                                # emits mad.wide.u32.
-                                fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                                fla_t_a = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v_idx_a, lane_in_group),
+                            if write_cache_idx_raw >= 0:
+                                ht_o0 = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v0, lane_in_group),
                                 )
-                                cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
-                                fla_t_b = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v_idx_b, lane_in_group),
+                                cute.autovec_copy(cute.slice_(r_h, (0, None)), ht_o0)
+                                ht_o1 = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v1, lane_in_group),
                                 )
-                                cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
-                                fla_t_c = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v_idx_c, lane_in_group),
+                                cute.autovec_copy(cute.slice_(r_h, (1, None)), ht_o1)
+                                ht_o2 = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v2, lane_in_group),
                                 )
-                                cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t_c)
-                                fla_t_d = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v_idx_d, lane_in_group),
+                                cute.autovec_copy(cute.slice_(r_h, (2, None)), ht_o2)
+                                ht_o3 = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v3, lane_in_group),
                                 )
-                                cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t_d)
+                                cute.autovec_copy(cute.slice_(r_h, (3, None)), ht_o3)
+                                ht_o4 = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v4, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (4, None)), ht_o4)
+                                ht_o5 = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v5, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (5, None)), ht_o5)
+                                ht_o6 = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v6, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (6, None)), ht_o6)
+                                ht_o7 = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v7, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (7, None)), ht_o7)
+            elif cutlass.const_expr(ilp_rows == 4):
+                # === 4-ROW ILP PATH: Process 4 V-rows simultaneously ===
+                quarter_rows: cutlass.Constexpr[int] = rows_per_group // 4
 
-                    # Write final state back for ALL 4 rows (if not disabled).
-                    # Negative write indices skip the writeback.
-                    if cutlass.const_expr(
-                        not disable_state_update and not per_token_pool_scatter
-                    ):
-                        if write_cache_idx_raw >= 0:
-                            h_tile_out_a = cute.local_tile(
-                                h_write_view,
+                for row_quad in cutlass.range_constexpr(quarter_rows):
+                    v_idx_a = i_v * tile_v + group_idx * rows_per_group + row_quad * 4
+                    v_idx_b = v_idx_a + 1
+                    v_idx_c = v_idx_a + 2
+                    v_idx_d = v_idx_a + 3
+
+                    if v_idx_d < V:
+                        # Load h for 4 V-rows. Warps 1-3 skip first quad (prefetched in Phase 1).
+                        if cutlass.const_expr(c0 == 0) and (
+                            cutlass.const_expr(cache_replayssm)
+                            or warp_idx == 0
+                            or row_quad > 0
+                        ):
+                            h_tile_a = cute.local_tile(
+                                h_read_view,
                                 (1, vec_size),
                                 (v_idx_a, lane_in_group),
                             )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
-                            h_tile_out_b = cute.local_tile(
-                                h_write_view,
+                            h_tile_b = cute.local_tile(
+                                h_read_view,
                                 (1, vec_size),
                                 (v_idx_b, lane_in_group),
                             )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
-                            h_tile_out_c = cute.local_tile(
-                                h_write_view,
+                            h_tile_c = cute.local_tile(
+                                h_read_view,
                                 (1, vec_size),
                                 (v_idx_c, lane_in_group),
                             )
-                            cute.autovec_copy(cute.slice_(r_h, (2, None)), h_tile_out_c)
-                            h_tile_out_d = cute.local_tile(
-                                h_write_view,
+                            h_tile_d = cute.local_tile(
+                                h_read_view,
                                 (1, vec_size),
                                 (v_idx_d, lane_in_group),
                             )
-                            cute.autovec_copy(cute.slice_(r_h, (3, None)), h_tile_out_d)
-        elif cutlass.const_expr(ilp_rows == 2):
-            # === 2-ROW ILP PATH: Process 2 V-rows simultaneously ===
-            half_rows: cutlass.Constexpr[int] = rows_per_group // 2
+                            cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
+                            cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
+                            cute.autovec_copy(h_tile_c, cute.slice_(r_h, (2, None)))
+                            cute.autovec_copy(h_tile_d, cute.slice_(r_h, (3, None)))
+                        # else: warps 1-3 on first quad — r_h already loaded during Phase 1
 
-            for row_pair in cutlass.range_constexpr(half_rows):
-                v_idx_a = i_v * tile_v + group_idx * rows_per_group + row_pair * 2
-                v_idx_b = v_idx_a + 1
-
-                if v_idx_b < V:
-                    # Load h for BOTH rows. Warps 1-3 skip first pair (prefetched).
-                    if (
-                        cutlass.const_expr(cache_replayssm)
-                        or warp_idx == 0
-                        or row_pair > 0
-                    ):
-                        h_tile_a = cute.local_tile(
-                            h_read_view,
-                            (1, vec_size),
-                            (v_idx_a, lane_in_group),
-                        )
-                        h_tile_b = cute.local_tile(
-                            h_read_view,
-                            (1, vec_size),
-                            (v_idx_b, lane_in_group),
-                        )
-                        cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
-                        cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
-                    # else: warps 1-3 on first pair — r_h already loaded during Phase 1
-
-                    # Process all T time steps with both h vectors in registers
-                    for i_t in cutlass.range_constexpr(T):
-                        # Load pre-computed q, k from shared memory (shared between both rows)
-                        sQ_tile = cute.local_tile(
-                            sQ, (1, vec_size), (i_t, lane_in_group)
-                        )
-                        sK_tile = cute.local_tile(
-                            sK, (1, vec_size), (i_t, lane_in_group)
-                        )
-                        cute.autovec_copy(sQ_tile, r_q)
-                        cute.autovec_copy(sK_tile, r_k)
-
-                        r_g = sG[i_t]
-                        r_beta = sBeta[i_t]
-
-                        # Step 1: Apply decay to BOTH h vectors (ILP)
-                        for i in cutlass.range_constexpr(vec_size):
-                            r_h[0, i] = r_h[0, i] * r_g
-                            r_h[1, i] = r_h[1, i] * r_g
-
-                        # Step 2: Compute dot products for BOTH rows (ILP)
-                        sum_hk_a = 0.0
-                        sum_hk_b = 0.0
-                        for i in cutlass.range_constexpr(vec_size):
-                            sum_hk_a += r_h[0, i] * r_k[i]
-                            sum_hk_b += r_h[1, i] * r_k[i]
-
-                        # Warp-level reduction for BOTH (interleaved shuffles)
-                        for offset in [16, 8, 4, 2, 1]:
-                            sum_hk_a += cute.arch.shuffle_sync_bfly(
-                                sum_hk_a, offset=offset, mask=-1, mask_and_clamp=31
+                        # Process all T time steps with all 4 h vectors in registers
+                        for j_c in cutlass.range_constexpr(CHUNK):
+                            i_t = c0 + j_c
+                            # Load pre-computed q, k from shared memory (shared between all rows)
+                            sQ_tile = cute.local_tile(
+                                sQ, (1, vec_size), (j_c, lane_in_group)
                             )
-                            sum_hk_b += cute.arch.shuffle_sync_bfly(
-                                sum_hk_b, offset=offset, mask=-1, mask_and_clamp=31
+                            sK_tile = cute.local_tile(
+                                sK, (1, vec_size), (j_c, lane_in_group)
                             )
+                            cute.autovec_copy(sQ_tile, r_q)
+                            cute.autovec_copy(sK_tile, r_k)
 
-                        # Step 3: Load v for BOTH rows, apply delta rule
-                        if cutlass.const_expr(use_smem_v):
-                            v_local_a = v_idx_a - i_v * tile_v
-                            r_v_a = sVdata[(i_t, v_local_a)]
-                            r_v_b = sVdata[(i_t, v_local_a + 1)]
-                        else:
-                            r_v_a = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_a])
-                            r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
-                        v_new_a = (r_v_a - sum_hk_a) * r_beta
-                        v_new_b = (r_v_b - sum_hk_b) * r_beta
+                            r_g = sG[j_c]
+                            r_beta = sBeta[j_c]
 
-                        # Step 4: Update BOTH h vectors (ILP)
-                        for i in cutlass.range_constexpr(vec_size):
-                            r_h[0, i] += r_k[i] * v_new_a
-                            r_h[1, i] += r_k[i] * v_new_b
+                            # Steps 1+2 FUSED: Decay + h@k using fma_packed_f32x2
+                            # Process 2 elements at a time; Blackwell packs 2 FMA in 1 instruction
+                            sum_hk_a = cutlass.Float32(0.0)
+                            sum_hk_a2 = cutlass.Float32(0.0)
+                            sum_hk_b = cutlass.Float32(0.0)
+                            sum_hk_b2 = cutlass.Float32(0.0)
+                            sum_hk_c = cutlass.Float32(0.0)
+                            sum_hk_c2 = cutlass.Float32(0.0)
+                            sum_hk_d = cutlass.Float32(0.0)
+                            sum_hk_d2 = cutlass.Float32(0.0)
+                            for i in cutlass.range_constexpr(0, vec_size, 2):
+                                r_h[0, i] = r_h[0, i] * r_g
+                                r_h[0, i + 1] = r_h[0, i + 1] * r_g
+                                r_h[1, i] = r_h[1, i] * r_g
+                                r_h[1, i + 1] = r_h[1, i + 1] * r_g
+                                r_h[2, i] = r_h[2, i] * r_g
+                                r_h[2, i + 1] = r_h[2, i + 1] * r_g
+                                r_h[3, i] = r_h[3, i] * r_g
+                                r_h[3, i + 1] = r_h[3, i + 1] * r_g
+                                if cutlass.const_expr(use_packed_fma):
+                                    sum_hk_a, sum_hk_a2 = cute.arch.fma_packed_f32x2(
+                                        src_a=(r_h[0, i], r_h[0, i + 1]),
+                                        src_b=(r_k[i], r_k[i + 1]),
+                                        src_c=(sum_hk_a, sum_hk_a2),
+                                    )
+                                    sum_hk_b, sum_hk_b2 = cute.arch.fma_packed_f32x2(
+                                        src_a=(r_h[1, i], r_h[1, i + 1]),
+                                        src_b=(r_k[i], r_k[i + 1]),
+                                        src_c=(sum_hk_b, sum_hk_b2),
+                                    )
+                                    sum_hk_c, sum_hk_c2 = cute.arch.fma_packed_f32x2(
+                                        src_a=(r_h[2, i], r_h[2, i + 1]),
+                                        src_b=(r_k[i], r_k[i + 1]),
+                                        src_c=(sum_hk_c, sum_hk_c2),
+                                    )
+                                    sum_hk_d, sum_hk_d2 = cute.arch.fma_packed_f32x2(
+                                        src_a=(r_h[3, i], r_h[3, i + 1]),
+                                        src_b=(r_k[i], r_k[i + 1]),
+                                        src_c=(sum_hk_d, sum_hk_d2),
+                                    )
+                                else:
+                                    sum_hk_a, sum_hk_a2 = fma_pair(
+                                        r_h[0, i],
+                                        r_h[0, i + 1],
+                                        r_k[i],
+                                        r_k[i + 1],
+                                        sum_hk_a,
+                                        sum_hk_a2,
+                                    )
+                                    sum_hk_b, sum_hk_b2 = fma_pair(
+                                        r_h[1, i],
+                                        r_h[1, i + 1],
+                                        r_k[i],
+                                        r_k[i + 1],
+                                        sum_hk_b,
+                                        sum_hk_b2,
+                                    )
+                                    sum_hk_c, sum_hk_c2 = fma_pair(
+                                        r_h[2, i],
+                                        r_h[2, i + 1],
+                                        r_k[i],
+                                        r_k[i + 1],
+                                        sum_hk_c,
+                                        sum_hk_c2,
+                                    )
+                                    sum_hk_d, sum_hk_d2 = fma_pair(
+                                        r_h[3, i],
+                                        r_h[3, i + 1],
+                                        r_k[i],
+                                        r_k[i + 1],
+                                        sum_hk_d,
+                                        sum_hk_d2,
+                                    )
+                            sum_hk_a = sum_hk_a + sum_hk_a2
+                            sum_hk_b = sum_hk_b + sum_hk_b2
+                            sum_hk_c = sum_hk_c + sum_hk_c2
+                            sum_hk_d = sum_hk_d + sum_hk_d2
 
-                        # Cache intermediate state if needed
-                        if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
-                            inter_tile_a = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_a, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile_a)
-                            inter_tile_b = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_b, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
+                            # Full warp reduction for ALL 4 h@k dot products
+                            for offset in [16, 8, 4, 2, 1]:
+                                if cutlass.const_expr(offset < threads_per_group):
+                                    shuffle_control: cutlass.Constexpr[int] = (
+                                        (32 - threads_per_group) << 8
+                                    ) | (threads_per_group - 1)
+                                    sum_hk_a += cute.arch.shuffle_sync_bfly(
+                                        sum_hk_a,
+                                        offset=offset,
+                                        mask=-1,
+                                        mask_and_clamp=shuffle_control,
+                                    )
+                                    sum_hk_b += cute.arch.shuffle_sync_bfly(
+                                        sum_hk_b,
+                                        offset=offset,
+                                        mask=-1,
+                                        mask_and_clamp=shuffle_control,
+                                    )
+                                    sum_hk_c += cute.arch.shuffle_sync_bfly(
+                                        sum_hk_c,
+                                        offset=offset,
+                                        mask=-1,
+                                        mask_and_clamp=shuffle_control,
+                                    )
+                                    sum_hk_d += cute.arch.shuffle_sync_bfly(
+                                        sum_hk_d,
+                                        offset=offset,
+                                        mask=-1,
+                                        mask_and_clamp=shuffle_control,
+                                    )
 
-                        # FLA-style per-token pool scatter (parallel to cache).
-                        # The snapshot belongs to the real token, so only its
-                        # last micro-step scatters.
-                        if cutlass.const_expr(
-                            per_token_pool_scatter and i_t % n_h == n_h - 1
-                        ):
-                            pool_slot_t = cutlass.Int32(
-                                ssm_state_indices[i_n, i_t // n_h]
-                            )
-                            if pool_slot_t >= 0:
-                                # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                                # (65,536 bytes). Element multiply overflows Int32 at
-                                # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                                # T=8 the max is 73,727 — well over. Matches the
-                                # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                                # used by reads (PR #3230). Zero reg cost: compiler
-                                # emits mad.wide.u32.
-                                fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                                fla_t_a = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v_idx_a, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
-                                fla_t_b = cute.local_tile(
-                                    h0_source,
-                                    (1, 1, vec_size),
-                                    (fla_idx, v_idx_b, lane_in_group),
-                                )
-                                cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
-
-                        # Step 5: Compute output for BOTH rows (ILP)
-                        sum_hq_a = 0.0
-                        sum_hq_b = 0.0
-                        for i in cutlass.range_constexpr(vec_size):
-                            sum_hq_a += r_h[0, i] * r_q[i]
-                            sum_hq_b += r_h[1, i] * r_q[i]
-
-                        # Warp-level reduction for BOTH (interleaved)
-                        for offset in [16, 8, 4, 2, 1]:
-                            sum_hq_a += cute.arch.shuffle_sync_bfly(
-                                sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_b += cute.arch.shuffle_sync_bfly(
-                                sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-
-                        # Write output for BOTH rows
-                        if lane_in_group == 0:
+                            # Step 3: Load v for ALL 4 rows, apply delta rule
                             if cutlass.const_expr(use_smem_v):
-                                vla2 = v_idx_a - i_v * tile_v
-                                sOutput[(i_t, vla2)] = cutlass.BFloat16(sum_hq_a)
-                                sOutput[(i_t, vla2 + 1)] = cutlass.BFloat16(sum_hq_b)
+                                v_local_a = v_idx_a - i_v * tile_v
+                                r_v_a = sVdata[(j_c, v_local_a)]
+                                r_v_b = sVdata[(j_c, v_local_a + 1)]
+                                r_v_c = sVdata[(j_c, v_local_a + 2)]
+                                r_v_d = sVdata[(j_c, v_local_a + 3)]
                             else:
-                                # Only the last micro-step of a real token produces an output row.
-                                if cutlass.const_expr(i_t % n_h == n_h - 1):
-                                    o[(i_n, i_t // n_h, i_hv, v_idx_a)] = (
-                                        cutlass.BFloat16(sum_hq_a)
+                                r_v_a = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_a])
+                                r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
+                                r_v_c = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_c])
+                                r_v_d = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_d])
+                            v_new_a = (r_v_a - sum_hk_a) * r_beta
+                            v_new_b = (r_v_b - sum_hk_b) * r_beta
+                            v_new_c = (r_v_c - sum_hk_c) * r_beta
+                            v_new_d = (r_v_d - sum_hk_d) * r_beta
+
+                            # Steps 4+5 FUSED: h-update + h@q using fma_packed_f32x2
+                            sum_hq_a = cutlass.Float32(0.0)
+                            sum_hq_a2 = cutlass.Float32(0.0)
+                            sum_hq_b = cutlass.Float32(0.0)
+                            sum_hq_b2 = cutlass.Float32(0.0)
+                            sum_hq_c = cutlass.Float32(0.0)
+                            sum_hq_c2 = cutlass.Float32(0.0)
+                            sum_hq_d = cutlass.Float32(0.0)
+                            sum_hq_d2 = cutlass.Float32(0.0)
+                            for i in cutlass.range_constexpr(0, vec_size, 2):
+                                if cutlass.const_expr(use_packed_fma):
+                                    r_h[0, i], r_h[0, i + 1] = (
+                                        cute.arch.fma_packed_f32x2(
+                                            src_a=(r_k[i], r_k[i + 1]),
+                                            src_b=(v_new_a, v_new_a),
+                                            src_c=(r_h[0, i], r_h[0, i + 1]),
+                                        )
                                     )
-                                    o[(i_n, i_t // n_h, i_hv, v_idx_b)] = (
-                                        cutlass.BFloat16(sum_hq_b)
+                                    r_h[1, i], r_h[1, i + 1] = (
+                                        cute.arch.fma_packed_f32x2(
+                                            src_a=(r_k[i], r_k[i + 1]),
+                                            src_b=(v_new_b, v_new_b),
+                                            src_c=(r_h[1, i], r_h[1, i + 1]),
+                                        )
+                                    )
+                                    r_h[2, i], r_h[2, i + 1] = (
+                                        cute.arch.fma_packed_f32x2(
+                                            src_a=(r_k[i], r_k[i + 1]),
+                                            src_b=(v_new_c, v_new_c),
+                                            src_c=(r_h[2, i], r_h[2, i + 1]),
+                                        )
+                                    )
+                                    r_h[3, i], r_h[3, i + 1] = (
+                                        cute.arch.fma_packed_f32x2(
+                                            src_a=(r_k[i], r_k[i + 1]),
+                                            src_b=(v_new_d, v_new_d),
+                                            src_c=(r_h[3, i], r_h[3, i + 1]),
+                                        )
+                                    )
+                                    sum_hq_a, sum_hq_a2 = cute.arch.fma_packed_f32x2(
+                                        src_a=(r_h[0, i], r_h[0, i + 1]),
+                                        src_b=(r_q[i], r_q[i + 1]),
+                                        src_c=(sum_hq_a, sum_hq_a2),
+                                    )
+                                    sum_hq_b, sum_hq_b2 = cute.arch.fma_packed_f32x2(
+                                        src_a=(r_h[1, i], r_h[1, i + 1]),
+                                        src_b=(r_q[i], r_q[i + 1]),
+                                        src_c=(sum_hq_b, sum_hq_b2),
+                                    )
+                                    sum_hq_c, sum_hq_c2 = cute.arch.fma_packed_f32x2(
+                                        src_a=(r_h[2, i], r_h[2, i + 1]),
+                                        src_b=(r_q[i], r_q[i + 1]),
+                                        src_c=(sum_hq_c, sum_hq_c2),
+                                    )
+                                    sum_hq_d, sum_hq_d2 = cute.arch.fma_packed_f32x2(
+                                        src_a=(r_h[3, i], r_h[3, i + 1]),
+                                        src_b=(r_q[i], r_q[i + 1]),
+                                        src_c=(sum_hq_d, sum_hq_d2),
+                                    )
+                                else:
+                                    r_h[0, i], r_h[0, i + 1] = fma_pair(
+                                        r_k[i],
+                                        r_k[i + 1],
+                                        v_new_a,
+                                        v_new_a,
+                                        r_h[0, i],
+                                        r_h[0, i + 1],
+                                    )
+                                    r_h[1, i], r_h[1, i + 1] = fma_pair(
+                                        r_k[i],
+                                        r_k[i + 1],
+                                        v_new_b,
+                                        v_new_b,
+                                        r_h[1, i],
+                                        r_h[1, i + 1],
+                                    )
+                                    r_h[2, i], r_h[2, i + 1] = fma_pair(
+                                        r_k[i],
+                                        r_k[i + 1],
+                                        v_new_c,
+                                        v_new_c,
+                                        r_h[2, i],
+                                        r_h[2, i + 1],
+                                    )
+                                    r_h[3, i], r_h[3, i + 1] = fma_pair(
+                                        r_k[i],
+                                        r_k[i + 1],
+                                        v_new_d,
+                                        v_new_d,
+                                        r_h[3, i],
+                                        r_h[3, i + 1],
+                                    )
+                                    sum_hq_a, sum_hq_a2 = fma_pair(
+                                        r_h[0, i],
+                                        r_h[0, i + 1],
+                                        r_q[i],
+                                        r_q[i + 1],
+                                        sum_hq_a,
+                                        sum_hq_a2,
+                                    )
+                                    sum_hq_b, sum_hq_b2 = fma_pair(
+                                        r_h[1, i],
+                                        r_h[1, i + 1],
+                                        r_q[i],
+                                        r_q[i + 1],
+                                        sum_hq_b,
+                                        sum_hq_b2,
+                                    )
+                                    sum_hq_c, sum_hq_c2 = fma_pair(
+                                        r_h[2, i],
+                                        r_h[2, i + 1],
+                                        r_q[i],
+                                        r_q[i + 1],
+                                        sum_hq_c,
+                                        sum_hq_c2,
+                                    )
+                                    sum_hq_d, sum_hq_d2 = fma_pair(
+                                        r_h[3, i],
+                                        r_h[3, i + 1],
+                                        r_q[i],
+                                        r_q[i + 1],
+                                        sum_hq_d,
+                                        sum_hq_d2,
+                                    )
+                            sum_hq_a = sum_hq_a + sum_hq_a2
+                            sum_hq_b = sum_hq_b + sum_hq_b2
+                            sum_hq_c = sum_hq_c + sum_hq_c2
+                            sum_hq_d = sum_hq_d + sum_hq_d2
+
+                            # Full warp reduction for ALL 4 h@q dot products
+                            for offset in [16, 8, 4, 2, 1]:
+                                if cutlass.const_expr(offset < threads_per_group):
+                                    shuffle_control_q: cutlass.Constexpr[int] = (
+                                        (32 - threads_per_group) << 8
+                                    ) | (threads_per_group - 1)
+                                    sum_hq_a += cute.arch.shuffle_sync_bfly(
+                                        sum_hq_a,
+                                        offset=offset,
+                                        mask=-1,
+                                        mask_and_clamp=shuffle_control_q,
+                                    )
+                                    sum_hq_b += cute.arch.shuffle_sync_bfly(
+                                        sum_hq_b,
+                                        offset=offset,
+                                        mask=-1,
+                                        mask_and_clamp=shuffle_control_q,
+                                    )
+                                    sum_hq_c += cute.arch.shuffle_sync_bfly(
+                                        sum_hq_c,
+                                        offset=offset,
+                                        mask=-1,
+                                        mask_and_clamp=shuffle_control_q,
+                                    )
+                                    sum_hq_d += cute.arch.shuffle_sync_bfly(
+                                        sum_hq_d,
+                                        offset=offset,
+                                        mask=-1,
+                                        mask_and_clamp=shuffle_control_q,
                                     )
 
-                    # Write final state back for BOTH rows (if not disabled).
-                    # Negative write indices skip the writeback.
-                    if cutlass.const_expr(
-                        not disable_state_update and not per_token_pool_scatter
-                    ):
-                        if write_cache_idx_raw >= 0:
-                            h_tile_out_a = cute.local_tile(
-                                h_write_view,
+                            # Write output for ALL 4 rows
+                            if lane_in_group == 0:
+                                if cutlass.const_expr(use_smem_v):
+                                    vla = v_idx_a - i_v * tile_v
+                                    sOutput[(j_c, vla)] = cutlass.BFloat16(sum_hq_a)
+                                    sOutput[(j_c, vla + 1)] = cutlass.BFloat16(sum_hq_b)
+                                    sOutput[(j_c, vla + 2)] = cutlass.BFloat16(sum_hq_c)
+                                    sOutput[(j_c, vla + 3)] = cutlass.BFloat16(sum_hq_d)
+                                else:
+                                    # Only the last micro-step of a real token produces an output row.
+                                    if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                        o[(i_n, i_t // n_h, i_hv, v_idx_a)] = (
+                                            cutlass.BFloat16(sum_hq_a)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v_idx_b)] = (
+                                            cutlass.BFloat16(sum_hq_b)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v_idx_c)] = (
+                                            cutlass.BFloat16(sum_hq_c)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v_idx_d)] = (
+                                            cutlass.BFloat16(sum_hq_d)
+                                        )
+
+                            # Cache intermediate state LAST in timestep (fire-and-forget stores
+                            # overlap with next timestep's compute)
+                            if cache_intermediate_states:
+                                flat_idx = i_n * T * HV + i_t * HV + i_hv
+                                inter_tile_a = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx_a, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (0, None)), inter_tile_a
+                                )
+                                inter_tile_b = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx_b, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (1, None)), inter_tile_b
+                                )
+                                inter_tile_c = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx_c, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (2, None)), inter_tile_c
+                                )
+                                inter_tile_d = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx_d, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (3, None)), inter_tile_d
+                                )
+
+                            # FLA-style per-token pool scatter (parallel to cache).
+                            # The snapshot belongs to the real token, so only its
+                            # last micro-step scatters.
+                            if cutlass.const_expr(
+                                per_token_pool_scatter and i_t % n_h == n_h - 1
+                            ):
+                                pool_slot_t = cutlass.Int32(
+                                    ssm_state_indices[i_n, i_t // n_h]
+                                )
+                                if pool_slot_t >= 0:
+                                    # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                                    # (65,536 bytes). Element multiply overflows Int32 at
+                                    # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                                    # T=8 the max is 73,727 — well over. Matches the
+                                    # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                                    # used by reads (PR #3230). Zero reg cost: compiler
+                                    # emits mad.wide.u32.
+                                    fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                                    fla_t_a = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v_idx_a, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (0, None)), fla_t_a
+                                    )
+                                    fla_t_b = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v_idx_b, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (1, None)), fla_t_b
+                                    )
+                                    fla_t_c = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v_idx_c, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (2, None)), fla_t_c
+                                    )
+                                    fla_t_d = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v_idx_d, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (3, None)), fla_t_d
+                                    )
+
+                        # Write final state back for ALL 4 rows (if not disabled).
+                        # Negative write indices skip the writeback.
+                        if cutlass.const_expr(
+                            not disable_state_update
+                            and not per_token_pool_scatter
+                            and c0 + CHUNK >= T  # final state: last chunk only
+                        ):
+                            if write_cache_idx_raw >= 0:
+                                h_tile_out_a = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v_idx_a, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (0, None)), h_tile_out_a
+                                )
+                                h_tile_out_b = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v_idx_b, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (1, None)), h_tile_out_b
+                                )
+                                h_tile_out_c = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v_idx_c, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (2, None)), h_tile_out_c
+                                )
+                                h_tile_out_d = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v_idx_d, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (3, None)), h_tile_out_d
+                                )
+            elif cutlass.const_expr(ilp_rows == 2):
+                # === 2-ROW ILP PATH: Process 2 V-rows simultaneously ===
+                half_rows: cutlass.Constexpr[int] = rows_per_group // 2
+
+                for row_pair in cutlass.range_constexpr(half_rows):
+                    v_idx_a = i_v * tile_v + group_idx * rows_per_group + row_pair * 2
+                    v_idx_b = v_idx_a + 1
+
+                    if v_idx_b < V:
+                        # Load h for BOTH rows. Warps 1-3 skip first pair (prefetched).
+                        if cutlass.const_expr(c0 == 0) and (
+                            cutlass.const_expr(cache_replayssm)
+                            or warp_idx == 0
+                            or row_pair > 0
+                        ):
+                            h_tile_a = cute.local_tile(
+                                h_read_view,
                                 (1, vec_size),
                                 (v_idx_a, lane_in_group),
                             )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
-                            h_tile_out_b = cute.local_tile(
-                                h_write_view,
+                            h_tile_b = cute.local_tile(
+                                h_read_view,
                                 (1, vec_size),
                                 (v_idx_b, lane_in_group),
                             )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
-        # === Cooperative output writeback from SMEM to GMEM (only if use_smem_v) ===
-        if cutlass.const_expr(use_smem_v):
-            cute.arch.barrier()  # Ensure all groups finished writing to sOutput
-            v_tile_base = i_v * tile_v
-            for t_idx in cutlass.range_constexpr(T):
-                # only a token's LAST micro-step carries its output; the rest
-                # staged zeros into the same row
-                if cutlass.const_expr(t_idx % n_h == n_h - 1):
-                    # 128 threads, tile_v values to write per timestep
-                    if tidx < tile_v:
-                        v_global = v_tile_base + tidx
-                        if v_global < V:
-                            o[(i_n, t_idx // n_h, i_hv, v_global)] = sOutput[
-                                (t_idx, tidx)
-                            ]
+                            cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
+                            cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
+                        # else: warps 1-3 on first pair — r_h already loaded during Phase 1
+
+                        # Process all T time steps with both h vectors in registers
+                        for j_c in cutlass.range_constexpr(CHUNK):
+                            i_t = c0 + j_c
+                            # Load pre-computed q, k from shared memory (shared between both rows)
+                            sQ_tile = cute.local_tile(
+                                sQ, (1, vec_size), (j_c, lane_in_group)
+                            )
+                            sK_tile = cute.local_tile(
+                                sK, (1, vec_size), (j_c, lane_in_group)
+                            )
+                            cute.autovec_copy(sQ_tile, r_q)
+                            cute.autovec_copy(sK_tile, r_k)
+
+                            r_g = sG[j_c]
+                            r_beta = sBeta[j_c]
+
+                            # Step 1: Apply decay to BOTH h vectors (ILP)
+                            for i in cutlass.range_constexpr(vec_size):
+                                r_h[0, i] = r_h[0, i] * r_g
+                                r_h[1, i] = r_h[1, i] * r_g
+
+                            # Step 2: Compute dot products for BOTH rows (ILP)
+                            sum_hk_a = 0.0
+                            sum_hk_b = 0.0
+                            for i in cutlass.range_constexpr(vec_size):
+                                sum_hk_a += r_h[0, i] * r_k[i]
+                                sum_hk_b += r_h[1, i] * r_k[i]
+
+                            # Warp-level reduction for BOTH (interleaved shuffles)
+                            for offset in [16, 8, 4, 2, 1]:
+                                sum_hk_a += cute.arch.shuffle_sync_bfly(
+                                    sum_hk_a, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                sum_hk_b += cute.arch.shuffle_sync_bfly(
+                                    sum_hk_b, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+
+                            # Step 3: Load v for BOTH rows, apply delta rule
+                            if cutlass.const_expr(use_smem_v):
+                                v_local_a = v_idx_a - i_v * tile_v
+                                r_v_a = sVdata[(j_c, v_local_a)]
+                                r_v_b = sVdata[(j_c, v_local_a + 1)]
+                            else:
+                                r_v_a = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_a])
+                                r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
+                            v_new_a = (r_v_a - sum_hk_a) * r_beta
+                            v_new_b = (r_v_b - sum_hk_b) * r_beta
+
+                            # Step 4: Update BOTH h vectors (ILP)
+                            for i in cutlass.range_constexpr(vec_size):
+                                r_h[0, i] += r_k[i] * v_new_a
+                                r_h[1, i] += r_k[i] * v_new_b
+
+                            # Cache intermediate state if needed
+                            if cache_intermediate_states:
+                                flat_idx = i_n * T * HV + i_t * HV + i_hv
+                                inter_tile_a = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx_a, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (0, None)), inter_tile_a
+                                )
+                                inter_tile_b = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx_b, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (1, None)), inter_tile_b
+                                )
+
+                            # FLA-style per-token pool scatter (parallel to cache).
+                            # The snapshot belongs to the real token, so only its
+                            # last micro-step scatters.
+                            if cutlass.const_expr(
+                                per_token_pool_scatter and i_t % n_h == n_h - 1
+                            ):
+                                pool_slot_t = cutlass.Int32(
+                                    ssm_state_indices[i_n, i_t // n_h]
+                                )
+                                if pool_slot_t >= 0:
+                                    # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                                    # (65,536 bytes). Element multiply overflows Int32 at
+                                    # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                                    # T=8 the max is 73,727 — well over. Matches the
+                                    # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                                    # used by reads (PR #3230). Zero reg cost: compiler
+                                    # emits mad.wide.u32.
+                                    fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                                    fla_t_a = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v_idx_a, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (0, None)), fla_t_a
+                                    )
+                                    fla_t_b = cute.local_tile(
+                                        h0_source,
+                                        (1, 1, vec_size),
+                                        (fla_idx, v_idx_b, lane_in_group),
+                                    )
+                                    cute.autovec_copy(
+                                        cute.slice_(r_h, (1, None)), fla_t_b
+                                    )
+
+                            # Step 5: Compute output for BOTH rows (ILP)
+                            sum_hq_a = 0.0
+                            sum_hq_b = 0.0
+                            for i in cutlass.range_constexpr(vec_size):
+                                sum_hq_a += r_h[0, i] * r_q[i]
+                                sum_hq_b += r_h[1, i] * r_q[i]
+
+                            # Warp-level reduction for BOTH (interleaved)
+                            for offset in [16, 8, 4, 2, 1]:
+                                sum_hq_a += cute.arch.shuffle_sync_bfly(
+                                    sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                                sum_hq_b += cute.arch.shuffle_sync_bfly(
+                                    sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+
+                            # Write output for BOTH rows
+                            if lane_in_group == 0:
+                                if cutlass.const_expr(use_smem_v):
+                                    vla2 = v_idx_a - i_v * tile_v
+                                    sOutput[(j_c, vla2)] = cutlass.BFloat16(sum_hq_a)
+                                    sOutput[(j_c, vla2 + 1)] = cutlass.BFloat16(
+                                        sum_hq_b
+                                    )
+                                else:
+                                    # Only the last micro-step of a real token produces an output row.
+                                    if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                        o[(i_n, i_t // n_h, i_hv, v_idx_a)] = (
+                                            cutlass.BFloat16(sum_hq_a)
+                                        )
+                                        o[(i_n, i_t // n_h, i_hv, v_idx_b)] = (
+                                            cutlass.BFloat16(sum_hq_b)
+                                        )
+
+                        # Write final state back for BOTH rows (if not disabled).
+                        # Negative write indices skip the writeback.
+                        if cutlass.const_expr(
+                            not disable_state_update
+                            and not per_token_pool_scatter
+                            and c0 + CHUNK >= T  # final state: last chunk only
+                        ):
+                            if write_cache_idx_raw >= 0:
+                                h_tile_out_a = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v_idx_a, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (0, None)), h_tile_out_a
+                                )
+                                h_tile_out_b = cute.local_tile(
+                                    h_write_view,
+                                    (1, vec_size),
+                                    (v_idx_b, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (1, None)), h_tile_out_b
+                                )
+            # === Cooperative output writeback from SMEM to GMEM (only if use_smem_v) ===
+            if cutlass.const_expr(use_smem_v):
+                cute.arch.barrier()  # Ensure all groups finished writing to sOutput
+                v_tile_base = i_v * tile_v
+                for t_idx in cutlass.range_constexpr(CHUNK):
+                    # only a token's LAST micro-step carries its output; the rest
+                    # staged zeros into the same row
+                    if cutlass.const_expr((c0 + t_idx) % n_h == n_h - 1):
+                        # 128 threads, tile_v values to write per timestep
+                        if tidx < tile_v:
+                            v_global = v_tile_base + tidx
+                            if v_global < V:
+                                o[(i_n, (c0 + t_idx) // n_h, i_hv, v_global)] = sOutput[
+                                    (t_idx, tidx)
+                                ]
 
 
 @cute.jit
@@ -3235,9 +3337,7 @@ def run_mtp_decode(
         )
         cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
     else:
-        # TODO(next commit): chunk_rows = choose_stage_rows(...).
-        # The kernel does not stage per chunk yet, so CHUNK == T.
-        chunk_rows = T
+        chunk_rows = choose_stage_rows(T, K, tile_v, ilp_rows)
         warp_cache_key = (
             target.compile_key,
             T,

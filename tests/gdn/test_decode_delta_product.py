@@ -755,8 +755,8 @@ def test_choose_stage_rows_requires_single_sweep():
 
 @pytest.mark.parametrize(
     "num_householder,T,chunk",
-    [(3, 8, 12), (2, 8, 8)],
-    ids=["nh3_T8_chunk12", "nh2_T8_chunk8"],
+    [(3, 8, 12), (2, 12, 8)],
+    ids=["nh3_T8_chunk12", "nh2_T12_chunk8"],
 )
 def test_chunked_smem_is_bit_identical(num_householder, T, chunk):
     """Chunking must be exactly invisible in the results.
@@ -776,8 +776,21 @@ def test_chunked_smem_is_bit_identical(num_householder, T, chunk):
     compilation, so the matrix is kept deliberately small.
     """
     import flashinfer.gdn_kernels.gdn_decode_mtp as mtp
+    from flashinfer.gdn_kernels.gdn_decode_mtp import get_mtp_config
 
-    n_h, B, HQ, HV, K, V = num_householder, 3, 16, 32, 128, 128
+    # Two conditions, both easy to lose:
+    #   B * HV > 128, or run_mtp_decode picks the inline kernel, which is not
+    #   chunked -- both runs would be the same kernel and compare equal.
+    #   T * n_h > 16, so get_mtp_config caps tile_v to 16 and rows_per_group
+    #   (tile_v // 4) equals ilp_rows; otherwise the consumer re-sweeps the
+    #   token range and choose_stage_rows rightly refuses to chunk.
+    n_h, B, HQ, HV, K, V = num_householder, 32, 16, 32, 128, 128
+    assert B * HV > 128, "this shape must route to the warp-specialized kernel"
+    tile_v, _, ilp_rows, _ = get_mtp_config(B, T * n_h, HV, V)
+    assert tile_v // 4 == ilp_rows, (
+        f"T*n_h={T * n_h} gives tile_v={tile_v}, ilp_rows={ilp_rows}: this "
+        "shape re-sweeps the token range, so chunking it is unsafe"
+    )
     TN = T * n_h
     assert chunk < TN and TN % chunk == 0, "chunk must be a proper divisor of T*n_h"
     device, dtype = torch.device("cuda"), torch.bfloat16
