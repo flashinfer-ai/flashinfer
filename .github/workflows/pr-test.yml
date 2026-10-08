@@ -725,20 +725,31 @@ jobs:
             exit 0
           fi
 
-          # Run the check (warning mode: annotations but no hard failure yet).
-          # Capture the report for the step summary.
+          FAIL_FLAG=""
+          if [ "$ENFORCE_SKIP_ALL" == "true" ]; then
+            FAIL_FLAG="--fail"
+          fi
+
+          # Run the check. Passes --fail only when ENFORCE_SKIP_ALL is 'true'.
           REPORT=$(python3 scripts/pr_checks/check_skip_all.py \
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
             $SUMMARY_ARGS \
             $SHARD_ARGS \
             --junit-dir junit-h100 \
-            --github-actions 2>&1) || true
+            --github-actions $FAIL_FLAG 2>&1)
+          SKIP_ALL_EXIT=$?
           echo "$REPORT"
 
           if echo "$REPORT" | grep -q "skip-all"; then
             echo "skip_all_found=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip_all_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$SKIP_ALL_EXIT" -ne 0 ]; then
+            echo "skip_all_failed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_all_failed=false" >> "$GITHUB_OUTPUT"
           fi
 
           # Append to step summary.
@@ -751,8 +762,14 @@ jobs:
         id: trace-coverage
         if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
         run: |
+          TRACE_FAIL_FLAG=""
+          if [ "$ENFORCE_TRACE_COVERAGE" == "true" ]; then
+            TRACE_FAIL_FLAG="--fail"
+          fi
+
           REPORT=$(python3 scripts/pr_checks/check_trace_coverage.py \
-            --github-actions 2>&1) || true
+            --github-actions $TRACE_FAIL_FLAG 2>&1)
+          TRACE_EXIT=$?
           echo "$REPORT"
           {
             echo ""
@@ -765,6 +782,12 @@ jobs:
             echo "trace_gaps=false" >> "$GITHUB_OUTPUT"
           fi
 
+          if [ "$TRACE_EXIT" -ne 0 ]; then
+            echo "trace_failed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "trace_failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check Results
         if: needs.gate.outputs.authorized == 'true'
         env:
@@ -774,7 +797,9 @@ jobs:
           # in another file and must not be what keeps this step from being injectable.
           TEST_SCOPE: ${{ needs.setup.outputs.test_scope }}
           SKIP_ALL_FOUND: ${{ steps.skip-all.outputs.skip_all_found }}
+          SKIP_ALL_FAILED: ${{ steps.skip-all.outputs.skip_all_failed }}
           TRACE_GAPS: ${{ steps.trace-coverage.outputs.trace_gaps }}
+          TRACE_FAILED: ${{ steps.trace-coverage.outputs.trace_failed }}
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -826,7 +851,26 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
+          # Hard-fail on enforced quality checks before declaring success.
+          QUALITY_FAILED=false
+          if [ "$SKIP_ALL_FAILED" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⛔ **Skip-all check failed (enforcement is active).** Changed test files had zero executed tests on all CI lanes." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            QUALITY_FAILED=true
+          fi
+          if [ "$TRACE_FAILED" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⛔ **Trace coverage check failed (enforcement is active).** Verified GDN/KDA definitions are missing numerical coverage." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            QUALITY_FAILED=true
+          fi
+
           if [ "$RESULT" == "success" ] || [ "$RESULT" == "skipped" ]; then
+            if [ "$QUALITY_FAILED" == "true" ]; then
+              echo "Result: Quality Checks Failed" >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
             echo "Result: Tests Passed" >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
@@ -835,3 +879,4 @@ jobs:
           # cancelled test means "stopped early", not "flaky".
           echo "Result: Tests Failed" >> $GITHUB_STEP_SUMMARY
           exit 1
+
