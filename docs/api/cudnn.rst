@@ -26,7 +26,13 @@ CTAs, where it measures at 0.35-0.95x fa2 (multi-token rows without tensor cores
 which have no fa2 kernel, take cuDNN whenever its decode path can run them);
 ``FLASHINFER_DECODE_AUTO_CUDNN`` overrides the choice. Under CUDA graphs ``auto``
 takes cuDNN only with a caller-owned ``block_tables`` (the auto-built table cannot
-grow once captured), and the resolution is frozen after the first plan.
+grow once captured), and the resolution is frozen after the first plan. The
+performance-driven choice also requires that the frontend's FROST engines can run
+on the install: its own CuTe-DSL check (``nvidia-cutlass-dsl`` 4.7.0 or newer,
+above the 4.6.2 the packages' dependency metadata admit) must pass, otherwise the
+backend engine would serve the graph and fa2 is kept. Callers passing
+``fixed_split_size`` or ``disable_split_kv`` (fa2's batch-invariance controls)
+keep fa2 wherever fa2 can serve the rows.
 
 Compatible decode runs and replans retain the prepared cuDNN graph. Planning
 still stages changing KV lengths and, unless the caller supplies a dense GPU
