@@ -101,43 +101,60 @@ def _cake_gdn_sentinel(device_index: int, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty(1, dtype=dtype, device=torch.device("cuda", device_index))
 
 
-# Int32 device copies of int64 metadata tensors, keyed exactly like the host-int
-# cache above and under the same immutability contract.  The kernels take int32
-# offsets / slots; converting on every call launched one extra kernel ahead of the
-# main kernel (and exposed the main launch gap in eager mode) for int64 callers.
+# Int32 device copies of int64 ``cu_seqlens`` / ``checkpoint_cu_starts``, keyed exactly
+# like the host-int cache above.  Those two tensors are already immutable by this
+# adapter's contract (their values are host-resolved once per live tensor), so one
+# int32 copy per live tensor is as safe as the cached host ints.  ``state_indices`` is
+# dynamic device data validated on-device every call and is converted per call.  The
+# kernels take int32 offsets / slots; converting on every call launched one extra
+# kernel ahead of the main kernel (and exposed the main launch gap in eager mode)
+# for int64 callers.
 _CAKE_GDN_I32_COPIES: collections.OrderedDict[
     tuple[int, int, Optional[int], int],
-    tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor],
+    tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor, int],
 ] = collections.OrderedDict()
+
+_cake_gdn_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _cake_gdn_current_raw_stream(device_index: int) -> int:
+    """Handle of the current CUDA stream on one device (cheap, no Stream object)."""
+
+    if _cake_gdn_raw_stream is not None:
+        return int(_cake_gdn_raw_stream(device_index))
+    return int(torch.cuda.current_stream(device_index).cuda_stream)
 
 
 def _cake_gdn_i32(values: torch.Tensor) -> torch.Tensor:
-    """Return ``values`` as int32, converting an int64 metadata tensor once per tensor.
+    """Return contract-immutable metadata as int32, converting an int64 tensor once.
 
-    Int32 tensors are returned as is.  Int64 metadata is converted on first sight
-    and the copy is reused while the same tensor object (same storage, same version
-    for non-inference tensors) is passed again, mirroring ``_cake_gdn_host_ints``.
-    During CUDA Graph capture a miss converts per call so the cast is recorded in the
-    graph; an eager call before capture populates the cache like the host ints.
+    Only for ``cu_seqlens`` and ``checkpoint_cu_starts``, whose values this adapter
+    already resolves once per live tensor (``_cake_gdn_host_ints``).  Int32 tensors
+    are returned as is.  During CUDA Graph capture the cast is always recorded, so
+    the graph's private pool owns the int32 copy and replay re-reads the live tensor;
+    the cache is neither consulted nor filled then.  Eagerly, the copy is reused while
+    the same tensor object (same storage, same version for non-inference tensors) is
+    passed again.  A copy consumed on a stream other than the one that produced it is
+    recorded on the consuming stream, so the bounded LRU can drop it safely.
     """
 
     if values.dtype == torch.int32:
         return values
+    if torch.cuda.is_current_stream_capturing():
+        return values.to(torch.int32)
+    device_index = int(values.device.index or 0)
     version = None if values.is_inference() else int(values._version)
-    key = (
-        int(values.device.index or 0),
-        int(values.data_ptr()),
-        version,
-        int(values.numel()),
-    )
+    key = (device_index, int(values.data_ptr()), version, int(values.numel()))
+    raw_stream = _cake_gdn_current_raw_stream(device_index)
     cached = _CAKE_GDN_I32_COPIES.get(key)
     if cached is not None and cached[0]() is values:
         _CAKE_GDN_I32_COPIES.move_to_end(key)
-        return cached[1]
-    converted = values.to(torch.int32)
-    if torch.cuda.is_current_stream_capturing():
+        converted = cached[1]
+        if cached[2] != raw_stream:
+            converted.record_stream(torch.cuda.current_stream(device_index))
         return converted
-    _CAKE_GDN_I32_COPIES[key] = (weakref.ref(values), converted)
+    converted = values.to(torch.int32)
+    _CAKE_GDN_I32_COPIES[key] = (weakref.ref(values), converted, raw_stream)
     while len(_CAKE_GDN_I32_COPIES) > _CAKE_GDN_HOST_INTS_MAX:
         _CAKE_GDN_I32_COPIES.popitem(last=False)
     return converted
@@ -466,9 +483,13 @@ def _run_cake_gdn_prefill(
 
     empty_i32 = _cake_gdn_sentinel(device_index, torch.int32)
     cu_seqlens_i32 = _cake_gdn_i32(cu_seqlens)
-    state_indices_i32 = (
-        empty_i32 if state_indices is None else _cake_gdn_i32(state_indices)
-    )
+    if state_indices is None:
+        state_indices_i32 = empty_i32
+    elif state_indices.dtype == torch.int32:
+        state_indices_i32 = state_indices
+    else:
+        # Slots are dynamic device data (validated on-device above): convert per call.
+        state_indices_i32 = state_indices.to(torch.int32)
     empty_state = _cake_gdn_sentinel(device_index, state_dtype)
     launch_initial_state = initial_state if initial_state is not None else empty_state
     launch_output_state = (
