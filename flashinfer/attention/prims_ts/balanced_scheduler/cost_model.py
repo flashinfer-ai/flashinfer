@@ -153,6 +153,42 @@ B200_BALANCED_COST_MODELS = {
 }
 
 
+# Full B300 SXM6 AC calibration from the default tuner protocol, artifact
+# ``primsts_balanced_cost_model_b300_sxm6_ac_148sm_20261008.jsonl``. Legacy
+# buckets were measured separately in the companion ``_legacy.jsonl`` artifact
+# (fit generation 2); no B200 coefficients are used as a B300 fallback.
+B300_BALANCED_COST_MODELS = {
+    ("1cta", "bf16", "single"): BalancedCostModel(1000, 0, 0, 0, 18264, 168),
+    ("1cta", "bf16", "sparse_small"): BalancedCostModel(1000, 0, 0, 0, 0, 168),
+    ("1cta", "bf16", "sparse_uniform_small"): BalancedCostModel(1000, 0),
+    ("1cta", "bf16", "sparse"): BalancedCostModel(1000, 0, 0, 0, 0, 168),
+    ("1cta", "bf16", "dense_small"): BalancedCostModel(1000, 0, 17839, 32860, 0, 15),
+    ("1cta", "bf16", "dense_large"): BalancedCostModel(1000, 18333, 0, 23135),
+    ("1cta", "bf16", "legacy"): BalancedCostModel(1000, 0),
+    ("1cta", "fp8", "single"): BalancedCostModel(1000, 0, 0, 0, 0, 180),
+    ("1cta", "fp8", "sparse_small"): BalancedCostModel(1000, 0, 0, 0, 0, 180),
+    ("1cta", "fp8", "sparse_uniform_small"): BalancedCostModel(1000, 0),
+    ("1cta", "fp8", "sparse"): BalancedCostModel(1000, 0, 0, 0, 0, 180),
+    ("1cta", "fp8", "dense_small"): BalancedCostModel(1000, 39793, 2960, 0, 0, 74),
+    ("1cta", "fp8", "dense_large"): BalancedCostModel(1000, 8755, 0, 6038),
+    ("1cta", "fp8", "legacy"): BalancedCostModel(1000, 0),
+    ("2cta", "bf16", "single"): BalancedCostModel(1000, 0),
+    ("2cta", "bf16", "sparse_small"): BalancedCostModel(1000, 0, 0, 0, 27539),
+    ("2cta", "bf16", "sparse_uniform_small"): BalancedCostModel(1000, 0),
+    ("2cta", "bf16", "sparse"): BalancedCostModel(1000, 0, 0, 20296),
+    ("2cta", "bf16", "dense_small"): BalancedCostModel(1000, 0),
+    ("2cta", "bf16", "dense_large"): BalancedCostModel(1000, 0, 1624, 312),
+    ("2cta", "bf16", "legacy"): BalancedCostModel(1000, 0, 0, 0, 0, 233),
+    ("2cta", "fp8", "single"): BalancedCostModel(1000, 0, 0, 0, 0, 168),
+    ("2cta", "fp8", "sparse_small"): BalancedCostModel(1000, 0, 0, 0, 27053),
+    ("2cta", "fp8", "sparse_uniform_small"): BalancedCostModel(1000, 0),
+    ("2cta", "fp8", "sparse"): BalancedCostModel(1000, 0, 0, 20918),
+    ("2cta", "fp8", "dense_small"): BalancedCostModel(1000, 0, 46283, 54355),
+    ("2cta", "fp8", "dense_large"): BalancedCostModel(1000, 0, 31, 1186),
+    ("2cta", "fp8", "legacy"): BalancedCostModel(1000, 0, 0, 0, 0, 231),
+}
+
+
 @dataclass(frozen=True)
 class BalancedCostModelCalibration:
     """Checked-in cost-model identity for one exact GPU configuration."""
@@ -164,6 +200,12 @@ class BalancedCostModelCalibration:
 
 
 B200_BALANCED_COST_MODEL_ID = "b200-sm100-148sm-balanced-mla-v2"
+B300_BALANCED_COST_MODEL_ID = "b300-sxm6-ac-sm103-148sm-balanced-mla-v1"
+
+_CALIBRATED_COST_MODELS = {
+    B200_BALANCED_COST_MODEL_ID: B200_BALANCED_COST_MODELS,
+    B300_BALANCED_COST_MODEL_ID: B300_BALANCED_COST_MODELS,
+}
 
 # Calibration is intentionally matched by exact product name, compute
 # capability, and SM count. Architecture-family or name-substring fallbacks can
@@ -178,6 +220,12 @@ BALANCED_COST_MODEL_CALIBRATIONS: Mapping[
             model_id=B200_BALANCED_COST_MODEL_ID,
             device_name="NVIDIA B200",
             compute_capability=(10, 0),
+            multi_processor_count=148,
+        ),
+        ("NVIDIA B300 SXM6 AC", (10, 3), 148): BalancedCostModelCalibration(
+            model_id=B300_BALANCED_COST_MODEL_ID,
+            device_name="NVIDIA B300 SXM6 AC",
+            compute_capability=(10, 3),
             multi_processor_count=148,
         ),
     }
@@ -220,15 +268,14 @@ def require_balanced_cost_model_calibration(
         ) from error
 
 
-def select_b200_balanced_cost_model(
-    seq_lens: Sequence[int],
+def calibrated_balanced_cost_model_for_bucket(
+    calibration: BalancedCostModelCalibration,
     *,
     kernel_family: str,
     dtype_name: str,
-    num_partitions: int,
-    k_tile_tokens: int = 128,
-) -> tuple[str, BalancedCostModel]:
-    """Return the calibrated B200 bucket and scheduler model."""
+    cost_bucket: str,
+) -> BalancedCostModel:
+    """Resolve one calibrated row for eager diagnostics and device tables."""
 
     family_aliases = {
         "1cta": "1cta",
@@ -253,14 +300,42 @@ def select_b200_balanced_cost_model(
         dtype = dtype_aliases[dtype_name]
     except KeyError as error:
         raise ValueError(f"unsupported balanced input dtype {dtype_name!r}") from error
-    bucket = balanced_cost_bucket(
+    try:
+        models = _CALIBRATED_COST_MODELS[calibration.model_id]
+    except KeyError as error:
+        raise RuntimeError(
+            f"balanced cost-model calibration {calibration.model_id!r} has no selector"
+        ) from error
+    # Preserve the historically measured B200 legacy policy only for B200.
+    if calibration.model_id == B200_BALANCED_COST_MODEL_ID and cost_bucket == "legacy":
+        return B200_BF16_2CTA_COST
+    try:
+        return models[(family, dtype, cost_bucket)]
+    except KeyError as error:
+        raise RuntimeError(
+            f"balanced cost-model calibration {calibration.model_id!r} "
+            f"has no cost model for {(family, dtype, cost_bucket)!r}"
+        ) from error
+
+
+def select_b200_balanced_cost_model(
+    seq_lens: Sequence[int],
+    *,
+    kernel_family: str,
+    dtype_name: str,
+    num_partitions: int,
+    k_tile_tokens: int = 128,
+) -> tuple[str, BalancedCostModel]:
+    """Return the calibrated B200 bucket and scheduler model."""
+
+    return select_calibrated_balanced_cost_model(
+        BALANCED_COST_MODEL_CALIBRATIONS[("NVIDIA B200", (10, 0), 148)],
         seq_lens,
+        kernel_family=kernel_family,
+        dtype_name=dtype_name,
         num_partitions=num_partitions,
         k_tile_tokens=k_tile_tokens,
     )
-    if bucket == "legacy":
-        return bucket, B200_BF16_2CTA_COST
-    return bucket, B200_BALANCED_COST_MODELS[(family, dtype, bucket)]
 
 
 def select_calibrated_balanced_cost_model(
@@ -274,14 +349,12 @@ def select_calibrated_balanced_cost_model(
 ) -> tuple[str, BalancedCostModel]:
     """Select a workload bucket from an explicitly identified calibration."""
 
-    if calibration.model_id == B200_BALANCED_COST_MODEL_ID:
-        return select_b200_balanced_cost_model(
-            seq_lens,
-            kernel_family=kernel_family,
-            dtype_name=dtype_name,
-            num_partitions=num_partitions,
-            k_tile_tokens=k_tile_tokens,
-        )
-    raise RuntimeError(
-        f"balanced cost-model calibration {calibration.model_id!r} has no selector"
+    bucket = balanced_cost_bucket(
+        seq_lens, num_partitions=num_partitions, k_tile_tokens=k_tile_tokens
+    )
+    return bucket, calibrated_balanced_cost_model_for_bucket(
+        calibration,
+        kernel_family=kernel_family,
+        dtype_name=dtype_name,
+        cost_bucket=bucket,
     )

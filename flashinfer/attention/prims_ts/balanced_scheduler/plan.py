@@ -31,11 +31,9 @@ from ..kernels.mla_decode.helpers.constants import (
 from .jit import gen_prims_balanced_mla_plan_module
 
 from .cost_model import (
-    B200_BALANCED_COST_MODEL_ID,
-    B200_BALANCED_COST_MODELS,
-    B200_BF16_2CTA_COST,
     BalancedCostModelCalibration,
     BalancedCostModel,
+    calibrated_balanced_cost_model_for_bucket,
     require_balanced_cost_model_calibration,
 )
 
@@ -185,7 +183,7 @@ class BalancedMLADecodePlan:
         self.multi_processor_count = sm_count
         self._calibration = calibration
         self._auto_cost = cost is None
-        self._cost = cost or B200_BF16_2CTA_COST
+        self._cost = self._cost_for_device_bucket("legacy") if cost is None else cost
         self._cost_model_id = (
             calibration.model_id if calibration is not None else "explicit-unregistered"
         )
@@ -262,58 +260,20 @@ class BalancedMLADecodePlan:
         if not self._auto_cost:
             rows = [self._cost_row(self._cost)] * len(_DEVICE_COST_BUCKETS)
         else:
-            assert self._calibration is not None
-            if self._calibration.model_id != B200_BALANCED_COST_MODEL_ID:
-                raise RuntimeError(
-                    f"balanced cost-model calibration {self._calibration.model_id!r} "
-                    "has no device selector"
-                )
-            family_aliases = {
-                "1cta": "1cta",
-                "2cta": "2cta",
-                "throughput_latency_1cta": "1cta",
-                "throughput_2cta": "2cta",
-            }
-            dtype_aliases = {
-                "bf16": "bf16",
-                "bfloat16": "bf16",
-                "fp8": "fp8",
-                "e4m3": "fp8",
-                "float8_e4m3fn": "fp8",
-            }
-            try:
-                family = family_aliases[self.kernel_family]
-            except KeyError as error:
-                raise ValueError(
-                    f"unsupported balanced kernel family {self.kernel_family!r}"
-                ) from error
-            try:
-                dtype = dtype_aliases[self.dtype_name]
-            except KeyError as error:
-                raise ValueError(
-                    f"unsupported balanced input dtype {self.dtype_name!r}"
-                ) from error
-            rows = []
-            for bucket in _DEVICE_COST_BUCKETS:
-                cost = (
-                    B200_BF16_2CTA_COST
-                    if bucket == "legacy"
-                    else B200_BALANCED_COST_MODELS[(family, dtype, bucket)]
-                )
-                rows.append(self._cost_row(cost))
+            rows = [
+                self._cost_row(self._cost_for_device_bucket(bucket))
+                for bucket in _DEVICE_COST_BUCKETS
+            ]
         return torch.tensor(rows, dtype=torch.int32, device=self.device)
 
     def _cost_for_device_bucket(self, bucket: str) -> BalancedCostModel:
-        if bucket == "legacy":
-            return B200_BF16_2CTA_COST
-        # The table was normalized and validated when it was materialized.
-        family = (
-            "1cta"
-            if self.kernel_family in {"1cta", "throughput_latency_1cta"}
-            else "2cta"
+        assert self._calibration is not None
+        return calibrated_balanced_cost_model_for_bucket(
+            self._calibration,
+            kernel_family=self.kernel_family,
+            dtype_name=self.dtype_name,
+            cost_bucket=bucket,
         )
-        dtype = "fp8" if self.dtype_name in {"fp8", "e4m3", "float8_e4m3fn"} else "bf16"
-        return B200_BALANCED_COST_MODELS[(family, dtype, bucket)]
 
     @property
     def cost(self) -> BalancedCostModel:

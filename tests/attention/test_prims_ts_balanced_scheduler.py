@@ -11,6 +11,7 @@ import torch
 
 from flashinfer.attention.prims_ts.balanced_scheduler import (
     cost_model as scheduler_module,
+    plan as scheduler_plan_module,
     tune_cost_model as cost_model_tuner,
 )
 from flashinfer.attention.prims_ts.balanced_scheduler.gate import (
@@ -22,8 +23,11 @@ from flashinfer.attention.prims_ts.balanced_scheduler.gate import (
 from flashinfer.attention.prims_ts.balanced_scheduler.cost_model import (
     B200_BALANCED_COST_MODEL_ID,
     B200_BF16_2CTA_COST,
+    B300_BALANCED_COST_MODEL_ID,
+    B300_BALANCED_COST_MODELS,
     BalancedCostModel,
     balanced_cost_bucket,
+    calibrated_balanced_cost_model_for_bucket,
     require_balanced_cost_model_calibration,
     select_b200_balanced_cost_model,
 )
@@ -411,6 +415,62 @@ def test_balanced_calibration_registry_requires_exact_device_identity():
                 multi_processor_count=identity[2],
                 device_index=7,
             )
+
+
+def test_b300_calibration_requires_full_measured_device_identity():
+    calibration = require_balanced_cost_model_calibration(
+        device_name="NVIDIA B300 SXM6 AC",
+        compute_capability=(10, 3),
+        multi_processor_count=148,
+    )
+    assert calibration.model_id == B300_BALANCED_COST_MODEL_ID
+    for name, capability, sm_count in (
+        ("NVIDIA Graphics Device", (10, 3), 80),
+        ("NVIDIA B300 SXM6 AC", (10, 3), 80),
+        ("NVIDIA B300 SXM6 AC", (10, 0), 148),
+        ("NVIDIA B300", (10, 3), 148),
+    ):
+        with pytest.raises(NotImplementedError, match="no calibrated cost model"):
+            require_balanced_cost_model_calibration(
+                device_name=name,
+                compute_capability=capability,
+                multi_processor_count=sm_count,
+            )
+
+
+@pytest.mark.parametrize("key", tuple(B300_BALANCED_COST_MODELS))
+def test_b300_cost_lookup_uses_measured_bucket_and_normalizes_aliases(key):
+    family, dtype, bucket = key
+    calibration = require_balanced_cost_model_calibration(
+        device_name="NVIDIA B300 SXM6 AC",
+        compute_capability=(10, 3),
+        multi_processor_count=148,
+    )
+    cost = calibrated_balanced_cost_model_for_bucket(
+        calibration,
+        kernel_family=(
+            "throughput_latency_1cta" if family == "1cta" else "throughput_2cta"
+        ),
+        dtype_name="bfloat16" if dtype == "bf16" else "float8_e4m3fn",
+        cost_bucket=bucket,
+    )
+    assert cost == B300_BALANCED_COST_MODELS[key]
+
+
+def test_b300_missing_legacy_calibration_never_borrows_b200(monkeypatch):
+    calibration = require_balanced_cost_model_calibration(
+        device_name="NVIDIA B300 SXM6 AC",
+        compute_capability=(10, 3),
+        multi_processor_count=148,
+    )
+    monkeypatch.delitem(B300_BALANCED_COST_MODELS, ("1cta", "fp8", "legacy"))
+    with pytest.raises(RuntimeError, match="has no cost model"):
+        calibrated_balanced_cost_model_for_bucket(
+            calibration,
+            kernel_family="1cta",
+            dtype_name="fp8",
+            cost_bucket="legacy",
+        )
 
 
 def test_balanced_device_plan_rejects_uncalibrated_device_before_allocation(
@@ -907,6 +967,47 @@ def test_optimized_scheduler_corrects_wave_boundaries(seq_lens, cost, expected_t
     plan.schedule_device(device_seq_lens, scheduler="optimized")
 
     assert plan.last_target_piece_tiles == expected_target
+    _assert_device_plan_covers_requests(plan, seq_lens)
+
+
+@_REQUIRES_CUDA_SCHEDULER
+@pytest.mark.parametrize("family", ("1cta", "2cta"))
+@pytest.mark.parametrize("dtype", ("bf16", "fp8"))
+def test_device_cost_table_uses_current_device_calibration(family, dtype):
+    device = torch.device("cuda")
+    try:
+        calibration = require_balanced_mla_calibration(device)
+    except NotImplementedError as error:
+        pytest.skip(str(error))
+    partitions = calibration.multi_processor_count // (2 if family == "2cta" else 1)
+    plan = BalancedMLADecodePlan(
+        batch_size=8,
+        num_partitions=partitions,
+        num_insts_kv=2 if family == "1cta" else 1,
+        device=device,
+        calibration=calibration,
+        kernel_family=family,
+        dtype_name=dtype,
+        max_seq_len=131072,
+    )
+    expected = [
+        plan._cost_row(
+            calibrated_balanced_cost_model_for_bucket(
+                calibration,
+                kernel_family=family,
+                dtype_name=dtype,
+                cost_bucket=bucket,
+            )
+        )
+        for bucket in scheduler_plan_module._DEVICE_COST_BUCKETS
+    ]
+    assert plan._device_cost_models.cpu().tolist() == [list(row) for row in expected]
+    # The eager diagnostic model must use the same calibration as the device table.
+    assert plan.cost == plan._cost_for_device_bucket("legacy")
+    seq_lens = [512] * 7 + [131072]
+    plan.schedule_device(torch.tensor(seq_lens, dtype=torch.int32, device=device))
+    assert plan.cost == plan._cost_for_device_bucket(plan.last_cost_bucket)
+    assert plan.cost_model_info["model_id"] == calibration.model_id
     _assert_device_plan_covers_requests(plan, seq_lens)
 
 

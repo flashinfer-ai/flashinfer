@@ -51,8 +51,10 @@ from flashinfer.attention.prims_ts import (
     batch_mla_decode_with_paged_kv_cache,
 )
 from flashinfer.attention.prims_ts.balanced_scheduler.cost_model import (
-    B200_BALANCED_COST_MODEL_ID,
     require_balanced_cost_model_calibration,
+)
+from flashinfer.attention.prims_ts.balanced_scheduler.plan import (
+    require_balanced_mla_calibration,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
     make_mla_decode_config,
@@ -1192,6 +1194,11 @@ def test_attention_ts_mla_balanced_1cta_causal_mask_respects_descriptor_end(
     plan = wrapper._plan_state.balanced_plan
     assert plan is not None
     assert plan.num_insts_kv == int(policy["num_insts_kv"])
+    # Check the calibrated route, then force the masking edge case independently
+    # of device-specific split costs (which may select a single three-tile piece).
+    calibrated_out = _run_case(wrapper, case, qo_indptr=qo_indptr)
+    _assert_case_correct(calibrated_out, case, policy, qo_indptr=qo_indptr)
+    plan.schedule_device(case.seq_lens, forced_target_piece_tiles=1)
     descriptors = plan.work_descriptors[: plan.last_descriptor_count].cpu()
     assert torch.any(descriptors[:, 2] - descriptors[:, 1] == 1)
 
@@ -1216,6 +1223,7 @@ def test_attention_ts_mla_balanced_1cta_causal_mask_respects_descriptor_end(
     for runtime_seq_len in (129, 257):
         case.seq_lens.fill_(runtime_seq_len)
         wrapper.schedule(case.seq_lens)
+        plan.schedule_device(case.seq_lens, forced_target_piece_tiles=1)
         graph_out.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
@@ -1911,7 +1919,10 @@ def test_attention_ts_mla_balanced_workspace_size_is_publicly_queryable():
     plan_info = wrapper.plan_info
     assert dict(plan_info["policy"]) == dict(state.policy)
     assert plan_info["balanced"] is True
-    assert plan_info["cost_model"]["model_id"] == B200_BALANCED_COST_MODEL_ID
+    assert (
+        plan_info["cost_model"]["model_id"]
+        == require_balanced_mla_calibration(case.query.device).model_id
+    )
     assert plan_info["cost_model"]["bucket"] == (state.balanced_plan.last_cost_bucket)
     assert plan_info["cost_model"]["parameters"] == state.balanced_plan.cost
     workspace_end = workspace.data_ptr() + workspace.numel()

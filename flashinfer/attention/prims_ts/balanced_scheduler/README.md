@@ -6,6 +6,18 @@ MLA execution requires a checked-in calibration for the exact GPU product,
 compute capability, and SM count. It deliberately fails instead of using a
 model measured on another device.
 
+Checked-in calibrations currently cover these exact CUDA device identities:
+
+| Product name | Compute capability | SM count |
+| --- | --- | --- |
+| NVIDIA B200 | 10.0 | 148 |
+| NVIDIA B300 SXM6 AC | 10.3 | 148 |
+
+An 80-SM device or a different product name is not covered by the B300
+calibration. `plan_auto()` warns and uses ordinary kernels if the admission
+gate requests balanced execution on an uncalibrated device; `plan_balanced()`
+requires an exact registered calibration.
+
 ## Calibrating a device
 
 Run the tuner from the repository root in an environment with FlashInfer's
@@ -39,6 +51,16 @@ paired validation records before copying the fitted models and exact hardware
 identity into `cost_model.py`. Then run the balanced scheduler and MLA decode
 tests and the full fixed-seed performance sweep. Do not add an
 architecture-wide or device-name-substring fallback.
+
+The default workload cohort fits the six specialized buckets. Registering a
+new device also requires measurements and paired validation for its `legacy`
+bucket (high-batch sparse launches and moderately skewed small batches). Do
+not copy B200's legacy row into a new device calibration without measurement.
+The B300 calibration includes separate forced-target curves for B128 with
+512 tokens per request and B8 with seven 2048-token requests plus one
+8192-token request, alongside the default ragged-B128 cases. Both families and
+dtypes have device-specific legacy rows. Split-target calibration does not
+recalibrate the admission gate or the 1CTA/2CTA family boundary.
 
 ## Measuring scheduler latency
 
