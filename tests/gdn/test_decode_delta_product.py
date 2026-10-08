@@ -13,11 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Phase 1, step 3: Gated DeltaProduct decode (MTP).
+Gated DeltaProduct decode (MTP).
 
-Unlike prefill, the gate is computed INSIDE the kernel from A_log/a/dt_bias, so the
-neutral value for the non-first micro-steps is a sentinel in `a`, not a 1.0
-in `g`. `test_gate_sentinel_is_exactly_neutral` pins that.
+Unlike prefill, the gate is computed INSIDE the kernel from A_log/a/dt_bias:
+`a` carries one row per REAL token and the kernel applies the decay on that
+token's FIRST micro-step, leaving the rest neutral. Nothing is written into
+`a` to mark them.
 
 Layout note: decode is DENSE [B, T, ...], not varlen. The reference is still
 `delta_product`, reached by flattening to [B*T, ...] with seq_lens = [T]*B.

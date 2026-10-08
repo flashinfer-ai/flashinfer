@@ -309,7 +309,11 @@ def _gdp_decode_reference(
                 if token_slot >= 0:
                     final_state[token_slot] = state.float()
         if not disable_state_update and ssm_state_indices is None:
-            final_state[slot] = state.float()
+            write_slot = slot
+            if output_state_indices is not None:
+                write_slot = int(output_state_indices[row])
+            if write_slot >= 0:
+                final_state[write_slot] = state.float()
     return out, final_state
 
 
