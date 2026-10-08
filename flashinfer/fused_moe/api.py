@@ -1370,6 +1370,58 @@ class CuTileMxfp4Bf16Config(CuTileMxfp4Config):
 
 
 @dataclass(frozen=True)
+class CuTileDeepSeekFp8Config:
+    """FP8 GEMMs with FP32 128x128 weight scales and BF16 intermediates.
+
+    Python inputs, GEMM1 output, activation output, and final output are BF16.
+    Both GEMM inputs are quantized per 1x128 block with FP32 scales.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 103
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp8,
+        w1_scale,
+        w2_fp8,
+        w2_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        cache_bf16_weights: bool = False,
+    ):
+        """Prepare shared FP8 weights, optionally caching unscaled BF16 copies."""
+        from .prepare import prepare_cutile_deepseek_fp8_weights
+
+        return prepare_cutile_deepseek_fp8_weights(
+            w1_fp8,
+            w1_scale,
+            w2_fp8,
+            w2_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation or SwiGLU(),
+            device=device,
+            cache_bf16_weights=cache_bf16_weights,
+        )
+
+
+@dataclass(frozen=True)
+class CuTileDeepSeekFp8Bf16Config(CuTileDeepSeekFp8Config):
+    """E4M3 block-scaled weights with BF16 inputs to both GEMMs.
+
+    Each 128-element K block produces an FP32 partial; its FP32 weight scale
+    is applied before accumulation, preserving the unrounded checkpoint scale.
+    """
+
+
+@dataclass(frozen=True)
 class CuTileFp8PerTensorConfig:
     """cuTile per-tensor E4M3 weights and activations.
 
@@ -2280,6 +2332,8 @@ BackendConfigType = Union[
     TrtllmMxInt4Config,
     CutlassBf16Config,
     CuTileBf16Config,
+    CuTileDeepSeekFp8Bf16Config,
+    CuTileDeepSeekFp8Config,
     CuTileFp8PerTensorBf16Config,
     CuTileFp8PerTensorConfig,
     CuTileMxfp4Bf16Config,
@@ -2319,6 +2373,8 @@ ALL_BACKEND_CONFIGS = (
     TrtllmMxInt4Config,
     CutlassBf16Config,
     CuTileBf16Config,
+    CuTileDeepSeekFp8Bf16Config,
+    CuTileDeepSeekFp8Config,
     CuTileFp8PerTensorBf16Config,
     CuTileFp8PerTensorConfig,
     CuTileMxfp4Bf16Config,

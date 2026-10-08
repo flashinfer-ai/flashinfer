@@ -35,6 +35,7 @@ from .activation import (
     _activation_kernel_args,
     _apply_gated_activation,
     _apply_ungated_activation,
+    _row_tile_is_live,
     launch_activation,
 )
 from .fp4 import _decode_e4m3_bytes, _load_w4a4_weight_tile
@@ -297,11 +298,13 @@ def quantize(
 
 
 @ct.function
-def _pack_sorted_impl(X, XS, SLOTS, OUT, OS, TOP_K: ConstInt, MX: ConstBool):
-    rows = ct.bid(0) * 16 + ct.arange(16, dtype=ct.int32)
+def _pack_sorted_impl(
+    X, XS, SLOTS, OUT, OS, TOP_K: ConstInt, SCALE_GROUP: ConstInt, TILE_ROWS: ConstInt
+):
+    rows = ct.bid(0) * TILE_ROWS + ct.arange(TILE_ROWS, dtype=ct.int32)
     columns = ct.bid(1) * 128 + ct.arange(128, dtype=ct.int32)
     slots = ct.gather(SLOTS, (rows,), check_bounds=True, padding_value=2147483647)
-    source_rows = ct.reshape(slots // TOP_K, (16, 1))
+    source_rows = ct.reshape(slots // TOP_K, (TILE_ROWS, 1))
     values = ct.gather(
         X,
         (source_rows, ct.reshape(columns, (1, 128))),
@@ -309,11 +312,14 @@ def _pack_sorted_impl(X, XS, SLOTS, OUT, OS, TOP_K: ConstInt, MX: ConstBool):
         padding_value=0,
     )
     ct.store(OUT, (ct.bid(0), ct.bid(1)), values)
-    if MX:
-        groups = ct.bid(1) * 4 + ct.arange(4, dtype=ct.int32)
+    if SCALE_GROUP:
+        groups_per_tile = 128 // SCALE_GROUP
+        groups = ct.bid(1) * groups_per_tile + ct.arange(
+            groups_per_tile, dtype=ct.int32
+        )
         scales = ct.gather(
             XS,
-            (source_rows, ct.reshape(groups, (1, 4))),
+            (source_rows, ct.reshape(groups, (1, groups_per_tile))),
             check_bounds=True,
             padding_value=0,
         )
@@ -321,8 +327,20 @@ def _pack_sorted_impl(X, XS, SLOTS, OUT, OS, TOP_K: ConstInt, MX: ConstBool):
 
 
 @ct.kernel
-def _pack_sorted(X, XS, SLOTS, OUT, OS, TOP_K: ConstInt, MX: ConstBool):
-    _pack_sorted_impl(X, XS, SLOTS, OUT, OS, TOP_K, MX)
+def _pack_sorted(
+    X,
+    XS,
+    SLOTS,
+    OUT,
+    OS,
+    TOP_K: ConstInt,
+    SCALE_GROUP: ConstInt,
+    TILE_ROWS: ConstInt,
+    VALID_ROWS,
+    HAS_LIMIT: ConstBool,
+):
+    if _row_tile_is_live(VALID_ROWS, HAS_LIMIT, TILE_ROWS):
+        _pack_sorted_impl(X, XS, SLOTS, OUT, OS, TOP_K, SCALE_GROUP, TILE_ROWS)
 
 
 @ct.kernel
@@ -333,9 +351,13 @@ def _pack_sorted_i64(
     OUT: ct.IndexedWithInt64,
     OS: ct.IndexedWithInt64,
     TOP_K: ConstInt,
-    MX: ConstBool,
+    SCALE_GROUP: ConstInt,
+    TILE_ROWS: ConstInt,
+    VALID_ROWS,
+    HAS_LIMIT: ConstBool,
 ):
-    _pack_sorted_impl(X, XS, SLOTS, OUT, OS, TOP_K, MX)
+    if _row_tile_is_live(VALID_ROWS, HAS_LIMIT, TILE_ROWS):
+        _pack_sorted_impl(X, XS, SLOTS, OUT, OS, TOP_K, SCALE_GROUP, TILE_ROWS)
 
 
 @ct.function
@@ -1644,9 +1666,14 @@ def _pack_sorted_input(
     top_k,
     block_scaled,
     quantize_input,
+    scale_group_size=32,
+    tile_rows=16,
+    valid_rows=None,
 ):
+    """Pack or quantize rows; scale-group and row-limit options configure copying."""
     stream = torch.cuda.current_stream(x.device)
-    grid = ((out.shape[0] + 15) // 16, (out.shape[1] + 127) // 128)
+    tile_rows = 16 if quantize_input else tile_rows
+    grid = ((out.shape[0] + tile_rows - 1) // tile_rows, (out.shape[1] + 127) // 128)
     if quantize_input:
         if block_scaled:
             kernel = (
@@ -1672,7 +1699,18 @@ def _pack_sorted_input(
         stream,
         grid,
         kernel,
-        (x, xs, slots, out, out_scale, top_k, block_scaled),
+        (
+            x,
+            xs,
+            slots,
+            out,
+            out_scale,
+            top_k,
+            scale_group_size if block_scaled else 0,
+            tile_rows,
+            out if valid_rows is None else valid_rows,
+            valid_rows is not None,
+        ),
     )
 
 
