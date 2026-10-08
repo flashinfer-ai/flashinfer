@@ -111,7 +111,9 @@ def recurrent_kda(
             Query of shape ``[B, T, H, K]``, or
             ``[1, total_tokens, H, K]`` when using ``cu_seqlens``. Must be
             bfloat16. ``T=1`` selects decode; eligible ``T>1`` calls may select
-            the frozen prefill backend.
+            the frozen prefill backend. Ordinary prefill accepts strided Q/K:
+            dense-only providers pack them internally, while cuDNN retains
+            supported strides. Other inputs keep their layout requirements.
         k (torch.Tensor):
             Key with the same shape as ``q``. Must be bfloat16.
         v (torch.Tensor):
@@ -574,6 +576,24 @@ def recurrent_kda(
     is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
         q, cu_seqlens, num_spec_tokens
     )
+    original_q, original_k = q, k
+    if (
+        is_plain_prefill
+        and isinstance(k, torch.Tensor)
+        and (not q.is_contiguous() or not k.is_contiguous())
+    ):
+        # Validate original storage before packing can hide an output alias.
+        if output is not None:
+            _kda_prefill._check_output_does_not_overlap_inputs(
+                output,
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+            )
+        q, k = q.contiguous(), k.contiguous()
     if backend in ("auto", "small-bh"):
         small_bh_available = (
             is_cute_dsl_available()
@@ -883,8 +903,8 @@ def recurrent_kda(
     # An explicit small-BH request either returned or raised in prefill dispatch.
     assert backend != "small-bh"
     return _kda_decode._dispatch_recurrent_kda_decode(
-        q=q,
-        k=k,
+        q=original_q,
+        k=original_k,
         v=v,
         g=g,
         beta=beta,

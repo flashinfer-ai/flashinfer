@@ -52,18 +52,23 @@ the launch share it).
   leader-push exchange form of the default or sample build of a multi-CTA stream (``_lp`` /
   ``_cs_lp`` / ``_sp_lp``: every CTA stores its compacted candidate list straight into the first
   CTA's receive buffer and its length into every CTA before the single exchange barrier, so the
-  pull form's DSM read rounds and exit rendezvous disappear; it displaces bits 7 and 8), bit 10
+  pull form's DSM read rounds and exit rendezvous disappear; it displaces bits 7 and 8; on 10.0 a
+  two-chunk ept-32 speculative-sample row at batch <= 2 and top-k <= 50 takes it instead of the
+  slab tail), bit 10
   the CTA-local select form of a leader-push sample build (``_cs_lp_l1`` / ``_sp_lp_l1``: each CTA
   picks its filter bucket from its own sample, so the cluster-wide coarse-histogram round
   disappears and the push is the only cluster round; fused launches with the smallest top-k, up to
-  32 on compute capability 10.3, 20 on 10.0 and 10 on 9.0; on 10.0 and 10.3 it also carries the
+  32 on compute capability 10.3, 20 on 10.0 and 10.7 and 10 on 9.0, and up to 64 on 10.0 / 10.3
+  when the row is one register chunk per CTA (V128256 on cluster 8); on 10.0 and 10.3 it also carries the
   leader push onto the two-chunk ept-32 rows the bit-9 chunk rule excludes -- at any batch on 10.0,
   on 10.3 when the second chunk is full or the batch has at least four rows), bit 11 the integer-tested form of the whole-CTA
   tail build (``_bt_tia``: the tail's f64 target and sample tests run as the stage-2/3 integer
   emulation; compute capability 10.3, whose FP64 pipe is slow) and bit 5
   the row-span filter arm of a cluster-8 stream above the two-warp tail.  Each build is taken only on
   the capabilities, cluster sizes and row lengths where it measured faster; the policy constants
-  live in :mod:`flashinfer.cake_sampling`.
+  live in :mod:`flashinfer.cake_sampling`.  Inside every multi-CTA streaming build the leader's radix
+  passes stop early, exactly, once the selected bucket's count equals the remaining rank (no host
+  flag; the result is bit-identical to the full pass sequence).
 * **Stage-2/3 static forms**: the stage-2/3 kernel exists in three forms that differ only in
   instruction selection -- the base form (f64 top-p tests, max / min bitonic exchange), a form
   whose bitonic exchange is one 64-bit compare and select (``one_cmp_select``, compute capability
@@ -95,7 +100,12 @@ constants are keyed by the device's SM count (148 for B200 / B300, 132 for H100,
 R200; other devices use the nearest measured table).  On the 212-SM table a small-k (``top_k_max``
 at most 64 or unknown) ept-32 streaming pick whose grid and the cluster-8 grid both fit one wave is
 re-picked to the cluster-8 ept-16 stream (measured 8-15 % faster on R200 at batch <= 16; multi-wave
-grids, large k and the other tables keep the ranked pick).  ``renorm_out`` and ``workspace`` expose the
+grids, large k and the other tables keep the ranked pick).  On the 132-SM table a small-k cluster-2
+ept-32 pick on rows of at least 16 register chunks for a single CTA (V262144: eight per CTA under the
+cluster-2 pick, sixteen under the cluster-1 replacement) from batch 64 is re-picked to the cluster-1 ept-32
+stream when both grids run in one wave (measured 1.4-1.9 % faster on H100 with both arms carrying the
+round-11 kernels; 5-7 % against round 10 including E1).  ``renorm_out``
+and ``workspace`` expose the
 sorted slab of a call.
 
 Source product

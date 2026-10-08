@@ -30,8 +30,8 @@ Routes are selected from host-known scalars only — head count, page size and
 
 | heads | page_kv | next_n | model |
 |---|---|---|---|
-| 32 | 128, 64 | 1, 2, 4 | DeepSeek-V4.1-Flash decode |
-| 64 | 64 | 1, 2, 4 | DeepSeek-V3.2 decode |
+| 32 | 128, 64 | 1, 2, 3, 4, 5, 6 | DeepSeek-V4.1-Flash decode |
+| 64 | 64 | 1, 2, 3, 4, 5, 6 | DeepSeek-V3.2 decode |
 
 `route_available(num_heads, page_kv, next_n)` answers on the host; there is no
 fallback for an unsupported configuration. The scheduler program is shared by
@@ -48,12 +48,16 @@ block_table, max_context_len, *, page_kv=None, schedule_meta=None, output=None,
 sm_count=None)` binds
 
 - `q` E4M3 `[B, next_n, H, 128]`, contiguous;
-- `kv_cache` uint8 `[pages, page_kv, 1, 132]`, contiguous — each page holds
-  `page_kv` FP8 rows of 128 bytes followed by `page_kv` FP32 scales, read in
-  place (the vLLM `indexer_k_store` layout). A vLLM allocation whose physical
-  block stride exceeds `page_kv * 132` is passed as its 2-D
-  `[pages, block_stride_bytes]` view together with `page_kv=`; the stride must
-  be a multiple of 16 bytes and the TMA descriptor takes it from the tensor;
+- `kv_cache` uint8 `[pages, page_kv, 1, 132]` — each page holds `page_kv`
+  FP8 rows of 128 bytes followed by `page_kv` FP32 scales, read in place (the
+  vLLM `indexer_k_store` layout). The token rows must be dense (`stride(3) ==
+  1`, `stride(1) == 132`); the page stride `stride(0)` may exceed
+  `page_kv * 132` — the strided per-layer view of a block-outermost engine
+  layout (every layer's page in one block) and an alignment-padded page are
+  read without a copy. Such an allocation may also be passed as its 2-D
+  `[pages, block_stride_bytes]` view together with `page_kv=`. The block stride
+  must be a multiple of 16 bytes; the TMA descriptor takes it from the tensor
+  and the kernel never reads past the `page_kv * 132` bytes of a page;
 - `weights` FP32 `[B * next_n, H]`, contiguous;
 - `context_lens` int32 `[B, next_n]`, contiguous — the schedule is sized from
   each request's **last** token, every token masks with its own length;
@@ -124,8 +128,9 @@ pytest tests/experimental/test_sm120_paged_mqa_logits.py -q
 python benchmarks/bench_sm120_paged_mqa_logits.py
 ```
 
-The test covers every shipped `(H, page_kv, next_n)` program against a
-dequantized PyTorch reference and an independent Python mirror of the schedule,
+The test covers every shipped `next_n`, both head counts and both page sizes
+against a dequantized PyTorch reference and an independent Python mirror of the
+schedule,
 the `clean_logits=False` write extent, the padded block-stride cache view, CUDA
 Graph replay with changed contents, one-shot/plan equivalence and the
 architecture-target gate. It skips on devices without catalogued programs.
@@ -136,7 +141,10 @@ architecture-target gate. It skips on devices without catalogued programs.
 `routes`. Policy keys: `head_dim`, `fused_row_bytes` (132), `heads`, `page_kv`,
 `next_n`, `split_kv` (128 for every exported program, which is why the metadata
 entry keeps DeepGEMM's head-count-free signature), `next_n_atoms` (the Q-atom
-rule, `ceil(next_n / 2)`), `max_batch` (the scheduler's shared-memory request
+rule, a function of `next_n` only: one atom per request for `next_n` 1–4 — 1
+and 2 pair the tokens as DeepGEMM does, 3 and 4 score the whole request from
+one atom where DeepGEMM runs two — and DeepGEMM's three 2-token atoms for 5
+and 6), `max_batch` (the scheduler's shared-memory request
 ceiling), `logits_stride_alignment` (`[128, 256]`), `clean_logits` (`"raw"`),
 `metadata_program`, `metadata_route`, `threads` and per-program `programs`
 records (tile size, group count, KV stages, atoms, shared-memory bytes). A
