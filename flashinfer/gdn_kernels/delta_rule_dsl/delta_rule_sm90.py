@@ -139,6 +139,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         checkpoint_cu_starts_dtype: torch.dtype | None = None,
         state_inner_strides: tuple[int, ...] | None = None,
         init_state_inner_strides: tuple[int, ...] | None = None,
+        num_householder: int = 1,
     ):
         self.needs_alpha = needs_alpha
         self.needs_beta = needs_beta
@@ -166,6 +167,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         self.qk_stage = 2
         self.kk_stage = 2
         self.alpha_beta_stage = 5
+        self.num_householder = num_householder
         self.manual_cache_key(
             "needs_alpha",
             "needs_beta",
@@ -193,6 +195,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             "qk_stage",
             "kk_stage",
             "alpha_beta_stage",
+            "num_householder",
         )
 
     def get_next_work(
@@ -323,6 +326,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         is_final_block: bool,
         B: cutlass.Int32,
         scale: cutlass.Float32,
+        # offset of the first real Q from the start of the block
+        first_q: cutlass.Int32,
     ):
         if cutlass.const_expr(self.needs_beta):
             beta_row = sBeta[None, beta_stage]
@@ -335,12 +340,19 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             for i in cutlass.range_constexpr(cute.size(tKKcMkk)):
                 # s, t = tKKcMkk[i]
                 s, t = tQKcMqk[i]
-                alpha = cute.math.exp2(
+                q_s = first_q + s * self.num_householder
+                q_alpha = cute.math.exp2(
+                    cutlass.Float32(alpha_cumlog[q_s if q_s < B else cutlass.Int32(0)])
+                    - cutlass.Float32(alpha_cumlog[t]),
+                    fastmath=True,
+                )
+
+                k_alpha = cute.math.exp2(
                     cutlass.Float32(alpha_cumlog[s]) - cutlass.Float32(alpha_cumlog[t]),
                     fastmath=True,
                 )
-                tQKrQK[i] = tQKrQK[i] * alpha * scale
-                tKKrKK[i] = tKKrKK[i] * alpha
+                tQKrQK[i] = tQKrQK[i] * q_alpha * scale
+                tKKrKK[i] = tKKrKK[i] * k_alpha
         else:
             for i in cutlass.range_constexpr(cute.size(tQKrQK)):
                 tQKrQK[i] = tQKrQK[i] * scale
@@ -348,13 +360,16 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         for i in cutlass.range_constexpr(cute.size(tKKcMkk)):
             # s, t = tKKcMkk[i]
             s, t = tQKcMqk[i]
-            pred = s >= t
-            tQKrQK[i] = tQKrQK[i] if pred else cutlass.Float32(0.0)
-            tKKrKK[i] = tKKrKK[i] if pred else cutlass.Float32(0.0)
+            q_s = first_q + s * self.num_householder
+            k_pred = s >= t
+            q_pred = q_s >= t and q_s < B
+            tQKrQK[i] = tQKrQK[i] if q_pred else cutlass.Float32(0.0)
+            tKKrKK[i] = tKKrKK[i] if k_pred else cutlass.Float32(0.0)
+
             if cutlass.const_expr(is_final_block):
-                pred = s < B and t < B
-                tQKrQK[i] = tQKrQK[i] if pred else cutlass.Float32(0.0)
-                tKKrKK[i] = tKKrKK[i] if pred else cutlass.Float32(0.0)
+                k_pred = s < B and t < B
+                tQKrQK[i] = tQKrQK[i] if t < B else cutlass.Float32(0.0)
+                tKKrKK[i] = tKKrKK[i] if k_pred else cutlass.Float32(0.0)
 
     # ─── qk_store ─────────────────────────────────────────────────────────────
 
@@ -388,15 +403,22 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         sAlpha: cute.Tensor,
         alpha_stage: cutlass.Int32,
         scale: cutlass.Float32,
+        B: cutlass.Int32,
+        first_q: cutlass.Int32,
     ):
         if cutlass.const_expr(self.needs_alpha):
             alpha_cpscale = sAlpha[None, AlphaProcessor.CUMPROD_SCALE, alpha_stage]
-            for i in cutlass.range_constexpr(cute.size(tOrO)):
-                _, tok_q = tOcO[i]
-                tOrO[i] = cutlass.Float32(alpha_cpscale[tok_q]) * tOrO[i]
-        else:
-            for i in cutlass.range_constexpr(cute.size(tOrO)):
-                tOrO[i] = scale * tOrO[i]
+
+        for i in cutlass.range_constexpr(cute.size(tOrO)):
+            _, tok_q = tOcO[i]
+            tok_q = first_q + tok_q * self.num_householder
+            _scale = scale
+            if cutlass.const_expr(self.needs_alpha):
+                if tok_q < B:
+                    # CUMPROD_SCALE already carries `scale`, so this replaces it
+                    _scale = cutlass.Float32(alpha_cpscale[tok_q])
+
+            tOrO[i] = _scale * tOrO[i] if tok_q < B else cutlass.Float32(0.0)
 
     # ─── sk_epi ───────────────────────────────────────────────────────────────
 
@@ -533,9 +555,15 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         k_pipeline.producer_commit(k_producer_state)
         k_producer_state.advance()
 
+        # GDP: q is per REAL token, so this chunk's queries are the contiguous
+        # real tokens starting at blk_tok // n_h -- sQ row i holds q[t0 + i], NOT
+        # micro-step blk_tok + i.  The tile stays BLK_Q wide, so it over-fetches:
+        # only rows whose query micro-step (first_q + i*n_h) lands inside the
+        # chunk are live; the rest are re-loaded by the chunks that own them.
+        q_blk_tok = blk_tok // self.num_householder
         sQ = sQ_SD[None, None, q_producer_state.index]
         mQ = cute.domain_offset(
-            (blk_tok, cutlass.Int32(0)),
+            (q_blk_tok, cutlass.Int32(0)),
             tma_tensor_q[None, None, q_head_idx],
         )
         gQ = cute.zipped_divide(mQ, (self.BLK_Q, self.D))[
@@ -601,13 +629,14 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     ):
         lane_id = cute.arch.lane_idx()
         sAlpha_k = sAlpha[None, None, alpha_stage]
-        num_iters = self.BLK_Q // 32
+        num_iters = self.BLK_KV // 32
         for i in cutlass.range_constexpr(num_iters):
             row = cutlass.Int32(i * 32) + lane_id
             tok = blk_tok + row
-            if tok < tok_end:
+            # decay the state only on the first householder of each real token
+            if tok < tok_end and tok % self.num_householder == 0:
                 sAlpha_k[row, AlphaProcessor.CUMSUM_LOG] = g_alpha[
-                    tok * num_sab_heads + sab_head_idx
+                    (tok // self.num_householder) * num_sab_heads + sab_head_idx
                 ]
             else:
                 sAlpha_k[row, AlphaProcessor.CUMSUM_LOG] = cutlass.Float32(1.0)
@@ -711,6 +740,14 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 gCheckpointKV = mCheckpoint[None, None, o_head_idx, checkpoint_idx]
                 self.kv_store(tKVrKV, gCheckpointKV, kv_tiled_mma, thread_idx)
 
+    def first_q_in_blk(self, blk: cutlass.Int32) -> cutlass.Int32:
+        # With num_householder > 1 a block boundary need not land on a token
+        # boundary: one Q spans num_householder Ks, Vs and betas.  Return the
+        # offset of the first real Q in the chunk; rows before it are padding.
+        prev_chunk_padding_len = blk * cutlass.Int32(self.BLK_KV) % self.num_householder
+        # the real Q matches the last householder of the token by convention
+        return (self.num_householder - 1) - prev_chunk_padding_len
+
     # ─── compute_loop_body ───────────────────────────────────────────────────
     # Translates the C++ compute_loop_body lambda captured inside compute().
     # Called by Math WGs (tidx >= 128) for one block iteration.
@@ -755,6 +792,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         scale: cutlass.Float32,
         # WG role: MathWarpGroupRole.STATE0 or MathWarpGroupRole.STATE1.
         wg_idx: cutlass.Int32,
+        # offset of the first real Q from the start of the block
+        first_q: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx - cutlass.Int32(128)  # relative to compute threads
@@ -879,7 +918,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             cute.nvgpu.warpgroup.commit_group()
             self._math_order_notify(wg_idx)
             cute.nvgpu.warpgroup.wait_group(0)
-            self.o1_epi(tOrO, tOcO, sAlpha, alpha_consumer_state.index, scale)
+            self.o1_epi(
+                tOrO, tOcO, sAlpha, alpha_consumer_state.index, scale, B, first_q
+            )
         q_pipeline.consumer_release(q_consumer_state)
         q_consumer_state.advance()
 
@@ -1304,6 +1345,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 tKVrKV,
                 scale,
                 wg_idx,
+                self.first_q_in_blk(0),
             )
         else:
             (
@@ -1345,6 +1387,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 tKVrKV,
                 scale,
                 wg_idx,
+                self.first_q_in_blk(0),
             )
         self.maybe_store_checkpoint(
             tKVrKV,
@@ -1403,6 +1446,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 tKVrKV,
                 scale,
                 wg_idx,
+                self.first_q_in_blk(blk),
             )
             self.maybe_store_checkpoint(
                 tKVrKV,
@@ -1461,6 +1505,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 tKVrKV,
                 scale,
                 wg_idx,
+                self.first_q_in_blk(last_blk),
             )
             self.maybe_store_checkpoint(
                 tKVrKV,
@@ -1571,6 +1616,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             is_final_block,
             B,
             scale,
+            self.first_q_in_blk(blk),
         )
 
         kk_pipeline.producer_acquire(kk_producer_state)
@@ -2247,7 +2293,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     work_desc.v_head_idx(),
                 )
             elif ldst_warp_role == LoadStoreWarpRole.STORE_O:
-                CollectiveStoreTma(self.BLK_Q, self.D).run(
+                CollectiveStoreTma(self.BLK_Q, self.D, self.num_householder).run(
                     sO,
                     tma_atom_o,
                     tma_tensor_o,
@@ -2362,6 +2408,7 @@ def _get_prefill_kernel(
     checkpoint_cu_starts_dtype,
     state_inner_strides,
     init_state_inner_strides,
+    num_householder,
 ):
     return _FullyFusedDeltaRuleSm90(
         needs_alpha,
@@ -2378,6 +2425,7 @@ def _get_prefill_kernel(
         checkpoint_cu_starts_dtype=checkpoint_cu_starts_dtype,
         state_inner_strides=state_inner_strides,
         init_state_inner_strides=init_state_inner_strides,
+        num_householder=num_householder,
     )
 
 
@@ -2385,8 +2433,8 @@ def delta_rule_prefill_dsl_sm90(
     o: torch.Tensor,  # (total_seqlen, num_o_heads, D) fp16/bf16, output
     state: torch.Tensor,  # (num_seqs, num_sab_heads, D, D) fp32, output
     q: torch.Tensor,  # (total_seqlen, num_q_heads, D)
-    k: torch.Tensor,  # (total_seqlen, num_k_heads, D)
-    v: torch.Tensor,  # (total_seqlen, num_v_heads, D)
+    k: torch.Tensor,  # (total_seqlen * num_householder, num_k_heads, D)
+    v: torch.Tensor,  # (total_seqlen * num_householder, num_v_heads, D)
     init_state: torch.Tensor | None,  # (num_seqs, num_sab_heads, D, D) fp32, optional
     alpha: torch.Tensor | None,
     beta: torch.Tensor | None,
@@ -2396,6 +2444,7 @@ def delta_rule_prefill_dsl_sm90(
     checkpoint_cu_starts: torch.Tensor | None = None,
     checkpoint_every_n_tokens: int = 0,
     state_indices: torch.Tensor | None = None,
+    num_householder: int = 1,
 ):
     import cuda.bindings.driver as cuda_driver
 
@@ -2487,17 +2536,20 @@ def delta_rule_prefill_dsl_sm90(
             raise RuntimeError(f"{name} must be contiguous")
 
     total_seqlen = q.shape[0]
+    assert k.shape[0] == total_seqlen * num_householder
+    assert v.shape[0] == total_seqlen * num_householder
+
     num_o_heads = o.shape[1]
     q_tma = q.as_strided(
         (total_seqlen, D, num_q_heads),
         (num_q_heads * D, 1, D),
     )
     k_tma = k.as_strided(
-        (D, total_seqlen, num_k_heads),
+        (D, total_seqlen * num_householder, num_k_heads),
         (1, num_k_heads * D, D),
     )
     v_tma = v.as_strided(
-        (D, total_seqlen, num_v_heads),
+        (D, total_seqlen * num_householder, num_v_heads),
         (1, num_v_heads * D, D),
     )
     o_tma = o.as_strided(
@@ -2533,6 +2585,7 @@ def delta_rule_prefill_dsl_sm90(
             if use_state_indices and needs_init_state
             else None
         ),
+        num_householder=num_householder,
     )
 
     compiled_delta_rule_kernel = get_cached_compile(

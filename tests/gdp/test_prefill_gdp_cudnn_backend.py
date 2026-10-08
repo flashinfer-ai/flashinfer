@@ -40,18 +40,48 @@ import flashinfer
 from flashinfer.cudnn import cudnn_chunk_gated_delta_product
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.gdp_prefill import chunk_gated_delta_product
+from flashinfer.utils import get_compute_capability
 from tests.test_helpers.cudnn_linear_attention import (
     HEAD_DIM,
     assert_rel_close,
     assert_state_orientation,
+    cudnn_linear_attention_unavailable_reason,
     packed_offsets,
     rel_err,
-    requires_cudnn_linear_attention,
     serial_delta_product,
     widened_view,
 )
 
-pytestmark = requires_cudnn_linear_attention
+_CUDNN_UNAVAILABLE = cudnn_linear_attention_unavailable_reason()
+
+
+def _flashinfer_unavailable_reason() -> str | None:
+    major, _ = get_compute_capability(torch.device("cuda"))
+    if major not in (9, 10):
+        return f"flashinfer GDP prefill needs SM90 or SM100, found sm{major}0"
+    cuda_version = torch.version.cuda
+    if major == 10 and cuda_version and int(cuda_version.split(".")[0]) < 13:
+        return "Blackwell GDN prefill needs CUDA 13+"
+    return None
+
+
+_FLASHINFER_UNAVAILABLE = _flashinfer_unavailable_reason()
+
+
+@pytest.fixture(autouse=True)
+def _require_backend(request):
+    """Skip on the backend a test actually exercises.
+
+    A module-level cuDNN mark would skip the flashinfer-backend cases on SM90,
+    where cuDNN has no engine but the in-tree GDN kernel does.
+    """
+    callspec = getattr(request.node, "callspec", None)
+    backend = callspec.params.get("backend", "cudnn") if callspec else "cudnn"
+    if backend in ("cudnn", "auto") and _CUDNN_UNAVAILABLE is not None:
+        pytest.skip(f"cuDNN linear attention unavailable: {_CUDNN_UNAVAILABLE}")
+    if backend == "flashinfer" and _FLASHINFER_UNAVAILABLE is not None:
+        pytest.skip(_FLASHINFER_UNAVAILABLE)
+
 
 SERIAL_TOLERANCE = 5e-2
 KERNEL_TOLERANCE = 1e-2
@@ -233,7 +263,9 @@ def test_gdp_with_num_householder_one_matches_gdn(backend, use_initial_state):
         initial_state=None if state is None else state.clone(),
         output_final_state=True,
         cu_seqlens=inputs["cu_seqlens"],
-        backend="cudnn",
+        # cuDNN has no GDN engine on SM90, so fall back to the in-tree kernel
+        # as the oracle there.
+        backend="cudnn" if _CUDNN_UNAVAILABLE is None else "flashinfer",
     )
     gdp_out, gdp_state = _run(
         inputs,

@@ -3536,6 +3536,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             tKVrKV,
             scale,
             wg_idx,
+            self.first_q_in_blk(0),
         )
         self.maybe_store_checkpoint(
             tKVrKV,
@@ -3592,6 +3593,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                 tKVrKV,
                 scale,
                 wg_idx,
+                self.first_q_in_blk(blk),
             )
             self.maybe_store_checkpoint(
                 tKVrKV,
@@ -3651,6 +3653,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                 tKVrKV,
                 scale,
                 wg_idx,
+                self.first_q_in_blk(last_blk),
             )
             self.maybe_store_checkpoint(
                 tKVrKV,
@@ -4158,7 +4161,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                         v_head_idx,
                     )
                 elif ldst_warp_role == LoadStoreWarpRole.STORE_O:
-                    CollectiveStoreTma(self.BLK_Q, self.D).run(
+                    CollectiveStoreTma(self.BLK_Q, self.D, self.num_householder).run(
                         sO,
                         tma_atom_o,
                         tma_tensor_o,
