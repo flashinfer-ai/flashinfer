@@ -3484,22 +3484,35 @@ class TmemCorrResource(DecodeGenResourceBase):
                     )
             return
 
+        # Lanes store disjoint output rows, so every store instruction
+        # touches one cache line per lane, and those line touches bound the
+        # tail. A 16-bit output chunk is one 32-byte sector (16 columns):
+        # whole-sector stores halve the touches of 16-byte stores, and plain
+        # predicated stores (no branch) let the next chunk's TMEM loads issue
+        # ahead of the current chunk's store. FP8 output keeps 8 columns.
+        chunk_cols = 8 if cfg.use_fp8_output else 16
+        assert (output_pair_regs * 2) % chunk_cols == 0
+        # Row strides and lane column bases are multiples of 32 bytes, so
+        # sector-wide stores are legal exactly when the output base is.
+        o_misalignment = self.o_ptr.toint() & Int64(31)
+        store_sectors = valid_output_row & (o_misalignment == Int64(0))
+        store_halves = valid_output_row & (o_misalignment != Int64(0))
         regs_o_chunk = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-        for store_idx in cutlass.range_constexpr(output_pair_regs // 4):
-            chunk_col = store_idx * 8
+        for store_idx in cutlass.range_constexpr(output_pair_regs * 2 // chunk_cols):
+            chunk_col = store_idx * chunk_cols
             # FP16/BF16 or generic FP8 path: load one output chunk from each
             # tail O stage, combine the two instances, then pack to output type.
             o0_vals = _keeps_tcgen05_ld(
                 cfg,
                 prims.make_tmem_ptr(base_addr0 + Int32(chunk_col), Float32),
-                num=8,
+                num=chunk_cols,
                 offset=keeps_o_ldst_offset,
             )
             if cutlass.const_expr(cfg.num_insts_kv != 1):
                 o1_vals = _keeps_tcgen05_ld(
                     cfg,
                     prims.make_tmem_ptr(base_addr1 + Int32(chunk_col), Float32),
-                    num=8,
+                    num=chunk_cols,
                     offset=keeps_o_ldst_offset,
                 )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
@@ -3548,8 +3561,10 @@ class TmemCorrResource(DecodeGenResourceBase):
                         final_pair1[1],
                     )
             else:
-                final_vals = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
-                for chunk_idx in cutlass.range_constexpr(4):
+                final_vals = cutlass.Array(
+                    Float32, chunk_cols, space=cutlass.AddressSpace.rmem
+                )
+                for chunk_idx in cutlass.range_constexpr(chunk_cols // 2):
                     reg_base = chunk_idx * 2
                     if cutlass.const_expr(cfg.num_insts_kv == 1):
                         final_pair = fmul2(
@@ -3572,15 +3587,15 @@ class TmemCorrResource(DecodeGenResourceBase):
                     final_vals,
                     None,
                     first_col=col_base + Int32(chunk_col),
-                    count=8,
+                    count=chunk_cols,
                     row_has_mass=reduced_sum_0 > Float32(0.0),
                 )
-                regs_o_chunk = self._pack_final_o_regs(final_vals, None, 8)
+                regs_o_chunk = self._pack_final_o_regs(final_vals, None, chunk_cols)
             dst_ptr = cutlass.inttoptr(
                 self.o_ptr.toint()
                 + dst_row_base
                 + dst_col_offset
-                + Int64(store_idx * (8 if cfg.use_fp8_output else 16)),
+                + Int64(chunk_col * cfg.o_dtype_bytes),
                 mem_space=1,
                 dtype=Int32,
             )
@@ -3591,11 +3606,13 @@ class TmemCorrResource(DecodeGenResourceBase):
                         alignment=8,
                     )
             else:
-                if valid_output_row:
+                if store_sectors:
                     dst_ptr.store(
-                        regs_o_chunk.data_ptr().load(count=4, alignment=4),
-                        alignment=16,
+                        regs_o_chunk.data_ptr().load(count=8, alignment=4),
+                        alignment=32,
                     )
+                if store_halves:
+                    self._store_16bit_output_chunks(dst_ptr, regs_o_chunk, chunk_cols)
         return
 
     @cute.jit
