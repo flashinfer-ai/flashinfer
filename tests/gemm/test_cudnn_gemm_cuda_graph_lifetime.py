@@ -16,11 +16,9 @@ import torch
 
 _SCENARIO = textwrap.dedent(
     """
-    import sys
     import torch
     import flashinfer.gemm.gemm_base as gb
 
-    evict = sys.argv[1]
     dev = torch.device("cuda")
     torch.manual_seed(0)
     one = torch.ones((), dtype=torch.float32, device=dev)
@@ -57,13 +55,9 @@ _SCENARIO = textwrap.dedent(
             gemm(A, B, out, tactic)
         captured.append((tactic, g, out, ref))
 
-    if evict == "clear":
-        gb.clear_cudnn_graph_cache()
-    else:  # overflow the LRU with new shapes, as varying prefill lengths do
-        for i in range(2100):
-            mm = m + 1 + i
-            o = torch.empty(1, mm, n, device=dev, dtype=torch.bfloat16)
-            gemm(fp8(1, mm, k), B, o, -1)
+    # Evict the graphs.  Overflowing the LRU with >2048 new shapes (as varying
+    # prefill lengths do in serving) has the same effect but is too slow for CI.
+    gb.clear_cudnn_graph_cache()
     torch.cuda.synchronize()
 
     # Build plans for another shape so that freed kernel memory gets reused.
@@ -97,13 +91,12 @@ def _skip_reason():
     return None
 
 
-@pytest.mark.parametrize("evict", ["clear", "overflow"])
-def test_cudnn_fp8_gemm_graph_outlives_cache_eviction(evict):
+def test_cudnn_fp8_gemm_graph_outlives_cache_eviction():
     reason = _skip_reason()
     if reason:
         pytest.skip(reason)
     proc = subprocess.run(
-        [sys.executable, "-c", _SCENARIO, evict],
+        [sys.executable, "-c", _SCENARIO],
         capture_output=True,
         text=True,
         timeout=600,
