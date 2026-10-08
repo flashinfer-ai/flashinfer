@@ -370,17 +370,20 @@ def test_cake_concat_mla_k_is_cuda_graph_safe(num_tokens: int, dtype: torch.dtyp
     _require_cake_concat_mla_k()
     torch.manual_seed(23)
     k, k_nope, k_rope = _make_cake_tensors(num_tokens, dtype, "contiguous", False)
-    concat_mla_k(k, k_nope, k_rope, backend="cake")  # JIT load + warm-up outside the capture
+    concat_mla_k(
+        k, k_nope, k_rope, backend="cake"
+    )  # JIT load + warm-up outside the capture
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(stream):
-        with torch.cuda.graph(graph, stream=stream):
-            concat_mla_k(k, k_nope, k_rope, backend="cake")
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        concat_mla_k(k, k_nope, k_rope, backend="cake")
     torch.cuda.current_stream().wait_stream(stream)
     for seed in (29, 31):
         torch.manual_seed(seed)
-        _, fresh_nope, fresh_rope = _make_cake_tensors(num_tokens, dtype, "contiguous", False)
+        _, fresh_nope, fresh_rope = _make_cake_tensors(
+            num_tokens, dtype, "contiguous", False
+        )
         k_nope.copy_(fresh_nope)
         k_rope.copy_(fresh_rope)
         k.fill_(0)
@@ -388,7 +391,9 @@ def test_cake_concat_mla_k_is_cuda_graph_safe(num_tokens: int, dtype: torch.dtyp
         torch.cuda.synchronize()
         expected = torch.empty_like(k)
         expected[..., :QK_NOPE_HEAD_DIM] = k_nope
-        expected[..., QK_NOPE_HEAD_DIM:] = k_rope.expand(num_tokens, NUM_LOCAL_HEADS, -1)
+        expected[..., QK_NOPE_HEAD_DIM:] = k_rope.expand(
+            num_tokens, NUM_LOCAL_HEADS, -1
+        )
         assert torch.equal(
             k.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
         )

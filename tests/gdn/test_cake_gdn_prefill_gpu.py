@@ -592,7 +592,8 @@ def test_public_cake_gdn_prefill_int64_metadata_is_converted_once():
     }
     assert len(cached) == 1, sorted(prefill_mod._CAKE_GDN_I32_COPIES)
     assert not any(
-        ref() is slots64 for ref, _value, _stream in prefill_mod._CAKE_GDN_I32_COPIES.values()
+        ref() is slots64
+        for ref, _value, _stream in prefill_mod._CAKE_GDN_I32_COPIES.values()
     ), "state_indices must not be cached"
     first_copies = {id(value) for value in cached.values()}
 
@@ -607,7 +608,9 @@ def test_public_cake_gdn_prefill_int64_metadata_is_converted_once():
         for ref, value, _stream in prefill_mod._CAKE_GDN_I32_COPIES.values()
         if ref() is cu64
     }
-    assert again == first_copies, "the second int64 call must reuse the cached int32 copy"
+    assert again == first_copies, (
+        "the second int64 call must reuse the cached int32 copy"
+    )
 
     # A fresh int64 tensor (new identity) converts again; the stale entry is not reused.
     cu64_again = cu64.clone()
@@ -618,7 +621,8 @@ def test_public_cake_gdn_prefill_int64_metadata_is_converted_once():
     torch.cuda.synchronize()
     assert torch.equal(case["output"], out_i32)
     assert any(
-        ref() is cu64_again for ref, _value, _stream in prefill_mod._CAKE_GDN_I32_COPIES.values()
+        ref() is cu64_again
+        for ref, _value, _stream in prefill_mod._CAKE_GDN_I32_COPIES.values()
     )
 
 
@@ -705,7 +709,9 @@ def test_public_cake_gdn_prefill_int64_metadata_graph_owns_its_copy():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         _launch(case)
-    assert len(prefill_mod._CAKE_GDN_I32_COPIES) == entries_before, "capture must not fill the cache"
+    assert len(prefill_mod._CAKE_GDN_I32_COPIES) == entries_before, (
+        "capture must not fill the cache"
+    )
 
     prefill_mod._CAKE_GDN_I32_COPIES.clear()
     with torch.cuda.stream(stream):

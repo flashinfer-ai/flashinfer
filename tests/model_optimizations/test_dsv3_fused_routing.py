@@ -558,20 +558,23 @@ def test_dsv3_fused_routing_cake_is_cuda_graph_safe(
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(stream):
-        with torch.cuda.graph(graph, stream=stream):
-            run("cake")
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        run("cake")
     torch.cuda.current_stream().wait_stream(stream)
     for seed in (7, 11):
         torch.manual_seed(seed)
-        scores.copy_(torch.randn(num_tokens, num_experts, device="cuda", dtype=data_type))
+        scores.copy_(
+            torch.randn(num_tokens, num_experts, device="cuda", dtype=data_type)
+        )
         bias.copy_(torch.randn(num_experts, device="cuda", dtype=data_type))
         graph.replay()
         torch.cuda.synchronize()
         replay = (topk_values.clone(), topk_indices.clone(), routing_replay_out.clone())
         run("cake")
         torch.cuda.synchronize()
-        for got, want in zip(replay, (topk_values, topk_indices, routing_replay_out)):
+        for got, want in zip(
+            replay, (topk_values, topk_indices, routing_replay_out), strict=True
+        ):
             assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
 
 

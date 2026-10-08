@@ -34,6 +34,8 @@ _PROMOTED_BF16_ROWS = [
     (8, 4, 4, 8, True, True, True, 4),
     (5, 4, 4, 8, False, True, True, 4),
 ]
+
+
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
 @pytest.mark.parametrize(
     "batch_size,seq_len,num_q_heads,num_v_heads,strided,disable,cache,cache_steps",
