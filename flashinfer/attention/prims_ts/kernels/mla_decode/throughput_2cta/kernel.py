@@ -1601,9 +1601,9 @@ class MlaDecodeTs:
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
-        # One shared metadata ring feeds both K/V issuers. Each copies its
-        # offsets to registers before releasing the stage; TMA payloads have
-        # separate lifetimes. Reuse this ring for either sparse input format.
+        # One shared metadata ring feeds both K/V issuers. Each holds its
+        # stage through the last coordinate read; TMA consumes register
+        # operands and its payload buffers have independent lifetimes.
         sparse_offsets_smem = None
         if cutlass.const_expr(cfg.page_size == 1 and cfg.use_fp8_split_mma_schedule):
             sparse_offsets_smem = cutlass.Array(

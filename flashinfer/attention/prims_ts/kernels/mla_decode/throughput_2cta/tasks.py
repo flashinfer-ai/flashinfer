@@ -514,7 +514,7 @@ def create_load_k_task(
     task_class: type = MlaTask,
     **task_kwargs,
 ) -> Task:
-    """Create the FP8 Q/K TMA task (warp 9).
+    """Create the FP8 Q/K TMA task on its configured loader warps.
 
     Q is loaded once before the loop. K uses one whole-tile pipeline stage per
     logical K tile. Sparse indices are prefetched through the shared offset
@@ -588,7 +588,7 @@ def create_load_v_task(
     task_class: type = MlaTask,
     **task_kwargs,
 ) -> Task:
-    """Create the FP8 V TMA task (warp 10)."""
+    """Create the FP8 V TMA task on its configured loader warps."""
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
 
     def load_v_body(smem_v, page_offsets=None, work_queue=None):

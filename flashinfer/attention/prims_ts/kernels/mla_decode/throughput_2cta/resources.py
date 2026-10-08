@@ -637,7 +637,11 @@ class MlaWorkQueue(WorkQueue):
 
 @dataclass(kw_only=True)
 class PageOffsetWindowResource(HighThroughputMlaResource):
-    """GMEM page table cached as one register per lane of the TMA warp."""
+    """Page-coordinate staging for paged and sparse KV loads.
+
+    FP8 sparse loaders read uniform quads from the prefetched shared ring.
+    Other schedules retain page windows in registers.
+    """
 
     request_lengths: Any = field(init=False, default=None)
     page_offsets: Any = None  # GMEM page-offset tensor
@@ -1612,8 +1616,8 @@ class SmemKVResource(HighThroughputMlaResource):
 class SmemKResource(HighThroughputMlaResource):
     """SMEM K buffer for the FP8 split-MMA path.
 
-    Producer: LoadTma. Consumer: MmaQkTask. A single producer stage contains
-    all latent K sub-tiles plus the RoPE K sub-tile for one logical K tile.
+    Producer: LoadKTask. Consumer: MmaQkTask. A single producer stage contains
+    all latent K sub-tiles and optional RoPE channels for one logical K tile.
     """
 
     smem_k: Any = None
@@ -1821,7 +1825,7 @@ class SmemKResource(HighThroughputMlaResource):
 class SmemVResource(HighThroughputMlaResource):
     """SMEM V buffer for the FP8 split-MMA path.
 
-    Producer: LoadTma. Consumer: MmaPvTask. A single stage contains every V
+    Producer: LoadVTask. Consumer: MmaPvTask. A single stage contains every V
     sub-tile needed by the PV MMA for one logical K tile.
     """
 
