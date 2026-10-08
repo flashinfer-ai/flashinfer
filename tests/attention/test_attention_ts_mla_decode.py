@@ -2507,6 +2507,10 @@ def test_attention_ts_mla_balanced_plan_fails_calibration_before_policy_or_alloc
         "_resolve_cuda_device",
         lambda _device: (torch.device("cuda:7"), 7),
     )
+    # This test exercises calibration admission with a fictitious CUDA ordinal.
+    monkeypatch.setattr(
+        mla_decode_module, "_validate_runtime_device", lambda _device: None
+    )
     monkeypatch.setattr(
         balanced_plan_module,
         "require_balanced_mla_calibration",

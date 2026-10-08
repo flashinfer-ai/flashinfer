@@ -1878,6 +1878,7 @@ class BatchMLADecodePagedTSWrapper:
         o_data_type: torch.dtype,
         mask_type: Literal["dense", "causal"] = "causal",
         workspace_buffer: Optional[torch.Tensor] = None,
+        validate: bool = True,
     ) -> None:
         """Compile and bind a standard task-scheduled MLA decode plan.
 
@@ -1916,6 +1917,9 @@ class BatchMLADecodePagedTSWrapper:
             must be 32-byte aligned and at least the size returned by
             :func:`get_prims_ts_batch_mla_decode_workspace_size`. If omitted,
             the wrapper allocates and retains the scratch buffer.
+        validate : bool
+            Validate static geometry and caller scratch. Defaults to ``True``.
+            Disable only for previously validated inputs and warmed topology.
         """
 
         self._plan(
@@ -1933,6 +1937,7 @@ class BatchMLADecodePagedTSWrapper:
             o_data_type=o_data_type,
             mask_type=mask_type,
             workspace_buffer=workspace_buffer,
+            validate=validate,
         )
 
     @flashinfer_experimental_api
