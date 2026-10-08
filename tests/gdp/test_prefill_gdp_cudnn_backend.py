@@ -56,6 +56,8 @@ _CUDNN_UNAVAILABLE = cudnn_linear_attention_unavailable_reason()
 
 
 def _flashinfer_unavailable_reason() -> str | None:
+    if not torch.cuda.is_available():
+        return "CUDA is required"
     major, _ = get_compute_capability(torch.device("cuda"))
     if major not in (9, 10):
         return f"flashinfer GDP prefill needs SM90 or SM100, found sm{major}0"
@@ -78,8 +80,19 @@ def _require_backend(request):
     callspec = getattr(request.node, "callspec", None)
     backend = callspec.params.get("backend", "cudnn") if callspec else "cudnn"
     if backend == "auto":
-        if _CUDNN_UNAVAILABLE is not None and _FLASHINFER_UNAVAILABLE is not None:
-            pytest.skip("no GDP prefill backend can serve this device")
+        # mirror the resolution in chunk_gated_delta_product: cuDNN everywhere
+        # except SM90, where it has no engine and "auto" picks flashinfer.
+        resolved = (
+            "flashinfer"
+            if torch.cuda.is_available()
+            and get_compute_capability(torch.device("cuda"))[0] == 9
+            else "cudnn"
+        )
+        reason = (
+            _FLASHINFER_UNAVAILABLE if resolved == "flashinfer" else _CUDNN_UNAVAILABLE
+        )
+        if reason is not None:
+            pytest.skip(f'backend="auto" resolves to {resolved}: {reason}')
     elif backend == "cudnn" and _CUDNN_UNAVAILABLE is not None:
         pytest.skip(f"cuDNN linear attention unavailable: {_CUDNN_UNAVAILABLE}")
     if backend == "flashinfer" and _FLASHINFER_UNAVAILABLE is not None:
@@ -624,6 +637,46 @@ def test_gdn_entry_point_declines_householders_it_cannot_serve(gdn_backend, back
             num_householder=2,
             backend=gdn_backend,
         )
+
+
+@pytest.mark.parametrize("backend", ["auto"])
+def test_gate_lengths_are_validated(backend):
+    """A beta on the real-token timeline reads past itself, so reject it.
+
+    g is per real token and beta per (token, Householder); the kernel walks
+    k's timeline, so a short beta is an out-of-bounds read rather than a
+    failure. That is what the default used to be.
+    """
+    inputs = _make_inputs([256], 4, 4, 4, 2, seed=77)
+    total = inputs["q"].shape[0]
+    device = inputs["q"].device
+    with pytest.raises(ValueError, match="num_householder"):
+        chunk_gated_delta_rule(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            inputs["g"],
+            torch.ones(total, 4, dtype=torch.float32, device=device),
+            None,
+            cu_seqlens=inputs["cu_seqlens"] * 2,
+            num_householder=2,
+            backend="flashinfer",
+        )
+
+
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_default_beta_spans_the_expanded_timeline(backend):
+    """beta=None must mean ones per (token, Householder), not per token."""
+    inputs = _make_inputs([256], 4, 4, 4, 2, seed=31)
+    total = inputs["q"].shape[0]
+    device = inputs["q"].device
+    ones_beta = torch.ones(total * 2, 4, dtype=torch.float32, device=device)
+    # against the reference, not against another kernel run: a too-short beta
+    # reads whatever follows it, which can happen to be ones.
+    ref_out, _ = _serial({**inputs, "beta": ones_beta})
+    out = _run(inputs, backend=backend, beta=None)
+    assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
+    assert rel_err(out, _run(inputs, backend=backend, beta=ones_beta)) < 1e-6
 
 
 def test_backend_argument_is_validated():

@@ -677,8 +677,16 @@ def chunk_gated_delta_rule(
         where ``num_sab_heads = max(num_q_heads, num_v_heads)``.  Must be
         float32.  Defaults to all ones when ``None``.
     beta : torch.Tensor, optional
-        Update gate (beta) of shape ``[total_seq_len, num_sab_heads]``.
-        Must be float32.  Defaults to all ones when ``None``.
+        Update gate (beta) of shape ``[total_seq_len * num_householder,
+        num_sab_heads]``.  Must be float32.  Defaults to all ones when
+        ``None``.
+    num_householder : int
+        Householder updates per token (Gated DeltaProduct).  ``1`` (the
+        default) is the gated delta rule.  Above 1, ``k``, ``v`` and ``beta``
+        carry ``num_householder`` rows per token and ``cu_seqlens`` counts
+        that expanded timeline, while ``q``, ``g`` and the output stay at
+        real-token rows.  Only the flashinfer backend implements it, on SM90
+        and SM100.
     scale : float, optional
         Scale factor for the attention scores.  Defaults to
         ``1 / sqrt(head_size)`` when ``None``.
@@ -882,6 +890,17 @@ def chunk_gated_delta_rule(
     head_size = q.size(2)
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
+    # g is per real token, beta per (token, Householder).  Getting beta's
+    # length wrong reads past it rather than failing, so check it here.
+    if g is not None and g.size(0) != q.size(0):
+        raise ValueError(
+            f"g must have one row per token, got {g.size(0)} for {q.size(0)} tokens"
+        )
+    if beta is not None and beta.size(0) != q.size(0) * num_householder:
+        raise ValueError(
+            f"beta must have num_householder ({num_householder}) rows per token, "
+            f"got {beta.size(0)} for {q.size(0)} tokens"
+        )
 
     if backend == "cudnn":
         from .cudnn import cudnn_chunk_gated_delta_rule
