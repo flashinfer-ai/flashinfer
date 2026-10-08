@@ -85,10 +85,14 @@ def _cudnn_supports_paged_auto() -> bool:
     if not CUDNN_AVAILABLE:
         return False
     try:
-        version = tuple(map(int, cudnn.__version__.split(".")[:2]))
+        from packaging.version import Version
+
+        # Nightly wheels can expose the native capability before the required
+        # selector fix lands. A 1.31.dev build is older than the 1.31 release.
+        version = Version(cudnn.__version__)
         binder = getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None)
         return (
-            version >= (1, 31)
+            version >= Version("1.31.0")
             and cudnn_frontend_frost_runtime_available()
             and cudnn.backend_version() >= 92700
             and bool(getattr(binder, "supports_paged_packed_split", False))

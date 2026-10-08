@@ -28,6 +28,11 @@ from flashinfer.cudnn.utils import supports_ordered_cudnn_execution
     "version,backend,native,runtime,expected",
     [
         ("1.30.0", 92700, True, True, False),
+        ("1.31.0.dev72349147", 92700, True, True, False),
+        ("1.31.0rc1", 92700, True, True, False),
+        ("1.31.0+local", 92700, True, True, True),
+        ("1.32.0.dev1", 92700, True, True, True),
+        ("unknown", 92700, True, True, False),
         ("1.31.0", 92600, True, True, False),
         ("1.31.0", 92700, False, True, False),
         ("1.31.0", 92700, True, False, False),
