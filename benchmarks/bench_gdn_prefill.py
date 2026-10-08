@@ -360,24 +360,33 @@ def main():
                 if name == "FLA":
                     block_medians[name].append(bench_fla(args, endpoints, h_qk, h_v, d))
                 else:
-                    block_medians[name].append(
-                        bench_fi(
-                            args,
-                            endpoints,
-                            h_qk,
-                            h_v,
-                            d,
-                            backend=(
-                                "cudnn"
-                                if name == "cuDNN"
-                                # GDP's "auto" IS cuDNN, so both columns would
-                                # measure the same kernel; name it instead.
-                                else "flashinfer"
-                                if args.num_householder > 1
-                                else "auto"
-                            ),
+                    # The probe above answers for one shape; an engine may still
+                    # decline a particular config here, which should cost that
+                    # row rather than the whole run.
+                    try:
+                        block_medians[name].append(
+                            bench_fi(
+                                args,
+                                endpoints,
+                                h_qk,
+                                h_v,
+                                d,
+                                backend=(
+                                    "cudnn"
+                                    if name == "cuDNN"
+                                    # GDP's "auto" IS cuDNN, so both columns would
+                                    # measure the same kernel; name it instead.
+                                    else "flashinfer"
+                                    if args.num_householder > 1
+                                    else "auto"
+                                ),
+                            )
                         )
-                    )
+                    except Exception as exc:
+                        if name != "cuDNN":
+                            raise
+                        print(f"  cuDNN declined {h_label} {s_label}: {exc}")
+                        block_medians[name] = []
                 time.sleep(args.cooling_time)
             fi_ms = float(np.median(block_medians["FI"]))
             tflops = _gdn_tflops(T, h_v, d, fi_ms, args.num_householder)
@@ -385,7 +394,7 @@ def main():
                 f"{h_label:<15s}  {s_label:<16s}  {h_qk:>4d} {h_v:>4d}"
                 f"  {fi_ms:>21.3f}ms  {tflops:>6.1f}"
             )
-            if has_cudnn:
+            if has_cudnn and block_medians["cuDNN"]:
                 cudnn_ms = float(np.median(block_medians["cuDNN"]))
                 speedup = fi_ms / cudnn_ms
                 marker = "+" if speedup > 1.0 else "-"
