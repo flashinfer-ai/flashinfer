@@ -375,16 +375,27 @@ def select_gemm2(
     *,
     late_dep_wait: bool | None = None,
     weight_l2_hint: bool | None = None,
+    sched_chunk_major: int = 0,
 ) -> Kernel:
     """The swap-AB GEMM2 finalize form the plan selected.
 
     ``late_dep_wait`` is the module's griddepcontrol placement (the plan's
     ``pdl and dep_prefetch``); ``weight_l2_hint`` its weight-stream L2 policy (the
-    plan's ``swap_weight_l2_hint``; the n16 / n32 forms exist under both).
+    plan's ``swap_weight_l2_hint``; the n16 / n32 forms exist under both);
+    ``sched_chunk_major`` the finalize scheduler raster (the plan's
+    ``GemmForm.sched_chunk_major``): ``0`` = the row-group-major raster, ``B >= 1``
+    the chunk-major raster blocked ``B`` weight chunks per row group (``_cm<B>``) --
+    the n192 2-CTA form exists under both.
     """
     form: dict[str, Any] = dict(
-        kind="gemm2_swapab", n_tile=int(n_tile), kbps=int(kbps), m_group=int(m_group)
+        kind="gemm2_swapab",
+        n_tile=int(n_tile),
+        kbps=int(kbps),
+        m_group=int(m_group),
+        sched_chunk_major=bool(sched_chunk_major),
     )
+    if sched_chunk_major:
+        form["sched_m_block"] = int(sched_chunk_major)
     if late_dep_wait is not None:
         form["late_dep_wait"] = bool(late_dep_wait)
     if weight_l2_hint is not None:

@@ -89,13 +89,14 @@ with ``w2_scale`` ``[L, H, I_shard/32]`` (``uint8``).
 
 ``plan`` refuses two classes of rows, both with ``NotImplementedError``.
 ``decision.supported`` is ``False`` only when the hand-written selection needs
-an IR form this chain has not traced (the wide 192-row ``mixed192`` form, MoE-TP
-rows of 8192 tokens and above); ``decision.reason`` names the missing form.
-Every other row reports ``decision.supported`` as ``True``, but ``plan`` also
-refuses a row whose ``decision.path`` is not in ``EXECUTABLE_PATHS`` (the
-``two_stage`` finalize on MoE-TP rows of 17 to 127 tokens is traced but not
-enqueued by this chain).  Callers that need a hard answer before ``plan``
-check ``decision.path in EXECUTABLE_PATHS`` as well as ``decision.supported``.
+an IR form this chain has not traced; ``decision.reason`` names the missing
+form (no contract row is in this class).  Every other row reports
+``decision.supported`` as ``True``, but ``plan`` also refuses a row whose
+``decision.path`` is not in ``EXECUTABLE_PATHS`` (the ``two_stage`` finalize
+on MoE-TP rows of 17 to 127 tokens is traced but not enqueued by this chain).
+The two-stream ``mixed192`` chain serves the MoE-TP rows of 8192 tokens and
+above.  Callers that need a hard answer before ``plan`` check
+``decision.path in EXECUTABLE_PATHS`` as well as ``decision.supported``.
 The dense grouped-GEMM path above ``swapab_max_tokens``, the split two-stage
 path and the hybrid path run through their own executable chains (see
 ``executed_chains`` in the manifest).
@@ -145,6 +146,10 @@ not on a contract row).
      - cake, cake_cute
      - ``e2e_registry``
    * - ``gemm2_swapab_finalize_n192_2cta``
+     - gemm2_swapab
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_swapab_finalize_n192_2cta_cm4``
      - gemm2_swapab
      - cake, cake_cute
      - ``e2e_registry``
@@ -212,6 +217,30 @@ not on a contract row).
      - gemm2_dense
      - cake, cake_cute
      - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n192_c12_rauto``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_2cta_rauto``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_c12_rg``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_2cta_rg``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_c12_rg_rauto``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_2cta_rg_rauto``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
    * - ``gemm1_dense_situ_m128_n256``
      - gemm1_dense
      - cake, cake_cute
@@ -237,6 +266,26 @@ not on a contract row).
      - cake, cake_cute
      - ``e2e_registry``
    * - ``gemm1_dense_situ_m128_n128_rowgroup_early``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m128_n256_rowgroup_zero_fill``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m256_n256_2cta_rowgroup_zero_fill_secondary``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m256_n256_2cta_rowgroup``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m128_n256_rowgroup_zero_fill_nol2``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m256_n256_2cta_rowgroup_zero_fill_secondary_nol2``
      - gemm1_dense
      - cake, cake_cute
      - ``e2e_registry``
