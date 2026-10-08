@@ -32,6 +32,14 @@ CASES = [
     (32, 64, 2, 8, 2048),
     (64, 64, 1, 8, 2048),
     (64, 64, 4, 2, 512),
+    # next_n 3 (one 3-token atom), 5 (2 + 2 + 1 tokens: partial last atom) and
+    # 6 (2 + 2 + 2), on both head counts.
+    (32, 128, 3, 3, 1024),
+    (32, 64, 5, 2, 1024),
+    (32, 128, 6, 2, 512),
+    (64, 64, 3, 3, 1024),
+    (64, 64, 5, 2, 512),
+    (64, 64, 6, 2, 1024),
 ]
 
 
@@ -376,9 +384,10 @@ def test_sm120_paged_host_helpers_and_rejections():
     assert stride % 256 == 0 and stride >= 1000
     assert not _runtime.route_available(16, 64, 1)
     assert not _runtime.route_available(64, 128, 1)
-    assert not _runtime.route_available(32, 64, 3)
+    assert _runtime.route_available(32, 64, 3)
+    assert not _runtime.route_available(32, 64, 7)
     with pytest.raises(ValueError):
-        _runtime.next_n_atoms(3)
+        _runtime.next_n_atoms(7)
     # Every logits route is the ordered (metadata, logits) pair behind one
     # prepared sequence; the metadata route is the standalone scheduler.
     metadata_route = _runtime.metadata_route_name()
@@ -389,11 +398,15 @@ def test_sm120_paged_host_helpers_and_rejections():
         else:
             assert stages == ["metadata", "logits"] and record["sequence"]
             assert record["kernel_launches"] == 2
-    # One Q atom per request for every shipped next_n: 1 and 2 pair the tokens as
-    # DeepGEMM does; 4 scores the whole request from one atom (DeepGEMM: two
-    # 2-token atoms), so its schedule has half as many items as DeepGEMM's.
-    for next_n in _runtime.exported_next_n():
-        assert _runtime.next_n_atoms(next_n) == 1
+    # The Q-atom rule is a function of next_n only.  One atom per request up to
+    # next_n 4: 1 and 2 pair the tokens as DeepGEMM does, 3 and 4 score the whole
+    # request from one atom (DeepGEMM: two atoms).  5 and 6 run two atoms of at
+    # most three tokens (DeepGEMM: three), so their schedules carry two items per
+    # request.
+    expected_atoms = {1: 1, 2: 1, 3: 1, 4: 1, 5: 3, 6: 3}
+    assert set(_runtime.exported_next_n()) == set(expected_atoms)
+    for next_n, atoms in expected_atoms.items():
+        assert _runtime.next_n_atoms(next_n) == atoms
 
 
 def test_sm120_arch_targets_follow_the_compilation_context(monkeypatch):
