@@ -2615,6 +2615,15 @@ with contextlib.suppress(Exception):
     _cmk_k_rope = torch.randn(_cmk_T, 1, _cmk_rope, dtype=torch.bfloat16, device=device)
     _concat_mla_k(_cmk_k, _cmk_k_nope, _cmk_k_rope)
 
+# concat_mla_kv_quant_fp8 (MLA context K/V pack + fp8 cast, 12 local heads).
+with contextlib.suppress(Exception):
+    from flashinfer import concat_mla_kv_quant_fp8 as _concat_mla_kv_quant_fp8
+
+    _ckv_T, _ckv_H = 2048, 12
+    _ckv_kv_nope = torch.randn(_ckv_T, _ckv_H, 256, dtype=torch.bfloat16, device=device)
+    _ckv_k_pe = torch.randn(_ckv_T, 64, dtype=torch.bfloat16, device=device)
+    _concat_mla_kv_quant_fp8(_ckv_kv_nope, _ckv_k_pe)
+
 # xqa_batch_decode_with_kv_cache (SM100+ XQA decode wrapper, NHD 5-D cache).
 with contextlib.suppress(Exception):
     import math as _math2
