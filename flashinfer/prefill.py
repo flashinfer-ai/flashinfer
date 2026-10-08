@@ -3003,7 +3003,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
                 max_item_len_ptr=max_item_len_ptr,
                 max_sequence_kv=max_sequence_kv,
-                fixed_split_size=fixed_split_size,
             )
             if block_tables is None:
                 block_tables = _build_block_tables_from_paged_kv_indices(
@@ -3030,6 +3029,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 page_size=page_size,
                 causal=causal,
                 sm_scale=sm_scale,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
+                use_cuda_graph=self._use_cuda_graph,
             )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -4695,8 +4697,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
                 max_item_len_ptr=max_item_len_ptr,
                 max_sequence_kv=max_sequence_kv,
-                fixed_split_size=fixed_split_size,
             )
+            if fixed_split_size not in (-1, None):
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support "
+                    f"fixed_split_size={fixed_split_size} with ragged K/V"
+                )
             assert self._prims_backend is not None
             self._prims_backend.plan_ragged(
                 qo_indptr=self._qo_indptr_buf,
