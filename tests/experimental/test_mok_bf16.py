@@ -603,3 +603,7 @@ def test_comm_sms_defaults_follow_the_device_generation():
         mok.comm_sms_defaults("fp8")
     for row in mok.COMM_SMS_DEFAULTS.values():
         assert set(row) == {"bf16", "mxfp8"}
+    # The measured per-generation rows (backend README); a change here is a shipping change.
+    assert mok.COMM_SMS_DEFAULTS[(10, 0)] == {"bf16": (20, 24), "mxfp8": (40, 32)}
+    assert mok.COMM_SMS_DEFAULTS[(10, 3)] == {"bf16": (24, 28), "mxfp8": (40, 32)}
+    assert mok.COMM_SMS_DEFAULTS[(10, 7)] == {"bf16": (40, 32), "mxfp8": (72, 64)}

@@ -64,9 +64,12 @@ def mxfp8_quantize(x_bf16, return_normal=True, return_transposed=True):
 # Communication SMs (forward, backward) per precision and GPU generation: the splits at which
 # the complete training step is fastest (EP4 GLM-5.2 shape sweeps of each kernel pair, uniform
 # routing; backend README). Keyed by compute capability (major, minor); a generation without
-# its own row uses the B200 table. B300 (10, 3) is measured with the B200 splits for now.
+# its own row uses the B200 table. The B300 row keeps the B200 MXFP8 split (its own sweep
+# agrees) and moves BF16 to 24 / 28: at 20 / 24 the BF16 checkpoint step loses to the
+# reference on 16 GPUs and the full step only ties (backend README).
 COMM_SMS_DEFAULTS = {
     (10, 0): {"bf16": (20, 24), "mxfp8": (40, 32)},
+    (10, 3): {"bf16": (24, 28), "mxfp8": (40, 32)},
     (10, 7): {"bf16": (40, 32), "mxfp8": (72, 64)},
 }
 _COMM_SMS_FALLBACK_ARCH = (10, 0)

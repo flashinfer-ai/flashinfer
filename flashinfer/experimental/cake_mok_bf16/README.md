@@ -122,9 +122,15 @@ for unequal lengths, empty ranks, count changes and graph reuse.
   212-SM compute-capability-10.7 part ships 40 / 32 for BF16 and 72 / 64 for MXFP8 (same
   protocol; BF16 full step 20/24 19.54 ms, 32/28 16.95, 40/32 16.81, 48/40 16.82, 56/40
   16.96, 64/48 17.18; MXFP8 full 72/64 13.05, 80/64 13.31, 80/56 13.52, 96/64 13.81,
-  112/64 14.54, checkpoint 72/64 16.50, 80/64 16.62, 80/56 16.92). Generations without
-  their own row use the B200 values. Pass `precision="mxfp8"` to the factory for an
-  MXFP8 workload, or set the counts explicitly.
+  112/64 14.54, checkpoint 72/64 16.50, 80/64 16.62, 80/56 16.92). The 160-SM
+  compute-capability-10.3 part ships 24 / 28 for BF16 and keeps 40 / 32 for MXFP8 (same
+  protocol on 4 and 16 GPUs: BF16 full step on 4 GPUs 20/24 27.32 ms, 24/28 27.21, 32/28
+  27.52, 40/32 28.00, 48/40 28.68; on 16 GPUs across four nodes BF16 full 20/24 26.27,
+  24/28 25.63, 32/28 25.62, 40/32 25.85 and BF16 checkpoint 20/24 32.34-32.36, 24/28
+  31.42-31.43, 32/28 31.43-31.44, 40/32 31.74, 48/40 32.21; MXFP8 full on 4 GPUs 40/32
+  20.54, 48/40 20.72, 56/40 21.13, 64/48 21.86, 72/64 23.71, checkpoint 40/32 25.41, 56/40
+  25.98, 72/64 28.41). Generations without their own row use the B200 values. Pass
+  `precision="mxfp8"` to the factory for an MXFP8 workload, or set the counts explicitly.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
 - An EP16 workload can use 16,384 source tokens per rank (262,144 global), hidden width
