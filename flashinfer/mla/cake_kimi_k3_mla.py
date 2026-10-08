@@ -22,13 +22,24 @@ row of ``kv_cache`` must be 576 contiguous FP8 elements, and rows must be equall
 16-byte multiple); the TMA descriptors of the row-tile programs and of the two-CTA wide kernel
 carry that row stride.  ``out`` rows are dense (512 BF16 elements apart); ``block_tables``,
 ``seq_lens`` and ``cum_seq_lens_q`` are contiguous int32.
+
+``backend="auto"`` selects these programs for the qualified one-token decode contract only
+(SM100 / SM103, FP8 query and cache, ``kv_lora_rank=512`` / ``qk_rope_head_dim=64``, page 64,
+:data:`AUTO_QUALIFIED_HEADS` heads, dense ``[B, 1, H, 576]`` query) through the pure predicate
+:func:`cake_kimi_k3_mla_auto_reason` followed by the guarded program build
+:func:`cake_kimi_k3_mla_auto_prepare`; every other call, and a build that fails, keeps the
+previous dispatch, and ``FLASHINFER_DISABLE_CAKE_AUTO=1`` (:data:`AUTO_DISABLE_ENV`) turns the
+automatic admission off.  ``backend="cake"`` stays strict;
+:func:`cake_kimi_k3_mla_contract_reason` is the one contract checker behind both routes.
 """
 
 from __future__ import annotations
 
 import functools
 import math
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -640,12 +651,350 @@ def run_cake_kimi_k3_mla_fp8_paged_attention(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Dispatch admission: the strict backend="cake" contract and the backend="auto" qualification
+# ---------------------------------------------------------------------------
+
+# Head counts ``backend="auto"`` may route here.  The programs are generated and tested for 12 and
+# 96 heads, packed variable-Q / MTP and prefill; only the 12-head one-token decode is qualified
+# for automatic selection until the other shapes are measured against the incumbent.  All of them
+# stay reachable through the explicit ``backend="cake"``.
+AUTO_QUALIFIED_HEADS: tuple[int, ...] = (12,)
+# Kill switch: any value other than "" / "0" keeps ``backend="auto"`` on its previous dispatch.
+AUTO_DISABLE_ENV = "FLASHINFER_DISABLE_CAKE_AUTO"
+
+
+def cake_kimi_k3_mla_contract_reason(
+    *,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    seq_lens: Optional[torch.Tensor],
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    bmm1_scale: Any,
+    bmm2_scale: Any,
+    sparse_mla_top_k: int = 0,
+    sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
+    sinks: Any = None,
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+    enable_dcp: bool = False,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
+    use_fp16_softmax: Optional[bool] = None,
+    enable_pdl: Optional[bool] = None,
+    multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+) -> Optional[str]:
+    """Why a ``trtllm_batch_decode_with_kv_cache_mla`` call is outside this route's contract, or ``None``.
+
+    The one checker behind the explicit ``backend="cake"`` route, which raises the reason, and the
+    ``backend="auto"`` admission, which treats it as "not selected", so the two cannot drift.  Host
+    facts only.  Unsupported here: sparse top-k, sinks, LSE output, DCP, skip-softmax, FP16 softmax,
+    PDL and the multi-CTA counter; required: ``seq_lens``, FP8 (E4M3) query and cache,
+    ``kv_lora_rank=512`` / ``qk_rope_head_dim=64`` and host-float scales.  The prepared launcher
+    validates the remaining layout (page size, row strides, workspace) at construction.
+    """
+    unsupported = []
+    if sparse_mla_top_k > 0 or sparse_mla_top_k_lens is not None:
+        unsupported.append("sparse_mla_top_k")
+    if sinks is not None:
+        unsupported.append("sinks")
+    if return_lse or lse is not None:
+        unsupported.append("return_lse / lse")
+    if enable_dcp:
+        unsupported.append("enable_dcp")
+    if skip_softmax_threshold_scale_factor is not None:
+        unsupported.append("skip_softmax_threshold_scale_factor")
+    if use_fp16_softmax:
+        unsupported.append("use_fp16_softmax")
+    if enable_pdl:
+        unsupported.append("enable_pdl")
+    if multi_ctas_kv_counter_buffer is not None:
+        unsupported.append("multi_ctas_kv_counter_buffer")
+    if unsupported:
+        return "does not support " + ", ".join(unsupported)
+    if seq_lens is None:
+        return "requires seq_lens"
+    if query.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
+        return (
+            "requires float8_e4m3fn query and kv_cache, got "
+            f"{query.dtype} and {kv_cache.dtype}"
+        )
+    if kv_lora_rank != LATENT or qk_rope_head_dim != ROPE:
+        return f"supports kv_lora_rank={LATENT} and qk_rope_head_dim={ROPE} only"
+    if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
+        return "takes host float bmm1_scale / bmm2_scale"
+    return None
+
+
+@functools.cache
+def cake_kimi_k3_mla_is_available() -> bool:
+    """Whether the generated programs can be built in this process: sources and an nvcc toolchain.
+
+    Checked once per process; never raises.  ``True`` means the JIT build may be attempted (it
+    happens at first use, per program and architecture), not that it has succeeded.
+    """
+    try:
+        from ..jit.cake_kimi_k3_mla import MODULES, get_csrc_dir
+        from ..jit.cpp_ext import get_cuda_path
+
+        csrc_dir = get_csrc_dir()
+        for record in MODULES.values():
+            for source in record["sources"]:
+                if not (csrc_dir / Path(source).name).is_file():
+                    return False
+        return (Path(get_cuda_path()) / "bin" / "nvcc").is_file()
+    except Exception:
+        return False
+
+
+def _auto_disabled() -> bool:
+    return os.environ.get(AUTO_DISABLE_ENV, "0").strip() not in ("", "0")
+
+
+def _arch_name(compute_capability: tuple[int, int]) -> str:
+    return f"sm_{compute_capability[0]}{compute_capability[1]}a"
+
+
+def _auto_plan(
+    *, batch: int, num_heads: int, max_seq_len: int, sm_count: int
+) -> AttentionPlan:
+    """The plan of a one-token decode shape, with the launcher's exact ``plan_attention`` key."""
+    return plan_attention(
+        batch=int(batch),
+        max_q_len=1,
+        num_heads=int(num_heads),
+        max_seq_len=int(max_seq_len),
+        sm_count=int(sm_count),
+        num_split=None,
+    )
+
+
+def cake_kimi_k3_mla_auto_reason(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: Optional[torch.Tensor],
+    workspace_buffer: torch.Tensor,
+    max_seq_len: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    bmm1_scale: Any,
+    bmm2_scale: Any,
+    out: Optional[torch.Tensor] = None,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
+    sparse_mla_top_k: int = 0,
+    sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
+    sinks: Any = None,
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+    enable_dcp: bool = False,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
+    use_fp16_softmax: Optional[bool] = None,
+    enable_pdl: Optional[bool] = None,
+    multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    uses_shared_paged_kv_idx: bool = True,
+) -> Optional[str]:
+    """Why ``backend="auto"`` does not select this route, or ``None`` when it may.
+
+    A pure predicate over host facts (shapes, dtypes, strides, scalars, the device's compute
+    capability and SM count): no device synchronisation, no allocation, no JIT work (the
+    programs are built afterwards by :func:`cake_kimi_k3_mla_auto_prepare`).  On top of
+    :func:`cake_kimi_k3_mla_contract_reason` it admits only the qualified decode domain: a dense
+    ``[B, 1, H, 576]`` query with ``B >= 1`` and ``H`` in :data:`AUTO_QUALIFIED_HEADS`, a page-64
+    FP8 cache, the shared paged-KV index layout with contiguous int32 ``block_tables`` /
+    ``seq_lens`` of ``B`` rows and the aligned table width the previous dispatch requires, a
+    contiguous workspace that holds the plan, ``out`` absent or a dense BF16 ``[B, 1, H, 512]``
+    buffer, every tensor on the query's device, programs generated for the device (SM100 /
+    SM103), the sources and nvcc present, and :data:`AUTO_DISABLE_ENV` unset.
+    ``enable_pdl=None`` (auto-detect) is not a PDL request: the Cake programs run without PDL,
+    as on the explicit route; ``enable_pdl=True`` is declined.  A ``multi_ctas_kv_counter_buffer``
+    (the trtllm-gen counter hint, best-effort under ``auto``) does not disqualify the call and
+    stays unused.
+    """
+    # Cheap shape gates first: most SM10x calls are DeepSeek-shaped and leave here.
+    if cum_seq_lens_q is not None or max_q_len is not None or query.ndim != 4:
+        return "auto selects dense [batch, 1, heads, 576] queries only"
+    batch, q_len, num_heads, qk_dim = (int(d) for d in query.shape)
+    if batch == 0:
+        return "auto needs at least one request"
+    if q_len != 1:
+        return f"auto selects one query token per request, got q_len={q_len}"
+    if num_heads not in AUTO_QUALIFIED_HEADS:
+        heads = ", ".join(str(h) for h in AUTO_QUALIFIED_HEADS)
+        return f"auto is qualified for {heads} heads, got {num_heads}"
+    if _auto_disabled():
+        return f"{AUTO_DISABLE_ENV} is set"
+    from ..jit.cake_kimi_k3_mla import supported_arches
+
+    arch = _arch_name(compute_capability)
+    if arch not in supported_arches():
+        return f"no generated programs for {arch}"
+    if not cake_kimi_k3_mla_is_available():
+        return "generated sources or an nvcc toolchain are not available"
+    reason = cake_kimi_k3_mla_contract_reason(
+        query=query,
+        kv_cache=kv_cache,
+        seq_lens=seq_lens,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        sparse_mla_top_k=sparse_mla_top_k,
+        sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+        sinks=sinks,
+        return_lse=return_lse,
+        lse=lse,
+        enable_dcp=enable_dcp,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        use_fp16_softmax=use_fp16_softmax,
+        enable_pdl=enable_pdl,
+        # The trtllm-gen counter is a hint that ``auto`` honours only when the tuner picks
+        # trtllm-gen; the Cake programs leave it unused, so it does not disqualify the call
+        # (the explicit route keeps rejecting it through the contract checker).
+        multi_ctas_kv_counter_buffer=None,
+    )
+    if reason is not None:
+        return reason
+    assert seq_lens is not None  # required by the contract checker
+    if qk_dim != QK_DIM:
+        return f"query last dim must be {QK_DIM}, got {qk_dim}"
+    if kv_cache.ndim not in (3, 4) or (kv_cache.ndim == 4 and kv_cache.shape[1] != 1):
+        return "kv_cache must be [pages, 64, 576] or [pages, 1, 64, 576]"
+    if kv_cache.shape[-1] != QK_DIM or kv_cache.shape[-2] != PAGE_SIZE:
+        return (
+            f"kv_cache must hold pages of {PAGE_SIZE} x {QK_DIM} elements, "
+            f"got {tuple(kv_cache.shape)}"
+        )
+    for name, tensor in (("block_tables", block_tables), ("seq_lens", seq_lens)):
+        if tensor.dtype != torch.int32 or not tensor.is_contiguous():
+            return f"{name} must be a contiguous int32 tensor"
+    if not uses_shared_paged_kv_idx:
+        return (
+            "auto selects the shared paged KV index layout only "
+            "(uses_shared_paged_kv_idx=True)"
+        )
+    if block_tables.ndim != 2 or block_tables.shape[0] != batch:
+        return f"block_tables must be [{batch}, pages_per_sequence]"
+    # The previous ``auto`` dispatch requires an aligned page-table width
+    # (``_check_mla_dense_page_table_shape``: ``width % (128 / page_size) == 0``); keep that
+    # requirement so the calls it rejected still raise the same error.
+    if block_tables.shape[-1] % (128 // PAGE_SIZE) != 0:
+        return (
+            f"block_tables.shape[-1] must be a multiple of {128 // PAGE_SIZE} (the previous "
+            f"dispatch's aligned page-table width), got {block_tables.shape[-1]}"
+        )
+    if seq_lens.ndim != 1 or seq_lens.shape[0] != batch:
+        return f"seq_lens must be [{batch}]"
+    tensors = [kv_cache, block_tables, seq_lens, workspace_buffer]
+    if out is not None:
+        tensors.append(out)
+    if any(tensor.device != query.device for tensor in tensors):
+        return "all tensors must live on the query's device"
+    try:
+        _fp8_rows(query, "query")
+        _fp8_rows(kv_cache, "kv_cache")
+        if out is not None:
+            if out.dtype != torch.bfloat16 or tuple(out.shape) != (
+                batch,
+                1,
+                num_heads,
+                V_DIM,
+            ):
+                return f"out must be BF16 [{batch}, 1, {num_heads}, {V_DIM}]"
+            if _rows_view(out, V_DIM, 2, "out").stride(0) != V_DIM:
+                return f"out rows must be dense ({V_DIM} elements apart)"
+    except ValueError as exc:
+        return str(exc)
+    if not workspace_buffer.is_contiguous():
+        return "workspace_buffer must be contiguous"
+    plan = _auto_plan(
+        batch=batch, num_heads=num_heads, max_seq_len=max_seq_len, sm_count=sm_count
+    )
+    need = workspace_bytes(plan.rows_max, plan.num_split)
+    have = workspace_buffer.numel() * workspace_buffer.element_size()
+    if have < need:
+        return f"workspace_buffer holds {have} bytes, the plan needs {need}"
+    return None
+
+
+# Build failures of the auto route, per architecture: once a program could not be built in this
+# process, ``backend="auto"`` keeps the previous dispatch on that architecture for every shape,
+# including shapes whose programs had already built and served, without retrying the build (the
+# memo is sticky for the process, so a failing build is never paid for twice;
+# :func:`reset_auto_build_failures` clears it).
+_auto_build_failures: dict[str, str] = {}
+
+
+def reset_auto_build_failures() -> None:
+    """Forget the remembered build failures, so the next admitted ``auto`` call retries the build."""
+    _auto_build_failures.clear()
+
+
+def cake_kimi_k3_mla_auto_prepare(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    query: torch.Tensor,
+    max_seq_len: int,
+) -> Optional[str]:
+    """Build the programs an admitted ``backend="auto"`` call will launch, or say why auto steps back.
+
+    Called after :func:`cake_kimi_k3_mla_auto_reason` returned ``None``: the plan of the shape
+    names the main program and, for a split KV, the reducer; both are built and loaded once per
+    process and architecture (``_kernel_entry`` is process-cached, so the launcher that follows
+    finds them loaded).  A failure (a toolchain that cannot target the device, JIT disabled
+    without a cached artifact, a broken build, ...) is remembered for the process and
+    architecture and returned as the reason, so later calls neither retry the build nor raise;
+    this also holds for a transient cause (a full or unreachable JIT workspace, an interrupted
+    build), by design.  Because the memo is per architecture and programs are built lazily per
+    plan kind, a later shape whose program fails to build also moves shapes Cake had already
+    served on that architecture back to the previous dispatch: ``auto`` never retries and never
+    raises, but it can switch a shape's kernel once, in that direction.
+    :func:`reset_auto_build_failures` clears the memo; restarting the process is the production
+    equivalent.
+    """
+    arch = _arch_name(compute_capability)
+    failure = _auto_build_failures.get(arch)
+    if failure is not None:
+        return failure
+    batch, _, num_heads, _ = (int(d) for d in query.shape)
+    plan = _auto_plan(
+        batch=batch, num_heads=num_heads, max_seq_len=max_seq_len, sm_count=sm_count
+    )
+    kinds = [plan.main_kind] + ([plan.reduce_kind] if plan.num_split > 1 else [])
+    try:
+        from ..jit.cake_kimi_k3_mla import get_cake_kimi_k3_mla_kernel
+
+        for kind in kinds:
+            record = get_cake_kimi_k3_mla_kernel(kind, arch=arch)
+            _kernel_entry(record["name"], arch, record["ffi_entry"])
+    except Exception as exc:
+        failure = (
+            f"the generated programs could not be built for {arch} "
+            f"({type(exc).__name__}: {exc})"
+        )
+        _auto_build_failures[arch] = failure
+        return failure
+    return None
+
+
 __all__ = [
+    "AUTO_DISABLE_ENV",
+    "AUTO_QUALIFIED_HEADS",
     "AttentionPlan",
     "KimiK3MlaFp8PagedAttention",
+    "cake_kimi_k3_mla_auto_prepare",
+    "cake_kimi_k3_mla_auto_reason",
+    "cake_kimi_k3_mla_contract_reason",
+    "cake_kimi_k3_mla_is_available",
     "plan_attention",
     "plan_num_split",
     "plan_num_split_wide",
+    "reset_auto_build_failures",
     "plan_wide_work",
     "reduce_warps_per_row",
     "run_cake_kimi_k3_mla_fp8_paged_attention",
