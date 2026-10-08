@@ -149,6 +149,8 @@ def build_mla_decode_task_manager(
     output=None,
     atten_sinks=None,
     lse_in_natural_log=False,
+    output_quant=None,
+    output_quant_args=None,
     acc_output=None,
     lse=None,
     acc_lse=None,
@@ -480,6 +482,8 @@ def build_mla_decode_task_manager(
         tmem_corr_ref=tmem_corr,
         atten_sinks=atten_sinks,
         lse_in_natural_log=lse_in_natural_log,
+        output_quant=output_quant,
+        output_quant_args=output_quant_args,
         output_scale=None,  # set at runtime
         softmax_scale_log2=None,  # set at runtime
         smem_exchange=None,  # set at runtime
@@ -889,6 +893,7 @@ class MlaDecodeTs:
         self.device_scales = device_scales
         self.fuse_sparse_reduction = False
         self.fuse_sparse_epilogue = False
+        self.output_quant = None
         # Separate prepared source lists, rather than a premerged tagged list.
         # Both representations reuse the same metadata staging and KV loaders.
         self.direct_sparse = False
@@ -959,6 +964,7 @@ class MlaDecodeTs:
             self._reduction_topology(),
             self.fuse_sparse_reduction,
             self.fuse_sparse_epilogue,
+            self.output_quant,
             self.direct_sparse,
             self.assume_valid_prefix,
             self.direct_static_scales,
@@ -1065,6 +1071,7 @@ class MlaDecodeTs:
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         stream: object,
+        output_quant_args=None,
     ):
         """Execute the MLA decode TS kernel."""
         if cutlass.const_expr(self.fuse_sparse_reduction):
@@ -1393,6 +1400,7 @@ class MlaDecodeTs:
             output_scale,
             tile_sched_params,
             clc_tile_sched_params,
+            output_quant_args,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -1417,6 +1425,7 @@ class MlaDecodeTs:
                     cache_seqs,
                     cu_seqlens_q,
                     block_split_kvs,
+                    output_quant_args,
                 ).launch(
                     grid=(
                         (
@@ -1488,6 +1497,7 @@ class MlaDecodeTs:
         output_scale: cutlass.Float32,
         tile_sched_params: MLAStaticTileSchedulerParams,
         clc_tile_sched_params: object,
+        output_quant_args=None,
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         if cutlass.const_expr(self.direct_sparse):
@@ -1918,6 +1928,8 @@ class MlaDecodeTs:
                 output=o,
                 atten_sinks=sinks if self.fuse_sparse_epilogue else None,
                 lse_in_natural_log=self.fuse_sparse_epilogue,
+                output_quant=self.output_quant if self.fuse_sparse_epilogue else None,
+                output_quant_args=output_quant_args,
                 acc_output=acc_o,
                 lse=lse,
                 acc_lse=acc_lse,
@@ -2112,6 +2124,7 @@ class MlaDecodeTs:
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: object,
+        output_quant_args=None,
     ):
         """Dispatch the high-split fixed-D512 cluster reducer."""
 
@@ -2154,4 +2167,6 @@ class MlaDecodeTs:
             topology.slots_per_rank,
             atten_sinks,
             self.fuse_sparse_reduction,
+            self.output_quant,
+            output_quant_args,
         )

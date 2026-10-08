@@ -203,6 +203,8 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     elements_per_slice: cutlass.Constexpr[int],
     atten_sinks=None,
     finalize_attention: cutlass.Constexpr[bool] = False,
+    output_quant: cutlass.Constexpr = None,
+    output_quant_args=None,
 ):
     """Reduce G1 partials with the compact row-shared schedule."""
 
@@ -393,7 +395,9 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             cu_seqlens_q,
         )
         out_elem_offset = _output_element_offset(cfg, output_query_row, dim_idx)
-        if cutlass.const_expr(output_elements_per_thread == 1):
+        if cutlass.const_expr(output_quant is not None):
+            output_quant.store(output_quant_args, output_acc, output_query_row, dim_idx)
+        elif cutlass.const_expr(output_elements_per_thread == 1):
             (output.iterator.raw_ptr() + out_elem_offset).store(
                 output.element_type(output_acc[0])
             )
@@ -804,6 +808,8 @@ def run_parallel_gmem_reduction_kernel(
     elements_per_slice: cutlass.Constexpr[int],
     atten_sinks=None,
     finalize_attention: cutlass.Constexpr[bool] = False,
+    output_quant: cutlass.Constexpr = None,
+    output_quant_args=None,
 ):
     """Reduce split-KV partials with row-shared local and peer statistics."""
 
@@ -823,6 +829,8 @@ def run_parallel_gmem_reduction_kernel(
             elements_per_slice,
             atten_sinks,
             finalize_attention,
+            output_quant,
+            output_quant_args,
         )
         return
 

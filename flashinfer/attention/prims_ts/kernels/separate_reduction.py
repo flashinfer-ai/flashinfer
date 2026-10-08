@@ -115,15 +115,36 @@ def attention_sink_scale(log2_lse, sink):
 
 
 class MergeMlaSourceStates:
-    def __init__(self, independent_sources: bool):
+    def __init__(self, independent_sources: bool, output_quant=None):
         self.independent_sources = independent_sources
+        self.output_quant = output_quant
 
     @cute.jit
     def __call__(
-        self, part_s, part_c, lse_s, lse_c, count_s, count_c, sinks, out, lse, stream
+        self,
+        part_s,
+        part_c,
+        lse_s,
+        lse_c,
+        count_s,
+        count_c,
+        sinks,
+        out,
+        lse,
+        stream,
+        output_quant_args=None,
     ):
         self.finish(
-            part_s, part_c, lse_s, lse_c, count_s, count_c, sinks, out, lse
+            part_s,
+            part_c,
+            lse_s,
+            lse_c,
+            count_s,
+            count_c,
+            sinks,
+            out,
+            lse,
+            output_quant_args,
         ).launch(
             grid=((out.shape[0] * out.shape[1] + 3) // 4, 1, 1),
             block=(128, 1, 1),
@@ -131,7 +152,19 @@ class MergeMlaSourceStates:
         )
 
     @cute.kernel
-    def finish(self, part_s, part_c, lse_s, lse_c, count_s, count_c, sinks, out, lse):
+    def finish(
+        self,
+        part_s,
+        part_c,
+        lse_s,
+        lse_c,
+        count_s,
+        count_c,
+        sinks,
+        out,
+        lse,
+        output_quant_args=None,
+    ):
         block, _, _ = cute.arch.block_idx()
         tid = cute.arch.thread_idx()[0]
         lane = tid % 32
@@ -154,32 +187,37 @@ class MergeMlaSourceStates:
                 sink_scale = attention_sink_scale(kv_lse, Float32(sinks[h]))
                 ws *= sink_scale
                 wc *= sink_scale
-            for chunk in cutlass.range_constexpr(8):
-                column = lane * 2 + chunk * 64
-                values = cutlass.Array(Float32, 2, space=cutlass.AddressSpace.rmem)
-                values[0], values[1] = Float32(0), Float32(0)
+            width = cutlass.const_expr(4 if self.output_quant is not None else 2)
+            for chunk in cutlass.range_constexpr(512 // (32 * width)):
+                column = lane * width + chunk * (32 * width)
+                values = cutlass.Array(Float32, width, space=cutlass.AddressSpace.rmem)
+                for j in cutlass.range_constexpr(width):
+                    values[j] = Float32(0)
                 if have_s:
                     offset = q * part_s.stride[0] + h * part_s.stride[1] + column
                     pair = cutlass.Pointer(
                         part_s.iterator + offset, dtype=part_s.element_type
-                    ).load(count=2, alignment=4)
-                    for j in cutlass.range_constexpr(2):
+                    ).load(count=width, alignment=width * 2)
+                    for j in cutlass.range_constexpr(width):
                         values[j] = Float32(pair[j]) * ws
                 if have_c:
                     offset = q * part_c.stride[0] + h * part_c.stride[1] + column
                     pair = cutlass.Pointer(
                         part_c.iterator + offset, dtype=part_c.element_type
-                    ).load(count=2, alignment=4)
-                    for j in cutlass.range_constexpr(2):
+                    ).load(count=width, alignment=width * 2)
+                    for j in cutlass.range_constexpr(width):
                         values[j] += Float32(pair[j]) * wc
-                packed = cutlass.Array(
-                    out.element_type, 2, space=cutlass.AddressSpace.rmem
-                )
-                for j in cutlass.range_constexpr(2):
-                    packed[j] = values[j].to(out.element_type)
-                offset = q * out.stride[0] + h * out.stride[1] + column
-                cutlass.Pointer(out.iterator + offset, dtype=out.element_type).store(
-                    packed.load(0, 2), alignment=4
-                )
+                if cutlass.const_expr(self.output_quant is not None):
+                    self.output_quant.store(output_quant_args, values, row, column)
+                else:
+                    packed = cutlass.Array(
+                        out.element_type, 2, space=cutlass.AddressSpace.rmem
+                    )
+                    for j in cutlass.range_constexpr(2):
+                        packed[j] = values[j].to(out.element_type)
+                    offset = q * out.stride[0] + h * out.stride[1] + column
+                    cutlass.Pointer(
+                        out.iterator + offset, dtype=out.element_type
+                    ).store(packed.load(0, 2), alignment=4)
             if lane == 0:
                 lse[q, h] = public_lse

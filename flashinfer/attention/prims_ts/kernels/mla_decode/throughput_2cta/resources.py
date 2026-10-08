@@ -3590,6 +3590,8 @@ class GmemOResource(HighThroughputMlaResource):
     tmem_corr_ref: Any = None  # Reference to TmemCorrResource for correction data
     output_scale: Any = None
     atten_sinks: Any = None
+    output_quant: cutlass.Constexpr = None
+    output_quant_args: Any = None
     lse_in_natural_log: cutlass.Constexpr[bool] = False
     softmax_scale_log2: Any = None
     smem_exchange: Any = None  # SMEM for row_sum exchange (as Int32 base addr)
@@ -3808,6 +3810,20 @@ class GmemOResource(HighThroughputMlaResource):
                                 vec_partial,
                                 evict="noallocate",
                             )
+                elif cutlass.const_expr(self.output_quant is not None):
+                    output_row = Int64(storage_flat_query_row)
+                    if cutlass.const_expr(self.cu_seqlens_q is None):
+                        output_row += (
+                            Int64(batch_idx)
+                            * self.logical_num_heads_q
+                            * self.logical_seq_len_q
+                        )
+                    self.output_quant.store(
+                        self.output_quant_args,
+                        qk_acc_regs,
+                        output_row,
+                        iter_n * tile_d + g_j,
+                    )
                 else:
                     # 16-bit output (split_kv == 1, direct output)
                     if cutlass.const_expr(self.cu_seqlens_q is not None):
@@ -4055,6 +4071,20 @@ class GmemOResource(HighThroughputMlaResource):
                             vec_partial,
                             evict="noallocate",
                         )
+            elif cutlass.const_expr(self.output_quant is not None):
+                output_row = Int64(storage_flat_query_row)
+                if cutlass.const_expr(self.cu_seqlens_q is None):
+                    output_row += (
+                        Int64(batch_idx)
+                        * self.logical_num_heads_q
+                        * self.logical_seq_len_q
+                    )
+                self.output_quant.store(
+                    self.output_quant_args,
+                    qk_acc_regs,
+                    output_row,
+                    iter_n * tile_d + g_j,
+                )
             else:
                 if cutlass.const_expr(self.cu_seqlens_q is not None):
                     o_base_ptr = self.output.iterator.raw_ptr() + Int64(

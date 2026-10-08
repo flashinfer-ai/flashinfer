@@ -336,6 +336,257 @@ def prepare_sparse_mla_metadata(
     return out
 
 
+def _inverse_output_rope(values, positions, cos_sin):
+    result = values.reshape(positions.numel(), values.shape[-2], 512).clone()
+    table = cos_sin[positions.reshape(-1)].to(result.dtype)
+    c, s = table[:, None, :32], table[:, None, 32:]
+    x, y = result[..., 448::2].clone(), result[..., 449::2].clone()
+    result[..., 448::2] = x * c + y * s
+    result[..., 449::2] = y * c - x * s
+    return result
+
+
+def _dequant_output(output, scales, block_size):
+    if scales.dtype == torch.int32:
+        exponent = torch.stack([(scales >> i) & 255 for i in (0, 8, 16, 24)], -1)
+        scales = torch.exp2(exponent.flatten(-2).float() - 127)
+    values = (
+        output.float().unflatten(-1, (-1, block_size)) * scales[..., None]
+    ).flatten(-2)
+    return values, scales
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "batch,queries,heads,topk,block,fmt,packed,independent",
+    [
+        (64, 1, 128, 513, 32, "ue8m0", False, False),
+        (64, 1, 128, 513, 128, "fp32", False, False),
+        (128, 1, 8, 513, 32, "fp32", False, False),
+        (128, 1, 16, 513, 128, "ue8m0", False, False),
+        (32, 1, 32, 513, 32, "ue8m0", False, False),
+        (32, 1, 32, 513, 128, "fp32", False, False),
+        (1, 1, 16, 513, 128, "ue8m0", False, False),
+        (1, 1, 8, 8193, 32, "fp32", False, False),
+        (2, 2, 24, 513, 32, "ue8m0", True, True),
+        (1, 3, 64, 129, 128, "ue8m0", False, False),
+        (1, 1, 128, 2049, 128, "fp32", False, False),
+        (1, 161, 64, 513, 32, "ue8m0", False, False),
+    ],
+)
+def test_rope_quant_graph(
+    dtype, batch, queries, heads, topk, block, fmt, packed, independent
+):
+    """Exercise final stores and reductions through public automatic dispatch."""
+    torch.manual_seed(317)
+    rows = batch * queries - int(packed)
+    shape = (rows, heads, 512) if packed else (batch, queries, heads, 512)
+    q = (torch.randn(shape, device="cuda") * 0.5).to(dtype)
+    kv = (torch.randn(1024, 1, 512, device="cuda") * 0.5).to(dtype)
+    extra = (torch.randn(256, 1, 512, device="cuda") * 0.5).to(dtype)
+    # Duplicates are intentional: output fusion must preserve sparse semantics.
+    indices = torch.randint(1024, (rows, topk), device="cuda", dtype=torch.int32)
+    extra_indices = torch.randint(256, (rows, 128), device="cuda", dtype=torch.int32)
+    lengths = torch.full((rows,), topk, device="cuda", dtype=torch.int32)
+    extra_lengths = torch.full((rows,), 128, device="cuda", dtype=torch.int32)
+    if rows > 1:
+        lengths[0], extra_lengths[0] = 0, 0
+        lengths[-1] = min(topk, 17)
+    sinks = torch.linspace(-3, 4, heads, device="cuda")
+    sinks[0] = torch.inf
+    descales = dict(
+        kv_scale=0.5 if dtype == torch.float8_e4m3fn else 1.0,
+        extra_kv_scale=(1.5 if independent else 0.5)
+        if dtype == torch.float8_e4m3fn
+        else 1.0,
+        output_scale=0.75,
+    )
+    positions = (torch.arange(rows, device="cuda", dtype=torch.int32) * 3 + 19).view(
+        shape[:-2]
+    )
+    theta = torch.randn(rows * 3 + 64, 32, device="cuda")
+    cos_sin = torch.cat((theta.cos(), theta.sin()), -1)
+    groups = max(1, heads // 8)
+    wrapper = BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(
+        "cuda",
+        batch,
+        heads,
+        max_topk=topk,
+        max_extra_topk=128,
+        max_seq_len_q=queries,
+        packed_query=packed,
+        q_data_type=dtype,
+        has_sinks=True,
+        return_lse=True,
+        output_quant_block_size=block,
+        out_scale_format=fmt,
+        num_output_groups=groups,
+    )
+    metadata = prepare_sparse_mla_metadata(
+        wrapper,
+        q,
+        kv,
+        indices,
+        lengths,
+        extra_kv_cache=extra,
+        extra_indices=extra_indices,
+        extra_lengths=extra_lengths,
+        sinks=sinks,
+        **descales,
+    )
+    indptr = (
+        torch.tensor([0, queries, rows], device="cuda", dtype=torch.int32)
+        if packed
+        else None
+    )
+    kwargs = dict(
+        qo_indptr=indptr,
+        sinks=sinks,
+        token_positions=positions,
+        cos_sin_cache=cos_sin,
+        **descales,
+    )
+    output, scales, lse = wrapper.run(q, kv, metadata, extra, **kwargs)
+    assert output.shape == (rows, groups, heads // groups * 512)
+    assert output.dtype == torch.float8_e4m3fn
+    padded = (rows + 3) // 4 * 4
+    columns = heads // groups * 512 // block // (4 if fmt == "ue8m0" else 1)
+    assert scales.shape == (rows, groups, columns)
+    assert scales.stride() == (1, columns * padded, padded)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(
+            q,
+            kv,
+            metadata,
+            extra,
+            out=output,
+            out_scale=scales,
+            lse=lse,
+            validate=False,
+            **kwargs,
+        )
+    # Query positions are graph-live, including packed/chunked query batches.
+    positions.add_(7)
+    graph.replay()
+    ref, ref_lse, bound = _reference(
+        q,
+        kv,
+        extra,
+        indices,
+        extra_indices,
+        lengths=lengths,
+        extra_lengths=extra_lengths,
+        sinks=sinks,
+        **descales,
+    )
+    ref = _inverse_output_rope(ref, positions, cos_sin)
+    # Rotate the componentwise attention error bound using absolute coefficients.
+    bound = bound.reshape(rows, heads, 512)
+    c, s = (
+        cos_sin[positions.flatten(), :32].abs()[:, None],
+        cos_sin[positions.flatten(), 32:].abs()[:, None],
+    )
+    bx, by = bound[..., 448::2].clone(), bound[..., 449::2].clone()
+    bound[..., 448::2] = bx * c + by * s
+    bound[..., 449::2] = by * c + bx * s
+    actual, dequant_scales = _dequant_output(output, scales, block)
+    actual = actual.view(rows, heads, 512)
+    # E4M3 RN adds at most 1/16 relative error plus half a subnormal step.
+    rounding = dequant_scales.repeat_interleave(block, dim=-1).view_as(actual) / 1024
+    allowed = bound + (ref.abs() + bound) / 16 + rounding + 1e-6
+    assert torch.all((actual - ref).abs() <= allowed)
+    assert (actual - ref).norm() / ref.norm().clamp_min(1e-20) < 0.06
+    torch.testing.assert_close(lse.double(), ref_lse, atol=0.03, rtol=0.01)
+    assert torch.count_nonzero(actual[:, 0]) == 0
+    if rows > 1:
+        assert torch.count_nonzero(actual[0]) == 0
+
+
+@pytest.mark.parametrize("block", [32, 128])
+@pytest.mark.parametrize("fmt", ["fp32", "ue8m0"])
+def test_rope_quant_scales_and_contract(block, fmt):
+    """One selected KV makes output/scale arithmetic independently checkable."""
+    q = torch.zeros((1, 1, 8, 512), device="cuda", dtype=torch.bfloat16)
+    kv = torch.linspace(-1, 1, 512, device="cuda").to(torch.bfloat16).view(1, 1, 512)
+    kv[..., :32] = 0
+    kv[..., 32:64] = 1e-8
+    indices = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    positions = torch.ones((1, 1), device="cuda", dtype=torch.int32)
+    cos_sin = torch.tensor(
+        # Exact quarter-turn: isolate scale/packing checks from FMA rounding
+        # at FP8 ties. The graph test above covers arbitrary angles.
+        [[1.0] * 32 + [0.0] * 32, [0.0] * 32 + [1.0] * 32],
+        device="cuda",
+    )
+    wrapper = BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(
+        "cuda",
+        1,
+        8,
+        max_topk=1,
+        output_quant_block_size=block,
+        out_scale_format=fmt,
+        num_output_groups=2,
+    )
+    metadata = prepare_sparse_mla_metadata(wrapper, q, kv, indices)
+    output, scales = wrapper.run(
+        q,
+        kv,
+        metadata,
+        token_positions=positions,
+        cos_sin_cache=cos_sin,
+    )
+    reference = _inverse_output_rope(kv.expand(1, 8, 512).float(), positions, cos_sin)
+    grouped = reference.reshape(1, 2, 2048).unflatten(-1, (-1, block))
+    expected_scales = grouped.abs().amax(-1).clamp_min(1e-4) / 448
+    if fmt == "ue8m0":
+        expected_scales = expected_scales.log2().ceil().exp2()
+    expected = (grouped / expected_scales[..., None]).to(torch.float8_e4m3fn).float()
+    expected = (expected * expected_scales[..., None]).flatten(-2)
+    actual, actual_scales = _dequant_output(output, scales, block)
+    torch.testing.assert_close(actual_scales, expected_scales, atol=0, rtol=2e-6)
+    torch.testing.assert_close(actual, expected, atol=2e-7, rtol=2e-6)
+    with pytest.raises(ValueError, match="token_positions"):
+        wrapper.run(
+            q, kv, metadata, token_positions=positions + 2, cos_sin_cache=cos_sin
+        )
+    with pytest.raises(ValueError, match="out_scale"):
+        wrapper.run(
+            q,
+            kv,
+            metadata,
+            token_positions=positions,
+            cos_sin_cache=cos_sin,
+            out_scale=scales.contiguous(),
+        )
+
+    # A packed zero-token batch needs valid empty views, but no device launch.
+    wrapper.plan(
+        "cuda",
+        1,
+        8,
+        max_topk=1,
+        packed_query=True,
+        output_quant_block_size=block,
+        out_scale_format=fmt,
+        num_output_groups=2,
+    )
+    empty_q = q.view(1, 8, 512)[:0]
+    empty_metadata = prepare_sparse_mla_metadata(wrapper, empty_q, kv, indices[:0])
+    empty_out, empty_scales = wrapper.run(
+        empty_q,
+        kv,
+        empty_metadata,
+        qo_indptr=torch.zeros(2, device="cuda", dtype=torch.int32),
+        token_positions=positions.view(-1)[:0],
+        cos_sin_cache=cos_sin,
+    )
+    assert empty_out.shape == (0, 2, 2048)
+    assert empty_scales.shape == (0, 2, 2048 // block // (4 if fmt == "ue8m0" else 1))
+
+
 # Accuracy and important public validation contracts.
 
 

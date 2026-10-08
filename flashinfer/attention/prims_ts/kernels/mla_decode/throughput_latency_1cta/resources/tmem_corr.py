@@ -118,6 +118,8 @@ class TmemCorrResource(MlaResource):
     output_scale: Float32 = None
     sparse_epilogue_params: object = None
     atten_sinks: object = None
+    output_quant: cutlass.Constexpr = None
+    output_quant_args: object = None
     o_tensor: object = None
     lse_tensor: object = None
     acc_o_tensor: object = None
@@ -930,7 +932,16 @@ class TmemCorrResource(MlaResource):
                                     out_byte_offset = out_elem_offset * Int64(
                                         cfg.o_dtype_bytes
                                     )
-                                    if cutlass.const_expr(cfg.use_fp8_output == 1):
+                                    if cutlass.const_expr(
+                                        self.output_quant is not None
+                                    ):
+                                        self.output_quant.store(
+                                            self.output_quant_args,
+                                            acc_vec,
+                                            output_query_row,
+                                            head_dim_offset + dim_idx,
+                                        )
+                                    elif cutlass.const_expr(cfg.use_fp8_output == 1):
                                         packed_o = cutlass.Array(
                                             Int32, 2, space=cutlass.AddressSpace.rmem
                                         )
@@ -1548,6 +1559,36 @@ class TmemCorrResource(MlaResource):
             cfg.head_dim_per_stage_v // 2
         )
 
+        if cutlass.const_expr(self.output_quant is not None):
+            # Each lane owns half a head's D stage. K128 can span the two
+            # lanes separated by 16; K32 blocks remain entirely lane-local.
+            width = cfg.head_dim_per_stage_v // 2
+            values = cutlass.Array(Float32, width, space=cutlass.AddressSpace.rmem)
+            for chunk in cutlass.range_constexpr(0, width, 8):
+                loaded = tcgen05_ld_16x32bx2_f32(
+                    prims.make_tmem_ptr(base_addr0 + Int32(chunk), Float32),
+                    num=8,
+                    offset=Int32(width),
+                )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                cute.arch.fence_view_async_tmem_load()
+                for i in cutlass.range_constexpr(8):
+                    values[chunk + i] = loaded[i] * final_scale0[0]
+            if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
+                row = public_query_flat_row(
+                    cfg, storage_flat_query_row, batch_idx, self.cu_seqlens_q
+                )
+                self.output_quant.store(
+                    self.output_quant_args,
+                    values,
+                    row,
+                    head_dim_offset
+                    + v_stage_idx * cfg.head_dim_per_stage_v
+                    + half_warp_col_offset,
+                    lane_stride=16,
+                )
+            return
+
         # ``tcgen05.ld.sync.aligned`` must remain convergent across the warp.
         # Padded query rows still own valid physical TMEM rows, so load and
         # normalize every row and predicate only the externally visible store.
@@ -2021,6 +2062,142 @@ class TmemCorrResource(MlaResource):
             )
 
     @cute.jit
+    def _store_swap_quantized_stage(
+        self,
+        stage_info,
+        task_cache,
+        base_addr0,
+        base_addr1,
+        final_scale0,
+        final_scale1,
+        v_stage_idx,
+        head_dim_offset,
+    ):
+        """Keep swapped O in FP32; only block maxima cross warp boundaries.
+
+        A 32x32b load gives each lane one D channel and a register per Q row.
+        This avoids the normal BF16 SMEM transpose before output quantization.
+        K32 needs a warp reduction; K128 shares four warp maxima in the now
+        unused normalization scratch, with one barrier for the entire Q tile.
+        """
+        cfg = self.cfg
+        warp = task_cache[_TASK_CACHE_WARP_IDX]
+        lane = task_cache[_TASK_CACHE_LANE_IDX]
+        loaded0 = prims.tcgen05_ld(
+            "32x32b", prims.make_tmem_ptr(base_addr0, Float32), num=cfg.tile_size_q
+        )
+        if cutlass.const_expr(cfg.one_insts_kv_swap):
+            loaded1 = loaded0
+        else:
+            loaded1 = prims.tcgen05_ld(
+                "32x32b", prims.make_tmem_ptr(base_addr1, Float32), num=cfg.tile_size_q
+            )
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        cute.arch.fence_view_async_tmem_load()
+        batch = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+        head_base = head_idx_for_stage(self.head_idx, cfg, stage_info)
+        q_tile = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
+        column = (
+            head_dim_offset + v_stage_idx * cfg.head_dim_per_stage_v + warp * 32 + lane
+        )
+        rotated = cutlass.Array(
+            Float32, cfg.tile_size_q, space=cutlass.AddressSpace.rmem
+        )
+        maxima = cutlass.Array(
+            Float32, cfg.tile_size_q, space=cutlass.AddressSpace.rmem
+        )
+        for h in cutlass.range_constexpr(cfg.tile_size_q):
+            scale_idx = (h // 8) * 2 + h % 2
+            source_lane = (h % 8) // 2
+            s0 = cprims.shfl_sync(
+                thread_mask=0xFFFFFFFF,
+                val=final_scale0[scale_idx],
+                offset=source_lane,
+                mask_and_clamp=0x1F,
+                kind=cprims.Shfl.IDX,
+            )
+            value = loaded0[h] * s0
+            if cutlass.const_expr(not cfg.one_insts_kv_swap):
+                s1 = cprims.shfl_sync(
+                    thread_mask=0xFFFFFFFF,
+                    val=final_scale1[scale_idx],
+                    offset=source_lane,
+                    mask_and_clamp=0x1F,
+                    kind=cprims.Shfl.IDX,
+                )
+                value += loaded1[h] * s1
+            flat_row, _, _, _, valid = flat_query_row_state(
+                head_base + h,
+                q_tile,
+                cfg.tile_size_q,
+                cfg.logical_num_heads_q,
+                cfg.logical_seq_len_q,
+                self.cu_seqlens_q,
+                batch,
+            )
+            row = public_query_flat_row(cfg, flat_row, batch, self.cu_seqlens_q)
+            values = cutlass.Array(Float32, 1, space=cutlass.AddressSpace.rmem)
+            values[0] = value
+            if head_base + h < cfg.num_heads_q and valid:
+                rope_values = self.output_quant.rotate(
+                    self.output_quant_args, values, row, column, value_stride=32
+                )
+                values[0] = rope_values[0]
+            rotated[h] = values[0]
+            amax = cute.math.max(cute.math.abs(values[0]), Float32(1e-4))
+            for step in cutlass.range_constexpr(5):
+                peer = cprims.shfl_sync(
+                    thread_mask=0xFFFFFFFF,
+                    val=amax,
+                    offset=1 << step,
+                    mask_and_clamp=0x1F,
+                    kind=cprims.Shfl.BFLY,
+                )
+                amax = cute.math.max(amax, peer)
+            maxima[h] = amax
+            if cutlass.const_expr(self.output_quant.block_size == 128):
+                if lane == 0:
+                    self._sum_scratch[h * 4 + warp] = amax
+        if cutlass.const_expr(self.output_quant.block_size == 128):
+            prims.barrier_cta_sync(
+                self.store_barrier_id, thread_count=WARPGROUP_THREADS
+            )
+        for h in cutlass.range_constexpr(cfg.tile_size_q):
+            flat_row, _, _, _, valid = flat_query_row_state(
+                head_base + h,
+                q_tile,
+                cfg.tile_size_q,
+                cfg.logical_num_heads_q,
+                cfg.logical_seq_len_q,
+                self.cu_seqlens_q,
+                batch,
+            )
+            if head_base + h < cfg.num_heads_q and valid:
+                row = public_query_flat_row(cfg, flat_row, batch, self.cu_seqlens_q)
+                amax = maxima[h]
+                if cutlass.const_expr(self.output_quant.block_size == 128):
+                    for w in cutlass.range_constexpr(4):
+                        amax = cute.math.max(amax, self._sum_scratch[h * 4 + w])
+                values = cutlass.Array(Float32, 1, space=cutlass.AddressSpace.rmem)
+                values[0] = rotated[h]
+                self.output_quant.store_rotated(
+                    self.output_quant_args,
+                    values,
+                    row,
+                    column,
+                    value_stride=32,
+                    amax_override=amax,
+                    scale_owner=(
+                        lane == 0
+                        and (warp == 0 if self.output_quant.block_size == 128 else True)
+                    ),
+                )
+        if cutlass.const_expr(self.output_quant.block_size == 128):
+            prims.barrier_cta_sync(
+                self.store_barrier_id, thread_count=WARPGROUP_THREADS
+            )
+
+    @cute.jit
     def _normalize_and_store_tail_o(
         self,
         stage_info: StageInfo,
@@ -2076,6 +2253,19 @@ class TmemCorrResource(MlaResource):
                         final_scale0=final_scale0,
                         v_stage_idx=v_stage_idx,
                         head_dim_offset=head_dim_offset,
+                    )
+                elif cutlass.const_expr(
+                    self.output_quant is not None and cfg.fuse_sparse_epilogue
+                ):
+                    self._store_swap_quantized_stage(
+                        stage_info,
+                        task_cache,
+                        base_addr0,
+                        base_addr1,
+                        final_scale0,
+                        final_scale1,
+                        v_stage_idx,
+                        head_dim_offset,
                     )
                 else:
                     self._stage_swaps_tail_o_to_smem(

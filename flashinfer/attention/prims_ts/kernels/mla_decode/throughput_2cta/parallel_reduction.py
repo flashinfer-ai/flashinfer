@@ -152,6 +152,8 @@ def _store_parallel_reduction_result(
     batch_idx,
     cu_seqlens_q,
     finalize_attention: cutlass.Constexpr[bool] = False,
+    output_quant: cutlass.Constexpr = None,
+    output_quant_args=None,
 ):
     """Publish one normalized FP32 output fragment and final LSE."""
 
@@ -162,6 +164,16 @@ def _store_parallel_reduction_result(
             lse[logical_head_idx, storage_q_idx] = global_lse
         else:
             lse[logical_head_idx, logical_q_idx, batch_idx] = global_lse
+
+    if cutlass.const_expr(output_quant is not None):
+        if query_is_valid:
+            row = Int64(storage_q_idx) * output_quant.num_heads + logical_head_idx
+            if cutlass.const_expr(cu_seqlens_q is None):
+                row = (
+                    Int64(batch_idx) * output.shape[2] + logical_q_idx
+                ) * output_quant.num_heads + logical_head_idx
+            output_quant.store(output_quant_args, output_vals, row, element_idx)
+        return
 
     out_element_dtype = output.element_type
     output_regs = cutlass.Array(
@@ -202,6 +214,8 @@ def run_parallel_reduction_kernel(
     slots_per_rank: cutlass.Constexpr[int],
     atten_sinks=None,
     finalize_attention: cutlass.Constexpr[bool] = False,
+    output_quant: cutlass.Constexpr = None,
+    output_quant_args=None,
 ):
     """Reduce one D=512 row cooperatively across a padded CTA cluster.
 
@@ -402,6 +416,8 @@ def run_parallel_reduction_kernel(
             batch_idx,
             cu_seqlens_q,
             finalize_attention,
+            output_quant,
+            output_quant_args,
         )
         return
 

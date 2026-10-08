@@ -487,6 +487,8 @@ def build_throughput_latency_mla_task_manager(
     scale_softmax_log2=None,
     output_scale=None,
     sparse_epilogue_params=None,
+    output_quant=None,
+    output_quant_args=None,
     o_tensor=None,
     lse_tensor=None,
     acc_o_tensor=None,
@@ -537,6 +539,8 @@ def build_throughput_latency_mla_task_manager(
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
             sparse_epilogue_params=sparse_epilogue_params,
+            output_quant=output_quant,
+            output_quant_args=output_quant_args,
             o_tensor=o_tensor,
             lse_tensor=lse_tensor,
             acc_o_tensor=acc_o_tensor,
@@ -832,6 +836,8 @@ def build_throughput_latency_mla_task_manager(
         output_scale=output_scale,
         sparse_epilogue_params=sparse_epilogue_params,
         atten_sinks=_atten_sinks_view(cfg, sparse_epilogue_params),
+        output_quant=output_quant,
+        output_quant_args=output_quant_args,
         o_tensor=o_tensor,
         lse_tensor=lse_tensor,
         acc_o_tensor=acc_o_tensor,
@@ -852,6 +858,8 @@ def build_throughput_latency_mla_task_manager(
         output_scale=output_scale,
         sparse_epilogue_params=sparse_epilogue_params,
         atten_sinks=_atten_sinks_view(cfg, sparse_epilogue_params),
+        output_quant=output_quant,
+        output_quant_args=output_quant_args,
         o_tensor=o_tensor,
         lse_tensor=lse_tensor,
         acc_o_tensor=acc_o_tensor,
@@ -1172,6 +1180,8 @@ def _make_single_kv_pipe_task_graph(
     scale_softmax_log2=None,
     output_scale=None,
     sparse_epilogue_params=None,
+    output_quant=None,
+    output_quant_args=None,
     o_tensor=None,
     lse_tensor=None,
     acc_o_tensor=None,
@@ -1431,6 +1441,8 @@ def _make_single_kv_pipe_task_graph(
         output_scale=output_scale,
         sparse_epilogue_params=sparse_epilogue_params,
         atten_sinks=_atten_sinks_view(cfg, sparse_epilogue_params),
+        output_quant=output_quant,
+        output_quant_args=output_quant_args,
         o_tensor=o_tensor,
         lse_tensor=lse_tensor,
         acc_o_tensor=acc_o_tensor,
@@ -1715,6 +1727,7 @@ class ThroughputLatencyMlaDecodeTs:
         self.device_scales = device_scales
         self.sparse_profile = sparse_profile
         self.finalize_output = finalize_output
+        self.output_quant = None
         # Separate prepared source lists, rather than a premerged tagged list.
         # Both representations reuse the same metadata staging and KV loaders.
         self.direct_sparse = False
@@ -1828,6 +1841,7 @@ class ThroughputLatencyMlaDecodeTs:
             self.parallel_reduction_topology,
             self.parallel_reduction_elements_per_slice,
             self.compile_topology_signature(),
+            self.output_quant,
         )
 
     def _make_config(self):
@@ -1936,6 +1950,7 @@ class ThroughputLatencyMlaDecodeTs:
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         stream: object,
+        output_quant_args=None,
     ):
         """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q."""
         cfg = self._make_config()
@@ -2252,6 +2267,7 @@ class ThroughputLatencyMlaDecodeTs:
             output_scale,
             tile_sched_params,
             block_split_kvs,
+            output_quant_args,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -2297,6 +2313,7 @@ class ThroughputLatencyMlaDecodeTs:
                     cache_seqs,
                     cu_seqlens_q,
                     atten_sinks,
+                    output_quant_args,
                 )
                 if cutlass.const_expr(topology.cluster_size == 1):
                     parallel_reducer.launch(
@@ -2370,6 +2387,7 @@ class ThroughputLatencyMlaDecodeTs:
         output_scale: cutlass.Float32,
         tile_sched_params: object,
         sparse_scale_params: object,
+        output_quant_args=None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
@@ -2511,6 +2529,10 @@ class ThroughputLatencyMlaDecodeTs:
             scale_softmax_log2=softmax_scale_log2,
             output_scale=output_scale,
             sparse_epilogue_params=sparse_epilogue_params,
+            output_quant=self.output_quant
+            if (cfg.fuse_sparse_epilogue or cfg.fuse_sparse_cluster_epilogue)
+            else None,
+            output_quant_args=output_quant_args,
             o_tensor=o,
             lse_tensor=lse,
             acc_o_tensor=acc_o,
@@ -2662,6 +2684,7 @@ class ThroughputLatencyMlaDecodeTs:
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
         atten_sinks: cute.Tensor | None = None,
+        output_quant_args=None,
     ):
         """Dispatch the automatically selected parallel standalone reducer."""
 
@@ -2681,4 +2704,6 @@ class ThroughputLatencyMlaDecodeTs:
             elements,
             atten_sinks,
             cfg.fuse_sparse_reduction,
+            self.output_quant,
+            output_quant_args,
         )
