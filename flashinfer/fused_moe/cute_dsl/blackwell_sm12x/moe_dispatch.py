@@ -64,13 +64,9 @@ _MXFP4_BLOCK_SIZE = 32
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
 _STATIC_RETAINED_GROUP_N = 2 * _LEVEL_TILE_N
-# Rows stored per compact (virtual) expert slot in the static workspace.  The
-# static route kernel splits every expert into tile-M-row chunks (chunk =
-# alloc_row // tile_m), each with its own slot, so no slot ever holds more rows;
-# the kernels read the slot stride from token_map.shape[1] and require it to
-# equal their tile M.  Sizing slots at tile M rows instead of the routed-row
-# capacity keeps the packed-activation planes at a few MB for any capacity
-# (E=512, 2560 rows: 2.2 GB -> ~40 MB).
+# Routing splits each expert into tile-M-row chunks, one per workspace slot.
+# The token-map and packed-activation slot strides must match the kernel's M
+# tile, rather than reserving the full routed-row capacity for every slot.
 _STATIC_TILE_M = 32
 _STATIC_SLOT_ROWS = _STATIC_TILE_M
 
@@ -134,8 +130,6 @@ _STATIC_COMPACT_CUTOVER_ROWS_PER_EXPERT_PADDED = 16
 # another wrapper capacity resolves the density rule above (the measurements
 # ran at one capacity and say nothing about smaller or larger wrappers).  The
 # environment override wins over both (measurement runs).
-_STATIC_CUTOVER_REGISTRY_VERSION = 3
-_STATIC_CUTOVER_MEASURED_CAPACITY_TOKENS = 8192
 
 
 def _static_cutover_capacity_key(capacity_tokens: int | None) -> int | None:
@@ -774,13 +768,10 @@ class _WeightViews:
     # Shares the true-extent backing (or the same TMA-stride fallback).
     tma_w13_fp4: object = None
     tma_down_fp4: object = None
-    # Single-slice shapes: static and direct micro consume 256-aligned
-    # copies; these are their storages and
-    # the concatenated [2*256, k//2, E] / [k, 256//2, E] views.
+    # Single-slice shapes: static and direct micro consume these 256-aligned
+    # copies. Direct micro reads their packed storage through raw pointers.
     static_family_w1_storage: torch.Tensor | None = None
     static_family_w2_storage: torch.Tensor | None = None
-    static_family_w13_fp4: object = None
-    static_family_down_fp4: object = None
     # Lazy legacy views: when the caller hands over unpadded weights, the
     # tile-padded [2n, k//2, E] / [k, n//2, E] copies for direct-micro
     # fallbacks are built by this callable on first use only.
@@ -1205,7 +1196,7 @@ def _get_weight_views(
     static_down = w2_static.permute(1, 2, 0)
     tma_w13 = w1_static.permute(1, 2, 0)
     static_sf: Tuple[torch.Tensor | None, torch.Tensor | None] = (None, None)
-    family: Tuple = (None, None, None, None)
+    family: Tuple = (None, None)
     # Branch-major views for the gated dynamic kernel (and the static kernel
     # unless overridden): true extent when TMA-legal, else the 128-padded
     # copies at the aligned extent (I % 32 != 0 -> non-16-byte down stride).
@@ -1267,12 +1258,7 @@ def _get_weight_views(
             _WEIGHT_CACHE[sf_key] = cached_sf
             _register_cache_eviction(_WEIGHT_CACHE, sf_key, w1_sf_s, w2_sf_s)
         static_sf = cached_sf
-        family = (
-            w1_s,
-            w2_s,
-            w1_s.permute(1, 2, 0).view(torch.float4_e2m1fn_x2),
-            w2_s.permute(1, 2, 0).view(torch.float4_e2m1fn_x2),
-        )
+        family = (w1_s, w2_s)
     elif static_needs_256_extent(n_true):
         raise ValueError(
             f"intermediate_size {n_true} spans a single N128 slice; the static "
@@ -1294,8 +1280,6 @@ def _get_weight_views(
         tma_down_fp4=branch_major_down.view(torch.float4_e2m1fn_x2),
         static_family_w1_storage=family[0],
         static_family_w2_storage=family[1],
-        static_family_w13_fp4=family[2],
-        static_family_down_fp4=family[3],
         sfb_w13_ptr=make_ptr(
             sf_dtype,
             w13_sf_contiguous.data_ptr(),
@@ -2283,7 +2267,7 @@ def launch_sm120_static_moe(
     # kernel consume the 256-aligned copies (_get_weight_views static_override);
     # MMA micro keeps the TMA-legal extent in weights.intermediate_size.
     family_n = n
-    if weights.static_family_w13_fp4 is not None:
+    if weights.static_family_w1_storage is not None:
         family_n = int(weights.static_intermediate_size or n)
     # Direct micro uses scalar row addresses, so it can consume the source
     # scale atoms at an unaligned gate boundary without the MMA micro kernel's
@@ -4033,8 +4017,8 @@ def _get_cached_workspace(
 # ==========================================================================
 # Unified dispatch
 # ==========================================================================
-# Tile-padded block scales (needed by every W4A4 kernel for I % 128 != 0) and tile-padded FP4 copies (dynamic /
-# micro kernels only, built lazily) are cached separately: one scale bundle per weight set, never duplicated.
+# Cache padded block scales independently from FP4 copies so consumers can
+# prepare the scale layout they need without materializing padded weights.
 _PADDED_SCALE_CACHE: Dict[Tuple, Tuple] = {}
 _PADDED_FP4_CACHE: Dict[Tuple, Tuple] = {}
 
@@ -4057,10 +4041,9 @@ def _pad_intermediate_to_tile(
     multiple of ``tile`` (gate/up tile-split requirement); padded channels are
     zero, so the result is numerically identical.
 
-    With ``pad_fp4=False`` only the block-scale tensors are padded: the static kernel streams the FP4 weights at
-    the true extent through TMA views and needs just the 128-aligned scale
-    layout, so a static-only caller never materializes the padded FP4 copies
-    (the returned FP4 tensors are the originals).
+    With ``pad_fp4=False`` only the block-scale tensors are padded; the FP4
+    tensors are returned unchanged. Consumers of true-extent weights can
+    prepare a padded scale layout without allocating padded FP4 copies.
     """
     quant_mode = _normalize_quant_mode(quant_mode)
     sf_vec_size, _ = _sf_params_for_quant_mode(quant_mode)
@@ -4118,9 +4101,8 @@ def _pad_intermediate_to_tile(
         shp[dim] = new - old
         return torch.cat([t, t.new_zeros(shp)], dim=dim)
 
-    # The block scales are padded once per weight set (the static kernel needs the 128-aligned per-branch scale
-    # layout on its first call); the FP4 copies are a separate, later cache entry so a static-only caller never
-    # holds them and a dynamic / micro caller never pads the scales twice.
+    # Reuse padded scales across consumers, including a later request that
+    # also needs FP4 padding.
     scale_key = (
         n,
         tile,
