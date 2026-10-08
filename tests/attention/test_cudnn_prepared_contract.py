@@ -596,11 +596,16 @@ def test_prefill_hn_same_plan_rebinds_current_output_stride(monkeypatch):
 
 
 @pytest.mark.parametrize("supported", [False, True])
-def test_prefill_capacity_is_a_plan_descriptor(monkeypatch, supported):
+@pytest.mark.parametrize("shape_override", [False, True])
+def test_prefill_capacity_is_a_plan_descriptor(monkeypatch, supported, shape_override):
     """A larger lifetime capacity must not reuse a smaller compiled graph."""
-    monkeypatch.setattr(prefill, "_cudnn_supports_bounded_ragged", lambda **kw: supported)
+    monkeypatch.setattr(
+        prefill, "_cudnn_supports_bounded_ragged", lambda **kw: supported
+    )
     monkeypatch.setattr(prefill, "_cudnn_supports_direct_seqlens", lambda *a, **k: True)
-    monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
+    monkeypatch.setattr(
+        prefill, "_cudnn_supports_shape_override", lambda: shape_override
+    )
     monkeypatch.setattr(
         prefill,
         "_build_prefill_graph",
@@ -612,7 +617,7 @@ def test_prefill_capacity_is_a_plan_descriptor(monkeypatch, supported):
     kv = torch.empty(3 * 2048, 4, 128, dtype=q.dtype)
 
     def metadata(capacity):
-        return prefill._PrefillMetadata(
+        resolved = prefill._PrefillMetadata(
             128,
             2048,
             False,
@@ -621,6 +626,8 @@ def test_prefill_capacity_is_a_plan_descriptor(monkeypatch, supported):
             batch_offsets_k=indptr,
             max_total_num_rows=capacity,
         ).resolve_from_plan(q.dtype, 16, 4, 128, 128)
+        resolved._bounded_ragged = supported
+        return resolved
 
     first = metadata(130)
     plan = prefill._CudnnPrefillPlan.prepare(first, q.dtype, q.device)

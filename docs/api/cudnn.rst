@@ -83,7 +83,12 @@ Batch and lengths round up to powers of two within the qualified range;
 Q129 and Q241 can share the same Q256 graph. The graph also receives a packed
 Q capacity, allowing either cuDNN provider to reserve workspace and choose
 parallelism from useful bounds. A bounded declaration does not force an engine
-or split count. Other inputs retain their existing cache policy.
+or split count. In CUDA Graph mode, the wrapper's initialized total-query
+capacity also bounds packed workspace and is part of the graph cache key.
+Replanning fewer live tokens preserves that lifetime capacity, so older captures
+remain valid. No device length read or extra preparation is added to ``run()``.
+Wrappers without an initialized lifetime capacity retain the batch/Q envelope.
+Other inputs retain their existing cache policy.
 
 A new graph signature can require graph construction and kernel compilation.
 Warm the signatures needed by the serving schedule **before** CUDA Graph

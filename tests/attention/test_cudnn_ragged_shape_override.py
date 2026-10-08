@@ -784,11 +784,18 @@ def test_small_workspace_selection_reuse_and_capture(
 
 @requires_override
 @pytest.mark.parametrize("lse_layout", ["NH", "HN"])
-def test_fixed_graph_query_capacity_replan_and_capture(monkeypatch, lse_layout):
-    """Fixed graph capacities are cache keys and survive shorter live replans."""
+@pytest.mark.parametrize("shape_override", [False, True])
+def test_graph_query_capacity_replan_and_capture(
+    monkeypatch, lse_layout, shape_override
+):
+    """Graph capacities are cache keys and survive shorter live replans."""
     if not cudnn_prefill._cudnn_supports_bounded_ragged():
         pytest.skip("packed capacity declarations require FE 1.31 native support")
-    monkeypatch.setenv("FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE", "0")
+    if shape_override and not cudnn_prefill._cudnn_supports_bounded_ragged(d128=True):
+        pytest.skip("bounded D128 requires matching native support")
+    monkeypatch.setenv(
+        "FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE", str(int(shape_override))
+    )
     workspace = torch.empty(128 << 20, device="cuda", dtype=torch.uint8)
     klens = [2048] * 3
     ko = _indptr(klens)

@@ -339,9 +339,24 @@ def _prefill_descriptor_key(
     )
 
 
+def _prefill_graph_total_q(override_cache, max_total_num_rows):
+    if override_cache is None:
+        return max_total_num_rows
+    if override_cache[0] >= _OVERRIDE_CACHE_BATCH:
+        # Preserve the broad fallback's existing declaration and cache domain.
+        return None
+    capacity = override_cache[0] * override_cache[1]
+    return (
+        min(capacity, max_total_num_rows)
+        if max_total_num_rows is not None
+        else capacity
+    )
+
+
 def _prefill_override_descriptor_key(key, override_cache):
     core, (return_lse, stats) = key
-    _, causal, _, table, seq_q, seq_kv, offsets = core
+    shape, causal, _, table, seq_q, seq_kv, offsets = core
+    total_q = _prefill_graph_total_q(override_cache, shape[3])
 
     def indptr_layout(layout):
         if layout is None:
@@ -351,7 +366,7 @@ def _prefill_override_descriptor_key(key, override_cache):
 
     return (
         (
-            override_cache,
+            (*override_cache, total_q),
             causal,
             True,
             table,
@@ -471,13 +486,9 @@ if CUDNN_AVAILABLE:
             )
         graph_s_qo = max_token_seq_q
         graph_s_kv = max_sequence_kv
-        graph_total_q = max_total_num_rows
+        graph_total_q = _prefill_graph_total_q(override_cache, max_total_num_rows)
         if override_cache is not None:
             graph_b, graph_s_qo, graph_s_kv = override_cache
-            # The override graph retains its own declaration and reuse domain.
-            graph_total_q = (
-                graph_b * graph_s_qo if graph_b < _OVERRIDE_CACHE_BATCH else None
-            )
 
         def indptr_tensor(like: torch.Tensor):
             # (b+1)-row int32 buffers (ragged offsets, cu_seq_lens). Declared at
