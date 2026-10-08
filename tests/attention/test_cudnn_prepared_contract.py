@@ -546,3 +546,48 @@ def test_prefill_hn_same_plan_rebinds_current_output_stride(monkeypatch):
         at = call["override_uids"].index(prefill.UIDs.STATS_UID.value)
         assert call["override_strides"][at] == [4 * tokens, tokens, 1, 1]
     assert calls[0]["override_strides"] is not calls[1]["override_strides"]
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_prefill_capacity_is_a_plan_descriptor(monkeypatch, supported):
+    """A larger lifetime capacity must not reuse a smaller compiled graph."""
+    monkeypatch.setattr(prefill, "_cudnn_supports_bounded_ragged", lambda: supported)
+    monkeypatch.setattr(prefill, "_cudnn_supports_direct_seqlens", lambda *a, **k: True)
+    monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
+    monkeypatch.setattr(
+        prefill,
+        "_build_prefill_graph",
+        lambda **kw: (SimpleNamespace(get_workspace_size=lambda: 0), []),
+        raising=False,
+    )
+    indptr = torch.tensor([0, 128, 129, 130], dtype=torch.int32)
+    q = torch.empty(130, 16, 128, dtype=torch.bfloat16)
+    kv = torch.empty(3 * 2048, 4, 128, dtype=q.dtype)
+
+    def metadata(capacity):
+        return prefill._PrefillMetadata(
+            128,
+            2048,
+            False,
+            False,
+            batch_offsets_q=indptr,
+            batch_offsets_k=indptr,
+            max_total_num_rows=capacity,
+        ).resolve_from_plan(q.dtype, 16, 4, 128, 128)
+
+    first = metadata(130)
+    plan = prefill._CudnnPrefillPlan.prepare(first, q.dtype, q.device)
+    prepared = prefill.prepare_cudnn_batch_prefill(
+        q, kv, kv, 0.5, torch.empty(0), metadata=first
+    )
+    same = prefill._CudnnPrefillPlan.prepare(metadata(130), q.dtype, q.device, plan)
+    larger = prefill._CudnnPrefillPlan.prepare(metadata(384), q.dtype, q.device, plan)
+    assert same is plan
+    assert prepared.matches_plan(q, kv, kv, 0.5, same, False)
+    assert prepared.matches_plan(q, kv, kv, 0.5, larger, False) is not supported
+    assert plan.execution_shape == (3, 128, 2048)
+    if supported:
+        assert first.max_total_num_rows == 130
+        assert larger.metadata.max_total_num_rows >= 384
+    else:
+        assert first.max_total_num_rows is None

@@ -114,7 +114,7 @@ def _cudnn_version_supports_shape_override() -> bool:
 
 @functools.cache
 def _cudnn_supports_bounded_ragged() -> bool:
-    """Bounded packed overrides require a matching FE Python/native stack."""
+    """Packed capacity declarations require a matching FE Python/native stack."""
     if not CUDNN_AVAILABLE:
         return False
     try:
@@ -288,6 +288,7 @@ def _prefill_descriptor_key(
     lse: Optional[torch.Tensor] = None,
     o_data_type: Optional[torch.dtype] = None,
     override_cache: Optional[tuple[int, int, int]] = None,
+    max_total_num_rows: Optional[int] = None,
 ):
     if actual_seq_lens_q is not None:
         graph_b = actual_seq_lens_q.shape[0]
@@ -305,7 +306,7 @@ def _prefill_descriptor_key(
         return layouts[id(t)]
 
     core = (
-        (graph_b, max_token_seq_q, max_sequence_kv),
+        (graph_b, max_token_seq_q, max_sequence_kv, max_total_num_rows),
         bottom_right_causal_mask,
         False,
         layout(block_tables),
@@ -411,6 +412,7 @@ if CUDNN_AVAILABLE:
         lse: Optional[torch.Tensor] = None,
         o_data_type: Optional[torch.dtype] = None,
         override_cache: Optional[tuple[int, int, int]] = None,
+        max_total_num_rows: Optional[int] = None,
         stats_head_stride: int = 0,
         stats_use_log2: bool = False,
         workspace_limit: Optional[int] = None,
@@ -462,8 +464,13 @@ if CUDNN_AVAILABLE:
             )
         graph_s_qo = max_token_seq_q
         graph_s_kv = max_sequence_kv
+        graph_total_q = max_total_num_rows
         if override_cache is not None:
             graph_b, graph_s_qo, graph_s_kv = override_cache
+            # The override graph retains its own declaration and reuse domain.
+            graph_total_q = (
+                graph_b * graph_s_qo if graph_b < _OVERRIDE_CACHE_BATCH else None
+            )
 
         def indptr_tensor(like: torch.Tensor):
             # (b+1)-row int32 buffers (ragged offsets, cu_seq_lens). Declared at
@@ -763,9 +770,8 @@ if CUDNN_AVAILABLE:
                     # A fixed upper bound, shared by backend and FROST. The
                     # generic large envelope retains its previous contract.
                     **(
-                        {"max_total_seq_len_q": graph_b * graph_s_qo}
-                        if override_cache is not None
-                        and graph_b < _OVERRIDE_CACHE_BATCH
+                        {"max_total_seq_len_q": graph_total_q}
+                        if graph_total_q is not None
                         else {}
                     ),
                     compute_data_type=cudnn.data_type.FLOAT,
@@ -953,6 +959,9 @@ class _PrefillMetadata:
     k_scale: Optional[torch.Tensor] = None
     v_scale: Optional[torch.Tensor] = None
 
+    # Only a wrapper-enforced lifetime capacity is safe here. A live total is
+    # insufficient: captured graphs can outlive later plan() calls.
+    max_total_num_rows: Optional[int] = None
     _bounded_mla: bool = False
 
     def resolve(self, q, k_cache, v_cache, *, batch_offsets_units="elements"):
@@ -988,6 +997,7 @@ class _PrefillMetadata:
             and get_compute_capability(self.batch_offsets_q.device) == (10, 0)
         )
         if batch_offsets_units != "tokens":
+            self.max_total_num_rows = None
             return self
         if self.batch_offsets_o is None:
             self.batch_offsets_o = self.batch_offsets_q
@@ -1003,6 +1013,15 @@ class _PrefillMetadata:
                 else self.batch_offsets_k is not None
             )
         )
+        # The wrapper's initialization capacity is already fixed across
+        # graph-mode replans. Preserve it without padding the packed total.
+        if self.max_total_num_rows is not None and not (
+            self.max_total_num_rows > 0
+            and direct
+            and q_dtype in (torch.float16, torch.bfloat16)
+            and _cudnn_supports_bounded_ragged()
+        ):
+            self.max_total_num_rows = None
         if direct:
             self.cu_seq_lens_q = self.batch_offsets_q
             self.cu_seq_lens_kv = None if paged else self.batch_offsets_k
@@ -1076,6 +1095,7 @@ class _PrefillMetadata:
     def graph_kwargs(self, override_cache):
         return dict(
             max_token_seq_q=self.max_token_per_sequence,
+            max_total_num_rows=self.max_total_num_rows,
             max_sequence_kv=self.max_sequence_kv,
             override_cache=override_cache,
             actual_seq_lens_q=self.actual_seq_lens_q,
@@ -1276,7 +1296,7 @@ class _CudnnPrefillPlan:
                 (None,) * 5 + tuple(bindings.values()),
             ),
         )
-        self.execution_shape = exact[0][0]
+        self.execution_shape = exact[0][0][:3]
         self.bound_graph = None
         self.bound_stats_head_stride = 0
         self.execute_kwargs = {}
