@@ -46,8 +46,40 @@ RESULT_NAMES = (
 )
 
 
+class _ExpertLinear(torch.autograd.Function):
+    """``x @ w.T`` whose weight gradient is the FP32 product of the operands.
+
+    torch's BF16 ``grad_out.T @ x`` (transposed operand, K = routed row count)
+    silently drops the last ``K mod 256`` rows for some K on current cuBLAS
+    builds: observed for K in 9219..9731 with K mod 256 in 1..3 on sm_100a,
+    sm_103a and sm_107a (CUDA 13.1 and 13.5 torch builds), e.g. the 9475
+    routed rows of ``mok_bf16_unequal`` case 2.  The kernels accumulate in
+    FP32 and round once, so the FP32 product is also the faithful reference.
+    The input gradient keeps the regular matmul (K = feature count).
+    """
+
+    @staticmethod
+    def forward(ctx, x, w):
+        ctx.save_for_backward(x, w)
+        return x @ w.T
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, w = ctx.saved_tensors
+        grad_x = grad_out @ w if ctx.needs_input_grad[0] else None
+        grad_w = None
+        if ctx.needs_input_grad[1]:
+            tf32 = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = False
+            try:
+                grad_w = (grad_out.float().T.contiguous() @ x.float()).to(w.dtype)
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = tf32
+        return grad_x, grad_w
+
+
 def expert(x, gate, up, down, swiglu_limit=None):
-    a, b = x @ gate.T, x @ up.T
+    a, b = _ExpertLinear.apply(x, gate), _ExpertLinear.apply(x, up)
     a, b = a.float(), b.float()
     if swiglu_limit is not None:
         # GLM-5.3-Flash clamp; torch.clamp's inclusive-boundary derivative
@@ -56,7 +88,7 @@ def expert(x, gate, up, down, swiglu_limit=None):
         b = torch.clamp(b, min=-swiglu_limit, max=swiglu_limit)
     # Native SwiGLU promotes BF16 inputs to FP32, then rounds the product once.
     hidden = (torch.nn.functional.silu(a) * b).to(x.dtype)
-    return hidden @ down.T
+    return _ExpertLinear.apply(hidden, down)
 
 
 def reference(
