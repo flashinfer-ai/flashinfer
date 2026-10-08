@@ -235,20 +235,23 @@ def _changed_test_files_from_list(path: str) -> list[str]:
 def _load_summary(path: str, lane_name: str | None = None) -> tuple[str, list[dict]]:
     """Load a run-summary.json and return (lane_name, sources).
 
-    The lane name is inferred from the path or defaults to "unknown".
+    The lane name comes from the ``gpu_name`` field in the summary (written by
+    the test runner), falling back to path-based inference for older summaries.
     """
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
     if lane_name is None:
-        # Infer lane name from parent directory structure or filename.
-        # Typical: junit-h100/run-summary.json, junit-a10g/run-summary.json, etc.
-        parts = PurePosixPath(path).parts
-        lane_name = "unknown"
-        for part in parts:
-            lower = part.lower()
-            if any(gpu in lower for gpu in ("h100", "a10g", "t4", "sm90", "sm86", "sm75")):
-                lane_name = part
-                break
+        # Prefer the embedded gpu_name written by the runner.
+        lane_name = data.get("gpu_name", "")
+        if not lane_name or lane_name == "unknown":
+            # Fall back to path-based inference for older summaries.
+            parts = PurePosixPath(path).parts
+            lane_name = "unknown"
+            for part in parts:
+                lower = part.lower()
+                if any(gpu in lower for gpu in ("h100", "a10g", "t4", "sm90", "sm86", "sm75")):
+                    lane_name = part
+                    break
     sources = data.get("sources", [])
     return lane_name, sources
 
