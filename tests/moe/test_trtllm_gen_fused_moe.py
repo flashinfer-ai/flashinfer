@@ -2490,6 +2490,37 @@ def test_bf16_moe_swiglu_oa_activation_param_validation():
     with pytest.raises(ValueError, match=r"ActivationType\.Swiglu"):
         trtllm_bf16_routed_moe(**routed_kwargs, gemm1_clamp_limit=per_expert)
 
+    step_kwargs = {**kwargs, "activation_type": ActivationType.SwigluStep.value}
+    with pytest.raises(ValueError, match="SwigluStep accepts gemm1_clamp_limit only"):
+        trtllm_bf16_moe(**step_kwargs, gemm1_alpha=per_expert)
+    with pytest.raises(ValueError, match="SwigluStep accepts gemm1_clamp_limit only"):
+        trtllm_bf16_moe(**step_kwargs, gemm1_beta=per_expert)
+
+
+def test_fp8_per_tensor_swiglu_step_limit_validation():
+    """The direct ABI accepts only per-expert FP32 raw limits for SwigluStep."""
+    from flashinfer.fused_moe.core import _validate_fp8_per_tensor_step_limit
+
+    raw_limit = torch.tensor([7.0, 16.0], dtype=torch.float32)
+    _validate_fp8_per_tensor_step_limit(
+        ActivationType.SwigluStep, raw_limit, 2, torch.device("cpu")
+    )
+    with pytest.raises(ValueError, match="SwigluStep only"):
+        _validate_fp8_per_tensor_step_limit(
+            ActivationType.Swiglu, raw_limit, 2, torch.device("cpu")
+        )
+    with pytest.raises(ValueError, match="Invalid shape"):
+        _validate_fp8_per_tensor_step_limit(
+            ActivationType.SwigluStep, raw_limit[:1], 2, torch.device("cpu")
+        )
+    with pytest.raises(ValueError, match="Invalid dtype"):
+        _validate_fp8_per_tensor_step_limit(
+            ActivationType.SwigluStep,
+            raw_limit.to(torch.bfloat16),
+            2,
+            torch.device("cpu"),
+        )
+
 
 def test_bf16_moe_swiglu_oa_activation_params(cache_permute_indices):
     """TRT-LLM Gen BF16 MoE applies raw fused FC1 SwiGLU OA params."""
@@ -2635,6 +2666,224 @@ def test_bf16_moe_swiglu_oa_activation_params(cache_permute_indices):
     assert torch.allclose(output_default, output_noop, atol=1e-2, rtol=1e-2)
     assert not torch.allclose(output_default, output_oa, atol=1e-2, rtol=1e-2)
     assert not torch.allclose(output_oa, output_beta_oa, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("moe_impl", "weight_layout"),
+    [
+        pytest.param(BF16Moe(), WeightLayout.BlockMajorK, id="bf16"),
+        pytest.param(
+            FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4),
+            WeightLayout.MajorK,
+            id="nvfp4",
+        ),
+        pytest.param(FP8PerTensorMoe(), WeightLayout.MajorK, id="fp8-per-tensor"),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
+            WeightLayout.MajorK,
+            id="mxfp8-block",
+        ),
+    ],
+)
+def test_swiglu_step_mixed_expert_limits(
+    moe_impl, weight_layout, cache_permute_indices
+):
+    """The fused GEMM caps SiLU and up independently for per-expert 7/16 limits.
+
+    The larger inputs make both limits effective. NVFP4 and per-tensor FP8
+    have non-unit FC1 dequant scales, so this also checks their raw-limit
+    conversion; the reference consumes physical limits.
+    """
+    num_experts = 32
+    intermediate_size = 512
+    limits = torch.tensor(
+        [7.0 if expert % 2 == 0 else 16.0 for expert in range(num_experts)],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    run_moe_test(
+        num_tokens=32,
+        hidden_size=512,
+        intermediate_size=intermediate_size,
+        moe_impl=moe_impl,
+        routing_config={
+            "num_experts": num_experts,
+            "top_k": 2,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [
+                BF16Moe,
+                FP4Moe,
+                FP8PerTensorMoe,
+                FP8BlockScaleMoe,
+            ],
+            "compatible_intermediate_size": [intermediate_size],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": weight_layout,
+            "compatible_moe_impls": [
+                BF16Moe,
+                FP4Moe,
+                FP8PerTensorMoe,
+                FP8BlockScaleMoe,
+            ],
+        },
+        activation_type=ActivationType.SwigluStep,
+        cache_permute_indices=cache_permute_indices,
+        hidden_state_amplitude=12.0,
+        gemm1_clamp_limit=limits,
+    )
+
+
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="nvfp4"),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
+            id="mxfp8-block",
+        ),
+    ],
+)
+def test_swiglu_step_fused_shared_limit_16(moe_impl, cache_permute_indices):
+    """A fused shared expert reads its own cap after the routed expert rows."""
+    num_routed_experts = 32
+    limits = torch.tensor(
+        [7.0] * num_routed_experts + [16.0],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    run_moe_test(
+        num_tokens=32,
+        hidden_size=512,
+        intermediate_size=512,
+        moe_impl=moe_impl,
+        routing_config={
+            "num_experts": num_routed_experts,
+            "top_k": 4,
+            "padding": 8,
+            "n_groups": 8,
+            "top_k_groups": 4,
+            "routed_scaling": 2.5,
+            "has_routing_bias": True,
+            "routing_method_type": RoutingMethodType.DeepSeekV3,
+            "num_fused_shared_experts": 1,
+            "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
+            "compatible_intermediate_size": [512],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
+        },
+        activation_type=ActivationType.SwigluStep,
+        cache_permute_indices=cache_permute_indices,
+        hidden_state_amplitude=12.0,
+        gemm1_clamp_limit=limits,
+    )
+
+
+@pytest.mark.parametrize("limit", [0.25, 7.0, 16.0])
+@pytest.mark.parametrize("from_logits", [False, True], ids=["pre-routed", "logits"])
+def test_bf16_swiglu_step_clamps_after_silu_and_graph_replay(limit, from_logits):
+    """Sparse projections distinguish post-SiLU capping and both signs of up."""
+    from flashinfer.fused_moe import (
+        ExpertConfig,
+        MoEActivationPack,
+        MoEConfig,
+        MoEWeightPack,
+        QuantConfig,
+        QuantFormat,
+        RoutingConfig,
+        RoutingInputMode,
+        SwiGLUStep,
+        TrtllmBf16Config,
+        TrtllmBf16RoutedRunner,
+    )
+
+    if not torch.cuda.is_available() or get_compute_capability(
+        torch.device("cuda")
+    ) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Requires a TRTLLM Blackwell or Rubin MoE kernel")
+    device = torch.device("cuda")
+    experts, hidden, intermediate, tokens = 8, 512, 512, 8
+    up = torch.tensor([-32.0, -8.0, -2.0, 0.5, 8.0, 32.0, 1.0, -4.0], device=device)
+    gate = torch.tensor([32.0, 16.0, 8.0, 7.0, 6.0, 1.0, -1.0, -4.0], device=device)
+    x = torch.zeros(tokens, hidden, device=device, dtype=torch.bfloat16)
+    x[:, 0], x[:, 1] = up, gate
+    w1 = torch.zeros(experts, 2 * intermediate, hidden, device=device, dtype=x.dtype)
+    w2 = torch.zeros(experts, hidden, intermediate, device=device, dtype=x.dtype)
+    w1[:, 0, 0] = w1[:, intermediate, 1] = w2[:, 0, 0] = 1
+    ids = torch.arange(tokens, device=device, dtype=torch.int32).reshape(-1, 1)
+    logits = torch.full((tokens, experts), -80.0, device=device)
+    logits.scatter_(1, ids.long(), 80.0)
+    activation = SwiGLUStep(limit=limit)
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=experts, top_k=1),
+        quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+        experts=ExpertConfig(intermediate_size=intermediate),
+        activation=activation,
+    )
+    act = MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=None,
+        topk_ids=None if from_logits else ids,
+        topk_weights=None if from_logits else torch.ones(tokens, 1, device=device),
+        routing_logits=logits if from_logits else None,
+        routing_input_mode=(
+            RoutingInputMode.FromLogits
+            if from_logits
+            else RoutingInputMode.UnpackedPrecomputed
+        ),
+    )
+    runner = TrtllmBf16RoutedRunner(config, device)
+    runner.check_support()
+    runner.build()
+    weights = MoEWeightPack()
+    weights.prepare_for(
+        runner.backend_key,
+        TrtllmBf16Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            activation=activation,
+        ),
+    )
+    inputs = runner.pack_inputs(act, weights)
+    if limit == 7.0 and not from_logits:
+        # Call the native runner directly to exercise the C++ ABI validation.
+        for key in ("gemm1_alpha", "gemm1_beta"):
+            native_kwargs = dict(inputs.launch_state.static_kwargs)
+            native_kwargs[key] = torch.ones(experts, device=device)
+            with pytest.raises(
+                Exception, match="SwigluStep accepts gemm1_clamp_limit only"
+            ):
+                runner._inner.forward(inputs, **native_kwargs)
+    actual = runner.forward(inputs).clone()
+    expected = torch.zeros_like(actual)
+    expected[:, 0] = (
+        torch.nn.functional.silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
+    ).to(x.dtype)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if limit == 0.25:
+        wrong = torch.nn.functional.silu(gate.clamp(max=limit)) * up.clamp(
+            -limit, limit
+        )
+        assert not torch.allclose(actual[:, 0].float(), wrong, rtol=0.01, atol=0.001)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = runner.forward(inputs)
+    graph.replay()
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
 
 def test_fp8_block_scale_routed_activation_type_relu2_smoke():

@@ -25,7 +25,6 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_ALPHA,
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
-    normalize_activation_type,
 )
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 from ._init_helpers import fp8_block_quant_1d, fp8_block_quant_2d
@@ -183,6 +182,8 @@ def _fp8_moe_run_experts(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
 ):
     """FP8 block-scale dequantization + SwiGLU + GEMM for all routing types.
 
@@ -200,25 +201,40 @@ def _fp8_moe_run_experts(
         )
     device = hidden_states.device
 
-    A_fp32 = hidden_states.to(torch.float32)
-    A_scale = hidden_states_scale.to(torch.float32)  # [H/128, T]
-    A_scale_TH = A_scale.permute(1, 0).contiguous()  # [T, H/128]
-    A_scale_expanded = (
-        A_scale_TH.unsqueeze(-1).repeat(1, 1, BLOCK).reshape(T, H).contiguous()
-    )
-    A = A_fp32 * A_scale_expanded
+    is_step = int(activation_type) == 7
+    if is_step:
+        if int(fp8_quantization_type) != 2:
+            raise ValueError("SwiGLUStep requires fused MXFP8 block scaling")
+        if gemm1_alpha is not None or gemm1_beta is not None:
+            raise ValueError("SwiGLUStep accepts gemm1_clamp_limit only")
+        # MXFP8 uses one UE8M0 scale per row and 32 values along K.
+        a_exp = hidden_states_scale.view(torch.uint8).reshape(T, H // 32)
+        a_scale = torch.exp2(a_exp.to(torch.float32) - 127.0)
+        A = hidden_states.float() * a_scale.repeat_interleave(32, dim=-1)
+        s1 = torch.exp2(gemm1_weights_scale.view(torch.uint8).float() - 127.0)
+        s2 = torch.exp2(gemm2_weights_scale.view(torch.uint8).float() - 127.0)
+        W13 = gemm1_weights.float() * s1.repeat_interleave(32, dim=-1)
+        W2 = gemm2_weights.float() * s2.repeat_interleave(32, dim=-1)
+    else:
+        A_fp32 = hidden_states.to(torch.float32)
+        A_scale = hidden_states_scale.to(torch.float32)  # [H/128, T]
+        A_scale_TH = A_scale.permute(1, 0).contiguous()  # [T, H/128]
+        A_scale_expanded = (
+            A_scale_TH.unsqueeze(-1).repeat(1, 1, BLOCK).reshape(T, H).contiguous()
+        )
+        A = A_fp32 * A_scale_expanded
 
-    W13_fp32 = gemm1_weights.to(torch.float32)
-    S13 = gemm1_weights_scale.to(torch.float32)
-    S13_expanded = torch.repeat_interleave(S13, BLOCK, dim=1)
-    S13_expanded = torch.repeat_interleave(S13_expanded, BLOCK, dim=2)
-    W13 = W13_fp32 * S13_expanded
+        W13_fp32 = gemm1_weights.to(torch.float32)
+        S13 = gemm1_weights_scale.to(torch.float32)
+        S13_expanded = torch.repeat_interleave(S13, BLOCK, dim=1)
+        S13_expanded = torch.repeat_interleave(S13_expanded, BLOCK, dim=2)
+        W13 = W13_fp32 * S13_expanded
 
-    W2_fp32 = gemm2_weights.to(torch.float32)
-    S2 = gemm2_weights_scale.to(torch.float32)
-    S2_expanded = torch.repeat_interleave(S2, BLOCK, dim=1)
-    S2_expanded = torch.repeat_interleave(S2_expanded, BLOCK, dim=2)
-    W2 = W2_fp32 * S2_expanded
+        W2_fp32 = gemm2_weights.to(torch.float32)
+        S2 = gemm2_weights_scale.to(torch.float32)
+        S2_expanded = torch.repeat_interleave(S2, BLOCK, dim=1)
+        S2_expanded = torch.repeat_interleave(S2_expanded, BLOCK, dim=2)
+        W2 = W2_fp32 * S2_expanded
 
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
@@ -235,7 +251,12 @@ def _fp8_moe_run_experts(
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W13[le].t())
         X1, X2 = G1[:, :I], G1[:, I:]
-        if gemm1_clamp_limit is not None:
+        if is_step:
+            limit = 7.0 if gemm1_clamp_limit is None else gemm1_clamp_limit[le]
+            activated = torch.clamp(X1, min=-limit, max=limit) * torch.clamp(
+                torch.nn.functional.silu(X2), max=limit
+            )
+        elif gemm1_clamp_limit is not None:
             limit = gemm1_clamp_limit[le].to(device=X1.device, dtype=torch.float32)
             X1 = torch.clamp(X1, min=-limit, max=limit)
             X2 = torch.clamp(X2, max=limit)
@@ -250,7 +271,9 @@ def _fp8_moe_run_experts(
             else gemm1_beta[le].to(device=X1.device, dtype=torch.float32)
         )
         silu_X2 = X2 * torch.sigmoid(alpha * X2)
-        O = (silu_X2 * (X1 + beta)).matmul(W2[le].t())
+        if not is_step:
+            activated = silu_X2 * (X1 + beta)
+        O = activated.matmul(W2[le].t())
         # per-expert contribution weight for each token
         w_tok = weights.index_select(0, token_idx)
         # find which slot in topk_idx[token_idx] corresponds to ge
@@ -286,6 +309,9 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    **_unused,
 ):
     """
     FP8 block-scale MoE with DeepSeek-V3 routing:
@@ -299,6 +325,9 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     With ``S > 0``, append ids ``[E, E + S)`` at weight ``1.0``. Weight
     tensors contain ``E + S`` rows.
     """
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    )
     E_global = routing_logits.shape[1]
     T = routing_logits.shape[0]
     TOP_K = int(top_k)
@@ -364,6 +393,8 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
     )
 
 
@@ -392,11 +423,17 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    **_unused,
 ):
     """
     FP8 block-scale MoE with Default routing: Softmax → TopK.
     routing_bias is added to logits before softmax when provided.
     """
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    )
     TOP_K = int(top_k)
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
@@ -419,6 +456,8 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
     )
 
 
@@ -439,12 +478,18 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    **_unused,
 ):
     """
     FP8 block-scale MoE with Renormalize routing: TopK → Softmax.
     TopK is applied on raw logits; weights are then derived by softmax
     over the selected logits.
     """
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    )
     TOP_K = int(top_k)
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
@@ -467,6 +512,8 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
     )
 
 
@@ -487,6 +534,9 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    **_unused,
 ):
     """
     FP8 block-scale MoE with Llama4 routing: Top1 → Sigmoid.
@@ -494,6 +544,9 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
     By definition Llama4 routing uses top_k=1; the parameter is accepted for
     schema consistency with the other routing methods.
     """
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    )
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
     if routing_bias is not None:
@@ -515,6 +568,8 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
     )
 
 
@@ -535,11 +590,17 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    **_unused,
 ):
     """
     FP8 block-scale MoE with RenormalizeNaive routing: Softmax → TopK → Renormalize.
     Same as Default but the selected weights are re-normalised to sum to 1.
     """
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    )
     TOP_K = int(top_k)
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
@@ -564,6 +625,8 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
     )
 
 
@@ -584,11 +647,17 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    **_unused,
 ):
     """
     FP8 block-scale MoE with TopK-only routing: TopK, uniform weights.
     No softmax or sigmoid; all selected experts receive equal weight.
     """
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    )
     TOP_K = int(top_k)
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
@@ -616,6 +685,8 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
     )
 
 
@@ -1264,6 +1335,15 @@ def trtllm_fp8_block_scale_moe_trace_dispatch(**kwargs):
     DeepSeekV3 calls with shared experts use a separate template.
     """
     routing_method_type = int(kwargs.get("routing_method_type", 0))
+    if int(kwargs.get("activation_type", 3)) == 7:
+        if int(kwargs.get("fp8_quantization_type", 1)) != 2:
+            raise ValueError("SwiGLUStep requires fused MXFP8 block scaling")
+        if (
+            routing_method_type == 2
+            and int(kwargs.get("num_fused_shared_experts") or 0) > 0
+        ):
+            return trtllm_mxfp8_step_shared_experts_trace
+        return _STEP_MXFP8_TRACE_BY_ROUTING_TYPE.get(routing_method_type)
     if (
         routing_method_type == 2
         and int(kwargs.get("num_fused_shared_experts") or 0) > 0
@@ -1414,6 +1494,10 @@ def _fp4_moe_run_experts(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    output1_scale_scalar=None,
+    output1_scale_gate_scalar=None,
+    output2_scale_scalar=None,
+    per_token_scale=None,
     **_unused,
 ):
     """FP4 dequantize + gated activation + GEMM for all routing types.
@@ -1449,12 +1533,16 @@ def _fp4_moe_run_experts(
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
     activation_type = int(activation_type)
-    swiglu, situ = 3, 10
-    if activation_type not in (swiglu, situ):
+    swiglu, step, situ = 3, 7, 10
+    if activation_type not in (swiglu, step, situ):
         raise ValueError(
-            "FP4 MoE trace reference supports activation_type 3 (SwiGLU) "
-            f"and 10 (SiTU), got {activation_type}"
+            "FP4 MoE trace reference supports activation_type 3 (SwiGLU), "
+            f"7 (SwiGLUStep), and 10 (SiTU), got {activation_type}"
         )
+    if activation_type == step and (is_mxfp4 or hidden_states.dtype != torch.uint8):
+        raise ValueError("FP4 SwiGLUStep requires NVFP4 activations and weights")
+    if activation_type == step and (gemm1_alpha is not None or gemm1_beta is not None):
+        raise ValueError("SwiGLUStep accepts gemm1_clamp_limit only")
     if activation_type == situ:
         for name, param in (
             ("gemm1_alpha", gemm1_alpha),
@@ -1484,11 +1572,28 @@ def _fp4_moe_run_experts(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)  # [N, H]
         G1 = A_e.matmul(W1[le].t())  # [N, 2*I]
+        if activation_type == step and per_token_scale is not None:
+            G1 = G1 * per_token_scale.index_select(0, token_idx).reshape(-1, 1).float()
         if gemm1_bias is not None:
             G1 = G1 + gemm1_bias[le].to(torch.float32)
         # TRTLLM-Gen convention: x0 is linear/first; x1 is gate/second.
         x0, x1 = G1[:, :I], G1[:, I:]
-        if activation_type == situ:
+        if activation_type == step:
+            gate_scale = (
+                1.0
+                if output1_scale_gate_scalar is None
+                else output1_scale_gate_scalar[le]
+            )
+            up_scale = 1.0 if output1_scale_scalar is None else output1_scale_scalar[le]
+            raw_limit = (
+                7.0 / gate_scale if gemm1_clamp_limit is None else gemm1_clamp_limit[le]
+            )
+            up = torch.clamp(x0, min=-raw_limit, max=raw_limit) * up_scale
+            gate = torch.clamp(
+                torch.nn.functional.silu(x1 * gate_scale), max=raw_limit * gate_scale
+            )
+            activated = up * gate
+        elif activation_type == situ:
             alpha = (
                 torch.tensor(1.0, dtype=torch.float32, device=device)
                 if gemm1_alpha is None
@@ -1515,6 +1620,8 @@ def _fp4_moe_run_experts(
         O = activated.matmul(W2[le].t())  # [N, H]
         if gemm2_bias is not None:
             O = O + gemm2_bias[le].to(torch.float32)
+        if activation_type == step and output2_scale_scalar is not None:
+            O = O * output2_scale_scalar[le]
         # Fold per-token expert weight.
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()
@@ -1885,6 +1992,12 @@ _FP4_STANDARD_AXES: dict[str, Var | Const] = {
 }
 
 _FP4_STANDARD_INPUTS: dict[str, Tensor | Scalar] = {
+    "per_token_scale": Tensor(
+        ["seq_len"],
+        dtype="float32",
+        optional=True,
+        description="FC1 token dequantization scales applied before StepFun clipping.",
+    ),
     "routing_logits": Tensor(
         ["seq_len", "num_experts"],
         description="Routing logits for expert selection.",
@@ -2460,6 +2573,16 @@ def _moe_expert_param(value, expert_idx, default, device):
     return float(value)
 
 
+def _step_decode_precomputed_routing(topk_ids):
+    if isinstance(topk_ids, (tuple, list)):
+        ids, weights = topk_ids
+        return ids.to(torch.int64), weights.to(torch.float32)
+    packed = topk_ids.to(torch.int32)
+    ids = torch.bitwise_right_shift(packed, 16).to(torch.int64)
+    weights = packed.to(torch.int16).view(torch.bfloat16).to(torch.float32)
+    return ids, weights
+
+
 @torch.no_grad()
 def _moe_bf16_run_experts(
     hidden_states,
@@ -2472,27 +2595,24 @@ def _moe_bf16_run_experts(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
-    activation_type=ActivationType.Swiglu.value,
+    activation_type=3,
     situ_beta=None,
     situ_linear_beta=None,
 ):
     """Un-quantized (bf16) MoE expert computation."""
-    activation_type = normalize_activation_type(activation_type)
+    # Keep enum values local so the serialized reference needs only PyTorch.
+    swiglu, swiglu_step, geglu_tanh, relu2 = 3, 7, 8, 6
+    activation_type = int(activation_type)
     if situ_beta is not None or situ_linear_beta is not None:
         from ...fused_moe.cute_dsl.moe_utils import (
             validate_cute_dsl_moe_situ_config,
         )
 
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
-    if activation_type not in (
-        ActivationType.Swiglu,
-        ActivationType.GegluTanh,
-        ActivationType.Relu2,
-    ):
+    if activation_type not in (swiglu, swiglu_step, geglu_tanh, relu2):
         raise ValueError(
             f"Unsupported activation_type {activation_type!r}; "
-            f"expected {ActivationType.Swiglu!r}, "
-            f"{ActivationType.GegluTanh!r}, or {ActivationType.Relu2!r}"
+            "expected 3 (SwiGLU), 7 (SwiGLUStep), 8 (GeGLUTanh), or 6 (ReLU2)"
         )
     T, H = hidden_states.shape
     E_local, gemm1_out, _ = gemm1_weights.shape
@@ -2513,7 +2633,7 @@ def _moe_bf16_run_experts(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W1[le].t())
-        if activation_type == ActivationType.Relu2:
+        if activation_type == relu2:
             act = torch.relu(G1) ** 2
         else:
             X1, X2 = G1[:, :I], G1[:, I:]
@@ -2523,16 +2643,21 @@ def _moe_bf16_run_experts(
                 if situ_linear_beta is not None:
                     up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
                 act = gate * up
-            elif activation_type == ActivationType.GegluTanh:
+            elif activation_type == geglu_tanh:
                 act = torch.nn.functional.gelu(X2, approximate="tanh") * X1
+            elif activation_type == swiglu_step:
+                if gemm1_alpha is not None or gemm1_beta is not None:
+                    raise ValueError("SwiGLUStep accepts gemm1_clamp_limit only")
+                limit = _moe_expert_param(gemm1_clamp_limit, le, 7.0, X1.device)
+                up = torch.clamp(X1, min=-limit, max=limit)
+                gate = torch.clamp(torch.nn.functional.silu(X2), max=limit)
+                act = gate * up
             else:
                 limit = _moe_expert_param(
-                    gemm1_clamp_limit, le, DEFAULT_SWIGLU_LIMIT, X1.device
+                    gemm1_clamp_limit, le, torch.finfo(torch.float32).max, X1.device
                 )
-                alpha = _moe_expert_param(
-                    gemm1_alpha, le, DEFAULT_SWIGLU_ALPHA, X2.device
-                )
-                beta = _moe_expert_param(gemm1_beta, le, DEFAULT_SWIGLU_BETA, X1.device)
+                alpha = _moe_expert_param(gemm1_alpha, le, 1.0, X2.device)
+                beta = _moe_expert_param(gemm1_beta, le, 0.0, X1.device)
                 up = torch.clamp(X1, min=-limit, max=limit)
                 gate = torch.clamp(X2, max=limit)
                 act = gate * torch.sigmoid(alpha * gate) * (up + beta)
@@ -2590,6 +2715,7 @@ def _trtllm_bf16_moe_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
     **_unused,
 ):
     """Reference for TRT-LLM BF16 MoE (Default routing)."""
@@ -2607,6 +2733,7 @@ def _trtllm_bf16_moe_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
     )
 
 
@@ -2623,9 +2750,25 @@ def _trtllm_bf16_routed_moe_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
     **_unused,
 ):
     """Reference for TRT-LLM BF16 MoE with precomputed topk_ids."""
+    if int(activation_type) == 7:
+        topk_idx, w_topk = _step_decode_precomputed_routing(topk_ids)
+        return _moe_bf16_run_experts(
+            hidden_states,
+            gemm1_weights,
+            gemm2_weights,
+            w_topk,
+            topk_idx,
+            local_expert_offset,
+            int(num_experts),
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            activation_type=activation_type,
+        )
     T = topk_ids.shape[0]
     scale = float(routed_scaling_factor or 1.0)
     # Uniform weight per selected expert (real routing scales not available).
@@ -2646,7 +2789,57 @@ def _trtllm_bf16_routed_moe_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
     )
+
+
+@torch.no_grad()
+def _trtllm_fp8_per_tensor_step_run_experts(
+    hidden_states,
+    gemm1_weights,
+    output1_scales_scalar,
+    output1_scales_gate_scalar,
+    gemm2_weights,
+    output2_scales_scalar,
+    weights,
+    topk_idx,
+    local_expert_offset,
+    num_experts,
+    gemm1_clamp_limit=None,
+):
+    """StepFun epilogue with raw accumulator limits and calibrated FP8 scales."""
+    activations = hidden_states.to(torch.float32)
+    w1 = gemm1_weights.to(torch.float32)
+    w2 = gemm2_weights.to(torch.float32)
+    intermediate = w1.shape[1] // 2
+    output = torch.zeros_like(activations)
+    for local_idx in range(w1.shape[0]):
+        global_idx = int(local_expert_offset) + local_idx
+        if global_idx < 0 or global_idx >= int(num_experts):
+            continue
+        matches = topk_idx == global_idx
+        token_idx = torch.nonzero(matches.any(dim=1), as_tuple=False).squeeze(1)
+        if token_idx.numel() == 0:
+            continue
+        gemm1_out = activations.index_select(0, token_idx).matmul(w1[local_idx].t())
+        raw_up, raw_gate = gemm1_out[:, :intermediate], gemm1_out[:, intermediate:]
+        gate_scale = output1_scales_gate_scalar[local_idx].to(torch.float32)
+        raw_limit = (
+            7.0 / gate_scale
+            if gemm1_clamp_limit is None
+            else gemm1_clamp_limit[local_idx].to(torch.float32)
+        )
+        up = torch.clamp(raw_up, min=-raw_limit, max=raw_limit)
+        gate = torch.clamp(
+            torch.nn.functional.silu(raw_gate * gate_scale),
+            max=raw_limit * gate_scale,
+        )
+        activated = up * output1_scales_scalar[local_idx].to(torch.float32) * gate
+        expert_out = activated.matmul(w2[local_idx].t())
+        expert_out = expert_out * output2_scales_scalar[local_idx].to(torch.float32)
+        selected_weights = (weights * matches).sum(dim=1).index_select(0, token_idx)
+        output.index_add_(0, token_idx, expert_out * selected_weights.unsqueeze(1))
+    return output.to(torch.bfloat16)
 
 
 @torch.no_grad()
@@ -2663,6 +2856,8 @@ def _trtllm_fp8_per_tensor_scale_moe_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor=None,
+    activation_type=3,
+    gemm1_clamp_limit=None,
     **_unused,
 ):
     """Reference for TRT-LLM FP8 per-tensor scale MoE. Dequantizes per-expert."""
@@ -2670,6 +2865,20 @@ def _trtllm_fp8_per_tensor_scale_moe_reference(
     w_topk, topk_idx = _default_routing_weights(
         routing_logits, routing_bias, top_k, routed_scaling_factor
     )
+    if int(activation_type) == 7:
+        return _trtllm_fp8_per_tensor_step_run_experts(
+            hidden_states,
+            gemm1_weights,
+            output1_scales_scalar,
+            output1_scales_gate_scalar,
+            gemm2_weights,
+            output2_scales_scalar,
+            w_topk,
+            topk_idx,
+            local_expert_offset,
+            num_experts,
+            gemm1_clamp_limit,
+        )
     # Per-expert dequant: each expert has its own scalar scale for FC1 gate,
     # FC1 up, and FC2. Scale broadcasts over the non-expert dims.
     W1 = gemm1_weights.to(torch.float32)
@@ -2703,12 +2912,28 @@ def _trtllm_fp8_per_tensor_scale_routed_moe_reference(
     output2_scales_scalar,
     num_experts,
     local_expert_offset,
+    activation_type=3,
+    gemm1_clamp_limit=None,
     **_unused,
 ):
     """Reference for routed TRT-LLM FP8 per-tensor scale MoE."""
     packed_topk = topk_ids.to(torch.int32)
     topk_idx = torch.bitwise_right_shift(packed_topk, 16).to(torch.int64)
     topk_weights = packed_topk.to(torch.int16).view(torch.bfloat16).to(torch.float32)
+    if int(activation_type) == 7:
+        return _trtllm_fp8_per_tensor_step_run_experts(
+            hidden_states,
+            gemm1_weights,
+            output1_scales_scalar,
+            output1_scales_gate_scalar,
+            gemm2_weights,
+            output2_scales_scalar,
+            topk_weights,
+            topk_idx,
+            local_expert_offset,
+            num_experts,
+            gemm1_clamp_limit,
+        )
 
     T, H = hidden_states.shape
     E_local = gemm1_weights.shape[0]
@@ -2741,6 +2966,27 @@ def _trtllm_fp8_per_tensor_scale_routed_moe_reference(
     return output.to(torch.bfloat16)
 
 
+cast(Any, _trtllm_bf16_moe_reference)._trace_reference_dependencies = (
+    _moe_expert_param,
+    _moe_bf16_run_experts,
+    _default_routing_weights,
+)
+cast(Any, _trtllm_bf16_routed_moe_reference)._trace_reference_dependencies = (
+    _moe_expert_param,
+    _moe_bf16_run_experts,
+    _step_decode_precomputed_routing,
+)
+cast(Any, _trtllm_fp8_per_tensor_scale_moe_reference)._trace_reference_dependencies = (
+    _moe_expert_param,
+    _moe_bf16_run_experts,
+    _default_routing_weights,
+    _trtllm_fp8_per_tensor_step_run_experts,
+)
+cast(
+    Any, _trtllm_fp8_per_tensor_scale_routed_moe_reference
+)._trace_reference_dependencies = (_trtllm_fp8_per_tensor_step_run_experts,)
+
+
 @torch.no_grad()
 def _trtllm_fp8_block_scale_routed_moe_reference(
     topk_ids,
@@ -2757,6 +3003,8 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
     **_unused,
 ):
     """Reference for TRT-LLM FP8 block-scale routed MoE (precomputed topk_ids).
@@ -2765,15 +3013,19 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
     a uniform per-token weight tensor (real routing scales are not available
     from topk_ids alone).
     """
-    T = topk_ids.shape[0]
+    topk_idx = topk_ids
+    if int(activation_type) == 7:
+        topk_idx, w_topk = _step_decode_precomputed_routing(topk_ids)
+    T = topk_idx.shape[0]
     TOP_K = int(top_k)
     scale = float(routed_scaling_factor or 1.0)
-    w_topk = torch.full(
-        (T, TOP_K),
-        scale / TOP_K,
-        dtype=torch.float32,
-        device=hidden_states.device,
-    )
+    if int(activation_type) != 7:
+        w_topk = torch.full(
+            (T, TOP_K),
+            scale / TOP_K,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
     return _fp8_moe_run_experts(
         hidden_states,
         hidden_states_scale,
@@ -2782,12 +3034,14 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
         gemm2_weights,
         gemm2_weights_scale,
         w_topk,
-        topk_ids.to(torch.int64),
+        topk_idx.to(torch.int64),
         local_expert_offset,
         int(num_experts),
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
     )
 
 
@@ -2810,18 +3064,22 @@ def _trtllm_fp4_block_scale_routed_moe_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
-    **_unused,
+    **activation_kwargs,
 ):
     """Reference for TRT-LLM FP4 block-scale routed MoE (precomputed topk_ids)."""
-    T = topk_ids.shape[0]
+    topk_idx = topk_ids
+    if int(activation_type) == 7:
+        topk_idx, w_topk = _step_decode_precomputed_routing(topk_ids)
+    T = topk_idx.shape[0]
     TOP_K = int(top_k)
     scale = float(routed_scaling_factor or 1.0)
-    w_topk = torch.full(
-        (T, TOP_K),
-        scale / TOP_K,
-        dtype=torch.float32,
-        device=hidden_states.device,
-    )
+    if int(activation_type) != 7:
+        w_topk = torch.full(
+            (T, TOP_K),
+            scale / TOP_K,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
     return _fp4_moe_run_experts(
         hidden_states,
         hidden_states_scale,
@@ -2832,13 +3090,14 @@ def _trtllm_fp4_block_scale_routed_moe_reference(
         gemm1_bias,
         gemm2_bias,
         w_topk,
-        topk_ids.to(torch.int64),
+        topk_idx.to(torch.int64),
         local_expert_offset,
         int(num_experts),
         activation_type=activation_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        **activation_kwargs,
     )
 
 
@@ -3212,7 +3471,10 @@ _TRTLLM_MOE_COMMON_OUTPUTS: dict[str, Tensor | Scalar] = {
     ),
 }
 
-_TRTLLM_BF16_SWIGLU_OA_INPUTS: dict[str, Tensor] = {
+_TRTLLM_BF16_SWIGLU_OA_INPUTS: dict[str, Tensor | Scalar] = {
+    "activation_type": Scalar(
+        "int32", optional=True, description="3=SwiGLU, 7=SwiGLUStep, 6=ReLU2."
+    ),
     "gemm1_alpha": Tensor(
         ["num_local_experts"],
         dtype="float32",
@@ -3229,7 +3491,7 @@ _TRTLLM_BF16_SWIGLU_OA_INPUTS: dict[str, Tensor] = {
         ["num_local_experts"],
         dtype="float32",
         optional=True,
-        description="Optional per-expert SwiGLU OA clamp limit.",
+        description="Optional per-expert SwiGLU OA or SwiGLUStep clamp limit.",
     ),
 }
 
@@ -3288,6 +3550,15 @@ trtllm_fp8_per_tensor_scale_moe_trace = TraceTemplate(
     axes=dict(_TRTLLM_MOE_COMMON_AXES),
     inputs={
         **_TRTLLM_MOE_COMMON_INPUTS,
+        "gemm1_clamp_limit": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            optional=True,
+            description="Per-expert raw FC1 accumulator limits for SwiGLUStep.",
+        ),
+        "activation_type": Scalar(
+            "int32", optional=True, description="3=SwiGLU, 7=SwiGLUStep, 6=ReLU2."
+        ),
         "output1_scales_scalar": Tensor(
             ["num_local_experts"],
             dtype="float32",
@@ -3317,6 +3588,15 @@ trtllm_fp8_per_tensor_scale_routed_moe_trace = TraceTemplate(
     description="TRT-LLM FP8 per-tensor scale MoE with packed precomputed routing.",
     axes=dict(_TRTLLM_MOE_ROUTED_AXES),
     inputs={
+        "gemm1_clamp_limit": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            optional=True,
+            description="Per-expert raw FC1 accumulator limits for SwiGLUStep.",
+        ),
+        "activation_type": Scalar(
+            "int32", optional=True, description="3=SwiGLU, 7=SwiGLUStep, 6=ReLU2."
+        ),
         "topk_ids": Tensor(
             ["seq_len", "top_k"],
             dtype="int32",
@@ -3456,6 +3736,12 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
         ),
     },
     inputs={
+        "gemm1_bias": _FP4_STANDARD_INPUTS["gemm1_bias"],
+        "gemm2_bias": _FP4_STANDARD_INPUTS["gemm2_bias"],
+        "output1_scale_scalar": _FP4_STANDARD_INPUTS["output1_scale_scalar"],
+        "output1_scale_gate_scalar": _FP4_STANDARD_INPUTS["output1_scale_gate_scalar"],
+        "output2_scale_scalar": _FP4_STANDARD_INPUTS["output2_scale_scalar"],
+        "per_token_scale": _FP4_STANDARD_INPUTS["per_token_scale"],
         "topk_ids": Tensor(
             ["seq_len", "top_k"], dtype="int32", description="Precomputed top-k."
         ),
@@ -3517,6 +3803,144 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
     tags=["status:experimental", "backend:trtllm", "quantization:nvfp4"],
     reference=_trtllm_fp4_block_scale_routed_moe_reference,
 )
+
+
+# StepFun siblings preserve the existing activation's definition filenames.
+def _make_step_moe_trace(base: TraceTemplate, *, mxfp8: bool = False) -> TraceTemplate:
+    axes = dict(base.axes)
+    axes["activation_type"] = Const(abbrev="act", value=7)
+    inputs = dict(base.inputs)
+    inputs["activation_type"] = Scalar("int32", description="7=SwiGLUStep.")
+    if mxfp8:
+        rows = "num_weight_rows" if "num_weight_rows" in axes else "num_local_experts"
+        axes.pop("num_gemm1_out_blocks", None)
+        axes["num_hidden_blocks"] = Const(abbrev="", description="hidden_size / 32.")
+        axes["num_intermediate_blocks"] = Const(
+            abbrev="", description="intermediate_size / 32."
+        )
+        inputs["fp8_quantization_type"] = Scalar("int32", description="2=MxFp8.")
+        inputs["hidden_states_scale"] = Tensor(
+            ["seq_len", "num_hidden_blocks"],
+            description="Linear UE8M0 activation scales over 32 values along K.",
+        )
+        inputs["gemm1_weights_scale"] = Tensor(
+            [rows, "gemm1_out_size", "num_hidden_blocks"],
+            description="UE8M0 FC1 weight scales over 32 values along K.",
+        )
+        inputs["gemm2_weights_scale"] = Tensor(
+            [rows, "hidden_size", "num_intermediate_blocks"],
+            description="UE8M0 FC2 weight scales over 32 values along K.",
+        )
+        inputs["gemm1_clamp_limit"] = Tensor(
+            [rows],
+            dtype="float32",
+            optional=True,
+            description="Per-expert physical StepFun limit; None uses 7.",
+        )
+    return TraceTemplate(
+        op_type=base.op_type,
+        axes=axes,
+        inputs=inputs,
+        outputs=dict(base.outputs),
+        name_prefix=f"{base.name_prefix}_swiglu_step",
+        reference=base.reference,
+        check=base.check,
+        constraints=list(base.constraints),
+        tags=list(base.tags),
+        description=f"{base.description} StepFun caps the gate after SiLU.",
+    )
+
+
+def _make_step_moe_trace_dispatch(base: TraceTemplate, step: TraceTemplate):
+    def dispatch(**kwargs):
+        return step if int(kwargs.get("activation_type", 3)) == 7 else base
+
+    dispatch.templates = [base, step]  # type: ignore[attr-defined]
+    return dispatch
+
+
+trtllm_bf16_moe_step_trace = _make_step_moe_trace(trtllm_bf16_moe_trace)
+trtllm_bf16_routed_moe_step_trace = _make_step_moe_trace(trtllm_bf16_routed_moe_trace)
+trtllm_fp8_per_tensor_scale_moe_step_trace = _make_step_moe_trace(
+    trtllm_fp8_per_tensor_scale_moe_trace
+)
+trtllm_fp8_per_tensor_scale_routed_moe_step_trace = _make_step_moe_trace(
+    trtllm_fp8_per_tensor_scale_routed_moe_trace
+)
+
+trtllm_bf16_moe_trace_dispatch = _make_step_moe_trace_dispatch(
+    trtllm_bf16_moe_trace, trtllm_bf16_moe_step_trace
+)
+trtllm_bf16_routed_moe_trace_dispatch = _make_step_moe_trace_dispatch(
+    trtllm_bf16_routed_moe_trace, trtllm_bf16_routed_moe_step_trace
+)
+trtllm_fp8_per_tensor_scale_moe_trace_dispatch = _make_step_moe_trace_dispatch(
+    trtllm_fp8_per_tensor_scale_moe_trace, trtllm_fp8_per_tensor_scale_moe_step_trace
+)
+trtllm_fp8_per_tensor_scale_routed_moe_trace_dispatch = _make_step_moe_trace_dispatch(
+    trtllm_fp8_per_tensor_scale_routed_moe_trace,
+    trtllm_fp8_per_tensor_scale_routed_moe_step_trace,
+)
+trtllm_fp8_block_scale_routed_moe_step_trace = _make_step_moe_trace(
+    trtllm_fp8_block_scale_routed_moe_trace, mxfp8=True
+)
+trtllm_fp8_block_scale_routed_moe_trace_dispatch = _make_step_moe_trace_dispatch(
+    trtllm_fp8_block_scale_routed_moe_trace,
+    trtllm_fp8_block_scale_routed_moe_step_trace,
+)
+_STEP_MXFP8_TRACE_BY_ROUTING_TYPE = {
+    routing: _make_step_moe_trace(base, mxfp8=True)
+    for routing, base in _MOE_TRACE_BY_ROUTING_TYPE.items()
+}
+trtllm_mxfp8_step_shared_experts_trace = _make_step_moe_trace(
+    trtllm_fp8_block_scale_moe_ds_shared_experts_trace, mxfp8=True
+)
+trtllm_fp8_block_scale_moe_trace_dispatch.templates += [  # type: ignore[attr-defined]
+    *_STEP_MXFP8_TRACE_BY_ROUTING_TYPE.values(),
+    trtllm_mxfp8_step_shared_experts_trace,
+]
+
+for _fp8_reference in (
+    _trtllm_fp8_block_scale_moe_ds_routing_reference,
+    _trtllm_fp8_block_scale_moe_default_routing_reference,
+    _trtllm_fp8_block_scale_moe_renormalize_routing_reference,
+    _trtllm_fp8_block_scale_moe_llama4_routing_reference,
+    _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference,
+    _trtllm_fp8_block_scale_moe_topk_routing_reference,
+):
+    cast(Any, _fp8_reference)._trace_reference_dependencies = (_fp8_moe_run_experts,)
+cast(
+    Any, _trtllm_fp8_block_scale_routed_moe_reference
+)._trace_reference_dependencies = (
+    _step_decode_precomputed_routing,
+    _fp8_moe_run_experts,
+)
+_FP4_REFERENCE_DEPENDENCIES = (
+    _unpack_fp4_e2m1,
+    _ue8m0_to_float32,
+    _decode_block_scales,
+    _dequantize_fp4_tensor,
+    _dequantize_fp4_hidden_states,
+    _fp4_moe_run_experts,
+)
+for _fp4_reference in (
+    _trtllm_fp4_block_scale_moe_default_routing_reference,
+    _trtllm_fp4_block_scale_moe_renormalize_routing_reference,
+    _trtllm_fp4_block_scale_moe_ds_routing_reference,
+    _trtllm_fp4_block_scale_moe_llama4_routing_reference,
+    _trtllm_fp4_block_scale_moe_renormalize_naive_routing_reference,
+    _trtllm_fp4_block_scale_moe_topk_routing_reference,
+):
+    cast(
+        Any, _fp4_reference
+    )._trace_reference_dependencies = _FP4_REFERENCE_DEPENDENCIES
+cast(
+    Any, _trtllm_fp4_block_scale_routed_moe_reference
+)._trace_reference_dependencies = (
+    *_FP4_REFERENCE_DEPENDENCIES,
+    _step_decode_precomputed_routing,
+)
+
 
 # MxInt4 block-scale MoE
 trtllm_mxint4_block_scale_moe_trace = TraceTemplate(

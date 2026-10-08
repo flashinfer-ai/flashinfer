@@ -788,6 +788,45 @@ controls remain in backend-native `MoEWeightPack` views: TRT-LLM uses
 `situ_beta` / `situ_linear_beta`. Where supported, these tensors override the
 config-derived values.
 
+TRT-LLM supports StepFun's clipped activation through `SwiGLUStep(limit=7)`:
+
+```python
+activation = SwiGLUStep(limit=7.0)
+# Physical values, after FC1 dequantization:
+activated = up.clamp(-7.0, 7.0) * torch.nn.functional.silu(gate).clamp(max=7.0)
+```
+
+The gate is capped after SiLU. The fused epilogue accepts a per-expert
+`gemm1_clamp_limit` tensor and rejects `gemm1_alpha` / `gemm1_beta` for this
+activation. A null limit pointer uses physical `7`; a custom typed limit,
+including `SwiGLUStep(limit=16)`, is materialized during weight preparation.
+An explicit tensor in the prepared view overrides that typed limit.
+
+The tensor contains raw FC1 accumulator limits: for NVFP4 and per-tensor FP8,
+divide physical limits by the FC1 gate dequantization scale. BF16 and MXFP8
+use physical limits directly. The FP8 preparation helper performs this
+conversion, and the NVFP4 helper prepares unit global scales. With fused
+shared experts in NVFP4 or MXFP8, append the shared expert limits after the
+routed expert limits:
+
+```python
+limits = torch.full((num_local_experts + 1,), 7.0, device=device)
+limits[-1] = 16.0
+gate_scale = view.get(
+    "output1_scales_gate_scalar", view.get("output1_scale_gate_scalar")
+)
+view["gemm1_clamp_limit"] = (
+    limits if gate_scale is None else limits / gate_scale
+).contiguous()
+```
+
+The fused StepFun epilogue supports BF16, FP8 per tensor, MXFP8 block scale,
+and NVFP4. DeepSeek FP8 uses a separate activation kernel and rejects StepFun.
+NVFP4 also supports explicit per-token scaling through BF16-output FC1
+StepFun cubins followed by per-token requantization for FC2.
+The TRT-LLM backend requires batched-GEMM export `7.0.5.0.4.0` or later
+containing StepFun epilogues; older artifacts report missing StepFun kernels.
+
 `SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
 `linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the
 unclamped linear branch, which only the CuTe-DSL scalar ABI can express: the
@@ -851,13 +890,13 @@ python scripts/generate_moe_activation_matrix.py --write
 | `sm12x_fp8` | `SM12xFp8Config` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `sm12x_mxfp8_mxfp4` | `SM12xMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU` |
 | `sm12x_nvfp4_bf16` | `SM12xNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
-| `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
+| `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×BF16` | `SwiGLU` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
-| `trtllm_fp4_routed` | `TrtllmFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `trtllm_fp4_routed` | `TrtllmFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `SiTU`, `ReLU2` |
 | `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
-| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2` |
-| `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
+| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `ReLU2` |
+| `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
 
