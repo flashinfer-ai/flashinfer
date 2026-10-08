@@ -1003,19 +1003,23 @@ class _PrefillMetadata:
         batch_offsets_units="tokens",
     ):
         self._bounded_ragged = (
-            q_dtype == torch.bfloat16
+            q_dtype in (torch.float16, torch.bfloat16)
             # The bounded-override contract is part of FE 1.31. Keep older
             # stacks on the established broad cache rather than multiplying
             # their graphs without a usable packed split implementation.
             and head_dim_vo == 128
             and 4 <= num_qo_heads <= 64
             and (
-                (head_dim_qk == 192 and num_qo_heads == num_kv_heads)
+                (
+                    head_dim_qk == 192
+                    and q_dtype == torch.bfloat16
+                    and num_qo_heads == num_kv_heads
+                )
                 or (
                     head_dim_qk == 128
                     and num_kv_heads > 0
                     and num_qo_heads % num_kv_heads == 0
-                    and num_qo_heads // num_kv_heads in (1, 2, 4, 8)
+                    and num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16)
                 )
             )
             and _cudnn_supports_bounded_ragged(d128=head_dim_qk == 128)

@@ -785,8 +785,10 @@ def test_small_workspace_selection_reuse_and_capture(
 @requires_override
 @pytest.mark.parametrize("lse_layout", ["NH", "HN"])
 @pytest.mark.parametrize("shape_override", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_kv_heads", [1, 4])
 def test_graph_query_capacity_replan_and_capture(
-    monkeypatch, lse_layout, shape_override
+    monkeypatch, lse_layout, shape_override, dtype, num_kv_heads
 ):
     """Graph capacities are cache keys and survive shorter live replans."""
     if not cudnn_prefill._cudnn_supports_bounded_ragged():
@@ -799,7 +801,7 @@ def test_graph_query_capacity_replan_and_capture(
     workspace = torch.empty(128 << 20, device="cuda", dtype=torch.uint8)
     klens = [2048] * 3
     ko = _indptr(klens)
-    k = torch.zeros(sum(klens), 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(sum(klens), num_kv_heads, 128, device="cuda", dtype=dtype)
     v = torch.empty_like(k)
     for i in range(3):
         v[ko[i] : ko[i + 1]].fill_(i + 1)
@@ -823,7 +825,13 @@ def test_graph_query_capacity_replan_and_capture(
 
             def plan(lens):
                 wrapper.plan(
-                    _indptr(lens), ko, 16, 4, 128, q_data_type=q.dtype, causal=True
+                    _indptr(lens),
+                    ko,
+                    16,
+                    num_kv_heads,
+                    128,
+                    q_data_type=q.dtype,
+                    causal=True,
                 )
 
             def run():
