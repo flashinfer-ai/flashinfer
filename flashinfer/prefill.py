@@ -3342,11 +3342,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 if self._cudnn_paged_bounds is not None:
                     max_pages = max(max_pages, self._cudnn_paged_bounds[1] // page_size)
                     if self.is_cuda_graph_enabled:
-                        # Any request may later own the initialized indices.
-                        # Reserve the admitted KV range once for old captures.
+                        # Any request may later own all initialized indices,
+                        # even after auto selects FA2 for a longer prefix. Also
+                        # reserve padding for the largest admitted KV bucket.
+                        index_capacity = self._paged_kv_indices_buf.numel()
+                        admitted_pages = min(index_capacity, 32768 // page_size)
                         max_pages = max(
                             max_pages,
-                            min(self._paged_kv_indices_buf.numel(), 32768 // page_size),
+                            index_capacity,
+                            1 << (admitted_pages - 1).bit_length(),
                         )
                 old_table = self._cudnn_block_tables
                 if (

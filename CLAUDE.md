@@ -165,8 +165,11 @@ provider's metadata pointers. Keep wrapper-owned tables and length buffers alive
 and refresh them in `plan()` whenever replay can still use them; `run()` must not
 rebuild or repack metadata. Validate transitions with changed page IDs as well as
 changed lengths. Shortening a KV prefix without changing page IDs can accidentally
-pass while the captured table is stale. Keep numerical and lifetime tests
-independent of heuristic winners and timing thresholds.
+pass while the captured table is stale. Table capacity must cover initialized
+indices and rounded graph bounds; also test a fallback beyond cuDNN admission.
+Replay an old capture only with lengths inside its declared bounds and compatible
+buffers. Keep numerical and lifetime tests independent of heuristic winners and
+timing thresholds.
 
 ## Benchmarking
 

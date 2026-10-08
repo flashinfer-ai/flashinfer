@@ -1370,3 +1370,93 @@ def test_paged_auto_fallback_refreshes_retained_capture(
             check()
     finally:
         graph.reset()
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize(
+    "page_capacity,larger_kv,fallback", [(300, 4500, False), (2304, 36000, True)]
+)
+def test_paged_auto_capture_reserves_initialized_page_capacity(
+    monkeypatch, page_capacity, larger_kv, fallback
+):
+    if (
+        not prefill._cudnn_supports_paged_auto()
+        or torch.cuda.get_device_capability() != (10, 0)
+    ):
+        pytest.skip("requires the qualified SM100 paged-auto runtime")
+    # Select the provider independently of evolving performance heuristics.
+    admitted = [True]
+    monkeypatch.setattr(
+        flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: admitted[0]
+    )
+    q = torch.randn(64, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(page_capacity, 16, 2, 128, device=q.device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    qo = torch.tensor([0, len(q)], dtype=torch.int32)
+    indices = torch.randperm(page_capacity, device=q.device, dtype=torch.int32)
+    out = torch.empty_like(q)
+    lse = torch.empty((8, len(q)), device=q.device)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, device=q.device, dtype=torch.uint8),
+        kv_layout="HND",
+        backend="auto",
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.empty_like(qo, device=q.device),
+        paged_kv_indptr_buf=torch.empty_like(qo, device=q.device),
+        paged_kv_indices_buf=torch.empty_like(indices),
+        paged_kv_last_page_len_buf=torch.empty(1, device=q.device, dtype=torch.int32),
+    )
+
+    def plan(kv_length):
+        ip = torch.tensor([0, (kv_length + 15) // 16], dtype=torch.int32)
+        last = torch.tensor([(kv_length - 1) % 16 + 1], dtype=torch.int32)
+        ix = indices[: int(ip[-1])]
+        wrapper.plan(qo, ip, ix, last, 8, 2, 128, 16, causal=True, q_data_type=q.dtype)
+        return ip, ix, last
+
+    def run():
+        wrapper.run(
+            q,
+            (k.transpose(1, 2), v.transpose(1, 2)),
+            out=out,
+            lse=lse,
+            return_lse=True,
+            lse_layout="HN",
+            lse_base="ln",
+        )
+
+    def check(metadata):
+        expected, stats = _reference(
+            q, k, v, qo, *metadata, causal=True, scale=128**-0.5
+        )
+        torch.testing.assert_close(out.float(), expected, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(lse.T, stats, atol=0.001, rtol=0.001)
+
+    metadata = plan(2100)
+    run()
+    check(metadata)
+    table = wrapper._cudnn_block_tables
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run()
+        admitted[0] = not fallback
+        indices = indices.roll(17)
+        metadata = plan(larger_kv)
+        assert wrapper._backend == ("fa2" if fallback else "cudnn")
+        assert wrapper._cudnn_block_tables is table
+        run()
+        check(metadata)
+        # An old capture is replayable only within its declared bounds. Return
+        # to that range with different page IDs and values before replaying it.
+        admitted[0] = True
+        indices = indices.roll(31)
+        metadata = plan(2100)
+        assert wrapper._cudnn_block_tables is table
+        v.mul_(0.75)
+        out.fill_(torch.nan)
+        lse.fill_(torch.nan)
+        graph.replay()
+        check(metadata)
+    finally:
+        graph.reset()
