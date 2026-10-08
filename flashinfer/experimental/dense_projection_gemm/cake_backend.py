@@ -476,6 +476,7 @@ def instance_key(
     sk_slab: int = 0,
     cta1: bool = False,
     cgrp: bool = False,
+    ovr: bool = False,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
@@ -483,7 +484,7 @@ def instance_key(
     overlapped single-TMEM-buffer tall epilogue, ``htail`` = deterministic half-height tail wave, ``b_swz`` = MN-major B
     panel width in bytes (128 / 64 / 32; K-major B instances always keep 128), ``sk_exact`` = exact p-way stream-K
     split, ``_skx`` symbols; round 18 (Cake W2): ``sk_sync`` = synchronised stream-K tail, field 26, ``_sks`` symbols;
-    round 19: ``sk_slab`` (Cake W2, field 27, ``_sb{n}``) and ``cta1`` (Cake W3, field 28, ``_c1``); round 21: ``cgrp`` (Cake W3, field 29 = LAST, ``_cg``), see below); the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11 (under ``cgrp`` the group counts column tiles).  ``smem_limit`` (bytes; default = the largest
+    round 19: ``sk_slab`` (Cake W2, field 27, ``_sb{n}``) and ``cta1`` (Cake W3, field 28, ``_c1``); round 21: ``cgrp`` (Cake W3, field 29, ``_cg``); round 24: ``ovr`` (the round-20 Cake W3 knob ported in round 23 by W4, field 30 = LAST, ``_or``), see below); the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11 (under ``cgrp`` the group counts column tiles).  ``smem_limit`` (bytes; default = the largest
     architecture limit, ``smem_limit_for(None)``) only bounds the stage count - it is not part of
     the key, so an instance has one symbol on every architecture (the planner passes
     ``smem_limit_for(arch)`` like the Cake launcher).  Diagnostic (attribution) instances are not
@@ -505,14 +506,22 @@ def instance_key(
     policies / probes (``htail`` / ``sk_exact`` / ``sk_sync`` / ``a_mcast``), the tall and 64-row families (``ovl`` /
     ``park``) and the batched raster knob.  Its B stage streams the whole BLOCK_N columns per CTA, so the stage
     geometry (``b_stage_bytes`` / ``default_stages`` / ``box_rows_of``) takes the CTA group.
-    ``cgrp`` (round 21, Cake W3, field 29 = LAST, symbol ``_cg``) selects the column-grouped raster: the ``group_m``
+    ``cgrp`` (round 21, Cake W3, field 29, symbol ``_cg``) selects the column-grouped raster: the ``group_m``
     launch parameter counts COLUMN tiles per raster group (any count >= 1) and consecutive pairs sweep a group's
     columns of one pair row before the next pair row (a group's B panels stay L2-resident, A streams once per column
-    group); every other field is unchanged and the OFF form renders byte-identical.  [Cake ``instance_key``]"""
+    group); every other field is unchanged and the OFF form renders byte-identical.
+    ``ovr`` (round 24; the round-20 Cake W3 knob ported in round 23 by W4, field 30 = LAST, symbol ``_or`` after
+    ``_cg``) selects the overlapped tall epilogue released by row half: the eight epilogue warps drain TMEM buffer 0
+    (rows [0, 128), 32 rows x 128 columns per warp) and release it to the next tile's half-0 MMAs while buffer 1 is
+    drained; the B stage keeps the plain tall layout (one N = 256 MMA per row half per K step - half the tcgen05.mma
+    issues and 3/4 of the tensor-core SMEM operand traffic of ``ovl``).  Tall 256-column tiles only; it excludes
+    ``ovl`` / ``park`` and the pf / box_rows / a_mcast probes, and (like ``ovl``) the synchronised stream-K plan and
+    the single-CTA form; every other field is unchanged and the OFF form renders byte-identical.  [Cake ``instance_key``]"""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf = int(block_n), int(cta_rows), int(pf)
     cta1 = bool(cta1)
     cgrp = bool(cgrp)
+    ovr = bool(ovr)
     cg = 1 if cta1 else CTA_GROUP
     hints = (str(hints[0]), str(hints[1]))
     if any(h not in L2_HINTS for h in hints):
@@ -590,6 +599,23 @@ def instance_key(
         raise ValueError(
             f"ovl owns the 256-column B load coordinates and needs the 128-byte B swizzle (got b_swz={b_swz})"
         )
+    if ovr and (
+        cta_rows != 256
+        or block_n != 256
+        or ovl
+        or park
+        or pf
+        or box_rows
+        or "a_mcast" in diag
+    ):
+        # round 20 (Cake W3, ported in round 23 by W4): the row-half release is the overlapped epilogue of the tall
+        # 256-column tile over the plain B stage (one N = 256 MMA per row half per K step); it excludes the column-chunk
+        # release, the parked epilogue and the prefetch / box cap / A-multicast probe (the planner never emits diag, so
+        # the a_mcast term is inert; kept for message parity)  [Cake instance_key]
+        raise ValueError(
+            f"ovr needs cta_rows=256, block_n=256 and no ovl / park / pf / box_rows / a_mcast (got cta_rows={cta_rows}, "
+            f"block_n={block_n}, ovl={ovl}, park={park}, pf={pf}, box_rows={box_rows}, diag={diag})"
+        )
     htail = bool(htail)
     if htail and (cta_rows not in (128, 256) or pf or box_rows or "a_mcast" in diag):
         raise ValueError(
@@ -616,12 +642,13 @@ def instance_key(
         raise ValueError(
             "sk_sync (synchronised stream-K) excludes htail and sk_exact - one tail policy per instance"
         )
-    if sk_sync and (ovl or park or int(pd) or "a_mcast" in diag):
+    if sk_sync and (ovl or ovr or park or int(pd) or "a_mcast" in diag):
         # round 18 (Cake W2): the synchronised plan's two-partial fixup closes a unit's single-pass or serialised tall
-        # epilogue; the overlapped / parked tall forms, the pipelined drain and the A multicast are excluded  [Cake instance_key]
+        # epilogue; the overlapped (column-chunk ``ovl`` / row-half ``ovr``) / parked tall forms, the pipelined drain
+        # and the A multicast are excluded  [Cake instance_key]
         raise ValueError(
-            f"sk_sync needs the single-pass or the serialised tall epilogue (no ovl / park / pd / a_mcast; got ovl={ovl}, "
-            f"park={park}, pd={pd}, diag={diag})"
+            f"sk_sync needs the single-pass or the serialised tall epilogue (no ovl / ovr / park / pd / a_mcast; got ovl={ovl}, "
+            f"ovr={ovr}, park={park}, pd={pd}, diag={diag})"
         )
     # L1::no_allocate.L2::evict_first on the fp32 v8 stores: only that store form carries the hint  [Cake instance_key]
     store_ef = bool(store_ef) and f32_v8
@@ -679,6 +706,7 @@ def instance_key(
     if cta1 and (
         cta_rows != 128
         or ovl
+        or ovr
         or park
         or htail
         or sk_exact
@@ -687,10 +715,10 @@ def instance_key(
         or "a_mcast" in diag
     ):
         # round 19 (Cake W3): the single-CTA form is the 128-row single-pass family without the pair-level tail
-        # policies / probes  [Cake instance_key]
+        # policies / probes (and without the tall family's overlapped epilogues ``ovl`` / ``ovr``)  [Cake instance_key]
         raise ValueError(
-            f"cta1 needs cta_rows=128 and no ovl / park / htail / sk_exact / sk_sync / batch_group / a_mcast (got "
-            f"cta_rows={cta_rows}, ovl={ovl}, park={park}, htail={htail}, sk_exact={sk_exact}, sk_sync={sk_sync}, "
+            f"cta1 needs cta_rows=128 and no ovl / ovr / park / htail / sk_exact / sk_sync / batch_group / a_mcast (got "
+            f"cta_rows={cta_rows}, ovl={ovl}, ovr={ovr}, park={park}, htail={htail}, sk_exact={sk_exact}, sk_sync={sk_sync}, "
             f"batch_group={batch_group}, diag={diag})"
         )
     return (
@@ -723,6 +751,7 @@ def instance_key(
         sk_slab,
         cta1,
         cgrp,
+        ovr,
     )
 
 
@@ -737,8 +766,9 @@ def instance_symbol(key: tuple) -> str:
     p-way stream-K split (round 13), ``_sks`` for the synchronised stream-K tail (round 18) followed by ``_sb<n>`` for
     its slab path (round 19), ``_so<f|l|n>`` after the batch-raster term for the TMA-store L2 eviction policy,
     then ``_pd<n>`` / ``_sh<n>`` for the pipelined TMEM drain / suspend-time hint (round 15), ``_c1`` for
-    the single-CTA form (round 19; its default stage count is the single-CTA fit) and a trailing ``_cg`` for the
-    column-grouped raster (round 21)).  [Cake ``instance_symbol``]"""
+    the single-CTA form (round 19; its default stage count is the single-CTA fit), ``_cg`` for the column-grouped
+    raster (round 21) and a trailing ``_or`` for the tall epilogue released by row half (round 24)).
+    [Cake ``instance_symbol``]"""
     (
         a_mn,
         b_mn,
@@ -769,6 +799,7 @@ def instance_symbol(key: tuple) -> str:
         sk_slab,
         cta1,
         cgrp,
+        ovr,
     ) = key
     cg = 1 if cta1 else CTA_GROUP
     so = {
@@ -816,6 +847,7 @@ def instance_symbol(key: tuple) -> str:
         + (f"_sh{sh}" if sh else "")
         + ("_c1" if cta1 else "")
         + ("_cg" if cgrp else "")
+        + ("_or" if ovr else "")
         + "".join(f"_{d}" for d in diag)
     )
 
@@ -884,14 +916,15 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', True, True, True, True, False, 576, None, 6144): {"hints": ('evict_first', 'evict_first'), "epi": 'tma'},
     ('sm_107a', False, False, False, False, False, 32, 6144, None): {"promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, False, 576, 6144, None): {"cta_rows": 256, "hints": ('evict_first', 'none'), "stages": 5},
+    ('sm_107a', False, False, False, False, False, 2048, 6144, None): {"group_m": 8, "cgrp": True},
     ('sm_107a', False, False, False, False, False, 6144, 2048, None): {"htail": True},
-    ('sm_107a', False, False, False, False, False, 6144, 12288, None): {"cta_rows": 256, "sk_parts": 3},
-    ('sm_107a', False, False, False, False, False, 6144, 16384, None): {"cta_rows": 256, "ovl": True, "htail": True},
+    ('sm_107a', False, False, False, False, False, 6144, 12288, None): {"cta_rows": 256, "group_m": 12, "sk_parts": 3, "cgrp": True, "ovr": True},
+    ('sm_107a', False, False, False, False, False, 6144, 16384, None): {"cta_rows": 256, "group_m": 8, "htail": True, "cgrp": True, "ovr": True},
     ('sm_107a', False, False, False, False, False, 16384, 2048, None): {"group_m": 32},
     ('sm_107a', False, False, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, True, 256, 512, None): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, True, 512, 256, None): {"promo": 'l2_256b'},
-    ('sm_107a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 128, "group_m": 2, "slots": 2, "pd": 2},
+    ('sm_107a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 128, "group_m": 2, "slots": 2, "pd": 3, "cta1": True},
     ('sm_107a', False, True, False, False, False, 6144, 128, None): {"cta_rows": 128, "slots": 2, "pd": 2},
     ('sm_107a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "epi": 'reg', "quad_store": True, "pd": 1},
     ('sm_107a', False, True, False, False, False, 6144, 2048, None): {"htail": True},
@@ -905,7 +938,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, True, False, False, 2048, 4096, None): {"epi": 'reg', "stages": 9, "f32_v8": True, "store_ef": True},
     ('sm_107a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_107a', False, True, True, False, False, 2048, 16384, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
-    ('sm_107a', False, True, True, False, False, 6144, 32, None): {"block_n": 128, "group_m": 2, "slots": 2},
+    ('sm_107a', False, True, True, False, False, 6144, 32, None): {"block_n": 128, "group_m": 2, "slots": 1, "cta1": True},
     ('sm_107a', False, True, True, False, False, 6144, 128, None): {"block_n": 128},
     ('sm_107a', False, True, True, False, False, 6144, 576, None): {"group_m": 8, "promo": 'l2_256b'},
     ('sm_107a', False, True, True, False, False, 6144, 2048, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "htail": True},
@@ -913,6 +946,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, True, False, False, 12288, 6144, None): {"cta_rows": 256},
     ('sm_107a', False, True, True, False, False, 16384, 6144, None): {"cta_rows": 256},
     ('sm_107a', True, True, False, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "group_m": 4, "sk_parts": 2, "b_swz": 64},
+    ('sm_107a', True, True, False, False, False, 2048, None, 6144): {"sk_sync": True, "sk_sync_m": 38, "sk_slab": 2},
     ('sm_107a', True, True, False, False, False, 6144, None, 2048): {"sk_sync": True, "sk_sync_m": 26},
     ('sm_107a', True, True, False, False, False, 6144, None, 12288): {"cta_rows": 256, "sk_parts": 2},
     ('sm_107a', True, True, False, False, False, 12288, None, 6144): {"sk_parts": 3},
@@ -1310,11 +1344,17 @@ class GemmPlan:
     # 128 x BLOCK_N tile per CTA with cluster dims (1, 1, 1), so ``m_tiles`` is not rounded to pairs, ``pair_tiles``
     # counts CTA tiles, ``sm_pairs`` holds the SM count and ``grid`` = ``num_cluster_tiles`` CTAs
     cta1: bool = False
-    # round 21 (Cake W3): the column-grouped raster (instance_key field 28 = the 29th and LAST field, ``_cg`` symbols):
+    # round 21 (Cake W3): the column-grouped raster (instance_key field 28 = the 29th field, ``_cg`` symbols):
     # ``group_m`` counts COLUMN tiles per raster group (any count >= 1; the pair invariant is unchanged), consecutive
     # pairs sweep a group's columns of one pair row before the next pair row, so a group's B panels stay L2-resident
     # and A streams once per column group; the plan arithmetic (tiles, units, tail policy, grid) is the pair form's
     cgrp: bool = False
+    # round 24 (the round-20 Cake W3 knob ported in round 23 by W4): the overlapped tall epilogue released by ROW HALF
+    # (instance_key field 29 = the 30th and LAST field, ``_or`` symbols, after ``_cg``): the eight epilogue warps drain
+    # TMEM buffer 0 and release it to the next tile's half-0 MMAs while buffer 1 drains; the B stage keeps the plain
+    # tall layout (one N = 256 MMA per row half per K step).  Tall 256-column tiles only; it replaces ``ovl`` on a row
+    # (never both), and the plan arithmetic (tiles, units, tail policy, grid, hint gate) is the tall pair form's
+    ovr: bool = False
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -1415,6 +1455,7 @@ def plan_dense_projection_gemm(
     sk_slab: Optional[int] = None,
     cta1: Optional[bool] = None,
     cgrp: Optional[bool] = None,
+    ovr: Optional[bool] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -1435,6 +1476,10 @@ def plan_dense_projection_gemm(
     with the launcher's yield rules for a rule-derived value.  Round 21: ``cgrp`` (Cake W3) selects the
     column-grouped raster program (``_cg``): ``group_m`` counts column tiles per raster group (any count >= 1) and
     the hint gate takes the column raster's wave working set (``default_hints_cgrp``); the plan arithmetic is unchanged.
+    Round 24: ``ovr`` (the round-20 Cake W3 knob ported in round 23 by W4) selects the tall epilogue released by row
+    half (``_or``, instance-key field 30): a rule-derived ``ovr`` yields to a caller-forced ``ovl``, a caller-forced
+    ``ovr`` replaces a rule-derived ``ovl`` (forcing both raises in ``instance_key``), it is dropped at BLOCK_N != 256,
+    and it leaves the raster, the hint gate and the plan arithmetic unchanged.
     [Cake ``dense_projection_gemm`` L1234-L1358]
 
     One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
@@ -1475,6 +1520,7 @@ def plan_dense_projection_gemm(
         sk_slab=sk_slab,
         cta1=cta1,
         cgrp=cgrp,
+        ovr=ovr,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -1554,6 +1600,7 @@ def plan_dense_projection_gemm(
                 "sk_sync_m",
                 "sk_slab",
                 "cta1",
+                "ovr",
             )
         }
     if cta1 is None:
@@ -1606,8 +1653,23 @@ def plan_dense_projection_gemm(
         quad_store = rule.get("quad_store", False)
     if park is None:
         park = rule.get("park", False)
+    rule_ovl = ovl is None
     if ovl is None:
         ovl = rule.get("ovl", False)
+    if ovr is None:
+        # round 20 (Cake W3) / round 24: the overlapped tall epilogue released by row half, from the row's rule  [Cake launcher]
+        ovr = rule.get("ovr", False)
+        if ovr and ovl and not rule_ovl:
+            # round 24: a caller-forced column-chunk release replaces the row's row-half release (the registrations of
+            # the ``_ov`` programs at rows whose rule now carries ovr)  [Cake launcher]
+            ovr = False
+    elif ovr and rule_ovl:
+        # a caller-forced row-half release replaces the row's column-chunk release (sweeps / registrations of the
+        # ``_or`` programs); forcing both raises (instance_key)  [Cake launcher]
+        ovl = False
+    if ovr and int(block_n) != 256:
+        # like ovl: built for the 256-column tall tile  [Cake launcher]
+        ovr = False
     if htail is None:
         htail = rule.get("htail", False)
     if b_swz is None:
@@ -1653,7 +1715,11 @@ def plan_dense_projection_gemm(
         # the overlapped epilogue is built for the 256-column tall tile; a narrower tall tile keeps the serialized
         # tall epilogue  [Cake launcher]
         ovl = False
-    if sk_sync and rule_sk_sync and (ovl or park or int(pd) or htail or sk_exact):
+    if (
+        sk_sync
+        and rule_sk_sync
+        and (ovl or ovr or park or int(pd) or htail or sk_exact)
+    ):
         # The row's synchronised plan needs the single-pass or the serialised tall epilogue and is the row's only tail
         # policy (instance_key); a caller that forces another form on the row gets that form with the plain plan - the
         # rule's tail policy does not carry over (the Cake launcher also yields to its ``a_mcast`` attribution probe, which
@@ -1815,6 +1881,7 @@ def plan_dense_projection_gemm(
         sk_slab=int(sk_slab) if sync_plan is not None else 0,
         cta1=cta1,
         cgrp=cgrp,
+        ovr=ovr,
     )
     plan = GemmPlan(
         L=L,
@@ -1861,6 +1928,7 @@ def plan_dense_projection_gemm(
         sk_slab=int(key[26]),
         cta1=bool(key[27]),
         cgrp=bool(key[28]),
+        ovr=bool(key[29]),
     )
     if _fallback and plan.template not in KERNELS.get(arch, {}):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
@@ -2105,6 +2173,7 @@ def prepare_dense_projection_gemm(
     sk_slab: Optional[int] = None,
     cta1: Optional[bool] = None,
     cgrp: Optional[bool] = None,
+    ovr: Optional[bool] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
@@ -2153,6 +2222,7 @@ def prepare_dense_projection_gemm(
         sk_slab=sk_slab,
         cta1=cta1,
         cgrp=cgrp,
+        ovr=ovr,
         arch=arch,
     )
     module_name = select_module(arch, plan.template)
