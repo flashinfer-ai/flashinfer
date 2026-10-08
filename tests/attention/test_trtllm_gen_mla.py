@@ -12,6 +12,7 @@ from flashinfer.autotuner import autotune
 from flashinfer.mla import _core as core
 from flashinfer.mla import (
     MLALayerDimensions,
+    compact_query_mla_dimensions,
     deepseek_mla_dimensions,
     supported_mla_layer_dimensions,
     smaller_mla_dimensions,
@@ -1522,6 +1523,9 @@ def test_trtllm_batch_decode_mla_sparse(
 @pytest.mark.parametrize("batch_size", [1, 3])
 def test_trtllm_batch_decode_mla_sparse_compact_query(batch_size: int):
     """Test sparse MLA with a 64-wide query and latent rank 512."""
+    dimensions = compact_query_mla_dimensions
+    assert dimensions == core.MLAHeadDimensions(64, 64, 128, 512)
+    assert dimensions in core.supported_mla_head_dimensions
     trtllm_batch_decode_mla_sparse(
         batch_size=batch_size,
         scale=1.0,
@@ -1531,7 +1535,7 @@ def test_trtllm_batch_decode_mla_sparse_compact_query(batch_size: int):
         is_varlen=True,
         enable_pdl=False,
         backend="trtllm-gen",
-        qk_nope_head_dim=64,
+        qk_nope_head_dim=dimensions.qk_nope_head_dim,
         num_attn_heads=8,
     )
 
