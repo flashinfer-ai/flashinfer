@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Complete distributed BF16 MoK validation on one peer-accessible GPU domain.
+"""Complete distributed MoK validation on one peer-accessible GPU domain.
 
-Launch one process per GPU with torchrun; WORLD_SIZE must be 16 or 64.
-Defaults exercise 16,384 source tokens/rank, H=6144, I=2048, E=256, top-8.
-Use --layout and --routing to run matrix rows in independent processes.
-All reference checks are outside the benchmark and captured training graph.
+Launch one process per GPU with torchrun; WORLD_SIZE is 4, 8, 16, 32 or 64.
+Defaults exercise 16,384 source tokens/rank, H=6144, I=2048, E=256, top-8;
+``--experts 288`` selects the GLM-5.3-Flash layout (EP8 or EP32) and
+``--swiglu-limit`` its clamped SwiGLU. Use --layout and --routing to run
+matrix rows in independent processes. BF16 runs gate every element of all
+nine outputs against the BF16 autograd reference; ``--mxfp8`` runs routed
+experts natively in MXFP8 and gates the global relative L2 error of the
+routed-dependent outputs against an FP32 reference plus the BF16 shared
+expert weight gradients elementwise. All reference checks are outside the
+benchmark and captured training graph.
 """
 
 import argparse
@@ -20,8 +26,14 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from flashinfer.mok import create_mok_bf16_workspace, prepare_mok_bf16
+from flashinfer.mok import (
+    create_mok_bf16_workspace,
+    prepare_mok_bf16,
+    quantize_mok_mxfp8_weights,
+)
 from mok_bf16_toy import RESULT_NAMES, TrainingIteration, error_report, reference
+
+MXFP8_REL_L2 = 0.15
 
 
 def source_counts(ep, layout, tokens):
@@ -51,13 +63,13 @@ def source_counts(ep, layout, tokens):
         ]
         if tokens != 16384:
             raise ValueError("The strong layout is defined for 16384 tokens/rank")
-        return pattern * (ep // len(pattern))
+        return (pattern * max(1, ep // len(pattern)))[:ep]
     if layout == "empty":
         return [0] * ep
     raise ValueError(layout)
 
 
-def make_weights(rank, ep, hidden, intermediate, device):
+def make_weights(rank, ep, hidden, intermediate, device, experts=256):
     def one(seed):
         torch.manual_seed(seed)
         return (
@@ -69,14 +81,14 @@ def make_weights(rank, ep, hidden, intermediate, device):
         )
 
     shared = one(33471)
-    local_experts = 256 // ep
+    local_experts = experts // ep
     routed = [
         one(32471 + e) for e in range(rank * local_experts, (rank + 1) * local_experts)
     ]
     return (*shared, *(torch.stack([v[k] for v in routed]) for k in range(3)))
 
 
-def make_data(counts, hidden, routing, generation, device):
+def make_data(counts, hidden, routing, generation, device, experts=256):
     total = sum(counts)
     x = torch.empty(total, hidden, device=device, dtype=torch.bfloat16)
     dy = torch.empty_like(x)
@@ -92,11 +104,13 @@ def make_data(counts, hidden, routing, generation, device):
         )
         # Sampling without replacement keeps eight distinct expert IDs/token.
         if routing == "uniform":
-            chosen = torch.rand(count, 256, device=device).topk(8, dim=-1).indices
+            chosen = torch.rand(count, experts, device=device).topk(8, dim=-1).indices
         else:
-            hot = torch.rand(count, 64, device=device).topk(4, dim=-1).indices
-            cold = torch.rand(count, 192, device=device).topk(4, dim=-1).indices + 64
-            chosen = torch.cat((hot, cold), dim=-1)
+            # Four of the first quarter of experts and four of the rest.
+            hot_n = experts // 4
+            hot = torch.rand(count, hot_n, device=device).topk(4, dim=-1).indices
+            cold = torch.rand(count, experts - hot_n, device=device).topk(4, dim=-1)
+            chosen = torch.cat((hot, cold.indices + hot_n), dim=-1)
         ids[rows].copy_(chosen)
         s = torch.rand(count, 8, device=device) + 0.125
         scores[rows].copy_(s / s.sum(-1, keepdim=True) * 2.5)
@@ -130,14 +144,15 @@ def snapshot(outputs, path=None):
 
 def audit_routes(iteration, data, counts, rank, ep):
     storage = iteration.workspace.storage
+    experts = iteration.weights[3].shape[0] * ep
     expected = torch.full_like(storage.all_gather_top_experts_buffer, -1)
     offset = 0
     for peer, count in enumerate(counts):
         expected[peer, :count].copy_(data["expert_ids"][offset : offset + count])
         offset += count
     assert torch.equal(expected, storage.all_gather_top_experts_buffer)
-    histogram = torch.bincount(data["expert_ids"].flatten(), minlength=256)
-    local_experts = 256 // ep
+    histogram = torch.bincount(data["expert_ids"].flatten(), minlength=experts)
+    local_experts = experts // ep
     own = histogram[rank * local_experts : (rank + 1) * local_experts]
     padded = ((own + 255) // 256) * 256
     schedule = iteration.schedule
@@ -151,16 +166,18 @@ def audit_routes(iteration, data, counts, rank, ep):
     assert valid.sum().item() == own.sum().item()
     limits = torch.tensor(counts, device=storage.device)[peers] * 8
     assert torch.all((indices >= 0) & (indices < limits)).item()
+    # Only the active 256-row prefix past the real rows is padded and read;
+    # rows beyond it (reserved capacity) are never touched.
     n = counts[rank]
+    rows = max(256, (n + 255) // 256 * 256)
     for tail in (
-        storage.x_buffer[n:],
-        storage.d_y_buffer[n:],
-        storage.combine_buffer[n * 8 :],
-        storage.d_x_routed_buffer[n * 8 :],
-        storage.d_router_weight_buffer[n:],
+        storage.d_y_buffer[n:rows],
+        storage.combine_buffer[n * 8 : rows * 8],
+        storage.d_x_routed_buffer[n * 8 : rows * 8],
+        storage.d_router_weight_buffer[n:rows],
     ):
         assert torch.count_nonzero(tail).item() == 0
-    assert torch.all(storage.router_weight_buffer[n:] == 1).item()
+    assert torch.all(storage.router_weight_buffer[n:rows] == 1).item()
     if n == 0:
         assert all(torch.count_nonzero(t).item() == 0 for t in iteration.outputs[6:])
     dist.barrier()
@@ -250,8 +267,8 @@ def run(args):
         "nccl", device_id=device, timeout=datetime.timedelta(seconds=600)
     )
     rank, ep = dist.get_rank(), dist.get_world_size()
-    if ep not in (16, 64):
-        raise ValueError("Launch with exactly 16 or 64 ranks")
+    if ep not in (4, 8, 16, 32, 64) or args.experts % ep:
+        raise ValueError("Launch with 4, 8, 16, 32 or 64 ranks dividing the experts")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     counts = source_counts(ep, args.layout, args.tokens)
@@ -259,7 +276,14 @@ def run(args):
         raise ValueError("Source counts must be nonnegative")
     rank_dir = args.output / f"rank-{rank:02d}"
     rank_dir.mkdir(parents=True, exist_ok=False)
-    functional = prepare_mok_bf16(ep_size=ep, local_experts=256 // ep, topk=8)
+    limit = args.swiglu_limit
+    functional = prepare_mok_bf16(
+        ep_size=ep,
+        local_experts=args.experts // ep,
+        topk=8,
+        clamped_swiglu=limit is not None,
+    )
+    functional.prepare(limit, args.mxfp8)
     config, workspace = create_mok_bf16_workspace(
         group=dist.group.WORLD,
         device=device,
@@ -274,15 +298,33 @@ def run(args):
     )
     assert workspace.initial_source_counts == tuple(counts)
     check_peer_access(workspace, rank, ep)
-    weights = make_weights(rank, ep, args.hidden, args.intermediate, device)
+    weights = make_weights(
+        rank, ep, args.hidden, args.intermediate, device, args.experts
+    )
+    mxfp8_weights = quantize_mok_mxfp8_weights(*weights[3:]) if args.mxfp8 else None
+    options = dict(
+        functional=functional, swiglu_limit=limit, mxfp8_weights=mxfp8_weights
+    )
     gate = dict(atol=1e-2, rtol=1e-2)
-    data = make_data(counts, args.hidden, args.routing, 0, device)
+
+    def data_for(lengths, generation):
+        return make_data(
+            lengths, args.hidden, args.routing, generation, device, args.experts
+        )
+
+    def expected_for(source, lengths):
+        # MXFP8 runs are gated against FP32; BF16 runs against the BF16 reference.
+        bf16 = reference(source, weights, source_counts=lengths, swiglu_limit=limit)
+        if not args.mxfp8:
+            return bf16, None
+        fp32 = reference(
+            source, weights, fp32=True, source_counts=lengths, swiglu_limit=limit
+        )
+        return bf16, fp32
+
+    data = data_for(counts, 0)
     first = TrainingIteration(
-        config,
-        workspace,
-        *local_inputs(data, counts, rank),
-        weights,
-        functional=functional,
+        config, workspace, *local_inputs(data, counts, rank), weights, **options
     )
     first.capture()
     reports = []
@@ -290,7 +332,23 @@ def run(args):
     def check(iteration, expected, source, lengths, label, save=False):
         actual = iteration.run()
         torch.cuda.synchronize()
-        errors = error_report(actual, expected, gate)
+        bf16, fp32 = expected
+        errors = error_report(actual, bf16, gate)
+        if fp32 is not None:
+            # Routed-dependent outputs carry MXFP8 quantization error: gate their
+            # global relative L2 against FP32; the BF16 shared expert stays strict.
+            for name, a, b in zip(RESULT_NAMES[:6], actual[:6], fp32[:6], strict=True):
+                stats = torch.zeros(2, dtype=torch.float64, device=a.device)
+                stats[0] = (a.double() - b.double()).square().sum()
+                stats[1] = b.double().square().sum()
+                dist.all_reduce(stats)
+                rel = (stats[0] / stats[1]).sqrt().item() if stats[1] else 0.0
+                errors[name] = dict(
+                    global_relative_l2_vs_fp32=rel,
+                    bound=MXFP8_REL_L2,
+                    pass_=rel < MXFP8_REL_L2,
+                )
+                errors[name]["pass"] = errors[name].pop("pass_")
         routes = audit_routes(iteration, source, lengths, rank, ep)
         assert actual[0].shape == actual[1].shape == (lengths[rank], args.hidden)
         assert actual[2].shape == (lengths[rank], 8)
@@ -308,6 +366,7 @@ def run(args):
             )
         return hashes
 
+    shift = 5 % ep or 1
     if args.sanitizer_smoke:
         # Numerics are qualified separately; instrument all recurring operations.
         rows = []
@@ -320,14 +379,14 @@ def run(args):
                     routes=audit_routes(iteration, source, lengths, rank, ep),
                 )
             )
-        changed_counts = counts[5:] + counts[:5]
-        changed = make_data(changed_counts, args.hidden, args.routing, 1, device)
+        changed_counts = counts[shift:] + counts[:shift]
+        changed = data_for(changed_counts, 1)
         second = TrainingIteration(
             config,
             workspace,
             *local_inputs(changed, changed_counts, rank),
             weights,
-            functional=functional,
+            **options,
         )
         second.capture()
         second.run()
@@ -363,7 +422,7 @@ def run(args):
         dist.destroy_process_group()
         return
 
-    expected = reference(data, weights, source_counts=counts)
+    expected = expected_for(data, counts)
     repeated = [
         check(first, expected, data, counts, f"fixed-{i}", save=True) for i in range(3)
     ]
@@ -373,27 +432,27 @@ def run(args):
     # Keep only the original local inputs while checking a different count vector.
     del data
     gc.collect()
-    changed_counts = counts[5:] + counts[:5]
-    changed = make_data(changed_counts, args.hidden, args.routing, 1, device)
+    changed_counts = counts[shift:] + counts[:shift]
+    changed = data_for(changed_counts, 1)
     second = TrainingIteration(
         config,
         workspace,
         *local_inputs(changed, changed_counts, rank),
         weights,
-        functional=functional,
+        **options,
     )
     second.capture()
-    expected = reference(changed, weights, source_counts=changed_counts)
+    expected = expected_for(changed, changed_counts)
     check(second, expected, changed, changed_counts, "changed-counts-and-inputs")
     del expected, changed
     gc.collect()
-    data = make_data(counts, args.hidden, args.routing, 0, device)
-    expected = reference(data, weights, source_counts=counts)
+    data = data_for(counts, 0)
+    expected = expected_for(data, counts)
     replayed = check(first, expected, data, counts, "earlier-graph")
     assert replayed == repeated[0]
     del expected, data
     gc.collect()
-    updated = make_data(counts, args.hidden, args.routing, 2, device)
+    updated = data_for(counts, 2)
     for dest, value in zip(
         (first.x, first.ids, first.scores, first.dy),
         local_inputs(updated, counts, rank),
@@ -402,7 +461,7 @@ def run(args):
         dest.copy_(value)
     torch.cuda.synchronize()
     dist.barrier()
-    expected = reference(updated, weights, source_counts=counts)
+    expected = expected_for(updated, counts)
     check(first, expected, updated, counts, "same-shape-update")
     del expected, updated, second
     gc.collect()
@@ -416,6 +475,13 @@ def run(args):
         Path(__file__).resolve().parents[1] / "flashinfer/experimental/cake_mok_bf16"
     )
     source_registry = json.loads((package / "sources.json").read_text())
+    from flashinfer.experimental.cake_mok_bf16.jit import target_arch
+
+    arch = target_arch(device)
+    fused = [
+        role + ("_mxfp8" if args.mxfp8 else "") + ("_clamped" if limit else "")
+        for role in ("forward", "backward")
+    ]
     passed = all(e["pass"] for row in reports for e in row["errors"].values())
     record = dict(
         status="PASS" if passed else "FAIL",
@@ -429,15 +495,23 @@ def run(args):
         global_tokens=sum(counts),
         hidden=args.hidden,
         intermediate=args.intermediate,
-        experts=256,
+        experts=args.experts,
         topk=8,
+        swiglu_limit=limit,
+        mxfp8=args.mxfp8,
+        target=arch,
         numerical_gate=gate,
         reports=reports,
         three_replays_bitwise_identical=True,
         earlier_graph_identical=True,
         performance=performance,
         fused_source_sha256={
-            k: source_registry[k]["sha256"] for k in ("forward", "backward")
+            k: next(
+                v["sha256"]
+                for v in source_registry[k]["variants"]
+                if arch in v["arches"]
+            )
+            for k in fused
         },
     )
     (rank_dir / "summary.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -489,6 +563,9 @@ if __name__ == "__main__":
     parser.add_argument("--tokens", type=int, default=16384)
     parser.add_argument("--hidden", type=int, default=6144)
     parser.add_argument("--intermediate", type=int, default=2048)
+    parser.add_argument("--experts", type=int, choices=(256, 288), default=256)
+    parser.add_argument("--swiglu-limit", type=float)
+    parser.add_argument("--mxfp8", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--save-outputs", action="store_true")
     parser.add_argument(

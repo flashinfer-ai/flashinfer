@@ -21,7 +21,7 @@ def test_unequal_source_graphs(monkeypatch, mok_distributed_group):
         (10, 3),
         (10, 7),
     ):
-        pytest.skip("Requires an SM100a-compatible CUDA device")
+        pytest.skip("Requires an SM100a, SM103a or SM107a CUDA device")
     directory = Path(__file__).resolve().parents[2] / "examples"
     monkeypatch.syspath_prepend(str(directory))
     spec = importlib.util.spec_from_file_location(

@@ -29,14 +29,50 @@ RESULT_NAMES = (
 )
 
 
-def expert(x, gate, up, down):
-    a, b = x @ gate.T, x @ up.T
+class _ClampMax(torch.autograd.Function):
+    """clamp(max=L) whose derivative is 1 where the input is <= L."""
+
+    @staticmethod
+    def forward(ctx, value, limit):
+        ctx.save_for_backward(value)
+        ctx.limit = limit
+        return value.clamp(max=limit)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (value,) = ctx.saved_tensors
+        return grad * (value <= ctx.limit).to(grad.dtype), None
+
+
+class _ClampBoth(torch.autograd.Function):
+    """clamp(-L, L) whose derivative is 1 where -L <= input <= L."""
+
+    @staticmethod
+    def forward(ctx, value, limit):
+        ctx.save_for_backward(value)
+        ctx.limit = limit
+        return value.clamp(-limit, limit)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (value,) = ctx.saved_tensors
+        inside = (value >= -ctx.limit) & (value <= ctx.limit)
+        return grad * inside.to(grad.dtype), None
+
+
+def expert(x, gate, up, down, swiglu_limit=None):
+    a, b = (x @ gate.T).float(), (x @ up.T).float()
+    if swiglu_limit is not None:
+        # Clamped SwiGLU: silu(clamp(gate, max=L)) * clamp(up, -L, L).
+        a, b = _ClampMax.apply(a, swiglu_limit), _ClampBoth.apply(b, swiglu_limit)
     # Native SwiGLU promotes BF16 inputs to FP32, then rounds the product once.
-    hidden = (torch.nn.functional.silu(a.float()) * b.float()).to(x.dtype)
+    hidden = (torch.nn.functional.silu(a) * b).to(x.dtype)
     return hidden @ down.T
 
 
-def reference(global_data, weights, *, fp32=False, source_counts=None):
+def reference(
+    global_data, weights, *, fp32=False, source_counts=None, swiglu_limit=None
+):
     rank, ep = dist.get_rank(), dist.get_world_size()
     device = weights[0].device
     dtype = torch.float32 if fp32 else torch.bfloat16
@@ -63,7 +99,7 @@ def reference(global_data, weights, *, fp32=False, source_counts=None):
             continue
         xe = x[rows].detach().requires_grad_()
         we = [w[e].detach().to(dtype).requires_grad_() for w in weights[3:]]
-        out = expert(xe, *we)
+        out = expert(xe, *we, swiglu_limit=swiglu_limit)
         # Differentiating already-scaled score inputs; scaling is not repeated.
         se = scores[rows, slots].detach().requires_grad_()
         weighted = out.float() * se[:, None]
@@ -77,7 +113,7 @@ def reference(global_data, weights, *, fp32=False, source_counts=None):
         dist.all_reduce(tensor)
     xs = x[own_rows].detach().requires_grad_()
     ws = [w.detach().to(dtype).requires_grad_() for w in weights[:3]]
-    ys = expert(xs, *ws)
+    ys = expert(xs, *ws, swiglu_limit=swiglu_limit)
     shared_grads = torch.autograd.grad(ys, (xs, *ws), dy[own_rows])
     y = (y_sum[own_rows] + ys.detach().float()).to(dtype)
     dx = (dx_sum[own_rows] + shared_grads[0].float()).to(dtype)
@@ -180,7 +216,32 @@ def error_report(actual, expected, gate):
 
 
 class TrainingIteration:
-    def __init__(self, config, workspace, x, ids, scores, dy, weights, *, functional):
+    """One complete schedule + forward + backward, optionally CUDA-Graph captured.
+
+    ``weights`` are the BF16 shared and routed weights. ``mxfp8_weights`` (the
+    pair returned by ``quantize_mok_mxfp8_weights``) runs the routed experts in
+    native MXFP8. ``recompute`` discards the forward context and rebuilds it
+    with ``recompute_forward_context`` before backward (activation
+    checkpointing). ``accumulators`` are six FP32 tensors zeroed and filled by
+    an ``fp32_wgrad`` adapter.
+    """
+
+    def __init__(
+        self,
+        config,
+        workspace,
+        x,
+        ids,
+        scores,
+        dy,
+        weights,
+        *,
+        functional,
+        swiglu_limit=None,
+        mxfp8_weights=None,
+        recompute=False,
+        accumulators=None,
+    ):
         if (
             x.dtype != torch.bfloat16
             or dy.dtype != torch.bfloat16
@@ -207,10 +268,19 @@ class TrainingIteration:
         self.functional = functional
         self.x, self.ids, self.scores, self.dy = x, ids, scores, dy
         self.weights = weights
+        self.swiglu_limit = swiglu_limit
+        self.recompute = recompute
+        self.accumulators = accumulators
+        if mxfp8_weights is None:
+            self.forward_weights = self.backward_weights = weights
+        else:
+            self.forward_weights = (*weights[:3], *mxfp8_weights[0])
+            self.backward_weights = (*weights[:3], *mxfp8_weights[1])
         self.graph = None
         self.outputs = None
 
     def _execute(self):
+        limit = self.swiglu_limit
         self.schedule = self.functional.build_schedule(
             self.workspace,
             self.config,
@@ -223,8 +293,28 @@ class TrainingIteration:
             self.schedule,
             self.x,
             self.scores,
-            *self.weights,
+            *self.forward_weights,
+            swiglu_limit=limit,
         )
+        if self.recompute:
+            self.context = None
+            w = self.forward_weights
+            self.context = self.functional.recompute_forward_context(
+                self.config,
+                self.workspace,
+                self.schedule,
+                self.x,
+                w[0],
+                w[1],
+                w[3],
+                w[4],
+                swiglu_limit=limit,
+            )
+        extra = {}
+        if self.accumulators is not None:
+            for accumulator in self.accumulators:
+                accumulator.zero_()
+            extra["weight_grad_accumulators"] = self.accumulators
         gradients = self.functional.backward(
             self.config,
             self.workspace,
@@ -233,14 +323,15 @@ class TrainingIteration:
             self.dy,
             self.x,
             self.scores,
-            *self.weights,
+            *self.backward_weights,
+            swiglu_limit=limit,
+            **extra,
         )
         self.outputs = (y, *gradients)
-        if any(
-            v.dtype != (torch.float32 if idx == 2 else torch.bfloat16)
-            for idx, v in enumerate(self.outputs)
-        ):
-            raise RuntimeError("BF16 output/gradient formats changed")
+        weight_dtype = torch.bfloat16 if self.accumulators is None else torch.float32
+        expected = (torch.bfloat16, torch.bfloat16, torch.float32) + (weight_dtype,) * 6
+        if any(v.dtype != d for v, d in zip(self.outputs, expected, strict=True)):
+            raise RuntimeError("Output/gradient formats changed")
         return self.outputs
 
     def capture(self):
@@ -276,7 +367,7 @@ def main():
             "nccl", device_id=device, timeout=datetime.timedelta(seconds=180)
         )
     rank, ep = dist.get_rank(), dist.get_world_size()
-    assert ep in (1, 4, 16, 64), "Launch with 1, 4, 16 or 64 ranks"
+    assert ep in (1, 4, 8, 16, 32, 64), "Launch with 1, 4, 8, 16, 32 or 64 ranks"
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     tokens = 512

@@ -13,11 +13,13 @@ def mok_distributed_group():
     if "RANK" not in os.environ or int(os.environ.get("WORLD_SIZE", "0")) not in (
         1,
         4,
+        8,
         16,
+        32,
         64,
     ):
         pytest.skip(
-            "Launch MoK distributed tests with torchrun using 1, 4, 16 or 64 ranks"
+            "Launch MoK distributed tests with torchrun using 1, 4, 8, 16, 32 or 64 ranks"
         )
     import torch
     import torch.distributed as dist
@@ -26,7 +28,7 @@ def mok_distributed_group():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(
         device
     ) not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("Requires an SM100a-compatible CUDA device")
+        pytest.skip("Requires an SM100a, SM103a or SM107a CUDA device")
     torch.cuda.set_device(device)
     owns_group = not dist.is_initialized()
     if owns_group:
