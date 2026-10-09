@@ -102,20 +102,20 @@ class _Program:
 # (``exact_*``) and the chunk-parallel program (``chunkpar_*``).
 _SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_ff8a998f8c"
 _SCAN_MODULES = {
-    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_eba19916b3",
-    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_b56612c764",
-    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_dac68e5ef1",
-    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_5332560192",
-    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_dd75c0cd47",
-    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_70e1bc6bef",
+    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_7da5d63944",
+    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_3a3fe8cb43",
+    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_bfec63639e",
+    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_ea2dad0346",
+    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_86a33e371f",
+    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_7f4b2ec368",
 }
 _CHUNKPAR_MODULES = {
-    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_b5e0c1cc35",
-    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_72f5ce3af3",
-    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_f471149926",
-    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_aa911bd5d9",
-    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_32d827eb25",
-    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_39f645fa37",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_df1813f0fc",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_fe997dc53a",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_c940274209",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_4d536d26a8",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_8fb2ad56db",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_58cc6c44e9",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -140,7 +140,7 @@ _STATE_DTYPE_KEYS = {
 # Dynamic shared memory (bytes) of each family's main kernel; refreshed by the
 # Cake export.  0 is the unfilled placeholder: the program refuses to build.
 _EXACT_SMEM_BYTES = 232448
-_CHUNKPAR_SMEM_BYTES = 231936
+_CHUNKPAR_SMEM_BYTES = 232448
 
 
 # Positional launcher ABI shared by every program: preprocess arguments, its
