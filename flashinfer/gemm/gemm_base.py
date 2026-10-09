@@ -465,17 +465,19 @@ def _cute_dsl_mm_bf16_requirement(
     ] = "cudnn",
 ):
     if out_dtype != torch.bfloat16:
-        raise ValueError("The CuTeDSL backend requires bfloat16 output.")
+        raise ValueError("The CuTeDSL low-M backend requires bfloat16 output.")
     if out is not None and out.dtype != torch.bfloat16:
-        raise ValueError("The CuTeDSL backend requires a bfloat16 out tensor.")
+        raise ValueError("The CuTeDSL low-M backend requires a bfloat16 out tensor.")
     if not is_sm100a_supported(a.device):
-        raise ValueError("The CuTeDSL backend requires SM100/SM103 with CUDA 12.8+.")
+        raise ValueError(
+            "The CuTeDSL low-M backend requires SM100/SM103 with CUDA 12.8+."
+        )
     if a.ndim != 2 or b.ndim != 2:
-        raise ValueError("The CuTeDSL backend requires 2D inputs.")
+        raise ValueError("The CuTeDSL low-M backend requires 2D inputs.")
     if not a.is_contiguous():
-        raise ValueError("The CuTeDSL backend requires row-major A.")
+        raise ValueError("The CuTeDSL low-M backend requires row-major A.")
     if not b.T.is_contiguous():
-        raise ValueError("The CuTeDSL backend requires column-major B.")
+        raise ValueError("The CuTeDSL low-M backend requires column-major B.")
     if b.shape[0] != a.shape[1]:
         raise ValueError(
             f"Incompatible shapes: A is {tuple(a.shape)}, B is {tuple(b.shape)}."
@@ -483,7 +485,7 @@ def _cute_dsl_mm_bf16_requirement(
     if b.device != a.device:
         raise ValueError("A and B must be on the same CUDA device.")
     if out is not None and not out.is_contiguous():
-        raise ValueError("The CuTeDSL backend requires row-major output.")
+        raise ValueError("The CuTeDSL low-M backend requires row-major output.")
     if bias is not None and (
         bias.device != a.device
         or bias.shape != (b.shape[1],)
@@ -495,19 +497,15 @@ def _cute_dsl_mm_bf16_requirement(
     from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
     if not is_cute_dsl_available():
-        raise LibraryError("The CuTeDSL backend requires nvidia-cutlass-dsl.")
+        raise LibraryError("The CuTeDSL low-M backend requires nvidia-cutlass-dsl.")
 
     if a.shape[0] > _CUTE_DSL_BF16_MAX_M:
-        from .kernels.dense_bf16_gemm_sm100 import autotune_tactics
+        from .kernels.dense_bf16_gemm_sm100 import supports
 
-        if (
-            bias is None
-            and all(t.data_ptr() % 16 == 0 for t in (a, b, out) if t is not None)
-            and autotune_tactics(a.shape[0], b.shape[1], a.shape[1])
-        ):
+        if supports(a, b, bias, out):
             return True
-        # Otherwise served by the cuBLASLt fallback runner of the cute-dsl
-        # runner set; pdl is ignored there because cuBLASLt has no PDL API.
+        # Served by the cuBLASLt fallback runner of the cute-dsl runner set;
+        # pdl is ignored there because cuBLASLt has no PDL API.
         return _cublaslt_mm_bf16_requirement(
             a, b, out, out_dtype, bias, False, "cublaslt"
         )
@@ -733,11 +731,10 @@ def mm_bf16(
             ``bias`` / ``pdl``. Requires SM >= 90.
         ``"cute-dsl"`` uses standalone Blackwell low-M kernels for M <= 32
         (direct, cluster Split-K and warp Split-K) and, above that, a
-        persistent tensor-core kernel (no bias; N and K multiples of 8) or
-        cuBLASLt otherwise.
+        persistent kernel (no bias; N and K multiples of 8), else cuBLASLt.
         It is never auto-selected; serving frameworks must select it
         explicitly. Without autotuning, M > 32 runs the persistent kernel's
-        default tactic where it applies, cuBLASLt otherwise; below, the
+        default tactic where it applies; below, the
         direct kernel runs where its shape heuristic applies, otherwise the
         warp Split-K kernel whenever it is eligible (N % 16 == 0, K % 128 == 0
         with at most 64 K tiles; requires CuTe DSL >= 4.7), and
@@ -2499,48 +2496,26 @@ def _cute_dsl_direct_bf16_gemm_runner(
 
 @functools.cache
 def _cute_dsl_persistent_bf16_gemm_runner(compute_capability: int):
-    from .kernels.dense_bf16_gemm_sm100 import (
-        PersistentTactic,
-        autotune_tactics,
-        default_tactic,
-        run_persistent_dense,
-    )
+    from .kernels.dense_bf16_gemm_sm100 import TACTICS, run_persistent_dense, supports
 
     class CuteDSLPersistentBf16Runner(_CuteDSLBf16Runner):
         """Persistent tensor-core GEMM for M > _CUTE_DSL_BF16_MAX_M without bias."""
 
         def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
             a, b, bias, _, out, *_ = inputs
-            return (
-                a.shape[0] > _CUTE_DSL_BF16_MAX_M
-                and bias is None
-                and all(t.data_ptr() % 16 == 0 for t in (a, b, out))
-                and bool(autotune_tactics(a.shape[0], b.shape[1], a.shape[1]))
-            )
+            return a.shape[0] > _CUTE_DSL_BF16_MAX_M and supports(a, b, bias, out)
 
         def is_tactic_compatible(
             self, inputs: List[torch.Tensor], tactic: object
         ) -> bool:
-            if tactic == -1:
-                return True
-            a, b, *_ = inputs
-            if not isinstance(tactic, (tuple, list)):
-                return False
-            try:
-                tactic = PersistentTactic(*tactic)
-            except TypeError:
-                return False
-            return tactic in autotune_tactics(a.shape[0], b.shape[1], a.shape[1])
+            return tactic == -1 or (
+                isinstance(tactic, (tuple, list)) and tuple(tactic) in TACTICS
+            )
 
         def get_valid_tactics(
             self, inputs: List[torch.Tensor], profile: OptimizationProfile
         ) -> List[tuple]:
-            if not self.supports_inputs(inputs):
-                return []
-            a, b, *_ = inputs
-            return [
-                tuple(t) for t in autotune_tactics(a.shape[0], b.shape[1], a.shape[1])
-            ]
+            return list(TACTICS) if self.supports_inputs(inputs) else []
 
         def forward(
             self,
@@ -2549,12 +2524,10 @@ def _cute_dsl_persistent_bf16_gemm_runner(compute_capability: int):
             do_preparation: bool = False,
             **kwargs,
         ) -> torch.Tensor:
-            a, b, bias, pdl, out, *_ = inputs
-            if bias is not None:
-                raise ValueError("CuTeDSL persistent GEMM does not support bias.")
-            if tactic == -1:
-                tactic = default_tactic(a.shape[0], b.shape[1], a.shape[1])
-            return run_persistent_dense(a, b, out, pdl, PersistentTactic(*tactic))
+            a, b, _, pdl, out, *_ = inputs
+            return run_persistent_dense(
+                a, b, out, pdl, TACTICS[0] if tactic == -1 else tactic
+            )
 
     return CuteDSLPersistentBf16Runner(compute_capability)
 
