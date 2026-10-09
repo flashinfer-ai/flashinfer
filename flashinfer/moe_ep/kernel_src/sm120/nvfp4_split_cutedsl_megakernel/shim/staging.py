@@ -23,11 +23,19 @@ def _stage_bf16_inputs(
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         fused_quant_stage,
         fused_quant_stage_supported,
-        nvfp4_quantize_per_block_16,
     )
 
     tokens = hidden_states.shape[0]
     if fused_quant_stage_supported(hidden_states, quant_type="nvfp4"):
+        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage import (
+            note_staged_tokens,
+        )
+
+        # A smaller bucket view can leave stale IDs beyond its end. The
+        # live-count memo alone cannot describe them when the view grows.
+        # Force sentinel cleanup over the full selected bucket, as the
+        # prequantized path does, without clearing activations or weights.
+        note_staged_tokens(staged_topk_ids, x.shape[0])
         fused_quant_stage(
             hidden_states,
             topk_ids,
@@ -38,19 +46,41 @@ def _stage_bf16_inputs(
             staged_topk_weights,
             quant_type="nvfp4",
             norm_const=norm_const,
+            nvfp4_cuda_compatible=True,
         )
         return
 
-    quantized, raw_scale = nvfp4_quantize_per_block_16(
-        hidden_states.to(torch.float32), norm_const
-    )
-    x[:tokens].copy_(quantized)
-    x_scale[:tokens].zero_()
-    x_scale[:tokens, : raw_scale.shape[1]].copy_(raw_scale)
+    # Keep offset/misaligned-width fallbacks numerically identical to the
+    # fused CUDA-compatible recipe. A device fill is safe inside CUDA graphs.
+    if tokens:
+        from flashinfer import fp4_quantize
+
+        if hidden_states.data_ptr() % 16:
+            hidden_states = hidden_states.clone()
+        quantized, raw_scale = fp4_quantize(
+            hidden_states,
+            torch.full(
+                (), norm_const, dtype=torch.float32, device=hidden_states.device
+            ),
+            sf_vec_size=16,
+            is_sf_swizzled_layout=False,
+            backend="cuda",
+        )
+        x[:tokens].view(torch.uint8).copy_(quantized.view(torch.uint8))
+        if raw_scale.shape[1] < x_scale.shape[1]:
+            x_scale[:tokens, raw_scale.shape[1] :].zero_()
+        x_scale[:tokens, : raw_scale.shape[1]].view(torch.uint8).copy_(
+            raw_scale.view(torch.uint8)
+        )
     staged_topk_ids[:tokens].copy_(topk_ids)
     staged_topk_weights[:tokens].copy_(topk_weights)
     if tokens < x.shape[0]:
         staged_topk_ids[tokens:].fill_(-1)
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage import (
+        note_staged_tokens,
+    )
+
+    note_staged_tokens(staged_topk_ids, tokens)
 
 
 def stage_inputs(
@@ -107,7 +137,8 @@ def stage_inputs(
         raise ValueError("workspace activation-scale row is not padded to four bytes")
 
     x[:tokens].view(torch.uint8).copy_(hidden_states.view(torch.uint8))
-    x_scale[:tokens].zero_()
+    if valid_scale_columns < x_scale.shape[1]:
+        x_scale[:tokens, valid_scale_columns:].zero_()
     x_scale[:tokens, :valid_scale_columns].view(torch.uint8).copy_(
         raw_scale[:, :valid_scale_columns].view(torch.uint8)
     )

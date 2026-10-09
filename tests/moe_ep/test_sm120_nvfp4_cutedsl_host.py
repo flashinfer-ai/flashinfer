@@ -156,7 +156,7 @@ def test_workspace_pool_key_covers_nvfp4_contract(monkeypatch) -> None:
         return backend._workspace_pool_key(fleet)
 
     assert key() == key()
-    assert key(norm_const=2.0) != key()
+    assert key(norm_const=2.0) == key()
     assert key(gate_up_clamp=10.0) != key()
 
 
@@ -245,3 +245,72 @@ def test_caller_reset_advances_shared_epoch_without_clearing_ready_flags() -> No
     assert torch.all(storage.local_workspace[32:].view(torch.int32) == -1)
     assert storage.rank_combine_ready[-1, 0].item() == 19
     assert torch.all(storage.rank_combine_ready[:-1] == 17)
+
+
+@pytest.mark.parametrize("reuse_storage", (False, True))
+def test_execution_allocation_synchronizes_only_new_storage(
+    monkeypatch, reuse_storage
+) -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+        runtime,
+    )
+
+    events = []
+    tensor = torch.empty(4)
+    storage = runtime._ExecutionStorage(
+        local_workspace=tensor,
+        shared_workspace=tensor,
+        combine_output=tensor,
+        epilogue_args=(tensor, tensor, tensor),
+    )
+    workspace = SimpleNamespace(
+        _executions={},
+        _storages={32: storage} if reuse_storage else {},
+        _sym_roots=[],
+        fc1_alpha=tensor,
+        fc2_alpha=tensor,
+        fc1_norm_const=tensor,
+    )
+    frontend = object.__new__(runtime.MegaMoESm120Nvfp4Frontend)
+    frontend.workspace = workspace
+    frontend.compile_bucket = 32
+    frontend.config = SimpleNamespace(num_topk=1, hidden=1, world_size=4)
+    spec = SimpleNamespace(kernel=SimpleNamespace(rank_local_combine=False))
+    bundle = SimpleNamespace(local_workspace_bytes=4, shared_workspace_bytes=4)
+    monkeypatch.setattr(frontend, "_ensure_plan", lambda bucket: (spec, bundle))
+    monkeypatch.setattr(runtime, "ensure_not_capturing", lambda op: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
+    monkeypatch.setattr(torch, "zeros", lambda *a, **kw: tensor)
+
+    def allocate(*args):
+        events.append("allocate")
+        assert events[0] == "sync"
+        return tensor
+
+    monkeypatch.setattr(runtime, "sym_zeros", allocate)
+    monkeypatch.setattr(runtime, "sym_byte_view", lambda *args: (tensor, tensor))
+    monkeypatch.delenv("MEGA_SPLIT_GLOBALTIMER", raising=False)
+    monkeypatch.delenv("MEGA_SPLIT_K2_TILE_TRACE", raising=False)
+    execution = frontend._ensure_execution()
+    assert events == ([] if reuse_storage else ["sync", "allocate"])
+    assert frontend._ensure_execution() is execution
+    assert events == ([] if reuse_storage else ["sync", "allocate"])
+
+
+def test_cold_execution_rejects_capture_before_synchronization(monkeypatch) -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+        runtime,
+    )
+
+    frontend = object.__new__(runtime.MegaMoESm120Nvfp4Frontend)
+    frontend.workspace = SimpleNamespace(_executions={})
+    frontend.compile_bucket = 32
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def unexpected_sync():
+        pytest.fail("capture rejection must precede synchronization")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", unexpected_sync)
+    with pytest.raises(RuntimeError, match="cannot run during CUDA Graph capture"):
+        frontend._ensure_execution()

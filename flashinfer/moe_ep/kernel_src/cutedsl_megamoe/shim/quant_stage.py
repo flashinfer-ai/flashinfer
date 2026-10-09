@@ -9,7 +9,7 @@ quantizes it in smem (NVFP4 per-16 E4M3 scales or MXFP8 per-32 E8M0), and
 repacks routing to the int64/fp32 layout the mega kernels consume.
 
 Caching mirrors the mega frontends: one ``cute.compile`` per
-``(topk, hidden, quant_type)`` per process, plus a launch-args cache keyed on
+``(topk, hidden, quant_type, nvfp4_cuda_compatible)`` per process, plus a launch-args cache keyed on
 data pointers + token count + stream, so the steady state is a single cached
 kernel launch (CUDA-graph capturable; compile is guarded by
 :func:`.comm.ensure_not_capturing` and must happen during warmup).
@@ -119,6 +119,7 @@ def fused_quant_stage(
     *,
     quant_type: str,
     norm_const: Optional[float] = None,
+    nvfp4_cuda_compatible: bool = False,
 ) -> None:
     """Quantize + stage one batch into the mega symm-buffer views.
 
@@ -129,13 +130,17 @@ def fused_quant_stage(
     is re-masked to ``-1``, matching the torch staging path's contract.
 
     ``norm_const`` is the NVFP4 offline per-tensor scale (required for
-    ``quant_type="nvfp4"``, rejected otherwise).
+    ``quant_type="nvfp4"``, rejected otherwise). When
+    ``nvfp4_cuda_compatible`` is true, preserve the CUDA FP4 quantizer\'s
+    fast-math encode-scale ordering instead of the legacy MegaMoE recipe.
     """
     if quant_type not in _QUANT_TYPES:
         raise ValueError(
             f"quant_type must be one of {_QUANT_TYPES}, got {quant_type!r}"
         )
     is_nvfp4 = quant_type == "nvfp4"
+    if nvfp4_cuda_compatible and not is_nvfp4:
+        raise ValueError("CUDA-compatible FP4 scaling requires quant_type=nvfp4")
     if is_nvfp4 and norm_const is None:
         raise ValueError("nvfp4 staging requires an offline norm_const")
     if not is_nvfp4 and norm_const is not None:
@@ -172,14 +177,19 @@ def fused_quant_stage(
             f"for hidden={hidden}, {quant_type}."
         )
 
-    key = (topk, hidden, quant_type)
+    key = (topk, hidden, quant_type, nvfp4_cuda_compatible)
     stager = _STAGERS.get(key)
     if stager is None:
         ensure_not_capturing("fused staging construction")
         from src.inputs_process import DataPreprocess
 
         stager = _CompiledStager(
-            dp=DataPreprocess(topk=topk, hidden=hidden, quant_type=quant_type)
+            dp=DataPreprocess(
+                topk=topk,
+                hidden=hidden,
+                quant_type=quant_type,
+                nvfp4_cuda_compatible=nvfp4_cuda_compatible,
+            )
         )
         _STAGERS[key] = stager
 

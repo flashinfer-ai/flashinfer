@@ -234,7 +234,7 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fleet_params.token_hidden_size,
             config.intermediate_size,
             _effective_clamp(config),
-            config.input_norm_const,
+            # Calibration is consumed by this layer's stager, not the workspace.
             config.data_parallel_size,
             config.tensor_parallel_size,
             knobs_pool_key(config.knobs),

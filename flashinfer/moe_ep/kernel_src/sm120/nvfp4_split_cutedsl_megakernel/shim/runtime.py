@@ -182,6 +182,7 @@ class MegaMoESm120Nvfp4Workspace:
     _frontends: dict[tuple[int, ...], "MegaMoESm120Nvfp4Frontend"] = field(
         default_factory=dict
     )
+    _green_resources: dict[tuple[int, int], Any] = field(default_factory=dict)
     _staged_tokens: int = 0
     _destroyed: bool = False
 
@@ -191,10 +192,18 @@ class MegaMoESm120Nvfp4Workspace:
         for frontend in self._frontends.values():
             frontend.release()
         self._frontends.clear()
+        for resources in self._green_resources.values():
+            resources.close()
+        self._green_resources.clear()
         self._executions.clear()
         self._compiled_k12.clear()
         self._execution_plans.clear()
         self._storages.clear()
+        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage import (
+            forget_staged_tokens,
+        )
+
+        forget_staged_tokens(self.topk_ids)
         for root in reversed(self._sym_roots):
             free_sym_tensor(root)
         self._sym_roots.clear()
@@ -427,6 +436,9 @@ class MegaMoESm120Nvfp4Frontend:
         spec, bundle = self._ensure_plan(self.compile_bucket)
         storage = self.workspace._storages.get(self.compile_bucket)
         if storage is None:
+            # NVSHMEM allocation is collective and not ordered on the caller
+            # stream. Drain in-flight peer-dependent graphs before entering it.
+            torch.cuda.synchronize()
             local_workspace = torch.zeros(
                 (bundle.local_workspace_bytes,),
                 dtype=torch.uint8,
@@ -505,6 +517,7 @@ class MegaMoESm120Nvfp4Frontend:
         )
         from moe_sm120_nvfp4_split.runtime.green_context import (
             NativeGreenContextGraph,
+            NativeGreenContextPair,
         )
 
         profile_start = time.monotonic()
@@ -615,7 +628,17 @@ class MegaMoESm120Nvfp4Frontend:
         finalizer_executor = compiled_finalizer.to(None) if compiled_finalizer else None
         k3_executor = compiled_k3.to(None)
         all_kernels_ready = time.monotonic()
+        # Preserve per-layer graph/weight bindings; only the device/SM partition
+        # is shared by sequential calls on this pooled workspace.
+        resource_key = (torch.cuda.current_device(), spec.kernel.k1_sms)
+        green_resources = self.workspace._green_resources.get(resource_key)
+        if green_resources is None:
+            green_resources = NativeGreenContextPair.create(
+                device=resource_key[0], k1_sm_count=resource_key[1]
+            )
+            self.workspace._green_resources[resource_key] = green_resources
         graph = NativeGreenContextGraph.capture(
+            green_resources=green_resources,
             root_stream=root_stream,
             k1_stream=k1_stream,
             k2_stream=k2_stream,

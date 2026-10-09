@@ -23,8 +23,13 @@ must be warmed up collectively before an outer CUDA Graph capture begins.
 
 Layers with identical geometry share activation, routing, K1/K2 scratch, and
 combine buffers through FlashInfer's process-level workspace pool. Each layer
-keeps a separate native Green Context graph because the graph captures that
-layer's weight pointers.
+keeps a separate native graph because the graph captures that layer's weight
+pointers. Graphs using the same device and K1/K2 SM partition share a
+workspace-owned Green Context pair, released only after all frontend graphs.
+Layer-dependent input calibration is consumed by each layer's fused stager,
+not by workspace allocation, and therefore does not split the workspace pool.
+The selected bucket's padding IDs are reset to -1, including when bucket views
+shrink and grow; activation and routing-weight padding need not be cleared.
 
 Dispatch-cache and rank-local scratch reset on the caller stream before the
 Green graph's launch-ready event; launch-done orders the next invocation.
@@ -45,3 +50,18 @@ both optimizations. Compile buckets remain separate from workspace capacity.
 FlashInfer adaptation: `runtime/green_context.py` uses the graph-capture-aware
 implementation from the SM120 W4A8 integration, allowing the native Green
 Context graph to be inserted as a child node during an outer CUDA capture.
+Kernel-node rebinding retains the captured `CUkernel` and leaves `CUfunction`
+unset: a non-null `CUfunction` makes CUDA ignore the requested context.
+The wrapper verifies the retained context before instantiation so persistent
+K1/K2 grids cannot silently lose their disjoint SM partitions.
+
+The SM120 fused input stager opts into the CUDA FP4 fast-math encode-scale
+order (`rcp(sf * rcp(norm))`) to preserve the old CUDA-prequantized path at
+E2M1 rounding boundaries. Other MegaMoE backends retain their legacy recipe.
+Offset/misaligned-width inputs use the CUDA quantizer fallback. Padding IDs
+remain -1; only scale-column alignment padding requires zeroing.
+
+First allocation of a bucket's execution storage drains in-flight device work
+before entering collective NVSHMEM allocation. This avoids mixing the allocator
+with peer-dependent Green Context graphs. Cached execution/storage paths add no
+synchronization; cold allocation remains forbidden during outer graph capture.

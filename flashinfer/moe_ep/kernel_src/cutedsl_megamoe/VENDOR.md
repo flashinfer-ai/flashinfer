@@ -62,6 +62,12 @@ replace, what to audit) lives in `SKILL.md`.
   `_pack_fp4_kernel` is exempt because it widens its flat index to int64 for
   the > 2**31-element combine round-trip. Send upstream on the next re-sync.
 
+- `src/src/inputs_process.py` supports an opt-in
+  `nvfp4_cuda_compatible` encode-scale recipe, matching the CUDA FP4
+  quantizer's fast-math reciprocal order. SM120 NVFP4 uses it so fusing
+  quantization/staging does not change E2M1 rounding at calibrated scales.
+  The flag defaults to false; existing SM100 and MXFP8 consumers are unchanged.
+
 ## Related trees
 
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` is a **separate snapshot**

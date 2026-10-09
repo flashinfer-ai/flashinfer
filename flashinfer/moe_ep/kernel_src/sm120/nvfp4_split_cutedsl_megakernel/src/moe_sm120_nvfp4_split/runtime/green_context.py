@@ -267,6 +267,80 @@ class NativeGreenContextResources:
 
 
 @dataclass
+class NativeGreenContextPair:
+    """A workspace-owned K1/K2 partition shared by sequential layer graphs."""
+
+    k1_sm_count: int
+    k2_sm_count: int
+    green_contexts: tuple[Any, Any]
+    execution_contexts: tuple[Any, Any]
+    _closed: bool = False
+
+    @classmethod
+    def create(cls, *, k1_sm_count: int, device: int) -> "NativeGreenContextPair":
+        from cuda.bindings import driver as cuda
+
+        _check_cuda(cuda.cuInit(0), "cuInit")
+        (cuda_device,) = _check_cuda(cuda.cuDeviceGet(device), "cuDeviceGet")
+        (resource,) = _check_cuda(
+            cuda.cuDeviceGetDevResource(
+                cuda_device, cuda.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+            ),
+            "cuDeviceGetDevResource",
+        )
+        minimum = max(1, int(resource.sm.minSmPartitionSize))
+        if not minimum <= k1_sm_count <= int(resource.sm.smCount) - minimum:
+            raise ValueError(f"invalid K1 SM count {k1_sm_count}")
+        groups, count, remainder = _check_cuda(
+            cuda.cuDevSmResourceSplitByCount(1, resource, 0, k1_sm_count),
+            "cuDevSmResourceSplitByCount",
+        )
+        if int(count) != 1 or len(groups) != 1:
+            raise RuntimeError("CUDA did not produce one K1 SM partition.")
+        resources = (groups[0], remainder)
+        contexts, execution_contexts = [], []
+        try:
+            for resource in resources:
+                (descriptor,) = _check_cuda(
+                    cuda.cuDevResourceGenerateDesc([resource], 1),
+                    "cuDevResourceGenerateDesc",
+                )
+                (context,) = _check_cuda(
+                    cuda.cuGreenCtxCreate(
+                        descriptor,
+                        cuda_device,
+                        cuda.CUgreenCtxCreate_flags.CU_GREEN_CTX_DEFAULT_STREAM,
+                    ),
+                    "cuGreenCtxCreate",
+                )
+                contexts.append(context)
+                (execution_context,) = _check_cuda(
+                    cuda.cuCtxFromGreenCtx(context), "cuCtxFromGreenCtx"
+                )
+                execution_contexts.append(execution_context)
+        except Exception:
+            for context in reversed(contexts):
+                cuda.cuGreenCtxDestroy(context)
+            raise
+        return cls(
+            k1_sm_count=int(resources[0].sm.smCount),
+            k2_sm_count=int(resources[1].sm.smCount),
+            green_contexts=tuple(contexts),
+            execution_contexts=tuple(execution_contexts),
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        from cuda.bindings import driver as cuda
+
+        # Workspace teardown closes every referring graph before this call.
+        for context in reversed(self.green_contexts):
+            _check_cuda(cuda.cuGreenCtxDestroy(context), "cuGreenCtxDestroy")
+        self._closed = True
+
+
+@dataclass
 class NativeGreenContextGraph:
     """A native CUDA Graph with K1/K2 nodes bound to disjoint contexts."""
 
@@ -313,7 +387,9 @@ class NativeGreenContextGraph:
         k1_grid_clusters: Optional[int] = None,
         k2_grid_clusters: Optional[int] = None,
         k2_drain_grid_clusters: Optional[int] = None,
-        green_resources: Optional[NativeGreenContextResources] = None,
+        green_resources: Optional[
+            NativeGreenContextResources | NativeGreenContextPair
+        ] = None,
         device: Optional[int] = None,
     ) -> "NativeGreenContextGraph":
         """Capture on ordinary streams, then rebind K1/K2 graph nodes."""
@@ -431,11 +507,11 @@ class NativeGreenContextGraph:
             k2_sm_count = green_resources.k2_sm_count
             green_contexts = [
                 green_resources.green_contexts[0],
-                green_resources.green_contexts[3],
+                green_resources.green_contexts[-1],
             ]
             execution_contexts = [
                 green_resources.execution_contexts[0],
-                green_resources.execution_contexts[3],
+                green_resources.execution_contexts[-1],
             ]
         try:
             if green_resources is None:
@@ -517,11 +593,18 @@ class NativeGreenContextGraph:
                 if context_index is None:
                     continue
 
+                if not int(params.kern):
+                    raise RuntimeError(
+                        "Green Context graph binding requires a context-independent "
+                        "CUkernel handle; the captured node exposes only CUfunction."
+                    )
                 updated = cuda.CUgraphNodeParams()
                 updated.type = (
                     cuda.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
                 )
-                updated.kernel.func = params.func
+                # A non-null CUfunction makes CUDA ignore ctx and retains the
+                # primary context, defeating the disjoint K1/K2 SM partitions.
+                updated.kernel.kern = params.kern
                 updated.kernel.gridDimX = params.gridDimX
                 updated.kernel.gridDimY = params.gridDimY
                 updated.kernel.gridDimZ = params.gridDimZ
@@ -536,6 +619,15 @@ class NativeGreenContextGraph:
                     cuda.cuGraphNodeSetParams(node, updated),
                     f"cuGraphNodeSetParams(K{context_index + 1})",
                 )
+                (bound,) = _check_cuda(
+                    cuda.cuGraphKernelNodeGetParams(node),
+                    "cuGraphKernelNodeGetParams(bound)",
+                )
+                if int(bound.ctx) != int(execution_contexts[context_index]):
+                    raise RuntimeError(
+                        f"CUDA did not retain the K{context_index + 1} "
+                        "Green Context binding."
+                    )
                 rebound[context_index] += 1
 
             if min(rebound) <= 0:
