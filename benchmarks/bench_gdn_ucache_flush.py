@@ -14,25 +14,41 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 ---------------------------------------------------------------------------
-Simple perf bench for the GDN ucache verify+flush kernel (fused scheme).
+Perf bench for the GDN ucache verify+flush kernels: the HMMA kernel's dtype
+arms (``--arm bf16 | fp16_state | fp16_io | ring_fp16 | fp16_state_cache``,
+backend pinned to HMMA) and the UMMA (tcgen05 / TMEM) backend of the
+fp16_state arm (``--arm umma``, plus ``umma_ph10`` / ``umma_ph5`` / ``umma_lcg``
+with stochastic rounding of the flushed state).
 
-Prints one row per batch size, one column per flush rate. Methodology
-matches BENCHMARK.md's scheme sweep: T=4, flush_min=13, verify rows at
-P=12, flush rows at P=13 scattered at exact counts, the closure captured
-as a CUDA graph and benched on the replay (CUPTI, cold L2). Timing under
-graph replay matters: eager calls carry ~25 us of host launch overhead
-that serving (always graph-captured) never pays.
+Prints one row per batch size, one column per flush rate. Steady-state
+operating points: at ``--T 4`` flush_min = 13, verify rows at P = 12, flush
+rows at P = 13 scattered at exact counts; ``--T 8`` uses the lazy
+flush_min = 17 - T = 9 (verify rows at P = 8, flush rows at P = 9). The
+closure is captured as a CUDA graph and benched on the replay (CUPTI, cold
+L2): eager calls carry ~25 us of host launch overhead that serving (always
+graph-captured) never pays.
 
-Anchors (B200, median of 1000, 2026-07-19): B=32/20% ~= 32 us,
+Cold-L2 method (``--l2``):
+  zero (default): ``bench_gpu_time(cold_l2_cache=True)``, which flushes with
+      ``buffer.zero_()``. That leaves L2 full of DIRTY lines, and the timed
+      kernel pays their write-back to DRAM -- several us on short launches.
+  read: L2 is flushed by a read-only pass over a 2x-L2 buffer (clean lines),
+      then the kernel's own CUPTI record is taken (exactly one kernel per
+      call is asserted). Cold L2 without the flush's write-back in the
+      measurement.
+
+Anchors (B200, median of 1000, 2026-07-19, ``--l2 zero``): B=32/20% ~= 32 us,
 B=256/20% ~= 163 us, B=256/0% ~= 134 us. Regressions >5% are real.
 
 Run:
-  source env.sh && python benchmarks/bench_gdn_ucache_flush.py [--iters 200]
+  python benchmarks/bench_gdn_ucache_flush.py --arm umma --T 4 --l2 read \
+      --no-commit --batches 512 --rates 0 30 --iters 200
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import importlib.util
 import math
 import os
@@ -45,7 +61,7 @@ from flashinfer.testing import bench_gpu_time
 
 DEV = "cuda"
 H, HV, K, V = 16, 64, 128, 128  # Qwen3.5-122B GDN @ TP1
-T, W = 4, 16  # W = max history window (kernel W_RING)
+T, W = 4, 16  # W = max history window (kernel W_RING); T is set by --T
 RING = 32  # physical ring depth (kernel RING_SLOTS)
 FLUSH_MIN = 13
 SCALE = 1.0 / math.sqrt(K)
@@ -71,7 +87,52 @@ ARMS = {
         torch.float16,
         torch.float16,
     ),
+    # UMMA (tcgen05 / TMEM) drop-in for the fp16_state arm: same tensors and contract
+    # (flashinfer/gdn_kernels/gdn_replay_mtp_umma.py)
+    "umma": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
+    # ... with stochastic rounding of the flushed state (fixed seed; the bits do not
+    # change the work): Philox 5 / 10 rounds, LCG
+    "umma_ph5": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
+    "umma_ph10": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
+    "umma_lcg": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
 }
+_UMMA_SR = {
+    "umma": {},
+    "umma_ph5": dict(stochastic_rounding="philox", philox_rounds=5),
+    "umma_ph10": dict(stochastic_rounding="philox", philox_rounds=10),
+    "umma_lcg": dict(stochastic_rounding="lcg"),
+}
+# history length of the non-flushing (verify) rows: None = flush_min - 1 (--hist full)
+P_VERIFY = None
+# --row-order: which request each CTA runs (umma arms only; the kernel reads the permutation)
+ROW_ORDER = "none"
+
+
+def make_row_order(hl_src, flush_min, mode):
+    """Row permutation for ``mode``: identity (same work, exercises the kernel's row_order
+    load), flush_first (longest CTAs first), verify_tail (the last two waves of CTAs hold no
+    flushing row: their flush rows are swapped with verify rows from the front)."""
+    B = hl_src.numel()
+    order = torch.arange(B, dtype=torch.int64, device=hl_src.device)
+    if mode == "identity":
+        return order.to(torch.int32)
+    is_flush = hl_src >= flush_min
+    if mode == "flush_first":
+        return torch.argsort((~is_flush).to(torch.int32), stable=True).to(torch.int32)
+    assert mode == "verify_tail", mode
+    slots = torch.cuda.get_device_properties(hl_src.device).multi_processor_count * 4
+    tail = min(B, 2 * -(-slots // H))  # two waves of CTAs, in rows (H CTAs per row)
+    tail_pos = order[B - tail :]
+    tail_flush = tail_pos[is_flush[tail_pos]]
+    head_pos = order[: B - tail]
+    head_verify = head_pos[~is_flush[head_pos]][: tail_flush.numel()]
+    n = head_verify.numel()
+    if n:
+        a, b = tail_flush[:n].clone(), head_verify.clone()
+        order[a], order[b] = b, a
+    return order.to(torch.int32)
+
+
 _FLUSH_PATH = str(
     Path(__file__).resolve().parents[1]
     / "flashinfer/gdn_kernels/gdn_decode_bf16_wy_ucache_flush.py"
@@ -80,6 +141,16 @@ _FLUSH_PATH = str(
 
 def load_flush(arm):
     io_env, state_env, ring_env, io_dtype, state_dtype, ring_dtype = ARMS[arm]
+    if arm in _UMMA_SR:
+        from flashinfer.gdn_kernels.gdn_replay_mtp_umma import (
+            gated_delta_rule_mtp_ucache_flush_umma,
+        )
+
+        fn = gated_delta_rule_mtp_ucache_flush_umma
+        if _UMMA_SR[arm]:
+            seed = torch.tensor([0x5EED], dtype=torch.int64, device=DEV)
+            fn = functools.partial(fn, rand_seed=seed, **_UMMA_SR[arm])
+        return fn, io_dtype, state_dtype, ring_dtype
     old = {
         k: os.environ.pop(k, None)
         for k in (
@@ -104,7 +175,10 @@ def load_flush(arm):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    return mod.gated_delta_rule_mtp_ucache_flush, io_dtype, state_dtype, ring_dtype
+    # the dtype arms time the HMMA kernel (on SM100 the fp16_state arm would
+    # otherwise auto-route to the UMMA backend, which has its own arms above)
+    fn = functools.partial(mod.gated_delta_rule_mtp_ucache_flush, backend="hmma")
+    return fn, io_dtype, state_dtype, ring_dtype
 
 
 torch.manual_seed(0)
@@ -162,6 +236,7 @@ def bench_point(
     ring_dtype=torch.bfloat16,
     base=0,
     no_commit=False,
+    l2="zero",
 ):
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, idx = make_case(
         B, seed, io_dtype, state_dtype, ring_dtype
@@ -173,12 +248,19 @@ def bench_point(
         mask[torch.randperm(B, generator=g_cpu)[:nf].to(DEV)] = True
     hl_src = torch.where(
         mask,
-        torch.tensor(13, dtype=torch.int32, device=DEV),
-        torch.tensor(12, dtype=torch.int32, device=DEV),
+        torch.tensor(FLUSH_MIN, dtype=torch.int32, device=DEV),
+        torch.tensor(
+            FLUSH_MIN - 1 if P_VERIFY is None else P_VERIFY,
+            dtype=torch.int32,
+            device=DEV,
+        ),
     )
     hl = hl_src.clone()
     cb_src = torch.full((B,), base, dtype=torch.int32, device=DEV)
     cb = cb_src.clone()
+    extra = {}
+    if ROW_ORDER != "none":
+        extra["row_order"] = make_row_order(hl_src, FLUSH_MIN, ROW_ORDER)
 
     def fn():
         uc_flush(
@@ -199,12 +281,15 @@ def bench_point(
             scale=SCALE,
             flush_min=FLUSH_MIN,
             restart_hist_on_flush=not no_commit,
+            **extra,
         )
         if not no_commit:
             # wrapper committed cursors for flushed rows; restore them
             hl.copy_(hl_src)
             cb.copy_(cb_src)
 
+    if l2 == "read":
+        return kernel_us_read_flush(graphed(fn), iters)
     times = bench_gpu_time(
         graphed(fn),
         enable_cupti=True,
@@ -215,8 +300,78 @@ def bench_point(
     return float(np.median(times)) * 1000.0  # us
 
 
+_READ_FLUSH = {}
+
+
+def kernel_us_read_flush(runner, iters):
+    """Median kernel time (us) with a cold, CLEAN L2: before each call a read-only pass
+    over a 2x-L2 buffer evicts everything (no dirty lines left behind), then the
+    graph replay runs alone. The kernel's own CUPTI activity record is the time
+    (torch.profiler), and exactly one kernel per call is asserted."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from flashinfer.testing.utils import get_l2_cache_size
+
+    if not _READ_FLUSH:
+        _READ_FLUSH["buf"] = torch.ones(
+            2 * get_l2_cache_size() // 4, dtype=torch.int32, device=DEV
+        )
+        _READ_FLUSH["out"] = torch.empty((), dtype=torch.int64, device=DEV)
+    buf, out = _READ_FLUSH["buf"], _READ_FLUSH["out"]
+
+    def gpu_events(prof):
+        return [
+            e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+        ]
+
+    for _ in range(10):
+        runner()
+    torch.cuda.synchronize()
+    # The call alone must be exactly one GPU kernel (no memsets / copies / extra launches).
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(5):
+            runner()
+        torch.cuda.synchronize()
+    names = {e.name for e in gpu_events(prof)}
+    assert len(gpu_events(prof)) == 5 and len(names) == 1, (
+        f"expected one kernel per call, got {len(gpu_events(prof))} for 5 calls: {names}"
+    )
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            torch.sum(
+                buf, dim=0, out=out
+            )  # read-only L2 flush (its kernels are dropped below)
+            torch.cuda.synchronize()
+            runner()
+            torch.cuda.synchronize()
+    kern = [e for e in gpu_events(prof) if e.name in names]
+    assert len(kern) == iters, (len(kern), iters)
+    return float(np.median([e.device_time for e in kern]))
+
+
 def main():
+    global T, FLUSH_MIN, P_VERIFY
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--T", type=int, default=4, help="draft tokens (flush_min = 17 - T)"
+    )
+    ap.add_argument(
+        "--l2",
+        choices=["zero", "read"],
+        default="zero",
+        help="cold-L2 method: zero = bench_gpu_time's zero_() flush; "
+        "read = read-only flush + kernel-only CUPTI record (see module docstring)",
+    )
+    ap.add_argument(
+        "--json", type=str, default=None, help="append rows to this JSON file"
+    )
+    ap.add_argument(
+        "--hist",
+        choices=["full", "mid", "zero"],
+        default="full",
+        help="history length of the non-flushing rows: full = flush_min - 1 (default), "
+        "mid = (flush_min - 1) // 2, zero = 0",
+    )
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--batches", type=int, nargs="+", default=[8, 32, 64, 128, 256])
     ap.add_argument("--rates", type=int, nargs="+", default=[0, 20, 40, 80])
@@ -224,7 +379,8 @@ def main():
         "--arm",
         choices=list(ARMS),
         default="bf16",
-        help="dtype config: bf16 | fp16_state | fp16_io",
+        help="dtype config: bf16 | fp16_state | fp16_io | ring_fp16 | fp16_state_cache | umma (UMMA kernel, "
+        "fp16 state) | umma_ph5 / umma_ph10 / umma_lcg (UMMA with stochastic rounding)",
     )
     ap.add_argument(
         "--no-commit",
@@ -244,18 +400,33 @@ def main():
         help="ring window origin for all rows (28 exercises the "
         "wrapped-window path: base+P crosses RING_SLOTS)",
     )
+    ap.add_argument(
+        "--row-order",
+        choices=["none", "identity", "flush_first", "verify_tail"],
+        default="none",
+        help="umma arms: which request each CTA runs (see make_row_order); identity "
+        "isolates the cost of the kernel's row_order load from the ordering itself",
+    )
     args = ap.parse_args()
+    global ROW_ORDER
+    ROW_ORDER = args.row_order
+    T = args.T
+    FLUSH_MIN = W - T + 1
+    P_VERIFY = {"full": FLUSH_MIN - 1, "mid": (FLUSH_MIN - 1) // 2, "zero": 0}[
+        args.hist
+    ]
 
     uc_flush, io_dtype, state_dtype, ring_dtype = load_flush(args.arm)
     print(
         f"GPU: {torch.cuda.get_device_name(0)} | fused verify+flush, "
         f"arm={args.arm} (io={io_dtype}, state={state_dtype}, "
         f"ring={ring_dtype}), "
-        f"T={T} W={W} ring={RING} base={args.base} fm={FLUSH_MIN} "
+        f"T={T} W={W} ring={RING} base={args.base} fm={FLUSH_MIN} P_verify={P_VERIFY} "
         f"H={H} HV={HV} K=V={K} | "
-        f"CUDA-graph replay, CUPTI cold-L2, median of {args.iters}",
+        f"CUDA-graph replay, CUPTI cold-L2 ({args.l2} flush), median of {args.iters}",
         flush=True,
     )
+    recs = []
     hdr = "   B | " + " | ".join(f"{r:3d}% (us)" for r in args.rates)
     print(hdr)
     print("-" * len(hdr))
@@ -272,10 +443,45 @@ def main():
                 ring_dtype,
                 base=args.base,
                 no_commit=args.no_commit,
+                l2=args.l2,
             )
             for r in args.rates
         ]
         print(f"{B:4d} | " + " | ".join(f"{t:9.2f}" for t in row), flush=True)
+        recs += [
+            dict(
+                arm=args.arm,
+                T=T,
+                B=B,
+                rate=r,
+                l2=args.l2,
+                no_commit=args.no_commit,
+                folded_rows=0 if r == 0 else max(1, round(B * r / 100)),
+                hist=args.hist,
+                p_verify=P_VERIFY,
+                row_order=args.row_order,
+                us=t,
+            )
+            for r, t in zip(args.rates, row, strict=True)
+        ]
+    if args.json:
+        import json
+
+        path = Path(args.json)
+        prev = json.loads(path.read_text()) if path.exists() else []
+        key = lambda d: (  # noqa: E731
+            d["arm"],
+            d["T"],
+            d["B"],
+            d["rate"],
+            d["l2"],
+            d["no_commit"],
+            d.get("hist", "full"),
+        )
+        new = {key(d) for d in recs}
+        path.write_text(
+            json.dumps([d for d in prev if key(d) not in new] + recs, indent=1)
+        )
 
 
 if __name__ == "__main__":

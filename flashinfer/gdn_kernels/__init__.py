@@ -65,6 +65,17 @@ try:
 except (ImportError, RuntimeError):
     gated_delta_rule_mtp_ucache_flush = None  # type: ignore
 
+# UMMA (tcgen05 / TMEM) backend of the flush kernel for SM100 (fp16-state arm); reached
+# through gated_delta_rule_mtp_ucache_flush(backend="auto") or called directly.
+try:
+    from .gdn_replay_mtp_umma import (
+        flush_first_row_order,
+        gated_delta_rule_mtp_ucache_flush_umma,
+    )
+except (ImportError, RuntimeError):
+    gated_delta_rule_mtp_ucache_flush_umma = None  # type: ignore
+    flush_first_row_order = None  # type: ignore
+
 try:
     from .gdn_decode_pretranspose import run_pretranspose_decode
 except (ImportError, RuntimeError):
@@ -117,6 +128,8 @@ __all__ = [
     "gated_delta_rule_mtp",
     "gated_delta_rule_mtp_ucache",
     "gated_delta_rule_mtp_ucache_flush",
+    "gated_delta_rule_mtp_ucache_flush_umma",
+    "flush_first_row_order",
     "gated_delta_rule_mtp_wy_output_only",
     "gated_delta_rule_bf16state_cooprow",
     "gated_delta_rule_bf16state_cooprow_mtp",

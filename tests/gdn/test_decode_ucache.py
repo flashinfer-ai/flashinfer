@@ -99,7 +99,28 @@ ARMS = {
         torch.float16,
         torch.float16,
     ),
+    # the fp16_state arm served by the UMMA (tcgen05 / TMEM) backend (SM100 only)
+    "umma": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
 }
+# Backend pinned per arm: the dtype arms test the HMMA kernel (on SM100 the fp16_state
+# arm would otherwise auto-route to UMMA), "umma" the UMMA kernel through the same API.
+_ARM_BACKEND = {"umma": "umma"}
+
+
+class _WithBackend:
+    """The loaded flush module with ``gated_delta_rule_mtp_ucache_flush`` pinned to one
+    backend; every other attribute is the module's."""
+
+    def __init__(self, mod, backend):
+        self._mod, self._backend = mod, backend
+
+    def __getattr__(self, name):
+        return getattr(self._mod, name)
+
+    def gated_delta_rule_mtp_ucache_flush(self, *args, **kw):
+        return self._mod.gated_delta_rule_mtp_ucache_flush(
+            *args, backend=self._backend, **kw
+        )
 
 
 def _skip_if_not_sm90_or_later():
@@ -139,6 +160,13 @@ def _load_flush(arm: str):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+    backend = _ARM_BACKEND.get(arm, "hmma")
+    if backend == "umma":
+        from flashinfer.utils import get_compute_capability
+
+        if get_compute_capability(torch.device("cuda"))[0] != 10:
+            pytest.skip("the UMMA backend needs an SM100-class GPU")
+    mod = _WithBackend(mod, backend)
     _MODULE_CACHE[arm] = mod
     return mod
 
