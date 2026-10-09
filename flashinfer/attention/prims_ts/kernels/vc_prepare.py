@@ -17,9 +17,12 @@ Following the paper, V residuals get one E4M3 scale per (batch, head,
 channel) and the block means are stored divided by that scale. Q and K stay
 in their input dtype.
 
-Every kernel runs 128 threads. Thread ``t`` owns head_dim columns
-``(t % 8) * 16 .. + 16`` (one 32-byte vector) of rows ``t // 8 + 16 * i``
-for ``i < 8``.
+Every kernel runs 256 threads. Thread ``t`` owns head_dim columns
+``(t % 16) * 8 .. + 8`` (one 16-byte vector) of rows ``t // 16 + 16 * i``
+for ``i < 8``. Rows stream through registers, never a tile-sized slab, and the
+per-column state is 8 wide: the pre-pass is HBM-latency-bound and needs the
+occupancy (a 128-value fp32 slab per thread capped it at 2 CTAs/SM and 17% of
+DRAM bandwidth; 16-wide column state at 96 registers still at 30%).
 """
 
 from __future__ import annotations
@@ -48,9 +51,9 @@ from ..vc_attention import vc_repair_kv_len
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 # The kernels are specialized for head_dim 128.
 _D = 128
-_THREADS = 128
+_THREADS = 256
 _TILE = VC_K_BLOCK_SIZE
-_COLS_PER_THREAD = 16
+_COLS_PER_THREAD = 8
 _COL_GROUPS = _D // _COLS_PER_THREAD
 _ROW_GROUPS = _THREADS // _COL_GROUPS
 _ROWS_PER_THREAD = _TILE // _ROW_GROUPS
@@ -63,10 +66,10 @@ def _abs_f32(x: Float32) -> Float32:
 
 
 @cute.jit
-def _load_row16(base_addr: Int64, is_bf16: cutlass.Constexpr[bool]):
-    """16 bf16/fp16 elements at ``base_addr`` as a Vector of 16 Float32."""
+def _load_row(base_addr: Int64, is_bf16: cutlass.Constexpr[bool]):
+    """This thread's 8 bf16/fp16 elements at ``base_addr`` as a Vector of Float32."""
     regs = cutlass.inttoptr(base_addr, mem_space=1, dtype=Int32).load(
-        count=8, alignment=32
+        count=_COLS_PER_THREAD // 2, alignment=16
     )
     if cutlass.const_expr(is_bf16):
         return regs.bitcast(cutlass.BFloat16).to(Float32)
@@ -74,10 +77,13 @@ def _load_row16(base_addr: Int64, is_bf16: cutlass.Constexpr[bool]):
 
 
 @cute.jit
-def _store_row16_fp8(base_addr: Int64, vals, scale_inv: Float32):
-    """Quantize 16 Float32 values (Array or Vector) by ``scale_inv`` and store 16 E4M3 bytes."""
-    packed = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-    for j in cutlass.range_constexpr(4):
+def _store_row_fp8(base_addr: Int64, vals, scale_inv: Float32):
+    """Quantize this thread's 8 Float32 values (Array or Vector) by ``scale_inv``
+    and store 8 E4M3 bytes."""
+    packed = cutlass.Array(
+        Int32, _COLS_PER_THREAD // 4, space=cutlass.AddressSpace.rmem
+    )
+    for j in cutlass.range_constexpr(_COLS_PER_THREAD // 4):
         packed[j] = _pack_float4_to_fp8_e4m3(
             vals[4 * j] * scale_inv,
             vals[4 * j + 1] * scale_inv,
@@ -85,7 +91,7 @@ def _store_row16_fp8(base_addr: Int64, vals, scale_inv: Float32):
             vals[4 * j + 3] * scale_inv,
         )
     cutlass.inttoptr(base_addr, mem_space=1, dtype=Int32).store(
-        packed.data_ptr().load(count=4, alignment=16), alignment=16
+        packed.data_ptr().load(count=_COLS_PER_THREAD // 4, alignment=8), alignment=8
     )
 
 
@@ -159,21 +165,23 @@ class VcKvPass1:
                     + (Int64(h) * _D + col0) * 2
                 )
                 regs = cutlass.inttoptr(src, mem_space=1, dtype=Int32).load(
-                    count=8, alignment=32
+                    count=_COLS_PER_THREAD // 2, alignment=16
                 )
                 cutlass.inttoptr(dst, mem_space=1, dtype=Int32).store(
-                    regs, alignment=32
+                    regs, alignment=16
                 )
 
-        # V, tile mean and residual amax.
-        vvals = cutlass.Array(
-            Float32,
-            _ROWS_PER_THREAD * _COLS_PER_THREAD,
-            space=cutlass.AddressSpace.rmem,
-        )
+        # V, tile mean and residual amax. The rows stream through registers:
+        # per-column sum, max and min are enough, since
+        # max_i |v_i - mean| == max(vmax - mean, mean - vmin) exactly (fl() is
+        # monotonic, negation exact).
         psum = cutlass.Array(Float32, _COLS_PER_THREAD, space=cutlass.AddressSpace.rmem)
+        pmax = cutlass.Array(Float32, _COLS_PER_THREAD, space=cutlass.AddressSpace.rmem)
+        pmin = cutlass.Array(Float32, _COLS_PER_THREAD, space=cutlass.AddressSpace.rmem)
         for j in cutlass.range_constexpr(_COLS_PER_THREAD):
             psum[j] = Float32(0.0)
+            pmax[j] = -Float32.inf
+            pmin[j] = Float32.inf
         for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
             pos = t * _TILE + rg + _ROW_GROUPS * i
             if pos < seq_len:
@@ -182,13 +190,11 @@ class VcKvPass1:
                     + (Int64(b) * Int64(seq_len) + Int64(toks[i])) * row_bytes
                     + (Int64(h) * _D + col0) * 2
                 )
-                row = _load_row16(addr, self.is_bf16)
+                row = _load_row(addr, self.is_bf16)
                 for j in cutlass.range_constexpr(_COLS_PER_THREAD):
-                    vvals[i * _COLS_PER_THREAD + j] = row[j]
                     psum[j] = psum[j] + row[j]
-            else:
-                for j in cutlass.range_constexpr(_COLS_PER_THREAD):
-                    vvals[i * _COLS_PER_THREAD + j] = Float32(0.0)
+                    pmax[j] = cute.arch.fmax(pmax[j], row[j])
+                    pmin[j] = cute.arch.fmin(pmin[j], row[j])
         for j in cutlass.range_constexpr(_COLS_PER_THREAD):
             col_sums[rg * _TILE + col0 + j] = psum[j]
         cute.arch.sync_threads()
@@ -210,19 +216,15 @@ class VcKvPass1:
                 + ((Int64(bh) * Int64(num_tiles) + t) * _D + col0) * 4
             )
             cutlass.inttoptr(mean_addr, mem_space=1, dtype=Float32).store(
-                mean.data_ptr().load(count=16, alignment=64), alignment=64
+                mean.data_ptr().load(count=_COLS_PER_THREAD, alignment=32), alignment=32
             )
         # Per-channel residual amax of this tile (reduced over tiles on the host).
+        # Threads without a valid row keep -inf/inf and contribute 0.
         cmax = cutlass.Array(Float32, _COLS_PER_THREAD, space=cutlass.AddressSpace.rmem)
         for j in cutlass.range_constexpr(_COLS_PER_THREAD):
             cmax[j] = Float32(0.0)
-        for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
-            pos = t * _TILE + rg + _ROW_GROUPS * i
-            if pos < seq_len:
-                for j in cutlass.range_constexpr(_COLS_PER_THREAD):
-                    cmax[j] = cute.arch.fmax(
-                        cmax[j], _abs_f32(vvals[i * _COLS_PER_THREAD + j] - mean[j])
-                    )
+            if pmax[j] >= pmin[j]:
+                cmax[j] = cute.arch.fmax(pmax[j] - mean[j], mean[j] - pmin[j])
         cute.arch.sync_threads()  # everyone is done reading col_sums as sums
         for j in cutlass.range_constexpr(_COLS_PER_THREAD):
             col_sums[rg * _TILE + col0 + j] = cmax[j]
@@ -238,7 +240,7 @@ class VcKvPass1:
                 + ((Int64(bh) * Int64(num_tiles) + t) * _D + col0) * 4
             )
             cutlass.inttoptr(amax_addr, mem_space=1, dtype=Float32).store(
-                cmax.data_ptr().load(count=16, alignment=64), alignment=64
+                cmax.data_ptr().load(count=_COLS_PER_THREAD, alignment=32), alignment=32
             )
 
     @cute.jit
@@ -285,9 +287,10 @@ class VcKvPass1:
 
 
 @cute.jit
-def _load_row16_f32(base_addr: Int64):
+def _load_row_f32(base_addr: Int64):
+    """This thread's 8 Float32 elements at ``base_addr``."""
     return cutlass.inttoptr(base_addr, mem_space=1, dtype=Float32).load(
-        count=16, alignment=64
+        count=_COLS_PER_THREAD, alignment=32
     )
 
 
@@ -330,17 +333,17 @@ class VcKvPass2:
         )
 
         smem = cutlass.utils.SmemAllocator()
-        # V repair, per-thread partial residual energies of 16 channels for each of 8 rows.
+        # V repair, per-thread partial residual energies of 8 channels for each of 8 rows.
         energy_part = smem.allocate_array(Float32, _THREADS * _ROWS_PER_THREAD)
 
         vscale_base = mVScale.iterator.toint() + Int64(bh) * (_D * 4)  # [B, H, D] fp32
-        vs = _load_row16_f32(vscale_base + col0 * 4)
+        vs = _load_row_f32(vscale_base + col0 * 4)
         vs_inv = cutlass.Array(
             Float32, _COLS_PER_THREAD, space=cutlass.AddressSpace.rmem
         )
         for j in cutlass.range_constexpr(_COLS_PER_THREAD):
             vs_inv[j] = Float32(1.0) / vs[j]
-        mean = _load_row16_f32(mean_base + col0 * 4)
+        mean = _load_row_f32(mean_base + col0 * 4)
         for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
             pos = t * _TILE + rg + _ROW_GROUPS * i
             energy = Float32(0.0)
@@ -355,7 +358,7 @@ class VcKvPass2:
                     + (Int64(b) * Int64(seq_len) + Int64(tok)) * row_bytes
                     + (Int64(h) * _D + col0) * 2
                 )
-                row = _load_row16(addr, self.is_bf16)
+                row = _load_row(addr, self.is_bf16)
                 res = cutlass.Array(
                     Float32, _COLS_PER_THREAD, space=cutlass.AddressSpace.rmem
                 )
@@ -373,21 +376,25 @@ class VcKvPass2:
                 )
                 if cutlass.const_expr(repair):
                     # Residual energy of the E4M3 rounding in value units.
-                    packed = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-                    for j in cutlass.range_constexpr(4):
+                    packed = cutlass.Array(
+                        Int32, _COLS_PER_THREAD // 4, space=cutlass.AddressSpace.rmem
+                    )
+                    for j in cutlass.range_constexpr(_COLS_PER_THREAD // 4):
                         packed[j] = _pack_float4_to_fp8_e4m3(
                             res[4 * j], res[4 * j + 1], res[4 * j + 2], res[4 * j + 3]
                         )
-                    words = packed.data_ptr().load(count=4, alignment=16)
+                    words = packed.data_ptr().load(
+                        count=_COLS_PER_THREAD // 4, alignment=8
+                    )
                     codes = words.bitcast(cutlass.Float8E4M3FN).to(Float32)
                     for c in cutlass.range_constexpr(_COLS_PER_THREAD):
                         err = (res[c] - codes[c]) * vs[c]
                         energy = energy + err * err
                     cutlass.inttoptr(out_addr, mem_space=1, dtype=Int32).store(
-                        words, alignment=16
+                        words, alignment=8
                     )
                 else:
-                    _store_row16_fp8(out_addr, res, Float32(1.0))
+                    _store_row_fp8(out_addr, res, Float32(1.0))
             if cutlass.const_expr(repair):
                 energy_part[(rg + _ROW_GROUPS * i) * _COL_GROUPS + cg] = energy
         if cutlass.const_expr(repair):
@@ -411,6 +418,8 @@ class VcKvPass2:
         # group, c = K core matrix, r = row, k = K index. Tile 8o+i of the group
         # owns K slots 2i and 2i+1 of every row of operand o; the operands are
         # zeroed by the host, so each thread stores only its two rows' slots.
+        # The operand mapping below was written for 128 threads (idx0 spans
+        # exactly _MU_ELEMS); the upper half of the CTA has nothing to store.
         k_per_core = VC_MEAN_MMA_K // 2
         idx0 = tidx * (2 * k_per_core)
         g = idx0 // (8 * VC_MEAN_MMA_K)
@@ -433,7 +442,7 @@ class VcKvPass2:
         s1 = cutlass.inttoptr(
             vscale_base + Int64(d0 + 1) * 4, mem_space=1, dtype=Float32
         ).load()
-        if cutlass.const_expr(not repair) and c == c_slot:
+        if cutlass.const_expr(not repair) and c == c_slot and tidx < 128:
             # Means are stored divided by the per-channel value scale (paper, Appendix B).
             num_groups = (num_tiles + VC_MEAN_GROUP_TILES - 1) // VC_MEAN_GROUP_TILES
             dst = (
