@@ -2737,10 +2737,15 @@ def test_round27_stt_knob(T):
     # a caller-forced form outside the staging's admission on the stt row keeps that form WITHOUT the staging (the rule's stt does not carry
     # over, like the rule's sk_sync / sk_slab: the e2e registrations of the _t_tma1 and _sks_sb2 programs at this row), while a caller-forced
     # stt on such a form raises
+    # pd (the pipelined TMEM drain) is not a caller form of this row at all: it needs a row-major output and a 128 / 256-column
+    # tile, so the planner rejects it here with or without stt, like the Cake launcher
+    with pytest.raises(ValueError, match="pd needs"):
+        plan_dense_projection_gemm(
+            v["A"], v["B"], v["out"], transposed_out=v["transposed"], pd=2, **kw107
+        )
     for forced in (
         dict(epi="tma"),
         dict(sk_sync=True, sk_slab=2),
-        dict(pd=2),
         dict(cta_rows=256),
     ):
         r, *_ = plan_dense_projection_gemm(
