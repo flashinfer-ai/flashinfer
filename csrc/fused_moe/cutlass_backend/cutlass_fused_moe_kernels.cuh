@@ -4434,6 +4434,11 @@ void CutlassMoeFCRunner<
       use_deepseek_fp8_block_scale ? getDeepSeekBlockScaleGemmRunner() : nullptr;
   bool const use_fused_block_scale_quant =
       (blockscale_gemm_runner != nullptr) && blockscale_gemm_runner->isActivationPrequantized();
+  // The fused path packs fp8 activations + scales into permuted_data_ / fc1_result_; the BF16
+  // LoRA kernels would reinterpret those buffers without dequantizing.
+  TLLM_CHECK_WITH_INFO(!(use_fused_block_scale_quant && use_lora),
+                       "Fused FP8 block-scale activation quant does not support LoRA; set "
+                       "FLASHINFER_MOE_FUSED_BLOCKSCALE_QUANT=0.");
 
   TLLM_CHECK(input_activations);
   TLLM_CHECK(token_selected_experts);
