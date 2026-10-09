@@ -3,6 +3,7 @@
   "build_contract": {
     "architecture_source": "modules[].arch",
     "binary_payloads": false,
+    "source_license_header_sha256": "dcf2449c2d70596e2c32bf1fa23720023965ff05857b85772decee99d830bf2f",
     "target_infrastructure": {
       "binding_runtime": "flashinfer_tvm_ffi_utils",
       "headers_owned_by_target": true,
@@ -13,6 +14,9 @@
     "translation_unit_model": "separate_device_and_binding"
   },
   "contract": {
+    "arches": [
+      "sm_103a"
+    ],
     "backend": "cake",
     "correctness": "byte_exact_copy_and_broadcast",
     "dtypes": [
@@ -32,6 +36,23 @@
       "nope_strided",
       "both_strided"
     ],
+    "integration_files": [
+      "flashinfer/concat_ops.py",
+      "flashinfer/jit/cake_concat_mla_k.py"
+    ],
+    "launch_policy": {
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "grid": "ceil(tokens / tokens_per_cta[element_bytes]), 1, 1",
+      "min_blocks_per_sm": 2,
+      "tokens_per_cta": {
+        "element_bytes_1": 2,
+        "element_bytes_2": 1
+      }
+    },
     "mutation": "caller_owned_k_in_place",
     "operator": "concat_mla_k",
     "output_layouts": [
@@ -39,24 +60,33 @@
       "caller_owned_leading_strided_uninitialized"
     ],
     "public_api": "flashinfer.concat_ops.concat_mla_k",
-    "return_value": null,
     "signature": "concat_mla_k(k, k_nope, k_rope) -> None",
-    "target": "sm_103a"
+    "stages": [
+      "vector_copy"
+    ],
+    "stages_by_arch": {
+      "sm_103a": [
+        "vector_copy"
+      ]
+    }
   },
   "files": [
     {
-      "bytes": 2946,
-      "kind": "device_source",
-      "path": "csrc/concat_mla/cake_concat_mla_k_vector_copy_sm_103a.cu",
-      "sha256": "146ef3b028c818fd1243256681de9eca3bf69ee245fd32ce6727fabd250ad790"
+      "bytes": 4394,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/concat_mla/cake_concat_mla_k_e4d878c1c0ec28530858_binding.cu",
+      "sha256": "e5e3a1f56ac646ccc79e82e6b523cb6b9f59c0be984ef2e08d7ad9d115b170b6"
     },
     {
-      "bytes": 7058,
-      "kind": "tvm_ffi_binding",
-      "path": "csrc/concat_mla/cake_concat_mla_k_vector_copy_sm_103a_binding.cu",
-      "sha256": "9fc547121309a0c0c364e1084cb51eefccea013900c9b3534ab38db75420c9e5"
+      "bytes": 14153,
+      "kind": "device_source",
+      "path": "csrc/concat_mla/cake_concat_mla_k_e4d878c1c0ec28530858_kernel.cu",
+      "sha256": "96b6e151702a1db8cfd6b62a3445c0af1b7d214cd522e4bcbf3d715142d99826"
     }
   ],
+  "generation_inputs": {
+    "schema": "cake.library_export.generation_inputs.v4"
+  },
   "library": "flashinfer",
   "modules": [
     {
@@ -99,6 +129,10 @@
           "k_rope_stride_0_bytes"
         ],
         [
+          "parameter",
+          "tokens"
+        ],
+        [
           "grid",
           "grid_x"
         ],
@@ -111,7 +145,7 @@
           "grid_z"
         ]
       ],
-      "arg_plan_sha256": "17c4ced2842a6275d4c90de0c381500304c5208df74f19f5b7f557b1e966eb64",
+      "arg_plan_sha256": "d020c444ae3565324c9dbc7d04379652fa06fb4396be3dcf03044ff9f852d55e",
       "binding_infrastructure": {
         "runtime": "flashinfer_tvm_ffi_utils",
         "target_owned_headers": [
@@ -120,24 +154,20 @@
       },
       "closure": [
         {
-          "bytes": 2946,
-          "path": "csrc/concat_mla/cake_concat_mla_k_vector_copy_sm_103a.cu",
-          "sha256": "146ef3b028c818fd1243256681de9eca3bf69ee245fd32ce6727fabd250ad790"
+          "bytes": 14153,
+          "path": "csrc/concat_mla/cake_concat_mla_k_e4d878c1c0ec28530858_kernel.cu",
+          "sha256": "96b6e151702a1db8cfd6b62a3445c0af1b7d214cd522e4bcbf3d715142d99826"
         },
         {
-          "bytes": 7058,
-          "path": "csrc/concat_mla/cake_concat_mla_k_vector_copy_sm_103a_binding.cu",
-          "sha256": "9fc547121309a0c0c364e1084cb51eefccea013900c9b3534ab38db75420c9e5"
+          "bytes": 4394,
+          "path": "csrc/concat_mla/cake_concat_mla_k_e4d878c1c0ec28530858_binding.cu",
+          "sha256": "e5e3a1f56ac646ccc79e82e6b523cb6b9f59c0be984ef2e08d7ad9d115b170b6"
         }
       ],
-      "closure_sha256": "f21bee1de92e6270c04908885c41810c95821de3308a08b96e959cf3ab6eecff",
-      "compile_flags": [
-        "-gencode=arch=compute_103a,code=sm_103a",
-        "-DFLASHINFER_ENABLE_FP8_E8M0",
-        "-DFLASHINFER_ENABLE_FP4_E2M1"
-      ],
+      "closure_sha256": "a7031081e0a88e37a7e80d9ac2de5aa7e01f666111beff0805f712aafc0d8cc7",
+      "compile_flags": [],
       "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_concat_mla_k_vector_copy",
+      "kernel_symbol": "kernel_cake_concat_mla_k_e4d878c1c0ec28530858",
       "launch": {
         "block": [
           512,
@@ -149,32 +179,56 @@
           1,
           1
         ],
+        "cluster_scheduling_policy": "spread",
         "cooperative": false,
         "dynamic_smem_bytes": 0,
+        "max_persistent_clusters": null,
+        "persistent_ctas_per_sm": 1,
         "use_pdl": false
       },
-      "module_ident": "cake_concat_mla_k_vector_copy_sm_103a_main",
-      "name": "cake_concat_mla_k_vector_copy",
-      "role": "main",
+      "module_ident": "cake_concat_mla_k_e4d878c1c0ec28530858_sm_103a",
+      "name": "cake_concat_mla_k_e4d878c1c0ec28530858",
+      "noncontiguous_tensors": [
+        "k",
+        "k_nope",
+        "k_rope"
+      ],
+      "role": "kernel",
       "route": {
-        "backend": "cake",
-        "nope_dim": 128,
-        "num_heads": 128,
-        "rope_dim": 64,
-        "target": "sm_103a",
-        "threads": 512,
-        "tokens": "runtime_grid_x"
+        "source_identity": "fe244227464f273eeda4161f922c8fb52c9836293dece95da63ad334a78bdb56",
+        "specialization": {},
+        "stage": "vector_copy",
+        "template": "flashinfer_blackwell_concat_mla_k_vector_copy"
       },
-      "tma_abi": "pointer",
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "persistent_ctas_per_sm": 1,
+        "physical_schedule": "resolved_final_ir",
+        "schedule_identity": "ef55c8e491b4715098c5a13b7f79f43a6e42be5944f84897fbf67d3761265294",
+        "source_arch": null,
+        "source_cluster_scheduling_policy": "spread",
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
       "translation_units": {
-        "binding": "csrc/concat_mla/cake_concat_mla_k_vector_copy_sm_103a_binding.cu",
+        "binding": "csrc/concat_mla/cake_concat_mla_k_e4d878c1c0ec28530858_binding.cu",
         "compile_separately": true,
-        "device": "csrc/concat_mla/cake_concat_mla_k_vector_copy_sm_103a.cu"
+        "device": "csrc/concat_mla/cake_concat_mla_k_e4d878c1c0ec28530858_kernel.cu"
       }
     }
   ],
   "name": "cake_concat_mla_k",
   "producer": "cake",
-  "producer_revision": "932d3e0d3d5b6f044c40cf6321045801d0543a4e",
-  "schema": "cake.library_export.v1"
+  "producer_revision": null,
+  "public_namespace": "cake",
+  "schema": "cake.library_export.v5",
+  "sequences": []
 }
