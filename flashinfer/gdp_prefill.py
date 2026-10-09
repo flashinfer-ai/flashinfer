@@ -41,6 +41,7 @@ def chunk_gated_delta_product(
     output_state: Optional[torch.Tensor] = None,
     *,
     backend: Literal["auto", "cudnn"] = "auto",
+    state_indices: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated DeltaProduct (GDP) attention for prefill.
 
@@ -109,13 +110,23 @@ def chunk_gated_delta_product(
     output_state : torch.Tensor, optional
         Pre-allocated final-state buffer, written in place.  Allocated
         internally when ``None`` and ``output_final_state`` is set.  It must
-        not alias ``initial_state``; the kernel splits one sequence across
+        not alias ``initial_state`` without ``state_indices``; the kernel splits one sequence across
         CTAs, so the CTA reading the incoming state would race the one writing
         the outgoing state.
     backend : Literal["auto", "cudnn"], optional
         FlashInfer carries no GDP kernel of its own, so ``"auto"`` (default)
         and ``"cudnn"`` both run cuDNN's fused SM100 linear-attention engine
         through :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_product`.
+
+    state_indices : torch.Tensor, optional
+        Contiguous int32 ``[num_seqs]`` slots in ``initial_state`` and
+        ``output_state`` pools, requiring cuDNN frontend 1.31+. Pools have
+        shape ``[N_pool, H, V, K]``, dense inner rows, and a 16-byte aligned
+        slot stride. Slot values must be unique and in range.
+        When ``output_final_state=True``, an explicit output pool is required;
+        it may be the identical input view or disjoint memory. The returned
+        state is the whole output pool, with unselected slots unchanged.
+        When false, neither pool is modified. Values are not read on the CPU.
 
     Returns
     -------
@@ -155,4 +166,5 @@ def chunk_gated_delta_product(
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         output=output,
         output_state=output_state,
+        state_indices=state_indices,
     )

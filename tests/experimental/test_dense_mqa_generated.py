@@ -13,6 +13,7 @@ import bisect
 
 import pytest
 import torch
+
 from flashinfer.dense_mqa import prepare_dense_mqa_logits
 from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa as _runtime
 
@@ -368,3 +369,412 @@ def test_dense_mqa_rejects_unsupported_shapes():
         prepare_dense_mqa_logits("fp8", q, kv, weights, starts, ends[:3], kv_scales=ks)
     with pytest.raises(ValueError):
         prepare_dense_mqa_logits("bf16", q, kv, weights, starts, ends, kv_scales=ks)
+
+
+# ---------------------------------------------------------------------------
+# DeepGEMM-signature one-shot entry (fp8_mqa_logits) and the head-count table
+# ---------------------------------------------------------------------------
+
+
+def test_dense_route_table_is_catalog_driven():
+    """Host-only: the 32-head names are unchanged, other head counts carry the
+    ``h<H>`` infix with tiers named by their token ceiling, and availability
+    (including the per-head KV alignment) is the catalog's word."""
+    assert _runtime.route_name("fp8", 16, 4096) == "fp8:full:le16"
+    assert _runtime.route_name("fp8", 1, 4096) == "fp8:q1:short"
+    assert _runtime.route_name("fp8", 130, 8192) == "fp8:partial:le2048"
+    assert _runtime.dense_route_available(32, 16, 4096)
+    assert not _runtime.dense_route_available(32, 16, 4100)  # 32 heads: K % 256
+    record = _runtime.route_record("fp8", 16, 4096)
+    assert record["num_heads"] == 32 and record["block_q"] == 4
+    assert record["clean_logits"] == "fused" and record["kv_alignment"] == 256
+    if 64 in _runtime.heads():
+        assert _runtime.block_q(64) == 2
+        assert _runtime.route_name("fp8", 16, 4096, 64) == "fp8:h64:full:le64"
+        assert _runtime.route_name("fp8", 3, 4100, 64) == "fp8:h64:partial:le8"
+        assert _runtime.route_name("fp8", 1, 300, 64) == "fp8:h64:q1"
+        assert _runtime.route_name("fp8", 1024, 5124, 64) == "fp8:h64:full:le1024"
+        # W-dense contract: single-stage gridDim-strided programs, no metadata stage, no query bound.
+        assert not _runtime.schedules_metadata(64) and _runtime.max_queries(64) is None
+        # Availability of a 64-head point is decided per architecture (policy.dense_admission).
+        for arch in sorted(_runtime._catalog()["arches"]):
+            admitted = set(_runtime.h64_admission(arch)["admitted_routes"])
+            assert _runtime.dense_route_available(64, 37, 4137, arch=arch) == (
+                "fp8:h64:partial:le64" in admitted
+            )
+            assert _runtime.dense_route_available(64, 100_000, 7, arch=arch) == (
+                "fp8:h64:full:any" in admitted
+            )
+        h64_route = next(
+            r for r in _runtime._catalog()["routes"] if r.startswith("fp8:h64:")
+        )
+        record = _runtime._catalog()["routes"][h64_route]
+        assert record["clean_logits"] == "raw" and record["kv_alignment"] == 1
+        assert [stage for stage, _p in record["stages"]] == ["logits"]
+        # Only tiers admitted on at least one architecture have a record (and programs); a route withheld
+        # everywhere is absent from the table. Every catalogued 64-head route is a single logits stage whose
+        # program is a catalogued program (program ids are the generated-unit names, not template names).
+        programs = set(_runtime._catalog()["programs"])
+        for r in _runtime._catalog()["routes"]:
+            if r.startswith("fp8:h64:"):
+                names = _runtime.program_names(r)
+                assert len(names) == 1 and set(names) <= programs, (r, names)
+    else:
+        assert not _runtime.dense_route_available(64, 16, 4096)
+    assert (
+        _runtime.schedules_metadata(32)
+        and _runtime.max_queries(32)
+        == 4 * _runtime._catalog()["policy"]["max_q_blocks"]
+    )
+    assert not _runtime.dense_route_available(16, 16, 4096)
+    assert not _runtime.dense_route_available(32, 0, 4096)
+
+
+@pytest.mark.parametrize(
+    "queries,keys,heads",
+    [
+        (16, 4096, 32),
+        (3, 2048, 32),
+        (1, 4096, 32),
+        (128, 4096, 32),
+        (37, 4100, 64),
+        (1, 8192, 64),
+    ],
+)
+def test_fp8_mqa_logits_one_shot(queries, keys, heads):
+    """``fp8_mqa_logits(q, (kv, scales), weights, ks, ke)``: the plan's result on
+    an exact ``[Q]`` slice (rows below the query block padded by the entry), the
+    same bits whether ``clean_logits`` is passed or not, and ``max_seqlen_k``
+    rejected."""
+    _skip_unless_exported()
+    arch = _runtime.device_arch(torch.device("cuda"))
+    if not _runtime.dense_route_available(heads, queries, keys, arch=arch):
+        pytest.skip(
+            f"catalog has no admitted route for H={heads}, Q={queries}, K={keys} on {arch}"
+        )
+    from flashinfer.dense_mqa import fp8_mqa_logits
+
+    torch.manual_seed(3)
+    q = torch.randn(queries, heads, 128, device="cuda").to(torch.float8_e4m3fn)
+    kv = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.rand(keys, device="cuda") + 0.5
+    weights = torch.randn(queries, heads, device="cuda")
+    ks = torch.zeros(queries, device="cuda", dtype=torch.int32)
+    ke = torch.full_like(ks, keys)
+    ke[1::3] = 17
+    ks = torch.minimum(ks, ke)
+    record = _runtime.route_record("fp8", queries, keys, heads)
+    out = fp8_mqa_logits(q, (kv, scales), weights, ks, ke, clean_logits=False)
+    if record["clean_logits"] == "fused":
+        out_clean = fp8_mqa_logits(q, (kv, scales), weights, ks, ke, clean_logits=True)
+    else:
+        with pytest.raises(ValueError):
+            fp8_mqa_logits(q, (kv, scales), weights, ks, ke, clean_logits=True)
+        out_clean = out
+    torch.cuda.synchronize()
+    assert tuple(out.shape) == (queries, keys)
+    assert out.dtype == torch.float32 and out.stride(1) == 1 and out.stride(0) % 4 == 0
+    assert torch.equal(out, out_clean)
+    if heads == 32:
+        expected = _reference(
+            "fp8", q, kv, None, scales, weights, ks, ke, queries, keys
+        )
+    else:
+        q_f32, kv_f32 = q.float(), kv.float()
+        expected = torch.zeros(queries, keys, device="cuda")
+        for head in range(heads):
+            expected += (
+                torch.relu(q_f32[:, head] @ kv_f32.T) * weights[:, head : head + 1]
+            )
+        expected *= scales[None, :]
+        position = torch.arange(keys, device="cuda")[None, :]
+        expected = expected.masked_fill(
+            ~((position >= ks[:, None]) & (position < ke[:, None])), float("-inf")
+        )
+    finite = torch.isfinite(expected)
+    if record["clean_logits"] == "fused":
+        assert torch.equal(torch.isfinite(out), finite)
+    else:
+        assert torch.isfinite(
+            out[finite]
+        ).all()  # raw stores: cells outside the windows are unspecified
+    torch.testing.assert_close(out[finite], expected[finite], atol=0.1, rtol=0.1)
+    with pytest.raises(ValueError):
+        fp8_mqa_logits(q, (kv, scales), weights, ks, ke, max_seqlen_k=keys)
+    with pytest.raises(ValueError):
+        fp8_mqa_logits(q, kv, weights, ks, ke)  # kv must be the (values, scales) pair
+    try:
+        import deep_gemm
+    except ImportError:
+        return
+    if not hasattr(deep_gemm, "fp8_mqa_logits") or heads != 32:
+        return
+    native = deep_gemm.fp8_mqa_logits(
+        q, (kv, scales), weights, ks, ke, clean_logits=False
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out[finite], native[finite], atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("queries,keys,heads", [(16, 4096, 32), (37, 4100, 64)])
+def test_fp8_mqa_logits_graph_replay(queries, keys, heads):
+    """The one-shot entry captured in a CUDA graph launches on the capture
+    stream: a replay after the captured output is poisoned reproduces the eager
+    bits (an empty capture leaves the poison and fails), and the logits are
+    non-trivial."""
+    _skip_unless_exported()
+    arch = _runtime.device_arch(torch.device("cuda"))
+    if not _runtime.dense_route_available(heads, queries, keys, arch=arch):
+        pytest.skip(
+            f"catalog has no admitted route for H={heads}, Q={queries}, K={keys} on {arch}"
+        )
+    from flashinfer.dense_mqa import fp8_mqa_logits
+
+    torch.manual_seed(5)
+    q = torch.randn(queries, heads, 128, device="cuda").to(torch.float8_e4m3fn)
+    kv = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.rand(keys, device="cuda") + 0.5
+    weights = torch.randn(queries, heads, device="cuda")
+    ks = torch.zeros(queries, device="cuda", dtype=torch.int32)
+    ke = torch.full_like(ks, keys)
+    eager = fp8_mqa_logits(
+        q, (kv, scales), weights, ks, ke
+    )  # eager warm-up builds the module
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = fp8_mqa_logits(q, (kv, scales), weights, ks, ke)
+    with torch.cuda.stream(stream):
+        captured.fill_(float("nan"))
+        graph.replay()
+    stream.synchronize()
+    assert torch.equal(captured, eager), (
+        "graph replay does not reproduce the eager logits"
+    )
+    assert torch.isfinite(captured).all() and bool((captured != 0).any())
+    with torch.cuda.stream(stream):
+        weights.neg_()
+        captured.fill_(float("nan"))
+        graph.replay()
+        changed = fp8_mqa_logits(q, (kv, scales), weights, ks, ke)
+    stream.synchronize()
+    assert torch.equal(captured, changed) and not torch.equal(captured, eager)
+
+
+def test_catalog_programs_are_delivered_and_distinct():
+    """Host-only: every program a dense or paged route names is catalogued, its generated units exist
+    under FlashInfer's ``csrc`` (a module: its own ``<name>_kernel.cu`` + ``<name>_binding.cu``; a
+    sequence: >= 2 module kernels + its own binding), no two generated kernel units are byte-identical
+    and no generated unit is unreferenced -- a route table pointing at a program hash whose units were
+    regenerated under a new hash fails here, not at JIT build time."""
+    import hashlib
+
+    from flashinfer.jit import env
+
+    csrc = env.FLASHINFER_CSRC_DIR
+    catalog = _runtime._catalog()
+    programs = catalog["programs"]
+    generated = "csrc/experimental/deepgemm_dense_mqa/generated"
+    for table in ("routes", "paged_routes"):
+        for route, record in catalog.get(table, {}).items():
+            for _stage, program in record["stages"]:
+                assert program in programs, (table, route, program)
+            assert not record.get("sequence") or record["sequence"] in programs, (
+                table,
+                route,
+            )
+    referenced, kernels = set(), {}
+    for name, record in programs.items():
+        for source in record["sources"]:
+            assert source.startswith("csrc/"), (name, source)
+            assert (csrc / source.removeprefix("csrc/")).is_file(), (name, source)
+            referenced.add(source)
+        if record.get(
+            "standalone", True
+        ):  # an omitted-binding module carries no closure digest
+            for arch in record["arches"]:
+                assert arch in (record.get("closure_sha256") or {}), (name, arch)
+        if record["kind"] == "module":
+            expected = {f"{generated}/{name}_kernel.cu"}
+            if record["standalone"]:
+                expected.add(f"{generated}/{name}_binding.cu")
+            assert set(record["sources"]) == expected, (name, record["sources"])
+            kernels[f"{generated}/{name}_kernel.cu"] = name
+        else:
+            assert record["kind"] == "sequence", name
+            devices = [s for s in record["sources"] if s.endswith("_kernel.cu")]
+            assert (
+                len(devices) >= 2
+                and f"{generated}/{name}_binding.cu" in record["sources"]
+            ), name
+            for device in devices:
+                owner = device.rsplit("/", 1)[1].removesuffix("_kernel.cu")
+                assert programs.get(owner, {}).get("kind") == "module", (name, device)
+    digests = {}
+    for source, name in sorted(kernels.items()):
+        digest = hashlib.sha256(
+            (csrc / source.removeprefix("csrc/")).read_bytes()
+        ).hexdigest()
+        assert digest not in digests, (
+            f"{name} kernel unit is byte-identical to {digests[digest]}'s"
+        )
+        digests[digest] = name
+    generated_dir = csrc / generated.removeprefix("csrc/")
+    orphans = sorted(
+        p.name
+        for p in generated_dir.iterdir()
+        if p.suffix == ".cu" and f"{generated}/{p.name}" not in referenced
+    )
+    assert not orphans, f"generated units not referenced by the catalog: {orphans}"
+
+
+def test_h64_admission_matches_the_catalog_table():
+    """Host-only: the shipped allow-list of the 64-head family is decided per architecture
+    (``policy.dense_admission``): on every catalogued arch the admitted and withheld tier names are disjoint
+    and together name every 64-head tier (none when the family is not exported), a reason accompanies a
+    non-empty withheld list, every admitted route has a catalog record, and ``dense_route_available`` on that
+    arch is True exactly for the query counts of admitted tiers. Without ``arch`` the architectures must
+    agree, otherwise the call raises (no silent admit)."""
+    catalog = _runtime._catalog()
+    arches = sorted(catalog["arches"])
+    tiers = {
+        "fp8:h64:q1",
+        *(
+            f"fp8:h64:{kind}:{tier}"
+            for kind in ("full", "partial")
+            for tier in ("le8", "le64", "le1024", "any")
+        ),
+    }
+    verdicts, sample = {}, {}
+    for arch in arches:
+        admission = _runtime.h64_admission(arch)
+        admitted, withheld = (
+            set(admission["admitted_routes"]),
+            set(admission["withheld_routes"]),
+        )
+        assert admitted <= tiers and withheld <= tiers and not admitted & withheld
+        assert admitted <= set(catalog["routes"])
+        assert bool(withheld) == (admission["reason"] is not None)
+        if 64 not in _runtime.heads():
+            assert not admitted and not withheld
+            continue
+        assert admitted | withheld == tiers
+        for queries in (1, 2, 3, 8, 9, 16, 37, 64, 65, 128, 1024, 1025, 4096, 100_000):
+            route = _runtime.route_name("fp8", queries, 300, 64)
+            assert _runtime.dense_route_available(64, queries, 300, arch=arch) == (
+                route in admitted
+            ), (arch, queries, route)
+            verdicts.setdefault(route, set()).add(route in admitted)
+            sample.setdefault(route, queries)
+    for route, outcomes in verdicts.items():
+        if len(outcomes) == 1:
+            assert (
+                _runtime.dense_route_available(64, sample[route], 300, arch=None)
+                == outcomes.pop()
+            )
+        else:
+            with pytest.raises(ValueError, match="pass arch"):
+                _runtime.dense_route_available(64, sample[route], 300, arch=None)
+    with pytest.raises(ValueError, match="arch must be one of"):
+        _runtime.h64_admission("sm_999x")
+
+
+def _route_point(route_name, record):
+    """A legal ``(queries, keys)`` of one dense route: the KV length that selects the
+    route's KV range (``:short`` fused routes below their ceiling, the non-fused
+    ``fp8:q1`` above ``fused_q1_max_kv``, the 64-head routes any length) and the
+    smallest query count the router maps to the route name."""
+    policy = _runtime._catalog()["policy"]
+    precision = route_name.split(":")[0]
+    num_heads = int(record["num_heads"])
+    if route_name.endswith(":short"):
+        keys = 512
+    elif route_name == "fp8:q1":
+        keys = int(policy["fused_q1_max_kv"]) + 256
+    else:
+        keys = 512 if num_heads == _runtime.NUM_HEADS else 300
+    for queries in range(1, 4200):
+        if _runtime.route_name(precision, queries, keys, num_heads) == route_name:
+            return queries, keys
+    raise AssertionError(
+        f"no query count in 1..4199 selects {route_name} at K = {keys}"
+    )
+
+
+def test_dense_bindings_cover_every_program_argument():
+    """Host-only, every dense route (32- and 64-head, every tier): every operand of
+    every program the route launches -- its prepared ``sequence`` (``stage.name``
+    keys) or each of its ``stages`` -- is produced by ``stage_bindings`` under the
+    name the catalog ``arg_plan`` uses, looked up exactly as ``_submission`` does.
+    The contract-level check that fails before a prebuild or launch would (an earlier
+    export left the paged logits programs' ``num_sms`` parameter unbound);
+    ``stage_bindings`` only reshapes and views, so CPU tensors suffice."""
+    catalog = _runtime._catalog()
+    num_sms = 4
+    checked = 0
+    for route_name, record in catalog["routes"].items():
+        precision = route_name.split(":")[0]
+        num_heads, bq = int(record["num_heads"]), int(record["block_q"])
+        queries, keys = _route_point(route_name, record)
+        assert any(
+            _runtime.dense_route_available(
+                num_heads, queries, keys, precision, arch=arch
+            )
+            for arch in catalog["arches"]
+        ), (route_name, queries, keys)
+        starts = torch.zeros(queries, dtype=torch.int32)
+        ends = torch.full((queries,), keys, dtype=torch.int32)
+        if precision == "fp4":
+            q = torch.zeros((queries, num_heads, 64), dtype=torch.uint8)
+            kv = torch.zeros((keys, 64), dtype=torch.uint8)
+            q_scales = torch.zeros((queries, num_heads, 4), dtype=torch.uint8)
+            kv_scales = torch.zeros((keys, 4), dtype=torch.uint8)
+            rows = queries
+        else:
+            rows = max(bq, queries) if num_heads == _runtime.NUM_HEADS else queries
+            head_dim = _runtime.HEAD_DIM
+            q = torch.zeros((rows, num_heads, head_dim), dtype=torch.float8_e4m3fn)
+            kv = torch.zeros((keys, head_dim), dtype=torch.float8_e4m3fn)
+            q_scales = None
+            kv_scales = torch.zeros(_runtime.align4(keys), dtype=torch.float32)[:keys]
+        weights = torch.zeros((rows, num_heads), dtype=torch.float32)
+        stride = _runtime.logits_stride(keys)
+        output = torch.zeros((queries, stride), dtype=torch.float32)
+        metadata = None
+        if _runtime.schedules_metadata(num_heads):
+            words = _runtime.metadata_words(queries, num_sms, num_heads)
+            metadata = torch.zeros(words, dtype=torch.int32)
+        bindings = _runtime.stage_bindings(
+            precision,
+            q,
+            kv,
+            weights,
+            starts,
+            ends,
+            output,
+            metadata,
+            q_scales=q_scales,
+            kv_scales=kv_scales,
+            num_sms=num_sms,
+            num_heads=num_heads,
+        )
+        sequence = record.get("sequence")
+        if sequence:
+            selections = [(None, sequence)]
+        else:
+            selections = [tuple(stage) for stage in record["stages"]]
+        for stage, program in selections:
+            missing = []
+            for kind, key in catalog["programs"][program]["arg_plan"]:
+                assert kind != "workspace", (route_name, program, key)
+                selected, name = key.split(".", 1) if stage is None else (stage, key)
+                if name not in bindings.get(selected, {}):
+                    missing.append(key)
+            assert not missing, (
+                f"{route_name} program {program} (stage {stage}): unbound arguments {missing}"
+            )
+            checked += 1
+    assert checked >= len(catalog["routes"])

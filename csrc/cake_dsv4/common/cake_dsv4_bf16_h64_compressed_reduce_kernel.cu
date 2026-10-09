@@ -76,7 +76,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_dsv4_ff2e22a8db18dbc0c76e(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, int num_heads, int num_splits)
+kernel_cake_dsv4_066155afbbeb7c940ca0(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, int num_heads, int num_splits)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -129,13 +129,8 @@ kernel_cake_dsv4_ff2e22a8db18dbc0c76e(__nv_bfloat16* __restrict__ partial_O, flo
             uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_0[0 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _pair * 2])[1])
-                    : "r"(_vpairs_0[_pair]));
+                (&_vec_load_0[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                (&_vec_load_0[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
             }
         }
         float _vec_load_1[4];
@@ -145,13 +140,8 @@ kernel_cake_dsv4_ff2e22a8db18dbc0c76e(__nv_bfloat16* __restrict__ partial_O, flo
             uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_1[0 + _pair * 2])[0]), "=f"((&_vec_load_1[0 + _pair * 2])[1])
-                    : "r"(_vpairs_1[_pair]));
+                (&_vec_load_1[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
+                (&_vec_load_1[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
             }
         }
         float _vec_load_2[4];
@@ -161,13 +151,8 @@ kernel_cake_dsv4_ff2e22a8db18dbc0c76e(__nv_bfloat16* __restrict__ partial_O, flo
             uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_2[0 + _pair * 2])[0]), "=f"((&_vec_load_2[0 + _pair * 2])[1])
-                    : "r"(_vpairs_2[_pair]));
+                (&_vec_load_2[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
+                (&_vec_load_2[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
             }
         }
         float _vec_load_3[4];
@@ -177,13 +162,8 @@ kernel_cake_dsv4_ff2e22a8db18dbc0c76e(__nv_bfloat16* __restrict__ partial_O, flo
             uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_3[0 + _pair * 2])[0]), "=f"((&_vec_load_3[0 + _pair * 2])[1])
-                    : "r"(_vpairs_3[_pair]));
+                (&_vec_load_3[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
+                (&_vec_load_3[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
             }
         }
         float _shfl_0 = __shfl_sync(0xFFFFFFFF, normalized_weight, 0);
@@ -209,13 +189,8 @@ kernel_cake_dsv4_ff2e22a8db18dbc0c76e(__nv_bfloat16* __restrict__ partial_O, flo
             uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_4[0 + _pair * 2])[0]), "=f"((&_vec_load_4[0 + _pair * 2])[1])
-                    : "r"(_vpairs_4[_pair]));
+                (&_vec_load_4[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) << 16);
+                (&_vec_load_4[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) & 0xffff0000u);
             }
         }
         float _vec_load_5[4];
@@ -225,13 +200,8 @@ kernel_cake_dsv4_ff2e22a8db18dbc0c76e(__nv_bfloat16* __restrict__ partial_O, flo
             uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_5[0 + _pair * 2])[0]), "=f"((&_vec_load_5[0 + _pair * 2])[1])
-                    : "r"(_vpairs_5[_pair]));
+                (&_vec_load_5[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) << 16);
+                (&_vec_load_5[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) & 0xffff0000u);
             }
         }
         float _vec_load_6[4];
@@ -241,13 +211,8 @@ kernel_cake_dsv4_ff2e22a8db18dbc0c76e(__nv_bfloat16* __restrict__ partial_O, flo
             uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_6[0 + _pair * 2])[0]), "=f"((&_vec_load_6[0 + _pair * 2])[1])
-                    : "r"(_vpairs_6[_pair]));
+                (&_vec_load_6[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) << 16);
+                (&_vec_load_6[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) & 0xffff0000u);
             }
         }
         float _shfl_4 = __shfl_sync(0xFFFFFFFF, normalized_weight, 0);
@@ -272,13 +237,8 @@ kernel_cake_dsv4_ff2e22a8db18dbc0c76e(__nv_bfloat16* __restrict__ partial_O, flo
                 uint32_t* _vpairs_7 = reinterpret_cast<uint32_t*>(&_vld_7);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_vec_load_7[0 + _pair * 2])[0]), "=f"((&_vec_load_7[0 + _pair * 2])[1])
-                        : "r"(_vpairs_7[_pair]));
+                    (&_vec_load_7[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_7[_pair]) << 16);
+                    (&_vec_load_7[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_7[_pair]) & 0xffff0000u);
                 }
             }
             float _shfl_7 = __shfl_sync(0xFFFFFFFF, normalized_weight, split);
