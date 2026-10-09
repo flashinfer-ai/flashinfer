@@ -21,6 +21,7 @@ import queue
 import subprocess
 import sys
 import threading
+from concurrent.futures import Future
 
 from ....jit.core import logger
 
@@ -57,7 +58,7 @@ class _Pool:
             for _ in range(workers)
         ]
         self.jobs = queue.Queue()
-        self.busy = 0
+        self.pending = 0
         self.timer = None
         for proc in self.procs:
             threading.Thread(target=self._serve, args=(proc,), daemon=True).start()
@@ -65,7 +66,7 @@ class _Pool:
     def _serve(self, proc):
         alive = True
         while True:
-            job, done = self.jobs.get()
+            job, fut = self.jobs.get()
             if job is None:
                 return
             err = "compile worker exited"
@@ -79,9 +80,23 @@ class _Pool:
                 except Exception as e:  # noqa: BLE001 -- reported to the caller
                     alive = False
                     err = f"{type(e).__name__}: {e}"
-            done.put((job, err))
+            with _lock:
+                self.pending -= 1
+                if self.pending == 0:
+                    self.timer = threading.Timer(IDLE_SECONDS, _release, (self,))
+                    self.timer.daemon = True
+                    self.timer.start()
+            fut.set_result(err)
 
     def close(self):
+        """Drop the queued jobs and let the workers exit after their current one."""
+        while True:
+            try:
+                job, fut = self.jobs.get_nowait()
+            except queue.Empty:
+                break
+            self.pending -= 1
+            fut.set_result("compile pool closed")
         for _ in self.procs:
             self.jobs.put((None, None))
         for proc in self.procs:
@@ -89,23 +104,36 @@ class _Pool:
                 proc.stdin.close()
 
 
-def _release():
+def _release(pool):
     global _pool
     with _lock:
-        pool = _pool
-        if pool is not None and pool.busy == 0:
+        if _pool is pool and pool.pending == 0:
             _pool = None
             pool.close()
 
 
-def compile_all(jobs, arch, on_done):
-    """Compile ``jobs`` in worker subprocesses; ``on_done(job, error)`` runs in
-    this thread as each one finishes. Returns ``False`` (nothing done) when the
-    pool is unavailable."""
+def shutdown():
+    """Stop the workers now, dropping queued jobs."""
+    global _pool
+    with _lock:
+        pool, _pool = _pool, None
+        if pool is not None:
+            if pool.timer is not None:
+                pool.timer.cancel()
+            pool.close()
+
+
+def submit(jobs, arch, start=True):
+    """Queue ``jobs`` on the worker subprocesses, in order.
+
+    Returns one ``Future`` per job whose result is ``None`` or the error
+    text, or ``None`` when no pool is running and ``start`` is false or the
+    workers cannot be started.
+    """
     global _pool, _disabled
     with _lock:
-        if _disabled:
-            return False
+        if _disabled or (_pool is None and not start):
+            return None
         if _pool is None:
             try:
                 _pool = _Pool(num_workers(), arch)
@@ -114,25 +142,18 @@ def compile_all(jobs, arch, on_done):
                     f"SM12x mxfp8: no compile workers ({e}); compiling serially"
                 )
                 _disabled = True
-                return False
+                return None
         pool = _pool
-        pool.busy += 1
         if pool.timer is not None:
             pool.timer.cancel()
-    try:
-        done = queue.Queue()
+            pool.timer = None
+        pool.pending += len(jobs)
+        futures = []
         for job in jobs:
-            pool.jobs.put((job, done))
-        for _ in jobs:
-            on_done(*done.get())
-    finally:
-        with _lock:
-            pool.busy -= 1
-            if pool.busy == 0:
-                pool.timer = threading.Timer(IDLE_SECONDS, _release)
-                pool.timer.daemon = True
-                pool.timer.start()
-    return True
+            fut: Future = Future()
+            pool.jobs.put((job, fut))
+            futures.append(fut)
+    return futures
 
 
 def _main():

@@ -10,6 +10,7 @@ scales in the F8_128x4 layout. The output is BF16 or FP16.
 import functools
 import os
 import threading
+from concurrent.futures import as_completed
 
 import torch
 
@@ -217,8 +218,30 @@ def _get_compiled(index, n, k, tactic, out_f16):
     return fn
 
 
+# Representative M of the autotuner buckets whose candidates are queued for
+# compilation when a shape is first prepared (see _prepare).
+_AHEAD_MS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+_AHEAD_DONE: set = set()
+_INFLIGHT: dict = {}
+
+
+def _preparation_tactics(m, n, k, dev):
+    """Kernels a bucket's profiling can launch: the candidates and, for the
+    cooperative ping-pong tile, its 128-row fallback for smaller M."""
+    out = []
+    for choice in policy.valid_tactics(m, n, k, dev):
+        out.append(choice)
+        if choice[0] == "pingpong" and choice[7]:
+            out.append(policy.resolve(choice, 1))
+    return out
+
+
 def _prepare(index, n, k, tactics, out_f16):
-    """Load ``tactics``, compiling the uncached ones in worker subprocesses."""
+    """Load ``tactics``, compiling the uncached ones in worker subprocesses.
+
+    The first preparation of a shape also queues the candidates of the other
+    buckets behind its own, so they compile while this bucket is profiled.
+    """
     from ....jit.cute_dsl_core import (
         JitSpecCuteDsl,
         _hash_source_files,
@@ -226,33 +249,55 @@ def _prepare(index, n, k, tactics, out_f16):
     )
     from . import compile_pool
 
-    pending = [t for t in tactics if (index, n, k, t, out_f16) not in _COMPILED]
+    shape = (index, n, k, out_f16)
+
+    def key_of(t):
+        return (index, n, k, t, out_f16)
+
+    pending = [t for t in tactics if key_of(t) not in _COMPILED]
     if (
-        len(pending) > 1
+        pending
         and compile_pool.num_workers() > 1
         and not cute_dsl_cache_disabled()
         and not torch.cuda.is_current_stream_capturing()
     ):
         dev = _device(index)
-        jobs = []
-        for t in pending:
+        wanted = list(pending)
+        if shape not in _AHEAD_DONE:
+            _AHEAD_DONE.add(shape)
+            for m in _AHEAD_MS:
+                wanted += _preparation_tactics(m, n, k, dev)
+        jobs, queued = [], set()
+        for t in wanted:
+            key = key_of(t)
+            if key in _COMPILED or key in _INFLIGHT or key in queued:
+                continue
             module, name, compile_fn, key_files = _kernel_spec(n, k, t, dev, out_f16)
             spec = JitSpecCuteDsl(
                 module, name, compile_fn, _hash_source_files(key_files)
             )
             if not spec.is_compiled:
-                jobs.append([n, k, list(t), dev.sms, dev.l2_bytes, out_f16])
-        if len(jobs) > 1:
+                jobs.append(t)
+                queued.add(key)
+        if jobs:
             major, minor = get_compute_capability(torch.device("cuda", index))
             arch = os.environ.get("CUTE_DSL_ARCH") or f"sm_{major}{minor}a"
-
-            def load(job, err):
-                if err is not None:
-                    compile_pool.logger.debug(f"SM12x mxfp8 compile worker: {err}")
-                _get_compiled(index, n, k, tuple(job[2]), out_f16)
-
-            compile_pool.compile_all(jobs, arch, load)
+            futures = compile_pool.submit(
+                [[n, k, list(t), dev.sms, dev.l2_bytes, out_f16] for t in jobs],
+                arch,
+                start=len(jobs) > 1,
+            )
+            if futures is not None:
+                for t, fut in zip(jobs, futures, strict=True):
+                    _INFLIGHT[key_of(t)] = fut
+        waits = {_INFLIGHT[key_of(t)]: t for t in pending if key_of(t) in _INFLIGHT}
+        for fut in as_completed(waits):
+            err = fut.result()
+            if err is not None:
+                compile_pool.logger.debug(f"SM12x mxfp8 compile worker: {err}")
+            _get_compiled(index, n, k, waits[fut], out_f16)
     for t in tactics:
+        _INFLIGHT.pop(key_of(t), None)
         _get_compiled(index, n, k, t, out_f16)
 
 
@@ -302,13 +347,9 @@ class Sm12xMxfp8GemmRunner(TunableRunner):
         index = get_device_index(a.device)
         dev = _device(index)
         if do_preparation:
-            tactics = []
-            for choice in policy.valid_tactics(m, n, k, dev):
-                tactics.append(choice)
+            tactics = _preparation_tactics(m, n, k, dev)
+            for choice in tactics:
                 _workspace(index).get(*_workspace_need(choice, m, n, k, dev))
-                if choice[0] == "pingpong" and choice[7]:
-                    # The 128-row fallback of policy.resolve for smaller M.
-                    tactics.append(policy.resolve(choice, 1))
             _prepare(index, n, k, tactics, out.dtype == torch.float16)
             return out
         if tactic is None or tactic == -1 or not policy.supports_m(tactic, m):

@@ -289,6 +289,43 @@ def test_autotune_cache_file_roundtrip(tmp_path):
         _assert_exact(mm_mxfp8(a, b, sfa, sfb, backend="cute-dsl"), ref)
 
 
+def test_parallel_compile_into_empty_cache(monkeypatch, tmp_path):
+    """Kernels compiled by the worker subprocesses, for this bucket and ahead
+    for another, land in the disk cache and run exactly."""
+    from flashinfer.gemm.kernels.sm12x_mxfp8 import compile_pool, policy, runner
+    from flashinfer.jit import env as jit_env
+
+    jit_dir = tmp_path / jit_env.FLASHINFER_JIT_DIR.relative_to(
+        jit_env.FLASHINFER_BASE_DIR
+    )
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(tmp_path))
+    monkeypatch.setenv("FLASHINFER_SM12X_MXFP8_COMPILE_WORKERS", "4")
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", jit_dir)
+    monkeypatch.setattr(runner, "_COMPILED", {})
+    monkeypatch.setattr(runner, "_INFLIGHT", {})
+    monkeypatch.setattr(runner, "_AHEAD_DONE", set())
+    monkeypatch.setattr(runner, "_AHEAD_MS", (64,))
+    compile_pool.shutdown()
+    r, dev = _runner_and_device()
+    try:
+        for m in (8, 64):
+            n, k = 640, 2560
+            (a, b, sfa, sfb), ref = _operands(m, n, k, seed=m)
+            out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+            inputs = [a, b, sfa, sfb, torch.bfloat16, out, None]
+            r(inputs, do_preparation=True)
+            for tactic in policy.valid_tactics(m, n, k, dev):
+                out.fill_(float("nan"))
+                r(inputs, tactic=tactic)
+                _assert_exact(out, ref)
+        expected = {
+            t for m in (8, 64) for t in runner._preparation_tactics(m, n, k, dev)
+        }
+        assert len(list(jit_dir.rglob("*.o"))) == len(expected)
+    finally:
+        compile_pool.shutdown()
+
+
 def test_foreign_tactic_falls_back_to_default():
     """A tactic that is not one of this backend's runs the default instead."""
     runner, _ = _runner_and_device()
