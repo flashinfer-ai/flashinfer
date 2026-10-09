@@ -373,7 +373,7 @@ def _cutlass_mm_bf16_requirement(
 
 
 # cuBLASLt supports BF16 GEMM on SM80+.
-@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cublaslt_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -403,7 +403,7 @@ def _cublaslt_mm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cudnn_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -419,7 +419,7 @@ def _cudnn_mm_bf16_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _tgv_gemm_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -512,7 +512,7 @@ def _cute_dsl_mm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([90, 100, 103, 110, 120, 121])
+@supported_compute_capability([90, 100, 103, 107, 110, 120, 121])
 def _cutile_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -845,7 +845,7 @@ def _cutlass_bmm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cudnn_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -857,7 +857,7 @@ def _cudnn_bmm_bf16_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
-@supported_compute_capability([90, 100, 103, 110, 120, 121])
+@supported_compute_capability([90, 100, 103, 107, 110, 120, 121])
 def _cutile_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -876,7 +876,7 @@ def _cutile_bmm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _tgv_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2950,7 +2950,7 @@ def get_tgv_gemm_sm10x_module(
     )
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _cutedsl_low_latency_blockscaled_tgv_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -3089,7 +3089,7 @@ def tgv_gemm_sm100(
         - torch.float8_e5m2
 
     Note:
-        - Requires SM100 or SM103 architecture.
+        - Requires SM100, SM103 or SM107 architecture.
         - Dense inputs must have the same dtype and do not use scale factors.
         - Tensor b is expected to be in column-major layout (transposed from typical PyTorch row-major).
         - Block-scaled inputs require ``M <= 8`` and flattened 128x4 scale-factor layouts.
@@ -3098,8 +3098,8 @@ def tgv_gemm_sm100(
         - FP4 packs two values per byte, so its physical K dimension is ``K // 2``.
         - For block-scaled inputs, ``bias`` and the output must be BF16 or FP16 and share the same dtype.
     """
-    if not _match_sm_version(a.device, ["100", "103"]):
-        raise ValueError("TGV GEMM requires SM100, SM103 architecture")
+    if not _match_sm_version(a.device, ["100", "103", "107"]):
+        raise ValueError("TGV GEMM requires SM100, SM103, SM107 architecture")
 
     fp4_dtype = get_native_fp4_dtype()
     quantized_dtypes = (fp4_dtype, torch.float8_e4m3fn, torch.float8_e5m2)
@@ -5706,7 +5706,7 @@ def _trtllm_low_latency_gemm_fp8_requirement(**_):
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _cutedsl_low_latency_blockscaled_gemm_fp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -6186,7 +6186,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _cutedsl_low_latency_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -6217,7 +6217,7 @@ def _cutedsl_low_latency_gemm_mxfp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cudnn_mm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7489,7 +7489,7 @@ def _cute_dsl_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _cutedsl_low_latency_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7659,7 +7659,7 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
         _, _, _, _, _, _, problem_mnkl, _, _ = prepared_inputs
         a_dtype, b_dtype, sf_dtype, sf_vec_size, c_dtype, _ = dtypes
         _, n, _, _ = problem_mnkl
-        if sm_version not in (100, 103) or n > 8:
+        if sm_version not in (100, 103, 107) or n > 8:
             return []
         return autotune_tactics(
             problem_mnkl,
@@ -9542,7 +9542,7 @@ def _check_gemm_fp8_nt_groupwise_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cutile_gemm_fp8_nt_groupwise_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -10915,7 +10915,7 @@ def group_deepgemm_fp8_nt_groupwise(
     return out
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _check_group_gemm_fp8_nt_groupwise_contiguous(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -11145,9 +11145,75 @@ def _check_batch_deepgemm_fp8_nt_groupwise(
     )
 
 
+@supported_compute_capability([100, 103])
+def _check_batch_deepgemm_fp8_nt_groupwise_cake(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["deepgemm", "cake"] = "cake",
+) -> bool:
+    """Admission of the generated Cake programs: exactly the band the Cake dispatcher owns.
+
+    SM100a / SM103a devices with an exported SM count, the eight inventory
+    ``(N, K)`` geometries, 128-aligned ``M`` / ``N`` / ``K``, contiguous FP8
+    operands with float32 ``(1, 128, 128)`` scales (or the native MN-major packed
+    UE8M0 int32 scales of the serving routes), int32 ``masked_m`` and a bfloat16
+    output.  Every other problem raises through ``backend_requirement``.
+    """
+    del backend
+    from .cake_batch_deepgemm_fp8 import check_batch_deepgemm_fp8_nt_groupwise_cake
+
+    return check_batch_deepgemm_fp8_nt_groupwise_cake(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        scale_granularity_mnk=scale_granularity_mnk,
+        out=out,
+        out_dtype=out_dtype,
+    )
+
+
+@supported_compute_capability([100, 103, 107])
+def _check_batch_deepgemm_fp8_nt_groupwise_deepgemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["deepgemm", "cake"] = "deepgemm",
+) -> bool:
+    del backend
+    return _check_batch_deepgemm_fp8_nt_groupwise(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        scale_granularity_mnk=scale_granularity_mnk,
+        out=out,
+        out_dtype=out_dtype,
+    )
+
+
 @backend_requirement(
-    {},
-    common_check=_check_batch_deepgemm_fp8_nt_groupwise,
+    {
+        "deepgemm": _check_batch_deepgemm_fp8_nt_groupwise_deepgemm,
+        "cake": _check_batch_deepgemm_fp8_nt_groupwise_cake,
+    },
 )
 @flashinfer_api(trace=batch_deepgemm_fp8_nt_groupwise_trace)
 def batch_deepgemm_fp8_nt_groupwise(
@@ -11160,6 +11226,7 @@ def batch_deepgemm_fp8_nt_groupwise(
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,  # (batch_size, m, n)
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["deepgemm", "cake"] = "deepgemm",
 ):
     r"""Perform batch matrix multiplication with FP8 data types using DeepGEMM backend.
 
@@ -11219,6 +11286,22 @@ def batch_deepgemm_fp8_nt_groupwise(
         Data type of the output tensor. If `out` is provided, this parameter is ignored.
         Default is ``torch.bfloat16``.
 
+    backend : {"deepgemm", "cake"}, optional
+        ``"deepgemm"`` (default) runs the bundled DeepGEMM masked kernel.
+        ``"cake"`` runs the generated Cake programs for the band they own
+        (SM100a / SM103a; ``(n, k)`` in ``{(128, 512), (512, 128),
+        (4096, 7168), (7168, 2048), (6144, 7168), (7168, 3072), (4096, 4096),
+        (4096, 2048)}``; bfloat16 output; FP32 accumulation with the same
+        ordered block-scale application as DeepGEMM) and raises for every other
+        problem.  With ``backend="cake"`` the scales may also be the native
+        MN-major packed UE8M0 ``torch.int32`` tensors of the serving routes
+        (``a_scale`` of shape ``(batch_size, m, k // 512)``, ``b_scale`` of
+        shape ``(batch_size, n, k // 512)``), consumed without conversion.
+        Every launch of the Cake backend, including the first, may be captured
+        into a CUDA graph; see
+        :func:`flashinfer.gemm.cake_batch_deepgemm_fp8.prepare_batch_deepgemm_fp8_nt_groupwise`
+        for the allocation-free prepared form.
+
     Returns
     -------
     torch.Tensor
@@ -11265,13 +11348,20 @@ def batch_deepgemm_fp8_nt_groupwise(
     - All input tensors must be on the same CUDA device
     - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
     """
-    from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
-
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(
             a.shape[0], a.shape[1], b.shape[1], dtype=out_dtype, device=a.device
         )
+
+    if backend == "cake":
+        from .cake_batch_deepgemm_fp8 import run_batch_deepgemm_fp8_nt_groupwise
+
+        return run_batch_deepgemm_fp8_nt_groupwise(
+            a, b, a_scale, b_scale, masked_m, expected_m, out=out
+        )
+
+    from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
 
     m_grouped_fp8_gemm_nt_masked(
         (a, a_scale), (b, b_scale), out, masked_m, expected_m, scale_granularity_mnk

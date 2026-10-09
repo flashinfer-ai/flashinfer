@@ -49,9 +49,12 @@ def prepare_kimi_k3_fused_router(
     The experimental generated-program backend routes FP32 gate logits for 896
     experts (top-16 on ``sigmoid(logits) + bias``, weights renormalized over
     the selected sigmoid scores) and writes the ``block_m``-aligned route plan
-    (``moe_align_block_size`` layout) in one launch.  Exactly the routed
-    shapes ``num_tokens in {1, 2, 4, ..., 8192}`` with ``block_m in {8, 16}``
-    are served; see ``flashinfer/experimental/kimi_k3_fused_router/README.md``.
+    (``moe_align_block_size`` layout) in one launch.  Any ``num_tokens`` from
+    1 to 8192 is served with ``block_m in {8, 16}``: the dispatch arm is
+    chosen from a table measured at the powers of two from 1 to 8192 tokens,
+    other counts taking the arm of the next measured count up; larger counts
+    raise ``ValueError``.  See
+    ``flashinfer/experimental/kimi_k3_fused_router/README.md``.
 
     Parameters
     ----------

@@ -69,8 +69,8 @@ def test_tuner_dispatch(arch, dtype, backend, dispatched):
         ["--arch", "sm107", "--dtype", "sm90_fp8_e4m3"],
         ["--arch", "sm100", "--dtype", "sm90_fp8_e5m2"],
         ["--arch", "sm90", "--dtype", "nvfp4"],
-        ["--arch", "sm107", "--combine-dtype", "nvfp4"],
-        ["--arch", "sm107", "--combine-dtype", "mxfp8"],
+        ["--arch", "sm107", "--kernel-variant", "genphase", "--combine-dtype", "nvfp4"],
+        ["--arch", "sm107", "--kernel-variant", "genphase", "--combine-dtype", "mxfp8"],
         ["--arch", "sm100", "--activation", "situ"],
         ["--arch", "sm100", "--situ-beta", "1.0"],
         ["--arch", "sm100", "--fc1-alpha", "0.5"],
@@ -142,3 +142,50 @@ def test_invalid_tuning_scalar_identifies_argument(field):
 def test_mxfp4_tuner_rejects_unwired_architecture(arch, capsys):
     assert tune.main([*_GEOMETRY, "--arch", arch, "--dtype", "mxfp4_mxfp8"]) == 2
     assert capsys.readouterr().err
+
+
+def test_genphase_reaches_sm107_tuner(dispatched):
+    assert (
+        tune.main([*_GEOMETRY, "--arch", "sm107", "--kernel-variant", "genphase"]) == 17
+    )
+    assert len(dispatched) == 1
+
+
+@pytest.mark.parametrize("arch", ["sm90", "sm100"])
+def test_genphase_rejects_other_architectures(arch, dispatched):
+    dtype = "sm90_fp8_e4m3" if arch == "sm90" else "nvfp4"
+    assert (
+        tune.main(
+            [
+                *_GEOMETRY,
+                "--arch",
+                arch,
+                "--dtype",
+                dtype,
+                "--kernel-variant",
+                "genphase",
+            ]
+        )
+        == 2
+    )
+    assert not dispatched
+
+
+@pytest.mark.parametrize("dtype", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+@pytest.mark.parametrize("combine_dtype", ["nvfp4", "mxfp8"])
+def test_sm107_quantized_combine_reaches_tuner(dtype, combine_dtype, dispatched):
+    assert (
+        tune.main(
+            [
+                *_GEOMETRY,
+                "--arch",
+                "sm107",
+                "--dtype",
+                dtype,
+                "--combine-dtype",
+                combine_dtype,
+            ]
+        )
+        == 17
+    )
+    assert len(dispatched) == 1

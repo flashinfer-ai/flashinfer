@@ -38,23 +38,31 @@ All-Gather Matmul
 
 ``all_gather_matmul`` keeps its architecture-based default routing when
 ``backend="auto"``. On SM100 and SM103, ``backend="cake"`` explicitly selects
-the Cake fused backend for contiguous bfloat16 or float16 inputs with
-``K=8192``, ``N=2048``, a positive ``M`` divisible by 128, an NVSHMEM symmetric
-memory backend, and a two-, four- or eight-rank NCCL process group. The local
-input may be an ordinary contiguous CUDA tensor because Cake uses internal
-symmetric scratch and flags for remote access and synchronization. Unsupported
-explicit Cake requests raise instead of silently falling back. One generated
-source per kernel serves both architectures; the JIT loader compiles it with
-the exact flag set of the device it runs on.
+the Cake fused backend for bfloat16 or float16 operands with ``K=8192``: a
+contiguous ``[M, 8192]`` input with any positive ``M``, a ``[8192, N]`` weight
+with ``N`` a positive multiple of 256 that is either contiguous or the
+transposed view of a contiguous ``[N, 8192]`` parameter (each layout has its
+own generated kernel; no copy is made), the process's torch symmetric-memory
+backend being the default ``CUDA`` backend or ``NVSHMEM`` (the Cake backend
+never selects one itself), and a two-, four- or eight-rank NCCL process group.
+The local input may be an ordinary contiguous CUDA tensor because Cake uses
+internal symmetric scratch and flags for remote access and synchronization;
+the scratch of a group grows to the largest ``M`` seen, and that growth is the
+only collective after the first call. Unsupported explicit Cake requests raise
+instead of silently falling back. One generated source per kernel serves both
+architectures; the JIT loader compiles it with the exact flag set of the
+device it runs on.
 
-``prepare_all_gather_matmul`` prepares the packed-QKV route for bfloat16,
-contiguous ``[M, 8192]`` inputs and a contiguous ``[8192, 1280]`` weight on
-eight-rank groups (SM100 or SM103) or a ``[8192, 2560]`` weight on four-rank
-groups (SM103), where ``M`` is a positive multiple of 128. It binds the weight
-and process group once and returns a callable that accepts a contiguous input
-with the same shape, dtype, and device. Both ``backend="auto"`` and
-``backend="cake"`` select this prepared route. Unsupported configurations raise
-during preparation instead of falling back.
+``prepare_all_gather_matmul`` binds the weight, the process group and a row
+capacity ``max_rows`` (default: the rows of the sample input) once, sizing the
+symmetric scratch in that single collective, and returns a callable that
+accepts any contiguous input with the same dtype, device and ``K`` and at
+most ``max_rows`` rows. Both ``backend="auto"`` and ``backend="cake"`` select
+this prepared Cake route; the same operand rules as the one-shot Cake route
+apply. The returned launcher is CUDA-graph capturable: a captured call
+allocates nothing but its output, and a call that would need a larger scratch
+raises inside capture instead of running a collective. Unsupported
+configurations raise during preparation instead of falling back.
 
 .. autosummary::
     :toctree: ../generated

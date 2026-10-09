@@ -41,12 +41,9 @@ from flashinfer.jit.cake_dcp import (
     DCP_BALANCED_FAMILIES,
     DCP_BALANCED_N_ROWS,
     get_dcp_spec_balanced_uri,
+    get_dcp_spec_registry,
 )
-from flashinfer.jit.cake_fmha import (
-    CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
-    CAKE_FMHA_MANIFEST_SHA256,
-    get_cake_fmha_manifest,
-)
+from flashinfer.jit.cake_fmha import CAKE_FMHA_JIT_TAG
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
 
 _LOG2_E = math.log2(math.e)
@@ -611,8 +608,7 @@ def test_balanced_scratch_sizes_are_shape_independent() -> None:
 
 def test_balanced_uri_names_the_family_instance_and_pins() -> None:
     assert get_dcp_spec_balanced_uri("dcp_spec_bf16_balanced", "sm100a", 32) == (
-        "cake_fmha_dcp_spec_bf16_balanced_n32_sm100a_"
-        f"{CAKE_FMHA_MANIFEST_SHA256[:12]}_{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"cake_fmha_dcp_spec_bf16_balanced_n32_sm100a_{CAKE_FMHA_JIT_TAG}"
     )
     assert get_dcp_spec_balanced_uri(
         "dcp_spec_bf16_fp8_d256_balanced", "sm103a", 64
@@ -652,9 +648,7 @@ _KIND_MANIFEST_BAND = {
 
 
 def test_balanced_families_ship_one_program_with_both_packed_instances() -> None:
-    families = get_cake_fmha_manifest()["add_ons"]["cake_fmha_dcp_spec"]["manifest"][
-        "families"
-    ]
+    families = get_dcp_spec_registry()["families"]
     csrc_dir = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha"
     header = (csrc_dir / "include" / "cake_fmha.h").read_text()
     for family in DCP_BALANCED_FAMILIES:
@@ -673,7 +667,6 @@ def test_balanced_families_ship_one_program_with_both_packed_instances() -> None
         assert "#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)" in program_text
         for member in entry["source_family"]:
             assert member["sources"] == {"sm_100a": program, "sm_103a": program}
-            assert member["sha256"]["sm_100a"] == member["sha256"]["sm_103a"]
             assert member["defines"] == {"N_ROWS": member["selector"]["n_rows"]}
         assert entry["binding_source"] == f"bindings/cake_fmha_{family}_binding.cu"
         assert (csrc_dir / entry["binding_source"]).is_file()
@@ -690,9 +683,7 @@ def test_balanced_families_ship_one_program_with_both_packed_instances() -> None
 
 
 def test_balanced_route_constants_match_the_shipped_manifest() -> None:
-    routes = get_cake_fmha_manifest()["add_ons"]["cake_fmha_dcp_spec"]["manifest"][
-        "balanced_routes"
-    ]
+    routes = get_dcp_spec_registry()["balanced_routes"]
     pins = {
         "bf16_p16": (DCP_BALANCED_BF16_MIN_Q_LEN, DCP_BALANCED_BF16_MAX_Q_LEN, DCP_BALANCED_BF16_MIN_ITEMS, DCP_BALANCED_BF16_LONG_TILE_BLOCKS, None),
         "fp8_p64": (DCP_BALANCED_FP8_MIN_Q_LEN, DCP_BALANCED_FP8_MAX_Q_LEN, DCP_BALANCED_FP8_MIN_ITEMS, DCP_BALANCED_FP8_LONG_TILE_BLOCKS, DCP_BALANCED_FP8_TWO_WAVE_MIN_ITEMS),
@@ -859,9 +850,7 @@ def _patch_loaders(monkeypatch, *, sm_count=148, target="sm100a"):
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: sm_count)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: target)
     monkeypatch.setattr(jit_dcp, "load_dcp_spec_balanced_module", loader("balanced"))
-    monkeypatch.setattr(jit_dcp, "load_dcp_spec_module", loader("static"))
-    monkeypatch.setattr(jit_dcp, "load_dcp_spec_fp8_module", loader("fp8"))
-    monkeypatch.setattr(jit_dcp, "load_dcp_spec_fp8_d256_module", loader("d256"))
+    monkeypatch.setattr(jit_dcp, "load_dcp_spec_static_module", loader("static"))
     return calls, launches
 
 
@@ -909,7 +898,8 @@ def test_band_row_without_balanced_scratch_keeps_the_static_route(monkeypatch) -
     inputs["completion_buffer"] = None
     run_dcp_spec_decode(**inputs)
     assert not calls["balanced"]
-    assert calls["static"][0][0] == "v1"  # 9 local blocks: the unsplit specialization
+    # 9 local blocks: the unsplit specialization
+    assert calls["static"][0][:2] == ("bf16_v1", "retain1")
     assert len(launches["static"]) == 1
 
 
@@ -936,7 +926,7 @@ def test_forced_static_route_bypasses_the_band(monkeypatch) -> None:
     run_dcp_spec_decode(**inputs, route="static")
     assert (
         not calls["balanced"]
-        and calls["static"][0][0] == "v1"
+        and calls["static"][0][:2] == ("bf16_v1", "retain1")
         and len(launches["static"]) == 1
     )
 
@@ -984,7 +974,7 @@ def test_fp8_band_row_launches_the_e4m3_program_with_both_scales(monkeypatch) ->
     inputs["bmm2_scale"] = 0.25
     run_dcp_spec_decode(**inputs)
     assert calls["balanced"] == [("dcp_spec_bf16_fp8_balanced", "sm100a", 32)]
-    assert not calls["fp8"]
+    assert not calls["static"]
     (args,) = launches["balanced"]
     assert args[1].dtype == torch.uint8 and args[2].dtype == torch.uint8
     assert args[1].data_ptr() == inputs["k_cache"].data_ptr()
@@ -1000,7 +990,8 @@ def test_fp8_two_wave_row_follows_the_architecture_floor(monkeypatch) -> None:
         "fp8_p64", batch=8, q_len=4, prefixes=[4096] * 8, cp_world=4, cp_rank=0
     )
     run_dcp_spec_decode(**inputs)
-    assert not calls["balanced"] and len(calls["fp8"]) == 1
+    assert not calls["balanced"]
+    assert [c[:2] for c in calls["static"]] == [("fp8_d128", "split1_retain1")]
     calls, _launches = _patch_loaders(monkeypatch, sm_count=152, target="sm103a")
     inputs = _rank_inputs(
         "fp8_p64",
@@ -1014,7 +1005,7 @@ def test_fp8_two_wave_row_follows_the_architecture_floor(monkeypatch) -> None:
     run_dcp_spec_decode(**inputs)
     assert (
         calls["balanced"] == [("dcp_spec_bf16_fp8_balanced", "sm103a", 32)]
-        and not calls["fp8"]
+        and not calls["static"]
     )
 
 
@@ -1026,7 +1017,7 @@ def test_d256_band_row_launches_the_gqa16_program(monkeypatch) -> None:
     inputs["bmm2_scale"] = 0.5
     run_dcp_spec_decode(**inputs)
     assert calls["balanced"] == [("dcp_spec_bf16_fp8_d256_balanced", "sm100a", 64)]
-    assert not calls["d256"]
+    assert not calls["static"]
     (args,) = launches["balanced"]
     assert args[10] == pytest.approx(0.5) and args[11:] == (0, 4, 16, 1, 64, 5, 148)
     # b8 q4 at ctx 32768 stays on the static D256 family (one wave of split-4 tiles).
@@ -1034,7 +1025,10 @@ def test_d256_band_row_launches_the_gqa16_program(monkeypatch) -> None:
         "fp8_p64_d256", batch=8, q_len=4, prefixes=[32764] * 8, cp_world=4, cp_rank=0
     )
     run_dcp_spec_decode(**inputs)
-    assert len(calls["balanced"]) == 1 and calls["d256"][0][-1] == 4
+    assert len(calls["balanced"]) == 1
+    assert calls["static"][0][:2] == ("fp8_d256", "splitn")
+    # compile-line split count of the one-wave split-4 launch
+    assert calls["static"][0][3]["NUM_SPLIT"] == 4
 
 
 # ---------------------------------------------------------------------------

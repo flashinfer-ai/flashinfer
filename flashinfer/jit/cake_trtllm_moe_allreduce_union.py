@@ -26,8 +26,10 @@ translation unit ``cake_trtllm_moe_allreduce_union_launcher.cu``.
 ``KERNELS`` lists the kernels; ``ROUTES`` maps one route key
 ``(arch, world_size, dtype, launch_with_pdl, specialization)`` to the kernel
 (or the per-rank kernels of a rank-specialised route) and its residency
-parameters; ``_REVIEWED_SPECIALIZATIONS`` selects a specialization for the
-reviewed ``(token_num, num_experts)`` points.
+parameters; ``_SPECIALIZATION_RULES`` selects a specialization for the
+reviewed ``num_experts`` and token ranges, and ``_WIDE_MLP_CLASSES`` names the
+classes whose program outside those ranges is ``wide_mlp`` (``generic``
+otherwise).
 """
 
 from __future__ import annotations
@@ -102,17 +104,11 @@ KERNELS: dict[str, Kernel] = {
     "ws4_bf16_wide_mlp": Kernel("bfloat16", 4, 224, 4),
     "ws4_f16_pipe2_u4_b5": Kernel("float16", 4, 224, 4),
     "ws4_f16_wide_mlp": Kernel("float16", 4, 224, 4),
-    "ws4_f16_wide_mlp_t128_e16_owner_forward_rank0": Kernel("float16", 4, 224, 4),
-    "ws4_f16_wide_mlp_t128_e16_owner_forward_rank1": Kernel("float16", 4, 224, 4),
-    "ws4_f16_wide_mlp_t128_e16_owner_forward_rank2": Kernel("float16", 4, 224, 4),
-    "ws4_f16_wide_mlp_t128_e16_owner_forward_rank3": Kernel("float16", 4, 224, 4),
     "ws8_bf16_generic": Kernel("bfloat16", 8, 224, 4),
-    "ws8_bf16_sm100_ws8_mid": Kernel("bfloat16", 8, 224, 4),
     "ws8_bf16_pipe1_u4_b5": Kernel("bfloat16", 8, 224, 4),
+    "ws8_bf16_sm100_ws8_mid": Kernel("bfloat16", 8, 224, 4),
     "ws8_f16_generic": Kernel("float16", 8, 224, 4),
     "ws8_f16_pipe1_u4_b5": Kernel("float16", 8, 224, 4),
-    "ws8_f16_sm100_ws8_mid": Kernel("float16", 8, 224, 4),
-    "ws2_bf16_sm103_t1": Kernel("bfloat16", 2, 224, 4),
     "ws2_bf16_generic": Kernel("bfloat16", 2, 224, 4),
     "ws2_bf16_pipe1_u4_b5": Kernel("bfloat16", 2, 224, 4),
     "ws2_f16_generic": Kernel("float16", 2, 224, 4),
@@ -185,22 +181,8 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_100a", 4, "float16", True, "wide_mlp"): Route(
         "ws4_f16_wide_mlp", 4, None, False
     ),
-    ("sm_100a", 4, "float16", True, "wide_mlp_t128_e16_owner_forward"): Route(
-        (
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank0",
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank1",
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank2",
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank3",
-        ),
-        1,
-        None,
-        True,
-    ),
     ("sm_100a", 8, "bfloat16", False, "generic"): Route(
         "ws8_bf16_generic", 4, None, False
-    ),
-    ("sm_100a", 8, "bfloat16", False, "sm100_ws8_mid"): Route(
-        "ws8_bf16_sm100_ws8_mid", 4, None, False
     ),
     ("sm_100a", 8, "bfloat16", True, "generic"): Route(
         "ws8_bf16_generic", 4, None, False
@@ -217,20 +199,11 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_100a", 8, "float16", False, "pipe1_u4_b5"): Route(
         "ws8_f16_pipe1_u4_b5", 5, 175, False
     ),
-    ("sm_100a", 8, "float16", False, "sm100_ws8_mid"): Route(
-        "ws8_f16_sm100_ws8_mid", 4, None, False
-    ),
     ("sm_100a", 8, "float16", True, "generic"): Route(
         "ws8_f16_generic", 4, None, False
     ),
     ("sm_100a", 8, "float16", True, "pipe1_u4_b5"): Route(
         "ws8_f16_pipe1_u4_b5", 5, 175, False
-    ),
-    ("sm_100a", 8, "float16", True, "sm100_ws8_mid"): Route(
-        "ws8_f16_sm100_ws8_mid", 4, None, False
-    ),
-    ("sm_103a", 2, "bfloat16", False, "sm103_t1"): Route(
-        "ws2_bf16_sm103_t1", 1, None, False
     ),
     ("sm_103a", 2, "bfloat16", False, "wide_mlp"): Route(
         "ws2_bf16_wide_mlp", 4, None, False
@@ -289,17 +262,6 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_103a", 4, "float16", True, "wide_mlp"): Route(
         "ws4_f16_wide_mlp", 4, None, False
     ),
-    ("sm_103a", 4, "float16", True, "wide_mlp_t128_e16_owner_forward"): Route(
-        (
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank0",
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank1",
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank2",
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank3",
-        ),
-        1,
-        None,
-        True,
-    ),
     ("sm_103a", 8, "bfloat16", False, "generic"): Route(
         "ws8_bf16_generic", 4, None, False
     ),
@@ -335,65 +297,65 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_103a", 8, "float16", True, "push_g"): Route("ws8_f16_push_g", 4, None, False),
 }
 
-# (arch, world_size, dtype, launch_with_pdl, token_num, num_experts) -> specialization
-_REVIEWED_SPECIALIZATIONS: dict[tuple[str, int, str, bool, int, int], str] = {
-    ("sm_100a", 2, "bfloat16", False, 1, 8): "wide_mlp_cta1",
-    ("sm_100a", 2, "bfloat16", False, 128, 16): "wide_mlp",
-    ("sm_100a", 2, "bfloat16", False, 256, 8): "wide_mlp",
-    ("sm_100a", 2, "bfloat16", True, 64, 8): "wide_mlp",
-    ("sm_100a", 2, "bfloat16", True, 256, 12): "pipe2_u4",
-    ("sm_100a", 2, "bfloat16", True, 2048, 12): "pipe2_u4_b5",
-    ("sm_100a", 2, "float16", False, 64, 12): "wide_mlp",
-    ("sm_100a", 2, "float16", False, 2048, 8): "pipe2_u4_b5",
-    ("sm_100a", 2, "float16", True, 128, 16): "wide_mlp",
-    ("sm_100a", 2, "float16", True, 2048, 16): "pipe2_u4_b5",
-    ("sm_100a", 4, "bfloat16", False, 1, 8): "wide_mlp_t1_e8_serial_clear_cta1",
-    ("sm_100a", 4, "bfloat16", False, 128, 16): "clrfirst",
-    ("sm_100a", 4, "bfloat16", True, 64, 8): "wide_mlp",
-    ("sm_100a", 4, "bfloat16", True, 2048, 12): "pipe2_u4_b5",
-    ("sm_100a", 4, "float16", False, 64, 12): "wide_mlp_t64_e12_resident",
-    ("sm_100a", 4, "float16", False, 2048, 8): "pipe2_u4_b5",
-    ("sm_100a", 4, "float16", True, 128, 16): "wide_mlp_t128_e16_owner_forward",
-    ("sm_100a", 4, "float16", True, 2048, 16): "pipe2_u4_b5",
-    ("sm_100a", 8, "bfloat16", False, 128, 16): "sm100_ws8_mid",
-    ("sm_100a", 8, "bfloat16", True, 64, 8): "sm100_ws8_mid",
-    ("sm_100a", 8, "bfloat16", True, 2048, 12): "pipe1_u4_b5",
-    ("sm_100a", 8, "float16", False, 64, 12): "sm100_ws8_mid",
-    ("sm_100a", 8, "float16", False, 2048, 8): "pipe1_u4_b5",
-    ("sm_100a", 8, "float16", True, 128, 16): "sm100_ws8_mid",
-    ("sm_100a", 8, "float16", True, 2048, 16): "pipe1_u4_b5",
-    ("sm_103a", 2, "bfloat16", False, 1, 8): "sm103_t1",
-    ("sm_103a", 2, "bfloat16", False, 128, 16): "wide_mlp",
-    ("sm_103a", 2, "bfloat16", False, 256, 8): "wide_mlp",
-    ("sm_103a", 2, "bfloat16", True, 64, 8): "wide_mlp",
-    ("sm_103a", 2, "bfloat16", True, 2048, 12): "pipe1_u4_b5",
-    ("sm_103a", 2, "float16", False, 2048, 8): "pipe1_u4_b5",
-    ("sm_103a", 2, "float16", True, 128, 16): "wide_mlp",
-    ("sm_103a", 2, "float16", True, 2048, 16): "pipe1_u4_b5",
-    ("sm_103a", 4, "bfloat16", False, 1, 8): "sm103_t1_t1_e8_serial_clear",
-    ("sm_103a", 4, "bfloat16", False, 128, 16): "wide_mlp",
-    ("sm_103a", 4, "bfloat16", False, 256, 8): "wide_mlp",
-    ("sm_103a", 4, "bfloat16", True, 64, 8): "wide_mlp",
-    ("sm_103a", 4, "bfloat16", True, 256, 12): "wide_mlp",
-    ("sm_103a", 4, "bfloat16", True, 2048, 12): "pipe2_u4_b5",
-    ("sm_103a", 4, "float16", False, 64, 12): "wide_mlp_t64_e12_resident",
-    ("sm_103a", 4, "float16", False, 2048, 8): "pipe2_u4_b5",
-    ("sm_103a", 4, "float16", True, 128, 16): "wide_mlp_t128_e16_owner_forward",
-    ("sm_103a", 4, "float16", True, 2048, 16): "pipe2_u4_b5",
-    ("sm_103a", 8, "bfloat16", False, 1, 8): "sm103_t1",
-    ("sm_103a", 8, "bfloat16", False, 128, 16): "push_g",
-    ("sm_103a", 8, "bfloat16", False, 256, 8): "pipe1",
-    ("sm_103a", 8, "bfloat16", True, 64, 8): "push_g",
-    ("sm_103a", 8, "bfloat16", True, 256, 12): "push_g",
-    ("sm_103a", 8, "bfloat16", True, 2048, 12): "pipe1_u4_b5",
-    ("sm_103a", 8, "float16", False, 64, 12): "push_g",
-    ("sm_103a", 8, "float16", False, 2048, 8): "pipe1_u4_b5",
-    ("sm_103a", 8, "float16", True, 128, 16): "push_g",
-    ("sm_103a", 8, "float16", True, 2048, 16): "pipe1_u4_b5",
+# (arch, world_size, dtype, launch_with_pdl, num_experts) ->
+#     ((token_lo, token_hi, specialization), ...)
+# Inclusive token ranges, sorted and non-overlapping: a launch whose token_num
+# falls inside a range runs that specialization; every other launch runs the
+# class program.  Each range is the token span the specialization was measured
+# correct and at least 2 % faster than the class program over.
+_SPECIALIZATION_RULES: dict[
+    tuple[str, int, str, bool, int], tuple[tuple[int, int, str], ...]
+] = {
+    ("sm_100a", 2, "bfloat16", False, 8): ((1, 32, "wide_mlp_cta1"),),
+    ("sm_100a", 2, "bfloat16", True, 12): (
+        (192, 384, "pipe2_u4"),
+        (1536, 2048, "pipe2_u4_b5"),
+    ),
+    ("sm_100a", 2, "float16", False, 8): ((1536, 2048, "pipe2_u4_b5"),),
+    ("sm_100a", 2, "float16", True, 16): ((1536, 2048, "pipe2_u4_b5"),),
+    ("sm_100a", 4, "bfloat16", False, 8): (
+        (1, 32, "wide_mlp_t1_e8_serial_clear_cta1"),
+    ),
+    ("sm_100a", 4, "bfloat16", False, 16): ((96, 192, "clrfirst"),),
+    ("sm_100a", 4, "bfloat16", True, 8): ((32, 96, "wide_mlp"),),
+    ("sm_100a", 4, "bfloat16", True, 12): ((1536, 2048, "pipe2_u4_b5"),),
+    ("sm_100a", 4, "float16", False, 8): ((1536, 2048, "pipe2_u4_b5"),),
+    ("sm_100a", 4, "float16", False, 12): ((32, 96, "wide_mlp_t64_e12_resident"),),
+    ("sm_100a", 4, "float16", True, 16): ((1536, 2048, "pipe2_u4_b5"),),
+    ("sm_100a", 8, "bfloat16", True, 8): ((32, 96, "sm100_ws8_mid"),),
+    ("sm_100a", 8, "bfloat16", True, 12): ((1536, 2048, "pipe1_u4_b5"),),
+    ("sm_100a", 8, "float16", False, 8): ((1536, 2048, "pipe1_u4_b5"),),
+    ("sm_100a", 8, "float16", True, 16): ((1536, 2048, "pipe1_u4_b5"),),
+    ("sm_103a", 2, "bfloat16", True, 8): ((32, 96, "wide_mlp"),),
+    ("sm_103a", 2, "bfloat16", True, 12): ((1536, 2048, "pipe1_u4_b5"),),
+    ("sm_103a", 2, "float16", False, 8): ((1536, 2048, "pipe1_u4_b5"),),
+    ("sm_103a", 2, "float16", True, 16): (
+        (96, 192, "wide_mlp"),
+        (1536, 2048, "pipe1_u4_b5"),
+    ),
+    ("sm_103a", 4, "bfloat16", False, 8): ((1, 32, "sm103_t1_t1_e8_serial_clear"),),
+    ("sm_103a", 4, "bfloat16", True, 8): ((32, 96, "wide_mlp"),),
+    ("sm_103a", 4, "bfloat16", True, 12): (
+        (192, 384, "wide_mlp"),
+        (1536, 2048, "pipe2_u4_b5"),
+    ),
+    ("sm_103a", 4, "float16", False, 8): ((1536, 2048, "pipe2_u4_b5"),),
+    ("sm_103a", 4, "float16", False, 12): ((32, 96, "wide_mlp_t64_e12_resident"),),
+    ("sm_103a", 4, "float16", True, 16): ((1536, 2048, "pipe2_u4_b5"),),
+    ("sm_103a", 8, "bfloat16", False, 8): ((1, 32, "sm103_t1"), (192, 384, "pipe1")),
+    ("sm_103a", 8, "bfloat16", False, 16): ((96, 192, "push_g"),),
+    ("sm_103a", 8, "bfloat16", True, 8): ((32, 96, "push_g"),),
+    ("sm_103a", 8, "bfloat16", True, 12): ((1536, 2048, "pipe1_u4_b5"),),
+    ("sm_103a", 8, "float16", False, 8): ((1536, 2048, "pipe1_u4_b5"),),
+    ("sm_103a", 8, "float16", False, 12): ((32, 96, "push_g"),),
+    ("sm_103a", 8, "float16", True, 16): (
+        (96, 192, "push_g"),
+        (1536, 2048, "pipe1_u4_b5"),
+    ),
 }
 
 # (arch, world_size, dtype, launch_with_pdl) classes whose program is the
-# ``wide_mlp`` schedule for every token count outside the reviewed points.
+# ``wide_mlp`` schedule for every token count outside the rules' ranges.
 _WIDE_MLP_CLASSES: tuple[tuple[str, int, str, bool], ...] = (
     ("sm_100a", 2, "bfloat16", False),
     ("sm_100a", 2, "bfloat16", True),
@@ -430,20 +392,28 @@ def select_specialization(
     token_num: int,
     active_experts: int,
 ) -> str:
-    """Return the specialization name for one launch configuration."""
+    """Return the specialization name for one launch configuration.
 
-    reviewed = _REVIEWED_SPECIALIZATIONS.get(
+    The token-range rule of the ``(arch, world_size, dtype, launch_with_pdl,
+    active_experts)`` key that holds ``token_num`` wins; outside every range the
+    class program runs (``wide_mlp`` for the ``_WIDE_MLP_CLASSES`` classes,
+    ``generic`` otherwise).
+    """
+
+    token_num = int(token_num)
+    rules = _SPECIALIZATION_RULES.get(
         (
             str(arch),
             int(world_size),
             str(dtype_name),
             bool(launch_with_pdl),
-            int(token_num),
             int(active_experts),
-        )
+        ),
+        (),
     )
-    if reviewed is not None:
-        return reviewed
+    for token_lo, token_hi, specialization in rules:
+        if token_lo <= token_num <= token_hi:
+            return specialization
     if (
         str(arch),
         int(world_size),
@@ -455,7 +425,13 @@ def select_specialization(
 
 
 def route_applies(*, world_size: int, device_capability: Sequence[int]) -> bool:
-    """Whether the union has programs for this (architecture, world size)."""
+    """Whether the union has programs for this (architecture, world size).
+
+    The union owns exactly the (architecture, world size) scopes it has routes
+    for, with or without the all-reduce output: a call without
+    ``moe_allreduce_out`` runs the same kernels against a loader-owned scratch
+    tensor, so the caller's output selection does not narrow the scope.
+    """
 
     arch = arch_for_capability(device_capability)
     return arch is not None and (arch, int(world_size)) in _EXPORTED_SCOPES
@@ -669,10 +645,18 @@ def run_cake_moe_allreduce_union(
     norm_out: torch.Tensor,
     weight_bias: Optional[float],
 ) -> None:
-    """Select and launch one union kernel for the caller's validated tensors."""
+    """Select and launch one union kernel for the caller's validated tensors.
+
+    ``moe_allreduce_out`` may be ``None``: the kernels always store the
+    all-reduce output, so the call then writes into a loader-owned scratch
+    tensor (``scratch_allreduce_output``).
+    ``scale_factor`` belongs to the public API's quant path; the union kernels
+    emit no quant output and take no scale factor.
+    """
 
     if backend != "cake":
         raise ValueError(f"backend must be 'cake', got {backend!r}")
+    del scale_factor
     world_size = int(world_size)
     if world_size not in WORLD_SIZES:
         raise ValueError(
@@ -710,12 +694,6 @@ def run_cake_moe_allreduce_union(
     )
     name = route_kernel(route, int(world_rank), world_size)
     kernel = KERNELS[name]
-    if moe_allreduce_out is None:
-        moe_allreduce_out = scratch_allreduce_output(
-            moe_reduction_active_experts_token_input.device,
-            moe_reduction_active_experts_token_input.dtype,
-            int(token_num),
-        )
     grid_x = launch_grid_x(
         int(token_num),
         route.cooperative,
@@ -724,6 +702,12 @@ def run_cake_moe_allreduce_union(
         kernel.cluster,
         route.max_persistent_clusters,
     )
+    if moe_allreduce_out is None:
+        moe_allreduce_out = scratch_allreduce_output(
+            moe_reduction_active_experts_token_input.device,
+            moe_reduction_active_experts_token_input.dtype,
+            int(token_num),
+        )
     load(name, arch).run(
         moe_reduction_active_experts_token_input,
         moe_reduction_scale_input,

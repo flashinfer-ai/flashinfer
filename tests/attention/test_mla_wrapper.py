@@ -13,11 +13,13 @@ import weakref
 import pytest
 import torch
 
+import flashinfer
 from flashinfer.mla._batch_mla import _wrapper
 from flashinfer.mla._batch_mla._backends._capabilities import (
     MLAPlanCapabilities,
     _BackendPlanUnsupportedError,
 )
+from flashinfer.utils import is_sm90a_supported
 
 
 COMMON_PLAN_KWARGS = dict(
@@ -127,7 +129,7 @@ def test_batch_mla_module_proxy_rejects_invalid_workspace_prefix(
 
 def _minimal_uninitialized_wrapper(wrapper_cls, *, use_cuda_graph=False):
     wrapper = wrapper_cls.__new__(wrapper_cls)
-    wrapper._float_workspace_buffer = torch.empty(16, dtype=torch.uint8)
+    wrapper._float_workspace_buffer = torch.empty(256 * 1024, dtype=torch.uint8)
     wrapper._int_workspace_buffer = torch.empty(16, dtype=torch.uint8)
     wrapper._pin_memory_int_workspace_buffer = torch.empty(16, dtype=torch.uint8)
     wrapper._use_cuda_graph = use_cuda_graph
@@ -163,6 +165,8 @@ def _patch_fake_fa_module(monkeypatch, fake_module):
             module, "_validate_generated_fa_plan", lambda **kwargs: None
         )
     monkeypatch.setattr(fa_common, "_validate_fa_plan_workload", lambda *args: None)
+    # Model one SM while keeping the real workspace-capacity check enabled.
+    monkeypatch.setattr(fa_common, "get_device_sm_count", lambda device: 1)
     monkeypatch.setattr(fa2_backend, "get_batch_mla_module", lambda *args: fake_module)
     monkeypatch.setattr(fa3_backend, "get_batch_mla_module", lambda *args: fake_module)
 
@@ -736,7 +740,9 @@ def test_failed_backend_replan_keeps_previous_runnable_backend(
         wrapper, kernel = _planned_cutile_wrapper(monkeypatch)
         plan_kwargs = _cutile_contract_plan_kwargs()
         query, cache = _cutile_contract_inputs()
-        monkeypatch.setattr(cutile_backend, "get_cutile_mla_decode", lambda: fail_plan)
+        monkeypatch.setattr(
+            cutile_backend, "get_cutile_mla_decode", lambda device: fail_plan
+        )
         old_indices = None
     else:
         kernel = _FakeBatchMLAModule()
@@ -2144,8 +2150,10 @@ def _skip_if_planned_backend_runtime_is_unavailable(backend):
             pytest.skip("xqa planned MLA requires a supported SM12x/CUDA configuration")
         return
 
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip(f"{backend} planned MLA requires SM100/SM103, got {capability}")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip(
+            f"{backend} planned MLA requires SM100/SM103/SM107, got {capability}"
+        )
     if backend == "cutile":
         pytest.importorskip("cuda.tile.compilation")
         from flashinfer.cutile.cutile_common import is_cuda_tile_available
@@ -2734,8 +2742,11 @@ def test_cute_dsl_alias_does_not_hide_planning_errors(monkeypatch, error_type, m
 
 @pytest.fixture
 def cutile_sm100():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("prepared cuTile acceptance requires SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 7),
+    ):
+        pytest.skip("prepared cuTile acceptance requires SM100/SM107")
     pytest.importorskip("cuda.tile.compilation")
     from flashinfer.cutile.cutile_common import is_cuda_tile_available
 
@@ -2819,7 +2830,7 @@ def _cutile_reference(query, cache, lengths, table, scale=None):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("heads", [64, 128, 192])
 @pytest.mark.parametrize("page", [1, 2])
 def test_cutile_small_page_large_batch_numerics(cutile_sm100, dtype, heads, page):
     """Small key tiles must remain correct with the large-batch launch policy."""
@@ -2949,7 +2960,7 @@ def _patch_fake_cutile_kernel(monkeypatch, kernel):
         cutile_backend, "_get_compute_capability", lambda device: (10, 0)
     )
     monkeypatch.setattr(
-        cutile_backend, "get_cutile_mla_decode", lambda: lambda **kwargs: kernel
+        cutile_backend, "get_cutile_mla_decode", lambda device: lambda **kwargs: kernel
     )
 
 
@@ -3008,6 +3019,69 @@ def _planned_cutile_wrapper(monkeypatch, *, use_cuda_graph=False, metadata=None)
     return wrapper, kernel
 
 
+@pytest.mark.parametrize("planned_supported", [False, True])
+def test_cutile_availability_uses_planned_device(monkeypatch, planned_supported):
+    import importlib.metadata
+
+    from flashinfer.cutile import cutile_common
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
+    from flashinfer.mla._batch_mla._backends import cutile_backend, _cutile_prepared
+
+    # Model a mixed-GPU process without launching kernels. CPU storage represents
+    # the planned device; the implicit current device has the opposite support.
+    target = torch.device("cpu")
+    current = [100]
+    original_version = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda name: "1.4.0" if name == "cuda-tile" else original_version(name),
+    )
+    original_find_spec = cutile_common.importlib.util.find_spec
+    monkeypatch.setattr(
+        cutile_common.importlib.util,
+        "find_spec",
+        lambda name: object() if name == "cuda.tile.tune" else original_find_spec(name),
+    )
+    monkeypatch.setattr(cutile_common, "_find_tileiras_binary", lambda: "tileiras")
+    monkeypatch.setattr(
+        cutile_common, "_tileiras_supports_arch", lambda _, arch: arch == "sm_100"
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device=None: (10, (0 if planned_supported else 7))
+        if device == target
+        else (10, current[0] - 100),
+    )
+    monkeypatch.setattr(cutile_backend, "_get_compute_capability", lambda _: (10, 7))
+    kernel = _FakeCutileKernel()
+    monkeypatch.setattr(
+        _cutile_prepared, "prepare_cutile_mla_decode", lambda **kwargs: kernel
+    )
+    cutile_backend.get_cutile_mla_decode.cache_clear()
+    try:
+        # A successful lookup on another device must not approve this target.
+        cutile_backend.get_cutile_mla_decode(torch.device("cuda:0"))
+        if planned_supported:
+            cutile_backend.get_cutile_mla_decode.cache_clear()
+            current[0] = 107
+        wrapper = BatchMLAPagedAttentionWrapper(
+            torch.empty(1024, dtype=torch.uint8), backend="cutile"
+        )
+        if planned_supported:
+            wrapper.plan(**_cutile_contract_plan_kwargs())
+            query, kv_cache = _cutile_contract_inputs()
+            wrapper.run(query=query, kv_cache=kv_cache)
+            assert len(kernel.calls) == 1
+        else:
+            with pytest.raises(_BackendPlanUnsupportedError, match="compiler"):
+                wrapper.plan(**_cutile_contract_plan_kwargs())
+    finally:
+        cutile_backend.get_cutile_mla_decode.cache_clear()
+
+
 def test_cutile_lazy_kernel_lookup_and_retained_dense_metadata(monkeypatch):
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
@@ -3020,8 +3094,8 @@ def test_cutile_lazy_kernel_lookup_and_retained_dense_metadata(monkeypatch):
         cutile_backend, "_get_compute_capability", lambda device: (10, 0)
     )
 
-    def get_kernel():
-        getter_calls.append(None)
+    def get_kernel(device):
+        getter_calls.append(device)
         return lambda **kwargs: kernel
 
     monkeypatch.setattr(cutile_backend, "get_cutile_mla_decode", get_kernel)
@@ -3033,14 +3107,14 @@ def test_cutile_lazy_kernel_lookup_and_retained_dense_metadata(monkeypatch):
     assert getter_calls == []
 
     wrapper.plan(**_cutile_contract_plan_kwargs(metadata))
-    assert getter_calls == [None]
+    assert getter_calls == [wrapper.device]
 
     query, kv_cache = _cutile_contract_inputs()
     out = torch.empty_like(query[0])
     actual = wrapper.run(query=query, kv_cache=kv_cache, out=out)
 
     assert actual is out
-    assert getter_calls == [None]
+    assert getter_calls == [wrapper.device]
     assert len(kernel.calls) == 1
     call = kernel.calls[0]
     assert call["q_nope"] is query[0]
@@ -3182,7 +3256,7 @@ def test_cutile_plan_rejects_unsupported_contracts(monkeypatch, plan_overrides):
         lambda device: (10, 0),
     )
 
-    def unexpected_preparation():
+    def unexpected_preparation(device):
         pytest.fail("unsupported cuTile plan attempted native preparation")
 
     monkeypatch.setattr(
@@ -3217,7 +3291,7 @@ def test_cutile_rejects_unsupported_head_counts(num_heads):
         _validate_cutile_num_heads(num_heads)
 
 
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (12, 0), (12, 1)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7), (12, 0), (12, 1)])
 def test_cutile_plan_accepts_supported_blackwell_architectures(monkeypatch, capability):
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
     from flashinfer.mla._batch_mla._backends import cutile_backend
@@ -3227,7 +3301,7 @@ def test_cutile_plan_accepts_supported_blackwell_architectures(monkeypatch, capa
         cutile_backend, "_get_compute_capability", lambda device: capability
     )
     monkeypatch.setattr(
-        cutile_backend, "get_cutile_mla_decode", lambda: lambda **kwargs: kernel
+        cutile_backend, "get_cutile_mla_decode", lambda device: lambda **kwargs: kernel
     )
     wrapper = BatchMLAPagedAttentionWrapper(
         torch.empty(1024, dtype=torch.uint8), backend="cutile"
@@ -3248,7 +3322,7 @@ def test_cutile_plan_rejects_undemonstrated_architectures(monkeypatch, capabilit
         cutile_backend, "_get_compute_capability", lambda device: capability
     )
 
-    def unexpected_preparation():
+    def unexpected_preparation(device):
         pytest.fail("unsupported cuTile plan attempted native preparation")
 
     monkeypatch.setattr(
@@ -3361,7 +3435,7 @@ def _rollback_plan_args(*, graph=False, **overrides):
             "metadata": _dense_metadata(),
             "output_dtype": torch.bfloat16,
             "kv_layout": "combined",
-            "_float_workspace_buffer": torch.full((128,), 17, dtype=torch.uint8),
+            "_float_workspace_buffer": torch.full((256 * 1024,), 17, dtype=torch.uint8),
             "_use_cuda_graph": graph,
             "_qo_indptr_buf": torch.full((3,), -1, dtype=torch.int32),
             "_kv_indptr_buf": torch.full((3,), -1, dtype=torch.int32),
@@ -3598,3 +3672,166 @@ def test_wrapper_warns_once_after_successful_backend_plan(
                     {"automatic": backend == "auto"},
                 ),
             ]
+
+
+@pytest.mark.parametrize("head_dim_ckv", [128, 256], ids=["ckv128", "ckv256"])
+@pytest.mark.parametrize(
+    "dtype,head_dim_kpe,causal,max_kv_len",
+    [(torch.bfloat16, 64, False, 257), (torch.float16, 0, True, 129)],
+    ids=["bf16-multi-tile", "fp16-causal-no-pe"],
+)
+def test_mla_fa3_ckv_width(head_dim_ckv, dtype, head_dim_kpe, causal, max_kv_len):
+    # PV must advance its value descriptor by the actual row width. A fixed
+    # CKV512 stride silently corrupts CKV256 and reads out of bounds for CKV128.
+    device = torch.device("cuda:0")
+    if not is_sm90a_supported(device):
+        pytest.skip("fa3 backend requires SM90a")
+    torch.manual_seed(917)
+    num_heads, page_size = 16, 16
+    kv_lengths = [max_kv_len - 12, max_kv_len]
+    page_counts = [(n + page_size - 1) // page_size for n in kv_lengths]
+    query = (
+        torch.randn(
+            4, num_heads, head_dim_ckv + head_dim_kpe, device=device, dtype=dtype
+        )
+        * 0.5
+    )
+    kv = (
+        torch.randn(
+            sum(page_counts),
+            page_size,
+            head_dim_ckv + head_dim_kpe,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.5
+    )
+    indices = torch.arange(sum(page_counts), device=device, dtype=torch.int32).flip(0)
+    kv_offsets = [0, page_counts[0], sum(page_counts)]
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        torch.empty(128 * 1024**2, device=device, dtype=torch.uint8), backend="fa3"
+    )
+    wrapper.plan(
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            torch.tensor([0, 1, 4], device=device, dtype=torch.int32),
+            torch.tensor(kv_offsets, device=device, dtype=torch.int32),
+            indices,
+            torch.tensor(kv_lengths, device=device, dtype=torch.int32),
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=causal,
+        sm_scale=0.125,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        lse_mode="basee",
+        enable_pdl=False,
+    )
+    out, lse = wrapper.run(
+        query=query, kv_cache=kv, return_lse=True, return_lse_base_on_e=True
+    )
+    torch.cuda.synchronize()
+    for batch, (start, end) in enumerate(((0, 1), (1, 4))):
+        pages = indices[kv_offsets[batch] : kv_offsets[batch + 1]].long()
+        keys = (
+            kv[pages]
+            .reshape(-1, head_dim_ckv + head_dim_kpe)[: kv_lengths[batch]]
+            .float()
+        )
+        scores = torch.einsum("qhd,kd->qhk", query[start:end].float(), keys) * 0.125
+        if causal:
+            positions = (
+                torch.arange(end - start, device=device) + len(keys) - (end - start)
+            )
+            mask = torch.arange(len(keys), device=device)[None, :] > positions[:, None]
+            scores.masked_fill_(mask[:, None, :], -float("inf"))
+        expected = scores.softmax(-1) @ keys[:, :head_dim_ckv]
+        torch.testing.assert_close(
+            out[start:end].float(), expected, rtol=1e-2, atol=1e-2
+        )
+        torch.testing.assert_close(
+            lse[start:end], scores.logsumexp(-1), rtol=1e-2, atol=1e-2
+        )
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_mla_page_index_uint32_overflow_regression(backend):
+    # Regression for the int64 widening in mla.cuh / mla_hopper.cuh
+    # (`indices[q] * ckv_stride_page`). For a contiguous
+    # [num_pages, page_size, head_dim_ckv] cache with page_size=32 and
+    # head_dim_ckv=512, ckv_stride_page = 16384 elements. Any page index
+    # >= 2^32 / 16384 = 262144 makes the multiplication overflow uint32 and
+    # — pre-fix — silently wraps to the wrong page (no crash, wrong output).
+    device = torch.device("cuda:0")
+    if backend == "fa3" and not is_sm90a_supported(device):
+        pytest.skip("fa3 backend requires SM90a")
+
+    page_size, head_dim_ckv, head_dim_kpe, num_heads = 32, 512, 64, 128
+    # 262144 * (32 * 512) = 2^32 exactly — the smallest index that overflows.
+    OVERFLOW_START = 262144
+    NUM_PAGES = 26  # matches the 26-page decode scenario from the original repro
+    total_num_pages = OVERFLOW_START + NUM_PAGES  # 262170
+    kv_len = NUM_PAGES * page_size
+
+    # Big cache alone is ~9.66 GiB (bf16/fp16). Skip on small-memory runners.
+    if torch.cuda.mem_get_info(device)[0] < 12 * (1 << 30):
+        pytest.skip("needs ≥12 GiB free VRAM to force the 32-bit overflow")
+
+    torch.manual_seed(0)
+    torch.set_grad_enabled(False)
+    dtype = torch.float16
+    sm_scale = 1.0 / ((128 + 64) ** 0.5)
+
+    real_ckv = torch.randn(
+        NUM_PAGES, page_size, head_dim_ckv, device=device, dtype=dtype
+    )
+    real_kpe = torch.randn(
+        NUM_PAGES, page_size, head_dim_kpe, device=device, dtype=dtype
+    )
+    q_nope = torch.randn(1, num_heads, head_dim_ckv, device=device, dtype=dtype)
+    q_pe = torch.randn(1, num_heads, head_dim_kpe, device=device, dtype=dtype)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    def _run(ckv_cache, kpe_cache, page_indices):
+        w = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend=backend)
+        w.plan(
+            torch.tensor([0, 1], dtype=torch.int32, device=device),  # qo_indptr
+            torch.tensor([0, len(page_indices)], dtype=torch.int32, device=device),
+            page_indices,
+            torch.tensor([kv_len], dtype=torch.int32, device=device),
+            num_heads,
+            head_dim_ckv,
+            head_dim_kpe,
+            page_size,
+            False,
+            sm_scale,
+            dtype,
+            dtype,
+        )
+        return w.run(q_nope, q_pe, ckv_cache, kpe_cache)
+
+    # Overflow path: big contiguous cache; real data lives at [OVERFLOW_START, end).
+    # stride(0) = page_size * head_dim_ckv = 16384 matches the reference below,
+    # so only the page-index arithmetic differs between the two runs.
+    ckv_big = torch.zeros(
+        total_num_pages, page_size, head_dim_ckv, device=device, dtype=dtype
+    )
+    kpe_big = torch.zeros(
+        total_num_pages, page_size, head_dim_kpe, device=device, dtype=dtype
+    )
+    ckv_big[OVERFLOW_START:] = real_ckv
+    kpe_big[OVERFLOW_START:] = real_kpe
+    big_indices = torch.arange(
+        OVERFLOW_START, total_num_pages, dtype=torch.int32, device=device
+    )
+    out = _run(ckv_big, kpe_big, big_indices)
+    del ckv_big, kpe_big
+    torch.cuda.empty_cache()
+
+    # Reference: same data, same stride(0), but page indices < overflow threshold.
+    ref_indices = torch.arange(NUM_PAGES, dtype=torch.int32, device=device)
+    ref = _run(real_ckv, real_kpe, ref_indices)
+
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)

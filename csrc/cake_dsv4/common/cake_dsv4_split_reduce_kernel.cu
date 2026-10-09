@@ -26,7 +26,6 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
@@ -38,7 +37,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -79,7 +77,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_dsv4_d50dd820272ad24f7027(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, int num_q_heads, int num_split)
+kernel_cake_dsv4_bc35ea7ec11bbcbe338c(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, int num_q_heads, int num_split)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -128,8 +126,7 @@ kernel_cake_dsv4_d50dd820272ad24f7027(__nv_bfloat16* __restrict__ partial_O, flo
     }
     #pragma unroll
     for (int s = 0; s < 4; s++) {
-        float _shfl_0;
-        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_0) : "f"(local_weight), "r"(s));
+        float _shfl_0 = __shfl_sync(0xFFFFFFFF, local_weight, s);
         float split_weight = _shfl_0;
         float _vec_load_0[4];
         {
@@ -138,13 +135,8 @@ kernel_cake_dsv4_d50dd820272ad24f7027(__nv_bfloat16* __restrict__ partial_O, flo
             uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_vec_load_0[0 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _pair * 2])[1])
-                    : "r"(_vpairs_0[_pair]));
+                (&_vec_load_0[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                (&_vec_load_0[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
             }
         }
         #pragma unroll

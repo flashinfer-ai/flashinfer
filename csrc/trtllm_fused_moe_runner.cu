@@ -115,6 +115,8 @@ static inline ActType activationTypeToGatedActType(ActivationType actType) {
   switch (actType) {
     case ActivationType::Swiglu:
       return ActType::SwiGlu;
+    case ActivationType::SwigluStep:
+      return ActType::SwiGluStep;
     case ActivationType::Geglu:
       return ActType::GeGlu;
     case ActivationType::Situ:
