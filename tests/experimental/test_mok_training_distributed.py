@@ -3,7 +3,8 @@
 """Run with torchrun --standalone --nproc-per-node=4 -m pytest <this file>.
 
 Clamped SwiGLU, recompute-vs-saved-context, FP32 weight-gradient
-accumulation and native MXFP8 over unequal (including empty) ranks. EP4 uses
+accumulation (BF16 and MXFP8) and native MXFP8 over unequal (including empty)
+ranks. EP4 uses
 256 routed experts; EP8 and EP32 use the 288-expert GLM-5.3-Flash layout.
 """
 

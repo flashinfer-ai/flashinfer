@@ -177,15 +177,17 @@ Single-GPU tests:
   FP32 accumulation, GLM-5.3-Flash local expert counts, recompute versus
   saved context, every scheduler layout and the epilogues.
 - `tests/experimental/test_mok_mxfp8.py`: the weight quantizer, the fused MXFP8
-  forward and forward+backward against a quantization-aware reference
-  (plain and clamped), GLM-5.3-Flash local expert counts and MXFP8 recompute.
+  forward and forward+backward against a quantization-aware reference (plain
+  and clamped; routed and shared-expert gradients; BF16 or FP32
+  weight-gradient accumulation), GLM-5.3-Flash local expert counts and MXFP8
+  recompute.
 
 Distributed tests (`torchrun --standalone --nproc-per-node=4 -m pytest ...`):
 `test_mok_bf16_distributed.py` (toy), `test_mok_bf16_unequal.py` (unequal and
 empty ranks, graph reuse), `test_mok_bf16_capacity.py` (API guards) and
 `test_mok_training_distributed.py` (clamped SwiGLU, recompute versus saved
-context, FP32 accumulation and MXFP8 over unequal ranks; 288 experts at EP8 or
-EP32). `test_mok_bf16_tolerance.py` checks the tolerance reporter. The
+context, FP32 accumulation with BF16 and MXFP8 routed experts, and MXFP8
+over unequal ranks; 288 experts at EP8 or EP32). `test_mok_bf16_tolerance.py` checks the tolerance reporter. The
 runnable examples are `examples/mok_bf16_toy.py`,
 `examples/mok_bf16_unequal.py` and `examples/mok_training_features.py`.
 

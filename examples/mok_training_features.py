@@ -15,9 +15,10 @@ Checks per case:
 - BF16 cases: every element of all nine outputs against the independent BF16
   autograd reference (atol = rtol = 1e-2). FP32 accumulators start from zero
   and are checked the same way.
-- MXFP8 cases: global relative L2 error of the routed-dependent outputs
-  against an FP32 autograd reference (quantization error), the BF16 shared
-  expert weight gradients elementwise against the BF16 reference, and a
+- MXFP8 cases (BF16 or FP32 weight-gradient accumulation): global relative
+  L2 error of the routed-dependent outputs against an FP32 autograd reference
+  (quantization error), the BF16 shared expert weight gradients elementwise
+  against the BF16 reference and within a tight relative L2 of FP32, and a
   distance from the BF16 result showing the routed GEMMs ran in MXFP8.
 - Recompute cases: the checkpointed iteration (forward, context dropped,
   ``recompute_forward_context``, backward) is bitwise identical to the
@@ -52,6 +53,7 @@ CASES = (
     dict(name="bf16-recompute", recompute=True),
     dict(name="bf16-fp32-wgrad", fp32_wgrad=True),
     dict(name="mxfp8", mxfp8=True),
+    dict(name="mxfp8-fp32-wgrad", mxfp8=True, fp32_wgrad=True),
     dict(
         name="mxfp8-clamped-recompute",
         mxfp8=True,
@@ -59,8 +61,11 @@ CASES = (
         recompute=True,
     ),
 )
-# MXFP8 quantization error bounds (global relative L2 against FP32).
+# MXFP8 quantization error bounds (global relative L2 against FP32). The BF16
+# shared expert's weight gradients carry only BF16 rounding (and clamp-mask
+# flips), so they get a much tighter bound.
 MXFP8_REL_L2 = 0.15
+SHARED_REL_L2 = 0.02
 MXFP8_MIN_DISTANCE = 1e-3
 
 
@@ -244,6 +249,7 @@ def main():
                 )
                 assert record["shared_strict_pass"], (rank, case["name"], shared_errors)
                 bound = {n: MXFP8_REL_L2 for n in RESULT_NAMES[:6]}
+                bound.update({n: SHARED_REL_L2 for n in RESULT_NAMES[6:]})
                 assert all(record["rel_l2_vs_fp32"][n] < b for n, b in bound.items()), (
                     case["name"],
                     record["rel_l2_vs_fp32"],

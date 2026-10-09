@@ -170,10 +170,25 @@ def test_mxfp8_forward(swiglu_limit, hidden, intermediate, macro):
 
 
 def _mxfp8_training(
-    swiglu_limit, hidden, intermediate, macro, seed, repeat=1, experts=4, topk=2
+    swiglu_limit,
+    hidden,
+    intermediate,
+    macro,
+    seed,
+    repeat=1,
+    experts=4,
+    topk=2,
+    fp32_wgrad=False,
 ):
+    """Mismatch counts of every returned gradient against the reference.
+
+    The routed reference follows the MXFP8 recipe; the BF16 shared expert's
+    weight gradients are checked against a BF16 reference of the shared MLP.
+    ``fp32_wgrad`` adds every weight gradient into nonzero FP32 starting
+    accumulators; the reference adds each macrobatch's FP32 product.
+    """
     forward = MoKForwardMXFP8(swiglu_limit is not None)
-    backward = MoKBackwardMXFP8(swiglu_limit is not None)
+    backward = MoKBackwardMXFP8(swiglu_limit is not None, fp32_wgrad)
     tokens, mini, comm = 512, 256, 4
     x, dy, shared, routed, scores, s = _setup(
         hidden,
@@ -190,11 +205,20 @@ def _mxfp8_training(
     dx_peer = torch.zeros(tokens * topk, hidden, **options)
     ds_peer = torch.zeros_like(scores)
     schedule = (s["peers"], s["schedule"], s["num_tokens"], s["counts"])
+    initial = accumulators = None
+    if fp32_wgrad:
+        initial = [
+            torch.randn(w.shape, device="cuda") * 0.01 for w in (*shared, *routed)
+        ]
+        accumulators = [value.clone() for value in initial]
 
     def run():
         combine.zero_()
         dx_peer.zero_()
         ds_peer.zero_()
+        if fp32_wgrad:
+            for accumulator, start in zip(accumulators, initial, strict=True):
+                accumulator.copy_(start)
         values = forward(
             x, [x.data_ptr()], combine, [combine.data_ptr()],
             shared[0], fwd_w[0], shared[1], fwd_w[1], shared[2], fwd_w[2],
@@ -206,10 +230,11 @@ def _mxfp8_training(
             shared[0], bwd_w[0], shared[1], bwd_w[1], shared[2], bwd_w[2],
             *values[:7], x, [x.data_ptr()], *schedule,
             topk, swiglu_limit, comm, macro, mini,
+            weight_grad_accumulators=accumulators,
         )  # fmt: skip
         torch.cuda.synchronize()
         # Returned gradients only; macrobatch scratch has uninitialized padding.
-        return (dx_peer.clone(), ds_peer.clone(), result[0], *result[9:])
+        return tuple(t.clone() for t in (dx_peer, ds_peer, result[0], *result[9:]))
 
     first = run()
     for _ in range(repeat):
@@ -273,34 +298,69 @@ def _mxfp8_training(
         dx_route[lo:hi] = (
             dg_deq[lo:hi] @ wg_t[e].T + du_deq[lo:hi] @ wu_t[e].T
         ).bfloat16()
-    dw = [torch.zeros_like(w) for w in routed]
+    if fp32_wgrad:
+        dw = [value.clone() for value in initial[3:]]
+    else:
+        dw = [torch.zeros_like(w) for w in routed]
     for e, lo, hi in segments:
         first_part = True
         for m_lo in range(0, actual, macro):
             k_lo, k_hi = max(lo, m_lo), min(hi, m_lo + macro)
             if k_lo >= k_hi:
                 continue
-            parts = [
-                (dgt_deq[:, k_lo:k_hi] @ xt_deq[:, k_lo:k_hi].T).bfloat16(),
-                (dut_deq[:, k_lo:k_hi] @ xt_deq[:, k_lo:k_hi].T).bfloat16(),
-                (dt_deq[:, k_lo:k_hi] @ ht_deq[:, k_lo:k_hi].T).bfloat16(),
+            exact = [
+                dgt_deq[:, k_lo:k_hi] @ xt_deq[:, k_lo:k_hi].T,
+                dut_deq[:, k_lo:k_hi] @ xt_deq[:, k_lo:k_hi].T,
+                dt_deq[:, k_lo:k_hi] @ ht_deq[:, k_lo:k_hi].T,
             ]
-            for dest, part in zip(dw, parts, strict=True):
-                dest[e] = (
-                    part if first_part else (dest[e].float() + part.float()).bfloat16()
-                )
+            for dest, part in zip(dw, exact, strict=True):
+                if fp32_wgrad:
+                    dest[e] += part
+                elif first_part:
+                    dest[e] = part.bfloat16()
+                else:
+                    # Native BF16 accumulation across macrobatches.
+                    dest[e] = (dest[e].float() + part.bfloat16().float()).bfloat16()
             first_part = False
+    # BF16 shared expert over every local token (unscaled dY), as the shared
+    # BF16 GEMMs and SwiGLU tasks compute it.
+    s_gate = (x.float() @ shared[0].float().T).bfloat16()
+    s_up = (x.float() @ shared[1].float().T).bfloat16()
+    s_act = swiglu(s_gate, s_up, swiglu_limit)
+    s_g, s_u = s_gate.float(), s_up.float()
+    s_mask_g = s_mask_u = torch.ones_like(s_g)
+    if swiglu_limit is not None:
+        s_mask_g = (s_g <= swiglu_limit).float()
+        s_mask_u = ((s_u >= -swiglu_limit) & (s_u <= swiglu_limit)).float()
+        s_g, s_u = s_g.clamp(max=swiglu_limit), s_u.clamp(-swiglu_limit, swiglu_limit)
+    s_sig = torch.sigmoid(s_g)
+    s_silu = s_g * s_sig
+    s_dh = (dy.float() @ shared[2].float()).bfloat16()
+    s_dg = (((1 - s_silu) * s_sig + s_silu) * s_u * s_dh.float() * s_mask_g).bfloat16()
+    s_du = (s_silu * s_dh.float() * s_mask_u).bfloat16()
+    dw_shared = [
+        s_dg.float().T @ x.float(),
+        s_du.float().T @ x.float(),
+        dy.float().T @ s_act.float(),
+    ]
+    if fp32_wgrad:
+        dw_shared = [a + b for a, b in zip(initial[:3], dw_shared, strict=True)]
+    else:
+        dw_shared = [part.bfloat16() for part in dw_shared]
     expected_dx = torch.zeros_like(dx_peer)
     expected_dx[rows[valid].long()] = dx_route[valid]
     expected_ds = torch.zeros_like(ds_peer).flatten()
     expected_ds[rows[valid].long()] = ds_route[valid]
-    dx_peer, ds_peer, _, _, dw_gate, _, dw_up, _, dw_down = first
+    dx_peer, ds_peer, _, dws_gate, dw_gate, dws_up, dw_up, dws_down, dw_down = first
     return dict(
         dx_routed=_close(dx_peer, expected_dx),
         d_scores=_close(ds_peer.flatten(), expected_ds),
         dw_gate=_close(dw_gate, dw[0]),
         dw_up=_close(dw_up, dw[1]),
         dw_down=_close(dw_down, dw[2]),
+        dw_shared_gate=_close(dws_gate, dw_shared[0]),
+        dw_shared_up=_close(dws_up, dw_shared[1]),
+        dw_shared_down=_close(dws_down, dw_shared[2]),
     )
 
 
@@ -317,6 +377,23 @@ def test_mxfp8_training(swiglu_limit, hidden, intermediate, macro):
     """
     require_gpu()
     mismatches = _mxfp8_training(swiglu_limit, hidden, intermediate, macro, seed=7000)
+    assert all(v == 0 for v in mismatches.values()), mismatches
+
+
+@LIMITS
+@pytest.mark.parametrize(
+    "hidden,intermediate,macro", [(512, 256, 768), (512, 512, 1536), (512, 256, 512)]
+)
+def test_mxfp8_training_fp32_wgrad(swiglu_limit, hidden, intermediate, macro):
+    """MXFP8 training with FP32 weight-gradient accumulation onto nonzero starts.
+
+    Shared (BF16) and routed (MXFP8) weight gradients are both added into the
+    caller's FP32 accumulators; the shapes include multiple macrobatches.
+    """
+    require_gpu()
+    mismatches = _mxfp8_training(
+        swiglu_limit, hidden, intermediate, macro, seed=7000, fp32_wgrad=True
+    )
     assert all(v == 0 for v in mismatches.values()), mismatches
 
 
@@ -338,6 +415,9 @@ def test_mxfp8_training_glm_flash_local_experts(experts):
         dw_gate=experts * 256 * 512,
         dw_up=experts * 256 * 512,
         dw_down=experts * 512 * 256,
+        dw_shared_gate=256 * 512,
+        dw_shared_up=256 * 512,
+        dw_shared_down=512 * 256,
     )
     assert all(mismatches[k] <= 1e-4 * sizes[k] for k in sizes), mismatches
 
