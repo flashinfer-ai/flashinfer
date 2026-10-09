@@ -22,15 +22,17 @@ its tile mean; the kernel restores the mean inside the online softmax as
 residual quantization error no longer carries the value DC component. This
 variant keeps Q and K in bf16. Only P and V are E4M3.
 
-This module provides the reference preprocessing:
+This module provides the preprocessing:
 
 * ``vc_token_permutation`` -- online k-means over value rows, one
   permutation per (batch, head), applied to K and V (attention is invariant to
   a common key/value permutation);
 * ``vc_quantize`` -- K permutation, V tile-mean subtraction, per-channel
-  E4M3 residual quantization, and the packed kernel operands;
+  E4M3 residual quantization, and the packed kernel operands, as two CuTe DSL
+  kernels;
+* ``vc_quantize_repair`` -- V repair rows instead of tile means;
 * ``VCAttentionPreprocessor`` -- the paper's V-Smooth schedule over the
-  denoising steps on top of ``vc_quantize_fused``;
+  denoising steps on top of ``vc_quantize``;
 * ``pack_vc_tile_means`` -- the bf16 mean operand layout the kernel's
   unswizzled K-major descriptor expects;
 * ``vc_reference`` -- the fp32 attention over the dequantized operands.
@@ -86,16 +88,36 @@ class VCAttentionConfig:
     """Compile-time VC-Attention-QK16 recipe of one plan.
 
     ``k_block_size`` tokens share one restored value mean. The kernel supports
-    its 128-token K/V tile only.
+    its 128-token K/V tile only. A non-zero ``repair_tiles`` selects V repair
+    instead of the tile means. That many 128-row K/V tiles of quantization
+    residuals from ``vc_quantize_repair`` follow the sequence and only add to
+    the output.
     """
 
     k_block_size: int = VC_K_BLOCK_SIZE
+    repair_tiles: int = 0
 
     def __post_init__(self) -> None:
         if self.k_block_size != VC_K_BLOCK_SIZE:
             raise ValueError(
                 f"k_block_size must be {VC_K_BLOCK_SIZE}, got {self.k_block_size}"
             )
+        if self.repair_tiles < 0:
+            raise ValueError(f"repair_tiles must be >= 0, got {self.repair_tiles}")
+
+
+def vc_repair_tiles(seq_len_kv: int, budget: float) -> int:
+    """Repair tiles of a V repair run, whole 128-row tiles holding the selected
+    tokens, ``budget`` times the sequence length rounded and at least one."""
+    if not (0.0 < budget < 1.0):
+        raise ValueError(f"budget must be in (0, 1), got {budget}")
+    return _blocks(max(1, round(budget * seq_len_kv)), VC_K_BLOCK_SIZE)
+
+
+def vc_repair_kv_len(seq_len_kv: int, repair_tiles: int) -> int:
+    """K/V rows of a V repair run, the sequence zero-padded to whole tiles plus
+    the repair tiles."""
+    return (_blocks(seq_len_kv, VC_K_BLOCK_SIZE) + repair_tiles) * VC_K_BLOCK_SIZE
 
 
 @dataclass(frozen=True)
@@ -109,11 +131,12 @@ class VCAttentionParams:
     ``v_scale``). The scale must be positive and finite. The kernel does not
     check it. ``demean`` says whether the run restores the means. It is
     ``False`` after the V-Smooth window, when they are zero and the kernel
-    skips the mean steps, so it changes per run.
+    skips the mean steps, so it changes per run. A V repair plan takes no
+    ``tile_means``.
     """
 
     v_scale: torch.Tensor
-    tile_means: torch.Tensor
+    tile_means: torch.Tensor | None
     demean: bool = True
 
 
@@ -126,6 +149,9 @@ def vc_scale_shapes(
     head_dim: int,
 ) -> dict[str, tuple[int, ...]]:
     """Return the shape of every ``VCAttentionParams`` tensor a plan consumes, by field name."""
+    repairs_v = config.repair_tiles > 0
+    if repairs_v:
+        return {"v_scale": (batch_size, num_kv_heads, head_dim)}
     num_kv_tiles = _blocks(seq_len_kv, config.k_block_size)
     return {
         "v_scale": (batch_size, num_kv_heads, head_dim),
@@ -182,7 +208,10 @@ class VCAttentionOperands:
 
     ``k`` is the bf16 input in permuted token order; ``v`` is E4M3
     ``[B, S, H, D]`` in the same order holding the tile residuals
-    ``(V[perm] - mean) / v_scale``.
+    ``(V[perm] - mean) / v_scale``. With ``repair_tiles`` the order is the input
+    order, ``mean``, ``mu`` and ``perm`` are ``None`` and the rows are the whole
+    128-token tiles, the repair tiles of key copies and E4M3 value residuals,
+    then the zero-padded partial last tile.
     """
 
     k: torch.Tensor
@@ -190,12 +219,15 @@ class VCAttentionOperands:
     v_scale: (
         torch.Tensor
     )  # [B, H, D] fp32 per-channel E4M3 residual scale (feeds output_scale)
-    mean: torch.Tensor  # [B, H, num_kv_tiles, D] fp32 tile means (permuted order)
+    mean: (
+        torch.Tensor | None
+    )  # [B, H, num_kv_tiles, D] fp32 tile means in permuted order
     mu: (
-        torch.Tensor
+        torch.Tensor | None
     )  # [B, H, ceil(num_kv_tiles / 16), 16, 256] bf16 packed kernel operands
-    perm: torch.Tensor  # [B, H, S_k] int64 token permutation
+    perm: torch.Tensor | None  # [B, H, S_k] int64 token permutation
     demean: bool = True  # whether the means were subtracted (else zero)
+    repair_tiles: int = 0
 
     @property
     def params(self) -> "VCAttentionParams":
@@ -364,6 +396,52 @@ def pack_vc_tile_means(
 
 
 @torch.no_grad()
+def vc_quantize_repair(
+    k: torch.Tensor, v: torch.Tensor, *, budget: float
+) -> VCAttentionOperands:
+    """Turn ``[B, S, H, D]`` K/V into VC-Attention-QK16 V repair operands.
+
+    Values are quantized to E4M3 in input order with one scale per batch,
+    head and channel. The ``budget`` fraction of tokens with the largest
+    residual energy per batch and head gets a repair row, a copy of the key
+    with the E4M3 residual of the value.
+    """
+    if k.dim() != 4 or k.shape != v.shape:
+        raise ValueError("k and v must be [B, S, H, D] with matching shapes")
+    from .kernels.vc_prepare import vc_prepare
+
+    b, s_k, h, d = k.shape
+    repair_tiles = vc_repair_tiles(s_k, budget)
+    k_all, v_all, v_scale, _, _, energy = vc_prepare(
+        k.contiguous(), v.contiguous(), None, demean=False, repair_tiles=repair_tiles
+    )
+    selected = max(1, round(budget * s_k))
+    whole = s_k // VC_K_BLOCK_SIZE * VC_K_BLOCK_SIZE
+    shift = repair_tiles * VC_K_BLOCK_SIZE
+    index = energy.topk(selected, dim=2, sorted=False).indices  # [B, H, sel]
+    index = index.permute(0, 2, 1).unsqueeze(-1).expand(-1, -1, -1, d)
+    vs = v_scale.unsqueeze(1)
+    v_sel = torch.gather(v, 1, index).float()
+    k_all[:, whole : whole + selected] = torch.gather(k, 1, index)
+    v_all[:, whole : whole + selected] = (
+        (v_sel - (v_sel / vs).to(torch.float8_e4m3fn).float() * vs) / vs
+    ).to(torch.float8_e4m3fn)
+    for rows in (k_all, v_all):
+        rows[:, whole + selected : whole + shift].zero_()
+        rows[:, s_k + shift :].zero_()
+    return VCAttentionOperands(
+        k=k_all,
+        v=v_all,
+        v_scale=v_scale,
+        mean=None,
+        mu=None,
+        perm=None,
+        demean=False,
+        repair_tiles=repair_tiles,
+    )
+
+
+@torch.no_grad()
 def vc_quantize(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -383,92 +461,11 @@ def vc_quantize(
     """
     if k.dim() != 4 or k.shape != v.shape:
         raise ValueError("k and v must be [B, S, H, D] with matching shapes")
-    b, s_k, h, d = k.shape
-    if perm is None:
-        perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)
-    gather_idx = (
-        perm.permute(0, 2, 1).unsqueeze(-1).expand(-1, -1, -1, d)
-    )  # [B, S, H, D]
-    k_p = torch.gather(k, 1, gather_idx)
-    v_p = torch.gather(v.float(), 1, gather_idx)
-
-    num_kv_tiles = _blocks(s_k, VC_K_BLOCK_SIZE)
-    v_pad = _pad_tokens(v_p, VC_K_BLOCK_SIZE).view(
-        b, num_kv_tiles, VC_K_BLOCK_SIZE, h, d
-    )
-    valid = torch.zeros(
-        num_kv_tiles, VC_K_BLOCK_SIZE, device=v.device, dtype=torch.float32
-    )
-    valid.view(-1)[:s_k] = 1.0
-    counts = valid.sum(dim=1).clamp_min(1.0)  # [T]
-    mean = (v_pad * valid.view(1, num_kv_tiles, VC_K_BLOCK_SIZE, 1, 1)).sum(
-        dim=2
-    ) / counts.view(1, num_kv_tiles, 1, 1)  # [B, T, H, D]
-    if not demean:
-        mean = torch.zeros_like(mean)
-    residual = (v_pad - mean.unsqueeze(2)) * valid.view(
-        1, num_kv_tiles, VC_K_BLOCK_SIZE, 1, 1
-    )
-    residual = residual.view(b, num_kv_tiles * VC_K_BLOCK_SIZE, h, d)[:, :s_k]
-    # One E4M3 scale per (batch, head, channel) over all tokens (paper).
-    v_scale = (
-        (residual.abs().amax(dim=1) / E4M3_MAX).clamp_min(1e-12).float()
-    )  # [B, H, D]
-    v8 = (residual / v_scale.unsqueeze(1)).to(torch.float8_e4m3fn)
-    mean = mean.permute(0, 2, 1, 3).contiguous()  # [B, H, T, D]
-    return VCAttentionOperands(
-        k=k_p.contiguous(),
-        v=v8.contiguous(),
-        v_scale=v_scale,
-        mean=mean,
-        mu=pack_vc_tile_means(mean, v_scale),
-        perm=perm,
-        demean=demean,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Fused preprocessing (CuTe DSL kernels in kernels/vc_prepare.py)
-# ---------------------------------------------------------------------------
-@torch.no_grad()
-def vc_quantize_fused(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    perm: torch.Tensor | None = None,
-    kmeans_iters: int = VC_KMEANS_ITERS,
-    generator: torch.Generator | None = None,
-    demean: bool = True,
-) -> VCAttentionOperands:
-    """Same contract as ``vc_quantize``, computed by two CuTe DSL kernels
-    (``flashinfer.attention.prims_ts.kernels.vc_prepare``).
-
-    Pass 1 gathers each permuted 128-token K/V tile once, writes the permuted
-    K rows, and writes the V tile mean and residual amax. A reduction over the
-    tile amaxes gives the per-channel V scale. Pass 2 writes the E4M3 residuals
-    and the packed bf16 mean operand. Requires head_dim 128 and bf16/fp16
-    inputs; other cases fall back to ``vc_quantize``.
-    """
-    if k.dim() != 4 or k.shape != v.shape:
-        raise ValueError("k and v must be [B, S, H, D] with matching shapes")
-    if (
-        k.shape[-1] != 128
-        or k.dtype not in (torch.bfloat16, torch.float16)
-        or not k.is_cuda
-    ):
-        return vc_quantize(
-            k,
-            v,
-            perm=perm,
-            kmeans_iters=kmeans_iters,
-            generator=generator,
-            demean=demean,
-        )
     from .kernels.vc_prepare import vc_prepare
 
     if perm is None:
         perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)
-    k_p, v8, v_scale, mean, mu = vc_prepare(
+    k_p, v8, v_scale, mean, mu, _ = vc_prepare(
         k.contiguous(),
         v.contiguous(),
         perm,
@@ -573,7 +570,7 @@ class VCAttentionPreprocessor:
         else:
             perm = torch.arange(k.shape[1], device=k.device, dtype=torch.int64)
             perm = perm.view(1, 1, -1).expand(k.shape[0], k.shape[2], -1).contiguous()
-        return vc_quantize_fused(k, v, perm=perm, demean=smooth)
+        return vc_quantize(k, v, perm=perm, demean=smooth)
 
 
 @torch.no_grad()
@@ -587,13 +584,29 @@ def vc_reference(
         sm_scale = 1.0 / math.sqrt(d)
     q = q.float()
     k = ops.k.float()
+    v = ops.v.float() * ops.v_scale.unsqueeze(1)
+    repairs_v = ops.repair_tiles > 0
+    if repairs_v:
+        # Repair rows add to the numerator only, the zero padding of the partial
+        # last tile is masked, and the denominator runs over the original tokens.
+        repair = ops.repair_tiles * VC_K_BLOCK_SIZE
+        s_orig = s_k - repair
+        whole = s_orig // VC_K_BLOCK_SIZE * VC_K_BLOCK_SIZE
+        row = torch.arange(s_k, device=k.device)
+        original = (row < whole) | ((row >= whole + repair) & (row < s_orig + repair))
+        scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * sm_scale
+        scores = scores.masked_fill(row >= s_orig + repair, -torch.inf)
+        weights = torch.exp(scores - scores.amax(dim=-1, keepdim=True))
+        out = torch.einsum("bhqk,bkhd->bqhd", weights, v)
+        denom = weights[..., original].sum(dim=-1).permute(0, 2, 1)  # [B, Sq, H]
+        return out / denom.unsqueeze(-1)
     # The kernel restores bf16(mean / v_scale) * v_scale, per channel.
     vs = ops.v_scale.reshape(b, ops.k.shape[2], 1, d)  # [B, H, 1, D]
     mean = (ops.mean / vs).to(torch.bfloat16).float() * vs
     mean_tokens = mean.permute(0, 2, 1, 3).repeat_interleave(VC_K_BLOCK_SIZE, dim=1)[
         :, :s_k
     ]
-    v = ops.v.float() * ops.v_scale.unsqueeze(1) + mean_tokens
+    v = v + mean_tokens
     scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * sm_scale
     probs = torch.softmax(scores, dim=-1)
     return torch.einsum("bhqk,bkhd->bqhd", probs, v)
@@ -618,8 +631,10 @@ __all__ = [
     "vc_mean_operand_shape",
     "VC_MEAN_GROUP_TILES",
     "VC_MEAN_OPERANDS",
-    "vc_quantize_fused",
+    "vc_quantize_repair",
     "vc_reference",
+    "vc_repair_kv_len",
+    "vc_repair_tiles",
     "vc_scale_shapes",
     "vc_token_permutation",
     "vc_token_permutation_with_centroids",

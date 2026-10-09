@@ -9,6 +9,10 @@ VC-Attention-QK16 operands with each tensor read once (V twice) and written once
 * :class:`VcKvPass2`: after the per-channel V residual scale is known, writes
   the E4M3 V residuals and the packed bf16 tile-mean UMMA operand.
 
+With ``repair`` the token order is the input order, the partial last tile
+moves ``tail_shift`` rows down to leave room for the V repair tiles, and pass
+2 writes each token's residual energy instead of the mean operand.
+
 Following the paper, V residuals get one E4M3 scale per (batch, head,
 channel) and the block means are stored divided by that scale. Q and K stay
 in their input dtype.
@@ -39,6 +43,7 @@ from ..vc_attention import (
 )
 from .fmha_decode.fmha_decode_resources.helpers_common import _pack_float2_to_bf16
 from .fmha_decode.fmha_decode_resources.helpers_softmax import _pack_float4_to_fp8_e4m3
+from ..vc_attention import vc_repair_kv_len
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 # The kernels are specialized for head_dim 128.
@@ -100,7 +105,11 @@ class VcKvPass1:
         seq_len: Int32,
         num_heads: Int32,
         num_tiles: Int32,
+        out_len: Int32,
+        tail_start: Int32,
+        tail_shift: Int32,
         demean: cutlass.Constexpr[bool],
+        repair: cutlass.Constexpr[bool],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         t, bh, _ = cute.arch.block_idx()
@@ -122,11 +131,13 @@ class VcKvPass1:
         toks = cutlass.Array(Int32, _ROWS_PER_THREAD, space=cutlass.AddressSpace.rmem)
         for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
             pos = t * _TILE + rg + _ROW_GROUPS * i
-            tok = Int32(0)
-            if pos < seq_len:
-                tok = cutlass.inttoptr(
-                    perm_base + Int64(pos) * 4, mem_space=1, dtype=Int32
-                ).load()
+            tok = pos
+            if cutlass.const_expr(not repair):
+                tok = Int32(0)
+                if pos < seq_len:
+                    tok = cutlass.inttoptr(
+                        perm_base + Int64(pos) * 4, mem_space=1, dtype=Int32
+                    ).load()
             toks[i] = tok
 
         # K, copy the permuted rows.
@@ -140,7 +151,11 @@ class VcKvPass1:
                 )
                 dst = (
                     kp_base
-                    + (Int64(b) * Int64(seq_len) + Int64(pos)) * row_bytes
+                    + (
+                        Int64(b) * Int64(out_len)
+                        + Int64(pos + tail_shift * Int32(pos >= tail_start))
+                    )
+                    * row_bytes
                     + (Int64(h) * _D + col0) * 2
                 )
                 regs = cutlass.inttoptr(src, mem_space=1, dtype=Int32).load(
@@ -239,11 +254,28 @@ class VcKvPass1:
         num_heads: Int32,
         num_tiles: Int32,
         num_batch_heads: Int32,
+        out_len: Int32,
+        tail_start: Int32,
+        tail_shift: Int32,
         demean: cutlass.Constexpr[bool],
+        repair: cutlass.Constexpr[bool],
         stream,
     ):
         self.kernel(
-            mK, mV, mPerm, mKPerm, mMean, mVAmax, seq_len, num_heads, num_tiles, demean
+            mK,
+            mV,
+            mPerm,
+            mKPerm,
+            mMean,
+            mVAmax,
+            seq_len,
+            num_heads,
+            num_tiles,
+            out_len,
+            tail_start,
+            tail_shift,
+            demean,
+            repair,
         ).launch(
             grid=[num_tiles, num_batch_heads, 1],
             block=[_THREADS, 1, 1],
@@ -272,9 +304,14 @@ class VcKvPass2:
         mVScale: cute.Tensor,
         mV8: cute.Tensor,
         mMu: cute.Tensor,
+        mEnergy: cute.Tensor,
         seq_len: Int32,
         num_heads: Int32,
         num_tiles: Int32,
+        out_len: Int32,
+        tail_start: Int32,
+        tail_shift: Int32,
+        repair: cutlass.Constexpr[bool],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         t, bh, _ = cute.arch.block_idx()
@@ -292,6 +329,10 @@ class VcKvPass2:
             _D * 4
         )
 
+        smem = cutlass.utils.SmemAllocator()
+        # V repair, per-thread partial residual energies of 16 channels for each of 8 rows.
+        energy_part = smem.allocate_array(Float32, _THREADS * _ROWS_PER_THREAD)
+
         vscale_base = mVScale.iterator.toint() + Int64(bh) * (_D * 4)  # [B, H, D] fp32
         vs = _load_row16_f32(vscale_base + col0 * 4)
         vs_inv = cutlass.Array(
@@ -302,10 +343,13 @@ class VcKvPass2:
         mean = _load_row16_f32(mean_base + col0 * 4)
         for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
             pos = t * _TILE + rg + _ROW_GROUPS * i
+            energy = Float32(0.0)
             if pos < seq_len:
-                tok = cutlass.inttoptr(
-                    perm_base + Int64(pos) * 4, mem_space=1, dtype=Int32
-                ).load()
+                tok = pos
+                if cutlass.const_expr(not repair):
+                    tok = cutlass.inttoptr(
+                        perm_base + Int64(pos) * 4, mem_space=1, dtype=Int32
+                    ).load()
                 addr = (
                     v_base
                     + (Int64(b) * Int64(seq_len) + Int64(tok)) * row_bytes
@@ -319,11 +363,49 @@ class VcKvPass2:
                     res[j] = (row[j] - mean[j]) * vs_inv[j]
                 out_addr = (
                     v8_base
-                    + (Int64(b) * Int64(seq_len) + Int64(pos)) * v8_row_bytes
+                    + (
+                        Int64(b) * Int64(out_len)
+                        + Int64(pos + tail_shift * Int32(pos >= tail_start))
+                    )
+                    * v8_row_bytes
                     + Int64(h) * _D
                     + col0
                 )
-                _store_row16_fp8(out_addr, res, Float32(1.0))
+                if cutlass.const_expr(repair):
+                    # Residual energy of the E4M3 rounding in value units.
+                    packed = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+                    for j in cutlass.range_constexpr(4):
+                        packed[j] = _pack_float4_to_fp8_e4m3(
+                            res[4 * j], res[4 * j + 1], res[4 * j + 2], res[4 * j + 3]
+                        )
+                    words = packed.data_ptr().load(count=4, alignment=16)
+                    codes = words.bitcast(cutlass.Float8E4M3FN).to(Float32)
+                    for c in cutlass.range_constexpr(_COLS_PER_THREAD):
+                        err = (res[c] - codes[c]) * vs[c]
+                        energy = energy + err * err
+                    cutlass.inttoptr(out_addr, mem_space=1, dtype=Int32).store(
+                        words, alignment=16
+                    )
+                else:
+                    _store_row16_fp8(out_addr, res, Float32(1.0))
+            if cutlass.const_expr(repair):
+                energy_part[(rg + _ROW_GROUPS * i) * _COL_GROUPS + cg] = energy
+        if cutlass.const_expr(repair):
+            cute.arch.sync_threads()
+            for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
+                pos = t * _TILE + rg + _ROW_GROUPS * i
+                if (cg == 0) & (pos < seq_len):
+                    acc = Float32(0.0)
+                    for c in cutlass.range_constexpr(_COL_GROUPS):
+                        acc = (
+                            acc + energy_part[(rg + _ROW_GROUPS * i) * _COL_GROUPS + c]
+                        )
+                    cutlass.inttoptr(
+                        mEnergy.iterator.toint()
+                        + (Int64(bh) * Int64(seq_len) + Int64(pos)) * 4,
+                        mem_space=1,
+                        dtype=Float32,
+                    ).store(acc)
 
         # Mean operands of this tile's group in core-matrix order, g = 8-row
         # group, c = K core matrix, r = row, k = K index. Tile 8o+i of the group
@@ -351,7 +433,7 @@ class VcKvPass2:
         s1 = cutlass.inttoptr(
             vscale_base + Int64(d0 + 1) * 4, mem_space=1, dtype=Float32
         ).load()
-        if c == c_slot:
+        if cutlass.const_expr(not repair) and c == c_slot:
             # Means are stored divided by the per-channel value scale (paper, Appendix B).
             num_groups = (num_tiles + VC_MEAN_GROUP_TILES - 1) // VC_MEAN_GROUP_TILES
             dst = (
@@ -384,16 +466,37 @@ class VcKvPass2:
         mVScale: cute.Tensor,
         mV8: cute.Tensor,
         mMu: cute.Tensor,
+        mEnergy: cute.Tensor,
         seq_len: Int32,
         num_heads: Int32,
         num_tiles: Int32,
         num_batch_heads: Int32,
+        out_len: Int32,
+        tail_start: Int32,
+        tail_shift: Int32,
+        repair: cutlass.Constexpr[bool],
         stream,
     ):
         self.kernel(
-            mV, mPerm, mMean, mVScale, mV8, mMu, seq_len, num_heads, num_tiles
+            mV,
+            mPerm,
+            mMean,
+            mVScale,
+            mV8,
+            mMu,
+            mEnergy,
+            seq_len,
+            num_heads,
+            num_tiles,
+            out_len,
+            tail_start,
+            tail_shift,
+            repair,
         ).launch(
-            grid=[num_tiles, num_batch_heads, 1], block=[_THREADS, 1, 1], stream=stream
+            grid=[num_tiles, num_batch_heads, 1],
+            block=[_THREADS, 1, 1],
+            smem=_THREADS * _ROWS_PER_THREAD * 4,
+            stream=stream,
         )
 
 
@@ -415,7 +518,7 @@ def _in_dtype(dtype: torch.dtype):
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled(dtype: torch.dtype, demean: bool):
+def _compiled(dtype: torch.dtype, demean: bool, repair: bool = False):
     cdt, is_bf16 = _in_dtype(dtype)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     f32 = lambda: _fake1d(Float32, 64)  # noqa: E731
@@ -433,7 +536,11 @@ def _compiled(dtype: torch.dtype, demean: bool):
         Int32(1),
         Int32(1),
         Int32(1),
+        Int32(1),
+        Int32(1),
+        Int32(1),
         demean,
+        repair,
         stream,
         options=_COMPILE_OPTIONS,
     )
@@ -445,10 +552,15 @@ def _compiled(dtype: torch.dtype, demean: bool):
         f32(),
         e4m3(),
         _fake1d(cutlass.BFloat16),
+        f32(),
         Int32(1),
         Int32(1),
         Int32(1),
         Int32(1),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        repair,
         stream,
         options=_COMPILE_OPTIONS,
     )
@@ -459,17 +571,21 @@ def _compiled(dtype: torch.dtype, demean: bool):
 def vc_prepare(
     k: torch.Tensor,
     v: torch.Tensor,
-    perm: torch.Tensor,
+    perm: torch.Tensor | None,
     *,
     demean: bool = True,
+    repair_tiles: int = 0,
 ) -> tuple[torch.Tensor, ...]:
     """Run the two preparation kernels.
 
     ``k``, ``v``: contiguous ``[B, S, H, D]`` bf16/fp16; ``perm``:
     ``[B, H, S_k]`` int32/int64. ``demean=False`` keeps the tile means at zero
     (V-Smooth off, plain per-channel E4M3 V). Returns ``(k_perm, v8, v_scale,
-    mean, mu)`` in the ``VCAttentionOperands`` layouts; ``v_scale`` is
-    ``[B, H, D]``.
+    mean, mu, energy)`` in the ``VCAttentionOperands`` layouts; ``v_scale`` is
+    ``[B, H, D]``. With ``repair_tiles`` the token order is the input order,
+    ``k_perm`` and ``v8`` use the V repair layout with the repair tiles left
+    unwritten, and ``energy`` holds each token's residual energy ``[B, H, S]``
+    in place of the mean operand.
     """
     b, s_k, h, d = k.shape
     if d != _D:
@@ -479,14 +595,23 @@ def vc_prepare(
     dev = k.device
     t = (s_k + _TILE - 1) // _TILE
     bh = b * h
-    p1, p2 = _compiled(k.dtype, bool(demean))
-    perm32 = perm.to(torch.int32).contiguous()
-    k_perm = torch.empty_like(k)
-    v8 = torch.empty((b, s_k, h, d), dtype=torch.float8_e4m3fn, device=dev)
+    repair = repair_tiles > 0
+    rows = vc_repair_kv_len(s_k, repair_tiles) if repair else s_k
+    tail_start = s_k // _TILE * _TILE if repair else s_k
+    p1, p2 = _compiled(k.dtype, bool(demean), repair)
+    perm32 = (
+        torch.zeros((1,), dtype=torch.int32, device=dev)
+        if repair
+        else perm.to(torch.int32).contiguous()
+    )
+    k_perm = torch.empty((b, rows, h, d), dtype=k.dtype, device=dev)
+    v8 = torch.empty((b, rows, h, d), dtype=torch.float8_e4m3fn, device=dev)
     mean = torch.empty((b, h, t, d), dtype=torch.float32, device=dev)
     vamax = torch.empty((b, h, t, d), dtype=torch.float32, device=dev)
     mu = torch.zeros(
-        (
+        (1,)
+        if repair
+        else (
             b,
             h,
             (t + VC_MEAN_GROUP_TILES - 1) // VC_MEAN_GROUP_TILES,
@@ -494,6 +619,9 @@ def vc_prepare(
         ),
         dtype=torch.bfloat16,
         device=dev,
+    )
+    energy = torch.empty(
+        (b, h, s_k) if repair else (1,), dtype=torch.float32, device=dev
     )
     p1(
         k.view(-1),
@@ -506,6 +634,9 @@ def vc_prepare(
         h,
         t,
         bh,
+        rows,
+        tail_start,
+        repair_tiles * _TILE,
     )
     v_scale = (vamax.amax(dim=2) / E4M3_MAX).clamp_min(1e-12).contiguous()  # [B, H, D]
     p2(
@@ -515,9 +646,13 @@ def vc_prepare(
         v_scale.view(-1),
         v8.view(-1),
         mu.view(-1),
+        energy.view(-1),
         s_k,
         h,
         t,
         bh,
+        rows,
+        tail_start,
+        repair_tiles * _TILE,
     )
-    return k_perm, v8, v_scale, mean, mu
+    return k_perm, v8, v_scale, mean, mu, energy

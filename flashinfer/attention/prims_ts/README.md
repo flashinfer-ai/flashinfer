@@ -456,9 +456,10 @@ afterwards. `vc_quantize` is the torch reference of the same preparation.
 from `pack_vc_tile_means`; both are contiguous and 16-byte aligned on the run
 device, and a validating `run()` checks them against the plan. `demean` says
 whether the run restores the means (`False` after the V-Smooth window, when
-they are zero). `VCAttentionPreprocessor.prepare`, `vc_quantize_fused` (CuTe
-DSL) and `vc_quantize` (torch) return them with the permuted K and the E4M3 V
-as `VCAttentionOperands`, whose `.params` is the run-time object.
+they are zero). `VCAttentionPreprocessor.prepare` and `vc_quantize` (two CuTe
+DSL kernels) return them with the permuted K and the E4M3 V as
+`VCAttentionOperands`, whose `.params` is the run-time object; `vc_quantize_repair`
+builds the V repair operands instead (`VCAttentionConfig(repair_tiles=...)`).
 
 ### Example
 

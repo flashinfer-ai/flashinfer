@@ -2368,6 +2368,9 @@ def create_softmax_task(
             raise ValueError("p_in_smem requires the group's SMEM P resource")
         dst.append(smem_p)
     vc_attention = tmem_sp.cfg.vc_attention
+    # VC-Attention-QK16 V treatment: tile means restored in-kernel, or V repair tiles.
+    vc_restores_means = tmem_sp.cfg.vc_restores_means
+    vc_repairs_v = vc_attention and not vc_restores_means
 
     def softmax_schedule_body(
         sp: TmemSPResource,
@@ -2386,7 +2389,12 @@ def create_softmax_task(
             p_chunk = sp.init_softmax_state()
         scale_softmax_log2 = sp.load_scale_softmax_log2()
 
-        vc_state: dict[str, Any] = {"prev_sum": None, "row_sum": None, "sums": None}
+        vc_state: dict[str, Any] = {
+            "prev_sum": None,
+            "row_sum": None,
+            "sums": None,
+            "kept": None,
+        }
 
         def exp2_p(
             sp: TmemSPResource,
@@ -2408,7 +2416,17 @@ def create_softmax_task(
                     row_max=row_max, scale_softmax_log2=scale_softmax_log2
                 )
                 pb.acquire()
-                if vc_attention:
+                if vc_repairs_v:
+                    out = sp.vc_store_p_repair(
+                        old_row_max=old_row_max,
+                        row_max=row_max,
+                        row_sum=vc_state["row_sum"],
+                        vc_kept_row_sum=vc_state["kept"],
+                        p_chunk=p_chunk,
+                        is_tail=is_tail,
+                    )
+                    vc_state["kept"], vc_state["row_sum"] = out[0], out[1]
+                elif vc_restores_means:
                     out = sp.vc_store_p(
                         old_row_max=old_row_max,
                         row_max=row_max,
@@ -2445,7 +2463,8 @@ def create_softmax_task(
             if vc_attention:
                 init = sp.vc_init_row_scale()
                 vc_row_scale, vc_state["prev_sum"] = init[0], init[1]
-                vc_state["sums"] = init[2:]
+                vc_state["sums"] = init[2:-1]
+                vc_state["kept"] = init[-1]
             if tmem_sp.uses_varlen_q_offset_cache:
                 q_offset = sp.cache_q_offset()
             if tmem_sp.uses_packed_dense_k_mask:
@@ -2795,7 +2814,7 @@ def create_softmax_task(
                         scale_softmax_log2=scale_softmax_log2,
                     )
                 vec.acquire()
-                if vc_attention:
+                if vc_restores_means:
                     # The last row sums ride a second P handoff to the tail step.
                     pb.acquire()
                     sp.vc_store_rowsum_final(
@@ -2806,6 +2825,9 @@ def create_softmax_task(
                         },
                     )
                     pb.commit()
+                elif vc_repairs_v:
+                    # The repair tiles stay out of the denominator.
+                    row_sum = vc_state["kept"]
                 # Cleanup: drain the final SP slot and publish identity stats.
                 if not p_in_smem:
                     sp.wait()
@@ -2820,7 +2842,7 @@ def create_softmax_task(
                 vec.commit()
             else:
                 # Non-causal tail: no more tiles, just publish the final stats.
-                if vc_attention:
+                if vc_restores_means:
                     # The last row sums ride a second P handoff to the tail step.
                     pb.acquire()
                     sp.vc_store_rowsum_final(
@@ -2831,6 +2853,9 @@ def create_softmax_task(
                         },
                     )
                     pb.commit()
+                elif vc_repairs_v:
+                    # The repair tiles stay out of the denominator.
+                    row_sum = vc_state["kept"]
                 if not p_in_smem:
                     sp.wait()
                     sp.release()
