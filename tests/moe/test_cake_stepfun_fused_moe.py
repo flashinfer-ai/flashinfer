@@ -445,11 +445,15 @@ def _require_runner_support(runner_cls, config, device, *, unavailable: str) -> 
     """Skip when ``runner_cls`` rejects ``config`` for ``unavailable``, a path this tree or
     module does not provide; any other rejection is a failure.
 
-    ``"SwiGLUStep"``: the public trtllm-gen artifact ships no StepFun kernels, so the native
-    runners do not advertise SwiGLUStep and a native comparison needs a tree with the native
-    StepFun path. ``"full Cake path"``: the Cake router serves Renormalize over routed experts
-    only. ``MoELayer`` folds every runner rejection into one ``RuntimeError`` while it builds
-    its runners, so the probe runs on the runner before the layer is constructed.
+    ``"SwiGLUStep"``: the native trtllm-gen runners of all four families (NVFP4, BF16, FP8
+    per-tensor, MXFP8) advertise SwiGLUStep now that the native StepFun path is upstream, so
+    the native comparison arms run in this tree; the probe skips only on a
+    ``NotImplementedError`` from ``check_support()`` that names SwiGLUStep. It does not guard
+    the kernel inventory: a batched-GEMM artifact without StepFun epilogues fails the native
+    arm later, when the C++ runner is constructed, exactly as upstream's own StepFun tests
+    fail. ``"full Cake path"``: the Cake router serves Renormalize over routed experts only.
+    ``MoELayer`` folds every runner rejection into one ``RuntimeError`` while it builds its
+    runners, so the probe runs on the runner before the layer is constructed.
     """
     try:
         runner_cls(config, device).check_support()
@@ -1114,9 +1118,8 @@ def test_stepfun_reproduces_native_fc1_twin_bitwise(
     assert outputs, (
         f"no Cake tactic at T={num_tokens}: {cake_tactics} vs tiles {sorted(cake_tiles)}"
     )
-    # The native arm (skips here on a tree without the native StepFun path) is pinned to the
-    # twinned (FC1, FC2) configurations; a mismatch lists the native tactics of the tile that
-    # do match, if any.
+    # The native arm is pinned to the twinned (FC1, FC2) configurations; a mismatch lists the
+    # native tactics of the tile that do match, if any.
     _, native, native_packed, native_kwargs, _ = _native_runner(case, device)
     cake_space = _factorized(cake, cake_packed)
     for tactic in cake_tactics:
@@ -1545,8 +1548,8 @@ def test_full_path_matches_native_pipeline(
             outputs[tuple(tactic)] = output
         default = _forward(cake, cake_packed, cake_kwargs, -1)
         check_accuracy(case.reference, default.float(), **case.tolerances)
-        # The native arm runs the twinned (FC1, FC2) configurations of the tile; on a tree
-        # without the native StepFun path it skips here, after the Cake accuracy checks.
+        # The native arm runs the twinned (FC1, FC2) configurations of the tile, after the Cake
+        # accuracy checks.
         _, native, native_packed, native_kwargs, _ = _native_runner(case, device)
         cake_space = _factorized(cake, cake_packed)
         twin_outputs = {}
@@ -1919,8 +1922,7 @@ def test_full_path_precomputed_ids_matches_native_pipeline(
     assert torch.equal(
         replayed, _forward(cake, cake_packed, cake_kwargs, cake_tactics[0])
     )
-    # The native arm (skips here on a tree without the native StepFun path) runs the twinned
-    # (FC1, FC2) configurations of the tile.
+    # The native arm runs the twinned (FC1, FC2) configurations of the tile.
     _, native, native_packed, native_kwargs, _ = _layer_runner(
         case.native_config, device, spec.native_runner, act, case.weights, native=True
     )

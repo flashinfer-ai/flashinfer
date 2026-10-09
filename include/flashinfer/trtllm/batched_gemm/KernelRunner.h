@@ -50,12 +50,16 @@ enum class ActType {
   GeGlu = 1,
   SiTuGlu = 2,
   None = 3,
+  // StepFun applies the gate cap after SiLU: clamp(up, -L, L) * min(silu(gate), L).
+  SwiGluStep = 4,
 };
 
 static_assert(static_cast<int>(ActType::SwiGlu) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::SwiGlu));
 static_assert(static_cast<int>(ActType::GeGlu) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::GeGlu));
+// SwiGluStep is value 4 in trtllm-gen export 7.0.5.0.4.0. The public 7.0.4
+// headers omit it; retain source compatibility until the new cubins are pinned.
 #ifndef TLLM_RUBIN_FEATURES
 // Historically the separate Rubin BMM pin predated SiTuGlu: its
 // gemmGatedAct::ActType was {SwiGlu, GeGlu, None} with None == 2, so these two

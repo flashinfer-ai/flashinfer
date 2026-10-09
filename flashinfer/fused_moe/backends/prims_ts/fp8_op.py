@@ -221,9 +221,8 @@ def prims_ts_fp8_per_tensor_scale_moe(
     output : Optional[torch.Tensor]
         Optional in-place output tensor.
     gemm1_clamp_limit : Optional[torch.Tensor]
-        Per-expert StepFun FC1 clamp limits. Positional mirror of the
-        trtllm-gen argument; the Prims-TS per-tensor path has no StepFun
-        epilogue and rejects a non-``None`` value.
+        Reserved for TRTLLM signature compatibility; must be ``None``.
+        This Prims-TS API does not support SwiGLUStep limits.
     weight_layout : int
         Prims-TS weight layout enum value (default ``MajorK``). Keyword-only.
     fc1_per_channel_weight_scale : Optional[torch.Tensor]
@@ -237,6 +236,10 @@ def prims_ts_fp8_per_tensor_scale_moe(
         Same return contract as
         :func:`~flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_moe`.
     """
+    if gemm1_clamp_limit is not None:
+        raise NotImplementedError(
+            "Prims-TS FP8 per-tensor API does not support gemm1_clamp_limit"
+        )
     if hidden_states.dtype != torch.float8_e4m3fn:
         raise ValueError("Prims-TS FP8 per-tensor path requires float8_e4m3fn input")
     if gemm1_weights.dtype != torch.float8_e4m3fn:
@@ -301,12 +304,6 @@ def prims_ts_fp8_per_tensor_scale_moe(
     expert_weights = torch.empty(
         0, dtype=routing_logits.dtype, device=hidden_states.device
     )
-
-    if gemm1_clamp_limit is not None:
-        raise NotImplementedError(
-            "Prims-TS FP8 per-tensor path does not support gemm1_clamp_limit "
-            "(StepFun activation)"
-        )
 
     moe_op = _get_moe_op()
     moe_runner = PrimsTsFp8PerTensorMoERunner(

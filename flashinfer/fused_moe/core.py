@@ -37,14 +37,14 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.moe import (
     cutlass_fused_moe_trace,
-    trtllm_bf16_moe_trace,
-    trtllm_bf16_routed_moe_trace,
+    trtllm_bf16_moe_trace_dispatch as trtllm_bf16_moe_trace,
+    trtllm_bf16_routed_moe_trace_dispatch as trtllm_bf16_routed_moe_trace,
     trtllm_fp4_block_scale_moe_trace_dispatch,
     trtllm_fp4_block_scale_routed_moe_trace,
     trtllm_fp8_block_scale_moe_trace_dispatch,
-    trtllm_fp8_block_scale_routed_moe_trace,
-    trtllm_fp8_per_tensor_scale_moe_trace,
-    trtllm_fp8_per_tensor_scale_routed_moe_trace,
+    trtllm_fp8_block_scale_routed_moe_trace_dispatch as trtllm_fp8_block_scale_routed_moe_trace,
+    trtllm_fp8_per_tensor_scale_moe_trace_dispatch as trtllm_fp8_per_tensor_scale_moe_trace,
+    trtllm_fp8_per_tensor_scale_routed_moe_trace_dispatch as trtllm_fp8_per_tensor_scale_routed_moe_trace,
     trtllm_mxint4_block_scale_moe_trace,
 )
 from ..autotuner import (

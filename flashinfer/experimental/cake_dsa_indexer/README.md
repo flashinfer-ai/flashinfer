@@ -142,7 +142,8 @@ by the CUB block radix sort or -- where the policy's `finalize_rank_for`
 names a bitmap window for the call -- by the prefix-popcount rank scatter
 program of that window; grid = `T`).  The scan exists in several physical programs and the host picks
 one per call from host-known integers only -- `T`, `Tkv`, `S`, `ratio`,
-`top_k`, the optional `max_seqlen_k` bound and the SM count; no tensor is read -- through the registry's
+`top_k`, the optional `max_seqlen_k` bound and the SM count (the device's compute capability and SM count
+are read once per device index and reused); no tensor is read -- through the registry's
 per-architecture `POLICY` record (`cake_policy.DispatchPolicy`,
 `cake_backend.plan_dsa_indexer_topk`).  The estimate behind most rules is the
 mean key tiles per work unit, `(Tkv - T / (2 ratio)) / S / 128`.
@@ -198,8 +199,12 @@ that writes the registry verifies the record against them before it is frozen.
 * `cake_backend.py` -- validation, planning, argument binding, the prepared
   runner and the eager entry point.
 * `csrc/cake_dsa_indexer_topk/` -- generated kernel and binding translation
-  units, one source per program for every architecture (`.clang-format`
-  disables formatting: the sources are identity-checked by the export).
+  units, one source per program for every architecture, with the shared device
+  preamble `cake_dsa_indexer_topk_device_common.cuh` and the shared launch helpers
+  `cake_dsa_indexer_topk_host_common.cuh` delivered once; the preamble's helper
+  functions are content-addressed files under `csrc/cake_device_helpers/`
+  (`csrc/.clang-format` disables formatting: the sources are identity-checked by
+  the export).
 
 ## Tests and benchmark
 

@@ -227,6 +227,22 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
     arch_msg << "The trtllm-gen batched GEMM cubin manifest contains no kernels runnable on sm"
              << sm_version << "; this backend currently ships cubins for sm100, sm103 and sm107.";
     FLASHINFER_CHECK(anyArchCompatible, arch_msg.str());
+    if (mOptions.fusedAct && mOptions.actType == ActType::SwiGluStep) {
+      bool anyStepCompatible = false;
+      for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
+        auto const& config = configs[i];
+        if (config.mOptions.mFusedAct &&
+            static_cast<int>(config.mOptions.mActType) == static_cast<int>(ActType::SwiGluStep) &&
+            isArchCompatible(sm_version, config.mSm)) {
+          anyStepCompatible = true;
+          break;
+        }
+      }
+      FLASHINFER_CHECK(
+          anyStepCompatible,
+          "SwiGLUStep requires trtllm-gen batched-GEMM cubins with the StepFun epilogue "
+          "(export 7.0.5.0.4.0 or later); the current artifact contains no StepFun kernels.");
+    }
   }
 
   std::ostringstream error_msg;

@@ -5549,7 +5549,13 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
-        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (
+            SwiGLU,
+            SwiGLUStep,
+            GeGLU,
+            SiTU,
+            ReLU2,
+        ),
         (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
         (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
     }
@@ -5948,7 +5954,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
-        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, SwiGLUStep, GeGLU, ReLU2),
     }
 
     def _check_support(self) -> None:
@@ -6304,10 +6310,10 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
     supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
         (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
     )
-    # The per-tensor cubin manifest has SwiGLU and ReLU2 epilogues. GeGLU is
-    # representable by the enum but has no matching generated kernel.
+    # GeGLU is representable by the enum but has no matching generated kernel.
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
         SwiGLU,
+        SwiGLUStep,
         ReLU2,
     )
 
@@ -6628,10 +6634,10 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
     supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
         (QuantFormat.BF16, QuantFormat.BF16),
     )
-    # The BF16 cubin manifest currently contains SwiGLU and ReLU2. GeGLU and
-    # SiTU are represented by the launcher enum but have no matching kernels.
+    # GeGLU and SiTU are represented by the launcher enum but have no matching kernels.
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
         SwiGLU,
+        SwiGLUStep,
         ReLU2,
     )
 
@@ -9586,6 +9592,15 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
                 f"{type(self).__name__} supports pre-routed packs only "
                 f"(PackedPrecomputed / UnpackedPrecomputed), got {act.routing_input_mode!r}."
             )
+        if act.per_token_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} takes no per_token_scale; the cuDNN grouped "
+                "GEMMs have no per-token activation scale input."
+            )
+        # The cuDNN-specific reasons above come first; the shared pack contract is
+        # the common gate every unified runner passes through (see
+        # tests/moe/test_unified_moe_pack_contract.py).
+        self._validate_pack_contract(act)
         num_tokens, hidden_size = self._validate_hidden_states(act.hidden_states_q)
         _validate_prerouted_inputs(
             act,
@@ -9595,11 +9610,6 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
             allowed_weights_dtypes=(torch.float32, torch.bfloat16),
             require_contiguous=True,
         )
-        if act.per_token_scale is not None:
-            raise ValueError(
-                f"{type(self).__name__} takes no per_token_scale; the cuDNN grouped "
-                "GEMMs have no per-token activation scale input."
-            )
         view = weights.get_view(self.backend_key)
         weight_inputs = self._pack_weight_inputs(view, hidden_size)
         extra_inputs = self._pack_extra_inputs(act, view)

@@ -3351,28 +3351,35 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "state_dtype,mode_varlen,expected",
+    "family,state_dtype,mode_varlen,expected",
     [
-        (torch.bfloat16, False, "exact_bf16_batched"),
-        (torch.bfloat16, True, "exact_bf16_varlen"),
-        (torch.float16, False, "exact_f16_batched"),
-        (torch.float16, True, "exact_f16_varlen"),
-        (torch.float32, False, "exact_f32_batched"),
-        (torch.float32, True, "exact_f32_varlen"),
+        ("exact", torch.bfloat16, False, "exact_bf16_batched"),
+        ("exact", torch.bfloat16, True, "exact_bf16_varlen"),
+        ("exact", torch.float16, False, "exact_f16_batched"),
+        ("exact", torch.float16, True, "exact_f16_varlen"),
+        ("exact", torch.float32, False, "exact_f32_batched"),
+        ("exact", torch.float32, True, "exact_f32_varlen"),
+        ("chunkpar", torch.bfloat16, False, "chunkpar_bf16_batched"),
+        ("chunkpar", torch.bfloat16, True, "chunkpar_bf16_varlen"),
+        ("chunkpar", torch.float16, False, "chunkpar_f16_batched"),
+        ("chunkpar", torch.float16, True, "chunkpar_f16_varlen"),
+        ("chunkpar", torch.float32, False, "chunkpar_f32_batched"),
+        ("chunkpar", torch.float32, True, "chunkpar_f32_varlen"),
     ],
 )
 def test_source_program_name_covers_every_state_dtype(
-    state_dtype, mode_varlen, expected
+    family, state_dtype, mode_varlen, expected
 ):
-    """One kernel family serves every admitted input: the program follows
-    from the state dtype and the batched/packed mode alone."""
+    """Both kernel families serve every admitted input: the program follows
+    from the family, the state dtype and the batched/packed mode alone."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
 
-    actual = module._program_name(state_dtype, mode_varlen)
+    actual = module._program_name(family, state_dtype, mode_varlen)
 
     assert actual == expected
     assert actual in module._PROGRAMS
+    assert module._PROGRAMS[actual].family == family
     assert module._STATE_DTYPE_CODES == {
         "bf16": (4, 16),
         "f16": (2, 16),
@@ -3803,7 +3810,7 @@ def test_source_direct_preprocess_and_sequence_argument_order():
         mode_varlen=True,
         dt_softplus=False,
         dt_limit=(0.0, float("inf")),
-        threads=32,
+        tiles_per_block=4,
         seq_idx_i32=sentinels["seq_idx_i32"],
         seq_idx_i64=sentinels["seq_idx_i64"],
         seq_idx_int64=True,
@@ -3819,6 +3826,7 @@ def test_source_direct_preprocess_and_sequence_argument_order():
     main = {name: object() for name in module._MAIN_ARGS}
 
     bound = module._sequence_arguments(
+        module._MAIN_ARGS,
         preprocess,
         preprocess_grid,
         main,
@@ -3843,7 +3851,8 @@ def test_source_direct_preprocess_and_sequence_argument_order():
     assert preprocess["metadata_from_cu_seqlens"] == 0
     assert preprocess["checkpoint_state_count"] == 0
     assert preprocess["preprocess_status"] is sentinels["preprocess_status"]
-    assert preprocess_grid == (12, 1, 1)
+    # 3 segments x 128 heads = 384 (segment, head) tiles, four per CTA
+    assert preprocess_grid == (96, 1, 1)
     assert set(preprocess) == set(module._PREPROCESS_ARGS)
     # CAKE-990 appended ``preprocess_status`` last; CAKE-934 item 2 inserts the
     # cu_seqlens derivation inputs before it (the status word stays last).
@@ -3862,9 +3871,7 @@ def test_source_direct_preprocess_and_sequence_argument_order():
     )
     assert bound == (
         *(preprocess[name] for name in module._PREPROCESS_ARGS),
-        12,
-        1,
-        1,
+        *preprocess_grid,
         *(main[name] for name in module._MAIN_ARGS),
         148,
         1,
@@ -3980,7 +3987,9 @@ def test_source_sequence_arguments_fail_closed_on_missing_values():
     del main["checkpoint_state_count"]
 
     with pytest.raises(KeyError, match="checkpoint_state_count"):
-        module._sequence_arguments(preprocess, (1, 1, 1), main, (1, 1, 1), 0)
+        module._sequence_arguments(
+            module._MAIN_ARGS, preprocess, (1, 1, 1), main, (1, 1, 1), 0
+        )
 
 
 def test_source_program_launch_orders_stage_arguments(monkeypatch):
@@ -4020,29 +4029,76 @@ def test_source_program_launch_orders_stage_arguments(monkeypatch):
     ]
 
 
+_HOST_PLACEHOLDERS = (
+    "CAKE_SSD_PROGRAM",
+    "CAKE_SSD_PREPROCESS_MODULE",
+    "CAKE_SSD_PREPROCESS_KERNEL",
+    "CAKE_SSD_PREPROCESS_THREADS",
+    "CAKE_SSD_MAIN_MODULE",
+    "CAKE_SSD_MAIN_KERNEL",
+    "CAKE_SSD_STATE_DTYPE_CODE",
+    "CAKE_SSD_STATE_DTYPE_BITS",
+    "CAKE_SSD_MAIN_SMEM_BYTES",
+)
+
+
 def test_source_program_table_names_shipped_sources():
+    """Every program of both families binds shipped generated sources: the
+    one preprocess (one warp per tile of its block), its family's host
+    template and main dynamic SMEM, and a main kernel whose symbol is the
+    module identity without its hash.  Table entries the Cake export has
+    not filled fail here by name."""
+
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     source_dir = module._source_dir()
 
     assert set(module._PROGRAMS) == {
-        "exact_bf16_batched",
-        "exact_bf16_varlen",
-        "exact_f16_batched",
-        "exact_f16_varlen",
-        "exact_f32_batched",
-        "exact_f32_varlen",
+        f"{family}_{state}_{mode}"
+        for family in ("exact", "chunkpar")
+        for state in ("bf16", "f16", "f32")
+        for mode in ("batched", "varlen")
     }
-    assert "PENDINGEXPORT" not in "".join(module._SCAN_MODULES.values())
-    template = (source_dir / module._HOST_TEMPLATE).read_text(encoding="utf-8")
+    assert set(module._SCAN_MODULES) == {
+        name for name in module._PROGRAMS if name.startswith("exact_")
+    }
+    assert set(module._CHUNKPAR_MODULES) == {
+        name for name in module._PROGRAMS if name.startswith("chunkpar_")
+    }
+    pending = sorted(
+        name
+        for name, program in module._PROGRAMS.items()
+        if module._PENDING_EXPORT in program.main.module or program.main_smem_bytes <= 0
+    )
+    assert not pending, f"programs awaiting the Cake export: {pending}"
+    assert module._PENDING_EXPORT not in module._SEGMENT_PREPROCESS_MODULE
+    assert (
+        module._SEGMENT_PREPROCESS.threads
+        == 32 * module._SEGMENT_PREPROCESS_TILES_PER_BLOCK
+    )
+    family_host = {
+        "exact": (module._HOST_TEMPLATE, module._MAIN_ARGS, module._EXACT_SMEM_BYTES),
+        "chunkpar": (
+            module._CHUNKPAR_HOST_TEMPLATE,
+            module._MAIN_ARGS_CHUNKPAR,
+            module._CHUNKPAR_SMEM_BYTES,
+        ),
+    }
+    templates = {
+        family: (source_dir / template).read_text(encoding="utf-8")
+        for family, (template, _, _) in family_host.items()
+    }
     device_sources = set()
     for name, program in module._PROGRAMS.items():
         family, state_key, mode = name.split("_")
-        assert family == "exact"
+        template_path, main_args, smem_bytes = family_host[family]
+        assert program.family == family
+        assert program.host_template == template_path
+        assert program.main_args == main_args
+        assert program.main_smem_bytes == smem_bytes
         assert (program.state_dtype_code, program.state_dtype_bits) == (
             module._STATE_DTYPE_CODES[state_key]
         )
         assert program.preprocess is module._SEGMENT_PREPROCESS
-        assert program.main_smem_bytes == module._EXACT_SMEM_BYTES
         assert program.main.module.startswith(
             program.main.kernel.removeprefix("kernel_") + "_"
         )
@@ -4056,25 +4112,20 @@ def test_source_program_table_names_shipped_sources():
                 rf"\b{kernel.kernel}\(", source.read_text(encoding="utf-8")
             )
             device_sources.add(source)
+        template = templates[family]
         rendered = module._render_host_source(template, name, program)
-        placeholders = (
-            "CAKE_SSD_PROGRAM",
-            "CAKE_SSD_PREPROCESS_MODULE",
-            "CAKE_SSD_PREPROCESS_KERNEL",
-            "CAKE_SSD_PREPROCESS_THREADS",
-            "CAKE_SSD_MAIN_MODULE",
-            "CAKE_SSD_MAIN_KERNEL",
-            "CAKE_SSD_STATE_DTYPE_CODE",
-            "CAKE_SSD_STATE_DTYPE_BITS",
-            "CAKE_SSD_MAIN_SMEM_BYTES",
-        )
-        assert all(placeholder in template for placeholder in placeholders)
-        assert not any(placeholder in rendered for placeholder in placeholders)
+        assert all(placeholder in template for placeholder in _HOST_PLACEHOLDERS)
+        assert not any(placeholder in rendered for placeholder in _HOST_PLACEHOLDERS)
         assert f"TVM_FFI_EMBED_CUBIN({program.preprocess.module});" in rendered
         assert f"TVM_FFI_EMBED_CUBIN({program.main.module});" in rendered
         assert f'"{program.main.kernel}"' in rendered
         assert f"namespace cake_mamba_ssd_combined_host_{name} {{" in rendered
+        # The main launch is a plain back-to-back launch after the preprocess
+        # (no programmatic dependent launch); its dynamic SMEM is the family
+        # literal.
         assert f"stream, {program.main_smem_bytes}u)" in rendered
+        assert "LaunchEx(" not in rendered
+        assert "PROGRAMMATIC_STREAM_SERIALIZATION" not in rendered
         # The regenerated host shim brace-initialises the DLDataType of the
         # three state tensors from the two state placeholders; delta checks
         # are FP16 for every program (D1) and not factored.
@@ -4086,9 +4137,10 @@ def test_source_program_table_names_shipped_sources():
             )
             assert state_check in rendered, state_check
         assert "DLDataType{kDLFloat, 16, 1}" in rendered
-    # One shared source per physical kernel: six scan sources plus the one
-    # preprocess kernel, no architecture copies.
-    assert len(device_sources) == 7
+    # One shared source per physical kernel: six exact-scan and six
+    # chunk-parallel main sources plus the one preprocess kernel, no
+    # architecture copies and no orphans.
+    assert len(device_sources) == 13
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
     ) == sorted(path.name for path in device_sources)
@@ -4100,11 +4152,15 @@ def test_active_source_package_declares_cuda_half_types_explicitly():
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     source_root = module._source_dir() / module._DEVICE_DIR
+    # Programs the Cake export has not filled yet ship no source; they fail
+    # by name in test_source_program_table_names_shipped_sources.
     sources = {
         kernel.source
         for program in module._PROGRAMS.values()
         for kernel in program.kernels
+        if module._PENDING_EXPORT not in kernel.module
     }
+    assert sources
     for name in sorted(sources):
         source = (source_root / name).read_text(encoding="utf-8")
         assert source.count("#include <cuda_fp16.h>") == 1, name
@@ -4171,10 +4227,824 @@ def test_source_program_loader_builds_one_module_per_arch(monkeypatch, tmp_path)
     assert "namespace host_exact_bf16_varlen {}" in rendered
     assert f"TVM_FFI_EMBED_CUBIN({program.preprocess.module});" in rendered
     assert (
-        f"{program.preprocess.kernel} 128 {program.main.kernel} 4 16 231936" in rendered
+        f"{program.preprocess.kernel} {program.preprocess.threads} "
+        f"{program.main.kernel} 4 16 {program.main_smem_bytes}" in rendered
     )
     assert set(load_calls[0][1]["embed_cubin"]) == {
         program.preprocess.module,
         program.main.module,
     }
     assert load_calls[0][0][0].startswith("cake_mamba_ssd_exact_bf16_varlen_sm_103a_")
+
+
+# ---------------------------------------------------------------------------
+# Chunk-parallel program family (``chunkpar_*``): the exact scan's arithmetic
+# in a grid-barrier-separated schedule, selected per call by the calibrated
+# cost rule mirrored from the Cake seed module.
+
+_CHUNK_PARALLEL_ENV = "FLASHINFER_CAKE_SSD_CHUNK_PARALLEL"
+_SELECTION_SM_COUNT = 148
+_SELECTION_CAPABILITIES = ((10, 0), (10, 3))
+_CHUNK_PARALLEL_WORKSPACE_ARGS = ("h_map", "s_work", "h_words", "grid_barrier")
+
+
+@pytest.fixture(autouse=True)
+def _without_chunk_parallel_override(monkeypatch):
+    """Every test starts with ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` unset
+    (``auto``): the runner reads it on every call, so a value inherited from
+    the invoking shell would route every call through the other family or
+    make every call raise.  Tests of the override set the variable through
+    their own ``monkeypatch`` afterwards."""
+
+    monkeypatch.delenv(_CHUNK_PARALLEL_ENV, raising=False)
+
+
+def _batched_selection(
+    batch,
+    nheads,
+    nchunks,
+    *,
+    sm_count=_SELECTION_SM_COUNT,
+    capability=(10, 0),
+    mode="auto",
+):
+    """``chunk_parallel_selected`` of a batched call: ``batch`` sequences of
+    ``nchunks`` 128-token chunks (one segment per chunk)."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    return module.chunk_parallel_selected(
+        nheads=nheads,
+        num_sequences=batch,
+        num_segments=batch * nchunks,
+        nchunks=nchunks,
+        mode_varlen=False,
+        sm_count=sm_count,
+        capability=capability,
+        mode=mode,
+    )
+
+
+@pytest.mark.parametrize("capability", _SELECTION_CAPABILITIES, ids=("sm100", "sm103"))
+@pytest.mark.parametrize(
+    "batch,nheads,nchunks,expected",
+    (
+        (1, 8, 16, True),
+        (1, 8, 8, False),
+        (1, 128, 32, False),
+        (1, 8, 256, True),
+        (4, 8, 64, True),
+        (1, 32, 16, False),
+    ),
+    ids=("1x8x16", "1x8x8", "1x128x32", "1x8x256", "4x8x64", "1x32x16"),
+)
+def test_source_chunk_parallel_selection_rule(
+    capability, batch, nheads, nchunks, expected
+):
+    """The calibrated family rule at 148 SMs on both measured capabilities.
+    Chunk-parallel needs fewer (sequence, head) items than SMs, a workspace
+    within the cap and a predicted main-kernel time that beats the exact
+    scan's by the selection margin: 1 x 2048 tokens x 8 heads (16 chunks,
+    128 tiles), the 32768-token few-head prefill and 4 x 8192 x 8 qualify;
+    8 chunks do not amortise the fixed cost, 128 heads pay for 4096 tiles,
+    and 1 x 2048 x 32 (512 tiles) lands inside the margin."""
+
+    selected = _batched_selection(batch, nheads, nchunks, capability=capability)
+    assert selected is expected
+
+
+def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
+    """``selection_quantities`` reports the rule's inputs and both programs'
+    predicted main-kernel times from the calibrated constants: the exact
+    scan's per-chunk cost interpolates linearly between 32 and 128 work
+    items, the chunk-parallel program pays its fixed cost plus one per-tile
+    cost for every tile beyond the first wave of SMs; unmeasured
+    capabilities use the B200 constants."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    model = module._CHUNK_PARALLEL_COST_MODEL_US
+    assert set(model) == set(_SELECTION_CAPABILITIES)
+    assert module._CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE == 64 * 128 * (4 + 2)
+
+    def quantities(nheads, nchunks, capability, sm_count=_SELECTION_SM_COUNT):
+        return module.selection_quantities(
+            nheads=nheads,
+            num_sequences=1,
+            num_segments=nchunks,
+            nchunks=nchunks,
+            mode_varlen=False,
+            sm_count=sm_count,
+            capability=capability,
+        )
+
+    small = quantities(8, 16, (10, 0))
+    assert small["work_items"] == 8 and small["tiles"] == 128
+    assert small["chunks"] == 16 and small["sm_count"] == 148
+    assert small["workspace_bytes"] == 128 * 48 * 1024
+    b200 = model[(10, 0)]
+    predicted = small["predicted_us"]
+    assert predicted["exact_scan"] == pytest.approx(
+        b200["serial_fixed"] + b200["serial_per_chunk_small"] * 16
+    )
+    # 128 tiles fit the first wave of 148 SMs: the fixed cost alone.
+    assert predicted["chunk_parallel"] == pytest.approx(b200["cp_fixed"])
+
+    # The calibration row: 1 x 32768 tokens x 8 heads (the seed measured
+    # 688 -> 160 us on B200 and 667 -> 153 us on B300).
+    long_prefill = quantities(8, 256, (10, 0))["predicted_us"]
+    assert long_prefill["exact_scan"] == pytest.approx(691.48)
+    assert long_prefill["chunk_parallel"] == pytest.approx(149.03)
+    long_prefill = quantities(8, 256, (10, 3))["predicted_us"]
+    assert long_prefill["exact_scan"] == pytest.approx(668.24)
+    assert long_prefill["chunk_parallel"] == pytest.approx(141.85)
+
+    large = quantities(128, 32, (10, 3))
+    b300 = model[(10, 3)]
+    assert large["predicted_us"]["exact_scan"] == pytest.approx(
+        b300["serial_fixed"] + b300["serial_per_chunk_large"] * 32
+    )
+    assert large["predicted_us"]["chunk_parallel"] == pytest.approx(
+        b300["cp_fixed"] + b300["cp_per_tile"] * (4096 - 148)
+    )
+
+    # 80 work items: halfway between the small and the large per-chunk cost.
+    middle = quantities(80, 16, (10, 0))
+    per_chunk = (b200["serial_per_chunk_small"] + b200["serial_per_chunk_large"]) / 2
+    assert middle["predicted_us"]["exact_scan"] == pytest.approx(
+        b200["serial_fixed"] + per_chunk * 16
+    )
+
+    other = quantities(8, 16, (12, 0))
+    assert other["capability"] == (12, 0)
+    assert other["predicted_us"] == small["predicted_us"]
+
+
+@pytest.mark.parametrize("form", ("triple", "cu_seqlens"))
+def test_source_chunk_parallel_selection_varlen_uses_the_mean_chunk_count(form):
+    """Packed varlen: the per-sequence chunk counts live on the device, so
+    the rule's ``chunks`` is ``ceil(num_segments / num_sequences)`` in both
+    metadata forms (the cu_seqlens form passes its host segment bound as
+    ``num_segments``, so its tiles and chunks are upper bounds)."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    num_sequences, total = 2, 32768
+    if form == "triple":
+        num_segments = 256  # two 16384-token sequences: 128 logical chunks each
+    else:
+        num_segments = module._segment_bound(total, num_sequences)
+        assert num_segments == 256 + 2 * num_sequences
+    kwargs = dict(
+        nheads=8,
+        num_sequences=num_sequences,
+        num_segments=num_segments,
+        nchunks=-(-total // 128),
+        mode_varlen=True,
+        sm_count=_SELECTION_SM_COUNT,
+        capability=(10, 0),
+    )
+    quantities = module.selection_quantities(**kwargs)
+    assert quantities["work_items"] == 16
+    assert quantities["tiles"] == num_segments * 8
+    assert quantities["chunks"] == -(-num_segments // num_sequences)
+    assert module.chunk_parallel_selected(**kwargs, mode="auto") is True
+
+
+def test_source_chunk_parallel_needs_idle_sms():
+    """With at least as many (sequence, head) items as SMs the exact scan
+    already fills the machine: the chunk-parallel program is not selected
+    even where the cost model alone would prefer it."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    kwargs = dict(
+        nheads=8,
+        num_sequences=1,
+        num_segments=256,
+        nchunks=256,
+        mode_varlen=False,
+        capability=(10, 0),
+    )
+    assert module.chunk_parallel_selected(**kwargs, sm_count=148, mode="auto")
+    predicted = module.selection_quantities(**kwargs, sm_count=8)["predicted_us"]
+    assert predicted["chunk_parallel"] * 1.05 <= predicted["exact_scan"]
+    assert not module.chunk_parallel_selected(**kwargs, sm_count=8, mode="auto")
+
+
+def test_source_chunk_parallel_workspace_cap():
+    """The S/H workspace (32 KB f32 + 16 KB bf16 per (chunk, head) tile) is
+    capped at 256 MiB: above it the exact scan serves the call although the
+    prediction favours chunk-parallel."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    per_tile = module._CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE
+    assert per_tile == 48 * 1024
+    assert module._CHUNK_PARALLEL_WORKSPACE_CAP_BYTES == 256 << 20
+
+    def selected(nchunks):
+        kwargs = dict(
+            nheads=8,
+            num_sequences=1,
+            num_segments=nchunks,
+            nchunks=nchunks,
+            mode_varlen=False,
+            sm_count=_SELECTION_SM_COUNT,
+            capability=(10, 0),
+        )
+        quantities = module.selection_quantities(**kwargs)
+        predicted = quantities["predicted_us"]
+        assert predicted["chunk_parallel"] * 1.05 <= predicted["exact_scan"]
+        assert quantities["workspace_bytes"] == nchunks * 8 * per_tile
+        return module.chunk_parallel_selected(**kwargs, mode="auto")
+
+    # 1 x 65536 tokens x 8 heads: 4096 tiles = 192 MiB.
+    assert selected(512) is True
+    # 1 x 131072 tokens x 8 heads: 8192 tiles = 384 MiB.
+    assert selected(1024) is False
+
+
+def test_source_chunk_parallel_mode_override(monkeypatch):
+    """``always`` / ``never`` force the family regardless of the rule; the
+    ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` variable is read on every call,
+    trimmed and case-folded, defaults to ``auto`` and rejects any other
+    value."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert module._CHUNK_PARALLEL_ENV == _CHUNK_PARALLEL_ENV
+    assert _batched_selection(1, 8, 8, mode="always") is True
+    assert _batched_selection(1, 8, 256, mode="never") is False
+    with pytest.raises(ValueError, match="auto, always or never"):
+        _batched_selection(1, 8, 16, mode="sometimes")
+
+    assert module._chunk_parallel_mode() == "auto"
+    for value, expected in (
+        ("always", "always"),
+        (" Never ", "never"),
+        ("AUTO", "auto"),
+    ):
+        monkeypatch.setenv(_CHUNK_PARALLEL_ENV, value)
+        assert module._chunk_parallel_mode() == expected
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "1")
+    with pytest.raises(ValueError, match=_CHUNK_PARALLEL_ENV):
+        module._chunk_parallel_mode()
+
+
+def test_source_chunk_parallel_main_arguments_extend_the_exact_order():
+    """The chunk-parallel main kernel's parameter order (the generated host's
+    positional ABI) is the exact scan's with the state-operand tensor map
+    ``h_map`` after ``out_map`` and the workspace pointers ``s_work``,
+    ``h_words``, ``grid_barrier`` after ``out_native``; each program binds
+    its family's order and host template."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    expected = list(module._MAIN_ARGS)
+    expected.insert(expected.index("out_map") + 1, "h_map")
+    position = expected.index("out_native") + 1
+    expected[position:position] = ["s_work", "h_words", "grid_barrier"]
+    assert tuple(expected) == module._MAIN_ARGS_CHUNKPAR
+    assert len(module._MAIN_ARGS) == 41 and len(module._MAIN_ARGS_CHUNKPAR) == 45
+    assert set(module._MAIN_ARGS_CHUNKPAR) - set(module._MAIN_ARGS) == set(
+        _CHUNK_PARALLEL_WORKSPACE_ARGS
+    )
+    for name, program in module._PROGRAMS.items():
+        family = name.split("_")[0]
+        assert program.family == family
+        if family == "chunkpar":
+            assert program.main_args == module._MAIN_ARGS_CHUNKPAR
+            assert program.host_template == module._CHUNKPAR_HOST_TEMPLATE
+        else:
+            assert program.main_args == module._MAIN_ARGS
+            assert program.host_template == module._HOST_TEMPLATE
+
+
+def test_source_chunk_parallel_launch_orders_its_main_arguments(monkeypatch):
+    """``_launch_program`` orders a chunk-parallel program's main values by
+    ``_MAIN_ARGS_CHUNKPAR`` (45 values between the preprocess grid and the
+    main grid) and fails closed when the four workspace values are missing."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+
+    class Generated:
+        def run(self, *args):
+            calls.append(args)
+
+    monkeypatch.setattr(module, "_load_generated_program", lambda *_: Generated())
+    preprocess = {name: f"pre:{name}" for name in module._PREPROCESS_ARGS}
+    main = {name: f"main:{name}" for name in module._MAIN_ARGS_CHUNKPAR}
+
+    module._launch_program(
+        "chunkpar_f32_varlen",
+        "sm_100a",
+        preprocess=preprocess,
+        preprocess_grid=(8, 1, 1),
+        main=main,
+        main_grid=(148, 1, 1),
+        cuda_stream=0x1234,
+    )
+
+    assert calls == [
+        (
+            *(f"pre:{name}" for name in module._PREPROCESS_ARGS),
+            8,
+            1,
+            1,
+            *(f"main:{name}" for name in module._MAIN_ARGS_CHUNKPAR),
+            148,
+            1,
+            1,
+            0x1234,
+        )
+    ]
+    assert len(calls[0]) == 27 + 3 + 45 + 3 + 1
+    exact_values = {name: object() for name in module._MAIN_ARGS}
+    with pytest.raises(KeyError, match="h_map"):
+        module._launch_program(
+            "chunkpar_f32_varlen",
+            "sm_100a",
+            preprocess=preprocess,
+            preprocess_grid=(8, 1, 1),
+            main=exact_values,
+            main_grid=(1, 1, 1),
+            cuda_stream=0,
+        )
+
+
+@pytest.mark.parametrize("gap", ("module", "smem"))
+def test_source_unexported_program_refuses_to_build(monkeypatch, tmp_path, gap):
+    """A program whose table entries the Cake export has not filled -- a
+    module identity still carrying the placeholder token or a zero main
+    dynamic SMEM literal -- is refused by name, naming the export step,
+    before any source is read or nvcc is resolved."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    exported = module._PROGRAMS["exact_bf16_batched"]
+    module._require_exported("exact_bf16_batched", exported)
+    if gap == "module":
+        main = module._scan("mamba_ssd_chunk_parallel_bf16_batched_PENDINGEXPORT")
+        smem_bytes = exported.main_smem_bytes
+    else:
+        main = module._scan("mamba_ssd_chunk_parallel_bf16_batched_0123456789")
+        smem_bytes = 0
+    assert main.kernel == "kernel_mamba_ssd_chunk_parallel_bf16_batched"
+    program = module._Program(
+        "chunkpar",
+        module._SEGMENT_PREPROCESS,
+        main,
+        4,
+        16,
+        smem_bytes,
+        module._CHUNKPAR_HOST_TEMPLATE,
+        module._MAIN_ARGS_CHUNKPAR,
+    )
+    name = "chunkpar_bf16_batched_probe"
+    monkeypatch.setitem(module._PROGRAMS, name, program)
+    monkeypatch.setattr(module, "_source_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        module, "_nvcc", lambda: pytest.fail("nvcc resolved for an unexported program")
+    )
+    module._load_generated_program.cache_clear()
+
+    with pytest.raises(RuntimeError, match="not exported yet") as excinfo:
+        module._load_generated_program(name, "sm_100a")
+    module._load_generated_program.cache_clear()
+
+    message = str(excinfo.value)
+    assert name in message and "export_cake_mamba_ssd_combined" in message
+    assert not any(tmp_path.iterdir())
+
+
+def test_source_chunk_parallel_program_builds_from_its_own_template(
+    monkeypatch, tmp_path
+):
+    """An exported chunk-parallel program renders the chunk-parallel host
+    template (not the exact scan's) with the same nine placeholders, embeds
+    its own main cubin and gets its own module name; the exact program of
+    the same source tree still renders the exact template."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    exact = module._PROGRAMS["exact_bf16_batched"]
+    program = module._Program(
+        "chunkpar",
+        module._SEGMENT_PREPROCESS,
+        module._scan("mamba_ssd_chunk_parallel_bf16_batched_0123456789"),
+        4,
+        16,
+        200704,
+        module._CHUNKPAR_HOST_TEMPLATE,
+        module._MAIN_ARGS_CHUNKPAR,
+    )
+    name = "chunkpar_bf16_batched_probe"
+    monkeypatch.setitem(module._PROGRAMS, name, program)
+    device_dir = tmp_path / module._DEVICE_DIR
+    device_dir.mkdir(parents=True)
+    for kernel in (*exact.kernels, program.main):
+        (device_dir / kernel.source).write_text(
+            f"{kernel.kernel} source\n", encoding="utf-8"
+        )
+    placeholders = " ".join(_HOST_PLACEHOLDERS)
+    for template, label in (
+        (module._HOST_TEMPLATE, "exact"),
+        (module._CHUNKPAR_HOST_TEMPLATE, "chunkpar"),
+    ):
+        host = tmp_path / template
+        host.parent.mkdir(parents=True, exist_ok=True)
+        host.write_text(
+            f"// {label} launcher\n"
+            "TVM_FFI_EMBED_CUBIN(CAKE_SSD_PREPROCESS_MODULE);\n"
+            "TVM_FFI_EMBED_CUBIN(CAKE_SSD_MAIN_MODULE);\n"
+            f"{placeholders}\n",
+            encoding="utf-8",
+        )
+    nvcc = tmp_path / "cuda" / "bin" / "nvcc"
+    nvcc.parent.mkdir(parents=True)
+    nvcc.touch()
+    load_calls = []
+
+    def run(command, **kwargs):
+        module.Path(command[-1]).write_bytes(module.Path(command[-3]).read_bytes())
+        return SimpleNamespace(returncode=0, stderr="")
+
+    def load_inline(*args, **kwargs):
+        load_calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(module, "_source_dir", lambda: tmp_path)
+    monkeypatch.setattr(module, "_nvcc", lambda: nvcc)
+    monkeypatch.setattr(module.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(module, "cpp", SimpleNamespace(load_inline=load_inline))
+    module._load_generated_program.cache_clear()
+
+    module._load_generated_program(name, "sm_100a")
+    module._load_generated_program("exact_bf16_batched", "sm_100a")
+    module._load_generated_program.cache_clear()
+
+    (chunkpar_args, chunkpar_kwargs), (exact_args, exact_kwargs) = load_calls
+    assert chunkpar_args[0].startswith(f"cake_mamba_ssd_{name}_sm_100a_")
+    assert exact_args[0].startswith("cake_mamba_ssd_exact_bf16_batched_sm_100a_")
+    rendered = chunkpar_kwargs["cpp_sources"]
+    assert rendered.startswith("// chunkpar launcher\n")
+    assert exact_kwargs["cpp_sources"].startswith("// exact launcher\n")
+    assert not any(placeholder in rendered for placeholder in _HOST_PLACEHOLDERS)
+    assert f"TVM_FFI_EMBED_CUBIN({program.main.module});" in rendered
+    preprocess = module._SEGMENT_PREPROCESS
+    assert (
+        f"{name} {preprocess.module} {preprocess.kernel} {preprocess.threads} "
+        f"{program.main.module} {program.main.kernel} 4 16 200704"
+    ) in rendered
+    assert set(chunkpar_kwargs["embed_cubin"]) == {
+        preprocess.module,
+        program.main.module,
+    }
+    build_dir = tmp_path / "jit" / chunkpar_args[0]
+    assert (build_dir / f"{program.main.module}.cubin").is_file()
+
+
+def test_source_chunk_parallel_host_template_binds_main_arguments_in_loader_order():
+    """The chunk-parallel host launcher is its own exported template with
+    the same nine placeholders and namespace scheme as the exact scan's;
+    its ``Prepare`` / ``Run`` list ``_PREPROCESS_ARGS`` and
+    ``_MAIN_ARGS_CHUNKPAR`` in order.  Fails by name until the Cake export
+    delivers the template."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert (
+        Path("generated/host/mamba_ssd_combined_sequence.cpp") == module._HOST_TEMPLATE
+    )
+    assert (
+        Path("generated/host/mamba_ssd_combined_chunk_parallel_sequence.cpp")
+        == module._CHUNKPAR_HOST_TEMPLATE
+    )
+    template_path = module._source_dir() / module._CHUNKPAR_HOST_TEMPLATE
+    assert template_path.is_file(), f"{template_path} is not exported yet"
+    template = template_path.read_text(encoding="utf-8")
+
+    assert _host_prepare_arguments(template, "preprocess") == module._PREPROCESS_ARGS
+    assert _host_prepare_arguments(template, "main") == module._MAIN_ARGS_CHUNKPAR
+    assert _host_run_arguments(template, "preprocess") == module._PREPROCESS_ARGS
+    assert _host_run_arguments(template, "main") == module._MAIN_ARGS_CHUNKPAR
+    for placeholder in _HOST_PLACEHOLDERS:
+        assert placeholder in template, placeholder
+    assert "namespace cake_mamba_ssd_combined_host_CAKE_SSD_PROGRAM {" in template
+    assert "stream, CAKE_SSD_MAIN_SMEM_BYTESu)" in template
+    assert "LaunchEx(" not in template
+    assert "PROGRAMMATIC_STREAM_SERIALIZATION" not in template
+    program = module._PROGRAMS["chunkpar_bf16_varlen"]
+    rendered = module._render_host_source(template, "chunkpar_bf16_varlen", program)
+    assert not any(placeholder in rendered for placeholder in _HOST_PLACEHOLDERS)
+    assert "namespace cake_mamba_ssd_combined_host_chunkpar_bf16_varlen {" in rendered
+    assert f"TVM_FFI_EMBED_CUBIN({program.main.module});" in rendered
+
+
+def test_source_chunk_parallel_forward_binds_the_workspace_without_gpu(monkeypatch):
+    """Forced chunk-parallel, the runner names the ``chunkpar_*`` program and
+    binds the four workspace values: ``h_map``, the contiguous bf16
+    ``[tiles, 64, 128]`` state operand the host wraps in a TMA descriptor;
+    ``s_work``, the f32 ``[tiles, 64, 128]`` state increments; ``h_words``,
+    the u32 view of ``h_map``'s storage; ``grid_barrier``, two u32 words
+    allocated zeroed once per device and never reset by the host.  The main
+    grid is one CTA per (chunk, head) tile capped at the SM count.  The
+    buffers grow only; ``never`` and the rule's own choice fall back to the
+    exact scan on the same runner without the four values."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(module, monkeypatch, calls, nheads=8, ngroups=8)
+    monkeypatch.setattr(module, "_sm_count", lambda _: 148)
+    assert runner.last_program_name is None
+
+    def inputs(seqlen):
+        x = torch.empty((1, seqlen, 8, 64), dtype=torch.bfloat16)
+        dt = torch.empty((1, seqlen, 8), dtype=torch.float32)
+        A = torch.empty((8,), dtype=torch.float32)
+        B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+        return x, dt, A, B, torch.empty_like(B)
+
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "always")
+    runner.run(*inputs(2048))  # 16 chunks x 8 heads = 128 tiles
+    name, launch = calls[-1]
+    assert name == runner.last_program_name == "chunkpar_bf16_batched"
+    assert launch["main_grid"] == (128, 1, 1)
+    main = launch["main"]
+    assert set(main) == set(module._MAIN_ARGS_CHUNKPAR)
+    h_map, s_work, h_words, barrier = (
+        main[key] for key in _CHUNK_PARALLEL_WORKSPACE_ARGS
+    )
+    assert tuple(h_map.shape) == (128, 64, 128) and h_map.dtype == torch.bfloat16
+    assert h_map.is_contiguous()
+    assert tuple(s_work.shape) == (128, 64, 128) and s_work.dtype == torch.float32
+    assert tuple(h_words.shape) == (128, 64, 64) and h_words.dtype == torch.uint32
+    assert h_words.data_ptr() == h_map.data_ptr()
+    assert tuple(barrier.shape) == (2,) and barrier.dtype == torch.uint32
+    assert barrier.view(torch.int32).tolist() == [0, 0]
+    # One preprocess (segment, head) row per tile.
+    assert launch["preprocess"]["delta"].shape[0] == 128
+
+    # Grow only: a longer call replaces the buffers and caps the grid at the
+    # SM count; the barrier words persist untouched (they are the kernel's).
+    barrier.view(torch.int32)[1] = 7
+    runner.run(*inputs(32768))  # 256 chunks x 8 heads = 2048 tiles
+    name, launch = calls[-1]
+    assert name == "chunkpar_bf16_batched"
+    assert launch["main_grid"] == (148, 1, 1)
+    grown = launch["main"]
+    assert tuple(grown["h_map"].shape) == (2048, 64, 128)
+    assert grown["h_words"].data_ptr() == grown["h_map"].data_ptr()
+    assert grown["grid_barrier"] is barrier
+    assert barrier.view(torch.int32).tolist() == [0, 7]
+    # A shorter call reuses the larger buffers (the kernel addresses only
+    # the tiles below its own bound).
+    runner.run(*inputs(2048))
+    name, launch = calls[-1]
+    assert launch["main_grid"] == (128, 1, 1)
+    assert launch["main"]["h_map"] is grown["h_map"]
+    assert launch["main"]["s_work"] is grown["s_work"]
+
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
+    runner.run(*inputs(32768))
+    name, launch = calls[-1]
+    assert name == runner.last_program_name == "exact_bf16_batched"
+    assert set(launch["main"]) == set(module._MAIN_ARGS)
+    assert launch["main_grid"] == (8, 1, 1)
+
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "auto")
+    runner.run(*inputs(32768))  # 8 work items on 148 SMs, 256 chunks
+    assert calls[-1][0] == "chunkpar_bf16_batched"
+    runner.run(*inputs(1024))  # 8 chunks: the exact scan
+    assert calls[-1][0] == "exact_bf16_batched"
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "later")
+    with pytest.raises(ValueError, match=_CHUNK_PARALLEL_ENV):
+        runner.run(*inputs(1024))
+
+
+def _state_key(state_dtype):
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    return module._STATE_DTYPE_KEYS[state_dtype]
+
+
+def _forced_runs(monkeypatch, runner, tensors, arguments):
+    """The same call on the forced exact scan (``never``) and the forced
+    chunk-parallel program (``always``), per mode: the cloned output, the
+    cloned final states, the checkpoint-state table the call wrote (a fresh
+    copy of the caller's table per mode; ``None`` without checkpoints) and
+    the program the runner reports."""
+
+    results = {}
+    for mode in ("never", "always"):
+        monkeypatch.setenv(_CHUNK_PARALLEL_ENV, mode)
+        call_arguments = dict(arguments)
+        checkpoint_states = arguments.get("checkpoint_states")
+        if checkpoint_states is not None:
+            checkpoint_states = checkpoint_states.clone()
+            call_arguments["checkpoint_states"] = checkpoint_states
+        out, final = runner.run(*tensors, **call_arguments)
+        results[mode] = SimpleNamespace(
+            out=out.clone(),
+            final=final.clone(),
+            checkpoint_states=checkpoint_states,
+            program=runner._cake_runner.last_program_name,
+        )
+    return results
+
+
+def _checkpoint_arguments(arguments, tokens, slots):
+    """``arguments`` plus one checkpoint request per sequence: the absolute
+    token index a sequence checkpoints at (``-1``: none) and the slot it
+    writes in a fresh NaN-filled ``[3, nheads, 64, 128]`` state table, so
+    the slots a call must leave untouched stay NaN."""
+
+    initial_states = arguments["initial_states"]
+    return {
+        **arguments,
+        "checkpoint_token_indices": torch.tensor(
+            tokens, dtype=torch.int32, device="cuda"
+        ),
+        "checkpoint_state_slots": torch.tensor(slots, dtype=torch.int32, device="cuda"),
+        "checkpoint_states": torch.full(
+            (3, *initial_states.shape[1:]),
+            torch.nan,
+            dtype=initial_states.dtype,
+            device="cuda",
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "state_dtype,varlen,form,lengths",
+    (
+        (torch.bfloat16, False, "batched", None),
+        (torch.float16, False, "batched", None),
+        (torch.float32, False, "batched", None),
+        (torch.bfloat16, True, "triple", (96, 160)),
+        (torch.bfloat16, True, "triple", (128, 896)),
+        (torch.float16, True, "cu_seqlens", (1024, 100)),
+        (torch.float32, True, "cu_seqlens", (96, 160)),
+    ),
+    ids=(
+        "bf16_batched",
+        "f16_batched",
+        "f32_batched",
+        "bf16_triple_96x160",
+        "bf16_triple_128x896",
+        "f16_cu_seqlens_1024x100",
+        "f32_cu_seqlens_96x160",
+    ),
+)
+def test_cake_ssd_combined_chunk_parallel_is_bitwise_the_exact_scan(
+    monkeypatch, state_dtype, varlen, form, lengths
+):
+    """The chunk-parallel program computes the exact scan's arithmetic in a
+    grid-barrier-separated schedule: forced on, its output and final states
+    are bitwise the forced exact scan's -- batched calls with z, D, dt_bias,
+    softplus, a finite clamp and initial states, and packed-varlen calls in
+    both metadata forms, for every state dtype."""
+
+    _skip_unless_cake_arch()
+    if varlen:
+        constructor, tensors, arguments = _case(
+            state_dtype=state_dtype, varlen=True, lengths=lengths
+        )
+        if form == "cu_seqlens":
+            arguments = _cu_seqlens_arguments(arguments, lengths)
+    else:
+        constructor, tensors, arguments = _case(
+            state_dtype=state_dtype, batch=2, seqlen=1024
+        )
+    runner = SSDCombined(**constructor, backend="cake")
+
+    results = _forced_runs(monkeypatch, runner, tensors, arguments)
+
+    exact, chunk_parallel = results["never"], results["always"]
+    mode = "varlen" if varlen else "batched"
+    assert exact.program == f"exact_{_state_key(state_dtype)}_{mode}"
+    assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
+    assert chunk_parallel.final.dtype == state_dtype
+    assert torch.isfinite(chunk_parallel.out.to(torch.float32)).all()
+    assert torch.equal(chunk_parallel.out, exact.out), (
+        "chunk-parallel output differs from the exact scan"
+    )
+    assert torch.equal(chunk_parallel.final, exact.final)
+
+
+@pytest.mark.parametrize(
+    "state_dtype,form,lengths,tokens,slots",
+    (
+        (torch.bfloat16, "batched", None, (384, 1024), (0, 2)),
+        (torch.float16, "batched", None, (768, -1), (1, -1)),
+        (torch.float32, "triple", (300, 700), (-1, 556), (-1, 2)),
+        (torch.bfloat16, "cu_seqlens", (300, 700), (-1, 556), (-1, 2)),
+        (torch.float16, "cu_seqlens", (1000,), (768,), (1,)),
+    ),
+    ids=(
+        "bf16_batched_384_and_sequence_end",
+        "f16_batched_768",
+        "f32_triple_300x700_at_556",
+        "bf16_cu_seqlens_300x700_at_556",
+        "f16_cu_seqlens_1000_on_grid_768",
+    ),
+)
+def test_cake_ssd_combined_chunk_parallel_checkpoints_are_bitwise_the_exact_scan(
+    monkeypatch, state_dtype, form, lengths, tokens, slots
+):
+    """The chunk-parallel program's checkpoint publish is the exact scan's:
+    forced on, the state it writes into each requested slot is bitwise the
+    forced exact scan's (output and final states included) and the other
+    slots stay untouched -- batched checkpoints on the chunk grid and at a
+    sequence end, a chunk-unaligned checkpoint exposed through the caller's
+    triple and one the cu_seqlens preprocess inserts itself, and an on-grid
+    cu_seqlens checkpoint.  ``auto`` routes checkpoint calls like any other
+    call, so the chunk-parallel path must serve them exactly."""
+
+    _skip_unless_cake_arch()
+    if form == "batched":
+        constructor, tensors, arguments = _case(
+            state_dtype=state_dtype, batch=2, seqlen=1024
+        )
+    else:
+        constructor, tensors, arguments = _case(
+            state_dtype=state_dtype, varlen=True, lengths=lengths
+        )
+        if form == "cu_seqlens":
+            arguments = _cu_seqlens_arguments(arguments, lengths)
+        else:
+            # The triple must expose every checkpoint as a logical chunk end;
+            # the runner derives the sequence prefix sum on the device.
+            chunk_indices, chunk_offsets = _logical_chunk_metadata(
+                lengths, tuple(token for token in tokens if token >= 0)
+            )
+            arguments = {
+                **arguments,
+                "chunk_indices": chunk_indices,
+                "chunk_offsets": chunk_offsets,
+                "seq_chunk_cumsum": None,
+            }
+    arguments = _checkpoint_arguments(arguments, tokens, slots)
+    runner = SSDCombined(**constructor, backend="cake")
+
+    results = _forced_runs(monkeypatch, runner, tensors, arguments)
+
+    exact, chunk_parallel = results["never"], results["always"]
+    mode = "batched" if form == "batched" else "varlen"
+    assert exact.program == f"exact_{_state_key(state_dtype)}_{mode}"
+    assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
+    assert torch.equal(chunk_parallel.out, exact.out)
+    assert torch.equal(chunk_parallel.final, exact.final)
+    written = {slot for slot in slots if slot >= 0}
+    for slot in range(3):
+        exact_slot = exact.checkpoint_states[slot]
+        chunk_parallel_slot = chunk_parallel.checkpoint_states[slot]
+        if slot in written:
+            assert torch.isfinite(exact_slot.to(torch.float32)).all(), slot
+            assert torch.equal(chunk_parallel_slot, exact_slot), (
+                f"chunk-parallel checkpoint slot {slot} differs from the exact scan"
+            )
+        else:
+            assert torch.isnan(exact_slot).all(), slot
+            assert torch.isnan(chunk_parallel_slot).all(), slot
+
+
+def test_cake_ssd_combined_auto_selects_chunk_parallel_for_long_prefill(monkeypatch):
+    """``auto``: one 32768-token sequence with 8 heads (8 work items, 2048
+    tiles) selects the chunk-parallel program on the device's own SM count
+    and capability, reports it as ``last_program_name`` and is bitwise the
+    forced exact scan."""
+
+    _skip_unless_cake_arch()
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    constructor, tensors, arguments = _case(batch=1, seqlen=32768, nheads=8, ngroups=8)
+    device = tensors[0].device
+    assert module.chunk_parallel_selected(
+        nheads=8,
+        num_sequences=1,
+        num_segments=256,
+        nchunks=256,
+        mode_varlen=False,
+        sm_count=torch.cuda.get_device_properties(device).multi_processor_count,
+        capability=tuple(torch.cuda.get_device_capability(device)),
+        mode="auto",
+    )
+    runner = SSDCombined(**constructor, backend="cake")
+    cake = runner._cake_runner
+    assert cake.last_program_name is None
+
+    out, final = (value.clone() for value in runner.run(*tensors, **arguments))
+
+    assert cake.last_program_name == "chunkpar_bf16_batched"
+    monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
+    out_exact, final_exact = runner.run(*tensors, **arguments)
+    assert cake.last_program_name == "exact_bf16_batched"
+    assert torch.equal(out, out_exact) and torch.equal(final, final_exact)
+
+
+def test_cake_ssd_combined_auto_keeps_the_exact_scan_for_many_heads(monkeypatch):
+    """``auto``: 128 heads on a 1024-token sequence (128 work items, 1024
+    tiles) stay on the exact scan -- at that head count the chunk-parallel
+    per-tile cost exceeds the scan's per-chunk cost."""
+
+    _skip_unless_cake_arch()
+    constructor, tensors, arguments = _case(batch=1, seqlen=1024, nheads=128, ngroups=8)
+    runner = SSDCombined(**constructor, backend="cake")
+
+    out, final = runner.run(*tensors, **arguments)
+
+    assert runner._cake_runner.last_program_name == "exact_bf16_batched"
+    assert tuple(out.shape) == (1, 1024, 128, 64)
+    assert tuple(final.shape) == (1, 128, 64, 128)
