@@ -8,9 +8,10 @@ from .helpers import smid, tensormap_replace_global_dim_1
 
 
 class CollectiveStoreTma:
-    def __init__(self, blk_q: int, d: int):
+    def __init__(self, blk_q: int, d: int, num_householder: int = 1):
         self.BLK_Q = blk_q
         self.D = d
+        self.num_householder = num_householder
 
     @cute.jit
     def tail_tensormap_gmem_ptr(self, g_tensormaps: cute.Tensor):
@@ -42,6 +43,9 @@ class CollectiveStoreTma:
         # Otherwise, the last tile of a packed non-final sequence needs a
         # temporary descriptor with the seqlen dimension shrunk to this sequence.
         can_process = work_desc.seq_idx == num_seqs - cutlass.Int32(1)
+        if cutlass.const_expr(self.num_householder > 1):
+            return can_process
+
         if blk < num_blocks - cutlass.Int32(1):
             can_process = True
         if work_desc.seq_len % cutlass.Int32(self.BLK_Q) == cutlass.Int32(0):
@@ -60,9 +64,10 @@ class CollectiveStoreTma:
             cpasync.copy_tensormap(tma_atom_o, tail_ptr)
         cute.arch.sync_warp()
         with cute.arch.elect_one():
+            tok = work_desc.tok_offset + work_desc.seq_len
             tensormap_replace_global_dim_1(
                 tail_ptr,
-                work_desc.tok_offset + work_desc.seq_len,
+                tok // self.num_householder,
             )
         cute.arch.sync_warp()
         cpasync.fence_tma_desc_release()
@@ -78,8 +83,9 @@ class CollectiveStoreTma:
         blk: cutlass.Int32,
         stage_idx: cutlass.Int32,
     ):
+        tok = work_desc.tok_offset + blk * cutlass.Int32(self.BLK_Q)
         mO = cute.domain_offset(
-            (cutlass.Int32(0), work_desc.tok_offset + blk * cutlass.Int32(self.BLK_Q)),
+            (cutlass.Int32(0), tok // self.num_householder),
             tma_tensor_o[None, None, o_head_idx],
         )
         gO = cute.zipped_divide(mO, (self.D, self.BLK_Q))[

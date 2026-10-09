@@ -71,6 +71,7 @@ def _prefill_kernel_name(
     state_dtype_str: str,
     HQ: int,
     HV: int,
+    num_householder: int,
     is_GQA: bool,
     use_initial_state: bool,
     store_final_state: bool,
@@ -94,6 +95,7 @@ def _prefill_kernel_name(
         state_dtype_str,
         HQ,
         HV,
+        num_householder,
         is_GQA,
         use_initial_state,
         store_final_state,
@@ -115,6 +117,7 @@ def _get_compiled_cache(
     state_dtype_str: str,
     HQ: int,
     HV: int,
+    num_householder: int,
     is_GQA: bool,
     use_initial_state: bool,
     store_final_state: bool,
@@ -217,6 +220,7 @@ def chunk_gated_delta_rule_sm100(
     cu_checkpoints: Optional[torch.Tensor] = None,
     output_checkpoints: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
+    num_householder: int = 1,
 ) -> None:
     """Execute the Blackwell chunked GDN prefill kernel.
 
@@ -271,6 +275,7 @@ def chunk_gated_delta_rule_sm100(
         str(state_torch_dtype),
         HQ,
         HV,
+        num_householder,
         is_GQA,
         use_initial_state,
         store_final_state,
@@ -308,6 +313,7 @@ def chunk_gated_delta_rule_sm100(
             mma_tiler_qs=(128, 64, 128),
             mma_tiler_qkv=(128, 64, 64),
             mma_tiler_kv=(128, 128, 64),
+            num_householder=num_householder,
             max_active_clusters=max_active_clusters,
             num_sm=num_sm,
             is_GQA=is_GQA,

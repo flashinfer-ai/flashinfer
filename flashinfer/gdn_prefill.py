@@ -653,6 +653,7 @@ def chunk_gated_delta_rule(
     _cp_chunk_len: Optional[int] = None,
     backend: Literal["auto", "flashinfer", "cake_gdn", "cudnn"] = "auto",
     max_seqlen: Optional[int] = None,
+    num_householder: int = 1,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -676,8 +677,16 @@ def chunk_gated_delta_rule(
         where ``num_sab_heads = max(num_q_heads, num_v_heads)``.  Must be
         float32.  Defaults to all ones when ``None``.
     beta : torch.Tensor, optional
-        Update gate (beta) of shape ``[total_seq_len, num_sab_heads]``.
-        Must be float32.  Defaults to all ones when ``None``.
+        Update gate (beta) of shape ``[total_seq_len * num_householder,
+        num_sab_heads]``.  Must be float32.  Defaults to all ones when
+        ``None``.
+    num_householder : int
+        Householder updates per token (Gated DeltaProduct).  ``1`` (the
+        default) is the gated delta rule.  Above 1, ``k``, ``v`` and ``beta``
+        carry ``num_householder`` rows per token and ``cu_seqlens`` counts
+        that expanded timeline, while ``q``, ``g`` and the output stay at
+        real-token rows.  Only the flashinfer backend implements it, on SM90
+        and SM100.
     scale : float, optional
         Scale factor for the attention scores.  Defaults to
         ``1 / sqrt(head_size)`` when ``None``.
@@ -866,11 +875,40 @@ def chunk_gated_delta_rule(
         )
     if cp_max_seqlen > total_seq_len:
         raise ValueError("max_seqlen cannot exceed total_seq_len")
+    if num_householder < 1:
+        raise ValueError(f"num_householder must be >= 1, got {num_householder}")
+    # "auto" resolves to the flashinfer kernels below, which implement GDP.
+    # The others would reach their own kernel and silently compute GDN,
+    # ignoring every Householder but the first.
+    if num_householder > 1 and backend not in ("auto", "flashinfer"):
+        raise NotImplementedError(
+            f"num_householder={num_householder} (Gated DeltaProduct) is only "
+            f"implemented for the flashinfer GDN backend, got backend={backend!r}"
+        )
     num_q_heads = q.size(1)
     num_v_heads = v.size(1)
     head_size = q.size(2)
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
+    # k, v and beta ride the expanded timeline while q and g stay at
+    # real-token rows.  A short tensor reads past itself rather than failing,
+    # so check every one of them here, before any arch dispatch.
+    expanded = q.size(0) * num_householder
+    for _name, _t in (("k", k), ("v", v)):
+        if _t.size(0) != expanded:
+            raise ValueError(
+                f"{_name} must have num_householder ({num_householder}) rows per "
+                f"token, got {_t.size(0)} for {q.size(0)} tokens"
+            )
+    if g is not None and g.size(0) != q.size(0):
+        raise ValueError(
+            f"g must have one row per token, got {g.size(0)} for {q.size(0)} tokens"
+        )
+    if beta is not None and beta.size(0) != expanded:
+        raise ValueError(
+            f"beta must have num_householder ({num_householder}) rows per token, "
+            f"got {beta.size(0)} for {q.size(0)} tokens"
+        )
 
     if backend == "cudnn":
         from .cudnn import cudnn_chunk_gated_delta_rule
@@ -967,6 +1005,13 @@ def chunk_gated_delta_rule(
     _cuda_major = _cuda_version[0]
     _device_capability = get_compute_capability(device)
     _arch_major = _device_capability[0]
+    if num_householder > 1 and _arch_major not in (9, 10):
+        # Only the SM90 and SM100 kernels index q/gate/output per REAL token.
+        raise NotImplementedError(
+            f"num_householder={num_householder} (Gated DeltaProduct) is only "
+            f"implemented on SM90 and SM100, got compute capability "
+            f"{_arch_major}.x"
+        )
     _device_name = get_device_name(device)
     cp_heuristic_matches = _arch_major in (9, 10, 12) and should_use_cp_host(
         num_seqs * num_sab_heads,
@@ -1111,7 +1156,10 @@ def chunk_gated_delta_rule(
                 beta
                 if beta is not None
                 else torch.ones(
-                    total_seq_len, num_sab_heads, dtype=torch.float32, device=device
+                    total_seq_len * num_householder,
+                    num_sab_heads,
+                    dtype=torch.float32,
+                    device=device,
                 )
             )
             cp_delta_rule_dsl = cast(
@@ -1209,8 +1257,12 @@ def chunk_gated_delta_rule(
         _beta = (
             beta
             if beta is not None
+            # beta is per (token, Householder): the kernel walks k's timeline
             else torch.ones(
-                total_seq_len, num_sab_heads, dtype=torch.float32, device=device
+                total_seq_len * num_householder,
+                num_sab_heads,
+                dtype=torch.float32,
+                device=device,
             )
         )
 
@@ -1229,6 +1281,7 @@ def chunk_gated_delta_rule(
             cu_checkpoints=checkpoint_cu_starts,
             output_checkpoints=state_checkpoints,
             state_indices=state_indices,
+            num_householder=num_householder,
         )
     elif _arch_major == 12:
         # SM120 Blackwell path (CuTe DSL kernel)
@@ -1286,6 +1339,7 @@ def chunk_gated_delta_rule(
             checkpoint_cu_starts,
             checkpoint_every_n_tokens,
             state_indices=state_indices,
+            num_householder=num_householder,
         )
     else:
         raise NotImplementedError("GDN prefill DSL kernel is unavailable")

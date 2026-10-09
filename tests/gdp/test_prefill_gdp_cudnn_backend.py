@@ -40,18 +40,64 @@ import flashinfer
 from flashinfer.cudnn import cudnn_chunk_gated_delta_product
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.gdp_prefill import chunk_gated_delta_product
+from flashinfer.utils import get_compute_capability
 from tests.test_helpers.cudnn_linear_attention import (
     HEAD_DIM,
     assert_rel_close,
     assert_state_orientation,
+    cudnn_linear_attention_unavailable_reason,
     packed_offsets,
     rel_err,
-    requires_cudnn_linear_attention,
     serial_delta_product,
     widened_view,
 )
 
-pytestmark = requires_cudnn_linear_attention
+_CUDNN_UNAVAILABLE = cudnn_linear_attention_unavailable_reason()
+
+
+def _flashinfer_unavailable_reason() -> str | None:
+    if not torch.cuda.is_available():
+        return "CUDA is required"
+    major, _ = get_compute_capability(torch.device("cuda"))
+    if major not in (9, 10):
+        return f"flashinfer GDP prefill needs SM90 or SM100, found sm{major}0"
+    cuda_version = torch.version.cuda
+    if major == 10 and cuda_version and int(cuda_version.split(".")[0]) < 13:
+        return "Blackwell GDN prefill needs CUDA 13+"
+    return None
+
+
+_FLASHINFER_UNAVAILABLE = _flashinfer_unavailable_reason()
+
+
+@pytest.fixture(autouse=True)
+def _require_backend(request):
+    """Skip on the backend a test actually exercises.
+
+    A module-level cuDNN mark would skip the flashinfer-backend cases on SM90,
+    where cuDNN has no engine but the in-tree GDN kernel does.
+    """
+    callspec = getattr(request.node, "callspec", None)
+    backend = callspec.params.get("backend", "cudnn") if callspec else "cudnn"
+    if backend == "auto":
+        # mirror the resolution in chunk_gated_delta_product: cuDNN everywhere
+        # except SM90, where it has no engine and "auto" picks flashinfer.
+        resolved = (
+            "flashinfer"
+            if torch.cuda.is_available()
+            and get_compute_capability(torch.device("cuda"))[0] == 9
+            else "cudnn"
+        )
+        reason = (
+            _FLASHINFER_UNAVAILABLE if resolved == "flashinfer" else _CUDNN_UNAVAILABLE
+        )
+        if reason is not None:
+            pytest.skip(f'backend="auto" resolves to {resolved}: {reason}')
+    elif backend == "cudnn" and _CUDNN_UNAVAILABLE is not None:
+        pytest.skip(f"cuDNN linear attention unavailable: {_CUDNN_UNAVAILABLE}")
+    if backend == "flashinfer" and _FLASHINFER_UNAVAILABLE is not None:
+        pytest.skip(_FLASHINFER_UNAVAILABLE)
+
 
 SERIAL_TOLERANCE = 5e-2
 KERNEL_TOLERANCE = 1e-2
@@ -128,6 +174,9 @@ def _make_inputs(
     }
 
 
+GDP_BACKENDS = ["cudnn", "flashinfer"]
+
+
 def _run(inputs, **kwargs):
     return chunk_gated_delta_product(
         inputs["q"],
@@ -164,12 +213,14 @@ def _serial(inputs, *, scale=None, l2norm=False, initial_state=...):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
 @pytest.mark.parametrize("seq_lens", [[96, 64], [512], [64, 1, 1024]])
 @pytest.mark.parametrize("num_q_heads,num_k_heads,num_v_heads", HEAD_CONFIGS)
 @pytest.mark.parametrize("num_householder", [2, 3])
 @pytest.mark.parametrize("use_initial_state", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gdp_matches_serial_reference(
+    backend,
     seq_lens,
     num_q_heads,
     num_k_heads,
@@ -195,6 +246,7 @@ def test_gdp_matches_serial_reference(
         inputs,
         initial_state=None if state is None else state.clone(),
         output_final_state=True,
+        backend=backend,
     )
     assert out.shape == (sum(seq_lens), max(num_q_heads, num_v_heads), HEAD_DIM)
     assert out.dtype == dtype
@@ -204,7 +256,8 @@ def test_gdp_matches_serial_reference(
 
 
 @pytest.mark.parametrize("use_initial_state", [False, True])
-def test_gdp_with_num_householder_one_matches_gdn(use_initial_state):
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_with_num_householder_one_matches_gdn(backend, use_initial_state):
     """``num_householder == 1`` is exactly the gated delta rule.
 
     Same inputs through ``chunk_gated_delta_rule`` are an independent kernel
@@ -226,10 +279,13 @@ def test_gdp_with_num_householder_one_matches_gdn(use_initial_state):
         initial_state=None if state is None else state.clone(),
         output_final_state=True,
         cu_seqlens=inputs["cu_seqlens"],
-        backend="cudnn",
+        # cuDNN has no GDN engine on SM90, so fall back to the in-tree kernel
+        # as the oracle there.
+        backend="cudnn" if _CUDNN_UNAVAILABLE is None else "flashinfer",
     )
     gdp_out, gdp_state = _run(
         inputs,
+        backend=backend,
         initial_state=None if state is None else state.clone(),
         output_final_state=True,
     )
@@ -241,35 +297,41 @@ def test_gdp_with_num_householder_one_matches_gdn(use_initial_state):
     assert_rel_close("state vs serial", gdp_state, ref_state, SERIAL_TOLERANCE)
 
 
-def test_gdp_applies_in_kernel_l2norm():
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_applies_in_kernel_l2norm(backend):
     """Un-normalized q/k plus the in-kernel norm must match a hand-normalized oracle."""
     inputs = _make_inputs([96, 64], 4, 4, 4, 2, seed=37, normalize=False)
     ref_out, ref_state = _serial(inputs, l2norm=True)
     out, final_state = _run(
-        inputs, output_final_state=True, use_qk_l2norm_in_kernel=True
+        inputs, backend=backend, output_final_state=True, use_qk_l2norm_in_kernel=True
     )
     assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
     assert_rel_close("final_state", final_state, ref_state, SERIAL_TOLERANCE)
 
 
-def test_gdp_honors_scale():
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_honors_scale(backend):
     inputs = _make_inputs([256], 4, 4, 4, 2, seed=43)
     scale = 3.0 / math.sqrt(HEAD_DIM)
     ref_out, _ = _serial(inputs, scale=scale)
-    out = _run(inputs, scale=scale)
+    out = _run(inputs, backend=backend, scale=scale)
     assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
-    assert rel_err(out, _run(inputs)) > 0.5, "scale=3/sqrt(d) matched the default"
+    assert rel_err(out, _run(inputs, backend=backend)) > 0.5, (
+        "scale=3/sqrt(d) matched the default"
+    )
 
 
-def test_gdp_defaults_gates_to_ones():
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_defaults_gates_to_ones(backend):
     """Omitting g/beta selects the identity gates."""
     device = torch.device("cuda")
     num_heads = 4
     inputs = _make_inputs([256], num_heads, num_heads, num_heads, 2, seed=31)
     total = inputs["q"].shape[0]
-    implicit = _run(inputs, g=None, beta=None)
+    implicit = _run(inputs, backend=backend, g=None, beta=None)
     explicit = _run(
         inputs,
+        backend=backend,
         g=torch.ones(total, num_heads, dtype=torch.float32, device=device),
         beta=torch.ones(2 * total, num_heads, dtype=torch.float32, device=device),
     )
@@ -277,17 +339,31 @@ def test_gdp_defaults_gates_to_ones():
 
 
 @pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16, torch.float16])
-def test_gdp_accepts_forget_gate_dtypes(gate_dtype):
-    """``g`` may be fp32, bf16 or fp16, like GDN's."""
+def test_gdp_cudnn_accepts_forget_gate_dtypes(gate_dtype):
+    """cuDNN takes ``g`` in fp32, bf16 or fp16."""
     inputs = _make_inputs([256, 128], 4, 4, 4, 2, seed=47, gate_dtype=gate_dtype)
     ref_out, ref_state = _serial(inputs)
-    out, final_state = _run(inputs, output_final_state=True)
+    out, final_state = _run(inputs, backend="cudnn", output_final_state=True)
     assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
     assert_rel_close("final_state", final_state, ref_state, SERIAL_TOLERANCE)
 
 
+@pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float16])
+def test_gdp_flashinfer_rejects_non_float32_gates(gate_dtype):
+    """GDN documents g/beta as float32, so GDP must say so before the kernel does.
+
+    Reaching the kernel with a bf16 gate fails deep in the FFI layer with
+    "Mismatched Tensor on argument #3", which names neither the parameter nor
+    the fix.
+    """
+    inputs = _make_inputs([256, 128], 4, 4, 4, 2, seed=47, gate_dtype=gate_dtype)
+    with pytest.raises(ValueError, match="requires g in float32"):
+        _run(inputs, backend="flashinfer", output_final_state=True)
+
+
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_gdp_carries_state_dtype(state_dtype):
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_carries_state_dtype(backend, state_dtype):
     device = torch.device("cuda")
     inputs = _make_inputs(
         [192, 64], 4, 4, 4, 2, seed=59, initial_state=True, state_dtype=state_dtype
@@ -298,6 +374,7 @@ def test_gdp_carries_state_dtype(state_dtype):
     )
     out, final_state = _run(
         inputs,
+        backend=backend,
         initial_state=inputs["initial_state"],
         output_final_state=True,
         output_state=output_state,
@@ -308,12 +385,22 @@ def test_gdp_carries_state_dtype(state_dtype):
     assert_rel_close("final_state", final_state, ref_state, SERIAL_TOLERANCE)
 
 
-def test_gdp_handles_zero_length_sequences():
+@pytest.mark.parametrize("backend", ["cudnn"])
+def test_gdp_handles_zero_length_sequences(backend):
+    """cuDNN leaves an empty sequence's incoming state in place.
+
+    cuDNN only: the GDN kernel emits no work for an empty sequence, so it
+    never writes that row of the final state and the caller reads whatever
+    torch.empty returned.  That predates GDP -- it reproduces at
+    num_householder=1 and through chunk_gated_delta_rule directly -- and
+    belongs to GDN rather than this entry point.
+    """
     seq_lens = [0, 65, 0, 33]
     inputs = _make_inputs(seq_lens, 4, 4, 4, 2, seed=61, initial_state=True)
     ref_out, ref_state = _serial(inputs)
     out, final_state = _run(
         inputs,
+        backend=backend,
         initial_state=inputs["initial_state"].clone(),
         output_final_state=True,
     )
@@ -390,15 +477,17 @@ def test_gdp_serves_both_batch_invariant_settings():
 
 
 @pytest.mark.parametrize("cu_seqlens_dtype", [torch.int32, torch.int64])
-def test_gdp_accepts_both_cu_seqlens_dtypes(cu_seqlens_dtype):
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_accepts_both_cu_seqlens_dtypes(backend, cu_seqlens_dtype):
     inputs = _make_inputs(
         [256, 256], 4, 4, 4, 2, seed=29, cu_seqlens_dtype=cu_seqlens_dtype
     )
     ref_out, _ = _serial(inputs)
-    assert_rel_close("output", _run(inputs), ref_out, SERIAL_TOLERANCE)
+    assert_rel_close("output", _run(inputs, backend=backend), ref_out, SERIAL_TOLERANCE)
 
 
-def test_gdp_honors_output_buffers():
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_honors_output_buffers(backend):
     device = torch.device("cuda")
     num_heads = 8
     inputs = _make_inputs([384, 384], num_heads, num_heads, num_heads, 2, seed=5)
@@ -407,7 +496,7 @@ def test_gdp_honors_output_buffers():
         2, num_heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=device
     )
     returned_out, returned_state = _run(
-        inputs, output_final_state=True, output=out, output_state=state
+        inputs, backend=backend, output_final_state=True, output=out, output_state=state
     )
     assert returned_out.data_ptr() == out.data_ptr()
     assert returned_state.data_ptr() == state.data_ptr()
@@ -502,10 +591,92 @@ def test_public_api_is_exported():
 
 @pytest.mark.parametrize("backend", ["auto", "cudnn"])
 def test_both_backend_values_reach_cudnn(backend):
-    """FlashInfer has no GDP kernel, so ``auto`` and ``cudnn`` are one path."""
+    """Where cuDNN can serve, ``auto`` resolves to it."""
+    if _CUDNN_UNAVAILABLE is not None:
+        pytest.skip(f"cuDNN linear attention unavailable: {_CUDNN_UNAVAILABLE}")
     inputs = _make_inputs([256], 4, 4, 4, 2, seed=113)
     ref_out, _ = _serial(inputs)
     assert_rel_close("output", _run(inputs, backend=backend), ref_out, SERIAL_TOLERANCE)
+
+
+# Parametrized on one value so the fixture above gates it as "auto": this must
+# run wherever EITHER backend can serve, which is the whole point of it.
+@pytest.mark.parametrize("backend", ["auto"])
+def test_auto_resolves_to_a_backend_that_can_serve(backend):
+    """``auto`` must not pick an engine this device has no kernel for.
+
+    cuDNN's linear-attention engines are SM100-family only, so on SM90 ``auto``
+    has to resolve to the in-tree kernel instead of raising with no engine.
+    """
+    inputs = _make_inputs([256, 128], 4, 4, 4, 2, seed=11)
+    ref_out, _ = _serial(inputs)
+    assert_rel_close("output", _run(inputs, backend=backend), ref_out, SERIAL_TOLERANCE)
+
+
+# "auto" only tells the fixture above to run this anywhere either backend can:
+# the call under test raises before it reaches an engine.
+@pytest.mark.parametrize("backend", ["auto"])
+@pytest.mark.parametrize("gdn_backend", ["cudnn", "cake_gdn"])
+def test_gdn_entry_point_declines_householders_it_cannot_serve(gdn_backend, backend):
+    """Only the flashinfer GDN backend implements num_householder > 1.
+
+    The cuDNN and cake dispatches sit above the GDP arch guard, so without
+    this they would return a plain GDN result -- every Householder but the
+    first silently dropped.
+    """
+    inputs = _make_inputs([256], 4, 4, 4, 2, seed=5)
+    with pytest.raises(NotImplementedError, match="Gated DeltaProduct"):
+        chunk_gated_delta_rule(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            inputs["g"],
+            inputs["beta"],
+            None,
+            cu_seqlens=inputs["cu_seqlens"] * 2,
+            num_householder=2,
+            backend=gdn_backend,
+        )
+
+
+@pytest.mark.parametrize("backend", ["flashinfer"])
+def test_gate_lengths_are_validated(backend):
+    """A beta on the real-token timeline reads past itself, so reject it.
+
+    g is per real token and beta per (token, Householder); the kernel walks
+    k's timeline, so a short beta is an out-of-bounds read rather than a
+    failure. That is what the default used to be.
+    """
+    inputs = _make_inputs([256], 4, 4, 4, 2, seed=77)
+    total = inputs["q"].shape[0]
+    device = inputs["q"].device
+    with pytest.raises(ValueError, match="num_householder"):
+        chunk_gated_delta_rule(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            inputs["g"],
+            torch.ones(total, 4, dtype=torch.float32, device=device),
+            None,
+            cu_seqlens=inputs["cu_seqlens"] * 2,
+            num_householder=2,
+            backend="flashinfer",
+        )
+
+
+@pytest.mark.parametrize("backend", GDP_BACKENDS)
+def test_gdp_default_beta_spans_the_expanded_timeline(backend):
+    """beta=None must mean ones per (token, Householder), not per token."""
+    inputs = _make_inputs([256], 4, 4, 4, 2, seed=31)
+    total = inputs["q"].shape[0]
+    device = inputs["q"].device
+    ones_beta = torch.ones(total * 2, 4, dtype=torch.float32, device=device)
+    # against the reference, not against another kernel run: a too-short beta
+    # reads whatever follows it, which can happen to be ones.
+    ref_out, _ = _serial({**inputs, "beta": ones_beta})
+    out = _run(inputs, backend=backend, beta=None)
+    assert_rel_close("output", out, ref_out, SERIAL_TOLERANCE)
+    assert rel_err(out, _run(inputs, backend=backend, beta=ones_beta)) < 1e-6
 
 
 def test_backend_argument_is_validated():

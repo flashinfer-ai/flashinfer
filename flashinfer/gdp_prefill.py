@@ -19,6 +19,7 @@ from typing import Literal, Optional, Tuple, Union
 import torch
 
 from .api_logging import flashinfer_api
+from .utils import get_compute_capability
 from .trace.templates.gdp import gdp_prefill_trace
 
 _CU_SEQLENS_DTYPES = (torch.int32, torch.int64)
@@ -40,7 +41,7 @@ def chunk_gated_delta_product(
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["auto", "cudnn"] = "auto",
+    backend: Literal["auto", "cudnn", "flashinfer"] = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated DeltaProduct (GDP) attention for prefill.
 
@@ -80,8 +81,8 @@ def chunk_gated_delta_product(
     g : torch.Tensor, optional
         Per-head forget gate in linear space (``alpha``, elementwise in
         ``(0, 1]``), shape ``[total_seq_len, num_sab_heads]`` at real-token
-        rows, at float32, bfloat16 or float16.  All-ones (no decay) when
-        ``None``.
+        rows, at float32, bfloat16 or float16 (float32 only when
+        ``backend="flashinfer"``).  All-ones (no decay) when ``None``.
     beta : torch.Tensor, optional
         Per-head, per-Householder update gate ``[total_seq_len *
         num_householder, num_sab_heads]``, post-sigmoid, in float32 or
@@ -112,10 +113,17 @@ def chunk_gated_delta_product(
         not alias ``initial_state``; the kernel splits one sequence across
         CTAs, so the CTA reading the incoming state would race the one writing
         the outgoing state.
-    backend : Literal["auto", "cudnn"], optional
-        FlashInfer carries no GDP kernel of its own, so ``"auto"`` (default)
-        and ``"cudnn"`` both run cuDNN's fused SM100 linear-attention engine
-        through :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_product`.
+    backend : Literal["auto", "cudnn", "flashinfer"], optional
+        ``"auto"`` (default) and ``"cudnn"`` run cuDNN's fused SM100
+        linear-attention engine through
+        :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_product`.
+        ``"flashinfer"`` runs the in-tree GDN prefill kernel over the
+        expanded sub-token timeline on SM90 and SM100; it requires ``g`` and
+        ``beta`` in float32, as
+        :func:`flashinfer.gdn_prefill.chunk_gated_delta_rule` does, and does
+        not write the final state of a zero-length sequence.  On SM90, where
+        cuDNN has no linear-attention engine, ``"auto"`` resolves to
+        ``"flashinfer"`` rather than failing.
 
     Returns
     -------
@@ -130,13 +138,51 @@ def chunk_gated_delta_product(
     engine's call: a graph it cannot serve is declined by cuDNN (the per-engine
     reason lands in the frontend's log).
     """
-    if backend not in ("auto", "cudnn"):
-        raise ValueError(f'backend must be "auto" or "cudnn", got {backend!r}')
+    if backend not in ("auto", "cudnn", "flashinfer"):
+        raise ValueError(
+            f'backend must be "auto", "cudnn" or "flashinfer", got {backend!r}'
+        )
     if cu_seqlens is None:
         raise ValueError("cu_seqlens is required for varlen mode")
     if cu_seqlens.dtype not in _CU_SEQLENS_DTYPES:
         raise ValueError(
             f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
+        )
+
+    if backend == "auto" and get_compute_capability(q.device)[0] == 9:
+        # cuDNN's linear-attention engines are SM100-family only, so on SM90
+        # "auto" would raise with no engine. The in-tree GDN kernel serves it.
+        backend = "flashinfer"
+
+    if backend == "flashinfer":
+        from .gdn_prefill import chunk_gated_delta_rule
+
+        for _name, _gate in (("g", g), ("beta", beta)):
+            if _gate is not None and _gate.dtype != torch.float32:
+                raise ValueError(
+                    f'backend="flashinfer" requires {_name} in float32, got '
+                    f"{_gate.dtype}; cast it or use the cudnn backend"
+                )
+
+        # GDP is GDN over the expanded sub-token timeline: only cu_seqlens is
+        # scaled.  q, the forget gate and the output stay at real-token rows and
+        # the kernel indexes them directly, so nothing is materialised.  CP
+        # schedules on the expanded timeline and is not validated for it.
+        return chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            cu_seqlens * num_householder,
+            use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            use_cp=False,
+            num_householder=num_householder,
         )
 
     from .cudnn import cudnn_chunk_gated_delta_product
