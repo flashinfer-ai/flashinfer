@@ -1434,18 +1434,19 @@ def test_qsa_completed_group_compression_matches_bf16_rounding_and_rope(
     )
 
 
-def test_qsa_packed_speculative_rejection_replaces_stale_groups_before_use() -> None:
+@pytest.mark.parametrize("page_size", [96, 64])
+def test_qsa_packed_speculative_rejection_replaces_stale_groups_before_use(page_size) -> None:
     device = require_sm120()
     caps = _caps(
         device,
         max_batch=1,
         max_raw_state_slots=1,
         max_q_rows=8,
-        max_seq_len=96,
+        max_seq_len=page_size,
         num_main_cache_pages=1,
         num_compressed_cache_pages=1,
-        main_page_size=96,
-        compressed_page_size=24,
+        main_page_size=page_size,
+        compressed_page_size=page_size // 4,
         max_speculative_tokens=7,
     )
     binding = _allocate_binding(caps)
@@ -1523,7 +1524,8 @@ def test_qsa_packed_speculative_rejection_replaces_stale_groups_before_use() -> 
     assert torch.equal(binding.main_v_cache, main_v_before)
 
 
-def test_qsa_production_page_boundary_after_speculative_rollback_graph_replay() -> None:
+@pytest.mark.parametrize("page_size,drafts,width", [(1504, 3, 4), (64, 7, 8)])
+def test_qsa_production_page_boundary_after_speculative_rollback_graph_replay(page_size, drafts, width) -> None:
     device = require_sm120()
     caps = _caps(
         device,
@@ -1533,11 +1535,11 @@ def test_qsa_production_page_boundary_after_speculative_rollback_graph_replay() 
         max_seq_len=2048,
         num_main_cache_pages=146,
         num_compressed_cache_pages=146,
-        main_page_size=1504,
-        compressed_page_size=376,
-        max_speculative_tokens=3,
-        q_heads=12,
-        kv_heads=1,
+        main_page_size=page_size,
+        compressed_page_size=page_size // 4,
+        max_speculative_tokens=drafts,
+        q_heads=24 if page_size == 64 else 12,
+        kv_heads=2 if page_size == 64 else 1,
         head_dim=256,
         index_heads=4,
         index_head_dim=128,
@@ -1559,21 +1561,21 @@ def test_qsa_production_page_boundary_after_speculative_rollback_graph_replay() 
     binding.main_v_cache[145].normal_()
     binding.compressed_k_cache[14].normal_()
     binding.compressed_k_cache[145].zero_()
-    binding.raw_interval_start_positions[0] = 1503
+    binding.raw_interval_start_positions[0] = page_size - 1
 
     crossing = _dynamic_inputs(
         binding,
-        positions=(1504, 1505, 1506, 1507),
-        request_ids=(0, 0, 0, 0),
+        positions=tuple(range(page_size, page_size + width)),
+        request_ids=(0,) * width,
         accepted_tokens=(1,),
     )
     qsa.run(binding, **crossing)
-    assert int(binding.raw_interval_start_positions[0]) == 1504
+    assert int(binding.raw_interval_start_positions[0]) == page_size
 
     replay = _dynamic_inputs(
         binding,
-        positions=(1506, 1507, 1508, 1509),
-        request_ids=(0, 0, 0, 0),
+        positions=tuple(range(page_size + 2, page_size + 2 + width)),
+        request_ids=(0,) * width,
         accepted_tokens=(2,),
     )
     raw_before = binding.raw_k_ring.clone()
@@ -1592,8 +1594,13 @@ def test_qsa_production_page_boundary_after_speculative_rollback_graph_replay() 
     binding.compressed_k_cache[145, 0].copy_(compressed_before)
     binding.output.zero_()
     binding.selected_positions.fill_(-1)
+    torch.cuda.synchronize(device)
+    allocated_before = torch.cuda.memory_stats(device)
     graph.replay()
     torch.cuda.synchronize(device)
+    allocated_after = torch.cuda.memory_stats(device)
+    for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+        assert allocated_before[key] == allocated_after[key]
 
     expected = sparse_paged_gqa_reference(
         replay["query"],
@@ -1601,10 +1608,10 @@ def test_qsa_production_page_boundary_after_speculative_rollback_graph_replay() 
         binding.main_v_cache,
         binding.main_block_table,
         replay["request_ids"],
-        binding.selected_positions[:4],
+        binding.selected_positions[:width],
         replay["query_positions"],
     )
-    assert torch.all(binding.selected_positions[:4, 0] >= 0)
+    assert torch.all(binding.selected_positions[:width, 0] >= 0)
     assert torch.count_nonzero(result) > 0
     torch.testing.assert_close(result, expected, rtol=0.0, atol=2e-2)
 
