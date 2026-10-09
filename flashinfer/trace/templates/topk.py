@@ -37,7 +37,9 @@ def _top_k_varlen_reference(
     indices = torch.empty(num_rows, top_k, dtype=torch.int32, device=logits.device)
     logits_f32 = logits.to(torch.float32)
     for r in range(num_rows):
-        s = int(row_starts[r].item()) if row_starts is not None else 0
+        # the kernel clamps a negative start to 0 and a start past the width
+        # to the width (an empty window); the window end is clamped to the width
+        s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0
         n = max(min(s + int(seq_lens[r].item()), N) - s, 0)
         row = logits_f32[r, s : s + n]
         _, idx = torch.topk(row, min(top_k, n), largest=True, sorted=False)
@@ -88,15 +90,24 @@ def _top_k_varlen_check(
     logits_f32 = logits.to(torch.float32)
     N = logits_f32.shape[1]
     for r in range(act.shape[0]):
-        s = int(row_starts[r].item()) if row_starts is not None else 0
+        s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0
         n = max(min(s + int(seq_lens[r].item()), N) - s, 0)
+        sel = act[r].long()  # window-local indices (absolute: shift back by s)
+        if absolute_indices:
+            sel = torch.where(sel >= 0, sel - s, sel)  # -1 pads stay -1
         if n < top_k:
+            # short window: every window position exactly once (the identity
+            # set, in any order) and top_k - n pads of -1 -- never skipped
+            valid = sel[sel >= 0]
+            if int((sel < 0).sum()) != top_k - n or valid.numel() != n:
+                return False
+            if n and not torch.equal(
+                torch.sort(valid).values, torch.arange(n, device=sel.device)
+            ):
+                return False
             continue
         row = logits_f32[r, s : s + n]
         kth = torch.topk(row, top_k).values[-1].item()
-        sel = act[r].long()  # window-local indices (absolute: shift back by s)
-        if absolute_indices:
-            sel = sel - s
         # a -1 pad in a full row, or any index outside the window, is a
         # failure -- not a wrap-around gather or a device-side index assert
         if bool((sel < 0).any()) or bool((sel >= n).any()):
