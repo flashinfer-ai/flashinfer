@@ -35,7 +35,7 @@ now; unlike the decode APIs, their ``@flashinfer_experimental_api`` decorators d
 register trace templates.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import functools
 import importlib.metadata
 import itertools
@@ -45,6 +45,13 @@ import struct
 from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import torch
+
+from .vc_attention import (
+    VCAttentionConfig,
+    VCAttentionParams,
+    validate_vc_params,
+    vc_scale_shapes,
+)
 
 from flashinfer.api_logging import flashinfer_experimental_api
 
@@ -140,6 +147,8 @@ class _ContextPlanGeometry:
     causal_single_kv_tile: bool
     packed_dense_k_mask: bool
     head_dim_vo: int | None = None
+    # VC-Attention-QK16 recipe, or ``None`` for a plain plan.
+    vc: Optional[VCAttentionConfig] = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +163,11 @@ class _ContextPlanState:
     variable_window_cta_starts: torch.Tensor
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
+    # Placeholders bound to the VC-Attention-QK16 operand slots of non-VC plans.
+    empty_vc_mu: torch.Tensor
+    vc_scale_shapes: Optional[dict[str, tuple[int, ...]]] = None
+    vc_ctrl_on: Optional[torch.Tensor] = None
+    vc_ctrl_off: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -232,6 +246,7 @@ class _ContextCompileSpec:
     scheduler: _ContextScheduler
     head_dim_vo: int | None = None
     two_cta_umma: bool = False
+    vc: Optional[VCAttentionConfig] = None
 
 
 @dataclass(frozen=True)
@@ -279,6 +294,9 @@ def _make_context_kernel(
     two_cta_umma: bool = False,
     page_size: int | None = None,
     max_kv_len: int | None = None,
+    vc_k_block_size: int = 0,
+    vc_num_q_heads: int = 0,
+    vc_head_dim_v: int = 128,
 ):
     """Build one context kernel from its batch-independent static topology."""
 
@@ -328,6 +346,9 @@ def _make_context_kernel(
         enable_skip_correction=True,
         uses_ldtm_stat=uses_ldtm_stat,
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
+        vc_k_block_size=vc_k_block_size,
+        vc_num_q_heads=vc_num_q_heads,
+        vc_head_dim_v=vc_head_dim_v,
         **paged_kwargs,
     )
     return fmha
@@ -1618,8 +1639,11 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
     The two-CTA launch is non-persistent with heads on grid Y and batch on
     grid Z. CUDA limits grid Y and Z to 65,535. Oversized geometries keep the
     persistent flattened grid so the valid int32 plans stay launchable."""
+    # VC-Attention-QK16 always runs two-CTA. With P in SMEM, the bf16 K ring,
+    # tile-mean ring and row-sum operands leave room for one K/V stage per CTA
+    # at one CTA and three in the halved form. The VC tail needs two.
     return (
-        _default_two_cta_umma(geometry.device_index)
+        (_default_two_cta_umma(geometry.device_index) or geometry.vc is not None)
         and geometry.head_dim == 128
         and geometry.head_dim_vo in (None, 128)
         and geometry.mask_type == "dense"
@@ -1723,6 +1747,7 @@ def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec
         packed_dense_k_mask=geometry.packed_dense_k_mask,
         scheduler=_resolve_context_scheduler(geometry),
         two_cta_umma=_two_cta_umma_geometry_eligible(geometry),
+        vc=geometry.vc,
     )
 
 
@@ -1778,6 +1803,7 @@ def _get_compiled_context(
     packed_dense_k_mask = compile_spec.packed_dense_k_mask
     scheduler = compile_spec.scheduler
     two_cta_umma = compile_spec.two_cta_umma
+    vc_attention = compile_spec.vc is not None
 
     import cutlass
     import cutlass.cute as cute
@@ -1813,6 +1839,9 @@ def _get_compiled_context(
         two_cta_umma=two_cta_umma,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
         fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
+        vc_k_block_size=compile_spec.vc.k_block_size if vc_attention else 0,
+        vc_num_q_heads=num_qo_heads if vc_attention else 0,
+        vc_head_dim_v=head_dim_vo or head_dim,
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -1844,6 +1873,8 @@ def _get_compiled_context(
         variable_window_token_starts: cute.Tensor,
         variable_window_token_ends: cute.Tensor,
         variable_window_cta_starts: cute.Tensor,
+        vc_mu: cute.Tensor,
+        vc_ctrl: cute.Tensor,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
@@ -1869,6 +1900,8 @@ def _get_compiled_context(
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
+                vc_mu=vc_mu,
+                vc_ctrl=vc_ctrl,
             )
         else:
             fmha(
@@ -1883,6 +1916,8 @@ def _get_compiled_context(
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
+                vc_mu=vc_mu,
+                vc_ctrl=vc_ctrl,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -1918,7 +1953,13 @@ def _get_compiled_context(
     v_fake = fake_compact(input_pv_dtype, (*kv_shape[:-1], head_dim_vo), 16)
     out_fake = fake_compact(output_dtype, out_shape, 16)
     scale_fake = fake_compact(cutlass.Float32, (1,), 4)
-    output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
+    if vc_attention:
+        # Per-(batch, q head, channel) V residual scale table.
+        output_scale_fake = fake_compact(
+            cutlass.Float32, (batch_size * num_qo_heads * head_dim_vo,), 64
+        )
+    else:
+        output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     qo_indptr_fake = fake_compact(cutlass.Int32, qo_indptr_shape, 4)
     kv_indptr_fake = fake_compact(cutlass.Int32, kv_indptr_shape, 4)
     if has_variable_window:
@@ -1937,6 +1978,20 @@ def _get_compiled_context(
     variable_window_cta_starts_fake = fake_compact(
         cutlass.Int32, variable_window_cta_shape, 4
     )
+    if vc_attention:
+        if packed:
+            raise RuntimeError("VC-Attention-QK16 context requires fixed tensors")
+        vc_mu_shape: tuple[object, ...] = vc_scale_shapes(
+            compile_spec.vc,
+            batch_size=batch_size,
+            seq_len_kv=max_seq_len_k,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim_vo or head_dim,
+        )["tile_means"]
+    else:
+        vc_mu_shape = (1, 1, 1, 1, 1)
+    vc_mu_fake = fake_compact(cutlass.BFloat16, vc_mu_shape, 16)
+    vc_ctrl_fake = fake_compact(cutlass.Int32, (1,), 4)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -1955,6 +2010,8 @@ def _get_compiled_context(
             variable_window_starts_fake,
             variable_window_ends_fake,
             variable_window_cta_starts_fake,
+            vc_mu_fake,
+            vc_ctrl_fake,
             stream_fake,
             max_active_clusters,
             packed,
@@ -1968,6 +2025,7 @@ def _get_compiled_context(
         ("uniform_packed_lengths", uniform_packed_lengths),
         ("causal_single_kv_tile", causal_single_kv_tile),
         ("packed_dense_k_mask", packed_dense_k_mask),
+        ("vc_attention", vc_attention),
     )
     return compiled, policy
 
@@ -2528,8 +2586,14 @@ class BatchPrefillTSWrapper:
         window_left: int = -1,
         sm_scale: Optional[float] = None,
         output_scale: float = 1.0,
+        vc_config: Optional[VCAttentionConfig] = None,
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
+
+        ``vc_config`` selects the VC-Attention-QK16 recipe. Q and K stay bf16
+        and V is E4M3, stored as per-128-token-tile residuals whose bf16 tile
+        means the kernel restores. Every :meth:`run` then supplies the permuted
+        K, the E4M3 V and ``vc=VCAttentionParams(...)``.
 
         Packed plans conservatively support any positive per-request Q and K/V
         lengths bounded by ``max_seq_len_q`` and ``max_kv_len``. Fixed plans
@@ -2579,6 +2643,9 @@ class BatchPrefillTSWrapper:
             Softmax scale; defaults to the inverse square root of head size.
         output_scale : float
             Scale applied to the attention output.
+        vc_config : VCAttentionConfig, optional
+            The VC-Attention-QK16 recipe. Requires fixed dense tensors, head_dim
+            128, equal Q and K/V head counts, bf16 Q/K and E4M3 V.
         """
 
         resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
@@ -2604,6 +2671,9 @@ class BatchPrefillTSWrapper:
             window_left=window_left,
             output_dtype=resolved_out_dtype,
         )
+        if vc_config is not None and not isinstance(vc_config, VCAttentionConfig):
+            raise TypeError("vc_config must be a VCAttentionConfig instance")
+        geometry = replace(geometry, vc=vc_config)
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
         sm_scale = _validate_scale(sm_scale, "sm_scale")
@@ -2614,9 +2684,21 @@ class BatchPrefillTSWrapper:
         scale_tensor = torch.tensor(
             [scale_softmax_log2], dtype=torch.float32, device=geometry.device
         )
-        output_scale_tensor = torch.tensor(
-            [output_scale], dtype=torch.float32, device=geometry.device
-        )
+        if geometry.vc is not None:
+            output_scale_tensor = torch.full(
+                (
+                    geometry.batch_size
+                    * geometry.num_qo_heads
+                    * (geometry.head_dim_vo or geometry.head_dim),
+                ),
+                output_scale,
+                dtype=torch.float32,
+                device=geometry.device,
+            )
+        else:
+            output_scale_tensor = torch.tensor(
+                [output_scale], dtype=torch.float32, device=geometry.device
+            )
         empty_i32 = torch.empty(1, dtype=torch.int32, device=geometry.device)
         if geometry.mask_type == "variable_window":
             tile_size_q = _variable_window_tile_size_q(geometry.head_dim)
@@ -2643,6 +2725,18 @@ class BatchPrefillTSWrapper:
         # making plan publication atomic, this lets compute-sanitizer patch the
         # generated attention kernel without interleaving later PyTorch setup
         # launches with the DSL compiler/runtime callbacks.
+        empty_vc_mu = torch.zeros(
+            (1, 1, 1, 1, 1), dtype=torch.bfloat16, device=geometry.device
+        )
+        vc_shapes = None
+        if vc_config is not None:
+            vc_shapes = vc_scale_shapes(
+                vc_config,
+                batch_size=geometry.batch_size,
+                seq_len_kv=geometry.max_seq_len_k,
+                num_kv_heads=geometry.num_kv_heads,
+                head_dim=geometry.head_dim_vo or geometry.head_dim,
+            )
         compiled, policy = _get_compiled_context(_context_compile_spec(geometry))
         self._plan_state = _ContextPlanState(
             geometry=geometry,
@@ -2653,6 +2747,10 @@ class BatchPrefillTSWrapper:
             variable_window_cta_starts=variable_window_cta_starts,
             compiled=compiled,
             policy=policy,
+            empty_vc_mu=empty_vc_mu,
+            vc_scale_shapes=vc_shapes,
+            vc_ctrl_on=torch.ones((1,), dtype=torch.int32, device=geometry.device),
+            vc_ctrl_off=torch.zeros((1,), dtype=torch.int32, device=geometry.device),
         )
 
     @flashinfer_experimental_api
@@ -2670,6 +2768,7 @@ class BatchPrefillTSWrapper:
         out: Optional[torch.Tensor] = None,
         scale_softmax_log2: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
+        vc: Optional[VCAttentionParams] = None,
         validate: bool = True,
     ) -> torch.Tensor:
         """Launch the compiled specialization with per-request tensors.
@@ -2677,7 +2776,9 @@ class BatchPrefillTSWrapper:
         Parameters
         ----------
         q, k, v : torch.Tensor
-            Runtime query, key, and value tensors matching the plan.
+            Runtime query, key, and value tensors matching the plan. Under a
+            VC plan ``k`` is in the permuted token order and ``v`` holds the
+            E4M3 residuals, as :class:`VCAttentionPreprocessor` produces them.
         qo_indptr, kv_indptr : torch.Tensor, optional
             Cumulative packed Q and K/V offsets. Required by packed plans and
             forbidden by fixed plans.
@@ -2697,11 +2798,16 @@ class BatchPrefillTSWrapper:
             to the scale retained by the plan.
         output_scale : torch.Tensor, optional
             Per-run one-element float32 output scale. Defaults to the plan.
+            A VC plan multiplies it by the per-channel V residual scale.
+        vc : VCAttentionParams, optional
+            Operands of this run. Required by a VC plan and rejected
+            otherwise.
         validate : bool
             Validate tensor structure and metadata values. Disable only when
             the caller guarantees these contracts. Output must not overlap
             any live input or plan-owned buffer in either mode; storage
-            overlap and lifetime are caller preconditions. Defaults to ``True``.
+            overlap and lifetime are caller preconditions. The VC operand
+            requirement is checked in both modes. Defaults to ``True``.
         """
 
         state = self._plan_state
@@ -2725,6 +2831,21 @@ class BatchPrefillTSWrapper:
             runtime_qo_indptr = state.empty_i32
             runtime_kv_indptr = state.empty_i32
 
+        if (vc is None) == (geometry.vc is not None):
+            raise ValueError(
+                "vc=VCAttentionParams(...) is required by a VC plan and rejected "
+                "by a plan without VC-Attention-QK16"
+            )
+        vc_output_scale: Optional[torch.Tensor] = None
+        vc_ctrl = state.vc_ctrl_on
+        vc_mu = state.empty_vc_mu
+        if vc is not None:
+            if validate:
+                validate_vc_params(vc, state.vc_scale_shapes, device=geometry.device)
+            vc_mu = vc.tile_means
+            group = geometry.num_qo_heads // geometry.num_kv_heads
+            vc_output_scale = vc.v_scale.repeat_interleave(group, dim=1).reshape(-1)
+            vc_ctrl = state.vc_ctrl_on if vc.demean else state.vc_ctrl_off
         if validate:
             _validate_runtime_inputs(
                 q,
@@ -2796,6 +2917,9 @@ class BatchPrefillTSWrapper:
                 "output_scale",
                 device=geometry.device,
             )
+        if vc_output_scale is not None:
+            # The per-channel V residual scale multiplies the planned/passed scale.
+            output_scale = (vc_output_scale * output_scale).contiguous()
 
         if out is None:
             out = torch.empty(
@@ -2822,6 +2946,8 @@ class BatchPrefillTSWrapper:
             runtime_window_starts,
             runtime_window_ends,
             runtime_window_cta_starts,
+            vc_mu,
+            vc_ctrl,
         )
         return out
 
@@ -3168,6 +3294,8 @@ def batch_prefill(
     output_scale: float = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
+    vc: Optional[VCAttentionParams] = None,
+    vc_config: Optional[VCAttentionConfig] = None,
 ) -> torch.Tensor:
     """Run one-shot fixed or packed-ragged task-scheduled context attention.
 
@@ -3225,6 +3353,10 @@ def batch_prefill(
             "batch_prefill cannot derive host plan bounds during CUDA graph "
             "capture; plan BatchPrefillTSWrapper before capture"
         )
+    if vc_config is not None and vc is None:
+        raise ValueError("vc_config requires the vc operands of this call")
+    if vc is not None and vc_config is None:
+        vc_config = VCAttentionConfig()
     geometry = _resolve_geometry(
         q,
         k,
@@ -3254,6 +3386,7 @@ def batch_prefill(
         window_left=window_left,
         sm_scale=sm_scale,
         output_scale=output_scale,
+        vc_config=vc_config,
     )
     return wrapper.run(
         q,
@@ -3264,6 +3397,7 @@ def batch_prefill(
         variable_window_token_starts=variable_window_token_starts,
         variable_window_token_ends=variable_window_token_ends,
         out=out,
+        vc=vc,
     )
 
 
