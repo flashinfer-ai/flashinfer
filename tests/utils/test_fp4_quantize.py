@@ -1851,6 +1851,58 @@ def test_nvfp4_quantize_fp8_backend_parity(
     )
 
 
+# FP8 input with m >= 1024 takes the TMA kernel only when n is a multiple of its
+# 1024-column chunk; odd multiples of 512 must fall back to the non-TMA kernel.
+NVFP4_FP8_TMA_SHAPES = [
+    (1024, 512),
+    (1024, 1024),
+    (1024, 1536),
+    (4096, 512),
+    (4096, 1536),
+    (4096, 2048),
+]
+NON_TMA_ROWS = 512
+
+
+@pytest.mark.parametrize("shape", NVFP4_FP8_TMA_SHAPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_fp8_tma_matches_non_tma(
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    device: str,
+) -> None:
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x_fp8 = torch.randn((m, n)).to(torch.float8_e4m3fn)
+    tensor_amax = torch.abs(x_fp8.float()).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    def quantize(x):
+        return nvfp4_quantize(x, global_scale, sfLayout=sf_layout, backend="cuda")
+
+    quant, scale = quantize(x_fp8)
+
+    # Row blocks of 512 stay on the non-TMA kernel, and every SF layout keeps
+    # 512-row blocks contiguous, so concatenating them rebuilds the full result.
+    blocks = [quantize(x_fp8[i : i + NON_TMA_ROWS]) for i in range(0, m, NON_TMA_ROWS)]
+    quant_ref = torch.cat([q for q, _ in blocks])
+    scale_ref = torch.cat([s.flatten() for _, s in blocks])
+
+    torch.testing.assert_close(
+        quant.view(torch.uint8), quant_ref.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        scale.flatten().view(torch.uint8), scale_ref.view(torch.uint8), rtol=0, atol=0
+    )
+
+
 # =============================================================================
 # NVFP4 TMA Kernel Tests
 # =============================================================================
