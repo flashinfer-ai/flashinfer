@@ -9,6 +9,59 @@ import pytest
 import torch
 
 
+def _require_sm120_w4a8_green_context() -> None:
+    from flashinfer.jit.cpp_ext import get_cuda_version
+
+    if get_cuda_version().major < 13:
+        pytest.skip("SM120 W4A8 Green Context tests require CUDA toolkit 13+")
+
+    from cuda.bindings import driver
+
+    # CUDA 12.9 bindings lack the partition metadata used by green_context.py.
+    required_fields = ("minSmPartitionSize", "smCoscheduledAlignment")
+    if not all(hasattr(driver.CUdevSmResource, field) for field in required_fields):
+        pytest.skip(
+            "SM120 W4A8 Green Context tests require CUDA 13+ cuda-bindings "
+            "with CUdevSmResource.minSmPartitionSize and smCoscheduledAlignment"
+        )
+
+
+@pytest.fixture
+def require_sm120_w4a8_green_context() -> None:
+    _require_sm120_w4a8_green_context()
+
+
+@pytest.mark.parametrize(
+    "toolkit,fields,skip_reason",
+    (
+        ("12.9", (), "CUDA toolkit 13"),
+        ("12.9", ("minSmPartitionSize", "smCoscheduledAlignment"), "CUDA toolkit 13"),
+        ("13.0", (), "cuda-bindings"),
+        ("13.0", ("minSmPartitionSize",), "cuda-bindings"),
+        ("13.0", ("smCoscheduledAlignment",), "cuda-bindings"),
+        ("13.0", ("minSmPartitionSize", "smCoscheduledAlignment"), None),
+        ("13.4", ("minSmPartitionSize", "smCoscheduledAlignment"), None),
+    ),
+)
+def test_sm120_w4a8_green_context_requirements(
+    monkeypatch, toolkit, fields, skip_reason
+) -> None:
+    from cuda.bindings import driver
+    from packaging.version import Version
+
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", lambda: Version(toolkit))
+    monkeypatch.setattr(
+        driver, "CUdevSmResource", type("SmResource", (), dict.fromkeys(fields))
+    )
+    if skip_reason is not None:
+        with pytest.raises(pytest.skip.Exception, match=skip_reason):
+            _require_sm120_w4a8_green_context()
+    else:
+        _require_sm120_w4a8_green_context()
+
+
 def test_sm120_w4a8_graph_compile_bucket_selection() -> None:
     from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel import (
         select_graph_compile_bucket,
@@ -172,6 +225,7 @@ def test_sm120_w4a8_frontend_graph_cache_key_includes_bucket() -> None:
     assert len({key[:-1] for key in keys}) == 1
 
 
+@pytest.mark.usefixtures("require_sm120_w4a8_green_context")
 @pytest.mark.arch_sm120
 @pytest.mark.parametrize("bucket", (384, 512, 1024, 2048, 4096))
 def test_sm120_w4a8_medium_bucket_shrink_and_graph_replay(bucket: int) -> None:
@@ -423,6 +477,7 @@ def _make_layer(
     )
 
 
+@pytest.mark.usefixtures("require_sm120_w4a8_green_context")
 @pytest.mark.arch_sm120
 def test_sm120_w4a8_single_rank_replay_and_cuda_graph() -> None:
     if not torch.cuda.is_available():
@@ -474,6 +529,7 @@ def test_sm120_w4a8_single_rank_replay_and_cuda_graph() -> None:
         layer.destroy()
 
 
+@pytest.mark.usefixtures("require_sm120_w4a8_green_context")
 @pytest.mark.arch_sm120
 def test_sm120_w4a8_workspace_capacity_is_independent_of_compile_bucket() -> None:
     if not torch.cuda.is_available():
@@ -534,6 +590,7 @@ def test_sm120_w4a8_workspace_capacity_is_independent_of_compile_bucket() -> Non
         layer.destroy()
 
 
+@pytest.mark.usefixtures("require_sm120_w4a8_green_context")
 @pytest.mark.arch_sm120
 def test_sm120_w4a8_two_layers_share_workspace() -> None:
     if not torch.cuda.is_available():
@@ -576,6 +633,7 @@ def test_sm120_w4a8_two_layers_share_workspace() -> None:
         layer2.destroy()
 
 
+@pytest.mark.usefixtures("require_sm120_w4a8_green_context")
 @pytest.mark.gpu_4
 @pytest.mark.arch_sm120
 @pytest.mark.parametrize(

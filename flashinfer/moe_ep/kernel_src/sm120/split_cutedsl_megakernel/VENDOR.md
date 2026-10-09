@@ -27,6 +27,12 @@ combine policies. Their caller-stream reset, graph launch events, and finalizer
 form one replay ownership protocol and must be updated together with the raw
 kernel source.
 
+Green Context execution requires CUDA toolkit 13+ and compatible `cuda-bindings`
+exposing `CUdevSmResource.minSmPartitionSize` and `smCoscheduledAlignment`.
+The W4A8 GPU integration tests skip unsupported toolkit/bindings combinations,
+including CUDA 12.9; host-only bucket and cache-key tests remain enabled. This
+test gate does not add CUDA 12.9 runtime support.
+
 Multi-rank execution requires NVSHMEM 3.7.0 and the matching
 `nvshmem4py-cu13` 0.3.1 Python bindings. Single-rank execution can set
 `MEGA_NO_DIST=1` and does not import NVSHMEM. The backend must be warmed up
