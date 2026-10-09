@@ -1278,6 +1278,7 @@ def _run_nvfp4_routing_rounds(
     with_norm=False,
     apply_topk_in_fc1=False,
     check_graph=False,
+    input_scale=1.0,
 ):
     """One public layer reuses its workspace across skew, empty sources and refill."""
     import dataclasses
@@ -1406,6 +1407,10 @@ def _run_nvfp4_routing_rounds(
                 num_experts=num_experts,
                 topk=topk,
             )
+            if input_scale != 1.0:
+                # Kernel and exact oracle consume the same BF16 values near
+                # the SiTU origin or in its saturated gate/up regions.
+                hidden_states.mul_(input_scale)
             problem = dict(
                 hidden=hidden,
                 intermediate=intermediate,
@@ -1488,15 +1493,16 @@ def _run_nvfp4_routing_rounds(
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "activation_params,with_norm,alpha_source,apply_topk_in_fc1,token_back_mode",
+    "activation_params,with_norm,alpha_source,apply_topk_in_fc1,token_back_mode,input_scale",
     [
-        pytest.param({}, True, "runtime", False, "epi_warps", id="swiglu-norm"),
+        pytest.param({}, True, "runtime", False, "epi_warps", 1.0, id="swiglu-norm"),
         pytest.param(
             {"swiglu_alpha": 1.702, "swiglu_beta": 1.0},
             False,
             "config",
             False,
             "epi_warps",
+            1.0,
             id="minimax",
         ),
         pytest.param(
@@ -1505,6 +1511,7 @@ def _run_nvfp4_routing_rounds(
             "runtime",
             True,
             "reuse_dispatch_warps",
+            1.0,
             id="minimax-norm-topk",
         ),
         pytest.param(
@@ -1513,6 +1520,7 @@ def _run_nvfp4_routing_rounds(
             "config",
             False,
             "epi_warps",
+            1.0,
             id="situ-norm",
         ),
         pytest.param(
@@ -1521,12 +1529,58 @@ def _run_nvfp4_routing_rounds(
             "runtime",
             True,
             "reuse_dispatch_warps",
+            1.0,
             id="situ-linear-norm-topk",
+        ),
+        pytest.param(
+            {"activation": "situ", "situ_beta": 4.00000024},
+            True,
+            "config",
+            False,
+            "epi_warps",
+            1.0,
+            id="situ-non-fp32-beta",
+        ),
+        pytest.param(
+            {
+                "activation": "situ",
+                "situ_beta": 4.00000024,
+                "situ_linear_beta": 25.000001,
+            },
+            True,
+            "runtime",
+            True,
+            "reuse_dispatch_warps",
+            1.0,
+            id="situ-linear-non-fp32-beta",
+        ),
+        pytest.param(
+            {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0},
+            True,
+            "runtime",
+            False,
+            "epi_warps",
+            1e-4,
+            id="situ-small",
+        ),
+        pytest.param(
+            {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0},
+            True,
+            "runtime",
+            False,
+            "epi_warps",
+            128.0,
+            id="situ-saturated",
         ),
     ],
 )
 def test_nvfp4_w4a16_epilogue_contract(
-    activation_params, with_norm, alpha_source, apply_topk_in_fc1, token_back_mode
+    activation_params,
+    with_norm,
+    alpha_source,
+    apply_topk_in_fc1,
+    token_back_mode,
+    input_scale,
 ):
     """Opt-in activations and normalization retain the EP-aware bit-exact contract."""
     _require_cuda()
@@ -1547,6 +1601,7 @@ def test_nvfp4_w4a16_epilogue_contract(
         alpha_source=alpha_source,
         apply_topk_in_fc1=apply_topk_in_fc1,
         check_graph=True,
+        input_scale=input_scale,
     )
 
 
