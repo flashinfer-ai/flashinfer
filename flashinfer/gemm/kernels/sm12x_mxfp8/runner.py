@@ -278,7 +278,12 @@ def _prepare(index, n, k, tactics, out_f16, tuning):
         if shape not in _AHEAD_DONE:
             _AHEAD_DONE.add(shape)
             wanted += _ahead_tactics(n, k, dev, tuning)
-        jobs, queued = [], set()
+        # A single missing kernel that is not queued yet compiles in this
+        # process, alongside the queue rather than behind it.
+        inline = {key_of(t) for t in pending if key_of(t) not in _INFLIGHT}
+        if len(pending) > 1:
+            inline = set()
+        jobs, queued = [], set(inline)
         for t in wanted:
             key = key_of(t)
             if key in _COMPILED or key in _INFLIGHT or key in queued:
@@ -301,7 +306,11 @@ def _prepare(index, n, k, tactics, out_f16, tuning):
             if futures is not None:
                 for t, fut in zip(jobs, futures, strict=True):
                     _INFLIGHT[key_of(t)] = fut
-        waits = {_INFLIGHT[key_of(t)]: t for t in pending if key_of(t) in _INFLIGHT}
+        waits = {
+            _INFLIGHT[key_of(t)]: t
+            for t in pending
+            if key_of(t) in _INFLIGHT and key_of(t) not in inline
+        }
         for fut in as_completed(waits):
             err = fut.result()
             if err is not None:
