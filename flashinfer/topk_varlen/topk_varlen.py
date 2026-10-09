@@ -1199,9 +1199,8 @@ def release_gvr2_resources(device=None) -> int:
             )
     # The caches live in the gvr_2 host module; if it was never imported in
     # this process no gvr_2 launch has happened and nothing can be cached.
-    # Looking it up in sys.modules (instead of importing `.kernels`, whose
-    # package __init__ eagerly imports the optional CuTe-DSL kernel modules)
-    # keeps this a no-op on installations without nvidia-cutlass-dsl.
+    # Looking it up in sys.modules (instead of importing it) keeps this a
+    # true no-op: nothing is loaded and no device is synchronized.
     host = sys.modules.get(f"{__package__}.kernels.gvr2_topk_host")
     if host is None:
         return 0

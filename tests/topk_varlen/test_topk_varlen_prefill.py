@@ -23,6 +23,9 @@ poisoned with NaN / +-inf / 3e38 and the <= 3 lead lanes before a misaligned
 CUDA-graph replay after warm-up, and the API/backends' admission rules.
 """
 
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -1153,3 +1156,58 @@ def test_prefill_warmup_recreates_slab_after_release():
     g.replay()
     torch.cuda.synchronize()
     _check_windowed(lg, out, rs, le, top_k)
+
+
+def test_prefill_env_probe_mirrors_gvr2_cc_list():
+    """The host's environment probe admits exactly the compute capabilities the
+    public gvr_2 checker declares (every CC-10 part), so the two enumerations
+    cannot drift apart silently."""
+    from flashinfer.topk_varlen import topk_varlen as _api
+
+    assert set(_api._GVR_CCS) == {cc for cc in _api._ALL_CCS if cc // 10 == 10}
+
+
+@pytest.mark.skipif(
+    not _FLASHINFER_AVAILABLE
+    or not torch.cuda.is_available()
+    or flashinfer.top_k_varlen.is_backend_supported("gvr_2", _cc()),
+    reason="needs a device outside the gvr_2 support set",
+)
+def test_prefill_helpers_refuse_unsupported_device():
+    """On a part outside the gvr_2 support set ``prefill_ready`` is False and
+    ``warmup_prefill`` raises one sentence naming the reason, instead of an
+    opaque compile or launch error."""
+    assert _host.prefill_ready(8, 512, 4096) is False
+    with pytest.raises(RuntimeError, match="outside the gvr_2 support set"):
+        _host.warmup_prefill(512, 4096)
+
+
+def test_prefill_helpers_without_cute_dsl_subprocess():
+    """With the CuTe DSL made unavailable (``sys.modules['cutlass'] = None``
+    before any flashinfer import) the package still imports, the lazy
+    ``flashinfer.topk_varlen`` exports resolve, ``release_gvr2_resources`` is a
+    no-op, ``prefill_ready`` is False and ``warmup_prefill`` raises a sentence
+    naming the missing dependency (never a NameError or a compile error)."""
+    code = r"""
+import sys
+for name in ("cutlass", "cutlass.cute", "cutlass.cutlass_dsl", "cutlass._mlir"):
+    sys.modules[name] = None
+import flashinfer
+from flashinfer.topk_varlen import release_gvr2_resources
+assert release_gvr2_resources() == 0  # the host module was never loaded
+from flashinfer.topk_varlen import prefill_ready, warmup_prefill
+assert prefill_ready(8, 512, 4096) is False
+try:
+    warmup_prefill(512, 4096)
+except RuntimeError as e:
+    assert "nvidia-cutlass-dsl" in str(e), e
+else:
+    raise SystemExit("warmup_prefill did not raise")
+print("NO_DSL_OK")
+"""
+    r = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=900
+    )
+    assert r.returncode == 0 and "NO_DSL_OK" in r.stdout, (
+        r.stdout[-2000:] + r.stderr[-4000:]
+    )

@@ -975,6 +975,39 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
     return lc
 
 
+_PREFILL_DSL_OK: bool | None = None
+
+
+def _prefill_env_error() -> str | None:
+    """Why the windowed engines cannot run on the CURRENT device, or None.
+    Mirrors the public gvr_2 admission (the CuTe DSL importable; a compute-
+    capability-10 part, i.e. SM100 / SM103 / SM107 = the ``_GVR_CCS`` list of
+    the ``top_k_varlen`` checker) so ``warmup_prefill`` fails with one sentence
+    instead of an opaque compile or launch error and ``prefill_ready`` can
+    answer without compiling anything."""
+    global _PREFILL_DSL_OK
+    if _PREFILL_DSL_OK is None:
+        try:
+            from ...cute_dsl.availability import is_cute_dsl_available
+
+            _PREFILL_DSL_OK = bool(is_cute_dsl_available())
+        except ImportError:  # standalone dir
+            import importlib.util
+
+            _PREFILL_DSL_OK = importlib.util.find_spec("cutlass") is not None
+    if not _PREFILL_DSL_OK:
+        return "the CuTe DSL (nvidia-cutlass-dsl) is not importable"
+    if not torch.cuda.is_available():
+        return "CUDA is not available"
+    major, minor = torch.cuda.get_device_capability()
+    if major != 10:
+        return (
+            f"compute capability {major}.{minor} is outside the gvr_2 support set "
+            "(SM100 / SM103 / SM107)"
+        )
+    return None
+
+
 # ---- prefill (windowed) launcher cache --------------------------------------
 # Windowed rows (TRT-LLM #18702 port) always run the streaming `main` family
 # with R == 1 (one CTA per row, no SPLIT, no workspace publish). The compiled
@@ -1345,6 +1378,9 @@ def warmup_prefill(
     ``warmup_prefill`` mirror. ``absolute_indices`` warms the absolute-column
     output variants (a distinct compiled set); call once per output frame the
     server uses."""
+    err = _prefill_env_error()
+    if err is not None:
+        raise RuntimeError(f"gvr_2 windowed (prefill) engines unavailable: {err}")
     dev = torch.cuda.current_device()
     k = int(top_k)
     max_cols = int(max_cols)
@@ -1424,6 +1460,8 @@ def prefill_ready(
     ``max_seq_len`` (leave ``width`` None)."""
     if num_rows == 0:
         return True
+    if _prefill_env_error() is not None:
+        return False
     width = int(n_env) if width is None else int(width)
     n_env = min(max(int(n_env), 1), width)
     n_bucket = _prefill_bucket(n_env)
