@@ -201,11 +201,27 @@ def _reference_reduced(pkg, *, problem, symm_buffer, l1, l2):
 
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(
-    "swap_ab,pingpong",
-    [(False, None), (True, None), (True, True)],
-    ids=["native", "swap_ab", "swap_ab_pingpong"],
+    "swap_ab,pingpong,intermediate",
+    [
+        (False, None, 512),
+        (True, None, 512),
+        (True, True, 512),
+        # intermediate % 64 == 0 but % 256 != 0: the kernel's real bound is
+        # the 64-element TMA K atom (the backend used to reject this).
+        (False, None, 192),
+        (True, None, 192),
+    ],
+    ids=[
+        "native",
+        "swap_ab",
+        "swap_ab_pingpong",
+        "native_inter192",
+        "swap_ab_inter192",
+    ],
 )
-def test_sm90_bf16_kernel_matches_drop_reference(monkeypatch, swap_ab, pingpong):
+def test_sm90_bf16_kernel_matches_drop_reference(
+    monkeypatch, swap_ab, pingpong, intermediate
+):
     """Single-rank ``hopper_bf16_mega_moe`` matches ``compute_megamoe_reference_bf16``.
 
     ``pingpong=True`` with swap-AB resolves to the manual-mode default tile
@@ -228,7 +244,7 @@ def test_sm90_bf16_kernel_matches_drop_reference(monkeypatch, swap_ab, pingpong)
     # monkeypatch (not os.environ): restored after the test, so it cannot
     # silently downgrade later nvshmem-path tests in the same process.
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    problem = _single_rank_problem()
+    problem = _single_rank_problem(intermediate=intermediate)
     rank, world_size = 0, 1
     n = problem["num_tokens"]
 

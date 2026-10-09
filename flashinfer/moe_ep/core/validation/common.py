@@ -402,6 +402,7 @@ def validate_mega_fleet_params(
     intermediate_size: int,
     top_k: int,
     alignment: int = 128,
+    hidden_alignment: int | None = None,
 ) -> None:
     # ``alignment`` is backend-specific: deep_gemm's wire format stores scale
     # factors 4-per-int32 word (hidden/128 columns, static-asserted host and
@@ -409,6 +410,11 @@ def validate_mega_fleet_params(
     # TMA zero-fill and predicated epilogue tails; their true bound is the
     # 16B TMA row alignment and SF-word packing, i.e. 64 (verified 2026-07-21
     # against gpt-oss-120b geometry, hidden=inter=2880).
+    # ``hidden_alignment`` overrides ``alignment`` for token_hidden_size only,
+    # for backends whose hidden bound (e.g. the fc2 N tile) is stricter than
+    # their intermediate bound.
+    if hidden_alignment is None:
+        hidden_alignment = alignment
     if world_size <= 0:
         raise MoEEpConfigError(f"world_size must be positive, got {world_size}")
     if params.num_experts % world_size != 0:
@@ -416,10 +422,10 @@ def validate_mega_fleet_params(
             f"num_experts ({params.num_experts}) must be divisible by "
             f"world_size ({world_size})"
         )
-    if params.token_hidden_size % alignment != 0:
+    if params.token_hidden_size % hidden_alignment != 0:
         raise MoEEpConfigError(
             f"token_hidden_size ({params.token_hidden_size}) must be a "
-            f"multiple of {alignment}"
+            f"multiple of {hidden_alignment}"
         )
     if intermediate_size % alignment != 0:
         raise MoEEpConfigError(

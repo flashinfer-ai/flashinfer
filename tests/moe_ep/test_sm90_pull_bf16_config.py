@@ -93,6 +93,68 @@ class TestSm90PullBf16Config:
         assert "preprocess_sm90_pull_bf16_mega_weights" in moe_ep.__all__
 
 
+class TestSm90PullBf16ValidateInit:
+    """Backend shape contract has TWO bounds: hidden % 256, intermediate % 64.
+
+    Regression guard: the backend used to pass a single alignment=256 to the
+    shared fleet validator, which rejected intermediate sizes the kernel
+    accepts (64 / 128 / 192, verified against the GPU reference).
+    """
+
+    @staticmethod
+    def _validate_init(monkeypatch, *, intermediate_size: int, hidden: int) -> None:
+        from flashinfer.moe_ep.backends.mega.kernel.sm90.bf16_bf16_bf16_pull_cutedsl import (
+            backend as backend_mod,
+        )
+        from flashinfer.moe_ep.config import BootstrapConfig, FleetParams
+
+        # Host-only: the arch probe is covered by TestSm90ArchGate.
+        monkeypatch.setattr(backend_mod, "validate_mega_arch_sm90", lambda: None)
+        backend = create_mega_kernel(
+            Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig(
+                intermediate_size=intermediate_size, top_k=4
+            )
+        )
+        backend.validate_init(
+            BootstrapConfig(rank=0, world_size=2),
+            FleetParams(
+                num_experts=8, max_tokens_per_rank=64, token_hidden_size=hidden
+            ),
+        )
+
+    @pytest.mark.parametrize("intermediate_size", [64, 128, 192, 256, 3072])
+    def test_intermediate_multiple_of_64_accepted(
+        self, monkeypatch, intermediate_size
+    ) -> None:
+        self._validate_init(
+            monkeypatch, intermediate_size=intermediate_size, hidden=256
+        )
+
+    @pytest.mark.parametrize("intermediate_size", [32, 96, 200])
+    def test_intermediate_not_multiple_of_64_rejected(
+        self, monkeypatch, intermediate_size
+    ) -> None:
+        from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+        with pytest.raises(MoEEpConfigError, match="intermediate_size"):
+            self._validate_init(
+                monkeypatch, intermediate_size=intermediate_size, hidden=256
+            )
+
+    @pytest.mark.parametrize("hidden", [256, 512, 2048, 7168])
+    def test_hidden_multiple_of_256_accepted(self, monkeypatch, hidden) -> None:
+        self._validate_init(monkeypatch, intermediate_size=64, hidden=hidden)
+
+    @pytest.mark.parametrize("hidden", [64, 128, 192, 320, 2880])
+    def test_hidden_needs_256(self, monkeypatch, hidden) -> None:
+        # Multiples of 64 that are not multiples of 256 must still fail on the
+        # hidden bound (fc2 N tile), independent of the intermediate bound.
+        from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+        with pytest.raises(MoEEpConfigError, match="token_hidden_size"):
+            self._validate_init(monkeypatch, intermediate_size=64, hidden=hidden)
+
+
 class TestSm90PullBf16RuntimeRequirements:
     def test_requires_nvshmem_and_torch_dist(self, monkeypatch) -> None:
         monkeypatch.delenv("MEGA_NO_DIST", raising=False)

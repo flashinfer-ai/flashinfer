@@ -77,10 +77,11 @@ def _make_inputs(
     hidden: int,
     num_experts: int,
     topk: int,
+    seed: int = 7,
 ):
     import torch
 
-    g = torch.Generator(device="cuda").manual_seed(7 + rank)
+    g = torch.Generator(device="cuda").manual_seed(seed + rank)
     hidden_states = torch.randn(
         num_tokens, hidden, dtype=torch.bfloat16, device="cuda", generator=g
     )
@@ -102,7 +103,8 @@ def _make_inputs(
         torch.arange(min(topk, world_size), device="cuda", dtype=torch.int64)
         * num_local
     )
-    topk_ids[0, : forced.numel()] = forced
+    if num_tokens > 0:
+        topk_ids[0, : forced.numel()] = forced
 
     return hidden_states, topk_weights.to(torch.float32), topk_ids
 
@@ -320,6 +322,9 @@ def _assert_ikr_close(y, y_ref, *, topk):
     """
     import torch
 
+    assert y.shape == y_ref.shape, (tuple(y.shape), tuple(y_ref.shape))
+    if y.numel() == 0:
+        return  # empty rank: nothing to compare
     a = y.float()
     b = y_ref.float()
     diff = (a - b).abs()
@@ -389,6 +394,7 @@ def _run_mega_layer(
     num_experts: int = 8,
     topk: int = 4,
     hidden: int = 2048,
+    zero_token_ranks: tuple[int, ...] = (),
 ):
     import torch
     import torch.distributed as dist
@@ -410,6 +416,11 @@ def _run_mega_layer(
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
 
+    # ``zero_token_ranks`` stage an EMPTY local batch (0 rows) while the other
+    # ranks keep ``num_tokens``; the empty rank must still serve its experts
+    # and take part in the collective launch.
+    if rank in zero_token_ranks:
+        num_tokens = 0
     problem = _mega_problem(
         rank,
         world_size,
@@ -826,6 +837,37 @@ def test_moe_ep_sm90_pull_bf16_mega_layer_prestaged_inputs_matches_reference():
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_hopper
+@pytest.mark.parametrize("in_kernel_fc2_reduce", [False, True])
+def test_moe_ep_sm90_pull_bf16_mega_layer_zero_token_rank(in_kernel_fc2_reduce):
+    """One rank stages an empty batch while the others route tokens to it.
+
+    Regression guard for the shim's former ``num_tokens == 0`` early return
+    (in_kernel_fc2_reduce): the launch is collective, so an empty rank must
+    still launch the padded buffer (all ``topk_idx == -1``), serve its
+    experts to the peers' pulls and reach every cross-rank barrier.  Skipping
+    it hung the non-empty ranks.  The non-empty ranks' outputs must match the
+    reference exactly (separate reduce) / within the ikr band.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        zero_token_ranks=(0,),
+    )
+    print(
+        f"rank {rank}: sm90_bf16_bf16_bf16_pull_cutedsl mega layer with an "
+        f"empty rank 0 (in_kernel_fc2_reduce={in_kernel_fc2_reduce}) matches "
+        "reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
 def test_moe_ep_sm90_pull_bf16_mega_layer_in_kernel_fc2_reduce():
     """In-flight top-k combine (``in_kernel_fc2_reduce=True``) for SM90 BF16.
 
@@ -897,11 +939,25 @@ def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
             f"expert {e}: non-zero pad rows"
         )
         checked += 1
+    # Rows past the last live segment are padding too; on a second launch with
+    # fewer tokens they would otherwise hold the previous launch's values.
+    tail = fc1_c[offsets[-1] :]
+    assert tail.numel() == 0 or tail.abs().max().item() == 0.0, (
+        f"{int((tail != 0).sum().item())} non-zero elements past the last "
+        "live expert segment"
+    )
     assert checked > 0, "no local expert received tokens"
     return checked
 
 
-def _run_mega_torch_oracle(rank, world_size, *, swap_ab=False, generate_c=False):
+def _run_mega_torch_oracle(
+    rank,
+    world_size,
+    *,
+    swap_ab=False,
+    generate_c=False,
+    relaunch_token_counts: tuple[int, ...] = (),
+):
     """Real-EP kernel launch vs the drop's pure-torch GLOBAL reference.
 
     Every rank stages its own bf16 shard, runs the fused kernel with real
@@ -912,6 +968,11 @@ def _run_mega_torch_oracle(rank, world_size, *, swap_ab=False, generate_c=False)
     ``(num_ranks, tokens_per_rank, ...)`` operands and computes
     ``expert(topk_idx[r, t, k])`` across rank boundaries.  Each rank asserts
     its own output slice within the single-GPU oracle's tolerances.
+
+    ``relaunch_token_counts`` re-stages the SAME session (symm buffer, compiled
+    kernel, ``fc1_c`` pool) with fresh routing of that many tokens per rank and
+    repeats the full check after each launch -- the regression guard for state
+    that must not leak between launches (``fc1_c`` pad rows).
     """
     import torch
     import torch.distributed as dist
@@ -940,95 +1001,117 @@ def _run_mega_torch_oracle(rank, world_size, *, swap_ab=False, generate_c=False)
         kernel.runtime_requirements(bootstrap),
     )
     try:
-        n = problem["num_tokens"]
         hidden = problem["hidden"]
 
         symm_buffer = _alloc_symm_buffer(
             problem, rank, world_size, generate_c=generate_c
         )
         try:
-            stage_mega_moe_inputs(
-                problem["hidden_states"],
-                problem["topk_weights"],
-                problem["topk_ids"],
-                symm_buffer.x,
-                symm_buffer.topk_idx,
-                symm_buffer.topk_weights,
-            )
-            # Snapshot exactly what the kernel consumes (this rank's shard).
-            x_local = symm_buffer.x[:n].clone()
-
             transformed_l1, transformed_l2 = _preprocess_weights(problem)
-
-            y_kernel = torch.empty(n, hidden, dtype=torch.bfloat16, device="cuda")
-            hopper_bf16_mega_moe(
-                y_kernel,
-                transformed_l1,
-                transformed_l2,
-                symm_buffer,
-                num_tokens=n,
-                gate_up_clamp=problem["gate_up_clamp"],
-                fast_math=problem["fast_math"],
-            )
-            torch.cuda.synchronize()
-            dist.barrier()
-
-            # Reassemble the global problem from the operands each rank staged.
-            x_g = _all_gather_stack(x_local)  # (R, n, hidden) bf16
-            idx_g = _all_gather_stack(problem["topk_ids"])  # (R, n, K) int64
-            w_g = _all_gather_stack(problem["topk_weights"])  # (R, n, K) fp32
             # Keep the weights K-major across the gather: ship the contiguous
             # transpose and transpose back so the gather does not silently
             # re-stride them to row-major.
             fc1_w_g = _all_gather_stack(transformed_l1.mT).mT  # (R, E_local, H, 2I)
             fc2_w_g = _all_gather_stack(transformed_l2.mT).mT  # (R, E_local, I, H)
 
-            combine_ref = compute_megamoe_reference_bf16(
-                input_activation=x_g,
-                input_topk_idx=idx_g,
-                input_topk_weights=w_g,
-                fc1_weight=fc1_w_g,
-                fc2_weight=fc2_w_g,
-                ref_compute_graph="deepgemm",  # matches the shim's apply_topk_in_fc1
-                fc2_output_dtype=torch.bfloat16,
-                gate_up_clamp=problem["gate_up_clamp"],
-                return_fc1_gateup=generate_c,
-            )
-            # deepgemm graph folds topk weights before the bf16 fc1-out store,
-            # so the per-topk terms reduce with a plain sum; compare this
-            # rank's slice.
-            fc1_gateup_ref = None
-            if generate_c:
-                combine_ref, fc1_gateup_ref = combine_ref
-            y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
+            def launch_and_check(hidden_states, topk_weights, topk_ids, tag):
+                n = hidden_states.shape[0]
+                stage_mega_moe_inputs(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    symm_buffer.x,
+                    symm_buffer.topk_idx,
+                    symm_buffer.topk_weights,
+                )
+                # Snapshot exactly what the kernel consumes (this rank's shard).
+                x_local = symm_buffer.x[:n].clone()
 
-            assert torch.isfinite(y_kernel).all()
-            yk = y_kernel.to(torch.float32)
-            rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
-            print(
-                f"[sm90 bf16 multirank oracle rank {rank} swap_ab={swap_ab}] "
-                f"rel_l2={rel_l2.item():.4g} "
-                f"max|d|={(yk - y_ref).abs().max().item():.4g} "
-                f"amax(ref)={y_ref.abs().max().item():.4g}"
-            )
-            # Single-GPU oracle tolerances (drop mega_runner: atol=rtol=1e-2),
-            # valid because the problem is conditioned to O(1) outputs and
-            # kernel + reference share the same gathered bf16 operands.
-            torch.testing.assert_close(yk, y_ref, atol=1e-2, rtol=1e-2)
-            assert rel_l2.item() < 0.02
-            if generate_c:
-                checked = _check_generate_c_output(
-                    symm_buffer.fc1_c,
-                    fc1_gateup_ref,
-                    idx_g,
-                    rank,
-                    problem["num_experts"] // world_size,
+                y_kernel = torch.empty(n, hidden, dtype=torch.bfloat16, device="cuda")
+                hopper_bf16_mega_moe(
+                    y_kernel,
+                    transformed_l1,
+                    transformed_l2,
+                    symm_buffer,
+                    num_tokens=n,
+                    gate_up_clamp=problem["gate_up_clamp"],
+                    fast_math=problem["fast_math"],
                 )
+                torch.cuda.synchronize()
+                dist.barrier()
+
+                # Reassemble the global problem from the operands each rank
+                # staged.
+                x_g = _all_gather_stack(x_local)  # (R, n, hidden) bf16
+                idx_g = _all_gather_stack(topk_ids)  # (R, n, K) int64
+                w_g = _all_gather_stack(topk_weights)  # (R, n, K) fp32
+
+                combine_ref = compute_megamoe_reference_bf16(
+                    input_activation=x_g,
+                    input_topk_idx=idx_g,
+                    input_topk_weights=w_g,
+                    fc1_weight=fc1_w_g,
+                    fc2_weight=fc2_w_g,
+                    ref_compute_graph="deepgemm",  # matches apply_topk_in_fc1
+                    fc2_output_dtype=torch.bfloat16,
+                    gate_up_clamp=problem["gate_up_clamp"],
+                    return_fc1_gateup=generate_c,
+                )
+                # deepgemm graph folds topk weights before the bf16 fc1-out
+                # store, so the per-topk terms reduce with a plain sum; compare
+                # this rank's slice.
+                fc1_gateup_ref = None
+                if generate_c:
+                    combine_ref, fc1_gateup_ref = combine_ref
+                y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
+
+                assert torch.isfinite(y_kernel).all()
+                yk = y_kernel.to(torch.float32)
+                rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
                 print(
-                    f"[sm90 bf16 generate_c rank {rank} swap_ab={swap_ab}] "
-                    f"fc1_c matches the reference gate+up for {checked} "
-                    "local experts"
+                    f"[sm90 bf16 multirank oracle rank {rank} swap_ab={swap_ab} "
+                    f"{tag}] rel_l2={rel_l2.item():.4g} "
+                    f"max|d|={(yk - y_ref).abs().max().item():.4g} "
+                    f"amax(ref)={y_ref.abs().max().item():.4g}"
                 )
+                # Single-GPU oracle tolerances (drop mega_runner:
+                # atol=rtol=1e-2), valid because the problem is conditioned to
+                # O(1) outputs and kernel + reference share the same gathered
+                # bf16 operands.
+                torch.testing.assert_close(yk, y_ref, atol=1e-2, rtol=1e-2)
+                assert rel_l2.item() < 0.02
+                if generate_c:
+                    checked = _check_generate_c_output(
+                        symm_buffer.fc1_c,
+                        fc1_gateup_ref,
+                        idx_g,
+                        rank,
+                        problem["num_experts"] // world_size,
+                    )
+                    print(
+                        f"[sm90 bf16 generate_c rank {rank} swap_ab={swap_ab} "
+                        f"{tag}] fc1_c matches the reference gate+up for "
+                        f"{checked} local experts"
+                    )
+
+            launch_and_check(
+                problem["hidden_states"],
+                problem["topk_weights"],
+                problem["topk_ids"],
+                f"launch 0 ({problem['num_tokens']} tok)",
+            )
+            for i, count in enumerate(relaunch_token_counts, start=1):
+                assert 0 < count <= problem["max_tokens"], count
+                hs, tw, ti = _make_inputs(
+                    rank,
+                    world_size,
+                    num_tokens=count,
+                    hidden=hidden,
+                    num_experts=problem["num_experts"],
+                    topk=problem["topk"],
+                    seed=101 * i,
+                )
+                launch_and_check(hs, tw, ti, f"launch {i} ({count} tok)")
             return rank
         finally:
             # A failing rank must still free its symmetric-heap slice;
@@ -1106,3 +1189,29 @@ def test_moe_ep_sm90_pull_bf16_mega_multirank_generate_c(swap_ab):
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     _run_mega_torch_oracle(rank, world_size, swap_ab=swap_ab, generate_c=True)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_moe_ep_sm90_pull_bf16_mega_multirank_generate_c_shrinking_routing(swap_ab):
+    """generate_c pad-rows-zero contract ACROSS launches on one session.
+
+    Launch 64 tokens/rank, then re-stage the same session with 1 token/rank
+    (token 0 is forced onto one expert per rank, so every rank's local expert
+    0 drops from ~128 rows to 4 while the rest drop to 0), then 16.  Without
+    the per-launch ``fc1_c`` zero the rows that became padding keep the
+    previous launch's activations; each launch is checked against the torch
+    oracle including the pad rows and the tail past the last live segment.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    _run_mega_torch_oracle(
+        rank,
+        world_size,
+        swap_ab=swap_ab,
+        generate_c=True,
+        relaunch_token_counts=(1, 16),
+    )

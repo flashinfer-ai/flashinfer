@@ -39,9 +39,12 @@ if TYPE_CHECKING:
 
 _NAME = "sm90_bf16_bf16_bf16_pull_cutedsl"
 
-# Drop-harness shape contract (moe_hopper_bf16/run_mega_tests.sh): hidden a
-# multiple of the fc2 N tile.  Mirrors the shim config's check.
+# BF16 shape contract, mirroring the shim config's check: hidden a multiple of
+# the fc2 N tile (drop-harness contract, moe_hopper_bf16/run_mega_tests.sh);
+# intermediate a multiple of the bf16 TMA K atom (64 two-byte elements per
+# 128 B swizzle row).
 _HIDDEN_ALIGN = 256
+_INTERMEDIATE_ALIGN = 64
 
 
 def _resolve_gate_up_clamp(
@@ -110,9 +113,10 @@ class Sm90PullBf16MegaKernelBackend(MegaKernelBackend):
             bootstrap.world_size,
             intermediate_size=self._kernel_config.intermediate_size,
             top_k=self._kernel_config.top_k,
-            # hidden must be a multiple of the fc2 N tile (drop contract);
-            # the shim additionally requires intermediate % 64 == 0.
-            alignment=_HIDDEN_ALIGN,
+            # Two different bounds (same as the shim): intermediate only
+            # needs the 64-element TMA K atom, hidden the 256-wide fc2 N tile.
+            alignment=_INTERMEDIATE_ALIGN,
+            hidden_alignment=_HIDDEN_ALIGN,
         )
 
     def preprocess_weights(

@@ -418,6 +418,13 @@ class MegaMoEHopperBf16Frontend:
             # every launch (full raw buffer, so stale rows beyond a partial
             # num_tokens can't leak from an earlier, larger launch).
             inputs.output_activation.zero_()
+        if mega.fc1_c is not None:
+            # generate_c pad-rows-zero contract: the kernel writes only the
+            # live rows of each expert segment, so when an expert receives
+            # fewer tokens than on the previous launch the rows that became
+            # padding would keep stale activations.  Re-zero the pool before
+            # every launch.
+            mega.fc1_c.zero_()
         mega.compiled(**mega.launch_kwargs)
         if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
@@ -433,7 +440,8 @@ class MegaMoEHopperBf16Frontend:
 
         Steady-state fast path for timing loops and tuners; see the FP8
         frontend for the contract.  With ``in_kernel_fc2_reduce`` the thunk
-        is two stream-ordered nodes (output zero + launch).
+        is two stream-ordered nodes (output zero + launch); ``generate_c``
+        adds the per-launch ``fc1_c`` zero (pad-rows-zero contract).
         """
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
@@ -442,11 +450,17 @@ class MegaMoEHopperBf16Frontend:
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         compiled = mega.compiled
 
+        pre_zero: list[torch.Tensor] = []
         if self.config.in_kernel_fc2_reduce:
-            output_activation = inputs.output_activation
+            pre_zero.append(inputs.output_activation)
+        if mega.fc1_c is not None:
+            pre_zero.append(mega.fc1_c)
+
+        if pre_zero:
 
             def thunk() -> None:
-                output_activation.zero_()
+                for t in pre_zero:
+                    t.zero_()
                 compiled(**runtime_kwargs)
 
         else:
@@ -604,7 +618,9 @@ class MegaMoEHopperBf16Frontend:
         )
         if c.generate_c:
             # Expert-major pool rows (kernel.pool_token_capacity already counts
-            # the 128-row padding per local expert); zeroed so pad rows stay 0.
+            # the 128-row padding per local expert).  Allocated zeroed AND
+            # re-zeroed before every launch (run / make_launch_thunk): the
+            # kernel only writes live rows, so pad rows are zero by host fill.
             mega.fc1_c = torch.zeros(
                 (kernel.pool_token_capacity, c.fc1_out),
                 dtype=torch.bfloat16,
@@ -626,8 +642,10 @@ class MegaMoEHopperBf16Frontend:
 
         Same layout contract as ``MegaMoEHopperFp8Frontend.fc1_c``:
         ``(pool_rows, 2 * intermediate)`` BF16, expert-major 128-row-aligned
-        segments in dispatch arrival order, pad rows zero.  None unless
-        ``config.generate_c``; valid until the next launch.
+        segments in dispatch arrival order, pad rows zero (the pool is
+        re-zeroed before every launch, so the contract holds across launches
+        with shrinking per-expert counts).  None unless ``config.generate_c``;
+        valid until the next launch.
         """
         return None if self._mega is None else self._mega.fc1_c
 
@@ -1242,8 +1260,11 @@ def hopper_bf16_mega_moe(
         raise ValueError(
             f"num_tokens must be in [0, {symm_buffer.num_max_tokens}], got {n}."
         )
-    if n == 0 and symm_buffer._frontend.config.in_kernel_fc2_reduce:
-        return symm_buffer.output_activation[:0] if y is None else None
+    # NOTE: n == 0 is NOT an early return.  The launch is a collective: a rank
+    # with no local tokens still serves its experts to the other ranks' pulls
+    # and must reach every cross-rank barrier, so it launches the full padded
+    # buffer (all topk_idx == -1) like any other rank.  Skipping the launch on
+    # the empty rank hangs the peers (observed with in_kernel_fc2_reduce).
     if y is not None:
         if y.shape != (n, symm_buffer.hidden):
             raise ValueError(

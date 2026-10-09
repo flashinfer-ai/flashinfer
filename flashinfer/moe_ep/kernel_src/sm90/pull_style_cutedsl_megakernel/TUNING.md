@@ -632,6 +632,17 @@ What differs from FP8:
 - **Knob cache** is the FP8 tree's `shim/knob_cache.py`; BF16 entries are
   keyed with `dtype="bf16"` and `fp8_scale_mode="none"`, so they never
   collide with FP8 or SM100 entries.
+- **Host-side launch contracts** (review fixes, 2026-10-09): an empty rank
+  (0 local tokens) still launches the collective kernel with every
+  `topk_idx == -1` — it serves its experts to the peers' pulls and must
+  reach every cross-rank barrier (the former `num_tokens == 0` early return
+  under `in_kernel_fc2_reduce` hung the non-empty ranks).  With
+  `generate_c` the shim zeroes `fc1_c` before every launch (`run` and the
+  launch thunk), since the kernel writes only live rows and an expert whose
+  count shrinks between launches would otherwise leave stale activations in
+  its pad rows.  The backend checks the two shape bounds separately
+  (hidden % 256, intermediate % 64); intermediate = 64 / 128 / 192 are
+  valid and covered by the single-GPU oracle.
 
 Bench (BF16 twin of the FP8 harness; heuristic launch configs, tokens
 8..32768, drop perf data recipe `--perf-data uniform` = dense positive
