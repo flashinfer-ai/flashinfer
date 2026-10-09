@@ -732,8 +732,7 @@ def mm_bf16(
         persistent kernel (no bias; N and K nonzero multiples of 8; A, B and
         ``out`` 16-byte aligned), else cuBLASLt, which ignores ``pdl``.
         It is never auto-selected; serving frameworks must select it
-        explicitly. Without autotuning, M > 32 runs the persistent kernel's
-        default tactic where it applies; below, the
+        explicitly. Without autotuning, M > 32 runs cuBLASLt; below, the
         direct kernel runs where its shape heuristic applies, otherwise the
         warp Split-K kernel whenever it is eligible (N % 16 == 0, K % 128 == 0
         with at most 64 K tiles; requires CuTe DSL >= 4.7), and
@@ -2589,7 +2588,9 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[_CuteDSLBf16Runne
     the cuBLASLt fallback serves the rest. Runtime-supported runners come
     first so ``[0]`` is a valid no-autotune default. Within that group, prefer
     direct where its shape heuristic applies, then warp, then cluster Split-K,
-    then persistent ahead of cuBLASLt.
+    then cuBLASLt ahead of persistent: untuned, the persistent default tactic
+    is slower than cuBLASLt's heuristic on B200, so it only runs when
+    autotuning selects it.
     """
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
     from .kernels.dense_bf16_gemm_direct import prefer_direct_bf16_gemm_sm100
@@ -2619,7 +2620,7 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[_CuteDSLBf16Runne
         else (warp_splitk, cluster_splitk, direct)
     )
     return sorted(
-        (runner for runner in (*kernels, persistent, fallback) if runner is not None),
+        (runner for runner in (*kernels, fallback, persistent) if runner is not None),
         key=lambda runner: not runner.supports_inputs(inputs),
     )
 

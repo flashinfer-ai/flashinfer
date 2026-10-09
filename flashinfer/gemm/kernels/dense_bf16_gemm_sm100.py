@@ -16,8 +16,8 @@ import torch
 from .bmm_fp8_blackwell import PersistentDenseGemmKernel
 from .bmm_fp8_wrapper import _compile_and_create_tensor_api, _create_fake_tensors
 
-# (use_2cta_instrs, tile_m, tile_n, cluster_m, cluster_n); index 0 is the
-# untuned default.
+# (use_2cta_instrs, tile_m, tile_n, cluster_m, cluster_n); index 0 serves
+# tactic -1.
 TACTICS = (
     (False, 128, 128, 1, 1),
     (False, 64, 128, 1, 1),

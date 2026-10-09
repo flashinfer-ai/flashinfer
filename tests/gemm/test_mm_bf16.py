@@ -40,8 +40,8 @@ _SMOKE_CASES = [
     (8, 768, 8320, torch.bfloat16, False, False, "cute-dsl", False),
     (33, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
     (64, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
-    # Persistent kernel (M > 32, no bias): default tactic with PDL and M / N
-    # tails, then every tactic under autotuning.
+    # M > 32: cuBLASLt untuned, then the persistent kernel's tactics compete
+    # under autotuning.
     (333, 1000, 520, torch.bfloat16, False, True, "cute-dsl", False),
     (1024, 4096, 2048, torch.bfloat16, False, False, "cute-dsl", True),
     (64, 4096, 2048, torch.bfloat16, False, False, "auto", True),
@@ -280,8 +280,9 @@ def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
     assert cos_sim > 0.99
 
 
-def test_mm_bf16_cute_dsl_large_m_runner():
-    """M > 32 runs the persistent kernel; bias falls back to cuBLASLt."""
+@pytest.mark.parametrize("pdl", [False, True])
+def test_mm_bf16_cute_dsl_large_m_runner(pdl: bool):
+    """M > 32 defaults to cuBLASLt; the persistent kernel is bias-free only."""
     if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("CuTeDSL backend requires SM100/SM103/SM107.")
 
@@ -292,13 +293,23 @@ def test_mm_bf16_cute_dsl_large_m_runner():
 
     from flashinfer.gemm.gemm_base import _cute_dsl_bf16_runners
 
-    a = torch.randn((256, 1024), device="cuda", dtype=torch.bfloat16)
-    b = torch.randn((1024, 1024), device="cuda", dtype=torch.bfloat16)
-    out = torch.empty((256, 1024), device="cuda", dtype=torch.bfloat16)
-    bias = torch.zeros(1024, device="cuda", dtype=torch.bfloat16)
-    for bias_arg, name in ((None, "Persistent"), (bias, "CublasltFallback")):
-        runner = _cute_dsl_bf16_runners([a, b.T, bias_arg, False, out, None])[0]
-        assert type(runner).__name__ == f"CuteDSL{name}Bf16Runner"
+    # M / N tails.
+    a = torch.randn((333, 520), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((1000, 520), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty((333, 1000), device="cuda", dtype=torch.bfloat16)
+    bias = torch.zeros(1000, device="cuda", dtype=torch.bfloat16)
+    inputs = [a, b.T, None, pdl, out, None]
+    runners = _cute_dsl_bf16_runners(inputs)
+    assert type(runners[0]).__name__ == "CuteDSLCublasltFallbackBf16Runner"
+    persistent = runners[1]
+    assert type(persistent).__name__ == "CuteDSLPersistentBf16Runner"
+    assert persistent.supports_inputs(inputs)
+    assert not persistent.supports_inputs([a, b.T, bias, pdl, out, None])
+
+    persistent(inputs=inputs, tactic=-1)
+    torch.testing.assert_close(
+        out, (a.float() @ b.float().T).to(out.dtype), rtol=2e-2, atol=5e-2
+    )
 
 
 if __name__ == "__main__":
