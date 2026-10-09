@@ -199,9 +199,11 @@ def arch_for(device: Optional[torch.device] = None) -> Optional[str]:
     """Architecture tag of ``device`` (``None`` when unsupported or without CUDA)."""
     if not torch.cuda.is_available():
         return None
-    if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    return SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
+    if device is not None and torch.device(device).type != "cuda":
+        # the refusal torch.cuda.get_device_capability raised here before the facts were memoised
+        raise ValueError(f"Expected a cuda device, but got: {device}")
+    capability, _ = _device_facts(_device_index(device))
+    return SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
 
 
 def default_softmax_scale() -> float:
@@ -466,7 +468,7 @@ def _check_output(
 # Program selection and workspace bound
 # ---------------------------------------------------------------------------
 
-_SM_COUNTS: dict[int, int] = {}
+_DEVICE_FACTS: dict[int, tuple[tuple[int, int], int]] = {}
 
 
 def _outputs_aligned(tensors: Iterable[Optional[torch.Tensor]], align: int) -> bool:
@@ -485,14 +487,22 @@ def _device_index(device: Optional[torch.device]) -> int:
     )
 
 
-def _num_sms(device: Optional[torch.device]) -> int:
-    index = _device_index(device)
-    count = _SM_COUNTS.get(index)
-    if count is None:
-        count = _SM_COUNTS[index] = int(
-            torch.cuda.get_device_properties(index).multi_processor_count
+def _device_facts(index: int) -> tuple[tuple[int, int], int]:
+    """``((major, minor), multi_processor_count)`` of ``cuda:index``: immutable for the life of the process, so queried
+    once per device index; the index itself (``None`` / an index-less device = torch's current device) is resolved on
+    every call by ``_device_index``."""
+    facts = _DEVICE_FACTS.get(index)
+    if facts is None:
+        properties = torch.cuda.get_device_properties(index)
+        facts = _DEVICE_FACTS[index] = (
+            (int(properties.major), int(properties.minor)),
+            int(properties.multi_processor_count),
         )
-    return count
+    return facts
+
+
+def _num_sms(device: Optional[torch.device]) -> int:
+    return _device_facts(_device_index(device))[1]
 
 
 def plan_dsa_indexer_topk(

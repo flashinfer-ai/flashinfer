@@ -69,7 +69,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--heads", nargs="+", type=int, default=[32, 64])
     parser.add_argument("--page-kv", nargs="+", type=int, default=[128, 64])
-    parser.add_argument("--next-n", nargs="+", type=int, default=[1, 2, 4])
+    parser.add_argument("--next-n", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6])
     parser.add_argument("--batch", nargs="+", type=int, default=[8, 64])
     parser.add_argument("--context", nargs="+", type=int, default=[4096, 16384])
     parser.add_argument("--repeat-ms", type=int, default=200)

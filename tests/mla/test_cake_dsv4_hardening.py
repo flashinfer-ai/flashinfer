@@ -237,6 +237,27 @@ def _rows(out: torch.Tensor, inputs: _Inputs) -> torch.Tensor:
     return out.reshape(-1, inputs.p.h_q, inputs.p.d_v)
 
 
+def _allocation_requests() -> int:
+    """Cumulative number of caching-allocator requests on the current device.
+
+    The no-allocation checks compare this monotonic counter rather than
+    ``torch.cuda.memory_allocated()``: the live-bytes figure also moves when an
+    unrelated tensor is released inside the measured window (a cyclic-garbage
+    collection pass can free an earlier case's inputs during the call), which
+    is not an allocation by the call under test and made the equality fail with
+    *fewer* bytes live after the call (flashinfer-ai/flashinfer#6236).
+
+    Only the native caching allocator maintains the counter; under
+    ``PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync`` it stays at zero and the
+    checks would pass vacuously, so they skip there.
+    """
+    if torch.cuda.get_allocator_backend() != "native":
+        pytest.skip(
+            "the no-allocation checks read a native caching-allocator statistic"
+        )
+    return int(torch.cuda.memory_stats()["allocation.all.allocated"])
+
+
 _CASES = [
     pytest.param(
         h, dtype, s_q, id=f"h{h}-{'bf16' if dtype == torch.bfloat16 else 'fp8'}-q{s_q}"
@@ -398,10 +419,10 @@ def test_descriptor_storage_reassignment_matches_reference(
     torch.cuda.synchronize()
     for i in inputs + inputs[::-1]:
         out = _out_like(i)
-        allocated = torch.cuda.memory_allocated()
+        requests = _allocation_requests()
         i.run(out=out, workspace=workspace)
         torch.cuda.synchronize()
-        assert torch.cuda.memory_allocated() == allocated, "descriptor pool grew"
+        assert _allocation_requests() == requests, "descriptor pool grew"
         _assert_close(_rows(out, i), i.reference_rows(), dtype)
 
 
@@ -476,10 +497,10 @@ def test_cuda_graph_replay_matches_eager(h_q, dtype, s_q):
     static.run(out=out, workspace=workspace)
     static.run(out=out, workspace=workspace)
     torch.cuda.synchronize()
-    baseline_allocated = torch.cuda.memory_allocated()
+    baseline_requests = _allocation_requests()
     static.run(out=out, workspace=workspace)
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == baseline_allocated, "eager call allocated"
+    assert _allocation_requests() == baseline_requests, "eager call allocated"
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -495,11 +516,11 @@ def test_cuda_graph_replay_matches_eager(h_q, dtype, s_q):
     assert mutated.query.shape == static.query.shape
     static.copy_from(mutated)
     torch.cuda.synchronize()
-    replay_allocated = torch.cuda.memory_allocated()
+    replay_requests = _allocation_requests()
     for _ in range(3):
         graph.replay()
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == replay_allocated, "graph replay allocated"
+    assert _allocation_requests() == replay_requests, "graph replay allocated"
 
     eager_out = _out_like(static, fill=0.0)
     static.run(out=eager_out, workspace=_workspace(static))
@@ -1592,21 +1613,21 @@ def test_row_tiled_launches_match_the_single_launch(monkeypatch, layout):
     out = case.nan_out()
     case.run(workspace=small, out=out)
     torch.cuda.synchronize()
-    allocated = torch.cuda.memory_allocated()
+    requests = _allocation_requests()
     case.run(workspace=small, out=out)
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == allocated, "tiled call allocated"
+    assert _allocation_requests() == requests, "tiled call allocated"
     # Capture + replay: the per-chunk offset writes and launches are recorded.
     graph = torch.cuda.CUDAGraph()
     out.fill_(0.0)
     with torch.cuda.graph(graph):
         case.run(workspace=small, out=out)
     torch.cuda.synchronize()
-    replay_allocated = torch.cuda.memory_allocated()
+    replay_requests = _allocation_requests()
     graph.replay()
     graph.replay()
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == replay_allocated, "graph replay allocated"
+    assert _allocation_requests() == replay_requests, "graph replay allocated"
     _assert_valid(out.reshape(-1, 32, 512), case, expected)
 
 
@@ -1674,13 +1695,13 @@ def test_counters_are_zeroed_inside_capture_without_priming():
     torch.cuda.synchronize()
     assert not cake._counters_primed(workspace, raw)
     assert torch.all(raw[1024 : 1024 + 12 * 4 * 4] == 0xFF), "capture executed nothing"
-    allocated = torch.cuda.memory_allocated()
     for _ in range(3):
         out.fill_(float("nan"))
+        requests = _allocation_requests()
         graph.replay()
         torch.cuda.synchronize()
+        assert _allocation_requests() == requests, "graph replay allocated"
         _assert_valid(out.reshape(-1, 32, 512), case, expected)
-    assert torch.cuda.memory_allocated() == allocated, "graph replay allocated"
     assert torch.all(raw[1024 : 1024 + 12 * 4 * 4].view(torch.uint32) == 0)
     # Eager first use through the still-unregistered workspace primes it.
     workspace.fill_(0xFF)
