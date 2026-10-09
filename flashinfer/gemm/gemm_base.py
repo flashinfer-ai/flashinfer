@@ -465,19 +465,17 @@ def _cute_dsl_mm_bf16_requirement(
     ] = "cudnn",
 ):
     if out_dtype != torch.bfloat16:
-        raise ValueError("The CuTeDSL low-M backend requires bfloat16 output.")
+        raise ValueError("The CuTeDSL backend requires bfloat16 output.")
     if out is not None and out.dtype != torch.bfloat16:
-        raise ValueError("The CuTeDSL low-M backend requires a bfloat16 out tensor.")
+        raise ValueError("The CuTeDSL backend requires a bfloat16 out tensor.")
     if not is_sm100a_supported(a.device):
-        raise ValueError(
-            "The CuTeDSL low-M backend requires SM100/SM103 with CUDA 12.8+."
-        )
+        raise ValueError("The CuTeDSL backend requires SM100/SM103 with CUDA 12.8+.")
     if a.ndim != 2 or b.ndim != 2:
-        raise ValueError("The CuTeDSL low-M backend requires 2D inputs.")
+        raise ValueError("The CuTeDSL backend requires 2D inputs.")
     if not a.is_contiguous():
-        raise ValueError("The CuTeDSL low-M backend requires row-major A.")
+        raise ValueError("The CuTeDSL backend requires row-major A.")
     if not b.T.is_contiguous():
-        raise ValueError("The CuTeDSL low-M backend requires column-major B.")
+        raise ValueError("The CuTeDSL backend requires column-major B.")
     if b.shape[0] != a.shape[1]:
         raise ValueError(
             f"Incompatible shapes: A is {tuple(a.shape)}, B is {tuple(b.shape)}."
@@ -485,7 +483,7 @@ def _cute_dsl_mm_bf16_requirement(
     if b.device != a.device:
         raise ValueError("A and B must be on the same CUDA device.")
     if out is not None and not out.is_contiguous():
-        raise ValueError("The CuTeDSL low-M backend requires row-major output.")
+        raise ValueError("The CuTeDSL backend requires row-major output.")
     if bias is not None and (
         bias.device != a.device
         or bias.shape != (b.shape[1],)
@@ -497,7 +495,7 @@ def _cute_dsl_mm_bf16_requirement(
     from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
     if not is_cute_dsl_available():
-        raise LibraryError("The CuTeDSL low-M backend requires nvidia-cutlass-dsl.")
+        raise LibraryError("The CuTeDSL backend requires nvidia-cutlass-dsl.")
 
     if a.shape[0] > _CUTE_DSL_BF16_MAX_M:
         from .kernels.dense_bf16_gemm_sm100 import supports
@@ -731,7 +729,8 @@ def mm_bf16(
             ``bias`` / ``pdl``. Requires SM >= 90.
         ``"cute-dsl"`` uses standalone Blackwell low-M kernels for M <= 32
         (direct, cluster Split-K and warp Split-K) and, above that, a
-        persistent kernel (no bias; N and K multiples of 8), else cuBLASLt.
+        persistent kernel (no bias; N and K nonzero multiples of 8; A, B and
+        ``out`` 16-byte aligned), else cuBLASLt, which ignores ``pdl``.
         It is never auto-selected; serving frameworks must select it
         explicitly. Without autotuning, M > 32 runs the persistent kernel's
         default tactic where it applies; below, the
@@ -829,8 +828,9 @@ def mm_bf16(
             ["tinygemm"], a, b, bias, pdl, out, out_dtype, backend
         )
     elif backend == "cute-dsl":
-        # One runner set covers both M ranges (cuBLASLt above 32, ignoring
-        # pdl), so one autotune call profiles both; see _cute_dsl_bf16_runners.
+        # One runner set covers both M ranges (persistent kernel or cuBLASLt
+        # above 32), so one autotune call profiles both; see
+        # _cute_dsl_bf16_runners.
         backends = ["cute-dsl"]
     else:
         backends = [backend]
@@ -2253,8 +2253,9 @@ class _CuteDSLBf16Runner(TunableRunner):
     ``_cute_dsl_bf16_runners`` lists every runner of the backend so that one
     autotune call profiles each of them on the buckets it owns; a runner
     returns no tactics for a profile whose M it does not serve. The defaults
-    here describe the CuTe-DSL kernels (M <= ``_CUTE_DSL_BF16_MAX_M``, one
-    cache-key layout); the cuBLASLt fallback overrides them. After autotuner
+    here describe the low-M CuTe-DSL kernels (M <= ``_CUTE_DSL_BF16_MAX_M``,
+    one cache-key layout); the persistent and cuBLASLt runners override them
+    for M > ``_CUTE_DSL_BF16_MAX_M``. After autotuner
     selection, ``supports_inputs`` and ``is_tactic_compatible`` are re-checked
     against the real inputs because a cached entry can come from a bucket on
     the other side of ``_CUTE_DSL_BF16_MAX_M`` or from another M.
@@ -2496,7 +2497,12 @@ def _cute_dsl_direct_bf16_gemm_runner(
 
 @functools.cache
 def _cute_dsl_persistent_bf16_gemm_runner(compute_capability: int):
-    from .kernels.dense_bf16_gemm_sm100 import TACTICS, run_persistent_dense, supports
+    from .kernels.dense_bf16_gemm_sm100 import (
+        TACTICS,
+        prepare_persistent_dense,
+        run_persistent_dense,
+        supports,
+    )
 
     class CuteDSLPersistentBf16Runner(_CuteDSLBf16Runner):
         """Persistent tensor-core GEMM for M > _CUTE_DSL_BF16_MAX_M without bias."""
@@ -2525,9 +2531,11 @@ def _cute_dsl_persistent_bf16_gemm_runner(compute_capability: int):
             **kwargs,
         ) -> torch.Tensor:
             a, b, _, pdl, out, *_ = inputs
-            return run_persistent_dense(
-                a, b, out, pdl, TACTICS[0] if tactic == -1 else tactic
-            )
+            tactic = TACTICS[0] if tactic == -1 else tactic
+            if do_preparation:
+                prepare_persistent_dense(a, pdl, tactic)
+                return out
+            return run_persistent_dense(a, b, out, pdl, tactic)
 
     return CuteDSLPersistentBf16Runner(compute_capability)
 

@@ -33,18 +33,31 @@ TACTICS = (
 
 
 def supports(a, b, bias, out) -> bool:
-    """Every tactic applies: the TMA store clips M/N tails, leaving 16-byte alignment."""
+    """Every tactic applies: the TMA store clips M/N tails, leaving 16-byte alignment.
+
+    K must be nonzero: with no K tiles the MMA warp never writes the accumulator.
+    """
     return (
         bias is None
+        and a.shape[1] > 0
         and a.shape[1] % 8 == 0
         and b.shape[1] % 8 == 0
         and all(t.data_ptr() % 16 == 0 for t in (a, b, out) if t is not None)
     )
 
 
-@functools.cache
+_unit_scales: dict = {}
+
+
 def _unit_scale(device_index: int) -> torch.Tensor:
-    return torch.ones(1, dtype=torch.float32, device=f"cuda:{device_index}")
+    scale = _unit_scales.get(device_index)
+    if scale is None:
+        scale = torch.ones(1, dtype=torch.float32, device=f"cuda:{device_index}")
+        # Under stream capture the fill only runs on replay and the memory
+        # belongs to the graph pool, so the tensor must not outlive this call.
+        if not torch.cuda.is_current_stream_capturing():
+            _unit_scales[device_index] = scale
+    return scale
 
 
 @functools.cache
@@ -64,6 +77,14 @@ def _get_compiled_kernel(device_index: int, tactic: tuple, use_pdl: bool):
             *_create_fake_tensors(cutlass.BFloat16, cutlass.BFloat16, "k", "k", "n"),
             (cluster_m, cluster_n),
         )
+
+
+def prepare_persistent_dense(a, pdl: bool, tactic: tuple = TACTICS[0]) -> None:
+    """Compile ``tactic`` and create the output scale without launching."""
+    device_index = a.get_device()
+    _get_compiled_kernel(device_index, tuple(tactic), bool(pdl))
+    with torch.cuda.device(device_index):
+        _unit_scale(device_index)
 
 
 def run_persistent_dense(a, b, out, pdl: bool, tactic: tuple = TACTICS[0]):

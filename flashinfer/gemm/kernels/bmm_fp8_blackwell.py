@@ -650,6 +650,12 @@ class PersistentDenseGemmKernel:
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
+            # PDL: every load is issued, so the dependent grid's prologue can
+            # overlap the remaining MMA and epilogue; its griddepcontrol_wait
+            # still waits for this grid to finish.
+            if cutlass.const_expr(self.use_pdl):
+                griddepcontrol_launch_dependents()
+
             ab_producer.tail()
 
         # Specialized MMA warp
@@ -767,9 +773,6 @@ class PersistentDenseGemmKernel:
 
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
-
-        if cutlass.const_expr(self.use_pdl):
-            griddepcontrol_launch_dependents()
 
     @staticmethod
     def _compute_grid(
