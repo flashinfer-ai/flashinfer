@@ -688,8 +688,9 @@ def gen_all_modules(
     if has_sm103a_exact:
         jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm103a"))
     # ... and the specialized kernel (auto's pick for 12 local heads), one
-    # module for every Blackwell target.
-    if has_sm100 or has_sm103 or has_sm107 or has_sm110 or has_sm120 or has_sm121:
+    # module, pre-built for the same exact Blackwell targets as the Cake
+    # programs (other targets JIT it on first use).
+    if has_sm100a_exact or has_sm103a_exact:
         jit_specs.append(gen_mla_kv_pack_fp8_module())
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
