@@ -1,14 +1,14 @@
 # MiniMax M3 paged index selection
 
 This API replaces index scoring, partial top-k, and top-k merge. It excludes
-attention-output merging. The vLLM consumer must resolve all three public APIs:
-minimax_m3_index_decode, minimax_m3_index_decode_supported, and
-minimax_m3_index_decode_warmup. Older libraries and unsupported calls retain
+attention-output merging. The vLLM consumer must resolve all three public APIs from flashinfer.msa_ops:
+msa_index_decode, msa_index_decode_supported, and
+msa_index_decode_warmup. Older libraries and unsupported calls retain
 the framework stock implementation.
 
 ## Dispatch contract
 
-The JSON allowlist is flashinfer/minimax_m3_workloads.json: Hopper SM90,
+The JSON allowlist is flashinfer/msa_ops/msa_index_decode_workloads.json: Hopper SM90,
 B8/B16 single-token decode, one BF16 head of width 128, 128-token pages,
 128-column int32 table, int32 lengths/output, topk16/init0/local1, and host bound
 through 16384. Input/output inner strides must be one, lengths contiguous,
@@ -26,7 +26,7 @@ mode change.
 ## Compilation and graph readiness
 
 There are four kernel definitions: one dynamic-batch CUDA kernel and three Triton
-kernels. The CUDA JIT key is minimax_m3_index_decode_sm90, with SM90a and
+kernels. The CUDA JIT key is msa_index_decode_sm90, with SM90a and
 --fmad=false; the process module cache is keyed by device. Triton compiles stock
 and device-gated variants. Readiness keys include device, B, Q/cache/table/output
 strides, pointer alignment modulo16, and host bound. Thus four definitions are NOT
@@ -36,7 +36,7 @@ additional Triton signatures.
 The public warmup runs before capture on the actual layout and prepares both stock
 and gated variants at bound16384, plus the current larger bound where needed.
 Capture does not query device properties or compile. Cold/unready callers retain
-stock. Introspection _minimax_m3_index_decode_stats reports CUDA module count,
+stock. Introspection _msa_index_decode_stats reports CUDA module count,
 four definitions, chain signatures, dispatch counts, and precompile errors.
 
 ## Evidence scope
@@ -54,7 +54,7 @@ answers on both sides. See the PR description for the protocol, finite accuracy
 scope, and original first-trial tail regression that follow-ups did not reproduce.
 
 Subsequent commits update test registration, package-data metadata, and
-documentation. Review fixes add a query-device guard to the stock fallback and
+documentation, and relocate the helper into flashinfer.msa_ops. Review fixes add a query-device guard to the stock fallback and
 an order-insensitive trace checker with regression tests. Kernel algorithms and
 the optimized dispatch path are unchanged; no additional model measurement is
 claimed for these descendants.

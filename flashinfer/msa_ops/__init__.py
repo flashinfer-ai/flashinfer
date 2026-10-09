@@ -2,6 +2,7 @@
 
 Sparse prefill, sparse decode, and top-k selection support SM100, SM103, SM120,
 and SM121 Blackwell GPUs. Proxy scoring remains SM120/SM121-only.
+Combined decode index selection has a specialized SM90 path.
 """
 
 import torch
@@ -15,6 +16,11 @@ from ._nvfp4_decode_sm100 import (
 from ._nvfp4_prefill_sm100 import (
     msa_prefill_nvfp4_specialized_stats,
     warm as msa_prefill_nvfp4_specialized_warmup,
+)
+from .index_decode import (
+    msa_index_decode,
+    msa_index_decode_supported,
+    msa_index_decode_warmup,
 )
 from .proxy_score import (
     msa_proxy_score,
@@ -48,6 +54,9 @@ __all__ = [
     "msa_decode_nvfp4_specialized_warmup",
     "msa_prefill_nvfp4_specialized_stats",
     "msa_prefill_nvfp4_specialized_warmup",
+    "msa_index_decode",
+    "msa_index_decode_supported",
+    "msa_index_decode_warmup",
     "msa_proxy_score",
     "msa_proxy_score_fp4",
     "msa_sparse_attention",

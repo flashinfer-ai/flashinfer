@@ -283,28 +283,3 @@ PageAttention for MLA
     :members:
 
     .. automethod:: __init__
-
-
-MiniMax M3 Index Selection
-=========================
-
-.. currentmodule:: flashinfer.minimax_m3
-
-These APIs select logical cache blocks for MiniMax M3 decode. A framework
-integration on the vLLM side is required. The Hopper specialization supports
-batch 8/16, one BF16 head of width 128, page/table width 128, top-16 selection,
-and single-token decode with a host context bound up to 16384. Other signatures
-use the stock Triton path.
-
-Call ``minimax_m3_index_decode_supported(...)`` before choosing this integration
-and ``minimax_m3_index_decode_warmup(...)`` on the actual input/output layouts
-before CUDA-graph capture. Both helpers accept the decode API's arguments;
-the support probe returns a boolean and warmup returns the selected indices. Set
-``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` to force the stock path; autotuning
-also disables specialization. Selected indices may be reordered within their
-valid prefix, but the selected multiset and trailing ``-1`` padding are preserved.
-
-.. autosummary::
-    :toctree: ../generated
-
-    minimax_m3_index_decode

@@ -454,7 +454,7 @@ def _topk_index_merge_kernel(
 
 
 @torch.no_grad()
-def minimax_m3_index_decode_score(
+def msa_index_decode_score(
     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
     index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
     block_table: torch.Tensor,  # [num_reqs, max_blocks]
@@ -554,7 +554,7 @@ def minimax_m3_index_decode_score(
 
 
 @torch.no_grad()
-def minimax_m3_index_decode(
+def msa_index_decode(
     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
     index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
     block_table: torch.Tensor,  # [num_reqs, max_blocks]
@@ -587,7 +587,7 @@ def minimax_m3_index_decode(
     pdl_kwargs: dict[str, bool | int] = {}
     if use_pdl:
         pdl_kwargs.update({"launch_pdl": True})
-    score = minimax_m3_index_decode_score(
+    score = msa_index_decode_score(
         idx_q,
         index_kv_cache,
         block_table,

@@ -7,22 +7,22 @@ from pathlib import Path
 import pytest
 import torch
 
-from flashinfer.trace.templates.minimax_m3 import minimax_m3_index_decode_trace
+from flashinfer.trace.templates.msa import msa_index_decode_trace
 
 
 @pytest.fixture(params=["template", "exported"])
 def check(request):
     """Exercise the live checker and its standalone serialized form."""
     if request.param == "template":
-        return minimax_m3_index_decode_trace.check
+        return msa_index_decode_trace.check
     path = (
         Path(__file__).parent
         / "fi_trace_out"
-        / ("minimax_m3_index_decode_h1_d128_ps128_bt128_kv1_k16.json")
+        / ("msa_index_decode_h1_d128_ps128_bt128_kv1_k16.json")
     )
     namespace = {}
     exec(json.loads(path.read_text())["check"], namespace)
-    return namespace["_minimax_m3_index_decode_check"]
+    return namespace["_msa_index_decode_check"]
 
 
 @pytest.mark.parametrize("wrapper", ["tensor", "list", "tuple", "dict"])

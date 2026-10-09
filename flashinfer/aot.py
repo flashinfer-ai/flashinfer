@@ -34,7 +34,7 @@ from .compilation_context import CompilationContext
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit.activation import act_func_def_str, gen_act_and_mul_module
-from .jit.minimax_m3 import gen_minimax_m3_index_decode_module
+from .jit.msa_index_decode import gen_msa_index_decode_module
 from .jit.attention import (
     gen_batch_decode_module,
     gen_batch_mla_module,
@@ -860,7 +860,7 @@ def gen_all_modules(
             jit_specs.extend(gen_cake_selective_state_update_modules("sm_103a"))
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
-            jit_specs.append(gen_minimax_m3_index_decode_module())
+            jit_specs.append(gen_msa_index_decode_module())
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())

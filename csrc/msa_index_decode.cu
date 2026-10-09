@@ -18,8 +18,8 @@ __global__ void index_decode_kernel(const int32_t* lengths, int32_t* output, int
 }
 }  // namespace
 
-void minimax_m3_index_decode(TensorView q, TensorView cache, TensorView table, TensorView lengths,
-                             TensorView out, int64_t max_seq_len) {
+void msa_index_decode(TensorView q, TensorView cache, TensorView table, TensorView lengths,
+                      TensorView out, int64_t max_seq_len) {
   CHECK_CUDA(q);
   CHECK_CUDA(cache);
   CHECK_CUDA(table);
@@ -63,4 +63,4 @@ void minimax_m3_index_decode(TensorView q, TensorView cache, TensorView table, T
   auto status = cudaGetLastError();
   TVM_FFI_ICHECK(status == cudaSuccess) << cudaGetErrorString(status);
 }
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(minimax_m3_index_decode, minimax_m3_index_decode);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(msa_index_decode, msa_index_decode);

@@ -442,9 +442,3 @@ from .kda_prefill import KDAPrefillPlanCache as KDAPrefillPlanCache
 from .kda_prefill import (
     kda_prefill_supports_fp32_checkpoints as kda_prefill_supports_fp32_checkpoints,
 )
-
-from .minimax_m3 import (
-    minimax_m3_index_decode,
-    minimax_m3_index_decode_supported,
-    minimax_m3_index_decode_warmup,
-)

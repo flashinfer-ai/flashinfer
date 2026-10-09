@@ -7,12 +7,12 @@ import os
 from importlib import resources
 from typing import Any
 import torch
-from .autotuner import AutoTuner
-from .api_logging import flashinfer_api
-from .trace.templates.minimax_m3 import minimax_m3_index_decode_trace
-from .jit.minimax_m3 import gen_minimax_m3_index_decode_module
+from ..autotuner import AutoTuner
+from ..api_logging import flashinfer_api
+from ..trace.templates.msa import msa_index_decode_trace
+from ..jit.msa_index_decode import gen_msa_index_decode_module
 
-from .jit.core import logger as _LOG
+from ..jit.core import logger as _LOG
 
 _MODULES: dict[int, Any] = {}
 _ERRORS: dict[int, str] = {}
@@ -30,11 +30,13 @@ _COUNTS = {
 def _allowlist():
     """Load the packaged geometry limits once per process."""
     return json.loads(
-        resources.files("flashinfer").joinpath("minimax_m3_workloads.json").read_text()
+        resources.files("flashinfer.msa_ops")
+        .joinpath("msa_index_decode_workloads.json")
+        .read_text()
     )
 
 
-def _minimax_m3_index_decode_stats():
+def _msa_index_decode_stats():
     """Return dispatch counts and per-device preparation diagnostics."""
     return dict(
         _COUNTS,
@@ -109,7 +111,7 @@ def _supports_geometry(
     )
 
 
-def minimax_m3_index_decode_supported(
+def msa_index_decode_supported(
     idx_q,
     index_kv_cache,
     block_table,
@@ -155,7 +157,7 @@ def minimax_m3_index_decode_supported(
         return torch.cuda.get_device_capability(device) == (9, 0)
 
 
-def minimax_m3_index_decode_warmup(*args, **kwargs):
+def msa_index_decode_warmup(*args, **kwargs):
     """Prepare the current layouts before graph capture and return their result.
 
     Call this on the same input and output layouts as subsequent graph calls.
@@ -166,11 +168,11 @@ def minimax_m3_index_decode_warmup(*args, **kwargs):
     with torch.cuda.device(idx_q.device):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("MiniMax indexer warmup must run before CUDA capture")
-        return minimax_m3_index_decode(*args, **kwargs)
+        return msa_index_decode(*args, **kwargs)
 
 
-@flashinfer_api(trace=minimax_m3_index_decode_trace)
-def minimax_m3_index_decode(
+@flashinfer_api(trace=msa_index_decode_trace)
+def msa_index_decode(
     idx_q,
     index_kv_cache,
     block_table,
@@ -242,7 +244,7 @@ def minimax_m3_index_decode(
     Notes
     -----
     All tensors must be on the query's CUDA device. Call
-    minimax_m3_index_decode_warmup on the actual layouts before graph
+    msa_index_decode_warmup on the actual layouts before graph
     capture to prepare the specialized kernels.
     """
     b = idx_q.shape[0]
@@ -279,13 +281,13 @@ def minimax_m3_index_decode(
                         supported = False
                     else:
                         _MODULES[device] = (
-                            gen_minimax_m3_index_decode_module().build_and_load()
+                            gen_msa_index_decode_module().build_and_load()
                         )
             except (ImportError, OSError, RuntimeError) as exc:
                 _ERRORS[device] = str(exc)
                 _LOG.warning("MiniMax M3 indexer compilation failed: %s", str(exc))
                 supported = False
-    from ._minimax_m3_stock import minimax_m3_index_decode as stock
+    from ._index_decode_triton import msa_index_decode as stock
 
     if supported:
         output = (
@@ -335,7 +337,7 @@ def minimax_m3_index_decode(
                     chain(bound, True)  # compile the device-gated variant
                     _CHAIN_READY.add(key)
         if max_seq_len <= 2048:
-            _MODULES[device].minimax_m3_index_decode(
+            _MODULES[device].msa_index_decode(
                 idx_q, index_kv_cache, block_table, seq_lens, output, max_seq_len
             )
             _COUNTS["direct_dispatch_count"] += 1

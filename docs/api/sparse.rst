@@ -131,3 +131,32 @@ dtypes, raise :class:`ValueError`.
     msa_sparse_decode_attention
     msa_topk_select
     prepare_msa_nvfp4_sparse_decode
+
+
+Combined Decode Index Selection
+-------------------------------
+
+.. currentmodule:: flashinfer.msa_ops
+
+This combined scoring-and-selection helper returns selected indices and can
+skip scoring when all visible blocks fit within the selection. The separate
+proxy-score and top-k APIs retain their own contracts.
+
+These APIs select logical cache blocks for MiniMax M3 decode. A framework
+integration on the vLLM side is required. The Hopper specialization supports
+batch 8/16, one BF16 head of width 128, page/table width 128, top-16 selection,
+and single-token decode with a host context bound up to 16384. Other signatures
+use the stock Triton path.
+
+Call ``msa_index_decode_supported(...)`` before choosing this integration
+and ``msa_index_decode_warmup(...)`` on the actual input/output layouts
+before CUDA-graph capture. Both helpers accept the decode API's arguments;
+the support probe returns a boolean and warmup returns the selected indices. Set
+``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` to force the stock path; autotuning
+also disables specialization. Selected indices may be reordered within their
+valid prefix, but the selected multiset and trailing ``-1`` padding are preserved.
+
+.. autosummary::
+    :toctree: ../generated
+
+    msa_index_decode
