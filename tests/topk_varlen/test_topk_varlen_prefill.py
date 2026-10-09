@@ -320,6 +320,7 @@ def test_prefill_cuda_graph_replay_after_warmup():
     le = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(
         s
     ):  # eager warm-up ON the capturing stream (slab + launcher)
@@ -361,6 +362,7 @@ def test_prefill_unwarmed_capture_raises_loudly():
     # drop every windowed launcher (slab tiers and register rungs alike)
     _host._PREFILL_CACHE.clear()
     s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         _host.default_workspace(lg)  # the slab exists; only the launcher is missing
     torch.cuda.synchronize()
@@ -568,6 +570,7 @@ def test_prefill_hinted_cuda_graph_replay():
     )
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         flashinfer.top_k_varlen(
             lg,
@@ -780,6 +783,7 @@ def test_prefill_absolute_indices_warmup_and_graph_replay():
     le = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         flashinfer.top_k_varlen(
             lg,
@@ -964,6 +968,7 @@ def test_prefill_cuda_graph_replay_grows_windows():
     le = torch.full((rows,), 300, dtype=torch.int32, device=_DEV)  # 300 < k
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         flashinfer.top_k_varlen(
             lg, le, top_k, row_starts=rs, out_indices=out, backend="gvr_2"
@@ -1008,6 +1013,7 @@ def test_prefill_hinted_cuda_graph_replay_shifts_starts():
     )
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         flashinfer.top_k_varlen(
             lg,
@@ -1061,6 +1067,13 @@ def test_prefill_hinted_capture_on_fresh_stream_needs_no_slab():
     )
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    # torch.cuda.Stream() hands out pooled handles: an earlier test may have
+    # left a slab on this very handle, so establish "no slab on s" instead of
+    # assuming it (retire every launch first, then drop the entry under the lock)
+    torch.cuda.synchronize()
+    with torch.cuda.stream(s), _host._mu:
+        _host._ws_keep.pop(_host._ws_key(torch.cuda.current_device()), None)
     with torch.cuda.stream(s):
         assert _host.prefill_ready(rows, top_k, L, width=R * L)
         assert not _host.prefill_ready(rows, top_k, wide)  # slab engine: no slab on s
