@@ -40,6 +40,7 @@ from .cudnn.prefill import (
     CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE,
     _CUDNN_NATIVE_HN_SUPPORTED,
     _cudnn_supports_direct_seqlens,
+    _cudnn_supports_paged_auto,
     CudnnPrefillGraph,
     _PrefillMetadata,
     _CudnnPrefillPlan,
@@ -1694,27 +1695,72 @@ def _build_block_tables_from_paged_kv_indices(
     paged_kv_indices: torch.Tensor,
     batch_size: int,
     device: torch.device,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Convert flat paged-KV indices to a shared ``[B, M]`` block table.
+    """Stage shared K/V page mappings during plan, reusing output capacity."""
+    offsets = paged_kv_indptr_host.tolist()[: batch_size + 1]
+    spans = list(zip(offsets, offsets[1:], strict=False))
+    if out is None:
+        max_pages = max(end - start for start, end in spans)
+        out = torch.empty((batch_size, max_pages), dtype=torch.int32, device=device)
+    # Clear unused row tails, including retained capacity after a shorter replan.
+    out.zero_()
+    indices = paged_kv_indices.to(device)
+    dst, src = [], []
+    for i, (start, end) in enumerate(spans):
+        if end > start:
+            dst.append(out[i, : end - start])
+            src.append(indices[start:end])
+    if len(dst) == 1:
+        dst[0].copy_(src[0], non_blocking=True)
+    elif dst:
+        torch._foreach_copy_(dst, src, non_blocking=True)
+    return out
 
-    This is the input format consumed by the existing backend and SM120 PRIMS.
-    K and V share every logical-to-physical page mapping.
-    """
-    blocks_per_seq = [
-        int(paged_kv_indptr_host[i + 1] - paged_kv_indptr_host[i])
-        for i in range(batch_size)
-    ]
-    max_num_blocks_per_seq = max(blocks_per_seq)
-    block_tables = torch.zeros(
-        (batch_size, max_num_blocks_per_seq),
-        dtype=torch.int32,
-        device=device,
+
+def _paged_kv_host_metadata(indptr, last_page_len, seq_lens, page_size):
+    indptr_host = indptr.to("cpu")
+    last_host = last_page_len.to("cpu")
+    lengths = (
+        get_seq_lens(indptr_host, last_host, page_size)
+        if seq_lens is None
+        else seq_lens.cpu().flatten().to(torch.int32)
     )
-    for i, num_blocks_needed in enumerate(blocks_per_seq):
-        start = int(paged_kv_indptr_host[i])
-        end = int(paged_kv_indptr_host[i + 1])
-        block_tables[i, :num_blocks_needed] = paged_kv_indices[start:end]
-    return block_tables
+    return indptr_host, last_host, lengths
+
+
+def _blackwell_paged_auto_cudnn(
+    device,
+    layout,
+    q_dtype,
+    kv_dtype,
+    o_dtype,
+    head_dim_qk,
+    head_dim_vo,
+    batch,
+    hq,
+    hk,
+    max_q,
+    max_kv,
+    page_size,
+):
+    """Measured D128 prefix domain; feature compatibility is checked by plan."""
+    return (
+        layout == "HND"
+        and q_dtype == kv_dtype == o_dtype == torch.bfloat16
+        and head_dim_qk == head_dim_vo == 128
+        and 1 <= batch <= 4
+        and 8 <= hq <= 64
+        and hk > 0
+        and hq % hk == 0
+        and hq // hk in (1, 2, 4, 8, 16)
+        and page_size == 16
+        and 64 <= max_q <= 1024
+        and 2048 <= max_kv <= 32768
+        and max_kv >= 4 * max_q
+        and get_compute_capability(device) == (10, 0)
+        and _cudnn_supports_paged_auto()
+    )
 
 
 # Ragged-prefill `auto` on Blackwell: tried in this order, first eligible wins.
@@ -2264,6 +2310,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = max_total_num_rows
+        self._requested_backend = backend
         self._backend = backend
         self._plan_info = None
         self._cached_module = None
@@ -2274,6 +2321,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._cudnn_q_lens_buffer: Optional[torch.Tensor] = None
         self._cudnn_prepared: Optional[CudnnPrefillGraph] = None
         self._cudnn_plan: Optional[_CudnnPrefillPlan] = None
+        self._cudnn_paged_bounds: Optional[Tuple[int, int]] = None
+        self._cudnn_qo_indptr_buffer: Optional[torch.Tensor] = None
         self._prims_backend = None
         if backend == "cute-dsl-prims":
             try:
@@ -2530,7 +2579,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
 
         use_custom_mask = custom_mask is not None or packed_custom_mask is not None
-        backend = self._backend
+        backend = self._requested_backend
         if self._jit_module is not None:
             module = self._jit_module
         else:
@@ -2816,19 +2865,94 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             self._max_q_len = (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
 
-        if max_sequence_kv is not None:
-            self._max_kv_len = max_sequence_kv
-        # Non-cuDNN planners still consume host page metadata even when the
-        # caller supplies a maximum. Keep cuDNN's device-length fast path.
-        if max_sequence_kv is None or self._backend != "cudnn":
-            paged_kv_indptr_host = paged_kv_indptr.to("cpu")
-            paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
-            if seq_lens is None:
-                kv_lens_arr_host = get_seq_lens(
-                    paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
+        kv_lens_arr_host = None
+        if max_sequence_kv is None:
+            paged_kv_indptr_host, paged_kv_last_page_len_host, kv_lens_arr_host = (
+                _paged_kv_host_metadata(
+                    paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
                 )
-            else:
-                kv_lens_arr_host = seq_lens.cpu().flatten().to(torch.int32)
+            )
+            self._max_kv_len = kv_lens_arr_host.max().item()
+        else:
+            self._max_kv_len = max_sequence_kv
+
+        if self._requested_backend == "auto" and self._jit_module is None:
+            self._backend = determine_attention_backend(
+                self.device,
+                PosEncodingMode[pos_encoding_mode].value,
+                use_fp16_qk_reduction,
+                packed_custom_mask is not None
+                or (self.is_cuda_graph_enabled and self._custom_mask_buf is not None),
+                q_data_type,
+                kv_data_type,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+            )
+            if (
+                self._backend == "fa2"
+                and causal
+                and pos_encoding_mode == "NONE"
+                and not use_fp16_qk_reduction
+                and packed_custom_mask is None
+                and not self._variant_owns_mask
+                and (not self.is_cuda_graph_enabled or self._custom_mask_buf is None)
+                and window_left == -1
+                and logits_soft_cap == 0
+                and prefix_len_ptr is None
+                and token_pos_in_items_ptr is None
+                and max_item_len_ptr is None
+                and getattr(self, "_sinks", None) is None
+                and fixed_split_size == -1
+                and not disable_split_kv
+                and (
+                    not self.is_cuda_graph_enabled
+                    or self._qo_indptr_buf.dtype == torch.int32
+                )
+                and _blackwell_paged_auto_cudnn(
+                    self.device,
+                    self._kv_layout,
+                    q_data_type,
+                    kv_data_type,
+                    o_data_type,
+                    head_dim_qk,
+                    head_dim_vo,
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    self._max_q_len,
+                    self._max_kv_len,
+                    page_size,
+                )
+            ):
+                self._backend = "cudnn"
+
+        self._cudnn_paged_bounds = None
+        if self._requested_backend == "auto" and self._backend == "cudnn":
+            # Actual per-request lengths still drive masking and addressing.
+            # Stable declared bounds and table capacity avoid a graph per step.
+            # Above the short-Q class, preserve both packed and unpacked tile counts.
+            # Rounding whole powers of two can hide an underfilled grid.
+            q_tile = 128 // (num_qo_heads // num_kv_heads)
+            bounds = (
+                # Preserve the short-query occupancy class instead of declaring
+                # Q64 as Q128. Larger classes retain the existing tile buckets.
+                64
+                if self._max_q_len <= 64
+                else max(128, ((int(self._max_q_len) + q_tile - 1) // q_tile) * q_tile),
+                1 << (int(self._max_kv_len) - 1).bit_length(),
+            )
+            if block_tables is None or block_tables.shape[1] * page_size >= bounds[1]:
+                self._cudnn_paged_bounds = bounds
+
+        # Resolve auto before staging backend-specific metadata. A cuDNN call
+        # with explicit maxima and device lengths retains its no-readback path.
+        if kv_lens_arr_host is None and self._backend != "cudnn":
+            paged_kv_indptr_host, paged_kv_last_page_len_host, kv_lens_arr_host = (
+                _paged_kv_host_metadata(
+                    paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
+                )
+            )
+        if kv_lens_arr_host is not None:
             required_size = len(kv_lens_arr_host)
             if required_size > self._kv_lens_buffer.shape[0]:
                 self._kv_lens_buffer = torch.empty(
@@ -2837,8 +2961,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._kv_lens_buffer[:required_size].copy_(
                 kv_lens_arr_host, non_blocking=non_blocking
             )
-            if max_sequence_kv is None:
-                self._max_kv_len = kv_lens_arr_host.max().item()
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
@@ -2891,7 +3013,24 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # NOTE(Zihao): mask_indptr has the same length as qo_indptr
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
         else:
-            self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=non_blocking)
+            if self._cudnn_paged_bounds is not None and qo_indptr.device.type == "cpu":
+                # Own CPU-origin prefixes so a same-batch plan can retain its
+                # metadata bindings. Device-origin prefixes stay borrowed.
+                owned = self._cudnn_qo_indptr_buffer
+                if (
+                    owned is None
+                    or owned.shape != qo_indptr.shape
+                    or owned.dtype != qo_indptr.dtype
+                ):
+                    owned = self._cudnn_qo_indptr_buffer = torch.empty_like(
+                        qo_indptr, device=self.device
+                    )
+                owned.copy_(qo_indptr, non_blocking=non_blocking)
+                self._qo_indptr_buf = owned
+            else:
+                self._qo_indptr_buf = qo_indptr.to(
+                    self.device, non_blocking=non_blocking
+                )
             self._paged_kv_indptr_buf = paged_kv_indptr.to(
                 self.device, non_blocking=non_blocking
             )
@@ -3034,17 +3173,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if self._backend == "auto":
-                self._backend = determine_attention_backend(
-                    self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
-                    use_fp16_qk_reduction,
-                    self._custom_mask_buf is not None,  # use_custom_mask
-                    q_data_type,
-                    kv_data_type,
-                    head_dim_qk=head_dim_qk,
-                    head_dim_vo=head_dim_vo,
-                )
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -3062,6 +3190,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args
                 )
+            else:
+                # A previous FA2 plan must not execute after auto selects cuDNN.
+                self._cached_module = None
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
@@ -3138,8 +3269,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = seq_lens
         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
 
-        if self._backend == "cudnn":
-            if (
+        # Old cuDNN captures still own this table after auto selects FA2.
+        # Refresh their metadata during plan; replay cannot rebind pointers.
+        if self._backend == "cudnn" or (
+            self.is_cuda_graph_enabled and self._cudnn_block_tables is not None
+        ):
+            if self._backend == "cudnn" and (
                 pos_encoding_mode != "NONE"
                 or window_left != -1
                 or logits_soft_cap != 0
@@ -3163,7 +3298,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # Supplied lengths are copied straight from their own device into
             # the wrapper-owned buffers (stream-ordered, cast on copy); reading
             # them back to the host would block plan() on all queued GPU work.
-            if max_sequence_kv is not None:
+            if max_sequence_kv is not None and kv_lens_arr_host is None:
                 kv_lengths = (
                     seq_lens.flatten()
                     if seq_lens is not None
@@ -3202,47 +3337,79 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 batch_size, 1, 1, 1
             )
             if block_tables is None:
-                table = _build_block_tables_from_paged_kv_indices(
-                    paged_kv_indptr.to("cpu"), paged_kv_indices, batch_size, self.device
+                page_indptr_host = paged_kv_indptr.to("cpu")
+                offsets = page_indptr_host.tolist()[: batch_size + 1]
+                max_pages = max(
+                    end - start
+                    for start, end in zip(offsets, offsets[1:], strict=False)
                 )
+                if self._cudnn_paged_bounds is not None:
+                    max_pages = max(max_pages, self._cudnn_paged_bounds[1] // page_size)
+                    if self.is_cuda_graph_enabled:
+                        # Any request may later own all initialized indices,
+                        # even after auto selects FA2 for a longer prefix. Also
+                        # reserve padding for the largest admitted KV bucket.
+                        index_capacity = self._paged_kv_indices_buf.numel()
+                        admitted_pages = min(index_capacity, 32768 // page_size)
+                        max_pages = max(
+                            max_pages,
+                            index_capacity,
+                            1 << (admitted_pages - 1).bit_length(),
+                        )
                 old_table = self._cudnn_block_tables
                 if (
                     old_table is None
                     or old_table.shape[0] != batch_size
-                    or old_table.shape[1] < table.shape[1]
+                    or old_table.shape[1] < max_pages
                 ):
                     if self.is_cuda_graph_enabled and old_table is not None:
                         raise ValueError(
                             "captured cuDNN block table cannot grow; supply a fixed block_tables buffer"
                         )
-                    self._cudnn_block_tables = table
-                else:
-                    old_table.zero_()
-                    old_table[:, : table.shape[1]].copy_(table)
-                self._block_tables = self._cudnn_block_tables
-            previous_cudnn_plan = self._cudnn_plan
-            self._cudnn_plan = None
-            if _CUDNN_GRAPH_AVAILABLE and _cudnn_supports_direct_seqlens(
-                q_data_type, mixed=True
-            ):
-                metadata = _PrefillMetadata(
-                    self._max_q_len,
-                    self._max_kv_len,
-                    causal,
-                    True,
-                    o_data_type=o_data_type,
-                    actual_seq_lens_q=self._seq_lens_q,
-                    actual_seq_lens_kv=self._seq_lens_kv,
-                    block_tables=self._block_tables,
-                    batch_offsets_q=self._qo_indptr_buf,
-                    batch_offsets_o=self._qo_indptr_buf,
-                    batch_offsets_stats=self._qo_indptr_buf,
-                ).resolve_from_plan(
-                    q_data_type, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo
+                    self._cudnn_block_tables = torch.empty(
+                        (batch_size, max_pages), dtype=torch.int32, device=self.device
+                    )
+                self._block_tables = _build_block_tables_from_paged_kv_indices(
+                    page_indptr_host,
+                    self._paged_kv_indices_buf,
+                    batch_size,
+                    self.device,
+                    out=self._cudnn_block_tables,
                 )
-                self._cudnn_plan = _CudnnPrefillPlan.prepare(
-                    metadata, q_data_type, self.device, previous_cudnn_plan
-                )
+            if self._backend == "cudnn":
+                previous_cudnn_plan = self._cudnn_plan
+                self._cudnn_plan = None
+                if _CUDNN_GRAPH_AVAILABLE and _cudnn_supports_direct_seqlens(
+                    q_data_type, mixed=True
+                ):
+                    graph_q, graph_kv = self._cudnn_paged_bounds or (
+                        self._max_q_len,
+                        self._max_kv_len,
+                    )
+                    metadata = _PrefillMetadata(
+                        graph_q,
+                        graph_kv,
+                        causal,
+                        True,
+                        o_data_type=o_data_type,
+                        actual_seq_lens_q=self._seq_lens_q,
+                        actual_seq_lens_kv=self._seq_lens_kv,
+                        block_tables=self._block_tables,
+                        batch_offsets_q=self._qo_indptr_buf,
+                        batch_offsets_o=self._qo_indptr_buf,
+                        batch_offsets_stats=self._qo_indptr_buf,
+                        max_total_num_rows=self._max_total_num_rows,
+                        _bounded_paged=self._cudnn_paged_bounds is not None,
+                    ).resolve_from_plan(
+                        q_data_type,
+                        num_qo_heads,
+                        num_kv_heads,
+                        head_dim_qk,
+                        head_dim_vo,
+                    )
+                    self._cudnn_plan = _CudnnPrefillPlan.prepare(
+                        metadata, q_data_type, self.device, previous_cudnn_plan
+                    )
 
     @flashinfer_api
     def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
@@ -5067,6 +5234,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     batch_offsets_k=self._kv_indptr_buf,
                     batch_offsets_v=self._v_indptr_buf,
                     batch_offsets_stats=self._cudnn_stats_offsets,
+                    max_total_num_rows=self._max_total_num_rows,
                 ).resolve_from_plan(
                     q_data_type, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo
                 )
