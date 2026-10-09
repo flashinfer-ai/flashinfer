@@ -101,6 +101,7 @@ def _enable_fc12_sources() -> None:
         Path(__file__).resolve().parents[1]
         / "moe_ep"
         / "kernel_src"
+        / "sm100"
         / "cutedsl_megamoe"
         / "src"
     )

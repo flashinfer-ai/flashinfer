@@ -16,7 +16,6 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
     RoutingConfig,
 )
 from flashinfer.utils import is_sm100a_supported
@@ -62,7 +61,7 @@ def test_fc12_processes_cluster_routed_rows():
 
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.BF16),
+        quant=QuantConfig(),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_num_experts=num_experts,
@@ -76,7 +75,7 @@ def test_fc12_processes_cluster_routed_rows():
         MegaMoeFc12Config.prepare_weights(
             w13,
             w2,
-            variant=QuantVariant.BF16,
+            quant=QuantConfig(),
             num_local_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
