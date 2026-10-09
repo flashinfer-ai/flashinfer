@@ -31,10 +31,17 @@ The default ``--model deepseek-v3`` preserves the original workload.
 ``--model kimi-k3 --parallel-modes ep --precomputed-routing`` selects the
 routed latent D3584/E3072/N896/K16 core with SiTU(4,25), using synthetic NVFP4
 weights. K3's outer latent projections, RMSNorm, shared experts, router GEMM,
-and attention are excluded; this is not a released-checkpoint benchmark.
+and attention are excluded.
 K3 routes use CPU FP32 sigmoid/bias top-k with stable expert-ID tie breaking,
 outside timing; the native grouped router does not support its single-group
 top-16 configuration. Both split and Mega variants use the selected activation.
+
+``--model deepseek-v41-flash --parallel-modes ep --precomputed-routing`` selects
+the routed D5120/E2304/N384/K6 backbone core with SwiGLU (gate upper clamp 10,
+linear clamp [-10,10]) and CPU sqrt-softplus/bias top-k normalized to 1.5.
+It uses synthetic NVFP4 weights; shared experts, DSpark layers, router GEMM,
+and attention are excluded. Routing weights retain the same configurable
+placement as the other presets.
 
 Both timers include routing, staging, communication, compute, output handling,
 and MegaMoE runtime FP32 alpha copies. ``--precomputed-routing`` excludes routing.
@@ -105,6 +112,7 @@ from bench_moe_deepseek import (
 @dataclass
 class ModelConfig(DeepSeekConfig):
     activation: str = "swiglu"
+    gate_up_clamp: float | None = None
     situ_beta: float | None = None
     situ_linear_beta: float | None = None
     routing_backend: str = "fused_deepseek"
@@ -113,6 +121,17 @@ class ModelConfig(DeepSeekConfig):
 MODEL_CONFIGS = {
     "deepseek-v3": ModelConfig(),
     "glm5": ModelConfig(hidden_size=6144),
+    "deepseek-v41-flash": ModelConfig(
+        hidden_size=5120,
+        intermediate_size=2304,
+        num_experts=384,
+        n_group=1,
+        topk_group=1,
+        top_k=6,
+        routed_scaling_factor=1.5,
+        gate_up_clamp=10.0,
+        routing_backend="cpu_sqrtsoftplus_topk",
+    ),
     "kimi-k3": ModelConfig(
         hidden_size=3584,
         intermediate_size=3072,
@@ -681,7 +700,11 @@ def _distributed_moe_config(
         activation=(
             SiTU(gate_scale=CFG.situ_beta, linear_scale=CFG.situ_linear_beta)
             if CFG.activation == "situ"
-            else SwiGLU()
+            else (
+                SwiGLU(limit=CFG.gate_up_clamp)
+                if CFG.gate_up_clamp is not None
+                else SwiGLU()
+            )
         ),
         routing=RoutingConfig(num_experts=CFG.num_experts, top_k=CFG.top_k),
         quant=QuantConfig(
@@ -843,7 +866,11 @@ def _create_distributed_inputs(num_tokens, rank, world_size, device):
     routing_bias = (
         torch.randn(
             CFG.num_experts,
-            dtype=torch.bfloat16,
+            dtype=(
+                torch.float32
+                if CFG.routing_backend == "cpu_sqrtsoftplus_topk"
+                else torch.bfloat16
+            ),
             device=device,
             generator=bias_generator,
         )
@@ -855,13 +882,16 @@ def _create_distributed_inputs(num_tokens, rank, world_size, device):
 def _route_tokens(router_logits, routing_bias, topk_values, topk_indices):
     if router_logits.shape[0] == 0:
         return
-    if CFG.routing_backend == "cpu_sigmoid_topk":
-        # K3 has one group and top-k 16, which fused_topk_deepseek rejects.
+    if CFG.routing_backend in ("cpu_sigmoid_topk", "cpu_sqrtsoftplus_topk"):
+        # These ungrouped routers are not supported by fused_topk_deepseek.
         # The CLI requires precomputed routes: CPU work and H2D copies must
         # stay outside timed forwards, CUDA graphs, and profiler ranges.
         with torch.no_grad():
+            logits = router_logits.detach().to(device="cpu", dtype=torch.float32)
             scores = (
-                router_logits.detach().to(device="cpu", dtype=torch.float32).sigmoid()
+                torch.nn.functional.softplus(logits).sqrt()
+                if CFG.routing_backend == "cpu_sqrtsoftplus_topk"
+                else logits.sigmoid()
             )
             bias = routing_bias.detach().to(device="cpu", dtype=torch.float32)
             ids = torch.argsort(scores + bias, dim=-1, descending=True, stable=True)[
@@ -1298,6 +1328,7 @@ def _benchmark_distributed_megamoe(
                 activation=CFG.activation,
                 situ_beta=CFG.situ_beta,
                 situ_linear_beta=CFG.situ_linear_beta,
+                gate_up_clamp=CFG.gate_up_clamp,
                 intermediate_size=CFG.intermediate_size,
                 top_k=CFG.top_k,
                 knobs=args.megamoe_knobs,
@@ -1997,7 +2028,10 @@ def main():
         "--model",
         choices=tuple(MODEL_CONFIGS),
         default="deepseek-v3",
-        help="Synthetic routed-MoE shape/activation preset; kimi-k3 requires EP precomputed routing.",
+        help=(
+            "Synthetic routed-MoE shape/activation preset; kimi-k3 and "
+            "deepseek-v41-flash require EP precomputed routing."
+        ),
     )
     parser.add_argument(
         "--num-tokens",
@@ -2168,8 +2202,15 @@ def main():
     args = parser.parse_args()
     CFG = MODEL_CONFIGS[args.model]
 
-    if CFG.routing_backend == "cpu_sigmoid_topk" and not args.precomputed_routing:
-        parser.error("--model kimi-k3 requires --precomputed-routing")
+    if (
+        CFG.routing_backend
+        in (
+            "cpu_sigmoid_topk",
+            "cpu_sqrtsoftplus_topk",
+        )
+        and not args.precomputed_routing
+    ):
+        parser.error(f"--model {args.model} requires --precomputed-routing")
 
     variant_names = args.variants.split(",")
     if not set(variant_names) <= _VARIANTS_BY_NAME.keys() or len(
