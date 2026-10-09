@@ -673,23 +673,25 @@ def prepare_msa_nvfp4_sparse_decode(
     seqused_k: torch.Tensor,
     k_global_scale: float,
     v_global_scale: float,
-    workspace_buffer: Optional[torch.Tensor] = None,
     seqlen_q: int = 1,
     softmax_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     backend: str = "cake",
 ):
-    r"""Prepare NVFP4 paged-KV sparse decode with the generated Cake program (SM100/SM103).
+    r"""Prepare NVFP4 paged-KV sparse decode with the generated Cake programs (SM100/SM103/SM107).
 
     The experimental Cake backend serves the same problem surface as the
     packed-NVFP4 paged-KV route of :func:`msa_sparse_decode_attention` -- the
     planar page pool of ``docs/design_docs/nvfp4_msa_paged_kv_layout.md``,
-    top-k 16, right-aligned causal decode tokens -- with one persistent kernel
+    top-k 16, right-aligned causal decode tokens -- with a persistent kernel
     that keeps the K tiles resident in tensor memory and runs both MMAs in the
-    swapped orientation.  Preparation validates and binds the tensors; the
-    returned runner launches with no allocation and no host synchronization
-    and can be captured into a CUDA Graph.
+    swapped orientation (small batches split each work item across a cluster
+    of CTAs that merge through distributed shared memory) and a short-item
+    cluster program for batches of requests within four pages.  Preparation
+    validates and binds the tensors; the returned runner launches with no
+    allocation and no host synchronization and can be captured into a CUDA
+    Graph.
 
     Parameters
     ----------
@@ -716,13 +718,6 @@ def prepare_msa_nvfp4_sparse_decode(
     k_global_scale, v_global_scale : float
         Positive per-side global scales; the K scale is folded into the
         softmax scale and the V scale is applied in the epilogue.
-    workspace_buffer : Optional[torch.Tensor]
-        Caller-owned CUDA bytes for the split-KV partials, at least
-        :func:`flashinfer.experimental.msa_nvfp4_decode.cake_backend.msa_nvfp4_decode_workspace_size`;
-        required only when the batch is small enough to split (the runner
-        reports the chosen factor as ``splits``).  The kernel resets its
-        completion counters after every merge, so the region must not be
-        shared with other work between launches.
     seqlen_q : int
         Query tokens per request, in ``[1, 32]``; token ``i`` sits at KV
         position ``seqused_k[b] - seqlen_q + i`` and attends causally.
@@ -757,7 +752,6 @@ def prepare_msa_nvfp4_sparse_decode(
         seqused_k=seqused_k,
         k_global_scale=k_global_scale,
         v_global_scale=v_global_scale,
-        workspace_buffer=workspace_buffer,
         seqlen_q=seqlen_q,
         softmax_scale=softmax_scale,
         out=out,

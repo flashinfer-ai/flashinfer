@@ -392,15 +392,13 @@ def get_cake_mxfp8_grouped_quantization_module():
         mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from ..jit.cake_grouped_mxfp8_quantize import (
-            get_cake_grouped_mxfp8_quantize_module,
+            cake_grouped_mxfp8_quantize_launch,
         )
 
         b, m, k = a.shape
         padded_k = _round_up(k, 128)
         padded_m = _round_up(m, 128)
         scale_k = padded_k // 32
-        input_tensor = a.contiguous()
-        mask_tensor = mask.contiguous()
         output = torch.empty(
             (b, m, padded_k),
             dtype=torch.float8_e4m3fn,
@@ -411,10 +409,7 @@ def get_cake_mxfp8_grouped_quantization_module():
             dtype=torch.uint8,
             device=a.device,
         )
-
-        module = get_cake_grouped_mxfp8_quantize_module(a.dtype, a.device)
-        stream = int(torch.cuda.current_stream(a.device).cuda_stream)
-        module.run(input_tensor, mask_tensor, output, output_scales, stream)
+        cake_grouped_mxfp8_quantize_launch(a, mask, output, output_scales)
 
         output = output.permute(1, 2, 0)
         output_scales = output_scales.view(b, padded_m // 128, scale_k // 4, 32, 4, 4)
@@ -442,21 +437,24 @@ def _mxfp8_grouped_quantize_cake(
     *,
     backend: Literal["cake"],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Dispatch an already validated request to an installed Cake profile."""
+    """Dispatch an already validated request to the generated Cake program."""
 
     if backend != "cake":
         raise ValueError(f"internal Cake dispatch received backend={backend!r}")
     from ..jit.cake_grouped_mxfp8_quantize import (
-        cake_grouped_mxfp8_target,
         is_cake_grouped_mxfp8_quantize_available,
     )
 
-    target = cake_grouped_mxfp8_target(a.device)
     if not is_cake_grouped_mxfp8_quantize_available(a.dtype, a.device):
         raise RuntimeError(
-            "backend='cake' requires an installed generated grouped MXFP8 "
-            f"profile for dtype={a.dtype} and target={target}; use the default "
-            "backend='cutile' until that profile is installed"
+            "backend='cake' requires float16 or bfloat16 input on a device of "
+            f"exact compute capability 10.0 or 10.3; got dtype={a.dtype} on "
+            f"{torch.cuda.get_device_name(a.device)}"
+        )
+    if not a.is_contiguous() or not mask.is_contiguous():
+        raise ValueError(
+            "backend='cake' requires contiguous a [B, M, K] and mask [B]; pass "
+            "a.contiguous() / mask.contiguous() explicitly instead of a view"
         )
     return (
         get_cake_mxfp8_grouped_quantization_module().cake_mxfp8_grouped_quantize_impl(

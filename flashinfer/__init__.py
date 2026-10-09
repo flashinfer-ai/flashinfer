@@ -21,7 +21,6 @@ from .version import __version__ as __version__
 from .version import __git_commit__ as __git_commit__
 from .version import __git_version__ as __git_version__  # backward compat
 
-
 from . import jit as jit
 from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
@@ -114,6 +113,12 @@ from .quantization.fp4_quantization import (
     nvfp4_kv_dequantize,
     nvfp4_kv_dequantize_paged,
     nvfp4_kv_quantize,
+)
+from .quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    NVFP44Over6ErrMode,
+    make_nvfp4_global_scale,
+    resolve_nvfp4_4over6,
 )
 from .quantization.fp8_quantization import (
     mxfp8_dequantize_host,
@@ -246,6 +251,17 @@ from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
+from .cake_rmsnorm_train import CakeRMSNormFunction as CakeRMSNormFunction
+from .cake_rmsnorm_train import cake_rmsnorm as cake_rmsnorm
+from .cake_rmsnorm_train import (
+    cake_rmsnorm_train_backward as cake_rmsnorm_train_backward,
+)
+from .cake_rmsnorm_train import (
+    cake_rmsnorm_train_backward_workspace_bytes as cake_rmsnorm_train_backward_workspace_bytes,
+)
+from .cake_rmsnorm_train import (
+    cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
+)
 from . import nvfp4_attention_sm120 as nvfp4_attention_sm120
 from .nvfp4_attention_sm120 import (
     nvfp4_attention_sm120_fwd as nvfp4_attention_sm120_fwd,
@@ -347,6 +363,7 @@ from .trtllm_low_latency_gemm import (
     prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
+from .mla_kv_pack import concat_mla_kv_quant_fp8 as concat_mla_kv_quant_fp8
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba

@@ -27,45 +27,62 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # Kimi-K3 TP12 fused LatentMoE communication tail (SM100 / SM103, twelve
 # ranks in one multi-node NVLink domain).
 #
-# ``MODULES`` holds one record per physical generated module (a kernel plus
-# its host binding): translation units, compile flags, FFI entry, argument
-# plan and closure identity.  ``KERNELS`` maps ``"<arch>"`` to the logical
-# kernel key -> module assignment the host runtime resolves at preparation:
+# ``MODULES`` holds one record per generated program (a kernel plus its host
+# binding): translation units, compile flags, FFI entry, argument plan, launch
+# contract, closure identity and the architectures it is built for.
+# ``KERNELS`` maps the logical kernel key to the program the host runtime
+# resolves at preparation; both architectures run the same programs.  Every
+# route is two generated kernels, K1 and the tail, with cuBLAS between them
+# for ``M > 8``:
 #
-# * ``k1_oneshot:r<rank>``  the one-shot Lamport all-reduce of the routed
-#   partial fused with KimiRMSNorm for ``M <= 16`` tokens; the rank is a
-#   trace-time specialisation (reduction order and local packet position),
-#   so one module per rank;
-# * ``k1_twoshot:<grouped|pinned>``  the token-sliced two-shot form (owner
-#   reduce + norm, multicast broadcast) for ``M > 16``; ``grouped`` issues all
-#   twelve remote loads of the owner retry body before the first test
-#   (``M <= 256``), ``pinned`` keeps the per-rank pinned body (``M > 256``);
-# * ``k3:<grouped|pinned>``  the column reduce-scatter of the shared partial,
-#   fused add of this rank's up-projection slice, one BF16 rounding and the
-#   multicast all-gather of the output row, with the same poll schedule
-#   selection by ``M``, one CTA per token and column half (``4 < M < 256``,
-#   grouped poll schedule only);
-# * ``k3_persist:<grouped|pinned>``  the same K3 on a persistent grid of
+# * ``k1_oneshot_ess``  the one-shot Lamport all-reduce of the routed partial
+#   fused with KimiRMSNorm for ``M <= 16`` tokens with the early shared
+#   scatter (ESS): the same CTAs also scatter this rank's columns of the
+#   shared partial into the K3 workspace slots of their owner ranks (the K3
+#   workspace pointers and flags are extra arguments); the rank is a launch
+#   argument that places the packets and selects the retained local packet in
+#   the poll, the twelve-way sum stays in ascending rank order;
+# * ``k1_twoshot_ess:grouped``  the token-sliced two-shot form (owner reduce +
+#   norm, multicast broadcast) with the early shared scatter for
+#   ``16 < M < 256``; ``grouped`` issues all twelve remote loads of the owner
+#   retry body before the first test;
+# * ``k1_twoshot:<grouped|pinned>``  the two-shot form without the shared
+#   scatter for ``M >= 256`` (the persistent tail scatters the shared partial
+#   itself); ``grouped`` at ``M = 256``, ``pinned`` (the per-rank pinned retry
+#   body) above;
+# * ``k23:c<4|8>``  the fused up-projection + tail for ``M <= 8``: the fp32
+#   slice GEMM of the normalised latent with this rank's weight slice in the
+#   K2-stream summation order, fused with the owner reduce of the
+#   ESS-scattered shared columns, the add, one BF16 rounding and the multicast
+#   all-gather of the output (the numerics of the round-4 K2-stream + fp32-add
+#   K3 pair); one CTA per eight output columns, one program per accumulator
+#   capacity (four tokens for ``M <= 4``, eight for ``5 <= M <= 8``); the
+#   rank's column width only sizes the grid;
+# * ``k3_ess:grouped``  the tail for ``4 < M < 256`` after an ESS K1: owner
+#   reduce of the scattered shared columns, fused add of this rank's cuBLAS
+#   up-projection slice, one BF16 rounding and the multicast all-gather of
+#   the output row; one CTA per token and column half, no shared operand;
+# * ``k3_persist:grouped``  the full K3 (own scatter of the shared partial,
+#   owner reduce + add + rounding, all-gather) on a persistent grid of
 #   ``min(M, SM count)`` CTAs per column half, each walking its tokens as a
 #   three-stage pipeline (scatter ``t``, owner reduce + multicast ``t - P``,
 #   gather ``t - 2P``) so the fabric hops of consecutive tokens overlap
-#   (``M >= 256``; identical buffers, flags and numerics);
-# * ``k2_stream:n<640|512>``  the SIMT weight-streaming up-projection slice
-#   GEMM (fp32 output) that replaces cuBLAS for ``M <= 4``; one module per
-#   column width of the rank partition;
-# * ``k3_f32:grouped``  the fp32-add form of K3 that consumes the K2-stream
-#   slice (``M <= 4``).
+#   (``M = 256``);
+# * ``k3_persist_bulk:pinned``  the persistent K3 whose reduce-scatter stage
+#   pushes the shared columns with ``cp.async.bulk``, pinned poll schedule
+#   (``M > 256``).
 #
-# Every module is an exact-architecture program launched with programmatic
-# dependent launch.  Both literals are populated verbatim by the
-# generated-program export; do not edit them by hand.
+# Every program is one source compiled for each architecture it lists (the
+# SM100-family lowering preferences are ``__CUDA_ARCH__`` guards inside the
+# source) and is launched with programmatic dependent launch.  Both literals
+# are populated verbatim by the generated-program export; do not edit them by
+# hand.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_kimi_k3_tp12_tail_059199fc13dd03bacb12": {
-        "arch": "sm_100a",
+    "cake_kimi_k3_tp12_tail_45df1981c8c6ea60f8e7": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_059199fc13dd03bacb12_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_059199fc13dd03bacb12_binding.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_45df1981c8c6ea60f8e7_kernel.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_45df1981c8c6ea60f8e7_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -73,17 +90,16 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "routed"],
             ["buffer", "y_out"],
             ["buffer", "gamma"],
+            ["buffer", "peer_ptrs"],
             ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
             ["buffer", "buffer_flags"],
             ["parameter", "num_tokens"],
+            ["parameter", "rank"],
             ["parameter", "epsilon"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "3e02baaa77c505701fce86e04afcdc430235fe2e0896c23b1ff55ceb999a13d3",
-        "tma_workspace_bytes": 0,
         "launch": {
             "block": [448, 1, 1],
             "cluster": [1, 1, 1],
@@ -91,13 +107,14 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 128,
             "use_pdl": True,
         },
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "7147fd938d016ed5402187e8bf7569ced3087fddb05c2aa11ace9e1021a6bc2c",
     },
-    "cake_kimi_k3_tp12_tail_07a04921507a0e9a08c0": {
-        "arch": "sm_100a",
+    "cake_kimi_k3_tp12_tail_4dafdc41b373cd2ba5a5": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_07a04921507a0e9a08c0_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_07a04921507a0e9a08c0_binding.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_4dafdc41b373cd2ba5a5_kernel.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_4dafdc41b373cd2ba5a5_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -105,27 +122,31 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "y"],
             ["buffer", "w_slice"],
             ["buffer", "out"],
+            ["buffer", "peer_ptrs"],
+            ["raw_pointer", "mcast_ptr"],
+            ["buffer", "buffer_flags"],
             ["parameter", "num_tokens"],
+            ["parameter", "rank"],
+            ["parameter", "my_col_begin"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "e1b11c369f778525920546e498229aaa0ec88f026b0569b4d9a72ff4a3580345",
-        "tma_workspace_bytes": 0,
         "launch": {
             "block": [448, 1, 1],
             "cluster": [1, 1, 1],
             "cooperative": False,
-            "dynamic_smem_bytes": 4480,
+            "dynamic_smem_bytes": 3840,
             "use_pdl": True,
         },
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "b381dae992f05f5c2717579df742547ac66d02b448e72caa3dab1be923ecc819",
     },
-    "cake_kimi_k3_tp12_tail_089298c3514bbb135e16": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_tp12_tail_7919fc819bb5f04d4df0": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_089298c3514bbb135e16_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_089298c3514bbb135e16_binding.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_7919fc819bb5f04d4df0_kernel.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_7919fc819bb5f04d4df0_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -133,441 +154,31 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "y"],
             ["buffer", "w_slice"],
             ["buffer", "out"],
-            ["parameter", "num_tokens"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "c84b308ddb7515f6582f3f99a9c4102e09ea2cf6296a13c795757ec1a0dd395f",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 4480,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_0bdace2db5c1ea58de22": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_0bdace2db5c1ea58de22_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_0bdace2db5c1ea58de22_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
             ["buffer", "peer_ptrs"],
             ["raw_pointer", "mcast_ptr"],
             ["buffer", "buffer_flags"],
             ["parameter", "num_tokens"],
             ["parameter", "rank"],
-            ["parameter", "epsilon"],
+            ["parameter", "my_col_begin"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "71b566155932259aceea3eaf0f231d7adb4fbfdcf8c4c17d4b71300eb55364a4",
-        "tma_workspace_bytes": 0,
         "launch": {
             "block": [448, 1, 1],
             "cluster": [1, 1, 1],
             "cooperative": False,
-            "dynamic_smem_bytes": 128,
+            "dynamic_smem_bytes": 1920,
             "use_pdl": True,
         },
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "5ffd8ec71ad1e5cd33c64a3122616bb0dfcbb1b5f90d132033df0a3ce865d568",
     },
-    "cake_kimi_k3_tp12_tail_0fa91391b7203562780c": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_tp12_tail_8a4ce18ab9cd01e004d5": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_0fa91391b7203562780c_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_0fa91391b7203562780c_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "y"],
-            ["buffer", "w_slice"],
-            ["buffer", "out"],
-            ["parameter", "num_tokens"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "d5ba118c4484d439c3af6ab37e72b603860565a7b1ba8ccd68d4c1a92984af7c",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 3584,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_1aa73d0e225f019716c9": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_1aa73d0e225f019716c9_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_1aa73d0e225f019716c9_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "c44074e0f9954c105e77e880bb9190372a7bb2e9c15c52eb4869efd03e7bb630",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_208f95020e43bfd6b028": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_208f95020e43bfd6b028_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_208f95020e43bfd6b028_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "a15dff1c6bda093bda6b7964f19e14c35aee7011c178d1150431f182de0ac8ac",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_2612fc0c046ff8f7e1d7": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_2612fc0c046ff8f7e1d7_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_2612fc0c046ff8f7e1d7_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "bafc92b72a89b6a22dfa8bfc4f0971b47065e318e96a7c9dd67c4d13d35f48f1",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_38a23ee0f849bd40a266": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_38a23ee0f849bd40a266_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_38a23ee0f849bd40a266_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "956c24d2babed0e31ba9c51aa3c986b80b3322ef4474e337bc109951ac505a1b",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_3d4ea8055e0c38defafe": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_3d4ea8055e0c38defafe_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_3d4ea8055e0c38defafe_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "0c03448a215c83e8d1e7d1996d1b320ceb65e8511fc81254e66a8c69c46c0329",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_3e44777e07d6a76cb70b": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_3e44777e07d6a76cb70b_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_3e44777e07d6a76cb70b_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["buffer", "peer_ptrs"],
-            ["raw_pointer", "mcast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "rank"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "86585257092cb99c5dea64424a8cdd5d0a5afd8a0dbee9775fa7f53f474ac2e0",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_3ffbf6f10c254327b6b4": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_3ffbf6f10c254327b6b4_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_3ffbf6f10c254327b6b4_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "6bc601bee8d3d61b6ec4ae4e1f999e74f54d81dead5f3eea5d834b693cf4b8f4",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_478739c83690aaedd5e5": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_478739c83690aaedd5e5_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_478739c83690aaedd5e5_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "51ab21aa02779f087982c8e5c57f8c563afb79b86e261e09d37d18945de2f7c4",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_4d472a0c4bfd124ac918": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_4d472a0c4bfd124ac918_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_4d472a0c4bfd124ac918_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "db34227c348c426f537a7aa12b681dbe7cb13e95ebc0d27cba20c8e47ebbb63b",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_5659a33e7f6575b3b6b8": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_5659a33e7f6575b3b6b8_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_5659a33e7f6575b3b6b8_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "58ec94e444f03ba41b23d520df158e89e9304e855f56f0cab240bd580363a9ea",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_5b0f2c34849ef87ac24b": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_5b0f2c34849ef87ac24b_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_5b0f2c34849ef87ac24b_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "2aa2ed9666b02df33a4a489a40832d63f3ed34791d879ced41d15a59ec5b7366",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_6428e4b7302f64c80a27": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_6428e4b7302f64c80a27_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_6428e4b7302f64c80a27_binding.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_8a4ce18ab9cd01e004d5_kernel.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_8a4ce18ab9cd01e004d5_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -588,22 +199,21 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "936e6e38ab928a0346cf99bafe9358de763774d6c6bfda6f2288af87ce54b768",
-        "tma_workspace_bytes": 0,
         "launch": {
             "block": [448, 1, 1],
             "cluster": [1, 1, 1],
             "cooperative": False,
-            "dynamic_smem_bytes": 0,
+            "dynamic_smem_bytes": 14336,
             "use_pdl": True,
         },
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "ecbde1127ad330bd73b92ea5934834ac8fafa86215862dcabfa53f6fbd38efdc",
     },
-    "cake_kimi_k3_tp12_tail_655245e4ea6a0566f7c2": {
-        "arch": "sm_100a",
+    "cake_kimi_k3_tp12_tail_dc6b04abf0dbc4001019": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_655245e4ea6a0566f7c2_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_655245e4ea6a0566f7c2_binding.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_dc6b04abf0dbc4001019_kernel.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_dc6b04abf0dbc4001019_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -621,8 +231,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "1e3dcb63f657304b1efb07a05ac6a8a829cbb8806107c31138a623378a6c77bf",
-        "tma_workspace_bytes": 0,
         "launch": {
             "block": [448, 1, 1],
             "cluster": [1, 1, 1],
@@ -630,13 +238,120 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 128,
             "use_pdl": True,
         },
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "ada71f65e9943bfca679d2a23d8b16720258228044cce8450ea92ce76aff7f45",
     },
-    "cake_kimi_k3_tp12_tail_6836e5efb2cbef0c02ae": {
-        "arch": "sm_103a",
+    "cake_kimi_k3_tp12_tail_dcff3505bf890a147662": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_6836e5efb2cbef0c02ae_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_6836e5efb2cbef0c02ae_binding.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_dcff3505bf890a147662_kernel.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_dcff3505bf890a147662_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "routed"],
+            ["buffer", "shared"],
+            ["buffer", "y_out"],
+            ["buffer", "gamma"],
+            ["buffer", "peer_ptrs"],
+            ["raw_pointer", "mcast_ptr"],
+            ["buffer", "buffer_flags"],
+            ["buffer", "k3_peer_ptrs"],
+            ["raw_pointer", "k3_mcast_ptr"],
+            ["buffer", "k3_flags"],
+            ["parameter", "num_tokens"],
+            ["parameter", "rank"],
+            ["parameter", "epsilon"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [448, 1, 1],
+            "cluster": [1, 1, 1],
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": True,
+        },
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "f947815b792d2d3a3e1c9e3c4051ff4321b7462a4f1ef4e4e96aedafa7a3938b",
+    },
+    "cake_kimi_k3_tp12_tail_e604573d36e1bb117b68": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_e604573d36e1bb117b68_kernel.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_e604573d36e1bb117b68_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "routed"],
+            ["buffer", "shared"],
+            ["buffer", "y_out"],
+            ["buffer", "gamma"],
+            ["raw_pointer", "mcast_ptr"],
+            ["raw_pointer", "local_unicast_ptr"],
+            ["buffer", "buffer_flags"],
+            ["buffer", "k3_peer_ptrs"],
+            ["raw_pointer", "k3_mcast_ptr"],
+            ["buffer", "k3_flags"],
+            ["parameter", "num_tokens"],
+            ["parameter", "rank"],
+            ["parameter", "epsilon"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [448, 1, 1],
+            "cluster": [1, 1, 1],
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": True,
+        },
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "a527ddb456b2926ffe7ecbccb2ee3bb719db5023577eb18b1c3c4ce4d5ea5fff",
+    },
+    "cake_kimi_k3_tp12_tail_f1ce43c00dd2fc5bc34e": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_f1ce43c00dd2fc5bc34e_kernel.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_f1ce43c00dd2fc5bc34e_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "gemm_slice"],
+            ["buffer", "out"],
+            ["buffer", "peer_ptrs"],
+            ["raw_pointer", "mcast_ptr"],
+            ["buffer", "buffer_flags"],
+            ["parameter", "num_tokens"],
+            ["parameter", "rank"],
+            ["parameter", "my_col_begin"],
+            ["parameter", "my_cols"],
+            ["parameter", "gemm_plane_stride"],
+            ["parameter", "num_gemm_splits"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [448, 1, 1],
+            "cluster": [1, 1, 1],
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "5a82ab4ac6c5a42c3d88fa23095684400c96037850f8010c95322df9b4595f2d",
+    },
+    "cake_kimi_k3_tp12_tail_f8e15786d6ad190fa245": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_f8e15786d6ad190fa245_kernel.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_f8e15786d6ad190fa245_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -657,8 +372,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "cb65ab9833fcdde6786c2fdb459abc0f180377dd9d475de8ccb059eb838d542c",
-        "tma_workspace_bytes": 0,
         "launch": {
             "block": [448, 1, 1],
             "cluster": [1, 1, 1],
@@ -666,747 +379,21 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": True,
         },
-    },
-    "cake_kimi_k3_tp12_tail_734d3ec84d75fbfad81d": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_734d3ec84d75fbfad81d_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_734d3ec84d75fbfad81d_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "0ca8f935971e2d00ab24c522cf700999c3618b259d00576447249e9daf64c83a",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_7de4539e58943861165d": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_7de4539e58943861165d_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_7de4539e58943861165d_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "eded13e1198815c0b062adc3f2f85ac1e7ddd8e7e3141367c7178a3b5494807d",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_854cb9b1586c72761b2f": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_854cb9b1586c72761b2f_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_854cb9b1586c72761b2f_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "fe5db193555a21a22da60f415176f62d045877bb8722223641b0e7c9c171d7d0",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_8621affbb892d25c21c4": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_8621affbb892d25c21c4_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_8621affbb892d25c21c4_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "529d5f8a04f7a5d16beb11e4cdaf8bcf743b712515787ee1d4ece1f40fa92286",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_9df6effe73530626c497": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_9df6effe73530626c497_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_9df6effe73530626c497_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "385e557d2eb01efa0ca0407d2db17635f6f0426956c44e0ce80d8cf9c1ee15c7",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_a6e3998e39ed767bb130": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_a6e3998e39ed767bb130_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_a6e3998e39ed767bb130_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "40bedb59091e74926778203ae6c62d44dbf8cdaa42f2d32fa4b4314fff6a1c76",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_afc049beb5340f185e43": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_afc049beb5340f185e43_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_afc049beb5340f185e43_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "shared"],
-            ["buffer", "gemm_slice"],
-            ["buffer", "out"],
-            ["buffer", "peer_ptrs"],
-            ["raw_pointer", "mcast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "rank"],
-            ["parameter", "my_col_begin"],
-            ["parameter", "my_cols"],
-            ["parameter", "gemm_plane_stride"],
-            ["parameter", "num_gemm_splits"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "6dca65a136f2879f65ae3e0535f1465dd803440191ff5b6edeceb41c3468f1e0",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_b18646c92b839845eebe": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_b18646c92b839845eebe_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_b18646c92b839845eebe_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "214600fde209598f73fc6aa788b7e837f70ce6188c3334a36e0267f574b8fd1d",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_b276b8216af1ef607f85": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_b276b8216af1ef607f85_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_b276b8216af1ef607f85_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "3827c63920edabcbe3aa751a460fd29466e980c5b515fd79a9ebd4413508ca99",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_b65033ed0546ce6d229f": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_b65033ed0546ce6d229f_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_b65033ed0546ce6d229f_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "y"],
-            ["buffer", "w_slice"],
-            ["buffer", "out"],
-            ["parameter", "num_tokens"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "4e0265bf0bdd2d0e1f1f87b10d542b2b83568e26794e066ae0544feb683cf7df",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 3584,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_bff3b68ca7b2da0a79f0": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_bff3b68ca7b2da0a79f0_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_bff3b68ca7b2da0a79f0_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "d9758ad64ed54ccdc90098e3686b778f5eee5d304c6b1cdc634912ecb80ad2da",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_c6cb16cb98cd2e4443ac": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_c6cb16cb98cd2e4443ac_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_c6cb16cb98cd2e4443ac_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "shared"],
-            ["buffer", "gemm_slice"],
-            ["buffer", "out"],
-            ["buffer", "peer_ptrs"],
-            ["raw_pointer", "mcast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "rank"],
-            ["parameter", "my_col_begin"],
-            ["parameter", "my_cols"],
-            ["parameter", "gemm_plane_stride"],
-            ["parameter", "num_gemm_splits"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "5619833da37045d289dec0908c9f9633851f6d5e54ce6a3cb4f2dae4d37cefba",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_c728b4dbc601934e79fc": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_c728b4dbc601934e79fc_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_c728b4dbc601934e79fc_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["buffer", "peer_ptrs"],
-            ["raw_pointer", "mcast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "rank"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "c5a7c3d18c5d0f6507f617eeee776928ebb5451c0d4baafcd0f09579802a9374",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_c946edf026dbdb4ff989": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_c946edf026dbdb4ff989_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_c946edf026dbdb4ff989_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "shared"],
-            ["buffer", "gemm_slice"],
-            ["buffer", "out"],
-            ["buffer", "peer_ptrs"],
-            ["raw_pointer", "mcast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "rank"],
-            ["parameter", "my_col_begin"],
-            ["parameter", "my_cols"],
-            ["parameter", "gemm_plane_stride"],
-            ["parameter", "num_gemm_splits"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "6cdd84a110f889c322369e6cd111e5a28bd118f2c311eda089b9a84605d8dd4d",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_d0a751f069e7886b85ce": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_d0a751f069e7886b85ce_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_d0a751f069e7886b85ce_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "8b83e53e469f67e65d53c85a8b1d4a9faf43843a19ef30e28f0987fd16371086",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_d3c30da8ab9bdad37f5f": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_d3c30da8ab9bdad37f5f_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_d3c30da8ab9bdad37f5f_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "shared"],
-            ["buffer", "gemm_slice"],
-            ["buffer", "out"],
-            ["buffer", "peer_ptrs"],
-            ["raw_pointer", "mcast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "rank"],
-            ["parameter", "my_col_begin"],
-            ["parameter", "my_cols"],
-            ["parameter", "gemm_plane_stride"],
-            ["parameter", "num_gemm_splits"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "4351a0878707498eccec1fcbfb0b3525fb20fa634b3e90cbac1fb19e03032598",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_d87ce0e07959bc6a9a94": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_d87ce0e07959bc6a9a94_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_d87ce0e07959bc6a9a94_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "d4872921eacf7471cdc034fe79874774e9e1bbfa0c2af49e748456b481b5e107",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_d94322a9f13a2d1a870d": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_d94322a9f13a2d1a870d_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_d94322a9f13a2d1a870d_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "dcd954df139e16cc0f9cdbcd9a8b1087923a99c96b1e6609cfa8730fd9069d45",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_d99c3ecd0edd0ba892b0": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_d99c3ecd0edd0ba892b0_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_d99c3ecd0edd0ba892b0_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "routed"],
-            ["buffer", "y_out"],
-            ["buffer", "gamma"],
-            ["raw_pointer", "mcast_ptr"],
-            ["raw_pointer", "local_unicast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "epsilon"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "7a57a1d40b3f3b4188db5fa3f41c275d16de315c863b5b8eba014b79bd8c9d21",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 128,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_dbddaa98ccbe834184fd": {
-        "arch": "sm_103a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_dbddaa98ccbe834184fd_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_103a/cake_kimi_k3_tp12_tail_dbddaa98ccbe834184fd_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "shared"],
-            ["buffer", "gemm_slice"],
-            ["buffer", "out"],
-            ["buffer", "peer_ptrs"],
-            ["raw_pointer", "mcast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "rank"],
-            ["parameter", "my_col_begin"],
-            ["parameter", "my_cols"],
-            ["parameter", "gemm_plane_stride"],
-            ["parameter", "num_gemm_splits"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "82f50ebffb3a7f45ac904f0578fe0dfa0d26187e293fb3d5c7e1ff1dbc08838c",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
-    },
-    "cake_kimi_k3_tp12_tail_fba6f479c58d583f77de": {
-        "arch": "sm_100a",
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_fba6f479c58d583f77de_kernel.cu",
-            "cake_kimi_k3_tp12_tail/sm_100a/cake_kimi_k3_tp12_tail_fba6f479c58d583f77de_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "shared"],
-            ["buffer", "gemm_slice"],
-            ["buffer", "out"],
-            ["buffer", "peer_ptrs"],
-            ["raw_pointer", "mcast_ptr"],
-            ["buffer", "buffer_flags"],
-            ["parameter", "num_tokens"],
-            ["parameter", "rank"],
-            ["parameter", "my_col_begin"],
-            ["parameter", "my_cols"],
-            ["parameter", "gemm_plane_stride"],
-            ["parameter", "num_gemm_splits"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "89b602aeece6cc3b8da88bbd1d2d25812f371410326d2f0937487d7305f51b7b",
-        "tma_workspace_bytes": 0,
-        "launch": {
-            "block": [448, 1, 1],
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "1a1f7251f922bd803931ebe1d3666450720ed0443317003912deebd42b16ea17",
     },
 }
 
-KERNELS: dict[str, dict[str, str]] = {
-    "sm_100a": {
-        "k1_oneshot:r0": "cake_kimi_k3_tp12_tail_478739c83690aaedd5e5",
-        "k1_oneshot:r1": "cake_kimi_k3_tp12_tail_5659a33e7f6575b3b6b8",
-        "k1_oneshot:r10": "cake_kimi_k3_tp12_tail_38a23ee0f849bd40a266",
-        "k1_oneshot:r11": "cake_kimi_k3_tp12_tail_059199fc13dd03bacb12",
-        "k1_oneshot:r2": "cake_kimi_k3_tp12_tail_a6e3998e39ed767bb130",
-        "k1_oneshot:r3": "cake_kimi_k3_tp12_tail_bff3b68ca7b2da0a79f0",
-        "k1_oneshot:r4": "cake_kimi_k3_tp12_tail_734d3ec84d75fbfad81d",
-        "k1_oneshot:r5": "cake_kimi_k3_tp12_tail_8621affbb892d25c21c4",
-        "k1_oneshot:r6": "cake_kimi_k3_tp12_tail_b276b8216af1ef607f85",
-        "k1_oneshot:r7": "cake_kimi_k3_tp12_tail_d87ce0e07959bc6a9a94",
-        "k1_oneshot:r8": "cake_kimi_k3_tp12_tail_4d472a0c4bfd124ac918",
-        "k1_oneshot:r9": "cake_kimi_k3_tp12_tail_854cb9b1586c72761b2f",
-        "k1_twoshot:grouped": "cake_kimi_k3_tp12_tail_0bdace2db5c1ea58de22",
-        "k1_twoshot:pinned": "cake_kimi_k3_tp12_tail_655245e4ea6a0566f7c2",
-        "k2_stream:n512": "cake_kimi_k3_tp12_tail_b65033ed0546ce6d229f",
-        "k2_stream:n640": "cake_kimi_k3_tp12_tail_07a04921507a0e9a08c0",
-        "k3:grouped": "cake_kimi_k3_tp12_tail_c946edf026dbdb4ff989",
-        "k3_f32:grouped": "cake_kimi_k3_tp12_tail_6428e4b7302f64c80a27",
-        "k3_persist:grouped": "cake_kimi_k3_tp12_tail_d3c30da8ab9bdad37f5f",
-        "k3_persist:pinned": "cake_kimi_k3_tp12_tail_fba6f479c58d583f77de",
-    },
-    "sm_103a": {
-        "k1_oneshot:r0": "cake_kimi_k3_tp12_tail_3ffbf6f10c254327b6b4",
-        "k1_oneshot:r1": "cake_kimi_k3_tp12_tail_9df6effe73530626c497",
-        "k1_oneshot:r10": "cake_kimi_k3_tp12_tail_7de4539e58943861165d",
-        "k1_oneshot:r11": "cake_kimi_k3_tp12_tail_d0a751f069e7886b85ce",
-        "k1_oneshot:r2": "cake_kimi_k3_tp12_tail_2612fc0c046ff8f7e1d7",
-        "k1_oneshot:r3": "cake_kimi_k3_tp12_tail_3d4ea8055e0c38defafe",
-        "k1_oneshot:r4": "cake_kimi_k3_tp12_tail_d94322a9f13a2d1a870d",
-        "k1_oneshot:r5": "cake_kimi_k3_tp12_tail_208f95020e43bfd6b028",
-        "k1_oneshot:r6": "cake_kimi_k3_tp12_tail_1aa73d0e225f019716c9",
-        "k1_oneshot:r7": "cake_kimi_k3_tp12_tail_5b0f2c34849ef87ac24b",
-        "k1_oneshot:r8": "cake_kimi_k3_tp12_tail_b18646c92b839845eebe",
-        "k1_oneshot:r9": "cake_kimi_k3_tp12_tail_d99c3ecd0edd0ba892b0",
-        "k1_twoshot:grouped": "cake_kimi_k3_tp12_tail_3e44777e07d6a76cb70b",
-        "k1_twoshot:pinned": "cake_kimi_k3_tp12_tail_c728b4dbc601934e79fc",
-        "k2_stream:n512": "cake_kimi_k3_tp12_tail_0fa91391b7203562780c",
-        "k2_stream:n640": "cake_kimi_k3_tp12_tail_089298c3514bbb135e16",
-        "k3:grouped": "cake_kimi_k3_tp12_tail_afc049beb5340f185e43",
-        "k3_f32:grouped": "cake_kimi_k3_tp12_tail_c6cb16cb98cd2e4443ac",
-        "k3_persist:grouped": "cake_kimi_k3_tp12_tail_dbddaa98ccbe834184fd",
-        "k3_persist:pinned": "cake_kimi_k3_tp12_tail_6836e5efb2cbef0c02ae",
-    },
+KERNELS: dict[str, str] = {
+    "k1_oneshot_ess": "cake_kimi_k3_tp12_tail_e604573d36e1bb117b68",
+    "k1_twoshot:grouped": "cake_kimi_k3_tp12_tail_45df1981c8c6ea60f8e7",
+    "k1_twoshot:pinned": "cake_kimi_k3_tp12_tail_dc6b04abf0dbc4001019",
+    "k1_twoshot_ess:grouped": "cake_kimi_k3_tp12_tail_dcff3505bf890a147662",
+    "k23:c4": "cake_kimi_k3_tp12_tail_7919fc819bb5f04d4df0",
+    "k23:c8": "cake_kimi_k3_tp12_tail_4dafdc41b373cd2ba5a5",
+    "k3_ess:grouped": "cake_kimi_k3_tp12_tail_f1ce43c00dd2fc5bc34e",
+    "k3_persist:grouped": "cake_kimi_k3_tp12_tail_f8e15786d6ad190fa245",
+    "k3_persist_bulk:pinned": "cake_kimi_k3_tp12_tail_8a4ce18ab9cd01e004d5",
 }
 
 ARCHES = ("sm_100a", "sm_103a")
@@ -1416,46 +403,64 @@ ARCH_NVCC_FLAGS = {
 }
 WORLD_SIZE = 12
 POLL_SCHEDULES = ("grouped", "pinned")
+#: K23 accumulator capacities (one program each): four tokens for ``M <= 4``, eight for ``5 <= M <= 8``.
+K23_CAPACITIES = (4, 8)
+
+
+def _nvcc_flags(arches: list[str]) -> list[str]:
+    """The code-generation flags of every architecture a program lists, followed by the common flags, each once."""
+    flags: list[str] = []
+    for arch in arches:
+        for flag in ARCH_NVCC_FLAGS[arch]:
+            if flag not in flags:
+                flags.append(flag)
+    return flags
 
 
 def required_kernel_keys() -> tuple[str, ...]:
-    """Every logical kernel the runtime can select on one architecture."""
+    """Every logical kernel the runtime can select (nine keys, the same programs on both architectures)."""
+    # Unreachable, hence not registered: ``k1_twoshot_ess:pinned`` and ``k3_ess:pinned``
+    # (the ESS range ``M < 256`` is grouped-only), ``k3_persist:pinned`` and
+    # ``k3_persist_bulk:grouped`` (the plain persistent K3 serves exactly 256 tokens,
+    # the cp.async.bulk form the whole pinned range ``M > 256``).
     return (
-        *(f"k1_oneshot:r{rank}" for rank in range(WORLD_SIZE)),
+        "k1_oneshot_ess",
+        "k1_twoshot_ess:grouped",
         *(f"k1_twoshot:{schedule}" for schedule in POLL_SCHEDULES),
-        # the one-CTA-per-token K3 only below 256 tokens (grouped); K3-P owns every M >= 256
-        "k3:grouped",
-        *(f"k3_persist:{schedule}" for schedule in POLL_SCHEDULES),
-        "k2_stream:n640",
-        "k2_stream:n512",
-        "k3_f32:grouped",
+        *(f"k23:c{capacity}" for capacity in K23_CAPACITIES),
+        "k3_ess:grouped",
+        "k3_persist:grouped",
+        "k3_persist_bulk:pinned",
     )
 
 
 def route_available(arch: str, required_keys: tuple[str, ...] = ()) -> bool:
-    """True when ``arch`` is registered and carries every key in ``required_keys``."""
-    table = KERNELS.get(arch)
-    return table is not None and all(key in table for key in required_keys)
+    """True when every key in ``required_keys`` is registered with a program built for ``arch``."""
+    if arch not in ARCHES or not KERNELS:
+        return False
+    return all(
+        key in KERNELS and arch in MODULES[KERNELS[key]]["arches"]
+        for key in required_keys
+    )
 
 
 def kernel_module_name(arch: str, key: str) -> str:
-    """Return the registered physical module for ``key`` on ``arch``."""
-    table = KERNELS.get(arch)
-    if table is None:
+    """Return the registered program of logical kernel ``key``, checked to be built for ``arch``."""
+    if arch not in ARCHES or not KERNELS:
         raise NotImplementedError(
             f"The generated Kimi-K3 TP12 tail programs for {arch} are not "
             "registered in this checkout yet (see flashinfer-ai/flashinfer#4542)"
         )
-    name = table.get(key)
+    name = KERNELS.get(key)
     if name is None:
         raise NotImplementedError(
-            f"The generated Kimi-K3 TP12 tail kernel {key!r} for {arch} is not "
+            f"The generated Kimi-K3 TP12 tail kernel {key!r} is not "
             "registered in this checkout (see flashinfer-ai/flashinfer#4542)"
         )
     record = MODULES[name]
-    if record["arch"] != arch:
+    if arch not in record["arches"]:
         raise RuntimeError(
-            f"registered module {name!r} is an {record['arch']} program bound to {arch}"
+            f"registered program {name!r} is not built for {arch} (arches: {record['arches']})"
         )
     return name
 
@@ -1483,10 +488,7 @@ def gen_cake_kimi_k3_tp12_tail_module(name: str):
     return gen_jit_spec(
         name=f"{name}_" + record["closure_sha256"][:20],
         sources=sources,
-        extra_cuda_cflags=[
-            *ARCH_NVCC_FLAGS[record["arch"]],
-            *record["compile_flags"],
-        ],
+        extra_cuda_cflags=[*_nvcc_flags(record["arches"]), *record["compile_flags"]],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[root, *[p.parent for p in sources], *_header_dirs()],
         use_fast_math=False,

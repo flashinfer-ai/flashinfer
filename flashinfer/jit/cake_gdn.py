@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checksum-verified JIT loader for the source-only Cake GDN backend."""
+"""JIT loader for the source-only Cake GDN backend.
+
+Every variant in ``csrc/gdn/cake/manifest.json`` names one kernel source, the
+compile-time ``defines`` that specialize it, and one TVM-FFI host shim.  The
+kernel is compiled to a cubin with ``nvcc`` and embedded into the host shim.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +25,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -34,7 +40,7 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "6cf2de07b0bbcd663e87a171746eb8d53ea91fe7b433897dcb348b0f725f6bae"
+_DEFINE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
@@ -112,41 +118,10 @@ def _source_dir() -> Path:
 @functools.cache
 def _manifest() -> dict[str, Any]:
     path = _source_dir() / "manifest.json"
-    observed_digest = _sha256(path)
-    if observed_digest != _MANIFEST_SHA256:
-        raise RuntimeError(
-            f"Cake GDN manifest drift at {path}: "
-            f"expected {_MANIFEST_SHA256}, got {observed_digest}"
-        )
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    observed = (
-        manifest.get("schema"),
-        manifest.get("source_only"),
-        manifest.get("binary_artifacts"),
-        manifest.get("contract_row_count"),
-        manifest.get("architecture_row_count"),
-        manifest.get("admitted_architecture_rows"),
-        manifest.get("fail_closed_architecture_rows"),
-        manifest.get("variant_count"),
-        len(manifest.get("variants", [])),
-        manifest.get("scope", {}).get("explicit_backend_policy"),
-    )
-    expected = (
-        _EXPORT_SCHEMA,
-        True,
-        False,
-        1799,
-        3598,
-        3544,
-        54,
-        108,
-        108,
-        "one listed GDN non-CP variant or fail closed; no external fallback",
-    )
-    if observed != expected:
+    if manifest.get("schema") != _EXPORT_SCHEMA:
         raise RuntimeError(
-            "Cake GDN manifest does not match the frozen support contract: "
-            f"expected {expected!r}, got {observed!r}"
+            f"unexpected Cake GDN manifest schema at {path}: {manifest.get('schema')!r}"
         )
     return manifest
 
@@ -167,6 +142,15 @@ def _cuda_record(record: dict[str, Any], arch: CakeGDNArch) -> dict[str, Any]:
     return outputs[0]
 
 
+def _cubin_path(source: Path, *, arch: CakeGDNArch, digest: str) -> Path:
+    return (
+        jit_env.FLASHINFER_JIT_DIR
+        / "cake_gdn"
+        / arch
+        / f"{source.stem}-{digest[:16]}.cubin"
+    )
+
+
 def _compile_cubin(
     source: Path,
     *,
@@ -176,9 +160,9 @@ def _compile_cubin(
     include_paths: tuple[Path, ...],
     nvcc: Path,
 ) -> bytes:
-    cache_dir = jit_env.FLASHINFER_JIT_DIR / "cake_gdn" / arch
+    cubin = _cubin_path(source, arch=arch, digest=digest)
+    cache_dir = cubin.parent
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cubin = cache_dir / f"{source.stem}-{digest[:16]}.cubin"
     lock = FileLock(f"{cubin}.lock", thread_local=False)
     with lock:
         if not cubin.exists():
@@ -220,46 +204,49 @@ def _compile_cubin(
     return cubin.read_bytes()
 
 
+def _define_flags(record: dict[str, Any]) -> tuple[str, ...]:
+    """``-D`` flags for the variant's compile-time specialization."""
+
+    flags = []
+    for key, value in record.get("defines", {}).items():
+        if not _DEFINE_NAME.match(key):
+            raise RuntimeError(f"invalid Cake GDN define name {key!r}")
+        flags.append(f"-D{key}={value}")
+    return tuple(flags)
+
+
+def _compile_options(record: dict[str, Any]) -> tuple[str, ...]:
+    options = tuple(record.get("compile_options", ()))
+    unsupported_options = set(options) - {"--use_fast_math"}
+    if unsupported_options:
+        raise RuntimeError(
+            f"unsupported Cake GDN compile options: {sorted(unsupported_options)!r}"
+        )
+    return options + _define_flags(record)
+
+
 @functools.cache
-def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
-    """Compile and load one checksum-verified Cake GDN host entrypoint."""
+def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
+    """Compile one Cake GDN kernel variant for ``arch`` and return its cubin path."""
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
         raise CakeGDNUnsupportedError(f"unsupported Cake GDN architecture: {arch!r}")
     record = _kernel_record(name)
     cuda = _cuda_record(record, arch)
-    host = record["host_binding"]
     root = _source_dir()
     cuda_path = root / cuda["path"]
-    host_path = root / host["path"]
     headers = _manifest().get("cuda_headers", [])
-    sources = [
-        (cuda_path, cuda["sha256"]),
-        (host_path, host["sha256"]),
-        *((root / header["path"], header["sha256"]) for header in headers),
-    ]
-    for path, expected in sources:
-        observed = _sha256(path)
-        if observed != expected:
-            raise RuntimeError(
-                f"Cake GDN source drift at {path}: expected {expected}, got {observed}"
-            )
-    compile_options = tuple(record.get("compile_options", ()))
-    unsupported_options = set(compile_options) - {"--use_fast_math"}
-    if unsupported_options:
-        raise RuntimeError(
-            f"unsupported Cake GDN compile options: {sorted(unsupported_options)!r}"
-        )
+    compile_options = _compile_options(record)
     nvcc, nvcc_version = _nvcc_identity()
     compile_digest = _compile_cache_digest(
         arch=arch,
-        cuda_sha256=cuda["sha256"],
-        header_sha256s=tuple(header["sha256"] for header in headers),
+        cuda_sha256=_sha256(cuda_path),
+        header_sha256s=tuple(_sha256(root / header["path"]) for header in headers),
         compile_options=compile_options,
         nvcc=nvcc,
         nvcc_version=nvcc_version,
     )
-    cubin = _compile_cubin(
+    _compile_cubin(
         cuda_path,
         arch=arch,
         digest=compile_digest,
@@ -269,15 +256,28 @@ def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
         ),
         nvcc=nvcc,
     )
+    return _cubin_path(cuda_path, arch=arch, digest=compile_digest)
+
+
+@functools.cache
+def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
+    """Compile and load one Cake GDN host entrypoint."""
+
+    cubin = compile_cake_gdn_cubin(name, arch)
+    record = _kernel_record(name)
+    host = record["host_binding"]
+    root = _source_dir()
+    host_path = root / host["path"]
     module_digest = hashlib.sha256(
-        f"{compile_digest}\0{host['sha256']}".encode()
+        f"{cubin.stem}\0{_sha256(host_path)}".encode()
     ).hexdigest()
     module = cpp.load_inline(
         f"flashinfer_cake_gdn_{name}_{arch}_{module_digest[:12]}",
         cpp_sources=host_path.read_text(encoding="utf-8"),
-        embed_cubin={host["module_ident"]: cubin},
+        embed_cubin={host["module_ident"]: cubin.read_bytes()},
         extra_include_paths=[
             str(Path(get_cuda_path()) / "include"),
+            str(root / "host"),
             str(root.parent),
             str(root.parents[1]),
             str(root.parents[2] / "include"),
@@ -359,7 +359,7 @@ def _variant_for(
     return matches[0]
 
 
-@functools.cache
+@functools.lru_cache(maxsize=4096)
 def select_cake_gdn_prefill_variant(
     *,
     arch: CakeGDNArch,
@@ -532,7 +532,76 @@ def select_cake_gdn_prefill_variant(
     )
 
 
-@functools.cache
+# BF16-state T=1 decode: every per-rank (H, HV) geometry is admitted at any
+# batch; the body and grid tile follow the state-head count B*HV in bands
+# (mirrors the Cake program rule ``select_bf16_t1_route``; calibrated against
+# the FlashInfer BF16 pool kernel on B200/B300).  ``vec8`` is the
+# latency-first instance of the vec8 body (``__launch_bounds__(128, 1)``, every
+# first-block load ahead of the reductions), ``vec8r56`` the same schedule under
+# a 56-register cap (``__launch_bounds__(128, 9)``; the sm_103a build spills
+# nothing and reads 1.4-4.3 % faster than ``vec8`` at TILE_V=16 while the
+# sm_100a build is 4-5 % slower, so it is routed per architecture through
+# ``CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES``), ``vec8occ`` the occupancy-first
+# instance (default launch bounds, eight CTAs per SM so the 1024-CTA grids at
+# 256 and 512 state heads run in one wave) and ``wide`` the MTP wide-tile body
+# at ``T_STEPS=1`` (one 128-row CTA per state head) for the bandwidth-bound
+# large pools.  The grid is ``V / TILE_V`` 128-thread CTAs per state head.
+CAKE_GDN_BF16_T1_BODIES = ("vec8", "vec8r56", "vec8occ", "wide")
+# (largest state-head count of the band or None for the open last band, body, TILE_V)
+CAKE_GDN_BF16_T1_ROUTE_BANDS = (
+    (8, "vec8", 32),
+    # 9-192 heads: TILE_V=16 (``vec8r56`` on sm_103a).  TILE_V=32 ties it at
+    # 192 heads in the calibration sweeps on both GPUs but its 768-CTA grid is
+    # launch-order sensitive on GB300 (the first of two back-to-back launches
+    # runs ~7 % slower; export rows b6 H16/HV32 and b24 H4/HV8 failed the
+    # directional gate every round).
+    (192, "vec8", 16),
+    (256, "vec8occ", 32),
+    (384, "vec8", 64),
+    (512, "vec8occ", 64),
+    (768, "vec8", 64),
+    (None, "wide", 128),
+)
+
+
+# Per-architecture body overrides of the band rule ({arch: {band upper bound: body}};
+# mirrors Cake's ``BF16_T1_ROUTE_ARCH_BODIES``): GB300 takes the 56-register
+# ``vec8r56`` instance in the 9-192 band, B200 keeps ``vec8``.
+CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES: dict[str, dict[int, str]] = {
+    "sm_103a": {192: "vec8r56"}
+}
+
+
+def cake_gdn_bf16_t1_route(
+    batch_size: int, num_v_heads: int, arch: CakeGDNArch
+) -> tuple[str, int]:
+    """``(body, TILE_V)`` of the BF16-state T=1 decode route for ``batch_size * num_v_heads`` state heads on ``arch``."""
+
+    state_heads = int(batch_size) * int(num_v_heads)
+    for max_state_heads, body, tile_v in CAKE_GDN_BF16_T1_ROUTE_BANDS:
+        if max_state_heads is None or state_heads <= max_state_heads:
+            return CAKE_GDN_BF16_T1_ROUTE_ARCH_BODIES.get(arch, {}).get(
+                max_state_heads, body
+            ), tile_v
+    raise AssertionError("CAKE_GDN_BF16_T1_ROUTE_BANDS must end with an open band")
+
+
+def cake_gdn_bf16_route_tile_v(route_id: str) -> int:
+    """The grid tile a BF16 decode route id carries (``.vec8_t<N>``, ``.vec8r56_t<N>``, ``.vec8occ_t<N>``, ``.wide<N>`` or ``.tile16_fullwarp``)."""
+
+    if route_id.endswith(".tile16_fullwarp"):
+        return 16
+    match = re.fullmatch(
+        r".*\.(?:vec8_t|vec8r56_t|vec8occ_t|wide)(16|32|64|128)", route_id
+    )
+    if match is None:
+        raise CakeGDNUnsupportedError(
+            f"BF16 decode route {route_id!r} carries no grid tile"
+        )
+    return int(match.group(1))
+
+
+@functools.lru_cache(maxsize=1024)
 def select_cake_gdn_decode_variant(
     *,
     arch: CakeGDNArch,
@@ -552,7 +621,7 @@ def select_cake_gdn_decode_variant(
     cache_intermediate_states: bool = False,
     cache_steps: int = 0,
 ) -> CakeGDNRoute:
-    """Resolve one frozen FP32 T=1/MTP or exact promoted BF16 serving row."""
+    """Resolve one frozen FP32 T=1/MTP row, one BF16 T=1 serving geometry or one exact promoted BF16 verify/update row."""
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
         raise CakeGDNUnsupportedError(f"unsupported architecture {arch}")
@@ -576,9 +645,58 @@ def select_cake_gdn_decode_variant(
     if batch_size <= 0:
         raise CakeGDNUnsupportedError("decode batch size must be positive")
     if state_dtype == "bfloat16":
+        if layout != "pretranspose":
+            raise CakeGDNUnsupportedError(
+                "BF16 decode requires the pretranspose state-pool layout"
+            )
+        if seq_len == 1:
+            # Single-token serving decode: every per-rank (H, HV) geometry at
+            # any batch (Qwen3.5-35B TP1/TP2/TP4, Qwen3.5-397B TP2/TP4/TP8);
+            # every T=1 body takes its strides at runtime.  The body and grid
+            # tile follow the state-head count; an unlisted (geometry, body,
+            # tile) fails closed in _variant_for.
+            if disable_state_update or cache_intermediate_states or cache_steps:
+                raise CakeGDNUnsupportedError(
+                    "BF16 T=1 decode updates the state and caches nothing"
+                )
+            body, tile_v = cake_gdn_bf16_t1_route(batch_size, num_v_heads, arch)
+            if body == "wide":
+                record = _variant_for(
+                    domain="decode",
+                    schedule_attr="gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+                    specializations={
+                        "CACHE_INTERMEDIATE_STATES": 0,
+                        "H": num_q_heads,
+                        "HV": num_v_heads,
+                        "INTERMEDIATE_BATCH_STRIDE": 128 * 128,
+                        "INTERMEDIATE_TOKEN_STRIDE": 128 * 128,
+                        "SCALE": scale,
+                        "STRIDED_INPUTS": 1,
+                        "TILE_V_WIDE": tile_v,
+                        "T_STEPS": 1,
+                        "UPDATE_STATE": 1,
+                    },
+                )
+                return CakeGDNRoute(
+                    f"flashinfer.gdn_decode.indexed_bf16_t1.wide{tile_v}",
+                    record["name"],
+                )
+            record = _variant_for(
+                domain="decode",
+                schedule_attr=f"gdn_decode_pretranspose_t1_bf16state_{body}",
+                specializations={
+                    "H": num_q_heads,
+                    "HV": num_v_heads,
+                    "SCALE": scale,
+                    "STRIDED_INPUTS": 1,
+                    "TILE_V": tile_v,
+                },
+            )
+            return CakeGDNRoute(
+                f"flashinfer.gdn_decode.indexed_bf16_t1.{body}_t{tile_v}",
+                record["name"],
+            )
         promoted = {
-            (4, 1, 16, 32, True, False, False, 0),
-            (4, 1, 4, 8, True, False, False, 0),
             (4, 2, 16, 32, False, True, True, 4),
             (8, 3, 16, 64, True, True, True, 3),
             (8, 4, 16, 64, True, True, True, 4),
@@ -627,13 +745,9 @@ def select_cake_gdn_decode_variant(
             cache_intermediate_states,
             cache_steps,
         )
-        if (
-            layout != "pretranspose"
-            or num_k_heads != num_q_heads
-            or key not in promoted
-        ):
+        if key not in promoted:
             raise CakeGDNUnsupportedError(
-                "BF16 decode is limited to the exact promoted indexed/verify rows"
+                "BF16 multi-token decode is limited to the exact promoted verify/update rows"
             )
         if num_q_heads == 8 and num_v_heads == 16 and batch_size <= 4:
             # Qwen3.5-35B-A3B TP=2 per-rank verify (speculative_num_draft_tokens=7
@@ -657,28 +771,16 @@ def select_cake_gdn_decode_variant(
                 record["name"],
             )
         if num_q_heads == 4 and num_v_heads == 8:
-            if seq_len == 1:
-                schedule_attr = "gdn_decode_pretranspose_t1_bf16state_tile16"
-                specializations = {
-                    "H": num_q_heads,
-                    "HV": num_v_heads,
-                    "SCALE": scale,
-                    "STRIDED_INPUTS": int(strided_inputs),
-                }
-                route = "flashinfer.gdn_decode.indexed_bf16_t1.tile16_fullwarp"
-            else:
-                schedule_attr = "gdn_decode_pretranspose_t4_bf16state_tile16"
-                specializations = {
-                    "H": num_q_heads,
-                    "HV": num_v_heads,
-                    "INTERMEDIATE_BATCH_STRIDE": (
-                        cache_steps * num_v_heads * 128 * 128
-                    ),
-                    "INTERMEDIATE_TOKEN_STRIDE": num_v_heads * 128 * 128,
-                    "SCALE": scale,
-                    "STRIDED_INPUTS": 1,
-                }
-                route = "flashinfer.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp"
+            schedule_attr = "gdn_decode_pretranspose_t4_bf16state_tile16"
+            specializations = {
+                "H": num_q_heads,
+                "HV": num_v_heads,
+                "INTERMEDIATE_BATCH_STRIDE": (cache_steps * num_v_heads * 128 * 128),
+                "INTERMEDIATE_TOKEN_STRIDE": num_v_heads * 128 * 128,
+                "SCALE": scale,
+                "STRIDED_INPUTS": 1,
+            }
+            route = "flashinfer.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp"
             record = _variant_for(
                 domain="decode",
                 schedule_attr=schedule_attr,
@@ -713,9 +815,7 @@ def select_cake_gdn_decode_variant(
                 "UPDATE_STATE": int(update_state),
             },
         )
-        if seq_len == 1:
-            route = "flashinfer.gdn_decode.indexed_bf16_t1"
-        elif disable_state_update:
+        if disable_state_update:
             route = f"flashinfer.gdn_decode.indexed_bf16_verify_t{seq_len}"
         elif cache_intermediate_states:
             route = f"flashinfer.gdn_decode.indexed_bf16_checkpoint_t{seq_len}"
@@ -822,6 +922,7 @@ __all__ = [
     "CakeGDNRoute",
     "CakeGDNUnsupportedError",
     "arch_for_compute_capability",
+    "compile_cake_gdn_cubin",
     "load_cake_gdn_kernel",
     "select_cake_gdn_decode_variant",
     "select_cake_gdn_prefill_variant",

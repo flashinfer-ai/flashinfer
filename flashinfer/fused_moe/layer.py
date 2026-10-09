@@ -28,13 +28,23 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.moe_layer import moe_layer_trace
 from ..autotuner import AutoTuner
+from ..quantization.nvfp4_quantization_utils import _UNSET
 from ..utils import get_compute_capability
 from .api import (
     BackendOptions,
+    CudnnFrostBf16Config,
+    CudnnFrostMxfp8Config,
+    CudnnFrostNvfp4Config,
+    CudnnFrostMxfp8Mxfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
     CakeWarpDecodeConfig,
+    CudnnGroupedGemmBf16Config,
+    CudnnGroupedGemmFp8PerTensorConfig,
+    CudnnGroupedGemmMxfp8Config,
+    CudnnGroupedGemmNvfp4Config,
     CutlassBf16Config,
     CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
@@ -58,8 +68,10 @@ from .api import (
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
+    PrimsTsConfig,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
+    SM12xNvfp4Bf16Config,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -70,6 +82,10 @@ from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
     CakeWarpDecodeRunner,
+    CudnnGroupedGemmBf16Runner,
+    CudnnGroupedGemmFp8PerTensorRunner,
+    CudnnGroupedGemmMxfp8Runner,
+    CudnnGroupedGemmNvfp4Runner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
@@ -90,20 +106,34 @@ from .runners import (
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    PrimsTsRunner,
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
+    SM12xNvfp4Bf16Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
     TrtllmMxInt4RoutedRunner,
 )
+from .backends.cudnn_frost.bf16.moe import CudnnFrostBf16MoeRunner
+from .backends.cudnn_frost.mxfp8.moe import CudnnFrostMxfp8MoeRunner
+from .backends.cudnn_frost.nvfp4.moe import CudnnFrostNvfp4MoeRunner
+from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
 from .utils import map_to_hybrid_bucket
 
-# Concrete configured runners; automatic implementations are loaded lazily
-# through the registration contract, without naming them in this module.
+# Concrete host runners for explicit configs. Additional candidates use the
+# auto_candidates registration contract; device kernel loading stays deferred.
 _RunnerT = Union[
+    CudnnFrostBf16MoeRunner,
+    CudnnFrostMxfp8MoeRunner,
+    CudnnFrostNvfp4MoeRunner,
+    CudnnFrostMxfp8Mxfp4MoeRunner,
     CakeWarpDecodeRunner,
+    CudnnGroupedGemmBf16Runner,
+    CudnnGroupedGemmFp8PerTensorRunner,
+    CudnnGroupedGemmMxfp8Runner,
+    CudnnGroupedGemmNvfp4Runner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
@@ -124,8 +154,10 @@ _RunnerT = Union[
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    PrimsTsRunner,
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
+    SM12xNvfp4Bf16Runner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -137,7 +169,15 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    CudnnFrostBf16Config: CudnnFrostBf16MoeRunner,
+    CudnnFrostMxfp8Config: CudnnFrostMxfp8MoeRunner,
+    CudnnFrostNvfp4Config: CudnnFrostNvfp4MoeRunner,
+    CudnnFrostMxfp8Mxfp4Config: CudnnFrostMxfp8Mxfp4MoeRunner,
     CakeWarpDecodeConfig: CakeWarpDecodeRunner,
+    CudnnGroupedGemmBf16Config: CudnnGroupedGemmBf16Runner,
+    CudnnGroupedGemmFp8PerTensorConfig: CudnnGroupedGemmFp8PerTensorRunner,
+    CudnnGroupedGemmMxfp8Config: CudnnGroupedGemmMxfp8Runner,
+    CudnnGroupedGemmNvfp4Config: CudnnGroupedGemmNvfp4Runner,
     CutlassBf16Config: CutlassBf16Runner,
     CutlassFp8BlockConfig: CutlassFp8BlockRunner,
     CutlassFp8PerTensorConfig: CutlassFp8PerTensorRunner,
@@ -158,8 +198,10 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CuTileNvfp4Bf16Config: CuTileNvfp4Bf16Runner,
     CuTileNvfp4Config: CuTileNvfp4Runner,
     CuteDslConfig: CuteDslRunner,
+    PrimsTsConfig: PrimsTsRunner,
     SM12xFp8Config: SM12xFp8Runner,
     SM12xMxfp8Mxfp4Config: SM12xMxfp8Mxfp4Runner,
+    SM12xNvfp4Bf16Config: SM12xNvfp4Bf16Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
     TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,
@@ -219,6 +261,9 @@ class MoELayer:
 
         # Build one runner per compatible backend
         self.runners: List[_RunnerT] = []
+        # check_support() raises a precise reason; keep it instead of letting
+        # the filter swallow it, or every rejection reads "no usable backend".
+        rejected: List[str] = []
         for backend_cfg in config.backend:
             if not backend_cfg.supported(arch):
                 continue
@@ -238,7 +283,8 @@ class MoELayer:
                 )
                 runner = runner_cls(runner_config, device=self.device)
                 runner.check_support()
-            except (NotImplementedError, ValueError, RuntimeError):
+            except (NotImplementedError, ValueError, RuntimeError) as exc:
+                rejected.append(f"{runner_cls.__name__}: {exc}")
                 continue
             runner.build()
             self.runners.append(runner)
@@ -284,11 +330,32 @@ class MoELayer:
                 f"activation={config.quant.activation.name}, "
                 f"output={config.quant.output.name}."
             )
+            # Name the runners that implement an explicit recipe; the filter
+            # loop swallowed their _check_support() reasons.
+            if config.quant.nvfp4_4over6 is not _UNSET:
+                supporting = ", ".join(
+                    r.__name__
+                    for r in _BACKEND_RUNNERS.values()
+                    if r.supports_nvfp4_4over6
+                )
+                hint += (
+                    f" Note nvfp4_4over6={config.quant.nvfp4_4over6!r}: an "
+                    f"explicit NVFP4 4over6 setting is implemented only by "
+                    f"[{supporting}]; other backends read the "
+                    f"FLASHINFER_NVFP4_4OVER6* environment variables, which "
+                    f"leaving the field unset restores."
+                )
+            # Per-runner reasons last: they are the ground truth.
+            reasons = ""
+            if rejected:
+                reasons = " Backends rejected this configuration: " + "; ".join(
+                    rejected
+                )
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
                 f"arch sm{arch} for this configuration. Registered unified "
-                f"runners: [{mvp}].{hint}"
+                f"runners: [{mvp}].{hint}{reasons}"
             )
 
         # Cross-backend winner cache, keyed by (num_tokens tuning bucket,
@@ -303,7 +370,7 @@ class MoELayer:
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
 
-    @flashinfer_api
+    @flashinfer_api(trace=moe_layer_trace)
     def __call__(
         self,
         act_pack: MoEActivationPack,
@@ -326,9 +393,12 @@ class MoELayer:
         -------
         torch.Tensor or list of torch.Tensor
             The layer output. With ``config.finalize.do_finalize=False`` the
-            unreduced TRTLLM intermediates are returned instead, as
+            unreduced intermediates are returned instead, as
             ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``,
-            leaving the combine to the caller.
+            leaving the combine to the caller;
+            ``expanded_idx_to_permuted_idx[token * top_k + slot]`` is the row
+            of ``gemm2_output`` holding that assignment, or ``-1`` when its
+            expert is not local.
 
         Raises
         ------
@@ -352,21 +422,33 @@ class MoELayer:
         # here nor via a winner cached under the other mode, hence the
         # mode-qualified cache key below.
         mode = act_pack.routing_input_mode
-        runners = [r for r in self.runners if mode in r.supported_routing_modes]
+        exact_shape = any(
+            getattr(r, "requires_exact_shape", False) for r in self.runners
+        )
+        configured = [
+            (index, r)
+            for index, r in enumerate(self.runners)
+            if mode in r.supported_routing_modes
+            and (
+                not getattr(r, "requires_exact_shape", False)
+                or r.accepts(act_pack, weight_pack)
+            )
+        ]
+        runners = [r for _, r in configured]
         additional = self._additional_candidates(act_pack, weight_pack)
         runners.extend(additional)
         if not runners:
             raise NotImplementedError(
                 f"MoELayer: none of the usable backends "
                 f"{[r.backend_key for r in self.runners]} support "
-                f"routing_input_mode={mode!r}."
+                f"routing_input_mode={mode!r} with these input/weight packs."
             )
 
         bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
         # Optional plans can have exact geometry. Qualify their cache by both
         # shape and eligible candidate set; rejected per-call layouts must not
         # reuse a winner from a different set. Original bucket keys stay intact.
-        winner_key = (
+        winner_key: tuple[Any, ...] = (
             (
                 bucket,
                 mode,
@@ -377,6 +459,17 @@ class MoELayer:
             if additional
             else (bucket, mode)
         )
+        if exact_shape:
+            # Include configured positions so filtering one of two exact-shape
+            # runners with the same key cannot reuse the other's cached winner.
+            winner_key = (
+                bucket,
+                mode,
+                "exact",
+                tuple(index for index, _ in configured),
+                tuple(r.backend_key for r in additional),
+                tuple(act_pack.hidden_states_q.shape),
+            )
         winner = self._winners.get(winner_key)
         if winner is None:
             winner = self._select_winner(act_pack, weight_pack, runners)
@@ -388,9 +481,11 @@ class MoELayer:
         runner, tactic = winner
         self._last_winner_backend = runner.backend_key
         if any(runner is candidate for candidate in additional):
+            from .auto_candidates import is_experimental_candidate
             from ..api_logging import warn_experimental_backend_once
 
-            warn_experimental_backend_once("MoELayer", runner.backend_key)
+            if is_experimental_candidate(runner.backend_key):
+                warn_experimental_backend_once("MoELayer", runner.backend_key)
 
         inputs = runner.pack_inputs(act_pack, weight_pack)
         return runner.forward(
@@ -410,6 +505,7 @@ class MoELayer:
             weight_pack,
             tuning=self.tuner.is_tuning_mode,
             cache=getattr(self, "_automatic_runners", {}),
+            exclude={r.backend_key for r in self.runners},
         )
 
     def _select_winner(
@@ -418,8 +514,7 @@ class MoELayer:
         weight_pack: MoEWeightPack,
         runners: List[_RunnerT],
     ) -> Tuple[_RunnerT, Any]:
-        """Run per-runner autotune, then measure each winner-tactic and
-        pick cross-backend winner."""
+        """Tune each runner, then select by packing + forward GPU latency."""
         best_time_ms = float("inf")
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
@@ -446,16 +541,15 @@ class MoELayer:
                 break
             from ..testing.utils import bench_gpu_time
 
-            # Measure runner at its winning tactic.  Use CUDA-graph timing so
-            # the cross-backend comparison reflects production (graph-captured)
-            # latency rather than per-call launch/Python overhead — at low token
-            # counts (~tens of us kernels) a no-graph 10-iter median is dominated
-            # by that overhead and picks the wrong backend.  Requires a warmed-up
-            # layer (the autotune pass above), not a cold capture.
+            def run_candidate(r=runner, t=tactic):
+                packed_inputs = r.pack_inputs(act_pack, weight_pack)
+                return r.forward(
+                    packed_inputs, tactic=t, **r.launch_kwargs_for(packed_inputs)
+                )
+
+            # Measure packing + forward GPU time after warmup.
             times = bench_gpu_time(
-                lambda r=runner, i=inputs, t=tactic, kw=launch_kwargs: r.forward(
-                    i, tactic=t, **kw
-                ),
+                run_candidate,
                 dry_run_iters=5,
                 repeat_iters=30,
                 use_cuda_graph=True,
