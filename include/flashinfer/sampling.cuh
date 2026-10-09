@@ -1913,7 +1913,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
     float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
           p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
     float u = curand_uniform(&curand_state);
-    if (u * p < q) {
+    // curand_uniform includes 1, which must accept a probability-one ratio.
+    if ((p > 0 && q >= p) || u * p < q) {
       // accept the draft models output
       output_token_ids[row_idx * (num_speculative_tokens + 1) + i] = draft_id;
     } else {
@@ -1929,7 +1930,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
     float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
           p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
     float u = curand_uniform(&curand_state);
-    if (u * p < q) {
+    if ((p > 0 && q >= p) || u * p < q) {
       ++accepted_token_num;
     }
   }
