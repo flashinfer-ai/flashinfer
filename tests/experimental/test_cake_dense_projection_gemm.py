@@ -248,9 +248,9 @@ EXPECTED_TEMPLATES = {
     ('kv_a', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
     ('kv_a', 'wgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_nn_n192_hee_t_tma1',
-        (1001, 212): 'dense_proj_gemm_nn_n192_bz64_hee_t',
+        (1001, 212): 'dense_proj_gemm_nn_n192_bz64_hee_t_stt',
         (2049, 148): 'dense_proj_gemm_nn_n192_hee_t_tma1',
-        (2049, 212): 'dense_proj_gemm_nn_n192_bz64_hee_t',
+        (2049, 212): 'dense_proj_gemm_nn_n192_bz64_hee_t_stt',
     },
     ('kv_a', 'wgrad', 'f32'): {
         (1001, 148): 'dense_proj_gemm_nn_n192_hee_f32_t_tma1',
@@ -385,7 +385,12 @@ EXPECTED_TEMPLATES = {
         (2049, 212): 'dense_proj_gemm_kk_n128',
     },
     ('indexer_k', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256_tma2_pd2',
-    ('indexer_k', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n128_f32_tma1',
+    ('indexer_k', 'dgrad', 'f32'): {
+        (1001, 148): 'dense_proj_gemm_kn_n128_f32_tma1',
+        (1001, 212): 'dense_proj_gemm_kn_n128_f32_tma1_pd2_c1',
+        (2049, 148): 'dense_proj_gemm_kn_n128_f32_tma1',
+        (2049, 212): 'dense_proj_gemm_kn_n128_f32_tma1_pd2_c1',
+    },
     ('indexer_k', 'wgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_nn_n128_m64_t',
         (1001, 212): 'dense_proj_gemm_nn_n128_m64_t_skx',
@@ -497,6 +502,7 @@ EXPORTED_TEMPLATES = frozenset(
         'dense_proj_gemm_kk_n256_q',
         'dense_proj_gemm_kn_n128_f32_tma1',
         'dense_proj_gemm_kn_n128_f32_tma1_c1',
+        'dense_proj_gemm_kn_n128_f32_tma1_pd2_c1',
         'dense_proj_gemm_kn_n128_f32_tma2_s4_c1',
         'dense_proj_gemm_kn_n256',
         'dense_proj_gemm_kn_n256_cg',
@@ -534,7 +540,7 @@ EXPORTED_TEMPLATES = frozenset(
         'dense_proj_gemm_nn_n160_m256_bz64_f32_v8_ef',
         'dense_proj_gemm_nn_n192_bz64_hee_f32_t',
         'dense_proj_gemm_nn_n192_bz64_hee_f32_t_sks',
-        'dense_proj_gemm_nn_n192_bz64_hee_t_sks',
+        'dense_proj_gemm_nn_n192_bz64_hee_t_sks_stt',
         'dense_proj_gemm_nn_n192_hee_f32_t_tma1',
         'dense_proj_gemm_nn_n192_hee_t_tma1',
         'dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1_s6',
