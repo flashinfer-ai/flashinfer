@@ -402,19 +402,17 @@ def test_prefill_engine_key_distinct_from_decode():
         dev.get_compiled(tpl[:7], hint_free=True, prefill=True)
 
 
-def _reg_keys():
-    return [k for k in _host._PREFILL_CACHE if k[0] == "reg"]
-
-
 @requires_gvr2
 @pytest.mark.parametrize(
     "bound", [2045, 2048, 2049, 4096, 4097, 8192], ids=lambda b: f"L{b}"
 )
-@pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
+@pytest.mark.parametrize("top_k", [512, 1024, 2048], ids=lambda k: f"k{k}")
 def test_prefill_register_rung_hinted(top_k, bound):
     """With ``max_seq_len`` the launch runs on the register rung the per-part
     table picks for that bound (or the slab where the table says so): exact on
-    every lead with +inf poison, and the register launcher really is what ran."""
+    every lead with +inf poison, and the launcher the dispatcher resolves for
+    this geometry is exactly the one the table names -- its register key is
+    dropped first, so the launch itself must have (re)created it."""
     L = bound
     if bound <= 4097:
         R = 3  # three packed requests: every lead class at the request edges
@@ -431,7 +429,18 @@ def test_prefill_register_rung_hinted(top_k, bound):
     lens = [i + 1 for _ in range(R) for i in range(L)]
     lg, rs, le = _make_case(rows, ncols, ks, lens, seed=bound + top_k)
     plan = _host._prefill_reg_route(rows, top_k, L)
-    before = set(_reg_keys())
+    bucket = _host._prefill_bucket(L)
+    key = None
+    if plan is not None:
+        assert plan["tpl"][0] == 512 and plan["tpl"][0] * plan["tpl"][1] * 4 >= L
+        key = _host._prefill_cache_key(
+            "reg",
+            (tuple(plan["tpl"]), plan["rt"]["CMP"], plan["rt"]["QC"], plan["smem"]),
+            top_k,
+            0,
+            False,
+        )
+        _host._PREFILL_CACHE.pop(key, None)  # the launch below must recreate it
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     flashinfer.top_k_varlen(
         lg, le, top_k, row_starts=rs, out_indices=out, backend="gvr_2", max_seq_len=L
@@ -440,12 +449,13 @@ def test_prefill_register_rung_hinted(top_k, bound):
     # the bound + 3 lead lanes must fit the rung: no row may be skipped
     assert not bool((out == -7).any()), "a row was left unwritten by the hinted launch"
     _check_windowed(lg, out, rs, le, top_k)
+    lc = _host._prefill_get(rows, top_k, L, bucket, compile_ok=False)
+    assert lc is not None, "the launch left no launcher for its own geometry"
     if plan is not None:
-        new = set(_reg_keys()) - before
-        assert new or before, (
-            "register rung expected but no register launcher was compiled"
-        )
-        assert plan["tpl"][0] == 512 and plan["tpl"][0] * plan["tpl"][1] * 4 >= L
+        assert lc[0] == "reg", "the table names a register rung but the slab ran"
+        assert key in _host._PREFILL_CACHE, "exact register launcher key missing"
+    else:
+        assert lc[0] == "main", "the table sends this bound to the slab"
 
 
 @requires_gvr2
