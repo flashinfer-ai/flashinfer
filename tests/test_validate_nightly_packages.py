@@ -86,6 +86,10 @@ def test_nightly_package_validation_accepts_matching_packages(monkeypatch) -> No
             "flashinfer-jit-cache version '0.7.0+cu130' does not match",
         ),
         (
+            {"shim_version": "0.7.0.post1+cpu"},
+            "flashinfer-jit-cache version '0.7.0.post1+cpu' does not match",
+        ),
+        (
             {"provider_versions": {"flashinfer-jit-cache-sm90a": "0.7.0.post1+cu129"}},
             "flashinfer-jit-cache-sm90a version '0.7.0.post1+cu129' does not match",
         ),

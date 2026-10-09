@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import re
 from pathlib import Path
 
 from packaging.utils import canonicalize_name
@@ -44,8 +45,10 @@ def _validation_errors() -> list[str]:
             f"{flashinfer_version!r}"
         )
 
-    if shim_version != flashinfer_version and not shim_version.startswith(
-        f"{flashinfer_version}+"
+    if (
+        shim_version != flashinfer_version
+        and re.fullmatch(rf"{re.escape(flashinfer_version)}\+cu[0-9]+", shim_version)
+        is None
     ):
         errors.append(
             "flashinfer-jit-cache version "
