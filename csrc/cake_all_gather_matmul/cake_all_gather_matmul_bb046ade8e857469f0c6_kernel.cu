@@ -33,10 +33,10 @@
 
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_bede04b43f0bd85c421d(
+__global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_bb046ade8e857469f0c6(
     const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch,
-    const __grid_constant__ CUtensorMap B, __half* __restrict__ C,
-    __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
+    const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C,
+    __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
     unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles,
     int remote_order) {
   const int tid = threadIdx.x;
@@ -66,9 +66,9 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_bede04b
   const int cta_rank = 0;
 
   // Kernel setup ops
-  __half* smem_a = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_A_OFF);
+  __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_A_OFF);
   const int smem_a_addr = smem + SMEM_SMEM_A_OFF;
-  __half* smem_b = reinterpret_cast<__half*>(smem_raw + SMEM_SMEM_B_OFF);
+  __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_SMEM_B_OFF);
   const int smem_b_addr = smem + SMEM_SMEM_B_OFF;
 
   // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 12 barriers)
@@ -210,10 +210,14 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_bede04b
                    off_m / signal_rows);
               while (true) {
                 unsigned int _gca_v;
-                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p));
+                asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
+                             : "=r"(_gca_v)
+                             : "l"(_gca_p)
+                             : "memory");
                 if (_gca_v >= (unsigned int)(ready_target)) break;
               }
             }
+            asm volatile("fence.proxy.async.global;" ::: "memory");
           }
         }
 #pragma unroll 1
@@ -230,12 +234,8 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_bede04b
                                peer * scratch_pitch + off_m, iter_k,
                                tma_full_addr + (load_stage) * 8);
             }
-#pragma unroll
-            for (int b_panel = 0; b_panel < 4; b_panel++) {
-              tma_3d_gmem2smem(smem_b_addr + load_stage * 49152 + (unsigned int)(b_panel * 8192),
-                               (&B), off_n + b_panel * 64, off_k, 0,
-                               tma_full_addr + (load_stage) * 8);
-            }
+            tma_3d_gmem2smem(smem_b_addr + load_stage * 49152, (&B), 0, off_n, iter_k,
+                             tma_full_addr + (load_stage) * 8);
             mbarrier_arrive_expect_tx(tma_full_addr + (load_stage) * 8, 49152);
           }
           load_stage += 1;
@@ -267,8 +267,8 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_bede04b
           int init_flag = ((iter_k_1 == 0) ? 1 : 0);
           int _mma_a_lo_0 =
               make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072);
-          int _mma_b_lo_0 = make_warp_uniform(((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) +
-                                              (mma_tma_stage) * 3072);
+          int _mma_b_lo_0 =
+              make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072);
           {
             uint64_t _mma_ss_a_desc_0 =
                 (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
@@ -276,25 +276,25 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_bede04b
                 (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
             if (elect_sync()) {
               tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0,
-                              _mma_ss_b_desc_0, 138477584, ((init_flag) ? 0 : 1));
+                              _mma_ss_b_desc_0, 138413200, ((init_flag) ? 0 : 1));
             }
             incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-            incr_smem_desc_lo(_mma_ss_b_desc_0, 128U);
+            incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
             if (elect_sync()) {
               tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0,
-                              _mma_ss_b_desc_0, 138477584, 1);
+                              _mma_ss_b_desc_0, 138413200, 1);
             }
             incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-            incr_smem_desc_lo(_mma_ss_b_desc_0, 128U);
+            incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
             if (elect_sync()) {
               tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0,
-                              _mma_ss_b_desc_0, 138477584, 1);
+                              _mma_ss_b_desc_0, 138413200, 1);
             }
             incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-            incr_smem_desc_lo(_mma_ss_b_desc_0, 128U);
+            incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
             if (elect_sync()) {
               tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0,
-                              _mma_ss_b_desc_0, 138477584, 1);
+                              _mma_ss_b_desc_0, 138413200, 1);
             }
           }
           elect_commit(mma_done_addr + (mma_tma_stage) * 8);
@@ -410,15 +410,15 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_bede04b
             float _tmem_load_0[8];
             tmem_ld_x8(&_tmem_load_0[0], tmem_addr);
             asm volatile("tcgen05.wait::ld.sync.aligned;");
-            uint32_t _tmem_load_0_f16[4];
+            uint32_t _tmem_load_0_bf16[4];
 #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
-              __half2 _h2 = __float22half2_rn(
+              __nv_bfloat162 _bf2 = __float22bfloat162_rn(
                   make_float2(_tmem_load_0[_lp * 2 + 0], _tmem_load_0[_lp * 2 + 1 + 0]));
-              _tmem_load_0_f16[_lp] = *(uint32_t*)&_h2;
+              _tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
             }
             reinterpret_cast<int4*>(C + (out_base + (long long)(n_chunk * 8)))[0] =
-                reinterpret_cast<int4*>(_tmem_load_0_f16)[0];
+                reinterpret_cast<int4*>(_tmem_load_0_bf16)[0];
           }
         }
         if (off_m_1 + 128 > M) {
@@ -430,16 +430,16 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_bede04b
             float _tmem_load_1[8];
             tmem_ld_x8(&_tmem_load_1[0], tmem_addr_1);
             asm volatile("tcgen05.wait::ld.sync.aligned;");
-            uint32_t _tmem_load_1_f16[4];
+            uint32_t _tmem_load_1_bf16[4];
 #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
-              __half2 _h2 = __float22half2_rn(
+              __nv_bfloat162 _bf2 = __float22bfloat162_rn(
                   make_float2(_tmem_load_1[_lp * 2 + 0], _tmem_load_1[_lp * 2 + 1 + 0]));
-              _tmem_load_1_f16[_lp] = *(uint32_t*)&_h2;
+              _tmem_load_1_bf16[_lp] = *(uint32_t*)&_bf2;
             }
             if (local_row < M) {
               reinterpret_cast<int4*>(C + (out_base + (long long)(n_chunk_1 * 8)))[0] =
-                  reinterpret_cast<int4*>(_tmem_load_1_f16)[0];
+                  reinterpret_cast<int4*>(_tmem_load_1_bf16)[0];
             }
           }
         }

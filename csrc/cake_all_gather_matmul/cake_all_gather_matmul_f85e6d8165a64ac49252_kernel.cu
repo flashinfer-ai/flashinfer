@@ -33,7 +33,7 @@
 
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_fc5668c3f1fb4c1881e9(
+__global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_f85e6d8165a64ac49252(
     const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch,
     const __grid_constant__ CUtensorMap B, __half* __restrict__ C,
     __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
@@ -130,7 +130,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_fc5668c
       unsigned int load_stage = 0;
       unsigned int load_phase = 1;
 #pragma unroll 1
-      for (int tile = bid; tile < 4 * ((M + 127) / 128 * 128 / 128 * n_tiles); tile += num_bids) {
+      for (int tile = bid; tile < 8 * ((M + 127) / 128 * 128 / 128 * n_tiles); tile += num_bids) {
         int peer_pass_pm = tile / ((M + 127) / 128 * 128 / 128 * n_tiles);
         int rem_pm = tile - peer_pass_pm * ((M + 127) / 128 * 128 / 128 * n_tiles);
         int c_pm_raw = rem_pm / ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) /
@@ -151,7 +151,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_fc5668c
         int u_cm = tile - (M + 127) / 128 * 128 / 128 * n_tiles;
         int c_cm_raw =
             u_cm /
-            (3 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles));
+            (7 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles));
         int c_cm =
             ((c_cm_raw < ((M + 127) / 128 * 128 +
                           (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) /
@@ -163,7 +163,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_fc5668c
                            (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) -
                        1);
         int v_cm =
-            u_cm - c_cm * (3 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) /
+            u_cm - c_cm * (7 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) /
                                 128 * n_tiles));
         int tiles_m_cm =
             ((c_cm < ((M + 127) / 128 * 128 +
@@ -199,7 +199,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_fc5668c
                            ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128));
         int bid_m = inner % tiles_m_c;
         int bid_n = inner / tiles_m_c;
-        int peer = (rank - peer_pass + 4) % 4;
+        int peer = (rank - peer_pass + 8) % 8;
         int off_m = chunk_idx * (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) +
                     bid_m * 128;
         int off_n = bid_n * 256;
@@ -212,10 +212,14 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_fc5668c
                    off_m / signal_rows);
               while (true) {
                 unsigned int _gca_v;
-                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p));
+                asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
+                             : "=r"(_gca_v)
+                             : "l"(_gca_p)
+                             : "memory");
                 if (_gca_v >= (unsigned int)(ready_target)) break;
               }
             }
+            asm volatile("fence.proxy.async.global;" ::: "memory");
           }
         }
 #pragma unroll 1
@@ -255,7 +259,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_fc5668c
       unsigned int _phase_epilogue_done = 1;
       unsigned int _phase_tma_full = 0;
 #pragma unroll 1
-      for (int tile_1 = bid; tile_1 < 4 * ((M + 127) / 128 * 128 / 128 * n_tiles);
+      for (int tile_1 = bid; tile_1 < 8 * ((M + 127) / 128 * 128 / 128 * n_tiles);
            tile_1 += num_bids) {
         mbarrier_wait(epilogue_done_addr + (mma_epi_stage) * 8, _phase_epilogue_done);
 #pragma unroll 1
@@ -319,7 +323,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_fc5668c
       const int epi_tid = epi_warp * 32 + lane;
       unsigned int _phase_mainloop_done = 0;
 #pragma unroll 1
-      for (int tile_2 = bid; tile_2 < 4 * ((M + 127) / 128 * 128 / 128 * n_tiles);
+      for (int tile_2 = bid; tile_2 < 8 * ((M + 127) / 128 * 128 / 128 * n_tiles);
            tile_2 += num_bids) {
         int peer_pass_pm_1 = tile_2 / ((M + 127) / 128 * 128 / 128 * n_tiles);
         int rem_pm_1 = tile_2 - peer_pass_pm_1 * ((M + 127) / 128 * 128 / 128 * n_tiles);
@@ -342,7 +346,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_fc5668c
         int u_cm_1 = tile_2 - (M + 127) / 128 * 128 / 128 * n_tiles;
         int c_cm_raw_1 =
             u_cm_1 /
-            (3 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles));
+            (7 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 * n_tiles));
         int c_cm_1 =
             ((c_cm_raw_1 < ((M + 127) / 128 * 128 +
                             (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) /
@@ -355,7 +359,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_fc5668c
                        1);
         int v_cm_1 =
             u_cm_1 -
-            c_cm_1 * (3 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 *
+            c_cm_1 * (7 * ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128 *
                            n_tiles));
         int tiles_m_cm_1 =
             ((c_cm_1 < ((M + 127) / 128 * 128 +
@@ -391,7 +395,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_fc5668c
                            ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128));
         int bid_m_1 = inner_1 % tiles_m_c_1;
         int bid_n_1 = inner_1 / tiles_m_c_1;
-        int peer_1 = (rank - peer_pass_1 + 4) % 4;
+        int peer_1 = (rank - peer_pass_1 + 8) % 8;
         int off_m_1 =
             chunk_idx_1 * (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) +
             bid_m_1 * 128;

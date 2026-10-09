@@ -33,7 +33,7 @@
 
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_a80780ede8a1e951deef(
+__global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_dba24f495a33b1a179e7(
     const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch,
     const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C,
     __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
@@ -212,10 +212,14 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_all_gather_matmul_a80780e
                    off_m / signal_rows);
               while (true) {
                 unsigned int _gca_v;
-                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p));
+                asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
+                             : "=r"(_gca_v)
+                             : "l"(_gca_p)
+                             : "memory");
                 if (_gca_v >= (unsigned int)(ready_target)) break;
               }
             }
+            asm volatile("fence.proxy.async.global;" ::: "memory");
           }
         }
 #pragma unroll 1
