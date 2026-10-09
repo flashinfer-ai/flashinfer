@@ -109,13 +109,9 @@ not picked them up):
   arrival counts scale with it, and the base kernels route the idle warps
   straight to kernel_tail).  Touches `kernel_fp8_glu_fc12{,_swapab}.py`
   (dispatch-body gating) too; the drop tree still hardcodes 4.
-
-## MXFP4 local overlay
-
-Preserve the local MXFP4 changes and the FP8 extensions above when updating
-this tree. [VENDOR_PROVENANCE.md](VENDOR_PROVENANCE.md) records source
-revisions and update guidance; [TUNING.md](TUNING.md) describes the supported
-configurations and reproduction commands.
+- Humming MXFP4: adds packed MXFP4 weights on top of the FP8 implementation
+  from #4688 and #5338, reusing its dispatch, scheduling and reduction code.
+  See [TUNING.md](TUNING.md) for configurations and reproduction commands.
 
 ## Layout
 
@@ -136,7 +132,6 @@ kernel_src/sm90/pull_style_cutedsl_megakernel/
 │   ├── hopper_mxfp4.py     ← fused Humming MXFP4 frontend
 │   └── kernel_helpers.py   ← lazy re-export point for raw-kernel helpers/reference
 ├── SKILL.md                ← this file (drop-update workflow)
-├── VENDOR_PROVENANCE.md    ← upstream revisions and local overlays
 └── TUNING.md               ← measured perf vs the kernel drop's reference sweep,
                               benchmark methodology, knob surface, next levers
 ```
@@ -154,7 +149,7 @@ for kernel construct/launch kwargs (`run_kernel()`) when writing the shim.
 ## When the kernel team drops a new version of src/
 
 Same workflow as `kernel_src/sm100/cutedsl_megamoe/SKILL.md`, with this tree's
-package set. Reapply the documented local overlays and validate FP8 and MXFP4
+package set. Reapply the local extensions above and validate FP8 and MXFP4
 correctness, ordinary Graph replay, tuning, and cache isolation:
 
 ```bash

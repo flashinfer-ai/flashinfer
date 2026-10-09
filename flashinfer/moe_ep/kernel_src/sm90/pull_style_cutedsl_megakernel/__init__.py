@@ -12,8 +12,8 @@ revision.  The two trees are separate backends and are mutually exclusive per
 process (see ``shim/_paths.py``).
 
 Layering (same rules as the SM100 package — see SKILL.md):
-- ``src/`` preserves the joint kernel drop plus the versioned fused MXFP4
-  optimization overlay documented in VENDOR_PROVENANCE.md; do not mix drops.
+- ``src/`` contains the kernel drop and local FP8/MXFP4 extensions described
+  in SKILL.md; do not mix drops.
 - ``shim/`` is the only layer that imports the raw ``src/`` packages.
 - moe_ep backends import from this ``__init__`` only.
 
