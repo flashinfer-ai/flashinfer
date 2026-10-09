@@ -97,12 +97,16 @@ def _swiglu_kernel():
                 pack=1,
             )
         if SITU_BETA is not None:
-            # Match W4A16 MegaMoE's native SiTU tanh instruction. Preserve
-            # the sigmoid, FP32 multiplication order, and BF16 handoff below.
+            # Match the upstream exp2/rcp tanh approximation, not libdevice tanh.
             tanh_asm: tl.constexpr = """{
-                .reg .f32 x, result;
+                .reg .f32 x, exponent, denominator, inverse, result;
                 mul.rn.f32 x, $1, $3;
-                tanh.approx.f32 result, x;
+                mul.rn.f32 x, x, 0fC038AA3B;
+                ex2.approx.ftz.f32 exponent, x;
+                add.rn.f32 denominator, exponent, 0f3F800000;
+                rcp.approx.ftz.f32 inverse, denominator;
+                mul.rn.f32 result, inverse, 0f40000000;
+                sub.rn.f32 result, result, 0f3F800000;
                 mul.rn.f32 $0, $2, result;
             }"""
             bounded_gate = tl.inline_asm_elementwise(

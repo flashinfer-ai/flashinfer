@@ -454,23 +454,17 @@ class W4A16Fc1Epilogue(EpilogueContext):
             )
             if cutlass.const_expr(self.situ_beta is not None):
                 beta = cutlass.Float32(self.situ_beta)
-                # Keep the existing reciprocal rounding while processing the
-                # elementwise SiTU math in packed FP32 pairs.
                 inv_beta = cutlass.Float32(1.0 / self.situ_beta)
-                scaled_gate = cute.arch.mul_packed_f32x2(gate, (inv_beta, inv_beta))
-                bounded_gate = cute.arch.mul_packed_f32x2(
-                    (beta, beta), self._tanh_pair(scaled_gate)
+                gate_activated = (
+                    beta * self._tanh(gate[0] * inv_beta) * sigmoid[0],
+                    beta * self._tanh(gate[1] * inv_beta) * sigmoid[1],
                 )
-                gate_activated = cute.arch.mul_packed_f32x2(bounded_gate, sigmoid)
                 if cutlass.const_expr(self.situ_linear_beta is not None):
                     linear_beta = cutlass.Float32(self.situ_linear_beta)
                     inv_linear_beta = cutlass.Float32(1.0 / self.situ_linear_beta)
-                    scaled_up = cute.arch.mul_packed_f32x2(
-                        (t_up[i], t_up[i + 1]),
-                        (inv_linear_beta, inv_linear_beta),
-                    )
-                    up = cute.arch.mul_packed_f32x2(
-                        (linear_beta, linear_beta), self._tanh_pair(scaled_up)
+                    up = (
+                        linear_beta * self._tanh(t_up[i] * inv_linear_beta),
+                        linear_beta * self._tanh(t_up[i + 1] * inv_linear_beta),
                     )
                 else:
                     up = (t_up[i], t_up[i + 1])
@@ -493,11 +487,11 @@ class W4A16Fc1Epilogue(EpilogueContext):
                 )
 
     @cute.jit
-    def _tanh_pair(self, x):
-        return (
-            cute.math.tanh(x[0], approx=True),
-            cute.math.tanh(x[1], approx=True),
-        )
+    def _tanh(self, x: cutlass.Float32) -> cutlass.Float32:
+        exp = cute.math.exp2(x * cutlass.Float32(-2.8853900817779268), fastmath=True)
+        return cutlass.Float32(2.0) * cute.arch.rcp_approx(
+            cutlass.Float32(1.0) + exp
+        ) - cutlass.Float32(1.0)
 
     def __init__(
         self,
