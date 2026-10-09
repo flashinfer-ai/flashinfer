@@ -4349,7 +4349,7 @@ def _batched_selection(
         (1, 128, 32, False),
         (1, 8, 256, True),
         (4, 8, 64, True),
-        (1, 32, 16, False),
+        (1, 32, 16, True),
     ),
     ids=("1x8x16", "1x8x8", "1x128x32", "1x8x256", "4x8x64", "1x32x16"),
 )
@@ -4360,9 +4360,10 @@ def test_source_chunk_parallel_selection_rule(
     Chunk-parallel needs fewer (sequence, head) items than SMs, a workspace
     within the cap and a predicted main-kernel time that beats the exact
     scan's by the selection margin: 1 x 2048 tokens x 8 heads (16 chunks,
-    128 tiles), the 32768-token few-head prefill and 4 x 8192 x 8 qualify;
-    8 chunks do not amortise the fixed cost, 128 heads pay for 4096 tiles,
-    and 1 x 2048 x 32 (512 tiles) lands inside the margin."""
+    128 tiles), the 32768-token few-head prefill, 4 x 8192 x 8 and -- since
+    the round-4 re-fit of the constants -- 1 x 2048 x 32 (512 tiles, measured
+    chunk-parallel / exact 0.91) qualify; 8 chunks do not amortise the fixed
+    cost and 128 heads pay for 4096 tiles."""
 
     selected = _batched_selection(batch, nheads, nchunks, capability=capability)
     assert selected is expected
@@ -4404,14 +4405,14 @@ def test_source_chunk_parallel_selection_quantities_follow_the_cost_model():
     # 128 tiles fit the first wave of 148 SMs: the fixed cost alone.
     assert predicted["chunk_parallel"] == pytest.approx(b200["cp_fixed"])
 
-    # The calibration row: 1 x 32768 tokens x 8 heads (the seed measured
-    # 688 -> 160 us on B200 and 667 -> 153 us on B300).
+    # The calibration row: 1 x 32768 tokens x 8 heads (the round-4 re-fit
+    # measured 667 -> 134 us on B200 and 617 -> 124 us on B300).
     long_prefill = quantities(8, 256, (10, 0))["predicted_us"]
-    assert long_prefill["exact_scan"] == pytest.approx(691.48)
-    assert long_prefill["chunk_parallel"] == pytest.approx(149.03)
+    assert long_prefill["exact_scan"] == pytest.approx(668.754)
+    assert long_prefill["chunk_parallel"] == pytest.approx(118.87)
     long_prefill = quantities(8, 256, (10, 3))["predicted_us"]
-    assert long_prefill["exact_scan"] == pytest.approx(668.24)
-    assert long_prefill["chunk_parallel"] == pytest.approx(141.85)
+    assert long_prefill["exact_scan"] == pytest.approx(617.45)
+    assert long_prefill["chunk_parallel"] == pytest.approx(106.38)
 
     large = quantities(128, 32, (10, 3))
     b300 = model[(10, 3)]
