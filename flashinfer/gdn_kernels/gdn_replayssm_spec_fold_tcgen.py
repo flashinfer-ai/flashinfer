@@ -174,7 +174,8 @@ def _gdn_replayssm_fold_tcgen_kernel(
     safe_slot = requested_slot
     if not is_live:
         safe_slot = cutlass.Int32(0)
-    flat_slot = i_layer * slots_per_layer + safe_slot
+    # Int64: layers * slots * HV * V * K passes 2^31 elements on large pools.
+    flat_slot = cutlass.Int64(i_layer) * slots_per_layer + safe_slot
     state_flat = flat_slot * HV + i_hv
 
     smem = utils.SmemAllocator()
