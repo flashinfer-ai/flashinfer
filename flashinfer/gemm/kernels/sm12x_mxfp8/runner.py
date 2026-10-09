@@ -218,8 +218,10 @@ def _get_compiled(index, n, k, tactic, out_f16):
     return fn
 
 
-# Representative M of the autotuner buckets whose candidates are queued for
-# compilation when a shape is first prepared (see _prepare).
+# Representative M of the autotuner buckets. The first time a shape needs a
+# kernel, the kernels of these buckets are queued for compilation behind it:
+# every bucket's candidates when preparing an autotuner bucket, the default
+# tactics otherwise.
 _AHEAD_MS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 _AHEAD_DONE: set = set()
 _INFLIGHT: dict = {}
@@ -236,11 +238,22 @@ def _preparation_tactics(m, n, k, dev):
     return out
 
 
-def _prepare(index, n, k, tactics, out_f16):
+def _ahead_tactics(n, k, dev, tuning):
+    out = []
+    for m in _AHEAD_MS:
+        if tuning:
+            out += _preparation_tactics(m, n, k, dev)
+        else:
+            out.append(policy.resolve(policy.default_tactic(m, n, k, dev), m))
+    return out
+
+
+def _prepare(index, n, k, tactics, out_f16, tuning):
     """Load ``tactics``, compiling the uncached ones in worker subprocesses.
 
-    The first preparation of a shape also queues the candidates of the other
-    buckets behind its own, so they compile while this bucket is profiled.
+    The first call for a shape (per ``tuning`` mode) also queues the kernels
+    of the other buckets (see ``_AHEAD_MS``) behind its own, so they compile
+    while this one runs.
     """
     from ....jit.cute_dsl_core import (
         JitSpecCuteDsl,
@@ -248,8 +261,6 @@ def _prepare(index, n, k, tactics, out_f16):
         cute_dsl_cache_disabled,
     )
     from . import compile_pool
-
-    shape = (index, n, k, out_f16)
 
     def key_of(t):
         return (index, n, k, t, out_f16)
@@ -263,10 +274,10 @@ def _prepare(index, n, k, tactics, out_f16):
     ):
         dev = _device(index)
         wanted = list(pending)
+        shape = (index, n, k, out_f16, tuning)
         if shape not in _AHEAD_DONE:
             _AHEAD_DONE.add(shape)
-            for m in _AHEAD_MS:
-                wanted += _preparation_tactics(m, n, k, dev)
+            wanted += _ahead_tactics(n, k, dev, tuning)
         jobs, queued = [], set()
         for t in wanted:
             key = key_of(t)
@@ -350,11 +361,15 @@ class Sm12xMxfp8GemmRunner(TunableRunner):
             tactics = _preparation_tactics(m, n, k, dev)
             for choice in tactics:
                 _workspace(index).get(*_workspace_need(choice, m, n, k, dev))
-            _prepare(index, n, k, tactics, out.dtype == torch.float16)
+            _prepare(index, n, k, tactics, out.dtype == torch.float16, True)
             return out
         if tactic is None or tactic == -1 or not policy.supports_m(tactic, m):
             tactic = policy.default_tactic(m, n, k, dev)
-        return launch(policy.resolve(tactic, m), a, b, a_descale, b_descale, out)
+        tactic = policy.resolve(tactic, m)
+        out_f16 = out.dtype == torch.float16
+        if (index, n, k, tactic, out_f16) not in _COMPILED:
+            _prepare(index, n, k, [tactic], out_f16, False)
+        return launch(tactic, a, b, a_descale, b_descale, out)
 
 
 @functools.cache
