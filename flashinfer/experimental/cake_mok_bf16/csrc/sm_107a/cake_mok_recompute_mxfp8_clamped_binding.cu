@@ -21,7 +21,7 @@
 extern "C" __global__ void kernel_cake_mok_recompute_mxfp8_clamped(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap gate_shared_in, const __grid_constant__ CUtensorMap up_shared_in, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap x_q_store, const __grid_constant__ CUtensorMap x_sc_store, const __grid_constant__ CUtensorMap x_t_store, const __grid_constant__ CUtensorMap x_sc_t_store, const __grid_constant__ CUtensorMap x_q, const __grid_constant__ CUtensorMap x_sc, const __grid_constant__ CUtensorMap wg_q, const __grid_constant__ CUtensorMap wg_sc, const __grid_constant__ CUtensorMap wu_q, const __grid_constant__ CUtensorMap wu_sc, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap gate_q_store, const __grid_constant__ CUtensorMap gate_sc_store, const __grid_constant__ CUtensorMap up_q_store, const __grid_constant__ CUtensorMap up_sc_store, const __grid_constant__ CUtensorMap gate_routed_in, const __grid_constant__ CUtensorMap up_routed_in, const __grid_constant__ CUtensorMap hidden_q_store, const __grid_constant__ CUtensorMap hidden_sc_store, const __grid_constant__ CUtensorMap hidden_t_store, const __grid_constant__ CUtensorMap hidden_sc_t_store, unsigned long long* __restrict__ x_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ gate_ready, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit);
 
 
-namespace cake_host_shim_f80af8b7428ab9eb {
+namespace cake_host_shim_28ec7b24d171772a {
 
 using tvm::ffi::TensorView;
 
@@ -2023,6 +2023,6 @@ void Run(TensorView arg_x_shared, TensorView arg_wg_shared, TensorView arg_wu_sh
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_f80af8b7428ab9eb
+}  // namespace cake_host_shim_28ec7b24d171772a
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_f80af8b7428ab9eb::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_28ec7b24d171772a::Run);

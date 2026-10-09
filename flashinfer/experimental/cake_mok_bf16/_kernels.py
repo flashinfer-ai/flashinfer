@@ -812,6 +812,9 @@ class MoKForwardMXFP8:
         hidden_ready = torch.zeros(shared_rows + routed_rows, **counter_opts)
         y_ready = torch.zeros(minis, **counter_opts)
         y_done = torch.zeros(capacity // 128, **counter_opts)
+        # Launch-wide task counter: compute CTAs that finished their GEMM and
+        # SwiGLU work claim final-combine tasks alongside communication CTAs.
+        combine_next = torch.zeros(1, **counter_opts)
         layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
         with tvm_ffi.use_torch_stream():
             self.module.launch(
@@ -864,6 +867,7 @@ class MoKForwardMXFP8:
                 x_ready=x_ready,
                 y_ready=y_ready,
                 y_done=y_done,
+                combine_next=combine_next.view(torch.uint32),
                 local_tokens=local_tokens,
                 hidden=hidden,
                 intermediate=intermediate,

@@ -18,10 +18,10 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_mok_forward_mxfp8_clamped(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap x_q_store, const __grid_constant__ CUtensorMap x_sc_store, const __grid_constant__ CUtensorMap x_t_store, const __grid_constant__ CUtensorMap x_sc_t_store, const __grid_constant__ CUtensorMap x_q, const __grid_constant__ CUtensorMap x_sc, const __grid_constant__ CUtensorMap wg_q, const __grid_constant__ CUtensorMap wg_sc, const __grid_constant__ CUtensorMap wu_q, const __grid_constant__ CUtensorMap wu_sc, const __grid_constant__ CUtensorMap wd_q, const __grid_constant__ CUtensorMap wd_sc, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap gate_q_store, const __grid_constant__ CUtensorMap gate_sc_store, const __grid_constant__ CUtensorMap up_q_store, const __grid_constant__ CUtensorMap up_sc_store, const __grid_constant__ CUtensorMap gate_routed_in, const __grid_constant__ CUtensorMap up_routed_in, const __grid_constant__ CUtensorMap hidden_q_store, const __grid_constant__ CUtensorMap hidden_sc_store, const __grid_constant__ CUtensorMap hidden_t_store, const __grid_constant__ CUtensorMap hidden_sc_t_store, const __grid_constant__ CUtensorMap hidden_q, const __grid_constant__ CUtensorMap hidden_sc, const __grid_constant__ CUtensorMap y_routed, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ gate_ready, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit);
+extern "C" __global__ void kernel_cake_mok_forward_mxfp8_clamped(const __grid_constant__ CUtensorMap x_shared, const __grid_constant__ CUtensorMap wg_shared, const __grid_constant__ CUtensorMap wu_shared, const __grid_constant__ CUtensorMap wd_shared, const __grid_constant__ CUtensorMap gate_shared_out, const __grid_constant__ CUtensorMap up_shared_out, const __grid_constant__ CUtensorMap hidden_shared_out, const __grid_constant__ CUtensorMap hidden_shared_in, const __grid_constant__ CUtensorMap y_shared, const __grid_constant__ CUtensorMap x_q_store, const __grid_constant__ CUtensorMap x_sc_store, const __grid_constant__ CUtensorMap x_t_store, const __grid_constant__ CUtensorMap x_sc_t_store, const __grid_constant__ CUtensorMap x_q, const __grid_constant__ CUtensorMap x_sc, const __grid_constant__ CUtensorMap wg_q, const __grid_constant__ CUtensorMap wg_sc, const __grid_constant__ CUtensorMap wu_q, const __grid_constant__ CUtensorMap wu_sc, const __grid_constant__ CUtensorMap wd_q, const __grid_constant__ CUtensorMap wd_sc, const __grid_constant__ CUtensorMap gate_routed_out, const __grid_constant__ CUtensorMap up_routed_out, const __grid_constant__ CUtensorMap gate_q_store, const __grid_constant__ CUtensorMap gate_sc_store, const __grid_constant__ CUtensorMap up_q_store, const __grid_constant__ CUtensorMap up_sc_store, const __grid_constant__ CUtensorMap gate_routed_in, const __grid_constant__ CUtensorMap up_routed_in, const __grid_constant__ CUtensorMap hidden_q_store, const __grid_constant__ CUtensorMap hidden_sc_store, const __grid_constant__ CUtensorMap hidden_t_store, const __grid_constant__ CUtensorMap hidden_sc_t_store, const __grid_constant__ CUtensorMap hidden_q, const __grid_constant__ CUtensorMap hidden_sc, const __grid_constant__ CUtensorMap y_routed, __nv_bfloat16* __restrict__ y_routed_ptr, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ y_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ gate_ready, int* __restrict__ hidden_ready, int* __restrict__ x_ready, int* __restrict__ y_ready, int* __restrict__ y_done, unsigned int* __restrict__ combine_next, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size, float swiglu_limit);
 
 
-namespace cake_host_shim_5dbeab67bfa04986 {
+namespace cake_host_shim_bc1667c3e45a72fa {
 
 using tvm::ffi::TensorView;
 
@@ -2151,7 +2151,7 @@ inline CUtensorMap EncodeTma_y_routed(const TensorView& t) {
   return tm;
 }
 
-void Run(TensorView arg_x_shared, TensorView arg_wg_shared, TensorView arg_wu_shared, TensorView arg_wd_shared, TensorView arg_gate_shared_out, TensorView arg_up_shared_out, TensorView arg_hidden_shared_out, TensorView arg_hidden_shared_in, TensorView arg_y_shared, TensorView arg_x_q_store, TensorView arg_x_sc_store, TensorView arg_x_t_store, TensorView arg_x_sc_t_store, TensorView arg_x_q, TensorView arg_x_sc, TensorView arg_wg_q, TensorView arg_wg_sc, TensorView arg_wu_q, TensorView arg_wu_sc, TensorView arg_wd_q, TensorView arg_wd_sc, TensorView arg_gate_routed_out, TensorView arg_up_routed_out, TensorView arg_gate_q_store, TensorView arg_gate_sc_store, TensorView arg_up_q_store, TensorView arg_up_sc_store, TensorView arg_gate_routed_in, TensorView arg_up_routed_in, TensorView arg_hidden_q_store, TensorView arg_hidden_sc_store, TensorView arg_hidden_t_store, TensorView arg_hidden_sc_t_store, TensorView arg_hidden_q, TensorView arg_hidden_sc, TensorView arg_y_routed, TensorView arg_y_routed_ptr, TensorView arg_x_peers, TensorView arg_y_peers, TensorView arg_schedule_rank, TensorView arg_schedule_token, TensorView arg_num_tokens, TensorView arg_counts, TensorView arg_gate_ready, TensorView arg_hidden_ready, TensorView arg_x_ready, TensorView arg_y_ready, TensorView arg_y_done, int64_t arg_local_tokens, int64_t arg_hidden, int64_t arg_intermediate, int64_t arg_experts, int64_t arg_topk, int64_t arg_comm_sms, int64_t arg_macro_size, int64_t arg_mini_size, double arg_swiglu_limit, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_x_shared, TensorView arg_wg_shared, TensorView arg_wu_shared, TensorView arg_wd_shared, TensorView arg_gate_shared_out, TensorView arg_up_shared_out, TensorView arg_hidden_shared_out, TensorView arg_hidden_shared_in, TensorView arg_y_shared, TensorView arg_x_q_store, TensorView arg_x_sc_store, TensorView arg_x_t_store, TensorView arg_x_sc_t_store, TensorView arg_x_q, TensorView arg_x_sc, TensorView arg_wg_q, TensorView arg_wg_sc, TensorView arg_wu_q, TensorView arg_wu_sc, TensorView arg_wd_q, TensorView arg_wd_sc, TensorView arg_gate_routed_out, TensorView arg_up_routed_out, TensorView arg_gate_q_store, TensorView arg_gate_sc_store, TensorView arg_up_q_store, TensorView arg_up_sc_store, TensorView arg_gate_routed_in, TensorView arg_up_routed_in, TensorView arg_hidden_q_store, TensorView arg_hidden_sc_store, TensorView arg_hidden_t_store, TensorView arg_hidden_sc_t_store, TensorView arg_hidden_q, TensorView arg_hidden_sc, TensorView arg_y_routed, TensorView arg_y_routed_ptr, TensorView arg_x_peers, TensorView arg_y_peers, TensorView arg_schedule_rank, TensorView arg_schedule_token, TensorView arg_num_tokens, TensorView arg_counts, TensorView arg_gate_ready, TensorView arg_hidden_ready, TensorView arg_x_ready, TensorView arg_y_ready, TensorView arg_y_done, TensorView arg_combine_next, int64_t arg_local_tokens, int64_t arg_hidden, int64_t arg_intermediate, int64_t arg_experts, int64_t arg_topk, int64_t arg_comm_sms, int64_t arg_macro_size, int64_t arg_mini_size, double arg_swiglu_limit, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_x_shared.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));  // binds the context for the encoders
@@ -2274,6 +2274,9 @@ void Run(TensorView arg_x_shared, TensorView arg_wg_shared, TensorView arg_wu_sh
   check_cuda_tensor(arg_y_done, "y_done");
   check_dtype(arg_y_done, DLDataType{kDLInt, 32, 1}, "y_done");
   check_contiguous(arg_y_done, "y_done");
+  check_cuda_tensor(arg_combine_next, "combine_next");
+  check_dtype(arg_combine_next, DLDataType{kDLUInt, 32, 1}, "combine_next");
+  check_contiguous(arg_combine_next, "combine_next");
   TVM_FFI_CHECK(arg_local_tokens >= -2147483648LL && arg_local_tokens <= 2147483647LL, ValueError)
       << "scalar 'local_tokens' value " << arg_local_tokens
       << " is outside i32 range [-2147483648, 2147483647]";
@@ -2345,6 +2348,7 @@ void Run(TensorView arg_x_shared, TensorView arg_wg_shared, TensorView arg_wu_sh
   check_same_device(arg_x_ready, arg_x_shared, "x_ready", "x_shared");
   check_same_device(arg_y_ready, arg_x_shared, "y_ready", "x_shared");
   check_same_device(arg_y_done, arg_x_shared, "y_done", "x_shared");
+  check_same_device(arg_combine_next, arg_x_shared, "combine_next", "x_shared");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -2401,6 +2405,7 @@ void Run(TensorView arg_x_shared, TensorView arg_wg_shared, TensorView arg_wu_sh
   int* p_x_ready = static_cast<int*>(arg_x_ready.data_ptr());
   int* p_y_ready = static_cast<int*>(arg_y_ready.data_ptr());
   int* p_y_done = static_cast<int*>(arg_y_done.data_ptr());
+  unsigned int* p_combine_next = static_cast<unsigned int*>(arg_combine_next.data_ptr());
   int32_t v_local_tokens = (int32_t)arg_local_tokens;
   int32_t v_hidden = (int32_t)arg_hidden;
   int32_t v_intermediate = (int32_t)arg_intermediate;
@@ -2410,7 +2415,7 @@ void Run(TensorView arg_x_shared, TensorView arg_wg_shared, TensorView arg_wu_sh
   int32_t v_macro_size = (int32_t)arg_macro_size;
   int32_t v_mini_size = (int32_t)arg_mini_size;
   float v_swiglu_limit = (float)arg_swiglu_limit;
-  void* kargs[] = {&p_x_shared, &p_wg_shared, &p_wu_shared, &p_wd_shared, &p_gate_shared_out, &p_up_shared_out, &p_hidden_shared_out, &p_hidden_shared_in, &p_y_shared, &p_x_q_store, &p_x_sc_store, &p_x_t_store, &p_x_sc_t_store, &p_x_q, &p_x_sc, &p_wg_q, &p_wg_sc, &p_wu_q, &p_wu_sc, &p_wd_q, &p_wd_sc, &p_gate_routed_out, &p_up_routed_out, &p_gate_q_store, &p_gate_sc_store, &p_up_q_store, &p_up_sc_store, &p_gate_routed_in, &p_up_routed_in, &p_hidden_q_store, &p_hidden_sc_store, &p_hidden_t_store, &p_hidden_sc_t_store, &p_hidden_q, &p_hidden_sc, &p_y_routed, &p_y_routed_ptr, &p_x_peers, &p_y_peers, &p_schedule_rank, &p_schedule_token, &p_num_tokens, &p_counts, &p_gate_ready, &p_hidden_ready, &p_x_ready, &p_y_ready, &p_y_done, &v_local_tokens, &v_hidden, &v_intermediate, &v_experts, &v_topk, &v_comm_sms, &v_macro_size, &v_mini_size, &v_swiglu_limit};
+  void* kargs[] = {&p_x_shared, &p_wg_shared, &p_wu_shared, &p_wd_shared, &p_gate_shared_out, &p_up_shared_out, &p_hidden_shared_out, &p_hidden_shared_in, &p_y_shared, &p_x_q_store, &p_x_sc_store, &p_x_t_store, &p_x_sc_t_store, &p_x_q, &p_x_sc, &p_wg_q, &p_wg_sc, &p_wu_q, &p_wu_sc, &p_wd_q, &p_wd_sc, &p_gate_routed_out, &p_up_routed_out, &p_gate_q_store, &p_gate_sc_store, &p_up_q_store, &p_up_sc_store, &p_gate_routed_in, &p_up_routed_in, &p_hidden_q_store, &p_hidden_sc_store, &p_hidden_t_store, &p_hidden_sc_t_store, &p_hidden_q, &p_hidden_sc, &p_y_routed, &p_y_routed_ptr, &p_x_peers, &p_y_peers, &p_schedule_rank, &p_schedule_token, &p_num_tokens, &p_counts, &p_gate_ready, &p_hidden_ready, &p_x_ready, &p_y_ready, &p_y_done, &p_combine_next, &v_local_tokens, &v_hidden, &v_intermediate, &v_experts, &v_topk, &v_comm_sms, &v_macro_size, &v_mini_size, &v_swiglu_limit};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
       reinterpret_cast<const void*>(kernel_cake_mok_forward_mxfp8_clamped), 232448);
@@ -2443,6 +2448,6 @@ void Run(TensorView arg_x_shared, TensorView arg_wg_shared, TensorView arg_wu_sh
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_5dbeab67bfa04986
+}  // namespace cake_host_shim_bc1667c3e45a72fa
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_5dbeab67bfa04986::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_bc1667c3e45a72fa::Run);
