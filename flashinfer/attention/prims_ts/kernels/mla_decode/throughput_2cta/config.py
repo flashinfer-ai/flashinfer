@@ -470,8 +470,8 @@ def make_mla_decode_config(
         # Quantization keeps an output block and rotary coefficients live.
         # The gather tasks fit in 48 registers; use their surplus for the
         # correction task while preserving the CTA's 61,440-register budget.
-        cfg.softmax_reg_num = 144
-        cfg.correction_reg_num = 192
+        cfg.softmax_reg_num = 160
+        cfg.correction_reg_num = 176
         cfg.other_reg_num = 48
 
     # SETMAXNREG redistributes the CTA's initial allocation, rounded down
