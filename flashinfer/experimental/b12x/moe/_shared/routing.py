@@ -184,8 +184,7 @@ def route_topk(
         return
     block_e = triton.next_power_of_2(num_experts)
     topk_block = triton.next_power_of_2(top_k)
-    launcher = _route_topk_kernel if _launcher is None else _launcher
-    launcher[(num_tokens,)](
+    args = (
         router_logits,
         topk_logits,
         topk_ids,
@@ -202,6 +201,22 @@ def route_topk(
         image_mask.stride(0) if image_mask is not None else 0,
         float(routed_scaling_factor),
         num_experts,
+    )
+    if _launcher is not None:
+        # Compiled Triton launchers take the full positional source signature.
+        _launcher[(num_tokens, 1, 1)](
+            *args,
+            block_e,
+            top_k,
+            topk_block,
+            renormalize,
+            score_func,
+            correction_bias is not None,
+            image_correction_bias is not None and image_mask is not None,
+        )
+        return
+    _route_topk_kernel[(num_tokens,)](
+        *args,
         BLOCK_E=block_e,
         TOP_K=top_k,
         TOPK_BLOCK=topk_block,

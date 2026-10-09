@@ -483,11 +483,12 @@ def validate_moe_decode_config(
                 in {"materialized_queue", "persistent_grid"}
             )
         )
+        and not query.deterministic_output
         and query.activation == "silu"
         and 0 < query.routed_rows <= 256
     ):
         raise ValueError(
-            "the Triton route planner requires small NVFP4 or compact W4A8 SiLU workloads"
+            "the Triton route planner requires small nondeterministic NVFP4 or compact W4A8 SiLU workloads"
         )
     if config.max_active_clusters is not None and config.max_active_clusters <= 0:
         raise ValueError("max_active_clusters must be positive when set")
@@ -541,6 +542,8 @@ def validate_moe_decode_config(
             )
         if config.dynamic_route_mode not in {"direct", "grouped"}:
             raise ValueError("dynamic_route_mode must be 'direct' or 'grouped'")
+        if config.dynamic_route_mode == "direct" and query.deterministic_output:
+            raise ValueError("dynamic direct routing does not support deterministic output")
     elif config.dynamic_tile_m is not None:
         raise ValueError("dynamic_tile_m is only valid for dynamic MoE")
     elif config.dynamic_route_mode is not None:
@@ -641,7 +644,7 @@ def _materialize_tuning(query, device, choice):
                 n=_dynamic_kernel_intermediate_size(
                     query.intermediate_size, effective_query.quant_mode
                 ),
-                deterministic_output=False,
+                deterministic_output=query.deterministic_output,
                 planned_tile_m=config.dynamic_tile_m,
             )
         except RuntimeError as exc:
@@ -829,7 +832,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=23,
+    candidate_contract_version=24,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(

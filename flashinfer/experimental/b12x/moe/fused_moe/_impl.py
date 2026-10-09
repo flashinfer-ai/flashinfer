@@ -2701,7 +2701,7 @@ def _heuristic_dynamic_route_mode(
         routed_rows=query.routed_rows,
         num_experts=query.num_experts,
         n=dynamic_n,
-        deterministic_output=False,
+        deterministic_output=query.deterministic_output,
         planned_tile_m=planned_tile_m,
     )
     if (
@@ -3991,7 +3991,7 @@ def _plan_core_workspace(
             routed_rows=routed_rows,
             num_experts=state_E,
             n=dynamic_kernel_n,
-            deterministic_output=False,
+            deterministic_output=deterministic_output,
             planned_tile_m=dynamic_tile_m,
         ):
             direct_groups = max(
@@ -7531,6 +7531,11 @@ def plan_tp_moe_execution(
         weight_layout=weight_plan.w4a8_weight_layout,
         decode_config=decode_config,
     )
+    if deterministic_output is None:
+        deterministic_output = _dynamic_deterministic_output_enabled(
+            quant_mode=quant_mode,
+            device=device,
+        )
     dynamic_physical_tiles = None
     dynamic_task_capacity = None
     dynamic_tile_m = None
@@ -7566,7 +7571,7 @@ def plan_tp_moe_execution(
             routed_rows=routed_rows,
             num_experts=state_E,
             n=dynamic_kernel_n,
-            deterministic_output=False,
+            deterministic_output=deterministic_output,
             planned_tile_m=dynamic_tile_m,
         ):
             direct_groups = max(
@@ -7608,11 +7613,6 @@ def plan_tp_moe_execution(
             )
     else:
         regime = MoERegime.MATERIALIZED_PERSISTENT
-    if deterministic_output is None:
-        deterministic_output = _dynamic_deterministic_output_enabled(
-            quant_mode=quant_mode,
-            device=device,
-        )
     route_block_rows = None
     if implementation == "w4a16":
         from b12x.moe._shared.kernels.w4a16.host import (
