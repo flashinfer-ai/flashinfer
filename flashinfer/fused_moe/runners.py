@@ -8635,8 +8635,8 @@ class B12xW4A16Runner(_B12xRunner):
 #       (1) permute  sort the T*k assignments by expert (m_indptr, row maps),
 #                    then gather token rows into that order
 #       (2) gemm1    grouped_mm_*(permuted, W1, m_indptr) -> [rows, 2I | I]
-#       (3) act      typed ActivationConfig -> [rows, I]  (+ requant when quantized:
-#                    fused into the activation for FP8, a separate pass otherwise)
+#       (3) act      typed ActivationConfig -> [rows, I] bf16, requantized for a
+#                    quantized gemm2 in a separate pass
 #       (4) gemm2    grouped_mm_*(intermediate, W2, m_indptr) -> [rows, H]
 #       (5) finalize out[t] = sum_k topk_weights[t, k] * rows[token_to_row[t, k]]
 
@@ -8709,7 +8709,8 @@ class _GroupedGemmWorkspace:
     permuted_hidden_states: torch.Tensor  # [rows, H / k_pack], activation dtype
     gemm1_out: torch.Tensor  # [rows, 2I | I] bf16
     # [rows, I] bf16 activation output; only live rows are written, so padding
-    # rows keep finite values from earlier calls.
+    # rows keep finite values from earlier calls. The FP8 runner rescales it in
+    # place to requantize it.
     intermediate: torch.Tensor
     sort: dict[str, torch.Tensor]  # moe_sort out_* buffers
     # Block-scaled runners: token-major permuted scale rows with a spare last row
@@ -8800,6 +8801,11 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
         from ..grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION, _check_cudnn_version
 
         _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, f"{self.backend_key} MoE")
+        # Load the moe_utils kernels here, so a build or load failure (a
+        # RuntimeError) rejects this backend during selection.
+        from .cute_dsl.moe_utils import _get_moe_utils_module
+
+        _get_moe_utils_module()
 
     def _check_activation_parameters(self) -> None:
         activation = self.config.activation
@@ -8814,10 +8820,9 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
             )
 
     def _build(self) -> None:
-        """Load the ``moe_utils`` sort, permute, activation and finalize kernels."""
-        from .cute_dsl.moe_utils import MoeActivationType, _get_moe_utils_module
+        """Resolve the ``moe_activation`` kernel of the configured activation."""
+        from .cute_dsl.moe_utils import MoeActivationType
 
-        _get_moe_utils_module()
         self._moe_activation_type = MoeActivationType[self.config.activation.type.name]
 
     # --- geometry and workspace -------------------------------------------
@@ -9453,6 +9458,7 @@ class CudnnGroupedGemmFp8PerTensorRunner(_CudnnGroupedGemmRunnerBase):
     )
     _expected_num_inputs = 8
     _fc2_dequant_input = 7
+    _fc2_act_quant_scale_input = 6  # the static E4M3 requantization scale
     _intermediate_dtype = torch.float8_e4m3fn
 
     def _pack_extra_inputs(
@@ -9512,7 +9518,7 @@ class CudnnGroupedGemmFp8PerTensorRunner(_CudnnGroupedGemmRunnerBase):
         # buffer is the E4M3 operand.
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
         quantized = (
-            intermediate.mul_(inputs[6])
+            intermediate.mul_(inputs[self._fc2_act_quant_scale_input])
             .clamp_(-fp8_max, fp8_max)
             .to(torch.float8_e4m3fn)
         )
