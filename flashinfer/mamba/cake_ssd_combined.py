@@ -461,18 +461,18 @@ def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
 _CHUNK_PARALLEL_COST_MODEL_US = {
     # (major, minor) compute capability -> calibrated constants.
     (10, 0): {  # B200, sm_100a
-        "serial_fixed": 5.4,
-        "serial_per_chunk_small": 2.68,
-        "serial_per_chunk_large": 4.58,
-        "cp_fixed": 29.9,
-        "cp_per_tile": 0.0627,
+        "serial_fixed": 4.69,
+        "serial_per_chunk_small": 2.594,
+        "serial_per_chunk_large": 2.809,
+        "cp_fixed": 25.2,
+        "cp_per_tile": 0.0493,
     },
     (10, 3): {  # B300 / GB300, sm_103a
-        "serial_fixed": 5.2,
-        "serial_per_chunk_small": 2.59,
-        "serial_per_chunk_large": 4.16,
-        "cp_fixed": 28.8,
-        "cp_per_tile": 0.0595,
+        "serial_fixed": 4.33,
+        "serial_per_chunk_small": 2.395,
+        "serial_per_chunk_large": 2.51,
+        "cp_fixed": 24.3,
+        "cp_per_tile": 0.0432,
     },
 }
 # Unmeasured capabilities use the B200 constants.
