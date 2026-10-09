@@ -824,7 +824,7 @@ kc_pf = torch.randn(
 vc_pf = torch.randn(
     total_pf, page_size, num_kv, head_dim, dtype=torch.bfloat16, device=device
 )
-pf.run(q_pf, (kc_pf, vc_pf))
+pf.run(q_pf, (kc_pf, vc_pf), sinks=torch.linspace(4, 7, num_qo, device=device))
 
 # ── GQA ragged prefill (Llama-3.1-8B) ────────────────────────────────────────
 qo_indptr_r = torch.tensor([0, 64, 128, 192, 256], dtype=torch.int32, device=device)

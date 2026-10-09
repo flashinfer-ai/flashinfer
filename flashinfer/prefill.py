@@ -3450,6 +3450,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             attention-with-sink variant: an additional virtual token whose logit is
             ``sinks[head_idx]`` is appended to each row of the softmax denominator.
             Shape: ``[num_qo_heads]``, dtype ``float32``.
+            With ``backend="cudnn"``, must be contiguous and on the query device;
+            support is checked by the installed cuDNN Graph API. Rubin paged
+            sinks require an FE build containing cudnn-frontend PR #1479.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
             Per-block scale factors for NVFP4 KV cache. Accepts the same formats as
             ``paged_kv_cache``:
@@ -3763,12 +3766,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._backend == "cudnn":
             # The cuDNN graph declares dense output and Stats strides.
             if (
-                sinks is not None
-                or kv_cache_sf is not None
+                kv_cache_sf is not None
                 or skip_softmax_threshold_scale_factor is not None
             ):
                 raise NotImplementedError(
-                    "cuDNN paged prefill does not support sinks, NVFP4 or skip-softmax"
+                    "cuDNN paged prefill does not support NVFP4 or skip-softmax"
                 )
             if self._kv_layout == "NHD":
                 k_cache = k_cache.transpose(-3, -2)
@@ -3805,6 +3807,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     return_lse,
                     q.size(0) if native_hn else 0,
                     lse_base=lse_base,
+                    sinks=sinks,
                 ):
                     prepared = self._cudnn_prepared = prepare_cudnn_batch_prefill(
                         q,
@@ -3815,6 +3818,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         metadata=plan.build_metadata(return_lse),
                         stats_head_stride=q.size(0) if native_hn else 0,
                         lse_base=lse_base,
+                        sinks=sinks,
                     )
                 if native_hn and not prepared.stats_head_stride:
                     lse_out = lse
@@ -3831,6 +3835,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._float_workspace_buffer,
                     plan=plan,
                     lse_base=lse_base,
+                    sinks=sinks,
                 )
             else:
                 cudnn_batch_prefill_with_kv_cache(
@@ -3856,6 +3861,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     out=out,
                     lse=lse,
                     o_data_type=out_dtype,
+                    sinks=sinks,
                 )
         else:
             if self._backend != "trtllm-gen":
