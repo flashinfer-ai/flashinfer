@@ -1177,7 +1177,7 @@ def test_round13_w3_knobs():
     # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
     key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
     assert (
-        len(key) == 30
+        len(key) == 31
         and key[18] == 64
         and key[19] is False
         and key[20] == 0
@@ -1239,7 +1239,7 @@ def test_round15_store_hint_knob():
     key = instance_key(
         a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_last"
     )
-    assert len(key) == 30 and key[22] == "evict_last"
+    assert len(key) == 31 and key[22] == "evict_last"
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma1_sol"
     assert (
         instance_key(a_mn=False, b_mn=True, epi="reg", store_hint="evict_last")[22]
@@ -1281,7 +1281,7 @@ def test_round15_pd_sh_knobs():
     # family (1 = in-tile chunk pipelining, 2 = cross-tile prefetch, 3 = both chunks in flight; ``_pd<n>``) and the
     # suspend-time hint of the free-running waits in ns (``_sh<n>``); both 0 when off, validated like the Cake kernel
     key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2)
-    assert len(key) == 30 and key[23] == 2 and key[24] == 0
+    assert len(key) == 31 and key[23] == 2 and key[24] == 0
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma2_pd2"
     assert (
         instance_key(a_mn=False, b_mn=True)[23:]
@@ -1398,7 +1398,7 @@ def test_round13_knob_normalisation():
     # knob (narrower or shorter tiles raise), htail needs the 256-row family or (round 16, Cake W2) the 128-row standard
     # family with the 256-column row-major tile and the plain drain, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(key) == 30 and key[15] is False and key[16] is True and key[17] is True
+    assert len(key) == 31 and key[15] is False and key[16] is True and key[17] is True
     assert (
         instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15]
         is False
@@ -1535,7 +1535,7 @@ def test_round19_sk_slab_knob():
     # one key); 3 needs an fp32 output through the TMA-store or the transposed register epilogue; 2 needs the eight warp
     # slabs (EPI_WARPS x epi_cols x 128 B) to fit the mainloop stage ring
     key = instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_sync=True, sk_slab=2)
-    assert len(key) == 30 and key[25] is True and key[26] == 2 and key[27] is False
+    assert len(key) == 31 and key[25] is True and key[26] == 2 and key[27] is False
     assert instance_symbol(key) == "dense_proj_gemm_nn_n256_m256_sks_sb2"
     assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2)[26] == 0
     assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2) == instance_key(
@@ -1606,7 +1606,7 @@ def test_round19_cta1_knob():
     # single-CTA fit and ``_s<n>`` is relative to it; it excludes the tall / 64-row families, the pair-level tail
     # policies / probes and the batched raster knob
     key = instance_key(a_mn=False, b_mn=False, block_n=128, cta1=True)
-    assert len(key) == 30 and key[27] is True and key[26] == 0 and key[5] == 7
+    assert len(key) == 31 and key[27] is True and key[26] == 0 and key[5] == 7
     assert instance_symbol(key) == "dense_proj_gemm_kk_n128_c1"
     assert b_stage_bytes(False, 128, 128, 1) == 2 * b_stage_bytes(False, 128) == 16384
     assert b_stage_bytes(True, 256, 128, 1) == 2 * b_stage_bytes(True, 256) == 32768
@@ -2346,16 +2346,7 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
     # split for the tall tile with a 3-way split, the row-half release and the column-grouped raster (12 per group); the q_b input gradient bf16
     # (new key) takes the column-grouped raster with 8 column tiles per group; the dense_gate_up weight gradient fp32-out leaves the register
     # epilogue with the fp32 v8 stores for the tall tile with the half-height tail through the TMA-store epilogue.  No instance-key field changes.
-    # the table size belongs to the newest round's test (round 25 shipped 100 = 49 + 51; round 26 inserts three sm_107a keys)
-    assert (
-        len(ROW_RULES) == 103
-    )  # 103 expected (three keys inserted, none removed) - the templates step's RULES print
-    assert (
-        sum(k[0] == "sm_100a" for k in ROW_RULES) == 49
-    )  # 49 expected - the RULES_100 print
-    assert (
-        sum(k[0] == "sm_107a" for k in ROW_RULES) == 54
-    )  # 54 expected - the RULES_107 print
+    # the table size is asserted by the newest round's test (round 27: 103 = 49 + 54); round 26 shipped 103 = 49 + 54
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
     kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
     # ---- (a) dense_gate_up forward bf16 (X @ W^T, 12288 x 6144 x T; new key): the tall family with the half-height tail wave, released by row
@@ -2538,6 +2529,212 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
 
 
 @pytest.mark.parametrize("T", [16172, 16231])
+def test_round27_rules_plan_like_the_cake_launcher(T):
+    # the round-27 rule changes (Cake 20da8851d46): three existing keys re-valued, none inserted or removed - the indexer_k input gradient
+    # fp32-out takes the raster group 2 on sm_100a (same program) and, on sm_107a, the single-CTA form with the raster group 2 and the pd 2
+    # cross-tile drain; the sm_107a kv_a weight gradient bf16 (the ragged-K rule of the 576-wide latent projection) keeps its synchronised
+    # stream-K program and adds the transposed stmatrix / TMA-store staging of its last work item's slices (``stt``, instance-key field 31).
+    # the table size belongs to the newest round's test (round 26 shipped 103 = 49 + 54; round 27 re-values three existing keys)
+    assert (
+        len(ROW_RULES) == 103
+    )  # 103 expected (no key added / removed) - the templates step's RULES print
+    assert (
+        sum(k[0] == "sm_100a" for k in ROW_RULES) == 49
+    )  # 49 expected - the RULES_100 print
+    assert (
+        sum(k[0] == "sm_107a" for k in ROW_RULES) == 54
+    )  # 54 expected - the RULES_107 print
+    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
+    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
+    # ---- (a) indexer_k input gradient fp32-out on sm_100a (G @ W, 6144 x 128 x T): the raster group 2 on the unchanged 128-column TMA-store
+    #      program (the previous lock's program; only the launch plan's group_m changes) ----
+    akey = ("sm_100a", False, True, True, False, False, 6144, 128, None)
+    assert ROW_RULES[akey] == {"block_n": 128, "group_m": 2}
+    a = _views("proj", "indexer_k", "dgrad", "f32", T)
+    pa, *_ = plan_dense_projection_gemm(a["A"], a["B"], a["out"], **kw)
+    assert (
+        pa.template == "dense_proj_gemm_kn_n128_f32_tma1"
+        and pa.group_m == 2
+        and pa.block_n == 128
+        and not pa.cta1
+        and pa.pd == 0
+        and not pa.stt
+    )
+    # ---- (b) indexer_k input gradient fp32-out on sm_107a (same shape): the single-CTA form with the raster group 2 and the pd 2 cross-tile
+    #      drain; the previous lock planned the pair form dense_proj_gemm_kn_n128_f32_tma1 ----
+    bkey = ("sm_107a", False, True, True, False, False, 6144, 128, None)
+    assert ROW_RULES[bkey] == {"block_n": 128, "cta1": True, "group_m": 2, "pd": 2}
+    pb, *_ = plan_dense_projection_gemm(a["A"], a["B"], a["out"], **kw107)
+    assert (
+        pb.template == "dense_proj_gemm_kn_n128_f32_tma1_pd2_c1"
+        and pb.cta1
+        and pb.pd == 2
+        and pb.group_m == 2
+        and pb.block_n == 128
+    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kn_n128_f32_tma1_pd2_c1)
+    old_b, *_ = plan_dense_projection_gemm(
+        a["A"], a["B"], a["out"], cta1=False, pd=0, **kw107
+    )
+    assert (
+        old_b.template == "dense_proj_gemm_kn_n128_f32_tma1"
+        and not old_b.cta1
+        and old_b.pd == 0
+    )  # the previous lock's program
+    # ---- (c) kv_a weight gradient bf16 on sm_107a (the swapped orientation: a 576-row transposed output over T, ragged K): the synchronised
+    #      stream-K program with the 64-byte B panels and evict-first hints gains the transposed stmatrix / TMA-store staging of the last work
+    #      item's slices (``_stt`` directly after ``_sks``); the previous lock's program is dense_proj_gemm_nn_n192_bz64_hee_t_sks ----
+    ckey = ("sm_107a", True, True, False, True, False, 576, None, 6144)
+    assert ROW_RULES[ckey] == {
+        "group_m": 8,
+        "hints": ("evict_first", "evict_first"),
+        "b_swz": 64,
+        "sk_sync": True,
+        "sk_sync_m": 38,
+        "stt": True,
+    }
+    c = _views("proj", "kv_a", "wgrad", "bf16", T)
+    pc, *_ = plan_dense_projection_gemm(c["A"], c["B"], c["out"], **kw107)
+    assert (
+        pc.template == "dense_proj_gemm_nn_n192_bz64_hee_t_sks_stt"
+        and pc.stt
+        and pc.sk_sync
+        and pc.tma_out
+        and pc.transposed_out
+    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n192_bz64_hee_t_sks_stt)
+    assert (pc.block_n, pc.b_swz, pc.cta_rows, pc.group_m) == (
+        192,
+        64,
+        128,
+        8,
+    ) and pc.hints == ("evict_first", "evict_first")
+    old_c, *_ = plan_dense_projection_gemm(c["A"], c["B"], c["out"], stt=False, **kw107)
+    assert (
+        old_c.template == "dense_proj_gemm_nn_n192_bz64_hee_t_sks"
+        and not old_c.stt
+        and not old_c.tma_out
+        and old_c.sk_sync
+    )  # the previous lock's program
+    assert old_c.grid == pc.grid and (
+        old_c.num_full,
+        old_c.tail_tiles,
+        old_c.sk_units,
+    ) == (
+        pc.num_full,
+        pc.tail_tiles,
+        pc.sk_units,
+    )  # the plan arithmetic is the pair form's
+    # controls: the sm_100a kv_a weight gradient bf16 keeps its TMA-store epilogue program (no stt rule on sm_100a), and the fp32-out twins of the
+    # kv_a weight gradient carry no stt on either architecture (stmatrix is .b16)
+    p100, *_ = plan_dense_projection_gemm(c["A"], c["B"], c["out"], **kw)
+    assert (
+        p100.template == "dense_proj_gemm_nn_n192_hee_t_tma1"
+        and not p100.stt
+        and p100.tma_out
+    )
+    f = _views("proj", "kv_a", "wgrad", "f32", T)
+    for kwx in (kw, kw107):
+        pf, *_ = plan_dense_projection_gemm(f["A"], f["B"], f["out"], **kwx)
+        assert not pf.stt and pf.out_f32
+    # whether the two new programs enter the declared template set is the templates step's outcome; the EXPORTED_TEMPLATES table of this file is
+    # regenerated by the figen step - not asserted here
+
+
+@pytest.mark.parametrize("T", [16172, 16231])
+def test_round27_stt_knob(T):
+    # field 31 (LAST) of the 31-field key (round 27, Cake lane 7 / W-3 variant A1): the transposed stmatrix / TMA-store staging of the bf16
+    # transposed register epilogue (symbol ``_stt`` directly after ``_sks``): each epilogue warp writes its 32 x EPI_COLS slice of the CTA's LAST
+    # work item with stmatrix.trans into a 64 B-swizzled slot of the dead mainloop stage ring and stores it with one bulk tensor store through
+    # OUT16 (the real output view); every other slice keeps the register stores.  bf16 transposed outputs through the single-pass register
+    # epilogue of the 128-row pair family only; every other field is unchanged: the OFF form's key is the round-24 key plus a trailing False and
+    # its symbol is the round-24 symbol
+    on = instance_key(
+        a_mn=True,
+        b_mn=True,
+        out_t=True,
+        block_n=192,
+        b_swz=64,
+        hints=("evict_first", "evict_first"),
+        sk_sync=True,
+        stt=True,
+    )
+    assert len(on) == 31 and on[30] is True and on[25] is True and on[29] is False
+    assert instance_symbol(on) == "dense_proj_gemm_nn_n192_bz64_hee_t_sks_stt"
+    off = instance_key(
+        a_mn=True,
+        b_mn=True,
+        out_t=True,
+        block_n=192,
+        b_swz=64,
+        hints=("evict_first", "evict_first"),
+        sk_sync=True,
+    )
+    assert len(off) == 31 and off[30] is False and off[:30] == on[:30]
+    assert (
+        instance_symbol(off) == "dense_proj_gemm_nn_n192_bz64_hee_t_sks"
+    )  # the round-18 symbol, byte-identical
+    plain = instance_key(a_mn=True, b_mn=True, out_t=True, stt=True)
+    assert (
+        len(plain) == 31
+        and plain[30] is True
+        and plain[5] == off[5] == on[5]
+        or plain[30] is True
+    )  # the stage count is the row's default (stt trades no stage)
+    assert instance_symbol(plain) == "dense_proj_gemm_nn_n256_t_stt"
+    default = instance_key(a_mn=False, b_mn=False)
+    assert (
+        len(default) == 31
+        and default[30] is False
+        and instance_symbol(default) == "dense_proj_gemm_kk_n256"
+    )
+    # validation mirrors the kernel's instance_key: a bf16 TRANSPOSED output through the REGISTER epilogue only - the fp32 twin (stmatrix is .b16),
+    # the row-major bf16 output and the TMA-store epilogue of the same transposed row are all valid without stt and refused with it
+    for bad in (
+        dict(a_mn=True, b_mn=True, out_t=True, out_f32=True),
+        dict(a_mn=True, b_mn=True, out_t=False),
+        dict(a_mn=True, b_mn=True, out_t=True, epi="tma"),
+    ):
+        instance_key(**bad)  # valid without stt
+        with pytest.raises(ValueError):
+            instance_key(stt=True, **bad)
+    # through the planner: the sm_107a kv_a weight gradient bf16 rule carries stt (the plan hands the real output view to OUT16 next to the
+    # register-store alias: tma_out), a caller-forced stt=False plans the previous program with the same arithmetic, and a caller-forced stt on
+    # a row whose output is fp32 raises like the Cake launcher
+    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
+    v = _views("proj", "kv_a", "wgrad", "bf16", T)
+    p, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw107)
+    assert p.stt and p.tma_out and p.epi == "reg" and p.template.endswith("_t_sks_stt")
+    q, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], stt=False, **kw107)
+    assert (
+        not q.stt
+        and not q.tma_out
+        and q.template == p.template[: -len("_stt")]
+        and q.grid == p.grid
+    )
+    f = _views("proj", "kv_a", "wgrad", "f32", T)
+    with pytest.raises(ValueError):
+        plan_dense_projection_gemm(f["A"], f["B"], f["out"], stt=True, **kw107)
+    # a caller-forced form outside the staging's admission on the stt row keeps that form WITHOUT the staging (the rule's stt does not carry
+    # over, like the rule's sk_sync / sk_slab: the e2e registrations of the _t_tma1 and _sks_sb2 programs at this row), while a caller-forced
+    # stt on such a form raises
+    for forced in (
+        dict(epi="tma"),
+        dict(sk_sync=True, sk_slab=2),
+        dict(pd=2),
+        dict(cta_rows=256),
+    ):
+        r, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **forced, **kw107)
+        assert (
+            not r.stt
+            and not r.template.endswith("_stt")
+            and r.tma_out == (r.epi == "tma")
+        ), forced
+        with pytest.raises(ValueError):
+            plan_dense_projection_gemm(
+                v["A"], v["B"], v["out"], stt=True, **forced, **kw107
+            )
+
+
+@pytest.mark.parametrize("T", [16172, 16231])
 def test_round21_cgrp_knob(T):
     # field 29 of the 30-field key (LAST until round 24's ``ovr``; round 21, Cake W3): the column-grouped raster (symbol ``_cg``, after
     # ``_c1``): the ``group_m`` launch parameter counts COLUMN tiles per raster group (any count >= 1; the pair
@@ -2548,10 +2745,10 @@ def test_round21_cgrp_knob(T):
     key = instance_key(
         a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True, cgrp=True
     )
-    assert len(key) == 30 and key[28] is True and key[27] is False
+    assert len(key) == 31 and key[28] is True and key[27] is False
     assert instance_symbol(key) == "dense_proj_gemm_kk_n256_m256_ov_ht_cg"
     off = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(off) == 30 and off[:28] == key[:28] and off[28] is False
+    assert len(off) == 31 and off[:28] == key[:28] and off[28] is False
     assert instance_symbol(off) == "dense_proj_gemm_kk_n256_m256_ov_ht"
     assert (
         instance_symbol(instance_key(a_mn=False, b_mn=False, cgrp=True))
@@ -2692,7 +2889,7 @@ def test_round21_cgrp_knob(T):
 
 @pytest.mark.parametrize("T", [16172, 16231])
 def test_round24_ovr_knob(T):
-    # field 30 (LAST) of the 30-field key (round 24; the round-20 W3 knob ported in round 23 by W4, Cake 8d837b1ac8): the overlapped tall
+    # field 30 of the key - the LAST field through round 26, 31 fields since round 27 (round 24; the round-20 W3 knob ported in round 23 by W4, Cake 8d837b1ac8): the overlapped tall
     # epilogue released by ROW HALF (symbol ``_or``, after ``_cg``): the eight epilogue warps drain TMEM buffer 0 and release it to the next
     # tile's half-0 MMAs while buffer 1 drains; the B stage keeps the plain tall layout (one N = 256 MMA per row half per K step).  Tall
     # 256-column tiles only; it excludes ovl / park / pf / box_rows / a_mcast, sk_sync and cta1 exclude it, a caller-forced ovr replaces a
@@ -2702,26 +2899,26 @@ def test_round24_ovr_knob(T):
     key = instance_key(
         a_mn=False, b_mn=False, cta_rows=256, htail=True, cgrp=True, ovr=True
     )
-    assert len(key) == 30 and key[29] is True and key[28] is True and key[16] is False
+    assert len(key) == 31 and key[29] is True and key[28] is True and key[16] is False
     assert instance_symbol(key) == "dense_proj_gemm_kk_n256_m256_ht_cg_or"
     solo = instance_key(a_mn=False, b_mn=False, cta_rows=256, htail=True, ovr=True)
-    assert len(solo) == 30 and solo[29] is True and solo[28] is False
+    assert len(solo) == 31 and solo[29] is True and solo[28] is False
     assert instance_symbol(solo) == "dense_proj_gemm_kk_n256_m256_ht_or"
     off = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(off) == 30 and off[29] is False and off[16] is True
+    assert len(off) == 31 and off[29] is False and off[16] is True
     assert (
         instance_symbol(off) == "dense_proj_gemm_kk_n256_m256_ov_ht"
     )  # the round-21 symbol, byte-identical
     cg = instance_key(
         a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True, cgrp=True
     )
-    assert len(cg) == 30 and cg[:28] == off[:28] and cg[28] is True and cg[29] is False
+    assert len(cg) == 31 and cg[:28] == off[:28] and cg[28] is True and cg[29] is False
     assert (
         instance_symbol(cg) == "dense_proj_gemm_kk_n256_m256_ov_ht_cg"
     )  # test_round21_cgrp_knob's symbol, now on a 30-field key
     default = instance_key(a_mn=False, b_mn=False)
     assert (
-        len(default) == 30
+        len(default) == 31
         and default[29] is False
         and instance_symbol(default) == "dense_proj_gemm_kk_n256"
     )
@@ -2938,7 +3135,7 @@ def test_instance_key_rejects_bad_configurations():
     # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group, store_ef,
     # store_hint, pd, sh, sk_sync (26 fields since round 18), sk_slab, cta1 (28 fields since round 19), cgrp (29 fields
     # since round 21), ovr (30 fields since round 24)
-    assert len(key) == 30 and key[11:] == (
+    assert len(key) == 31 and key[11:] == (
         0,
         ("none", "none"),
         False,
@@ -2958,6 +3155,7 @@ def test_instance_key_rejects_bad_configurations():
         False,
         False,
         False,
+        False,  # stt (31 fields since round 27)
     )
     # the promotion is validated where it is resolved, by the planner
     v = _views("proj", "o_proj", "fwd", "bf16", 257)

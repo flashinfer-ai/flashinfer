@@ -360,6 +360,14 @@ def staging_bytes(slots: int) -> int:
     return EPI_WARPS * slots * SLOT_BYTES
 
 
+def stt_bytes(stt: bool) -> int:
+    """Dedicated staging bytes of the transposed stmatrix / TMA store (round 27, Cake lane 7, knob ``stt``): 0 - the
+    SMEM plan stages the per-warp EPI_COLS x 64 B slots in the DEAD mainloop stage ring of the CTA's last work item, so
+    no mainloop stage is traded; a dedicated-slot plan would be entered here and flow into ``default_stages`` and the
+    ``instance_key`` SMEM check together.  [Cake ``stt_bytes``]"""
+    return 0
+
+
 def b_stage_bytes(
     b_mn: bool, block_n: int, b_swz: int = 128, cta_group: int = CTA_GROUP
 ) -> int:
@@ -396,6 +404,7 @@ def default_stages(
     b_mn: bool = False,
     b_swz: int = 128,
     cta_group: int = CTA_GROUP,
+    stt: bool = False,
 ) -> int:
     """Mainloop stages that fit the 227 KiB opt-in with the epilogue staging: 32 KiB stages
     for 128-row tiles (24 KiB at BLOCK_N = 128, where the streaming-bound small-N rows are
@@ -405,14 +414,19 @@ def default_stages(
     ``b_mn`` sizes the MN-major B panels).  Narrow-panel instances (``b_swz`` 64 / 32, round 13) have smaller
     stages than their 128-byte-panel siblings and likewise take the deepest pipeline that fits the opt-in (at most
     12).  The single-CTA form (``cta1``, round 19: 48 KiB stages at BLOCK_N 256, 32 KiB at 128) takes the deepest
-    fit the same way.  [Cake ``default_stages``]"""
+    fit the same way.  ``stt`` (round 27, Cake lane 7) subtracts the transposed stmatrix store's dedicated staging bytes
+    (``stt_bytes``: 0 under the dead-ring plan) beside the slots'.  [Cake ``default_stages``]"""
     if cta_rows == 64 or int(b_swz) != 128 or int(cta_group) == 1:
         stage = min(cta_rows, 128) * a_halves_of(
             cta_rows
         ) * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz, cta_group)
         return max(
             2,
-            min(12, (SMEM_OPT_IN - WORK_STAGES * 16 - staging_bytes(slots)) // stage),
+            min(
+                12,
+                (SMEM_OPT_IN - WORK_STAGES * 16 - staging_bytes(slots) - stt_bytes(stt))
+                // stage,
+            ),
         )
     if cta_rows != 128:
         return (4, 4, 3)[slots]
@@ -477,6 +491,7 @@ def instance_key(
     cta1: bool = False,
     cgrp: bool = False,
     ovr: bool = False,
+    stt: bool = False,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
@@ -516,12 +531,21 @@ def instance_key(
     drained; the B stage keeps the plain tall layout (one N = 256 MMA per row half per K step - half the tcgen05.mma
     issues and 3/4 of the tensor-core SMEM operand traffic of ``ovl``).  Tall 256-column tiles only; it excludes
     ``ovl`` / ``park`` and the pf / box_rows / a_mcast probes, and (like ``ovl``) the synchronised stream-K plan and
-    the single-CTA form; every other field is unchanged and the OFF form renders byte-identical.  [Cake ``instance_key``]"""
+    the single-CTA form; every other field is unchanged and the OFF form renders byte-identical.
+    ``stt`` (round 27, Cake lane 7 / W-3 variant A1, field 31 = LAST after ``ovr`` = 30, symbol ``_stt`` directly after
+    ``_sks``) selects the transposed stmatrix / TMA-store staging of the bf16 transposed REGISTER epilogue of the 128-row
+    single-pass pair family: each epilogue warp writes its 32 x EPI_COLS bf16 slice with ``stmatrix.trans`` into a
+    64 B-swizzled slot of the dead mainloop stage ring of the CTA's last work item and stores it with one bulk tensor
+    store (``OUT16`` = the real [L, N, M] view, box (32, EPI_COLS, 1)); every other slice keeps the register stores
+    through ``out``.  bf16 transposed outputs only (stmatrix is .b16), whole 32-column warp slices up to 256 columns,
+    no ovl / ovr / park / htail / pd / cta1, ``sk_slab`` 0 / 1, and the pool must fit the 227 KiB opt-in; every other
+    field is unchanged and the OFF form renders byte-identical.  [Cake ``instance_key``]"""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf = int(block_n), int(cta_rows), int(pf)
     cta1 = bool(cta1)
     cgrp = bool(cgrp)
     ovr = bool(ovr)
+    stt = bool(stt)
     cg = 1 if cta1 else CTA_GROUP
     hints = (str(hints[0]), str(hints[1]))
     if any(h not in L2_HINTS for h in hints):
@@ -557,7 +581,7 @@ def instance_key(
         )
     slots = epi_slots(epi, out_f32, block_n, None, slots, cta_rows, out_t)
     stages = (
-        default_stages(slots, cta_rows, block_n, b_mn, b_swz, cg)
+        default_stages(slots, cta_rows, block_n, b_mn, b_swz, cg, stt)
         if stages is None
         else int(stages)
     )
@@ -568,7 +592,11 @@ def instance_key(
     stage_bytes = cta_rows * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz, cg)
     if (
         stages < 2
-        or stages * stage_bytes + staging_bytes(slots) + WORK_STAGES * 16 > limit
+        or stages * stage_bytes
+        + staging_bytes(slots)
+        + stt_bytes(stt)
+        + WORK_STAGES * 16
+        > limit
     ):
         raise ValueError(
             f"{stages} stages at BLOCK_N={block_n}, CTA_ROWS={cta_rows} exceed the {limit} B dynamic SMEM limit"
@@ -703,6 +731,53 @@ def instance_key(
         raise ValueError(
             f"sk_slab=2 stages the eight warp slabs ({slab_bytes} B) in the mainloop stage ring ({stages} stages); too small"
         )
+    if stt and (
+        out_f32
+        or not out_t
+        or epi != "reg"
+        or cta_rows != 128
+        or cta1
+        or ovl
+        or ovr
+        or park
+        or htail
+        or int(pd)
+        or cols % 32
+        or cols > 256
+        or sk_slab not in (0, 1)
+    ):
+        # round 27 (Cake lane 7, W-3 A1): the transposed stmatrix / TMA-store staging is built for the bf16 transposed
+        # REGISTER epilogue of the 128-row single-pass pair family (stmatrix is .b16: the fp32 rows are excluded; the
+        # 16x256b drain covers whole 32-column blocks; the box outer extent is <= 256; the ovl / ovr / park / htail / pd
+        # forms drain and store through their own chunk paths; the bulk slab read (sk_slab 2) copies a column-group
+        # prefix that the 16x256b order no longer is; sk_slab 3 is fp32-only; the single-CTA form's handoff is
+        # unmeasured)  [Cake instance_key]
+        raise ValueError(
+            f"stt (transposed stmatrix / TMA-store staging) needs a bf16 transposed output through the single-pass "
+            f"register epilogue of the 128-row pair family (no ovl / ovr / park / htail / pd) with whole 32-column warp "
+            f"slices of at most 256 columns and sk_slab 0 / 1 (got out_f32={out_f32}, out_t={out_t}, epi={epi!r}, "
+            f"cta_rows={cta_rows}, cta1={cta1}, ovl={ovl}, ovr={ovr}, park={park}, htail={htail}, pd={pd}, "
+            f"cols={cols}, sk_slab={sk_slab})"
+        )
+    stt_slots = EPI_WARPS * cols * 64
+    if stt and stt_slots > stages * (
+        cta_rows * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz, cg)
+    ):
+        raise ValueError(
+            f"stt stages the eight warp slots ({stt_slots} B) in the dead mainloop stage ring ({stages} stages); too small"
+        )
+    stt_pool = (
+        stages * (cta_rows * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz, cg))
+        + staging_bytes(slots)
+        + stt_bytes(stt)
+        + WORK_STAGES * 16
+    )
+    if stt and stt_pool > SMEM_OPT_IN:
+        # round 27 (Cake lane 7): an stt program must fit the 227 KiB opt-in - the oversized shared-memory mode is not
+        # shippable  [Cake instance_key]
+        raise ValueError(
+            f"stt needs the dynamic SMEM pool inside the {SMEM_OPT_IN} B opt-in (got {stt_pool} B at {stages} stages)"
+        )
     if cta1 and (
         cta_rows != 128
         or ovl
@@ -752,6 +827,7 @@ def instance_key(
         cta1,
         cgrp,
         ovr,
+        stt,
     )
 
 
@@ -767,7 +843,8 @@ def instance_symbol(key: tuple) -> str:
     its slab path (round 19), ``_so<f|l|n>`` after the batch-raster term for the TMA-store L2 eviction policy,
     then ``_pd<n>`` / ``_sh<n>`` for the pipelined TMEM drain / suspend-time hint (round 15), ``_c1`` for
     the single-CTA form (round 19; its default stage count is the single-CTA fit), ``_cg`` for the column-grouped
-    raster (round 21) and a trailing ``_or`` for the tall epilogue released by row half (round 24)).
+    raster (round 21) and a trailing ``_or`` for the tall epilogue released by row half (round 24); ``_stt`` directly
+    after ``_sks`` for the transposed stmatrix / TMA-store staging (round 27)).
     [Cake ``instance_symbol``]"""
     (
         a_mn,
@@ -800,6 +877,7 @@ def instance_symbol(key: tuple) -> str:
         cta1,
         cgrp,
         ovr,
+        stt,
     ) = key
     cg = 1 if cta1 else CTA_GROUP
     so = {
@@ -828,12 +906,13 @@ def instance_symbol(key: tuple) -> str:
         + (f"_{epi}{slots}" if epi != "reg" else "")
         + (
             f"_s{stages}"
-            if stages != default_stages(slots, cta_rows, block_n, b_mn, b_swz, cg)
+            if stages != default_stages(slots, cta_rows, block_n, b_mn, b_swz, cg, stt)
             else ""
         )
         + (f"_box{box_rows}" if box_rows else "")
         + ("_skx" if sk_exact else "")
         + ("_sks" if sk_sync else "")
+        + ("_stt" if stt else "")
         + (f"_sb{sk_slab}" if sk_slab else "")
         + (
             "_bf"
@@ -886,7 +965,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 2048, 16384, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 6144, 32, None): {"block_n": 128, "slots": 2, "stages": 4, "cta1": True},
-    ('sm_100a', False, True, True, False, False, 6144, 128, None): {"block_n": 128},
+    ('sm_100a', False, True, True, False, False, 6144, 128, None): {"block_n": 128, "group_m": 2},
     ('sm_100a', False, True, True, False, False, 6144, 576, None): {"group_m": 8, "promo": 'l2_256b'},
     ('sm_100a', False, True, True, False, False, 6144, 2048, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 6144, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True, "epi": 'reg', "f32_v8": True, "store_ef": True},
@@ -941,7 +1020,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_107a', False, True, True, False, False, 2048, 16384, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_107a', False, True, True, False, False, 6144, 32, None): {"block_n": 128, "group_m": 2, "slots": 1, "cta1": True},
-    ('sm_107a', False, True, True, False, False, 6144, 128, None): {"block_n": 128},
+    ('sm_107a', False, True, True, False, False, 6144, 128, None): {"block_n": 128, "group_m": 2, "pd": 2, "cta1": True},
     ('sm_107a', False, True, True, False, False, 6144, 576, None): {"group_m": 8, "promo": 'l2_256b'},
     ('sm_107a', False, True, True, False, False, 6144, 2048, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "htail": True},
     ('sm_107a', False, True, True, False, False, 6144, 12288, None): {"cta_rows": 256, "sk_parts": 3},
@@ -955,7 +1034,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, False, False, False, 16384, None, 6144): {"cta_rows": 256, "sk_parts": 3},
     ('sm_107a', True, True, False, True, False, 32, None, 6144): {"block_n": 128, "sk_exact": 3},
     ('sm_107a', True, True, False, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64, "sk_exact": 2},
-    ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first'), "b_swz": 64, "sk_sync": True, "sk_sync_m": 38},
+    ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first'), "b_swz": 64, "sk_sync": True, "sk_sync_m": 38, "stt": True},
     ('sm_107a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma', "stages": 6, "b_swz": 64},
     ('sm_107a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma', "stages": 6},
     ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "epi": 'reg', "sk_parts": 3, "b_swz": 64, "f32_v8": True, "store_ef": True},
@@ -1358,6 +1437,11 @@ class GemmPlan:
     # tall layout (one N = 256 MMA per row half per K step).  Tall 256-column tiles only; it replaces ``ovl`` on a row
     # (never both), and the plan arithmetic (tiles, units, tail policy, grid, hint gate) is the tall pair form's
     ovr: bool = False
+    # round 27 (Cake lane 7, W-3 variant A1): the transposed stmatrix / TMA-store staging of the bf16 transposed register
+    # epilogue (instance_key field 30 = the 31st and LAST field, ``_stt`` symbols, directly after ``_sks``): the last work
+    # item's warp slices go out through one bulk tensor store per warp from the dead mainloop stage ring (``OUT16`` = the
+    # real output view), every other slice through the register stores; the plan arithmetic is the pair form's
+    stt: bool = False
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -1418,7 +1502,9 @@ class GemmPlan:
 
     @property
     def tma_out(self) -> bool:
-        return self.epi == "tma"
+        # round 27: the stt program stores its last item's slices through OUT16 (the real view) and every other slice
+        # through ``out``  [Cake launcher]
+        return self.epi == "tma" or self.stt
 
 
 def plan_dense_projection_gemm(
@@ -1459,6 +1545,7 @@ def plan_dense_projection_gemm(
     cta1: Optional[bool] = None,
     cgrp: Optional[bool] = None,
     ovr: Optional[bool] = None,
+    stt: Optional[bool] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -1482,7 +1569,10 @@ def plan_dense_projection_gemm(
     Round 24: ``ovr`` (the round-20 Cake W3 knob ported in round 23 by W4) selects the tall epilogue released by row
     half (``_or``, instance-key field 30): a rule-derived ``ovr`` yields to a caller-forced ``ovl``, a caller-forced
     ``ovr`` replaces a rule-derived ``ovl`` (forcing both raises in ``instance_key``), it is dropped at BLOCK_N != 256,
-    and it leaves the raster, the hint gate and the plan arithmetic unchanged.
+    and it leaves the raster, the hint gate and the plan arithmetic unchanged.  Round 27: ``stt`` (Cake lane 7) selects the
+    transposed stmatrix / TMA-store staging of the bf16 transposed register epilogue (``_stt``, instance-key field 31):
+    the row's rule value is taken as is and ``instance_key`` admits or refuses it; the plan arithmetic is unchanged and
+    the launch hands the real output view to ``OUT16`` next to the register-store alias.
     [Cake ``dense_projection_gemm`` L1234-L1358]
 
     One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
@@ -1524,6 +1614,7 @@ def plan_dense_projection_gemm(
         cta1=cta1,
         cgrp=cgrp,
         ovr=ovr,
+        stt=stt,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -1604,6 +1695,7 @@ def plan_dense_projection_gemm(
                 "sk_slab",
                 "cta1",
                 "ovr",
+                "stt",
             )
         }
     if cta1 is None:
@@ -1673,6 +1765,12 @@ def plan_dense_projection_gemm(
     if ovr and int(block_n) != 256:
         # like ovl: built for the 256-column tall tile  [Cake launcher]
         ovr = False
+    rule_stt = stt is None
+    if stt is None:
+        # round 27 (Cake lane 7, W-3 A1): the transposed stmatrix / TMA-store staging of the bf16 transposed register
+        # epilogue, from the row's rule; a rule-derived value yields to a caller-forced form below, a caller-forced one is admitted or refused by instance_key  [Cake launcher]
+        stt = rule.get("stt", False)
+    stt = bool(stt)
     if htail is None:
         htail = rule.get("htail", False)
     if b_swz is None:
@@ -1827,6 +1925,43 @@ def plan_dense_projection_gemm(
             # the row's bulk slab read does not fit a caller-forced narrower pipeline: the plain synchronised program
             # [Cake launcher]
             sk_slab = 0
+    if stt and rule_stt:
+        # Round 27 (Cake lane 7, W-3 A1): the row's staging form belongs to the bf16 transposed single-pass register epilogue of
+        # the 128-row pair family and must stage its eight warp slots in the dead stage ring inside the opt-in (instance_key's
+        # admission).  A caller that forces another form on the row (the e2e registrations / sweeps of the _t_tma1, _sks_sb2, pd,
+        # cta1 and tall programs at the kv_a weight gradient row, a forced narrower pipeline) keeps that form WITHOUT the
+        # staging: the rule's stt does not carry over, like the rule's sk_sync / sk_slab above.  A caller-forced stt keeps
+        # raising on such a conflict (instance_key).  [Cake launcher]
+        cols_stt = epi_cols(block_n, cta_rows)
+        stage_b = int(cta_rows) * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz, cg)
+        stages_stt = (
+            default_stages(nslots, cta_rows, block_n, b_mn, b_swz, cg, True)
+            if stages is None
+            else int(stages)
+        )
+        slab_eff = int(sk_slab) if sync_plan is not None else 0
+        if (
+            out_f32
+            or not transposed_out
+            or mode != "reg"
+            or int(cta_rows) != 128
+            or cta1
+            or ovl
+            or ovr
+            or park
+            or htail
+            or int(pd)
+            or cols_stt % 32
+            or cols_stt > 256
+            or slab_eff not in (0, 1)
+            or EPI_WARPS * cols_stt * 64 > stages_stt * stage_b
+            or stages_stt * stage_b
+            + staging_bytes(nslots)
+            + stt_bytes(True)
+            + WORK_STAGES * 16
+            > SMEM_OPT_IN
+        ):
+            stt = False
     if pf is None:
         pf = rule.get("pf", default_pf(M, N, K))
     if promo is None:
@@ -1885,6 +2020,7 @@ def plan_dense_projection_gemm(
         cta1=cta1,
         cgrp=cgrp,
         ovr=ovr,
+        stt=stt,
     )
     plan = GemmPlan(
         L=L,
@@ -1932,6 +2068,7 @@ def plan_dense_projection_gemm(
         cta1=bool(key[27]),
         cgrp=bool(key[28]),
         ovr=bool(key[29]),
+        stt=bool(key[30]),
     )
     if _fallback and plan.template not in KERNELS.get(arch, {}):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
@@ -2085,9 +2222,12 @@ def _dummy(device: torch.device, dtype) -> torch.Tensor:
 
 
 def _dummy_map(device: torch.device, dtype) -> torch.Tensor:
+    """A ``[1, 256, 64]`` tensor for an output descriptor the instance never touches: it covers every output box (inner
+    <= 64 elements, outer <= 256 rows - OUT_BOX_OUTER is EPI_COLS <= 256 on the stt programs (round 27), 32 / CH_T_COLS
+    otherwise), so the dummy map encodes on every program.  [Cake ``_dummy_map``]"""
     key = (str(device), dtype, "map")
     if key not in _DUMMIES:
-        _DUMMIES[key] = torch.zeros((1, 32, 64), device=device, dtype=dtype)
+        _DUMMIES[key] = torch.zeros((1, 256, 64), device=device, dtype=dtype)
     return _DUMMIES[key]
 
 
@@ -2177,6 +2317,7 @@ def prepare_dense_projection_gemm(
     cta1: Optional[bool] = None,
     cgrp: Optional[bool] = None,
     ovr: Optional[bool] = None,
+    stt: Optional[bool] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
@@ -2226,6 +2367,7 @@ def prepare_dense_projection_gemm(
         cta1=cta1,
         cgrp=cgrp,
         ovr=ovr,
+        stt=stt,
         arch=arch,
     )
     module_name = select_module(arch, plan.template)
@@ -2247,7 +2389,8 @@ def prepare_dense_projection_gemm(
         B=b_desc,
         OUT32=O3 if (tma_out and out_f32) else _dummy_map(device, torch.float32),
         OUT16=O3 if (tma_out and not out_f32) else _dummy_map(device, torch.bfloat16),
-        out=o_alias if (not out_f32 and not tma_out) else dummy16,
+        # round 27: the stt program keeps the register-store alias next to the OUT16 descriptor  [Cake launcher]
+        out=o_alias if (not out_f32 and (not tma_out or plan.stt)) else dummy16,
         out32=o_alias if (out_f32 and not tma_out) else dummy32,
         ws=ws,
         counters=counters,
