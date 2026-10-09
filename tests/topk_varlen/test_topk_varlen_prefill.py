@@ -1116,3 +1116,40 @@ def test_prefill_absolute_indices_on_non_current_device():
     assert _same_rows(
         out_abs, torch.where(out_loc >= 0, out_loc + rs.unsqueeze(1), out_loc)
     )
+
+
+@requires_gvr2
+def test_prefill_warmup_recreates_slab_after_release():
+    """``release_gvr2_resources()`` drops the per-stream workspace slabs but
+    not the warm-up done set, so a second ``warmup_prefill`` with the same key
+    used to short-circuit and leave the stream slab-less: a slab-routed capture
+    then raised. The re-warm must recreate THIS stream's slab (the engines are
+    still compiled) and the capture must work."""
+    top_k, n, rows = 512, 8192, 64  # width 8192 at K=512 routes to the slab engine
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        _host.warmup_prefill(top_k, n)
+        assert _host.prefill_ready(rows, top_k, n)
+        torch.cuda.synchronize()
+        assert flashinfer.topk_varlen.release_gvr2_resources() > 0
+        assert not _host.prefill_ready(rows, top_k, n), "slab released: not ready"
+        _host.warmup_prefill(top_k, n)  # same done key: must still recreate the slab
+        assert _host.prefill_ready(rows, top_k, n)
+    torch.cuda.synchronize()
+    stride = ((n + 256 + 255) // 256) * 256
+    full = torch.randn((rows, stride), dtype=torch.float32, device=_DEV)
+    lg = full[:, :n]
+    rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
+    le = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    s.wait_stream(torch.cuda.current_stream())
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        flashinfer.top_k_varlen(
+            lg, le, top_k, row_starts=rs, out_indices=out, backend="gvr_2"
+        )
+    torch.cuda.current_stream().wait_stream(s)
+    g.replay()
+    torch.cuda.synchronize()
+    _check_windowed(lg, out, rs, le, top_k)

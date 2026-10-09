@@ -1392,6 +1392,12 @@ def warmup_prefill(
         row_stride,
         bool(absolute_indices),
     )
+    # THIS stream's default workspace slab, before the done-key short-circuit:
+    # only an eager launch creates it and release_cached_resources() drops it
+    # without touching the done set, so a re-warm after a release must bring
+    # the capturing stream back to ready although every engine is already
+    # compiled (same rule as warmup_varlen)
+    default_workspace(torch.empty(0, dtype=torch.uint8, device=torch.device("cuda", dev)))
     with _PREFILL_WARMUP_LOCK:
         if done_key in _PREFILL_WARMUP_DONE:
             return
