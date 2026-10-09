@@ -164,16 +164,13 @@ class MlaOutputQuant:
             else:
                 inv_scale = cute.math.rcp(scale, approx=True)
             block = (column + start) // self.block_size
-            group = head // (self.num_heads // self.num_groups)
-            block_in_group = (
-                head % (self.num_heads // self.num_groups) * (512 // self.block_size)
-                + block
-            )
+            # The validated [G, columns, pad4(T)] backing is contiguous in
+            # head/block order, so group decomposition is unnecessary.
             if lane // lane_stride % lanes == 0:
                 if cutlass.const_expr(self.ue8m0):
-                    word = block_in_group // 4
-                    byte = block_in_group % 4
-                    offset = token + group * scales.stride[1] + word * scales.stride[2]
+                    word = head * (512 // self.block_size // 4) + block // 4
+                    byte = block % 4
+                    offset = token + word * Int64(scales.stride[2])
                     byte_ptr = cutlass.inttoptr(
                         (scales.iterator.raw_ptr() + offset).toint(Int64) + byte,
                         mem_space=1,
@@ -181,7 +178,10 @@ class MlaOutputQuant:
                     )
                     byte_ptr.store(exponent.to(cutlass.Uint8))
                 else:
-                    scales[token, group, block_in_group] = scale
+                    offset = token + (head * (512 // self.block_size) + block) * Int64(
+                        scales.stride[2]
+                    )
+                    (scales.iterator.raw_ptr() + offset).store(scale)
 
             words = cutlass.const_expr(min(8, per_block // 4))
             for i in cutlass.range_constexpr(0, per_block, 4 * words):
