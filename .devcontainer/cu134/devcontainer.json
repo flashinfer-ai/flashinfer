@@ -7,7 +7,7 @@
         "args": {
             "CUDA_IMAGE": "nvidia/cuda:13.4.1-devel-ubuntu24.04",
             "PYTORCH_INDEX": "nightly/cu134",
-            "CUDNN_VERSION": "9.24.0.43"
+            "CUDNN_VERSION": "9.26.0.51"
         }
     },
     "runArgs": [

@@ -16,6 +16,7 @@ limitations under the License.
 
 import ctypes
 import hashlib
+import logging
 import os
 import pathlib
 import random
@@ -43,6 +44,28 @@ def safe_urljoin(base, path):
     if not base.endswith("/"):
         base += "/"
     return urljoin(base, path)
+
+
+def _log_error_response(response) -> None:
+    """Log an HTTP error response's headers and body at DEBUG level.
+
+    edge.urm.nvidia.com sits behind Akamai, which can reject a request (e.g. on
+    a rate or bot rule) before it reaches Artifactory. Its error page carries a
+    "Reference #" that the edge team needs to find the rule that fired, and the
+    response is gone once the retry loop moves on. This stays at DEBUG so it is
+    kept out of normal client logs; CI runs set FLASHINFER_LOGGING_LEVEL=DEBUG
+    and archive flashinfer_jit.log to retain it.
+    """
+    if response is None or not logger.isEnabledFor(logging.DEBUG):
+        return
+    headers = "".join(f"\n  {k}: {v}" for k, v in response.headers.items())
+    logger.debug(
+        "HTTP %d response from %s\nheaders:%s\nbody:\n%s",
+        response.status_code,
+        response.url,
+        headers,
+        response.text,
+    )
 
 
 def download_file(
@@ -120,6 +143,7 @@ def download_file(
                     logger.warning(
                         f"Downloading {source}: attempt {attempt + 1} failed: {e}"
                     )
+                    _log_error_response(e.response)
 
                     if attempt < retries - 1:
                         # Equal jitter: uniform[cap, 2*cap] with cap=base*2^attempt.

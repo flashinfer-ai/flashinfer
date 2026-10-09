@@ -275,6 +275,7 @@ def _make_context_kernel(
     causal_single_kv_tile: bool,
     scheduler: _ContextScheduler,
     uses_ldtm_stat: bool,
+    fp8_psmem_early_token: bool = False,
     two_cta_umma: bool = False,
     page_size: int | None = None,
     max_kv_len: int | None = None,
@@ -308,6 +309,7 @@ def _make_context_kernel(
         d=head_dim,
         d_v=head_dim_vo,
         is_persistent=is_persistent,
+        fp8_psmem_early_token=fp8_psmem_early_token,
         two_cta_umma=two_cta_umma,
         is_causal=mask_type == "causal",
         has_variable_window=mask_type == "variable_window",
@@ -521,6 +523,11 @@ def _default_exp2_fma_pairs(device_index: int, cfg) -> int:
     if cfg.pv_half_overlap:
         return 4
     return 2 if cfg.single_qkv_instance else 0
+
+
+def _default_fp8_psmem_early_token(device_index: int) -> bool:
+    """Release the S0/S1 token early on the fp8 SMEM-P path, on for SM103."""
+    return torch.cuda.get_device_capability(device_index) == (10, 3)
 
 
 def _default_two_cta_umma(device_index: int) -> bool:
@@ -1609,9 +1616,8 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
     """Dense contiguous MHA or GQA at D=128 with bf16 QK runs the two-CTA UMMA
     form, which pairs adjacent Q tiles of one head through the grid.
     The two-CTA launch is non-persistent with heads on grid Y and batch on
-    grid Z. CUDA limits grid Y and Z to 65,535; oversized geometries keep the
-    persistent flattened grid so every otherwise-valid int32 plan stays
-    launchable."""
+    grid Z. CUDA limits grid Y and Z to 65,535. Oversized geometries keep the
+    persistent flattened grid so the valid int32 plans stay launchable."""
     return (
         _default_two_cta_umma(geometry.device_index)
         and geometry.head_dim == 128
@@ -1619,7 +1625,7 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
         and geometry.mask_type == "dense"
         and not geometry.packed
         and not geometry.head_paired
-        and torch.finfo(geometry.qk_dtype).bits == 16
+        and torch.finfo(geometry.qk_dtype).bits in (8, 16)
         and not (
             geometry.batch_size > _CUDA_GRID_YZ_MAX
             or geometry.num_qo_heads > _CUDA_GRID_YZ_MAX
@@ -1806,6 +1812,7 @@ def _get_compiled_context(
         scheduler=scheduler,
         two_cta_umma=two_cta_umma,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -2020,6 +2027,7 @@ def _get_compiled_paged_context(
         causal_single_kv_tile=False,
         scheduler=scheduler,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )

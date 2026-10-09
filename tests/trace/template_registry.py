@@ -91,6 +91,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.mla._batch_mla._wrapper",
     "flashinfer.mla._core",
     "flashinfer.mla._sparse_mla_sm120._api",
+    "flashinfer.mla_kv_pack",
     "flashinfer.cake_minimax_h3",
     "flashinfer.msa_ops.proxy_score",
     "flashinfer.msa_ops.sparse_decode",
