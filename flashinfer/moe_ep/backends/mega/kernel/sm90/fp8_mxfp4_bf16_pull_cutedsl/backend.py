@@ -329,24 +329,8 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
         return view
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
-        k = self._kernel_config
-        # Auto sessions mutate their frontend tactic at first compute and
-        # may not borrow a pooled workspace.
-        if k.knobs == "auto":
-            return None
-
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
-            _resolve_hopper_mxfp4_mega_moe_config,
-        )
-
-        # Match allocation exactly. The frozen config captures the complete
-        # cache/heuristic/explicit constructor request, so equivalent selector
-        # spellings share a pool entry while cache-winner changes cannot reuse
-        # stale code or workspace state.
-        resolved_config = _resolve_hopper_mxfp4_mega_moe_config(
-            **self._fused_frontend_config_kwargs(fleet_params)
-        )
-        return self._workspace_pool_key_from_config(resolved_config)
+        request = self._workspace_pool_request(fleet_params)
+        return request[0] if request is not None else None
 
     def _workspace_pool_key_from_config(self, resolved_config: Any) -> Any:
         k = self._kernel_config
@@ -370,6 +354,7 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
     def _workspace_pool_request(self, fleet_params: FleetParams) -> Any:
         k = self._kernel_config
         if k.knobs == "auto":
+            # Autotuning mutates the frontend; keep these sessions unpooled.
             return None
         from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
             _get_symm_buffer_for_hopper_mxfp4_mega_moe_from_resolved_config,

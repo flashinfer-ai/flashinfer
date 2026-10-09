@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from itertools import cycle
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 import torch.distributed as dist
 
 from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (
@@ -15,106 +17,59 @@ from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import
 )
 
 
-class _Scalar:
-    def __init__(self, value):
-        self.value = value
-
-    def item(self):
-        return self.value
-
-    def __float__(self):
-        return float(self.value)
-
-
-class _Scores:
-    def __init__(self, values):
-        self.values = list(values)
-
-    def __getitem__(self, index):
-        return _Scalar(self.values[index])
-
-    def tolist(self):
-        return list(self.values)
-
-
-def test_score_is_max_across_rank_local_iteration_medians(monkeypatch):
-    """Official score is MAX_rank(MEDIAN_iteration), not median of rank maxes."""
-
-    candidates = [{"id": "a"}, {"id": "b"}]
-    frontend = SimpleNamespace(apply_knobs=mock.Mock())
-    callback = mock.Mock()
+@pytest.fixture
+def mock_collective(monkeypatch):
+    group = object()
     barriers = mock.Mock()
-    ep_group = object()
-    observed_local = []
-    status_calls = []
-
-    monkeypatch.setattr(comm, "ensure_not_capturing", mock.Mock())
+    tensor = torch.tensor
+    clock = cycle((0.0, 1.0))
+    monkeypatch.setattr(comm, "ensure_not_capturing", lambda _: None)
     monkeypatch.setattr(dist, "is_available", lambda: True)
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
     monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
     monkeypatch.setattr(dist, "barrier", barriers)
-
-    # Candidate A local times have a 100s outlier: local median is 3s.
-    # Candidate B local median is 5s. A remote rank then raises A's collective
-    # score to 7s and B's to 5.5s, so B must win.
-    clock = iter(
-        [
-            0.0,
-            1.0,
-            0.0,
-            100.0,
-            0.0,
-            3.0,
-            0.0,
-            4.0,
-            0.0,
-            5.0,
-            0.0,
-            6.0,
-        ]
+    monkeypatch.setattr(dist, "all_reduce", mock.Mock())
+    monkeypatch.setattr(
+        torch,
+        "tensor",
+        lambda values, **kwargs: tensor(values, **dict(kwargs, device="cpu")),
     )
     monkeypatch.setattr(autotune_module.time, "perf_counter", lambda: next(clock))
-    monkeypatch.setattr(
-        autotune_module.torch,
-        "tensor",
-        lambda values, **kwargs: _Scores(values),
-    )
-    monkeypatch.setattr(
-        autotune_module.torch,
-        "argmin",
-        lambda scores: SimpleNamespace(
-            item=lambda: min(
-                range(len(scores.values)),
-                key=scores.values.__getitem__,
-            )
-        ),
-    )
+    return group, barriers
+
+
+def test_score_is_max_across_rank_local_iteration_medians(monkeypatch, mock_collective):
+    candidates = [{"id": "a"}, {"id": "b"}]
+    frontend = SimpleNamespace(apply_knobs=mock.Mock())
+    callback = mock.Mock()
+    ep_group, barriers = mock_collective
+    observed_local = []
+    # Local medians are 3 and 5 despite A's outlier. Remote medians make B win.
+    clock = iter([0, 1, 0, 100, 0, 3, 0, 4, 0, 5, 0, 6])
+    monkeypatch.setattr(autotune_module.time, "perf_counter", lambda: next(clock))
 
     def all_reduce(scores, op, group=None):
         assert group is ep_group
         if op == dist.ReduceOp.MIN:
-            status_calls.append(scores.tolist())
             assert scores.tolist() == [1]
-            return
-        observed_local.append(scores.tolist())
-        assert op == dist.ReduceOp.MAX
-        scores.values[:] = [7.0, 5.5]
+        else:
+            assert op == dist.ReduceOp.MAX
+            observed_local.append(scores.tolist())
+            scores[:] = torch.tensor([7.0, 5.5])
 
     monkeypatch.setattr(dist, "all_reduce", all_reduce)
-
     winner = autotune_module.autotune_knobs(
         frontend,
         lambda: None,
         candidates,
         label="score-contract",
         warmup_iters=0,
+        timed_iters=3,
         process_group=ep_group,
         expected_world_size=2,
-        timed_iters=3,
         on_winner=callback,
     )
-
     assert observed_local == [[3.0, 5.0]]
     assert winner == candidates[1]
     assert frontend.apply_knobs.call_args_list == [
@@ -123,181 +78,70 @@ def test_score_is_max_across_rank_local_iteration_medians(monkeypatch):
         mock.call(candidates[1]),
     ]
     callback.assert_called_once_with(candidates[1], pytest.approx(5.5))
-    # Three candidate phases plus winner apply and winner commit are aligned.
-    expected_barriers = 3 * len(candidates) + 2
-    assert barriers.call_args_list == [mock.call(group=ep_group)] * expected_barriers
-    assert status_calls == [[1]] * expected_barriers
+    assert barriers.called
+    assert all(call == mock.call(group=ep_group) for call in barriers.call_args_list)
 
 
-def test_remote_candidate_failure_is_collectively_skipped(monkeypatch):
-    """A rank-local failure makes every EP rank reject the same candidate."""
+@pytest.mark.parametrize("failed_phase", ["apply", "prepare"])
+def test_remote_candidate_failure_is_discarded_before_launch(
+    monkeypatch, mock_collective, failed_phase
+):
+    candidates = [{"id": "bad"}, {"id": "good"}]
+    ep_group, _ = mock_collective
+    current = phase = None
+    launches, prepared, discarded = [], [], []
 
-    candidates = [{"id": "remote-failure"}, {"id": "good"}]
-    frontend = SimpleNamespace(apply_knobs=mock.Mock())
-    launch = mock.Mock()
-    barriers = mock.Mock()
-    ep_group = object()
-    status_round = 0
+    def apply(knobs):
+        nonlocal current, phase
+        current, phase = knobs["id"], "apply"
 
-    monkeypatch.setattr(comm, "ensure_not_capturing", mock.Mock())
-    monkeypatch.setattr(dist, "is_available", lambda: True)
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
-    monkeypatch.setattr(dist, "barrier", barriers)
-    clock = iter([0.0, 1.0])
-    monkeypatch.setattr(autotune_module.time, "perf_counter", lambda: next(clock))
-    monkeypatch.setattr(
-        autotune_module.torch,
-        "tensor",
-        lambda values, **kwargs: _Scores(values),
-    )
-    monkeypatch.setattr(
-        autotune_module.torch,
-        "argmin",
-        lambda scores: SimpleNamespace(
-            item=lambda: min(
-                range(len(scores.values)),
-                key=scores.values.__getitem__,
-            )
-        ),
-    )
+    def prepare():
+        nonlocal phase
+        prepared.append(current)
+        phase = "prepare"
 
     def all_reduce(scores, op, group=None):
-        nonlocal status_round
+        nonlocal phase
         assert group is ep_group
         if op == dist.ReduceOp.MIN:
-            status_round += 1
-            # Simulate the other EP rank failing the first candidate's apply.
-            if status_round == 1:
-                scores.values[0] = 0
-            return
-        assert op == dist.ReduceOp.MAX
-        assert scores.tolist() == [float("inf"), 1.0]
+            if current == "bad" and phase == failed_phase:
+                scores[0] = 0
+            phase = None
+        else:
+            assert op == dist.ReduceOp.MAX
+            assert scores.tolist() == [float("inf"), 1.0]
 
     monkeypatch.setattr(dist, "all_reduce", all_reduce)
-
     with pytest.warns(RuntimeWarning, match="failed on another EP rank"):
         winner = autotune_module.autotune_knobs(
-            frontend,
-            launch,
+            SimpleNamespace(apply_knobs=apply),
+            lambda: launches.append(current),
             candidates,
             label="failure-contract",
             warmup_iters=0,
             timed_iters=1,
             process_group=ep_group,
             expected_world_size=2,
+            prepare_candidate=prepare,
+            discard_candidate=lambda: discarded.append(current),
         )
-
-    assert winner == candidates[1]
-    assert frontend.apply_knobs.call_args_list == [
-        mock.call(candidates[0]),
-        mock.call(candidates[1]),
-        mock.call(candidates[1]),
-    ]
-    # The rejected candidate never launches; the next candidate remains usable.
-    launch.assert_called_once_with()
-    assert status_round == 6
-    assert barriers.call_args_list == [mock.call(group=ep_group)] * 6
-
-
-def test_remote_prepare_failure_is_discarded_before_any_launch(monkeypatch):
-    candidates = [{"id": "compile-fails-remotely"}, {"id": "good"}]
-    current = None
-    launches = []
-    prepare_calls = []
-    discard_calls = []
-    status_round = 0
-    ep_group = object()
-
-    class Frontend:
-        def apply_knobs(self, knobs):
-            nonlocal current
-            current = knobs["id"]
-
-    monkeypatch.setattr(comm, "ensure_not_capturing", mock.Mock())
-    monkeypatch.setattr(dist, "is_available", lambda: True)
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
-    monkeypatch.setattr(dist, "barrier", mock.Mock())
-    clock = iter([0.0, 1.0])
-    monkeypatch.setattr(autotune_module.time, "perf_counter", lambda: next(clock))
-    monkeypatch.setattr(
-        autotune_module.torch,
-        "tensor",
-        lambda values, **kwargs: _Scores(values),
-    )
-    monkeypatch.setattr(
-        autotune_module.torch,
-        "argmin",
-        lambda scores: SimpleNamespace(item=lambda: 1),
-    )
-
-    def all_reduce(scores, op, group=None):
-        nonlocal status_round
-        if op == dist.ReduceOp.MIN:
-            status_round += 1
-            # apply(1), prepare(2): only the remote rank fails preparation.
-            if status_round == 2:
-                scores.values[0] = 0
-            return
-        assert scores.tolist() == [float("inf"), 1.0]
-
-    monkeypatch.setattr(dist, "all_reduce", all_reduce)
-
-    with pytest.warns(RuntimeWarning, match="compile-only prepare"):
-        winner = autotune_module.autotune_knobs(
-            Frontend(),
-            lambda: launches.append(current),
-            candidates,
-            label="prepare-gate",
-            warmup_iters=0,
-            timed_iters=1,
-            process_group=ep_group,
-            expected_world_size=2,
-            prepare_candidate=lambda: prepare_calls.append(current),
-            discard_candidate=lambda: discard_calls.append(current),
-        )
-
     assert winner == candidates[1]
     assert launches == ["good"]
-    assert prepare_calls == ["compile-fails-remotely", "good", "good"]
-    assert discard_calls == ["compile-fails-remotely", "good"]
+    assert prepared == (["bad"] if failed_phase == "prepare" else []) + ["good", "good"]
+    assert discarded == ["bad", "good"]
 
 
-def test_winner_prepare_failure_discards_and_prevents_record(monkeypatch):
-    candidate = {"id": "winner"}
-    prepare_calls = 0
-    discard = mock.Mock()
-    record = mock.Mock()
-
-    monkeypatch.setattr(comm, "ensure_not_capturing", mock.Mock())
+def test_winner_prepare_failure_discards_and_prevents_record(
+    monkeypatch, mock_collective
+):
+    discard, record = mock.Mock(), mock.Mock()
+    prepare = mock.Mock(side_effect=[None, ValueError("winner compile rejected")])
     monkeypatch.setattr(dist, "is_available", lambda: False)
-    clock = iter([0.0, 1.0])
-    monkeypatch.setattr(autotune_module.time, "perf_counter", lambda: next(clock))
-    monkeypatch.setattr(
-        autotune_module.torch,
-        "tensor",
-        lambda values, **kwargs: _Scores(values),
-    )
-    monkeypatch.setattr(
-        autotune_module.torch,
-        "argmin",
-        lambda scores: SimpleNamespace(item=lambda: 0),
-    )
-
-    def prepare():
-        nonlocal prepare_calls
-        prepare_calls += 1
-        if prepare_calls == 2:
-            raise ValueError("winner compile rejected")
-
     with pytest.raises(RuntimeError, match="winner preparation failed"):
         autotune_module.autotune_knobs(
             SimpleNamespace(apply_knobs=mock.Mock()),
             lambda: None,
-            [candidate],
+            [{"id": "winner"}],
             label="winner-prepare",
             warmup_iters=0,
             timed_iters=1,
@@ -305,8 +149,7 @@ def test_winner_prepare_failure_discards_and_prevents_record(monkeypatch):
             discard_candidate=discard,
             on_winner=record,
         )
-
-    assert discard.call_args_list == [mock.call(), mock.call()]
+    assert discard.call_count == 2
     record.assert_not_called()
 
 

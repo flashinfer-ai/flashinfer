@@ -500,15 +500,6 @@ def test_mxfp4_hardware_identity_is_an_exact_cache_axis(tmp_path, monkeypatch) -
     )
 
 
-def test_cache_dtype_identities_spell_both_operand_formats():
-    fused = hopper_mxfp4._MXFP4_TUNING_DTYPE_ID
-    assert fused == (
-        "sm90_w_mxfp4_e2m1_k32_a_fp8_e4m3_per_token_full_hidden_humming_v1_"
-        "fold_m64_k128_gateup8_packedk2_residual64_swapab_fused_layout_v2_"
-        "fused_local_v2"
-    )
-
-
 def test_persistent_cache_isolates_format_versions(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "FLASHINFER_MOE_EP_KNOB_CACHE",

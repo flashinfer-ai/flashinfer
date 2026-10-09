@@ -135,6 +135,7 @@ run_unit() {
     --ignore-glob=tests/moe_ep/test_sm90_pull_mxfp4_\*.py \
     --ignore=tests/moe_ep/test_sm90_fused_comm_policy.py \
     --ignore=tests/moe_ep/test_sm90_pull_autotune_score.py \
+    --ignore=tests/moe_ep/test_sm90_pull_workspace_pool.py \
     --ignore=tests/moe_ep/test_sm90_pull_knob_cache_robustness.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py \
@@ -182,6 +183,7 @@ run_unit_sm90_mxfp4() {
     tests/moe_ep/test_sm90_mxfp4_local_layout.py \
     tests/moe_ep/test_sm90_fused_comm_policy.py \
     tests/moe_ep/test_sm90_pull_autotune_score.py \
+    tests/moe_ep/test_sm90_pull_workspace_pool.py \
     tests/moe_ep/test_sm90_pull_knob_cache_robustness.py \
     tests/moe_ep/test_sm90_pull_mxfp4_backend.py \
     tests/moe_ep/test_sm90_pull_mxfp4_config.py \

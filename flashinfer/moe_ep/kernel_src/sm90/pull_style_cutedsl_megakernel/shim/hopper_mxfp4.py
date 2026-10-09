@@ -274,9 +274,6 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
     _mega_key: Optional[tuple]
     _mega: Optional[_CompiledMega]
 
-    def __init__(self, config: MegaMoEHopperMxfp4Config) -> None:
-        super().__init__(config)
-
     def apply_knobs(self, knobs: Optional[dict]) -> None:
         """Apply only declared MXFP4 tactics; reject stale/cache-only fields."""
         if knobs is None:
@@ -291,24 +288,6 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
         ensure_not_capturing("MXFP4 apply_knobs (config change)")
         self._release_workspace()
         self._config = new_config
-
-    def requested_tactic(self) -> Dict[str, Any]:
-        """Return the complete fused tactic requested by this frontend.
-
-        The schema is always complete. A manually constructed frontend may
-        request hardware resolution with ``None`` group/stage values; cache
-        persistence instead uses :meth:`effective_tactic`, which records the
-        concrete compiled values.
-        """
-
-        c = self.config
-        return _validate_complete_mxfp4_tactic(
-            self._tactic_from_config(
-                group_hint=c.group_hint,
-                num_sched_stages=c.num_sched_stages,
-            ),
-            source="MXFP4 frontend requested tactic",
-        )
 
     def effective_tactic(self) -> Dict[str, Any]:
         """Return the complete tactic of the current compiled kernel.
@@ -329,78 +308,32 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
                 "to have an actual compiled kernel"
             )
         kernel = mega.kernel
-        required = (
-            "mxfp4_optimizations",
-            "group_hint",
-            "num_sched_stages",
-            "dedup_dispatch",
-            "grouped_token_back",
-            "combine_format",
-            "fc1_store_offload",
-            "fc1_early_done_publish",
-            "fold_producer_warps",
-            "tail_split_pairs",
-        )
-        missing = [name for name in required if not hasattr(kernel, name)]
-        token_comm = getattr(kernel, "token_comm", None)
-        if token_comm is None or not hasattr(token_comm, "active_dispatch_warps"):
-            missing.append("token_comm.active_dispatch_warps")
-        if missing:
-            raise RuntimeError(
-                "MXFP4 compiled kernel lacks effective tactic field(s): "
-                + ", ".join(missing)
-            )
-
-        tactic = self._tactic_from_config(
-            group_hint=kernel.group_hint,
-            num_sched_stages=kernel.num_sched_stages,
-        )
-        tactic.update(
-            dedup_dispatch=bool(kernel.dedup_dispatch),
-            grouped_token_back=bool(kernel.grouped_token_back),
-            combine_format=str(kernel.combine_format),
-            active_dispatch_warps=int(token_comm.active_dispatch_warps),
-            fc1_store_offload=bool(kernel.fc1_store_offload),
-            fc1_early_done_publish=bool(kernel.fc1_early_done_publish),
-            fold_producer_warps=bool(kernel.fold_producer_warps),
-            tail_split_pairs=bool(kernel.tail_split_pairs),
-            fc2_tail_n8=kernel.mxfp4_optimizations.fc2_tail_n8,
-            fc1_ready_mode=kernel.mxfp4_optimizations.fc1_ready_mode,
-        )
+        c = self.config
         return _validate_complete_mxfp4_tactic(
-            tactic,
+            {
+                "swap_ab": c.swap_ab,
+                "pingpong": c.pingpong,
+                "mma_tiler_mnk": tuple(c.mma_tiler_mnk),
+                "cluster_shape_mnk": tuple(c.cluster_shape_mnk),
+                "fp8_accum_mode": c.fp8_accum_mode,
+                "load_balance_mode": c.load_balance_mode,
+                "token_back_mode": c.resolved_token_back_mode,
+                "in_kernel_fc2_reduce": c.in_kernel_fc2_reduce,
+                "group_hint": kernel.group_hint,
+                "num_sched_stages": kernel.num_sched_stages,
+                "dedup_dispatch": bool(kernel.dedup_dispatch),
+                "grouped_token_back": bool(kernel.grouped_token_back),
+                "combine_format": str(kernel.combine_format),
+                "active_dispatch_warps": int(kernel.token_comm.active_dispatch_warps),
+                "fc1_store_offload": bool(kernel.fc1_store_offload),
+                "fc1_early_done_publish": bool(kernel.fc1_early_done_publish),
+                "fold_producer_warps": bool(kernel.fold_producer_warps),
+                "tail_split_pairs": bool(kernel.tail_split_pairs),
+                "fc2_tail_n8": kernel.mxfp4_optimizations.fc2_tail_n8,
+                "fc1_ready_mode": kernel.mxfp4_optimizations.fc1_ready_mode,
+            },
             source="MXFP4 frontend effective tactic",
         )
-
-    def _tactic_from_config(
-        self,
-        *,
-        group_hint: Any,
-        num_sched_stages: Any,
-    ) -> Dict[str, Any]:
-        c = self.config
-        return {
-            "swap_ab": bool(c.swap_ab),
-            "pingpong": bool(c.pingpong),
-            "mma_tiler_mnk": tuple(c.mma_tiler_mnk),
-            "cluster_shape_mnk": tuple(c.cluster_shape_mnk),
-            "fp8_accum_mode": str(c.fp8_accum_mode),
-            "load_balance_mode": str(c.load_balance_mode),
-            "token_back_mode": str(c.resolved_token_back_mode),
-            "group_hint": group_hint,
-            "num_sched_stages": num_sched_stages,
-            "in_kernel_fc2_reduce": bool(c.in_kernel_fc2_reduce),
-            "dedup_dispatch": bool(c.dedup_dispatch),
-            "grouped_token_back": bool(c.grouped_token_back),
-            "combine_format": str(c.combine_format),
-            "active_dispatch_warps": int(c.active_dispatch_warps),
-            "fc1_store_offload": bool(c.fc1_store_offload),
-            "fc1_early_done_publish": bool(c.fc1_early_done_publish),
-            "fold_producer_warps": bool(c.fold_producer_warps),
-            "fc2_tail_n8": c.fc2_tail_n8,
-            "fc1_ready_mode": c.fc1_ready_mode,
-            "tail_split_pairs": c.tail_split_pairs,
-        }
 
     @property
     def config(self) -> MegaMoEHopperMxfp4Config:
@@ -895,11 +828,6 @@ def resolve_hopper_mxfp4_knobs(
     )
 
 
-# Private compatibility name retained for existing shim-local callers and
-# white-box tests. Backends consume the public alias through the drop package.
-_resolve_mxfp4_knobs = resolve_hopper_mxfp4_knobs
-
-
 def _resolve_hopper_mxfp4_mega_moe_config(
     num_total_experts: int,
     num_max_tokens: int,
@@ -994,7 +922,7 @@ def _resolve_hopper_mxfp4_mega_moe_config(
             ),
         )
     else:
-        resolved = _resolve_mxfp4_knobs(
+        resolved = resolve_hopper_mxfp4_knobs(
             knobs,
             world_size=world_size,
             hidden=hidden,

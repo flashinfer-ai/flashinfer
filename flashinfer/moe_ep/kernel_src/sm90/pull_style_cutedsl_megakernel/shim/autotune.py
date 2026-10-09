@@ -208,123 +208,70 @@ def autotune_knobs(
             dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=process_group)
         return bool(flag[0].item())
 
-    def _warn_failure(
-        knobs: Dict[str, Any],
-        phase: str,
-        error: Optional[BaseException],
-    ) -> None:
-        detail = (
-            f"{type(error).__name__}: {error}"
-            if error is not None
-            else "failed on another EP rank"
-        )
-        warnings.warn(
-            f"[sm90-autotune] {label}: candidate {knobs} failed during "
-            f"{phase}: {detail}",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-
-    def _discard_or_raise(knobs: Dict[str, Any], failed_phase: str) -> None:
-        if discard_candidate is None:
-            _barrier()
-            return
-        discard_error: Optional[BaseException] = None
+    def _run_phase(phase: str, callback: Callable, *args) -> Any:
+        error = None
+        result = None
         try:
-            discard_candidate()
-        except Exception as exc:  # noqa: BLE001 -- align cleanup across EP ranks
-            discard_error = exc
-        if not _all_ranks_succeeded(discard_error is None):
+            result = callback(*args)
+        except Exception as exc:  # noqa: BLE001 -- coordinate failures across ranks
+            error = exc
+        if not _all_ranks_succeeded(error is None):
             detail = (
-                f"{type(discard_error).__name__}: {discard_error}"
-                if discard_error is not None
+                f"{type(error).__name__}: {error}"
+                if error is not None
                 else "failed on another EP rank"
             )
             raise RuntimeError(
-                f"[sm90-autotune] {label}: candidate {knobs} discard after "
-                f"{failed_phase} failed: {detail}"
+                f"[sm90-autotune] {label}: {phase} failed: {detail}"
+            ) from error
+        return result
+
+    def _prepare(knobs: Dict[str, Any], *, winner: bool = False) -> None:
+        _run_phase(
+            "winner application" if winner else "apply/compile setup",
+            frontend.apply_knobs,
+            knobs,
+        )
+        if prepare_candidate is not None:
+            _run_phase(
+                "winner preparation" if winner else "compile-only prepare",
+                prepare_candidate,
             )
         _barrier()
 
-    def _run_winner_lifecycle(
-        callback: Optional[Callable[[], None]],
-    ) -> tuple[bool, Optional[BaseException]]:
-        if callback is None:
-            return True, None
-        error: Optional[BaseException] = None
-        try:
-            callback()
-        except Exception as exc:  # noqa: BLE001 -- align lifecycle across EP ranks
-            error = exc
-        succeeded = _all_ranks_succeeded(error is None)
-        if succeeded:
-            _barrier()
-        return succeeded, error
+    def _discard() -> None:
+        if discard_candidate is not None:
+            _run_phase("candidate discard", discard_candidate)
+        _barrier()
 
-    preflight_succeeded, preflight_error = _run_winner_lifecycle(preflight)
-    if not preflight_succeeded:
-        detail = (
-            f"{type(preflight_error).__name__}: {preflight_error}"
-            if preflight_error is not None
-            else "failed on another EP rank"
-        )
-        raise RuntimeError(f"[sm90-autotune] {label}: preflight failed: {detail}")
+    def _warmup() -> None:
+        for _ in range(warmup_iters):
+            launch()
+
+    def _time_launches() -> float:
+        iters = []
+        for _ in range(timed_iters):  # launch() syncs internally
+            t0 = time.perf_counter()
+            launch()
+            iters.append(time.perf_counter() - t0)
+        return statistics.median(iters)
+
+    if preflight is not None:
+        _run_phase("preflight", preflight)
+        _barrier()
 
     scores: List[float] = []
     for knobs in candidates:
-        apply_error: Optional[BaseException] = None
         try:
-            frontend.apply_knobs(knobs)
-        except Exception as exc:  # noqa: BLE001 -- align failures across EP ranks
-            apply_error = exc
-        if not _all_ranks_succeeded(apply_error is None):
-            _warn_failure(knobs, "apply/compile setup", apply_error)
+            _prepare(knobs)
+            _run_phase("warmup", _warmup)
+            _barrier()
+            scores.append(_run_phase("timed iterations", _time_launches))
+        except RuntimeError as exc:
+            warnings.warn(f"{exc}; candidate {knobs}", RuntimeWarning, stacklevel=2)
             scores.append(math.inf)
-            _discard_or_raise(knobs, "apply/compile setup")
-            continue
-
-        prepare_error: Optional[BaseException] = None
-        if prepare_candidate is not None:
-            try:
-                prepare_candidate()
-            except Exception as exc:  # noqa: BLE001 -- align compile across EP ranks
-                prepare_error = exc
-            if not _all_ranks_succeeded(prepare_error is None):
-                _warn_failure(knobs, "compile-only prepare", prepare_error)
-                scores.append(math.inf)
-                _discard_or_raise(knobs, "compile-only prepare")
-                continue
-
-        _barrier()
-        warmup_error: Optional[BaseException] = None
-        try:
-            for _ in range(warmup_iters):  # first launch compiles
-                launch()
-        except Exception as exc:  # noqa: BLE001 -- align failures across EP ranks
-            warmup_error = exc
-        if not _all_ranks_succeeded(warmup_error is None):
-            _warn_failure(knobs, "warmup", warmup_error)
-            scores.append(math.inf)
-            _discard_or_raise(knobs, "warmup")
-            continue
-
-        _barrier()
-        timed_error: Optional[BaseException] = None
-        iters: List[float] = []
-        try:
-            for _ in range(timed_iters):  # launch() syncs internally
-                t0 = time.perf_counter()
-                launch()
-                iters.append(time.perf_counter() - t0)
-        except Exception as exc:  # noqa: BLE001 -- align failures across EP ranks
-            timed_error = exc
-        if not _all_ranks_succeeded(timed_error is None):
-            _warn_failure(knobs, "timed iterations", timed_error)
-            scores.append(math.inf)
-            _discard_or_raise(knobs, "timed iterations")
-        else:
-            scores.append(statistics.median(iters))
-            _discard_or_raise(knobs, "completed scoring")
+        finally:
+            _discard()
 
     t = torch.tensor(scores, dtype=torch.float64, device="cuda")
     if collective:
@@ -339,55 +286,13 @@ def autotune_knobs(
         )
     winner = candidates[best]
 
-    apply_error = None
     try:
-        frontend.apply_knobs(winner)
-    except Exception as exc:  # noqa: BLE001 -- align failures across EP ranks
-        apply_error = exc
-    if not _all_ranks_succeeded(apply_error is None):
-        detail = (
-            f"{type(apply_error).__name__}: {apply_error}"
-            if apply_error is not None
-            else "failed on another EP rank"
-        )
-        _discard_or_raise(winner, "winner application")
-        raise RuntimeError(
-            f"[sm90-autotune] {label}: winner application failed: {detail}"
-        )
-
-    prepare_error = None
-    if prepare_candidate is not None:
-        try:
-            prepare_candidate()
-        except Exception as exc:  # noqa: BLE001 -- align compile across EP ranks
-            prepare_error = exc
-        if not _all_ranks_succeeded(prepare_error is None):
-            detail = (
-                f"{type(prepare_error).__name__}: {prepare_error}"
-                if prepare_error is not None
-                else "failed on another EP rank"
-            )
-            _discard_or_raise(winner, "winner compile-only prepare")
-            raise RuntimeError(
-                f"[sm90-autotune] {label}: winner preparation failed: {detail}"
-            )
-    _barrier()
-
-    callback_error = None
+        _prepare(winner, winner=True)
+    except RuntimeError:
+        _discard()
+        raise
     if on_winner is not None:
-        try:
-            on_winner(winner, float(t[best]))
-        except Exception as exc:  # noqa: BLE001 -- align failures across EP ranks
-            callback_error = exc
-    if not _all_ranks_succeeded(callback_error is None):
-        detail = (
-            f"{type(callback_error).__name__}: {callback_error}"
-            if callback_error is not None
-            else "failed on another EP rank"
-        )
-        raise RuntimeError(
-            f"[sm90-autotune] {label}: winner commit/record failed: {detail}"
-        )
+        _run_phase("winner commit/record", on_winner, winner, float(t[best]))
     _barrier()
 
     if rank == 0:
@@ -400,6 +305,80 @@ def autotune_knobs(
             flush=True,
         )
     return winner
+
+
+def _autotune_hopper_mega_moe(
+    y,
+    transformed_l1,
+    transformed_l2,
+    symm_buffer,
+    *,
+    build_inputs,
+    launch_kernel,
+    candidates,
+    on_winner,
+    label,
+    num_tokens,
+    gate_up_clamp,
+    activation_clamp,
+    warmup_iters,
+    timed_iters,
+    process_group,
+) -> Dict[str, Any]:
+    from .comm import resolve_gate_up_clamp
+
+    frontend = symm_buffer._frontend
+    inputs = validated = None
+
+    def preflight() -> None:
+        nonlocal inputs, validated
+        clamp = resolve_gate_up_clamp(
+            gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
+        )
+        if clamp is not None:
+            frontend.set_gate_up_clamp(clamp)
+        n = num_tokens if num_tokens is not None else symm_buffer.num_max_tokens
+        if symm_buffer._destroyed:
+            raise RuntimeError("symm_buffer.destroy() was already called")
+        if n < 0 or n > symm_buffer.num_max_tokens:
+            raise ValueError("num_tokens is outside the symmetric-buffer capacity")
+        if tuple(y.shape) != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16:
+            raise ValueError("autotune output tensor does not match the live problem")
+        inputs = build_inputs(symm_buffer, transformed_l1, transformed_l2)
+        validated = frontend.validate_launch(inputs, num_tokens=None)
+        if validated is None:
+            raise ValueError("autotune requires a non-empty padded workspace")
+
+    def prepare() -> None:
+        frontend.prepare_launch(inputs, num_tokens=None, validated=validated)
+
+    def launch() -> None:
+        # The outer loop uses host timing, so each launch must finish before return.
+        launch_kernel(
+            y,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=num_tokens,
+            gate_up_clamp=gate_up_clamp,
+            activation_clamp=activation_clamp,
+            sync=True,
+        )
+
+    return autotune_knobs(
+        frontend,
+        launch,
+        candidates,
+        label=label,
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        on_winner=on_winner,
+        prepare_candidate=prepare,
+        discard_candidate=frontend.release,
+        preflight=preflight,
+        process_group=process_group,
+        expected_world_size=frontend.config.world_size,
+    )
 
 
 def autotune_hopper_fp8_mega_moe(
@@ -423,58 +402,13 @@ def autotune_hopper_fp8_mega_moe(
     knob dict; subsequent ``hopper_fp8_mega_moe`` calls on ``symm_buffer``
     reuse the winning compile.  COLLECTIVE -- see :func:`autotune_knobs`.
     """
-    from .comm import resolve_gate_up_clamp
     from .hopper_fp8 import _build_inputs, hopper_fp8_mega_moe
-
-    def launch() -> None:
-        # sync=True: the tune loop times launches with perf_counter, so the
-        # call must block until the kernel (and topk reduce) complete.
-        hopper_fp8_mega_moe(
-            y,
-            transformed_l1,
-            transformed_l2,
-            symm_buffer,
-            num_tokens=num_tokens,
-            gate_up_clamp=gate_up_clamp,
-            activation_clamp=activation_clamp,
-            sync=True,
-        )
 
     cfg = symm_buffer._frontend.config
     if candidates is None:
         candidates = hopper_fp8_candidates(
             fp8_scale_mode=cfg.fp8_scale_mode,
             max_tokens=cfg.num_tokens_per_rank,
-        )
-
-    preflight_state: Dict[str, Any] = {}
-
-    def _preflight() -> None:
-        clamp = resolve_gate_up_clamp(
-            gate_up_clamp=gate_up_clamp,
-            activation_clamp=activation_clamp,
-        )
-        if clamp is not None:
-            symm_buffer._frontend.set_gate_up_clamp(clamp)
-        n = num_tokens if num_tokens is not None else symm_buffer.num_max_tokens
-        if symm_buffer._destroyed:
-            raise RuntimeError("symm_buffer.destroy() was already called")
-        if n < 0 or n > symm_buffer.num_max_tokens:
-            raise ValueError("num_tokens is outside the symmetric-buffer capacity")
-        if tuple(y.shape) != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16:
-            raise ValueError("autotune output tensor does not match the live problem")
-        inputs = _build_inputs(symm_buffer, transformed_l1, transformed_l2)
-        validated = symm_buffer._frontend.validate_launch(inputs, num_tokens=None)
-        if validated is None:
-            raise ValueError("autotune requires a non-empty padded workspace")
-        preflight_state["inputs"] = inputs
-        preflight_state["validated"] = validated
-
-    def _prepare_candidate() -> None:
-        symm_buffer._frontend.prepare_launch(
-            preflight_state["inputs"],
-            num_tokens=None,
-            validated=preflight_state["validated"],
         )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
@@ -500,19 +434,22 @@ def autotune_hopper_fp8_mega_moe(
                 source="autotune",
             )
 
-    return autotune_knobs(
-        symm_buffer._frontend,
-        launch,
-        candidates,
+    return _autotune_hopper_mega_moe(
+        y,
+        transformed_l1,
+        transformed_l2,
+        symm_buffer,
+        build_inputs=_build_inputs,
+        launch_kernel=hopper_fp8_mega_moe,
+        candidates=candidates,
+        on_winner=_record,
         label="sm90_fp8_mega",
+        num_tokens=num_tokens,
+        gate_up_clamp=gate_up_clamp,
+        activation_clamp=activation_clamp,
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
-        on_winner=_record,
-        prepare_candidate=_prepare_candidate,
-        discard_candidate=symm_buffer._frontend.release,
-        preflight=_preflight,
         process_group=process_group,
-        expected_world_size=cfg.world_size,
     )
 
 
@@ -548,7 +485,6 @@ def autotune_hopper_mxfp4_mega_moe(
         _build_mxfp4_inputs,
         hopper_mxfp4_mega_moe,
     )
-    from .comm import resolve_gate_up_clamp
     from .mxfp4_tuner import (
         hopper_mxfp4_cache_provenance_sha256,
         _base_candidates,
@@ -561,20 +497,6 @@ def autotune_hopper_mxfp4_mega_moe(
         mxfp4_optimization_candidate_sha256,
         normalize_mxfp4_optimization_tactic,
     )
-
-    def launch() -> None:
-        # The outer loop uses perf_counter, so every launch must complete
-        # before the timestamp is sampled.
-        hopper_mxfp4_mega_moe(
-            y,
-            transformed_l1,
-            transformed_l2,
-            symm_buffer,
-            num_tokens=num_tokens,
-            gate_up_clamp=gate_up_clamp,
-            activation_clamp=activation_clamp,
-            sync=True,
-        )
 
     cfg = symm_buffer._frontend.config
     require_hopper_mxfp4_fused_tuning_device()
@@ -672,49 +594,22 @@ def autotune_hopper_mxfp4_mega_moe(
                 ),
             )
 
-    preflight_state: Dict[str, Any] = {}
-
-    def _preflight() -> None:
-        clamp = resolve_gate_up_clamp(
-            gate_up_clamp=gate_up_clamp,
-            activation_clamp=activation_clamp,
-        )
-        if clamp is not None:
-            symm_buffer._frontend.set_gate_up_clamp(clamp)
-        n = num_tokens if num_tokens is not None else symm_buffer.num_max_tokens
-        if symm_buffer._destroyed:
-            raise RuntimeError("symm_buffer.destroy() was already called")
-        if n < 0 or n > symm_buffer.num_max_tokens:
-            raise ValueError("num_tokens is outside the symmetric-buffer capacity")
-        if tuple(y.shape) != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16:
-            raise ValueError("autotune output tensor does not match the live problem")
-        inputs = _build_mxfp4_inputs(symm_buffer, transformed_l1, transformed_l2)
-        validated = symm_buffer._frontend.validate_launch(inputs, num_tokens=None)
-        if validated is None:
-            raise ValueError("autotune requires a non-empty padded workspace")
-        preflight_state["inputs"] = inputs
-        preflight_state["validated"] = validated
-
-    def _prepare_candidate() -> None:
-        symm_buffer._frontend.prepare_launch(
-            preflight_state["inputs"],
-            num_tokens=None,
-            validated=preflight_state["validated"],
-        )
-
-    return autotune_knobs(
-        symm_buffer._frontend,
-        launch,
-        candidates,
+    return _autotune_hopper_mega_moe(
+        y,
+        transformed_l1,
+        transformed_l2,
+        symm_buffer,
+        build_inputs=_build_mxfp4_inputs,
+        launch_kernel=hopper_mxfp4_mega_moe,
+        candidates=candidates,
+        on_winner=_record,
         label="sm90_mxfp4_fused_mega",
+        num_tokens=num_tokens,
+        gate_up_clamp=gate_up_clamp,
+        activation_clamp=activation_clamp,
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
-        on_winner=_record,
-        prepare_candidate=_prepare_candidate,
-        discard_candidate=symm_buffer._frontend.release,
-        preflight=_preflight,
         process_group=process_group,
-        expected_world_size=cfg.world_size,
     )
 
 

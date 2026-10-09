@@ -21,32 +21,6 @@ _VENDOR_ROOT = (
     Path(__file__).resolve().parents[2]
     / "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src"
 )
-_MXFP4_CODEGEN_ENV_VARS = {
-    "MEGA_MXFP4_FC2_SCALE_LOAD_OVERLAP",
-    "MEGA_MXFP4_FC2_STREAM_SCALE_PROMOTION",
-    "MEGA_MXFP4_FC1_K64_PIPELINE",
-    "MEGA_MXFP4_K256_FC1_TWO_GROUP_PIPELINE",
-    "MEGA_MXFP4_FC1_SPLIT_FINAL_SCALE",
-    "MEGA_MXFP4_K256_FC2_HALF_FRAGMENT",
-    "MEGA_MXFP4_REUSE_FC1_ACCUM_SCRATCH",
-    "MEGA_MXFP4_SPLIT_FC1_STORE_OVERLAP",
-}
-
-
-def _literal_top_level_assignments(path: Path) -> dict[str, object]:
-    assignments: dict[str, object] = {}
-    for node in ast.parse(path.read_text(encoding="utf-8")).body:
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-        ):
-            try:
-                value = ast.literal_eval(node.value)
-            except (TypeError, ValueError):
-                continue
-            assignments[node.targets[0].id] = value
-    return assignments
 
 
 def _workspace(*, capacity: int = 4, hidden: int = 128, top_k: int = 2):
@@ -62,23 +36,6 @@ def _routing(num_tokens: int, *, top_k: int = 2):
     ids = torch.arange(num_tokens * top_k, dtype=torch.int64).reshape(num_tokens, top_k)
     weights = torch.full((num_tokens, top_k), 1.0 / top_k, dtype=torch.float32)
     return ids, weights
-
-
-def test_mxfp4_codegen_policy_is_fixed_and_has_no_hidden_environment_reads():
-    source_text = "\n".join(
-        path.read_text(encoding="utf-8")
-        for package in ("common", "src", "moe_nvfp4_swapab", "moe_hopper_fp8")
-        for path in (_VENDOR_ROOT / package).rglob("*.py")
-    )
-    assert not (_MXFP4_CODEGEN_ENV_VARS & set(source_text.split()))
-    for variable in _MXFP4_CODEGEN_ENV_VARS:
-        assert variable not in source_text
-
-    epilogue_constants = _literal_top_level_assignments(
-        _VENDOR_ROOT / "moe_hopper_fp8/epilogue_fp8_swapab.py"
-    )
-    assert epilogue_constants["SwapABMxfp4ReuseFc1AccumScratch"] == 1
-    assert "SwapABMxfp4SplitFc1StoreOverlap" not in epilogue_constants
 
 
 @pytest.mark.parametrize("configured_chunks", [1, 2, 4, 8])

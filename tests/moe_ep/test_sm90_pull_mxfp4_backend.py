@@ -27,7 +27,6 @@ from flashinfer.moe_ep.core.kernel.registry import (
 )
 from flashinfer.moe_ep.sm90_routing import (
     SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
-    SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
 )
 
 
@@ -135,11 +134,11 @@ def test_mxfp4_backend_accepts_dedicated_collective_auto_tuning():
 
 def test_mxfp4_direct_knob_resolution_rejects_fake_auto():
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.hopper_mxfp4 import (
-        _resolve_mxfp4_knobs,
+        resolve_hopper_mxfp4_knobs,
     )
 
     with pytest.raises(ValueError, match="direct MXFP4 knob resolution"):
-        _resolve_mxfp4_knobs(
+        resolve_hopper_mxfp4_knobs(
             "auto",
             world_size=1,
             hidden=128,
@@ -155,7 +154,7 @@ def test_mxfp4_cache_identity_is_versioned_and_entries_fail_closed(monkeypatch):
         knob_cache,
     )
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.hopper_mxfp4 import (
-        _resolve_mxfp4_knobs,
+        resolve_hopper_mxfp4_knobs,
     )
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_tuner import (
         hopper_mxfp4_default_tactic,
@@ -171,7 +170,7 @@ def test_mxfp4_cache_identity_is_versioned_and_entries_fail_closed(monkeypatch):
         num_topk=6,
         num_max_tokens=64,
     )
-    resolved = _resolve_mxfp4_knobs(None, **kwargs)
+    resolved = resolve_hopper_mxfp4_knobs(None, **kwargs)
     assert resolved == dict(
         hopper_mxfp4_default_tactic(64),
         fc2_tail_n8=False,
@@ -203,11 +202,11 @@ def test_mxfp4_cache_identity_is_versioned_and_entries_fail_closed(monkeypatch):
     }
     lookup.return_value = invalid
     with pytest.raises(ValueError, match="stale_layout_field"):
-        _resolve_mxfp4_knobs(None, **kwargs)
+        resolve_hopper_mxfp4_knobs(None, **kwargs)
 
     lookup.return_value = {"swap_ab": True}
     with pytest.raises(ValueError, match="mxfp4_fused tactic fields differ"):
-        _resolve_mxfp4_knobs(None, **kwargs)
+        resolve_hopper_mxfp4_knobs(None, **kwargs)
 
 
 def test_mxfp4_all_none_selectors_preserve_cache_tactic(monkeypatch):
@@ -224,7 +223,7 @@ def test_mxfp4_all_none_selectors_preserve_cache_tactic(monkeypatch):
         fold_producer_warps=False,
     )
     resolver = mock.Mock(return_value=tactic)
-    monkeypatch.setattr(hopper_mxfp4, "_resolve_mxfp4_knobs", resolver)
+    monkeypatch.setattr(hopper_mxfp4, "resolve_hopper_mxfp4_knobs", resolver)
 
     resolved = hopper_mxfp4._resolve_hopper_mxfp4_mega_moe_config(
         **_shim_config_kwargs()
@@ -258,7 +257,7 @@ def test_mxfp4_each_explicit_execution_axis_uses_cache_free_manual_defaults(
     )
 
     resolver = mock.Mock(side_effect=AssertionError("manual selector consulted cache"))
-    monkeypatch.setattr(hopper_mxfp4, "_resolve_mxfp4_knobs", resolver)
+    monkeypatch.setattr(hopper_mxfp4, "resolve_hopper_mxfp4_knobs", resolver)
 
     resolved = hopper_mxfp4._resolve_hopper_mxfp4_mega_moe_config(
         **_shim_config_kwargs(**{field: value})
@@ -327,7 +326,7 @@ def test_mxfp4_explicit_token_back_keeps_precedence_over_cache(monkeypatch):
     )
 
     resolver = mock.Mock(return_value=_fused_tactic(token_back_mode="epi_warps"))
-    monkeypatch.setattr(hopper_mxfp4, "_resolve_mxfp4_knobs", resolver)
+    monkeypatch.setattr(hopper_mxfp4, "resolve_hopper_mxfp4_knobs", resolver)
     resolved = hopper_mxfp4._resolve_hopper_mxfp4_mega_moe_config(
         **_shim_config_kwargs(token_back_mode="standalone_warps")
     )
@@ -549,195 +548,6 @@ def test_mxfp4_auto_rejects_zero_copy_and_disables_workspace_pooling():
     assert backend._autotune_pending
     assert backend._workspace_pool_key(_fleet()) is None
     assert backend._workspace_pool_request(_fleet()) is None
-
-
-def test_mxfp4_workspace_key_is_explicitly_format_isolated():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.backend import (
-        Sm90PullFp8MegaKernelBackend,
-    )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.config import (
-        Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
-    )
-
-    group = object()
-    backend = _bound_backend(group=group)
-    fp8_backend = Sm90PullFp8MegaKernelBackend(
-        Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
-            intermediate_size=128,
-            top_k=2,
-        )
-    )
-    fp8_backend._ep_bootstrap = object()
-    fp8_backend._ep_rank = 1
-    fp8_backend._ep_world_size = 2
-    fp8_backend._ep_comm_group = group
-
-    device_name = (
-        "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel."
-        "shim.knob_cache._current_device_name"
-    )
-    with (
-        mock.patch("torch.cuda.is_available", return_value=True),
-        mock.patch("torch.cuda.current_device", return_value=3),
-        mock.patch("torch.cuda.get_device_capability", return_value=(9, 0)),
-        mock.patch(
-            "torch.cuda.get_device_properties",
-            return_value=mock.Mock(multi_processor_count=132),
-        ),
-        mock.patch(device_name, return_value="test-hopper"),
-    ):
-        key = backend._workspace_pool_key(_fleet())
-        fp8_key = fp8_backend._workspace_pool_key(_fleet())
-        changed = _bound_backend(
-            replace(_config(), token_back_mode="standalone_warps"),
-            group=group,
-        )._workspace_pool_key(_fleet())
-        exact = _bound_backend(
-            replace(
-                _config(swap_ab=True),
-                routing_profile=SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
-            ),
-            group=group,
-        )._workspace_pool_key(_fleet())
-
-    assert key != fp8_key
-    assert changed != key
-    assert exact != key
-    assert key[-1].routing_profile == SM90_ROUTING_PROFILE_BLOCK_PERMUTATION
-    assert exact[-1].routing_profile == SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED
-    assert "fused" in key
-    assert "mxfp4_e2m1" in key
-    assert "fp8_e4m3_per_token_full_hidden" in key
-    assert key[-1].fp8_scale_mode == "mxfp4_hybrid"
-    assert "humming_sm90_m64_k128_gateup8_residual_x64_v1" in key
-
-
-def test_mxfp4_workspace_key_contains_resolved_cache_tactic(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (
-        hopper_mxfp4,
-    )
-
-    first = {
-        "swap_ab": True,
-        "pingpong": False,
-        "mma_tiler_mnk": (128, 32, 128),
-        "cluster_shape_mnk": (1, 1, 1),
-        "fp8_accum_mode": "1xacc",
-        "group_hint": 64,
-        "load_balance_mode": "static",
-        "token_back_mode": "epi_warps",
-        "in_kernel_fc2_reduce": False,
-        "num_sched_stages": 2,
-        "dedup_dispatch": False,
-        "grouped_token_back": False,
-        "combine_format": "bf16",
-        "active_dispatch_warps": 4,
-        "fc1_store_offload": False,
-        "fc1_early_done_publish": False,
-        "fold_producer_warps": False,
-    }
-    second = {**first, "mma_tiler_mnk": (256, 32, 128)}
-    resolver = mock.Mock(side_effect=[first, second])
-    monkeypatch.setattr(hopper_mxfp4, "_resolve_mxfp4_knobs", resolver)
-    backend = _bound_backend(rank=0, world_size=1)
-
-    with mock.patch("torch.cuda.current_device", return_value=3):
-        first_key = backend._workspace_pool_key(_fleet())
-        second_key = backend._workspace_pool_key(_fleet())
-
-    assert first_key != second_key
-    assert first_key[-1].mma_tiler_mnk == (128, 32, 128)
-    assert second_key[-1].mma_tiler_mnk == (256, 32, 128)
-
-
-def test_mxfp4_workspace_key_uses_resolved_not_selector_identity(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (
-        hopper_mxfp4,
-    )
-
-    tactic = {
-        "swap_ab": True,
-        "pingpong": False,
-        "mma_tiler_mnk": (128, 32, 128),
-        "cluster_shape_mnk": (1, 1, 1),
-        "fp8_accum_mode": "1xacc",
-        "group_hint": 64,
-        "load_balance_mode": "static",
-        "token_back_mode": "epi_warps",
-        "in_kernel_fc2_reduce": False,
-        "num_sched_stages": 2,
-        "dedup_dispatch": False,
-        "grouped_token_back": False,
-        "combine_format": "bf16",
-        "active_dispatch_warps": 4,
-        "fc1_store_offload": False,
-        "fc1_early_done_publish": False,
-        "fold_producer_warps": False,
-    }
-    monkeypatch.setattr(
-        hopper_mxfp4, "_resolve_mxfp4_knobs", lambda _knobs, **_kwargs: tactic
-    )
-    group = object()
-    cached = _bound_backend(_config(), rank=0, world_size=1, group=group)
-    explicit = _bound_backend(_config(knobs=tactic), rank=0, world_size=1, group=group)
-
-    with mock.patch("torch.cuda.current_device", return_value=3):
-        assert cached._workspace_pool_key(_fleet()) == explicit._workspace_pool_key(
-            _fleet()
-        )
-
-
-def test_mxfp4_prepare_workspace_binds_key_and_allocator_to_one_resolution():
-    import flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel as pkg
-    from flashinfer.moe_ep.core.kernel import workspace_pool
-
-    fleet = _fleet()
-    backend = Sm90PullMxfp4MegaKernelBackend(_config())
-    first = pkg.MegaMoEHopperMxfp4Config(
-        rank=0,
-        world_size=1,
-        num_tokens_per_rank=64,
-        num_topk=2,
-        num_total_experts=8,
-        hidden=128,
-        intermediate=128,
-        active_dispatch_warps=1,
-    )
-    second = replace(
-        first,
-        active_dispatch_warps=2,
-        fold_producer_warps=False,
-    )
-    workspace = object()
-    captured = {}
-
-    def acquire(key, factory):
-        captured["key"] = key
-        return factory()
-
-    with (
-        mock.patch.object(
-            pkg,
-            "_resolve_hopper_mxfp4_mega_moe_config",
-            side_effect=(first, second),
-        ) as resolver,
-        mock.patch.object(
-            pkg,
-            "_get_symm_buffer_for_hopper_mxfp4_mega_moe_from_resolved_config",
-            return_value=workspace,
-        ) as allocator,
-        mock.patch.object(workspace_pool, "acquire_workspace", side_effect=acquire),
-        mock.patch("torch.cuda.current_device", return_value=0),
-    ):
-        result = backend.prepare_workspace(
-            BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
-            fleet,
-        )
-
-    assert result is workspace
-    resolver.assert_called_once()
-    assert captured["key"][-1] is first
-    assert allocator.call_args.args[0] is first
 
 
 def test_mxfp4_runtime_requirements_reuse_sm90_symmetric_heap(monkeypatch):

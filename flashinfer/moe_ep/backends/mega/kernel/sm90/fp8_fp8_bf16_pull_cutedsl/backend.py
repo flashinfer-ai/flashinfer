@@ -348,21 +348,8 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         return output if output is not None else view
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
-        if self._kernel_config.knobs == "auto":
-            # Autotune retunes (and recompiles) the workspace's shared
-            # frontend at first compute; give each session its own buffer.
-            return None
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
-            resolve_hopper_fp8_mega_moe_config,
-        )
-
-        # The resolved frontend config is the complete session tactic. This
-        # intentionally ignores whether an equivalent tactic was requested
-        # explicitly or came from cache/heuristic resolution.
-        resolved_config = resolve_hopper_fp8_mega_moe_config(
-            **self._frontend_config_kwargs(fleet_params)
-        )
-        return self._workspace_pool_key_from_config(resolved_config)
+        request = self._workspace_pool_request(fleet_params)
+        return request[0] if request is not None else None
 
     def _workspace_pool_key_from_config(self, resolved_config: Any) -> Any:
         import torch
@@ -376,6 +363,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
 
     def _workspace_pool_request(self, fleet_params: FleetParams) -> Any:
         if self._kernel_config.knobs == "auto":
+            # Autotuning mutates the frontend; keep these sessions unpooled.
             return None
         from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
             _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config,

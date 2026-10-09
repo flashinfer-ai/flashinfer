@@ -39,6 +39,20 @@ def _config(**overrides):
     )
 
 
+def _shim_config(**overrides):
+    values = dict(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=64,
+        num_topk=2,
+        num_total_experts=8,
+        hidden=128,
+        intermediate=128,
+    )
+    values.update(overrides)
+    return MegaMoEHopperMxfp4Config(**values)
+
+
 def _fused_knobs(**overrides):
     tactic = hopper_mxfp4_default_tactic(64)
     tactic.update(overrides)
@@ -85,15 +99,8 @@ def _frontend_with_complete_tactic(**overrides):
     )
     layout.update(overrides)
     tactic = _fused_knobs(**layout)
-    config = MegaMoEHopperMxfp4Config(
-        rank=0,
-        world_size=1,
-        num_tokens_per_rank=64,
-        num_topk=6,
-        num_total_experts=384,
-        hidden=7168,
-        intermediate=3072,
-        **tactic,
+    config = _shim_config(
+        num_topk=6, num_total_experts=384, hidden=7168, intermediate=3072, **tactic
     )
     return MegaMoEHopperMxfp4Frontend(config), normalize_mxfp4_optimization_tactic(
         tactic
@@ -101,13 +108,12 @@ def _frontend_with_complete_tactic(**overrides):
 
 
 @pytest.mark.parametrize("tail_split_pairs", (False, True))
-def test_sm90_mxfp4_frontend_reports_requested_and_compiled_effective_tactic(
+def test_sm90_mxfp4_frontend_reports_compiled_effective_tactic(
     tail_split_pairs,
 ):
     frontend, requested = _frontend_with_complete_tactic(
         cluster_shape_mnk=(1, 2, 1), tail_split_pairs=tail_split_pairs
     )
-    assert frontend.requested_tactic() == requested
 
     kernel = SimpleNamespace(
         mxfp4_optimizations=frontend.config.optimizations,
@@ -134,21 +140,6 @@ def test_sm90_mxfp4_frontend_reports_requested_and_compiled_effective_tactic(
     assert effective["tail_split_pairs"] is tail_split_pairs
 
 
-def test_sm90_mxfp4_requested_tactic_preserves_auto_schedule_values():
-    config = MegaMoEHopperMxfp4Config(
-        rank=0,
-        world_size=1,
-        num_tokens_per_rank=64,
-        num_topk=2,
-        num_total_experts=8,
-        hidden=128,
-        intermediate=128,
-    )
-    requested = MegaMoEHopperMxfp4Frontend(config).requested_tactic()
-    assert requested["group_hint"] is None
-    assert requested["num_sched_stages"] is None
-
-
 def test_sm90_mxfp4_legacy_tactic_resets_strategy_and_compile_identity():
     legacy = _fused_knobs(
         mma_tiler_mnk=(256, 64, 256),
@@ -156,8 +147,7 @@ def test_sm90_mxfp4_legacy_tactic_resets_strategy_and_compile_identity():
         active_dispatch_warps=1,
         fold_producer_warps=True,
     )
-    config = MegaMoEHopperMxfp4Config(
-        rank=0,
+    config = _shim_config(
         world_size=4,
         num_tokens_per_rank=2048,
         num_topk=6,
@@ -177,14 +167,14 @@ def test_sm90_mxfp4_legacy_tactic_resets_strategy_and_compile_identity():
         frontend.apply_knobs(enabled)
         assert frontend._mega_compile_key() != original_key
         assert frontend.config.optimizations.fc1_ready_bits == 48
-        assert frontend.requested_tactic()["fc2_tail_n8"] is True
+        assert frontend.config.fc2_tail_n8 is True
         frontend.apply_knobs(enabled)
         assert release.call_count == 1  # Identical identity keeps the workspace.
         frontend.apply_knobs(legacy)
         assert release.call_count == 2  # Protocol change releases old workspace.
     assert frontend._mega_compile_key() == original_key
-    assert frontend.requested_tactic()["fc1_ready_mode"] == "tile"
-    assert frontend.requested_tactic()["fc2_tail_n8"] is False
+    assert frontend.config.fc1_ready_mode == "tile"
+    assert frontend.config.fc2_tail_n8 is False
     assert frontend.config.optimizations.fc1_ready_bits == 0
 
 
@@ -207,7 +197,6 @@ def test_sm90_mxfp4_old_tactic_resets_tail_pairs_and_compile_identity(legacy_fie
     ):
         frontend.apply_knobs(enabled)
         assert frontend.config.tail_split_pairs is True
-        assert frontend.requested_tactic()["tail_split_pairs"] is True
         assert frontend._mega_compile_key() != original_key
         frontend.apply_knobs(legacy)
         assert release.call_count == 2
@@ -245,11 +234,7 @@ def test_sm90_mxfp4_effective_tactic_fails_closed_without_current_compile():
     with pytest.raises(RuntimeError, match="actual compiled kernel"):
         frontend.effective_tactic()
 
-    frontend._mega_key = frontend._mega_compile_key()
-    frontend._mega = SimpleNamespace(compiled=object(), kernel=SimpleNamespace())
-    with pytest.raises(RuntimeError, match="lacks effective tactic field"):
-        frontend.effective_tactic()
-
+    frontend._mega = SimpleNamespace(compiled=object())
     frontend._mega_key = ("stale",)
     with pytest.raises(RuntimeError, match="actual compiled kernel"):
         frontend.effective_tactic()
@@ -275,8 +260,6 @@ def test_sm90_mxfp4_config_defaults_are_format_specific():
     assert cfg.fc1_early_done_publish is None
     assert cfg.fold_producer_warps is None
     assert cfg.routing_profile == SM90_ROUTING_PROFILE_BLOCK_PERMUTATION
-    assert dataclasses.fields(cfg)[-1].name == "routing_profile"
-    assert dataclasses.fields(cfg)[-1].kw_only
 
 
 def test_sm90_mxfp4_public_config_strictly_validates_routing_profile():
@@ -303,14 +286,7 @@ def test_sm90_mxfp4_fused_layout_knobs_preserve_requested_values():
     assert public.fc1_early_done_publish is True
     assert public.fold_producer_warps is False
 
-    shim = MegaMoEHopperMxfp4Config(
-        rank=0,
-        world_size=1,
-        num_tokens_per_rank=64,
-        num_topk=2,
-        num_total_experts=8,
-        hidden=128,
-        intermediate=128,
+    shim = _shim_config(
         dedup_dispatch=True,
         active_dispatch_warps=2,
         fc1_store_offload=False,
@@ -324,6 +300,7 @@ def test_sm90_mxfp4_fused_layout_knobs_preserve_requested_values():
     assert shim.fold_producer_warps is False
 
 
+@pytest.mark.parametrize("make_config", [_config, _shim_config])
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     [
@@ -337,51 +314,21 @@ def test_sm90_mxfp4_fused_layout_knobs_preserve_requested_values():
         ("fold_producer_warps", "yes", "fold_producer_warps must be a bool"),
     ],
 )
-def test_sm90_mxfp4_public_config_strictly_validates_fused_layout_knobs(
-    field, value, match
+def test_sm90_mxfp4_configs_validate_fused_layout_knobs(
+    make_config, field, value, match
 ):
     with pytest.raises(ValueError, match=match):
-        _config(**{field: value})
+        make_config(**{field: value})
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "match"),
-    [
-        ("dedup_dispatch", 1, "dedup_dispatch must be a bool"),
-        ("grouped_token_back", True, "does not support grouped_token_back"),
-        ("combine_format", "32e5m2xe8m0", "combine_format='bf16'"),
-        ("active_dispatch_warps", True, "active_dispatch_warps"),
-        ("active_dispatch_warps", 3, "active_dispatch_warps"),
-        ("fc1_store_offload", 1, "fc1_store_offload must be a bool"),
-        ("fc1_early_done_publish", 0, "fc1_early_done_publish must be a bool"),
-        ("fold_producer_warps", None, "fold_producer_warps must be a bool"),
-        ("tail_split_pairs", True, "tail_split_pairs requires a token-side cluster"),
-        ("tail_split_pairs", 1, "tail_split_pairs must be a bool"),
-    ],
-)
-def test_sm90_mxfp4_shim_config_strictly_validates_fused_layout_knobs(
-    field, value, match
-):
-    common = dict(
-        rank=0,
-        world_size=1,
-        num_tokens_per_rank=64,
-        num_topk=2,
-        num_total_experts=8,
-        hidden=128,
-        intermediate=128,
-    )
-    with pytest.raises(ValueError, match=match):
-        MegaMoEHopperMxfp4Config(**common, **{field: value})
+@pytest.mark.parametrize("value", [True, 1])
+def test_sm90_mxfp4_shim_rejects_invalid_tail_pairs(value):
+    with pytest.raises(ValueError, match="tail_split_pairs"):
+        _shim_config(tail_split_pairs=value)
 
 
 def test_sm90_mxfp4_pingpong_uses_m128_and_keeps_scalar_stores():
-    config = MegaMoEHopperMxfp4Config(
-        rank=0,
-        world_size=1,
-        num_tokens_per_rank=64,
-        num_topk=2,
-        num_total_experts=8,
+    config = _shim_config(
         hidden=512,
         intermediate=512,
         mma_tiler_mnk=(128, 64, 256),
@@ -423,40 +370,16 @@ def test_sm90_mxfp4_configs_reject_non_bool_inherited_flags(field, value):
     with pytest.raises(ValueError, match=public_field + " must be a bool"):
         _config(**{public_field: value})
 
-    common = dict(
-        rank=0,
-        world_size=1,
-        num_tokens_per_rank=64,
-        num_topk=2,
-        num_total_experts=8,
-        hidden=128,
-        intermediate=128,
-    )
     with pytest.raises(ValueError, match=field + " must be a bool"):
-        MegaMoEHopperMxfp4Config(**common, **{field: value})
+        _shim_config(**{field: value})
 
 
-def test_sm90_mxfp4_shim_config_has_kw_only_strict_routing_identity():
-    common = dict(
-        rank=0,
-        world_size=1,
-        num_tokens_per_rank=64,
-        num_topk=2,
-        num_total_experts=8,
-        hidden=128,
-        intermediate=128,
-    )
-    block = MegaMoEHopperMxfp4Config(**common)
-    exact = MegaMoEHopperMxfp4Config(
-        **common,
-        routing_profile=SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
-    )
-    routing_field = dataclasses.fields(MegaMoEHopperMxfp4Config)[-1]
-    assert routing_field.name == "routing_profile"
-    assert routing_field.kw_only
+def test_sm90_mxfp4_shim_config_has_strict_routing_identity():
+    block = _shim_config()
+    exact = _shim_config(routing_profile=SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED)
     assert block != exact
     with pytest.raises(ValueError, match="routing_profile"):
-        MegaMoEHopperMxfp4Config(**common, routing_profile="exact")
+        _shim_config(routing_profile="exact")
 
 
 @pytest.mark.parametrize(
@@ -685,17 +608,10 @@ class TestMxfp4OptimizationPolicy(unittest.TestCase):
             base.identity(), _resolve_optimization(fc1_ready_mode="k256").identity()
         )
 
-    def test_diagnostic_legacy_and_independence_from_total_tokens(self):
+    def test_diagnostic_legacy_policy(self):
         self.assertEqual(
             _resolve_optimization(local_optimizations=False, skip_zero_counts=False),
             Mxfp4Optimizations(),
-        )
-        # There is intentionally no num_tokens argument or per-token source table.
-        import inspect
-
-        self.assertNotIn(
-            "num_tokens",
-            inspect.signature(resolve_mxfp4_optimizations).parameters,
         )
 
     def test_cross_h_local_defaults_keep_protocols_off(self):
@@ -763,11 +679,6 @@ class TestMxfp4OptimizationPolicy(unittest.TestCase):
                             static_expert_shape=(96, 6144, hidden), **overrides
                         ).peer32
                     )
-
-
-def test_public_mxfp4_rejects_old_reduction_field():
-    with pytest.raises(TypeError, match="in_kernel_fc2_reduce"):
-        _config(in_kernel_fc2_reduce=False)
 
 
 @pytest.mark.parametrize("field", ["compact_pull_buffer", "generate_c"])

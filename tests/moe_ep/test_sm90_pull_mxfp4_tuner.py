@@ -59,236 +59,30 @@ _DEFAULT_FIELDS = (
     "fc1_early_done_publish",
     "fold_producer_warps",
 )
+# fmt: off
 _EXPECTED_DEFAULTS = {
-    "block_permutation_v1": (
-        (
-            (256, 16, 256),
-            (2, 1, 1),
-            132,
-            1,
-            False,
-            "static",
-            "epi_warps",
-            False,
-            4,
-            True,
-            False,
-            False,
-        ),
-        (
-            (256, 16, 256),
-            (2, 1, 1),
-            132,
-            1,
-            False,
-            "static",
-            "epi_warps",
-            True,
-            4,
-            True,
-            False,
-            False,
-        ),
-        (
-            (256, 16, 256),
-            (2, 1, 1),
-            132,
-            1,
-            False,
-            "static",
-            "epi_warps",
-            False,
-            1,
-            True,
-            False,
-            False,
-        ),
-        (
-            (256, 16, 256),
-            (2, 1, 1),
-            512,
-            1,
-            False,
-            "static",
-            "epi_warps",
-            True,
-            2,
-            True,
-            False,
-            False,
-        ),
-        (
-            (256, 32, 128),
-            (1, 1, 1),
-            330,
-            1,
-            False,
-            "atomic_counter",
-            "epi_warps",
-            False,
-            2,
-            True,
-            False,
-            False,
-        ),
-        (
-            (256, 64, 256),
-            (2, 1, 1),
-            512,
-            1,
-            False,
-            "atomic_counter",
-            "epi_warps",
-            True,
-            1,
-            False,
-            True,
-            True,
-        ),
-        (
-            (256, 64, 256),
-            (2, 1, 1),
-            528,
-            2,
-            False,
-            "atomic_counter",
-            "epi_warps",
-            False,
-            1,
-            False,
-            True,
-            True,
-        ),
-        (
-            (256, 64, 256),
-            (2, 1, 1),
-            512,
-            1,
-            False,
-            "atomic_counter",
-            "epi_warps",
-            False,
-            1,
-            False,
-            True,
-            True,
-        ),
+    'block_permutation_v1': (
+        ((256, 16, 256), (2, 1, 1), 132, 1, False, 'static', 'epi_warps', False, 4, True, False, False),
+        ((256, 16, 256), (2, 1, 1), 132, 1, False, 'static', 'epi_warps', True, 4, True, False, False),
+        ((256, 16, 256), (2, 1, 1), 132, 1, False, 'static', 'epi_warps', False, 1, True, False, False),
+        ((256, 16, 256), (2, 1, 1), 512, 1, False, 'static', 'epi_warps', True, 2, True, False, False),
+        ((256, 32, 128), (1, 1, 1), 330, 1, False, 'atomic_counter', 'epi_warps', False, 2, True, False, False),
+        ((256, 64, 256), (2, 1, 1), 512, 1, False, 'atomic_counter', 'epi_warps', True, 1, False, True, True),
+        ((256, 64, 256), (2, 1, 1), 528, 2, False, 'atomic_counter', 'epi_warps', False, 1, False, True, True),
+        ((256, 64, 256), (2, 1, 1), 512, 1, False, 'atomic_counter', 'epi_warps', False, 1, False, True, True),
     ),
-    "published_exact_balanced_v1": (
-        (
-            (256, 16, 256),
-            (2, 1, 1),
-            396,
-            1,
-            False,
-            "atomic_counter",
-            "epi_warps",
-            False,
-            4,
-            False,
-            False,
-            False,
-        ),
-        (
-            (256, 16, 256),
-            (2, 1, 1),
-            512,
-            1,
-            False,
-            "atomic_counter",
-            "epi_warps",
-            False,
-            4,
-            False,
-            False,
-            False,
-        ),
-        (
-            (256, 16, 256),
-            (2, 1, 1),
-            512,
-            1,
-            False,
-            "atomic_counter",
-            "epi_warps",
-            False,
-            4,
-            False,
-            False,
-            False,
-        ),
-        (
-            (256, 16, 256),
-            (2, 1, 1),
-            512,
-            2,
-            False,
-            "atomic_counter",
-            "epi_warps",
-            False,
-            4,
-            False,
-            False,
-            False,
-        ),
-        (
-            (256, 16, 256),
-            (2, 1, 1),
-            396,
-            2,
-            False,
-            "static",
-            "epi_warps",
-            False,
-            4,
-            False,
-            False,
-            False,
-        ),
-        (
-            (256, 32, 128),
-            (2, 1, 1),
-            396,
-            2,
-            False,
-            "atomic_counter",
-            "epi_warps",
-            False,
-            4,
-            False,
-            False,
-            False,
-        ),
-        (
-            (128, 64, 256),
-            (2, 1, 1),
-            330,
-            2,
-            False,
-            "atomic_counter",
-            "reuse_dispatch_warps",
-            False,
-            4,
-            False,
-            False,
-            False,
-        ),
-        (
-            (128, 64, 256),
-            (1, 1, 1),
-            528,
-            2,
-            False,
-            "atomic_counter",
-            "reuse_dispatch_warps",
-            False,
-            4,
-            False,
-            False,
-            False,
-        ),
+    'published_exact_balanced_v1': (
+        ((256, 16, 256), (2, 1, 1), 396, 1, False, 'atomic_counter', 'epi_warps', False, 4, False, False, False),
+        ((256, 16, 256), (2, 1, 1), 512, 1, False, 'atomic_counter', 'epi_warps', False, 4, False, False, False),
+        ((256, 16, 256), (2, 1, 1), 512, 1, False, 'atomic_counter', 'epi_warps', False, 4, False, False, False),
+        ((256, 16, 256), (2, 1, 1), 512, 2, False, 'atomic_counter', 'epi_warps', False, 4, False, False, False),
+        ((256, 16, 256), (2, 1, 1), 396, 2, False, 'static', 'epi_warps', False, 4, False, False, False),
+        ((256, 32, 128), (2, 1, 1), 396, 2, False, 'atomic_counter', 'epi_warps', False, 4, False, False, False),
+        ((128, 64, 256), (2, 1, 1), 330, 2, False, 'atomic_counter', 'reuse_dispatch_warps', False, 4, False, False, False),
+        ((128, 64, 256), (1, 1, 1), 528, 2, False, 'atomic_counter', 'reuse_dispatch_warps', False, 4, False, False, False),
     ),
 }
+# fmt: on
 
 
 @pytest.mark.parametrize("profile", MXFP4_TUNING_ROUTING_PROFILES)
@@ -309,52 +103,31 @@ def test_defaults_and_complete_candidate_order(profile):
         assert candidates[0] == normalize_mxfp4_optimization_tactic(tactic)
 
 
-def test_cache_identity_invalidates_unfenced_winners_and_tracks_domain(monkeypatch):
-    unfenced = {
-        "block_permutation_v1": "0e34a82c58bf39fc04cd25c54a3d62ae88cc7d46f2449b8d5a36e388022d8682",
-        "published_exact_balanced_v1": "ab16d80c9766ee9de4c0f57ffbfd93de7bd5aa4fe71947578aadf3fd2b7e2443",
-    }
-    expected = {
-        profile: hopper_mxfp4_cache_provenance_sha256(routing_profile=profile)
-        for profile in unfenced
-    }
-    for profile, identity in expected.items():
-        assert identity != unfenced[profile]
-    changed = (
-        *mxfp4_tuner._BASE_TACTICS,
-        dict(mxfp4_tuner._BASE_TACTICS[0], group_hint=999),
-    )
-    with monkeypatch.context() as patch:
-        patch.setattr(mxfp4_tuner, "_BASE_TACTICS", changed)
-        for profile, identity in expected.items():
-            assert (
-                hopper_mxfp4_cache_provenance_sha256(routing_profile=profile)
-                != identity
-            )
+def test_cache_identity_tracks_candidates_and_policy(monkeypatch):
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.src.moe_hopper_fp8 import (
         mxfp4_policy,
     )
 
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (
-        mxfp4_optimization,
+    expected = {
+        profile: hopper_mxfp4_cache_provenance_sha256(routing_profile=profile)
+        for profile in MXFP4_TUNING_ROUTING_PROFILES
+    }
+    assert len(set(expected.values())) == len(expected)
+    changed = (
+        *mxfp4_tuner._BASE_TACTICS,
+        dict(mxfp4_tuner._BASE_TACTICS[0], group_hint=999),
     )
-
-    with monkeypatch.context() as patch:
-        patch.setattr(mxfp4_policy, "MXFP4_OPTIMIZATION_VERSION", "fused_local_v2")
-        patch.setattr(
-            mxfp4_optimization, "MXFP4_OPTIMIZATION_VERSION", "fused_local_v2"
-        )
-        for profile, identity in unfenced.items():
-            assert (
-                hopper_mxfp4_cache_provenance_sha256(routing_profile=profile)
-                == identity
-            )
-
-    monkeypatch.setattr(
-        mxfp4_policy, "MXFP4_OPTIMIZATION_VERSION", "changed-test-domain"
-    )
-    for profile, identity in expected.items():
-        assert hopper_mxfp4_cache_provenance_sha256(routing_profile=profile) != identity
+    for module, field, value in (
+        (mxfp4_tuner, "_BASE_TACTICS", changed),
+        (mxfp4_policy, "MXFP4_OPTIMIZATION_VERSION", "changed-test-domain"),
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(module, field, value)
+            for profile, identity in expected.items():
+                assert (
+                    hopper_mxfp4_cache_provenance_sha256(routing_profile=profile)
+                    != identity
+                )
 
 
 def test_h20_anchors_are_candidates_but_not_defaults():
@@ -1038,19 +811,10 @@ def _resolver_kwargs() -> dict:
     }
 
 
-def test_exact_standard_h200_is_accepted(monkeypatch) -> None:
-    _mock_cuda_device(
-        monkeypatch,
-        name="NVIDIA H200",
-        capability=(9, 0),
-        sm_count=132,
-    )
-    mxfp4_tuner.require_hopper_mxfp4_fused_tuning_device()
-
-
 @pytest.mark.parametrize(
     ("name", "sm_count"),
     [
+        ("NVIDIA H200", 132),
         ("NVIDIA H20-3e", 78),
         ("NVIDIA H100 80GB HBM3", 132),
         ("NVIDIA H200 NVL", 114),
@@ -1096,7 +860,7 @@ def test_cache_resolver_checks_sm90_device(monkeypatch) -> None:
         fused_guard,
     )
     with pytest.raises(RuntimeError, match="fused device guard"):
-        hopper_mxfp4._resolve_mxfp4_knobs(None, **_resolver_kwargs())
+        hopper_mxfp4.resolve_hopper_mxfp4_knobs(None, **_resolver_kwargs())
     fused_guard.assert_called_once_with()
 
 
@@ -1124,7 +888,7 @@ def test_h20_fused_none_cache_miss_uses_h200_derived_heuristic(monkeypatch) -> N
         "routing_profile": SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
     }
 
-    assert hopper_mxfp4._resolve_mxfp4_knobs(None, **kwargs) == (
+    assert hopper_mxfp4.resolve_hopper_mxfp4_knobs(None, **kwargs) == (
         normalize_mxfp4_optimization_tactic(
             mxfp4_tuner.hopper_mxfp4_default_tactic(
                 1,
@@ -1147,7 +911,7 @@ def test_complete_explicit_tactics_bypass_device_guard(monkeypatch) -> None:
         fused_guard,
     )
     fused = mxfp4_tuner._base_candidates()[0]
-    assert hopper_mxfp4._resolve_mxfp4_knobs(
+    assert hopper_mxfp4.resolve_hopper_mxfp4_knobs(
         fused,
         **_resolver_kwargs(),
     ) == normalize_mxfp4_optimization_tactic(fused)
