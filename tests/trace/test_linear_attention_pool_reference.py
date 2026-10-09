@@ -96,6 +96,41 @@ def test_gdn2_exported_initializer_produces_finite_prefill(definition_source):
     assert (args["g"] <= 0).all()
 
 
+@pytest.mark.parametrize("heads", [(2, 2), (4, 2), (2, 4)])
+@pytest.mark.parametrize(
+    "optional", [None, "g", "beta", "initial_state", "output_state"]
+)
+def test_gdp_pool_trace_resolves_output_heads(heads, optional):
+    hq, hv = heads
+    ho = max(heads)
+    args = dict(
+        q=torch.zeros(4, hq, 8),
+        k=torch.zeros(8, hq, 8),
+        v=torch.zeros(8, hv, 8),
+        num_householder=2,
+        cu_seqlens=torch.tensor([0, 4], dtype=torch.int64),
+        state_indices=torch.tensor([5], dtype=torch.int32),
+    )
+    if optional in ("g", "beta"):
+        args[optional] = torch.ones(4 if optional == "g" else 8, ho)
+    elif optional is not None:
+        args[optional] = torch.zeros(6, ho, 8, 8)
+
+    template = gdp_prefill_trace(**args)
+    # The registry uses the template directly; API tracing uses the dispatcher.
+    for trace in (
+        template.build_fi_trace_fn("flashinfer.gdp_prefill.chunk_gated_delta_product"),
+        chunk_gated_delta_product.fi_trace,
+    ):
+        definition = trace(**args)
+        axes = definition["axes"]
+        assert axes["num_o_heads"]["value"] == ho
+        assert axes["num_q_heads"]["value"] == hq
+        assert axes["num_v_heads"]["value"] == hv
+        assert all("value" in axis for axis in axes.values() if axis["type"] == "const")
+        assert definition["outputs"]["output"]["shape"][1] == "num_o_heads"
+
+
 @pytest.mark.parametrize("family", ["gdn2", "gdp"])
 @pytest.mark.parametrize("heads", [(4, 2, 2), (2, 2, 4)])
 @pytest.mark.parametrize("return_state", [False, True])

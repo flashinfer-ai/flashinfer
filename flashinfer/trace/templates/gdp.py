@@ -147,7 +147,18 @@ def _gdp_prefill_init(
     }
 
 
-_gdp_prefill_default_trace = TraceTemplate(
+class _GDPTraceTemplate(TraceTemplate):
+    def _build_axis_extractors(self):
+        extractors = super()._build_axis_extractors()
+        if "num_o_heads" in self.axes:
+            # Gates and states are optional; Q/V always define the output heads.
+            extractors["num_o_heads"] = lambda kwargs: max(
+                int(kwargs["q"].shape[1]), int(kwargs["v"].shape[1])
+            )
+        return extractors
+
+
+_gdp_prefill_default_trace = _GDPTraceTemplate(
     op_type="gdp",
     name_prefix="gdp_prefill",
     description=(
