@@ -32,9 +32,9 @@ SMEM/TMEM resources (pipelined)
 - TmemCorrResource  : Async(2 stages),              SoftmaxTask -> CorrectionTask
 - TmemOResource     : UmmaProducerAsync(1 stage),   MmaTask -> CorrectionTask
 
-GMEM (no pipeline)
-------------------
-- GmemOResource     : No pipeline, Correction -> GMEM
+Output
+------
+- GmemOResource     : Direct stores, or Async(2 stages) Correction -> TMA -> GMEM
 """
 
 from dataclasses import dataclass, field
@@ -69,6 +69,7 @@ from ..helpers.gather import (
 )
 
 from .config import (
+    OUTPUT_TMA_STAGE_BYTES,
     V_SMEM_K_BLOCK_TOKENS,
     V_TMA_LATENT_ELEMENTS,
     MlaDecodeConfig,
@@ -3580,8 +3581,10 @@ class TmemOResource(HighThroughputMlaResource):
 
 @dataclass(kw_only=True)
 class GmemOResource(HighThroughputMlaResource):
-    """GMEM output.  Producer: Correction (epilogue store).  No pipeline."""
+    """Final output: direct stores or staged quantization with a TMA consumer."""
 
+    smem_o: Any = None
+    tma_o_desc: Any = None
     output: Any = None
     partial_output: Any = None
     lse: Any = None
@@ -3676,14 +3679,53 @@ class GmemOResource(HighThroughputMlaResource):
 
     @cute.jit
     def _store_quantized_slice(
-        self, values, flat_row, batch_idx, column, rotary: cutlass.Constexpr[bool]
+        self,
+        values,
+        flat_row,
+        batch_idx,
+        column,
+        rotary: cutlass.Constexpr[bool],
+        stage_idx=0,
     ):
         row = Int64(flat_row)
         if cutlass.const_expr(self.cu_seqlens_q is None):
             row += Int64(batch_idx) * self.logical_num_heads_q * self.logical_seq_len_q
+        shared_output = None
+        if cutlass.const_expr(self.cfg.use_tma_output):
+            shared_output = self.smem_o.data_ptr(
+                stage_idx * OUTPUT_TMA_STAGE_BYTES
+            ).toint(Int32)
         self.output_quant.store(
-            self.output_quant_args, values, row, column, rotary=rotary
+            self.output_quant_args,
+            values,
+            row,
+            column,
+            rotary=rotary,
+            shared_output=shared_output,
         )
+        if cutlass.const_expr(self.cfg.use_tma_output):
+            cute.arch.fence_view_async_shared()
+
+    @consumer_work
+    @cute.jit
+    def tma_store_output(
+        self, stage_info: StageInfo, *, iter_n: cutlass.Constexpr[int]
+    ):
+        # Sparse launch flattens queries into batch rows; each CTA owns 64 heads.
+        cluster, _, token, _ = stage_info.work_tile.tile_idx
+        if prims.elect_sync():
+            for half in cutlass.range_constexpr(2):
+                prims.cp_async_bulk_tensor_global_shared_cta(
+                    self.tma_o_desc,
+                    self.smem_o.subview(
+                        stage_info.stage_idx * OUTPUT_TMA_STAGE_BYTES + half * 8192
+                    ),
+                    (iter_n * 256 + half * 128, cluster * 64, token),
+                )
+        prims.cp_async_bulk_commit_group()
+        # Release the stage only after TMA has consumed its shared source.
+        # The store task waits for global completion before retiring the CTA.
+        prims.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
     def _load_rotary_slice(
@@ -3903,6 +3945,9 @@ class GmemOResource(HighThroughputMlaResource):
                         batch_idx,
                         iter_n * tile_d + g_j,
                         False,
+                        stage_idx=stage_info.stage_idx
+                        if cutlass.const_expr(cfg.use_tma_output)
+                        else 0,
                     )
                 else:
                     # 16-bit output (split_kv == 1, direct output)
@@ -4185,6 +4230,9 @@ class GmemOResource(HighThroughputMlaResource):
                     batch_idx,
                     iter_n * tile_d + g_j,
                     False,
+                    stage_idx=stage_info.stage_idx
+                    if cutlass.const_expr(cfg.use_tma_output)
+                    else 0,
                 )
             else:
                 if cutlass.const_expr(self.cu_seqlens_q is not None):

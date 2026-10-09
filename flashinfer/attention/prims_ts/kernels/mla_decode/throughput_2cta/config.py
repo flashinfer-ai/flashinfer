@@ -46,6 +46,10 @@ V_SMEM_K_BLOCK_TOKENS = 32
 # Each transpose-TMA issue stages one 64-element slice of the latent dimension.
 V_TMA_LATENT_ELEMENTS = 64
 
+# Two N slices of the final M128xD512 FP8 output, split across two CTAs.
+OUTPUT_TMA_STAGES = 2
+OUTPUT_TMA_STAGE_BYTES = 64 * 256
+
 
 def ceil_div(a: int, b: int) -> int:
     """Return ``ceil(a / b)`` for positive integer divisors."""
@@ -155,6 +159,9 @@ class MlaDecodeConfig:
     iterations_qk_latent_stages: int = 4
     iterations_qk_stages: int = 5
     iterations_pv_stages: int = 4
+
+    # Final quantized output can use a staged TMA store on padding warp 10.
+    use_tma_output: bool = False
 
     # Pipeline stage counts for the captured schedule resources.  The combined
     # K/V stage count keeps enough delayed-V stages live for K-before-V overlap.

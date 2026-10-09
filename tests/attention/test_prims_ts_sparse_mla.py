@@ -372,6 +372,8 @@ def _dequant_output(output, scales, block_size):
         (1, 3, 64, 129, 128, "ue8m0", False, False),
         (1, 1, 128, 2049, 128, "fp32", False, False),
         (1, 161, 64, 513, 32, "ue8m0", False, False),
+        # Packed multiwave queries reuse the quantized output's shared stages.
+        (2, 81, 128, 513, 32, "fp32", True, False),
     ],
 )
 def test_rope_quant_graph(

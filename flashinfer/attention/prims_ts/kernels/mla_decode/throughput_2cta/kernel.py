@@ -50,6 +50,8 @@ from ...tensor_map import (
 )
 
 from .config import (
+    OUTPUT_TMA_STAGES,
+    OUTPUT_TMA_STAGE_BYTES,
     REDUCTION_ROWS_PER_CTA,
     REDUCTION_THREADS_PER_ROW,
     V_TMA_LATENT_ELEMENTS,
@@ -116,6 +118,7 @@ from .tasks import (
     create_softmax_task,
     create_correction_task,
     create_padding_task,
+    create_output_tma_task,
     create_scheduler_task,
 )
 
@@ -151,6 +154,8 @@ def build_mla_decode_task_manager(
     lse_in_natural_log=False,
     output_quant=None,
     output_quant_args=None,
+    smem_o=None,
+    tma_o_desc=None,
     acc_output=None,
     lse=None,
     acc_lse=None,
@@ -472,6 +477,14 @@ def build_mla_decode_task_manager(
         name="tmem_o",
     )
 
+    output_pipeline = None
+    if cfg.use_tma_output:
+        output_pipeline = PipelineConfig.create_async_async_pipeline_cfg(
+            num_stages=OUTPUT_TMA_STAGES,
+            producer_group=compute_group_local,
+            consumer_group=pipeline.CooperativeGroup(Agent.Thread, 32),
+            cta_layout_vmnk=cluster_shape_vmnk,
+        )
     gmem_o = GmemOResource(
         cfg=cfg,
         output=output,
@@ -484,6 +497,8 @@ def build_mla_decode_task_manager(
         lse_in_natural_log=lse_in_natural_log,
         output_quant=output_quant,
         output_quant_args=output_quant_args,
+        smem_o=smem_o,
+        tma_o_desc=tma_o_desc,
         output_scale=None,  # set at runtime
         softmax_scale_log2=None,  # set at runtime
         smem_exchange=None,  # set at runtime
@@ -492,6 +507,7 @@ def build_mla_decode_task_manager(
         logical_num_heads_q=logical_num_heads_q,
         logical_seq_len_q=logical_seq_len_q,
         name="gmem_o",
+        pipeline_config=output_pipeline,
     )
 
     # ──────────────────────────────────────────────────────────────
@@ -648,7 +664,15 @@ def build_mla_decode_task_manager(
                 num_registers=wg2_reg_count,
             )
         )
-    if cfg.use_fp8_split_mma_schedule and cfg.load_num_warps > 1:
+    if cfg.use_tma_output:
+        task_list.append(
+            create_output_tma_task(
+                gmem_o,
+                work_queue=work_queue,
+                num_registers=wg2_reg_count,
+            )
+        )
+    elif cfg.use_fp8_split_mma_schedule and cfg.load_num_warps > 1:
         task_list.append(
             create_padding_task(
                 work_queue=work_queue,
@@ -1035,7 +1059,7 @@ class MlaDecodeTs:
 
     def _make_config(self):
         """Share geometry and resource settings between launch and device code."""
-        return make_mla_decode_config(
+        cfg = make_mla_decode_config(
             mma_qk_tiler_mn=self.mma_qk_tiler_mn,
             mma_pv_tiler_mn=self.mma_pv_tiler_mn,
             rope_dim=self.rope_dim,
@@ -1054,6 +1078,22 @@ class MlaDecodeTs:
             fuse_output_quant=self.output_quant is not None
             and self.fuse_sparse_epilogue,
         )
+
+        # One flattened sparse query supplies a complete M128 tile. Its two
+        # CTAs each stage 64 heads without row predicates. Warp 10 is otherwise
+        # padding in the sparse FP8 schedule; using it for stores preserves
+        # gather/MMA/softmax resources and overlaps output traffic with work.
+        # Split reductions and other geometries retain direct vector stores.
+        cfg.use_tma_output = bool(
+            self.output_quant is not None
+            and self.fuse_sparse_epilogue
+            and cfg.is_fp8_qkv()
+            and cfg.page_size == 1
+            and self.num_heads == 128
+            and self.seq_len_q == 1
+            and cfg.mma_pv_tiler_mn == (128, 256)
+        )
+        return cfg
 
     @cute.jit
     def __call__(
@@ -1330,6 +1370,22 @@ class MlaDecodeTs:
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
 
+        tma_desc_o = tma_desc_q_latent
+        if cutlass.const_expr(cfg.use_tma_output):
+            flat_o = output_quant_args[0]
+            output_rows = cute.size(flat_o) // (128 * 512)
+            output_view = cute.make_tensor(
+                flat_o.iterator,
+                cute.make_layout((512, 128, output_rows), stride=(1, 512, 128 * 512)),
+            )
+            tma_desc_o = create_tensor_map_tiled_from_view(
+                output_view,
+                box_dims=(128, 64, 1),
+                stride_order=(0, 1, 2),
+                swizzle=cuda.TensorMapSwizzle.s128b,
+                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+            )
+
         softmax_scale_log2 = softmax_scale * LOG2_E
 
         kernel_split_kv = (
@@ -1403,6 +1459,7 @@ class MlaDecodeTs:
             tile_sched_params,
             clc_tile_sched_params,
             output_quant_args,
+            tma_desc_o,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -1500,6 +1557,7 @@ class MlaDecodeTs:
         tile_sched_params: MLAStaticTileSchedulerParams,
         clc_tile_sched_params: object,
         output_quant_args=None,
+        tma_desc_o: cutlass.GridConstant[cuda.TensorMap] = None,
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         if cutlass.const_expr(self.direct_sparse):
@@ -1624,6 +1682,15 @@ class MlaDecodeTs:
                 space=cutlass.AddressSpace.smem,
                 alignment=128,
             )
+        smem_o = None
+        if cutlass.const_expr(cfg.use_tma_output):
+            smem_o = cutlass.Array(
+                cutlass.Uint8,
+                OUTPUT_TMA_STAGES * OUTPUT_TMA_STAGE_BYTES,
+                space=cutlass.AddressSpace.smem,
+                alignment=1024,
+            )
+
         softmax_exchange_arr = cutlass.Array(
             self.acc_dtype,
             cfg.softmax_exchange_elems,
@@ -1932,6 +1999,8 @@ class MlaDecodeTs:
                 lse_in_natural_log=self.fuse_sparse_epilogue,
                 output_quant=self.output_quant if self.fuse_sparse_epilogue else None,
                 output_quant_args=output_quant_args,
+                smem_o=smem_o,
+                tma_o_desc=tma_desc_o.get_ptr(),
                 acc_output=acc_o,
                 lse=lse,
                 acc_lse=acc_lse,

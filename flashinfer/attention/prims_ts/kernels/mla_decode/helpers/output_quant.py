@@ -102,12 +102,15 @@ class MlaOutputQuant:
         column,
         lane_stride: cutlass.Constexpr[int] = 1,
         rotary: cutlass.Constexpr[bool] = True,
+        shared_output=None,
     ):
         """Finalize contiguous FP32 fragments after all attention reductions.
 
         Blocks fit in one thread or one warp; ``lane_stride=16`` joins the
         two lanes owning the halves of a keep-MMA head. Nonrotary D stages
         remove the rotation at compile time, limiting epilogue code size.
+        ``shared_output`` is the optional 2CTA FP8 output stage: two swizzled
+        64-row by 128-byte boxes, consumed by its asynchronous TMA-store task.
         """
         if cutlass.const_expr(rotary):
             # Some epilogues pass an immutable register vector. Two-CTA
@@ -198,20 +201,34 @@ class MlaOutputQuant:
                         ftz=True,
                     )
                     packed[w] = pack_float4_to_fp8_e4m3(lo[0], lo[1], hi[0], hi[1])
-                ptr = cutlass.inttoptr(
-                    (out.iterator.raw_ptr() + Int64(row) * 512 + column + v).toint(
-                        Int64
-                    ),
-                    mem_space=1,
-                    dtype=Int32,
-                )
-                if cutlass.const_expr(words == 8):
-                    # Native allocations support a 256-bit store. Retain the
-                    # documented 16-byte alignment for caller-owned buffers.
-                    if (ptr.toint(Int64) & Int64(31)) == 0:
-                        ptr.store(packed.load(0, 8), alignment=32)
-                    else:
-                        ptr.store(packed.load(0, 4), alignment=16)
-                        (ptr + 4).store(packed.load(4, 4), alignment=16)
+                if cutlass.const_expr(shared_output is not None):
+                    for part in cutlass.range_constexpr(0, words, 4):
+                        col = Int32(column + v + part * 4) & Int32(255)
+                        smem_offset = (
+                            (col // 128) * 8192 + (Int32(head) & 63) * 128 + (col & 127)
+                        )
+                        # TMA 128B swizzle XORs byte bits [4:7] with [7:10].
+                        # The stage base is 1024B aligned, so its bits are zero.
+                        swizzled = smem_offset ^ ((smem_offset >> 3) & 0x70)
+                        destination = cutlass.inttoptr(
+                            shared_output + swizzled, mem_space=3, dtype=Int32
+                        )
+                        destination.store(packed.load(part, 4), alignment=16)
                 else:
-                    ptr.store(packed.load(0, words), alignment=4 * words)
+                    ptr = cutlass.inttoptr(
+                        (out.iterator.raw_ptr() + Int64(row) * 512 + column + v).toint(
+                            Int64
+                        ),
+                        mem_space=1,
+                        dtype=Int32,
+                    )
+                    if cutlass.const_expr(words == 8):
+                        # Native allocations support a 256-bit store. Retain the
+                        # documented 16-byte alignment for caller-owned buffers.
+                        if (ptr.toint(Int64) & Int64(31)) == 0:
+                            ptr.store(packed.load(0, 8), alignment=32)
+                        else:
+                            ptr.store(packed.load(0, 4), alignment=16)
+                            (ptr + 4).store(packed.load(4, 4), alignment=16)
+                    else:
+                        ptr.store(packed.load(0, words), alignment=4 * words)
