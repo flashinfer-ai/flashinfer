@@ -152,6 +152,23 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         >>> gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, max_active_clusters, stream)
     """
 
+    # Largest kernel N a narrow (< 64) N tile may run at. A narrow tile is a
+    # sub-tile of the 128-token SFB tile: the mainloop shifts the MMA's SFB
+    # TMEM column by tok_off // 32, and an odd shift makes tcgen05.mma fault,
+    # so every sub-tile must stay within the first 32 tokens. See can_implement.
+    NARROW_TILE_MAX_N = 32
+
+    @classmethod
+    def narrow_tile_ok(cls, tile_n: int, kernel_n: int) -> bool:
+        """Whether an MMA N tile of width ``tile_n`` may run at ``kernel_n``.
+
+        Tiles of 64 or wider are unrestricted; narrow tiles must stay within
+        ``NARROW_TILE_MAX_N`` kernel-N columns (kernel N is the token count
+        under swap_ab). Shared by can_implement and by the mm_mxfp8 / mm_fp4
+        runners, which re-check a tactic before launching it.
+        """
+        return tile_n >= 64 or kernel_n <= cls.NARROW_TILE_MAX_N
+
     def __init__(
         self,
         sf_vec_size: int,
@@ -1950,7 +1967,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         # tile's two-column shift is fine), so every sub-tile has to stay in
         # the first 32-token group: the kernel-N extent is limited to 32 and
         # the SFB tile is never multicast. Wider N takes the 64-wide or
-        # 128-wide tiles.
-        if mma_tiler_mn[1] < 64 and (n > 32 or cluster_shape_mn[1] > 1):
+        # 128-wide tiles. narrow_tile_ok holds the 32-column bound, shared with
+        # the mm_mxfp8 / mm_fp4 runners' pre-launch re-check of replayed tactics.
+        if not cls.narrow_tile_ok(mma_tiler_mn[1], n) or (
+            mma_tiler_mn[1] < 64 and cluster_shape_mn[1] > 1
+        ):
             can_implement = False
         return can_implement

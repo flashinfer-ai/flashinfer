@@ -59,11 +59,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Optional
 
+import functools
+
 import torch
 import tvm_ffi
 
+from ...utils import get_compute_capability, get_device_sm_count
 from .cake_jit import (
     MODULES,
+    kernel_definitions,
     kernel_module_name,
     load_cake_nvfp4_per_token_module,
     route_available,
@@ -84,6 +88,16 @@ BASELINE_THREADS = (128, 256, 512)
 # Row counts that launch as one wave of one-row CTAs on both supported parts (148 / 152 SMs).
 SINGLE_WAVE_MAX_ROWS = 148
 MAX_REG_BLOCKS = 8  # 16-element blocks one quantizer thread holds in registers
+# Static-K quantizer tier (port of the production ``STATIC_M_LIMIT`` / ``STATIC_K``): contiguous row
+# sets of fewer than :data:`STATIC_M_LIMIT` tokens at a row width in :data:`STATIC_K` take an instance
+# with the row width compiled in (key suffix ``_k<K>``, ``-DK_STATIC``); every other row set, every
+# other width and every row-strided view takes the runtime-geometry instance of the same CTA shape.
+# The widths and the limit are the ones where the compiled-in build won or tied the runtime-geometry
+# build of the same CTA shape on both parts (5 interleaved rounds per row): +1.0..3.9 % at 2688 and
+# 4096, +0.0..2.7 % at 7168; from 8192 rows on the CTA shape changes and the compiled-in build loses
+# at 4096 and 7168, and widths of 8192 and above lose at every row count.
+STATIC_M_LIMIT = 8192
+STATIC_K: tuple[int, ...] = (2688, 4096, 7168)
 WIDE_MAX_M = 4096
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 ARCHES = tuple(sorted(set(SUPPORTED_COMPUTE_CAPABILITIES.values())))
@@ -123,6 +137,21 @@ VALIDATED_QUANTIZE_K: tuple[int, ...] = (7168, 8192, 16384, 18432, 28672)
 VALIDATED_RAGGED_FAMILIES: tuple[tuple[int, int], ...] = ((7168, 2112), (8192, 8192))
 VALIDATED_F16_INPUT_ROWS: tuple[int, ...] = (8, 257, 2048)
 VALIDATED_FOLD_ROWS: tuple[int, ...] = (1, 130, 8192)
+# Coverage rows: the small token counts between the swapped-orientation tiles
+# (M in 9..16 on five families), a (K, N) pair outside the measured families
+# and quantizer K values outside the measured families (K % 16 == 0 only).
+VALIDATED_SMALL_M_ROWS: tuple[int, ...] = (9, 12, 16)
+VALIDATED_SMALL_M_FAMILIES: tuple[tuple[int, int], ...] = (
+    (7168, 2112),
+    (8192, 8192),
+    (7168, 18432),
+    (8192, 28672),
+    (16384, 7168),
+)
+VALIDATED_OFF_MATRIX_FAMILY: tuple[int, int] = (4096, 3200)
+VALIDATED_OFF_MATRIX_ROWS: tuple[int, ...] = (16, 300)
+VALIDATED_OFF_MATRIX_QUANTIZE_K: tuple[int, ...] = (2688, 4096)
+VALIDATED_OFF_MATRIX_QUANTIZE_ROWS: tuple[int, ...] = (1, 16, 130, 2048, 8192)
 
 
 # ---------------------------------------------------------------------------
@@ -227,13 +256,56 @@ def cta_config(k: int, m: int) -> tuple[int, int]:
     return threads, min_blocks_for(k, threads)
 
 
+LARGE_ROW_MIN_M = 512
+STORE_HINT_DEFAULT = "NONE"
+STORE_HINT_LARGE_ROW = "L2_EVICT_LAST"
+
+
+def blocks_per_thread_for(k: int, threads: int) -> int:
+    """Register capacity of the compiled instance: 16-element blocks per thread of a ``K``-wide row."""
+    return (k // SF_VEC + threads - 1) // threads
+
+
+def large_row_config(k: int, threads: int, min_blocks: int) -> bool:
+    """True for the CTA configurations :func:`cta_config` picks for row sets of
+    :data:`LARGE_ROW_MIN_M` tokens or more (port of ``large_row_config``)."""
+    return (threads, min_blocks) in {
+        cta_config(k, LARGE_ROW_MIN_M),
+        cta_config(k, 8192),
+    }
+
+
+def default_store_hint(k: int, threads: int, min_blocks: int) -> str:
+    """Output-store cache policy of the ``(K, threads, min_blocks)`` configuration (port of
+    ``default_store_hint``): L2 evict-last for the large-row configurations, whose 2-130 MB of
+    outputs would otherwise be written back into their own read stream."""
+    return (
+        STORE_HINT_LARGE_ROW
+        if large_row_config(k, threads, min_blocks)
+        else STORE_HINT_DEFAULT
+    )
+
+
 def quant_kernel_key(
-    k: int, threads: int, min_blocks: int, is_bf16: bool, fold: bool
+    threads: int,
+    blocks_per_thread: int,
+    min_blocks: int,
+    is_bf16: bool,
+    fold: bool,
+    store_hint: str = STORE_HINT_DEFAULT,
+    k_static: Optional[int] = None,
 ) -> str:
-    """Logical kernel key of one quantizer instance."""
+    """Logical kernel key of one quantizer instance: CTA width, register capacity (blocks per
+    thread), launch-bounds occupancy, input dtype, folded scale, the large-row store policy
+    (``_sl``) and, for the small-row tier, the compiled-in row width (``_k<K>``).  ``K`` and
+    the row stride are otherwise kernel arguments, not part of the key."""
     dtype = "bf16" if is_bf16 else "f16"
-    suffix = "_fold" if fold else ""
-    return f"quant:k{k}_t{threads}_mb{min_blocks}_{dtype}{suffix}"
+    return (
+        f"quant:t{threads}_b{blocks_per_thread}_mb{min_blocks}_{dtype}"
+        + ("_fold" if fold else "")
+        + ("_sl" if store_hint == STORE_HINT_LARGE_ROW else "")
+        + (f"_k{k_static}" if k_static is not None else "")
+    )
 
 
 @dataclass(frozen=True)
@@ -247,31 +319,61 @@ class QuantizePlan:
     is_bf16: bool
     fold: bool
     threads: int
+    blocks_per_thread: (
+        int  # register capacity of the instance (16-element blocks per thread)
+    )
     min_blocks: int  # launch-bounds occupancy (CTAs per SM)
+    store_hint: str  # output-store cache policy of the instance
+    k_static: Optional[
+        int
+    ]  # compiled-in row width of the small-row tier (None: runtime geometry)
     grid: int  # one CTA per padded row
     padded_rows: int
     padded_cols: int
     kernel_key: str
 
 
+def static_k_for(k: int, m: int, x_row_stride: Optional[int] = None) -> Optional[int]:
+    """``k`` when ``(M, K)`` takes the instance with the row width compiled in, else ``None``
+    (runtime geometry): ``K`` in :data:`STATIC_K`, contiguous rows and fewer than
+    :data:`STATIC_M_LIMIT` of them.  Port of the production ``static_k_for``."""
+    if k not in STATIC_K or m >= STATIC_M_LIMIT:
+        return None
+    # A single row has no row stride: ``M == 1`` always takes the static-K instance.
+    if m == 1 or x_row_stride is None or x_row_stride == k:
+        return int(k)
+    return None
+
+
 def quant_plan(
-    m: int, k: int, is_bf16: bool, fold: bool, arch: str, sm_count: int
+    m: int,
+    k: int,
+    is_bf16: bool,
+    fold: bool,
+    arch: str,
+    sm_count: int,
+    x_row_stride: Optional[int] = None,
 ) -> QuantizePlan:
     """Resolve the quantizer instance and grid exactly like the Cake production launcher
-    (``quantize_per_token``): CTA width and occupancy from :func:`cta_config`, one CTA
-    per padded row (the CTAs past ``M`` zero the padding rows of the scale tiles)."""
+    (``quantize_per_token``): CTA width and occupancy from :func:`cta_config`, the
+    static-K instance for contiguous row sets of fewer than :data:`STATIC_M_LIMIT` tokens
+    at a row width in :data:`STATIC_K`, one CTA per padded row (the CTAs past ``M`` zero
+    the padding rows of the scale tiles).  ``x_row_stride`` (elements; ``None`` =
+    contiguous) only decides between the static-K and the runtime-geometry instance."""
     m, k = int(m), int(k)
     if m < 1:
         raise ValueError("M must be positive")
     if k <= 0 or k % SF_VEC:
         raise ValueError(f"K must be a positive multiple of {SF_VEC}, got {k}")
     threads, min_blocks = cta_config(k, m)
-    blocks_per_thread = (k // SF_VEC + threads - 1) // threads
+    blocks_per_thread = blocks_per_thread_for(k, threads)
     if blocks_per_thread > MAX_REG_BLOCKS:
         raise ValueError(
             f"K={k} at {threads} threads needs {blocks_per_thread} register blocks "
             f"per thread (max {MAX_REG_BLOCKS})"
         )
+    store_hint = default_store_hint(k, threads, min_blocks)
+    k_static = static_k_for(k, m, x_row_stride)
     pm, cols = padded_rows(m), padded_sf_cols(k)
     return QuantizePlan(
         arch=arch,
@@ -281,11 +383,16 @@ def quant_plan(
         is_bf16=bool(is_bf16),
         fold=bool(fold),
         threads=threads,
+        blocks_per_thread=blocks_per_thread,
         min_blocks=min_blocks,
+        store_hint=store_hint,
+        k_static=k_static,
         grid=pm,
         padded_rows=pm,
         padded_cols=cols,
-        kernel_key=quant_kernel_key(k, threads, min_blocks, is_bf16, fold),
+        kernel_key=quant_kernel_key(
+            threads, blocks_per_thread, min_blocks, is_bf16, fold, store_hint, k_static
+        ),
     )
 
 
@@ -525,8 +632,9 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
         # 128-wide persistent tile (two waves) beats the scorer's single-wave wide tile.
         if sm_count < TWO_CTA_PER_SM_MIN_SMS:
             tactic["tile_n"] = tile_n = 128
-    elif m <= BLOCK_M and tile_m == BLOCK_M and tile_n == 128:
-        # One token tile, one wave of 128-wide tiles (both parts): no L2 promotion.
+    if m <= BLOCK_M and tile_m == BLOCK_M and tile_n == 128:
+        # One token tile over 128-wide tiles (one or two waves, both parts): no L2 promotion;
+        # one generated program serves every such row.
         tactic["l2_promo"] = None
     if tile_m == 256:
         tactic["two_cta"] = True
@@ -864,6 +972,16 @@ def validated_problems() -> tuple[tuple[str, int, int, int, bool, bool, bool], .
         for m in VALIDATED_ROWS:
             for fold in (False, True):
                 rows.append(("quantize", k, 0, m, True, False, fold))
+    for k, n in VALIDATED_SMALL_M_FAMILIES:
+        for m in VALIDATED_SMALL_M_ROWS:
+            rows.append(("gemm", k, n, m, True, False, False))
+    k, n = VALIDATED_OFF_MATRIX_FAMILY
+    for m in VALIDATED_OFF_MATRIX_ROWS:
+        rows.append(("gemm", k, n, m, True, False, False))
+    for k in VALIDATED_OFF_MATRIX_QUANTIZE_K:
+        for m in VALIDATED_OFF_MATRIX_QUANTIZE_ROWS:
+            for fold in (False, True):
+                rows.append(("quantize", k, 0, m, True, False, fold))
     return tuple(rows)
 
 
@@ -889,7 +1007,7 @@ def required_kernel_keys(arch: str, sm_count: Optional[int] = None) -> tuple[str
 
 
 def _device_arch(device: torch.device) -> str:
-    capability = torch.cuda.get_device_capability(device)
+    capability = get_compute_capability(device)
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
     if arch is None:
         raise ValueError(
@@ -900,7 +1018,7 @@ def _device_arch(device: torch.device) -> str:
 
 
 def _sm_count(device: torch.device) -> int:
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+    return int(get_device_sm_count(device))
 
 
 def _device_index(device: torch.device) -> int:
@@ -908,32 +1026,65 @@ def _device_index(device: torch.device) -> int:
 
 
 def generated_program_available(device: torch.device) -> bool:
-    """True when this checkout registers every validated program for ``device``."""
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
+    """True when this checkout registers the generated programs of ``device``'s architecture.
+
+    The tactic of a shape is resolved for the device's actual SM count; a shape
+    whose kernel is not registered raises ``NotImplementedError`` naming the key
+    at preparation (:func:`kernel_module_name`)."""
+    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(get_compute_capability(device))
     if arch is None:
         return False
-    return bool(MODULES) and route_available(
-        arch, required_kernel_keys(arch, _sm_count(device))
+    return bool(MODULES) and route_available(arch)
+
+
+def _bind(
+    arch: str, kernel_key: str, kwargs: dict[str, Any]
+) -> tuple[Callable[..., Any], tuple]:
+    """Order ``kwargs`` by the argument plan of the program behind ``kernel_key`` and load its ``arch`` build."""
+    entry, arg_plan = _entry(arch, kernel_key)
+    missing = [name for kind, name in arg_plan if kind != "grid" and name not in kwargs]
+    if missing:
+        raise KeyError(
+            f"generated kernel {kernel_key!r} expects arguments {missing}; "
+            f"host binding provides {sorted(kwargs)}"
+        )
+    return entry, _arguments(arg_plan, kwargs)
+
+
+def _entry(
+    arch: str, kernel_key: str
+) -> tuple[Callable[..., Any], tuple[tuple[str, str], ...]]:
+    """FFI entry and argument plan of the registered program behind ``kernel_key``: its
+    module built with the key's compile-line definitions (the module load is cached)."""
+    module_name = kernel_module_name(arch, kernel_key)
+    record = MODULES[module_name]
+    module = load_cake_nvfp4_per_token_module(
+        module_name, arch, kernel_definitions(kernel_key)
+    )
+    return getattr(module, record["ffi_entry"]), tuple(
+        tuple(item) for item in record["arg_plan"]
     )
 
 
-def _bind(module_name: str, kwargs: dict[str, Any]) -> tuple[Callable[..., Any], tuple]:
-    """Order ``kwargs`` by the argument plan of ``module_name`` and load its entry."""
-    record = MODULES[module_name]
-    grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
-    arguments = []
-    for kind, name in record["arg_plan"]:
-        if kind == "grid":
-            arguments.append(grid[name])
-        elif name in kwargs:
-            arguments.append(kwargs[name])
-        else:
-            raise KeyError(
-                f"generated module {module_name!r} expects argument {name!r} "
-                f"({kind}); host binding provides {sorted(kwargs)}"
-            )
-    module = load_cake_nvfp4_per_token_module(module_name)
-    return getattr(module, record["ffi_entry"]), tuple(arguments)
+def _arguments(arg_plan: tuple[tuple[str, str], ...], kwargs: dict[str, Any]) -> tuple:
+    grid = kwargs["grid"]
+    grid_by_name = {"grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
+    return tuple(
+        grid_by_name[name] if kind == "grid" else kwargs[name]
+        for kind, name in arg_plan
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _cached_scalar_f32(value: float, device_index: int) -> torch.Tensor:
+    """One device-resident float32 scalar per distinct Python value and device (the public
+    entries take ``global_scale_inv`` as a float; the kernel reads it from device memory)."""
+    return torch.full(
+        (1,),
+        float(value),
+        dtype=torch.float32,
+        device=torch.device("cuda", device_index),
+    )
 
 
 def _scalar_f32(value: torch.Tensor, name: str, device: torch.device) -> torch.Tensor:
@@ -1005,17 +1156,30 @@ class NVFP4PerTokenQuantizeRunner:
         return len(self.launches)
 
 
+def row_stride_of(x: torch.Tensor) -> int:
+    """Elements between consecutive rows of ``x[M, K]`` (unit stride along the row required)."""
+    m, k = (int(v) for v in x.shape)
+    if k > 1 and x.stride(1) != 1:
+        raise ValueError("x must have unit stride along the row (K dimension)")
+    stride = int(x.stride(0)) if m > 1 else k
+    if stride < k:
+        raise ValueError(f"x rows overlap: row stride {stride} < K={k}")
+    return stride
+
+
 def validate_quantize_inputs(
     x: torch.Tensor, outputs: PerTokenQuantizeOutputs
 ) -> tuple[int, int]:
-    """Shape / dtype validation of one quantizer call; returns ``(M, K)``."""
-    if x.dim() != 2 or not x.is_contiguous() or x.device.type != "cuda":
-        raise ValueError("x must be a contiguous 2-D CUDA tensor")
+    """Shape / dtype validation of one quantizer call; returns ``(M, K)``.  ``x`` may be a
+    row-strided view (unit stride along the row)."""
+    if x.dim() != 2 or x.device.type != "cuda":
+        raise ValueError("x must be a 2-D CUDA tensor")
     if x.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"x must be bf16 or fp16, got {x.dtype}")
     m, k = (int(v) for v in x.shape)
-    if k % SF_VEC:
-        raise ValueError(f"K={k} must be a multiple of {SF_VEC}")
+    if k <= 0 or k % SF_VEC:
+        raise ValueError(f"K={k} must be a positive multiple of {SF_VEC}")
+    row_stride_of(x)
     fp4, sf, scale = outputs
     if (
         tuple(fp4.shape) != (m, k // 2)
@@ -1063,20 +1227,48 @@ def prepare_nvfp4_per_token_quantize(
     gs_inv = _scalar_f32(global_scale_inv, "global_scale_inv", device)
     fold = out_scale is not None
     scale_arg = _scalar_f32(out_scale, "out_scale", device) if fold else gs_inv
-    plan = quant_plan(m, k, x.dtype == torch.bfloat16, fold, arch, _sm_count(device))
-    kwargs: dict[str, Any] = dict(
+    plan = quant_plan(
+        m, k, x.dtype == torch.bfloat16, fold, arch, _sm_count(device), row_stride_of(x)
+    )
+    kwargs = _quant_kwargs(plan, x, outputs, gs_inv, scale_arg)
+    with torch.cuda.device(_device_index(device)):
+        launch = _bind(arch, plan.kernel_key, kwargs)
+    return NVFP4PerTokenQuantizeRunner(plan, x, outputs, (launch,))
+
+
+def _quant_kwargs(
+    plan: QuantizePlan,
+    x: torch.Tensor,
+    outputs: PerTokenQuantizeOutputs,
+    gs_inv: torch.Tensor,
+    scale_arg: torch.Tensor,
+) -> dict[str, Any]:
+    return dict(
         x=x,
         out_fp4=outputs.fp4,
         out_sf=outputs.sf.view(-1),
         per_token_scale=outputs.scale,
         global_scale_inv=gs_inv,
         out_scale=scale_arg,
-        M=m,
+        M=plan.M,
+        K=plan.K,
+        x_row_stride=row_stride_of(x),
         grid=(plan.grid, 1, 1),
     )
-    with torch.cuda.device(_device_index(device)):
-        launch = _bind(kernel_module_name(arch, plan.kernel_key), kwargs)
-    return NVFP4PerTokenQuantizeRunner(plan, x, outputs, (launch,))
+
+
+@functools.lru_cache(maxsize=4096)
+def _quant_prepared(
+    m: int, k: int, is_bf16: bool, fold: bool, device_index: int, x_row_stride: int
+) -> tuple[QuantizePlan, Callable[..., Any], tuple[tuple[str, str], ...]]:
+    """Plan, loaded FFI entry and argument plan of the quantizer launch of one shape on one device
+    (``x_row_stride`` selects the static-K or the runtime-geometry instance)."""
+    device = torch.device("cuda", device_index)
+    arch = _device_arch(device)
+    plan = quant_plan(m, k, is_bf16, fold, arch, _sm_count(device), x_row_stride)
+    with torch.cuda.device(device_index):
+        entry, arg_plan = _entry(arch, plan.kernel_key)
+    return plan, entry, arg_plan
 
 
 def nvfp4_quantize_per_token(
@@ -1100,21 +1292,34 @@ def nvfp4_quantize_per_token(
         )
     if x.dim() != 2 or x.device.type != "cuda":
         raise ValueError("x must be a 2-D CUDA tensor")
-    x = x.contiguous()
+    if x.shape[1] > 1 and x.stride(1) != 1:
+        # Only a non-unit stride along the row needs a copy; row-strided views are read in place.
+        x = x.contiguous()
+    device = x.device
+    device_index = _device_index(device)
     if isinstance(global_scale_inv, torch.Tensor):
-        gs_inv = global_scale_inv.float().reshape(1).contiguous().to(x.device)
+        gs_inv = global_scale_inv
+        if gs_inv.dtype != torch.float32 or gs_inv.device != device:
+            gs_inv = gs_inv.to(device=device, dtype=torch.float32)
+        gs_inv = gs_inv.reshape(1)
     else:
-        gs_inv = torch.tensor(
-            [float(global_scale_inv)], dtype=torch.float32, device=x.device
-        )
+        gs_inv = _cached_scalar_f32(float(global_scale_inv), device_index)
     if out_scale is not None:
-        out_scale = out_scale.float().reshape(1).contiguous().to(x.device)
-    outputs = allocate_nvfp4_per_token_quantize_outputs(
-        x.shape[0], x.shape[1], x.device
+        if out_scale.dtype != torch.float32 or out_scale.device != device:
+            out_scale = out_scale.to(device=device, dtype=torch.float32)
+        out_scale = out_scale.reshape(1)
+    m, k = (int(v) for v in x.shape)
+    if k <= 0 or k % SF_VEC:
+        raise ValueError(f"K={k} must be a positive multiple of {SF_VEC}")
+    outputs = allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    fold = out_scale is not None
+    plan, entry, arg_plan = _quant_prepared(
+        m, k, x.dtype == torch.bfloat16, fold, device_index, row_stride_of(x)
     )
-    runner = prepare_nvfp4_per_token_quantize(x, gs_inv, outputs, out_scale=out_scale)
-    fp4, sf, scale = runner.launch()
-    return fp4, sf, scale
+    kwargs = _quant_kwargs(plan, x, outputs, gs_inv, out_scale if fold else gs_inv)
+    with tvm_ffi.use_torch_stream():
+        entry(*_arguments(arg_plan, kwargs))
+    return outputs.fp4, outputs.sf, outputs.scale
 
 
 # ---------------------------------------------------------------------------
@@ -1237,6 +1442,25 @@ def prepare_mm_fp4_per_token(
     plan = gemm_plan(
         m, n, k, out.dtype == torch.float16, arch, _sm_count(device), tactic=tactic
     )
+    kwargs = _gemm_kwargs(plan, a_fp4, a_flat, b_fp4, b_flat, alpha, out)
+    with torch.cuda.device(_device_index(device)):
+        launch = _bind(arch, plan.kernel_key, kwargs)
+    return NVFP4PerTokenGemmRunner(plan, out, (launch,))
+
+
+def _gemm_kwargs(
+    plan: GemmPlan,
+    a_fp4: torch.Tensor,
+    a_flat: torch.Tensor,
+    b_fp4: torch.Tensor,
+    b_flat: torch.Tensor,
+    alpha: torch.Tensor,
+    out: torch.Tensor,
+) -> dict[str, Any]:
+    """Kernel arguments of one GEMM launch (operand views of the resolved plan)."""
+    m, n, k = plan.M, plan.N, plan.K
+    cols = padded_sf_cols(k)
+    pm, pn = padded_rows(m), padded_rows(n)
     # Scale atoms as u32 words: (atoms, K/64 sets, 128 words) for whole-atom operands;
     # narrow token tiles of the swapped orientation address eight-row groups.
     a_view = a_flat.view(torch.uint32).view(pm // ROW_TILE, cols // 4, 128)
@@ -1269,7 +1493,7 @@ def prepare_mm_fp4_per_token(
         # Stream-K tail: FP32 partial workspace, the generation flags (also bound as the plain
         # u32 pointer the holders read their own word through) and the tail geometry.
         red_ws, red_flags = _stream_k_workspace(
-            device, plan.sk_workspace_floats, plan.sk_flag_words, plan.sk_slices
+            out.device, plan.sk_workspace_floats, plan.sk_flag_words, plan.sk_slices
         )
         kwargs.update(
             red_ws=red_ws,
@@ -1278,9 +1502,20 @@ def prepare_mm_fp4_per_token(
             sk_tiles=plan.sk_tiles,
             sk_pairs=plan.sk_pairs,
         )
-    with torch.cuda.device(_device_index(device)):
-        launch = _bind(kernel_module_name(arch, plan.kernel_key), kwargs)
-    return NVFP4PerTokenGemmRunner(plan, out, (launch,))
+    return kwargs
+
+
+@functools.lru_cache(maxsize=4096)
+def _gemm_prepared(
+    m: int, n: int, k: int, out_f16: bool, device_index: int
+) -> tuple[GemmPlan, Callable[..., Any], tuple[tuple[str, str], ...]]:
+    """Plan, loaded FFI entry and argument plan of the default-tactic GEMM of one shape on one device."""
+    device = torch.device("cuda", device_index)
+    arch = _device_arch(device)
+    plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device))
+    with torch.cuda.device(device_index):
+        entry, arg_plan = _entry(arch, plan.kernel_key)
+    return plan, entry, arg_plan
 
 
 def mm_fp4_per_token(
@@ -1309,10 +1544,38 @@ def mm_fp4_per_token(
         )
     a_u8 = a.view(torch.uint8) if a.dtype != torch.uint8 else a
     b_u8 = b_nk.view(torch.uint8) if b_nk.dtype != torch.uint8 else b_nk
-    runner = prepare_mm_fp4_per_token(
-        a_u8, a_descale, b_u8, b_sf, alpha.contiguous(), out
+    if a_u8.dim() != 2 or not a_u8.is_contiguous():
+        raise ValueError("a_fp4 must be a contiguous uint8 [M, K/2] tensor")
+    m, kh = (int(v) for v in a_u8.shape)
+    n, kh_b = (int(v) for v in b_u8.shape)
+    if kh != kh_b:
+        raise ValueError(
+            f"K mismatch: a_fp4 has {2 * kh} elements per row, b_fp4 {2 * kh_b}"
+        )
+    k = 2 * kh
+    device = a_u8.device
+    if device.type != "cuda":
+        raise ValueError("the operands must be CUDA tensors")
+    if any(t.device != device for t in (a_descale, b_u8, b_sf, alpha, out)):
+        raise ValueError("every operand must be on one CUDA device")
+    if out.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"out must be bf16 or fp16, got {out.dtype}")
+    if tuple(out.shape) != (m, n) or not out.is_contiguous():
+        raise ValueError(f"out must be a contiguous [{m}, {n}] tensor")
+    if alpha.dtype != torch.float32 or alpha.numel() != m:
+        raise ValueError("alpha must be a float32 tensor with one value per token")
+    if not alpha.is_contiguous():
+        alpha = alpha.contiguous()
+    cols = padded_sf_cols(k)
+    a_flat = _flat_u8_scales(a_descale, "a_sf", padded_rows(m), cols)
+    b_flat = _flat_u8_scales(b_sf, "b_sf", padded_rows(n), cols)
+    plan, entry, arg_plan = _gemm_prepared(
+        m, n, k, out.dtype == torch.float16, _device_index(device)
     )
-    return runner.launch()
+    kwargs = _gemm_kwargs(plan, a_u8, a_flat, b_u8, b_flat, alpha, out)
+    with tvm_ffi.use_torch_stream():
+        entry(*_arguments(arg_plan, kwargs))
+    return out
 
 
 # ---------------------------------------------------------------------------

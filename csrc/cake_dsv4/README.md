@@ -1,186 +1,108 @@
 # Cake DeepSeek V4 sparse MLA
 
-Current support covers SM100 and SM103. The complete current 94-case tables, comparisons, runtime and hardware evidence are in the [current SM100](https://github.com/flashinfer-ai/flashinfer/pull/4573#current-sm100-validation) and [current SM103](https://github.com/flashinfer-ai/flashinfer/pull/4573#current-sm103-validation) PR sections.
-
-## Historical SM103 implementation and validation
-
-The original implementation details and acceptance values below remain historical evidence; the [unchanged historical 94-case table](https://github.com/flashinfer-ai/flashinfer/pull/4573#historical-sm103-94-case-performance) remains in the PR body.
-
-Select the Cake backend through the existing public API:
+Generated device kernels and TVM-FFI launchers for SM100 / SM103 behind
+`trtllm_batch_decode_sparse_mla_dsv4(..., backend="cake")` for BF16 and FP8 E4M3
+inputs with head dimension 512 (BF16 output). Select the backend explicitly;
+`backend="auto"` keeps the architecture-based selection. Programmatic dependent
+launch and the TRTLLM-GEN RopeQuant epilogue are not supported.
 
 ```python
-from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+from flashinfer.mla import (
+    cake_dsv4_workspace_reset,
+    get_cake_dsv4_workspace_bytes,
+    trtllm_batch_decode_sparse_mla_dsv4,
+)
 
-output = trtllm_batch_decode_sparse_mla_dsv4(
-    query=query,
-    swa_kv_cache=swa_kv_cache,
-    workspace_buffer=workspace_buffer,
-    sparse_indices=sparse_indices,
-    compressed_kv_cache=compressed_kv_cache,
-    sparse_topk_lens=sparse_topk_lens,
-    seq_lens=seq_lens,
-    backend="cake",
+workspace = torch.empty(
+    get_cake_dsv4_workspace_bytes(num_query_tokens, num_heads, sparse_topk, dtype),
+    dtype=torch.uint8, device="cuda",
+)
+cake_dsv4_workspace_reset(workspace)  # zero the split-merge counters once
+out = trtllm_batch_decode_sparse_mla_dsv4(
+    query=query, swa_kv_cache=swa_kv_cache, compressed_kv_cache=compressed_kv_cache,
+    workspace_buffer=workspace, sparse_indices=sparse_indices,
+    sparse_topk_lens=sparse_topk_lens, seq_lens=seq_lens, backend="cake",
 )
 ```
 
-This backend targets SM103 GPUs and uses head dimension 512. The validated
-94-case matrix covers BF16 and FP8 E4M3 inputs, NHD and HND cache layouts,
-fixed and ragged queries, optional attention sinks, decode, and prefill.
-Outputs are BF16. Cake is selected explicitly; `backend="auto"` retains the
-existing architecture-based selection. Programmatic dependent launch and the
-TRTLLM-GEN RopeQuant epilogue are unsupported by this backend.
+## Layout
 
-The directory contains 24 generated device kernels and 24 corresponding
-TVM-FFI bindings, plus four compiled dispatch programs that preserve the
-original multi-stage call boundaries. `cake_dsv4_modules.json` records each variant's source files,
-compilation flags, target architecture, and argument contract. FlashInfer's
-JIT compiles the device and binding as separate translation units on first
-use. Program host libraries link those kernels with their individual
-optimization flags retained. Rebuilding requires a CUDA toolkit that supports `sm_103a`.
+| path | contents |
+| --- | --- |
+| `sm_100a/`, `sm_103a/` | one `*_kernel.cu` (device code) and one `*_binding.cu` (launcher) per variant and architecture |
+| `common/` | kernels whose source is identical on both architectures (`split_reduce`, `bf16_h64_compressed_reduce`) |
+| `cake_dsv4_host_shim.h` | the launcher helpers shared by every binding (device guard, tensor checks, SM103 descriptor-storage writes) |
+| `cake_dsv4_launch_sequence.cc` | host-only `run_sequence`: issues the producer and reducer launches of a two-stage route from one FFI call |
 
-Python prepares descriptor storage before calling the generated binding.
-Descriptor addresses remain immutable for the process lifetime, including
-across caller-workspace replacement, while query and KV-cache tensors retain
-their normal lifetimes. Generated bindings perform no device allocation.
+`flashinfer/jit/cake_dsv4.py` registers each variant per architecture: its
+sources, nvcc flags, an identity that names the JIT module, and the `arg_plan`
+the host binds by name. `flashinfer/mla/cake_dsv4.py` resolves the sparse
+metadata, carves the caller-owned workspace, picks the route (`_route`) and
+launches the variant kernels directly, reducers included; shapes without an
+exported kernel are rejected before any launch. Bindings perform no device
+allocation.
 
-Validation on GB300 covers all 94 reference cases, using
-`atol=rtol=0.01` for BF16 and `atol=rtol=0.1` for FP8. Rebuilt correctness
-results: 94/94 correct with zero fallback. All 24 kernel libraries and four program host libraries built
-successfully.
+## Host contract
 
-This delivery uses a **2% per-row latency tolerance** for all three
-comparisons below. Each rebuilt result must satisfy
-`export latency <= 1.02 × baseline latency` across all 94 cases; aggregate
-speedup alone does not establish acceptance. Correctness, zero fallback,
-and source/export activity parity remain required. Original measurements
-and strict results are preserved. Qualification under this delivery-specific
-policy: **94/94 passed in all three comparisons**. Source/export activity parity passed all 94 cases, with zero fallback. The preserved raw strict verdict passes **54/94** cases jointly (73/94 for source/export, 70/94 for previous/new export, and 94/94 for TRTLLM-GEN/Cake).
+* Metadata: every kernel takes `swa_indices`, `compressed_indices`,
+  `sparse_topk_lens`, `swa_index_stride`, `compressed_index_stride`,
+  `sparse_topk_lens_offset`, `sparse_topk`, `num_query_tokens`. Combined
+  (`sparse_indices [T, sparse_topk]`) and separate (`sparse_indices [T, 128]` +
+  `extra_sparse_indices [T, topk_c]`, lengths via `sparse_topk_lens` or
+  `extra_sparse_topk_lens`) tables are resolved without copies; int32, unit column
+  stride, free row stride.
+* Padded rows: `num_query_tokens = T` is the metadata row count; `query` / `out`
+  may carry more rows, rows `>= T` are neither read nor written.
+* Workspace (contiguous, 128-byte aligned): `[0, 1024)` reserved,
+  `[1024, 1024 + 256 KiB)` split-merge counters (zero at first use, left zero by
+  every launch), then `partial_O` (BF16) and `partial_lse` (FP32) sized by
+  `get_cake_dsv4_workspace_bytes`. CUDA-graph replays are self-contained once the
+  counters were zeroed eagerly.
+* SM103 descriptor storage: the bindings with `tma_workspace_bytes` read their TMA
+  descriptors from a private device tensor the host passes in; the binding writes
+  the descriptors of the call into it when they differ from what it holds (in
+  stream order, never inside graph capture). The host keeps a bounded pool of
+  such tensors per (variant, device), keyed by the TMA source geometry: recent
+  geometries reuse their storage, new ones take a free or the least recently
+  used storage, geometries launched under graph capture keep theirs for the
+  process lifetime, and a capture that reaches a geometry never launched
+  eagerly raises.
+* Query / output / KV pools must be densely packed; the host makes no copies.
 
-| Comparison, all 94 cases | Baseline sum (ms) | Export sum (ms) | Aggregate speedup | Minimum row speedup | Maximum row latency change |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Original implementation / rebuilt export | 1.5146230 | 1.5112325 | 1.002243533× | 0.982532751× | +1.777778% |
-| Previous Cake export / rebuilt export | 1.5151350 | 1.5146385 | 1.000327801× | 0.988235294× | +1.190476% |
-| TRTLLM-GEN / Cake, retained public API | 1.8525280 | 1.5187200 | 1.219795617× | 1.006036217× | -0.600000% |
-
-Performance uses CUPTI GPU kernel active-union time with cold L2 and includes
-each comparison's stated API boundary. Launch gaps are excluded and
-overlapping kernel intervals are counted once. Each comparison uses three
-independent groups with equal ABBA and BAAB ordering within every group;
-results use pooled active-union medians. The
-[94-case comparison table in PR #4573](https://github.com/flashinfer-ai/flashinfer/pull/4573)
-contains all 14 recorded columns for every canonical case, including shape
-fields and the baseline latency, candidate latency, and speedup for each of
-the three comparisons.
-
-Selected sealed-row benchmark runtime sums to **19,937.948 s** across the 94 disjoint rows; this is harness runtime, not GPU active time. The corrected measurement campaign's physical turnaround was **4,221.966 s** (2026-09-12T13:51:04.703Z to 2026-09-12T15:01:26.669Z), including unsuccessful measurement attempts and retries. This elapsed interval covers the corrected campaign, before final qualification and publication; concurrent step durations are not added to obtain elapsed time.
-
-Separate sanitizer results:
-synccheck passed all 94 cases with zero errors; racecheck passed all 94 cases
-with zero hazards, errors, or warnings. The public routing and descriptor
-suite passed 101 tests.
-
-Public routing, binding, workspace and metadata tests (CPU) plus the GPU
-hardening suite:
+## Tests
 
 ```bash
-pytest tests/mla/test_cake_dsv4.py -q
-pytest tests/mla/test_cake_dsv4_hardening.py -q   # needs an SM100/SM103 GPU
+pytest tests/mla/test_cake_dsv4.py -q              # routing, binding, workspace, metadata (CPU)
+pytest tests/mla/test_cake_dsv4_hardening.py -q    # numerical and graph-replay checks (SM100/SM103 GPU)
 ```
 
-## Hardened host contract (flashinfer#4671)
+Tolerances: `atol=rtol=0.01` (BF16), `atol=rtol=0.1` (FP8).
 
-The Python host in `flashinfer/mla/cake_dsv4.py` follows the shared
-sparse-metadata ABI of the regenerated kernels and makes no device allocation
-on the call path.
-
-### Metadata
-
-Every variant receives the same eight kernel parameters, bound by name through
-the registration `arg_plan` (`flashinfer/jit/cake_dsv4.py`): `swa_indices`,
-`compressed_indices`, `sparse_topk_lens`, `swa_index_stride`,
-`compressed_index_stride`, `sparse_topk_lens_offset`, `sparse_topk`,
-`num_query_tokens`. Combined column `c` of row `t` is
-`swa_indices[t * swa_index_stride + c]` for `c < 128` and
-`compressed_indices[t * compressed_index_stride + c - 128]` otherwise; the
-active length is `clamp(sparse_topk_lens[t] + sparse_topk_lens_offset, 0,
-sparse_topk)`. The kernels never read a metadata slot outside
-`t < num_query_tokens`, `c < sparse_topk`, and every unread staged slot is `-1`.
-
-`trtllm_batch_decode_sparse_mla_dsv4(..., backend="cake")` accepts either
-form without copying (int32 tables with unit column stride; row strides are
-free):
-
-| Form | Arguments | Host resolution |
-| --- | --- | --- |
-| Combined | `sparse_indices [T, sparse_topk]`, `sparse_topk_lens [T]` (counts the 128 SWA slots) | compressed view = column offset 128 of the same storage, both strides `= sparse_topk` |
-| Separate | `sparse_indices [T, 128]` (SWA), `extra_sparse_indices [T, topk_c]`, `extra_sparse_topk_lens [T]` (compressed slots only) | offset `+= 128`; each table keeps its own row stride |
-| Separate, combined lengths | as above with `sparse_topk_lens` instead of `extra_sparse_topk_lens` | offset unchanged |
-
-`sparse_topk_lens_offset: int = 0` is added on top in every form.
-`num_query_tokens = T` is the metadata row count; `query` / `out` may carry
-more rows (dense `[B, Q, H, 512]` with `T <= B * Q`, ragged `[sum_q, H, 512]`
-with `T <= sum_q`). Rows `>= T` are neither read nor written. Every grid and
-workspace view derives from `T`. Batch-derived routes (`*_source_exact`,
-`bf16_h64_guard_q_tma_batch_r25`, `fp8_h128_prefill_source_persistent`,
-`fp8_h128_prefill_source_persistent_uniform`, `fp8_h64_prefill_source_persistent_m64`)
-walk `cum_seq_lens_q`, so the metadata must cover every token those prefix
-sums address.
-
-### Workspace
-
-One caller-owned `workspace_buffer` (contiguous, 128-byte aligned) is carved
-deterministically:
-
-```
-[0,      1024)             TMA descriptor slab — the generated bindings encode fresh
-                           descriptors and upload them here on every launch
-[1024,   1024 + 256 KiB)   split-merge counters, uint32[65536]
-[P,      P + O_bytes)      partial_O  BF16 [T * H * S * 512]      P = 1024 + 256 KiB
-[P + O_bytes, ...)         partial_lse FP32 [T * H * S]
-```
-
-```python
-from flashinfer.mla import get_cake_dsv4_workspace_bytes, cake_dsv4_workspace_reset
-
-num_bytes = get_cake_dsv4_workspace_bytes(num_query_tokens, num_heads, sparse_topk, dtype)
-# S = num_splits if given else max(ceil(sparse_topk / 128), 5)   (upper bound over routes)
-# bytes = 1024 + 262144 + align128(T * H * S * 512 * 2) + align128(T * H * S * 4)
-workspace = torch.empty(num_bytes, dtype=torch.uint8, device="cuda")
-cake_dsv4_workspace_reset(workspace)   # zero the counter region once
-```
-
-Counters must be zero at first use and the kernels leave them zero after every
-launch, so there is no per-call host state and CUDA graph replays are
-self-contained. The first eager call with a workspace tensor also zeroes the
-counters; if that first use happens during graph capture the host raises and
-asks for `cake_dsv4_workspace_reset` or an eager warm-up instead. The only
-allocation on the call path is the output when `out=None`; with `out` provided,
-eager calls and graph replays leave `torch.cuda.memory_allocated()` unchanged.
-The per-call padded index copy and the host-side split-merge generation counter
-(`completion_base`) of the previous host are gone.
-
-### Bindings
-
-`_launch_variant` builds a name -> value map and walks the variant's `arg_plan`
-(`tma_buffer` / `buffer` -> tensors, `parameter` -> ints, `workspace` -> the
-descriptor slab, `grid` -> launch grid). TMA sources alias onto `Q`,
-`SWA_cache`, `compressed_KV_cache`; `num_q_heads` / `num_split` alias onto
-`num_heads` / `num_splits`. Compiled programs bind their `tensor_keys`,
-`workspace_keys`, `scalar_names` the same way. Bindings that still declare the
-pre-hardening combined `sparse_indices` accept only a combined table with
-offset 0; `completion_base` is rejected. The CPU tests check that every
-registered name is bindable, so a regenerated registration with a new name
-fails fast on the host side.
-
-## SM120 / SM121: DeepSeek-V4 NVFP4 sparse-MLA decode
+## SM120 / SM121: DeepSeek-V4 NVFP4 sparse-MLA decode and prefill
 
 `sm_120a/` holds the Cake-generated SM120 (GB202: RTX 5090, RTX PRO 6000
-Blackwell) DeepSeek-V4 NVFP4 sparse-MLA decode family: one translation unit per
-query head count (8, 16, 32, 48, 64, 80, 96, 112, 128) with the single-cache
-decode, dual-cache decode and split-merge kernels (head counts divisible by 32
-also carry two-tile variants that process 32 heads per CTA over one shared
-candidate gather), the TVM-FFI binding
-`cake_sparse_mla_dsv4_nvfp4_binding.cu`, and
+Blackwell) DeepSeek-V4 NVFP4 sparse-MLA families (DeepSeek-V4 sparse MLA SM120
+tracker: flashinfer#4254):
+
+* **decode** -- one translation unit per query head count (8, 16, 32, 48, 64,
+  80, 96, 112, 128), `cake_sparse_mla_dsv4_nvfp4_h<N>.cu`, with the
+  single-cache decode, dual-cache decode and split-merge kernels (head counts
+  divisible by 32 also carry two-tile variants that process 32 heads per CTA
+  over one shared candidate gather);
+* **prefill** -- one translation unit per head count 16 .. 128,
+  `cake_sparse_mla_dsv4_nvfp4_prefill_h<N>.cu`, with one kernel per (head tiles
+  x single / dual cache x one-item / persistent CTAs): a prefill CTA holds
+  `16 * head_tiles` heads of one token (1 tile always, 2 for head counts
+  divisible by 32, 4 for head counts divisible by 64) and runs *all* of the
+  token's 64-candidate chunks (at most 16, so `topk + extra_topk <= 1024`)
+  with a direct epilogue -- no split scratch, no merge launch. The persistent
+  form launches `min(items, SMs)` CTAs that walk the (token, head block) items
+  with a grid stride while the IO warps prefetch and quantize the next item's
+  Q.
+
+Both share the TVM-FFI binding `cake_sparse_mla_dsv4_nvfp4_binding.cu`
+(entries `cake_sparse_mla_sm120_dsv4_nvfp4_decode` and
+`cake_sparse_mla_sm120_dsv4_nvfp4_prefill`), the kernel ABI header and
 `cake_sparse_mla_dsv4_nvfp4_manifest.json` (provenance, geometry constants
 and the source list the JIT spec compiles). Regenerate the whole directory
 from the Cake kernel schedules with one command; do not edit the generated
@@ -213,3 +135,162 @@ chunks per CTA, at most 16 chunks of 64 candidates per CTA, so more than 1024
 candidates always split) mirror the generating kernel module's launcher;
 `head_tiles` / `num_splits` on the low-level decode entry override them.
 `backend="auto"` keeps the hand-written SM120 kernels.
+
+For several query tokens the same entry points pick between the decode and
+the prefill kernel through
+`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel` (one token,
+head counts without a prefill instance, more than 16 chunks and candidate
+counts that are not multiples of 64 always decode; wide head counts (>= 64)
+decode up to 16 tokens, or up to 32 tokens with at most 128 candidates;
+narrower head counts decode up to 64 tokens with at least 512 candidates). The
+prefill planner `cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill` returns
+`(head_tiles, persistent)`: two tiles below 128 tokens for head counts >= 64
+that are divisible by 32, otherwise the largest instance (one tile for 16 / 32
+/ 48 heads), persistent CTAs once the one-item grid covers two waves of SMs.
+These thresholds are provisional until the paired decode / prefill sweeps on
+RTX PRO 6000 Blackwell and RTX 5090 land. The low-level entry
+`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_prefill` runs the prefill
+directly (caller-owned `output` / `out_lse`, `head_tiles` / `persistent`
+overrides, no scratch):
+
+```python
+from flashinfer.mla import cake_sparse_mla_sm120_dsv4_nvfp4_prefill
+
+plan = cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+    q, nvfp4_cache, indices, output, out_lse, sm_scale,
+    topk_length=lengths, attn_sink=sink,
+    extra_kv_cache=compressed_cache, extra_indices=extra_indices,
+)
+# plan == {"head_tiles": 4, "persistent": 1, "num_ctas": <SMs>} for 128 heads x 2048 tokens
+```
+
+```bash
+pytest tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4.py -q          # decode (needs SM120/SM121)
+pytest tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py -q  # prefill + CPU planner tests
+python benchmarks/bench_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py         # paired sparse / cake prefill rows
+```
+
+### Cache writers: fused GPT-J RoPE + NVFP4 quantize + paged insert
+
+`sm_120a/` also holds the generated writers of the same 384-byte NVFP4 record,
+`cake_dsv4_nvfp4_rope_insert_kernel.cu` + `cake_dsv4_nvfp4_rope_insert_binding.cu`
+(TVM-FFI entries `cake_dsv4_nvfp4_rope_insert_qkv` and
+`cake_dsv4_nvfp4_rope_insert_kv`) with their own
+`cake_dsv4_nvfp4_rope_insert_manifest.json` and JIT module
+(`flashinfer/jit/cake_dsv4_nvfp4_rope_insert.py`; the attention module is not
+rebuilt when the writers are regenerated). One launch per layer replaces the
+torch-level GPT-J RoPE of the query and latent KV, the query head padding and
+`nvfp4_quantize_append_sparse_mla_cache`: the roped KV row is rounded to BF16
+and quantized exactly like the append writer (byte-identical records: 224 B
+E2M1 NoPE, 128 B BF16 RoPE bits, 28 E4M3 scales + 4 zero bytes), `q_out` is the
+fp32 rotation of each live head rounded to BF16 with zero-filled padded heads;
+with `q_inplace=True` (no head padding, Q RoPE on) the entry rotates the 64
+RoPE dims of `q` itself and returns `q` (one warp per 8 heads, nothing else of
+`q` is touched or copied; the first warp of each token also inserts the KV row,
+so the production TP8 shape runs one warp per token). One warp per (token,
+head slot) otherwise, 256-thread CTAs,
+variants per padded head count (8, 16, 32, 64, 128) x Q RoPE on/off x slot
+dtype (int32 / int64) for the QKV form, the in-place form per head count x
+slot dtype, and per compress ratio (1, 2) x slot dtype for the KV form. Both
+entries take the 3-D / HND / NHD cache views with a runtime page size and a
+16-byte-multiple page stride, skip negative and out-of-range slots, accept a
+`slot_mapping` shorter than `positions` (data-parallel padding), allocate
+nothing but `q_out`, never synchronise and replay bitwise inside CUDA graphs.
+The KV entry inserts only boundary rows (`(pos + 1) % compress_ratio == 0`) at
+the cos/sin row `pos // compress_ratio * compress_ratio` -- the compressed-pool
+rule -- and is the speculative-context writer with `compress_ratio=1`. Until
+the family is exported the directory carries a placeholder manifest
+(`identity: "unexported"`): `cake_dsv4_nvfp4_rope_insert_format_info()["kernels_available"]`
+is `False` and every launch raises `FileNotFoundError`.
+
+```python
+from flashinfer.mla import (
+    cake_dsv4_nvfp4_kv_rope_quantize_insert,
+    cake_dsv4_nvfp4_rope_quantize_insert,
+)
+
+# Sliding-window pool (per layer): rotated, head-padded Q plus the quantized KV insert.
+q_out = cake_dsv4_nvfp4_rope_quantize_insert(
+    q, kv, swa_cache, slot_mapping, positions, cos_sin_cache, q_head_padded=16
+)
+# No head padding (every power-of-two TP split of DeepSeek-V4): rotate q in place.
+q = cake_dsv4_nvfp4_rope_quantize_insert(
+    q, kv, swa_cache, slot_mapping, positions, cos_sin_cache, q_inplace=True
+)
+# Compressed pool (ratio 2: boundary rows only) and speculative context (ratio 1).
+cake_dsv4_nvfp4_kv_rope_quantize_insert(
+    kv, compressed_cache, compressed_slots, positions, cos_sin_cache, compress_ratio=2
+)
+```
+
+```bash
+pytest tests/attention/test_cake_dsv4_nvfp4_rope_insert.py -q   # byte parity, graph replay, decode read-back
+python benchmarks/bench_cake_dsv4_nvfp4_rope_insert.py          # fused vs torch RoPE + append
+```
+
+## SM120 / SM121: DeepSeek-V4.1 mixed-cache sparse-MLA decode
+
+`sm_120a/` also holds the Cake-generated DeepSeek-V4.1 mixed-cache decode
+family `cake_sparse_mla_dsv41_mixed_*`: a 528-byte FP8 + UE8M0 group-32 main
+(SWA) cache, a 288-byte V41_FP4 extra (compressed) cache (512 E2M1 dims
+including RoPE, 256-byte payload + 32-byte E4M3 group-16 footer scales; never
+read as the 384-byte NVFP4 layout) and a BF16 query. QK runs in BF16
+(`mma.sync m16n8k16`) on exactly dequantized K (E4M3 x 2^e, E2M1 x E4M3), P and
+V are BF16, accumulation / softmax / split merge are fp32; output BF16, LSE
+base-2 with the public sink and `lse_scale` semantics. One translation unit per
+query head count (8, 16, 32, 48, 64, 80, 96, 112, 128: single-cache decode,
+dual-cache decode and the split merge kernel; 32 heads and up run two 16-head
+tiles per CTA sharing one gather), the TVM-FFI binding
+`cake_sparse_mla_dsv41_mixed_binding.cu` and
+`cake_sparse_mla_dsv41_mixed_manifest.json` (identity, kernel commit, ABI,
+planner geometry). The split merge runs one 64-thread CTA per (token, head) and
+is launched as a programmatic dependent of the decode grid when `enable_pdl`
+is set (`None` = device default; the merge waits for the decode's memory before
+its first load, so both settings are bitwise identical). The names are distinct
+from the NVFP4 family above so the two generated kernel sets never share a
+translation unit, header, manifest or JIT module name. Without the manifest,
+`flashinfer.mla.cake_sparse_mla_sm120_dsv41_mixed_format_info()["kernels_available"]`
+is `False`, the planners run on the provisional geometry and the first launch
+raises `FileNotFoundError` naming the expected manifest location.
+
+Select it through the existing SM120 entry points:
+
+```python
+from flashinfer.mla import (
+    SparseMLASm120Wrapper,
+    dsv41_fp4_quantize_pack_sparse_mla_cache,
+    dsv41_fp8_quantize_pack_sparse_mla_cache,
+    trtllm_batch_decode_sparse_mla_dsv4,
+)
+
+main_cache = dsv41_fp8_quantize_pack_sparse_mla_cache(latent_pages)   # [P, 1, page, 528]
+extra_cache = dsv41_fp4_quantize_pack_sparse_mla_cache(extra_pages)   # [P', 1, page', 288]
+out = trtllm_batch_decode_sparse_mla_dsv4(
+    query=q, swa_kv_cache=main_cache, workspace_buffer=workspace,
+    sparse_indices=indices, swa_topk_lens=lengths,
+    compressed_kv_cache=extra_cache, extra_sparse_indices=extra_indices,
+    extra_sparse_topk_lens=extra_lengths, bmm1_scale=sm_scale,
+    backend="cake", kv_cache_format="fp8_dsv41_fp4_ca",
+    enable_pdl=None,  # or True / False: merge launch attribute only
+)
+runner = SparseMLASm120Wrapper(
+    backend="cake", kv_cache_format="fp8", kv_scale_format="ue8m0_g32",
+    extra_kv_fp4=True, compute_precision="bf16",  # or "fp8" once exported
+)
+```
+
+Both caches keep their own positive page size and 16-byte-multiple page stride
+(`[P, page_bytes]`, `[P, page, bytes]`, HND or NHD views; rows stay packed
+inside a page because the footer layout stores `page * data` bytes followed by
+`page * scale` bytes). `compute_precision` is explicit: `"default"` and
+`"bf16"` select the BF16 route (Q unquantized, both caches dequantized exactly
+on chip), `"fp8"` the FP8 route when the family exports it; `"nvfp4"` is
+rejected. Split-K scratch is caller-owned or carved from `workspace_buffer`;
+size it with `cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes`. The planners
+`cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles` /
+`cake_sparse_mla_sm120_dsv41_mixed_plan_splits` are pure functions of
+`(num_tokens, num_heads, topk, extra_topk, num_sms)` and the manifest
+geometry. `backend="auto"` and `backend="sparse"` keep the hand-written SM120
+kernels; the main-cache writers `dsv41_fp8_quantize_pack_sparse_mla_cache` /
+`dsv41_fp8_quantize_append_sparse_mla_cache` are bit-identical to the torch
+reference quantizer used by the FlashInfer tests.

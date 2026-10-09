@@ -35,6 +35,7 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
     SUPPORTED_COMPUTE_CAPABILITIES,
     TileTables,
     assign_unit_slots,
+    bf16_unit_cost,
     build_bf16_segment_plan,
     choose_kv_splits,
     split_chunks,
@@ -113,18 +114,29 @@ def test_assign_unit_slots_lpt():
 def _decode_unit_table(plan):
     """``(segment, head, cluster, kv_begin, kv_blocks, slot)`` per scheduled unit."""
     table = plan.unit_table.tolist()
-    assert len(table) == UNIT_WORDS * plan.total_tiles
-    return [
-        (
-            table[UNIT_WORDS * u],
-            table[UNIT_WORDS * u + 1] >> 16,
-            table[UNIT_WORDS * u + 1] & 0xFFFF,
-            table[UNIT_WORDS * u + 2] >> 16,
-            table[UNIT_WORDS * u + 2] & 0xFFFF,
-            table[UNIT_WORDS * u + 3],
+    # ``num_clusters`` zero records of padding follow the scheduled units.
+    assert len(table) == UNIT_WORDS * (plan.total_tiles + plan.num_clusters)
+    assert table[UNIT_WORDS * plan.total_tiles :] == [0] * (
+        UNIT_WORDS * plan.num_clusters
+    )
+    begins = plan.seg_begin.tolist()
+    lens = plan.seg_len.tolist()
+    decoded = []
+    for u in range(plan.total_tiles):
+        record = table[UNIT_WORDS * u : UNIT_WORDS * (u + 1)]
+        seg = begins.index(record[0])
+        assert record[1] == lens[seg] and record[5:] == [0, 0, 0]
+        decoded.append(
+            (
+                seg,
+                record[2] >> 16,
+                record[2] & 0xFFFF,
+                record[3] >> 16,
+                record[3] & 0xFFFF,
+                record[4],
+            )
         )
-        for u in range(plan.total_tiles)
-    ]
+    return decoded
 
 
 def _check_split_units(units, combine, blocks_of, num_partial_slots, num_combine_units):
@@ -241,14 +253,18 @@ def test_bf16_segment_plan(label, cu, heads, grid_clusters, kv_splits):
         for k, (s, h, c) in zip(split_of, expected, strict=True)
         for b, n in split_chunks(blocks[s], k)
     ]
-    cost = [n + BF16_UNIT_OVERHEAD_BLOCKS for _key, _b, n in ranges]
+    # Units with at most 256 valid Q rows run one Q stage at a discounted cost.
+    cost = [
+        bf16_unit_cost(n, lengths[s] - c * CLUSTER_Q_ROWS <= CLUSTER_Q_ROWS // 2)
+        for (s, _h, c), _b, n in ranges
+    ]
     slots = assign_unit_slots(cost, plan.num_clusters)
     assert [((s, h, c), b, n) for s, h, c, b, n, _ in decoded] == [
         ranges[u] for u in slots
     ]
     G = plan.num_clusters
     for k in range(plan.total_tiles // G):
-        round_costs = [decoded[k * G + i][4] for i in range(G)]
+        round_costs = [cost[slots[k * G + i]] for i in range(G)]
         assert round_costs == sorted(round_costs)
 
 
@@ -508,6 +524,47 @@ def _make_inputs(cu, heads, seed, device="cuda"):
     return q, k, v, cu_seqlens
 
 
+def _make_engine_views(cu, heads, seed, layout, device="cuda"):
+    """Q/K/V as the engine's strided ``[T, H, 128]`` views (never copied).
+
+    ``"fused_qkv"``: column chunks of the fused QKV projection ``[T, 3 * H * 128]``
+    (strides ``(3 * H * 128, 128, 1)``).  ``"pack"``: the kind slices of the Cake
+    pre-attention pack ``[T, H, 3, 128]`` (strides ``(H * 384, 384, 1)``).
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    total = cu[-1]
+    if layout == "fused_qkv":
+        qkv = torch.randn(
+            (total, 3 * heads * HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=gen,
+        )
+        width = heads * HEAD_DIM
+        q, k, v = (
+            qkv[:, i * width : (i + 1) * width].view(total, heads, HEAD_DIM)
+            for i in range(3)
+        )
+        expected_strides = (3 * heads * HEAD_DIM, HEAD_DIM, 1)
+    elif layout == "pack":
+        pack = torch.randn(
+            (total, heads, 3, HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=gen,
+        )
+        q, k, v = (pack[:, :, i, :] for i in range(3))
+        expected_strides = (heads * 3 * HEAD_DIM, 3 * HEAD_DIM, 1)
+    else:
+        raise ValueError(layout)
+    for t in (q, k, v):
+        assert tuple(t.shape) == (total, heads, HEAD_DIM)
+        assert t.stride() == expected_strides
+        assert total == 0 or not t.is_contiguous()
+    cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=device)
+    return q, k, v, cu_seqlens
+
+
 def _reference(q, k, v, cu, scale):
     """Per-segment, per-head FP32 oracle with TF32 disabled (chunked rows)."""
     previous = torch.backends.cuda.matmul.allow_tf32
@@ -604,15 +661,142 @@ def test_bf16_zero_tokens():
     assert tuple(out.shape) == (0, 7, HEAD_DIM)
 
 
+def test_bf16_plan_cache_reuses_tables_per_layout_and_stream(monkeypatch):
+    """One-shot calls with one segment layout reuse the cached plan (tables, workspace); a different
+    layout, head count or stream gets its own plan; the cache is bounded and evicts the oldest."""
+    _require_program("bf16")
+    monkeypatch.setattr(cake_backend, "BF16_PLAN_CACHE_CAPACITY", 2)
+    cake_backend._BF16_PLANS.clear()
+    cu, heads = [0, 133, 300, 900], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=11)
+    out = torch.empty_like(q)
+    first = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+    )
+    second = prepare_minimax_h3_varlen_attention(
+        k, v, q, cu_seqlens, out=out, cu_seqlens_host=cu
+    )
+    assert second.plan is first.plan  # same layout, same stream: cached tables
+    assert len(cake_backend._BF16_PLANS) == 1
+    other_heads = prepare_minimax_h3_varlen_attention(
+        q[:, :5], k[:, :5], v[:, :5], cu_seqlens, cu_seqlens_host=cu
+    )
+    assert other_heads.plan is not first.plan
+    assert len(cake_backend._BF16_PLANS) == 2
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        on_stream = prepare_minimax_h3_varlen_attention(
+            q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+        )
+    assert on_stream.plan is not first.plan  # streams never share a plan
+    assert len(cake_backend._BF16_PLANS) == 2  # bounded: the oldest (first) was evicted
+    again = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+    )
+    assert again.plan is not first.plan and len(cake_backend._BF16_PLANS) == 2
+    # The cached plan reproduces the freshly built one table for table.
+    fresh = build_bf16_segment_plan(cu, q.device, heads)
+    for name in ("seg_begin", "seg_len", "unit_table", "combine_table"):
+        assert torch.equal(getattr(again.plan, name), getattr(fresh, name)), name
+    assert again.plan.num_clusters == fresh.num_clusters
+    cake_backend._BF16_PLANS.clear()
+    monkeypatch.undo()
+
+
+def test_bf16_one_shot_repeated_calls_do_not_allocate_or_copy():
+    """After the first call of a segment layout the one-shot entry re-launches with the cached plan:
+    no device allocation (caller-owned ``out``) and no host-to-device copy; the output is bitwise the
+    prepared runner's."""
+    _require_program("bf16")
+    cake_backend._BF16_PLANS.clear()
+    cu, heads = [0, 4310, 4567, 4824], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=12)
+    out = torch.empty_like(q)
+    minimax_h3_varlen_attention(q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu)
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for _ in range(3):
+            minimax_h3_varlen_attention(
+                q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+            )
+        torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == allocated
+    names = [event.name for event in prof.events()]
+    copies = [n for n in names if "Memcpy" in n or "memcpy" in n]
+    syncs = [
+        n for n in names if "Synchronize" in n and "cudaDeviceSynchronize" not in n
+    ]
+    assert not copies, copies
+    assert not syncs, syncs
+    runner = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, cu_seqlens_host=cu
+    )
+    runner()
+    torch.cuda.synchronize()
+    assert torch.equal(runner.out, out)
+    _check(
+        out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), BF16_ATOL, BF16_RTOL
+    )
+
+
+ENGINE_VIEW_ROWS = [
+    ("smoke_p8_133_300", [0, 133, 300], 7),
+    ("empty_segments", [0, 0, 640, 640, 1200, 1201], 7),
+    ("seg3_5s_p8", [0, 4310, 4567, 4824], 7),
+    ("seg4_6s_p2", [0, 12285, 16401, 20393, 24384], 28),
+]
+
+
+@pytest.mark.parametrize("layout", ["fused_qkv", "pack"])
+@pytest.mark.parametrize("label,cu,heads", ENGINE_VIEW_ROWS)
+def test_bf16_engine_views_match_fp32_reference(layout, label, cu, heads):
+    """Strided Q/K/V views of the fused QKV projection and of the pre-attention pack are
+    consumed in place (no THD copies) on ragged multi-segment packs."""
+    _require_program("bf16")
+    q, k, v, cu_seqlens = _make_engine_views(cu, heads, seed=6092, layout=layout)
+    out = minimax_h3_varlen_attention(q, k, v, cu_seqlens, cu_seqlens_host=cu)
+    torch.cuda.synchronize()
+    assert out.is_contiguous() and tuple(out.shape) == tuple(q.shape)
+    _check(
+        out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), BF16_ATOL, BF16_RTOL
+    )
+    # The reference on contiguous copies of the same values agrees (the views were read
+    # where they live).
+    contiguous = minimax_h3_varlen_attention(
+        q.contiguous(), k.contiguous(), v.contiguous(), cu_seqlens, cu_seqlens_host=cu
+    )
+    torch.testing.assert_close(out, contiguous, atol=0, rtol=0)
+
+
+def test_bf16_rejects_head_major_view():
+    """``k.transpose(0, 1).contiguous().transpose(0, 1)`` is a head-major ``[T, H, 128]``
+    view with strides ``(128, T * 128, 1)``.  The kernel's operand contract is token-major
+    (token stride at least ``H * head_stride``: the engine's fused-QKV column chunks and
+    pack slices); head-major views are rejected up front rather than encoded into a TMA
+    descriptor with non-ascending strides."""
+    _require_program("bf16")
+    cu, heads = [0, 300], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=3)
+    k_view = k.transpose(0, 1).contiguous().transpose(0, 1)
+    assert k_view.stride() == (HEAD_DIM, cu[-1] * HEAD_DIM, 1)
+    with pytest.raises(ValueError, match="token stride"):
+        minimax_h3_varlen_attention(q, k_view, v, cu_seqlens)
+
+
 def test_bf16_rejects_bad_inputs():
     _require_program("bf16")
     q, k, v, cu_seqlens = _make_inputs([0, 300], 7, seed=3)
     with pytest.raises(ValueError, match="bfloat16"):
         minimax_h3_varlen_attention(q.float(), k, v, cu_seqlens)
-    with pytest.raises(ValueError, match="contiguous"):
-        minimax_h3_varlen_attention(
-            q, k.transpose(0, 1).contiguous().transpose(0, 1), v, cu_seqlens
-        )
+    # A non-unit last stride (every other element of a [T, H, 256] buffer) is rejected.
+    wide = torch.randn((300, 7, 2 * HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    k_strided = wide[:, :, ::2]
+    assert tuple(k_strided.shape) == (300, 7, HEAD_DIM) and k_strided.stride(2) == 2
+    with pytest.raises(ValueError, match=r"stride|contiguous"):
+        minimax_h3_varlen_attention(q, k_strided, v, cu_seqlens)
     with pytest.raises(ValueError, match="token extent"):
         minimax_h3_varlen_attention(
             q, k, v, torch.tensor([0, 299], dtype=torch.int32, device="cuda")

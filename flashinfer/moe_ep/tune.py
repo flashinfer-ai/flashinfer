@@ -2,7 +2,7 @@
 
 ``--arch auto`` selects SM107 on Rubin and SM100 otherwise. The
 ``sm90_fp8_*`` dtypes select the Hopper tuner. BF16 and mixed BF16/MXFP8
-are supported by the SM100 tuner only.
+are supported by the SM100 tuner only. MXFP4/MXFP8 is wired for SM107.
 
 Match the deployment's GPU, EP world size, geometry, and token capacity::
 
@@ -34,6 +34,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "nvfp4",
             "mxfp8_e4m3",
             "mxfp8_e5m2",
+            "mxfp4_mxfp8",
             "sm90_fp8_e4m3",
             "sm90_fp8_e5m2",
             "bf16",
@@ -77,7 +78,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--combine-dtype",
         choices=("bf16", "mxfp8", "nvfp4"),
         default="bf16",
-        help="cross-rank combine wire (nvfp4 dtype only)",
+        help="cross-rank FC2 return format (SM100 NVFP4 or SM107)",
+    )
+    parser.add_argument(
+        "--kernel-variant",
+        choices=("inference", "genphase"),
+        default="inference",
+        help="SM107 kernel composition; GenPhase requires at most 1024 tokens/rank",
     )
     parser.add_argument("--gate-up-clamp", type=float, default=None)
     parser.add_argument(
@@ -176,10 +183,6 @@ def _resolve_arch(arch: str) -> str:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
-    if args.combine_dtype != "bf16" and args.dtype != "nvfp4":
-        print("--combine-dtype is only wired for --dtype nvfp4", file=sys.stderr)
-        return 2
-
     if args.dtype.startswith("sm90_fp8"):
         if args.arch not in ("auto", "sm90"):
             print("sm90_fp8_* dtypes require --arch auto or sm90", file=sys.stderr)
@@ -191,7 +194,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if family == "sm90" or (family == "sm107" and args.dtype.startswith("bf16")):
             print(f"--dtype {args.dtype} is unsupported on {family}", file=sys.stderr)
             return 2
-        if args.dtype == "nvfp4":
+        if args.dtype == "mxfp4_mxfp8":
+            if family != "sm107":
+                print("--dtype mxfp4_mxfp8 requires --arch sm107", file=sys.stderr)
+                return 2
+            backend = "mxfp8_mxfp4_bf16_cutedsl"
+        elif args.dtype == "nvfp4":
             backend = "nvfp4_nvfp4_bf16_cutedsl"
         elif args.dtype == "bf16":
             backend = "bf16_bf16_bf16_cutedsl"
@@ -200,8 +208,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             backend = "mxfp8_mxfp8_bf16_cutedsl"
 
-    if family == "sm107" and args.combine_dtype != "bf16":
-        print("SM107 supports --combine-dtype bf16 only", file=sys.stderr)
+    if family != "sm107" and args.combine_dtype != "bf16" and args.dtype != "nvfp4":
+        print("--combine-dtype requires SM100 NVFP4 or SM107", file=sys.stderr)
+        return 2
+    if args.kernel_variant == "genphase" and args.combine_dtype != "bf16":
+        print("GenPhase requires --combine-dtype bf16", file=sys.stderr)
+        return 2
+
+    if args.kernel_variant != "inference" and family != "sm107":
+        print("--kernel-variant genphase requires --arch sm107", file=sys.stderr)
         return 2
 
     activation_requested = (

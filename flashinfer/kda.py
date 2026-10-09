@@ -32,7 +32,6 @@ from . import kda_decode as _kda_decode
 from . import kda_prefill as _kda_prefill
 from . import kda_prefill_cute as _kda_prefill_cute
 from . import kda_prefill_cute_small_bh as _kda_prefill_cute_small_bh
-from .jit import flash_kda_indexed as _flash_kda_indexed
 from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .cute_dsl.availability import is_cute_dsl_available
 from .trace.templates.kda import recurrent_kda_trace
@@ -112,7 +111,9 @@ def recurrent_kda(
             Query of shape ``[B, T, H, K]``, or
             ``[1, total_tokens, H, K]`` when using ``cu_seqlens``. Must be
             bfloat16. ``T=1`` selects decode; eligible ``T>1`` calls may select
-            the frozen prefill backend.
+            the frozen prefill backend. Ordinary prefill accepts strided Q/K:
+            dense-only providers pack them internally, while cuDNN retains
+            supported strides. Other inputs keep their layout requirements.
         k (torch.Tensor):
             Key with the same shape as ``q``. Must be bfloat16.
         v (torch.Tensor):
@@ -575,6 +576,24 @@ def recurrent_kda(
     is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
         q, cu_seqlens, num_spec_tokens
     )
+    original_q, original_k = q, k
+    if (
+        is_plain_prefill
+        and isinstance(k, torch.Tensor)
+        and (not q.is_contiguous() or not k.is_contiguous())
+    ):
+        # Validate original storage before packing can hide an output alias.
+        if output is not None:
+            _kda_prefill._check_output_does_not_overlap_inputs(
+                output,
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+            )
+        q, k = q.contiguous(), k.contiguous()
     if backend in ("auto", "small-bh"):
         small_bh_available = (
             is_cute_dsl_available()
@@ -712,58 +731,6 @@ def recurrent_kda(
                 **sm120_prefill_kwargs
             )
 
-    use_generated_indexed_prefill = (
-        backend == "cake"
-        and is_plain_prefill
-        and _flash_kda_indexed.flash_kda_indexed_prefill_is_eligible(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            initial_state=initial_state,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            use_gate_in_kernel=use_gate_in_kernel,
-            lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
-            ssm_state_indices=ssm_state_indices,
-            num_spec_tokens=num_spec_tokens,
-            num_accepted_tokens=num_accepted_tokens,
-            output=output,
-            initial_state_source=initial_state_source,
-            initial_state_indices=initial_state_indices,
-            beta_is_logit=beta_is_logit,
-            seq_order=seq_order,
-            prefill_workspace=prefill_workspace,
-            state_checkpoints=state_checkpoints,
-            checkpoint_cu_starts=checkpoint_cu_starts,
-            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-        )
-    )
-    if use_generated_indexed_prefill:
-        assert A_log is not None
-        assert dt_bias is not None
-        assert initial_state is not None
-        assert ssm_state_indices is not None
-        assert lower_bound is not None
-        return _flash_kda_indexed._run_flash_kda_indexed_prefill(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
-            output=output,
-            state_indices=ssm_state_indices,
-        )
     try_cute_dsl_prefill = backend in ("auto", "cute-dsl")
     if try_cute_dsl_prefill and is_plain_prefill:
         cute_dsl_eligible = _kda_prefill_cute._is_cute_dsl_kda_prefill_eligible(
@@ -936,8 +903,8 @@ def recurrent_kda(
     # An explicit small-BH request either returned or raised in prefill dispatch.
     assert backend != "small-bh"
     return _kda_decode._dispatch_recurrent_kda_decode(
-        q=q,
-        k=k,
+        q=original_q,
+        k=original_k,
         v=v,
         g=g,
         beta=beta,

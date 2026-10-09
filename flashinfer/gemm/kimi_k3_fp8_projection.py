@@ -147,3 +147,34 @@ def kimi_k3_fp8_projection(
     )
 
     return run(x, prepared, out, workspace=workspace)
+
+
+@flashinfer_experimental_api(feature="Kimi-K3 FP8 projection")
+def kimi_k3_fp8_projection_launcher(prepared: Any, *, max_workspaces: int = 64) -> Any:
+    r"""A per-weight launcher for repeated calls with changing activations and output views.
+
+    ``launcher(x, out=None)`` computes ``out[:, :n_valid] = bf16(x @ dequant(weight).T)`` for any
+    ``M = x.shape[0]`` with the route plan cached per ``(M, output row stride, output address class)``
+    and the workspace of each ``M`` allocated once and reused (least recently used ``M`` evicted beyond
+    ``max_workspaces``; an ``M`` first seen under CUDA-graph capture stays pinned).  A call binds only the
+    call's tensors: no route resolution, workspace allocation or host synchronisation per call.  This is
+    the form an inference engine's linear layer should hold (one launcher per prepared weight).
+
+    Parameters
+    ----------
+    prepared: Any
+        From :func:`prepare_kimi_k3_fp8_projection_weights`.
+    max_workspaces: int
+        Bound of the per-``M`` workspace cache.
+
+    Returns
+    -------
+    launcher: Any
+        Callable ``launcher(x, out=None) -> out``; ``launcher.workspace(M)`` and ``launcher.plan(x, out)``
+        expose the cached state.
+    """
+    from ..experimental.kimi_k3_fp8_projection.cake_backend import (
+        kimi_k3_fp8_projection_launcher as make_launcher,
+    )
+
+    return make_launcher(prepared, max_workspaces=max_workspaces)

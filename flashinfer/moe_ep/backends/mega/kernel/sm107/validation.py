@@ -38,6 +38,8 @@ def make_workspace_config(
             rank=rank,
             world_size=world_size,
             quant_kind=quant_kind,
+            kernel_variant=k.kernel_variant,
+            combine_dtype=k.combine_dtype,
             gate_up_clamp=gate_up_clamp,
             activation=k.activation,
             situ_beta=k.situ_beta,
@@ -54,7 +56,7 @@ def validate_unit_scalars(t) -> None:
     for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
         if getattr(t, name) is not None:
             raise MoEEpConfigError(
-                f"SM107 MXFP8 does not accept {name}; "
+                f"SM107 MX formats do not accept {name}; "
                 "global normalization scalars are supported only for NVFP4."
             )
 
@@ -105,7 +107,7 @@ def validate_forward_metadata(
     tokens, cols = hidden_states.shape
     hidden = fleet_params.token_hidden_size
     fp4 = quant_kind == "nvfp4"
-    if quant_kind not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"):
+    if quant_kind not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"):
         raise MoEEpConfigError(f"unsupported quant_kind {quant_kind!r}")
     expected_cols = hidden // 2 if fp4 and not quantize_input else hidden
     if tokens > fleet_params.max_tokens_per_rank or cols != expected_cols:
@@ -117,7 +119,7 @@ def validate_forward_metadata(
         getattr(torch, "float4_e2m1fn_x2", torch.uint8)
         if fp4
         else torch.float8_e4m3fn
-        if quant_kind == "mxfp8_e4m3"
+        if quant_kind in ("mxfp8_e4m3", "mxfp4_mxfp8")
         else torch.float8_e5m2
     )
     allowed = (

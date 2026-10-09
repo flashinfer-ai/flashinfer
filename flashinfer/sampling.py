@@ -1014,8 +1014,15 @@ def sampling_from_logits(
         Whether to check nan in :attr:`logits`, default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
+
+        The output row index also feeds the Philox subsequence: moving the same seed
+        and offset to a different batch slot changes the RNG stream, so per-row seeds
+        do not make sampling invariant to batch position.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1023,7 +1030,10 @@ def sampling_from_logits(
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1094,8 +1104,15 @@ def sampling_from_probs(
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
+
+        The output row index also feeds the Philox subsequence: moving the same seed
+        and offset to a different batch slot changes the RNG stream, so per-row seeds
+        do not make sampling invariant to batch position.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1103,7 +1120,10 @@ def sampling_from_probs(
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1205,8 +1225,15 @@ def top_p_sampling_from_probs(
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
+
+        The output row index also feeds the Philox subsequence: moving the same seed
+        and offset to a different batch slot changes the RNG stream, so per-row seeds
+        do not make sampling invariant to batch position.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1214,7 +1241,10 @@ def top_p_sampling_from_probs(
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1325,8 +1355,15 @@ def top_k_sampling_from_probs(
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
+
+        The output row index also feeds the Philox subsequence: moving the same seed
+        and offset to a different batch slot changes the RNG stream, so per-row seeds
+        do not make sampling invariant to batch position.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1334,7 +1371,10 @@ def top_k_sampling_from_probs(
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1446,8 +1486,15 @@ def min_p_sampling_from_probs(
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
+
+        The output row index also feeds the Philox subsequence: moving the same seed
+        and offset to a different batch slot changes the RNG stream, so per-row seeds
+        do not make sampling invariant to batch position.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1455,7 +1502,10 @@ def min_p_sampling_from_probs(
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1677,8 +1727,15 @@ def top_k_top_p_sampling_from_logits(
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
+
+        The output row index also feeds the Philox subsequence: moving the same seed
+        and offset to a different batch slot changes the RNG stream, so per-row seeds
+        do not make sampling invariant to batch position.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1686,7 +1743,10 @@ def top_k_top_p_sampling_from_logits(
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1844,8 +1904,15 @@ def top_k_top_p_sampling_from_probs(
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
+
+        The output row index also feeds the Philox subsequence: moving the same seed
+        and offset to a different batch slot changes the RNG stream, so per-row seeds
+        do not make sampling invariant to batch position.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1853,7 +1920,10 @@ def top_k_top_p_sampling_from_probs(
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -2255,8 +2325,15 @@ def chain_speculative_sampling(
         A random number generator for the operation.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
+
+        The output row index also feeds the Philox subsequence: moving the same seed
+        and offset to a different batch slot changes the RNG stream, so per-row seeds
+        do not make sampling invariant to batch position.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -2264,7 +2341,10 @@ def chain_speculative_sampling(
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
-        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
+        A length-one tensor broadcasts to all output rows; otherwise, its length
+        must equal the number of output rows, with one value per output row rather
+        than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating

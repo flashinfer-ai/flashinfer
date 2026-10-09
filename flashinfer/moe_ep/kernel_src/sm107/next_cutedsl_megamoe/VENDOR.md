@@ -49,22 +49,25 @@ export manifest/log and file hashes with the integration evidence.
 ## Scope of this drop
 
 The generic inference entry point is `RubinInferenceMegaMoE`
-(`BlockScaledSwapAbMegaMoeKernel`). FlashInfer's existing NVFP4 and MXFP8 E4M3/E5M2
-backends expose SwiGLU and SiTU with BF16 combine/output, supporting separate
-and in-kernel reduction. They accept canonical prequantized weights; NVFP4
+(`BlockScaledSwapAbMegaMoeKernel`). FlashInfer's NVFP4, MXFP8 E4M3/E5M2, and MXFP4-weight/MXFP8-activation
+backends expose SwiGLU and SiTU with BF16 output. BF16 combine supports separate
+and in-kernel reduction; `combine_dtype="nvfp4"` and `combine_dtype="mxfp8"`
+require separate reduction. They accept canonical prequantized weights; NVFP4
 also supports non-unit normalization and per-expert correction tensors.
 Shared helpers, schedulers, communication and workspace code come from the
 same pinned snapshot.
 
-`RubinInferenceGenphaseMegaMoE` (`BlockScaledSwapAbGenphaseMoeKernel`) is included
-in the vendored export for future integration. It is not yet selectable through
-the FlashInfer backend or benchmark. SiTU requires both beta parameters,
-matching the exported kernel.
+`RubinInferenceGenphaseMegaMoE` (`BlockScaledSwapAbGenphaseMoeKernel`) is selected
+with `kernel_variant="genphase"`. It requires uniform `(4, 1)` clusters,
+`fc2_use_bulk=True`, and at most 1024 tokens per rank. Combine remains BF16.
+Tile K is 256 for NVFP4 activations and 128 for MXFP8 activations.
+SiTU requires both beta parameters, matching the exported kernel.
 
-`+combine_nvfp4` and `+combine_mxfp8` remain future FlashInfer configuration,
-workspace/scale handling, correctness and measurement work. Their device paths
-already exist in the export. Training kernels and the local fused-routing kernel
-are not selected; the latter supplies one dependency through an export marker.
+`combine_dtype="nvfp4"` selects the existing quantized FC2 return path.
+It sends packed E2M1 values with a BF16 amax per 16 elements.
+`combine_dtype="mxfp8"` sends E4M3 values with an E8M0 scale per 32 elements.
+Both formats use the generic inference kernel. Training kernels and the local
+fused-routing kernel are not selected; the latter supplies one dependency through an export marker.
 No upstream tester, build metadata or repository scaffolding is vendored.
 
 ## Compiler contract and validation
@@ -81,8 +84,9 @@ the older drop. At FlashInfer `0f710df8`, this export passed 187 host/CUDA check
 with no skips. See the
 [qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md)
 for coverage and the separate reference-decoder regression.
-Tuning-cache entries use revision `sm107-block-scaled-1667b47a-v4`, which includes
-activation, beta parameters, and clamp settings in the cache identity.
+Tuning-cache entries use revision `sm107-block-scaled-1667b47a-runtime-options-v1`.
+The cache identity includes the kernel variant and combine format, along with
+activation, beta parameters, and clamp settings.
 
 ## Export transformations
 
@@ -118,3 +122,4 @@ drop comes from upstream's `next/` generation, with relative imports and the
 
 - `backends/mega/kernel/sm107/nvfp4_nvfp4_bf16_cutedsl/`
 - `backends/mega/kernel/sm107/mxfp8_mxfp8_bf16_cutedsl/`
+- `backends/mega/kernel/sm107/mxfp8_mxfp4_bf16_cutedsl/`

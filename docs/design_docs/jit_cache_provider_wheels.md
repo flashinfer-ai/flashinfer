@@ -188,7 +188,8 @@ flashinfer install-jit-cache-wheel --mode minimal --sm sm120f
 ```
 
 Without `--sm`, the CLI uses the visible CUDA devices. `--sm` may be repeated
-when preparing an image on a different machine. Each provider is self-contained
+when preparing an image on a different machine, and implies `--mode minimal`
+when no mode is given; combining it with `--mode all` is an error. Each provider is self-contained
 for its declared target. Minimal mode ranks only providers named by that shim,
 so SM86 currently selects `sm80` because it is the closest compatible published
 target, not because SM86 is a special case. No cross-major baseline is added.

@@ -55,17 +55,19 @@ def sm107_candidates(
     quant_kind: str = "nvfp4",
     *,
     allow_in_kernel_fc2_reduce: bool = False,
+    kernel_variant: str = "inference",
 ) -> List[Dict[str, Any]]:
     """Default SM107 candidate knob dicts (tile x launch x epi x fc2-bulk).
 
-    16 candidates (32 with the ikr axis), spanning the axes the upstream
-    Rubin perf report showed to matter (see TUNING.md):
+    Inference uses 16 candidates (32 with the ikr axis):
 
     - tile N 128 vs 256 (K fixed at the kind's 2x-mode depth),
     - uniform (2,1) grouped/grid-stride launch vs mixed-CGA (4,1)+(2,1)
       phase-interleave/atomic launch,
     - epi flag batches (1,4) vs (2,4),
     - FC2 bulk TMA (2 stages) on/off.
+
+    GenPhase fixes the cluster to (4, 1) and requires FC2 bulk stores.
 
     ``token_in_flag_batch`` and the phase-interleave hint are skew-sensitive —
     sweep them with :func:`sm107_schedule_candidates` instead.  An ikr winner
@@ -77,11 +79,20 @@ def sm107_candidates(
         ((2, 1), None, ("grouped", None), "grid_stride"),
         ((4, 1), (2, 1), ("phase_interleave", None), "atomic_counter"),
     )
+    if kernel_variant == "genphase":
+        launches = (
+            ((4, 1), None, ("grouped", None), "grid_stride"),
+            ((4, 1), None, ("phase_interleave", None), "atomic_counter"),
+        )
+    elif kernel_variant != "inference":
+        raise ValueError(f"unsupported kernel_variant {kernel_variant!r}")
     out: List[Dict[str, Any]] = []
     for tile_n in (128, 256):
         for cluster, fallback, schedule, work_id in launches:
             for epi in ((1, 4), (2, 4)):
-                for fc2_bulk in (False, True):
+                for fc2_bulk in (
+                    (True,) if kernel_variant == "genphase" else (False, True)
+                ):
                     for ikr in (
                         (False, True) if allow_in_kernel_fc2_reduce else (False,)
                     ):
@@ -103,12 +114,14 @@ def sm107_candidates(
     return out
 
 
-def sm107_schedule_candidates(base: Dict[str, Any]) -> List[Dict[str, Any]]:
+def sm107_schedule_candidates(
+    base: Dict[str, Any], *, kernel_variant: str = "inference"
+) -> List[Dict[str, Any]]:
     """Expand a base knob dict into the skew-sensitive schedule grid
     (phase-interleave hint x token-in flag batch)."""
     out: List[Dict[str, Any]] = []
     for hint in (None, 3, 4, 6):
-        for tif in (1, 4):
+        for tif in (1,) if kernel_variant == "genphase" else (1, 4):
             out.append(
                 {
                     **base,
@@ -149,7 +162,11 @@ def autotune_sm107_block_scaled_mega_moe(
 
     ensure_not_capturing("SM107 collective autotune sweep")
     cfg = symm_buffer.config
-    candidates = sm107_candidates(cfg.quant_kind) if candidates is None else candidates
+    candidates = (
+        sm107_candidates(cfg.quant_kind, kernel_variant=cfg.kernel_variant)
+        if candidates is None
+        else candidates
+    )
     if not candidates:
         raise ValueError("autotune needs a non-empty candidate list.")
     if warmup_iters < 1 or timed_iters < 1:
@@ -289,6 +306,8 @@ def autotune_sm107_block_scaled_mega_moe(
         record_knobs(
             winner,
             dtype=cfg.quant_kind,
+            kernel_variant=cfg.kernel_variant,
+            combine_dtype=cfg.combine_dtype,
             world_size=cfg.world_size,
             hidden=cfg.hidden,
             intermediate=cfg.intermediate,
