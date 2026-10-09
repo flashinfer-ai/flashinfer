@@ -1009,11 +1009,14 @@ def _prefill_env_error() -> str | None:
 
 
 # ---- prefill (windowed) launcher cache --------------------------------------
-# Windowed rows (TRT-LLM #18702 port) always run the streaming `main` family
-# with R == 1 (one CTA per row, no SPLIT, no workspace publish). The compiled
-# launcher depends only on the row tier, k and a power-of-two envelope bucket —
-# never on the exact row count or npad — so the cache stays bounded on a
-# long-running server; the per-call envelope (ke clamp) rides in the `n` slot.
+# Windowed rows (TRT-LLM #18702 port) run either a register rung — when the
+# caller's window bound fits a BLK=512 x VPT register batch, see
+# _prefill_reg_route — or the streaming `main` family with R == 1 (one CTA per
+# row, no SPLIT, no workspace publish). A slab launcher depends only on the row
+# tier, k and a power-of-two envelope bucket, a rung launcher on its (BLK, VPT,
+# MINB) plan — never on the exact row count or npad — so the cache stays
+# bounded on a long-running server; the per-call envelope (ke clamp) rides in
+# the `n` slot.
 _PREFILL_CACHE: dict = {}
 _PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
 _PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
@@ -2051,7 +2054,8 @@ def run_varlen(
     windows — the DSA prefill indexer contract (packed requests along the
     column axis, causal per-row windows). Hint-free only, ``next_n == 1`` and
     ``compress_ratio == 1``; columns outside a window are never read. Runs the
-    dedicated prefill engines of the streaming ``main`` family (one CTA per
+    dedicated prefill engines: a register rung when ``max_seq_len`` (or the
+    logits width) fits one, else the streaming ``main`` family (one CTA per
     row); ``warmup_prefill`` compiles them ahead of CUDA-graph capture.
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree

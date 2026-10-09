@@ -1685,25 +1685,26 @@ def top_k_varlen(
         whether a geometry would launch without compiling). Default ``None``
         (every window starts at column 0).
     max_seq_len : int, optional
-        Windowed (prefill) mode only: an optional tighter bound on the window lengths,
-        used to pick the engine before the launch (and before CUDA-graph
-        capture, where the choice is frozen). Defaults to the logits width,
-        which is always a valid bound (no window is wider than its row) but a
-        loose one for a packed multi-request batch, whose width sums every
-        request's keys. Pass the batch's longest window (``seq_lens.max()``,
-        host knowledge in every serving framework) so that short-window
-        batches run on the register-resident gvr_2 engine (windows up to 4K
-        tokens, 1.5-1.7x faster than the streaming engine on B200/B300; the 8K
-        class only for ``top_k=2048`` at ~1.05x; Rubin gates by row count);
-        beyond the register capacity every row takes the streaming engine,
-        which ranks every window exactly. On a register engine a row is either
-        ranked exactly or, when its window plus the up-to-3 alignment lanes
-        exceeds that engine's capacity (part-dependent; see
-        ``_prefill_reg_route``), reported as all ``-1`` -- never a truncated
-        ranking. So a caller-given bound must hold at every graph replay (the
-        width-derived default cannot be exceeded). A bound larger than the
-        logits width is clamped. Must be a Python ``int``. Ignored when
-        ``row_starts`` is ``None``.
+        Windowed (prefill) mode only: an upper bound on every window length
+        ``seq_lens[r]``, in logits columns. It selects the gvr_2 engine before
+        the launch (and before CUDA-graph capture, where the choice is frozen):
+        a bound that fits one of the register-resident engines selects it,
+        otherwise every row runs on the streaming engine, which ranks any
+        window exactly. Defaults to the logits width, which is always a valid
+        bound (no window is wider than its row) but a loose one for a packed
+        multi-request batch, whose width is the sum of every request's keys.
+        Pass the batch's longest window (``seq_lens.max()``, host knowledge in
+        every serving framework) whenever it is smaller than the width: the
+        register-resident engines cover window bounds up to 8192 columns
+        (which bounds qualify depends on ``top_k`` and the GPU part) and the
+        host admits one only where it is the faster engine. The bound is a
+        contract, not a hint: on a register-resident engine a row whose window
+        plus its up-to-3 alignment lanes exceeds the engine's capacity is
+        reported as all ``-1``, never as a truncated ranking, so a caller-given
+        bound must hold at every graph replay (the width-derived default
+        cannot be exceeded). A bound larger than the logits width is clamped
+        to the width. Must be a Python ``int``. Ignored when ``row_starts`` is
+        ``None``.
     absolute_indices : bool, optional
         Windowed (prefill) mode only: write each hit as its column of ``logits``
         (``window-local index + row_starts[r]``) instead of the window-local
