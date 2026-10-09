@@ -389,12 +389,67 @@ a shape comes in:
   `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` are NOT wired into this path.
 - The single slot is deliberate: each `_CompiledMega` pins symmetric-heap
   (NVSHMEM) workspaces, so keeping N candidates alive would multiply
-  symmetric memory.  `_mega_compile_key()` already covers every knob, so a
-  per-key dict (e.g. small+large profile selected per-launch by token
-  count) is the natural upgrade if per-shape dispatch is ever needed;
-  today the deployment pattern is per-role knob caches instead (one
-  prefill-tuned and one decode-tuned cache file, selected per engine role
-  via `FLASHINFER_MOE_EP_KNOB_CACHE` — validated in the vLLM e2e runs).
+  symmetric memory. Each `layer.create_workspace(capacity)` profile owns
+  one compiled slot, so callers can select a decode or prefill workspace
+  whose capacity has an offline winner in the same knob cache.
+
+### Caller finalization for BF16 and W4A16
+
+SM100 BF16 and W4A16 MegaMoE also accept `do_finalize=False` in their kernel
+configs. Call `layer.forward_unfinalized(t)` to receive borrowed, contiguous
+BF16 `[T * top_k, hidden]` rows, FP32 `[T, top_k]` remaining routing weights,
+and an int32 `[T, top_k]` identity route map. Consume the results on the current
+stream before the pooled workspace is reused. EP communication completes even
+on zero-token ranks; warm up on all ranks before CUDA graph capture.
+
+BF16 applies routing weights in FC1 by default and returns remaining weights of one.
+W4A16 returns the staged routing weights by default, or ones with
+`apply_topk_in_fc1=True`. Caller finalization can use:
+
+```python
+rows, weights, route_map = layer.forward_unfinalized(t)
+partials = rows[route_map.long()].float()
+output = (partials * weights.unsqueeze(-1)).sum(dim=1).bfloat16()
+```
+
+W4A16's built-in weighted reducer uses fused multiply-add. A caller's separate
+multiply and sum can therefore round differently despite identical per-route rows.
+
+Both backends require `enable_in_kernel_fc2_reduce=False` and reject
+`knobs="auto"` in this mode. Use `knobs=None` or an explicit knob dictionary.
+The `--no-do-finalize` offline tuning CLI remains specific to SM100 NVFP4.
+
+### Offline tuning for unfinalized NVFP4 output
+
+Use `--no-do-finalize` to tune SM100 NVFP4 for a serving configuration with
+`do_finalize=False`. EP communication completes; `forward_unfinalized()` returns
+BF16 `[T * top_k, hidden]` GEMM2 rows, FP32 `[T, top_k]` remaining weights, and
+an int32 `[T, top_k]` identity map for the caller's final reduction. All three
+results borrow workspace storage. The default `--do-finalize`
+includes finalization. Match the serving configuration's routing-weight
+placement with `--apply-topk-in-fc1` (default) or `--no-apply-topk-in-fc1`:
+
+```bash
+torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
+    --arch sm100 --dtype nvfp4 --hidden 7168 --intermediate 2048 \
+    --num-experts 256 --topk 8 --max-tokens 64 2048 \
+    --no-do-finalize --no-apply-topk-in-fc1
+```
+
+This mode requires BF16 combine and deterministic reduction. Each candidate
+prepares a fresh launch thunk before timing; the measured operation excludes
+input staging, output copying, and the caller's finalizer. The existing offline
+sweep synchronizes launches and selects the slowest-rank median latency.
+Finalized and unfinalized output, and both routing-weight placements, have separate
+cache entries. Older entries without an output-mode field describe reduced
+output; entries from the removed explicit startup tuner are ignored.
+
+Use the actual per-rank workspace capacities for `--max-tokens`. With
+`--live-tokens`, the cache still keys on capacity, so distinct workload winners
+for the same capacity need separate cache files. Serving loads the winner with
+`knobs=None` and the matching `do_finalize` / `apply_topk_in_fc1` settings,
+falling back to the heuristic on a cache miss. Retune NVFP4 entries previously
+recorded without the correct routing-weight placement.
 
 ### Session setup + steady-state forward (`knobs=None` / explicit dict)
 

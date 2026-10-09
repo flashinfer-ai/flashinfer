@@ -79,6 +79,7 @@ class MegaKernelBackend(ABC):
     # this capability during backend registration.  Keep the default false so
     # existing backends retain the materializing output path.
     supports_output_view: bool = False
+    supports_unfinalized_output: bool = False
 
     def __init__(self, config: object) -> None:
         self._config = config
@@ -244,6 +245,14 @@ class MegaKernelBackend(ABC):
         """Run the fused kernel. ``output=None`` (cutedsl backends) returns a
         zero-copy view of the workspace output, valid under stream ordering
         until the next launch on this session's buffers."""
+
+    def compute_unfinalized(
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+        """Return borrowed GEMM2 rows, remaining weights, and route-to-row indices."""
+        raise NotImplementedError("this MegaMoE backend cannot defer top-k reduction")
 
     def destroy(self, workspace: Any) -> None:
         """Release durable workspace resources (pool-aware, refcounted)."""

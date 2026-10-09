@@ -391,6 +391,8 @@ class MegaMoEBf16SymmBuffer:
     reduced_output: torch.Tensor
     _frontend: MegaMoEBf16Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
+    _unfinalized_route_map: Optional[torch.Tensor] = None
+    _unfinalized_weights: Optional[torch.Tensor] = None
     _destroyed: bool = False
 
     @property
@@ -406,6 +408,8 @@ class MegaMoEBf16SymmBuffer:
             for root in self._sym_roots:
                 free_sym_tensor(root)
             self._sym_roots.clear()
+            self._unfinalized_route_map = None
+            self._unfinalized_weights = None
             self._destroyed = True
 
 

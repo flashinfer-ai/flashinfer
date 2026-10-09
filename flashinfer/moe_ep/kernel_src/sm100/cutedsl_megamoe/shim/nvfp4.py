@@ -205,13 +205,11 @@ class MegaMoENvfp4Config:
                 "absorbed before fc2."
             )
         if self.defer_topk_reduce and (
-            self.in_kernel_fc2_reduce
-            or self.combine_dtype != "bf16"
-            or not self.apply_topk_in_fc1
+            self.in_kernel_fc2_reduce or self.combine_dtype != "bf16"
         ):
             raise ValueError(
                 "defer_topk_reduce requires in_kernel_fc2_reduce=False, "
-                "combine_dtype='bf16', and apply_topk_in_fc1=True."
+                "and combine_dtype='bf16'."
             )
         if self.group_hint is not None and self.group_hint <= 0:
             raise ValueError(
@@ -587,7 +585,7 @@ class MegaMoENvfp4Frontend:
             fc2_output_dtype=cutlass.BFloat16,
             non_ubulk_fc2_store=c.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
-            defer_topk_reduce=c.defer_topk_reduce,
+            defer_topk_reduce=c.defer_topk_reduce and c.apply_topk_in_fc1,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
             gate_up_clamp=self._gate_up_clamp,
@@ -599,6 +597,7 @@ class MegaMoENvfp4Frontend:
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
         )
+        kernel.defer_topk_reduce = c.defer_topk_reduce
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
@@ -1066,6 +1065,8 @@ class MegaMoESymmBuffer:
 
     _frontend: MegaMoENvfp4Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
+    _unfinalized_route_map: torch.Tensor | None = None
+    _unfinalized_weights: torch.Tensor | None = None
     _destroyed: bool = False
 
     def destroy(self) -> None:
@@ -1076,6 +1077,8 @@ class MegaMoESymmBuffer:
         for root in self._sym_roots:
             free_sym_tensor(root)
         self._sym_roots.clear()
+        self._unfinalized_route_map = None
+        self._unfinalized_weights = None
         self._destroyed = True
 
     @property
@@ -1180,6 +1183,8 @@ def get_symm_buffer_for_mega_moe(
             max_tokens=num_max_tokens,
             combine_dtype=combine_dtype,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            apply_topk_in_fc1=apply_topk_in_fc1,
+            defer_topk_reduce=defer_topk_reduce,
         )
     else:
         knobs = dict(knobs)
@@ -1422,7 +1427,9 @@ def nvfp4_mega_launch_thunk(
     Tester-parity timed region (``tester/solver.py perf_run``): the returned
     thunk is a bare compiled-kernel launch -- args prebuilt once, no per-call
     Python, no workspace reset (the kernel tail-cleans), no sync, no output
-    copy.  The reduced bf16 output lands in ``symm_buffer.output_activation``.
+    copy. The reduced output lands in ``symm_buffer.output_activation``;
+    deferred sessions expose per-route output through the frontend's
+    ``deferred_topk_reduce_workspace()`` instead.
     Compiles on this call if needed.  Rebuild the thunk after knob/clamp
     changes or buffer destruction.
     """
@@ -1570,6 +1577,8 @@ def create_dummy_inputs(
     situ_linear_beta: Optional[float] = None,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
+    apply_topk_in_fc1: bool = True,
+    defer_topk_reduce: bool = False,
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
@@ -1624,6 +1633,8 @@ def create_dummy_inputs(
         situ_linear_beta=situ_linear_beta,
         combine_dtype=combine_dtype,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        apply_topk_in_fc1=apply_topk_in_fc1,
+        defer_topk_reduce=defer_topk_reduce,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,
