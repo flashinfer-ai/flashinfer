@@ -484,11 +484,11 @@ the drop pins `4.5.0dev0`, and 4.6.0 compiles and runs this SM90 tree.  Whether 
 tree's ">=4.6.1 perf floor" finding applies to the SM90 kernels is
 UNTESTED — worth one A/B run.
 
-**Harness.**  `benchmarks/bench_moe_ep_sm90_mega.py`, one torchrun process
+**Harness.**  `benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py`, one torchrun process
 per GPU:
 
 ```bash
-torchrun --nproc_per_node=4 benchmarks/bench_moe_ep_sm90_mega.py
+torchrun --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py
 ```
 
 Defaults: heuristic launch configs, tokens 8..32768 (13 points) ×
@@ -893,7 +893,7 @@ for the benchmark:
 
 ```bash
 OMP_NUM_THREADS=4 torchrun --standalone --nproc_per_node=4 \
-  benchmarks/bench_moe_ep_sm90_mega.py \
+  benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py \
   --backend sm90_fp8_mxfp4_bf16_pull_cutedsl --scale-mode mxfp4_hybrid \
   --mxfp4-tactic-source cache_or_heuristic \
   --hidden 7168 --intermediate 3072 --num-experts 384 --top-k 6 \
@@ -916,7 +916,7 @@ print(row["runtime_tactic"])
 PYCODE
 )
 OMP_NUM_THREADS=4 torchrun --standalone --nproc_per_node=4 \
-  benchmarks/bench_moe_ep_sm90_mega.py \
+  benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py \
   --backend sm90_fp8_mxfp4_bf16_pull_cutedsl --scale-mode mxfp4_hybrid \
   --mxfp4-knobs-json "$mxfp4_tactic" \
   --hidden 7168 --intermediate 3072 --num-experts 384 --top-k 6 --tokens 2048 \

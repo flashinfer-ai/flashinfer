@@ -24,7 +24,8 @@ The plan/run flow is:
 flashinfer.mla.BatchMLAPagedAttentionWrapper
   -> normalize canonical or deprecated plan inputs
   -> build one backend-neutral plan request
-  -> selected backend.plan_from_wrapper()
+  -> resolve the requested backend or selection policy
+  -> backend support checks and transactional plan_from_wrapper()
   -> publish the completed backend and run contract
   -> normalize and validate run inputs
   -> selected backend.run_from_wrapper()
@@ -54,7 +55,7 @@ The boundary makes ownership explicit:
   preparation, and launch assembly.
 
 This separation keeps backend behavior independently inspectable while leaving
-functional APIs and selection machinery outside this interface.
+functional APIs outside this interface.
 
 ## Design properties
 
@@ -75,9 +76,7 @@ define:
 
 - A common base class for every attention backend in FlashInfer.
 - A functional `batch_mla_paged_attention` API or functional runner lifecycle.
-- A public backend registry, candidate loop, selection trace, or autotuning
-  policy.
-- Additional automatic backend candidates beyond FA2 and FA3.
+- A public backend registry, candidate loop, or selection trace.
 - Public exposure of `_batch_mla` or its concrete backend classes.
 - Sparse DSV4 orchestration inside the dense Batch MLA package.
 
@@ -350,6 +349,7 @@ flashinfer/mla/
 `-- _batch_mla/
     |-- __init__.py
     |-- _contracts.py
+    |-- _auto_policy.py
     |-- _planning.py
     |-- _wrapper.py
     `-- _backends/
@@ -377,26 +377,38 @@ name the mechanism they share rather than introducing a general backend layer.
 2. Normalize the structural and output contract for subsequent `run()` calls.
 3. Build `_MLAPlanArguments`, which owns a request-local lazy metadata resolver.
 4. Enforce the published backend's CUDA Graph replanning capability.
-5. Ask the configured concrete backend to build a complete backend instance.
+5. Ask the configured planner to build a complete concrete backend instance.
 6. Publish the backend and `MLAInputContract` only after planning succeeds.
 
-The wrapper's configured backend is fixed at construction. An explicit request
-evaluates only that backend. `backend="auto"` calls the
-`determine_mla_backend()` architecture helper once and selects FA3 on
-supported SM90a devices and FA2 otherwise. It does not consider CUTLASS,
-cuTile, TRTLLM-GEN, XQA, or CuTe DSL, iterate candidates, or fall back after a
-planning error. On Blackwell, the wrapper warns that this legacy architecture
-default is not Blackwell-native and points callers to the available
-alternatives.
+Construction validates the requested backend; selection and preparation happen
+in `plan()`. An explicit request evaluates only that backend. For `backend="auto"`,
+[`_auto_policy.py`](../../flashinfer/mla/_batch_mla/_auto_policy.py) applies a
+request-based preference policy on exact SM100 and SM103. Exact SM107 has its
+own `_ordered_sm107_backends` entry point, which delegates to the SM100 rules.
+These rules perform well in the measured SM107 cases; further investigation may
+identify useful SM107-specific ordering. SM80, supported SM90, and supported
+SM12x use their architecture policies; other devices use the default order.
+Every order includes all concrete backends exactly once, with support checks
+determining eligibility. The same module also owns the separate `autotune`
+policy, described under planned workload autotuning below.
 
-`backend="cute-dsl"` is the one private compatibility alias. Its wrapper-local
-planning class performs typed preflight on the monolithic CuTe backend first,
-then the modular CuTe backend; when `use_sinks=True`, it checks only the
-modular backend. Only
-`_BackendPlanUnsupportedError` raised before metadata mutation, compilation, or
-workspace mutation can move to the next CuTe candidate. Module-loading,
-compilation, allocation, launch, and non-typed planning errors surface to the
-caller and never fall back.
+The wrapper owns the planner registry, shared preparation and plan publication.
+Heuristic `auto` selection and the `cute-dsl` family alias both return a concrete
+prepared backend. Eager replanning may select another backend; graph replanning,
+where supported, retains the existing backend. For these policies, normal
+`run()` never selects, compiles or tunes a backend.
+
+Only `_BackendPlanUnsupportedError`, a `ValueError` subclass, permits trying
+another candidate. All typed unsupported-plan rejections use this value-error
+contract; callers that previously caught them as `RuntimeError` must catch
+`ValueError` instead. Ordinary `ValueError` and runtime errors propagate without
+fallback. Failed preparation restores shared buffers before fallback or returning
+control to the caller. Experimental auto candidates require
+`FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`; explicit selection is an opt-in.
+Architecture preferences retain fallback to the remaining concrete candidates.
+
+`backend="cute-dsl"` tries monolithic CuTe followed by modular CuTe using the
+same preparation and fallback rules. Both currently reject `use_sinks=True`.
 
 ## Planning contract
 
@@ -429,8 +441,9 @@ cuTile, TRTLLM-GEN, XQA, and CuTe DSL launch with device-resident dense
 tensors. Non-graph plans may stage CPU metadata or derive dense tables from
 CSR. Such copies are snapshots taken during planning, not live views of the
 source tensors. For backends requiring table-width alignment to
-`128 / page_size`, the resolver pads CSR-derived tables and rejects supplied
-dense tables with an unaligned width.
+`128 / page_size`, the resolver pads CSR-derived and eager dense tables without
+changing live page IDs. Graph plans reject padding of supplied dense tables,
+because a private padded copy would not observe caller-owned in-place updates.
 
 Canonical metadata receives strict shape and value validation. Deprecated flat
 CSR input is normalized through the same resolver but deliberately isolates the
@@ -524,9 +537,9 @@ device, and backend-specific option checks.
 | FA3 | CSR | Split | None, base 2, or base e | None | Supported with reserved metadata buffers |
 | CUTLASS | Dense | Packed | None | None or per-tensor FP8 | Rejected |
 | cuTile | Dense | Split | None | None | First plan/capture only |
-| TRTLLM-GEN | Dense | Packed | None or base 2 | None | First plan/capture only |
+| TRTLLM-GEN | Dense | Packed | None, base 2 or natural log | None | First plan/capture only |
 | XQA | Dense | Packed | None | None | First plan/capture only |
-| CuTe DSL monolithic | Dense | Packed | None or base e | None | First plan/capture only |
+| CuTe DSL monolithic | Dense | Packed | None, base 2, or base e | None | First plan/capture only |
 | CuTe DSL modular | Dense | Packed | None | None | Rejected before planning |
 
 ### FA2 and FA3
@@ -544,13 +557,15 @@ backend profiler planning. Their kernel-facing query and cache representation is
 split; a packed planned input reaches that representation through zero-copy
 slices.
 
+Native workspace-capacity and causal-layout restrictions produce typed support
+errors, allowing automatic selection to try another backend.
+
 ### CUTLASS
 
-CUTLASS is available only when explicitly selected as the wrapper backend. It
-requires:
+CUTLASS supports explicit selection and automatic fallback. It requires:
 
 - Compute capability major version 10 or 11.
-- Non-causal attention with exactly 128 query heads.
+- One query per request and exactly 128 query heads; causal and noncausal masks agree.
 - Compressed and positional widths 512 and 64.
 - Matching FP16 or BF16 query and KV-cache dtypes.
 - A page size no greater than 128 that divides 128.
@@ -566,30 +581,47 @@ the plan.
 
 ### cuTile
 
-cuTile is available only through `backend="cutile"`. It supports SM100, SM103,
-SM120, and SM121 DeepSeek MLA decode with matching FP16 or BF16 query/KV/output
-dtypes, 512 compressed dimensions, 64 positional dimensions, one query per
-request, 8-128 query heads in multiples of 8, and power-of-two page sizes from
-2 through 128. It accepts packed structural inputs or compact split views,
-consumes dense metadata, and does not support causality, LSE, profiling, output
-scaling, or KV scaling. Its kernel is loaded during planning, not wrapper
-import. A graph-mode plan may be captured with stable caller-owned buffers, but
-a second plan is rejected.
+cuTile is experimental: explicit selection opts in and emits a warning, while
+automatic selection considers it only with `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`,
+including when earlier candidates reject the request. Planning requires
+`cuda-tile>=1.4` and an available compiler; unsupported versions produce a typed
+rejection so auto can continue to the next eligible backend. Native execution supports
+SM100, SM103, SM107, SM120 and SM121 with matching FP16/BF16 query/KV/output,
+256 or 512 compressed dimensions, 64 positional dimensions, one query per
+request, positive query-head counts and power-of-two pages from 1 through 128.
+Packed storage, adjacent split views and compact independent split allocations
+are zero-copy inputs. `max_q_len` may overestimate the actual single query.
+Causal and noncausal single-query masks are equivalent; multi-query attention,
+LSE, profiling, output/KV scaling and sinks remain unsupported.
+SM107 requires a complete cuTile compiler/toolkit installation that supports
+that target; the minimum package version alone does not establish target support.
+Explicit cuTile selection remains experimental on SM107, and automatic
+selection still requires `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`.
+
+Planning prepares the cuTile AOT kernels, driver entry points and private scratch.
+Normal execution uses that prepared state without autotuning or specialization.
+CUDA Graph replay retains the metadata and scratch; a second graph-mode plan on
+the same wrapper is rejected.
 
 ### TRTLLM-GEN
 
-The planned TRTLLM-GEN backend is selected only by `backend="trtllm-gen"`. It
-requires SM100 or SM103, dense metadata, packed query and KV-cache tensors,
-non-causal attention, BF16 output, scalar BMM scales, and supported compressed
-and positional dimensions. The supplied `sm_scale` is authoritative; no
-separate non-positional Q/K width is needed by the planned backend. It may
-plan PDL, variable query metadata, sinks, skip-softmax, and base-2 LSE, but it
-rejects tensor BMM scales and sparse/DCP behavior outside this dense planned
-contract.
+The planned TRTLLM-GEN backend accepts explicit selection and automatic selection.
+It requires SM100, SM103 or SM107, dense metadata, packed query and KV-cache tensors,
+BF16 output and supported compressed and positional dimensions. BMM scales
+may be scalars, or single-element float32 device tensors with FP8 query/KV. Multi-query attention is bottom-right causal; noncausal attention
+is supported only for one query per request. Uniform and compact ragged queries
+use actual offsets rather than treating `max_q_len` capacity as an exact length.
+Compact ragged queries currently cannot return LSE. The supplied `sm_scale` is
+authoritative; no separate non-positional Q/K width is needed by the planned
+backend. It may plan PDL, variable query metadata, sinks, skip-softmax, and
+base-2 or natural-log LSE. Sparse/DCP behavior remains outside this dense
+planned contract; LSE cannot be combined with skip-softmax.
+SM107 uses the existing SM100-family kernels. Matching BF16 or FP8 E4M3
+query/KV inputs are supported; FP16 inputs remain unsupported.
 
 ### XQA
 
-The planned XQA backend is selected only by `backend="xqa"`. It requires SM120
+The planned XQA backend supports explicit selection and automatic fallback. It requires SM120
 with CUDA 12.8 or later, or SM12x minor versions 1 or greater with CUDA 12.9 or
 later. Non-graph plans may stage CPU metadata or derive aligned dense tables
 from CSR; CUDA Graph plans require caller-owned dense metadata on the wrapper
@@ -601,16 +633,31 @@ shape are not part of this backend.
 
 ### CuTe DSL
 
-The planned CuTe DSL backends are selected by `backend="cute-dsl-monolithic"`,
-`backend="cute-dsl-modular"`, or the private family selector
-`backend="cute-dsl"`. Both require SM100 or SM103, dense device metadata,
-packed query and KV-cache tensors, BF16 output, matching BF16 or FP8 E4M3
-query/KV dtypes, scalar BMM scales, non-causal attention, and uniform compact
-query metadata. The monolithic backend supports base-e LSE and first-plan CUDA
-Graph capture; it rejects sinks and points callers to modular CuTe. The modular
-backend supports sinks and deterministically rejects CUDA Graph planning before
-compilation or workspace mutation. CuTe DCP, sparse, HCA, DSV4, and compact
-variable-Q behavior are intentionally outside this planned dense wrapper.
+The concrete CuTe DSL backends support explicit and automatic selection;
+`backend="cute-dsl"` retains its family-alias policy across eager replans.
+Both require SM100, SM103 or SM107, dense device metadata, packed (or adjacent split)
+query and KV storage, FP16/BF16 output, matching FP16/BF16/FP8 E4M3 inputs,
+and scalar BMM scales. Monolithic supports causal multi-query attention,
+compact ragged queries, base-e LSE and first-plan graph capture, but no sinks.
+Modular supports uniform noncausal queries (up to the native four-query limit),
+but rejects sinks, causal multi-query attention, ragged queries, LSE and
+graph planning. For one query, causal and noncausal masks are equivalent.
+DCP, sparse, HCA and DSV4 remain outside this wrapper.
+
+On SM107, an installed CuTe DSL that lacks a native SM107 target must support
+the family target and start with `CUTE_DSL_ARCH=sm_100f` set **before importing
+Cutlass/CuTe DSL**. Setting it after import cannot retarget the captured DSL.
+The wrapper checks the existing target availability guard and does not mutate
+global compiler settings. An unavailable target produces a typed plan rejection
+so selectors can try their next eligible backend; explicit selection reports
+the rejection. Modular graph planning remains unsupported.
+
+For matching FP8 E4M3 query/KV inputs on SM100, SM103 and SM107, the default
+scale contract remains `default`; mixed-precision KV-only FP8 continues to use
+`kv-per-tensor`. Explicit scale contracts are preserved. Architecture eligibility
+does not determine automatic preference order. SM100 and SM103 share their
+ranking rules, and the SM107 policy currently delegates to those same rules.
+The SM107 entry point leaves room for future architecture-specific ordering.
 
 Callers do not declare sequence variability to the planned wrapper.
 TRTLLM-GEN derives compact query variability from `cum_seq_lens_q`; CuTe derives
@@ -624,8 +671,16 @@ updates stay within the compiled contract.
 
 A new backend instance owns the resources it creates while planning. The
 wrapper does not replace `_planned_backend` or `_input_contract` until
-`plan_from_wrapper()` returns successfully. A failed non-graph replan therefore
-leaves the previously published plan usable.
+`plan_from_wrapper()` returns successfully and any experimental warning is emitted.
+Backend planning failures restore shared buffers and leave the previously
+published plan usable. Each concrete backend owns snapshot and rollback directly in `plan_from_wrapper()`. Generated FA
+protects the shared integer workspace and reserved graph metadata; XQA protects
+only the 8 MiB semaphore prefix it zeroes. Float scratch and source metadata that
+planning only reads are not copied. Planners that do not mutate caller storage
+need no snapshots. The wrapper emits experimental-backend warnings after planning
+returns. Warnings promoted to exceptions do not roll back completed planning.
+The outer argument-audit decorator checks successful planners for development
+errors; its assertions are also outside the rollback boundary.
 
 Generated-FA CUDA Graph planning also stages metadata transactionally. Before
 copying, it verifies each reserved buffer's presence, rank where required,
@@ -644,9 +699,10 @@ candidate backend generation around that stable storage. Generated planning
 uses a private, allocator-aware pinned staging allocation for exactly the
 reported workspace prefix; that staging allocation is not public state and is
 not retained as a growing history of plans. If candidate planning or staging
-fails, the wrapper restores the affected device-workspace prefix and keeps the
-published plan and metadata pointers intact. Only after the candidate succeeds
-does the wrapper publish its backend and input-contract state, so ownership is
+fails, the backend restores its shared integer workspace and metadata, including unused
+tails, and keeps the published plan and pointers intact. Fallback restores that
+storage before trying another candidate. Only after preparation succeeds does
+the wrapper publish its backend and input-contract state, so ownership is
 bounded to the active plan plus temporary rollback state rather than an
 unbounded list of retired backends. These lifetime guarantees do not imply that
 the Python wrapper can intercept or validate direct external graph replay.
@@ -667,10 +723,25 @@ metadata with all three tensors on the wrapper device, contiguous, and
 or conversion would hide the storage consumed by replay. Convert metadata to
 dense device tensors before planning and retain those tensors. Update
 `seq_lens` and `block_tables` in place before replay, keeping lengths within
-reserved page-table/cache capacity and page indices valid. Keep query offsets,
-query lengths, and all tensor shapes fixed; these are compiled plan facts.
+reserved page-table/cache capacity and page indices valid. Keep query offsets
+and query lengths fixed except for the already-ragged monolithic case below.
+All tensor addresses and shapes remain fixed.
 Non-graph plans continue accepting CPU and CSR metadata. CuTe DSL modular
 continues to reject graph mode entirely.
+
+CuTe DSL monolithic plans created with nonuniform query lengths use
+`max_q_len` as the per-request launch and workspace capacity. The graph may
+redistribute those query tokens by updating `cum_seq_lens_q` in place, provided
+offsets start at zero, remain strictly increasing, retain the same final total,
+and every request length stays within the planned capacity. Batch size,
+causality and the remaining plan contract also stay fixed. Output and LSE
+storage remain compact, sized by the fixed total query-token count. When
+`max_q_len` is omitted, capacity is the largest initial request length.
+Initially uniform plans retain their fixed-query specialization and cannot
+change query lengths during replay. This exception applies only when the
+concrete planned backend is monolithic CuTe; `backend="auto"` does not promise
+that every selected backend can redistribute queries. Direct graph replay
+does not execute Python validation of updated offsets.
 
 The wrapper does not currently expose a CUDA Graph plan-update API. Any future
 plan-update surface must remain capability-gated per concrete backend;
@@ -697,8 +768,9 @@ A normal planned `run()` does not:
 - Allocate persistent workspaces.
 - Concatenate an independent split cache for a normal planned request.
 
-Compatibility paths described below are intentionally excluded from this
-normal hot-path guarantee.
+The first uncached `backend="autotune"` run is a preparation step and is excluded
+from this guarantee, as are the compatibility paths below. Subsequent runs use
+the retained selection without cache lookup or profiling.
 
 ## Compatibility and deprecation boundaries
 
@@ -725,3 +797,229 @@ plan-owned metadata capture. The MLA trace template normalizes structural
 `query` and `kv_cache` values to its stable split schema using the planned split
 widths. Compatibility adapters remain registered for both the historical
 `_core` module path and the canonical private implementation path.
+
+
+## Shared TRTLLM-GEN functional execution
+
+Dense, non-DCP TRTLLM-GEN functional decode and prefill reuse execution
+mechanics in `_batch_mla/_backends/trtllm_gen_backend.py`. That module owns
+cached executable acquisition and registration of every generated library,
+compatible output preparation, shared execution configuration and the native
+launch binding. Backend-neutral shape checks and zero-copy KV normalization
+live in `_utils.py` and are used by both adapters. The backend module also owns
+`_BatchMLAPagedAttentionTrtllmGenBackend`, importing the
+`TunableRunner` interface without invoking tuning or selection. It does not
+import the public MLA facades, `_core.py`, or the wrapper.
+
+The backend also reports functional head-count, page-size and ragged-LSE
+restrictions through a pure incompatibility-reason helper. Functional and planned
+checks share head-count/page-size and query-layout rules; backend diagnostics describe TRT
+restrictions without prescribing a fallback backend. Core preserves
+input-validation ordering, public exception types and lazy CuTe DSL fallback
+selection. This helper does not replace the planned adapter's narrower
+capability validation or the shared input-shape checks.
+
+`_core.py` retains public signatures, compatibility imports, cross-backend
+selection and tuning. Its shared `_mla_with_kv_cache_impl` serves the existing
+public decode and prefill APIs; `_check_mla_functional_shape` validates common
+query/KV/page-table shapes for TRTLLM-GEN, CuTe DSL and XQA and returns normalized
+KV storage. It composes common query/KV validation with explicit dense page-table
+or sparse index-table validation. Sparse indices use `[batch, query_length, top_k]`
+for uniform queries and `[total_query_tokens, top_k]` for flattened queries.
+Backend capability checks remain separate. The backend-local
+`_check_trtllm_gen_mla_shape` composes the same query/KV and dense page-table
+primitives with the wrapper's narrower dimensions and positive-width contract.
+The dispatcher performs shared validation, resolves architecture policy and
+backend eligibility, then executes one resolved route in this order: `autotune`,
+TRTLLM-GEN, CuTe DSL, XQA, and packed sparse. The internal `autotune` route also
+handles explicit uniform TRT/CuTe requests with one candidate; it is not a new
+functional backend argument. Explicit TRT inference skips selection because it
+has only tactic `-1`, while tuning-enabled calls still profile it. `auto` and
+explicit CuTe retain their tuning/cache behavior. Explicit TRT requests do not
+probe CuTe eligibility.
+Ragged TRT/CuTe requests execute directly, and CuTe eligibility remains lazy for
+ragged TRT requests. Native TRT sparse requests use the TRT runner routes;
+the final sparse branch is exclusively for packed SM120/SM121 execution.
+
+Functional dispatch and wrapper planning both use
+`_BatchMLAPagedAttentionTrtllmGenBackend`. The `from_functional(...)` factory
+binds call-local configuration; `plan_from_wrapper(...)` prepares persistent
+state. Each factory sets an explicit instance mode. Shared `forward` and
+`get_cache_key_extras` methods branch on that mode to preserve the distinct input
+contracts and cache namespaces, without replacing methods on the instance.
+Both factories call `_initialize_execution` with normalized native configuration,
+then share `_execute` for launch assembly and LSE units/strides. Neither shared
+method resolves wrapper metadata. Both factories also call
+`__init__(workspace_buffer)`, which owns backend identity, device, the shared
+`_workspace_buffer` reference and the initial counter-buffer slot. Native module
+acquisition and workload preparation remain in their respective construction or
+planning phases, preserving validation order. The planned path retains the
+`plan_from_wrapper`/`run_from_wrapper` interface. `_plan` prepares persistent
+metadata; `run_from_wrapper` resolves packed inputs and delegates to `_run`,
+which validates the current tensors and lowers them to `_execute`. The backend retains
+its cache-key fields, hashing, tactics, profile-local counters and LSE preparation. TRTLLM-GEN and
+CuTe DSL share sequence-length bucketing from `_utils.py`. Each launch binds the
+current trial or real request tensors. Functional ragged calls invoke the same
+runner directly, bypassing the autotuner, with call-local offsets and validated
+maxima. The runner preserves the already-flat query and shares counter
+allocation and native launch with uniform calls. Core validates caller-provided
+counters before runner construction to preserve error ordering. Only the
+existing omitted-maximum path inspects offsets on the host. Dense and sparse functional launches share the argument
+binding, explicitly forwarding top-k and optional per-query sparse lengths.
+Sparse validation, selection and preparation remain distinct; DCP retains its
+existing route. The dense planned adapter explicitly binds top-k to zero and
+sparse lengths to `None`.
+
+The planned adapter retains executable, normalized metadata and counter storage
+from a successful plan. Its run path validates the existing public contract,
+lowers current tensor views and invokes the shared launch with retained
+resources. It does not select a backend, compile, tune, stage metadata or
+allocate persistent state. Transactional plan publication and graph backend
+and pointer lifetimes remain wrapper responsibilities.
+
+Sharing execution does not equate the APIs' contracts. Functional calls can
+allocate outputs, accept separate K/V page indices and sparse metadata, and
+preserve nested LSE return shapes. Planned execution retains its output-storage,
+architecture and dense metadata restrictions. Both adapters use `_lower_bmm1_scale`:
+functional construction converts a tensor once per invocation before profiling;
+wrapper execution converts on each run. Graph capture records that conversion,
+so replay observes in-place updates without a host scalar read. Native scalar
+conversion stays in the launcher. Both adapters select base-2 or natural-log LSE
+through the shared native scale; ragged TRT execution still rejects LSE output.
+Mutable caller, runner and plan buffers are never cached globally.
+
+
+
+## Planned workload autotuning
+
+`BatchMLAPagedAttentionWrapper(..., backend="autotune")` uses the policy in
+`_batch_mla/_auto_policy.py`. TRTLLM-GEN, monolithic and modular CuTe DSL, XQA, CUTLASS, FA2/FA3,
+and experimental cuTile are registered when eligible,
+using their existing tactic `-1`; CuTe retains its heuristic split-K/reducer
+configuration. The policy compares backend/tactic candidates through
+`AutoTuner`; adding candidates does not require the TRT backend to know about
+other implementations. `backend="auto"` remains the existing planning heuristic.
+
+```python
+wrapper = BatchMLAPagedAttentionWrapper(workspace, backend="autotune")
+wrapper.plan(metadata=metadata, **plan_options)
+with flashinfer.autotune(True):
+    wrapper.run(query=q, kv_cache=kv, out=out)
+# Reuses this instance's prepared selection.
+wrapper.run(query=q, kv_cache=kv, out=out)
+```
+
+Planning validates and prepares eligible candidates without benchmarking. The
+policy snapshots query offsets, page mappings and KV lengths, and keys decisions
+by their contents, plan settings, workspace capacity, candidate set and runtime
+tensor/scalar facts. Change this metadata through a new plan, not by modifying
+caller tensors in place. Eager replanning publishes a fresh policy only after
+successful preparation. Graph plans still allow one plan per wrapper.
+
+Profiling follows the wrapper's `use_cuda_graph` setting. Non-graph plans use
+eager profiling and reject a measurement override requesting graph profiling;
+the generic tuner cannot silently re-enable capture. Graph plans exclude modular
+CuTe and may use an eager measurement override without widening candidate
+eligibility. Graph and non-graph plans have distinct workload cache identities.
+Running a non-graph autotune wrapper inside graph capture is rejected, including
+after a winner has been retained.
+
+On an uncached run, `flashinfer.autotune(True)` is required even with only one
+candidate. Profiling uses the current Q/KV and planned metadata with private
+output/LSE storage; it never synthesizes other batch sizes. The global
+`tuning_buckets` setting does not expand a wrapper plan. Successful tuning is
+followed by execution into the caller's actual output buffers. A skipped or
+failed tuning attempt cannot establish a measured selection.
+
+By default, wrapper tuning compares GPU elapsed time with a cold L2 cache.
+It does not minimize Python dispatch overhead or guarantee the fastest warmed
+end-to-end call. Near-tied candidates can also change order with measurement
+noise; selection applies to the measured workload and profiling policy.
+
+Decisions use a separate `batch_mla_paged_attention` cache namespace. Compatible
+instances can reuse a cached decision, but each owns its prepared backend and
+counter buffers. A successful selection lasts for the lifetime of the plan,
+including subsequent tuning-enabled runs. Ordinary eager calls pass current tensors and
+supported scalar options directly to that backend without rebuilding the tuning
+signature or searching the cache. Graph-bound calls retain signature guards.
+Backend validation still rejects unsupported
+inputs. Call `plan()` again to select for a different workload or layout; merely
+changing runtime inputs never switches the retained backend.
+CUDA graph capture requires a selection to have been warmed up first,
+even when a cache entry exists. Capture never tunes or switches backend, and
+changing the execution signature after capture requires a new wrapper.
+
+The functional API retains its existing batch-bucket sweep, cache-miss fallback,
+and direct ragged execution. Backend consolidation keeps wrapper planning and metadata transfers out of
+functional execution. Each unified backend also serves as its tuning candidate. Persisted selections written under the former runner
+class name no longer match; retune after upgrading. Functional cache misses retain
+the existing fallback, while wrapper autotune misses require tuning-enabled warmup.
+
+Tensor BMM scales are runtime inputs, including during planned autotuning. Their
+shape, stride, dtype and device participate in workload identity; their values
+and object addresses do not. A warm selection binds the current call's scale
+tensors. Immutable candidate options never retain them. For graph replay, keep
+the captured tensors alive and update their device values in place.
+
+## Shared monolithic CuTe execution
+
+Both concrete CuTe backends implement `TunableRunner` for functional and planned
+execution. Core resolves the CuTe family before constructing `from_functional`;
+it does not benchmark both CuTe implementations for one functional call. Uniform
+functional calls keep batch-bucket tuning, while compact ragged calls execute
+the backend directly. DCP, PDL and the direct public CuTe callable retain their
+functional contracts without becoming wrapper requirements or new wrapper APIs.
+
+Functional execution calls the existing low-level `cute_dsl_mla_decode`
+unchanged. Planned preparation uses the kernel module's existing support,
+workspace sizing and cached compilation helpers; planned execution calls the
+compiled kernel directly. The backend owns the planned native argument binding.
+Functional reducer heuristics and planned reducer defaults retain their
+respective scheduling policies. No request tensors are cached globally.
+The wrapper retains compiled state, metadata, workspace views and LSE scratch
+from plan time; its repeated runs do not compile or inspect device metadata.
+Monolithic wrapper LSE supports base-e and base-2 using the kernel's scale.
+
+Autotune filters each candidate against the complete declared operation before
+profiling. Unsupported configurations, insufficient workspace or missing optional
+CuTe dependencies exclude that candidate; unexpected compiler/launch failures
+propagate. Candidates share scratch workspace, retain their own prepared state
+and treat the policy's metadata snapshot as read-only. CuTe-specific table
+padding must not modify that snapshot. Modular CuTe participates only in supported
+non-graph plans: it rejects LSE, compact ragged queries, sinks and causal multi-Q.
+Its functional adapter preserves the existing modular callable and workspace
+sizing, while planned execution retains its existing prepared kernel binding.
+No low-level CuTe implementation is changed by the backend integration.
+
+
+### Additional planned autotune backends
+
+FA2 and FA3 share their tuning interface in `_fa_common.py`. They retain native
+CSR plans and use candidate-private integer workspace and graph metadata.
+Admission checks native scratch capacity and vector-load alignment. FA3 tuning
+admits the validated compressed KV dimensions 128, 256 and 512. The native PV
+descriptor increment follows the value row width for each configuration.
+CUTLASS and cuTile expose their existing prepared execution as tactic `-1`.
+cuTile participates only with the existing experimental-auto opt-in. These
+three backend families do not gain new functional entrypoints.
+
+The policy snapshots the caller's native CSR/dense metadata form and validates
+it before backend fallback. In graph mode, FA candidates allocate their own CSR
+buffers even when the supplied metadata is dense. Caller-reserved buffers are
+validated but never used as candidate-persistent storage. XQA's semaphore is
+isolated during autotune preparation; shared float workspace remains scratch.
+
+Split tuples retain their views during profiling, including adjacent storage.
+Their cache signatures include adjacency and pointer alignment as well as shapes
+and strides, so a retained vectorized kernel cannot bypass layout admission.
+Candidates use tactic admission for supported runtime layouts before profiling;
+malformed contracts and unexpected launch/compiler errors still propagate.
+Cold profiling flushes L2, including operands nested inside split tuples.
+
+XQA functional and planned entrypoints share the backend's native launch. The
+functional runner uses the actual workload, preserving native scale conventions
+and scalar/tensor support. Its single tactic runs directly outside a tuning
+context, avoiding generic cache selection on ordinary functional calls.
+Planned XQA keeps scalar-only BMM scales. Existing
+`auto` routing remains unchanged; cross-backend expansion applies to the
+wrapper's explicit `backend="autotune"` policy.

@@ -54,7 +54,7 @@ not picked them up):
   basic swap M128N64 on the strength of it.  New multirank tests
   `test_..._fold_producer_warps` and `test_..._blockwise_coop_n256` (the test
   helpers now take mma_tiler_mnk / pingpong / cluster_shape_mnk).
-  `benchmarks/bench_moe_ep_sm90_mega.py` `--pingpong on/off` now forwards
+  `benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py` `--pingpong on/off` now forwards
   the bucket's full heuristic config (cga / accum / token-back) so the
   override flips only ping-pong — earlier it leaked drop-driver manual
   defaults — and `--epi-mode {basic,pingpong,cooperative}` forces every

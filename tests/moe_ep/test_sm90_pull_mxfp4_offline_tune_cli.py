@@ -213,7 +213,7 @@ def test_mxfp4_main_dispatches_to_backend_local_tuner(monkeypatch) -> None:
     ("extra", "message"),
     [
         (("--fp8-scale-mode", "per_tensor"), "fixes --fp8-scale-mode"),
-        (("--combine-dtype", "mxfp8"), "only wired for --dtype nvfp4"),
+        (("--combine-dtype", "mxfp8"), "fixes --combine-dtype bf16"),
         (("--allow-nondeterministic",), "not applicable"),
         (("--sweep", "schedule"), "only --sweep default"),
         (("--base-knobs", "{}"), "no --base-knobs"),

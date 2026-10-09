@@ -4,7 +4,7 @@
 
 Fused execution reuses the production weight preprocessor and
 activation/routing staging code. Its deterministic data recipe matches the
-canonical MXFP4 workload in ``benchmarks/bench_moe_ep_sm90_mega.py``. The
+canonical MXFP4 workload in ``benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py``. The
 selected canonical routing profile is forwarded to candidate selection,
 session construction, and the collective tuner; this module only owns CLI
 orchestration and does not introduce a second benchmark/timer.

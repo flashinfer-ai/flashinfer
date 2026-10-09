@@ -1007,7 +1007,8 @@ def test_mxfp4_bulk_offsets_match_cpasync_after_repeat_and_reset(
         # Reuse the input recipe which exposed this race; the small oracle
         # fixture does not reproduce it. Keep the mathematical oracle separate.
         path = (
-            Path(__file__).resolve().parents[2] / "benchmarks/bench_moe_ep_sm90_mega.py"
+            Path(__file__).resolve().parents[2]
+            / "benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py"
         )
         spec = importlib.util.spec_from_file_location("_mxfp4_repeat_benchmark", path)
         assert spec is not None and spec.loader is not None

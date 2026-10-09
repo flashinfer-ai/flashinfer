@@ -18,41 +18,48 @@ from __future__ import annotations
 
 import functools
 from pathlib import Path
+from typing import Any
 
 from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec, sm103a_nvcc_flags
 
-# Explicit target-owned registration; each closure has separate translation units.
-MODULES = {
-    "cake_nvfp4_attention_8194d2d0334d525c11e4": {
-        "sources": [
-            "cake_nvfp4_attention/sm_103a/cake_nvfp4_attention_8194d2d0334d525c11e4_kernel.cu",
-            "cake_nvfp4_attention/sm_103a/cake_nvfp4_attention_8194d2d0334d525c11e4_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["tma_buffer", "K"],
-            ["tma_buffer", "Vt"],
-            ["tma_buffer", "SFQ"],
-            ["tma_buffer", "SFK"],
-            ["tma_buffer", "SFVtLo"],
-            ["tma_buffer", "SFVtHi"],
-            ["tma_buffer", "O"],
-            ["parameter", "seqlen_q"],
-            ["parameter", "seqlen_kv"],
-            ["parameter", "q_stride"],
-            ["parameter", "kv_stride"],
-            ["parameter", "softmax_scale_log2"],
-            ["parameter", "total_bh"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "closure_sha256": "ee5552c11855129fb3e6114684d4eec22ea15da85d3416dc28334b46f0161611",
-    }
+# The one generated program of this backend: its device and binding
+# translation units (relative to ``csrc/``), the compile flags of its source
+# build, and the physical argument order of its ``run`` entry. The same source
+# compiles for every listed architecture; the loader keys the cached library
+# by architecture.
+PROGRAM: dict[str, Any] = {
+    "name": "cake_nvfp4_attention_6045de810304deb488d9",
+    "arches": ["sm_103a"],
+    "sources": [
+        "cake_nvfp4_attention/cake_nvfp4_attention_6045de810304deb488d9_kernel.cu",
+        "cake_nvfp4_attention/cake_nvfp4_attention_6045de810304deb488d9_binding.cu",
+    ],
+    "compile_flags": ["--use_fast_math"],
+    "ffi_entry": "run",
+    "arg_plan": [
+        ["tma_buffer", "Q"],
+        ["tma_buffer", "K"],
+        ["tma_buffer", "Vt"],
+        ["tma_buffer", "SFQ"],
+        ["tma_buffer", "SFK"],
+        ["tma_buffer", "SFVtLo"],
+        ["tma_buffer", "SFVtHi"],
+        ["tma_buffer", "O"],
+        ["parameter", "seqlen_q"],
+        ["parameter", "seqlen_kv"],
+        ["parameter", "q_stride"],
+        ["parameter", "kv_stride"],
+        ["parameter", "softmax_scale_log2"],
+        ["parameter", "total_bh"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
 }
+
+ARCHES = tuple(PROGRAM["arches"])
+_NVCC_FLAGS = {"sm_103a": sm103a_nvcc_flags}
 
 
 def _header_dirs():
@@ -71,20 +78,25 @@ def _header_dirs():
 
 
 @functools.cache
-def gen_cake_nvfp4_attention_module(name):
-    record = MODULES[name]
+def gen_cake_nvfp4_attention_module(arch):
+    if arch not in ARCHES:
+        raise ValueError(f"NVFP4 attention is generated for {ARCHES}, not {arch}")
     root = Path(__file__).resolve().parent / "csrc"
-    sources = [root / relative for relative in record["sources"]]
+    sources = [root / relative for relative in PROGRAM["sources"]]
     return gen_jit_spec(
-        name=name + "_" + record["closure_sha256"][:20],
+        name=f"{PROGRAM['name']}_{arch}",
         sources=sources,
-        extra_cuda_cflags=[*sm103a_nvcc_flags, *record["compile_flags"]],
+        extra_cuda_cflags=[*_NVCC_FLAGS[arch], *PROGRAM["compile_flags"]],
         extra_ldflags=["-lcuda"],
-        extra_include_paths=[root, *[p.parent for p in sources], *_header_dirs()],
+        extra_include_paths=[
+            root,
+            *dict.fromkeys(p.parent for p in sources),
+            *_header_dirs(),
+        ],
         use_fast_math=False,
     )
 
 
 @functools.cache
-def load_cake_nvfp4_attention_module(name):
-    return gen_cake_nvfp4_attention_module(name).build_and_load()
+def load_cake_nvfp4_attention_module(arch):
+    return gen_cake_nvfp4_attention_module(arch).build_and_load()

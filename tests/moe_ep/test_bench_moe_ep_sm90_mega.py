@@ -14,7 +14,9 @@ import sys
 
 
 REPO = Path(__file__).resolve().parents[2]
-BENCH_PATH = REPO / "benchmarks" / "bench_moe_ep_sm90_mega.py"
+BENCH_PATH = (
+    REPO / "benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py"
+)
 HISTORICAL_FP8_CSV_FIELDS = (
     "kernel,scale_mode,operand_order,tile_m,tile_n,tile_k,"
     "tokens_per_rank,topk,world_size,total_experts,local_experts,hidden,"

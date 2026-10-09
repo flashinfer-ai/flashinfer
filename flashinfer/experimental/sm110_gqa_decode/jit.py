@@ -14,101 +14,117 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# JIT loader for the generated exact-SM110 GQA decode kernels.
+# Program registry and JIT loader of the exact-SM110 GQA decode kernels.
 
 from __future__ import annotations
 
 import functools
-import hashlib
-import json
 from pathlib import Path
 from typing import Any
 
-from ...jit import env as jit_env
 from ...jit.core import JitSpec, gen_jit_spec, logger, sm110a_nvcc_flags
 
-_OPERATOR_DIR = "sm110_gqa_decode"
-_MANIFEST = "manifest.json"
-
-
-def _get_operator_dir() -> Path:
-    operator_dir = Path(__file__).resolve().parent / "csrc" / _OPERATOR_DIR
-    if (operator_dir / _MANIFEST).is_file():
-        return operator_dir
-    raise FileNotFoundError(
-        "SM110 GQA decode sources were not found in the installed package or source checkout"
-    )
-
-
-def _read_manifest() -> tuple[Path, dict[str, Any]]:
-    operator_dir = _get_operator_dir()
-    manifest = json.loads((operator_dir / _MANIFEST).read_text())
-    if manifest.get("architecture") != "sm_110a":
-        raise RuntimeError("SM110 GQA decode manifest has an unexpected architecture")
-
-    routes = manifest.get("routes")
-    if not isinstance(routes, list) or {
-        route.get("ffi_entry") for route in routes if isinstance(route, dict)
-    } != {"run_short", "run_long"}:
-        raise RuntimeError("SM110 GQA decode manifest has an unexpected launch ABI")
-
-    files = manifest.get("files")
-    if not isinstance(files, list) or len(files) != 4:
-        raise RuntimeError("SM110 GQA decode manifest must contain four source files")
-    for artifact in files:
-        relative = Path(artifact["path"])
-        if relative.is_absolute() or ".." in relative.parts:
-            raise RuntimeError(f"invalid generated source path: {relative}")
-        source = operator_dir / relative
-        if not source.is_file():
-            raise FileNotFoundError(f"generated source not found: {source}")
-        digest = hashlib.sha256(source.read_bytes()).hexdigest()
-        if digest != artifact["sha256"]:
-            raise RuntimeError(f"generated source digest mismatch: {source}")
-    return operator_dir, manifest
-
-
-def _get_flashinfer_header_dirs() -> list[Path]:
-    installed = [jit_env.FLASHINFER_CSRC_DIR, jit_env.FLASHINFER_INCLUDE_DIR]
-    if (installed[0] / "tvm_ffi_utils.h").is_file() and (
-        installed[1] / "flashinfer" / "layout.cuh"
-    ).is_file():
-        return installed
-
-    checkout = Path(__file__).resolve().parents[3]
-    source = [checkout / "csrc", checkout / "include"]
-    if (source[0] / "tvm_ffi_utils.h").is_file() and (
-        source[1] / "flashinfer" / "layout.cuh"
-    ).is_file():
-        return source
-
-    raise FileNotFoundError("FlashInfer JIT headers were not found")
-
-
-@functools.cache
-def gen_sm110_gqa_decode_module() -> JitSpec:
-    """Create the exact-SM110a JIT specification from the sealed sources."""
-
-    operator_dir, manifest = _read_manifest()
-    sources = [operator_dir / artifact["path"] for artifact in manifest["files"]]
-    identity = hashlib.sha256(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()[:20]
-    spec = gen_jit_spec(
-        name=f"sm110_gqa_decode_{identity}",
-        sources=sources,
-        extra_cuda_cflags=[*sm110a_nvcc_flags],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[
-            operator_dir,
-            operator_dir / "sm_110a",
-            *_get_flashinfer_header_dirs(),
+# Every generated program the package compiles, keyed by module name: the
+# short (capacity <= 64, 256 threads) and long (384 threads) decode programs
+# and the three exact-shape specializations of the prepared API. Paths are
+# relative to this package.
+MODULES: dict[str, dict[str, Any]] = {
+    "original": {
+        "sources": [
+            "csrc/sm110_gqa_decode/sm_110a/sm110_gqa_decode_short_kernel.cu",
+            "csrc/sm110_gqa_decode/sm_110a/sm110_gqa_decode_short_binding.cu",
+            "csrc/sm110_gqa_decode/sm_110a/sm110_gqa_decode_long_kernel.cu",
+            "csrc/sm110_gqa_decode/sm_110a/sm110_gqa_decode_long_binding.cu",
         ],
+        "compile_flags": [],
+    },
+    "n32_b4_direct": {
+        "sources": [
+            "csrc/prepared/sm110_gqa_decode_n32_b4_direct.cu",
+            "csrc/prepared/sm110_gqa_decode_n32_b4_direct_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+    },
+    "n32_disjoint_s10": {
+        "sources": [
+            "csrc/prepared/sm110_gqa_decode_n32_disjoint_s10.cu",
+            "csrc/prepared/sm110_gqa_decode_n32_disjoint_s10_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+    },
+    "n64_kvlast_s10": {
+        "sources": [
+            "csrc/prepared/sm110_gqa_decode_n64_kvlast_s10.cu",
+            "csrc/prepared/sm110_gqa_decode_n64_kvlast_s10_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+    },
+}
+
+# Launch routes: the module and FFI entry serving each route, its kernel symbol
+# and split count. Routes with ``num_splits`` above one write FP32 partials and
+# merge them in the last CTA, so they need the caller-retained workspace that
+# the prepared API allocates once.
+ROUTES: dict[str, dict[str, Any]] = {
+    "short": {
+        "module": "original",
+        "ffi_entry": "run_short",
+        "kernel_symbol": "kernel_sm110_gqa_decode_short",
+        "num_splits": 1,
+    },
+    "long": {
+        "module": "original",
+        "ffi_entry": "run_long",
+        "kernel_symbol": "kernel_sm110_gqa_decode_long",
+        "num_splits": 1,
+    },
+    "n32_b4_direct": {
+        "module": "n32_b4_direct",
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_sm110_gqa_decode_n32_b4_direct",
+        "num_splits": 1,
+    },
+    "n32_disjoint_s10": {
+        "module": "n32_disjoint_s10",
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_sm110_gqa_decode_n32_disjoint_s10",
+        "num_splits": 10,
+    },
+    "n64_kvlast_s10": {
+        "module": "n64_kvlast_s10",
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_sm110_gqa_decode_n64_kvlast_s10",
+        "num_splits": 10,
+    },
+}
+
+# Capacities through this value use the short kernel.
+SHORT_CAPACITY_MAX = 64
+# Prepared default routes of the exact ``batch:capacity`` keys they were
+# qualified for; every other shape above SHORT_CAPACITY_MAX uses ``long``.
+PREPARED_ROUTES: dict[str, str] = {
+    "4:256": "n32_b4_direct",
+    "1:1024": "n64_kvlast_s10",
+    "1:4096": "n32_disjoint_s10",
+}
+
+
+def gen_sm110_gqa_decode_module(module: str) -> JitSpec:
+    """Create the exact-SM110a JIT specification of one registered module."""
+
+    record = MODULES[module]
+    root = Path(__file__).resolve().parent
+    spec = gen_jit_spec(
+        name=f"sm110_gqa_decode_{module}",
+        sources=[root / source for source in record["sources"]],
+        extra_cuda_cflags=[*sm110a_nvcc_flags, *record["compile_flags"]],
+        extra_ldflags=["-lcuda"],
     )
     logger.info(f"Generated SM110 GQA decode JIT spec: {spec.name}")
     return spec
 
 
+@functools.cache
 def _check_exact_sm110a(device: Any = None) -> None:
     import torch
 
@@ -124,17 +140,24 @@ def _check_exact_sm110a(device: Any = None) -> None:
 
 
 @functools.cache
-def _build_and_load() -> Any:
-    module = gen_sm110_gqa_decode_module().build_and_load()
-    logger.info("Loaded SM110 GQA decode module")
-    return module
+def _build_and_load(module: str) -> Any:
+    loaded = gen_sm110_gqa_decode_module(module).build_and_load()
+    logger.info(f"Loaded SM110 GQA decode module {module}")
+    return loaded
 
 
-def load_sm110_gqa_decode_module(*, device: Any = None) -> Any:
-    """Build or load the generated module for an exact SM110a device."""
+def load_sm110_gqa_decode_module(*, device: Any = None, module: str) -> Any:
+    """Build or load one registered module for an exact SM110a device."""
 
     _check_exact_sm110a(device)
-    return _build_and_load()
+    return _build_and_load(module)
 
 
-__all__ = ["gen_sm110_gqa_decode_module", "load_sm110_gqa_decode_module"]
+__all__ = [
+    "MODULES",
+    "PREPARED_ROUTES",
+    "ROUTES",
+    "SHORT_CAPACITY_MAX",
+    "gen_sm110_gqa_decode_module",
+    "load_sm110_gqa_decode_module",
+]
