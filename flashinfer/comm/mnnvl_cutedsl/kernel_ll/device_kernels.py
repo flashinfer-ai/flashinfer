@@ -728,6 +728,7 @@ class _LamportResidualRMSNormDeviceKernel:
         write_residual_output: bool,
         apply_rms_norm: bool = True,
         enable_pdl: bool,
+        write_norm_output: bool = True,
     ) -> None:
         if rank_lanes not in (1, 2, 4, 8):
             raise ValueError("rank_lanes must be 1, 2, 4, or 8")
@@ -747,10 +748,8 @@ class _LamportResidualRMSNormDeviceKernel:
         self.weight_bias = weight_bias
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
-        # When False the collective stops after the Lamport reduce (+ residual)
-        # and the cluster sum-of-squares, its barrier and the norm store are
-        # never emitted.
-        self.apply_rms_norm = apply_rms_norm
+        # Preserve the upstream norm-disable switch for existing callers.
+        self.write_norm_output = write_norm_output and apply_rms_norm
         self.enable_pdl = enable_pdl
         self.fragments = hidden // VEC_BF16
         self.groups_per_cta = threads // rank_lanes
@@ -960,11 +959,12 @@ class _LamportResidualRMSNormDeviceKernel:
                         Int64((contribution_mailbox.iterator + source_element).toint())
                     )
 
-        thread_sum = Float32(0.0)
-        for trip in cutlass.range_constexpr(self.trips):
-            fragment = base_fragment + trip * self.fragment_stride
-            if fragment < self.fragments and rank_lane == 0:
-                if cutlass.const_expr(self.apply_rms_norm):
+        # Without the norm, the reduced sum in residual_output is the result.
+        if cutlass.const_expr(self.write_norm_output):
+            thread_sum = Float32(0.0)
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = base_fragment + trip * self.fragment_stride
+                if fragment < self.fragments and rank_lane == 0:
                     values = prenorm_fragments[trip, None].load().to(Float32)
                     thread_sum = thread_sum + (values * values).reduce(
                         cute.ReductionOp.ADD,
@@ -972,10 +972,9 @@ class _LamportResidualRMSNormDeviceKernel:
                         reduction_profile=0,
                     )
 
-        smem = cutlass.utils.SmemAllocator()
-        warp_sums = smem.allocate_array(Float32, self.warps)
-        cluster_sums = smem.allocate_array(Float32, self.cluster_size)
-        if cutlass.const_expr(self.apply_rms_norm):
+            smem = cutlass.utils.SmemAllocator()
+            warp_sums = smem.allocate_array(Float32, self.warps)
+            cluster_sums = smem.allocate_array(Float32, self.cluster_size)
             cta_sum = _group_leader_block_sum(
                 thread_sum,
                 warp_sums,

@@ -26,10 +26,9 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed import ProcessGroup
 
-from .mnnvl import is_multicast_supported
+from .mnnvl_cutedsl.runtime import require_mnnvl_multicast_device
 from .mnnvl_cutedsl.kernel_ll.all_gather_dual_norm import (
     LLAllGatherDualNorm,
     LLAllGatherDualNormTuning,
@@ -65,13 +64,7 @@ class MNNVLCuteDSLAllGatherDualNormWorkspace:
             raise ValueError("tp_size must be 2, 4, or 8")
         if max_token_num <= 0:
             raise ValueError("max_token_num must be positive")
-        device = torch.device("cuda", torch.cuda.current_device())
-        if torch.cuda.get_device_capability(device)[0] < 10:
-            raise RuntimeError("requires a Blackwell GPU")
-        if symm_mem.get_backend(device) is None:
-            raise RuntimeError("PyTorch Symmetric Memory is unavailable")
-        if not is_multicast_supported(device.index):
-            raise RuntimeError("NVLink multicast is unavailable")
+        device = require_mnnvl_multicast_device()
         self.tp_size = tp_size
         self.max_token_num = max_token_num
         self.hidden_dim = hidden_dim

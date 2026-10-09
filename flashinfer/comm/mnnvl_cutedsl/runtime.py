@@ -77,5 +77,21 @@ def make_fake_dynamic_compact_tensor(
     )
 
 
+def require_mnnvl_multicast_device() -> torch.device:
+    """The current device, if it supports the MNNVL multicast kernels."""
+    import torch.distributed._symmetric_memory as symm_mem
+
+    from ..mnnvl import is_multicast_supported
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    if torch.cuda.get_device_capability(device)[0] < 10:
+        raise RuntimeError("requires a Blackwell GPU")
+    if symm_mem.get_backend(device) is None:
+        raise RuntimeError("PyTorch Symmetric Memory is unavailable")
+    if not is_multicast_supported(device.index):
+        raise RuntimeError("NVLink multicast is unavailable")
+    return device
+
+
 def current_cu_stream() -> cuda.CUstream:
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
