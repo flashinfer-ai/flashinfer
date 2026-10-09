@@ -1,8 +1,9 @@
 """GPU tests for the CAKE Kimi-K3 MLA FP8 paged-attention backend (SM100 / SM103).
 
-Covers the three call families of the Cake contract against an FP32 reference: low-head paged
-decode (q_len = 1), packed variable-Q / MTP (cum_seq_lens_q) and incremental prefill on the
-paged FP8 cache (prefix reuse, ragged KV), plus CUDA-Graph replay with a changed page table.
+Covers the three call families against an FP32 reference: low-head paged decode (q_len = 1),
+packed variable-Q / MTP (cum_seq_lens_q) and incremental prefill on the paged FP8 cache (prefix
+reuse, ragged KV), plus CUDA-Graph replay with a changed page table, row-strided query / cache
+views on a row-tile route and on the wide route, the route selection and the split planners.
 """
 
 import math
@@ -10,7 +11,12 @@ import math
 import pytest
 import torch
 
-from flashinfer.jit.cake_kimi_k3_mla import ROUTES, route_key
+from flashinfer.jit.cake_kimi_k3_mla import (
+    KERNELS,
+    MODULES,
+    get_cake_kimi_k3_mla_kernel,
+    supported_arches,
+)
 from flashinfer.utils import get_compute_capability
 
 LATENT = 512
@@ -25,8 +31,8 @@ def _skip_unless_sm100_family():
     major, minor = get_compute_capability(torch.device("cuda"))
     arch = f"sm_{major}{minor}a"
     # Only architectures with generated programs (sm_100a, sm_103a); other SM100-family parts
-    # such as sm_107a have no route in the registry.
-    if route_key("main_rt16", arch) not in ROUTES:
+    # such as sm_107a are not registered.
+    if arch not in supported_arches():
         pytest.skip(f"CAKE Kimi-K3 MLA has no generated programs for {arch}")
 
 
@@ -197,6 +203,44 @@ def test_mtp_variable_q(num_heads, q_lens, kv_lens):
     _check(out, _reference(case), atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "num_heads,kv_lens",
+    [
+        (12, [770]),  # one request: the 16-row tile, 7 KV tiles, three splits
+        (
+            12,
+            [770, 768, 785, 802, 812, 738, 889, 741],
+        ),  # the Kimi-K3 layer-91 band (11-14 pages)
+        (96, [6000, 5000]),  # 96-row tile, always-exact path
+        (96, [9000]),  # two-CTA wide route
+    ],
+)
+def test_decode_sink_key_rows(num_heads, kv_lens):
+    """A sink key ~150 octaves above every other key for most heads of a row tile, flat scores for the others.
+
+    The lazy E4M3 reference of the row-tile programs is re-referenced per tile for every column of an exceeding
+    warpgroup; before the bounded-drop rule a sink-less column's later move pulled the sink columns ~120 octaves
+    down and the FP32 rescale overflowed (Inf / NaN rows in Kimi-K3 serving).  The output must be finite and match
+    the FP32 reference.
+    """
+    _skip_unless_sm100_family()
+    device = torch.device("cuda")
+    case = _make_case(
+        len(kv_lens), [1] * len(kv_lens), kv_lens, num_heads, seed=645011, device=device
+    )
+    sink_heads = [h for h in range(num_heads) if h % 4 != 3]
+    for b in range(len(kv_lens)):
+        page = int(case["block_tables"][b, 0].item())
+        case["kv_cache"][page, 0] = _fp8(torch.full((QK_DIM,), 2.0, device=device))
+        case["query"][b, sink_heads] = _fp8(torch.full((QK_DIM,), 1.25, device=device))
+    out = _run(case, fixed_q_len=1)
+    _check(out, _reference(case), atol=0.1, rtol=0.1)
+    rel = (out.float() - _reference(case).float()).norm(dim=-1) / _reference(
+        case
+    ).float().norm(dim=-1).clamp_min(1e-6)
+    assert float(rel.max()) <= 0.05
+
+
 def test_incremental_prefill_prefix_reuse():
     _skip_unless_sm100_family()
     device = torch.device("cuda")
@@ -253,8 +297,8 @@ def test_route_selection():
     # (two items, fewer than the SM pairs: nothing runs unsplit).
     wide = runner(_make_case(2, [1, 1], [20000, 300], 96, seed=1, device=device))
     assert wide.route_metadata["route"] == "wide" and wide.rt is None
-    assert wide.plan["n_full_items"] == 0
-    assert wide.plan["grid_main"] == (2 * 2 * wide.num_split, 1, 1)
+    assert wide.plan.n_full_items == 0
+    assert wide.plan.grid_main == (2 * 2 * wide.num_split, 1, 1)
     # 96 rows but longest KV below 8192 -> row tiles (lazy-E4M3 precision gate of the wide route).
     # max_seq_len is the page-rounded table width, so the longest KV must stay below 8192 pages-wise.
     short = runner(_make_case(2, [1, 1], [8000, 300], 96, seed=2, device=device))
@@ -262,7 +306,7 @@ def test_route_selection():
     # 12 rows -> the 16-row tile whatever the KV.
     small = runner(_make_case(1, [1], [40000], 12, seed=3, device=device))
     assert small.route_metadata["route"] == "swapped" and small.rt == 16
-    assert small.plan["grid_main"] == (small.num_split, 1, 1)
+    assert small.plan.grid_main == (small.num_split, 1, 1)
 
 
 def test_cuda_graph_replay_changing_page_table():
@@ -312,6 +356,187 @@ def test_cuda_graph_replay_wide_route():
     g.replay()
     torch.cuda.synchronize()
     _check(out, _reference(case), atol=1e-2, rtol=1e-2)
+
+
+def test_row_strided_query_and_kv_views_match_contiguous():
+    _skip_unless_sm100_family()
+    from flashinfer.mla.cake_kimi_k3_mla import (
+        KimiK3MlaFp8PagedAttention,
+        workspace_bytes,
+    )
+
+    device = torch.device("cuda")
+    case = _make_case(2, [3, 1], [5000, 300], 12, seed=645301, device=device)
+    total_q, num_heads = case["query"].shape[:2]
+    workspace = torch.zeros(
+        workspace_bytes(total_q * num_heads, 256), dtype=torch.uint8, device=device
+    )
+
+    def run(query, kv_cache):
+        out = torch.full(
+            (total_q, num_heads, LATENT),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        attention = KimiK3MlaFp8PagedAttention(
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=case["block_tables"],
+            seq_lens=case["seq_lens"],
+            out=out,
+            workspace_buffer=workspace,
+            bmm1_scale=case["bmm1_scale"],
+            cum_seq_lens_q=case["q_indptr"],
+            max_q_len=max(case["q_lens"]),
+            max_seq_len=int(case["block_tables"].shape[1]) * PAGE,
+        )
+        # This case runs a row tile (36 rows, longest KV 5000 -> main_rt48); the wide route is
+        # covered by test_wide_route_row_strided_views_match_contiguous.
+        assert attention.route_metadata["route"] == "swapped"
+        assert attention.rt == 48
+        attention.launch()
+        torch.cuda.synchronize()
+        return out
+
+    dense = run(case["query"], case["kv_cache"])
+    # Query rows living inside a wider per-row buffer (640-byte rows) and a cache whose token rows
+    # carry 64 bytes of padding: both are addressed through the row stride, no copy.
+    wide_q = torch.zeros(
+        (total_q, num_heads, QK_DIM + 64), dtype=torch.float8_e4m3fn, device=device
+    )
+    wide_q[..., :QK_DIM] = case["query"]
+    pages = case["kv_cache"].shape[0]
+    wide_kv = torch.zeros(
+        (pages, PAGE, QK_DIM + 64), dtype=torch.float8_e4m3fn, device=device
+    )
+    wide_kv[..., :QK_DIM] = case["kv_cache"]
+    assert wide_q[..., :QK_DIM].stride(-2) == QK_DIM + 64
+    assert wide_kv[..., :QK_DIM].stride(-2) == QK_DIM + 64
+    strided = run(wide_q[..., :QK_DIM], wide_kv[..., :QK_DIM])
+    assert torch.equal(strided, dense)
+    _check(dense, _reference(case), atol=1e-2, rtol=2e-2)
+    # The output rows are written with a dense 512-element stride; a wider view is rejected.
+    wide_out = torch.empty(
+        (total_q, num_heads, LATENT + 64), dtype=torch.bfloat16, device=device
+    )
+    with pytest.raises(ValueError, match="out rows must be dense"):
+        KimiK3MlaFp8PagedAttention(
+            query=case["query"],
+            kv_cache=case["kv_cache"],
+            block_tables=case["block_tables"],
+            seq_lens=case["seq_lens"],
+            out=wide_out[..., :LATENT],
+            workspace_buffer=workspace,
+            bmm1_scale=case["bmm1_scale"],
+            cum_seq_lens_q=case["q_indptr"],
+            max_q_len=max(case["q_lens"]),
+        )
+
+
+def test_wide_route_row_strided_views_match_contiguous():
+    _skip_unless_sm100_family()
+    from flashinfer.mla.cake_kimi_k3_mla import (
+        KimiK3MlaFp8PagedAttention,
+        use_wide_route,
+        workspace_bytes,
+    )
+
+    device = torch.device("cuda")
+    # 96 heads, longest KV 8192 -> the two-CTA wide route; its TMA descriptors carry the row
+    # stride like the row-tile programs, so padded query / cache rows are addressed in place.
+    case = _make_case(1, [1], [8192], 96, seed=645302, device=device)
+    assert use_wide_route(96, 8192)
+    total_q, num_heads = case["query"].shape[:2]
+    workspace = torch.zeros(
+        workspace_bytes(total_q * num_heads, 256), dtype=torch.uint8, device=device
+    )
+
+    def run(query, kv_cache):
+        out = torch.full(
+            (total_q, num_heads, LATENT),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        attention = KimiK3MlaFp8PagedAttention(
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=case["block_tables"],
+            seq_lens=case["seq_lens"],
+            out=out,
+            workspace_buffer=workspace,
+            bmm1_scale=case["bmm1_scale"],
+            cum_seq_lens_q=case["q_indptr"],
+            max_q_len=max(case["q_lens"]),
+            max_seq_len=int(case["block_tables"].shape[1]) * PAGE,
+        )
+        assert attention.route_metadata["route"] == "wide"
+        attention.launch()
+        torch.cuda.synchronize()
+        return out
+
+    dense = run(case["query"], case["kv_cache"])
+    wide_q = torch.zeros(
+        (total_q, num_heads, QK_DIM + 64), dtype=torch.float8_e4m3fn, device=device
+    )
+    wide_q[..., :QK_DIM] = case["query"]
+    pages = case["kv_cache"].shape[0]
+    wide_kv = torch.zeros(
+        (pages, PAGE, QK_DIM + 64), dtype=torch.float8_e4m3fn, device=device
+    )
+    wide_kv[..., :QK_DIM] = case["kv_cache"]
+    assert wide_q[..., :QK_DIM].stride(-2) == QK_DIM + 64
+    assert wide_kv[..., :QK_DIM].stride(-2) == QK_DIM + 64
+    for query, kv_cache in (
+        (wide_q[..., :QK_DIM], case["kv_cache"]),
+        (case["query"], wide_kv[..., :QK_DIM]),
+        (wide_q[..., :QK_DIM], wide_kv[..., :QK_DIM]),
+    ):
+        assert torch.equal(run(query, kv_cache), dense)
+    _check(dense, _reference(case), atol=1e-2, rtol=1e-2)
+
+
+def test_plan_is_shared_across_calls_of_one_shape():
+    from flashinfer.mla.cake_kimi_k3_mla import plan_attention
+
+    first = plan_attention(
+        batch=8, max_q_len=1, num_heads=96, max_seq_len=342305, sm_count=148
+    )
+    second = plan_attention(
+        batch=8, max_q_len=1, num_heads=96, max_seq_len=342305, sm_count=148
+    )
+    assert first is second
+    assert first.wide and first.main_kind == "main_wide" and first.num_split == 9
+    narrow = plan_attention(
+        batch=1, max_q_len=1, num_heads=12, max_seq_len=40000, sm_count=148
+    )
+    assert not narrow.wide and narrow.main_kind == "main_rt16"
+
+
+def test_every_kernel_key_resolves_on_the_running_architecture():
+    _skip_unless_sm100_family()
+    major, minor = get_compute_capability(torch.device("cuda"))
+    arch = f"sm_{major}{minor}a"
+    for key, entry in KERNELS.items():
+        record = get_cake_kimi_k3_mla_kernel(key, arch=arch)
+        assert arch in record["arches"]
+        assert record["name"] == (entry if isinstance(entry, str) else entry[arch])
+        assert set(MODULES[record["name"]]) >= {
+            "sources",
+            "compile_flags",
+            "ffi_entry",
+            "arg_plan",
+            "arches",
+        }
+    # A per-architecture key names one program per supported architecture and nothing else.
+    for _key, entry in KERNELS.items():
+        if isinstance(entry, dict):
+            assert set(entry) == supported_arches()
+            assert all(
+                MODULES[name]["arches"] == [name_arch]
+                for name_arch, name in entry.items()
+            )
 
 
 def test_unsupported_options_rejected():

@@ -15,17 +15,15 @@ limitations under the License.
 """
 
 import functools
-from pathlib import Path
 from typing import Literal, NamedTuple, Optional
 
 from . import env as jit_env
-from .core import (
-    JitSpec,
-    gen_jit_spec,
-    logger,
-    sm100a_nvcc_flags,
-    sm100f_nvcc_flags,
+from ._kda_jit_common import (
+    gen_kda_jit_spec,
+    get_kda_csrc_dir as _get_csrc_dir,
+    get_flashinfer_include_dir as _get_include_dir,
 )
+from .core import JitSpec, logger
 from .utils import write_if_different
 
 FlashKDAPackedT1Variant = Literal["tile8", "tile16"]
@@ -35,11 +33,6 @@ FLASH_KDA_PACKED_T1_VARIANTS: tuple[FlashKDAPackedT1Variant, ...] = (
     "tile8",
     "tile16",
 )
-
-_FLASH_KDA_PACKED_T1_NVCC_FLAGS = {
-    "sm100a": sm100a_nvcc_flags,
-    "sm100f": sm100f_nvcc_flags,
-}
 
 _FLASH_KDA_PACKED_T1_TARGET_KIND = {
     "sm100a": 1000,
@@ -80,41 +73,6 @@ def _variant_for_batch(batch: int) -> FlashKDAPackedT1Variant:
     return "tile16" if batch >= 32 else "tile8"
 
 
-def _get_csrc_dir() -> Path:
-    """Locate the frozen packed-KDA sources in installs and checkouts."""
-
-    installed = jit_env.FLASHINFER_CSRC_DIR / "kda"
-    if installed.exists():
-        return installed
-
-    checkout = Path(__file__).resolve().parents[2] / "csrc" / "kda"
-    if checkout.exists():
-        return checkout
-
-    raise FileNotFoundError(
-        "frozen packed KDA T=1 sources were not found. Checked:\n"
-        f"  - {installed}\n"
-        f"  - {checkout}"
-    )
-
-
-def _get_include_dir() -> Path:
-    """Locate FlashInfer headers in installs and source checkouts."""
-
-    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
-        return jit_env.FLASHINFER_INCLUDE_DIR
-
-    checkout = Path(__file__).resolve().parents[2] / "include"
-    if checkout.exists():
-        return checkout
-
-    raise FileNotFoundError(
-        "FlashInfer headers were not found. Checked:\n"
-        f"  - {jit_env.FLASHINFER_INCLUDE_DIR}\n"
-        f"  - {checkout}"
-    )
-
-
 def get_flash_kda_packed_t1_uri(
     variant: FlashKDAPackedT1Variant,
     target: FlashKDAPackedT1Target,
@@ -123,7 +81,7 @@ def get_flash_kda_packed_t1_uri(
 
     if variant not in FLASH_KDA_PACKED_T1_VARIANTS:
         raise ValueError(f"unsupported packed KDA T=1 variant: {variant}")
-    if target not in _FLASH_KDA_PACKED_T1_NVCC_FLAGS:
+    if target not in _FLASH_KDA_PACKED_T1_TARGET_KIND:
         raise ValueError(f"unsupported packed KDA T=1 target: {target}")
     return f"flash_kda_packed_t1_{variant}_{target}"
 
@@ -132,30 +90,28 @@ def _get_binding_cu(
     variant: FlashKDAPackedT1Variant,
     metadata: FlashKDAPackedT1VariantMetadata,
 ) -> str:
-    """Render the binding translation unit without changing the frozen body."""
+    """Render the shared packed binding for one frozen fallback body.
+
+    The fallback bodies run one warp per value tile without dynamic shared
+    memory and keep the earlier kernel ABI, selected through
+    ``CAKE_KDA_PACKED_T1_LEGACY_ABI`` in ``cake_kda_packed_t1_binding.cuh``.
+    """
 
     return f"""\
 /*
  * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Licensed under the Apache License, Version 2.0.
  */
 
-#define FLASHKDA_PACKED_T1_BODY_FILE "cake_flashkda_packed_t1_{variant}.cu"
-#define FLASHKDA_PACKED_T1_KERNEL {metadata.symbol}
-#define FLASHKDA_PACKED_T1_VALUE_SPLITS {metadata.value_splits}
+#define CAKE_KDA_PACKED_T1_BODY_FILE "cake_flashkda_packed_t1_{variant}.cu"
+#define CAKE_KDA_PACKED_T1_KERNEL {metadata.symbol}
+#define CAKE_KDA_PACKED_T1_VALUE_TILES {metadata.value_splits}
+#define CAKE_KDA_PACKED_T1_THREADS 32
+#define CAKE_KDA_PACKED_T1_SMEM_BYTES 0
+#define CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 0
+#define CAKE_KDA_PACKED_T1_LEGACY_ABI 1
 
-#include "cake_flashkda_packed_t1_binding.cuh"
+#include "cake_kda_packed_t1_binding.cuh"
 """
 
 
@@ -168,14 +124,14 @@ def gen_flash_kda_packed_t1_module(
 
     if variant not in FLASH_KDA_PACKED_T1_VARIANTS:
         raise ValueError(f"unsupported packed KDA T=1 variant: {variant}")
-    if target not in _FLASH_KDA_PACKED_T1_NVCC_FLAGS:
+    if target not in _FLASH_KDA_PACKED_T1_TARGET_KIND:
         raise ValueError(f"unsupported packed KDA T=1 target: {target}")
 
     csrc_dir = _get_csrc_dir()
     body = csrc_dir / f"cake_flashkda_packed_t1_{variant}.cu"
     if not body.exists():
         raise FileNotFoundError(f"frozen packed KDA T=1 body not found: {body}")
-    binding_header = csrc_dir / "cake_flashkda_packed_t1_binding.cuh"
+    binding_header = csrc_dir / "cake_kda_packed_t1_binding.cuh"
     if not binding_header.exists():
         raise FileNotFoundError(
             f"packed KDA T=1 binding header not found: {binding_header}"
@@ -188,22 +144,17 @@ def gen_flash_kda_packed_t1_module(
     )
     write_if_different(binding, _get_binding_cu(variant, metadata))
 
-    spec = gen_jit_spec(
+    spec = gen_kda_jit_spec(
         name=uri,
         sources=[binding],
-        extra_cuda_cflags=[
-            *_FLASH_KDA_PACKED_T1_NVCC_FLAGS[target],
-            (
-                "-DFLASHINFER_FLASH_KDA_PACKED_T1_TARGET_KIND="
-                f"{_FLASH_KDA_PACKED_T1_TARGET_KIND[target]}"
-            ),
-            "--maxrregcount=128",
-        ],
-        extra_include_paths=[
-            csrc_dir,
-            csrc_dir.parent,
-            _get_include_dir(),
-        ],
+        target=target,
+        target_define=(
+            "-DFLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND="
+            f"{_FLASH_KDA_PACKED_T1_TARGET_KIND[target]}"
+        ),
+        csrc_dir=csrc_dir,
+        include_dir=_get_include_dir(),
+        extra_cuda_cflags=("--maxrregcount=128",),
     )
     logger.info(
         "Generated packed KDA T=1 %s %s JIT spec: %s",

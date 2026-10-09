@@ -57,6 +57,7 @@ struct Dsv4Nvfp4AttentionParams {
   size_t extra_page_stride_bytes;
   int num_tokens;
   float sm_scale;
+  int page_size;
   size_t page_stride_bytes;
   float lse_scale = 1.f;
 };

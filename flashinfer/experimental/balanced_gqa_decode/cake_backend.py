@@ -35,6 +35,7 @@ the row-tile program.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
@@ -43,7 +44,8 @@ import torch
 import tvm_ffi
 
 from .cake_jit import (
-    MODULES,
+    KINDS,
+    PROGRAMS,
     load_cake_balanced_gqa_decode_module,
     select_module,
 )
@@ -121,11 +123,29 @@ MAIN_KWARGS = (
 # ---------------------------------------------------------------------------
 
 
-def num_persistent_ctas(device: Optional[torch.device] = None) -> int:
-    """Grid size of the persistent launch: one CTA per SM."""
+def _device_index(device: Optional[torch.device] = None) -> int:
     if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+        return int(torch.cuda.current_device())
+    index = torch.device(device).index
+    return int(torch.cuda.current_device() if index is None else index)
+
+
+@functools.cache
+def _multi_processor_count(device_index: int) -> int:
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+@functools.cache
+def _device_arch(device_index: int) -> Optional[str]:
+    """``sm_100a`` / ``sm_103a`` of a device, ``None`` for other capabilities."""
+    return SUPPORTED_COMPUTE_CAPABILITIES.get(
+        torch.cuda.get_device_capability(device_index)
+    )
+
+
+def num_persistent_ctas(device: Optional[torch.device] = None) -> int:
+    """Grid size of the persistent launch: one CTA per SM (queried once per device)."""
+    return _multi_processor_count(_device_index(device))
 
 
 def _align(nbytes: int) -> int:
@@ -256,10 +276,10 @@ def program_kind(q_len_per_req: int) -> str:
 
 def generated_program_available(device: torch.device, q_len_per_req: int = 1) -> bool:
     """True when this checkout registers the program serving ``q_len_per_req`` on ``device``."""
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
-    kind = program_kind(q_len_per_req)
-    return arch is not None and any(
-        r["arch"] == arch and r.get("kind", "row") == kind for r in MODULES.values()
+    arch = _device_arch(_device_index(device))
+    program = KINDS.get(program_kind(q_len_per_req))
+    return (
+        arch is not None and program is not None and arch in PROGRAMS[program]["arches"]
     )
 
 
@@ -273,15 +293,14 @@ def bind_decode_payload(
 ) -> BalancedGQADecodeRunner:
     """Bind the prepared buffers to the generated physical argument order."""
     module_name = select_module(arch, kind)
-    record = MODULES[module_name]
-    physical = record["main"]
+    record = PROGRAMS[module_name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), main_kwargs["grid"], strict=True))
     arguments = tuple(
-        grid[name] if kind == "grid" else main_kwargs[name]
-        for kind, name in physical["arg_plan"]
+        grid[name] if slot == "grid" else main_kwargs[name]
+        for slot, name in record["arg_plan"]
     )
-    module = load_cake_balanced_gqa_decode_module(module_name, "main")
-    entry = getattr(module, physical["ffi_entry"])
+    module = load_cake_balanced_gqa_decode_module(module_name, arch)
+    entry = getattr(module, record["ffi_entry"])
     return BalancedGQADecodeRunner(
         module_name, main_kwargs, out, entry, arguments, block_tables_padded
     )
@@ -423,9 +442,9 @@ def prepare_balanced_batch_decode_with_kv_cache(
         raise ValueError("Expected all tensors on one CUDA device")
     if not all(t.is_contiguous() for t in tensors):
         raise ValueError("Expected contiguous tensors")
-    capability = torch.cuda.get_device_capability(device)
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
+    arch = _device_arch(_device_index(device))
     if arch is None:
+        capability = torch.cuda.get_device_capability(device)
         raise ValueError(
             "balanced GQA decode requires compute capability 10.0 or 10.3 "
             f"(got {capability[0]}.{capability[1]})"

@@ -483,6 +483,135 @@ def test_packed_calls_take_the_affine_split_and_cache_bitwise(lengths):
 
 
 @pytest.mark.parametrize(
+    "lengths,heads", [([16384], 16), ([16384], 12), ([8192, 8192], 16)]
+)
+def test_strided_qkv_views_take_the_same_route_as_dense_bitwise(lengths, heads):
+    # Serving hands q / k / v over as split(dim=-1) views of one packed qkv row
+    # (token pitch > heads * 128).  The affine split gate must see the same
+    # route as the dense copies it used to receive, and the composite must
+    # produce the same bits from the views as from dense operands.
+    dense = _inputs(lengths, heads, seed=23)
+    pool = dense["pool"].clone()
+    dense_call = _run(dense)
+    dense_got = _snapshot(dense)
+    if len(lengths) == 1:
+        assert "affine" in str(dense_call.schedule)
+
+    strided = dict(dense)
+    tokens = sum(lengths)
+    packed = torch.zeros(
+        1, tokens, 4 * heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    )
+    packed[:, :, 0:heads].copy_(dense["q"])
+    packed[:, :, heads : 2 * heads].copy_(dense["k"])
+    packed[:, :, 2 * heads : 3 * heads].copy_(dense["v"])
+    strided["q"] = packed[:, :, 0:heads]
+    strided["k"] = packed[:, :, heads : 2 * heads]
+    strided["v"] = packed[:, :, 2 * heads : 3 * heads]
+    assert not strided["q"].is_contiguous()
+    strided["out"] = torch.empty_like(dense["out"])
+    strided["state_checkpoints"] = torch.zeros_like(dense["state_checkpoints"])
+    dense["pool"].copy_(pool)
+    strided_call = _run(strided)
+    assert str(strided_call.schedule) == str(dense_call.schedule)
+    _assert_same(_snapshot(strided), dense_got)
+
+
+def _packed_qkv(d, heads, *, extra=0):
+    """Replace dense q / k / v with split views of one packed [T, pitch] row.
+
+    Serving hands the export the ``split(dim=-1)`` views of the fused
+    projection's conv output (token pitch 3 * H * 128 plus any allocator
+    padding, dense per-token payload).  Every exported body reads that pitch
+    in place through its TensorView strides; nothing is densified.
+    """
+    tokens = d["q"].shape[1]
+    width = heads * HEAD_DIM
+    pitch = 3 * width + extra
+    packed = torch.full(
+        (tokens, pitch), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    views = []
+    for index, name in enumerate(("q", "k", "v")):
+        view = packed[:, index * width : (index + 1) * width]
+        view.copy_(d[name][0].reshape(tokens, width))
+        views.append(view.unflatten(-1, (heads, HEAD_DIM)).unsqueeze(0))
+    assert not views[0].is_contiguous() and views[0].stride(1) == pitch
+    d = dict(d, q=views[0], k=views[1], v=views[2])
+    d["_packed"] = packed  # keep the storage alive
+    return d
+
+
+# Shapes that steer the automatic policy onto each body family (H12 / H16,
+# BF16 checkpoint rows, bounded and unbounded gates); the strided views must
+# take the same schedule as the dense operands and produce the same bits.
+_STRIDED_QKV_BODY_CASES = [
+    pytest.param([64] * 4, 12, True, None, 0, id="h12_short_direct_n16"),
+    pytest.param(
+        [17, 64, 65, 127, 128, 200, 255, 96], 12, True, None, 8, id="h12_ragged_plus8"
+    ),
+    pytest.param([512], 12, False, -1.0, 0, id="h12_bounded_dvsplit_m64"),
+    pytest.param([447], 12, False, -1.0, 8, id="h12_bounded_dvsplit_m64_plus8"),
+    pytest.param([1024] * 4, 16, True, None, 0, id="h16_direct_m128"),
+    pytest.param([2048, 3073], 16, True, -1.0, 0, id="h16_bounded_long"),
+    pytest.param([4096] * 4, 16, True, None, 8, id="h16_sequential_pack_plus8"),
+    pytest.param([16384], 12, True, None, 0, id="h12_affine_split"),
+]
+
+
+@pytest.mark.parametrize(
+    "lengths,heads,checkpoints,lower_bound,extra", _STRIDED_QKV_BODY_CASES
+)
+def test_strided_qkv_views_match_dense_bitwise_on_every_body(
+    lengths, heads, checkpoints, lower_bound, extra
+):
+    dense = _inputs(lengths, heads, seed=31)
+    pool = dense["pool"].clone()
+    dense_call = _run(dense, checkpoints=checkpoints, lower_bound=lower_bound)
+    dense_got = _snapshot(dense)
+
+    strided = _packed_qkv(dense, heads, extra=extra)
+    strided["out"] = torch.empty_like(dense["out"])
+    strided["state_checkpoints"] = torch.zeros_like(dense["state_checkpoints"])
+    dense["pool"].copy_(pool)
+    strided_call = _run(strided, checkpoints=checkpoints, lower_bound=lower_bound)
+    assert str(strided_call.schedule) == str(dense_call.schedule), (
+        dense_call.schedule,
+        strided_call.schedule,
+    )
+    _assert_same(_snapshot(strided), dense_got)
+
+
+@pytest.mark.parametrize("heads,lengths", [(12, [512]), (12, [447]), (16, [1024])])
+def test_hit_rebinds_strided_qkv_views_in_place(heads, lengths):
+    """A plan-cache hit re-points the strided q / k / v views (no staging copy
+    to refresh) and reproduces the fresh preparation bit for bit; refilling
+    the same views with new tokens is read on the next launch as well."""
+    cache = KDAPrefillPlanCache(8)
+    first = _packed_qkv(_inputs(lengths, heads, seed=21), heads)
+    second = _packed_qkv(_inputs(lengths, heads, seed=22), heads)
+    pool_second = second["pool"].clone()
+    miss = _run(first, cache, checkpoints=False, lower_bound=-1.0)
+    assert "dvsplit" in str(miss.schedule), miss.schedule
+    hit = _run(second, cache, checkpoints=False, lower_bound=-1.0)
+    assert hit is miss and (cache.misses, cache.hits) == (1, 1)
+    got = _snapshot(second)
+    second["pool"].copy_(pool_second)
+    _run(second, checkpoints=False, lower_bound=-1.0)
+    _assert_same(got, _snapshot(second))
+    third = _inputs(lengths, heads, seed=23)
+    for name in ("q", "k", "v"):
+        second[name].copy_(third[name])
+    pool_third = second["pool"].clone()
+    _run(second, cache, checkpoints=False, lower_bound=-1.0)
+    assert cache.fast_hits == 1
+    got = _snapshot(second)
+    second["pool"].copy_(pool_third)
+    _run(second, checkpoints=False, lower_bound=-1.0)
+    _assert_same(got, _snapshot(second))
+
+
+@pytest.mark.parametrize(
     "lengths", [[5461, 5461, 5462], [4096] * 4, [500] * 6 + [13384], [2048] * 8]
 )
 def test_packed_calls_below_the_break_even_keep_the_sequential_body(lengths):
