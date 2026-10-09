@@ -17,6 +17,7 @@ from typing import Literal, Optional, Sequence
 
 import torch
 import functools
+from typing_extensions import deprecated
 
 from ..api_logging import flashinfer_api
 
@@ -625,7 +626,20 @@ def moe_a2a_dispatch(
         # This uses absolute offsets in the workspace, so skip indexing into the workspace
         # Reuse views to avoid four tensor constructions per payload. Cached views
         # still observe fresh writes to the workspace bound above.
-        key = (ep_size, runtime_max_tokens_per_rank, offset, size, input_payload.dtype)
+        # ``int()`` guards the key rather than fixing an observed miss: tvm-ffi
+        # materializes an ``Array<int64_t>`` element as a real Python ``int``
+        # today, so these already hash by value. Coercing keeps that property
+        # local to this function instead of resting on an FFI implementation
+        # detail -- an int-like that hashed by identity would miss on every
+        # lookup, silently disabling the cache while the dict still grew. Same
+        # idiom as the ``int()`` on FFI scalars in ``_init_constants`` below.
+        key = (
+            ep_size,
+            runtime_max_tokens_per_rank,
+            int(offset),
+            int(size),
+            input_payload.dtype,
+        )
         payload_view = None if recv_view_cache is None else recv_view_cache.get(key)
         if payload_view is None:
             payload_view = moe_a2a_wrap_payload_tensor_in_workspace(
@@ -894,9 +908,20 @@ def moe_a2a_get_workspace_size_per_rank(
     )
 
 
+@deprecated(
+    "MoeAlltoAll is deprecated; use flashinfer.moe_ep.NVLinkOneSidedAlltoAll "
+    "(CakeAlltoAll for backend='cake'). Its implementation will "
+    "move into those classes."
+)
 class MoeAlltoAll:
     """
     Manages MoE All-to-All operations with proper workspace allocation and synchronization.
+
+    .. deprecated:: 0.7.1
+        Use :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`
+        (:class:`flashinfer.moe_ep.CakeAlltoAll` for
+        ``backend="cake"``). The implementation of this class will move into
+        them; they will no longer wrap it.
 
     This class provides the throughput-optimized backend that supports multiple payloads
     per collective operation, explicit dispatch/combine phases, and workspace-backed tensors.

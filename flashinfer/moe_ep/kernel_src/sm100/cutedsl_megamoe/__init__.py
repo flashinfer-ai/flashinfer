@@ -29,6 +29,9 @@ from __future__ import annotations
 # packages (moe_nvfp4_swapab, common, ...).  ``bootstrap_paths`` is re-exported
 # here so callers (e.g. core runtime) reach it through this public boundary.
 from .shim import (
+    free_sym_tensor,
+    resolve_gate_up_clamp,
+    sym_zeros,
     COMBINE_FORMAT_NAMES,
     CORRECTNESS_KNOBS,
     MegaMoEBf16Mxfp8Config,
@@ -94,12 +97,18 @@ from .shim import (
     with_knobs,
 )
 
+from .shim import kernel_helpers as _kernel_helpers
+from .shim.autotune import _session_candidates
+from .shim.comm import _CompiledMega, _compute_peer_offsets
+from .shim.nvfp4 import _resolve_per_expert_epilogue
+
 # Heavy kernel helpers (``mega_runner`` byte-stacking, ``mega_runner`` fp8/E8M0
 # tensor makers, and the MXFP8 torch reference) pull ``cutlass`` transitively.
 # Expose them lazily so ``import ...cutedsl_megamoe`` stays CPU-safe; the FI
 # backend + verification tests still reach them only through this boundary (the
 # access happens inside their functions).  See ``shim/kernel_helpers.py``.
 _LAZY_HELPERS = (
+    *_kernel_helpers.__all__,
     "CombineFormat",
     "_make_e8m0_scale_tensor",
     "_make_fp8_tensor",
@@ -122,6 +131,13 @@ def __getattr__(name):  # PEP 562
 create_dummy_inputs = create_dummy_nvfp4_inputs
 
 __all__ = [
+    "_CompiledMega",
+    "_compute_peer_offsets",
+    "_resolve_per_expert_epilogue",
+    "_session_candidates",
+    "free_sym_tensor",
+    "resolve_gate_up_clamp",
+    "sym_zeros",
     "COMBINE_FORMAT_NAMES",
     "CombineFormat",
     "MegaMoEBf16SymmBuffer",
@@ -194,3 +210,4 @@ __all__ = [
     "_make_fp8_tensor",
     "_stack_byte_reinterpretable_tensors",
 ]
+__all__ += [name for name in _kernel_helpers.__all__ if name not in __all__]

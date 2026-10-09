@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Behavioural coverage for the NVFP4 paged-KV MSA prefill route on compute
-capability 10.0/10.3.
+capability 10.0/10.3/10.7.
 
 The file has two halves, and they have deliberately different requirements.
 
@@ -125,9 +125,9 @@ def _require_supported_gpu() -> torch.device:
 
     device = torch.device("cuda")
     capability = get_compute_capability(device)
-    minimum_cuda = {(10, 0): "12.8", (10, 3): "12.9"}.get(capability)
+    minimum_cuda = {(10, 0): "12.8", (10, 3): "12.9", (10, 7): "13.4"}.get(capability)
     if minimum_cuda is None:
-        pytest.skip("requires compute capability 10.0 or 10.3")
+        pytest.skip("requires compute capability 10.0, 10.3 or 10.7")
     cuda_version = torch.version.cuda
     if cuda_version is None:
         pytest.skip("requires a CUDA-enabled PyTorch build")
@@ -1221,6 +1221,57 @@ def test_an_empty_union_produces_finite_zeros() -> None:
 
     assert torch.isfinite(served).all(), "an empty union produced a non-finite output"
     assert torch.count_nonzero(served) == 0, "an empty union produced a non-zero output"
+
+
+@pytest.mark.parametrize("q0", [180.0, 184.0, 186.0, 187.0, 188.0, 190.0, 192.0])
+@pytest.mark.parametrize("q1", [0.0, 2.0, -2.0])
+def test_a_replay_rebase_keeps_the_blocks_accumulated_before_it(
+    q0: float, q1: float
+) -> None:
+    """A rebase deep enough to underflow one FP32 factor must not erase earlier blocks.
+
+    One query selects two blocks with one large key each: key A in block 0
+    (logit ``6 * q0 * softmax_scale``) and key B in block 1 (A's logit plus
+    ``0.5 * q1 * softmax_scale``); V_A = e0 and V_B = e1, so output columns 0
+    and 1 are the softmax weights of A and B. Block 0 alone fits the fast
+    origin; adding block 1 pushes the sum past ``kMaxSafeSum`` and the replay
+    rebases to ``block_max + kRebaseMargin``. For q0 in ~[187, 188] the
+    rescale factor ``2^(old_origin - new_origin)`` is below 2^-126 although the
+    rescaled sum is a normal number, so a single flushed factor would zero
+    block 0's contribution and put all the weight on B.
+    """
+
+    device = _require_supported_gpu()
+    problem = _build_problem(
+        q_lens=[1], kv_lens=[2 * _PAGE_SIZE], device=device, seed=31
+    )
+    k, v = problem["k"], problem["v"]
+    k.zero_()
+    v.zero_()
+    problem["k_scale"].fill_(0x38)  # e4m3 1.0
+    problem["v_scale"].fill_(0x38)
+    page_a, page_b = problem["page_table"][0, :2].tolist()
+    # Element 0 is the low nibble of byte 0 and element 1 its high nibble.
+    # e2m1 codes: 1 -> 0.5, 2 -> 1.0, 7 -> 6.0.
+    k[page_a, :, 5, 0] = 7
+    v[page_a, :, 5, 0] = 2
+    k[page_b, :, 7, 0] = 7 | (1 << 4)
+    v[page_b, :, 7, 0] = 2 << 4
+
+    q = torch.zeros_like(problem["q"])
+    q[..., 0] = q0
+    q[..., 1] = q1
+    problem["q"] = q
+    indices = torch.full_like(problem["q2k_indices"], -1)
+    indices[..., 0] = 0
+    indices[..., 1] = 1
+    problem["q2k_indices"] = indices
+    problem["k_global_scale"] = 1.0
+    problem["v_global_scale"] = 1.0
+
+    actual = _serve(problem).float()
+    expected = _reference(problem).float()
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
 def test_repeated_calls_are_bit_identical_below_the_union_table_width() -> None:

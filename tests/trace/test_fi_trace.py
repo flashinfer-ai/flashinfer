@@ -319,6 +319,39 @@ def test_recurrent_kda_fi_trace():
     assert defn["axes"]["head_dim"]["value"] == head_dim
 
 
+def test_recurrent_kda_facades_trace_under_distinct_names():
+    """Two public APIs must not share one trace label.
+
+    The ``fi_api`` tag always told them apart, but the name did not, so a
+    trace inventory could not attribute a definition to a facade.
+    """
+    import flashinfer.kda
+    import flashinfer.kda_decode
+
+    batch_size, num_q_heads, num_v_heads, head_dim = 4, 8, 16, 128
+    q = torch.empty(batch_size, 1, num_q_heads, head_dim, dtype=torch.bfloat16)
+    v = torch.empty(batch_size, 1, num_v_heads, head_dim, dtype=torch.bfloat16)
+    call = dict(
+        q=q,
+        k=torch.empty_like(q),
+        v=v,
+        g=torch.empty_like(v),
+        beta=torch.empty(batch_size, 1, num_v_heads, dtype=torch.bfloat16),
+    )
+
+    canonical = flashinfer.kda.recurrent_kda.fi_trace(**call)
+    deprecated = flashinfer.kda_decode.recurrent_kda.fi_trace(**call)
+
+    assert canonical["name"] == "recurrent_kda_q8_v16_d128"
+    assert deprecated["name"] == "recurrent_kda_decode_q8_v16_d128"
+
+    # The canonical facade serves both phases; the decode facade serves one.
+    assert "stage:prefill" in canonical["tags"]
+    assert "stage:decode" in canonical["tags"]
+    assert "stage:prefill" not in deprecated["tags"]
+    assert "stage:decode" in deprecated["tags"]
+
+
 def test_ssd_combined_trace_dispatch_exposes_exact_finite_matrix():
     from flashinfer.trace.templates.mamba import ssd_combined_trace_dispatch
 
@@ -1524,3 +1557,42 @@ def test_nvfp4_append_trace_json_init_is_self_contained():
                 pytest.skip(f"{filename} init unsupported on CPU: {exc}")
             raise
         assert isinstance(result, dict)
+
+
+def test_gdn_replayssm_commit_fi_trace():
+    from flashinfer.gdn_decode import gated_delta_rule_replayssm_commit
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    args = gdn_replayssm_commit_trace.init(device="cpu")
+    defn = gated_delta_rule_replayssm_commit.fi_trace(**args)
+    _check_defn(defn, "gdn", "gated_delta_rule_replayssm_commit")
+    assert defn["axes"]["num_k_heads"]["value"] == 2
+    assert defn["inputs"]["accept_lens"]["dtype"] == "int32"
+    assert defn["outputs"]["checkpoint_state"]["dtype"] == "float32"
+
+
+def test_gdn_mtp_replayssm_fi_trace():
+    from flashinfer.gdn_decode import gated_delta_rule_mtp
+    from flashinfer.trace.templates.gdn import gdn_mtp_trace
+
+    args = gdn_mtp_trace.init(
+        batch_size=2,
+        pool_size=4,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=8,
+        device="cpu",
+    )
+    t = args["q"].shape[1]
+    args.update(
+        cache_replayssm=True,
+        disable_state_update=True,
+        replayssm_rawv=torch.empty(4, 8, t, 128, dtype=torch.bfloat16),
+        replayssm_rawk=torch.empty(4, 2, t, 128, dtype=torch.bfloat16),
+        replayssm_g=torch.empty(4, 8, t),
+        replayssm_beta=torch.empty(4, 8, t),
+    )
+    defn = gated_delta_rule_mtp.fi_trace(**args)
+    _check_defn(defn, "gdn", "gated_delta_rule_mtp")
+    for name in ("replayssm_rawv", "replayssm_rawk", "replayssm_g", "replayssm_beta"):
+        assert defn["outputs"][name]["shape"] == defn["inputs"][name]["shape"]

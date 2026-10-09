@@ -1,4 +1,5 @@
 import gc
+import json
 import random
 import tracemalloc
 import weakref
@@ -19,8 +20,13 @@ from flashinfer.fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
 )
+from flashinfer.mla._batch_mla._backends.cute_dsl_modular_backend import (
+    _BatchMLAPagedAttentionCuteDslModularBackend,
+)
+from flashinfer.mla._batch_mla._backends.cute_dsl_monolithic_backend import (
+    _BatchMLAPagedAttentionCuteDslMonolithicBackend,
+)
 from flashinfer.mla._core import (
-    CuteDslMlaDecodeRunner,
     _build_mla_decode_tuning_config,
     _mla_decode_tuning_config,
 )
@@ -693,6 +699,145 @@ def test_rank_tactics_returns_top_k_and_caches_winner(monkeypatch):
     assert tactic == 1
 
 
+def test_rank_tactics_reranks_when_profiling_policy_changes(monkeypatch):
+    """A shortlist measured under one replay/L2 policy must not be served for
+    another; the cache key alone does not distinguish them."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    hot = TuningConfig()
+    cold = TuningConfig(use_cold_l2_cache=True)
+    profile_calls = []
+    times = {"hot": {0: 5.0, 1: 1.0, 2: 3.0}, "cold": {0: 1.0, 1: 5.0, 2: 3.0}}
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return times["cold" if tuning_config.use_cold_l2_cache else "hot"][tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        assert tuner.rank_tactics("dummy_rank", [runner], hot, inputs, k=2) == [1, 2]
+        assert tuner.rank_tactics("dummy_rank", [runner], cold, inputs, k=2) == [0, 2]
+        # Same policy again is served from the shortlist cache.
+        assert tuner.rank_tactics("dummy_rank", [runner], cold, inputs, k=3) == [
+            0,
+            2,
+            1,
+        ]
+
+    assert profile_calls == [0, 1, 2, 0, 1, 2]
+
+
+def test_rank_tactics_records_winner_policy(monkeypatch):
+    """A ranked winner must carry the policy it was measured under, so
+    save_configs cannot persist a stale policy from an earlier choose_one."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    hot = TuningConfig()
+    cold = TuningConfig(use_cold_l2_cache=True)
+
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw: float(
+            tactic
+        ),
+    )
+    with autotune(tune_mode=True):
+        tuner.rank_tactics("dummy_rank", [runner], cold, inputs, k=2)
+    (key,) = tuner.profiling_cache
+    assert tuner._profiling_cache_policies[(None, key)] == tuner._profiling_policy(cold)
+
+    # Re-rank the same key under hot L2: the stale cold label must be replaced.
+    # The policy change alone invalidates the cold shortlist.
+    with autotune(tune_mode=True):
+        tuner.rank_tactics("dummy_rank", [runner], hot, inputs, k=2)
+    assert tuner._profiling_cache_policies[(None, key)] == tuner._profiling_policy(hot)
+
+
+@pytest.mark.parametrize("tune_with", ["choose_one", "rank_tactics"])
+def test_tuned_cold_policy_survives_save_and_load(monkeypatch, tmp_path, tune_with):
+    """A winner tuned under cold L2 is saved with that policy and reused by a
+    fresh process tuning under the same policy, whichever API tuned it."""
+    import flashinfer.autotuner.autotuner as autotuner_module
+
+    monkeypatch.setattr(
+        autotuner_module, "_collect_metadata", lambda: {"gpu": "test-gpu"}
+    )
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    cold = TuningConfig(use_cold_l2_cache=True)
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        if tune_with == "choose_one":
+            assert tuner.choose_one("dummy_save", [runner], cold, inputs)[1] == 1
+        else:
+            assert tuner.rank_tactics("dummy_save", [runner], cold, inputs, k=2) == [
+                1,
+                2,
+            ]
+        # Same process, same policy: served from memory without profiling.
+        profile_calls.clear()
+        assert tuner.choose_one("dummy_save", [runner], cold, inputs)[1] == 1
+        assert profile_calls == []
+
+    path = str(tmp_path / "cold.json")
+    tuner.save_configs(path)
+    saved = json.loads((tmp_path / "cold.json").read_text())
+    (record,) = [v for k, v in saved.items() if not k.startswith("_")]
+    assert tuple(record[2]) == tuner._profiling_policy(cold)
+
+    fresh = reset_autotuner()
+    assert fresh.load_configs(path)
+    fresh.is_tuning_mode = True
+    shapes = ((16, 32),)
+    assert fresh.search_cache("dummy_save", [runner], shapes, cold, inputs)[:3] == (
+        True,
+        0,
+        1,
+    )
+    assert not fresh.search_cache(
+        "dummy_save", [runner], shapes, TuningConfig(), inputs
+    )[0]
+
+
+def test_cold_rank_tactics_winner_does_not_satisfy_hot_choose_one(monkeypatch):
+    """A cold-L2 rank_tactics winner must not be reused by a hot choose_one in
+    the same tuning session: it re-profiles and picks the hot winner."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    hot = TuningConfig()
+    cold = TuningConfig(use_cold_l2_cache=True)
+    times = {"hot": {0: 5.0, 1: 1.0, 2: 3.0}, "cold": {0: 1.0, 1: 5.0, 2: 3.0}}
+    profile_calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return times["cold" if tuning_config.use_cold_l2_cache else "hot"][tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        assert tuner.rank_tactics("dummy_ranked", [runner], cold, inputs, k=2) == [0, 2]
+        num_calls = len(profile_calls)
+        assert tuner.choose_one("dummy_ranked", [runner], hot, inputs)[1] == 1
+    assert len(profile_calls) > num_calls
+
+
 def test_rank_tactics_rebuilds_shortlist_from_winner_only_cache(monkeypatch):
     tuner = reset_autotuner()
     runner = DummyRunner(valid_tactics=(0, 1, 2))
@@ -1172,7 +1317,9 @@ def test_tuning_config_profiling_repeat_override(monkeypatch):
 
     assert tuner._get_profiling_repeat(default_config) == 10
     assert tuner._get_profiling_repeat(override_config) == 3
-    assert len(tuner._prepare_input_tensors_with_batches(inputs, override_config)) == 4
+    batches = tuner._prepare_input_tensors_with_batches(inputs, override_config)
+    assert len(batches) == 1
+    assert batches[0] is inputs
 
     default_key = tuner._get_cache_key("op", DummyRunner(), ((1,),), default_config)
     override_key = tuner._get_cache_key("op", DummyRunner(), ((1,),), override_config)
@@ -1375,6 +1522,75 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
 
     assert latency >= 0
     assert allocations == [(8192, inputs[0].device)]
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_cold_l2_batches_preserve_strides_alignment_and_aliases(
+    monkeypatch, use_cuda_graph
+):
+    tuner = reset_autotuner()
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 4096
+    )
+    storage = torch.arange(4 * 40, dtype=torch.float32).reshape(4, 40)
+    packed = storage[:, 1:33]
+    left, right = packed.split(16, dim=-1)
+    inputs = [packed, left, right, (left, right), None]
+
+    batches = tuner._prepare_input_tensors_with_batches(
+        inputs,
+        TuningConfig(use_cold_l2_cache=True, use_cuda_graph=use_cuda_graph),
+    )
+
+    for batch in batches:
+        for actual, expected in zip(batch[:3], inputs[:3], strict=True):
+            assert actual.stride() == expected.stride()
+            assert actual.data_ptr() % 16 == expected.data_ptr() % 16
+            torch.testing.assert_close(actual, expected)
+        assert batch[1].data_ptr() == batch[0].data_ptr()
+        assert batch[2].data_ptr() == batch[0].data_ptr() + 16 * packed.element_size()
+        assert batch[3][0] is batch[1]
+        assert batch[3][1] is batch[2]
+        assert batch[4] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_cold_l2_choose_one_profiles_original_layout(monkeypatch, use_cuda_graph):
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "repeat", 2)
+    monkeypatch.setattr(tuner, "warmup", 1)
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 4096
+    )
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
+    )
+    storage = torch.arange(4 * 40, dtype=torch.float32, device="cuda").reshape(4, 40)
+    packed = storage[:, 1:33]
+    out = torch.empty_strided(packed.shape, packed.stride(), device="cuda")
+    observed = []
+
+    class LayoutRunner(DummyRunner):
+        def forward(
+            self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
+        ):
+            observed.append((inputs[0].stride(), inputs[0].data_ptr() % 16))
+            torch.add(inputs[0], 1, out=inputs[1])
+            return inputs[1]
+
+    runner = LayoutRunner(valid_tactics=(0,))
+    config = TuningConfig(use_cold_l2_cache=True, use_cuda_graph=use_cuda_graph)
+    with autotune(tune_mode=True):
+        selected, tactic = tuner.choose_one(
+            "cold_l2_layout", [runner], config, [packed, out]
+        )
+
+    assert selected is runner
+    assert tactic == 0
+    assert observed
+    assert set(observed) == {(packed.stride(), packed.data_ptr() % 16)}
+    torch.testing.assert_close(out, packed + 1)
 
 
 def test_autotune_context_rejects_invalid_cuda_graph_profile_replays():
@@ -1842,7 +2058,7 @@ def test_prepare_input_tensors_none_input_preserved():
 def test_prepare_input_tensors_with_batches_preserves_non_tensor(
     monkeypatch, non_tensor
 ):
-    """Cold-L2 batches clone tensors while preserving scalar and optional inputs."""
+    """Explicit cache flushing preserves tensor, scalar, and optional inputs."""
     tuner = reset_autotuner()
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 4)
     inputs = [torch.ones(1), non_tensor]
@@ -1852,11 +2068,9 @@ def test_prepare_input_tensors_with_batches_preserves_non_tensor(
     )
 
     assert batches[0] is inputs
-    assert len(batches) > 1
-    for batch in batches[1:]:
-        assert batch[0] is not inputs[0]
-        torch.testing.assert_close(batch[0], inputs[0])
-        assert batch[1] is non_tensor
+    assert len(batches) == 1
+    assert batches[0][0] is inputs[0]
+    assert batches[0][1] is non_tensor
 
 
 def test_choose_one_with_none_input_no_crash():
@@ -2582,10 +2796,11 @@ def test_find_nearest_profile_cache_dedups_mla_decode_config():
         _mla_decode_tuning_config.cache_clear()
 
 
-def _cute_dsl_runner_cache_extras(max_seq_len: int, workspace_bytes: int):
-    runner = object.__new__(CuteDslMlaDecodeRunner)
+def _cute_dsl_runner_cache_extras(backend_type, max_seq_len: int, workspace_bytes: int):
+    runner = object.__new__(backend_type)
+    runner._is_planned = False
     runner.kv_cache = torch.empty((1, 32, 576), dtype=torch.bfloat16)
-    runner.workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8)
+    runner._float_workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8)
     runner.qk_nope_head_dim = 512
     runner.kv_lora_rank = 512
     runner.qk_rope_head_dim = 64
@@ -2596,18 +2811,28 @@ def _cute_dsl_runner_cache_extras(max_seq_len: int, workspace_bytes: int):
     runner.enable_pdl = False
     runner.sinks = None
     runner.cute_dsl_impl = "auto"
-    runner._resolved_cute_dsl_impl = "monolithic"
+    runner.enable_dcp = False
+    runner.cp_world = 1
 
     query = torch.empty((1, 1, 128, 576), dtype=torch.bfloat16)
     out = torch.empty((1, 1, 128, 512), dtype=torch.bfloat16)
     return runner.get_cache_key_extras([query, None, None, out])
 
 
-def test_cute_dsl_runner_cache_tracks_split_workspace_geometry():
+@pytest.mark.parametrize(
+    "backend_type,other_seq_len",
+    [
+        (_BatchMLAPagedAttentionCuteDslMonolithicBackend, 385),
+        (_BatchMLAPagedAttentionCuteDslModularBackend, 513),
+    ],
+)
+def test_cute_dsl_runner_cache_tracks_split_workspace_geometry(
+    backend_type, other_seq_len
+):
     """Cache hits must not bypass sequence- or capacity-dependent validity."""
-    key_257 = _cute_dsl_runner_cache_extras(257, 1_000_000)
-    key_385 = _cute_dsl_runner_cache_extras(385, 1_000_000)
-    assert key_257 != key_385
+    key_257 = _cute_dsl_runner_cache_extras(backend_type, 257, 1_000_000)
+    key_other = _cute_dsl_runner_cache_extras(backend_type, other_seq_len, 1_000_000)
+    assert key_257 != key_other
 
-    key_small_workspace = _cute_dsl_runner_cache_extras(257, 800_000)
+    key_small_workspace = _cute_dsl_runner_cache_extras(backend_type, 257, 800_000)
     assert key_257 != key_small_workspace
