@@ -2821,9 +2821,8 @@ def _checked_cudnn_grouped_gemm_weights(
     alignment: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Validate canonical BF16 expert weights (``w1 [E, 2*I | I, H]`` in
-    ``[up, gate]`` order, ``w2 [E, H, I]``) and return them on ``device``,
-    gated fc1 rows reordered to ``[gate, up]``. ``w2`` aliases the input when it
-    is already contiguous there.
+    ``[up, gate]`` order, ``w2 [E, H, I]``) and return them on ``device``; each
+    aliases its input when it is already contiguous there.
     """
     if w1_bf16.ndim != 3 or w2_bf16.ndim != 3:
         raise ValueError(
@@ -2841,13 +2840,6 @@ def _checked_cudnn_grouped_gemm_weights(
         alignment=alignment if alignment > 1 else None,
         device=device,
     )
-    if _normalize_activation(activation).is_gated:
-        # [up, gate] -> [gate, up] as two strided copies; a torch.cat of the
-        # halves runs several times slower.
-        reordered = torch.empty(w1.shape, dtype=w1.dtype, device=device)
-        reordered[:, :intermediate_size].copy_(w1[:, intermediate_size:])
-        reordered[:, intermediate_size:].copy_(w1[:, :intermediate_size])
-        w1 = reordered
     return w1, w2
 
 
@@ -2864,11 +2856,11 @@ def prepare_cudnn_grouped_gemm_bf16_weights(
     """Build the weight view consumed by ``CudnnGroupedGemmBf16Runner``.
 
     Returns ``{"fc1_expert_weights", "fc2_expert_weights"}``: the two
-    ``grouped_mm_bf16`` operands, contiguous BF16 on ``device``
-    (``fc2_expert_weights`` aliases ``w2_bf16`` when it already is). GEMM1 computes
+    ``grouped_mm_bf16`` operands, contiguous BF16 on ``device`` (each aliases its
+    input when it already is). GEMM1 computes
     ``permuted_tokens @ fc1_expert_weights[e].T`` and GEMM2 computes
-    ``intermediate @ fc2_expert_weights[e].T``.
-    For gated activations the ``fc1_expert_weights`` rows are in ``[gate, up]`` order.
+    ``intermediate @ fc2_expert_weights[e].T``. Gated ``fc1_expert_weights`` rows
+    keep the canonical ``[up, gate]`` order.
     """
     w1, w2 = _checked_cudnn_grouped_gemm_weights(
         w1_bf16,
@@ -2902,8 +2894,8 @@ def prepare_cudnn_grouped_gemm_fp8_per_tensor_weights(
     ``fc1_dequant_scale = fc1_dequant / hidden_states_scale_global``,
     ``fc2_act_quant_scale = intermediate_scale_global`` and
     ``fc2_dequant_scale = fc2_dequant / intermediate_scale_global``. The
-    unfolded values stay in the view as calibration metadata.
-    For gated activations the ``fc1_expert_weights`` rows are in ``[gate, up]`` order.
+    unfolded values stay in the view as calibration metadata. Gated
+    ``fc1_expert_weights`` rows keep the canonical ``[up, gate]`` order.
     """
     w1, w2 = _checked_cudnn_grouped_gemm_weights(
         w1_bf16,
@@ -3016,8 +3008,8 @@ def prepare_cudnn_grouped_gemm_mxfp8_weights(
     / ``fc2_expert_weights`` (E4M3, same shapes as the BF16 view) and
     ``fc1_weight_scale`` / ``fc2_weight_scale`` (``uint8 [E_local, n, k // 32]``
     swizzled 128x4 block scales). ``hidden_size`` and ``intermediate_size``
-    must be multiples of 128.
-    For gated activations the ``fc1_expert_weights`` rows are in ``[gate, up]`` order.
+    must be multiples of 128. Gated ``fc1_expert_weights`` rows keep the
+    canonical ``[up, gate]`` order.
     """
     w1, w2 = _checked_cudnn_grouped_gemm_weights(
         w1_bf16,
@@ -3163,8 +3155,8 @@ def prepare_cudnn_grouped_gemm_nvfp4_weights(
     (``float8_e4m3fn [E_local, n, k // 16]`` swizzled 128x4 block scales) and
     ``fc1_dequant`` / ``fc2_dequant`` (``float32 [E_local]``, the inverse global
     scale the runner applies per output row). ``hidden_size`` and
-    ``intermediate_size`` must be multiples of 128.
-    For gated activations the ``fc1_expert_weights`` rows are in ``[gate, up]`` order.
+    ``intermediate_size`` must be multiples of 128. Gated ``fc1_expert_weights``
+    rows keep the canonical ``[up, gate]`` order.
     """
     w1, w2 = _checked_cudnn_grouped_gemm_weights(
         w1_bf16,

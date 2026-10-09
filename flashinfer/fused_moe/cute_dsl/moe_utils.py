@@ -24,6 +24,7 @@ import torch
 
 from ...jit.moe_utils import gen_moe_utils_module
 from ...tllm_enums import ActivationType, is_gated_activation, normalize_activation_type
+from ...utils import get_compute_capability
 
 
 def _get_cuda_stream_ptr() -> int:
@@ -725,11 +726,15 @@ def moe_sort(
     else:
         num_non_exiting_tiles = torch.empty((1,), dtype=torch.int32, device=device)
 
-    # Allocate expert counts buffer for large token counts (>1024).
+    # Expert counts buffer, required by the cooperative and multi-kernel routing
+    # paths. The block, dynamic-block and (SM90+ only) single-cluster kernels
+    # route small batches without it; 1024 tokens on SM90+ and 4 tokens before
+    # SM90 are conservative bounds of those kernels' limits.
     # Required size: 2 * num_experts. The kernel zeros this internally via
     # launchInitExpertCounts before reading, so no Python-side init is needed
     # (matching trt-llm's torch::empty allocation pattern).
-    if num_tokens > 1024:
+    expert_counts_min_tokens = 1024 if get_compute_capability(device)[0] >= 9 else 4
+    if num_tokens > expert_counts_min_tokens:
         expert_counts = torch.empty(
             (2 * num_experts,), dtype=torch.int32, device=device
         )
@@ -798,6 +803,8 @@ def moe_activation(
 
     This is a generic activation function that supports multiple activation types.
     For convenience, use the specific wrappers like moe_swiglu(), moe_gelu(), etc.
+    Only rows below their tile's ``tile_idx_to_mn_limit``, in the first
+    ``num_non_exiting_tiles`` tiles, are written.
 
     Args:
         input: Input tensor. For GLU activations (Swiglu, Geglu), shape is
@@ -833,6 +840,7 @@ def moe_activation(
         interm_size,
         tile_size,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 
