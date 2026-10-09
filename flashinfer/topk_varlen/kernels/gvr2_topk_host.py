@@ -1091,9 +1091,11 @@ def _prefill_reg_route(rows: int, k: int, n_hint: int) -> dict | None:
     ``n_hint + 3`` (lead lanes) fits its capacity, or None for the slab.
 
     Per-part table from the causal-staircase sweep (rows 2K-32K, K in {512,
-    2048}, window bounds filling each class; logs prefill_reg_sweep, same node
-    vs sglang topk_v2, 3 interleaved reps, min; B200 and B300 agree within
-    3%, Rubin differs):
+    1024, 2048}, window bounds filling each class; logs prefill_reg_sweep, same
+    node vs sglang topk_v2, 3 interleaved reps, min; B200 and B300 agree within
+    3%, Rubin differs; K=1024 was re-measured after the table was built and
+    confirmed every pick -- its only off-cell is Rubin's L <= 2048 class at 16K
+    rows, 5% behind the slab, inside the noise band, so the 16K gate stands):
       * L <= 2048: B200/B300 VPT=1/MINB=4, 1.6-2.0x the slab at every row
         count (K = 2048 never reaches this class: a <= 2048 window is an
         identity row, ``n_hint <= k`` above). Rubin: VPT=1/MINB=4 only
