@@ -112,17 +112,10 @@ not picked them up):
 
 ## MXFP4 local overlay
 
-The fused Humming MXFP4-weight/FP8-activation backend is layered on the FP8
-implementation merged by #4688. `VENDOR_PROVENANCE.md` records the upstream
-FP8 revisions and local MXFP4 changes. Preserve the FP8 extensions above when
-updating it.
-
-MXFP4 adds packed weights, safe tiny-value quantization, guarded communication
-optimizations, and dedicated tuning/cache identities. FP8 and MXFP4 share the
-communication capability checks, with FP8's new optimizations disabled by
-default. Ordinary library CUDA Graph replay is supported; the shared benchmark
-uses direct CUDA-event launches.
-See `TUNING.md` for the supported domains and current commands.
+Preserve the local MXFP4 changes and the FP8 extensions above when updating
+this tree. [VENDOR_PROVENANCE.md](VENDOR_PROVENANCE.md) records source
+revisions and update guidance; [TUNING.md](TUNING.md) describes the supported
+configurations and reproduction commands.
 
 ## Layout
 

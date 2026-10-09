@@ -189,10 +189,8 @@ _FUSED_FIELDS = frozenset(
     }
 )
 
-# Opaque inputs to the existing persistent cache key. Keep these values so
-# this source-only cleanup can replay already measured winners. Historical
-# reports are not loaded or validated; executable candidates and the current
-# optimization policy are hashed separately below.
+# Stable namespace for persistent tuning entries. The executable candidates
+# and current eligibility policy are hashed separately below.
 _CACHE_PROVENANCE = {
     "block_permutation_v1": {
         "artifact_manifest_sha256": "852cbb019a17a9e76991b4f82b5ae64fb3df3245f6e72ec43a20bb407cbbd477",

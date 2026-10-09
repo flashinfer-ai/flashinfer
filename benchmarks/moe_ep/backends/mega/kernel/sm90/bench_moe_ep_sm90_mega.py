@@ -23,7 +23,7 @@ Default tiles per layout (== the shim's per-layout defaults):
   * non_swap_ab: M64 N128  -> compare against ``..._nonswapab_TileM64_TileN128.csv``
   * swap_ab:     M256 N32  -> compare against ``..._swapab_TileM256_TileN32.csv``
 
-Two warm CUDA-event timed series are recorded per point:
+Two timed series per point, CUDA events per rank around each call:
   * ``e2e``     — ``MoEEpLayer.forward`` (validation + bf16->fp8 staging +
     kernel + output copy).  This is the FI production path; it has NO drop
     counterpart column (the drop times the bare kernel launch).
@@ -37,18 +37,15 @@ Two warm CUDA-event timed series are recorded per point:
   ``last_timings_ms`` are split-layer only — so the compute series drives the
   documented ``MegaKernelBackend`` API directly; no private internals.)
 
-Launch with the active environment's Python (one process per GPU,
-4-rank EP; srun-safe and non-interactive):
+Launch (one process per GPU, 4-rank EP; srun+torchrun safe, no interactivity):
 
-    python -m torch.distributed.run --standalone --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py
+    torchrun --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py
 
-The Humming MXFP4 path is selected explicitly and by default uses a
-fully-specified MXFP4-only tactic (no FP8 heuristic/cache fallback).
-``--mxfp4-tactic-source cache_or_heuristic`` instead passes ``knobs=None``
-through the production fused backend. FP8 and MXFP4 use direct launches for
-both timed series; CUDA-event samples retain the historical timing boundaries.
+Select the Humming MXFP4 backend with ``--backend``. Its default tactic uses
+explicit settings; ``--mxfp4-tactic-source cache_or_heuristic`` selects a
+cached tactic or the MXFP4 heuristic.
 
-    python -m torch.distributed.run --standalone --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py --backend sm90_fp8_mxfp4_bf16_pull_cutedsl --tokens 64
+    torchrun --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py --backend sm90_fp8_mxfp4_bf16_pull_cutedsl --tokens 64
 
 For MXFP4, this benchmark constructs deterministic canonical packed E2M1
 payloads plus raw K32 E8M0 scale bytes in PrequantizedMoEWeights and runs the
@@ -105,10 +102,7 @@ ROUTING_SEED = 1234
 ACTIVATION_AND_TOPK_WEIGHT_SEED_BASE = 42
 FP8_WEIGHT_SEED_BASE = 13
 
-# Phase-A known-correct baseline. These fields are passed explicitly to the
-# MXFP4 config, which bypasses both the generic FP8 heuristic and every knob
-# cache. A CLI tile/token-back override remains fixed for that run and is
-# printed verbatim in each result row.
+# Explicit MXFP4 defaults; CLI overrides apply to the whole run.
 MXFP4_DEFAULT_TILE = (128, 32)
 MXFP4_TILE_K = 128
 MXFP4_CLUSTER = (1, 1, 1)
@@ -260,7 +254,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar="JSON_OBJECT",
         help="ordinary-FP8-only explicit tuner tactic. Accepts the dicts "
         "returned by hopper_fp8_candidates(); tuple knobs use JSON arrays. "
-        "This bypasses cache/heuristic lookup and conflicts with legacy "
+        "This bypasses cache/heuristic lookup and conflicts with manual "
         "layout, --mma-tiler, and --token-back flags.",
     )
     p.add_argument(
@@ -286,10 +280,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--mxfp4-tactic-source",
         choices=["explicit", "cache_or_heuristic"],
         default="explicit",
-        help="MXFP4 tactic selector. Default 'explicit' preserves the legacy "
-        "CLI-controlled fused tactic. 'cache_or_heuristic' passes "
-        "knobs=None with no manual geometry so the dedicated persistent "
-        "fused cache is consulted before the manifest heuristic.",
+        help="MXFP4 tactic selection: 'explicit' uses the CLI settings (default); "
+        "'cache_or_heuristic' uses the MXFP4 cache, then its heuristic.",
     )
     p.add_argument(
         "--cga",

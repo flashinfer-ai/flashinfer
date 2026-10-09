@@ -312,7 +312,7 @@ The distributed target also accepts 2 or 8 ranks. See the
 The perf microbenchmark reproduces the kernel drop's Hopper P03 multirank
 token sweep (`moe_hopper_fp8/run_token_sweep_benchmark.py`, DSV4 geometry:
 topk 6, 384 experts EP4, hidden 7168, intermediate 3072 post-SwiGLU, tokens
-per rank 8..32768) through the FI `MoEEpLayer` mega path, on four Hopper GPUs:
+per rank 512..32768) through the FI `MoEEpLayer` mega path, on 4×H100:
 
 ```bash
 torchrun --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py
@@ -324,9 +324,8 @@ each row names the matching drop reference CSV
 away. The `compute_*_us` columns map to the drop's per-rank
 `mega_us + topk_us`; `e2e_*_us` adds FI staging/validation/output-copy.
 Axes: `--scale-mode {per_tensor,blockwise,both}`, `--swap-ab`/`--no-swap-ab`
-(default: the token-bucket heuristic; `--both-orders` tests both layouts),
-`--mma-tiler M,N`, `--tokens`, `--kind`. Fixed-layout default tiles are
-non-swap M64 N128 and swap-AB M256 N32. See the module docstring
+(default both layouts at the shim default tiles: non-swap M64 N128, swap-AB
+M256 N32), `--mma-tiler M,N`, `--tokens`, `--kind`. See the module docstring
 for the full timing/mapping notes. Measured results, comparison caveats,
 and the reproduce recipe live in
 [`kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md).

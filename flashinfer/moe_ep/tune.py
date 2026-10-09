@@ -167,10 +167,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="live token count to stage and time (default: the bucket size). "
-        "Existing dtype tuners may use a decode-like count while keeping a "
-        "larger buffer bucket. For sm90_mxfp4, an explicit value must equal "
-        "every --max-tokens bucket because live tokens are not a persistent "
-        "cache-key axis.",
+        "Use a decode-like count (e.g. 256) to tune for decode steps while "
+        "keeping the engine's buffer bucket; the cache entry is still keyed "
+        "on --max-tokens, so write decode-tuned winners to a separate cache "
+        "file (FLASHINFER_MOE_EP_KNOB_CACHE). For sm90_mxfp4, an explicit "
+        "value must equal every --max-tokens bucket.",
     )
     parser.add_argument(
         "--skew",
@@ -215,7 +216,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def _argument_error(args: argparse.Namespace) -> Optional[str]:
-    """Return a fail-closed CLI error without changing existing FP8 defaults."""
+    """Return an error for unsupported dtype-specific tuning options."""
     is_mxfp4 = args.dtype == "sm90_mxfp4"
 
     if not is_mxfp4:
@@ -235,8 +236,8 @@ def _argument_error(args: argparse.Namespace) -> Optional[str]:
         return str(exc)
     if args.seed != 0:
         return (
-            "--dtype sm90_mxfp4 requires --seed 0 so weights, activations, "
-            "routing IDs, and manifest-derived tactics keep their certified identity"
+            "--dtype sm90_mxfp4 requires --seed 0 to match the tuning "
+            "workload used by the cache"
         )
     if args.live_tokens is not None and any(
         args.live_tokens != max_tokens for max_tokens in args.max_tokens
@@ -249,7 +250,7 @@ def _argument_error(args: argparse.Namespace) -> Optional[str]:
     if args.allow_nondeterministic:
         return (
             "--allow-nondeterministic is not applicable to sm90_mxfp4; "
-            "the manifest candidate union fixes in-kernel reduce off"
+            "MXFP4 candidates disable in-kernel FC2 reduction"
         )
     if args.sweep != "default" or args.base_knobs is not None:
         return (

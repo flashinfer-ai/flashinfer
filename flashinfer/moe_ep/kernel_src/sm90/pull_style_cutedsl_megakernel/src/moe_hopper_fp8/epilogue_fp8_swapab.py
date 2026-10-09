@@ -115,7 +115,7 @@ def _resolve_mxfp4_reuse_fc1_accum_scratch(
     *,
     configured: int = SwapABMxfp4ReuseFc1AccumScratch,
 ) -> bool:
-    """Keep the experimental scratch alias isolated from every FP8 path."""
+    """Restrict FC1 accumulator scratch reuse to MXFP4."""
     return fp8_scale_mode == "mxfp4_hybrid" and configured == 1
 
 

@@ -82,10 +82,9 @@ _MXFP4_COMPILE_IDENTITY = (
     "fused_local_v1",
 )
 
-# The generic knob-cache schema has a single string ``dtype`` axis. Encode
-# every fixed Humming/layout semantic in that axis so a future MXFP4 layout
-# cannot consume a winner recorded for this Phase-A ABI. Tactic geometry
-# remains in the cached knob value and problem geometry in the normal key.
+# Encode the Humming weight/activation layout in the cache dtype so
+# incompatible layouts cannot share winners. Tactic geometry remains in
+# the cached value and problem geometry in the key.
 _MXFP4_TUNING_DTYPE_ID = (
     "sm90_w_mxfp4_e2m1_k32_a_fp8_e4m3_per_token_full_hidden_"
     "humming_v1_fold_m64_k128_gateup8_packedk2_residual64_"

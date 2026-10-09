@@ -779,8 +779,9 @@ def allow_mock_tuning_device(monkeypatch):
         )
 
 
-def test_full_union_records_effective_winner_and_cache_identity(
-    monkeypatch, allow_mock_tuning_device
+@pytest.mark.parametrize("selection", ["default", "full", "subset", "reordered"])
+def test_records_effective_winner_and_cache_identity(
+    monkeypatch, allow_mock_tuning_device, tmp_path, selection
 ):
     cfg = SimpleNamespace(
         rank=0,
@@ -834,7 +835,9 @@ def test_full_union_records_effective_winner_and_cache_identity(
     )
     output = SimpleNamespace(shape=(37, 7168), dtype=torch.bfloat16)
     ep_group = object()
-    record = mock.Mock(return_value="/tmp/cache.json")
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "cache.json"))
+    _mock_cuda_device(monkeypatch, name="NVIDIA H200", capability=(9, 0), sm_count=132)
+    record = mock.Mock(wraps=knob_cache.record_knobs)
     final_inputs = object()
     monkeypatch.setattr(knob_cache, "record_knobs", record)
     monkeypatch.setattr(
@@ -853,6 +856,11 @@ def test_full_union_records_effective_winner_and_cache_identity(
         return candidate
 
     candidates_expected = candidates
+    if selection == "subset":
+        candidates_expected = [candidate]
+    elif selection == "reordered":
+        candidates_expected = list(reversed(candidates))
+    supplied = None if selection == "default" else candidates_expected
     monkeypatch.setattr(autotune_module, "autotune_knobs", fake_autotune)
     winner = autotune_module.autotune_hopper_mxfp4_mega_moe(
         output,
@@ -862,7 +870,7 @@ def test_full_union_records_effective_winner_and_cache_identity(
         num_tokens=37,
         gate_up_clamp=10.0,
         process_group=ep_group,
-        candidates=candidates,
+        candidates=supplied,
     )
 
     assert winner == candidate
@@ -888,10 +896,13 @@ def test_full_union_records_effective_winner_and_cache_identity(
             routing_profile=cfg.routing_profile,
         )
     )
-    assert mxfp4_optimization_candidate_sha256(candidates) in kwargs["source"]
+    assert mxfp4_optimization_candidate_sha256(candidates_expected) in kwargs["source"]
+    assert record.call_count == 1
+    lookup_kwargs = {k: v for k, v in kwargs.items() if k not in {"p50_us", "source"}}
+    assert knob_cache.lookup_knobs(**lookup_kwargs) == effective
 
 
-def test_fused_supplied_candidates_must_be_complete_strategy_union_subset(
+def test_fused_supplied_candidates_must_be_supported_and_unique(
     monkeypatch, allow_mock_tuning_device
 ):
     cfg = SimpleNamespace(
@@ -922,6 +933,7 @@ def test_fused_supplied_candidates_must_be_complete_strategy_union_subset(
 
     def fake_autotune(frontend, launch, candidates, **kwargs):
         captured["candidates"] = candidates
+        frontend.effective_tactic = mock.Mock(return_value=candidates[0])
         kwargs["on_winner"](candidates[0], 0.0005)
         return candidates[0]
 
@@ -932,7 +944,8 @@ def test_fused_supplied_candidates_must_be_complete_strategy_union_subset(
     assert captured["candidates"] == [
         normalize_mxfp4_optimization_tactic(c) for c in subset
     ]
-    record.assert_not_called()
+    record.assert_called_once()
+    record.reset_mock()
 
     h20_anchor = next(
         candidate
@@ -945,7 +958,8 @@ def test_fused_supplied_candidates_must_be_complete_strategy_union_subset(
         object(), object(), object(), buffer, candidates=[h20_anchor]
     ) == normalize_mxfp4_optimization_tactic(h20_anchor)
     assert captured["candidates"] == [normalize_mxfp4_optimization_tactic(h20_anchor)]
-    record.assert_not_called()
+    record.assert_called_once()
+    record.reset_mock()
 
     full = hopper_mxfp4_candidates(
         cfg.num_tokens_per_rank,
@@ -962,7 +976,8 @@ def test_fused_supplied_candidates_must_be_complete_strategy_union_subset(
         )
         == tail
     )
-    record.assert_not_called()
+    record.assert_called_once()
+    record.reset_mock()
     # Admitting a neighbor's geometry does not admit its unlisted strategies.
     with pytest.raises(ValueError, match="model/layout/protocol candidate union"):
         autotune_module.autotune_hopper_mxfp4_mega_moe(

@@ -160,8 +160,6 @@ class SymBufferDeviceBase:
         )
 
 
-
-
 @dataclass(frozen=True)
 class SymBufferHost:
     """Runtime launch payload for a device-side ``SymBuffer{N}``.

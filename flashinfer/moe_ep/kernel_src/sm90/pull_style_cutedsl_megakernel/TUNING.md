@@ -755,9 +755,9 @@ by its median and takes the maximum across ranks. `knobs=None` consults the
 cache, then the routing/token-bucket heuristic, without timing. An explicit
 complete tactic bypasses both.
 
-Only the complete canonical ordered list may populate its production cache
-identity. A subset or reordered experiment can use its measured winner but
-cannot publish that winner as a full-list result. MXFP4 cache matching binds
+The winner is cached for the candidates measured, including a supplied subset
+or a reordered list. For smoke tests, set `FLASHINFER_MOE_EP_KNOB_CACHE=off`
+or use a separate cache file to preserve existing results. MXFP4 cache matching binds
 device/architecture/SM count, precision, EP size, shape, top-k, clamp, routing
 profile, format/protocol version, executable candidates and a stable cache
 namespace. Historical measurement reports are not loaded at runtime. Token

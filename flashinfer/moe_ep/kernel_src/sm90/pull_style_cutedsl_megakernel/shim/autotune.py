@@ -643,14 +643,9 @@ def autotune_hopper_mxfp4_mega_moe(
                 "supplied MXFP4 fused strategy is outside the supported "
                 "model/layout/protocol candidate union"
             )
-    persist_winner = candidates == full_candidates
-    strategy_union_sha256 = mxfp4_optimization_candidate_sha256(full_candidates)
+    strategy_union_sha256 = mxfp4_optimization_candidate_sha256(candidates)
 
     def _record(_winner: Dict[str, Any], p50_s: float) -> None:
-        # A subset is useful for smoke tests, but it does not justify a cache
-        # entry whose provenance identifies the complete production union.
-        if not persist_winner:
-            return
         effective_winner = symm_buffer._frontend.effective_tactic()
         if cfg.rank == 0:
             from .knob_cache import record_knobs

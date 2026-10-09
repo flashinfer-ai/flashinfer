@@ -512,7 +512,6 @@ class TokenInPullTokenBackPush:
                 f"'atomic_counter'; got {token_back_schedule_mode!r}."
             )
         self.token_back_schedule_mode = token_back_schedule_mode
-
         # How many of the (warpgroup-aligned) dispatch warps do token-comm
         # work AT ALL (prep + barrier + pull + reuse token-back).  The
         # physical warp count stays num_dispatch_warps -- the setmaxnreg
@@ -2344,7 +2343,6 @@ class TokenInPullTokenBackPush:
             nvlink_barrier_counter=token_comm_args.nvlink_barrier_counter,
         )
 
-
         nb_dispatch_to_sched = pipeline.NamedBarrier(
             barrier_id=self.dispatch_to_sched_named_barrier_id,
             num_threads=self.dispatch_to_sched_threads,
@@ -2382,7 +2380,7 @@ class TokenInPullTokenBackPush:
         if iket_active:
             _iket.range_pop()
 
-        if cutlass.const_expr(self.enable_token_back and (not self.token_back_standalone)):
+        if cutlass.const_expr(self.enable_token_back and not self.token_back_standalone):
             if iket_active:
                 _iket.range_push("Token_Back_By_Push")
 
@@ -2415,9 +2413,6 @@ class TokenInPullTokenBackPush:
 
             if iket_active:
                 _iket.range_pop()
-
-
-
 
     @cute.jit
     def token_back_warp_body(

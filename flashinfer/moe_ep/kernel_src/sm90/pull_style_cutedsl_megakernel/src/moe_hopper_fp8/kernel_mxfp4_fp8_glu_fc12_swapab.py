@@ -124,7 +124,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
             )
         if mma_tiler_mnk[2] == 2 * MXFP4_K_TILE and fp8_scale_mode != "mxfp4_hybrid":
             raise ValueError(
-                "The experimental MXFP4 K=256 tactic is available only for "
+                "The MXFP4 K=256 tactic is available only for "
                 "fp8_scale_mode='mxfp4_hybrid'."
             )
 

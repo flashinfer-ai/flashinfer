@@ -1,10 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Bounded fused MXFP4 strategy identities, separate from frozen measurements.
-
-This dependency-leaf host module neither compiles kernels nor touches caches.
-The legacy geometry tables remain provenance, not new performance results.
-"""
+"""Candidate generation and strategy validation for fused Hopper MXFP4."""
 
 from __future__ import annotations
 
