@@ -619,6 +619,7 @@ def create_dummy_inputs(
     gate_up_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
     use_persistent_finalize_kernel: bool = False,
+    num_valid_tokens_tensor: Optional[torch.Tensor] = None,
     knobs: Optional[dict] = None,
     seed: int = 0,
 ) -> tuple[
@@ -655,6 +656,7 @@ def create_dummy_inputs(
         ),
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         use_persistent_finalize_kernel=use_persistent_finalize_kernel,
+        num_valid_tokens_tensor=num_valid_tokens_tensor,
         knobs=knobs,
     )
 
